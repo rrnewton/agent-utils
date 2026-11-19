@@ -59,7 +59,9 @@ pub(crate) use control::{
     restore_agent_names, team_declaration_flags, team_undeliverable_notices, tree_order,
 };
 pub use control::{render_tree, ManageAction};
-pub use headless::{HeadlessApprovals, HeadlessStart, TakeoverOptions, TurnoverOptions};
+pub use headless::{
+    headless_refusal, HeadlessApprovals, HeadlessStart, TakeoverOptions, TurnoverOptions,
+};
 pub(crate) use stop_advice::{stop_reason, StopContext};
 pub use stop_advice::{RecoveryAction, StopFailure};
 
@@ -12469,6 +12471,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
         if let Some(viewer) = record.viewer_tab() {
             result[control::VIEWER_TAB] = json!(viewer);
+        }
+        if let Some(kind) = record.viewer_kind() {
+            result[control::VIEWER_KIND] = json!(kind);
         }
         if let Some(purpose) = record.purpose() {
             result[control::PURPOSE] = json!(purpose);

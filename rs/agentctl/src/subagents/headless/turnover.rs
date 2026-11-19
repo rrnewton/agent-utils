@@ -244,6 +244,9 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 record.mode, record.adapter
             )));
         }
+        if let Some(refusal) = super::headless_refusal(&record.harness) {
+            return Err(fail(refusal));
+        }
         let journal_path = crate::lineage::turnover_path(&self.registry, agent_name);
         let journal = read_journal(&journal_path)?;
         if options.abort {
@@ -373,7 +376,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             "handoff_kind": journal["handoff_kind"],
             "prompt_id": journal["prompt_id"],
             "wrapper": wrapper,
-            "next": format!("agentctl tail {agent_name} --follow"),
+            "next": format!("agentctl console {agent_name}"),
         }))
     }
 

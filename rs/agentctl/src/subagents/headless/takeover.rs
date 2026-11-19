@@ -768,7 +768,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                         "writers_ended": terminated,
                         "tab_closed": tab_closed,
                         "wrapper": {"systemd_unit": unit},
-                        "next": format!("agentctl tail {agent_name} --follow"),
+                        "next": format!("agentctl console {agent_name}"),
                     }));
                 }
                 Ok(output) => {
@@ -785,7 +785,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             "writers_ended": terminated,
             "tab_closed": tab_closed,
             "wrapper": {"pid": pid, "systemd_unit_failed": unit.map(|unit| json!({"unit": unit, "error": unit_error}))},
-            "next": format!("agentctl tail {agent_name} --follow"),
+            "next": format!("agentctl console {agent_name}"),
         }))
     }
 }

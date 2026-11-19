@@ -45,6 +45,10 @@ pub struct AgentFacts {
     pub lifecycle: String,
     /// Whether it runs headless (no pane of its own).
     pub headless: bool,
+    /// Whether the recorded viewer explicitly runs `agentctl tail` (#1879);
+    /// only an explicit tail viewer is stale. A legacy record with no kind
+    /// is left untouched until a deliberate turnover.
+    pub viewer_is_tail: bool,
     /// Its recorded working directory.
     pub cwd: String,
     /// The pinned process is proven live as the pane's foreground process.
@@ -285,12 +289,30 @@ pub fn plan(
                 agent: agent.name.clone(),
             });
         }
-        // One viewer per live headless agent: missing, closed, or pane-dead heals.
+        // One console viewer per live headless agent (#1879): missing,
+        // closed, pane-dead, or a stale tail viewer heals as console.
         let viewer_alive = agent
             .viewer_tab_id
             .as_deref()
             .is_some_and(|tab| live_tabs.contains(tab));
-        if agent.headless && (agent.lifecycle == "running" || agent.live_proven) && !viewer_alive {
+        let stale_tail = viewer_alive && agent.viewer_is_tail;
+        if agent.headless && (agent.lifecycle == "running" || agent.live_proven) && stale_tail {
+            if let Some(tab) = agent.viewer_tab_id.clone() {
+                actions.push(TabAction::CloseTab {
+                    tab_id: tab,
+                    why: "stale tail viewer (console is the paved view)".to_owned(),
+                });
+            }
+            if let Some(workspace) = viewer_workspace {
+                actions.push(TabAction::CreateViewer {
+                    agent: agent.name.clone(),
+                    workspace_id: workspace.to_owned(),
+                });
+            }
+        } else if agent.headless
+            && (agent.lifecycle == "running" || agent.live_proven)
+            && !viewer_alive
+        {
             if let Some(workspace) = viewer_workspace {
                 actions.push(TabAction::CreateViewer {
                     agent: agent.name.clone(),
@@ -325,6 +347,7 @@ mod tests {
             viewer_tab_id: None,
             lifecycle: "running".into(),
             headless: false,
+            viewer_is_tail: false,
             cwd: "/work/slot".into(),
             live_proven: pane.is_some(),
         }
@@ -460,6 +483,52 @@ mod tests {
             agent: "coord".into(),
             workspace_id: "w1".into()
         }));
+    }
+
+    #[test]
+    fn a_stale_tail_viewer_is_recreated_as_a_console_viewer() {
+        // #1879 D: a live headless agent whose viewer runs tail (not
+        // console) is stale: close it and create the console viewer. A
+        // console viewer is left alone.
+        let viewer_pane = pane("w1:p5", "w1:t5", "w1", "coord", false, false);
+        let panes = vec![viewer_pane];
+        let mut stale = agent("coord", None);
+        stale.headless = true;
+        stale.viewer_tab_id = Some("w1:t5".into());
+        stale.viewer_is_tail = true;
+        let order = vec![("w1".to_owned(), "w1:t5".to_owned())];
+        let (_, actions) = plan(
+            &panes,
+            &order,
+            &[stale],
+            &BTreeMap::new(),
+            0.0,
+            600.0,
+            Some("w1"),
+        );
+        assert!(actions.contains(&TabAction::CloseTab {
+            tab_id: "w1:t5".into(),
+            why: "stale tail viewer (console is the paved view)".into()
+        }));
+        assert!(actions.contains(&TabAction::CreateViewer {
+            agent: "coord".into(),
+            workspace_id: "w1".into()
+        }));
+
+        let mut fresh = agent("coord", None);
+        fresh.headless = true;
+        fresh.viewer_tab_id = Some("w1:t5".into());
+        fresh.viewer_is_tail = false;
+        let (_, actions) = plan(
+            &panes,
+            &order,
+            &[fresh],
+            &BTreeMap::new(),
+            0.0,
+            600.0,
+            Some("w1"),
+        );
+        assert!(actions.is_empty(), "{actions:?}");
     }
 
     #[test]

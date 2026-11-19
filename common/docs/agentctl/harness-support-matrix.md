@@ -46,8 +46,8 @@ Columns:
   (`--harness unknown`, #850 unknown-harness-mode). It knows no phrase,
   glyph, launch argument, or transcript of the program it drives.
 - **Headless**: a harness driven over its structured protocol instead of
-  a terminal (#565 headless-coordinator). Today this build runs only
-  Claude Code headless; the cell says so wherever it matters.
+  a terminal (#565 headless-coordinator). Today this build runs Claude
+  Code and Muse headless; the cell says so wherever it matters.
 
 Every cell names its code path. Paths are relative to this repository;
 `rs/` is the Rust edition, `py/` the Python edition.
@@ -56,31 +56,31 @@ Every cell names its code path. Paths are relative to this repository;
 
 | Capability | Claude Code | Codex | Muse | Unknown TUI | Headless |
 | --- | --- | --- | --- | --- | --- |
-| Send: typing + submit | supported | supported | supported | partial | supported (Claude only) |
+| Send: typing + submit | supported | supported | supported | partial | supported (Claude and Muse) |
 | Second Enter after delivery (#1691) | supported | supported | supported (delayed re-check, #1732) | none | n/a (no composer) |
-| Send: delivery receipts | supported | supported | supported | partial | supported (Claude only) |
+| Send: delivery receipts | supported | supported | supported | partial | supported (Claude and Muse) |
 | Follow-up while working | partial | supported | supported | none | n/a (queued turns) |
 | Stuck-paste / Enter backstop | supported | partial | supported | partial | n/a (no composer) |
 | Composer / draft detection | supported | supported | supported | none | n/a |
 | Busy / idle detection | supported | supported | supported | partial | supported (event log) |
-| Interrupt a running turn | supported | supported | supported | partial | supported (Claude only) |
-| Approvals relay to chat | none | none | none | none | supported (Claude only) |
+| Interrupt a running turn | supported | supported | supported | partial | supported (Claude and Muse) |
+| Approvals relay to chat | none | none | none | none | supported (Claude and Muse) |
 | Forms / questions (`prompts`, `answer`) | supported | supported | none (detect only) | none | n/a |
 | Trust dialogs | supported | supported | partial | none | n/a |
-| Headless mode itself | supported | none | in progress | none | — |
+| Headless mode itself | supported | none | supported | none | — |
 | Transcript reading | supported | supported | supported | none | supported (typed events) |
 | `--trace-thread` harvesting | supported | supported | supported | none | supported (typed events) |
 | `tail` / `console` / `read` | partial | partial | partial | partial | supported |
-| Session identity | supported | supported | supported | none | supported (Claude only) |
-| Takeover / handback | n/a (is the target) | none | none | none | supported (Claude only) |
-| Restore / revive (launch replay) | supported | supported | partial | none | supported (Claude only) |
-| Effort control | supported | supported | supported | none | supported (Claude only) |
-| Model selection | supported | supported | supported | none | supported (Claude only) |
+| Session identity | supported | supported | supported | none | supported (Claude and Muse) |
+| Takeover / handback | n/a (is the target) | none | none | none | supported (Claude and Muse) |
+| Restore / revive (launch replay) | supported | supported | partial | none | supported (Claude and Muse) |
+| Effort control | supported | supported | supported | none | supported (Claude and Muse) |
+| Model selection | supported | supported | supported | none | supported (Claude and Muse) |
 | Launch-env replay | supported | supported | supported | partial | supported |
 | Permission bypass at launch | supported | supported | supported | n/a | supported |
-| Chat-bridge delivery | supported | supported | supported | partial | supported (Claude only) |
+| Chat-bridge delivery | supported | supported | supported | partial | supported (Claude and Muse) |
 | Watcher notices (DONE / BLOCKED / idle / stalled) | supported | supported | supported | partial | none (skipped) |
-| Raw messages (no sender header) | supported | supported | supported | partial | supported (Claude only) |
+| Raw messages (no sender header) | supported | supported | supported | partial | supported (Claude and Muse) |
 | Goal commands | supported | supported | supported | none | partial |
 | Skill installation | supported | supported | supported | none | n/a |
 | Boxed launch (`--slot`, userns) | none | none | supported | none | n/a |
@@ -121,10 +121,11 @@ adapter (`HarnessAdapter::verified_submission`, `composer_view`,
   Enter, poll until it leaves the bottom of the screen
   (`rs/agentctl/src/unknown_harness.rs`). Nothing about the program is
   known, so staging is judged from screen movement alone.
-- **Headless**: supported for Claude Code only — the durable queue is
-  the only drainer and the wrapper feeds the stream-json process
-  (`rs/agentctl/src/headless/wrapper.rs`). Codex and Muse have no Rust
-  headless adapter; Muse is in progress, #1234 headless-muse.
+- **Headless**: supported for Claude Code and Muse — the durable queue is
+  the only drainer and the wrapper feeds the harness process
+  (`rs/agentctl/src/headless/wrapper.rs`, adapters in
+  `rs/agentctl/src/headless/claude.rs` and `rs/agentctl/src/headless/muse.rs`).
+  Codex has no Rust headless adapter.
 
 ### Send: delivery receipts
 
@@ -365,14 +366,15 @@ managed send checks for it before typing into an idle pane.
 
 ### Headless mode itself
 
-`agentctl start --mode headless` in the Rust edition runs exactly one
-harness: `HARNESSES = ["claude"]` in `rs/agentctl/src/headless/mod.rs`,
-Claude Code over stream-json (#565 headless-coordinator). Codex headless:
-none in this edition. Muse headless: in progress, #1234 headless-muse
-(mu-musehl) — a Muse adapter beside `rs/agentctl/src/headless/claude.rs`
-under the same wrapper, so queue, event log, `tail`, `console`, and
-approvals behave as a Claude headless agent's do. The Python edition's
-headless workers are a different mechanism; see
+`agentctl start --mode headless` in the Rust edition runs two harnesses:
+the adapters registered in `rs/agentctl/src/headless/adapter.rs` — Claude
+Code over stream-json (#565 headless-coordinator) and Muse over `muse
+serve` (MSP over stdio; `muse exec --json` per turn is the explicit
+fallback transport), both under the same wrapper, so queue, event log,
+`tail`, `console`, and approvals behave the same way. Codex headless:
+none in this edition, and `start`, `restore` and `turnover` refuse it up
+front naming this row (#1879). The Python edition's headless workers are
+a different mechanism; see
 [The Python edition](#the-python-edition).
 
 ### Transcript reading
@@ -733,9 +735,9 @@ The two smallest divergences, kept as rows so they cannot hide:
    in the pane.
 3. **`agentctl answer` does not answer Muse.** Muse forms are detected
    so status can say blocked; answering them is refused by design.
-4. **Headless means Claude.** In the Rust edition that the launchers
-   run, `start --mode headless` starts Claude Code only. Codex has no
-   headless adapter there, and Muse's is in progress (#1234).
+4. **Headless means Claude or Muse.** In the Rust edition that the
+   launchers run, `start --mode headless` starts Claude Code or Muse.
+   Codex has no headless adapter there and is refused up front (#1879).
 5. **Effort levels are three different sets.** `ultra` exists for Codex
    and Muse but not Claude Code; `none` exists only for Muse; a level
    copied from one harness's profile to another can be refused.

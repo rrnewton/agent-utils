@@ -436,6 +436,9 @@ fn console_input_queues_a_plain_turn_with_its_origin() {
     assert_eq!(processed["text"], "run `date`", "{processed:?}");
     assert_eq!(processed["raw"], true, "{processed:?}");
     assert_eq!(processed["from"], "console:alice");
+    // #1879 A: console input is urgent and delivered now, ahead of agent sends.
+    assert_eq!(processed["priority"], "urgent", "{processed:?}");
+    assert_eq!(processed["deliver"], "now", "{processed:?}");
     assert_eq!(processed["origin"]["kind"], "console");
     assert_eq!(processed["origin"]["user"], "alice");
     assert_eq!(processed["origin"]["tty"], "/dev/pts/7");
@@ -639,11 +642,113 @@ fn interrupt_ends_the_running_turn_and_the_next_input_runs() {
     fixture.wait("cancelled after start", || {
         fixture.has_event("input.cancelled", |data| data["before_start"] == false)
     });
+    // #1879 C: a bare interrupt holds queued agent items until the owner
+    // types; the console line releases the hold and goes first.
     fixture.enqueue("next", "are you there", json!({}));
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(fixture.state("next"), Some(queue::MessageState::Pending));
+    let answer = control::request(
+        &control::socket_path(&fixture.agent_directory),
+        &json!({"op": "console.input", "text": "owner check-in", "user": "alice", "tty": "/dev/pts/7"}),
+        Duration::from_secs(20),
+    )
+    .unwrap();
+    assert_eq!(answer["ok"], true, "{answer}");
     fixture.wait("next processed", || {
         fixture.has_event("assistant.text", |data| {
-            data["text"] == "echo: are you there"
+            data["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("are you there"))
         })
+    });
+    fixture.stop(handle);
+}
+
+#[test]
+fn interrupt_with_a_message_makes_it_the_next_turn() {
+    // #1879 B: `/interrupt MSG` ends the turn and MSG runs next, ahead of
+    // an already-queued normal item.
+    let fixture = Fixture::new("interrupt-msg", "normal");
+    let handle = fixture.start();
+    fixture.enqueue("slow", "SLOW work", json!({}));
+    fixture.wait("tool running", || {
+        fixture.has_event("tool.started", |_| true)
+    });
+    fixture.enqueue("later", "queued agent note", json!({}));
+    let answer = control::request(
+        &control::socket_path(&fixture.agent_directory),
+        &json!({"op": "interrupt", "text": "owner redirect", "user": "alice", "tty": "/dev/pts/7"}),
+        Duration::from_secs(20),
+    )
+    .unwrap();
+    assert_eq!(answer["ok"], true, "{answer}");
+    fixture.wait("interrupted", || {
+        fixture.has_event("turn.completed", |data| data["outcome"] == "interrupted")
+    });
+    fixture.wait("redirect echoed", || {
+        fixture.has_event("assistant.text", |data| {
+            data["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("owner redirect"))
+        })
+    });
+    fixture.wait("later processed", || {
+        fixture.state("later") == Some(queue::MessageState::Processed)
+    });
+    // The redirect is echoed before the queued note (they may share one
+    // combined turn-boundary prompt, redirect first).
+    let echoed = fixture
+        .events()
+        .iter()
+        .filter(|event| event.kind == "assistant.text")
+        .filter_map(|event| event.data["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let redirect_at = echoed.find("owner redirect").expect("redirect echoed");
+    let later_at = echoed.find("queued agent note").expect("later echoed");
+    assert!(redirect_at < later_at, "{echoed}");
+    fixture.stop(handle);
+}
+
+#[test]
+fn a_bare_interrupt_holds_the_queue_until_a_console_line() {
+    // #1879 C: after a bare interrupt nothing queued starts until the owner
+    // types again (the ~30 s expiry is the other release).
+    let fixture = Fixture::new("interrupt-hold", "normal");
+    let handle = fixture.start();
+    fixture.enqueue("slow", "SLOW work", json!({}));
+    fixture.wait("tool running", || {
+        fixture.has_event("tool.started", |_| true)
+    });
+    fixture.enqueue("later", "queued agent note", json!({}));
+    let answer = fixture.request("interrupt");
+    assert_eq!(answer["ok"], true, "{answer}");
+    fixture.wait("interrupted", || {
+        fixture.has_event("turn.completed", |data| data["outcome"] == "interrupted")
+    });
+    // Give a broken (unheld) wrapper ample chance to start the queued item.
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(
+        fixture.state("later"),
+        Some(queue::MessageState::Pending),
+        "queued item started during the post-interrupt hold"
+    );
+    let answer = control::request(
+        &control::socket_path(&fixture.agent_directory),
+        &json!({"op": "console.input", "text": "owner follow-up", "user": "alice", "tty": "/dev/pts/7"}),
+        Duration::from_secs(20),
+    )
+    .unwrap();
+    assert_eq!(answer["ok"], true, "{answer}");
+    fixture.wait("follow-up echoed", || {
+        fixture.has_event("assistant.text", |data| {
+            data["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("owner follow-up"))
+        })
+    });
+    fixture.wait("later processed", || {
+        fixture.state("later") == Some(queue::MessageState::Processed)
     });
     fixture.stop(handle);
 }

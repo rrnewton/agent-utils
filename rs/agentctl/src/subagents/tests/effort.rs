@@ -211,6 +211,48 @@ fn headless_start_refuses_an_unsupported_effort() {
 }
 
 #[test]
+fn headless_start_refuses_a_harness_with_no_adapter_naming_the_matrix() {
+    // #1879 E: Codex has no headless adapter; the refusal names the matrix
+    // row and changes nothing. Muse has one and is accepted.
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let error = manager
+        .start_headless(
+            "lead",
+            &fixture.root,
+            HeadlessStart {
+                harness: "codex".to_owned(),
+                reasoning_effort: Some("high".to_owned()),
+                launch: false,
+                ..HeadlessStart::default()
+            },
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("harness-support-matrix"),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("Headless mode itself"),
+        "{error}"
+    );
+    assert!(manager.load("lead").is_err(), "refusal changed state");
+    manager
+        .start_headless(
+            "muse-lead",
+            &fixture.root,
+            HeadlessStart {
+                harness: "muse".to_owned(),
+                reasoning_effort: Some("high".to_owned()),
+                launch: false,
+                ..HeadlessStart::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(manager.load("muse-lead").unwrap().harness, "muse");
+}
+
+#[test]
 fn set_model_records_an_override_that_wins_and_refuses_bad_names() {
     let fixture = Fixture::new();
     let manager = fixture.manager();

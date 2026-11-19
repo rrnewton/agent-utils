@@ -15,6 +15,42 @@ pub use takeover::TakeoverOptions;
 use takeover::{takeover_marker, takeover_needs_handback};
 pub use turnover::TurnoverOptions;
 
+/// Whether a systemd user manager answers (#1879 D).
+fn systemd_user_available() -> bool {
+    std::process::Command::new("systemctl")
+        .args(["--user", "show-environment"])
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
+/// The systemd user unit directory.
+fn systemd_user_dir() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(dir).join("systemd/user"));
+    }
+    let home = std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| fail("HOME is not set; cannot locate the systemd user directory"))?;
+    Ok(PathBuf::from(home).join(".config/systemd/user"))
+}
+
+/// Run one `systemctl --user` command, naming its failure.
+fn run_systemctl(args: &[&str]) -> Result<()> {
+    let output = std::process::Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .output()
+        .map_err(|error| fail(format!("run systemctl --user {}: {error}", args.join(" "))))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(fail(format!(
+        "systemctl --user {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr).trim()
+    )))
+}
+
 /// Schema of the `headless` block in a headless agent's record.
 const SPEC_SCHEMA: &str = "agentctl-headless/v1";
 /// How long `stop` waits for a running wrapper to finish and release its lock.
@@ -62,6 +98,26 @@ pub struct HeadlessStart {
     /// Muse transport (`serve` or `exec`), recorded for Muse agents;
     /// `None` selects the harness default. Never switched at runtime.
     pub transport: Option<String>,
+    /// Launch the wrapper as a detached setsid process instead of under its
+    /// own systemd user unit (#1879). The unit is the default: the wrapper is
+    /// never parented to Herdr or the caller's shell.
+    pub detached: bool,
+    /// Launch profile the start resolved, recorded on the agent record.
+    pub profile: Option<String>,
+}
+
+/// Why `harness` cannot run headless, naming the support-matrix row (#1879 E).
+/// `None` when this build has a headless adapter for it.
+#[must_use]
+pub fn headless_refusal(harness: &str) -> Option<String> {
+    if hl::adapter::adapter_for(harness).is_some() {
+        return None;
+    }
+    Some(format!(
+        "harness {harness:?} has no headless adapter (harness-support-matrix: \
+         \"Headless mode itself\" is none for {harness}); headless runs {} in this build",
+        hl::harnesses().join(", ")
+    ))
 }
 
 impl AgentRecord {
@@ -289,12 +345,18 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             super::control::validated_purpose(purpose)?;
         }
         let Some(adapter) = hl::adapter::adapter_for(&options.harness) else {
-            return Err(fail(format!(
-                "headless mode runs {} in this build, not {:?}",
-                hl::harnesses().join(", "),
-                options.harness
-            )));
+            return Err(fail(headless_refusal(&options.harness).unwrap_or_default()));
         };
+        // #1879 D: the default launch needs the systemd user manager; refuse
+        // before any record, unit or tab change when it cannot parent the
+        // wrapper. --detached (setsid) is the explicit alternative.
+        if options.launch && !options.detached && !systemd_user_available() {
+            return Err(fail(
+                "start --mode headless runs the wrapper under its own systemd user unit, \
+                 but no systemd user manager answers; pass --detached for the setsid launch"
+                    .to_owned(),
+            ));
+        }
         if let Some(effort) = options.reasoning_effort.as_deref() {
             crate::profiles::validate_effort(&options.harness, effort)?;
         }
@@ -388,7 +450,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             anchor_rule: None,
             former_names: Vec::new(),
             native_session: None,
-            profile: None,
+            profile: options.profile.clone(),
             slot: None,
             slot_project: None,
             slot_isolation: None,
@@ -453,7 +515,11 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         };
         drop(lock);
         let launched = if options.launch {
-            Some(self.launch_wrapper(agent_name)?)
+            Some(if options.detached {
+                self.launch_wrapper_detached(agent_name)?
+            } else {
+                self.launch_wrapper_systemd(agent_name)?
+            })
         } else {
             None
         };
@@ -478,7 +544,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         result["brief_message_id"] = json!(brief_id);
         result["wrapper_launched_pid"] = json!(launched);
         result["next"] = json!(if options.launch {
-            format!("agentctl tail {agent_name} --follow")
+            format!("agentctl console {agent_name}")
         } else {
             format!(
                 "register no detached wrapper: run `agentctl --registry {} run-headless {agent_name}` under a supervisor (agentctl install-units --headless {agent_name})",
@@ -488,8 +554,70 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         Ok(result)
     }
 
-    /// Start `agentctl run-headless NAME` in its own session, logging to the agent directory.
+    /// Start `agentctl run-headless NAME` under its own systemd user unit
+    /// (#1879 D): the unit parents the wrapper, never Herdr or the caller.
+    fn launch_wrapper_systemd(&self, agent_name: &str) -> Result<u32> {
+        let executable = std::env::current_exe()
+            .map_err(|error| fail(format!("locate this agentctl: {error}")))?;
+        let dest = systemd_user_dir()?;
+        let options = crate::units::InstallOptions {
+            dest: dest.clone(),
+            agentctl: executable,
+            herdr: PathBuf::from("herdr"),
+            registry: self.registry.clone(),
+            bridge_unit: None,
+            dry_run: false,
+            force: true,
+        };
+        let environment: Vec<(String, String)> = ["PATH", "CLAUDE_CONFIG_DIR"]
+            .iter()
+            .filter_map(|key| std::env::var(key).ok().map(|v| (key.to_string(), v)))
+            .collect();
+        let (file, contents) = crate::units::rendered_headless(
+            &options,
+            agent_name,
+            &crate::units::HeadlessUnit {
+                claude: None,
+                environment,
+            },
+        )?;
+        fs::create_dir_all(&dest)
+            .map_err(|error| fail(format!("create {}: {error}", dest.display())))?;
+        let path = dest.join(&file);
+        fs::write(&path, contents)
+            .map_err(|error| fail(format!("write {}: {error}", path.display())))?;
+        let unit = file.display().to_string();
+        run_systemctl(&["daemon-reload"])?;
+        run_systemctl(&["enable", "--now", &unit])?;
+        let socket = hcontrol::socket_path(&self.directory(agent_name)?);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            if hcontrol::request(&socket, &json!({"op": "status"}), Duration::from_secs(2)).is_ok()
+            {
+                let pid = std::process::Command::new("systemctl")
+                    .args(["--user", "show", "-p", "MainPID", "--value", &unit])
+                    .output()
+                    .ok()
+                    .and_then(|out| String::from_utf8(out.stdout).ok())
+                    .and_then(|text| text.trim().parse::<u32>().ok())
+                    .unwrap_or(0);
+                return Ok(pid);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Err(fail(format!(
+            "the headless wrapper unit {unit} did not open its control socket within 15 s"
+        )))
+    }
+
+    /// Relaunch the wrapper under its systemd unit (turnover/takeover/restore).
     fn launch_wrapper(&self, agent_name: &str) -> Result<u32> {
+        self.launch_wrapper_systemd(agent_name)
+    }
+
+    /// Start `agentctl run-headless NAME` in its own session, logging to the agent directory.
+    /// Only behind the explicit detached flag (#1879 D).
+    fn launch_wrapper_detached(&self, agent_name: &str) -> Result<u32> {
         let executable = std::env::current_exe()
             .map_err(|error| fail(format!("locate this agentctl: {error}")))?;
         let log_path = self.directory(agent_name)?.join("headless.log");
@@ -616,6 +744,9 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 "agent {agent_name:?} is not a headless agent (adapter {:?})",
                 record.adapter
             )));
+        }
+        if let Some(refusal) = headless_refusal(&record.harness) {
+            return Err(fail(refusal));
         }
         if record.lifecycle != "running" {
             return Err(fail(format!(

@@ -9,8 +9,9 @@
 //! plain user turn, byte for byte, with its origin logged. Approval
 //! answers (`approve a7`, `deny a7 too broad`) go through the existing
 //! approval path and are never delivered as messages. `/interrupt`, or
-//! Ctrl-C twice on an empty line inside the double-press window, asks
-//! the wrapper to interrupt the running turn; a single Ctrl-C only
+//! `/interrupt MSG` (MSG becomes the next turn), or Ctrl-C twice on an
+//! empty line inside the double-press window, asks the wrapper to
+//! interrupt the running turn; a single Ctrl-C only
 //! hints and never leaves. Ctrl-D, `/quit`, or a signal leaves the
 //! console, every exit prints the disconnected notice, and leaving
 //! never touches the agent. `/help` is answered locally, and any other
@@ -494,7 +495,20 @@ fn submit<A: ManagedApi + ?Sized>(
         return true;
     }
     if line == "/interrupt" {
-        send_interrupt(socket, shared);
+        send_interrupt(socket, shared, None, user, tty);
+        return false;
+    }
+    if let Some(message) = line.strip_prefix("/interrupt ") {
+        let message = message.trim();
+        if message.is_empty() {
+            send_interrupt(socket, shared, None, user, tty);
+        } else if message.len() > CONSOLE_INPUT_MAX_BYTES {
+            shared.print_line(&format!(
+                "message too large (at most {CONSOLE_INPUT_MAX_BYTES} bytes); not sent"
+            ));
+        } else {
+            send_interrupt(socket, shared, Some(message), user, tty);
+        }
         return false;
     }
     if line == "/help" {
@@ -503,7 +517,7 @@ fn submit<A: ManagedApi + ?Sized>(
             "  /help       show this help",
             "  /effort [LEVEL]  show or set the reasoning effort (menu without LEVEL)",
             "  /model [NAME]    show or set the model (menu without NAME)",
-            "  /interrupt  interrupt the running turn",
+            "  /interrupt [MSG]  interrupt the running turn; MSG (if given) becomes the next turn",
             "  /quit       leave the console (the agent keeps running)",
             "  approve aN / deny aN [reason]  answer an approval",
             "keys: Enter sends a plain turn; Ctrl-C twice on an empty line interrupts the turn; Ctrl-D on an empty line leaves",
@@ -721,9 +735,21 @@ fn apply_override<A: ManagedApi + ?Sized>(
 }
 
 /// Ask the wrapper to interrupt the running turn (the `/interrupt` line
-/// and Ctrl-C on an empty line). Interrupting never leaves the console.
-fn send_interrupt(socket: &Path, shared: &Arc<Shared>) {
-    match hcontrol::request(socket, &json!({"op": "interrupt"}), CONTROL_WAIT) {
+/// and Ctrl-C on an empty line). With `message`, the wrapper queues it as
+/// the urgent next turn (#1879 B); without one it holds the queue (#1879 C).
+/// Interrupting never leaves the console.
+fn send_interrupt(
+    socket: &Path,
+    shared: &Arc<Shared>,
+    message: Option<&str>,
+    user: &str,
+    tty: &str,
+) {
+    let body = match message {
+        Some(text) => json!({"op": "interrupt", "text": text, "user": user, "tty": tty}),
+        None => json!({"op": "interrupt"}),
+    };
+    match hcontrol::request(socket, &body, CONTROL_WAIT) {
         Ok(answer) if answer["ok"] == json!(true) => {
             shared.print_line("interrupt sent");
         }
@@ -754,7 +780,7 @@ fn console_banner(name: &str, purpose: Option<&str>) -> String {
         None => name.to_owned(),
     };
     format!(
-        "agentctl console {subject}: Enter sends a plain turn; /help lists the console commands; /interrupt or Ctrl-C twice interrupts the turn; Ctrl-D or /quit leaves; approve aN / deny aN [reason] answers an approval"
+        "agentctl console {subject}: Enter sends a plain turn; /help lists the console commands; /interrupt [MSG] or Ctrl-C twice interrupts the turn (MSG becomes the next turn); Ctrl-D or /quit leaves; approve aN / deny aN [reason] answers an approval"
     )
 }
 
@@ -881,7 +907,7 @@ pub fn run<A: ManagedApi + ?Sized>(
                         break 'input;
                     }
                 }
-                Action::Interrupt => send_interrupt(&socket, &shared),
+                Action::Interrupt => send_interrupt(&socket, &shared, None, &user, &tty),
                 Action::Hint => {
                     shared.print_line("press Ctrl-C again to interrupt");
                 }

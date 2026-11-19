@@ -33,6 +33,9 @@ pub(crate) const STANDING: &str = "standing";
 /// workspace-goal-reconciler, Phase 1). Hygiene ranks that tab with the
 /// agent; it is never the agent's pane.
 pub(crate) const VIEWER_TAB: &str = "viewer_tab_id";
+/// What the viewer tab runs: `console` (the paved view, #1879) or `tail`
+/// (stale for a live headless agent; hygiene recreates it as console).
+pub(crate) const VIEWER_KIND: &str = "viewer_kind";
 /// A one-line description of what the agent is for (#1342 agent-purpose-line):
 /// display-only metadata recorded at start. Unlike `goal` it is never sent to
 /// the harness as an instruction.
@@ -761,6 +764,9 @@ impl AgentRecord {
     /// Name the Herdr tab viewing this agent, or clear it; a record with no
     /// viewer carries no field.
     pub(super) fn set_viewer_tab(&mut self, tab: Option<&str>) {
+        if tab.is_none() {
+            self.set_viewer_kind(None);
+        }
         match &mut self.nested {
             Some(nested) => {
                 let map = nested.extensions_mut();
@@ -779,6 +785,40 @@ impl AgentRecord {
                 }
                 None => {
                     self.extra.remove(VIEWER_TAB);
+                }
+            },
+        }
+    }
+
+    /// What the viewer tab runs (`console` or `tail`), when recorded (#1879).
+    pub(super) fn viewer_kind(&self) -> Option<String> {
+        let value = match &self.nested {
+            Some(nested) => nested.extensions().get(VIEWER_KIND),
+            None => self.extra.get(VIEWER_KIND),
+        }?;
+        value.as_str().map(str::to_owned)
+    }
+
+    /// Record what the viewer tab runs, or clear it with the tab.
+    pub(super) fn set_viewer_kind(&mut self, kind: Option<&str>) {
+        match &mut self.nested {
+            Some(nested) => {
+                let map = nested.extensions_mut();
+                match kind {
+                    Some(kind) => {
+                        map.insert(VIEWER_KIND.to_owned(), json!(kind));
+                    }
+                    None => {
+                        map.remove(VIEWER_KIND);
+                    }
+                }
+            }
+            None => match kind {
+                Some(kind) => {
+                    self.extra.insert(VIEWER_KIND.to_owned(), json!(kind));
+                }
+                None => {
+                    self.extra.remove(VIEWER_KIND);
                 }
             },
         }
@@ -1762,16 +1802,30 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
     /// with the agent, and `bring_forward` can keep a headless coordinator's
     /// viewer first. The tab is a view only; no pane id is read or changed.
     pub fn set_viewer_tab(&self, agent_name: &str, tab: Option<String>) -> Result<Value> {
+        self.set_viewer_tab_kind(agent_name, tab, None)
+    }
+
+    /// Name the viewer tab and what it runs (`console` or `tail`, #1879).
+    pub fn set_viewer_tab_kind(
+        &self,
+        agent_name: &str,
+        tab: Option<String>,
+        kind: Option<&str>,
+    ) -> Result<Value> {
         let _lock = self.lock(agent_name)?;
         let mut record = self.load(agent_name)?;
         let previous = record.viewer_tab();
         record.set_viewer_tab(tab.as_deref());
-        if previous != tab {
+        if tab.is_some() {
+            record.set_viewer_kind(kind);
+        }
+        if previous != tab || kind.is_some() {
             self.save(&record)?;
         }
         Ok(json!({
             "name": record.name,
             "viewer_tab_id": tab,
+            "viewer_kind": kind,
             "previous": previous,
         }))
     }
@@ -1819,12 +1873,11 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         self.client.inherited_workspace()
     }
 
-    /// Create the viewer tab of a headless agent (#1793): a fresh tab in
-    /// `workspace` running `agentctl tail --follow NAME`, recorded as the
-    /// agent's `viewer_tab_id`. The viewer is a view only; the agent's pane
-    /// (it has none) and process are never touched. A console needs the
-    /// owner's foreground terminal, so automated creation always uses the
-    /// tail; an owner can point `--viewer-tab` at a console tab instead.
+    /// Create the viewer tab of a headless agent (#1879, #1793): a fresh tab in
+    /// `workspace` running `agentctl console NAME`, recorded as the agent's
+    /// `viewer_tab_id` with kind `console`. The viewer is a pure client over
+    /// the control socket; the agent's process is never touched, so losing
+    /// Herdr loses only the view and restore reopens it.
     pub fn ensure_headless_viewer(&self, agent_name: &str, workspace: &str) -> Result<String> {
         let record = self.load(agent_name)?;
         let (tab, pane) =
@@ -1834,14 +1887,14 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             .map_err(|error| fail(format!("locate this agentctl: {error}")))?;
         let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
         let command = format!(
-            "exec {} --registry {} tail --follow {}",
+            "exec {} --registry {} console {}",
             quote(&executable.display().to_string()),
             quote(&self.registry.display().to_string()),
             agent_name,
         );
         self.client.send_text(&pane, &command)?;
         self.client.send_keys(&pane, "Enter")?;
-        self.set_viewer_tab(agent_name, Some(tab.clone()))?;
+        self.set_viewer_tab_kind(agent_name, Some(tab.clone()), Some("console"))?;
         Ok(tab)
     }
 

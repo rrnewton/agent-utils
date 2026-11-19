@@ -633,7 +633,7 @@ fn a_viewer_tab_is_named_and_cleared_without_touching_the_pane() {
         .unwrap();
     assert_eq!(
         set,
-        json!({"name": "worker", "viewer_tab_id": "w1:t7", "previous": null})
+        json!({"name": "worker", "viewer_tab_id": "w1:t7", "viewer_kind": null, "previous": null})
     );
     let record = fixture.manager().load("worker").unwrap();
     assert_eq!(record.viewer_tab().as_deref(), Some("w1:t7"));
@@ -649,6 +649,36 @@ fn a_viewer_tab_is_named_and_cleared_without_touching_the_pane() {
     assert_eq!(record.pane_id, pane_before, "no pane ids changed");
     assert!(fixture.manager().status("worker").unwrap()["viewer_tab_id"].is_null());
     let _ = old;
+}
+
+#[test]
+fn a_viewer_kind_from_a_newer_agentctl_survives_a_rewrite() {
+    // #1879 + #809/#813 forward-compat: `viewer_kind` rides in the record's
+    // extension map beside `viewer_tab_id`, so an older build (which stores
+    // unknown extension keys untouched) loads the record, ignores the kind,
+    // and keeps it through a rewrite. No launch-spec field changes.
+    let (fixture, old) = recoverable("claude", false);
+    let _ = old;
+    fixture
+        .manager()
+        .set_viewer_tab_kind("worker", Some("w1:t7".to_owned()), Some("console"))
+        .unwrap();
+    assert_eq!(
+        fixture
+            .manager()
+            .load("worker")
+            .unwrap()
+            .viewer_kind()
+            .as_deref(),
+        Some("console")
+    );
+    // Simulate the older build: rewrite through an unrelated field change
+    // and confirm the kind is still on disk.
+    fixture.manager().pause("worker", true).unwrap();
+    let path = fixture.root.join("registry/agents/worker/agent.json");
+    let document = agent::read_private_json(&path).unwrap();
+    assert_eq!(document["viewer_kind"], json!("console"), "{document}");
+    assert_eq!(document["viewer_tab_id"], json!("w1:t7"), "{document}");
 }
 
 #[test]

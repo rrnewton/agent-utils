@@ -1,6 +1,6 @@
 ---
 title: 'headless-muse: a Muse adapter for run-headless (muse serve first, exec+resume fallback)'
-status: open
+status: closed
 priority: 2
 issue_type: task
 assignee: mu-musehl
@@ -35,3 +35,7 @@ Conformance (to fill in against the epic's table): turn acceptance vs completion
 # Notes
 
 Filed 2026-11-10 with #1232 (issues only; no code yet). Related: #1216 agentctl-effort-option, #1223 bridge-raw-headless, #670 agentctl-console.
+
+## Resolution
+
+[watermelon-full-preview] The Muse headless adapter landed (`rs/agentctl/src/headless/muse.rs`, serve and exec transports beside the Claude adapter), and #1879 agentctl-headless-console-paved-flow verified it with a real headless Muse run (a test agent under its systemd unit answered its brief exactly). The harness-support-matrix now records Muse headless as supported, and the headless refusal follows the adapter registry, so Muse passes and Codex is refused. Closed by #1879.

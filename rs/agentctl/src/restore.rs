@@ -4653,6 +4653,7 @@ pub fn tabs_listing<A: ManagedApi + ?Sized>(
                 viewer_tab_id: status["viewer_tab_id"].as_str().map(str::to_owned),
                 lifecycle: status["lifecycle"].as_str().unwrap_or_default().to_owned(),
                 headless: status["mode"].as_str() == Some("headless"),
+                viewer_is_tail: status["viewer_kind"].as_str() == Some("tail"),
                 live_proven: false,
             })
         })
@@ -4805,6 +4806,7 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
                 viewer_tab_id: status["viewer_tab_id"].as_str().map(str::to_owned),
                 lifecycle: status["lifecycle"].as_str().unwrap_or_default().to_owned(),
                 headless: status["mode"].as_str() == Some("headless"),
+                viewer_is_tail: status["viewer_kind"].as_str() == Some("tail"),
                 cwd: status["cwd"].as_str().unwrap_or_default().to_owned(),
                 live_proven: false,
             })
@@ -4913,6 +4915,7 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
                 viewer_tab_id: status["viewer_tab_id"].as_str().map(str::to_owned),
                 lifecycle: status["lifecycle"].as_str().unwrap_or_default().to_owned(),
                 headless: status["mode"].as_str() == Some("headless"),
+                viewer_is_tail: status["viewer_kind"].as_str() == Some("tail"),
                 live_proven,
             })
         })

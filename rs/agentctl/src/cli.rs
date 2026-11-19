@@ -1701,6 +1701,10 @@ struct Start {
     /// that runs `agentctl run-headless NAME` (see install-units --headless)
     #[arg(long)]
     no_launch: bool,
+    /// With --mode headless: launch the wrapper as a detached setsid process instead of
+    /// under its own systemd user unit (the default; the unit is never parented to Herdr)
+    #[arg(long)]
+    detached: bool,
     #[command(flatten)]
     delivery: Delivery,
 }
@@ -3770,7 +3774,7 @@ fn record_tail_viewer(registry: &Path, herdr_bin: &Path, name: &str) {
         .map_err(AgentError::from)
         .and_then(|client| {
             let manager = ManagedAgents::new(&client, registry)?;
-            manager.set_viewer_tab(name, Some(tab))
+            manager.set_viewer_tab_kind(name, Some(tab), Some("tail"))
         });
     if let Err(error) = recorded {
         eprintln!("agentctl tail: viewer tab not recorded for {name}: {error}");
@@ -4934,9 +4938,6 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 profile_slot_isolation,
             ) = if let Some(profile_name) = value.profile.as_deref() {
                 let mut overlaps = Vec::new();
-                if value.mode.is_some() {
-                    overlaps.push("--mode");
-                }
                 if value.harness.is_some() {
                     overlaps.push("--harness");
                 }
@@ -4972,7 +4973,9 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 }
                 (
                     profile.harness.clone(),
-                    profile.mode.clone(),
+                    // An explicit --mode switches the profile's mode (#1879 D:
+                    // any existing profile can start headless).
+                    value.mode.clone().unwrap_or_else(|| profile.mode.clone()),
                     profile.model.clone(),
                     profile.reasoning_effort.clone(),
                     profile.argv.clone(),
@@ -5055,10 +5058,12 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     eprintln!("agentctl: warning: {label}: {warning}");
                 }
             }
-            if mode == "headless"
-                && crate::headless::adapter::adapter_for(&harness).is_some()
-                && value.profile.is_none()
-            {
+            if mode == "headless" {
+                // #1879 E: refuse up front, naming the matrix row, before any
+                // record, unit or tab change.
+                if let Some(refusal) = crate::subagents::headless_refusal(&harness) {
+                    return Err(Failure::Usage(refusal));
+                }
                 let brief = match value.file {
                     Some(path) => Some(
                         fs::read_to_string(path)
@@ -5088,6 +5093,8 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                         purpose: start_purpose.clone(),
                         record_edges,
                         transport: value.transport.clone(),
+                        detached: value.detached,
+                        profile: value.profile.clone(),
                     },
                 )?
             } else if mode != "interactive" {
@@ -7439,8 +7446,9 @@ mod tests {
     #[test]
     fn profile_resume_cli_retains_every_other_explicit_profile_override_conflict() {
         let fixture = crate::subagents::tests::Fixture::new();
+        // #1879: --mode no longer conflicts with --profile; it switches the
+        // profile's mode (e.g. an interactive profile started headless).
         for (flag, arguments) in [
-            ("--mode", vec!["--mode=interactive"]),
             ("--harness", vec!["--harness=codex"]),
             ("--model", vec!["--model=other-model"]),
             ("--reasoning-effort", vec!["--reasoning-effort=high"]),

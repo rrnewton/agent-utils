@@ -442,6 +442,9 @@ struct Wrapper {
     /// Deliver nothing until released (a takeover holds deliveries while it waits for the turn
     /// to end, so no new turn starts between its check and its stop).
     held: bool,
+    /// After a bare console interrupt, hold queued deliveries until the next
+    /// console line or this deadline (#1879 agentctl-headless-console-paved-flow).
+    interrupt_hold_until: Option<Instant>,
     status: &'static str,
     rescan: bool,
     last_scan: Instant,
@@ -754,9 +757,16 @@ impl Wrapper {
 
     fn maybe_deliver(&mut self) -> Result<()> {
         self.consume_answers()?;
+        if self
+            .interrupt_hold_until
+            .is_some_and(|until| Instant::now() >= until)
+        {
+            self.interrupt_hold_until = None;
+        }
         if self.current.is_some()
             || self.stopping.is_some()
             || self.held
+            || self.interrupt_hold_until.is_some()
             || self.pause_until.is_some_and(|until| Instant::now() < until)
             || self
                 .harness
@@ -1637,6 +1647,32 @@ impl Wrapper {
                                     causation.as_deref(),
                                     json!({"request_id": request_id, "busy": self.busy}),
                                 )?;
+                                // #1879 B/C: `/interrupt MSG` enqueues MSG as the
+                                // urgent next turn; a bare interrupt holds the
+                                // queue until the next console line or ~30 s.
+                                let follow = request.body["text"]
+                                    .as_str()
+                                    .map(str::trim)
+                                    .filter(|text| !text.is_empty())
+                                    .map(str::to_owned);
+                                match follow {
+                                    Some(text) => {
+                                        let body = json!({
+                                            "text": text,
+                                            "user": request.body["user"].as_str().unwrap_or_default(),
+                                            "tty": request.body["tty"].as_str().unwrap_or_default(),
+                                        });
+                                        let _ = self.console_input(
+                                            &body,
+                                            request.peer,
+                                            request.peer_uid,
+                                        )?;
+                                    }
+                                    None => {
+                                        self.interrupt_hold_until =
+                                            Some(Instant::now() + Duration::from_secs(30));
+                                    }
+                                }
                                 self.pending_controls.insert(request_id, request.reply);
                                 return Ok(());
                             }
@@ -1923,13 +1959,15 @@ impl Wrapper {
                 let mut item = crate::agent::enqueued_item(identifier, &text, true);
                 item["from"] = json!(from);
                 item["origin"] = origin.clone();
-                item["priority"] = json!("normal");
-                item["deliver"] = json!("turn-boundary");
+                item["priority"] = json!("urgent");
+                item["deliver"] = json!("now");
                 item
             },
         );
         match enqueued {
             Ok(queue_id) => {
+                // A fresh console line releases a post-interrupt hold (#1879 C).
+                self.interrupt_hold_until = None;
                 self.rescan = true;
                 // Name the new item's place, so a console can show
                 // `position N of M; running turn Xs old` instead of a
@@ -2825,6 +2863,7 @@ pub fn run(config: WrapperConfig, terminate: Arc<AtomicBool>, hooks: &dyn Hooks)
         stopping: None,
         stop_deadline: None,
         held: false,
+        interrupt_hold_until: None,
         status: "starting",
         rescan: true,
         last_scan: Instant::now(),
