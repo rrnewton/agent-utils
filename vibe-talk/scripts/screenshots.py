@@ -764,9 +764,10 @@ STUB_JS = r"""
         body = {};
       }
       body.live_poll_seconds = 30;
-      // `#1881`: the account the own-messages-read state speaks as the owner's, as a real
-      // server's `[owner] user_ids` would name it in this same answer.
-      body.owner_author_ids = ["2000000000000000098"];
+      // `#1881`: the accounts the own-messages-read state speaks as the owner's, as a real
+      // server's `[owner] user_ids` would name them in this same answer: the account this
+      // server posts as (the fake's bot), and the replayed frame's author.
+      body.owner_author_ids = ["3000000000000000001", "2000000000000000098"];
       // ...and SAY it is pushing. `live_poll_seconds` alone used to imply a stream; the page now
       // reads `live_delivery` and falls back to "poll" -- a server that re-reads on a timer and
       // tells the page nothing -- so a stub that sets only the interval describes the opposite
@@ -3130,20 +3131,21 @@ def _act_live_message(driver: Driver) -> None:
 
 
 def _act_own_message_read(driver: Driver) -> None:
-    """`#1881`: the owner's own message arrives replayed, as after a reconnect or restart.
+    """`#1881`: the owner sends a message; its card is read from the moment it lands.
 
-    The frame is the stream's replay shape (`replayed: true`), which used to skip the
-    start-read noting entirely and draw his row unread until a later pass marked it.
+    Sent through the real composer and the real post route, against the fake chat
+    service: the confirmed part replaces the outbox entry (the echo, with its real
+    id), and the row must be drawn read at once — Unarchive offered, not Done — with
+    no later pass, restart or settings trip needed to mark it.
     """
     _act_open_channel(driver)
-    driver.js(
-        "window.__channelSays('9990000000000000007', 'ada', "
-        "'my own words, replayed after the reconnect — already read', false, null, "
-        "'2000000000000000098', true)"
-    )
+    driver.page.fill("#channel-compose-text", "my own words — already read")
+    driver.click("channel-send")
     driver.page.wait_for_function(
-        "() => !!document.querySelector('#discord-log > li[data-id=\"9990000000000000007\"]')",
-        timeout=10_000,
+        "() => { const rows = [...document.querySelectorAll('#discord-log > li')]; "
+        "const row = rows.find((li) => (li.textContent || '').includes('my own words')); "
+        "return !!row && row.getAttribute('data-archived') === 'true'; }",
+        timeout=15_000,
     )
     driver.settle(250)
 
@@ -7335,19 +7337,21 @@ SCENES: tuple[Scene, ...] = (
     ),
     Scene(
         name="79-own-messages-read",
-        what="the owner's own message, replayed after a reconnect, is already marked read",
+        what="the owner's own message, sent just now, is already marked read",
         act=_act_own_message_read,
         profiles=("android-412", "laptop-1280"),
         expect=(
             ("the Discord pane is up", "window.__visible('pane-discord')"),
             (
-                "the replayed own row is on screen",
-                "!!document.querySelector('#discord-log > li[data-id=\"9990000000000000007\"]')",
+                "the sent own row is on screen",
+                "([...document.querySelectorAll('#discord-log > li')].some((li) => "
+                "(li.textContent || '').includes('my own words')))",
             ),
             (
                 "and it is drawn read, not unread",
-                "document.querySelector('#discord-log > li[data-id=\"9990000000000000007\"]')"
-                ".getAttribute('data-archived') === 'true'",
+                "([...document.querySelectorAll('#discord-log > li')].find((li) => "
+                "(li.textContent || '').includes('my own words'))"
+                ".getAttribute('data-archived') === 'true')",
             ),
             ("no error banner is up", "!window.__visible('error-wrap')"),
         ),

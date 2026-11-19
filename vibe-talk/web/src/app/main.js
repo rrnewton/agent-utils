@@ -7292,7 +7292,7 @@ const timelineView = createTimelineView({
   replyTally, unseenReplies, followPlacement,
   unplacedCount: () => unplacedArrivals.count(), unplacedNext: () => unplacedArrivals.next(),
   heldUnansweredRoot, copyLedger, removalRecord, removedAfterRead, ownPostStands,
-  foldReadState, noteStartsRead, noteReplyGaps, noteServerPageBuild, renderColumns,
+  foldReadState, noteReplyGaps, noteServerPageBuild, renderColumns,
   threadPresenceNote: (hasThreads, inThread) => threadPresence.note(hasThreads, inThread),
   screenBelongsToToken, readModes, readLedger, api: /** @type {any} */ (api), currentDiscordLoad: (generation, channel, readingTodo) => currentDiscordLoad(generation, channel, readingTodo),
   get noChannelWords() { return NO_CHANNEL_TO_READ; }, notePinsRevision, noteBookmark, plainReach,

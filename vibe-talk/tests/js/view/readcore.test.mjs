@@ -126,7 +126,6 @@ function fakeDeps(overrides = {}) {
     removedAfterRead: () => false,
     ownPostStands: () => false,
     foldReadState: () => true,
-    noteStartsRead: () => {},
     noteReplyGaps: () => {},
     noteServerPageBuild: () => {},
     renderColumns: () => {},
@@ -164,31 +163,6 @@ test("`#624 voice-page-modularity`: a view no page has covered draws nothing hel
   assert.deepStrictEqual(view.heldViewRows(), []);
   assert.equal(view.walkCursorOwed(), false);
   assert.equal(view.drawProjection(), false);
-});
-
-test("`#1881`: a folded page's messages are offered to start-read noting, as a delta's are", () => {
-  const { createTimelineView } = READCORE;
-  const noted = [];
-  const { deps, canon } = fakeDeps({
-    noteStartsRead: (messages) => noted.push(messages.map((m) => String(m.id))),
-    copyLedger: {
-      place: () => {}, orderCopy: () => {}, buildCopyOn: () => {}, markPosted: () => {},
-      orderCopiesRead: () => {}, copyOlderThan: () => true, isPosted: () => false,
-    },
-    removalRecord: { believeCarried: () => {}, noteRemoved: () => {}, removedAfter: () => false },
-  });
-  Object.assign(canon, {
-    unplaced: new Set(), unplacedSince: new Map(), unplacedAnswered: new Set(),
-    removed: new Map(), complete: null, replyGaps: new Map(), passedOver: new Set(), settledByDone: new Map(),
-  });
-  const view = createTimelineView(deps);
-  const own = { id: "101", channel_id: "c", author_id: "ada", timestamp: "2026-11-18T00:00:00Z", content: "mine" };
-  const other = { id: "102", channel_id: "c", author_id: "bot", timestamp: "2026-11-18T00:01:00Z", content: "theirs" };
-  view.foldTimelinePage({ messages: [own, other], threads: [], dismissed: [], channel: { id: "c" } }, false);
-  assert.deepEqual(noted, [["101", "102"]], "the page's messages were not offered for start-read noting");
-  assert.equal(canon.messages.length, 2);
-  view.foldTimelineDelta({ messages: [other], threads: [], dismissed: [], delta: { complete: true }, channel: { id: "c" } }, null);
-  assert.equal(noted.length, 2, "the delta's messages were not offered for start-read noting");
 });
 
 test("`#624 voice-page-modularity`: the counts read is not begun for another channel or a hidden page, from the module alone", async () => {
