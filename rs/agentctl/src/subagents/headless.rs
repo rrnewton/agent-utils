@@ -610,9 +610,22 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         )))
     }
 
-    /// Relaunch the wrapper under its systemd unit (turnover/takeover/restore).
+    /// Relaunch the wrapper the way it was launched (turnover/takeover): under
+    /// its systemd unit when one is installed for the agent, otherwise the
+    /// detached launch its start used. Existing unit-run agents therefore
+    /// keep their supervisor untouched until a deliberate turnover (#1879).
     fn launch_wrapper(&self, agent_name: &str) -> Result<u32> {
-        self.launch_wrapper_systemd(agent_name)
+        let unit_installed = systemd_user_dir()
+            .map(|dir| {
+                dir.join(format!("agentctl-headless-{agent_name}.service"))
+                    .exists()
+            })
+            .unwrap_or(false);
+        if unit_installed && systemd_user_available() {
+            self.launch_wrapper_systemd(agent_name)
+        } else {
+            self.launch_wrapper_detached(agent_name)
+        }
     }
 
     /// Start `agentctl run-headless NAME` in its own session, logging to the agent directory.

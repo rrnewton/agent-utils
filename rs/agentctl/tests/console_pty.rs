@@ -402,6 +402,7 @@ fn console_shows_a_follower_error_instead_of_silence() {
         "--effort",
         "high",
         "--harness-arg=--permission-mode=bypassPermissions",
+        "--detached",
         "--cwd",
         &work,
     ]);
@@ -461,6 +462,7 @@ fn console_delivers_typed_lines_as_plain_turns() {
         "--effort",
         "high",
         "--harness-arg=--permission-mode=bypassPermissions",
+        "--detached",
         "--cwd",
         &work,
     ]);
