@@ -1,13 +1,14 @@
 ---
 title: 'vibe-talk-short-refs-per-channel: short refs resolve per channel, never across bridges'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
 - vibe-talk
 - owner-ui
 created_at: 2026-11-19T14:55:37-05:00
-updated_at: 2026-11-19T14:55:37-05:00
+updated_at: 2026-11-19T16:15:46-05:00
+closed_at: 2026-11-19T16:15:46-05:00
 ---
 
 # Description
@@ -50,3 +51,16 @@ Lane mu-shortrefs/1915. The live overlay change (adding the second
 bridge's file) is coordb's, outside this lane.
 
 ## Resolution
+
+Landed 57526af2 on github/main (fix 0a14f1e8, acceptance tests
+57526af2; gated on 64a3a9eb). Short refs are keyed by `(channel, n)`
+and resolve in the rendered message's own channel (page fill, pins,
+live, search index), with a unique-match fallback and ambiguous refs
+staying plain. Tests: overlapping numbers per channel, second-channel
+`:thread:`+`:email:`, thread-only number as `:email:` staying plain,
+ambiguous staying plain. Gate: 186 pass; `discuss-browser` failed on
+a 20 s condition wait under host load, passed 3/3 alone and in the
+exclusive rerun (flake waiver; not a touched step). Unverified at
+closure: the post-deploy live check against the real second bridge
+file (read-only) and the screenshot matrix — coordb deploys and adds
+that file to the live overlay first.
