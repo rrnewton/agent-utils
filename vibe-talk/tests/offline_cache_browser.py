@@ -1804,7 +1804,7 @@ KINDS_JS = """({pinned}) => {""" + FLOAT_HELPERS_JS + """
     if (!centred && Math.abs(r.right - b.right) > 2) {
         problems.push(`the kinds are ${(rowMid - mid).toFixed(1)}px off Links' middle and not right-aligned under the bar's end`);
     }
-    if (!centred && mid + r.width / 2 < b.right - 2) problems.push('the kinds are right-aligned where centred under Links would fit');
+    if (!centred && mid + r.width / 2 < b.right - 2 && mid - r.width / 2 >= b.left - 0.5) problems.push('the kinds are right-aligned where centred under Links would fit');
     if (r.left < -0.5 || r.right > width + 0.5) problems.push(`the kinds run off the screen: ${r.left.toFixed(1)}..${r.right.toFixed(1)} of ${width}`);
     if (r.width > b.width + 0.5) problems.push(`the kinds are ${r.width.toFixed(1)}px wide under a ${b.width.toFixed(1)}px bar`);
     if (document.documentElement.scrollWidth > width + 0.5) problems.push(`the page is ${document.documentElement.scrollWidth}px wide on a ${width}px screen`);

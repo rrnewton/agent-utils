@@ -84,7 +84,7 @@ class WholeApi(LabelsApi):
         return super().post(path, body)
 
 
-ICONS = ("author-filter", "links-filter", "pinned-filter", "search-entire-threads", "search-toggle")
+ICONS = ("author-filter", "links-filter", "labels-button", "search-entire-threads", "search-toggle")
 
 
 def whole_handler(api: WholeApi):  # type: ignore[no-untyped-def]
@@ -126,7 +126,7 @@ def walk_through(walk: Walk) -> None:
     walk.press("#search-toggle")
     walk.until("() => !document.getElementById('search-entire-threads').hidden",
                "the Whole-threads toggle did not stand on the search bar")
-    tips = page.evaluate("""() => Object.fromEntries(['author-filter','links-filter','pinned-filter','search-entire-threads','search-toggle']
+    tips = page.evaluate("""() => Object.fromEntries(['author-filter','links-filter','labels-button','search-entire-threads','search-toggle']
       .map((id) => { const b = document.getElementById(id);
         return [id, {title: b.getAttribute('title'), label: b.getAttribute('aria-label')}]; }))""")
     for icon in ICONS:
@@ -135,6 +135,9 @@ def walk_through(walk: Walk) -> None:
     walk.check(tips["search-entire-threads"] == {"title": "Whole threads: if any msg matches",
                                                  "label": "Whole threads: if any msg matches"},
                f"Whole-threads tooltip says {tips['search-entire-threads']}")
+    walk.check(tips["labels-button"] == {"title": "Filter by label",
+                                          "label": "Labels. Filter by label"},
+               f"Labels tooltip says {tips['labels-button']}")
     walk.check(page.evaluate("() => document.querySelectorAll('#search-bucket-row #search-entire-threads').length") == 0,
                "the old results-area chip still stands")
     walk.check(page.evaluate("() => document.querySelectorAll('#search-entire-threads').length") == 1,
@@ -149,6 +152,17 @@ def walk_through(walk: Walk) -> None:
     walk.until("() => document.getElementById('search-count').textContent.includes('of')",
                "the word search was not counted")
     walk.check(walk.shown() == ["211", "215"], f"word hits alone show {walk.shown()}")
+    if walk.touch:
+        # `#1853` on the combined bar: while the field holds the focus it
+        # keeps a readable row of its own, every toggle below it.
+        room = page.evaluate("""() => { const field = document.getElementById('search-field');
+          const whole = document.getElementById('search-entire-threads');
+          const f = field.getBoundingClientRect(), w = whole.getBoundingClientRect();
+          return {width: field.clientWidth, scroll: field.scrollWidth, below: w.top >= f.bottom - 1,
+                  focused: document.activeElement === field}; }""")
+        walk.check(room["focused"] and room["width"] >= 240 and room["scroll"] <= room["width"] + 1 and room["below"],
+                   f"the focused phone field has no readable room: {room}")
+        walk.shot("1c-field-focused")
     walk.press("#search-entire-threads")
     walk.until("() => document.getElementById('search-entire-threads').getAttribute('aria-pressed') === 'true'",
                "the toggle did not press on")

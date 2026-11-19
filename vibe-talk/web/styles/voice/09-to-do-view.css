@@ -1149,6 +1149,31 @@
   box-shadow: 0 1px 6px rgb(0 0 0 / 35%);
 }
 
+/* `#1852` + `#1853` on a phone: five toggles and the count leave the focused
+   field only a few letters (a typed `quixotic` ended under its own clear
+   button). While the bar stands open on a phone the field takes the first
+   row, count beside it; every toggle stands on the row below, still one tap
+   away. The shape does not change with focus, so no tap can move its own
+   target as the field gives focus up, and the list's head room below is
+   sized for both rows throughout. */
+@media (max-width: 480px) {
+  #screen-main[data-searching] #search-float:has(> #labels-button:not([hidden])) {
+    flex-wrap: wrap;
+    height: auto;
+    /* Keep the top edge where the one-line bar's was: its centre, not the
+       taller bar's, stays on the float line. */
+    top: calc(-0.5 * var(--search-bar));
+    transform: none;
+    border-radius: 1.5rem;
+    row-gap: 3px;
+  }
+
+  #screen-main[data-searching] #search-float:has(> #labels-button:not([hidden])) #search-field {
+    flex: 1 1 calc(100% - 4.75rem);
+    min-height: var(--toggle-hit);
+  }
+}
+
 /* Whichever filter is beside the glass — Pinned over the channel, Links over the call, which has
    no pins — keeps its square out of the glass's (`#search-toggle::after` reaches this far left of
    the disc), so neither steals the other's taps. On the glass, so it holds for either. */
@@ -1171,6 +1196,17 @@
    screen while the bar is, and closed there is no band at all. */
 #screen-main[data-searching] #scroll-area {
   padding-top: calc(var(--float-line) + var(--search-bar) / 2 + 0.35rem);
+}
+
+/* The two-row phone bar above takes the second row's room at the head too,
+   so its foot never covers the first row. Only where no hang margin already
+   does that work: with the kinds up (their `--hang-foot`, any phone width)
+   or the author disc hung (a narrow phone), the margin above the list
+   already starts it below the bar, and padding here would count it twice. */
+@media (min-width: 401px) and (max-width: 480px) {
+  #screen-main[data-searching]:not([data-link-kinds]) #scroll-area {
+    padding-top: calc(var(--float-line) + var(--search-bar) / 2 + var(--toggle-hit) + 3px + 0.35rem);
+  }
 }
 
 /* `#212 link-filter`. The kinds of link — PRs, Commits, Actions, and since `#266 link-filter-kinds`
@@ -1383,6 +1419,25 @@
   #screen-main[data-searching][data-link-kinds] #scroll-area {
     --hang-foot: calc(var(--float-line) + var(--search-bar) / 2 + 2 * (var(--kinds-gap) + var(--toggle-hit)));
     padding-top: 0.35rem;
+  }
+}
+
+/* The two-row phone bar's foot is one toggle lower again: every hang-foot
+   above (the kinds row, and the narrow phone's author disc under it or the
+   kinds) starts from that foot, not the one-line bar's. */
+@media (max-width: 480px) {
+  #screen-main[data-searching][data-link-kinds]:has(#labels-button:not([hidden])) #scroll-area {
+    --hang-foot: calc(var(--float-line) + var(--search-bar) / 2 + var(--toggle-hit) + 3px + var(--kinds-gap) + var(--toggle-hit));
+  }
+}
+
+@media (max-width: 400px) {
+  #screen-main[data-searching] #scroll-area {
+    --hang-foot: calc(var(--float-line) + var(--search-bar) / 2 + var(--toggle-hit) + 3px + var(--kinds-gap) + var(--toggle-hit));
+  }
+
+  #screen-main[data-searching][data-link-kinds]:has(#labels-button:not([hidden])) #scroll-area {
+    --hang-foot: calc(var(--float-line) + var(--search-bar) / 2 + var(--toggle-hit) + 3px + 2 * (var(--kinds-gap) + var(--toggle-hit)));
   }
 }
 
