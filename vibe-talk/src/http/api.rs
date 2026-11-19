@@ -2566,12 +2566,21 @@ fn exclude_transcripts(
 }
 
 /// Query parameters for the transcripts routes: a page-size limit, held
-/// to the same shape as every other read's (`?limit=soon` is refused).
+/// to the same shape as every other read's (`?limit=soon` is refused),
+/// and, for one day, the step-back cursor an earlier answer handed out
+/// (`#1886` part B: a day is read newest-first, a window at a time).
 #[derive(Debug, Default, Deserialize)]
 pub struct TranscriptsQuery {
     /// Maximum entries requested.
     pub limit: Option<u16>,
+    /// Continuation for the next older window of a day: the `next_before`
+    /// an earlier day answer carried, verbatim.
+    pub before: Option<String>,
 }
+
+/// The window a transcripts day read asks for when it names none
+/// (`#1886` part B): a screenful and its margin, never the whole day.
+const TRANSCRIPT_WINDOW: u16 = 50;
 
 /// `GET /api/v1/transcripts`: the Transcripts index — classed day-threads,
 /// newest day first, then agent. Store-only; no upstream read.
@@ -2607,16 +2616,30 @@ pub async fn transcripts(
     }))
 }
 
-/// `GET /api/v1/transcripts/{channel_id}/{thread_id}`: one agent-day's
-/// chunks, oldest first, legacy label lines dropped. The one surface a
-/// transcript thread may be read on (`#1608`).
+/// `GET /api/v1/transcripts/{channel_id}/{thread_id}`: one window of one
+/// agent-day's chunks, oldest first inside the window, legacy label
+/// lines dropped. Without `before` it is the day's NEWEST window; with
+/// the `next_before` an answer carried it steps one window older (the
+/// page's `has_more` says whether another exists). Never the whole day
+/// at once (`#1886` part B). The one surface a transcript thread may be
+/// read on (`#1608`).
 pub async fn transcript_thread(
     State(state): State<AppState>,
     ReadScope(caller): ReadScope,
     Path((channel_id, thread_id)): Path<(String, String)>,
     Query(query): Query<TranscriptsQuery>,
 ) -> Result<Response, ApiError> {
-    let _ = query.limit;
+    if query.before.as_ref().is_some_and(|cursor| {
+        cursor.is_empty() || cursor.len() > 16384 || cursor.chars().any(char::is_control)
+    }) {
+        return Err(ApiError::bad_request(
+            "before must be a continuation returned by this view",
+        ));
+    }
+    let limit = query
+        .limit
+        .unwrap_or(TRANSCRIPT_WINDOW)
+        .clamp(1, ops::MAX_PAGE);
     let channel_ref = crate::model::ChannelId(channel_id.clone());
     let class = state
         .store
@@ -2627,9 +2650,9 @@ pub async fn transcript_thread(
     let request = crate::threads::TimelineRequest {
         view: crate::threads::TimelineView::Thread,
         thread_id: Some(thread_id.clone()),
-        before: None,
+        before: query.before.clone(),
         after: None,
-        limit: ops::MAX_PAGE,
+        limit,
     };
     let (channel, mut page) = ops::timeline(&state, caller, &channel_id, &request).await?;
     attach_transcript_classes(&state, &channel.id, &mut page).await;
@@ -2657,7 +2680,7 @@ pub async fn transcript_thread(
         returned,
         channel,
         view: crate::threads::TimelineView::Thread,
-        limit: ops::MAX_PAGE,
+        limit,
         page,
         dismissed: Vec::new(),
         reply_dismissals: None,

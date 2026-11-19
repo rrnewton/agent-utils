@@ -5220,6 +5220,11 @@ const TUNING_BANDS = {
   // `#1816 vibe-talk-search-history-up-arrow`. Search terms kept for Up and Down to recall:
   // enough for a sitting's back-and-forth, few enough that the device holds nothing much.
   SEARCH_HISTORY_LIMIT: [10, 500, "search terms kept for Up and Down in the search box"],
+  // `#1886 vibe-talk-transcripts-view` part B. Chunks per window of a
+  // transcript day: a screenful and its margin, never so many that
+  // opening a day reads the whole history, never so few that stepping
+  // back is all the reader does.
+  DAY_WINDOW: [10, 500, "chunks in one window of a transcript day"],
   // `#1800 vibe-talk-read-aloud-chunk-start-clipping`. The silence before a cold chunk and how
   // long the output stays alive after a read: enough to wake a sleeping Bluetooth sink and to
   // bridge back-to-back reads, never so long that a cold chunk waits seconds or the output is

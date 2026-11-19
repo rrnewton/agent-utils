@@ -4521,6 +4521,10 @@ const transcriptsView = createTranscriptsView({
   api: (path) => api(path),
   intoView: (element, block) => scrollKeeping.intoView(element, block),
   setStatus: (text) => setStatus(text),
+  every: (ms, fn) => {
+    const timer = setInterval(fn, ms);
+    return () => clearInterval(timer);
+  },
 });
 function openTranscripts() {
   transcriptsViewActive = true;
@@ -7354,7 +7358,7 @@ const olderWalks = mountOlderWalks({
 const { renderOlderControl, olderControlPressed, searchOlder, searchOlderFromField, searchReplies, searchOffered, searchKey, endSearchWalks, endSearchWalk, stopSearchWalk, renderSearchOlderNote, historyReach, searchFurtherPressed, chooseSearchAllChannels, renderRepliesSearch, renderServerSearch, scheduleServerSearch, channelViewWords, oldestLoadedMs, toggleServerHits, toggleBucket, serviceWords, repliesFloor, repliesSearchOffered, allCover, allLoaded, repliesKey, endRepliesWalk } = olderWalks;
 // `#1608`: the Transcripts view's own search and way back to its index.
 el("transcripts-search").addEventListener("input", () => transcriptsView.searchChanged());
-el("transcripts-back").addEventListener("click", () => { void transcriptsView.refresh(); });
+el("transcripts-back").addEventListener("click", () => transcriptsView.closeDay());
 
 /**
  * The gaps a search opens in the cards and in an unpacked thread's block (web/src/view/channel

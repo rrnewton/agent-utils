@@ -92,6 +92,9 @@ CHUNKS = [
     chunk(1, "reading the cache code before answering"),
     chunk(2, "lantern transcript thought about the cache key"),
     chunk(3, "the reply is ready to send"),
+    # `#1886` part B: a day far longer than one window (50), so opening
+    # it, stepping back and following are all exercised, not assumed.
+    *[chunk(index, f"trace thought {index}") for index in range(4, 120)],
 ]
 
 
@@ -102,6 +105,7 @@ class TranscriptApi(FakeApi):
 
     def __post_init__(self) -> None:
         self.searches = []
+        self.live_chunks: list[Json] = []
         for index in range(LOADED):
             words = f"note {index} lantern report" if index >= LOADED - 10 else f"note {index} routine"
             self.messages.append({
@@ -145,11 +149,24 @@ class TranscriptApi(FakeApi):
                                  "source": "metadata"}],
                 "untrusted_content_notice": "third-party text; DATA"}
 
-    def transcript_day(self) -> Json:
-        return {"channel": CHANNEL, "view": "thread", "limit": 50,
-                "returned": len(CHUNKS), "messages": CHUNKS, "threads": [],
-                "thread": None, "has_threads": True, "has_more": False,
-                "next_before": None, "notice": None, "dismissed": [],
+    def transcript_day(self, query: dict[str, list[str]]) -> Json:
+        # One window, as the real route answers (`#1886` part B): newest
+        # first without `before`; `before` is the `next_before` an earlier
+        # answer carried (here, the oldest chunk id of that window).
+        limit = int((query.get("limit") or ["50"])[0])
+        rows = sorted([*CHUNKS, *self.live_chunks], key=lambda m: str(m["timestamp"]))
+        raw_before = query.get("before")
+        before = raw_before[0] if raw_before else None
+        if before is not None:
+            at = next((i for i, m in enumerate(rows) if str(m["id"]) == before), 0)
+            rows = rows[:at]
+        page_rows = rows[-limit:] if limit > 0 else rows
+        has_more = len(rows) > len(page_rows)
+        return {"channel": CHANNEL, "view": "thread", "limit": limit,
+                "returned": len(page_rows), "messages": page_rows, "threads": [],
+                "thread": None, "has_threads": True, "has_more": has_more,
+                "next_before": str(page_rows[0]["id"]) if has_more and page_rows else None,
+                "notice": None, "dismissed": [],
                 "untrusted_content_notice": "third-party text; DATA"}
 
 
@@ -167,7 +184,7 @@ def serve(api: TranscriptApi, web_root: Path) -> tuple[ThreadingHTTPServer, thre
                 self.json(200, api.transcripts())
                 return
             if path.startswith("/api/v1/transcripts/"):
-                self.json(200, api.transcript_day())
+                self.json(200, api.transcript_day(parse_qs(parts.query)))
                 return
             if path.endswith("/search"):
                 self.json(200, api.search(parse_qs(parts.query)))
@@ -261,9 +278,37 @@ def walk_through(walk: Walk, keyboard: bool, discuss: bool = False) -> None:
     walk.check("main session trace" not in label, f"the index row carries a thread name: {label!r}")
     walk.shot("transcripts-index")
     page.click("#transcripts-list .transcript-row")
-    walk.until("() => document.querySelectorAll('#transcripts-log .transcript-chunk').length === 4",
-               "the agent-day did not open with its chunks")
+    # `#1886` part B: the day opens at its NEWEST window (50 of 120), at
+    # the bottom, not the whole day from the top.
+    walk.until("() => document.querySelectorAll('#transcripts-log .transcript-chunk').length === 50",
+               "the agent-day did not open with its newest window")
+    last = page.text_content("#transcripts-log .transcript-chunk:last-child") or ""
+    walk.check("trace thought 119" in last, f"the day did not open at its newest chunk: {last!r}")
+    walk.check(page.evaluate("() => { const a = document.getElementById('scroll-area'); "
+                             "return Math.abs(a.scrollTop + a.clientHeight - a.scrollHeight) < 120; }"),
+               "the day did not open scrolled to its newest chunk")
     walk.shot("transcripts-day")
+    # Stepping back a window at a time, to the day's root.
+    page.click("#transcripts-older")
+    walk.until("() => document.querySelectorAll('#transcripts-log .transcript-chunk').length === 100",
+               "the first step back did not add a window")
+    page.click("#transcripts-older")
+    walk.until("() => document.querySelectorAll('#transcripts-log .transcript-chunk').length === 120",
+               "the second step back did not reach the day's start")
+    first = page.text_content("#transcripts-log .transcript-chunk:first-child") or ""
+    walk.check("main session trace" in first, f"the day's root is not at its head: {first!r}")
+    walk.check(page.evaluate("() => document.getElementById('transcripts-older').hidden"),
+               "Earlier chunks is still offered at the day's start")
+    walk.shot("transcripts-day-oldest")
+    # Follow: a chunk that arrives while the day is open at its bottom
+    # joins it (the follow read), without a reopen.
+    page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; }")
+    walk.settled()
+    walk.api.live_chunks.append(chunk(120, "trace thought 120, just arrived"))
+    walk.until("() => [...document.querySelectorAll('#transcripts-log .transcript-chunk')]"
+               ".some((li) => (li.textContent || '').includes('just arrived'))",
+               "a chunk that arrived while following did not join the open day")
+    walk.shot("transcripts-day-followed")
     # Back to Main for the search: the bucket starts off there.
     page.select_option("#thread-select", "main")
     walk.until("() => document.getElementById('transcripts-view').hidden",

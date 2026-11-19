@@ -120,6 +120,21 @@ test("part A: live folds, saved copies and restores keep transcript threads out 
   assert.deepEqual(saved.threads.map((t) => t.id), ["tp"]);
 });
 
+test("part B: day windows merge in reading order with no chunk twice", () => {
+  const at = (s) => `2026-11-19T00:00:${String(s).padStart(2, "0")}Z`;
+  const chunk = (id, s) => ({ id: String(id), timestamp: at(s), content: `chunk ${id}` });
+  const held = [chunk(3, 3), chunk(4, 4), chunk(5, 5)];
+  // An older window prepends; a newer window appends; overlaps stand once.
+  assert.deepEqual(CORE.mergeChunks(held, [chunk(1, 1), chunk(2, 2), chunk(3, 3)]).map((c) => c.id),
+    ["1", "2", "3", "4", "5"]);
+  assert.deepEqual(CORE.mergeChunks(held, [chunk(5, 5), chunk(6, 6)]).map((c) => c.id),
+    ["3", "4", "5", "6"]);
+  assert.deepEqual(CORE.sortChunks([chunk(9, 9), chunk(7, 7), chunk(8, 8)]).map((c) => c.id),
+    ["7", "8", "9"]);
+  assert.equal(CORE.chunkHeld(held, "4"), true);
+  assert.equal(CORE.chunkHeld(held, "9"), false);
+});
+
 test("a chunk's time is said the channel rows' way in Eastern, never as a raw ISO stamp", () => {
   const was = process.env.TZ;
   process.env.TZ = "America/New_York";

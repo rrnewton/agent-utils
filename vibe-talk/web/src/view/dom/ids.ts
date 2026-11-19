@@ -721,6 +721,7 @@ export interface ElementById {
   "transcripts-list": HTMLOListElement;
   "transcripts-log": HTMLOListElement;
   "transcripts-note": HTMLParagraphElement;
+  "transcripts-older": HTMLButtonElement;
   "transcripts-search": HTMLInputElement;
   "transcripts-title": HTMLHeadingElement;
   "transcripts-view": HTMLElement;

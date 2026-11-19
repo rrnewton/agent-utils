@@ -73,6 +73,45 @@ export function isTranscriptSummary(summary: TranscriptMark): boolean {
   return Boolean(summary && typeof summary === "object" && summary.class);
 }
 
+/** One chunk of a transcript day, as a day answer carries it. */
+export interface TranscriptChunk {
+  id: string;
+  timestamp: string;
+}
+
+/** A day answer's windowing facts (`#1886` part B). */
+export interface TranscriptWindow<Chunk extends TranscriptChunk> {
+  messages?: Chunk[];
+  has_more?: boolean;
+  next_before?: string | null;
+}
+
+/** Chunks in reading order: oldest first, by timestamp then id. */
+export function sortChunks<Chunk extends TranscriptChunk>(chunks: Chunk[]): Chunk[] {
+  return [...chunks].sort((a, b) =>
+    (Date.parse(a.timestamp) || 0) - (Date.parse(b.timestamp) || 0)
+    || String(a.id).localeCompare(String(b.id)));
+}
+
+/**
+ * Merge a freshly read window into the chunks a day already holds
+ * (`#1886` part B): no chunk stands twice, and the order is reading
+ * order. A newest window brings what arrived since; an older window
+ * prepends what lies further back. Either way the held chunks in
+ * between are kept, so a reader's place is never rebuilt under them.
+ */
+export function mergeChunks<Chunk extends TranscriptChunk>(held: Chunk[], window: Chunk[]): Chunk[] {
+  const byId = new Map<string, Chunk>();
+  for (const chunk of held) byId.set(String(chunk.id), chunk);
+  for (const chunk of window) byId.set(String(chunk.id), chunk);
+  return sortChunks([...byId.values()]);
+}
+
+/** Whether `chunk` is in `chunks`. */
+export function chunkHeld<Chunk extends TranscriptChunk>(chunks: Chunk[], id: string): boolean {
+  return chunks.some((chunk) => String(chunk.id) === String(id));
+}
+
 /** Whether a chunk's text holds every word of `query` (the day search). */
 export function chunkMatches(text: string, query: string): boolean {
   const words = query.toLowerCase().split(/\s+/).filter((word) => word !== "");

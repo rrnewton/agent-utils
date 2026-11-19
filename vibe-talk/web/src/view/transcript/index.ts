@@ -1,14 +1,20 @@
 // The Transcripts view (`#1608 agent-transcripts-timeline`): agent · day
 // trace threads and their chunks, the one home of transcript posts.
-// No thread names, no raw-feed rows: a day opens as plain chunks in time
-// order, and a search hit can open the day at its message, in context.
+// No thread names, no raw-feed rows: a day opens at its newest chunk,
+// follows what arrives, and steps back a window at a time as the reader
+// scrolls up (`#1886 vibe-talk-transcripts-view` part B). A search hit
+// can open the day at its message, in context.
 
 import {
+  chunkHeld,
   chunkMatches,
   filterTranscripts,
+  mergeChunks,
+  sortChunks,
   sortTranscripts,
   transcriptLabel,
 } from "../../core/transcripts/index.ts";
+import type { TranscriptWindow } from "../../core/transcripts/index.ts";
 import { messageTimeLabel } from "../../present/time/index.ts";
 import type { TranscriptThread } from "../../core/transcripts/index.ts";
 
@@ -26,7 +32,14 @@ export interface TranscriptsDependencies {
   api(path: string): Promise<unknown>;
   intoView?(element: Element, block: string): void;
   setStatus?(text: string): void;
+  /** Run `fn` every `ms` until the answer is called; the follow timer. */
+  every?(ms: number, fn: () => void): () => void;
 }
+
+/** Chunks asked for per window, the server's own page size. */
+export const DAY_WINDOW = 50;
+/** How often an open day looks for newer chunks while it is followed. */
+export const FOLLOW_MS = 4_000;
 
 /**
  * A chunk's time the way the channel rows say it (`#1608` review): the
@@ -53,6 +66,10 @@ export interface TranscriptsView {
   openAt(hit: { channel_id: string; thread?: { id: string } | null; id: string }): Promise<void>;
   /** The scoped search text changed: filter the index and the open day. */
   searchChanged(): void;
+  /** Back from an open day to the index. */
+  closeDay(): void;
+  /** Load the next older window of the open day, where there is one. */
+  loadOlder(): Promise<void>;
 }
 
 /** Create the view over its panel in the page. */
@@ -62,9 +79,25 @@ export function createTranscriptsView(deps: TranscriptsDependencies): Transcript
   let rows: TranscriptThread[] = [];
   let openRow: TranscriptThread | null = null;
   let chunks: TranscriptMessage[] = [];
+  let nextBefore: string | null = null;
+  let hasMore = false;
+  let loadingOlder = false;
+  let following = true;
   let highlightId = "";
+  let stopFollow: (() => void) | null = null;
+  let listening = false;
+  let olderBound = false;
 
   const panel = () => deps.el("transcripts-view");
+  const scroller = (): HTMLElement => deps.el("scroll-area");
+  const atBottom = (): boolean => {
+    const area = scroller();
+    return area.scrollHeight - area.scrollTop - area.clientHeight < 160;
+  };
+  const toBottom = (): void => {
+    const area = scroller();
+    area.scrollTop = area.scrollHeight;
+  };
 
   function renderList(): void {
     const list = deps.el("transcripts-list");
@@ -91,9 +124,10 @@ export function createTranscriptsView(deps: TranscriptsDependencies): Transcript
         : "";
   }
 
-  function renderDay(): void {
+  function renderDay(stay: { top: number; height: number } | null = null): void {
     const log = deps.el("transcripts-log");
     const query = (deps.el("transcripts-search") as HTMLInputElement).value || "";
+    const area = scroller();
     log.replaceChildren();
     for (const chunk of chunks) {
       if (!chunkMatches(chunk.content, query)) continue;
@@ -112,6 +146,10 @@ export function createTranscriptsView(deps: TranscriptsDependencies): Transcript
     deps.el("transcripts-title").textContent = openRow ? transcriptLabel(openRow) : "";
     deps.el("transcripts-day").hidden = openRow === null;
     deps.el("transcripts-list").hidden = openRow !== null;
+    const older = deps.el("transcripts-older") as HTMLButtonElement;
+    older.hidden = openRow === null || !hasMore;
+    older.disabled = loadingOlder;
+    older.textContent = loadingOlder ? "Loading earlier chunks…" : "Earlier chunks";
     if (highlightId !== "") {
       const target = log.querySelector(`[data-transcript-message="${CSS.escape(highlightId)}"]`);
       if (target) {
@@ -119,40 +157,121 @@ export function createTranscriptsView(deps: TranscriptsDependencies): Transcript
         if (deps.intoView) deps.intoView(target, "center");
       }
       highlightId = "";
+    } else if (stay) {
+      // Older chunks landed above: keep the reader on the same words.
+      area.scrollTop = stay.top + (area.scrollHeight - stay.height);
+    } else if (following) {
+      toBottom();
     }
   }
 
+  function dayPath(row: TranscriptThread, before: string | null): string {
+    const base = `/api/v1/transcripts/${encodeURIComponent(String(row.channel.id))}/${encodeURIComponent(row.thread_id)}`;
+    const query = before === null ? `?limit=${DAY_WINDOW}` : `?limit=${DAY_WINDOW}&before=${encodeURIComponent(before)}`;
+    return base + query;
+  }
+
+  async function readWindow(row: TranscriptThread, before: string | null): Promise<TranscriptWindow<TranscriptMessage>> {
+    return await deps.api(dayPath(row, before)) as TranscriptWindow<TranscriptMessage>;
+  }
+
   async function openDay(row: TranscriptThread, atMessage: string): Promise<void> {
+    // Read first, swap after: the day on screen stays until its
+    // replacement is in hand (no placeholder flash, `#1886` part B).
+    const answer = await readWindow(row, null);
     openRow = row;
+    chunks = sortChunks(answer.messages || []);
+    nextBefore = answer.next_before ?? null;
+    hasMore = answer.has_more === true && nextBefore !== null;
+    loadingOlder = false;
+    following = atMessage === "";
     highlightId = atMessage;
-    const answer = await deps.api(
-      `/api/v1/transcripts/${encodeURIComponent(String(row.channel.id))}/${encodeURIComponent(row.thread_id)}`,
-    ) as { messages?: TranscriptMessage[] };
-    chunks = [...(answer.messages || [])].sort(
-      (a, b) => (Date.parse(a.timestamp) || 0) - (Date.parse(b.timestamp) || 0),
-    );
+    // A search hit below the newest window: step back until it is held.
+    while (atMessage !== "" && !chunkHeld(chunks, atMessage) && hasMore) {
+      const older = await readWindow(row, nextBefore);
+      chunks = mergeChunks(chunks, older.messages || []);
+      nextBefore = older.next_before ?? null;
+      hasMore = older.has_more === true && nextBefore !== null;
+    }
     renderDay();
+    startFollow();
+  }
+
+  async function loadOlder(): Promise<void> {
+    if (!openRow || !hasMore || loadingOlder || nextBefore === null) return;
+    loadingOlder = true;
+    const area = scroller();
+    const stay = { top: area.scrollTop, height: area.scrollHeight };
+    renderDay(stay);
+    try {
+      const answer = await readWindow(openRow, nextBefore);
+      chunks = mergeChunks(chunks, answer.messages || []);
+      nextBefore = answer.next_before ?? null;
+      hasMore = answer.has_more === true && nextBefore !== null;
+    } finally {
+      loadingOlder = false;
+      renderDay(stay);
+    }
+  }
+
+  /** Bring an open day up to its newest chunk, where it is followed. */
+  async function followNew(): Promise<void> {
+    if (!active || !openRow) return;
+    const answer = await readWindow(openRow, null);
+    const merged = mergeChunks(chunks, answer.messages || []);
+    if (merged.length === chunks.length && chunks.every((chunk, at) => chunk.id === merged[at]?.id)) return;
+    chunks = merged;
+    renderDay();
+  }
+
+  function startFollow(): void {
+    stopFollow?.();
+    stopFollow = null;
+    if (!deps.every) return;
+    stopFollow = deps.every(FOLLOW_MS, () => {
+      if (following) void followNew().catch(() => {});
+    });
   }
 
   async function refresh(): Promise<void> {
     const answer = await deps.api("/api/v1/transcripts") as { transcripts?: TranscriptThread[] };
     rows = answer.transcripts || [];
     loaded = true;
-    renderList();
     if (openRow) renderDay();
+    else renderList();
   }
+
+  // The scroll that steps a day back, and the follow that a scroll away
+  // pauses: one listener on the shared scroller, live while this view is.
+  const onScroll = (): void => {
+    if (!active || !openRow) return;
+    following = atBottom();
+    const area = scroller();
+    if (area.scrollTop < 240) void loadOlder();
+  };
 
   return {
     active: () => active,
     async open() {
       active = true;
       panel().hidden = false;
+      if (!listening) {
+        listening = true;
+        scroller().addEventListener("scroll", onScroll);
+      }
+      if (!olderBound) {
+        olderBound = true;
+        deps.el("transcripts-older").addEventListener("click", () => { void loadOlder(); });
+      }
       if (!loaded) await refresh();
-      else { renderList(); if (openRow) renderDay(); }
+      else if (openRow) renderDay();
+      else renderList();
     },
     close() {
       active = false;
       panel().hidden = true;
+      stopFollow?.();
+      stopFollow = null;
     },
     refresh,
     async openAt(hit) {
@@ -171,5 +290,19 @@ export function createTranscriptsView(deps: TranscriptsDependencies): Transcript
       if (openRow) renderDay();
       else renderList();
     },
+    closeDay() {
+      stopFollow?.();
+      stopFollow = null;
+      openRow = null;
+      chunks = [];
+      nextBefore = null;
+      hasMore = false;
+      highlightId = "";
+      renderList();
+      deps.el("transcripts-day").hidden = true;
+      deps.el("transcripts-list").hidden = false;
+      deps.el("transcripts-title").textContent = "";
+    },
+    loadOlder,
   };
 }

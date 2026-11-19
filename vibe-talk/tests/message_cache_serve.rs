@@ -3728,3 +3728,44 @@ async fn transcript_threads_are_hidden_from_every_timeline_view_but_listed_for_t
         assert!(body.to_string().contains("liaison"), "transcripts index missing liaison: {body}");
     }
 }
+
+#[tokio::test]
+async fn a_transcript_day_reads_newest_first_a_window_at_a_time() {
+    // `#1886` part B: without `before` the day route answers its newest
+    // window, never the whole day; the cursor it hands back steps one
+    // window older, to the day's start. (Thread A holds a root and two
+    // entries; a window of two shows the pair at a time.)
+    let (state, _fake, _clock, _dir) = slack_transcript_deployment("transcript-windows").await;
+    let root_a = slack_fake::ts(600, 0);
+    let day = |query: &str| {
+        format!("/api/v1/transcripts/{SLACK_CH}/{root_a}?{query}")
+    };
+    let newest = ok(&state, &day("limit=2"), WRITE_TOKEN).await;
+    settled(&state).await;
+    assert_eq!(
+        texts(&newest),
+        ["thinking about the cache", "still thinking"],
+        "the newest window is not the day's newest chunks: {newest}"
+    );
+    assert_eq!(newest["has_more"], true, "{newest}");
+    let cursor = newest["next_before"].as_str().expect("a way back").to_owned();
+    let older = ok(
+        &state,
+        &day(&format!("limit=2&before={}", url_encode(&cursor))),
+        WRITE_TOKEN,
+    )
+    .await;
+    settled(&state).await;
+    assert_eq!(
+        texts(&older),
+        ["liaison main session trace, 2026-11-18 ET"],
+        "the step back did not reach the day's root: {older}"
+    );
+    assert_eq!(older["has_more"], false, "{older}");
+    // The default window is bounded too: the whole 3-chunk day fits it,
+    // and a refused cursor shape is a 400, not a silent newest page.
+    let whole = ok(&state, &day(""), WRITE_TOKEN).await;
+    assert_eq!(texts(&whole).len(), 3, "{whole}");
+    let (status, _body) = call(&state, &day("before="), WRITE_TOKEN).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
