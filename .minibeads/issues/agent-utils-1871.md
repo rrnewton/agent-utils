@@ -1,6 +1,6 @@
 ---
 title: "vibe-talk-save-chip-compact-layout: the chip reserve and the keyboard Send in the compact layout"
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -27,3 +27,7 @@ From the liaison's review of the #1867 matrix on a phone with the keyboard open 
 # Notes
 
 Fast follow to #1867 vibe-talk-save-draft-chip-covers-text from the liaison's matrix review. Owner-priority, path-selected gate.
+
+## Resolution
+
+[watermelon-full-preview] Landed as 32fbe0c0 on main. The focused channel box keeps the Save chip's 7rem room in the compact keyboard layout too, so a long line wraps before the chip and the floating keyboard Send; the chip check covers the keyboard-open phone state (chip and keyboard Send clear of the text area, asserted geometrically). Gate on 8e9f76a9: failed only screenshots-desks (the known state-59 load flake), exclusive rerun passed 2026-11-18T23:47:54Z. Final shots from main 32fbe0c0 in /tmp/save-draft-chip-shots with BUILD.txt (page build 78f5bc907f2547a7fe3ee1873bad88da).
