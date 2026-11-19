@@ -1,6 +1,6 @@
 ---
 title: 'agentctl-harness-wrapper-revive-liveness: agent-watch cannot notify a headless harness-wrapper coordinator'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -54,3 +54,18 @@ in parity. No new persisted field.
 downstream reader pins an old reader (writer_ceiling 2); report any
 new persisted field in a registry record before gating — prefer no
 new persisted field.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as
+744ac563ca6aba85b96ac9d0002f5d36747e7ef4 (gated as d06e0365, cold
+review SAFE). `revive_liveness` (Rust) and `_old_process` (Python)
+use the wrapper-recorded `harness_identity` for harness-wrapper
+records under the unchanged full process proof; no new persisted
+field. Where the verdict now reads Dead instead of Unknown, revive
+still refuses headless records for lack of a pane identity, so
+nothing launches twice. Tests: fake-client alive-to-skip, the
+watch-level coordinator finding, dead/stale-pid/reused-pid guards,
+and real-child tests in both editions; the alive tests fail on the
+old code. Follow-ups: the Python loader still refuses the
+harness-wrapper adapter (separate widening work).
