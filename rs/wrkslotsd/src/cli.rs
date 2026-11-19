@@ -798,7 +798,7 @@ pub(crate) enum Recovery {
         /// Agent name already recorded on the slot (with --reopen and no --to-agent: live agent to record)
         #[arg(long, value_name = "NAME")]
         agent: String,
-        /// New agent name to record instead of --agent (starts a new generation, requires a clean tree)
+        /// New agent name to record instead of --agent (starts a new generation, requires a clean tree except that gitignored files transfer with the slot and are reported)
         #[arg(long, value_name = "NAME")]
         to_agent: Option<String>,
         /// Live successor PID to bind

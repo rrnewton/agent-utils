@@ -48946,15 +48946,67 @@ def _cgroup_in_slot_box(cgroup_path: str, slot_type: str, slot: str) -> bool:
     )
 
 
-def _assert_clean_tree_for_rebind(config: Config, record: ActiveRecord) -> None:
+_SCRUBBED_GIT_CONFIG = (
+    ("core.excludesFile", "/dev/null"),
+    ("core.fsmonitor", "false"),
+    ("core.untrackedCache", "false"),
+)
+_SCRUBBED_GIT_ENV = {"HOME": "/dev/null", "XDG_CONFIG_HOME": "/dev/null"}
+
+
+def _scrubbed_git(
+    vcs: _GitVcs,
+    path: Path,
+    args: Sequence[str],
+    *,
+    input_bytes: bytes | None = None,
+    allowed: tuple[int, ...] = (0,),
+) -> bytes:
+    """One git call whose ignore answers the caller cannot control (#1870).
+
+    Every config source that could name ignore rules is neutralised:
+    the user excludes file is /dev/null, no fsmonitor or untracked
+    cache can hide changes, and HOME/XDG point nowhere.
+    """
+
+    result = vcs._run_bytes(
+        path,
+        args,
+        input_bytes=input_bytes,
+        env_overrides=_SCRUBBED_GIT_ENV,
+        timeout_seconds=600.0,
+        timeout_refusal="a clean-tree Git check needs more time",
+        config=_SCRUBBED_GIT_CONFIG,
+    )
+    if result.returncode not in allowed:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise Refusal(
+            f"Git refused the clean-tree check in {path}: {detail}"
+            if detail
+            else f"Git refused the clean-tree check in {path}"
+        )
+    return result.stdout
+
+
+def _assert_clean_tree_for_rebind(
+    config: Config, record: ActiveRecord
+) -> tuple[tuple[str, bytes], ...]:
     """Refuse a rename while any present checkout carries uncommitted work.
 
     Work in a checkout was authored under the recorded agent's name;
     renaming over it would silently reattribute that work. Cleanliness
     is the working tree only (outside configured caches): the branch
     and its commits keep their history either way.
+
+    Gitignored files are not authored work and carry no attribution
+    (#1870): they are routinely the slot's protected evidence, and a
+    rename that demanded their absence could be satisfied only by
+    destroying them. They transfer with the slot unchanged; the pairs
+    are returned so the caller can record them in its output. Only a
+    TRACKED .gitignore rule makes a file count as ignored here.
     """
 
+    ignored: list[tuple[str, bytes]] = []
     vcs = _GitVcs()
     for checkout in record.checkouts:
         path = _stored_path(config, checkout.path, "checkout path")
@@ -48968,14 +49020,130 @@ def _assert_clean_tree_for_rebind(config: Config, record: ActiveRecord) -> None:
                 f"checkout {checkout.name} branch changed: "
                 f"expected {checkout.branch}, found {branch}"
             )
-        status = vcs.status(path, _cache_globs_for(config, checkout.name))
+        status = _scrubbed_git(
+            vcs,
+            path,
+            [
+                "status",
+                "--porcelain=v2",
+                "-z",
+                "--untracked-files=all",
+                "--ignored=matching",
+                "--",
+                ".",
+                *(
+                    spec
+                    for pattern in _cache_globs_for(config, checkout.name)
+                    for spec in (
+                        f":(exclude,glob){pattern}",
+                        f":(exclude,glob){pattern}/**",
+                    )
+                ),
+            ],
+        )
         if status:
-            first = status.splitlines()[0]
+            entries = [entry for entry in status.split(b"\0") if entry]
+            candidates = [
+                entry[2:] for entry in entries if entry.startswith(b"! ")
+            ]
+            kept = _tracked_ignored_paths(vcs, path, candidates)
+            blocking = [
+                entry for entry in entries if not entry.startswith(b"! ")
+            ] + [b"! " + name for name in candidates if name not in kept]
+            if blocking:
+                first = os.fsdecode(blocking[0])
+                raise Refusal(
+                    f"checkout {checkout.name} is dirty or has untracked/ignored "
+                    f"files ({first}); a slot changes agent only with a clean "
+                    "tree: finish or discard the changes first"
+                )
+            ignored.extend((checkout.name, name) for name in candidates)
+    return tuple(ignored)
+
+
+def _tracked_ignored_paths(
+    vcs: _GitVcs, path: Path, candidates: Sequence[bytes]
+) -> set[bytes]:
+    """The candidates ignored by a TRACKED .gitignore rule, and only those.
+
+    What counts as ignored decides what a rename may carry (#1870
+    review), so the caller never controls it: the status runs with
+    the user excludes file disabled and HOME/XDG neutralised, and
+    each candidate is then attributed with check-ignore -- a rule
+    counts only when its source is a .gitignore tracked in the
+    index, with no hidden edit. Rules from .git/info/exclude (the
+    shared repository directory, not the slot), from untracked
+    .gitignore files (which can hide authored work), and edits
+    hidden by assume-unchanged or skip-worktree never count; a
+    hidden edit refuses outright.
+    """
+
+    if not candidates:
+        return set()
+    attributed = _scrubbed_git(
+        vcs,
+        path,
+        ["check-ignore", "-v", "-z", "--stdin"],
+        input_bytes=b"\0".join(candidates) + b"\0",
+        allowed=(0, 1),
+    )
+    fields = attributed.split(b"\0")
+    sources: dict[bytes, bytes] = {}
+    for index in range(0, len(fields) - 3, 4):
+        source = fields[index]
+        if source == b".gitignore" or source.endswith(b"/.gitignore"):
+            sources[fields[index + 3]] = source
+    if not sources:
+        return set()
+    unique_sources = sorted(set(sources.values()))
+    listed = _scrubbed_git(
+        vcs,
+        path,
+        ["--literal-pathspecs", "ls-files", "-v", "-z", "--", *map(os.fsdecode, unique_sources)],
+    )
+    tags: dict[bytes, bytes] = {}
+    for entry in listed.split(b"\0"):
+        if not entry:
+            continue
+        tag, _, name = entry.partition(b" ")
+        tags[name] = tag
+    staged = _scrubbed_git(
+        vcs,
+        path,
+        ["--literal-pathspecs", "ls-files", "-s", "-z", "--", *map(os.fsdecode, unique_sources)],
+    )
+    index_blobs: dict[bytes, bytes] = {}
+    for entry in staged.split(b"\0"):
+        if not entry:
+            continue
+        meta, _, name = entry.partition(b"\t")
+        parts = meta.split(b" ")
+        if len(parts) >= 2:
+            index_blobs[name] = parts[1]
+    for source in unique_sources:
+        source_tag = tags.get(source)
+        if source_tag is None:
+            continue
+        # A tracked source: refuse a hidden edit (assume-unchanged is
+        # a lowercase tag, skip-worktree is S) and any blob drift.
+        if source_tag == b"S" or source_tag.islower():
             raise Refusal(
-                f"checkout {checkout.name} is dirty or has untracked/ignored "
-                f"files ({first}); a slot changes agent only with a clean "
-                "tree: finish or discard the changes first"
+                f"ignore rules in {os.fsdecode(source)} are hidden by an "
+                "assume-unchanged or skip-worktree bit; a slot changes "
+                "agent only with its ignore rules visible"
             )
+        blob = _scrubbed_git(
+            vcs, path, ["hash-object", "--no-filters", "--", os.fsdecode(source)]
+        )
+        if blob.strip() != index_blobs.get(source, b""):
+            raise Refusal(
+                f"ignore rules in {os.fsdecode(source)} differ from the "
+                "index; a slot changes agent only with a clean tree"
+            )
+    tracked_sources = set(tags)
+    return {
+        name for name, source in sources.items() if source in tracked_sources
+    }
 
 
 @contextlib.contextmanager
@@ -49233,8 +49401,9 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
             basis = "slot-box"
         if _read_process_identity(successor.pid) != successor:
             raise Refusal("owner process generation changed during transfer-owner")
+        ignored_transferred: tuple[tuple[str, bytes], ...] = ()
         if rename:
-            _assert_clean_tree_for_rebind(config, record)
+            ignored_transferred = _assert_clean_tree_for_rebind(config, record)
         if reopen:
             assert coordinator is not None and released is not None
             transferred = dataclasses.replace(
@@ -49318,6 +49487,19 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
             f"transferred slot={transferred.slot} agent={transferred.agent} "
             f"generation={transferred.generation} owner_pid={successor.pid} basis={basis} "
             f"previous={previous_state}"
+        )
+    if ignored_transferred:
+        # The ignored set that transferred with the slot (#1870), recorded
+        # in the command output only -- not a new persisted field.
+        listing = b"\n".join(
+            checkout.encode("utf-8") + b"\0" + path
+            for checkout, path in ignored_transferred
+        )
+        digest = hashlib.sha256(listing).hexdigest()
+        print(
+            f"ignored_transferred count={len(ignored_transferred)} sha256={digest} "
+            "(informational only, never persisted); "
+            "gitignored files transfer with the slot, unchanged"
         )
     return 0
 
@@ -100120,7 +100302,8 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--to-agent", metavar="AGENT",
         help="new agent name to record instead of --agent (rebind a slot whose owner is "
         "provably dead to a differently named successor; starts a new generation and "
-        "requires a clean tree; default: keep --agent)",
+        "requires a clean tree, except that gitignored files transfer with the slot "
+        "unchanged and are reported in the output; default: keep --agent)",
     )
     transfer.add_argument(
         "--owner-pid", type=int, required=True, metavar="PID", help="live successor PID to bind"

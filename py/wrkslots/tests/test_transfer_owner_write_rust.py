@@ -253,6 +253,63 @@ def test_transfer_dead_owner_matches_python(tmp_path: Path) -> None:
     assert _events(rust_root) == _events(oracle_root)
 
 
+def test_transfer_rename_with_ignored_files_matches_python(tmp_path: Path) -> None:
+    """#1870: ignored evidence transfers with a rename in both editions."""
+
+    rust_root, oracle_root = _pair(tmp_path, _dead_identity())
+    for root in (rust_root, oracle_root):
+        worktree = root / "worktrees" / "slot-a" / "repo"
+        (worktree / ".gitignore").write_text(
+            ".buckconfig.local\nignored/\n", encoding="utf-8"
+        )
+        _git(worktree, "add", ".gitignore")
+        _git(worktree, "commit", "-qm", "ignore local evidence")
+        (worktree / ".buckconfig.local").symlink_to("x" * 44)
+        evidence = worktree / "ignored" / "live-evidence.bin"
+        evidence.parent.mkdir(parents=True)
+        evidence.write_text("precious evidence\n", encoding="utf-8")
+    assert _python(oracle_root, os.getpid(), to_agent="agent-new") == 0
+    result = _rust(rust_root, os.getpid(), to_agent="agent-new")
+    assert result.returncode == 0, result.stderr
+    outcome = json.loads(result.stdout)
+    assert outcome["agent"] == "agent-new"
+    assert outcome["ignored_transferred"]["count"] == 2
+    assert _active(rust_root) == _active(oracle_root)
+    assert _events(rust_root) == _events(oracle_root)
+    for root in (rust_root, oracle_root):
+        worktree = root / "worktrees" / "slot-a" / "repo"
+        link = worktree / ".buckconfig.local"
+        assert link.is_symlink() and os.readlink(link) == "x" * 44
+        assert (worktree / "ignored" / "live-evidence.bin").read_text(
+            encoding="utf-8"
+        ) == "precious evidence\n"
+
+
+def test_transfer_rename_refuses_caller_hidden_work_in_both_editions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1870 review: a global excludesFile hides nothing, in either edition."""
+
+    rust_root, oracle_root = _pair(tmp_path, _dead_identity())
+    excludes = tmp_path / "excludes"
+    excludes.write_text("notes.local\n", encoding="utf-8")
+    global_config = tmp_path / "gitconfig"
+    global_config.write_text(
+        f"[core]\n\texcludesFile = {excludes}\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+    for root in (rust_root, oracle_root):
+        worktree = root / "worktrees" / "slot-a" / "repo"
+        (worktree / "notes.local").write_text("authored work\n", encoding="utf-8")
+    with pytest.raises(Exception) as caught:
+        _python(oracle_root, os.getpid(), to_agent="agent-new")
+    assert "clean tree" in str(caught.value)
+    result = _rust(rust_root, os.getpid(), to_agent="agent-new")
+    assert result.returncode == 1, result.stderr
+    assert "clean tree" in result.stderr
+    assert _active(rust_root)["revision"] == 7
+
+
 def test_transfer_unowned_matches_python(tmp_path: Path) -> None:
     rust_root, oracle_root = _pair(tmp_path, None)
     assert _python(oracle_root, os.getpid()) == 0
@@ -494,4 +551,97 @@ def test_rebind_dirty_tree_refuses(tmp_path: Path) -> None:
     result = _rust(rust_root, os.getpid(), to_agent="agent-successor")
     assert result.returncode == 1
     assert "a slot changes agent only with a clean tree" in result.stderr
+    assert _active(rust_root)["revision"] == 7
+
+
+def test_rebind_hidden_gitignore_edit_refuses(tmp_path: Path) -> None:
+    """assume-unchanged .gitignore hiding authored work (#1959, both editions)."""
+    rust_root, oracle_root = _pair(tmp_path, _dead_identity())
+    for root in (rust_root, oracle_root):
+        worktree = root / "worktrees" / "slot-a" / "repo"
+        (worktree / ".gitignore").write_text("*.md\n", encoding="utf-8")
+        _git(worktree, "add", ".gitignore")
+        _git(worktree, "commit", "-qm", "ignore md")
+        (worktree / ".gitignore").write_text("*.md\nauthored.py\n", encoding="utf-8")
+        _git(worktree, "update-index", "--assume-unchanged", ".gitignore")
+        (worktree / "authored.py").write_text("authored work\n", encoding="utf-8")
+    with pytest.raises(Exception):
+        _python(oracle_root, os.getpid(), to_agent="agent-new")
+    result = _rust(rust_root, os.getpid(), to_agent="agent-new")
+    assert result.returncode == 1, result.stderr
+    assert "assume-unchanged" in result.stderr or "ignore rules" in result.stderr
+    assert _active(rust_root)["revision"] == 7
+
+
+def test_rebind_fsmonitor_hook_hides_nothing(tmp_path: Path) -> None:
+    """core.fsmonitor must not hide changes from the rename check (#1959)."""
+    rust_root, oracle_root = _pair(tmp_path, _dead_identity())
+    for root in (rust_root, oracle_root):
+        worktree = root / "worktrees" / "slot-a" / "repo"
+        _git(worktree, "config", "core.fsmonitor", "true")
+        (worktree / "file.txt").write_text("dirty\n")
+    with pytest.raises(Exception) as caught:
+        _python(oracle_root, os.getpid(), to_agent="agent-new")
+    assert "clean tree" in str(caught.value)
+    result = _rust(rust_root, os.getpid(), to_agent="agent-new")
+    assert result.returncode == 1, result.stderr
+    assert "clean tree" in result.stderr
+    assert _active(rust_root)["revision"] == 7
+
+
+def test_rebind_non_utf8_filename_matches_python(tmp_path: Path) -> None:
+    """Non-UTF8 ignored names: same outcome, no crash (#1959)."""
+    rust_root, oracle_root = _pair(tmp_path, _dead_identity())
+    raw_name = b"bad-\xff\xfe-name.txt"
+    for root in (rust_root, oracle_root):
+        worktree = root / "worktrees" / "slot-a" / "repo"
+        (worktree / ".gitignore").write_text("bad-*\n", encoding="utf-8")
+        _git(worktree, "add", ".gitignore")
+        _git(worktree, "commit", "-qm", "ignore bad name")
+        (worktree / os.fsdecode(raw_name)).write_bytes(b"content")
+    rc = _python(oracle_root, os.getpid(), to_agent="agent-new")
+    assert rc == 0
+    result = _rust(rust_root, os.getpid(), to_agent="agent-new")
+    assert result.returncode == 0, result.stderr
+    outcome = json.loads(result.stdout)
+    assert outcome["ignored_transferred"]["count"] == 1
+    assert (worktree / os.fsdecode(raw_name)).exists()
+
+
+def test_rebind_clean_filter_hidden_gitignore_edit_refuses(tmp_path: Path) -> None:
+    """--no-filters hashing catches a filter-hidden .gitignore edit (#1969).
+
+    Both editions: with .gitignore carrying filter=hide that restores
+    the committed blob on clean, status sees it clean and a filtered
+    hash-object round-trips to the index blob, yet the working rules
+    now hide authored work; the rename must still refuse.
+    """
+    rust_root, oracle_root = _pair(tmp_path, _dead_identity())
+    for root in (rust_root, oracle_root):
+        worktree = root / "worktrees" / "slot-a" / "repo"
+        (worktree / ".gitignore").write_text("ignored/\n", encoding="utf-8")
+        _git(worktree, "add", ".gitignore")
+        _git(worktree, "commit", "-qm", "ignore dir")
+        _git(worktree, "config", "filter.hide.clean",
+             "git cat-file blob HEAD:.gitignore")
+        common = _git(worktree, "rev-parse", "--git-common-dir").strip()
+        common_path = Path(common)
+        if not common_path.is_absolute():
+            common_path = (worktree / common_path).resolve()
+        (common_path / "info").mkdir(parents=True, exist_ok=True)
+        (common_path / "info" / "attributes").write_text(
+            ".gitignore filter=hide\n", encoding="utf-8"
+        )
+        gitignore = (worktree / ".gitignore").read_text(encoding="utf-8")
+        (worktree / ".gitignore").write_text(
+            gitignore.replace("ignored/", "authored", 1), encoding="utf-8"
+        )
+        secret = worktree / "authored" / "secret.py"
+        secret.parent.mkdir(parents=True, exist_ok=True)
+        secret.write_text("authored work\n", encoding="utf-8")
+    with pytest.raises(Exception):
+        _python(oracle_root, os.getpid(), to_agent="agent-new")
+    result = _rust(rust_root, os.getpid(), to_agent="agent-new")
+    assert result.returncode == 1, result.stderr
+    assert "clean tree" in result.stderr or "ignore rules" in result.stderr
     assert _active(rust_root)["revision"] == 7
