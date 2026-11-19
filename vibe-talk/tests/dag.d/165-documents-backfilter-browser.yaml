@@ -1,0 +1,19 @@
+steps:
+  # `#1908 vibe-talk-documents-back-and-filter-place` against the real server binary: Back
+  # from a document restoring the exact starred list (count line, cards and
+  # place) after newer arrivals push the older starred rows off the first
+  # page, and clearing the filter keeping the reader's place, at phone and desk.
+  - group: check
+    job: documents-backfilter-browser
+    desc: the Documents Back and filter place (Back restores the exact starred list; clearing Starred keeps the anchor card's place, never the top), against the real server (fake chat upstream) in current Chromium at 412x915 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/documents_backfilter_browser.py
+    jobs_flag: ""
+    deps: [build.release, setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 90
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824

@@ -730,7 +730,9 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
       // height the redraw added over it, measured across the render itself.
       const scroller = scrollerOrNull();
       const heightBefore = scroller ? scroller.scrollHeight : 0;
-      render([...rowsNow, ...older.filter((row) => !seen.has(row.key))]);
+      // Paging keeps its own anchor below (the height the older cards added),
+      // so the redraw must not also keep the filter-change anchor (`#1908`).
+      render([...rowsNow, ...older.filter((row) => !seen.has(row.key))], false);
       if (scroller && listOnScreen()) {
         const grew = scroller.scrollHeight - heightBefore;
         if (grew > 0) deps.nudge(scroller, grew);
@@ -803,7 +805,73 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
     return true;
   }
 
-  function render(rows: readonly DocumentRow[]): void {
+  /** A rect a place can be kept by, or null where it reports none usable. */
+  function usableRect(element: unknown): { top: number; bottom: number } | null {
+    const rect = rectOf(element);
+    if (rect === null || (rect.top === 0 && rect.bottom === 0)) return null;
+    return rect;
+  }
+
+  /**
+   * The reader's place before a redraw (`#1908 vibe-talk-documents-back-and-filter-place`):
+   * the first card at or below the visible band's top, with every drawn card's
+   * top, so the redraw can put that card back at the same height. Null where
+   * no usable geometry stands (a host without rects, the list off screen), in
+   * which case the redraw leaves the scroller exactly as it found it.
+   */
+  function captureAnchor(): { key: string; tops: Map<string, number>; order: string[] } | null {
+    if (!listOnScreen()) return null;
+    const band = visibleBand();
+    if (!band) return null;
+    const tops = new Map<string, number>();
+    const order: string[] = [];
+    let anchor: string | null = null;
+    for (const card of cardElements()) {
+      const rect = usableRect(card.element);
+      if (!rect) continue;
+      tops.set(card.key, rect.top);
+      order.push(card.key);
+      if (anchor === null && rect.bottom > band.top) anchor = card.key;
+    }
+    return anchor === null ? null : { key: anchor, tops, order };
+  }
+
+  /**
+   * Put the captured place back after a redraw: the anchor card at its old
+   * height, or — where the filter took it — the nearest surviving card at
+   * its own old height, so a reader near the bottom stays near the bottom
+   * and nothing ever lands the list at its top. One measured nudge through
+   * the scroll owner, only where the redraw actually moved the card.
+   */
+  function restoreAnchor(capture: { key: string; tops: Map<string, number>; order: string[] } | null): void {
+    if (!capture) return;
+    const scroller = scrollerOrNull();
+    if (!scroller || !listOnScreen()) return;
+    const now = new Map<string, number>();
+    for (const card of cardElements()) {
+      const rect = usableRect(card.element);
+      if (rect) now.set(card.key, rect.top);
+    }
+    let key: string | null = now.has(capture.key) ? capture.key : null;
+    if (key === null) {
+      const at = capture.order.indexOf(capture.key);
+      for (let i = at + 1; key === null && i < capture.order.length; i += 1) {
+        if (now.has(capture.order[i]!)) key = capture.order[i]!;
+      }
+      for (let i = at - 1; key === null && i >= 0; i -= 1) {
+        if (now.has(capture.order[i]!)) key = capture.order[i]!;
+      }
+    }
+    if (key === null) return;
+    const before = capture.tops.get(key);
+    const after = now.get(key);
+    if (before === undefined || after === undefined) return;
+    const delta = after - before;
+    if (delta !== 0) deps.nudge(scroller, delta);
+  }
+
+  function render(rows: readonly DocumentRow[], keepAnchor = true): void {
+    const anchor = keepAnchor ? captureAnchor() : null;
     rowsNow = dedupeDocumentRows(rows).sort(byOldest);
     listening.unmount();
     const list = deps.byId(LIST_ID);
@@ -846,6 +914,11 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
     // and the Starred chip (`#1265`) joins this same element. The Undo chip
     // sits just above it, where the reader's eye already is.
     list.replaceChildren(head, ...cards, ...(undo ? [undo] : []), bucketBar());
+    // The redraw moved the cards, not the reader (`#1908`): put the place
+    // captured above back before anything else reads the scroller. A caller
+    // landing somewhere named (a refresh's follow or recorded place) writes
+    // after this and wins, as it always has.
+    restoreAnchor(anchor);
     // Arrow keys walk the cards; Enter opens (above).
     listening.listen(list, "keydown", (event: KeyboardEvent) => {
       if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
@@ -931,9 +1004,42 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
     const scroller = scrollerOrNull();
     const follow = place ? place.follow : scroller !== null && listOnScreen() && atBottom(scroller, FOLLOW_SLACK_PX);
     const top = place ? place.top : scroller ? scroller.scrollTop : 0;
-    const answer = (await deps.api(LIST_PATH)) as DocumentsListAnswer;
+    // The loaded window is the reader's (`#1908 vibe-talk-documents-back-and-filter-place`):
+    // pages scrolled in above the newest page are part of the list the reader
+    // left, so a refresh — above all a Back from a document — re-reads the
+    // whole held window instead of dropping everything above the first page
+    // (which silently unlisted older starred rows). The first read asks for
+    // the held count outright (the server caps it at 500); older pages follow
+    // by mention time until the window is covered again.
+    const heldCount = rowsNow.length;
+    const heldOldest = rowsNow.reduce<number | null>(
+      (min, row) => (row.last_mentioned_ms !== null && (min === null || row.last_mentioned_ms < min) ? row.last_mentioned_ms : min),
+      null,
+    );
+    const firstPath = heldCount >= 100
+      ? `/api/v1/documents?limit=${Math.min(500, heldCount * 2)}`
+      : LIST_PATH;
+    const answer = (await deps.api(firstPath)) as DocumentsListAnswer;
     totalNow = typeof answer?.total === "number" ? answer.total : 0;
-    render(Array.isArray(answer?.documents) ? answer.documents : []);
+    let fresh: readonly DocumentRow[] = Array.isArray(answer?.documents) ? answer.documents : [];
+    if (heldOldest !== null) {
+      const oldestOf = (rows: readonly DocumentRow[]): number | null => rows.reduce<number | null>(
+        (min, row) => (row.last_mentioned_ms !== null && (min === null || row.last_mentioned_ms < min) ? row.last_mentioned_ms : min),
+        null,
+      );
+      let oldest = oldestOf(fresh);
+      while (oldest !== null && (oldest > heldOldest || dedupeDocumentRows(fresh).length < heldCount)) {
+        const page = (await deps.api(`/api/v1/documents?limit=100&before_ms=${oldest}`)) as DocumentsListAnswer;
+        const older = Array.isArray(page?.documents) ? page.documents : [];
+        if (older.length === 0) break;
+        const heldBefore = dedupeDocumentRows(fresh).length;
+        fresh = [...fresh, ...older];
+        const next = oldestOf(older);
+        if (next === null || (next >= oldest && dedupeDocumentRows(fresh).length <= heldBefore)) break;
+        oldest = next;
+      }
+    }
+    render(fresh);
     if (scroller && listOnScreen()) {
       if (follow) deps.toFoot(scroller); else deps.toPosition(scroller, top);
     }

@@ -582,6 +582,117 @@ test("documents list: older documents page in at the top, anchored; the bottom p
   });
 });
 
+test("documents list: a refresh keeps the paged-in window, so Back restores the whole list (#1908)", async () => {
+  const all = [docRow("a", 100), docRow("b", 200), docRow("c", 300), docRow("d", 400), docRow("e", 500)];
+  // A server with a three-row page: the first read is the newest page, a
+  // before_ms read is the newest page older than its cursor.
+  const serve = (path) => {
+    const before = /before_ms=(\d+)/.exec(path);
+    const pool = before ? all.filter((row) => row.last_mentioned_ms < Number(before[1])) : all;
+    return { documents: pool.slice(-3), total: all.length };
+  };
+  await withList(serve, async ({ list, scroller, paths, fire, keys }) => {
+    await list.refresh();
+    assert.deepEqual(keys(), ["c", "d", "e"], "the first read is not the newest page");
+    // Page the older rows in, as scrolling to the top does.
+    scroller.scrollTop = 100;
+    fire(scroller, "scroll");
+    await flush([]);
+    assert.deepEqual(keys(), ["a", "b", "c", "d", "e"], "paging did not load the older rows");
+    // A refresh (what Back from a document runs) must not drop them again:
+    // before the fix it re-read only the newest page and the older rows —
+    // starred ones among them — silently left the list.
+    paths.length = 0;
+    await list.refresh();
+    assert.deepEqual(keys(), ["a", "b", "c", "d", "e"],
+      "a refresh dropped the paged-in older rows (Back would restore a narrowed list)");
+    assert.ok(paths.some((path) => path.includes("before_ms=")),
+      `the refresh did not re-read down to the held window (paths: ${paths.join(", ")})`);
+  });
+});
+
+// A list whose cards report a real layout: each card is 100px tall in document
+// order, the scroller shows a 100px band, and a card's rect is its place in
+// the document less the scroll offset — so anchor arithmetic is observable.
+async function withMeasuredList(answer, run) {
+  const mod = requireModule(LIST, "src/view/documents/list.ts");
+  assert.equal(typeof mod.createDocumentsList, "function", "list does not export createDocumentsList");
+  const listEl = fakeElement("div");
+  const scroller = fakeElement("div");
+  scroller.scrollTop = 0;
+  scroller.clientHeight = 100;
+  scroller.getBoundingClientRect = () => ({ top: 0, bottom: 100, left: 0, right: 100, width: 100, height: 100 });
+  const cardIndex = (el) => {
+    const parent = el.parentNode;
+    if (!parent) return 0;
+    return parent.children.filter((kid) => String(kid.className).includes("doc-card")).indexOf(el);
+  };
+  const measured = (tag) => {
+    const el = fakeElement(tag);
+    el.getBoundingClientRect = () => {
+      const index = Math.max(0, cardIndex(el));
+      const top = index * 100 - scroller.scrollTop;
+      return { top, bottom: top + 100, left: 0, right: 100, width: 100, height: 100 };
+    };
+    return el;
+  };
+  Object.defineProperty(scroller, "scrollHeight", {
+    get: () => listEl.children.filter((kid) => String(kid.className).includes("doc-card")).length * 100 + 100,
+  });
+  const paneDocs = fakeElement("div");
+  const listView = fakeElement("div");
+  const byId = (id) => ({
+    "documents-list": listEl, "scroll-area": scroller, "pane-docs": paneDocs, "docs-list-view": listView,
+  })[id];
+  const paths = [];
+  const list = mod.createDocumentsList({
+    nudge: (scrollerEl, delta) => { scrollerEl.scrollTop += delta; },
+    toPosition: (scrollerEl, top) => { scrollerEl.scrollTop = top; },
+    toFoot: (scrollerEl) => { scrollerEl.scrollTop = scrollerEl.scrollHeight; },
+    api: async (path, options) => { paths.push(path); return answer(path, options); },
+    byId,
+    onOpen: () => {},
+    onStatus: () => {},
+  });
+  const savedDocument = globalThis.document;
+  globalThis.document = {
+    createElement: (tag) => measured(tag),
+    createElementNS: (_ns, tag) => measured(tag),
+    createTextNode: (text) => ({ nodeType: 3, textContent: String(text) }),
+    querySelector: () => null,
+  };
+  const cards = () => listEl.children.filter((kid) => String(kid.className).includes("doc-card"));
+  const topOf = (key) => {
+    const card = cards().find((kid) => kid.getAttribute("data-key") === key);
+    return card ? card.getBoundingClientRect().top : null;
+  };
+  try {
+    await run({ list, listEl, scroller, paths, cards, topOf });
+  } finally {
+    if (savedDocument === undefined) delete globalThis.document; else globalThis.document = savedDocument;
+    list.unmount();
+  }
+}
+
+test("documents list: clearing a filter keeps the reader's place, never the top (#1908)", async () => {
+  const rows = ["a", "b", "c", "d", "e", "f"].map((key, i) => docRow(key, (i + 1) * 100));
+  await withMeasuredList(() => ({ documents: rows, total: rows.length }), async ({ list, scroller, topOf }) => {
+    await list.refresh();
+    // Parked at the bottom: the newest card sits at the band's top.
+    scroller.scrollTop = 500;
+    assert.equal(topOf("f"), 0, "the newest card is not at the band's top before filtering");
+    // Narrow to that one card, then clear the filter — the owner's sequence.
+    // The card's height in the viewport must survive both redraws; before
+    // the fix the clear kept the numeric offset of the short list and the
+    // reader landed at the top of the full one.
+    list.setNameFilter("f.md");
+    assert.ok(Math.abs(topOf("f") - 0) <= 2, `narrowing moved the anchor card (top: ${topOf("f")})`);
+    list.setNameFilter("");
+    assert.ok(Math.abs(topOf("f") - 0) <= 2, `clearing the filter moved the anchor card (top: ${topOf("f")})`);
+    assert.equal(scroller.scrollTop, 500, "clearing the filter left the reader at the top of the list");
+  });
+});
+
 test("documents list: drag up parked at the bottom refreshes; other drags do not", async () => {
   const rows = [docRow("old", 100), docRow("new", 300)];
   await withList(() => ({ documents: rows, total: 2 }), async ({ list, listEl, scroller, paths, statuses, fire }) => {
