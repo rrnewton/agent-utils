@@ -44272,8 +44272,8 @@ def _eden_backing_doctor_findings(
 
     settings = config.worktrees_image
     findings: list[dict[str, object]] = []
-    if settings is not None and settings.eden_backing_repo is not None:
-        name = settings.eden_backing_repo
+    if settings is not None and settings.eden_backing_repos:
+        names = ", ".join(b.name for b in settings.eden_backing_repos)
         if config.worktrees_image_state != worktreesimage.MOUNTED:
             findings.append(
                 _operational_finding(
@@ -44281,29 +44281,41 @@ def _eden_backing_doctor_findings(
                     None,
                     config.machine,
                     "configuration.worktrees_image.eden_backing_repo="
-                    f"{name!r} cannot be checked: worktrees image is "
+                    f"{names!r} cannot be checked: worktrees image is "
                     f"{config.worktrees_image_state}; remedy: "
                     "wrkslots worktrees-image mount",
                 )
             )
         else:
             mount_point = settings.mount_point(config.control, config.worktrees)
-            resolved = worktreesimage.eden_backing_repo_path(mount_point, name)
-            problem = eden.backing_repo_problem(resolved)
-            if problem is not None:
-                findings.append(
-                    _operational_finding(
-                        "eden-backing",
-                        None,
-                        config.machine,
-                        f"{problem}; remedy: wrkslots worktrees-image "
-                        "seed-eden-backing --from <host backing repo>",
+            for backing in settings.eden_backing_repos:
+                try:
+                    resolved = worktreesimage.eden_backing_path(mount_point, backing)
+                except worktreesimage.WorktreesImageError as exc:
+                    findings.append(
+                        _operational_finding(
+                            "eden-backing", None, config.machine, str(exc)
+                        )
                     )
-                )
+                    continue
+                problem = eden.backing_repo_problem(resolved)
+                if problem is not None:
+                    findings.append(
+                        _operational_finding(
+                            "eden-backing",
+                            None,
+                            config.machine,
+                            f"{problem}; remedy: wrkslots worktrees-image "
+                            "seed-eden-backing --from <host backing repo>",
+                        )
+                    )
             root = worktreesimage.eden_backing_root(mount_point)
             if root.is_dir():
                 for entry in sorted(root.iterdir(), key=lambda item: item.name):
-                    if entry.name.startswith(f".seeding-{name}-"):
+                    if any(
+                        entry.name.startswith(f".seeding-{b.name}-")
+                        for b in settings.eden_backing_repos
+                    ):
                         findings.append(
                             _operational_finding(
                                 "eden-backing",
@@ -45065,7 +45077,7 @@ def _resolve_eden_backing(config: Config, given: str) -> str:
     """
 
     settings = config.worktrees_image
-    if settings is None or settings.eden_backing_repo is None:
+    if settings is None or not settings.eden_backing_repos:
         return given
     if config.worktrees_image_state != worktreesimage.MOUNTED:
         raise Refusal(
@@ -45074,16 +45086,26 @@ def _resolve_eden_backing(config: Config, given: str) -> str:
             "'wrkslots worktrees-image mount' first"
         )
     mount_point = settings.mount_point(config.control, config.worktrees)
-    resolved = worktreesimage.eden_backing_repo_path(
-        mount_point, settings.eden_backing_repo
-    )
-    if given not in {settings.eden_backing_repo, str(resolved)}:
+    resolved: Path | None = None
+    for backing in settings.eden_backing_repos:
+        try:
+            candidate = worktreesimage.eden_backing_path(mount_point, backing)
+        except worktreesimage.WorktreesImageError as exc:
+            raise Refusal(str(exc)) from exc
+        if given in {backing.name, backing.path, str(candidate)}:
+            resolved = candidate
+            break
+    if resolved is None:
+        configured = ", ".join(
+            f"{backing.name} ({worktreesimage.eden_backing_path(mount_point, backing)})"
+            for backing in settings.eden_backing_repos
+        )
         raise Refusal(
-            f"create --eden backing {given!r} does not match "
-            "configuration.worktrees_image.eden_backing_repo "
-            f"{settings.eden_backing_repo!r} (in-image: {resolved}); pass "
-            f"main={settings.eden_backing_repo} or main={resolved}, or unset "
-            "eden_backing_repo to use an external backing"
+            f"create --eden backing {given!r} does not match any "
+            "configuration.worktrees_image.eden_backing_repo entry; "
+            f"configured: {configured}; pass main=<a configured name or "
+            "its in-image path>, or unset eden_backing_repo to use an "
+            "external backing"
         )
     problem = eden.backing_repo_problem(resolved)
     if problem is not None:

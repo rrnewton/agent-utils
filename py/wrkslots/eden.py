@@ -401,48 +401,66 @@ def measure_tree(path: Path) -> tuple[int, int]:
     return total, files
 
 
-def _set_hgrc_default_path(hgrc: Path, value: str) -> None:
-    """Set ``[paths] default`` in an hgrc, preserving every other line."""
+def _set_hgrc_value(hgrc: Path, section: str, key: str, value: str) -> None:
+    """Set ``key`` under ``[section]`` in an hgrc, preserving other lines."""
 
     try:
         lines = hgrc.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         lines = []
     out: list[str] = []
-    in_paths = False
+    in_section = False
     done = False
+    header = f"[{section}]"
     for raw in lines:
         line = raw.strip()
         if line.startswith("["):
-            if in_paths and not done:
-                out.append(f"default = {value}")
+            if in_section and not done:
+                out.append(f"{key} = {value}")
                 done = True
-            in_paths = line == "[paths]"
+            in_section = line == header
             out.append(raw)
             continue
-        if in_paths and "=" in line and line.partition("=")[0].strip() == "default":
+        if in_section and "=" in line and line.partition("=")[0].strip() == key:
             if not done:
-                out.append(f"default = {value}")
+                out.append(f"{key} = {value}")
                 done = True
             continue
         out.append(raw)
     if not done:
-        if not in_paths:
-            out.append("[paths]")
-        out.append(f"default = {value}")
+        if not in_section:
+            out.append(header)
+        out.append(f"{key} = {value}")
     hgrc.write_text("\n".join(out) + "\n", encoding="utf-8")
 
 
-def seed_backing_repo(runner: Runner, source: Path, staging: Path) -> None:
-    """Clone ``source`` into ``staging`` and prove the copy stands alone.
+def _set_hgrc_default_path(hgrc: Path, value: str) -> None:
+    """Set ``[paths] default`` in an hgrc, preserving every other line."""
 
-    A local no-update clone (this Sapling build has no ``clone --pull``);
-    across filesystems the store files are copied, never hardlinked.
-    A clone records its source as the default path, so that is reset
-    to the source repo's own upstream: the published backing then has
-    the host backing's shape (full copied store, upstream only for
-    future lazy fetches). Refuses (staging kept for inspection) when
-    the clone cannot be made to stand alone. The caller owns the
+    _set_hgrc_value(hgrc, "paths", "default", value)
+
+
+def _is_remote_path(value: str) -> bool:
+    """Whether a ``[paths] default`` names a remote, not a local path."""
+
+    if value.startswith(("/", ".", "~")):
+        return False
+    return not Path(value).exists()
+
+
+def seed_backing_repo(
+    runner: Runner, source: Path, staging: Path, cachepath: Path
+) -> None:
+    """Lazily clone ``source``'s upstream into ``staging`` (#1804).
+
+    A lazy no-update clone of the source's ``[paths] default`` (never a
+    full local clone of the source), so the seeded backing is megabytes,
+    not the whole store; its ``[remotefilelog] cachepath`` points at the
+    in-image ``cachepath``, written only into the new clone's own hgrc.
+    Refuses when the source records no default, or a local one: there
+    is then nothing remote to be lazy against. Proves the clone stands
+    alone (no shared store, its default is the upstream, never the
+    source checkout, and a standalone log read). The caller owns the
     staging directory, the atomic rename into place, and reporting.
     """
 
@@ -453,8 +471,20 @@ def seed_backing_repo(runner: Runner, source: Path, staging: Path) -> None:
     source_default = (
         source_default_obj if isinstance(source_default_obj, str) else None
     )
+    if source_default is None:
+        raise EdenError(
+            f"backing source {source} records no [paths] default; a lazy "
+            "seed needs a remote upstream to clone from (staging kept "
+            "for inspection)"
+        )
+    if not _is_remote_path(source_default):
+        raise EdenError(
+            f"backing source {source} default path {source_default!r} is "
+            "a local path, not a remote; a lazy seed clones the upstream, "
+            "so name a remote there first (staging kept for inspection)"
+        )
     rc, stdout, stderr = runner(
-        ["sl", "clone", "-U", str(source), str(staging)]
+        ["sl", "clone", "-U", source_default, str(staging)]
     )
     if rc != 0:
         raise EdenError(
@@ -465,14 +495,10 @@ def seed_backing_repo(runner: Runner, source: Path, staging: Path) -> None:
     if problem is not None:
         raise EdenError(problem)
     if backing_facts(staging)["default_path"] == str(source):
-        if source_default is None or source_default == str(source):
-            raise EdenError(
-                f"seeded backing at {staging} still names its source "
-                f"{source} as the default path and the source records no "
-                "upstream to take over; not publishing it (staging kept "
-                "for inspection)"
-            )
         _set_hgrc_default_path(staging / ".hg" / "hgrc", source_default)
+    _set_hgrc_value(
+        staging / ".hg" / "hgrc", "remotefilelog", "cachepath", str(cachepath)
+    )
     rc, stdout, stderr = runner(
         ["sl", "-R", str(staging), "log", "-l", "1", "-T", "{node}"]
     )

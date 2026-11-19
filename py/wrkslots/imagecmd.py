@@ -237,21 +237,24 @@ def register(subparsers: argparse._SubParsersAction[_ParserT], formatter: type[a
         "seed-eden-backing",
         help="seed the configured in-image Eden backing repo from a host backing repo (dry run by default)",
         description=(
-            "Clone the host Eden backing repository named by --from into the "
-            "image at <image mount>/.eden-backing/<eden_backing_repo> (its own "
+            "Lazily clone the remote upstream of the host Eden backing "
+            "repository named by --from into the image at "
+            "<image mount>/.eden-backing/<configured path> (its own "
             "subvolume, outside every slot, never removed with a slot), so "
-            "Eden slots keep their metadata inside the image (#1567). This is "
-            "a coordinator operation: run it deliberately, never from a lane. "
-            "The default is a dry run: it measures the source, checks the "
-            "image free space, and prints the exact clone command and report "
-            "fields, writing nothing; --yes performs the clone into a staging "
-            "directory, proves the copy stands alone (its default path reset "
-            "to the source's own upstream, a standalone sl log read, no "
-            "shared-store reference), and only then renames it into place. "
-            "A lazy store still fetches content from that upstream on demand, "
-            "exactly like the host backing; the report says so. Deleting a "
-            "seeded backing is manual and out of scope: remove every Eden "
-            "slot first, then delete its subvolume by hand."
+            "Eden slots keep their metadata inside the image (#1567, "
+            "#1804). With several backings configured, --name selects one. "
+            "This is a coordinator operation: run it deliberately, never "
+            "from a lane. The default is a dry run: it measures the "
+            "source, and prints the exact clone command and report "
+            "fields, writing nothing; --yes performs the lazy clone into "
+            "a staging directory, sets its remotefilelog cachepath to "
+            "the in-image cache, proves the clone stands alone (a "
+            "standalone sl log read, no shared-store reference), and "
+            "only then renames it into place. A lazy store still fetches "
+            "content from that upstream on demand, exactly like the host "
+            "backing; the report says so. Deleting a seeded backing is "
+            "manual and out of scope: remove every Eden slot first, then "
+            "delete its subvolume by hand."
         ),
         epilog=(
             "examples:\n"
@@ -264,6 +267,10 @@ def register(subparsers: argparse._SubParsersAction[_ParserT], formatter: type[a
     wt_seed.add_argument(
         "--from", dest="source", required=True, metavar="PATH",
         help="host Eden backing repository to clone from (absolute path)",
+    )
+    wt_seed.add_argument(
+        "--name", dest="name", default=None, metavar="NAME",
+        help="configured eden_backing_repo name to seed (required when several are configured)",
     )
     wt_seed.add_argument(
         "--yes", action="store_true",
@@ -980,11 +987,28 @@ def _cmd_wt_seed_eden_backing(args: argparse.Namespace) -> int:
     from wrkslots import cli, eden
 
     config, settings = _wt_settings(args)
-    if settings.eden_backing_repo is None:
+    if not settings.eden_backing_repos:
         raise _refuse(
             "configuration.worktrees_image.eden_backing_repo is not set; name "
             "the in-image backing repo there before seeding it"
         )
+    chosen = [
+        entry
+        for entry in settings.eden_backing_repos
+        if args.name is None or entry.name == args.name
+    ]
+    if args.name is not None and not chosen:
+        configured = ", ".join(e.name for e in settings.eden_backing_repos)
+        raise _refuse(
+            f"no eden backing named {args.name!r}; configured: {configured}"
+        )
+    if len(chosen) != 1:
+        configured = ", ".join(e.name for e in settings.eden_backing_repos)
+        raise _refuse(
+            "several eden backings are configured; name one with --name "
+            f"(configured: {configured})"
+        )
+    backing_entry = chosen[0]
     if config.worktrees_image_state != worktreesimage.MOUNTED:
         raise _refuse(
             f"worktrees image is {config.worktrees_image_state}; run "
@@ -996,10 +1020,11 @@ def _cmd_wt_seed_eden_backing(args: argparse.Namespace) -> int:
     problem = eden.backing_repo_problem(source)
     if problem is not None:
         raise _refuse(problem)
-    name = settings.eden_backing_repo
+    name = backing_entry.name
     mount_point = settings.mount_point(config.control, config.worktrees)
     root = worktreesimage.eden_backing_root(mount_point)
-    final = worktreesimage.eden_backing_repo_path(mount_point, name)
+    final = worktreesimage.eden_backing_path(mount_point, backing_entry)
+    cachepath = worktreesimage.hgcache_path(mount_point)
     staging_prefix = f".seeding-{name}-"
     staging_name = f"{staging_prefix}{secrets.token_hex(4)}"
     leftovers = (
@@ -1029,7 +1054,10 @@ def _cmd_wt_seed_eden_backing(args: argparse.Namespace) -> int:
         "already_seeded": final.exists(),
         "staging_leftovers": leftovers,
         "image_free_bytes_before": free_before,
-        "seed_command": ["sl", "clone", "-U", str(source), str(root / staging_name)],
+        "seed_command": [
+            "sl", "clone", "-U", str(facts["default_path"]), str(root / staging_name)
+        ],
+        "hgcache_path": str(cachepath),
         "note": (
             "a lazy store still fetches content from its upstream on demand, "
             "exactly like the host backing"
@@ -1057,11 +1085,9 @@ def _cmd_wt_seed_eden_backing(args: argparse.Namespace) -> int:
             f"leftover seed staging in {root}: {', '.join(leftovers)}; "
             "inspect it, then rerun with --clean-staging to remove only those"
         )
-    if free_before < source_bytes:
-        raise _refuse(
-            f"image has {free_before} free bytes at {mount_point}, less than "
-            f"the source's {source_bytes}; grow the image first"
-        )
+    # A lazy seed clones the upstream, not the source's store, so the
+    # image need not hold the source's bytes (#1804); free space is
+    # reported, not gated on the source size.
     started = time.monotonic()
     with cli._mutation_locks(config, args.wait_lock):
         state = cli._load_active(config)
@@ -1082,13 +1108,7 @@ def _cmd_wt_seed_eden_backing(args: argparse.Namespace) -> int:
                 for leftover in leftovers:
                     shutil.rmtree(root / leftover)
             staging = root / staging_name
-            eden.seed_backing_repo(cli._eden_runner, source, staging)
-            if os.stat(staging).st_dev == os.stat(source).st_dev:
-                raise _refuse(
-                    "seeded copy shares a device with its source, so its "
-                    "store files may be hardlinks; not publishing it "
-                    f"(staging kept at {staging})"
-                )
+            eden.seed_backing_repo(cli._eden_runner, source, staging, cachepath)
             os.rename(staging, final)
             descriptor = os.open(root, os.O_RDONLY)
             try:

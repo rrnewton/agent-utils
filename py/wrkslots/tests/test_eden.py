@@ -1768,6 +1768,7 @@ def test_backing_facts_report_lazy_store_and_default(tmp_path: Path) -> None:
 def test_seed_clone_argv_and_default_rewrite(tmp_path: Path) -> None:
     source = _fake_backing(tmp_path / "source")
     staging = tmp_path / "staging"
+    cachepath = tmp_path / "image" / ".hgcache"
     calls: list[tuple[str, ...]] = []
 
     def run(argv: Sequence[str]) -> tuple[int, str, str]:
@@ -1777,12 +1778,16 @@ def test_seed_clone_argv_and_default_rewrite(tmp_path: Path) -> None:
             return 0, "", ""
         return 0, "a" * 40 + "\n", ""
 
-    eden.seed_backing_repo(run, source, staging)
+    eden.seed_backing_repo(run, source, staging, cachepath)
 
-    assert calls[0] == ("sl", "clone", "-U", str(source), str(staging))
+    # Lazy: clones the source's upstream, never the source checkout.
+    assert calls[0] == ("sl", "clone", "-U", "fb:source-repo", str(staging))
     assert calls[1][:3] == ("sl", "-R", str(staging))
     facts = eden.backing_facts(staging)
     assert facts["default_path"] == "fb:source-repo"
+    hgrc = (staging / ".hg" / "hgrc").read_text(encoding="utf-8")
+    assert f"cachepath = {cachepath}" in hgrc
+    assert (source / ".hg" / "hgrc").read_text(encoding="utf-8").find("cachepath") < 0
 
 
 def test_seed_refuses_when_clone_stays_pointed_at_source(tmp_path: Path) -> None:
@@ -1795,8 +1800,19 @@ def test_seed_refuses_when_clone_stays_pointed_at_source(tmp_path: Path) -> None
             return 0, "", ""
         return 0, "a" * 40 + "\n", ""
 
-    with pytest.raises(eden.EdenError, match="source"):
-        eden.seed_backing_repo(run, source, staging)
+    with pytest.raises(eden.EdenError, match="no \\[paths\\] default"):
+        eden.seed_backing_repo(run, source, staging, tmp_path / "cache")
+
+
+def test_seed_refuses_a_local_default_path(tmp_path: Path) -> None:
+    source = _fake_backing(tmp_path / "source", default="/host/backing")
+    staging = tmp_path / "staging"
+
+    def run(argv: Sequence[str]) -> tuple[int, str, str]:
+        return 0, "", ""
+
+    with pytest.raises(eden.EdenError, match="local path"):
+        eden.seed_backing_repo(run, source, staging, tmp_path / "cache")
 
 
 def test_create_eden_refuses_backing_mismatch_before_writing(
@@ -1817,7 +1833,9 @@ def test_create_eden_refuses_backing_mismatch_before_writing(
         worktrees_image=worktreesimage.WorktreesImageSettings(
             relative_path="worktrees.img",
             size_bytes=1024**3,
-            eden_backing_repo="source-repo",
+            eden_backing_repos=(
+                worktreesimage.EdenBacking("source-repo", "source-repo"),
+            ),
         ),
         worktrees_image_state=worktreesimage.MOUNTED,
     )
@@ -1825,6 +1843,68 @@ def test_create_eden_refuses_backing_mismatch_before_writing(
     with pytest.raises(wrkslots_cli.Refusal, match="eden_backing_repo"):
         wrkslots_cli._eden_create_plan(config, args)
     args = argparse.Namespace(eden=["main=source-repo"], eden_rev=[])
+    with pytest.raises(wrkslots_cli.Refusal, match="not seeded"):
+        wrkslots_cli._eden_create_plan(config, args)
+
+
+def test_seed_refuses_to_choose_among_several_backings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wrkslots import imagecmd, worktreesimage
+
+    config = _image_config(
+        tmp_path,
+        worktrees_image=worktreesimage.WorktreesImageSettings(
+            relative_path="worktrees.img",
+            size_bytes=1024**3,
+            eden_backing_repos=(
+                worktreesimage.EdenBacking("alpha", "alpha"),
+                worktreesimage.EdenBacking("beta", "beta"),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        imagecmd, "_wt_settings", lambda args: (config, config.worktrees_image)
+    )
+    args = argparse.Namespace(
+        name=None, source="/host/backing", yes=False, format="human"
+    )
+    with pytest.raises(wrkslots_cli.Refusal, match="several eden backings"):
+        imagecmd._cmd_wt_seed_eden_backing(args)
+    args = argparse.Namespace(
+        name="gamma", source="/host/backing", yes=False, format="human"
+    )
+    with pytest.raises(wrkslots_cli.Refusal, match="no eden backing named"):
+        imagecmd._cmd_wt_seed_eden_backing(args)
+
+
+def test_create_eden_selects_among_configured_backings(tmp_path: Path) -> None:
+    from wrkslots import worktreesimage
+
+    config = wrkslots_cli.Config(
+        config_path=tmp_path / ".wrkslots.yml",
+        root=tmp_path,
+        worktrees=tmp_path / "slots",
+        control=tmp_path / "ctrl",
+        machine="node-a",
+        default_remote="origin",
+        default_landed_ref="refs/remotes/origin/main",
+        heartbeat_ttl_seconds=60,
+        liveness_command=tmp_path / "live.py",
+        worktrees_image=worktreesimage.WorktreesImageSettings(
+            relative_path="worktrees.img",
+            size_bytes=1024**3,
+            eden_backing_repos=(
+                worktreesimage.EdenBacking("alpha", "alpha"),
+                worktreesimage.EdenBacking("beta", "team/beta"),
+            ),
+        ),
+        worktrees_image_state=worktreesimage.MOUNTED,
+    )
+    args = argparse.Namespace(eden=["main=gamma"], eden_rev=[])
+    with pytest.raises(wrkslots_cli.Refusal, match="alpha.*beta"):
+        wrkslots_cli._eden_create_plan(config, args)
+    args = argparse.Namespace(eden=["main=beta"], eden_rev=[])
     with pytest.raises(wrkslots_cli.Refusal, match="not seeded"):
         wrkslots_cli._eden_create_plan(config, args)
 

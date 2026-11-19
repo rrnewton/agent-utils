@@ -67,6 +67,67 @@ def test_settings_refuse_bad_eden_backing_repo(name: object) -> None:
         )
 
 
+def test_settings_accept_eden_backing_list_and_map() -> None:
+    listed = worktreesimage.settings_from_obj(
+        {
+            "path": "worktrees.img",
+            "size_bytes": 2 * GIB,
+            "eden_backing_repo": ["alpha", "beta"],
+        }
+    )
+    assert listed.eden_backing_repos == (
+        worktreesimage.EdenBacking("alpha", "alpha"),
+        worktreesimage.EdenBacking("beta", "beta"),
+    )
+    assert listed.eden_backing_repo is None
+    mapped = worktreesimage.settings_from_obj(
+        {
+            "path": "worktrees.img",
+            "size_bytes": 2 * GIB,
+            "eden_backing_repo": {"alpha": "team/alpha-store"},
+        }
+    )
+    assert mapped.eden_backing_repos == (
+        worktreesimage.EdenBacking("alpha", "team/alpha-store"),
+    )
+    assert mapped.eden_backing_repo == "alpha"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        ["alpha", "alpha"],
+        {"alpha": "../escape"},
+        {"alpha": "/absolute"},
+        {"alpha": "a/../b"},
+        {"alpha": "a//b"},
+        {"alpha": "validate/x"},
+        {"alpha": ""},
+        [],
+        {},
+    ],
+)
+def test_settings_refuse_bad_eden_backing_forms(value: object) -> None:
+    with pytest.raises(worktreesimage.WorktreesImageError, match="eden_backing_repo"):
+        worktreesimage.settings_from_obj(
+            {"path": "worktrees.img", "size_bytes": 2 * GIB, "eden_backing_repo": value}
+        )
+
+
+def test_eden_backing_path_refuses_a_symlink_escape(tmp_path: Path) -> None:
+    mount = tmp_path / "mount"
+    root = worktreesimage.eden_backing_root(mount)
+    root.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "link").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(worktreesimage.WorktreesImageError, match="outside"):
+        worktreesimage.eden_backing_path(
+            mount, worktreesimage.EdenBacking("link", "link/repo")
+        )
+
+
 def test_settings_refuse_fuse_honestly() -> None:
     with pytest.raises(worktreesimage.WorktreesImageError, match="no.*FUSE|fuse2fs"):
         worktreesimage.settings_from_obj(

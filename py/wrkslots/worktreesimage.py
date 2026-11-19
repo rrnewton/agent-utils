@@ -79,6 +79,19 @@ class WorktreesImageError(RuntimeError):
 
 
 @dataclasses.dataclass(frozen=True)
+class EdenBacking:
+    """One configured in-image Eden backing repo (#1804).
+
+    ``name`` is the plain directory name ``create --eden`` selects by;
+    ``path`` is the normalized relative suffix under ``.eden-backing/``
+    where the repo lives (equal to ``name`` unless a map says otherwise).
+    """
+
+    name: str
+    path: str
+
+
+@dataclasses.dataclass(frozen=True)
 class WorktreesImageSettings:
     """Configuration for the project worktrees image.
 
@@ -96,11 +109,18 @@ class WorktreesImageSettings:
     machines: tuple[str, ...] | None = None
     mount_at: str = MOUNT_AT_BINDS
     quota_mode: str = "simple"
-    #: In-image Eden backing repo name (#1567): the single-component
-    #: directory name under ``.eden-backing/`` every Eden slot in this
-    #: project's image must clone from. None keeps caller-supplied
+    #: In-image Eden backing repos (#1567, #1804): every configured
+    #: name/suffix under ``.eden-backing/`` an Eden slot in this
+    #: project's image may clone from. None keeps caller-supplied
     #: backing paths (the historical behaviour).
-    eden_backing_repo: str | None = None
+    eden_backing_repos: tuple[EdenBacking, ...] | None = None
+
+    @property
+    def eden_backing_repo(self) -> str | None:
+        """The sole configured backing name, when exactly one is set."""
+        if self.eden_backing_repos is not None and len(self.eden_backing_repos) == 1:
+            return self.eden_backing_repos[0].name
+        return None
 
     def applies_on(self, machine: str) -> bool:
         """Whether this section applies on the host named ``machine``."""
@@ -162,12 +182,15 @@ WORKTREES_IMAGE_DOCS: dict[str, str] = {
         "Mounting never changes an existing image's mode; status reports the active one."
     ),
     "eden_backing_repo": (
-        "Optional name of the one Eden backing repository inside the image "
-        "(<image mount>/.eden-backing/<name>, its own subvolume outside every "
-        "slot). When set, create --eden accepts only that name or its resolved "
+        "Optional Eden backing repositories inside the image: one plain name, "
+        "a list of names, or a map of name to relative path suffix, each under "
+        "<image mount>/.eden-backing/ (its own subvolume outside every slot). "
+        "When set, create --eden accepts only a configured name or its resolved "
         "in-image path and refuses anything else, so Eden metadata stays in "
-        "the image. Seed it with `wrkslots worktrees-image seed-eden-backing`; "
-        "absent keeps caller-supplied backing paths."
+        "the image. Seed each with `wrkslots worktrees-image seed-eden-backing`; "
+        "absent keeps caller-supplied backing paths. The list and map forms "
+        "need every wrkslots reader on the host to include #1804: older readers "
+        "refuse a non-string value."
     ),
 }
 
@@ -252,21 +275,9 @@ def settings_from_obj(value: object) -> WorktreesImageSettings:
             f"configuration.worktrees_image.quota_mode must be one of {', '.join(QUOTA_MODES)}, not {quota_mode!r}"
         )
     eden_backing = value.get("eden_backing_repo")
-    if eden_backing is not None:
-        # Validated on every host like `machines`: one plain directory
-        # component, never the validation entry or a traversal.
-        if (
-            not isinstance(eden_backing, str)
-            or not eden_backing
-            or eden_backing != eden_backing.strip()
-            or "/" in eden_backing
-            or eden_backing in {".", "..", VALIDATE_SUBDIR}
-            or any(char.isspace() for char in eden_backing)
-        ):
-            raise WorktreesImageError(
-                "configuration.worktrees_image.eden_backing_repo must be one "
-                "plain directory name (no path separators, spaces, or 'validate')"
-            )
+    eden_backings = (
+        _parse_eden_backing(eden_backing) if eden_backing is not None else None
+    )
     return WorktreesImageSettings(
         relative_path=candidate.as_posix(),
         size_bytes=size,
@@ -276,8 +287,87 @@ def settings_from_obj(value: object) -> WorktreesImageSettings:
         machines=tuple(machines) if machines is not None else None,
         mount_at=str(mount_at),
         quota_mode=str(quota_mode),
-        eden_backing_repo=str(eden_backing) if eden_backing is not None else None,
+        eden_backing_repos=eden_backings,
     )
+
+
+def _eden_backing_name_problem(name: object) -> str | None:
+    if (
+        not isinstance(name, str)
+        or not name
+        or name != name.strip()
+        or "/" in name
+        or name in {".", "..", VALIDATE_SUBDIR}
+        or any(char.isspace() for char in name)
+    ):
+        return (
+            "configuration.worktrees_image.eden_backing_repo names must be "
+            "plain directory names (no path separators, spaces, or 'validate')"
+        )
+    return None
+
+
+def _parse_eden_backing(value: object) -> tuple[EdenBacking, ...]:
+    """Validate ``eden_backing_repo``: a name, a list of names, or a map.
+
+    Validated on every host like ``machines``. Names are unique plain
+    directory components; a map suffix must be a relative, normalized
+    path with no ``..`` that stays under ``.eden-backing/`` (the
+    symlink-resolved containment is rechecked when a path is resolved).
+    """
+
+    pairs: list[tuple[object, object]] = []
+    if isinstance(value, str):
+        pairs = [(value, value)]
+    elif isinstance(value, list):
+        pairs = [(item, item) for item in value]
+    elif isinstance(value, dict):
+        pairs = list(value.items())
+    if not pairs:
+        raise WorktreesImageError(
+            "configuration.worktrees_image.eden_backing_repo must be one "
+            "plain directory name, a non-empty list of names, or a "
+            "non-empty map of name to relative path"
+        )
+    entries: list[EdenBacking] = []
+    seen: set[str] = set()
+    for name, suffix in pairs:
+        problem = _eden_backing_name_problem(name)
+        if problem is not None:
+            raise WorktreesImageError(problem)
+        assert isinstance(name, str)
+        if name in seen:
+            raise WorktreesImageError(
+                "configuration.worktrees_image.eden_backing_repo has a "
+                f"duplicate name: {name!r}"
+            )
+        seen.add(name)
+        if (
+            not isinstance(suffix, str)
+            or not suffix
+            or suffix != suffix.strip()
+            or "\\" in suffix
+        ):
+            raise WorktreesImageError(
+                "configuration.worktrees_image.eden_backing_repo paths must "
+                "be non-empty relative paths under .eden-backing/"
+            )
+        candidate = Path(suffix)
+        parts = candidate.parts
+        if (
+            candidate.is_absolute()
+            or not parts
+            or any(part in {"", ".", ".."} for part in parts)
+            or parts[0] == VALIDATE_SUBDIR
+            or candidate.as_posix() != suffix
+        ):
+            raise WorktreesImageError(
+                "configuration.worktrees_image.eden_backing_repo paths must "
+                "be normalized relative paths under .eden-backing/ "
+                "(no absolute paths, '..', or 'validate')"
+            )
+        entries.append(EdenBacking(name=name, path=suffix))
+    return tuple(entries)
 
 
 def classify_mount(
@@ -344,6 +434,31 @@ def eden_backing_repo_path(mount_point: Path, name: str) -> Path:
     """One in-image Eden backing repo inside :func:`eden_backing_root`."""
 
     return eden_backing_root(mount_point) / name
+
+
+def eden_backing_path(mount_point: Path, backing: EdenBacking) -> Path:
+    """The in-image path of one configured backing, containment-checked.
+
+    The configured suffix was validated lexically at load; this rechecks
+    after resolving symlinks, so a link inside ``.eden-backing/`` cannot
+    point a backing outside it (#1804).
+    """
+
+    root = eden_backing_root(mount_point)
+    resolved_root = Path(os.path.realpath(root))
+    resolved = Path(os.path.realpath(root / backing.path))
+    if resolved != resolved_root and resolved_root not in resolved.parents:
+        raise WorktreesImageError(
+            f"Eden backing {backing.name!r} resolves outside "
+            f"{root}: {resolved}"
+        )
+    return resolved
+
+
+def hgcache_path(mount_point: Path) -> Path:
+    """The in-image remotefilelog cache lazy backings fetch into (#1804)."""
+
+    return mount_point / ".hgcache"
 
 
 def ensure_eden_backing_root(mount_point: Path) -> Path:
@@ -1595,17 +1710,31 @@ def status_report(root: Path, worktrees: Path, settings: WorktreesImageSettings)
         stat = image_file.stat()
         report["apparent_bytes"] = stat.st_size
         report["allocated_bytes"] = stat.st_blocks * 512
-    if settings.eden_backing_repo is not None:
+    if settings.eden_backing_repos:
         from wrkslots import eden
 
-        backing_path = eden_backing_repo_path(mount_point, settings.eden_backing_repo)
-        problem = (
-            eden.backing_repo_problem(backing_path) if state == MOUNTED else None
-        )
-        report["eden_backing"] = {
-            "configured_name": settings.eden_backing_repo,
-            "path": str(backing_path),
-            "present": backing_path.is_dir() if state == MOUNTED else False,
-            "repo_ok": problem is None and state == MOUNTED,
-        }
+        entries: list[dict[str, object]] = []
+        for backing in settings.eden_backing_repos:
+            try:
+                backing_path: Path | None = eden_backing_path(mount_point, backing)
+            except WorktreesImageError:
+                backing_path = None
+            problem = (
+                eden.backing_repo_problem(backing_path)
+                if state == MOUNTED and backing_path is not None
+                else None
+            )
+            entries.append(
+                {
+                    "configured_name": backing.name,
+                    "path": str(backing_path) if backing_path is not None else "",
+                    "present": (
+                        backing_path.is_dir()
+                        if state == MOUNTED and backing_path is not None
+                        else False
+                    ),
+                    "repo_ok": problem is None and state == MOUNTED and backing_path is not None,
+                }
+            )
+        report["eden_backing"] = entries[0] if len(entries) == 1 else entries
     return report

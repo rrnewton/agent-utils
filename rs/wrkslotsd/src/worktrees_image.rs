@@ -37,7 +37,16 @@ pub(crate) struct WorktreesImageSettings {
     pub(crate) machines: Option<Vec<String>>,
     pub(crate) mount_at: String,
     pub(crate) quota_mode: String,
-    pub(crate) eden_backing_repo: Option<String>,
+    pub(crate) eden_backing_repos: Option<Vec<(String, String)>>,
+}
+
+impl WorktreesImageSettings {
+    pub(crate) fn eden_backing_repo(&self) -> Option<&str> {
+        match &self.eden_backing_repos {
+            Some(entries) if entries.len() == 1 => Some(entries[0].0.as_str()),
+            _ => None,
+        }
+    }
 }
 
 impl WorktreesImageSettings {
@@ -253,26 +262,9 @@ pub(crate) fn settings_from_obj(value: &Value) -> Result<WorktreesImageSettings,
             Some(parsed)
         }
     };
-    let eden_backing_repo = match map.get("eden_backing_repo") {
+    let eden_backing_repos = match map.get("eden_backing_repo") {
         None | Some(Value::Null) => None,
-        Some(value) => {
-            let invalid = || {
-                "configuration.worktrees_image.eden_backing_repo must be one plain directory name (no path separators, spaces, or 'validate')"
-                    .to_string()
-            };
-            let Some(name) = value.as_str() else {
-                return Err(invalid());
-            };
-            if name.is_empty()
-                || name.trim() != name
-                || name.contains('/')
-                || matches!(name, "." | ".." | "validate")
-                || name.chars().any(char::is_whitespace)
-            {
-                return Err(invalid());
-            }
-            Some(name.to_string())
-        }
+        Some(value) => Some(parse_eden_backing(value)?),
     };
     Ok(WorktreesImageSettings {
         relative_path: raw_path.replace('\\', "/"),
@@ -283,8 +275,78 @@ pub(crate) fn settings_from_obj(value: &Value) -> Result<WorktreesImageSettings,
         machines,
         mount_at: mount_at.to_string(),
         quota_mode: quota_mode.to_string(),
-        eden_backing_repo,
+        eden_backing_repos,
     })
+}
+
+fn eden_backing_name_invalid(name: &str) -> bool {
+    name.is_empty()
+        || name.trim() != name
+        || name.contains('/')
+        || matches!(name, "." | ".." | "validate")
+        || name.chars().any(char::is_whitespace)
+}
+
+pub(crate) fn parse_eden_backing(value: &Value) -> Result<Vec<(String, String)>, String> {
+    let invalid = |what: &str| {
+        format!(
+            "configuration.worktrees_image.eden_backing_repo {what}"
+        )
+    };
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    match value {
+        Value::String(name) => pairs.push((name.clone(), name.clone())),
+        Value::Array(items) => {
+            for item in items {
+                let Some(name) = item.as_str() else {
+                    return Err(invalid(
+                        "must be one plain directory name, a non-empty list of names, or a non-empty map of name to relative path",
+                    ));
+                };
+                pairs.push((name.to_string(), name.to_string()));
+            }
+        }
+        Value::Object(map) => {
+            for (name, suffix) in map {
+                let Some(suffix) = suffix.as_str() else {
+                    return Err(invalid("paths must be non-empty relative paths under .eden-backing/"));
+                };
+                pairs.push((name.clone(), suffix.to_string()));
+            }
+        }
+        _ => {}
+    }
+    if pairs.is_empty() {
+        return Err(invalid(
+            "must be one plain directory name, a non-empty list of names, or a non-empty map of name to relative path",
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for (name, suffix) in &pairs {
+        if eden_backing_name_invalid(name) {
+            return Err(invalid(
+                "names must be plain directory names (no path separators, spaces, or 'validate')",
+            ));
+        }
+        if !seen.insert(name.clone()) {
+            return Err(format!(
+                "configuration.worktrees_image.eden_backing_repo has a duplicate name: {name:?}"
+            ));
+        }
+        let parts: Vec<&str> = suffix.split('/').collect();
+        if suffix.is_empty()
+            || suffix.trim() != suffix.as_str()
+            || suffix.contains('\\')
+            || suffix.starts_with('/')
+            || parts.iter().any(|part| part.is_empty() || *part == "." || *part == "..")
+            || parts[0] == "validate"
+        {
+            return Err(invalid(
+                "paths must be normalized relative paths under .eden-backing/ (no absolute paths, '..', or 'validate')",
+            ));
+        }
+    }
+    Ok(pairs)
 }
 
 /// Classify the slots directory's mount state from an injected
@@ -1332,20 +1394,30 @@ pub(crate) fn status_report_with_quota(
             report.insert("allocated_bytes".into(), json!(meta.blocks() * 512));
         }
     }
-    if let Some(name) = &settings.eden_backing_repo {
-        let backing_path = mount_dir.join(".eden-backing").join(name);
-        let repo_ok = state == MOUNTED
-            && backing_path.join(".hg/requires").is_file()
-            && backing_path.join(".hg/store").is_dir()
-            && !backing_path.join(".hg/sharedpath").exists();
+    if let Some(entries) = &settings.eden_backing_repos {
+        let rendered: Vec<Value> = entries
+            .iter()
+            .map(|(name, suffix)| {
+                let backing_path = mount_dir.join(".eden-backing").join(suffix);
+                let repo_ok = state == MOUNTED
+                    && backing_path.join(".hg/requires").is_file()
+                    && backing_path.join(".hg/store").is_dir()
+                    && !backing_path.join(".hg/sharedpath").exists();
+                json!({
+                    "configured_name": name,
+                    "path": backing_path.to_string_lossy(),
+                    "present": state == MOUNTED && backing_path.is_dir(),
+                    "repo_ok": repo_ok,
+                })
+            })
+            .collect();
         report.insert(
             "eden_backing".into(),
-            json!({
-                "configured_name": name,
-                "path": backing_path.to_string_lossy(),
-                "present": state == MOUNTED && backing_path.is_dir(),
-                "repo_ok": repo_ok,
-            }),
+            if rendered.len() == 1 {
+                rendered.into_iter().next().unwrap_or(Value::Null)
+            } else {
+                Value::Array(rendered)
+            },
         );
     }
     Value::Object(report)
@@ -2157,6 +2229,39 @@ mod tests {
             settings_from_obj(&json!({"path": "../wt.img", "size_bytes": 1073741824})).is_err()
         );
         assert!(settings_from_obj(&json!({"path": "wt.img", "size_bytes": 5})).is_err());
+        let multi = settings_from_obj(
+            &json!({"path": "wt.img", "size_bytes": 1073741824, "eden_backing_repo": ["alpha", "beta"]}),
+        )
+        .expect("list ok");
+        assert_eq!(
+            multi.eden_backing_repos,
+            Some(vec![
+                ("alpha".to_string(), "alpha".to_string()),
+                ("beta".to_string(), "beta".to_string())
+            ])
+        );
+        assert_eq!(multi.eden_backing_repo(), None);
+        let mapped = settings_from_obj(
+            &json!({"path": "wt.img", "size_bytes": 1073741824, "eden_backing_repo": {"alpha": "team/alpha-store"}}),
+        )
+        .expect("map ok");
+        assert_eq!(mapped.eden_backing_repo(), Some("alpha"));
+        for bad in [
+            json!(["alpha", "alpha"]),
+            json!({"alpha": "../escape"}),
+            json!({"alpha": "/absolute"}),
+            json!({"alpha": "a/../b"}),
+            json!([]),
+            json!({}),
+        ] {
+            assert!(
+                settings_from_obj(
+                    &json!({"path": "wt.img", "size_bytes": 1073741824, "eden_backing_repo": bad})
+                )
+                .is_err(),
+                "{bad}"
+            );
+        }
         let fuse = settings_from_obj(
             &json!({"path": "wt.img", "size_bytes": 1073741824, "mount": "fuse"}),
         )
@@ -2299,7 +2404,7 @@ mod tests {
             machines: None,
             mount_at: "binds".to_string(),
             quota_mode: "simple".to_string(),
-            eden_backing_repo: None,
+            eden_backing_repos: None,
         };
         let ctx = WtCtx {
             root: &root,
@@ -2628,7 +2733,7 @@ mod tests {
             machines: None,
             mount_at: "binds".to_string(),
             quota_mode: "simple".to_string(),
-            eden_backing_repo: None,
+            eden_backing_repos: None,
         };
         let ctx = WtCtx {
             root: &root,

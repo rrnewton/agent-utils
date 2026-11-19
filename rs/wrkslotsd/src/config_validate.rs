@@ -823,22 +823,11 @@ fn worktrees_image_settings(raw: &Map<String, Value>) -> Result<Value> {
     let eden_backing_repo = match section.get("eden_backing_repo") {
         None | Some(Value::Null) => Value::Null,
         Some(value) => {
-            let invalid = || {
-                "configuration.worktrees_image.eden_backing_repo must be one plain directory name (no path separators, spaces, or 'validate')"
-                    .to_owned()
-            };
-            let Some(name) = value.as_str() else {
-                return Err(invalid());
-            };
-            if name.is_empty()
-                || name.trim() != name
-                || name.contains('/')
-                || matches!(name, "." | ".." | "validate")
-                || name.chars().any(char::is_whitespace)
-            {
-                return Err(invalid());
-            }
-            json!(name)
+            let pairs = crate::worktrees_image::parse_eden_backing(value)?;
+            json!(pairs
+                .iter()
+                .map(|(name, suffix)| json!([name, suffix]))
+                .collect::<Vec<_>>())
         }
     };
     Ok(json!({

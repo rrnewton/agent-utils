@@ -2963,6 +2963,19 @@ cap in your own project's configuration only, never by editing
 another project's. The cap counts checkouts across every daemon
 config dir and refuses closed when a daemon cannot be queried.
 
+With a worktrees image, `configuration.worktrees_image.eden_backing_repo`
+names the in-image backing repositories `create --eden` may clone
+from, each under `<image mount>/.eden-backing/`: one plain name, a
+list of names, or a map of name to relative path suffix. `create
+--eden NAME=<name>` selects one by its configured name (or resolved
+in-image path); anything else refuses and lists the configured
+entries. Seed each with `wrkslots worktrees-image seed-eden-backing
+--name <name>`, which lazily clones the host backing's remote
+upstream and fetches into an in-image cache. The list and map forms
+need every wrkslots reader on the host to include the multi-backing
+change: an older reader refuses a non-string `eden_backing_repo`
+value, so upgrade all readers before using them.
+
 Clones live at the mount under `eden_mount_root`;
 measure the disk with `df` on that filesystem, never with `du` or
 `find` over the mount (walking a mount fetches the whole repository

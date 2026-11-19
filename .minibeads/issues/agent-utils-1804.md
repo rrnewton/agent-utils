@@ -15,7 +15,7 @@ updated_at: 2026-11-17T15:30:00-05:00
 
 # Design
 
-- Design to the coordinator before coding (this issue tracks that gate).
+- Design sent to and approved by the coordinator before coding, with adjustments: strict per-entry validation (unique names; a relative, normalized suffix without `..`, rechecked inside `.eden-backing/` after resolving symlinks); `create --eden NAME=<name>` matches a configured name or its resolved path and refuses listing the configured entries; seeding lazily clones the source's remote `[paths] default` (refusing a missing or local one), writes `[remotefilelog] cachepath` only into the new clone's own hgrc, and proves standalone readability. Config widening only: no persisted field changes. The list/map forms need every wrkslots reader on the host to include this change: a pinned older reader refuses a non-string `eden_backing_repo` (the same caveat as a newly added key).
 
 # Acceptance Criteria
 
