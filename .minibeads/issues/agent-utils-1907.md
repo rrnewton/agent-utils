@@ -1,12 +1,12 @@
 ---
 title: 'agentctl-chat-trace-v2-sent-refs: bridge carries pending sent refs on v2 trace entries'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 labels:
 - agentctl
 created_at: 2026-11-19T08:17:33-05:00
-updated_at: 2026-11-19T08:17:33-05:00
+updated_at: 2026-11-19T11:18:36-05:00
 ---
 
 # Description
@@ -28,3 +28,7 @@ updated_at: 2026-11-19T08:17:33-05:00
 # Notes
 
 Related: #1886 vibe-talk-transcripts-view parts A-C (consumer `vibe-talk/src/transcripts.rs` already parses v2 `sent`, caps at 8, and refuses payloads over 2 KB), #1884 vibe-talk-thread-naming-from-cache, #832 chat-trace-format-tagging. Reader skew: pinned bridges run older builds; the only new persisted state is the `pending-sent.json` file named under Design, reported to the coordinator before gating. Test only against a fake Slack or test channel, never a real owner channel.
+
+## Resolution
+
+[watermelon-full-preview] Landed 37710d1a on github/main (gated tree 07b58388; gate red only on python.agentctl.shard-0's sigterm-during-startup timing test, green in both local validates, and its one exclusive rerun passed as a flake waiver). Reply delivery records a pending sent ref after a successful send into a new `pending-sent.json` bridge-state file (versioned, capped at 64, absent means empty, ignored whole by older pinned bridges); the trace driver claims the queue only for an entry's first part and carries the claimed refs across retries. Entries are v2 with `sent` capped at 8, oldest first, dropping the oldest until the serialised payload fits in 2 KB and never truncating a ref; roots keep the exact v1 shape with no `sent`, and the whole metadata stays under the shim's 8 KB. Tests: payload shape and budget, send order, roots unchanged, v1 fallback, a fake-Slack reply-to-next-entry end to end, and pending refs surviving a restart (a stale ref carries whole and the entry still classes, so the consumer simply skips it). Unverified: a live day on the turned-over liaison bridge, which the coordinator runs after this landing.
