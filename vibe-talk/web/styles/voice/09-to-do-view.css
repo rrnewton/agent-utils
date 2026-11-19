@@ -1205,7 +1205,16 @@
    already starts it below the bar, and padding here would count it twice. */
 @media (min-width: 401px) and (max-width: 480px) {
   #screen-main[data-searching]:not([data-link-kinds]) #scroll-area {
-    padding-top: calc(var(--float-line) + var(--search-bar) / 2 + var(--toggle-hit) + 3px + 0.35rem);
+    padding-top: calc(var(--float-line) + var(--search-bar) / 2 + var(--toggle-hit) + 7px + 0.35rem);
+  }
+}
+
+/* The Threads view's heading stands at its column's head, where the floating
+   bar also stands: the two-row bar's second row is its room too, so its
+   chips (Unpack, Main, order) stay tappable under it. */
+@media (max-width: 480px) {
+  #screen-main[data-searching]:has(#labels-button:not([hidden])) #side-heading {
+    margin-top: calc(var(--toggle-hit) + 7px);
   }
 }
 
@@ -1427,17 +1436,17 @@
    kinds) starts from that foot, not the one-line bar's. */
 @media (max-width: 480px) {
   #screen-main[data-searching][data-link-kinds]:has(#labels-button:not([hidden])) #scroll-area {
-    --hang-foot: calc(var(--float-line) + var(--search-bar) / 2 + var(--toggle-hit) + 3px + var(--kinds-gap) + var(--toggle-hit));
+    --hang-foot: calc(var(--float-line) + var(--search-bar) / 2 + var(--toggle-hit) + 7px + var(--kinds-gap) + var(--toggle-hit));
   }
 }
 
 @media (max-width: 400px) {
   #screen-main[data-searching] #scroll-area {
-    --hang-foot: calc(var(--float-line) + var(--search-bar) / 2 + var(--toggle-hit) + 3px + var(--kinds-gap) + var(--toggle-hit));
+    --hang-foot: calc(var(--float-line) + var(--search-bar) / 2 + var(--toggle-hit) + 7px + var(--kinds-gap) + var(--toggle-hit));
   }
 
   #screen-main[data-searching][data-link-kinds]:has(#labels-button:not([hidden])) #scroll-area {
-    --hang-foot: calc(var(--float-line) + var(--search-bar) / 2 + var(--toggle-hit) + 3px + 2 * (var(--kinds-gap) + var(--toggle-hit)));
+    --hang-foot: calc(var(--float-line) + var(--search-bar) / 2 + var(--toggle-hit) + 7px + 2 * (var(--kinds-gap) + var(--toggle-hit)));
   }
 }
 

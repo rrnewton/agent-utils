@@ -32,7 +32,13 @@ COUNT = 40
 
 TOP_VISIBLE = """() => {
   const area = document.getElementById('scroll-area');
-  const edge = area.getBoundingClientRect().top;
+  // The reader's first row is the first below the floating search bar, as
+  // the page's own place measures it: a row under the bar is covered, not
+  // read. On the combined bar (`#1852` + `#1853`) that foot is one row
+  // lower on a phone, and the anchor follows it.
+  const bar = document.getElementById('search-float');
+  const edge = Math.max(area.getBoundingClientRect().top,
+    bar ? bar.getBoundingClientRect().bottom : -Infinity);
   for (const li of document.getElementById('discord-log').children) {
     if (li.getBoundingClientRect().bottom > edge) {
       return { id: li.getAttribute('data-id'), top: li.getBoundingClientRect().top,
@@ -128,10 +134,16 @@ def walk(page: Page, base: str, label: str) -> None:
           f"{label}: the reload changed channel: {before} -> {after}")
     check(after["view"] == before["view"],
           f"{label}: the reload changed view: {before} -> {after}")
-    check(after["id"] == before["id"],
-          f"{label}: the reload lost the scroll anchor: {before} -> {after}")
-    check(abs(after["top"] - before["top"]) <= 2,
-          f"{label}: the anchor moved: {before} -> {after}")
+    # The anchor row itself, at the place the reload kept: measured from the
+    # list's own top on both sides, since the bar over it is closed again
+    # after the reload and its foot is not the edge either measure wants.
+    after_top = page.evaluate(
+        "(id) => { const row = document.querySelector(`#discord-log > li[data-id=\"${id}\"]`);"
+        " return row ? row.getBoundingClientRect().top : null; }", before["id"])
+    check(after_top is not None,
+          f"{label}: the reload lost the scroll anchor {before['id']}: {before} -> {after}")
+    check(abs(after_top - before["top"]) <= 2,
+          f"{label}: the anchor moved: {before} -> top {after_top}")
     check("scroll" not in after["url"],
           f"{label}: the scroll place leaked into the URL: {after['url']}")
 
