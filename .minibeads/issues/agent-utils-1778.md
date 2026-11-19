@@ -1,12 +1,13 @@
 ---
 title: 'wrkslots-old-seal-fallback-scan-rust-python-divergence: the Rust fallback scan accepts unrelated wrkslots processes as a seal operator'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-11-17T04:33:45-05:00
-updated_at: 2026-11-17T04:33:45-05:00
+updated_at: 2026-11-19T00:00:00-05:00
+closed_at: 2026-11-19T00:00:00-05:00
 ---
 
 # Description
@@ -30,3 +31,7 @@ The two scans are meant to be one rule: a wrkslots removal command for this proj
 # Notes
 
 Related: #1736 wrkslots-live-seal-reported-as-interrupted (the fallback scan this issue aligns), #1744 wrkslots-validate-batch-seal-left-after-start-refusal (where the divergence surfaced). Take after #1744 and #1735 in the mu-removelock lane.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as 526e5789: the Rust fallback scan now takes the FIRST --project-root in an argv, like Python's _wrkslots_project_of, so a wrapper argv embedding a whole wrkslots invocation as data no longer holds an old-format seal open in the Rust edition only. Identical hermetic fake-proc tables in both editions pin the rule.
