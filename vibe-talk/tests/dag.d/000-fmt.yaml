@@ -11,7 +11,11 @@ steps:
     hint:
       est_duration_s: 5
       classification: light
-      rss_baseline_bytes: 268435456
+      # 256 MiB starved rustfmt's own working set: the step died at
+      # its learned memory cap and reported NO_RESULT (#1763), which
+      # silently masked real fmt drift on main. 1 GiB, like the other
+      # cargo steps here, lets it report again.
+      rss_baseline_bytes: 1073741824
 
   # Every cargo command here runs build.rs, which builds the page with the esbuild
   # contract/package-lock.json pins (`#624 voice-page-modularity`): so each depends on the step that
