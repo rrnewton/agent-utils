@@ -119,7 +119,7 @@ enum Commands {
     Coordinator(Coordinator),
     /// Change which agent controls a registered agent: the calling agent (proved by process ancestry), a named agent, or none
     #[command(
-        after_help = "Examples:\n  agentctl manage worker-1\n  agentctl manage worker-1 --by lieutenant\n  agentctl manage worker-1 --clear\n\nmanaged_by decides who controls an agent: whom watch-agents tells about it, and where it sits in\n`agentctl tree`. start records the calling agent as both created_by (provenance, never changed) and\nmanaged_by; adopt records the adopting agent as managed_by. With neither --by nor --clear, the\ncalling agent takes over: it must be a registered agent of this registry whose pinned harness is an\nancestor of this process. A manager that would make a cycle is refused. An agent with no manager\nanswers to the designated coordinator."
+        after_help = "Examples:\n  agentctl manage worker-1\n  agentctl manage worker-1 --by lieutenant\n  agentctl manage worker-1 --clear\n\nmanaged_by decides who controls an agent: whom watch-agents tells about it, and where it sits in\n`agentctl tree`. start records the calling agent as both created_by (provenance, never changed) and\nmanaged_by; adopt records the adopting agent as managed_by. With neither --by nor --clear, the\ncalling agent takes over: it must be a registered agent of this registry whose pinned harness is an\nancestor of this process. A manager that would make a cycle is refused. An agent with no manager\nanswers to the designated coordinator. Related: `agentctl send --to-manager` sends to the calling\nagent's manager without naming it, and `agentctl send --to-children` sends to every agent it manages."
     )]
     Manage(Manage),
     /// Change a registered agent's durable settings: whether it is a standing agent, or which tab views it
@@ -258,7 +258,7 @@ enum Commands {
     Status(Named),
     /// Persist and deliver a prompt when the agent is ready
     #[command(
-        after_help = "Examples:\n  agentctl send reviewer 'Review the diff'\n  agentctl send reviewer --file task.txt --message-id review-1\n\nFor an agentcloud agent the prompt is journaled by `agentcloudctl send --end-of-turn` (a leading\n/goal is sent without --end-of-turn), up to 102400 bytes. When --from-session (default:\n$AGENTCLOUD_SESSION_ID) names a different agentcloud session, agentcloudctl refuses that send,\nso the prompt goes as an attributed `agentcloudctl send-message` from that session instead; it\narrives as an ordinary input and a /goal is not interpreted. An explicit\nhuman send (--from-session '') from inside a different agentcloud session is refused, never\ndisguised. --message-id becomes the idempotency\nkey, so repeating it journals nothing new; without it agentctl generates and prints one. The\ndelivery timeouts and --max-attempts do not apply.\n\nEvery prompt opens with a sender header line naming who sent it and how, for example\n`[from cl-foo via agentctl · reply: agentctl send cl-foo]`. The sender is the registered agent\nwhose harness runs this command, else $AGENTCTL_AGENT, else the nearest claude, codex or muse\nancestor (`claude:PID@HOST`), else `human@HOST` at a terminal or `unknown@HOST`. No option\nsuppresses it; a one-line harness slash command such as `/compact` is sent as written."
+        after_help = "Examples:\n  agentctl send reviewer 'Review the diff'\n  agentctl send reviewer --file task.txt --message-id review-1\n  agentctl send --to-manager 'The gate is green'\n  agentctl send --to-children --file brief.md\n\nRelationship addressing (#1904): --to-manager and --to-children name no recipient; the caller is\nproved by process ancestry as `agentctl manage` proves its caller, and an unproved caller is\nrefused. --to-manager delivers to the caller's recorded managed_by; with no manager it delivers to\nthe designated coordinator and the header says so (`to-manager: none recorded; designated\ncoordinator`); with neither it refuses. --to-children delivers one durable copy to each live agent\nwhose managed_by is the caller and prints who got it; an explicit --message-id is suffixed per child.\nA send to an ancestor that is not the direct manager, or a descendant that is not a direct child,\nis marked in the header `skip-level: SENDER -> TARGET via CHAIN`; direct, peer and unrelated sends\nstay plain. The mark is computed at send time; no record field is added.\n\nFor an agentcloud agent the prompt is journaled by `agentcloudctl send --end-of-turn` (a leading\n/goal is sent without --end-of-turn), up to 102400 bytes. When --from-session (default:\n$AGENTCLOUD_SESSION_ID) names a different agentcloud session, agentcloudctl refuses that send,\nso the prompt goes as an attributed `agentcloudctl send-message` from that session instead; it\narrives as an ordinary input and a /goal is not interpreted. An explicit\nhuman send (--from-session '') from inside a different agentcloud session is refused, never\ndisguised. --message-id becomes the idempotency\nkey, so repeating it journals nothing new; without it agentctl generates and prints one. The\ndelivery timeouts and --max-attempts do not apply.\n\nEvery prompt opens with a sender header line naming who sent it and how, for example\n`[from cl-foo via agentctl · reply: agentctl send cl-foo]`. The sender is the registered agent\nwhose harness runs this command, else $AGENTCTL_AGENT, else the nearest claude, codex or muse\nancestor (`claude:PID@HOST`), else `human@HOST` at a terminal or `unknown@HOST`. No option\nsuppresses it; a one-line harness slash command such as `/compact` is sent as written."
     )]
     Send(Send),
     /// Deliver queued prompts that are known not to have been submitted
@@ -1821,10 +1821,20 @@ impl Prompt {
     }
 }
 
+/// Resolved `send` recipients (#1904): (target, extra sender-header fields, per-target message ID).
+type SendTargets = Vec<(String, Vec<(String, String)>, Option<String>)>;
+
 #[derive(Args)]
 struct Send {
-    #[command(flatten)]
-    agent: Named,
+    /// Registered agent name (1-32 lowercase letters, digits, and hyphens); with --to-manager or --to-children this positional is the prompt text instead, and no recipient is named
+    #[arg(value_name = "NAME")]
+    name: Option<String>,
+    /// Send to the calling agent's recorded manager (managed_by), proved by process ancestry as `agentctl manage` proves its caller; with no manager, to the designated coordinator, said so in the delivered header (#1904 agentctl-send-to-manager-and-children)
+    #[arg(long)]
+    to_manager: bool,
+    /// Send one copy to each live agent whose managed_by is the proved calling agent; the result summary names who got it (#1904)
+    #[arg(long, conflicts_with = "to_manager")]
+    to_children: bool,
     #[command(flatten)]
     prompt: Prompt,
     /// Stable caller-supplied ID; an ID already present in any delivery state is refused
@@ -3283,6 +3293,18 @@ fn print_failure(service_log: bool, message: std::fmt::Arguments<'_>) {
         crate::chat_service::service_log(format_args!("agentctl: {message}"));
     } else {
         eprintln!("agentctl: {message}");
+    }
+}
+
+/// One-line text of a [`Failure`], for a per-child delivery summary (#1904).
+fn failure_message(error: &Failure) -> String {
+    match error {
+        Failure::Agent(error) => error.to_string(),
+        Failure::Stop(error) => error.to_string(),
+        Failure::Usage(message) => message.clone(),
+        Failure::Output(error) => error.to_string(),
+        Failure::Chat(error) => error.to_string(),
+        Failure::Inbox(error) => error.to_string(),
     }
 }
 
@@ -5530,11 +5552,53 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                         .to_owned(),
                 ));
             }
-            let text = value
-                .prompt
-                .read()
-                .map_err(Failure::Usage)?
-                .ok_or_else(|| Failure::Usage("send requires prompt text or --file".to_owned()))?;
+            // With a relationship flag the first positional is the prompt
+            // text, not a recipient: `send --to-manager 'gate green'` fills
+            // NAME with the text. A named recipient beside the flag (both
+            // positionals, or a name with --file) is refused here.
+            let raw_text = if value.to_manager || value.to_children {
+                if value.prompt.file.is_some() {
+                    if value.name.is_some() {
+                        return Err(Failure::Usage(
+                            "--to-manager/--to-children name no recipient; drop the NAME"
+                                .to_owned(),
+                        ));
+                    }
+                    value
+                        .prompt
+                        .read()
+                        .map_err(Failure::Usage)?
+                        .ok_or_else(|| {
+                            Failure::Usage("send requires prompt text or --file".to_owned())
+                        })?
+                } else if value.prompt.text.is_some() {
+                    return Err(Failure::Usage(
+                        "--to-manager/--to-children name no recipient; drop the NAME".to_owned(),
+                    ));
+                } else if let Some(text) = &value.name {
+                    if text.trim().is_empty() {
+                        return Err(Failure::Usage("instruction must not be empty".to_owned()));
+                    }
+                    text.clone()
+                } else {
+                    return Err(Failure::Usage(
+                        "send --to-manager/--to-children requires prompt text or --file".to_owned(),
+                    ));
+                }
+            } else {
+                if value.name.is_none() {
+                    return Err(Failure::Usage(
+                        "send requires a NAME, --to-manager, or --to-children".to_owned(),
+                    ));
+                }
+                value
+                    .prompt
+                    .read()
+                    .map_err(Failure::Usage)?
+                    .ok_or_else(|| {
+                        Failure::Usage("send requires prompt text or --file".to_owned())
+                    })?
+            };
             // Every path below delivers the prompt opened with its sender header (#609
             // sender-header-mandatory); nothing suppresses it.
             let route = if value.urgent {
@@ -5546,7 +5610,55 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 manager.caller_edge().map(|edge| edge.agent),
                 environment("AGENTCTL_AGENT"),
             );
-            let text = sender_header::stamp(&text, &sender, route);
+            // Relationship addressing (#1904): resolve the recipient(s) and
+            // the extra header fields each copy carries. (target, fields,
+            // per-target message id, via designated coordinator)
+            let mut via_coordinator = false;
+            let targets: SendTargets = if value.to_manager
+            {
+                let caller = manager.proved_caller()?;
+                let (target, fallback) = manager.manager_target(&caller)?;
+                via_coordinator = fallback;
+                let fields = if fallback {
+                    vec![(
+                        "to-manager".to_owned(),
+                        "none recorded; designated coordinator".to_owned(),
+                    )]
+                } else {
+                    Vec::new()
+                };
+                vec![(target, fields, value.message_id.clone())]
+            } else if value.to_children {
+                let caller = manager.proved_caller()?;
+                let children = manager.live_children(&caller)?;
+                if children.is_empty() {
+                    return Err(Failure::Usage(format!(
+                        "agent {caller:?} manages no live agent in this registry; \
+                             `send --to-children` has nobody to deliver to"
+                    )));
+                }
+                children
+                    .into_iter()
+                    .map(|child| {
+                        let id = value.message_id.as_ref().map(|id| format!("{id}-{child}"));
+                        (child, Vec::new(), id)
+                    })
+                    .collect()
+            } else {
+                let target = value.name.clone().ok_or_else(|| {
+                    Failure::Usage(
+                        "send requires a NAME, --to-manager, or --to-children".to_owned(),
+                    )
+                })?;
+                let fields = match &sender {
+                    sender_header::Sender::Agent(name) => manager
+                        .skip_level_for(name, &target)
+                        .map(|mark| vec![("skip-level".to_owned(), mark)])
+                        .unwrap_or_default(),
+                    sender_header::Sender::Other(_) => Vec::new(),
+                };
+                vec![(target, fields, value.message_id.clone())]
+            };
             // The designated coordinator's sends end with the status-file requests still
             // waiting for it, by name (#862 watch-status-requests).
             if let sender_header::Sender::Agent(name) = &sender {
@@ -5554,90 +5666,143 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     send_waiting = waiting_requests(&args.registry, name);
                 }
             }
-            if manager.is_headless(&value.agent.name)? {
-                let not_after = value.ttl.map(|ttl| {
-                    crate::agent::now_millis().saturating_add((ttl * 1000.0).ceil() as u64)
-                });
-                json!(manager.send_headless(
-                    &value.agent.name,
-                    &text,
-                    value.message_id.as_deref(),
-                    value.urgent,
-                    not_after,
-                    value.supersede_key.as_deref(),
-                    value.delivery.options().ready_timeout,
-                )?)
-            } else if manager.is_cloud(&value.agent.name)? {
-                if value.ttl.is_some() {
-                    return Err(Failure::Usage(
+            // One delivery through the ordinary per-target path; `value`
+            // supplies the delivery options shared by every copy.
+            let deliver = |target: &str,
+                           text: &str,
+                           message_id: Option<&str>|
+             -> std::result::Result<Value, Failure> {
+                if manager.is_headless(target)? {
+                    let not_after = value.ttl.map(|ttl| {
+                        crate::agent::now_millis().saturating_add((ttl * 1000.0).ceil() as u64)
+                    });
+                    Ok(json!(manager.send_headless(
+                        target,
+                        text,
+                        message_id,
+                        value.urgent,
+                        not_after,
+                        value.supersede_key.as_deref(),
+                        value.delivery.options().ready_timeout,
+                    )?))
+                } else if manager.is_cloud(target)? {
+                    if value.ttl.is_some() {
+                        return Err(Failure::Usage(
                         "--ttl applies to interactive agents; agentcloud journals the prompt at once"
                             .to_owned(),
                     ));
-                }
-                if value.supersede_key.is_some() {
-                    return Err(Failure::Usage(
+                    }
+                    if value.supersede_key.is_some() {
+                        return Err(Failure::Usage(
                         "--supersede-key applies to interactive and headless agents; agentcloud journals the prompt at once"
                             .to_owned(),
                     ));
-                }
-                if value.urgent {
-                    return Err(Failure::Usage(
+                    }
+                    if value.urgent {
+                        return Err(Failure::Usage(
                         "--urgent applies to interactive agents; agentcloud journals the prompt at once"
                             .to_owned(),
                     ));
-                }
-                manager.send_cloud(&value.agent.name, &text, value.message_id.as_deref())?
-            } else if let Some(refusal) = interactive_prompt_size(&text) {
-                return Err(refusal);
-            } else if value.queue_only {
-                let not_after = value.ttl.map(|ttl| {
-                    crate::agent::now_millis().saturating_add((ttl * 1000.0).ceil() as u64)
-                });
-                json!(manager.queue_identified(
-                    &value.agent.name,
-                    &text,
-                    not_after,
-                    value.supersede_key.as_deref(),
-                    value.message_id.as_deref(),
-                )?)
-            } else if value.urgent {
-                manager.send_urgent(
-                    &value.agent.name,
-                    &text,
-                    DrainOptions {
-                        deadline: value.deadline.map(Duration::from_secs_f64),
-                        ..value.delivery.options()
-                    },
-                    value.message_id.as_deref(),
-                    Duration::from_secs_f64(value.boundary_wait),
-                )?
-            } else {
-                let not_after = value.ttl.map(|ttl| {
-                    crate::agent::now_millis().saturating_add((ttl * 1000.0).ceil() as u64)
-                });
-                let result = manager.send_identified(
-                    &value.agent.name,
-                    &text,
-                    DrainOptions {
+                    }
+                    Ok(manager.send_cloud(target, text, message_id)?)
+                } else if let Some(refusal) = interactive_prompt_size(text) {
+                    Err(refusal)
+                } else if value.queue_only {
+                    let not_after = value.ttl.map(|ttl| {
+                        crate::agent::now_millis().saturating_add((ttl * 1000.0).ceil() as u64)
+                    });
+                    Ok(json!(manager.queue_identified(
+                        target,
+                        text,
                         not_after,
-                        deadline: value.deadline.map(Duration::from_secs_f64),
-                        ..value.delivery.options()
-                    },
-                    value.message_id.as_deref(),
-                    value.supersede_key.as_deref(),
-                )?;
-                let mut document = json!(result);
-                // A prompt typed into a busy harness can land in its queue, which counts as
-                // leaving the composer; say so instead of reporting a quiet delivery.
-                if result.outcome == crate::agent::QueueOutcome::Delivered {
-                    if let Ok(Some(turn)) = manager.turn(&value.agent.name) {
-                        if let Some(warning) = queued_warning(&value.agent.name, &turn) {
-                            eprintln!("agentctl send: {warning}");
-                            document["queued_behind_turn"] = json!(true);
-                            document["warning"] = json!(warning);
-                            document["turn"] = turn;
+                        value.supersede_key.as_deref(),
+                        message_id,
+                    )?))
+                } else if value.urgent {
+                    Ok(manager.send_urgent(
+                        target,
+                        text,
+                        DrainOptions {
+                            deadline: value.deadline.map(Duration::from_secs_f64),
+                            ..value.delivery.options()
+                        },
+                        message_id,
+                        Duration::from_secs_f64(value.boundary_wait),
+                    )?)
+                } else {
+                    let not_after = value.ttl.map(|ttl| {
+                        crate::agent::now_millis().saturating_add((ttl * 1000.0).ceil() as u64)
+                    });
+                    let result = manager.send_identified(
+                        target,
+                        text,
+                        DrainOptions {
+                            not_after,
+                            deadline: value.deadline.map(Duration::from_secs_f64),
+                            ..value.delivery.options()
+                        },
+                        message_id,
+                        value.supersede_key.as_deref(),
+                    )?;
+                    let mut document = json!(result);
+                    // A prompt typed into a busy harness can land in its queue, which counts as
+                    // leaving the composer; say so instead of reporting a quiet delivery.
+                    if result.outcome == crate::agent::QueueOutcome::Delivered {
+                        if let Ok(Some(turn)) = manager.turn(target) {
+                            if let Some(warning) = queued_warning(target, &turn) {
+                                eprintln!("agentctl send: {warning}");
+                                document["queued_behind_turn"] = json!(true);
+                                document["warning"] = json!(warning);
+                                document["turn"] = turn;
+                            }
                         }
                     }
+                    Ok(document)
+                }
+            };
+            if value.to_children {
+                let mut deliveries = Vec::new();
+                let mut recipients = Vec::new();
+                let mut first_error: Option<Failure> = None;
+                for (target, fields, message_id) in &targets {
+                    let stamped =
+                        sender_header::stamp_with_fields(&raw_text, &sender, route, fields);
+                    match deliver(target, &stamped, message_id.as_deref()) {
+                        Ok(mut document) => {
+                            document["agent"] = json!(target);
+                            recipients.push(target.clone());
+                            deliveries.push(document);
+                        }
+                        Err(error) => {
+                            deliveries.push(json!({
+                                "agent": target,
+                                "error": failure_message(&error),
+                            }));
+                            if first_error.is_none() {
+                                first_error = Some(error);
+                            }
+                        }
+                    }
+                }
+                if recipients.is_empty() {
+                    return Err(first_error.unwrap_or_else(|| {
+                        Failure::Usage("send --to-children delivered to nobody".to_owned())
+                    }));
+                }
+                json!({
+                    "to_children": true,
+                    "sender": sender.label(),
+                    "recipients": recipients,
+                    "deliveries": deliveries,
+                })
+            } else {
+                let (target, fields, message_id) = &targets[0];
+                let stamped = sender_header::stamp_with_fields(&raw_text, &sender, route, fields);
+                let mut document = deliver(target, &stamped, message_id.as_deref())?;
+                if value.to_manager {
+                    document["to_manager"] = json!(true);
+                    document["recipient"] = json!(target);
+                    document["via_coordinator"] = json!(via_coordinator);
                 }
                 document
             }
@@ -7213,6 +7378,44 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from(words.clone()).is_ok(), "{words:?}");
         }
+    }
+
+    #[test]
+    fn send_relationship_addressing_parses() {
+        // #1904: --to-manager / --to-children replace the NAME, never combine.
+        let cli = Cli::try_parse_from(["agentctl", "send", "--to-manager", "gate green"]).unwrap();
+        let Some(Commands::Send(send)) = cli.command else {
+            panic!("send");
+        };
+        // The single positional is the prompt text, held in `name` by clap;
+        // the handler takes it as the text and never as a recipient.
+        assert!(send.to_manager && send.name.as_deref() == Some("gate green"));
+        let cli = Cli::try_parse_from(["agentctl", "send", "--to-children", "--file", "brief.md"])
+            .unwrap();
+        let Some(Commands::Send(send)) = cli.command else {
+            panic!("send");
+        };
+        assert!(send.to_children && send.name.is_none());
+        // The two flags conflict with each other at parse time; a named
+        // recipient beside a flag (both positionals) parses and is refused
+        // by the handler, which alone can tell the shapes apart.
+        assert!(
+            Cli::try_parse_from(["agentctl", "send", "--to-manager", "--to-children", "now"])
+                .is_err()
+        );
+        let cli =
+            Cli::try_parse_from(["agentctl", "send", "lane-a", "now", "--to-manager"]).unwrap();
+        let Some(Commands::Send(send)) = cli.command else {
+            panic!("send");
+        };
+        assert!(send.to_manager && send.prompt.text.as_deref() == Some("now"));
+        let error = Cli::try_parse_from(["agentctl", "send", "--help"])
+            .err()
+            .unwrap();
+        let help = error.to_string();
+        assert!(help.contains("--to-manager"), "{help}");
+        assert!(help.contains("--to-children"), "{help}");
+        assert!(help.contains("skip-level"), "{help}");
     }
 
     #[test]

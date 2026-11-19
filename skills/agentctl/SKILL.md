@@ -40,6 +40,14 @@ Use the installed command as the authority:
   the turn and submits the queued input instead of anyone pressing Escape and Enter by hand; every
   prompt arrives opened with a sender header such as
   `[from cl-foo via agentctl · reply: agentctl send cl-foo]`, which nothing suppresses)
+- `agentctl send --to-manager --file PROMPT` / `agentctl send --to-children --file PROMPT`
+  (relationship addressing: `--to-manager` delivers to your recorded
+  `managed_by` without naming it — with no manager, to the designated coordinator, said so in the
+  header; `--to-children` delivers one durable copy to each live agent you manage and prints who
+  got it. The caller is proved by process ancestry, as with `agentctl manage`. A send to a
+  grandparent or grandchild is marked `skip-level: SENDER -> TARGET via CHAIN` in its header;
+  direct, peer and unrelated sends stay plain. `agentctl list` and `status` show `managed_by` and
+  `children_count`)
 - `agentctl progress NAME --file STATUS --matching TEXT --hours H` (declare what progress looks
   like, so `watch-agents` can tell activity from progress)
 - `agentctl read NAME --lines 500`

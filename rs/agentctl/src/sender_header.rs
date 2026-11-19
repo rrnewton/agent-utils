@@ -67,11 +67,33 @@ impl Sender {
 /// The header line, without a trailing newline.
 #[must_use]
 pub fn render(sender: &Sender, route: &str) -> String {
+    render_with_fields(sender, route, &[])
+}
+
+/// The header line with extra `KEY: VALUE` fields after the route (and after
+/// `reply`, for an agent sender), in the order given (#1904
+/// agentctl-send-to-manager-and-children: `skip-level`, `to-manager`). A key
+/// must be lowercase ASCII or `-` and a value must hold no `·` or `]`, as
+/// [`parse`] requires; a field that breaks the grammar is dropped rather than
+/// corrupting the header.
+#[must_use]
+pub fn render_with_fields(sender: &Sender, route: &str, fields: &[(String, String)]) -> String {
+    let extra: String = fields
+        .iter()
+        .filter(|(key, value)| {
+            !key.is_empty()
+                && key.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+                && !value.trim().is_empty()
+                && !value.contains('·')
+                && !value.contains(']')
+        })
+        .map(|(key, value)| format!("{SEPARATOR}{key}: {value}"))
+        .collect();
     match sender {
         Sender::Agent(name) => {
-            format!("[from {name} via {route}{SEPARATOR}reply: agentctl send {name}]")
+            format!("[from {name} via {route}{SEPARATOR}reply: agentctl send {name}{extra}]")
         }
-        Sender::Other(label) => format!("[from {label} via {route}]"),
+        Sender::Other(label) => format!("[from {label} via {route}{extra}]"),
     }
 }
 
@@ -103,10 +125,22 @@ pub fn is_slash_command(text: &str) -> bool {
 /// body can never stand first.
 #[must_use]
 pub fn stamp(text: &str, sender: &Sender, route: &str) -> String {
+    stamp_with_fields(text, sender, route, &[])
+}
+
+/// `text` opened with the header for `sender` and `route`, with extra header
+/// fields (see [`render_with_fields`]); a slash command is returned as is.
+#[must_use]
+pub fn stamp_with_fields(
+    text: &str,
+    sender: &Sender,
+    route: &str,
+    fields: &[(String, String)],
+) -> String {
     if is_slash_command(text) {
         return text.to_owned();
     }
-    format!("{}\n{text}", render(sender, route))
+    format!("{}\n{text}", render_with_fields(sender, route, fields))
 }
 
 /// A parsed header line.

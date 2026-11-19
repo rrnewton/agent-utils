@@ -1018,6 +1018,86 @@ fn tree_parent<'n>(
         .filter(|parent| parent.name != node.name)
 }
 
+/// The `managed_by` chain above `agent`, nearest first: its direct manager,
+/// then that agent's manager, and so on. Cycle-safe and depth-bounded; an
+/// edge no live node answers to ends the chain.
+pub(crate) fn manager_chain(nodes: &[ControlNode], registry: &Path, agent: &str) -> Vec<String> {
+    let mut chain = Vec::new();
+    let mut seen = BTreeSet::from([agent.to_owned()]);
+    let mut current = nodes.iter().find(|node| node.name == agent);
+    for _ in 0..MAX_DEPTH {
+        let Some(node) = current else { break };
+        let Some(parent) = tree_parent(nodes, registry, node) else {
+            break;
+        };
+        if !seen.insert(parent.name.clone()) {
+            break;
+        }
+        chain.push(parent.name.clone());
+        current = Some(parent);
+    }
+    chain
+}
+
+/// The direct children of `agent`: every node whose resolved `managed_by`
+/// parent is `agent`, in name order. `live_only` keeps only reachable nodes
+/// (running or starting), as `--to-children` delivers to.
+pub(crate) fn direct_children(
+    nodes: &[ControlNode],
+    registry: &Path,
+    agent: &str,
+    live_only: bool,
+) -> Vec<String> {
+    let mut children: Vec<String> = nodes
+        .iter()
+        .filter(|node| node.name != agent)
+        .filter(|node| !live_only || node.reachable)
+        .filter(|node| {
+            tree_parent(nodes, registry, node).is_some_and(|parent| parent.name == agent)
+        })
+        .map(|node| node.name.clone())
+        .collect();
+    children.sort();
+    children
+}
+
+/// The skip-level header value for a send from `sender` to `target`, when the
+/// target is in the sender's own chain but not adjacent to it (#1904): an
+/// ancestor that is not the direct manager, or a descendant that is not a
+/// direct child. The value is `SENDER -> TARGET via INTERMEDIATE...`, with
+/// the chain between them in sender-to-target order. Direct manager, direct
+/// child, self, peer and unrelated sends get `None` and stay plain.
+pub(crate) fn skip_level_value(
+    nodes: &[ControlNode],
+    registry: &Path,
+    sender: &str,
+    target: &str,
+) -> Option<String> {
+    if sender == target {
+        return None;
+    }
+    // Up: the target among the sender's managers.
+    let up = manager_chain(nodes, registry, sender);
+    if let Some(position) = up.iter().position(|name| name == target) {
+        if position == 0 {
+            return None; // The direct manager: ordinary.
+        }
+        let via = up[..position].join(" -> ");
+        return Some(format!("{sender} -> {target} via {via}"));
+    }
+    // Down: the sender among the target's managers.
+    let down = manager_chain(nodes, registry, target);
+    if let Some(position) = down.iter().position(|name| name == sender) {
+        if position == 0 {
+            return None; // A direct child: ordinary.
+        }
+        let mut via: Vec<&str> = down[..position].iter().map(String::as_str).collect();
+        via.reverse();
+        return Some(format!("{sender} -> {target} via {}", via.join(" -> ")));
+    }
+    None
+}
+
 /// Order `names` so every agent comes after the agents above it in the control tree: the
 /// designated coordinator first, then by depth, then by name.
 pub(crate) fn tree_order(
@@ -1225,6 +1305,65 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         Ok(self
             .designated_record(&records)?
             .and_then(|(_, record)| record.map(|record| record.name)))
+    }
+
+    /// The proved calling agent's name, as `manage` proves its caller: the
+    /// registered agent whose pinned harness is an ancestor of this process.
+    /// Relationship sends (`send --to-manager`, `send --to-children`, #1904)
+    /// require it, so an unproved caller is refused rather than guessed from
+    /// `AGENTCTL_AGENT`.
+    pub(crate) fn proved_caller(&self) -> Result<String> {
+        self.caller_edge().map(|edge| edge.agent).ok_or_else(|| {
+            fail(
+                "cannot prove this process belongs to a registered agent (no pinned harness \
+                 of this registry is among its ancestors); relationship sends need a proved \
+                 caller, as `agentctl manage` does",
+            )
+        })
+    }
+
+    /// Whom `send --to-manager` delivers to for the proved caller `caller`
+    /// (#1904): its recorded direct manager when a live record of this
+    /// registry answers to the edge, else the designated coordinator, with
+    /// the second element saying the header must record the fallback. With
+    /// neither, refused.
+    pub(crate) fn manager_target(&self, caller: &str) -> Result<(String, bool)> {
+        let (nodes, designated, registry) = self.control_view()?;
+        let chain = manager_chain(&nodes, &registry, caller);
+        if let Some(manager) = chain.first() {
+            return Ok((manager.clone(), false));
+        }
+        match designated {
+            Some(coordinator) if coordinator != caller => Ok((coordinator, true)),
+            _ => Err(fail(format!(
+                "agent {caller:?} has no manager recorded and this registry designates no \
+                 coordinator; name the recipient, or record a manager with `agentctl manage`"
+            ))),
+        }
+    }
+
+    /// The live direct children of the proved caller `caller`, for
+    /// `send --to-children` (#1904), in name order.
+    pub(crate) fn live_children(&self, caller: &str) -> Result<Vec<String>> {
+        let (nodes, _, registry) = self.control_view()?;
+        Ok(direct_children(&nodes, &registry, caller, true))
+    }
+
+    /// How many direct children `agent` has in this registry, for the
+    /// `children_count` of `list` and `status` rows (#1904).
+    pub(crate) fn children_count(&self, agent: &str) -> usize {
+        let Ok((nodes, _, registry)) = self.control_view() else {
+            return 0;
+        };
+        direct_children(&nodes, &registry, agent, false).len()
+    }
+
+    /// The skip-level header value for a send from registered agent `sender`
+    /// to `target` (#1904), computed from the current records; `None` when
+    /// the send is direct, peer or unrelated, or either name is unknown.
+    pub(crate) fn skip_level_for(&self, sender: &str, target: &str) -> Option<String> {
+        let (nodes, _, registry) = self.control_view().ok()?;
+        skip_level_value(&nodes, &registry, sender, target)
     }
 
     /// What control decisions read: every readable record as a node, the designated

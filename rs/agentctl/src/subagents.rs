@@ -12094,6 +12094,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     pub fn status(&self, agent_name: &str) -> Result<Value> {
         let record = self.load(agent_name)?;
         let mut result = self.status_record(&record)?;
+        // Direct children in this registry (#1904), beside the managed_by
+        // edge record_row already carries, for a per-lieutenant scan.
+        result["children_count"] = json!(self.children_count(agent_name));
         // Name a terminal another registry also records (#1683): two
         // registries driving one pane is easy to miss from either side.
         let shared_terminals = self.shared_terminal_findings(std::slice::from_ref(&record));
@@ -12468,7 +12471,11 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     }
 
     fn status_record(&self, record: &AgentRecord) -> Result<Value> {
-        self.status_record_viewing(record, true)
+        // Every status-shaped row carries children_count (#1904), so the
+        // editions agree on start/adopt/status/list outputs alike.
+        let mut result = self.status_record_viewing(record, true)?;
+        result["children_count"] = json!(self.children_count(&record.name));
+        Ok(result)
     }
 
     /// A `list` row's fields that need no live check: the record, its edges, queue and goal.
@@ -12763,9 +12770,14 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             .listed_names()?
             .iter()
             .map(|name| {
-                self.load(name)
+                let mut row = self
+                    .load(name)
                     .and_then(|record| self.status_record_listed(&record, &mut fleet))
-                    .unwrap_or_else(|error| Self::record_error_row(name, &error))
+                    .unwrap_or_else(|error| Self::record_error_row(name, &error));
+                // Direct children in this registry (#1904), beside the
+                // managed_by edge each row already carries.
+                row["children_count"] = json!(self.children_count(name));
+                row
             })
             .collect())
     }

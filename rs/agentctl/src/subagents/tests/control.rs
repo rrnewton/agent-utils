@@ -400,6 +400,108 @@ fn the_tree_hangs_every_agent_under_its_manager_and_the_rest_under_the_coordinat
 }
 
 #[test]
+fn relationship_sends_resolve_manager_children_and_skip_level() {
+    // #1904: a three-level scratch tree coordinator -> lieutenant -> lane,
+    // plus a second lane and an unmanaged agent.
+    let fixture = Fixture::new();
+    register(&fixture, "coordinator", 88);
+    register(&fixture, "lieutenant", 77);
+    register(&fixture, "lane", 66);
+    register(&fixture, "lane-b", 65);
+    register(&fixture, "loner", 55);
+    let mut manager = fixture.manager();
+    manager.coordinator_set("coordinator").unwrap();
+    manager
+        .manage("lieutenant", ManageAction::By("coordinator".to_owned()))
+        .unwrap();
+    manager
+        .manage("lane", ManageAction::By("lieutenant".to_owned()))
+        .unwrap();
+    manager
+        .manage("lane-b", ManageAction::By("lieutenant".to_owned()))
+        .unwrap();
+
+    // The proved caller is the nearest registered harness ancestor.
+    manager.caller_ancestry = called_from(&[66]);
+    assert_eq!(manager.proved_caller().unwrap(), "lane");
+    // --to-manager from the lane reaches the lieutenant, not the coordinator.
+    assert_eq!(
+        manager.manager_target("lane").unwrap(),
+        ("lieutenant".to_owned(), false)
+    );
+    // --to-manager with no manager falls back to the designated coordinator.
+    assert_eq!(
+        manager.manager_target("loner").unwrap(),
+        ("coordinator".to_owned(), true)
+    );
+    assert_eq!(
+        manager.manager_target("lieutenant").unwrap(),
+        ("coordinator".to_owned(), false)
+    );
+
+    // --to-children from the lieutenant reaches its lanes only.
+    assert_eq!(
+        manager.live_children("lieutenant").unwrap(),
+        ["lane", "lane-b"]
+    );
+    assert_eq!(
+        manager.live_children("coordinator").unwrap(),
+        ["lieutenant"]
+    );
+    assert!(manager.live_children("lane").unwrap().is_empty());
+
+    // list/status scan facts: managed_by rides on each row already.
+    assert_eq!(manager.children_count("coordinator"), 1);
+    assert_eq!(manager.children_count("lieutenant"), 2);
+    assert_eq!(manager.children_count("lane"), 0);
+    let status = manager.status("lieutenant").unwrap();
+    assert_eq!(status["managed_by"]["agent"], "coordinator");
+    assert_eq!(status["children_count"], 2);
+
+    // Skip-level is computed at send time: grandparent and grandchild sends
+    // are marked with the chain, direct and peer sends stay plain.
+    assert_eq!(
+        manager.skip_level_for("coordinator", "lane").as_deref(),
+        Some("coordinator -> lane via lieutenant")
+    );
+    assert_eq!(
+        manager.skip_level_for("lane", "coordinator").as_deref(),
+        Some("lane -> coordinator via lieutenant")
+    );
+    assert_eq!(manager.skip_level_for("lane", "lieutenant"), None);
+    assert_eq!(manager.skip_level_for("lieutenant", "lane"), None);
+    assert_eq!(manager.skip_level_for("lane", "lane-b"), None);
+    assert_eq!(manager.skip_level_for("coordinator", "loner"), None);
+    assert_eq!(manager.skip_level_for("lane", "lane"), None);
+
+    // A durable copy queued for the lane carries the skip-level header and
+    // parses back with the field intact.
+    let mark = manager.skip_level_for("coordinator", "lane").unwrap();
+    let stamped = crate::sender_header::stamp_with_fields(
+        "report when the gate lands",
+        &crate::sender_header::Sender::Agent("coordinator".to_owned()),
+        crate::sender_header::ROUTE,
+        &[("skip-level".to_owned(), mark)],
+    );
+    manager
+        .queue_identified("lane", &stamped, None, None, Some("skip-1"))
+        .unwrap();
+    let pending = manager.pending_prompts("lane").unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].0, "skip-1");
+    let header = crate::sender_header::parse(stamped.lines().next().unwrap()).unwrap();
+    assert_eq!(header.sender, "coordinator");
+    assert_eq!(
+        header.field("skip-level"),
+        Some("coordinator -> lane via lieutenant")
+    );
+
+    // An unproved caller is refused, as with manage.
+    let human = fixture.manager();
+    assert!(human.proved_caller().is_err());
+}
+
+#[test]
 fn restore_accepts_a_coordinator_named_by_a_live_alias() {
     use crate::restore::RestoreConfig;
     let fixture = Fixture::new();

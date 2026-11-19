@@ -1570,6 +1570,28 @@ under the coordinator. Every control decision follows `managed_by`, never
 `created_by`: whom `watch-agents` tells about an agent, and the order in which
 `restore` revives agents.
 
+**Messaging by relationship (Rust edition only, #1904).** `agentctl send
+--to-manager [--file F | TEXT]` delivers to the calling agent's recorded
+manager without naming it; the caller is proved by process ancestry exactly
+as `agentctl manage` proves its caller, and an unproved caller is refused.
+With no manager (no edge, or none a live record of this registry answers to)
+the prompt goes to the designated coordinator and the delivered header says
+so (`to-manager: none recorded; designated coordinator`); with neither, the
+send is refused. `agentctl send --to-children [--file F | TEXT]` delivers one
+durable copy to each live agent (running or starting) whose `managed_by` is
+the caller, through the same per-target delivery path as a named send, and
+prints a summary naming who got it; with no live children it refuses, and an
+explicit `--message-id` is suffixed per child (`ID-CHILD`). With either flag
+the positional is the prompt text, not a recipient; naming a recipient beside
+a flag is refused. A named send to an ancestor that is not the sender's
+direct manager, or a descendant that is not a direct child, is marked in the
+delivered header `skip-level: SENDER -> TARGET via CHAIN` (the `managed_by`
+chain between them); direct manager/child sends and peer or unrelated sends
+stay plain. The mark is computed at send time and no record field is added,
+so pinned older builds keep reading the records and ignore the header field.
+`agentctl list` and `agentctl status` rows already carry `managed_by` and
+now also `children_count`, the number of direct children in this registry.
+
 **Handing the coordinator role over.** Inter-team delivery (`agent-teams`)
 follows the designation, but only through declarations that name the
 registry; one pinned to the old coordinator's name keeps delivering into its

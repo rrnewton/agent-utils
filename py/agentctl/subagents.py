@@ -4719,10 +4719,38 @@ class ManagedAgents:
                     continue
         return count
 
+    def _children_count(self, name: str) -> int:
+        """Direct children of `name` in this registry (#1904): readable records whose
+        `managed_by` edge resolves to it, by name and token as the Rust edition resolves."""
+        try:
+            target_document = json.loads((self._directory(name) / "agent.json").read_text())
+        except Exception:
+            return 0
+        tokens = {str(target_document.get("token") or "")}
+        tokens.update(str(token) for token in target_document.get("former_tokens") or [])
+        registry = os.path.realpath(self.registry)
+        count = 0
+        for other in self._registered_names():
+            if other == name:
+                continue
+            try:
+                document = json.loads((self._directory(other) / "agent.json").read_text())
+            except Exception:
+                continue
+            edge = document.get("managed_by")
+            if not isinstance(edge, dict):
+                continue
+            if os.path.realpath(str(edge.get("registry") or "")) != registry:
+                continue
+            if str(edge.get("token") or "") in tokens:
+                count += 1
+        return count
+
     def _status_record(self, record: AgentRecord) -> dict[str, object]:
         """Probe one pinned record without resolving its name a second time."""
         name = record.name
         result: dict[str, object] = record.to_document()
+        result["children_count"] = self._children_count(name)
         result["launch_env_keys"] = self._launch_env_keys(record)
         result["queue"] = self._queue(name)
         result["output"] = str(self._directory(name) / "output.json")
@@ -4819,6 +4847,8 @@ class ManagedAgents:
                     "agent_status": "unknown",
                     "probe_error": str(exc),
                     "record_error": True,
+                    # As the Rust list adds to every row (#1904).
+                    "children_count": self._children_count(other_name),
                 })
         return rows
 

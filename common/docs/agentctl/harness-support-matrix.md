@@ -59,6 +59,7 @@ Every cell names its code path. Paths are relative to this repository;
 | Send: typing + submit | supported | supported | supported | partial | supported (Claude and Muse) |
 | Second Enter after delivery (#1691) | supported | supported | supported (delayed re-check, #1732) | none | n/a (no composer) |
 | Send: delivery receipts | supported | supported | supported | partial | supported (Claude and Muse) |
+| Send: relationship addressing (#1904: `--to-manager`, `--to-children`, skip-level header) | supported | supported | supported | partial | supported (Claude and Muse) |
 | Follow-up while working | partial | supported | supported | none | n/a (queued turns) |
 | Stuck-paste / Enter backstop | supported | partial | supported | partial | n/a (no composer) |
 | Composer / draft detection | supported | supported | supported | none | n/a |
@@ -797,6 +798,11 @@ differential lockstep for the interactive core, but it is not identical:
   records (`terminal-shared-across-registries`, #1683) is mirrored
   here: both editions read the sibling registries named by
   `restore.json`.
+- Relationship addressing (#1904: `send --to-manager`, `send
+  --to-children`, and the `skip-level` sender-header field, all computed
+  from `managed_by` in `rs/agentctl/src/subagents/control.rs`) is Rust-only,
+  like the `manage` and `tree` commands it builds on, which this edition
+  refuses; its plain `send` keeps the unmarked header.
 - Its headless workers are a different mechanism — resumable Codex, AGY,
   and Muse structured turns driven per turn (`py/agentctl/foreign/`),
   not the Rust wrapper's persistent Claude process. The user guide's
