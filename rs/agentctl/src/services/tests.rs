@@ -2551,7 +2551,6 @@ fn watch_on_snapshot(fake: &Fake, unit: &str, snapshot_dir: &Path, registry: &Pa
 struct PruneWorld {
     _temporary: Temporary,
     root: PathBuf,
-    registry: PathBuf,
     fake: Fake,
     directories: BTreeMap<String, PathBuf>,
 }
@@ -2618,7 +2617,6 @@ fn prune_world() -> PruneWorld {
     PruneWorld {
         _temporary: temporary,
         root,
-        registry,
         fake,
         directories,
     }

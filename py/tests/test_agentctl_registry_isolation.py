@@ -164,6 +164,6 @@ def test_gate_child_registries_are_removed_by_cleanup() -> None:
         first = Path(gate._child_environment()["AGENTCTL_REGISTRY"]).parent
         second = Path(gate._child_environment()["AGENTCTL_REGISTRY"]).parent
     assert first.exists() and second.exists()
-    gate._CHILD_REGISTRIES_FAILED = False
+    setattr(gate, "_CHILD_REGISTRIES_FAILED", False)
     gate._cleanup_child_registries()
     assert not first.exists() and not second.exists()
