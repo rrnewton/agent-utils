@@ -3721,3 +3721,59 @@ fn restore_revives_with_the_recorded_profile_environment() {
     assert_eq!(environments.len(), 2);
     assert_eq!(environments[1], ["RECOVERY_MODE=on"]);
 }
+
+#[test]
+fn watch_finds_a_headless_coordinator_alive_and_may_notify_it() {
+    // #1916: agent-watch may only send notices to a coordinator it proved
+    // alive; a headless coordinator's wrapper-recorded harness identity
+    // is that proof.
+    let fixture = Fixture::new();
+    fixture
+        .manager()
+        .start(
+            "coordinator",
+            &fixture.root,
+            StartOptions {
+                harness: "claude".to_owned(),
+                harness_args: vec!["--dangerously-skip-permissions".to_owned()],
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    let mut record = fixture.manager().load("coordinator").unwrap();
+    record.adapter = "harness-wrapper".to_owned();
+    record.mode = "headless".to_owned();
+    record.backend = "none".to_owned();
+    record.custom_process_identity = None;
+    record.anchor_rule = None;
+    record.pane_id = None;
+    record.tab_id = None;
+    record.workspace_id = None;
+    record.terminal_id = None;
+    fixture.manager().save(&record).unwrap();
+    fixture.client.started.store(true, Ordering::Relaxed);
+    let host = ScriptedHost::new();
+    let registry = fixture.root.join("registry");
+    let findings = watch_once(
+        &fixture.client,
+        &registry,
+        &host,
+        &config(&fixture, Some("coordinator")),
+        &WatchOptions {
+            interval: Duration::from_secs(60),
+            once: true,
+            check_only: true,
+            wrkslots: None,
+            state_dir: None,
+            queue_stale: Duration::from_secs(600),
+        },
+        &mut Default::default(),
+        &mut Default::default(),
+    );
+    let coordinator = findings
+        .iter()
+        .find(|row| row["check"] == "coordinator")
+        .unwrap();
+    assert_eq!(coordinator["ok"], true, "{findings:?}");
+    assert_eq!(coordinator["detail"], "harness alive", "{findings:?}");
+}

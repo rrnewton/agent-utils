@@ -3962,6 +3962,150 @@ fn restart_with_profile_environment_relaunches_in_a_fresh_tab_with_it() {
     assert_eq!(environments[1], ["RECOVERY_MODE=on"]);
 }
 
+/// Rewrite `record` as the headless record the wrapper writes (#1916): no
+/// pane, no custom identity, no anchor rule; the harness identity the
+/// wrapper recorded for its spawned process stays.
+fn as_harness_wrapper(record: &mut AgentRecord) {
+    record.adapter = "harness-wrapper".to_owned();
+    record.mode = "headless".to_owned();
+    record.backend = "none".to_owned();
+    record.custom_process_identity = None;
+    record.anchor_rule = None;
+    record.pane_id = None;
+    record.tab_id = None;
+    record.workspace_id = None;
+    record.terminal_id = None;
+}
+
+#[test]
+fn harness_wrapper_record_with_a_live_harness_identity_is_alive() {
+    // #1916: the notice check dry-runs a revive and trusts only a
+    // "skip ... alive" plan; a headless coordinator's recorded harness
+    // identity must answer Alive, not unverifiable.
+    let (fixture, mut old) = recoverable("claude", false);
+    as_harness_wrapper(&mut old);
+    fixture.manager().save(&old).unwrap();
+    fixture.client.dead_panes.lock().unwrap().clear();
+    fixture.client.started.store(true, Ordering::Relaxed);
+    let plan = fixture
+        .manager()
+        .revive("worker", true, None, TIMEOUT)
+        .unwrap();
+    assert_eq!(plan["action"], "skip", "{plan}");
+    assert!(
+        plan["reason"].as_str().unwrap().contains("alive"),
+        "{plan}"
+    );
+}
+
+#[test]
+fn harness_wrapper_record_with_a_dead_or_reused_harness_identity_is_not_alive() {
+    // #1916: the loosened proof must never call a dead, stale or reused
+    // process Alive.
+    for case in ["dead", "stale-pid", "reused-pid"] {
+        let (fixture, mut old) = recoverable("claude", false);
+        as_harness_wrapper(&mut old);
+        if case != "dead" {
+            fixture.client.dead_panes.lock().unwrap().clear();
+            fixture.client.started.store(true, Ordering::Relaxed);
+        }
+        match case {
+            "stale-pid" => old.harness_identity.as_mut().unwrap().pid += 1000,
+            "reused-pid" => {
+                old.harness_identity.as_mut().unwrap().starttime_ticks += 1
+            }
+            _ => {}
+        }
+        fixture.manager().save(&old).unwrap();
+        let plan = fixture
+            .manager()
+            .revive("worker", true, None, TIMEOUT)
+            .unwrap();
+        assert_eq!(plan["action"], "blocked", "{case}: {plan}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn harness_wrapper_liveness_tracks_a_real_child_process() {
+    // #1916: spawn a real child, record its real /proc identity the way
+    // the wrapper does, and watch the verdict follow the process: Alive
+    // while it runs, never Alive for a reused pid or after the kill.
+    // Liveness reads /proc only, so a real client over the fixture's
+    // registry needs no Herdr executable behind it.
+    use std::os::fd::AsRawFd as _;
+
+    struct Guard(std::process::Child);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let (fixture, mut old) = recoverable("claude", false);
+    let executable = fs::canonicalize("/usr/bin/sleep").unwrap();
+    let mut child = Guard(
+        std::process::Command::new(&executable)
+            .arg("300")
+            .spawn()
+            .unwrap(),
+    );
+    let pid = u64::from(child.0.id());
+    // Pin the identity only once the exec has landed: before that the
+    // forked child still carries this test binary's image. The bound
+    // only reports a hang; the wait is the /proc condition itself.
+    let started = std::time::Instant::now();
+    while fs::read_link(format!("/proc/{pid}/exe"))
+        .is_ok_and(|path| path != executable)
+    {
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "pid {pid} never exec'd {}",
+            executable.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let identity = crate::client::live_custom_process(pid).unwrap().identity;
+    as_harness_wrapper(&mut old);
+    old.harness_identity = Some(identity.clone());
+    fixture.manager().save(&old).unwrap();
+    let client =
+        HerdrClient::with_executable("direct", &fixture.root.join("herdr")).unwrap();
+    let manager = ManagedAgents::new(&client, &fixture.root.join("registry"))
+        .unwrap()
+        .with_inherited_workspace(None);
+    let plan = manager.revive("worker", true, None, TIMEOUT).unwrap();
+    assert_eq!(plan["action"], "skip", "{plan}");
+    assert!(
+        plan["reason"].as_str().unwrap().contains("alive"),
+        "{plan}"
+    );
+    // A reused pid (same pid, another generation) is never Alive.
+    let mut reused = old.clone();
+    reused.harness_identity.as_mut().unwrap().starttime_ticks += 1;
+    fixture.manager().save(&reused).unwrap();
+    let plan = manager.revive("worker", true, None, TIMEOUT).unwrap();
+    assert_eq!(plan["action"], "blocked", "{plan}");
+    fixture.manager().save(&old).unwrap();
+    // Kill it and wait on the kernel's own exit indication, then re-check.
+    let pinned = agent_queue::identity::open_pidfd(pid).unwrap();
+    child.0.kill().unwrap();
+    let mut descriptor = libc::pollfd {
+        fd: pinned.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: descriptor is initialized and refers to the owned child's pidfd.
+    assert_eq!(unsafe { libc::poll(&mut descriptor, 1, 120_000) }, 1);
+    assert_ne!(descriptor.revents & libc::POLLIN, 0);
+    let plan = manager.revive("worker", true, None, TIMEOUT).unwrap();
+    assert_eq!(plan["action"], "blocked", "{plan}");
+    child.0.wait().unwrap();
+    let plan = manager.revive("worker", true, None, TIMEOUT).unwrap();
+    assert_eq!(plan["action"], "blocked", "{plan}");
+}
+
 #[test]
 fn restart_with_resume_refuses_a_recorded_launch_environment_before_ending_anything() {
     // #1412: a same-pane relaunch cannot re-apply a recorded launch environment,

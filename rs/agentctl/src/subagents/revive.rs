@@ -2041,6 +2041,10 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
     fn revive_liveness(&self, record: &AgentRecord) -> ProcessLiveness {
         let identity = if record.anchors_with_harness_identity() {
             record.harness_anchor()
+        } else if record.adapter == "harness-wrapper" {
+            // The wrapper records the harness process it spawned itself;
+            // there is no pane pin, so no anchor rule gates this identity.
+            record.harness_identity.as_ref()
         } else {
             record.custom_process_identity.as_ref()
         };

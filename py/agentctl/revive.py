@@ -443,6 +443,9 @@ def _policy(manager: ManagedAgents, record: AgentRecord) -> _LaunchPolicy:
 
 def _old_process(record: AgentRecord) -> CustomProcessIdentity:
     identity = (record.harness_anchor if record.adapter in ("herdr", "herdr-foreign")
+                # The wrapper records the harness process it spawned itself;
+                # there is no pane pin, so no anchor rule gates this identity.
+                else record.harness_identity if record.adapter == "harness-wrapper"
                 else record.custom_process_identity)
     if identity is None:
         raise AgentDeliveryError("record lacks an independently pinned harness process; inspect it before replacing its generation")

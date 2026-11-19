@@ -1901,6 +1901,69 @@ def test_revive_never_launches_for_live_or_unverifiable_process(
     assert registry_bytes(manager.registry) == before and len(fake.launched) == 1 and fake.closed == []
 
 
+def _as_harness_wrapper(record: AgentRecord) -> AgentRecord:
+    """Rewrite `record` as the headless record the wrapper writes (#1916):
+    no pane, no custom identity, no anchor rule; the harness identity the
+    wrapper recorded for its spawned process stays."""
+    record.adapter = "harness-wrapper"
+    record.mode = "headless"
+    record.backend = "none"
+    record.custom_process_identity = None
+    record.anchor_rule = None
+    record.pane_id = None
+    record.tab_id = None
+    record.workspace_id = None
+    record.terminal_id = None
+    return record
+
+
+def test_old_process_uses_the_wrapper_recorded_harness_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #1916 (Python parity): a harness-wrapper record's pinned process is
+    # the harness identity the wrapper recorded, not the (absent) custom
+    # identity. The Python loader refuses this adapter before the revive
+    # plan can run, so the branch is exercised directly here; the
+    # end-to-end skip-alive plan is covered by the Rust edition.
+    from agentctl import revive as recovery
+    manager, _fake, _old = prepare_revive(tmp_path, monkeypatch)
+    record = _as_harness_wrapper(manager.get("worker"))
+    assert recovery._old_process(record) is record.harness_identity
+    record.harness_identity = None
+    with pytest.raises(AgentDeliveryError):
+        recovery._old_process(record)
+
+
+@pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="Linux pidfd identity required")
+def test_old_process_harness_wrapper_identity_tracks_a_real_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #1916: spawn a real child, record its real /proc identity the way
+    # the wrapper does, and watch the verdict follow the process.
+    import subprocess
+    from agentctl import revive as recovery
+    manager, _fake, _old = prepare_revive(tmp_path, monkeypatch)
+    record = _as_harness_wrapper(manager.get("worker"))
+    client = HerdrClient(herdr_bin="absent-herdr", run=lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("no herdr call")))
+    process = subprocess.Popen([os.path.realpath("/usr/bin/sleep"), "300"])
+    try:
+        observed = client._process_identity(process.pid)
+        assert observed is not None
+        record.harness_identity = observed[0]
+        identity = recovery._old_process(record)
+        assert client.process_liveness(identity) == "alive"
+        # A reused pid (same pid, another generation) is never Alive.
+        reused = replace(identity, starttime_ticks=identity.starttime_ticks + 1)
+        assert client.process_liveness(reused) != "alive"
+        process.kill()
+        process.wait(timeout=5)
+        assert client.process_liveness(identity) == "dead"
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
 def test_revive_distinguishes_explicit_missing_pane_from_server_outage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
