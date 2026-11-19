@@ -1196,7 +1196,8 @@ function applyTimelinePage(payload: TimelineResponse, older = false, saved = fal
     // The reader's text selection is kept across the rebuild, as at a landing (`#1209`).
     const list = el("discord-log");
     const keptSelection = deps.selectionIn ? deps.selectionIn(list) : null;
-    if (!renderWindowed(list, glom(shown))) patchRows(list, glom(shown), (group) => discordNode(group), [], (drawn, incoming) => drawn === incoming, selection().view);
+    const groups = glom(shown);
+    if (!renderWindowed(list, groups)) patchRows(list, groups, (group) => discordNode(group), [], (drawn, incoming) => drawn === incoming, selection().view);
     el("thread-list").replaceChildren(...threadCards(timelineRows().threads));
     if (keptSelection && deps.restoreSelectionIn) deps.restoreSelectionIn(list, keptSelection);
   }
@@ -1240,7 +1241,8 @@ function renderCachedTimeline(): void {
     // rebuild itself patches in place (`#1229 keyed-row-patching`).
     const list = el("discord-log");
     const keptSelection = deps.selectionIn ? deps.selectionIn(list) : null;
-    if (!renderWindowed(list, glom(shown))) patchRows(list, glom(shown), (group) => discordNode(group), [], (drawn, incoming) => drawn === incoming, selection().view);
+    const groups = glom(shown);
+    if (!renderWindowed(list, groups)) patchRows(list, groups, (group) => discordNode(group), [], (drawn, incoming) => drawn === incoming, selection().view);
     if (keptSelection && deps.restoreSelectionIn) deps.restoreSelectionIn(list, keptSelection);
     holdingReplyArrows(renderChannelRows);
     listState().backlog = shown.length;
@@ -1749,8 +1751,9 @@ function applyNewestPage(payload: TimelineResponse, saved = false): number {
   const keptSelection = deps.selectionIn ? deps.selectionIn(list) : null;
   // `#1846` step 3: a fresh newest page with nothing kept draws through the window when it
   // stands; a page kept over older rows draws in full, and the next full redraw windows it.
-  if (!(kept.length === 0 && renderWindowed(list, glom(messages)))) {
-    patchRows(list, glom(messages), (group) => discordNode(group), kept,
+  const newestGroups = glom(messages);
+  if (!(kept.length === 0 && renderWindowed(list, newestGroups))) {
+    patchRows(list, newestGroups, (group) => discordNode(group), kept,
       (drawn, incoming) => drawn === incoming || sameMessage(drawn, incoming), selection().view);
   }
   if (keptSelection && deps.restoreSelectionIn) deps.restoreSelectionIn(list, keptSelection);
