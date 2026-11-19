@@ -1707,6 +1707,130 @@ def test_a_prompt_visible_only_in_the_lower_region_is_flushed_not_retyped() -> N
     assert screen.keys == ["Enter"] and screen.pastes == []
 
 
+def _tail_only_screen(text: str, width: int, visible: int) -> str:
+    """Wrap `text` at `width` and keep only the last `visible` rows
+    above the bottom rule: the head has scrolled off (#1897)."""
+    avail = max(width - 2, 8)
+    rows: list[str] = []
+    first = True
+    for line in text.splitlines():
+        rest = line
+        while True:
+            if len(rest) <= avail:
+                chunk, rest = rest, ""
+            else:
+                cut = avail
+                space = rest.rfind(" ", 0, cut)
+                if space > avail // 2:
+                    cut = space
+                chunk, rest = rest[:cut], rest[cut:].lstrip()
+            rows.append(f"{'❯ ' if first else '  '}{chunk.strip()}")
+            first = False
+            if not rest:
+                break
+    kept = rows[-visible:]
+    return (
+        "● earlier output\n● more output\n"
+        + "\n".join(kept)
+        + "\n"
+        + "─" * width
+        + "\n  model · context left\n"
+    )
+
+
+_NARROW_TEXT = (
+    "[from lane-a via agentctl · reply: agentctl send lane-a]\n"
+    "lane-a: one read-only check alongside the reaper passes. Find which "
+    "retained run refers to the missing archive, whether the archive is "
+    "really gone or just at another path, and whether any publication "
+    "path is affected by its absence. Report which run it is, where the "
+    "archive actually lives, and whether receipts or ledger rows that "
+    "name it can still be read, in that order."
+)
+
+
+def test_region_match_recognises_a_tail_only_narrow_prompt() -> None:
+    from agentctl.submission import _region_match
+
+    for width in (30, 42, 80):
+        screen = _tail_only_screen(_NARROW_TEXT, width, 5)
+        assert _region_match(_NARROW_TEXT, screen), width
+    foreign = (
+        "a person's own long note about pruning old branches and "
+        "archiving the results so the next reader can find them"
+    )
+    for width in (30, 42, 80):
+        screen = _tail_only_screen(foreign, width, 5)
+        assert not _region_match(_NARROW_TEXT, screen), width
+
+
+def test_a_tail_only_prompt_at_narrow_widths_is_flushed_not_retyped() -> None:
+    # #1897, Python edition: the same tail-only shape is flushed with
+    # one Enter at 30, 42 and 80 columns, never retyped.
+    for width in (30, 42, 80):
+        screen = _RegionScreen(_NARROW_TEXT)
+        screen.screen = _tail_only_screen(_NARROW_TEXT, width, 5)
+        assert composer_view("claude", screen.read_screen("w1:p1")) is None
+        clock = Clock()
+        receipt = submit_verified(
+            screen, "w1:p1", "claude", _NARROW_TEXT, sleep=clock.sleep, monotonic=clock.monotonic
+        )
+        assert receipt.key == "Enter" and receipt.key_presses == 1, width
+        assert "lower region" in receipt.evidence, width
+        assert screen.keys == ["Enter"] and screen.pastes == [], width
+
+
+class _NarrowScreen:
+    """Empty parseable composer, then a fresh paste drawn tail-only."""
+
+    def __init__(self, text: str, width: int) -> None:
+        rule = "─" * max(width, 10)
+        self.screen = f"● earlier output\n{rule}\n❯ \n{rule}\n  model · context left\n"
+        self.stuck = _tail_only_screen(text, width, 5)
+        self.submitted = (
+            f"• earlier output\n• more output\n❯ {text}\n"
+            "• the agent is working on it\n• still working\n"
+            "• output line three\n• output line four\n• output line five\n"
+        )
+        self.keys: list[str] = []
+        self.pastes: list[str] = []
+
+    def read_screen(self, pane_id: str) -> str:
+        del pane_id
+        return self.screen
+
+    def send_text(self, pane_id: str, text: str) -> None:
+        del pane_id
+        self.pastes.append(text)
+        self.screen = self.stuck
+
+    def send_keys(self, pane_id: str, keys: str) -> None:
+        del pane_id
+        self.keys.append(keys)
+        if keys == "Enter":
+            self.screen = self.submitted
+
+
+def test_a_fresh_tail_only_paste_at_narrow_widths_is_submitted() -> None:
+    # #1897, Python edition: a fresh paste visible only by its tail is
+    # submitted in the same delivery, typed exactly once.
+    for width in (30, 42, 80):
+        screen = _NarrowScreen(_NARROW_TEXT, width)
+        clock = Clock()
+        receipt = submit_verified(
+            screen,
+            "w1:p1",
+            "claude",
+            _NARROW_TEXT,
+            sleep=clock.sleep,
+            monotonic=clock.monotonic,
+        )
+        assert receipt.key == "Enter", width
+        assert "lower region" in receipt.evidence, width
+        assert screen.keys == ["Enter"], width
+        assert len(screen.pastes) == 1, width
+
+
 def test_a_submitted_echo_high_in_the_transcript_is_never_flushed() -> None:
     # The position guard: the same text echoed as a user turn, with the
     # agent's output under it, is not a stuck draft.

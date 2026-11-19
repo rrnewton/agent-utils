@@ -208,7 +208,14 @@ in `rs/agentctl/src/stale_draft.rs`.
   parses, so an occupied but unparseable composer starts its clock —
   ours is submitted, a foreign draft is backed up and cleared only
   after the stale window. The region path presses Enter; on a busy
-  Codex that steers, as Enter always does there.
+  Codex that steers, as Enter always does there. Since #1897 the
+  region match also recognises a prompt whose head has scrolled out
+  of a narrow pane's visible frame (widths down to about 30 columns)
+  from a long exact run of its tail, in the watcher backstop, the
+  delivery-path recovery and the in-lock stage wait alike, and the
+  Python edition's same-prompt region flush matches it too; foreign
+  text, which cannot contain that run of a delivered prompt, still
+  gets no key.
 
 This is the row the owner did not know diverged: the backstop grew up
 Claude-first, reached Muse in #1546, and an unrecognised TUI still gets

@@ -9156,6 +9156,35 @@ mod tests {
     }
 
     #[test]
+    fn a_tail_only_narrow_stuck_paste_is_pressed() {
+        // #1897: in a ~42-column pane the prompt's head has scrolled off;
+        // only its tail shows above the composer's rule. The backstop
+        // still recognises its own delivered prompt and presses Enter.
+        let queue = sweep_queue("backstop-narrow", 1_000.0);
+        let divider = "─".repeat(42);
+        let stuck = format!(
+            "● earlier work\n  second line follows\n  here after. Needs your disposition\n  (ledger-tree file). Details in the queue.\n{divider}\n  model-x · context left"
+        );
+        let mut probe = SweepProbe {
+            queue: queue.clone(),
+            screens: vec![("worker".into(), stuck.clone(), "claude".into())],
+        };
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        let screens = vec![("worker".to_owned(), stuck, "claude".to_owned())];
+        let rows = run_backstop(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            screens,
+            &[1_120.0, 1_180.0, 1_240.0],
+        );
+        assert_eq!(rows[0]["backstop"], "pressed", "{rows:?}");
+        assert_eq!(notifier.presses, ["worker"]);
+        let _ = std::fs::remove_dir_all(&queue);
+    }
+
+    #[test]
     fn a_normal_submit_and_foreign_text_are_never_pressed() {
         let queue = sweep_queue("backstop-normal", 1_000.0);
         let mut probe = SweepProbe {

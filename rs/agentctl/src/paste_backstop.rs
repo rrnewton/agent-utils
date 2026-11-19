@@ -16,7 +16,12 @@
 //! does not say which, so wrapping and re-flow cannot hide a stuck paste).
 //! A prompt of at most [`BackstopConfig::short_max`] normalised characters
 //! matches only whole; a longer one matches when its first and last
-//! [`BackstopConfig::anchor`] normalised characters both appear, in order.
+//! [`BackstopConfig::anchor`] normalised characters both appear, in order,
+//! or — when a tall prompt in a narrow pane has scrolled its head out of
+//! the visible frame (#1897) — when a long exact run of its tail (at
+//! least [`TAIL_RUN_MIN`] normalised characters, the prompt's own ending)
+//! appears. Foreign text cannot contain that exact run of a delivered
+//! prompt, so the tail-only shape is still ours by construction.
 //! Three guards keep a submitted prompt from ever counting, because every
 //! TUI echoes a submitted prompt into its transcript:
 //!
@@ -83,6 +88,16 @@ impl Default for BackstopConfig {
         }
     }
 }
+
+/// Shortest exact tail run, in normalised characters, that alone
+/// identifies a long prompt whose head has scrolled off screen (#1897).
+/// Longer runs are tried first, so a pane showing more of the tail
+/// matches on more of the prompt.
+pub const TAIL_RUN_MIN: usize = 48;
+
+/// Tail-run lengths tried, longest first, when a long prompt's head
+/// anchor is not visible.
+const TAIL_RUNS: [usize; 6] = [160, 128, 96, 80, 64, TAIL_RUN_MIN];
 
 /// One prompt agentctl delivered, from its queue records: the only texts
 /// the backstop may ever match, so someone else's text cannot be submitted
@@ -311,10 +326,25 @@ pub fn match_region(prompt: &str, screen: &str, config: &BackstopConfig) -> Opti
         let tail: String = needle_chars[needle_chars.len() - config.anchor..]
             .iter()
             .collect();
-        let head_at = joined.find(&head)?;
-        joined[head_at + head.len()..]
-            .find(&tail)
-            .map(|at| head_at + head.len() + at + tail.len())
+        let by_anchors = joined.find(&head).and_then(|head_at| {
+            joined[head_at + head.len()..]
+                .find(&tail)
+                .map(|at| head_at + head.len() + at + tail.len())
+        });
+        by_anchors.or_else(|| {
+            // The head has scrolled out of the frame (#1897): the visible
+            // tail is the prompt's own ending, matched whole and as long
+            // as the pane shows it. The last occurrence counts, so an
+            // echoed copy higher up cannot shadow the composer's.
+            TAIL_RUNS.iter().find_map(|run| {
+                let run = (*run).min(needle_chars.len());
+                if run <= config.anchor {
+                    return None;
+                }
+                let suffix: String = needle_chars[needle_chars.len() - run..].iter().collect();
+                joined.rfind(&suffix).map(|at| at + suffix.len())
+            })
+        })
     }?;
     // Map the match end (a byte offset) back to its row.
     let end_row = offsets
@@ -399,6 +429,79 @@ mod tests {
         // prompt glyph the queue record does not have.
         let screen = "◆ earlier work\n────────────────\n❯ [from lane-a via agentctl · reply: agentctl send\n  lane-a] first line of the message second line\n  follows here after. Needs your disposition\n  (ledger-tree file). Details in the queue.\n────────────────\n  model · context left\n";
         assert!(match_region(PROMPT, screen, &config()).is_some());
+    }
+
+    const LONG_PROMPT: &str = "[from lane-a via agentctl · reply: agentctl send lane-a]\nlane-a: one read-only check alongside the reaper passes. Find which retained run refers to the missing archive, whether the archive is really gone or just at another path, and whether any publication path is affected by its absence. Report which run it is, where the archive actually lives, and whether receipts or ledger rows that name it can still be read, in that order.";
+
+    /// Wrap `text` as a composer at `width` columns draws it, then keep
+    /// only the last `visible` composer rows above the bottom rule: a
+    /// tall prompt in a narrow pane scrolls its first rows (and its
+    /// header) out of the frame, leaving only the tail (#1897).
+    fn tail_only_screen(text: &str, width: usize, visible: usize) -> String {
+        let avail = width.saturating_sub(2).max(8);
+        let mut rows: Vec<String> = Vec::new();
+        let mut first = true;
+        for line in text.lines() {
+            let mut rest = line;
+            loop {
+                let take = if rest.len() <= avail {
+                    rest.len()
+                } else {
+                    let mut cut = avail;
+                    while cut > 0 && !rest.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    if let Some(space) = rest[..cut].rfind(' ') {
+                        if space > avail / 2 {
+                            cut = space;
+                        }
+                    }
+                    cut
+                };
+                let (chunk, tail) = rest.split_at(take);
+                rows.push(format!(
+                    "{}{}",
+                    if first { "❯ " } else { "  " },
+                    chunk.trim()
+                ));
+                first = false;
+                rest = tail.trim_start();
+                if rest.is_empty() {
+                    break;
+                }
+            }
+        }
+        let kept = &rows[rows.len().saturating_sub(visible)..];
+        format!(
+            "● earlier output\n● more output\n{}\n{}\n  model · context left\n",
+            kept.join("\n"),
+            "─".repeat(width)
+        )
+    }
+
+    #[test]
+    fn a_tail_only_narrow_prompt_still_matches() {
+        // #1897: at 30 and 42 columns the head anchor has scrolled off;
+        // at 80 the whole prompt fits. All three must match.
+        for width in [30usize, 42, 80] {
+            let screen = tail_only_screen(LONG_PROMPT, width, 8);
+            assert!(
+                match_region(LONG_PROMPT, &screen, &config()).is_some(),
+                "width {width}: {screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tail_only_foreign_draft_does_not_match() {
+        let foreign = "[from lane-a via agentctl · reply: agentctl send lane-a]\nlane-a: a completely different instruction about pruning old branches and archiving the results so the next reader can find them without asking anyone where they went or what they mean today.";
+        for width in [30usize, 42, 80] {
+            let screen = tail_only_screen(foreign, width, 8);
+            assert!(
+                match_region(LONG_PROMPT, &screen, &config()).is_none(),
+                "width {width}"
+            );
+        }
     }
 
     #[test]

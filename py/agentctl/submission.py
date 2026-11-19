@@ -652,15 +652,21 @@ def _submit_key(harness: str, view: ComposerView) -> str:
 # box-drawing and prompt glyphs and removing every whitespace character,
 # the same normalisation the watcher backstop uses. A short prompt
 # matches whole; a longer one matches when its
-# first and last _REGION_ANCHOR characters both appear, in order. The
-# match must end within _REGION_TAIL_ROWS content rows of the bottom, so
-# a submitted prompt echoed into the transcript never counts.
+# first and last _REGION_ANCHOR characters both appear, in order, or —
+# when a tall prompt in a narrow pane has scrolled its head out of the
+# visible frame (#1897) — when a long exact run of its tail (at least
+# _REGION_TAIL_RUN_MIN characters, the prompt's own ending) appears.
+# Foreign text cannot contain that exact run of a delivered prompt.
+# The match must end within _REGION_TAIL_ROWS content rows of the
+# bottom, so a submitted prompt echoed into the transcript never counts.
 _RECHECK_DELAY_SECONDS = 1.0
 _RECHECK_VERIFY_SECONDS = 3.0
 _REGION_ROWS = 24
 _REGION_ANCHOR = 40
 _REGION_SHORT_MAX = 80
 _REGION_TAIL_ROWS = 4
+_REGION_TAIL_RUN_MIN = 48
+_REGION_TAIL_RUNS = (160, 128, 96, 80, 64, _REGION_TAIL_RUN_MIN)
 _REGION_PRESSES = 3
 _REGION_SETTLE_SECONDS = 3.0
 
@@ -700,12 +706,29 @@ def _region_match(text: str, screen: str) -> bool:
         end = at + len(needle)
     else:
         head_at = joined.find(needle[:_REGION_ANCHOR])
-        if head_at < 0:
-            return False
-        tail_at = joined.find(needle[-_REGION_ANCHOR:], head_at + _REGION_ANCHOR)
-        if tail_at < 0:
-            return False
-        end = tail_at + _REGION_ANCHOR
+        tail_at = (
+            joined.find(needle[-_REGION_ANCHOR:], head_at + _REGION_ANCHOR)
+            if head_at >= 0
+            else -1
+        )
+        if tail_at >= 0:
+            end = tail_at + _REGION_ANCHOR
+        else:
+            # The head has scrolled out of the frame (#1897): match the
+            # prompt's own ending, as much of it as the pane shows. The
+            # last occurrence counts, so an echoed copy higher up cannot
+            # shadow the composer's.
+            end = -1
+            for run in _REGION_TAIL_RUNS:
+                run = min(run, len(needle))
+                if run <= _REGION_ANCHOR:
+                    continue
+                at = joined.rfind(needle[-run:])
+                if at >= 0:
+                    end = at + run
+                    break
+            if end < 0:
+                return False
     offsets = []
     position = 0
     for row in normalised:
@@ -1055,10 +1078,40 @@ def _submit_verified_typed(
 
     started = monotonic()
     stage_deadline = started + stage_timeout
+    prev_region_screen: str | None = None
     while True:
-        view = composer_view(harness, terminal.read_screen(pane_id))
+        screen = terminal.read_screen(pane_id)
+        view = composer_view(harness, screen)
         if view is not None and _staged(view, text, placeholders_before):
             break
+        if view is None and _region_match(text, screen):
+            # No composer reader parses this screen, but our just-typed
+            # paste is visible in the lower region — at a narrow width
+            # only its tail shows (#1897). Once the screen is unchanged
+            # across two reads it is sitting there, not mid-redraw:
+            # submit it from the region instead of stranding it.
+            from agentctl.harness_tui import State as _State
+            from agentctl.harness_tui import harness_tui as _harness_tui
+
+            _adapter = _harness_tui(harness)
+            _blocked = _adapter is not None and _adapter.classify(screen).state in (
+                _State.QUESTION,
+                _State.MENU,
+            )
+            if prev_region_screen == screen and not _blocked:
+                receipt = _flush_region_draft(
+                    terminal,
+                    pane_id,
+                    text,
+                    sleep=sleep,
+                    monotonic=monotonic,
+                    deadline=min(hold_deadline, monotonic() + submit_timeout),
+                )
+                if receipt is not None:
+                    return receipt
+            prev_region_screen = screen
+        else:
+            prev_region_screen = None
         if monotonic() >= hold_deadline:
             raise HerdrUnavailable(
                 f"pane {pane_id}: submission exceeded the admission hold bound "

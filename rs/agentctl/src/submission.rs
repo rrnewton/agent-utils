@@ -1386,6 +1386,91 @@ fn recover_region_draft(
     }
 }
 
+/// Submit this call's own just-typed prompt when only its tail shows in
+/// the pane's lower region (#1897): at a narrow width a tall paste
+/// scrolls the composer's first row and the prompt's head out of the
+/// frame, so no composer reader parses the screen and the stage wait
+/// would strand a paste that is visibly sitting there. The text is the
+/// one this call typed into a verified-empty composer seconds earlier,
+/// so a tail-region match is ours; it gets the submission key (never
+/// while a question, a menu or a picker shows) and counts as submitted
+/// once the match has left the region and stayed gone for
+/// [`DRAFT_SETTLE`]. `None` when it is still there at `until`, or a
+/// blocked screen appears before any press.
+fn flush_region_prompt(
+    terminal: &dyn PromptTerminal,
+    pane_id: &str,
+    harness: &str,
+    text: &str,
+    runtime: &dyn AgentRuntime,
+    started: Duration,
+    until: Duration,
+) -> Option<SubmissionReceipt> {
+    let config = crate::paste_backstop::BackstopConfig::default();
+    let first = terminal.read_screen(pane_id).ok()?;
+    if blocked(harness, &first) {
+        return None;
+    }
+    let key = runtime.followup_key().unwrap_or("Enter");
+    terminal.send_keys(pane_id, key).ok()?;
+    let mut presses: u32 = 1;
+    let mut wait = FIRST_RETRY;
+    let mut next_press = runtime.monotonic().saturating_add(wait);
+    let mut gone_since: Option<Duration> = None;
+    loop {
+        runtime.sleep(POLL);
+        if runtime.cancelled() {
+            return None;
+        }
+        let now = runtime.monotonic();
+        if now >= until && gone_since.is_none() {
+            return None;
+        }
+        let current = terminal.read_screen(pane_id).ok()?;
+        if blocked(harness, &current) {
+            return Some(SubmissionReceipt {
+                key,
+                key_presses: presses,
+                elapsed: now.saturating_sub(started),
+                evidence: "pasted prompt submitted with Enter; the composer was not \
+                           recognisable, matched by its tail in the pane's lower region, \
+                           after which it asked a question"
+                    .to_owned(),
+                printed: true,
+                settled: true,
+                queued: false,
+            });
+        }
+        if crate::paste_backstop::match_region(text, &current, &config).is_none() {
+            let since = *gone_since.get_or_insert(now);
+            if now.saturating_sub(since) >= DRAFT_SETTLE {
+                return Some(SubmissionReceipt {
+                    key,
+                    key_presses: presses,
+                    elapsed: now.saturating_sub(started),
+                    evidence: "pasted prompt submitted with Enter; the composer was not \
+                               recognisable, matched by its tail in the pane's lower region"
+                        .to_owned(),
+                    printed: true,
+                    settled: true,
+                    queued: false,
+                });
+            }
+            continue;
+        }
+        gone_since = None;
+        if now >= until {
+            return None;
+        }
+        if presses < DRAFT_PRESSES && now >= next_press {
+            terminal.send_keys(pane_id, key).ok()?;
+            presses += 1;
+            wait = (wait * 2).min(MAX_RETRY);
+            next_press = now.saturating_add(wait);
+        }
+    }
+}
+
 /// Note the queue record `id` recovered, as
 /// [`crate::stale_draft::note_recovered`] does for a composer-matched
 /// draft: the drain then treats the prompt as delivered, never lost,
@@ -2032,6 +2117,33 @@ fn submit_verified_typed(
             let tail = bottom_region(&screen);
             if prev_tail.as_deref() == Some(tail.as_str()) && static_tail_holds(&screen, text) {
                 break view.clone();
+            }
+            prev_tail = Some(tail);
+        } else if crate::paste_backstop::match_region(
+            text,
+            &screen,
+            &crate::paste_backstop::BackstopConfig::default(),
+        )
+        .is_some()
+        {
+            // No composer model on this read, but our just-typed paste is
+            // visible in the lower region — at a narrow width only its
+            // tail shows (#1897). Once the tail is unchanged across two
+            // reads it is sitting there, not mid-redraw: submit it from
+            // the region instead of stranding it at the stage deadline.
+            let tail = bottom_region(&screen);
+            if prev_tail.as_deref() == Some(tail.as_str()) {
+                if let Some(receipt) = flush_region_prompt(
+                    terminal,
+                    pane_id,
+                    harness,
+                    text,
+                    runtime,
+                    started,
+                    grace_deadline,
+                ) {
+                    return Ok(Submission::Verified(receipt));
+                }
             }
             prev_tail = Some(tail);
         } else if static_tail_holds(&screen, text) {
@@ -6299,6 +6411,15 @@ mod tests {
     }
 
     impl RegionScreen {
+        fn stuck_screen(screen: String, submitted: String) -> Self {
+            Self {
+                screen: std::sync::Mutex::new(screen),
+                submitted,
+                keys: std::sync::Mutex::new(Vec::new()),
+                pastes: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
         fn stuck(draft: &str) -> Self {
             Self {
                 screen: std::sync::Mutex::new(format!(
@@ -6362,6 +6483,70 @@ mod tests {
         .unwrap();
     }
 
+    /// The #1897 prompt shape: a long sender header plus a long body.
+    fn narrow_prompt() -> String {
+        format!(
+            "{LANE}\nlane-a: one read-only check alongside the reaper passes. Find which \
+             retained run refers to the missing archive, whether the archive is really gone \
+             or just at another path, and whether any publication path is affected by its \
+             absence. Report which run it is, where the archive actually lives, and whether \
+             receipts or ledger rows that name it can still be read, in that order."
+        )
+    }
+
+    /// Wrap `text` as a composer at `width` columns draws it, then keep
+    /// only the last `visible` composer rows above the bottom rule: the
+    /// head (and the `❯` row) has scrolled out of the frame (#1897).
+    fn tail_only_screen(text: &str, width: usize, visible: usize) -> String {
+        let avail = width.saturating_sub(2).max(8);
+        let mut rows: Vec<String> = Vec::new();
+        let mut first = true;
+        for line in text.lines() {
+            let mut rest = line;
+            loop {
+                let take = if rest.len() <= avail {
+                    rest.len()
+                } else {
+                    let mut cut = avail;
+                    while cut > 0 && !rest.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    if let Some(space) = rest[..cut].rfind(' ') {
+                        if space > avail / 2 {
+                            cut = space;
+                        }
+                    }
+                    cut
+                };
+                let (chunk, tail) = rest.split_at(take);
+                rows.push(format!(
+                    "{}{}",
+                    if first { "❯ " } else { "  " },
+                    chunk.trim()
+                ));
+                first = false;
+                rest = tail.trim_start();
+                if rest.is_empty() {
+                    break;
+                }
+            }
+        }
+        let kept = &rows[rows.len().saturating_sub(visible)..];
+        format!(
+            "● earlier output\n● more output\n{}\n{}\n  model · context left\n",
+            kept.join("\n"),
+            "─".repeat(width)
+        )
+    }
+
+    fn submitted_screen(text: &str) -> String {
+        format!(
+            "• earlier output\n• more output\n❯ {text}\n\
+             • the agent is working on it\n• still working\n\
+             • output line three\n• output line four\n• output line five\n"
+        )
+    }
+
     fn region_record(queue: &TypedQueue, id: &str) -> serde_json::Value {
         crate::agent::read_private_json(&queue.0.join(format!("inbox/{id}.json"))).unwrap()
     }
@@ -6400,6 +6585,155 @@ mod tests {
                 .contains("lower region"),
             "{record}"
         );
+    }
+
+    /// #1897: a typed draft in a narrow pane shows only its tail above
+    /// the separator (head and `❯` scrolled off). It is still ours, at
+    /// 30, 42 and 80 columns: one Enter, never a retype, record noted.
+    #[test]
+    fn a_tail_only_draft_at_narrow_widths_is_submitted_from_the_lower_region() {
+        for width in [30usize, 42, 80] {
+            let lane = narrow_prompt();
+            let queue = TypedQueue::new(&format!("region-narrow-{width}"));
+            stranded_region_record(&queue, "lane", &lane);
+            let stuck = tail_only_screen(&lane, width, 5);
+            assert!(
+                composer_view("claude", &stuck).is_none(),
+                "width {width}: the premise: no composer reader recognises this screen:\n{stuck}"
+            );
+            let screen = RegionScreen::stuck_screen(stuck, submitted_screen(&lane));
+            let clock = Clock {
+                queue: Some(queue.0.clone()),
+                ..Clock::default()
+            };
+            let evidence = recover_typed_draft(&screen, "w1:p1", "claude", &queue.0, &clock)
+                .unwrap()
+                .unwrap_or_else(|| panic!("width {width}: the draft is ours and is submitted"));
+            assert!(
+                evidence.contains("lower region"),
+                "width {width}: {evidence}"
+            );
+            assert_eq!(screen.keys(), ["Enter"], "width {width}");
+            assert!(screen.pastes().is_empty(), "width {width}: never retyped");
+            assert!(
+                region_record(&queue, "lane")["draft_recovered_at"].is_number(),
+                "width {width}"
+            );
+        }
+    }
+
+    /// #1897: a foreign draft that shows only its tail at the same
+    /// widths gets no key at all.
+    #[test]
+    fn a_tail_only_foreign_draft_at_narrow_widths_gets_no_key() {
+        for width in [30usize, 42, 80] {
+            let lane = narrow_prompt();
+            let queue = TypedQueue::new(&format!("region-narrow-foreign-{width}"));
+            stranded_region_record(&queue, "lane", &lane);
+            let foreign = "a person's own long note about pruning old branches and archiving \
+                             the results so the next reader can find them without asking \
+                             anyone where they went or what they mean in practice today";
+            let screen = RegionScreen::stuck_screen(
+                tail_only_screen(foreign, width, 5),
+                submitted_screen(foreign),
+            );
+            let clock = Clock {
+                queue: Some(queue.0.clone()),
+                ..Clock::default()
+            };
+            let outcome = recover_typed_draft(&screen, "w1:p1", "claude", &queue.0, &clock);
+            assert!(matches!(outcome, Ok(None)), "width {width}: {outcome:?}");
+            assert!(screen.keys().is_empty(), "width {width}");
+            assert!(screen.pastes().is_empty(), "width {width}");
+        }
+    }
+
+    /// A pane whose composer parses while empty, then draws a fresh
+    /// paste only by its tail (#1897 fresh delivery).
+    struct NarrowScreen {
+        screen: std::sync::Mutex<String>,
+        stuck: String,
+        submitted: String,
+        keys: std::sync::Mutex<Vec<String>>,
+        pastes: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl NarrowScreen {
+        fn new(text: &str, width: usize) -> Self {
+            let rule = "─".repeat(width.max(10));
+            Self {
+                screen: std::sync::Mutex::new(format!(
+                    "● earlier output\n{rule}\n❯ \n{rule}\n  model · context left\n"
+                )),
+                stuck: tail_only_screen(text, width, 5),
+                submitted: submitted_screen(text),
+                keys: std::sync::Mutex::new(Vec::new()),
+                pastes: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl PromptTerminal for NarrowScreen {
+        fn read_screen(&self, _pane_id: &str) -> Result<String> {
+            Ok(self.screen.lock().expect("narrow screen").clone())
+        }
+
+        fn send_text(&self, _pane_id: &str, text: &str) -> Result<()> {
+            self.pastes
+                .lock()
+                .expect("narrow pastes")
+                .push(text.to_owned());
+            *self.screen.lock().expect("narrow screen") = self.stuck.clone();
+            Ok(())
+        }
+
+        fn send_keys(&self, _pane_id: &str, keys: &str) -> Result<()> {
+            self.keys.lock().expect("narrow keys").push(keys.to_owned());
+            if keys == "Enter" {
+                *self.screen.lock().expect("narrow screen") = self.submitted.clone();
+            }
+            Ok(())
+        }
+    }
+
+    /// #1897: a fresh paste that draws only by its tail in a narrow
+    /// pane is submitted in the same delivery (one verified Enter,
+    /// typed exactly once), not stranded after the stage window.
+    #[test]
+    fn a_fresh_paste_visible_only_by_its_tail_is_submitted_not_stranded() {
+        for width in [30usize, 42, 80] {
+            let text = narrow_prompt();
+            let screen = NarrowScreen::new(&text, width);
+            let clock = Clock::default();
+            let outcome = submit_verified(
+                &screen,
+                "w1:p1",
+                "claude",
+                &text,
+                in_lock_timeouts(),
+                &clock,
+            )
+            .unwrap();
+            let receipt = match outcome {
+                Submission::Verified(receipt) => receipt,
+                other => panic!("width {width}: expected Verified, got {other:?}"),
+            };
+            assert!(
+                receipt.evidence.contains("tail"),
+                "width {width}: {}",
+                receipt.evidence
+            );
+            assert_eq!(
+                *screen.keys.lock().unwrap(),
+                ["Enter"],
+                "width {width}: one verified Enter"
+            );
+            assert_eq!(
+                screen.pastes.lock().unwrap().len(),
+                1,
+                "width {width}: typed exactly once"
+            );
+        }
     }
 
     /// #1683 (the incident's shape): one sender's paste is stranded where
