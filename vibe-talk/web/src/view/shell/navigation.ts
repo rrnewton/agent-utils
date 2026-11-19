@@ -1250,9 +1250,20 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
    * it visible by landing in All. Both reuse the message-link jump and its Back level.
    */
   /** Highlight a just-opened thread's root: its first row, lit as a linked message is. */
-  async function highlightThreadRoot(channel: string): Promise<void> {
-    await waitForDeepLink(() => deps.visibleList().children.length > 0);
-    const first = deps.visibleList().children[0] as HTMLElement | undefined;
+  async function highlightThreadRoot(channel: string, notId?: string, side = false): Promise<void> {
+    // The side list is named outright: the column context does not survive an await.
+    const list = (): HTMLElement => {
+      if (!side) return deps.visibleList();
+      const thread = deps.leftEl("side-thread-list");
+      return thread && !thread.hidden && thread.children.length > 0 ? thread : deps.leftEl("side-list");
+    };
+    const firstRow = (): HTMLElement | undefined =>
+      ([...list().children] as HTMLElement[]).find((row) => row.getAttribute("data-id"));
+    await waitForDeepLink(() => {
+      const row = firstRow();
+      return Boolean(row) && (!notId || row!.getAttribute("data-id") !== notId);
+    });
+    const first = firstRow() || list().children[0] as HTMLElement | undefined;
     if (!first) return;
     const id = first.getAttribute("data-context-id") || deps.idsOf(first)[0];
     if (!id) return;
@@ -1273,9 +1284,15 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
         linkJumps.take(jump);
         scheduleBackSync();
         try {
+          const beforeRow = deps.inColumn(deps.sideColumn(), () => {
+            const thread = deps.leftEl("side-thread-list");
+            const list = thread && !thread.hidden ? thread : deps.leftEl("side-list");
+            return ([...list.children] as HTMLElement[])
+              .find((row) => row.getAttribute("data-id"))?.getAttribute("data-id") || undefined;
+          });
           arriveAtPlace({ screen: "main", channel: ref.channel, layout: "two", view: null, thread: null, origin: null, side: ref.thread });
           deps.setStatus("Here is the linked thread.");
-          await deps.inColumn(deps.sideColumn(), () => highlightThreadRoot(ref.channel));
+          await highlightThreadRoot(ref.channel, beforeRow, true);
         } finally {
           if (jump.landed === null && linkJumps.holds(jump)) {
             jump.landed = screenLevelsNow();
