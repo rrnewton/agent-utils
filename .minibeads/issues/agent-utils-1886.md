@@ -30,3 +30,5 @@ Part A (landed first, on its own): transcript threads, including the daily root 
 # Notes
 
 [watermelon-full-preview] 2026-11-18. Part B/C and addendum-1 follow as separate changes after part A lands.
+
+[watermelon-full-preview] 2026-11-19. Part A LANDED as 7d94969e on main (gated 571f4d1b; flake waiver on typing-scroll-browser and screenshots-desks, both load/timing failures on untouched steps, each passed its exclusive rerun). Root cause of the fresh daily root in Main after a reload: the timeline route already excluded classed messages, but the live hub/streams published transcript messages unchecked and the page folded and saved them unchecked; all three now keep transcript threads — root included — out of Main, All, two-column and thread views, unread counts, the jump offer and the call relay. Remaining open: part B (newest-first windowed Transcripts view with follow and demand-loaded older pages), part C (vestigial interleaved sent-chat entries, expandable), and the addendum-1 read-path work (cache-only transcript/older reads, view-switch abort, Cmd-2 from Transcripts), as separate changes.
