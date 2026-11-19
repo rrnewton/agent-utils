@@ -1,12 +1,12 @@
 ---
 title: 'agentctl-rename-keep-alias: keep the old name resolving after a rename'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
 - agentctl
 created_at: 2026-11-17T10:55:29-05:00
-updated_at: 2026-11-17T10:55:29-05:00
+updated_at: 2026-11-18T22:31:20-05:00
 ---
 
 # Description
@@ -101,3 +101,19 @@ team@host and resolves the designation by token through
 `agentctl coordinator show`, so it is unaffected by a rename except
 where a declaration pins a bare coordinator name; that pin is dropped
 at coordinator handover, not by rename.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as
+047d1fe5b5fa531765bc269538439ead57325c7d. `agentctl rename OLD NEW
+--keep-alias DURATION` writes `REGISTRY/aliases/<old>.json` inside the
+rename journal in both editions; resolution sits at the shared load
+point (same token required, one stderr note, JSON alias field, expiry
+pruned lazily, registration of OLD refused while live, chained
+renames re-pointed, restore accepting an aliased coordinator).
+`agentctl alias list|rm` included. Tests: Rust identity/control
+(alias, chained, crash, restore cases), Python identity mirrors, and
+the cross-edition `rename-alias` differential group (315 paired
+checks). Reader skew probed with a pre-change build: older builds
+ignore `aliases/` and unaliased resolution is unchanged. The gate
+passed on the rebased tree (240b1795) with no overlap flags.
