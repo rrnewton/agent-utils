@@ -3592,6 +3592,14 @@ test("`#548 cloud-read-failures`: no speech within a few seconds stops a cloud r
   await page.settle();
   page.expireTimers(limit);
   await page.settle();
+  // `#1872 vibe-talk-read-no-audio-retry`: the first silence is tried once more at
+  // the same segment, on a fresh ticket, before the read gives up.
+  assert.equal(page.el("error").textContent, "", "a first silence was not retried before giving up");
+  assert.equal(rowState(page, 1).reading, "true", "the retry is not reading");
+  page.audioStreams.at(-1).controller.bytes(joined(wavHeader(24000, 1), silentPcm(2400)));
+  await page.settle();
+  page.expireTimers(limit);
+  await page.settle();
   assert.match(page.el("error").textContent, /^Cloud voice isn't producing audio: no speech came within 4 seconds of its first audio/);
   assert.equal(rowState(page, 1).reading, "false");
   assert.deepEqual(page.speechFailureCalls.map((call) => call.failure.reason), ["no_audio"]);
@@ -3797,7 +3805,17 @@ test("a streamed read that ENDS PART-WAY through a sample did not arrive whole, 
       assert.deepEqual(page.dismissCalls, [{ messages: ["1000000000000000001"] }], `${ending} was not archived`);
       continue;
     }
-    assert.equal(page.audio.sources[0].halted, true, `${ending} played on`);
+    // `#1872 vibe-talk-read-no-audio-retry`: a truncated body is tried once more at
+    // the same segment first; only the second truncated body gives up.
+    assert.equal(page.audioStreams.length, 2, `${ending} was not retried`);
+    assert.doesNotMatch(page.el("status").textContent, /could not play/, `${ending} gave up on the first try`);
+    page.audioStreams.at(-1).controller.bytes(joined(wavHeader(24000, channels), samples));
+    await page.settle();
+    page.audioStreams.at(-1).controller.drop();
+    await page.settle();
+    for (const source of page.audio.sources) source.onended();
+    await page.settle();
+    assert.equal(page.audio.sources.at(-1).halted, true, `${ending} played on`);
     assert.match(page.el("status").textContent, /Cloud voice: it could not play this message\./, `${ending} passed as a clean end`);
     assert.equal(rowState(page, 0).reading, "false", `${ending} left the row looking like it is speaking`);
     assert.deepEqual(page.dismissCalls, [], `${ending} was archived as heard`);
