@@ -630,6 +630,29 @@ npm ci --prefix $VIBE_TALK_DIR/contract and re-run."
 That binary is the offline ElevenLabs substitute, and the summary states cannot be photographed
 without it: summaries come from a conversation with an agent and from nothing else."
 
+    # `#1863`: every shot folder says what it shows. BUILD.txt names the commit the server
+    # was built from and the page bundle's own build id (the "This page is build NNN" the
+    # page reports), so a stale-build shot set is visible from the folder alone.
+    mkdir -p "$SHOTS_OUT"
+    SHOTS_HEAD="$(git -C "$VIBE_TALK_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+    SHOTS_HEAD_DATE="$(git -C "$VIBE_TALK_DIR" log -1 --format=%cI HEAD 2>/dev/null || echo unknown)"
+    SHOTS_PAGE_BUILD="$(python3 - "$VIBE_TALK_DIR/target/release/build" <<'PY'
+import glob
+import json
+import os
+import sys
+
+manifests = glob.glob(sys.argv[1] + "/vibe-talk-*/out/web/assets.json")
+newest = max(manifests, key=os.path.getmtime) if manifests else ""
+print(json.load(open(newest))["page_build"] if newest else "unknown")
+PY
+)"
+    {
+        printf 'commit %s\n' "$SHOTS_HEAD"
+        printf 'commit-date %s\n' "$SHOTS_HEAD_DATE"
+        printf 'page-build %s\n' "$SHOTS_PAGE_BUILD"
+    } > "$SHOTS_OUT/BUILD.txt"
+
     step "Starting the offline ElevenLabs mock"
     # BEFORE the server, so the server's own configuration points at something that is already
     # listening. It costs nothing either way -- vibe-talk opens no vendor connection at startup --
