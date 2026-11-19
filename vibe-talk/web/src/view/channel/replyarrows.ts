@@ -157,6 +157,16 @@ export function createReplyArrows(deps: ReplyArrowsDependencies): ReplyArrows {
   /** How many older pages one tap on a reply's arrow may read, looking for what the reply answers. */
   const REPLY_JUMP_PAGES = 5;
 
+  /**
+   * How many no-progress steps back one walk waits out (`#1911`): since
+   * `#1886` a step back the server's copy cannot prove is answered with an
+   * empty page at the same cursor while the provider read fills the cache in
+   * the background, so a step that moved nothing proves nothing about where
+   * the message is and must not spend one of the walk's pages. Bounded, like
+   * the pages: a target the fill never brings is still given up on.
+   */
+  const REPLY_JUMP_STALLS = 10;
+
   /** How long the row a jump lands on stays lit: long enough to find, gone before it is clutter. */
   const REPLY_LANDED_MS = 2000;
 
@@ -585,11 +595,13 @@ export function createReplyArrows(deps: ReplyArrowsDependencies): ReplyArrows {
         }
       }
       let walked = 0;
+      let stalls = 0;
       // Main drawn from All takes its first step from its own read (`walkCursorOwed`, `#220`).
-      while (walked < REPLY_JUMP_PAGES && deps.olderPages().moreAbove === true && (deps.olderPages().cursor || deps.walkCursorOwed())) {
-        walked += 1;
+      while (deps.olderPages().moreAbove === true && (deps.olderPages().cursor || deps.walkCursorOwed())) {
+        if (walked >= REPLY_JUMP_PAGES) break;
+        const cursorBefore = deps.olderPages().cursor;
         const context = deps.channelContextKey();
-        deps.setStatus(`Looking further back: page ${walked} of ${REPLY_JUMP_PAGES}…`);
+        deps.setStatus(`Looking further back: page ${walked + 1} of ${REPLY_JUMP_PAGES}…`);
         try {
           const step = deps.loadOlder();
           steps.pause();
@@ -605,6 +617,21 @@ export function createReplyArrows(deps: ReplyArrowsDependencies): ReplyArrows {
         // Another tap, another channel or another view: this walk is nobody's any more.
         if (ticket !== replyJumpTicket.current() || context !== deps.channelContextKey()) return;
         if (arrive() || hiddenAsRead()) return;
+        // `#1911`: only a step that moved the cursor is one of the walk's
+        // pages. A step at the same cursor is the server's copy answering
+        // while its background fill runs (`#1886`): wait for the fill and
+        // step again there, a bounded number of times.
+        if (String(deps.olderPages().cursor) !== String(cursorBefore)) {
+          walked += 1;
+          stalls = 0;
+        } else {
+          stalls += 1;
+          if (stalls > REPLY_JUMP_STALLS) break;
+          // Step again at once: the step just taken was itself a full read,
+          // whose own wait on the provider is what paces the retry — no
+          // clock of this page's is waited on here.
+          if (ticket !== replyJumpTicket.current() || context !== deps.channelContextKey()) return;
+        }
       }
       if (deps.readHiding() && !deps.threading()) {
         deps.setStatus("Not in this list — Hide read is on.");

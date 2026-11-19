@@ -23,6 +23,12 @@ panel, the jump — is the shipped page. At 412x915 and 1280x800:
   timeline's earlier-summary citation, also without the stamp, tapped from
   inside its collapsed summary: the same same-window landing on its message.
 
+The timeline target stands two pages back, and its walk is first answered as
+the server's copy answers a slow step back since `#1886`: six empty pages at
+the same cursor while the background fill runs. A walk that counted those as
+pages would give up before the real page arrives (`#1911`); this one must
+wait them out and still land, fast, visible and marked.
+
 Condition waits only (owner rule 346). Pass --screenshots DIR to keep PNGs.
 """
 
@@ -122,8 +128,25 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
         body["discuss_available"] = True
         route.fulfill(status=200, content_type="application/json", body=json.dumps(body))
 
+    # Older reads the walk makes, answered at first as the server's copy
+    # answers a slow step back (`#1886`): empty, more above, same cursor.
+    stalls = {"left": 0}
+
+    def older_page(route: Route) -> None:
+        from urllib.parse import parse_qs, urlsplit
+        before = (parse_qs(urlsplit(route.request.url).query).get("before") or [""])[0]
+        if before and stalls["left"] > 0:
+            stalls["left"] -= 1
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({
+                "channel": {"id": CHANNEL, "label": "lead team"},
+                "messages": [], "has_more": True, "next_before": before,
+            }))
+            return
+        route.continue_()
+
     popups: list[str] = []
     page.context.on("page", lambda new_page: popups.append(new_page.url))
+    page.route(f"**/api/v1/channels/{CHANNEL}/page*", older_page)
     page.route("**/api/v1/client-config", client_config)
     page.route(f"**/api/v1/channels/{CHANNEL}/catchup/preview*", preview)
     page.route(f"**/api/v1/channels/{CHANNEL}/catchup/record*", record)
@@ -151,7 +174,7 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
     # Both targets stand outside the loaded window (one and two pages back);
     # the fake upstream's ids are contiguous, as its seeded rows show.
     targets["answer"] = str(int(loaded[0]) - 10)
-    targets["timeline"] = str(int(loaded[0]) - 20)
+    targets["timeline"] = str(int(loaded[0]) - 70)
     check(targets["answer"] not in loaded and targets["timeline"] not in loaded,
           f"{label}: fixture targets are already loaded: {targets} in {loaded[:3]}…")
 
@@ -197,7 +220,11 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
             page.screenshot(path=str(shots / f"{label}-{what}.png"))
 
     click_and_land("#discuss-answer a", targets["answer"], "answer-citation")
+    # The timeline walk first meets six server-copy stalls (see the head of
+    # this file): it must wait them out, not spend its pages on them.
+    stalls["left"] = 6
     click_and_land("#discuss-timeline a", targets["timeline"], "timeline-citation")
+    check(stalls["left"] == 0, f"{label}: the stall fixture was never exercised: {stalls}")
     print(f"discuss link ({label}): same-window landings passed, no new window")
 
 

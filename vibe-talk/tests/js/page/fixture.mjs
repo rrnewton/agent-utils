@@ -5893,6 +5893,12 @@ const TUNING_BANDS = {
     "and a question asked shortly before the newest page is out of reach of the control made for " +
     "it; past about ten, a tap on a reply to a deleted message reads hundreds of messages on a " +
     "walk that cannot succeed while the reader waits"],
+  // `#1911 vibe-talk-discuss-message-link-opens-new-window`: server-copy answers at the same cursor.
+  REPLY_JUMP_STALLS: [3, 30,
+    "no-progress steps back one walk waits out before giving up: a step the server's copy answered " +
+    "at the same cursor while its background fill runs. Fewer than three and a slow provider's first " +
+    "fill is outwaited only sometimes; past about thirty the reader waits on dozens of reads for a " +
+    "message that may never come"],
   // `#243 filter-keeps-selection`: a filter turned off over a message older than anything loaded.
   FILTER_WALK_PAGES: [3, 20,
     "older pages a filter change may read to put back the message it is keeping, an old pin chosen " +
