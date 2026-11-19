@@ -1,12 +1,13 @@
 ---
 title: 'agentctl-services-repair-watch-first-pass-health: repair watch fails turnover health on a large registry'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
 - agentctl
 created_at: 2026-11-19T04:44:01-05:00
-updated_at: 2026-11-19T04:44:01-05:00
+updated_at: 2026-11-19T05:07:50-05:00
+closed_at: 2026-11-19T05:07:50-05:00
 ---
 
 # Description
@@ -61,3 +62,25 @@ progress proof, and whichever lands second rebases over the other),
 Services and both watch daemons are Rust-only, so there is no
 Python mirror. The new persisted file was reported to the
 coordinator before gating, as reader-skew rules require.
+
+## Resolution
+
+[watermelon-full-preview] `health_timeout` now scales for kind
+`watch` as well as `watch-agents` (pass budget, or interval for
+`watch`, + 60 s + soak, fallback 120 s), kept as a minimal hunk for
+the #1890 rebase. Both watch daemons write the standalone
+`pass-progress.json` (`agentctl-watch-progress/v1`:
+`pass_started_at`, `heartbeat_at`) in their state directory at pass
+start, with the heartbeat advancing every 5 s; services health
+accepts it only when the pass began after the restart, the
+heartbeat is fresh, and it has advanced at least twice across
+probes, with the usual soak and same-process checks. The
+completed-pass proof is unchanged when no progress file exists. A
+crash, a pass that never begins, and a frozen heartbeat still fail
+health and restore the old binary. Tests: a 600 s first pass over a
+4000-record fake registry refreshes both watch kinds at a 120 s
+timeout (rolled back before the fix), the interval-scaled window
+completes a 140 s pass with no progress file, and never-begins /
+frozen-heartbeat cases still roll back; the daemon progress file
+and its advancing heartbeat are unit-tested. Unverified live: no
+real turnover on a large registry has run this build yet.
