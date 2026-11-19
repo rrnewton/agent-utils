@@ -268,13 +268,17 @@ pub(crate) fn recover_main(
             "--legacy-validate-checkout requires --completed-record and --repository".to_string(),
         );
     }
+    // --recovery-note alone is not a cleanup flag (#1923): on a
+    // journal-driven recover the recorded journal already carries its
+    // authorization, so the note is accepted and not persisted. It only
+    // acts as cleanup evidence when a target flag starts a new cleanup;
+    // the legacy/frozen combinations above still refuse it explicitly.
     let requested_ownerless = legacy_requested
         || ownerless_validate_checkout.is_some()
         || ownerless_validate_cargo_home.is_some()
         || frozen_validate_checkout.is_some()
         || completed_record.is_some()
         || repository.is_some()
-        || recovery_note.is_some()
         || validation_proof_manifest.is_some();
     if slot.is_some() && requested_ownerless {
         return Err(

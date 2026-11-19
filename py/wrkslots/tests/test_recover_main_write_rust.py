@@ -128,6 +128,20 @@ def test_recover_flag_combinations_match_python(tmp_path: Path) -> None:
     assert "legacy and ownerless validation path flags cannot be combined" in legacy.stderr
 
 
+def test_recover_note_alone_is_not_a_cleanup_flag(tmp_path: Path) -> None:
+    # #1923: a note on a journal-driven recover is accepted in both
+    # editions; with no journal it is not misread as a new cleanup.
+    rust_root = _fixture(tmp_path / "rust")
+    oracle_root = _fixture(tmp_path / "oracle")
+    with pytest.raises(Exception) as caught:
+        _python(oracle_root, slot="s1", recovery_note="owners are dead")
+    assert "no interrupted mutation is recorded" in str(caught.value)
+    result = _run(rust_root, ["--slot", "s1", "--recovery-note", "owners are dead"])
+    assert result.returncode == 1
+    assert "no interrupted mutation is recorded" in result.stderr
+    assert "cannot be combined" not in result.stderr
+
+
 def test_recover_ownerless_with_journal_recorded_matches_python(
     tmp_path: Path,
 ) -> None:

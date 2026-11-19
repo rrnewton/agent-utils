@@ -63332,6 +63332,7 @@ def _rollback_path_fence(
     vcs: _GitVcs,
     *,
     journal_path: Path,
+    retain_journal: bool = False,
 ) -> None:
     # A rollback interrupted partway would leave the removal for 'wrkslots
     # recover', so a remove-agent-batch item budget does not bound it.
@@ -63374,7 +63375,8 @@ def _rollback_path_fence(
         # returned to its canonical path for inspection.
         _repair_registration_at_slot(config, record, checkout, original, vcs)
     _remove_fenced_directory(config, fenced)
-    _clear_journal(config, journal, journal_path=journal_path)
+    if not retain_journal:
+        _clear_journal(config, journal, journal_path=journal_path)
 
 
 def _git_registers_checkout(
@@ -64383,25 +64385,53 @@ def _finish_remove_paths(
     elif private_fence_identity is not None:
         assert finish.private_cleanup is not None
         fresh_census = finish.private_cleanup.fresh_census
-        if fresh_census is None:
-            # Interrupted-operation recovery still establishes this snapshot
-            # while holding the recovery lock. Ordinary removal supplies the
-            # post-fence census captured outside mutation locks.
-            finish.private_cleanup.same_uid_census_performed = True
-            fresh_census = _capture_same_uid_process_path_census(
-                (fenced_slot,),
-                budget=finish.private_cleanup.census_budget,
+        census_captured_here = fresh_census is None
+        try:
+            if census_captured_here:
+                # Interrupted-operation recovery still establishes this snapshot
+                # while holding the recovery lock. Ordinary removal supplies the
+                # post-fence census captured outside mutation locks.
+                finish.private_cleanup.same_uid_census_performed = True
+                fresh_census = _capture_same_uid_process_path_census(
+                    (fenced_slot,),
+                    budget=finish.private_cleanup.census_budget,
+                )
+            assert fresh_census is not None
+            fresh_census.assert_slot_unused(
+                fenced_slot,
+                use_check_record,
+                ignore_invoking_ancestry=(
+                    finish.allow_live_validate_owner
+                    and record.slot_type == "validate"
+                ),
             )
-        fresh_census.assert_slot_unused(
-            fenced_slot,
-            use_check_record,
-            ignore_invoking_ancestry=(
-                finish.allow_live_validate_owner
-                and record.slot_type == "validate"
-            ),
-        )
-        # Do not begin destructive work after the batch evidence deadline.
-        finish.private_cleanup.census_budget.remaining_seconds()
+            # Do not begin destructive work after the batch evidence deadline.
+            finish.private_cleanup.census_budget.remaining_seconds()
+        except Refusal as exc:
+            if census_captured_here and not removed:
+                # The late pre-deletion census (#1923): a refusal here must
+                # not leave the slot fenced behind its seal. Roll the fence
+                # back exactly as the earlier recovery census does, but
+                # retain the finish journal (phase=prepared, written by the
+                # rollback) and the seal, so a later recover retry can
+                # re-fence and finish once the census closes. Ordinary
+                # removal, which supplies its census, keeps its own
+                # caller-side rollback.
+                try:
+                    _rollback_path_fence(
+                        config,
+                        record,
+                        journal,
+                        vcs,
+                        journal_path=journal_path,
+                        retain_journal=True,
+                    )
+                except (Refusal, StateError) as rollback:
+                    raise Refusal(
+                        f"{exc}; path-fence rollback failed: {rollback}; "
+                        "run 'wrkslots recover'"
+                    ) from rollback
+            raise
     present: list[Checkout] = []
     missing_after_remove: list[Checkout] = []
     abandoned_after_remove: list[Checkout] = []
@@ -95735,7 +95765,6 @@ def _cmd_recover(
                 "frozen_validate_checkout",
                 "completed_record",
                 "repository",
-                "recovery_note",
                 "validation_proof_manifest",
             )
         )
@@ -95835,6 +95864,11 @@ def _cmd_recover(
                     "--legacy-validate-checkout requires --completed-record and --repository"
                 )
             args.ownerless_validate_checkout = args.legacy_validate_checkout
+        # --recovery-note alone is not a cleanup flag (#1923): on a
+        # journal-driven recover the recorded journal already carries its
+        # authorization, so the note is accepted and not persisted. It
+        # only acts as cleanup evidence when a target flag below starts a
+        # new ownerless cleanup.
         requested_ownerless = any(
             value is not None
             for value in (
@@ -95843,7 +95877,6 @@ def _cmd_recover(
                 args.frozen_validate_checkout,
                 args.completed_record,
                 args.repository,
-                args.recovery_note,
                 getattr(args, "validation_proof_manifest", None),
             )
         )
@@ -100232,7 +100265,10 @@ usage or audit gate unknown, 3 fail-closed refusal.
         metavar="TEXT",
         help=(
             "why no retained run record exists; the tool still independently proves "
-            "path identity, no authored work, and no live use"
+            "path identity, no authored work, and no live use. On a journal-driven "
+            "recover (with --slot or a recorded journal, and no cleanup target flag) "
+            "the note is accepted and not recorded: the journal already carries "
+            "its authorization"
         ),
     )
     create_recovery = recover.add_mutually_exclusive_group()

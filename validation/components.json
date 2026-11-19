@@ -504,6 +504,7 @@
         "py/wrkslots/tests/test_recover_batch_text_rust.py",
         "py/wrkslots/tests/test_recover_cache_write_rust.py",
         "py/wrkslots/tests/test_recover_clone_write_rust.py",
+        "py/wrkslots/tests/test_recover_late_census_rollback.py",
         "py/wrkslots/tests/test_recover_main_write_rust.py",
         "py/wrkslots/tests/test_recover_ownerless_write_rust.py",
         "py/wrkslots/tests/test_recover_parent_death.py",
