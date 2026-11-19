@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-search-late-hits-shift-anchor: late server hits inserted above the reader hold the anchor in place'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -8,7 +8,8 @@ labels:
 - search
 - ui
 created_at: 2026-11-19T04:48:00-05:00
-updated_at: 2026-11-19T04:48:00-05:00
+updated_at: 2026-11-19T09:10:00-05:00
+closed_at: 2026-11-19T09:10:00-05:00
 ---
 
 # Description
@@ -34,3 +35,7 @@ updated_at: 2026-11-19T04:48:00-05:00
 # Notes
 
 Lane mu-hitsanchor on branch mu-hitsanchor/1901. Coordinates with #1894 (mu-labelsdrop, whose late-round stub overlay reproduces this) and #1880's scroll owner; reuse its hold, never a second input tracker.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as de9931f9 (e9d687c3 + de9931f9, replayed from gated defe5e32 on f404b565). `renderServerSearch` in `vibe-talk/web/src/view/channel/olderwalks.ts` now places server hits inside the #1880 scroll owner's existing `preservingScroll` hold, and re-marks the placed cards after it (the hold's scroll pass can unmark a card that holds no loaded search text; caught by page-3 `#1797`). Evidence, shot from landed main de9931f9 with harness-format BUILD.txt in /tmp/mu-hitsanchor-main (sidecars rect-top-landed.txt and rect-top-prefix.txt): anchor `rect.top` delta 0.1 px on both late paths (gated second page and Search-further-back grow), phone 412x915 and desktop 1280x800, light and dark, against +105.9 / +286.9,+287.9 px on pre-fix e4a54be6. Gate: full owner gate 177 passed / 1 failed on defe5e32, the sole red `reload-place-browser` (passes solo on both defe5e32 and pristine f404b565; the known race under load), whose one exclusive rerun passed; land-main recorded that flake waiver. Earlier gate on the same change (fa17297e) was 177/1 with sole red `thread-reader-follow-browser`, since disabled on main by #1903 f404b565.
