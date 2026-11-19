@@ -146,6 +146,8 @@ class FakeApi:
                     thread(NOTES, ROOT, None, False)),
             message(7, "209", f"Seventh note: the notes stay in the thread. {BODY} {BODY} {BODY}",
                     "human", thread(NOTES, ROOT, None, False)),
+            message(30, "211", "Short reply, one block only. It is read in one breath.",
+                    "me", thread(NOTES, ROOT, None, False)),
             message(6, "200", "Is the release lane green yet?", "human", thread(lone("200"), "200", 1)),
             message(7, "201", "Not yet, the integration shard is retrying.", "coder",
                     thread(lone("200"), "200", None, False)),
@@ -239,6 +241,8 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
                     if str(one) == ANCHOR:
                         entry["blocks"] = [{"kind": "paragraph", "spoken": True,
                                             "chars": len(text)} for text in PARAGRAPHS]
+                    if str(one) == "211":
+                        entry["blocks"] = [{"kind": "paragraph", "spoken": True, "chars": 48}]
                     prepared.append(entry)
                 self.json(200, {"prepared": prepared, "expires_in_seconds": 600})
             elif path.endswith("/dismiss"):
@@ -272,7 +276,11 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
                 total = int(seconds * rate)
                 per = rate * 50 // 1000
                 pitch = 300 + 40 * (int(block) if block and block.isdigit() else 0)
-                began = time.monotonic()
+                # The whole block at once, not at speaking pace: under gate load a
+                # paced server starves with the browsers it serves, and the read's
+                # advance then waits on this check's own writes. The browser still
+                # plays the second of audio in real time, so blocks advance on the
+                # audio clock, a condition, not on this server's timers.
                 sent = 0
                 while sent < total and not api.stopping.is_set():
                     count = min(per, total - sent)
@@ -280,9 +288,6 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
                         int(6000 * math.sin(2 * math.pi * pitch * (sent + i) / rate))
                         for i in range(count))))
                     sent += count
-                    delay = began + sent / rate - time.monotonic()
-                    if delay > 0:
-                        time.sleep(delay)
                 self.wfile.write(b"0\r\n\r\n")
                 self.wfile.flush()
             except OSError:
@@ -351,16 +356,23 @@ PLACE_JS = """(arg) => {
 TOP_JS = "() => document.getElementById('scroll-area').scrollTop"
 # `#1866`: the lit sentence against the reader strip: an intersection while reading.
 COVER_JS = """() => {
-  const strip = document.getElementById('read-steer');
-  if (!strip || strip.hidden) return null;
-  const s = strip.getBoundingClientRect();
-  if (s.height <= 0) return null;
+  // `#1866` x `#1862`: neither the reader strip (full, or React-only) nor the reading
+  // notice may stand over the lit sentence.
+  const covers = ['read-steer', 'status-line'].map((id) => document.getElementById(id))
+    .filter((el) => el && !el.hidden && el.getBoundingClientRect().height > 0);
+  if (covers.length === 0) return null;
   try {
     const ranges = CSS.highlights && CSS.highlights.get('read-aloud-sentence');
     if (!ranges) return null;
     for (const range of ranges) {
       const r = range.getBoundingClientRect();
-      if (r.height > 0 && r.bottom > s.top && r.top < s.bottom) return {sentence: [r.top, r.bottom], strip: [s.top, s.bottom]};
+      if (r.height <= 0) continue;
+      for (const cover of covers) {
+        const s = cover.getBoundingClientRect();
+        if (r.bottom > s.top && r.top < s.bottom) {
+          return {cover: cover.id, sentence: [r.top, r.bottom], strip: [s.top, s.bottom]};
+        }
+      }
     }
   } catch (e) {}
   return null;
@@ -526,7 +538,38 @@ def reader_follow_walk(walk: Walk, api: FakeApi) -> None:
                       f"and never moved up across live repaints")
     walk.shot("2-thread-following")
 
+    # A one-block read: the strip is React-only (`#1862`), and neither it nor the
+    # reading notice may cover the lit sentence either.
+    walk.settled()
+    page.evaluate("() => { const row = document.querySelector('#discord-log > li[data-id=\"211\"]'); if (row) row.scrollIntoView({block: 'center'}); }")
+    walk.settled()
+    walk.tap_row("211")
+    walk.wait_for("() => !!document.querySelector('#discord-log > li[data-id=\"211\"][data-reading=\"true\"]')",
+                  "the one-block read did not start")
+    react_hits: list[object] = []
+    react_deadline = time.monotonic() + 6
+    saw_react_only = False
+    while time.monotonic() < react_deadline:
+        saw_react_only = saw_react_only or bool(page.evaluate(
+            "() => { const strip = document.getElementById('read-steer');"
+            " return !!strip && !strip.hidden && strip.hasAttribute('data-react-only'); }"))
+        hit = page.evaluate(COVER_JS)
+        if hit is not None:
+            react_hits.append(hit)
+        page.wait_for_timeout(25)
+    walk.check(saw_react_only, "the one-block read never showed the React-only strip")
+    walk.check(not react_hits,
+               f"the React-only strip or the notice covered the lit sentence: {react_hits[:2]}")
+    walk.notes.append("a one-block read's React-only strip and the notice stayed clear of the sentence")
+    walk.shot("5-react-only")
+
     # Scroll the read message fully off screen: the Reading chip rises; tap it to return.
+    if not page.evaluate(f"() => !!document.querySelector('#discord-log > li[data-id=\"{ANCHOR}\"][data-reading=\"true\"]')"):
+        page.evaluate(f"() => {{ const row = document.querySelector('#discord-log > li[data-id=\"{ANCHOR}\"]'); if (row) row.scrollIntoView({{block: 'center'}}); }}")
+        walk.settled()
+        walk.tap_row(ANCHOR)
+        walk.wait_for(f"() => !!document.querySelector('#discord-log > li[data-id=\"{ANCHOR}\"][data-reading=\"true\"]')",
+                      "the long read did not restart for the chip phase")
     page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; }")
     walk.wait_for(ROW_OFF_SCREEN_JS, "the read message could not be scrolled off screen")
     walk.wait_for("() => !document.getElementById('jump-reading').hidden",
