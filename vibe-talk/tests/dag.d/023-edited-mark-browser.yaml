@@ -1,0 +1,19 @@
+steps:
+  - group: check
+    job: edited-mark-browser
+    desc: the edited mark laid out in current Chromium at 412x915 and 360x800 Android viewports and a 1280x800 desk
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/edited_mark_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 240
+    cpu_timeout: 30
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 5
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#427 server-thread-hues` in the browser engine: two browser contexts — two devices — each
+  # remembering the same six threads in different colours, both drawn in the colours the first
+  # device offered the server and the server took, and a reload of the second drawing them still.

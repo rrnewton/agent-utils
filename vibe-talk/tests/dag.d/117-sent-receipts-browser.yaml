@@ -1,0 +1,19 @@
+steps:
+  - group: check
+    job: sent-receipts-browser
+    desc: the Sent receipts of thread replies sent from the Threads view go once shown, are never saved, and a reload draws none, in current Chromium at 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/sent_receipts_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 20
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#1606 message-rerender-loses-formatting` in the browser engine at 390px and on a
+  # desk: a block post re-read from history draws with its bullets on separate lines and
+  # GH #329 as a link label, as its first (live) render did.

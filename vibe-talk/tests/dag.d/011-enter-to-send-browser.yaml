@@ -1,0 +1,21 @@
+steps:
+  - group: check
+    job: enter-to-send-browser
+    desc: Enter in the reply box sends by default and is a new line with Enter to send off, in current Chromium
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/enter_to_send_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 240
+    cpu_timeout: 30
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 3
+      classification: latency-bound
+      rss_baseline_bytes: 536870912
+
+  # `ios-keyboard-send` at an iPhone's size: every sending box's return key and input mode for the
+  # setting, a real Enter sending from the reply box, and the Send at the simulated keyboard's top
+  # while the row's own Send is outside the visible part. Chromium here, as its neighbours run;
+  # `--browser webkit` on a host with that browser installed runs the iOS engine, and a missing
+  # WebKit there skips with its reason rather than failing.

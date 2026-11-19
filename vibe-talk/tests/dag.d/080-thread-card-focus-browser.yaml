@@ -1,0 +1,23 @@
+steps:
+  - group: check
+    job: thread-card-focus-browser
+    desc: one thread card highlighted and shown whole, every other card's edge and link grey by computed colour and by pixels, its replies button and -> entering it, <- and Esc coming back, in current Chromium at 1280x800 and 412x915
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/thread_card_focus_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 5
+
+  # `#296 copy-highlighted-message` in the browser engine, the keys pressed through CDP and the clipboard
+  # read back with `clipboard-read` granted, a sentinel on it before every press: at 1280x800 with Ctrl,
+  # nothing highlighted copies nothing; Ctrl+C on the folded long question copies all of it as written,
+  # with a text/html flavour, says "Copied message." and moves nothing; in the message box it copies the
+  # box's selection, nothing with the caret alone, and y is typed; words of the question selected, those;
+  # y copies the message; a card of the thread list its first message; then, in a tab emulating a Mac,
+  # Cmd+C with the Edit menu's "copy" command and without it; and at 412x915 with a hardware keyboard, a
+  # tap's silent selection copies nothing while j's highlight copies by Ctrl+C and y. Measured on
+  # 2026-10-14: about 8s wall.

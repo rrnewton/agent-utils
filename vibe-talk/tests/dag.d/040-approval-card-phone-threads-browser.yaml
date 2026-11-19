@@ -1,0 +1,16 @@
+steps:
+  - group: check
+    job: approval-card-phone-threads-browser
+    desc: docked under the thread list through the view keys, arriving there and back from it with the channel's reader where they were, a draft arriving while Settings or Help was up, the reader kept at the foot as the box takes back its room after Send, and a reader of a draft opened by More kept on it, at 393x852, in current Chromium
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/approval_card_browser.py --part phone-threads
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 800
+    cpu_timeout: 100
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 90
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+

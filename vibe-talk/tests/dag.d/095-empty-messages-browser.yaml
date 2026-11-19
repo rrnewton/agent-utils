@@ -1,0 +1,29 @@
+steps:
+  - group: check
+    job: empty-messages-browser
+    desc: empty messages drawn nowhere and counted nowhere while the Settings switch is on, by default, and drawn again when it is off, kept across a reload, a file alone and a reaction alone still drawn, in current Chromium at 1280x800 and 393x852 in both schemes
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/empty_messages_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    # Failure bounds, not a performance verdict (#1250): solo under dagrun accounting this takes
+    # 13.8 s CPU / 16.0 s wall, so keep over five times that CPU headroom under hot-host load.
+    timeout: 480
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 20
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#299 all-thread-strip` in the browser engine, at 1280x800 with a mouse and at 412x915 by touch, in the
+  # dark scheme and the light, in All: a strip on every row of an answered thread and on no other row (not
+  # a message in no thread, not a root nobody has answered), its bar at least 5px (6px) and four times the
+  # row's border, its hit box 16px (22px) wide and the row's full height, in its Thread(N)'s colour by
+  # computed colour and by pixels, a read reply's too; every row's words at one inset, strip or none; a
+  # resting mouse widening it, the keys ringing it; a click on a strip: no scroll, no row moved by a pixel,
+  # still All, the rest at 0.3 and drained with grey strips by pixels, the thread's own at full strength; a
+  # live reply of the thread arriving in it and a live message of no thread dimmed; a second click, Esc,
+  # another strip and t; Thread(N) and Back keeping the selection; a live first reply giving its root a
+  # strip with its words unmoved; on the phone a tap selecting and a finger drawn sideways from a strip
+  # archiving nothing. Measured on 2026-10-14: about 20s wall.

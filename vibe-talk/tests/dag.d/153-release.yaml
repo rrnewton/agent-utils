@@ -1,0 +1,17 @@
+steps:
+  - group: build
+    job: release
+    desc: the release binary the server-shaped suites run against
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && ../scripts/with-node22 cargo build --release --locked
+    jobs_flag: ""
+    jobs_env: CARGO_BUILD_JOBS
+    deps: [setup.contract-tools]
+    timeout: 14400
+    cpu_timeout: 1800
+    hint:
+      est_duration_s: 240
+      classification: cpu-bound
+      preferred_inner_jobs: 16
+      rss_baseline_bytes: 4294967296
+

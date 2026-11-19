@@ -1,0 +1,19 @@
+steps:
+  - group: check
+    job: offline-cache-desk-browser
+    desc: saved-message snapshot and a read-scope sign-in in current Chromium at a 1280x800 desk
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/offline_cache_browser.py --profile desktop
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 1440
+    cpu_timeout: 300
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 70
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#1565 vibe-talk-short-ref-links` in the browser engine, at 1280x800 and 390x852: a
+  # :thread: link drills into its thread, an :email: link highlights its message in Main,
+  # an :issue: link uses the configured template, and an unknown reference is plain text.

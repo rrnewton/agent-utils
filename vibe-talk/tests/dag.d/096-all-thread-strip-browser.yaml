@@ -1,0 +1,22 @@
+steps:
+  - group: check
+    job: all-thread-strip-browser
+    desc: a thread's colour strip on every row of All that is in an answered thread, thicker than a border and a hit area wide, and a click or tap on it selecting the thread in All with the rest dimmed and nothing moving, in current Chromium at 1280x800 and 412x915 in both schemes
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/all_thread_strip_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 20
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#310 stale-live-read-flicker` in the browser engine, at 1280x800 in All on its newest line: two live
+  # messages, the second pushed once the first one's read has reached the server, each live read answered
+  # 300 ms late as the server had the channel when it arrived; the second message's row drawn and laid out
+  # in every animation frame from its first until both reads have landed and 30 frames more, and the first
+  # message's too. Its negative control runs the same walk against a copy of the page with the fix taken
+  # out, which must miss the row in some frame. Measured on 2026-10-14: about 6s wall, 1s CPU.

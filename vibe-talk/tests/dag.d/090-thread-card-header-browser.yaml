@@ -1,0 +1,26 @@
+steps:
+  - group: check
+    job: thread-card-header-browser
+    desc: a thread under its card at the top — on the right, joined to its root by one line, a resting mouse scrolling nothing, and across the window from the thread list — the card moving up from its place in the list, a redraw of Main leaving the keys on the right, in current Chromium at 1280x800 in both schemes and with reduced motion, and at 412x915 by touch
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/thread_card_header_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 720
+    cpu_timeout: 90
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 30
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#388 thread-header-collapse` in the browser engine, at 393x852 by touch and 1280x800 with a mouse and
+  # the keys, in the dark scheme and the light: a press on the card at the top of a thread folds it to a
+  # 14px bar of its fill and edge with a 24px press target and a press on the bar opens it, no row on
+  # screen moving part-way up the thread or at its foot; a link in it and its X do not fold it; a reload
+  # keeps it folded; in two columns the line from the root meets the bar, its lane left of every row.
+  # Measured on 2026-10-19: about 25s wall.
+  # `#404 threads-unpack-all` and `#405 root-under-summary` in the browser engine, at 1280x800 and
+  # 393x852 in both schemes: every thread unpacked under its card on a bridge in its colour, the
+  # summarised root first as the card's child, read runs on the spine under Collapse read, read
+  # replies gone under Hide read, off unchanged, kept across a reload; forty threads timed.

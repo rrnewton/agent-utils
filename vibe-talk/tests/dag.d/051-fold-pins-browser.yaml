@@ -1,0 +1,37 @@
+steps:
+  - group: check
+    job: fold-pins-browser
+    desc: a folded run naming its pinned messages, opened by its pinned count alone, in current Chromium at 412x915 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/fold_pins_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 15
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#224 keyboard-shortcuts` in the browser engine, the keys pressed through CDP Input.dispatchKeyEvent
+  # so that the browser's own default scrolling runs: PgUp, PgDn, Space, Shift+Space, Home and End move
+  # the channel's list with the focus where the page put it on load and after a view switch, and Space
+  # does not press the switch; "/" opens the search with its field focused; Ctrl+S goes to the message box
+  # from the list, the search field and Settings, and Ctrl+Enter from the list, the browser's Save page
+  # refused (`#248 composer-key`); "," and Ctrl+, open Settings with its screen focused, PgDn scrolls it and Escape
+  # returns to the list unmoved; in the message box PgUp pages the list and Ctrl+Home/End jump it; then
+  # the keymap: j, k and the arrows move a visible focus ring the list follows, e marks Done on the
+  # server and moves on to the next unread, PgDn brings the ring to the page, Shift+E marks one opened
+  # message alone Done on the server, asks the chat service once to mark it read, and folds it with
+  # neither the list nor the message moving (`#295 shift-e-read-collapse`), Enter folds, and -> enters
+  # a thread that <- and Esc leave, back on the message it was opened from; Ctrl+K opens the channel
+  # picker, Esc leaves it for the list, a channel chosen from it gives the keys back to the list, and
+  # Help left by "," after "?" still goes back to Settings from Settings; `#281 view-keys`: Ctrl+1 to
+  # Ctrl+4, and Cmd in a second tab emulating a Mac, choose Main, All, the thread list and two columns
+  # from the message box, the search and a card, the browser's default refused and no digit typed.
+  # Measured under dagrun on 2026-10-09 on a host at load 220: 27s wall (most of it waiting for each
+  # animated scroll to come to rest), 6.4s CPU, a 358MB peak; the view keys added about 3s of 65s wall
+  # on 2026-10-13, outside dagrun on a busier host. Measured solo again on 2026-11-11 after the
+  # unread-step walk split out (#1314): 107s wall, about 49s CPU; the budgets below are 5x those
+  # (the lead's 5x rule), since every page gate selects this step.

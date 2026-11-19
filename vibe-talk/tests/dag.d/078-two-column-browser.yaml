@@ -1,0 +1,26 @@
+steps:
+  - group: check
+    job: two-column-browser
+    desc: Main and a thread side by side, cards, selection, independent scrolling, the narrow fallback, the links between roots and cards, and the search's walk back to older matches, in current Chromium at 1440x900 and 1280x800, and the walk on a 412x915 phone
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/two_column_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 22
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#372 settings-header-layout` in the browser engine, at 1280x800, 1920x1080 and a 393x852 phone under a
+  # host too long for the phone's line: the host one quiet line (no larger than the page's text, ordinary
+  # weight, its name cut with an ellipsis and its port whole, whole in its tooltip and when copied), Expand
+  # all and Open help on its row on a desk and under it on the phone, above the sections, Tab going Back,
+  # Expand all, Open help, the first section, and Fold all in place. `#373 two-column-full-width`: two
+  # columns at 1920x1080 and 2560x1080 over the agent's long replies and the owner's answer with no
+  # threads, every row of Main but the owner's across its column to the gutter by the divider, the owner's
+  # kept partial, the glass over no row and no strip kept for it, the right column's heading and empty
+  # line across it, one column still at its reading width; and a thread open on the right, its rows
+  # across that column. Measured on 2026-10-19: about 8s wall.

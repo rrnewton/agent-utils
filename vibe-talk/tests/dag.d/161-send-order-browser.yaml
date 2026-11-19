@@ -1,0 +1,19 @@
+steps:
+  - group: check
+    job: send-order-browser
+    desc: messages to one destination land in the order written, through a bridge that fails the first, across a reload, past a Dismiss, on a slow bridge and after a caller hangs up, in current Chromium against the real server
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/send_order_browser.py
+    jobs_flag: ""
+    deps: [build.release, setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 15
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # THE ONE THAT LEAKED. It starts a real server and drives a real Chromium at it. Boxed, its
+  # descendants are reaped with it whether or not the script's own trap fires -- which is the whole
+  # reason this file exists, because for six days that trap did not.

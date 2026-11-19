@@ -1,0 +1,26 @@
+steps:
+  - group: check
+    job: reply-continuity-browser
+    desc: Reply opening under the message in the list without moving it, the box under its row through a resize, Send and Cancel moving nothing, and Quote reply, in current Chromium at 1280x800 and 412x915, and Quote reply moving no row at 393 and 360 wide; and the Draft chip finding a draft in the box, a quick reply and a reply, across a reload, newest first
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/reply_continuity_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 880
+    cpu_timeout: 110
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 50
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#410 inline-reply-editor` in the browser engine: at 1280x800 in two columns, Reply on an old message
+  # mid-thread on the right opens the reply's box directly under the row, later rows below it, the row not
+  # moved and one message box on screen, Grow growing it with the rows below following, Cancel putting it
+  # away and the columns' boxes back with a Draft on the row; Reply on Main's replica root brings its
+  # thread's replies under it on the bridge, the box under the last, and Send posts with them staying; in
+  # All, Reply on the runner's root gathers its eight replies under it and Escape puts them back; at
+  # 393x852 by touch, Reply mid-stream and Send; a refused reply from the right column says so on the
+  # status line and the column's chip; the view keys in an open reply (Ctrl+4 keeps it, Ctrl+2 puts it
+  # down as a draft); and two columns narrowed to 393 with a reply open, kept inline where its message is
+  # drawn and reopened with its words once it is drawn again. Measured on 2026-10-21: about 25s wall.

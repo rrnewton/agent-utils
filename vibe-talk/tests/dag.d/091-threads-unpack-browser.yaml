@@ -1,0 +1,16 @@
+steps:
+  - group: check
+    job: threads-unpack-browser
+    desc: every thread's messages unpacked under its card, bridged in the thread colour with the summarised root first, read modes inside each block, kept across a reload, in current Chromium at 1280x800 and 393x852 in both schemes
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/threads_unpack_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 1440
+    cpu_timeout: 180
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 60
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+

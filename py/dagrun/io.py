@@ -554,7 +554,9 @@ def _include_entries(
         namespace = _req_str(entry, "namespace", where)
         if not path:
             raise DagJsonError(f"{where}.path: must be non-empty")
-        if not _NAMESPACE_SEGMENT.fullmatch(namespace):
+        # An empty segment inherits the includer's namespace unchanged
+        # (a namespaced fragment fanning out into per-check files).
+        if namespace and not _NAMESPACE_SEGMENT.fullmatch(namespace):
             raise DagJsonError(
                 f"{where}.namespace: must match [A-Za-z0-9][A-Za-z0-9_-]*"
             )
@@ -575,7 +577,11 @@ def _include_entries(
 
 
 def _qualify(namespace: str, value: str) -> str:
-    return f"{namespace}.{value}" if namespace else value
+    if not namespace:
+        return value
+    if not value:
+        return namespace
+    return f"{namespace}.{value}"
 
 
 def _rewrite_step(entry: object, namespace: str) -> object:
@@ -669,9 +675,33 @@ def _resolve_include_path(raw: str, source: Path, root_dir: Path) -> Path:
         raise DagJsonError(
             f"{source}: include path {raw!r} resolves outside top-level DAG directory {root_dir}"
         ) from exc
-    if not resolved.is_file():
-        raise DagJsonError(f"{source}: include path {raw!r} does not name a regular file")
+    if not resolved.is_file() and not resolved.is_dir():
+        raise DagJsonError(
+            f"{source}: include path {raw!r} does not name a regular file or directory"
+        )
     return resolved
+
+
+def _include_files(resolved: Path, raw: str, source: Path) -> list[Path]:
+    """The files one include names: itself, or for a directory include
+    every `.yaml`/`.yml` file directly inside it, in file-name order."""
+    if resolved.is_file():
+        return [resolved]
+    try:
+        files = sorted(
+            path.resolve()
+            for path in resolved.iterdir()
+            if path.is_file() and path.suffix.lower() in {".yaml", ".yml"}
+        )
+    except OSError as exc:
+        raise DagJsonError(
+            f"{source}: cannot read include directory {resolved}: {exc}"
+        ) from exc
+    if not files:
+        raise DagJsonError(
+            f"{source}: include path {raw!r} names a directory with no .yaml files"
+        )
+    return files
 
 
 def dag_from_path(path: str | Path) -> DagConfig:
@@ -813,15 +843,27 @@ def dag_from_path(path: str | Path) -> DagConfig:
                         f"{source}: composed DAG exceeds {MAX_DAG_INCLUDE_INSTANCES} "
                         "include instances"
                     )
-                include_instances += 1
                 included = _resolve_include_path(raw_path, source, root_dir)
                 child_namespace = _qualify(namespace, segment)
-                child_start, child_end = visit(
-                    included,
-                    child_namespace,
-                    syntax_path=Path(raw_path),
-                    depth=depth + 1,
-                )
+                child_start = len(flattened_steps)
+                child_end = child_start
+                for included_file in _include_files(included, raw_path, source):
+                    if include_instances >= MAX_DAG_INCLUDE_INSTANCES:
+                        raise DagJsonError(
+                            f"{source}: composed DAG exceeds {MAX_DAG_INCLUDE_INSTANCES} "
+                            "include instances"
+                        )
+                    include_instances += 1
+                    # The file itself names the syntax for a directory
+                    # include; a single-file include keeps the written path.
+                    file_start, file_end = visit(
+                        included_file,
+                        child_namespace,
+                        syntax_path=included_file if included.is_dir() else Path(raw_path),
+                        depth=depth + 1,
+                    )
+                    child_start = min(child_start, file_start)
+                    child_end = max(child_end, file_end)
                 qualified_after = [_qualify(namespace, tag) for tag in after]
                 after_references.extend((tag, source) for tag in qualified_after)
                 inject_after(

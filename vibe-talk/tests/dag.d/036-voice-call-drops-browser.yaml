@@ -1,0 +1,21 @@
+steps:
+  - group: check
+    job: voice-call-drops-browser
+    desc: a spoken call replaying the bridge's event order — the greeting hand-off, a yes answered before its final transcript, the notice's wait, how the call ended, a long answer heard out before another channel's message, a typed cut — in current Chromium
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/voice_call_drops_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 720
+    cpu_timeout: 90
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 25
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#352 voice-reconnect-on-bridge-error` in the browser engine: a fake vibe-talk-v1 bridge loses a
+  # turn after an interrupt and a relayed message, and asks the page to reconnect. The call stays up on
+  # a second session (a greeting and no replay, the lost socket closed at once; then a bridge that lists
+  # replay), the message goes again once, and the page says so; a second lost turn within the minute,
+  # and any other error, still end the call. Measured on 2026-10-19: about 21s wall.

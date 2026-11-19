@@ -1,0 +1,24 @@
+steps:
+  - group: check
+    job: post-confirm-browser
+    desc: a tap on a just-shown post-confirmation card's Send commits nothing in current Chromium
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/post_confirm_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 240
+    cpu_timeout: 30
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 5
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#268 voice-call-drops` in the browser engine: a spoken call on Chromium's fake microphone against
+  # a mock `vibe-talk-v1` bridge — no microphone frame inside the greeting's hand-off; a "Yes." whose
+  # final transcript arrives after the agent's "One moment." commits the card once; the page's notice
+  # waits for that turn to complete before closing the segment; the server's close is said and
+  # recorded; a hang-up sends one goodbye. Measured on 2026-10-13: about 8s wall. `#330
+  # voice-long-turn-drop` and `#337 voice-relay-silent` added a fourth call — a long answer whose six
+  # banked seconds of audio play out in real time before a message from another watched channel
+  # goes, and a typed cut — which made it about 25s wall on 2026-10-18.

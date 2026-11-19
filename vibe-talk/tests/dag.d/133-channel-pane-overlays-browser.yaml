@@ -1,0 +1,23 @@
+steps:
+  - group: check
+    job: channel-pane-overlays-browser
+    desc: floating overlays centre on the channel pane while Discuss is docked, in current Chromium at a 412x915 phone in light and dark and a 1280x800 desk
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/channel_pane_overlays_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 16
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#300 reply-marks-read` in the browser engine, at 1280x800 in two columns with a mouse and the keys:
+  # Reply docked in the left column on a Main message and in the right on a thread's reply, sent with
+  # Enter, each marks the message it answers Done on the server, asks the provider to mark it
+  # `after_reply` after that Done, says so on the status line and draws the row read; a later message
+  # in an answered thread's box marks nothing; and the first reply typed in a new thread, opened from
+  # the grey Thread on the right, marks its root read in both columns, the second nothing. Measured on
+  # 2026-10-14: about 5s wall.

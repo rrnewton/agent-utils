@@ -1,0 +1,16 @@
+steps:
+  - group: check
+    job: approval-card-phone-place-browser
+    desc: the send card's place, thumb reach, hold, docked layout and frozen card, the recap line of a new call, and the channel's list held still as the card comes and goes, at 393x852, in current Chromium
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/approval_card_browser.py --part phone-place
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 800
+    cpu_timeout: 100
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 150
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+

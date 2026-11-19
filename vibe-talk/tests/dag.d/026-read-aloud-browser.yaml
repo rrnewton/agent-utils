@@ -1,0 +1,21 @@
+steps:
+  - group: check
+    job: read-aloud-browser
+    desc: read-aloud audio starts, switch/stop states and archive semantics in current Chromium; timings printed, budgets under --benchmark
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/read_aloud_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 16
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#552 wit-tts-provider` in the browser engine: Settings offers the Wit.ai voice and its
+  # catalogue picker, the picked voice is what speech preparation asks for, and a tap is heard,
+  # at 393x852 and on a desktop. The verdict is that behaviour only; the tap-to-audible time is
+  # printed, and the old 5000 ms budget is an opt-in `--benchmark` outside the gate (#1250
+  # vibe-talk-timing-robust, pattern #1248 fold-latency-behaviour-verdict).

@@ -1,0 +1,24 @@
+steps:
+  - group: check
+    job: column-overscroll-1920-browser
+    desc: the right column scrolls past its foot into blank room at a desk until the last card's top is mid-column, by the wheel after a rest and by PgDn, Space and the down arrow, closes it going back up, by End and by a search, holds the reader in it as the last card changes size and as replies arrive, and stops a fling or a held key on the foot, in current Chromium at 1920x1080, with six negative controls
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/column_overscroll_browser.py --size desk-1920
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 960
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 120
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#240 reading-bookmark` in the browser engine, at 1280x800 with a mouse and keys and at 412x915 by
+  # touch: the bookmark set on a message (Shift+B, or the row's menu) is a solid two-pixel line in the
+  # accent in the room between that row and the one above, touching neither; scrolled away, the
+  # Bookmark chip points up at it, directly right of Newest on the bottom line and overlapping no
+  # other chip; b or a tap on the chip puts the line at the top of the list under the pill, the
+  # message under it selected; a reply goes to the newest message, says b goes back, and b does; and
+  # a Done on the message under the line slides it to the next one, conditionally, on the server too.
+  # Measured on 2026-10-12: about 6s wall.

@@ -1,0 +1,39 @@
+steps:
+  - group: check
+    job: stale-live-read-browser
+    desc: a live message the stream drew stays drawn in every frame when a read asked before it lands late, with a negative control against the page without the fix, in current Chromium at 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/stale_live_read_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 6
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#280 scroll-stability` in the browser engine, at 1280x800 in two columns with a mouse and at 412x915
+  # in one by touch: with the reader scrolled up in Main, the first row on screen and its offset hold
+  # within a pixel while a message and a reply arrive live, a refresh redraws the list with a message
+  # above grown, a read sent while the reader was on the newest line lands after they scrolled up (the
+  # owner's jump to the bottom), summaries arrive, and the focus moves (the mouse, ] [ Tab, a card opening
+  # its thread); at the desk, sampled at every frame for 2.5 s, the mouse crossing the cards to the dock
+  # and to the top bar with nothing pressed, and ] on its own, move nothing — mouse movement or hover
+  # never scrolls (`#1144 scrollback-typing-jump`); a reader on the newest line follows a live message to the foot; the
+  # list of threads opens at its foot and stays there under the mouse and a moved thread; a thread with
+  # nothing unread, and one whose newest reply alone is unread, open at their foot, and older replies
+  # coming in keep the row at the head; after a reload the read behind the saved rows leaves the
+  # reader where they scrolled; `#281 view-keys`: the view keys show each view where it is read and
+  # nothing moves it after, the thread list opening at its foot from two columns, Main and All,
+  # Main coming back from it where the reader left it, a thread opened from it opening at its foot, and a
+  # reload in it opening it at its foot with the desk's dock on two rows; and, last, a card highlighted by
+  # a click (`#277 thread-card-focus`) with the mouse going on over another card to the dock moves
+  # nothing, and the mouse resting on it scrolls nothing either (`#1144 scrollback-typing-jump`).
+  # Measured on 2026-10-13: about 110s wall,
+  # most of it what were then 2.5 s holds, and about 10s CPU; the holds have since become
+  # settle-judged (`#1250`), so the wall is whatever this host takes to draw them. `#612 view-stability`: then, on fresh pages at 393x852 and
+  # 1280x800, the thread list halfway up holds the card being read, at every frame, while replies move the
+  # card above the screen, the card half off its top, one mid-screen and one below it to the foot. Measured
+  # on 2026-10-27 on a loaded host: 128s wall for the whole file.

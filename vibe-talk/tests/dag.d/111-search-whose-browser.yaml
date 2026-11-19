@@ -1,0 +1,24 @@
+steps:
+  - group: check
+    job: search-whose-browser
+    desc: the author filter's chip and tooltip name whose messages it shows, in current Chromium at 393x852 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/search_whose_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 8
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#439 search-unmatched-separators` in the browser engine, at 393x852 with a finger and 1280x800
+  # with a mouse, over three threads among a channel's own messages: "lantern" leaves its thread's
+  # four messages with a counted line in every gap, each line a thumb tall between its rows; a real
+  # press on the middle line shows its run where it stands, the bar still counting matches; into the
+  # thread under the search the field and count stay on screen, and "bright" leaves one message with
+  # the thread's other three said above it; over the thread list's cards "harbor" leaves one card,
+  # the threads skipped counted by their messages — one exactly, one as at least what the page holds
+  # — and a press on a card's line shows that card.

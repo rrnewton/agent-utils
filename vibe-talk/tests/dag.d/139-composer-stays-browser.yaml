@@ -1,0 +1,20 @@
+steps:
+  - group: check
+    job: composer-stays-browser
+    desc: the focused thread composer stays in the visual viewport through dictation, live arrivals and a refresh, in current Chromium at 412x915 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page, disabled-optin]
+    cmd: cd vibe-talk && python3 tests/composer_stays_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 13
+      classification: latency-bound
+  # DISABLED from gating (`disabled-optin`, owner survey 2026-11-19):
+  # a 190 s median walk for a row-rebuild verdict the channels unit
+  # suites already cover; it stays runnable by hand
+  # (`make -C vibe-talk refresh-replaces-browser`, or validate
+  # --include-disabled) and returns only as a fast, hot-host-robust
+  # behaviour-only check.

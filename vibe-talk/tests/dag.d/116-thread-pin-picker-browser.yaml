@@ -1,0 +1,22 @@
+steps:
+  - group: check
+    job: thread-pin-picker-browser
+    desc: pinnable threads in the thread picker pop-up, bang-bound pinned by default, persisting across reloads, in current Chromium at 1280x800 and 390x852
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/thread_pin_picker_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 20
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#500 sent-receipts-pile-up` in the browser engine, at 1280x800 with a mouse: receipts an earlier build
+  # saved for replies long confirmed are not drawn on load, nor kept; a reply sent from under an unpacked
+  # row of the Threads view is drawn directly under it while its post is held; three replies' Sent receipts
+  # at the foot of the packed cards go once shown (SENT_RECEIPT_MS, waited out for real), none saved, and a
+  # reload draws none while each reply is in its thread. Measured on 2026-10-24: about 19s wall, most of it
+  # the receipts' showing.

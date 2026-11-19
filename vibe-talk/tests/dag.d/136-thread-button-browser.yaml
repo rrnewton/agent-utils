@@ -1,0 +1,21 @@
+steps:
+  - group: check
+    job: thread-button-browser
+    desc: a new message's grey Thread drawn as Reply, starting its thread with the box focused, and turning coloured at the first reply, in current Chromium at 412x915 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/thread_button_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 6
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#1818 vibe-talk-thread-drill-in-keeps-anchor` in the browser engine, at 412x915 by touch and
+  # 1280x800 with a mouse: a reply scrolled to a measured offset in All opens its thread at that
+  # offset (within a few px), a row above it growing 120px late is corrected back by the
+  # ResizeObserver keeper, Back returns the reply to its place in All, and the thread's root at
+  # the head of Main opens its thread where it stood.

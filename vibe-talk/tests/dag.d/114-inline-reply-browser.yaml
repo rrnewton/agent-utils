@@ -1,0 +1,22 @@
+steps:
+  - group: check
+    job: inline-reply-browser
+    desc: Reply opening in the stream under the message and its replies, later rows below, one message box on screen, in two columns and one, at 1280x800 and 393x852, through Grow, Send, Cancel, a refusal, the view keys and two columns collapsing, in current Chromium
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/inline_reply_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 720
+    cpu_timeout: 90
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 25
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#419 threads-view-main-messages` in the browser engine, at 1280x800 with a mouse and 393x852 by touch:
+  # the Threads view's heading (title, Unread only, Unpack msgs, Main channel) on the search glass's row,
+  # its middle level with the glass's and every chip ending before it; Main channel putting the main
+  # channel's messages among the cards in time order and its box last; a reply on an old main-channel
+  # message opening directly under it, the rows after it below, the box at the foot giving way to it so
+  # one message box is on screen, and coming back on Cancel. Measured on 2026-10-22: about 6s wall.

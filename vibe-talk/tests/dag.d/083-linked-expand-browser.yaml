@@ -1,0 +1,21 @@
+steps:
+  - group: check
+    job: linked-expand-browser
+    desc: a jump to a folded message by link, reply arrow, combined constituent, short ref or deep link opens it whole and on screen, in current Chromium at 390x844 with touch and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/linked_expand_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 10
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#1224 mention-jump-in-view`, in the browser engine: a Documents mention tapped in a channel of
+  # 120 long messages read ten at a time, its message mid-history. At 393x852 with touch and at
+  # 1280x800, in the owner's configuration (collapsed summaries off) late reads that replace rows
+  # above, a live arrival, a live reaction and an older page must leave the highlighted row where
+  # the jump put it; then Summaries on and off must too.

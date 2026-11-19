@@ -1,0 +1,14 @@
+steps:
+  - group: check
+    job: keyboard-browser
+    desc: the scroll, search and Settings keys and the keymap pressed through CDP in current Chromium at 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/keyboard_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 600
+    cpu_timeout: 250
+
+  # `#1314 unread-step-keys`: Shift+Down and Shift+Up through only the unread messages of a mixed
+  # list at 1280x800, in their own step rather than more of keyboard-browser, which is at its CPU
+  # limit (113s wall, CPU-TIMEOUT solo on 2026-11-11).

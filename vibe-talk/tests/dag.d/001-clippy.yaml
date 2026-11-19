@@ -1,0 +1,19 @@
+steps:
+  - group: check
+    job: clippy
+    desc: clippy over every target, warnings denied
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && ../scripts/with-node22 cargo clippy --all-targets --locked -- -D warnings
+    jobs_flag: ""
+    jobs_env: CARGO_BUILD_JOBS
+    deps: [setup.contract-tools]
+    timeout: 7200
+    cpu_timeout: 900
+    hint:
+      est_duration_s: 120
+      classification: cpu-bound
+      preferred_inner_jobs: 8
+      # Clippy holds the whole crate graph. This is the step most likely to be the memory high
+      # water mark of the run, and the one worth a real number rather than a default.
+      rss_baseline_bytes: 3221225472
+

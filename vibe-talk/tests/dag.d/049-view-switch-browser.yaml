@@ -1,0 +1,25 @@
+steps:
+  - group: check
+    job: view-switch-browser
+    desc: Main and All switched from what the page holds, with every timeline request counted, in current Chromium
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/view_switch_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 240
+    cpu_timeout: 30
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 4
+      classification: latency-bound
+      rss_baseline_bytes: 536870912
+
+  # `#221 read-modes` in the browser engine: entering a thread lands on its first unread message,
+  # unfolded, under the pill, in Show read, Collapse read and Hide read, at 412x915 and 1280x800; the
+  # collapsed run's line is a 44px target a real tap opens with the reader unmoved; an old thread,
+  # drawn from the rows All holds and read behind them, ends where one entered with every row held
+  # does, its read held at a gate the walk opens rather than for a fixed time; and, `#222
+  # unread-replies`, on Main under Hide read the read root is kept by its unread replies, says
+  # "4 unread" beside "52 replies", the longest pairs ("about 52 replies" and "12+ unread") stay one
+  # line each beside each other, and a real tap on that count lands on the first of them.
+  # Measured under dagrun with the Main step: 17s wall on a host at load 320, 5.5s CPU, a 349MB peak.

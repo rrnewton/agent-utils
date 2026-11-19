@@ -1,0 +1,14 @@
+steps:
+  - group: check
+    job: bridge-even-browser
+    desc: even bridge connectors with the owner's rows left-justified, and the dimmed pack triangle centred against its card with its rectangle clear of the bridge's line, in current Chromium at 393x852, 412x915, 768x1024 and 1280x800 in both schemes
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/bridge_even_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 720
+    cpu_timeout: 90
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 25
+

@@ -1,0 +1,19 @@
+steps:
+  - group: check
+    job: link-url-chip-browser
+    desc: the URL chip under Links writes the links as their addresses and back, and nothing shows through the chip row, in current Chromium at 393x852, 412x915 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/link_url_chip_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 9
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#520 search-whose-toggle-hint` in the browser engine: each press of the author filter leaves a
+  # chip under it naming the state landed on, and hover/focus raises its tooltip, at 393x852 and
+  # 1280x800. Measured on 2026-10-25: about 8s wall (the chip's real 1.5s wait at each size).

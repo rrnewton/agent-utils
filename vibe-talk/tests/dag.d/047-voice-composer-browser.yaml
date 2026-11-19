@@ -1,0 +1,28 @@
+steps:
+  - group: check
+    job: voice-composer-browser
+    desc: the call's message box and the view switch on screen while the box is focused, and its first send, in current Chromium at 412x915 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/voice_composer_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 240
+    cpu_timeout: 30
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 4
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#340 composer-grow-box` in the browser engine, a real paste (the clipboard written, then Ctrl+V
+  # through CDP) into the message box: at 1280x800 and 1920x1080 the Grow checkbox drawn left of Send on
+  # its row and the box at its three-line resting height; Grow off, a long paste leaves it there; on, the
+  # paste grows it to within a line of 60% of the window, scrolling inside, Send on screen in the list;
+  # three short lines fit; Send clears it to rest; a reload keeps Grow, and with a long draft comes back at
+  # the list's foot with Send on screen; a short 1280x600 window keeps Send on screen; two columns grow the
+  # right column's box; a reader at the foot typing line after line stays there; Grow ticked after a
+  # paste keeps a reader at the foot there, and one 30-40px above it with the checkbox under the pointer,
+  # also by a click that focuses no checkbox, as in Safari and Firefox on a Mac, and moves none who
+  # scrolled the checkbox away; the same through the page's own measured height with field-sizing turned
+  # off; and a 393x852 phone draws no checkbox and lays the box out alike with Grow stored on or off.
+  # Measured on 2026-10-18 outside dagrun on a host at load 42: about 25s wall, 2.8s CPU in the script.

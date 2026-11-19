@@ -1,0 +1,35 @@
+steps:
+  - group: check
+    job: quote-dismiss-browser
+    desc: The X beside the Quoted reply chip clears the selection and hides both, the card still expanded and the scroll unmoved, in current Chromium at 412x915
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/quote_dismiss_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 27
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 27
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#344 search-shortcut` in the browser engine, the keys pressed through CDP Input.dispatchKeyEvent at
+  # 1280x800: Ctrl+/ opens the search with its field focused and its default refused from the channel's
+  # message box holding a draft (the draft untouched, no slash typed, a bare "/" there still a slash),
+  # the reading-pace popover's slider (the popover closed), a ⋯ menu's item (the menu closed), the channel
+  # picker, a text field on Settings, Help, the right column's box in two columns, past a listener on the
+  # box that stops every key, the Reply screen (left, its draft kept) and the list with single keys off;
+  # Ctrl+Shift+? opens Help at the Keyboard entry; a German Ctrl+Shift+7 searches, an AltGr "/" does not,
+  # and a held chord searches once; then Cmd on an emulated Mac, Cmd+Shift+/ reported as "/" opening
+  # Help. Its own step rather than more of keyboard-browser, which is near its wall limit. Measured on
+  # 2026-10-18 outside dagrun on a host at load 18: about 11s wall.

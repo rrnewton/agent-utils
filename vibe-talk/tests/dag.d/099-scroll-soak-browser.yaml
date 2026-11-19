@@ -1,0 +1,19 @@
+steps:
+  - group: check
+    job: scroll-soak-browser
+    desc: a reader parked mid-Main is sampled every frame for 60 s of background updates (live messages and replies, edits above and below, reactions incl. a folded card, read state, the Newest recount and the poll; summaries off), each update's anchor movement and layout shift reported separately beside the recorded baseline, plus a near-foot slack coda, in current Chromium at 393x852 and 1280x800 (--strict; the anchor within a pixel at every frame, at most one painted correction per act, no writes in an idle act)
+    labels: [validation-vibe-talk, validation-vibe-talk-page, disabled-optin]
+    cmd: cd vibe-talk && python3 tests/scroll_soak_browser.py --strict
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 720
+    cpu_timeout: 90
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 200
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#1722 vibe-talk-mention-link-not-clickable`: each mention form is one anchor with the
+  # right href and label, hover underlines it, and tapping it opens the profile in a new
+  # tab without folding the row, moving the scroll or making a selection.

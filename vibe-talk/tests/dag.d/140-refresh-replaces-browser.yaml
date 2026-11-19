@@ -1,0 +1,14 @@
+steps:
+  - group: check
+    job: refresh-replaces-browser
+    desc: a no-change poll refresh (restamped observed_ms only) replaces zero channel rows and zero thread cards, in current Chromium at 412x915 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page, disabled-optin]
+    cmd: cd vibe-talk && python3 tests/refresh_replaces_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 100
+      classification: latency-bound

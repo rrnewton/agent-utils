@@ -1,0 +1,31 @@
+steps:
+  - group: check
+    job: open-upstream-link-browser
+    desc: Open in Slack in the ⋯ menu opens the message's own address in a new page with no opener, by the link and by Shift+O, l copies it, absent without one; Copy Slack link and Copy vibe-talk link beside it, a right-click reaching the anchor's own contextmenu, and deep links opening their view and message (the same query on a fresh server too), in current Chromium at 1280x800 and 393x852
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/open_upstream_link_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 8
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#304 back-gesture-in-app` in the browser engine, at a 412x915 Android phone (touch, a mobile Chrome user
+  # agent, and the standalone display mode, answered by an init script where DevTools ignores its override):
+  # a thread opened from its root is one history entry at the same address, and the browser's Back -- what the
+  # phone's gesture sends -- closes it in the same document with All back at the reader's place; the thread
+  # list and a thread opened from it are two entries, history.back() comes back to the list and the browser's
+  # Back to All; the ⋯ menu over a thread is an entry, which the browser's Back closes alone; the on-screen Back
+  # goes back through the thread's entry, so at the top the browser's Back leaves the app. A page reloaded in a
+  # thread opened from the list stands on the earlier load's two entries: before any touch the first Back
+  # closes the thread alone, the next the list, the next leaves. With the app as the tab's first entry, as in
+  # an installed app's window, the same reload leaves no entry under the app's base, and a reload on Settings,
+  # which nothing reopens, goes back through its entry at once. At a 1440x900 desk in two columns, the browser's
+  # Back with a ⋯ menu open closes the menu and keeps the thread on the right. Against the page before it, the
+  # first Back in a thread leaves the app; against the page before its first review, the menu's Back closes the
+  # thread under it, the first Back after the reload closes the list with the thread, and the installed app
+  # keeps the earlier load's entries under its base. Measured on 2026-10-14: about 7s wall.

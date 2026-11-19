@@ -1,0 +1,22 @@
+steps:
+  - group: smoke
+    job: cli-help
+    desc: the built service binary exposes its operator help without configuration
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && ./target/release/vibe-talk --help >/dev/null
+    jobs_flag: ""
+    deps: [build.release]
+    timeout: 240
+    cpu_timeout: 30
+    hint:
+      est_duration_s: 1
+      classification: light
+      rss_baseline_bytes: 134217728
+
+  # ---- suites that need it ----------------------------------------------------------------------
+  #
+  # The test binaries, built for `test.unit` in a step of their own, a habit from when a second step
+  # ran them too and neither was to build them in its own box while the other waited on cargo's build
+  # lock (the page suite's slices below now need none). `cargo test --release` builds the
+  # dependencies again with the dev-dependencies' features, so this is most of what `test.unit` used
+  # to spend before its first test ran.

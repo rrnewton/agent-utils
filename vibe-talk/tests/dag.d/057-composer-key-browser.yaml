@@ -1,0 +1,19 @@
+steps:
+  - group: check
+    job: composer-key-browser
+    desc: Ctrl+S (Cmd+S) to the message box the rule names in two columns, from cards, selections, a button, the body, a text field and the thread list, pressed through CDP in current Chromium at 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/composer_key_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 12
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#406 command-bar-one-row`. The desk's dock in one row across the window with "Thread list" and a
+  # 120-character thread chosen, at 1280x800, 1920x1080 and 900x700, and a 393px phone's bar one row above
+  # its tile. Measured on 2026-10-21 outside dagrun on a loaded host: about 8s wall.

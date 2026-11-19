@@ -1,0 +1,18 @@
+steps:
+  - group: check
+    job: live-relay-check-self-test
+    desc: offline verdict controls for the opt-in live check of relays during a call
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 scripts/live-relay-check.py --self-test
+    jobs_flag: ""
+    timeout: 240
+    cpu_timeout: 30
+    hint:
+      est_duration_s: 1
+      classification: light
+      rss_baseline_bytes: 268435456
+
+  # The screenshot harness's own controls: the capture judge and its PNG decoder against frames it
+  # builds itself, a blank frame refused on the walk's path, and the scene table. Offline, with no
+  # browser and no server, where `shots.screenshots` needs both; it was in no step until
+  # `test-time-vibe-talk`, which found it broken by a test double the walk's driver had outgrown.

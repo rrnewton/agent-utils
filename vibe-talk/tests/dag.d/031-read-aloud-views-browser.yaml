@@ -1,0 +1,22 @@
+steps:
+  - group: check
+    job: read-aloud-views-browser
+    desc: reading aloud from every view by both voices in current Chromium at 1280x800, audio started and the light on the message read, and a silent voice stopping the read unarchived
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/read_aloud_views_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 45
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#554 read-pause-reply-resume` in the browser engine: on a phone, a read paused mid-message, the
+  # message answered from its Reply and sent, then resumed: the device voice (modelled on Chrome for
+  # Android, whose pause stops and whose resume does nothing) goes on from the sentence it was paused in,
+  # and the agent's voice from its block, judged by the held sentence and block and the steer steps after
+  # Resume (`#1250 vibe-talk-timing-robust`). Resume latencies are printed; their budget is an opt-in
+  # `--benchmark` outside the gate.

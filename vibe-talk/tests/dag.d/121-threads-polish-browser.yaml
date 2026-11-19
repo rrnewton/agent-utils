@@ -1,0 +1,26 @@
+steps:
+  - group: check
+    job: threads-polish-browser
+    desc: the Threads view's chips pressed alike, Cmd+S keeping it with Main channel on, the owner's main rows centred, and Cmd+[ and Cmd+] through the views, in current Chromium at 1280x800 and 393x852
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/threads_polish_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 9
+
+  # `#501 thread-bridge-gutter` in the browser engine, at 393x852 and 412x915 by touch and 1280x800
+  # with a mouse: on each phone the pack triangle's ink a few pixels from the left screen edge on
+  # a target of 32px at least, the unpacked rows a slim indent in from their card on a short
+  # branch; on the desk the wider indent it always had; scrolled to a thread's foot, a tap on
+  # the bridge's spine gliding back to its card, wholly at the head of the list, the thread
+  # still unpacked, and under reduced motion still landing there; the triangle packing as ever.
+  # `#524 thread-bridge-even-connectors` and `#526 pack-triangle-dim` in the browser engine:
+  # an unpacked thread holding the owner's and others' rows, every row at one left edge and
+  # every bridge connector one length, the owner's narrower and ragged on the right; the pack
+  # triangle dimmed at rest, its tip against the card above, centred in its hover rectangle;
+  # gathered replies in All even too; the triangle still packing. `pack-triangle-clear-bridge`:
+  # the triangle's whole button, the rectangle its wash draws, clear of the bridge's line.

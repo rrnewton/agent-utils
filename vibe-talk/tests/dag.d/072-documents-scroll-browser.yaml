@@ -1,0 +1,19 @@
+steps:
+  - group: check
+    job: documents-scroll-browser
+    desc: the Documents scroll landings (first open at the top, Back at the bottom or exactly where the list was left) with slow fetches, against the real server (fake chat upstream) in current Chromium at 393x852 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/documents_scroll_browser.py
+    jobs_flag: ""
+    deps: [build.release, setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 90
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#1263 documents-list-cards` against the real server binary: one meta line
+  # per card, the mentions pop-up, one card for a file linked at two refs, and
+  # the filter chips docked at the bottom, at phone and desktop sizes.

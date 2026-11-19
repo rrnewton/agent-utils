@@ -1,0 +1,86 @@
+steps:
+  - group: check
+    job: voice-expand-browser
+    desc: a long voice turn opened and closed by a tap on its card, a streamed reply kept whole as it grows and a reader's fold kept across its frames, the reader's place kept, in current Chromium at 393x852 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/voice_expand_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 720
+    cpu_timeout: 90
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 10
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#269 approval-card-inline` in the browser engine: the send card as the next message, in the list
+  # on the call's view and the channel and docked on Settings, Send's centre at least 0.62 of the way
+  # down a 393x852, 360x780 and 375x667 phone in every run (one and thirty rows, banner up or gone,
+  # short and long draft), uncovered and wholly on screen, and both buttons held when it appears;
+  # then Send freezes it into the transcript (`#270 voice-transcript-markers`), the claim of its send
+  # follows the commit, and a reload restores the same card. Docked under Settings the card never
+  # scrolls as a whole: folded and after More, where it goes, its status and both buttons stay on
+  # screen, on the three phones and at 667x375 and 375x330. At 1280x800 in two columns the card stays
+  # wholly above a reply open at the left column's foot, its Send outlined beside a reply in either
+  # column (`#277 reply-in-column`). On the three phones a hosted call sent a 412-word recap says so
+  # on the line above it, on one line at 393 and with nothing off the screen at 360 (`#270`), and on
+  # the channel the card arriving, Send and the box taking back its room leave a reader up the list on
+  # their row within a pixel and one at the foot there (`#280 scroll-stability`). At 393x852 and
+  # 1280x800 the thread list (`#281 view-keys`): Cmd/Ctrl+3 and +4 pressed on the card's own buttons
+  # post and withdraw nothing, the card docked under the cards, which stay at their foot above it, whole
+  # on screen with Send at a thumb's reach, back at the foot of Main in two columns, and a draft arriving
+  # there moving neither a reader at the cards' foot nor one up them; and back from the list, a reader
+  # at All's foot at it again with Send on screen, one 100 or 225px up All and one 100 to 380px up Main
+  # on their row; and with no card up as the list comes, a draft arriving under it leaving a reader 40
+  # or 100px up Main on their row behind the cards and back, and with none at all, one 100px up All on
+  # theirs (`#280`); and at 1280x800 a reader 60 to 260px up the list's cards, the card docked under them,
+  # on their card again by Ctrl+4 and Ctrl+3, though two columns put them at the foot of their cards, and
+  # one who moved the cards in two columns where they moved to; and at 393x852 and 1280x800 a reader at
+  # the foot of Main or All still there once the box takes back its room a second after Send, the sent
+  # message drawn by a live read in that second and with the browser's scroll anchoring off, and after a
+  # draft opened by More is settled elsewhere and the box takes the focus; and at 393x852 a reader who
+  # sees only a long draft opened by More finding it where it stood through the
+  # thread list and back and across Main and All (`#280`); and at 1280x800, that draft drawn taller in
+  # two columns' left column, a reader at the foot of Main or All at the foot through Ctrl+4 and back
+  # with Send tappable, one up either on their row, and one near the foot whom the change could not keep
+  # there on their row again on the way back; and at 393x852, 360x780 and 375x667 a reader who saw only
+  # that draft's card, past the slack of the foot, at the foot with no jump a second after Send or the
+  # draft settled elsewhere, in Main, All and the call's view, and at 393x852 one who saw only it as the
+  # thread list docked it, on the way back once it had gone (`#280`); and at 393x852 and 375x667 a reader
+  # of that draft back from Settings, by its gear or through Help and by Back or Esc, where they were: at
+  # the foot of Main, All or the call's view with Send tappable, or with the card they saw alone where it
+  # stood (`#280`); and at 393x852, All with Summarise and Expand all up, a reader 40 or 60px above its
+  # foot back from Settings on their row, or with the opened card where it stood, and one at the foot at it
+  # (`#280`); and at 393x852 and 1280x800, with no card, a reader 30 to 60px up Main, All or the call's view
+  # back from Settings offered no jump and nothing grown under them, one 150px up offered it still (`#207`);
+  # and at 393x852 and 375x667 a reader of that draft who pressed "?" or Ctrl+? for Help, the draft settled
+  # elsewhere, sent from under Help or replaced by a short one while Help was up, back by Esc, Help's Back or
+  # the browser's Back on the newest line with no jump, at the foot of Main, All or the call's view or having
+  # seen only the card (`#280`); and at 393x852 and 1280x800 a reader of the thread list to whom a draft came
+  # while Settings or Help was up, back at the foot of its cards over the docked card if they left from it,
+  # or on their card (`#336 draft-return-thread-list`).
+  # Measured on 2026-10-13: about 235s wall and 45s CPU on a loaded host, with a draft arriving under the
+  # thread list; its wall limit goes from 300s to 420s for that headroom, and its CPU limit stays 200s.
+  # Measured on 2026-10-14: about 330s wall on a loaded host with the box's room and the opened draft
+  # added; its wall limit goes from 420s to 480s, and its CPU limit stays 200s. The last gate ran it in
+  # 349s; the two-column round trips with the opened draft add about 22s alone, so its wall limit goes
+  # from 480s to 540s for that headroom, and its CPU limit stays 200s. The last gate ran it in 366s; the
+  # card going from a reader who saw only it adds about 108s alone at the three phones, so its wall limit
+  # goes from 540s to 660s for that headroom, and its CPU limit stays 200s. The last gate ran it in 476s;
+  # the trips to Settings and back add about 50s alone at the two phones, the chips' room about 20s at
+  # 393x852 and the jump back from Settings about 30s at 393x852 and 1280x800, so its wall limit goes from
+  # 660s to 780s for that headroom, and its CPU limit stays 200s. The last gate ran it in 568s; the trips to
+  # Help by its key add about 90s alone at the two phones, so its wall limit goes from 780s to 900s for that
+  # headroom, and its CPU limit stays 200s. The trips from the thread list to Settings and Help and back with a
+  # draft arriving there add about 36s alone at 393x852 and 1280x800 (2026-10-19), so its wall limit goes from
+  # 900s to 960s for that headroom, and its CPU limit stays 200s.
+  #
+  # `#474 browser-lane-critical-path`: the whole check ran about 690s wall on 2026-10-23 for about 85s of CPU,
+  # waiting on the page's own holds and settles, and as one step it was the longest in the gate. Its runs fall
+  # into independent parts (`PARTS` in the script), each in its own browser profiles against its own fake
+  # API and server, so they are steps here that the browser cap lets run side by side. The graph contract
+  # (py/tests/test_validation_graph_contract.py) holds these steps to exactly the script's parts, one each.
+  # Measured alone on a quiet host: the 393x852 walk's stretches about 150s, 110s and 95s, the smaller
+  # phones and short screens about 170s together, and the desk about 160s. Each wall limit is about three times that.
+  # Each CPU limit is half the whole check's 200s, as a backstop: no part used a quarter of the whole's 85s.

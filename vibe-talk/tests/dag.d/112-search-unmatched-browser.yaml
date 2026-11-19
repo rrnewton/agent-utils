@@ -1,0 +1,31 @@
+steps:
+  - group: check
+    job: search-unmatched-browser
+    desc: a search's unmatched lines opened by real presses, in All, in a thread and among the thread cards, in current Chromium at 393x852 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/search_unmatched_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 6
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#247 reply-continuity` in the browser engine, at 1280x800 with a mouse and at 412x915 by touch, at
+  # 80%, 100% and 130% text: Reply on a message in the middle of the list, just under the list's top,
+  # half under its top edge, low on the screen, a reply in its gutter, and one taller than the screen.
+  # Since `#410 inline-reply-editor` the reply opens in the list: the row is not moved (a low one only
+  # as far as shows the box whole, a tall one up as far as shows it too), the reply's box is
+  # directly under it on its tint, as wide as the list, the channel's box hidden, and Cancel moves
+  # nothing but the box. A resize keeps the box under its row; Send posts and marks the message Done
+  # without moving the list. `#185 reply-new-thread` added two short runs at both sizes on a channel
+  # whose messages each head an empty thread: "Start a new thread" offered between the box and Send,
+  # ticking it keeping the message where it was, and Send posting into the message's thread. And `#267
+  # quote-reply`: words selected by a mouse drag, a triple-click or as a long press leaves them make
+  # Reply "Quote reply", and r or a tap opens the reply with them quoted and the caret under them; on a
+  # phone at 393 and 360 wide, on long names and reply counts, the label moves no row's words ("Quote"
+  # at Reply's width where "Quote reply" would wrap the header line). Measured on 2026-10-21: about 40s
+  # wall.

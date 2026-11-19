@@ -1,0 +1,21 @@
+steps:
+  - group: check
+    job: server-hits-browser
+    desc: server hits stay one collapsed line until tapped so typing filters instantly, in current Chromium at 412x915 and 1280x800 in both schemes, keyboard open and closed
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/server_hits_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 600
+    cpu_timeout: 90
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 60
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#620 link-url-chip` in the browser engine, at 393x852 and 412x915 with a finger and 1280x800 with
+  # a mouse: URL first among the chips under Links, links written as their labels and then as their whole
+  # addresses wrapped at their slashes, the choice kept over a reload, a search by a word only an address
+  # holds, and the list starting below the chip row so no row shows through it. Measured on 2026-10-28:
+  # about 9s wall.

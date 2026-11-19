@@ -1,0 +1,28 @@
+steps:
+  - group: check
+    job: scroll-writer-guard
+    desc: direct scrollTop/scrollTo/scrollBy/scrollIntoView writes outside scrollkeep, enforcing for every adopted path (P1, P2, P3, P4, P5, P6, P7, P8 and P9)
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/scroll_writer_guard.py --enforce P1 P2 P3 P4 P5 P6 P7 P8 P9
+    jobs_flag: ""
+    timeout: 120
+    cpu_timeout: 30
+    hint:
+      est_duration_s: 5
+      classification: light
+      rss_baseline_bytes: 268435456
+
+  # `#338 column-overscroll` in the browser engine, at 1280x800 and 1920x1080 in two columns with a mouse:
+  # the right column's cards open at their foot with no room past it; the wheel, rested and turned at the
+  # foot, goes on into blank room until the last card's top is at half the column's height; the mouse
+  # resting on that card, and a press that shows it whole and one that puts it out, move nothing, sampled
+  # at every frame; back up past the foot closes the room; a fling of the wheel stops on the foot, judged
+  # only on turns closer together than the page's rest as the page heard them; PgDn, Space and a fresh
+  # down arrow on the last card go on past the foot, End comes back, and a held key stops on it; a search
+  # typed in the room closes it; a thread on the right is followed in the room, PgDn takes its last reply
+  # to the middle, a reply arriving there moves nothing and the room is fitted to it, and End lands on the
+  # foot (at 1280x700 its box already holds the last reply above the middle, so no room opens); and the
+  # thread list on its own (Ctrl+3) does the same. Then six negative controls at 1920x1080, each a copy of
+  # the page with one part taken out, each failing at the check that part answers for. Measured on
+  # 2026-10-19 in the gate: 198s wall and about 20s CPU, eight Chromium launches, most of it the
+  # frame-sampled holds; the budgets are about three and six times that.

@@ -1,0 +1,21 @@
+steps:
+  - group: check
+    job: server-thread-hues-browser
+    desc: two browser contexts drawing the same threads in the server's colours in current Chromium at a 1280x800 desk
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/server_thread_hues_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 15
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#242 rich-headers` in the browser engine: each headed row's tag, title and time drawn whole —
+  # beside the time and the buttons where the list is wide enough, as the row's first line where it
+  # is not — the words they restate hidden and every one of them in the header, a combined row's
+  # second message as written, the ⋯ menu over the row below, and the Settings switch drawing every
+  # first line as written across a reload, at a phone and a desk, in one column and two.

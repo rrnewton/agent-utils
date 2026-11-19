@@ -1,0 +1,25 @@
+steps:
+  - group: check
+    job: scripts
+    desc: strict typing and no explicit Any in the Python operator tools
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && make scripts-check
+    jobs_flag: ""
+    timeout: 960
+    cpu_timeout: 120
+    hint:
+      est_duration_s: 5
+      classification: light
+      rss_baseline_bytes: 536870912
+
+  # The generated browser contract matches the schema, and voice.js type-checks against it. The
+  # schema's own freshness against the Rust types is a `cargo test` in `test.unit`.
+  # The contract check runs the generator's tools (Ajv, TypeScript) from contract/node_modules, so
+  # it depends on the step that installs them from contract/package-lock.json rather than on
+  # whoever last ran `npm ci` in this checkout. A repeat run with the same lockfile does nothing.
+  # The page build uses them too (`#624 voice-page-modularity`): every cargo step, through build.rs,
+  # and every browser walk, which serves a page build of its own (tests/page_sources.py).
+  # The pinned Node 22 the page and contract steps run under (#865): on a host whose system
+  # node is v16 there is no --test-reporter and esbuild refuses, so these steps provision
+  # their own toolchain exactly as the timeline browser checks do. The provisioner is
+  # idempotent and flock-guarded, so this step and timeline's can both run.

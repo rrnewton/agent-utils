@@ -1,0 +1,23 @@
+steps:
+  - group: check
+    job: bookmark-browser
+    desc: the reading bookmark set, jumped to, kept across a reply and advanced by Done, and taken away by the X on its line with Undo (#420 bookmark-clear), in current Chromium at 1280x800 and 393x852
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/bookmark_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 6
+
+  # `#243 filter-keeps-selection` in the browser engine, the owner's own sequence at 1280x800 with a
+  # mouse and at 412x915 with a finger: search, Pinned, a pin chosen, the filter cleared -- the pin's row
+  # in the channel's list stands where it stood in the Pinned list, within a pixel, and half a second
+  # later still does; then a pin two pages older than the newest page, chosen and cleared with the reads
+  # held: the head of the list says "Loading earlier messages…" on the screen, and let go, the channel is
+  # walked back and the old pin's row stands where it stood; then a pin that is the second part of a
+  # combined row, whose own text stands where it stood; then the long message just above that row,
+  # opened by the reader's click or tap, which stays where they saw it. Measured on 2026-10-12: about
+  # 7s wall.

@@ -1,0 +1,23 @@
+steps:
+  - group: check
+    job: fallback-chain-browser
+    desc: read-aloud through a fallback chain in current Chromium, phone and desktop, behaviour verdict only (tap-to-audible printed)
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/fallback_chain_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 20
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#376 read-aloud-blocks` in the browser engine: a long message walked block by block against a
+  # voice with one session that speaks at speaking pace -- the blocks asked for and lit in order,
+  # the sentences lit in order, a tap on another block jumping there, Previous and Next, the media
+  # keys, pause holding and resume carrying on, and the strip's drawn geometry, at a phone and a desk.
+  # The verdict is that behaviour (`#1250 vibe-talk-timing-robust`); boundary gaps are printed, and
+  # their budgets plus the slow-voice, held-up-voice and late-page controls run only under the
+  # script's --benchmark, outside the gate.

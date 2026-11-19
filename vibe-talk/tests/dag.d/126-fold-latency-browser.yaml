@@ -1,0 +1,21 @@
+steps:
+  - group: check
+    job: fold-latency-browser
+    desc: Shift+O folds and e marks Done in an unpacked Threads view, each drawn as promised, and hiding a row restyles only what it touches (#532), in current Chromium at 393x852 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/fold_latency_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 960
+    cpu_timeout: 120
+    hint:
+      # A latency budget measures the page, so it owns every browser slot,
+      # like timeline.browser.benchmark.
+      resources: {browser: 8}
+      est_duration_s: 25
+
+  # `#459 pack-keeps-card-still` and `#460 pack-gap-slide` in the browser engine, at 1280x800 with a mouse and
+  # 393x852 by touch: a card packed at the foot of the Threads view by a click, its top the same in every
+  # frame, held past the foot in room that a live reply fills and that scrolling up takes away for good; the
+  # card after it held through the gap's hold and then moving only up; unpacked, the mirror; up the list no
+  # room; under reduced motion no animation. Measured on 2026-10-23: about 16s wall.

@@ -1,0 +1,33 @@
+steps:
+  - group: build
+    job: tests
+    desc: the release test binaries the Rust and page suites run
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && ../scripts/with-node22 cargo test --release --locked --no-run
+    jobs_flag: ""
+    jobs_env: CARGO_BUILD_JOBS
+    deps: [build.release]
+    # Measured 2026-10-23 on the validation host, after a change to the page the binaries embed:
+    # 73 to 104 s wall, 1000 to 1160 s of CPU and a 6.1 GiB peak. About twice the CPU.
+    timeout: 19200
+    cpu_timeout: 2400
+    hint:
+      est_duration_s: 100
+      classification: cpu-bound
+      preferred_inner_jobs: 16
+      rss_baseline_bytes: 6442450944
+
+  # `cargo test` runs the Rust tests AND the page suites through their own harnesses, so each page
+  # suite has one owner in the complete graph rather than being paid for twice. --no-fail-fast: by
+  # default cargo stops at the first failing test binary, so one red binary hid every later one.
+  #
+  # The app page's suite (tests/voice_page.rs, which runs node tests/js/voice_page.test.mjs) is the
+  # one exception: it is skipped here, by its exact name, and run by the `test.page-*` slices below,
+  # straight through node (`#472 gate-flake-hardening`, `test-time-vibe-talk`). It was single-threaded
+  # node work of 450 to 740 s CPU on the loaded validation host, and run-cargo runs the test binaries
+  # one after another, so inside this step it was most of the wall time and a third of the CPU
+  # budget, and runs were killed at the budget while it was still going. Run alone, `cargo test`
+  # (and `make test`) still runs every suite.
+  #
+  # The page build's suite (tests/page_build.rs) runs the esbuild contract/package-lock.json pins,
+  # so this step depends on the step that installs it (`#624 voice-page-modularity`).

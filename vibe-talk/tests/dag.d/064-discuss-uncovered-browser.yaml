@@ -1,0 +1,18 @@
+steps:
+  - group: check
+    job: discuss-uncovered-browser
+    desc: the Discuss uncovered-messages line and its cleanup, seeded through the fake-seed route and summarized through the real server (fake chat upstream, loopback model stub) in current Chromium at 412x915 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page, disabled-optin]
+    cmd: cd vibe-talk && python3 tests/discuss_uncovered_browser.py
+    jobs_flag: ""
+    deps: [build.release, setup.contract-tools]
+    timeout: 900
+    cpu_timeout: 300
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 180
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#1526 discuss-docked-pane-mobile`: the half-height phone sheet docked
+  # under the list, a citation landing in the visible upper area.

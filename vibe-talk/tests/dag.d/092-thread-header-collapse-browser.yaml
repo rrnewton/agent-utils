@@ -1,0 +1,22 @@
+steps:
+  - group: check
+    job: thread-header-collapse-browser
+    desc: the card at the top of a thread folded by a press to a thin bar of its own colours and opened again, nothing under it moving, kept across a reload, joined to its root, in current Chromium at 393x852 by touch and 1280x800 with a mouse, in both schemes
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/thread_header_collapse_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 720
+    cpu_timeout: 90
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 25
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#385 thread-line-overlap` in the browser engine, at 1000x800, 1280x800 (both schemes) and 1920x1080
+  # with a mouse: a thread opened on the right under its card, its one line from the root on Main runs
+  # down a lane right of the divider and at least 4px left of every row of the thread, whole and clipped
+  # at Main's top, the rows level with the card; the agent's rows and a third party's span the column and
+  # the owner's stay partial width; and at 393x852 by touch, in both schemes, the thread across the
+  # window draws no line and the owner's rows are partial width.

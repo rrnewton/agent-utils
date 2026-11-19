@@ -1,0 +1,16 @@
+steps:
+  - group: check
+    job: approval-card-phone-alone-browser
+    desc: a reader who saw only a long draft's card at the foot once it goes, there or from under the thread list, and back from Settings where they were, at 393x852, in current Chromium
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/approval_card_browser.py --part phone-alone
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 800
+    cpu_timeout: 100
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 110
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+

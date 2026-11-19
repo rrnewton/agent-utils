@@ -1,0 +1,47 @@
+steps:
+  - group: test
+    job: unit
+    desc: the Rust suites, and the contract's page suite through its harness
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && ../scripts/with-node22 python3 ../scripts/case_timings.py run-cargo -- cargo test --release --locked --no-fail-fast -- --skip the_voice_page_suite_passes --exact
+    jobs_flag: ""
+    jobs_env: CARGO_BUILD_JOBS
+    deps: [build.tests, setup.contract-tools]
+    # Measured 2026-10-23 on the loaded validation host: a passing run that built the test binaries
+    # and ran the page suite as well used 1789 s of CPU, and runs since were killed at the old 1800 s
+    # budget while that suite was still running; 2700 s was the stopgap (185b2539). Running the
+    # built binaries without it: 37 s wall, 39 s of CPU and a 442 MiB peak. The budget is for a
+    # loaded host, and a test binary that spins.
+    timeout: 4800
+    cpu_timeout: 600
+    hint:
+      est_duration_s: 40
+      classification: cpu-bound
+      preferred_inner_jobs: 8
+      # `#1388` (landing 2 added the catchup Update's tests and page suites):
+      # measured peak 4621602816 bytes (4.31 GiB) for this step on the
+      # validation host, 2026-11-14; sized to peak plus headroom.
+      rss_baseline_bytes: 2684354560
+
+  # The app page's suite, straight through node: tests/js/voice_page.test.mjs over web/voice.js, as
+  # four interleaved slices (`VOICE_PAGE_SHARD`, `test-time-vibe-talk`) that run side by side.
+  #
+  # Not through its cargo-test harness (`the_voice_page_suite_passes` in tests/voice_page.rs, which
+  # `test.unit` skips by name and `cargo test` alone still runs, the same slices at once): that
+  # harness only starts node and reads its counts, and the counts it held the run to are in the file
+  # now, which fails a slice that selected nothing or a file that collected less than its floor. So
+  # these need no test binary, hang off nothing, and run while the builds do instead of after them.
+  #
+  # Measured 2026-10-24 on the loaded validation host: the whole suite in one node, 605 s wall and
+  # 622 s of CPU with a 3.7 GiB peak, before the fixture stopped re-reading web/voice.html for every
+  # page; 168 s and 209 s after. Four slices side by side, 32 to 51 s wall each in a gate. A slice's
+  # CPU budget is the whole suite's, as a backstop for a slice that spins.
+  #
+  # `--max-old-space-size=1024`: what a slice keeps alive is a few hundred MiB, but on a host with a
+  # lot of memory V8 sizes its heap to the host and lets garbage pile up to 2.7 GiB a slice. Held to
+  # 1 GiB, a slice peaked at 0.86 GiB and ran faster (46 s against 55 s), and four of them starting
+  # beside the builds no longer ask for 11 GiB. A slice that ever needs more fails as out of memory,
+  # by name.
+  #
+  # Each slice builds the page with the pinned esbuild, so it waits for setup.contract-tools: in a
+  # fresh checkout with no vibe-talk/contract/node_modules yet, a slice otherwise raced the install.

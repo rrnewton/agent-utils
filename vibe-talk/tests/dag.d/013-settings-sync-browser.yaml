@@ -1,0 +1,18 @@
+steps:
+  - group: check
+    job: settings-sync-browser
+    desc: two devices share one server settings document and converge live, in current Chromium
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/settings_sync_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 6
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#1562 settings-long-message-share-inputs` in the browser engine: the first-share
+  # guard's two numbers as one typeable sentence at phone and desktop widths.

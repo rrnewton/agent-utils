@@ -1,0 +1,19 @@
+steps:
+  - group: check
+    job: thread-reader-follow-browser
+    desc: read-aloud follow is never yanked up while following in a thread, and the Reading chip returns to it from off screen, in current Chromium at 412x915 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/thread_reader_follow_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 14
+      classification: latency-bound
+  # `#1819 vibe-talk-thread-button-shows-slug` in the browser engine, at 412x915 by touch (scale
+  # 2.6) and 1280x800 with a mouse, light and dark, keyboard open and closed, Discuss open on the
+  # phone: a slugged root's tag reads "🧵 my-thread-slug (57)" with a greyed emoji inside its row,
+  # an unslugged root keeps Thread(N) and the grey start tag is unchanged; a narrowed list keeps
+  # the tag in its row and the narrowest rows fall back to the compact form.

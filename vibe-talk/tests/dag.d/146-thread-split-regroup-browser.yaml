@@ -1,0 +1,25 @@
+steps:
+  - group: check
+    job: thread-split-regroup-browser
+    desc: three parts of one bridge reply in a thread regroup when Combine messages is turned on, in current Chromium at 412x915 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/thread_split_regroup_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 6
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#377 compact-collapsed-rows` in the browser engine, at 393x852 by touch and 1280x800 with a mouse, in
+  # All: every collapsed row's header is one line inside its row (the name cut by an ellipsis, never under
+  # a few letters; the time; the Thread tag; ⋯) with no Reply, Done, Unarchive or Not noise drawn or in the
+  # accessibility tree; the Thread tag as tall as ⋯ and Reply, in Reply's type and its thread's colour; an
+  # opened row (short, or opened by a tap or Enter) has Reply, the Thread tag, ⋯ and Done or Unarchive
+  # together on one line at the right, none alone, and folding takes them away; a swipe archives a collapsed
+  # row; at the desk a wide list keeps every control on one line, in one column and two, and two columns
+  # at 1024x768 follow the phone's rule. The negative control requires an open row's Reply and Done.
+  # Measured on 2026-10-19: about 6s wall, two Chromium launches.

@@ -1,0 +1,16 @@
+steps:
+  - group: check
+    job: appearance-icon-browser
+    desc: the thread picker glyph contrasts with its button in Dark forced, Light forced and System on dark and light devices, in current Chromium at 412x915
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/appearance_icon_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 30
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+

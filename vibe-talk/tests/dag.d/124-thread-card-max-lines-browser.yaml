@@ -1,0 +1,19 @@
+steps:
+  - group: check
+    job: thread-card-max-lines-browser
+    desc: a long Markdown first message split for its thread card at K lines between lines, the rest unpacked as its formatted continuation, the summary layout taking over in place, K from Settings and a link landing on the card, in current Chromium at 393x852 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/thread_card_max_lines_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 720
+    cpu_timeout: 90
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 20
+
+  # `#528 thread-card-markdown-and-cap` in the browser engine: a long Markdown first message with one reply,
+  # as on Slack. The card is its formatted body cut between lines at K, the continuation formatted and
+  # numbered on; with a summariser the card waits in the summary's layout and only its words change when the
+  # summary is filed; with the summary filed, a fresh load draws it with the thread's card and a reload whose
+  # reads are held draws it from the device's copy. Measured on 2026-10-26: about 25s wall.

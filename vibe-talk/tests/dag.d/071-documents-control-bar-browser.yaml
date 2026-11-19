@@ -1,0 +1,19 @@
+steps:
+  - group: check
+    job: documents-control-bar-browser
+    desc: the Documents desktop control bar (centred Reader box, Fetch in list view and Outline in reader view, popups centred over their buttons and clamped), against the real server (fake chat upstream) in current Chromium at 393x852 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/documents_control_bar_browser.py
+    jobs_flag: ""
+    deps: [build.release, setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 90
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#1264 documents-scroll-landings` against the real server binary: a slow-fetch
+  # first open at the reader's top, Back at the list's bottom, and Back after
+  # scrolling up exact, at phone and desk.

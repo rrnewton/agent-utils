@@ -1,0 +1,16 @@
+steps:
+  - group: check
+    job: approval-card-short-screens-browser
+    desc: the docked card whole at 667x375 and 375x330, screens too short to hold it as an upright phone does, in current Chromium
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/approval_card_browser.py --part short-screens
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 800
+    cpu_timeout: 100
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 60
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+

@@ -1,0 +1,18 @@
+steps:
+  - group: check
+    job: message-rerender-browser
+    desc: a re-rendered block post's bullets and link labels, in current Chromium at 390px and on a desk
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/message_rerender_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 20
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#1867 vibe-talk-save-draft-chip-covers-text`: the Save draft chip never
+  # covers typed words, at a phone's and a desk's size, against the real server.

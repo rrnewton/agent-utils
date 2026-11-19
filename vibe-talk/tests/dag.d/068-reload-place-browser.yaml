@@ -1,0 +1,16 @@
+steps:
+  - group: check
+    job: reload-place-browser
+    desc: a reload keeps the view, the channel and the scroll anchor after a search filter, against the real server (fake chat upstream) in current Chromium at 412x915 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/reload_place_browser.py
+    jobs_flag: ""
+    deps: [build.release, setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 90
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+

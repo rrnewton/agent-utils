@@ -1,0 +1,24 @@
+steps:
+  - group: check
+    job: done-sync-browser
+    desc: a Done and an Undo drawn in a view held from earlier from its first frame, a thread opened on the right for the first time drawing a held Done from its first frame, and a sent reply's provider mark waiting for a held Done, in current Chromium at 412x915 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/done_sync_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 7
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#252 thread-button-state` in the browser engine, at 412x915 by touch and 1280x800 with a mouse: on
+  # Main, in the dark scheme and the light, a new message's Thread tag -- the thread Google Chat names
+  # for every message, which nobody has answered -- is drawn exactly as Reply beside it (border, ink,
+  # font size, height, no background) while an answered root's Thread(N) wears its thread's colour,
+  # each inside its row and uncovered; the grey tag opens the empty thread with the message alone in
+  # it and the focus in its box, the first reply typed there is posted with the message's thread id,
+  # and back on Main the tag is the coloured Thread(1); at the desk, in two columns, the empty thread
+  # opens on the right with that column's box focused. Measured on 2026-10-12: about 6s wall.

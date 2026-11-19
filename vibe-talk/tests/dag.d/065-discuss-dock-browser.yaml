@@ -1,0 +1,17 @@
+steps:
+  - group: check
+    job: discuss-dock-browser
+    desc: the Discuss half-height sheet docked under the message list on a phone (scroller ends at the panel top, list scrolls to its last row, a citation lands fully in the visible upper area) with the desk overlay unchanged, against the real server (fake chat upstream, contract-shaped catchup answer at the network edge) in current Chromium at 390x844 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/discuss_dock_browser.py
+    jobs_flag: ""
+    deps: [build.release, setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 60
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#1176 doc-kind-buckets`: one item of each kind in the Documents view.

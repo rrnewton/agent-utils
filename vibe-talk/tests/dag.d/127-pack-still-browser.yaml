@@ -1,0 +1,32 @@
+steps:
+  - group: check
+    job: pack-still-browser
+    desc: a thread card packed or unpacked in the Threads view still in every frame, past the foot where it takes that, and what is below sliding into the gap, in current Chromium at 1280x800 and 393x852
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/pack_still_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 16
+
+  # `#429 keyboard-hides-bar` in the browser engine, at 393x852 by touch with the on-screen keyboard
+  # simulated as Chrome on Android lays it out (the viewport 336px shorter): a focused box alone keeps both
+  # bars; the keyboard up takes the control bar and the dock away and the list reaches the window's foot,
+  # the box, Send and the message above on screen; down, or the box losing the focus, brings both back with
+  # the reader at the foot; a reply mid-list stays whole above the keys and its message does not move as
+  # they go; Read on leaves one slim Stop that a tap really stops. At 1280x800 with a mouse, a shorter
+  # window with the box focused keeps both bars. Measured on 2026-10-22: about 8s wall.
+  # `#1144 scrollback-typing-jump` in the browser engine, at 412x915 and 360x800 by touch (the keyboard
+  # the viewport 336px shorter) and 1280x800: typing at the foot follows an arrival, the strip's resizes
+  # and a row grown 180px late with the whole composer on screen; reading scrollback mid-draft holds its
+  # anchor across arrivals and resizes and typing again lands whole; on the desktop the same without a
+  # keyboard, unfocused keys navigating; and hover crossings and rests between the two columns scroll
+  # neither. Measured on 2026-11-09: about 25s wall.
+  # `#1186 two-column-splitter` in the browser engine, at 1280x800: the separator between the two
+  # columns dragged with the mouse narrows and widens them while each column's first on-screen row
+  # stays the same row at the same height, stops with neither column under 300px past either edge,
+  # double-clicks back to half and half, moves a point per arrow key from its focus with
+  # aria-valuenow saying where it stands, and survives a reload on the device.

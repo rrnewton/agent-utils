@@ -1,0 +1,24 @@
+steps:
+  - group: check
+    job: documents-read-browser
+    desc: the Documents reader reading aloud through the shared owner by both voices, against the real server (fake chat upstream, fake local-TTS sidecar) in current Chromium at 393x852 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/documents_read_browser.py
+    jobs_flag: ""
+    deps: [build.release, setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 90
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#1515 page-update-reload-loses-controls` against the real server binary: press
+  # `New version — reload` in the channel and reload at the reader's deep link, at
+  # 393x852 and 1280x800, and assert the bottom bar (and, in the reader, its pane)
+  # stands after every reload.
+  # `#1849 vibe-talk-reload-keeps-view-and-place` against the real server binary:
+  # seed a tall threadless channel (no threads), read mid-channel, filter by a
+  # search, reload at 412x915 and 1280x800, and assert the view, the channel and
+  # the session scroll anchor (never in the URL) survive.

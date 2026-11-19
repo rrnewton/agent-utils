@@ -1,0 +1,18 @@
+steps:
+  # ---- the cheap gates, which need nothing built ------------------------------------------------
+  - group: check
+    job: fmt
+    desc: rustfmt, in check mode
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && cargo fmt --all -- --check
+    jobs_flag: ""
+    timeout: 480
+    cpu_timeout: 60
+    hint:
+      est_duration_s: 5
+      classification: light
+      rss_baseline_bytes: 268435456
+
+  # Every cargo command here runs build.rs, which builds the page with the esbuild
+  # contract/package-lock.json pins (`#624 voice-page-modularity`): so each depends on the step that
+  # installs it, here and in `build.release` (which the other cargo steps follow).

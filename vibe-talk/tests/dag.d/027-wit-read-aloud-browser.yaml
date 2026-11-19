@@ -1,0 +1,21 @@
+steps:
+  - group: check
+    job: wit-read-aloud-browser
+    desc: read-aloud with the Wit.ai backend in current Chromium, phone and desktop, behaviour verdict only (tap-to-audible printed)
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/wit_read_aloud_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 20
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#561 local-tts-provider` in the browser engine: the read-aloud bar names the Local voice,
+  # Settings keeps it as the selected reader, and a tap is heard, at 393x852 and on a desktop.
+  # The verdict is that behaviour only; the tap-to-audible time is printed, and the old 5000 ms
+  # budget is an opt-in `--benchmark` outside the gate (#1250 vibe-talk-timing-robust, pattern
+  # #1248 fold-latency-behaviour-verdict).

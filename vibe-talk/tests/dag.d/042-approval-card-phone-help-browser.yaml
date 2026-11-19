@@ -1,0 +1,16 @@
+steps:
+  - group: check
+    job: approval-card-phone-help-browser
+    desc: back from Help opened by its key on the newest line once the draft went or changed while Help was up, the chips' room kept for a reader, and the jump decided on the list as it is laid out, at 393x852, in current Chromium
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/approval_card_browser.py --part phone-help
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 800
+    cpu_timeout: 100
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 95
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+

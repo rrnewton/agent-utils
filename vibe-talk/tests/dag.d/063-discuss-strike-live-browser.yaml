@@ -1,0 +1,25 @@
+steps:
+  - group: check
+    job: discuss-strike-live-browser
+    desc: the summary bullet strike following a row archive, put back and re-archive with no reload, and repeated citation links landing on screen, against the real server (fake chat upstream, contract-shaped catchup answer at the network edge) in current Chromium at 412x915 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/discuss_strike_live_browser.py
+    jobs_flag: ""
+    deps: [build.release, setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 60
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#1843 vibe-talk-discuss-uncovered-messages-line`: seed through the
+  # fake-seed route, summarize through the real router, leave a gap, and
+  # clean it up from the uncovered line, on main and in a thread.
+  # DISABLED from gating (`disabled-optin`, owner survey 2026-11-19): a
+  # 71 s median real-server walk whose proof is dynamic/manual by
+  # default (owner thread 193); it stays runnable by hand
+  # (`make -C vibe-talk discuss-uncovered-browser`, or validate
+  # --include-disabled) and returns only if it becomes fast and
+  # hot-host robust without losing the exact-id cleanup proof.

@@ -1,0 +1,25 @@
+steps:
+  - group: check
+    job: offline-cache-phone-browser
+    desc: saved-message snapshot and a read-scope sign-in in current Chromium at a 412x915 Android viewport
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/offline_cache_browser.py --profile phone
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    # The walk has grown with every page feature it checks (search bar, Pinned, Links and their kinds,
+    # tiles, the desktop dock, reply arrows) and measured 70-75 s wall and 42-46 s of CPU on a loaded
+    # host on 2026-10-08, against the old 90 s / 45 s — so a passing run was killed for its CPU. The
+    # budgets are a backstop against a hung browser, not a speed target: about twice the measurement.
+    # With the gathered-replies walk (`#214 reply-arrow`, `#215 reply-coalesce`) a passing run on the
+    # same host measured 155 s wall and 90 s of CPU, against 180 s / 100 s.
+    # As returned under #1250 on 2026-11-11, solo dagrun accounting measured this profile at
+    # 35.4 s CPU / 56.3 s wall and desktop at 28.5 s / 43.3 s; both keep 300 s CPU and the same
+    # 1440 s wall as hung-run backstops (over 8x CPU and 25x wall), not speed targets.
+    timeout: 1440
+    cpu_timeout: 300
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 70
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+

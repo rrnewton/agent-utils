@@ -10,7 +10,7 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page web-build pwa-installability enter-to-send-browser pairing-link-browser offline-cache-browser reactions-browser system-bots-browser edited-mark-browser rich-headers-browser read-aloud-browser wit-read-aloud-browser local-read-aloud-browser fallback-chain-browser read-aloud-blocks-browser read-aloud-views-browser read-pause-reply-browser pace-stepper-browser menu-above-chips-browser post-confirm-browser approval-card-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser fold-pins-browser keyboard-browser search-chord-browser composer-key-browser command-bar-browser documents-browser documents-scrubber-browser discuss-browser discuss-uncovered-browser discuss-dock-browser documents-scroll-browser two-column-browser desktop-layout-browser bookmark-browser reply-continuity-browser inline-reply-browser threads-main-browser sent-receipts-browser threads-polish-browser pack-still-browser reply-marks-read-browser done-sync-browser voice-read-acceptance-self-test android-speech-self-test screenshots-self-test container-smoke filter-place-browser search-dates-browser search-unmatched-browser labels-browser whole-threads-browser whole-threads-server-browser link-url-chip-browser voice-composer-browser composer-grow-browser thread-button-browser thread-drill-anchor-browser refresh-replaces-browser composer-stays-browser incremental-refresh-browser windowed-refresh-browser thread-slug-browser done-feedback-browser elision-browser clean thread-card-focus-browser thread-card-header-browser thread-header-collapse-browser threads-unpack-browser thread-line-browser empty-messages-browser all-thread-strip-browser scroll-stability-browser scroll-soak-browser copy-message-browser open-upstream-link-browser in-app-links-browser message-summaries-browser thread-hue-spread-browser server-thread-hues-browser fold-steps-browser back-gesture-browser live-pill-browser stale-live-read-browser provider-groups-browser voice-reconnect-browser live-relay-check-self-test live-relay-check channel-search-browser column-overscroll-browser channel-box-browser keyboard-hides-bar-browser reply-keyboard-clutter-browser typing-scroll-browser two-column-splitter-browser firstrun-browser
+.PHONY: validate validate-boxed dag-check check scripts-check contract-check typecheck test page web-build offline-cache-browser approval-card-browser container-smoke labels-browser whole-threads-browser whole-threads-server-browser clean thread-hue-spread-browser live-relay-check column-overscroll-browser firstrun-browser
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -47,8 +47,6 @@ validate-boxed:
 dag-check:
 	cd .. && ./common/bin/dagrun list --dag vibe-talk/tests.dag.yaml >/dev/null
 
-fmt:
-	cargo fmt --all -- --check
 
 check:
 	cargo clippy --all-targets --locked -- -D warnings
@@ -61,21 +59,6 @@ scripts-check:
 		--disallow-any-explicit --disallow-any-decorated vibe-talk
 	cd .. && python3 scripts/check_no_any.py vibe-talk
 
-# THE WIRE CONTRACT. `src/contract.rs` names the JSON the server and the page exchange; the files
-# under contract/ and web/contract.* are generated from it and checked in, so a change to a wire
-# type arrives as a reviewable diff. `contract` regenerates all of them: the schema and samples
-# from the Rust types, then the browser's validators and declarations from the schema, then every
-# contract test against the result. The browser-validator test is skipped while rewriting: it
-# would judge the OLD validators against the NEW samples, and stop the recipe before regenerating.
-# `contract-check` fails, naming the stale file, when the browser files no longer match the
-# schema; `cargo test --test integration contract::` does the same for the schema against the Rust types.
-#
-# Both, and `typecheck`, need the generator's pinned tools: `npm ci --prefix contract` once.
-# Serving the page never does -- web/contract.js is plain checked-in JavaScript.
-contract:
-	VIBE_TALK_UPDATE_CONTRACT=1 cargo test --locked --test integration -- contract:: --skip the_browser_validators
-	node contract/generate.mjs
-	cargo test --locked --test integration contract::
 
 contract-check:
 	node contract/generate.mjs --check
@@ -115,35 +98,9 @@ page:
 web-build:
 	node web/build.mjs --out target/web
 
-# A real current Chromium, speaking CDP. This validates the installability decision the DOM-only
-# page suite cannot make, at / and from the app's old address /voice (`#302 root-is-the-app`): a
-# 302 keeping query and fragment, the same app id, inside the scope. It runs the release binary on a
-# loopback secure context by default, so it builds that first; set VIBE_TALK_CHROMIUM to inspect
-# with a particular Chrome executable, or pass --url directly to the script for a deployed server.
-# It deliberately states that this is not physical-device launcher proof.
-pwa-installability:
-	cargo build --release --locked
-	python3 tests/pwa_installability.py
 
-# `#225 enter-to-send` in a real Chromium at a desk's size: real keys in the reply box. By default
-# Shift+Enter is a new line and Enter posts the reply; with "Enter to send" off in Settings (its hint
-# naming the key that sends, kept across a real reload), Enter is a new line and Ctrl+Enter posts.
-# Pass WEB_ROOT=dir to run it against another copy of the page.
-enter-to-send-browser:
-	python3 tests/enter_to_send_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT))
 
-# `ios-keyboard-send` at an iPhone's size: every sending box's return key and input mode, a real
-# Enter sending, and the Send at the simulated keyboard's top. Chromium by default, as validation
-# runs it; BROWSER=webkit runs the iOS engine where it is installed (a missing WebKit skips with
-# its reason, never a failure). Pass WEB_ROOT=dir against another copy of the page.
-ios-keyboard-send-browser:
-	python3 tests/ios_keyboard_send_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(BROWSER),--browser $(BROWSER))
 
-# `#369 pairing-link` in a real Chromium at a phone's size: a pairing link signs a fresh browser in
-# once, its code out of the address before any request; the same link in a second browser is refused.
-# Pass WEB_ROOT=dir to run it against another copy of the page.
-pairing-link-browser:
-	python3 tests/pairing_link_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT))
 
 # `#18 offline-message-cache` in a real Chromium at a phone's size: localStorage across a real
 # reload, a real fetch failure, the Cache Storage and service-worker registries, and the pill's
@@ -152,121 +109,21 @@ pairing-link-browser:
 offline-cache-browser:
 	python3 tests/offline_cache_browser.py $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#219 emoji-reactions` in a real Chromium: every reaction strip laid out under its row's text,
-# clear of the row's controls and legible, at 412px, 360px and a desk, dark and light. Pass
-# SCREENSHOTS=dir to keep PNGs.
-reactions-browser:
-	python3 tests/reactions_browser.py $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#323 slack-system-bots` in a real Chromium: a Slack welcome bot drawn as another bot, named and
-# labelled, set in and coloured as a colleague is, and a named coding agent drawn as the agent beside
-# it, at a phone and a desk, dark and light. Pass SCREENSHOTS=dir to keep PNGs.
-system-bots-browser:
-	python3 tests/system_bots_browser.py $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#320 slack-edited-mark` in a real Chromium: the "(edited)" after an edited row's time, on one line
-# inside the meta line, after the time, clear of the row's buttons, in the time's ink and size, at two
-# phone widths and a desk, in both schemes. Pass SCREENSHOTS=dir to keep one PNG per size and scheme.
-edited-mark-browser:
-	python3 tests/edited_mark_browser.py $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#242 rich-headers` in a real Chromium: each agent's tag, title and time drawn whole in the row's
-# header where it fits and as its first line where it does not, the words they restate hidden and
-# none lost, at 412px and a desk (and two columns), and the Settings switch drawing every first line
-# as written, kept across a reload. Pass SCREENSHOTS=dir to keep PNGs.
-rich-headers-browser:
-	python3 tests/rich_headers_browser.py $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#7 read-aloud-latency` in a real Chromium: tap to audible against audio streamed at speaking
-# pace, a switch and a stop closing the response, and only a read heard to its end archived. Its
-# negative control is the same tap through `<audio src>`, which must take seconds. Pass
-# WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to keep PNGs.
-read-aloud-browser:
-	python3 tests/read_aloud_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#552 wit-tts-provider` in a real Chromium: Settings offers the Wit.ai voice and its catalogue
-# picker, the picked voice is what speech preparation asks for, and a tap is heard, at 393x852
-# and on a desktop. Pass WEB_ROOT=dir to run it against another copy of the page, and
-# SCREENSHOTS=dir to keep PNGs.
-wit-read-aloud-browser:
-	python3 tests/wit_read_aloud_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#561 local-tts-provider` in a real Chromium: the bar names the Local voice, Settings keeps it
-# as the selected reader, and a tap is heard, at 393x852 and on a desktop. Pass WEB_ROOT=dir to
-# run it against another copy of the page, and SCREENSHOTS=dir to keep PNGs.
-local-read-aloud-browser:
-	python3 tests/local_read_aloud_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#563 read-aloud-fallback-chain` in a real Chromium: Settings displays the configured voice
-# order, a tap is heard, and the page names the fallback voice that spoke the block, at 393x852
-# and on a desktop. Pass WEB_ROOT=dir to run it against another copy of the page, and
-# SCREENSHOTS=dir to keep PNGs.
-fallback-chain-browser:
-	python3 tests/fallback_chain_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#376 read-aloud-blocks` in a real Chromium: a long message read block by block -- lit, counted,
-# jumped to by a tap, moved by Previous, Next and the media keys -- against a one-session voice at
-# speaking pace, with every block boundary measured on the audio clock. Its negative control is a
-# voice whose first audio is slow, which must show as a gap. Pass WEB_ROOT=dir to run it against
-# another copy of the page, and SCREENSHOTS=dir to keep PNGs.
-read-aloud-blocks-browser:
-	python3 tests/read_aloud_blocks_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#540 read-aloud-desktop` in a real Chromium: a message read aloud from every view (Main, All, the thread
-# list's cards and rows, one thread, two columns) by the agent's voice and the device's, the audio started
-# on a clock this check reads and the light on the message read; a voice answering with silence stops the
-# read unarchived. Pass WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to
-# keep PNGs.
-read-aloud-views-browser:
-	python3 tests/read_aloud_views_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#554 read-pause-reply-resume` in a real Chromium on a phone's screen: a read paused, the message replied
-# to and sent, then resumed, by both voices (the device's modelled on Chrome for Android, whose pause stops
-# and whose resume does nothing); the read goes on from where it was held. Pass WEB_ROOT=dir to run it
-# against another copy of the page, and SCREENSHOTS=dir to keep PNGs.
-read-pause-reply-browser:
-	python3 tests/read_pause_reply_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#567 pace-stepper` in a real Chromium at 393x852 by touch and 1280x800: the Pace popover's [-] [100%] [+]
-# stepper, its steps, typed and clamped values, arrows, and a change mid-read. Pass WEB_ROOT=dir to run it
-# against another copy of the page, and SCREENSHOTS=dir to keep PNGs.
-pace-stepper-browser:
-	python3 tests/pace_stepper_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#1228 menu-above-chips` in a real Chromium at 1280x800 and 393x852: a row's ellipsis menu over the
-# floating chips row, every item the topmost element at its centre. Pass WEB_ROOT=dir to run it
-# against another copy of the page, and SCREENSHOTS=dir to keep PNGs.
-menu-above-chips-browser:
-	python3 tests/menu_above_chips_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#49 post-confirmation-card-hold` in a real Chromium: a real touch on Send the moment a first
-# post-confirmation card appears commits nothing, and Send enables itself after the hold. Pass
-# WEB_ROOT=dir to run it against another copy of the page.
-post-confirm-browser:
-	python3 tests/post_confirm_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT))
 
-# `#268 voice-call-drops` in a real Chromium: a spoken call on the fake microphone replaying the
-# voice bridge's event order -- no microphone frame inside the greeting's hand-off, a "Yes." whose
-# final transcript arrives after the agent's reply committing the card once and never laid out as a
-# turn of its own (`#269 approval-card-inline`: it is drawn into the frozen card), the page's notice
-# waiting for that turn, the server's close said and recorded, and a hang-up sending one goodbye;
-# then (`#330 voice-long-turn-drop`, `#337 voice-relay-silent`) a long answer shown as it arrives and
-# heard out before a message from another watched channel goes, a typed cut that keeps the cut
-# answer's words, and a turn heard without text saying so.
-# Pass WEB_ROOT=dir to run it against another copy of the page.
-voice-call-drops-browser:
-	python3 tests/voice_call_drops_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT))
 
-# `#352 voice-reconnect-on-bridge-error` in a real Chromium: a fake vibe-talk-v1 bridge loses a turn
-# after an interrupt and a relayed message, and sends "turn N never started after an interrupt;
-# reconnect". The call stays up on a second session -- the deployed shape (a greeting, no replay) with
-# the bridge closing the lost socket at once, and a bridge that lists replay, handed this call's record
-# first -- the relayed message goes again once, the microphone reaches only the new session, and the
-# page says so; a second lost turn within the minute ends the call as reconnect_limit, and any other
-# error still ends it as error_frame. Pass WEB_ROOT=dir to run it against another copy of the page, and
-# SCREENSHOTS=dir to keep PNGs.
-voice-reconnect-browser:
-	python3 tests/voice_reconnect_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # `#431 voice-transcript-expand` in a real Chromium at 393x852 by touch and 1280x800 by mouse: a reply
 # streamed over a fake vibe-talk-v1 bridge grows past the fold and stays whole while the list follows
@@ -275,20 +132,7 @@ voice-reconnect-browser:
 # frames; scrolled up, a card opens where it stands. Pass WEB_ROOT=dir to run it against another copy
 # of the page, and SCREENSHOTS=dir to keep a PNG of each state.
 .PHONY: voice-expand-browser
-voice-expand-browser:
-	python3 tests/voice_expand_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#277 send-order` in a real Chromium against the real server binary, which posts through its real
-# provider client to a mock Google Chat bridge on loopback that fails A at once: B waits behind A,
-# saying so, and the bridge never sees it; A goes again under the same nonce and lands, then B;
-# across a real reload a message still waits behind the one before it, sending nothing, until Retry
-# lands both in order; Dismiss on a failing message lets the next go; a slow bridge is given one post
-# at a time, in order; and a post whose caller hangs up mid-post still lands before the next one.
-# Builds the release binary first, because web/ is compiled into it. Pass SCREENSHOTS=dir to keep a
-# PNG of each waiting state.
-send-order-browser:
-	cargo build --release --locked
-	python3 tests/send_order_browser.py $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # `#269 approval-card-inline` in a real Chromium at 393x852, 360x780 and 375x667: the send card laid
 # out as the next message -- in the list on the call's view and the channel, docked on Settings --
@@ -323,213 +167,29 @@ send-order-browser:
 approval-card-browser:
 	python3 tests/approval_card_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS)) $(if $(PART),--part $(PART))
 
-# `#241 voice-composer` in a real Chromium at 412x915 and 1280x800: the call's message box and the
-# view switch on screen and uncovered while the box has the focus -- at idle, in a typed
-# conversation, in a call, and on the phone with the on-screen keyboard's share of the screen taken
-# away -- focus and typing opening nothing, and the first send opening one typed conversation. Pass
-# WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to keep PNGs.
-voice-composer-browser:
-	python3 tests/voice_composer_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#340 composer-grow-box` in a real Chromium: the Grow checkbox left of Send, and with it ticked a real
-# long paste growing the message box to 60% of the window with Send on screen, at 1280x800, 1920x1080,
-# 1280x600 and in two columns, with field-sizing turned off too, a reader at the foot kept there while
-# typing and when Grow is ticked after a paste, one a little above it keeping the checkbox under the
-# pointer, also by a click that focuses no checkbox as in Safari and Firefox on a Mac, one up the list
-# not moved, the call's box with its recap line shown above it, and a 393x852 phone unchanged. Pass
-# WEB_ROOT=dir to run it against another copy of the page, and
-# SCREENSHOTS=dir to keep a PNG of each state, Grow off and on.
-composer-grow-browser:
-	python3 tests/composer_grow_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#220 view-switch-instant` in a real Chromium: All to Main and back with every timeline request
-# intercepted -- no read, never an empty list or the loading line, the reader's message kept -- All
-# never read drawn at once from held rows and read once behind them, and, paged, Main drawn from All
-# keeping its way back and All walked back to the reader's message before it is drawn. Pass
-# WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to keep PNGs.
-view-switch-browser:
-	python3 tests/view_switch_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#221 read-modes` in a real Chromium at 412x915 and 1280x800: entering a thread lands on its first
-# unread message, unfolded, under the pill, in each read mode, and Collapse read's "… N read
-# messages …" line is a 44px target a real tap opens without moving the reader; then, `#222
-# unread-replies`, Main under Hide read keeps the read question for its unread replies, says "4 unread"
-# beside "52 replies", and a real tap on the count lands on the first of them. Pass WEB_ROOT=dir to
-# run it against another copy of the page, and SCREENSHOTS=dir to keep a PNG of each step.
-read-modes-browser:
-	python3 tests/read_modes_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#1850 vibe-talk-fold-separator-shows-pinned` in a real Chromium at 412x915 and 1280x800.
-fold-pins-browser:
-	python3 tests/fold_pins_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#224 keyboard-shortcuts` in a real Chromium at 1280x800, the keys pressed through CDP
-# Input.dispatchKeyEvent so the browser's own defaults run: PgUp, PgDn, Space, Home and End move the
-# list on screen with the focus where the page put it on load and after a view switch; "/" and Ctrl+S
-# open the search (the browser's Save page refused); "," and Ctrl+, open Settings and Escape comes
-# back; in the message box PgUp pages the list and Ctrl+Home/End jump it; then the keymap: j, k and the
-# arrows move a visible focus ring, e marks Done and moves on, PgDn brings the ring to the page, Shift+E
-# marks one opened message Done, asks the chat service once to mark it read, and folds it with nothing
-# on screen moving (`#295 shift-e-read-collapse`), Enter folds, and -> enters a thread that <- and Esc
-# leave; Ctrl+K and a channel chosen give the keys back to the list, and Esc leaves the picker;
-# `#281 view-keys`: Ctrl+1 to Ctrl+4, and Cmd on an emulated Mac,
-# choose Main, All, the thread list and two columns from the message box, the search and a card, the
-# browser's default refused, and Esc on the thread list goes back to what it was chosen from. Pass
-# WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to keep a PNG of each step.
-keyboard-browser:
-	python3 tests/keyboard_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#344 search-shortcut` in a real Chromium at 1280x800, the keys pressed through CDP: Ctrl+/ opens the
-# search from the message box holding a draft (untouched), the pace popover and a ⋯ menu (closed first),
-# the channel picker, Settings, Help, the right column, past a listener that stops the key, the Reply
-# screen (its draft kept) and with single keys off; Ctrl+Shift+? opens Help; a German Shift+7 "/", an
-# AltGr "/" and a held chord; Cmd on an emulated Mac. Pass WEB_ROOT=dir to run it against another copy
-# of the page, and SCREENSHOTS=dir to keep a PNG of each step.
-search-chord-browser:
-	python3 tests/search_chord_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#403 composer-key-global` in a real Chromium at 1280x800 in two columns, the keys pressed through CDP:
-# Ctrl+S goes to Main's box from a thread card and the body after it; with a thread open on the right, to
-# the box of the column holding the focus or the selection, from a selected message in either column, the
-# search glass and the page body; from the search field to a box, and in a box it stays; on the thread
-# list, back to the view it was chosen from. The Save page is refused each time. Pass WEB_ROOT=dir to run
-# it against another copy of the page, and SCREENSHOTS=dir to keep a PNG of each step.
-composer-key-browser:
-	python3 tests/composer_key_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#406 command-bar-one-row` in a real Chromium at 1280x800, 1920x1080 and 900x700: the desk's dock is one
-# row across the window on a 120-character thread, the thread list, Main, All and two columns, its view
-# picker's tooltip naming the thread whole; a 393x852 phone's pane is one row above the bar. Pass
-# BASELINE_WEB_ROOT=dir (a copy of the page from before) to require the phone's dock to match it to the
-# pixel, WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to keep a PNG of each.
-command-bar-browser:
-	python3 tests/command_bar_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(BASELINE_WEB_ROOT),--baseline-web-root $(BASELINE_WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# The Documents view against the real server binary (fake chat upstream only):
-# list, touch fetch, reader, and a fetch error on the row, at 393x852.
-documents-browser:
-	python3 tests/documents_browser.py
 
-# The multi-level document scrubber (`#1508`) against the real server binary:
-# numbers on the document, navigator rows, tap-a-unit reading, both widths.
-documents-scrubber-browser:
-	python3 tests/documents_scrubber_browser.py
 
-# Discuss (`catchup-side-agent`, slice 1) in a real Chromium at 393x852 (touch) and
-# 1280x800: the panel opens, reads, marks exactly the markable ids and jumps, over a
-# contract-shaped catchup answer at the network edge. Run once the server's catchup
-# route and the page have landed together.
-discuss-browser:
-	python3 tests/discuss_browser.py
 
-# `#1843 vibe-talk-discuss-uncovered-messages-line` against the real server
-# binary: seed non-owner messages through the fake-seed route, summarize
-# through the real catch-up routes with only the model stubbed, leave a
-# gap, and clean it up from the uncovered line.
-discuss-uncovered-browser:
-	python3 tests/discuss_uncovered_browser.py
 
-# `#1526 discuss-docked-pane-mobile` against the real server binary: the
-# half-height phone sheet docked under the list, a citation landing in the
-# visible upper area, the desk overlay unchanged.
-discuss-dock-browser:
-	python3 tests/discuss_dock_browser.py
 
-# `#1264 documents-scroll-landings` against the real server binary: slow-fetch
-# first open at the top, Back at the bottom or exactly where the list was left.
-documents-scroll-browser:
-	python3 tests/documents_scroll_browser.py
 
-# `#355 provider-grouped-channels` in a real Chromium at 1280x800 and a 375x812 phone: with two chat
-# services, the bar's channel picker holds one <optgroup> per service in configuration order; Alt+Down
-# and Alt+Up, pressed through CDP, step across the groups in the order shown and stop at the ends; a
-# reload restores the channel inside its group; Ctrl+K and a choice read that channel; on the phone the
-# picker stays inside the window. Pass WEB_ROOT=dir to run it against another copy of the page, and
-# SCREENSHOTS=dir to keep a PNG of each state.
-provider-groups-browser:
-	python3 tests/provider_groups_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#402 who-is-who-channel-box` and `#401 hidden-channels-fold` in a real Chromium at 1280x800 and a
-# 393x852 phone: Who is who in Settings' channel box, following its picker, and asking for one channel on
-# All channels; the hidden channels a fold headed with their count, folded, the last thing in the Channels
-# section; opening it moves nothing above it, a picker change leaves it folded, and Show again works
-# inside it. Pass WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to keep a
-# PNG of each state.
-channel-box-browser:
-	python3 tests/channel_box_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#1781 vibe-talk-first-run-welcome-channel-default` in a real Chromium at 412x915 (scale 2.6) and
-# 1280x800, light and dark: a fresh sign-in meets the Welcome once and dismisses onto the Channel,
-# a reload and a saved Voice choice meet neither surprise, the Welcome re-opens from Settings and
-# Help, the no-channel Welcome is the guided config setup whose Check again lands on the channel
-# once configured, and `?v=docs` still wins. Pass WEB_ROOT=dir to run it against another copy of
-# the page, and SCREENSHOTS=dir to keep a PNG of each state.
-firstrun-browser:
-	python3 tests/firstrun_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#371 channel-search-hash` in a real Chromium at 1280x800: with one Slack service, the bar's picker
-# lists `#team-builds` as `team-builds`, so typing t, e, a, m into the focused picker (keys through CDP)
-# chooses it; Browse channels counts the seconds of a slow first read, then finds `#team-builds-archive`
-# for `Builds` and `#eng-ops` for `#ops`. Pass WEB_ROOT=dir to run it against another copy of the page,
-# and SCREENSHOTS=dir to keep a PNG of each state.
-channel-search-browser:
-	python3 tests/channel_search_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#229 desktop-two-column` in a real Chromium at 1440x900 and 1280x800: the layout button draws Main
-# and the right column side by side inside the window, the view picker saying so; `#281 view-keys`: the
-# thread list chosen from the picker is that column across the window, and real Ctrl+2 and Ctrl+4
-# leave and come back to two columns; the right column's cards are one height, newest activity first,
-# the long one cut to three lines; a card's replies button and a Main message's Thread(N) select a
-# thread there under its name, each column scrolls alone under the wheel, the X goes back to the cards,
-# and a window narrowed to 900px is one column in its old view, two again when wide. Pass WEB_ROOT=dir
-# to run it against another copy of the page, and SCREENSHOTS=dir to keep the list and thread states as
-# PNGs.
-two-column-browser:
-	python3 tests/two_column_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#372 settings-header-layout` and `#373 two-column-full-width` in a real Chromium. Settings at
-# 1280x800, 1920x1080 and a 393x852 phone, under a host too long for the phone's line: the host one
-# quiet line, its port whole, Expand all and Open help on its row (under it on the phone), Tab in that
-# order, Expand all turning to Fold all in place. Two columns at 1920x1080 and 2560x1080 over the
-# agent's long replies and the owner's answer with no threads: every row of Main but the owner's across
-# its column to the gutter by the divider, the owner's kept partial, the glass over no row, the right
-# column's heading and empty line across it, one column still at its reading width; and a thread open
-# on the right, its rows across that column. Pass WEB_ROOT=dir to run it against another copy of the
-# page, and SCREENSHOTS=dir to keep each state as a PNG.
-desktop-layout-browser:
-	python3 tests/desktop_layout_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#277 thread-card-focus` in a real Chromium, at 1280x800 over the right column's cards with a mouse and
-# the keys, and on a 412x915 phone over the Threads list with a finger: every card contracted, the one
-# under the mouse too; a click or a tap highlights one, shown whole and not entered, and every other
-# card's edge and every other link turns the page's grey — by the colour Chromium computes and by the
-# pixels a screenshot holds there — the highlighted card's staying in its colour; its replies button
-# enters its thread, <- or Back comes out to it still highlighted, Esc puts the highlight out, and -> enters
-# the card the keys are on. `#281 view-keys`: then the phone's thread list, chosen in the view picker, the
-# same cards across the window: the channel's highlight on them, the others grey, each replies button a
-# thumb high, a tap highlighting and showing one whole, its replies button opening the thread across the
-# window and Back coming to the list. Pass WEB_ROOT=dir to run it against another copy of the page, and
-# SCREENSHOTS=dir to keep a PNG of each state.
-thread-card-focus-browser:
-	python3 tests/thread_card_focus_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#296 copy-highlighted-message` in a real Chromium, the keys pressed through CDP and the clipboard read
-# back with `clipboard-read` granted: at 1280x800, Ctrl+C with nothing highlighted copies nothing; on the
-# folded long question it copies all of it as written, with a text/html flavour, and moves nothing; in the
-# message box, and with words selected, the browser's copy as ever; y copies the message, and a thread
-# list card copies its first message; in a tab emulating a Mac, Cmd+C with the Edit menu's "copy" command
-# and without it; on a 412x915 phone with a hardware keyboard, a tap's silent selection copies nothing and
-# j's highlight does. Pass WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to
-# keep a PNG of each state.
-copy-message-browser:
-	python3 tests/copy_message_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#543 in-app-message-links` in a real Chromium at 1280x800 and a 393x852 phone with touch: a link to
-# a message in a channel the app reads opens it in the app as one history entry, and a real Back returns
-# to the reader's message at the same height, stacked jumps undone one at a time. Pass WEB_ROOT=dir to
-# run it against another copy of the page, and SCREENSHOTS=dir to keep a PNG of each landing.
-in-app-links-browser:
-	python3 tests/in_app_links_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # `#564 message-summary-toggle` in a real Chromium at 393x852 (dark and light), 412x915 with touch and
 # 1280x800: an unpacked thread whose row holds a quote and a wide code block stays inside the screen,
@@ -539,17 +199,7 @@ in-app-links-browser:
 summarizer-health-browser:
 	python3 tests/summarizer_health_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-message-summaries-browser:
-	python3 tests/message_summaries_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#408 copy-upstream-link` as `#409 open-upstream-link` leaves it, in a real Chromium at 1280x800 and a
-# 393x852 phone: a message carrying its Slack address offers the "Open in Slack" link second in its ⋯
-# menu, wholly inside the window; the link and Shift+O open the address in a new page whose opener is
-# null, this page unmoved; l copies the address whole and says so; a message with no address offers no
-# item and neither key does anything. Pass WEB_ROOT=dir to run it against another copy of the page, and
-# SCREENSHOTS=dir to keep a PNG of the open menu at each size.
-open-upstream-link-browser:
-	python3 tests/open_upstream_link_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # `#414 thread-hue-spread` in a real Chromium at 1280x800: a channel that remembers 24 thread colours
 # from an earlier day, handed out as the page before `#414` did, gets eight new threads in a row; the
@@ -559,134 +209,17 @@ open-upstream-link-browser:
 thread-hue-spread-browser:
 	python3 tests/thread_hue_spread_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#427 server-thread-hues` in a real Chromium at 1280x800: two browser contexts, each remembering the
-# same six threads in different colours of its own, both drawn in the colours the first offered the
-# server and the server took; a reload of the second draws them still. SCREENSHOTS=dir keeps one PNG
-# per device.
-server-thread-hues-browser:
-	python3 tests/server_thread_hues_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#304 back-gesture-in-app` in a real Chromium at a 412x915 Android phone in standalone mode: the browser's
-# Back -- what the phone's back gesture sends -- closes a thread in the same document with the reader's place
-# kept, the thread list and a thread opened from it are two entries closed in turn by history.back() and the
-# browser's Back, the ⋯ menu over a thread is an entry the browser's Back closes alone, the on-screen Back goes
-# back through its entry so the browser's Back at the top leaves the app, and a page reloaded in a thread opened
-# from the list stands on the earlier load's entries, so the first Back, before any touch, closes the thread
-# alone. With the app as the tab's first entry, as in an installed app, no entry is left under it after a
-# reload; at a 1440x900 desk in two columns the browser's Back with a ⋯ menu open closes the menu, not the
-# thread on the right. Pass WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to
-# keep a PNG of each state.
-back-gesture-browser:
-	python3 tests/back_gesture_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#324 live-pill-covers-row` in a real Chromium at a 412x915 phone with touch, in both schemes, the pill saying
-# "Live · updated": in Main the unread chip scrolled onto the pill's line is clipped by the list's top edge, not
-# covered, and in Main and in a thread scrolled through nine places nothing of the list is under the pill or the
-# search glass, by a tap through the pill and by the pixels there; a thread entered from its root lands with the
-# root's date rule below the floating line. Its controls put the old room, padding inside the scroller, back and
-# find the list under the pill. Pass WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir
-# to keep a PNG of each state.
-live-pill-browser:
-	python3 tests/live_pill_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#298 thread-card-header` in a real Chromium at 1280x800 with a mouse, in both schemes: a card's replies
-# button opens its thread on the right under its card at the top of the column — the card's words, place,
-# height and colour, by computed colour and pixels, the X on it — joined to the thread's root on Main by
-# one line, clipped at Main's top while the root is above it, and a mouse resting on the card or crossing
-# it scrolling nothing (`#1144 scrollback-typing-jump`); a long question's card the same height, and Esc closing
-# the thread; the card moving up from its
-# place in the list, frame by frame, with nothing under it moving; the same card heading a thread opened
-# from the thread list (real Ctrl+3) across the window, at the desk and on a 412x915 phone by touch;
-# nothing moving under reduced motion; and a redraw of Main leaving the keys in the right column, so Esc
-# still closes its thread (`#284 redraw-keeps-pane`). Pass WEB_ROOT=dir to run it against another copy of
-# the page, and SCREENSHOTS=dir to keep a PNG of each state.
-thread-card-header-browser:
-	python3 tests/thread_card_header_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#388 thread-header-collapse` in a real Chromium at 393x852 by touch and 1280x800 with a mouse, in both
-# schemes: a tap or click on the card at the top of a thread folds it to a 14px bar of its own fill and
-# edge, by computed colour and pixels, with a 24px press target, and a tap on the bar opens it; no row on
-# screen moves either way, part-way up the thread or at its foot; a link in the card and its X do not fold
-# it; a reload keeps it folded; Enter and Space on its button; in two columns the line from the root meets
-# the bar's left edge, its lane still left of every row. Pass WEB_ROOT=dir to run it against another copy
-# of the page, and SCREENSHOTS=dir to keep a PNG of each state.
-thread-header-collapse-browser:
-	python3 tests/thread_header_collapse_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#404 threads-unpack-all` and `#405 root-under-summary` in a real Chromium at 1280x800 with a mouse
-# and the keys and 393x852 by touch, in both schemes: Unpack msgs draws every thread's messages under
-# its card on a bridge in the thread's colour, the summarised thread's root first as the card's child
-# and a raw thread with no root row; Collapse read folds each block's read run onto its spine and Hide
-# read leaves read replies out while keeping the summarised root; off is cards alone, and a reload
-# keeps it on. Forty threads say what unpacking costs. Pass WEB_ROOT=dir to run it against another
-# copy of the page, and SCREENSHOTS=dir to keep a PNG of each state.
-threads-unpack-browser:
-	python3 tests/threads_unpack_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#385 thread-line-overlap` in a real Chromium at 1000x800, 1280x800 (both schemes) and 1920x1080 with a
-# mouse, and 393x852 by touch: the line from a thread's root to its card on the right runs down a lane at
-# least 4px left of every row of the thread, whole and clipped at Main's top, and the owner's rows stay
-# partial width; on the phone no line is drawn. Pass WEB_ROOT=dir to run it against another copy of the
-# page, and SCREENSHOTS=dir to keep a PNG of each state.
-thread-line-browser:
-	python3 tests/thread_line_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#386 hide-empty-messages` in a real Chromium at 1280x800 (mouse) and 393x852 (touch), in both schemes:
-# with the Settings switch on, its default, no empty message is drawn or counted, in All, Main or a thread
-# on the right, while a file alone and a reaction alone are drawn; off, every empty message is back, kept
-# across a reload. Pass WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to
-# keep a PNG of each state.
-empty-messages-browser:
-	python3 tests/empty_messages_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#299 all-thread-strip` in a real Chromium at 1280x800 (mouse) and 412x915 (touch), in both schemes: in
-# All, a strip on every row of an answered thread and on no other row, its bar at least 5px (6px under a
-# finger) in its Thread(N)'s colour, its hit box 16px (22px) and the row's full height, every row's words
-# at one inset, a read reply's strip still coloured, by computed colour and pixels; a click (a tap) on a
-# strip: nothing scrolls or moves, still All, the rest at 0.3 and drained with grey strips; a live reply of
-# the thread arriving in it and a live message of no thread dimmed; a second click, Esc, another strip and
-# t; Thread(N) and Back keeping the selection; a first reply giving its root a strip without moving its
-# words; a finger drawn sideways from a strip archiving nothing. Pass WEB_ROOT=dir to run it against
-# another copy of the page, and SCREENSHOTS=dir to keep a PNG of each state.
-all-thread-strip-browser:
-	python3 tests/all_thread_strip_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#310 stale-live-read-flicker` in a real Chromium at 1280x800: in All on its newest line, two live
-# messages, the second pushed once the first one's read has reached the server, each live read answered
-# 300 ms late as the server had the channel when it arrived; the second message's row drawn and laid out
-# in every animation frame from its first until both reads have landed and 30 frames more. Its negative
-# control runs the same walk against a copy of the page with the fix taken out, which must miss the row
-# in some frame. Pass WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to
-# keep a PNG of each state.
-stale-live-read-browser:
-	python3 tests/stale_live_read_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#280 scroll-stability` in a real Chromium at 1280x800 in two columns (mouse) and 412x915 in one (touch):
-# the reader scrolled up in Main stays on the same row, within a pixel, while a message and a reply arrive
-# live, a refresh redraws the list with a message above them grown, a read sent while they were on the
-# newest line lands after they scrolled up (the owner's jump), summaries arrive, and the focus moves, and
-# at the desk while the mouse crosses the cards to the dock or the top bar, rests, or crosses back —
-# mouse movement or hover scrolls nothing (`#1144 scrollback-typing-jump`) — and ] is pressed on its
-# own, each sampled every frame for 2.5 s; a reader on the newest line follows a live message to the foot; the list of threads and a thread open at
-# their foot and stay there, older replies coming in under a reader at a thread's head; after a
-# reload the read behind the saved rows leaves the reader where they scrolled; `#281 view-keys`: the view
-# keys show each view where it is read and nothing moves it for 2.5 s after, the thread list opening at its
-# foot from two columns, Main and All, Main coming back from it where the reader left it, a thread
-# opened from it opening at its foot, and a reload in it opening it at its foot with the desk's dock on two
-# rows; and, last, a card highlighted by a click, the mouse going on over another card to the dock, or
-# resting on the highlighted card, leaves Main still. Pass WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to keep a
-# PNG of each stage.
-scroll-stability-browser:
-	python3 tests/scroll_stability_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#1210 ui-stability-no-async-shift` in a real Chromium at 393x852 by touch and 1280x800: a reader parked
-# mid-Main with a draft held holds still for 60 s of background updates (live messages and replies, edits
-# above and below, reactions, read state, summaries, the Newest recount and the poll), the anchor row
-# within a pixel at every frame and approximately zero layout shift, each update named separately; a
-# closing control with anchoring off proves the watch sees a shift. Pass WEB_ROOT=dir to run it against
-# another copy of the page, and SCREENSHOTS=dir to keep a PNG of each stage.
-scroll-soak-browser:
-	python3 tests/scroll_soak_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # `#338 column-overscroll` in a real Chromium at 1280x800 and 1920x1080, in two columns with a mouse: at a
 # desk the right column scrolls on past its foot into blank room until the last card's top is at half the
@@ -699,49 +232,10 @@ scroll-soak-browser:
 column-overscroll-browser:
 	python3 tests/column_overscroll_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS)) $(if $(NO_CONTROLS),--no-controls)
 
-# `#240 reading-bookmark` in a real Chromium at 1280x800 (mouse and keys) and 412x915 (touch): the
-# bookmark set on a message (Shift+B, or the row's menu) is a line in the accent drawn in the room
-# between that row and the one above; scrolled away, the Bookmark chip points to it, directly right of
-# Newest on the bottom line; b or the chip puts the line at the top of the list; a reply goes to the
-# newest message and b comes back; and a Done on the message under the line slides it to the next, on
-# the server too. Pass WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to
-# keep a PNG of each step.
-bookmark-browser:
-	python3 tests/bookmark_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#243 filter-keeps-selection` in a real Chromium at 1280x800 and 412x915, the owner's own sequence:
-# search, Pinned, a pin chosen with the mouse or a finger, the filter cleared -- the pin's row stands in
-# the channel's list where it stood in the Pinned list, within a pixel, and stays there; then an old pin,
-# two pages beyond what is loaded, walked back to under a "Loading earlier messages…" line and put where
-# it stood. Pass WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to keep a
-# PNG of each stage.
-filter-place-browser:
-	python3 tests/filter_place_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#249 search-highlight`, `#250 date-separators` and `#251 author-filter` in a real Chromium at
-# 1280x800 (mouse) and 412x915 (touch), over a week of a channel read at a fixed noon: a rule above the
-# first message of each day, the bookmark's line nearer the message than its day's; a search's hits lit,
-# its gaps said with the days they reach, each line as wide as the list and touching no row; and the
-# author filter showing only the owner's prompts with the one chosen left where it stood. Pass
-# WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to keep a PNG of each stage.
-search-dates-browser:
-	python3 tests/search_dates_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#620 link-url-chip` in a real Chromium at 393x852 and 412x915 (touch) and 1280x800 (mouse): the URL
-# chip under Links writes each link as its whole address, wrapped at its slashes, and back as its label,
-# kept over a reload and under a search by an address; and the list starts below the chip row, so no row
-# shows through between its pills. Pass WEB_ROOT=dir to run it against another copy of the page, and
-# SCREENSHOTS=dir to keep a PNG of each stage.
-link-url-chip-browser:
-	python3 tests/link_url_chip_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#439 search-unmatched-separators` in a real Chromium at 393x852 (touch) and 1280x800 (mouse): a
-# search's unmatched lines opened by real presses — in All, inside a thread opened under the search
-# with its bar still on screen, and among the thread list's cards counting whole threads' messages,
-# exactly or as at least what the page holds. Pass WEB_ROOT=dir to run it against another copy of
-# the page, and SCREENSHOTS=dir to keep a PNG of each stage.
-search-unmatched-browser:
-	python3 tests/search_unmatched_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # `#1825 vibe-talk-hashtag-labels` in a real Chromium at 412x915 (touch, scale 2.6) and
 # 1280x800 (mouse), light and dark, keyboard up on the phone: label chips, the hidden
@@ -765,173 +259,22 @@ whole-threads-browser:
 whole-threads-server-browser:
 	python3 tests/whole_threads_server_browser.py $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#247 reply-continuity` in a real Chromium at 1280x800 (mouse) and 412x915 (touch), at 80%, 100% and
-# 130% text: Reply on a message in the middle of the list, just under the list's top, half under its top
-# edge, low on the screen, a reply in its gutter, and one taller than the screen. Since `#410
-# inline-reply-editor` the reply opens in the list: the row is not moved (a low one only as far as shows
-# the box), the box directly under it on its tint, and Cancel moves nothing but the box. Pass
-# WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to keep a PNG of each.
-reply-continuity-browser:
-	python3 tests/reply_continuity_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#410 inline-reply-editor` in a real Chromium at 1280x800 in two columns and one, and 393x852 by touch:
-# Reply opens the reply's box in the stream, under the message and the replies gathered under it, later
-# rows below, one message box on screen; Grow, Send, Cancel, a refused reply, the view keys, and two
-# columns collapsing with a reply open. Pass WEB_ROOT=dir to run it against another copy of the page, and
-# SCREENSHOTS=dir to keep a PNG of each open reply.
-inline-reply-browser:
-	python3 tests/inline_reply_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#419 threads-view-main-messages` in a real Chromium at 1280x800 and 393x852: the Threads view's chips on
-# the search glass's row, Main channel among the cards with the main channel's box last, and a reply
-# under one of them moving the one box. Pass WEB_ROOT=dir to run it against another copy of the page, and
-# SCREENSHOTS=dir to keep a PNG of each state.
-threads-main-browser:
-	python3 tests/threads_main_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#500 sent-receipts-pile-up` in a real Chromium at 1280x800: receipts an earlier build saved for replies
-# long confirmed are not drawn on load; a reply sent from under an unpacked row of the Threads view is drawn
-# under it while it goes; the Sent receipts of thread replies drawn nowhere in the view go once shown, are
-# never saved, and a reload draws none while each reply is in its thread. Pass WEB_ROOT=dir to run it
-# against another copy of the page, and SCREENSHOTS=dir to keep a PNG of each state.
-sent-receipts-browser:
-	python3 tests/sent_receipts_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#421 chip-states`, `#422 composer-key-stay`, `#424 threads-main-own-center` and `#423
-# back-key-consistency` in a real Chromium at 1280x800 and 393x852: the Threads view's chips pressed alike,
-# Cmd+S keeping the Threads view with Main channel on, the owner's main rows centred, and Cmd+[ and Cmd+]
-# back and forward through the views, a thread and Settings. Pass WEB_ROOT=dir to run it against another
-# copy of the page, and SCREENSHOTS=dir to keep a PNG of each state.
-threads-polish-browser:
-	python3 tests/threads_polish_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#459 pack-keeps-card-still` and `#460 pack-gap-slide` in a real Chromium at 1280x800 and 393x852: a card
-# packed at the foot of the Threads view still in every frame, held past the foot in room that gives way one
-# way and to a live reply, what is below holding and then sliding into the gap, the mirror for unpack, and
-# nothing animated under reduced motion. Pass WEB_ROOT=dir to run it against another copy of the page, and
-# SCREENSHOTS=dir to keep a PNG of each state.
-pack-still-browser:
-	python3 tests/pack_still_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#429 keyboard-hides-bar` in a real Chromium at 393x852 by touch, the on-screen keyboard simulated by a
-# shorter viewport as Chrome on Android lays it out: both bars away while it is up and back as it goes or
-# the box loses the focus, the reader's place kept, and a slim Stop while reading; and a desk's shorter
-# window keeping both bars. Pass WEB_ROOT=dir to run it against another copy of the page, and
-# SCREENSHOTS=dir to keep a PNG of each state.
-keyboard-hides-bar-browser:
-	python3 tests/keyboard_hides_bar_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#1680 inline-reply-keyboard-clutter` in a real Chromium at 393x852 by touch, the on-screen keyboard
-# simulated by a shorter viewport: replying, one Send only (the reply's own), no floating chips over the
-# form, the reply's row compact on one line; in the main composer the corner Send alone; the keyboard
-# down brings the chips and helper text back; at 1280x800 with a mouse none of it. Pass WEB_ROOT=dir to
-# run it against another copy of the page, and SCREENSHOTS=dir to keep a PNG of each state.
-reply-keyboard-clutter-browser:
-	python3 tests/reply_keyboard_clutter_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#1725 vibe-talk-undo-chip-stretched` in a real Chromium at 412x915 (device scale 2.6) by touch in
-# light and dark, Discuss half-pane docked open, Undo up, the keyboard simulated by a shorter
-# viewport: the chip keeps a chip's height and stays clear of the reply box and Send reply, keyboard
-# up and down; at 1280x800 with a mouse it never moves or stretches. Pass WEB_ROOT=dir to run it
-# against another copy of the page, and SCREENSHOTS=dir to keep a PNG of each state.
-undo-chip-stretch-browser:
-	python3 tests/undo_chip_stretch_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#1144 scrollback-typing-jump` in a real Chromium at 412x915 and 360x800 by touch and 1280x800: typing
-# at the foot follows arrivals, strip resizes and a row grown late with the whole composer on screen;
-# reading scrollback holds across arrivals; unfocused keys navigate; hover between the columns scrolls
-# neither. Pass WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir for PNGs.
-typing-scroll-browser:
-	python3 tests/typing_scroll_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#1186 two-column-splitter` in a real Chromium at 1280x800: the separator between the two columns
-# dragged resizes them with neither column's anchor row moving, stops at 300px a column,
-# double-clicks back to half and half, moves by arrow keys, and survives a reload. Pass
-# WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir for PNGs.
-two-column-splitter-browser:
-	python3 tests/two_column_splitter_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#300 reply-marks-read` in a real Chromium at 1280x800, in two columns: a Reply docked in either column
-# and the first reply typed in a new thread's box mark what they answer read — Done on the server, the
-# provider asked `after_reply` after it, the row drawn read, in both columns for the thread's root — and
-# a later message in an answered thread's box marks nothing. Pass WEB_ROOT=dir to run it against another
-# copy of the page, and SCREENSHOTS=dir to keep a PNG of each state.
-reply-marks-read-browser:
-	python3 tests/reply_marks_read_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#306 done-stale-across-views` and `#311 sent-read-waits-for-done` in a real Chromium: on a 412x915
-# phone, a Done tapped in All drawn in Main, held from earlier, and an Undo in Main drawn in All, from the
-# first frame each view shows and with no read; at 1280x800 in two columns, a Reply sent while the Done of
-# the message it answers is held on the server asks the provider nothing until that Done is saved, and
-# nothing once it is refused. Pass WEB_ROOT=dir to run it against another copy of the page, and
-# SCREENSHOTS=dir to keep a PNG of each stage.
-done-sync-browser:
-	python3 tests/done_sync_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#252 thread-button-state` in a real Chromium at 412x915 (touch) and 1280x800 (mouse), in the dark
-# and light schemes: a new message's Thread tag, whose thread nobody has answered, is drawn as Reply
-# is and an answered root's Thread(N) in its thread's colour; the grey tag opens the empty thread
-# with its box focused, the first reply is posted into the message's thread, and the tag turns
-# coloured; at the desk, the same on the right in two columns. Pass WEB_ROOT=dir to run it against
-# another copy of the page, and SCREENSHOTS=dir to keep a PNG of each state.
-thread-button-browser:
-	python3 tests/thread_button_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#1818 vibe-talk-thread-drill-in-keeps-anchor` in a real Chromium at 412x915 (touch) and 1280x800
-# (mouse), in the dark scheme: a reply scrolled to a measured offset in All opens its thread at
-# that offset, late growth above it is corrected back, Back returns it to its place, and the
-# thread's root at the head of Main opens its thread where it stood. Pass WEB_ROOT=dir to run it
-# against another copy of the page, and SCREENSHOTS=dir to keep a PNG of each state.
-thread-drill-anchor-browser:
-	python3 tests/thread_drill_anchor_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#1856 vibe-talk-read-aloud-follow-not-yanked-up` in a real Chromium at 412x915 (touch) and
-# 1280x800 (mouse), in the dark scheme: Read on a long reply in its thread follows DOWN and is
-# never yanked back up across live repaints; scrolled fully off, the Reading chip rises and
-# brings it back. Pass WEB_ROOT=dir to run it against another copy of the page, and
-# SCREENSHOTS=dir to keep a PNG of each state.
-thread-reader-follow-browser:
-	python3 tests/thread_reader_follow_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#1839 vibe-talk-composer-stays-in-view-while-dictating` in a real Chromium at 412x915
-# (touch) and 1280x800 (mouse), in the dark scheme, keyboard really open: dictating into a
-# drilled thread's composer through live arrivals and a refresh never moves it out of the
-# visual viewport and never jumps scrollTop. Pass WEB_ROOT=dir to run it against another
-# copy of the page, and SCREENSHOTS=dir to keep a PNG of each state.
-composer-stays-browser:
-	python3 tests/composer_stays_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
-# `#1839 vibe-talk-composer-stays-in-view-while-dictating` (the re-render half): a live
-# poll refresh whose only difference is the server's restamped `observed_ms` replaces
-# zero rows in `#discord-log` and zero cards in `#thread-list`, in a real Chromium at
-# 412x915 (touch) and 1280x800 (mouse). Pass WEB_ROOT=dir against another copy of the
-# page, and SCREENSHOTS=dir to keep a PNG of each state.
-refresh-replaces-browser:
-	python3 tests/refresh_replaces_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
-# `#1838 vibe-talk-reader-continues-into-thread` in a real Chromium at 412x915 (touch) and
-# 1280x800 (mouse), in the dark scheme: Read on the long reply in All, tapped into its thread
-# mid-chunk, resumes on that chunk at the anchor's place, goes on to the next reply, resumes
-# again on Back, and stops with a word in place when switched to a view without the message.
-# Pass WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to keep a
-# PNG of each state.
-thread-reader-resume-browser:
-	python3 tests/thread_reader_resume_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
-# `#1846 vibe-talk-windowed-rendering` step 1 in a real Chromium at 412x915 (touch) and
-# 1280x800 (mouse), dark: a no-change poll replaces zero rows, one upstream edit rebuilds
-# exactly its row, one arrival keeps the rest. Pass WEB_ROOT=dir, SCREENSHOTS=dir as usual.
-incremental-refresh-browser:
-	python3 tests/incremental_refresh_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
-# `#1846 vibe-talk-windowed-rendering` step 3 budgets in a real Chromium at 412x915 and
-# 1280x800: 5000 messages mount at most the cap, one screenful mounts at most 20, an
-# off-screen edit does no DOM work. Pass WEB_ROOT=dir, SCREENSHOTS=dir as usual.
-windowed-refresh-browser:
-	python3 tests/windowed_refresh_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
-# `#1819 vibe-talk-thread-button-shows-slug` in a real Chromium at 412x915 (touch, scale 2.6) and
-# 1280x800 (mouse), light and dark, keyboard open and closed, Discuss open on the phone: a slugged
-# root's tag reads "🧵 my-thread-slug (57)" with a greyed emoji, an unslugged one keeps Thread(N),
-# the grey start tag is unchanged, a narrowed list keeps the tag in its row, and the narrowest
-# falls back. Pass WEB_ROOT=dir against another copy of the page, and SCREENSHOTS=dir to keep PNGs.
-thread-slug-browser:
-	python3 tests/thread_slug_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # `#377 compact-collapsed-rows` in a real Chromium at 393x852 (touch) and 1280x800 (mouse), in All: a
 # collapsed row's header is one line -- the name cut with an ellipsis where it must be, the time, a
@@ -942,12 +285,8 @@ thread-slug-browser:
 # Pass WEB_ROOT=dir to run it against another copy of the page, SCREENSHOTS=dir to keep a PNG of each
 # state, and REPORT=1 to print every header measured and go on past a failed check.
 .PHONY: discord-split-merge-browser
-discord-split-merge-browser:
-	python3 tests/discord_split_merge_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS)) $(if $(REPORT),--report)
 
 .PHONY: compact-rows-browser
-compact-rows-browser:
-	python3 tests/compact_rows_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS)) $(if $(REPORT),--report)
 
 # `#425 collapsed-lines` in a real Chromium at 1280x800 (keys) and 393x852 (touch): a folded long
 # message's body is 3 lines until Ctrl+( and Cmd+( step it to 1 and to 0 -- the header alone, no gap
@@ -960,64 +299,13 @@ compact-rows-browser:
 # another copy of the page, SCREENSHOTS=dir to keep a PNG of each state (0, 1, 3 and 6 lines among
 # them), and REPORT=1 to print every measure.
 .PHONY: collapsed-lines-browser
-collapsed-lines-browser:
-	python3 tests/collapsed_lines_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS)) $(if $(REPORT),--report)
 
-# `#245 done-feedback` in a real Chromium: at 1280x800 in both schemes, a selected unread message ringed
-# solid in the accent and a selected read one dashed in grey on the same lit surface, each at 3:1 or
-# more against it; e draws the moment on the row it left and lets it go; the Undo chip names the
-# message, and an Undo inside the hold takes the ring away at once; reduced motion gets the look with
-# no animation; at 412x915 and 1280x800 in both schemes, the pictures; on a 360px and a 412px phone the
-# Undo chip says only "Undo", taking no line, and at 1280 it names the message on one line; and at all
-# three, walked up from the end of the list through the message box, no chip or status pill meets the
-# box or its Send. Pass WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to
-# keep a PNG of each step.
-done-feedback-browser:
-	python3 tests/done_feedback_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#244 elision-word-count` in a real Chromium, in seven layouts (phones at 360 and 412px, at 80% and
-# 150% text, a desk, the widest reading column, two columns): every folded row's one label claims no
-# more than its clamp really hides, by the rects of its characters; Chinese and a bare address are
-# counted in characters; a table the clamp draws whole says nothing, and a table over prose, a code
-# block and a list of short items say no more than they hide; a rich header's row holds with the switch
-# on and off. Pass WEB_ROOT=dir to run
-# it against another copy of the page, and SCREENSHOTS=dir to keep a PNG of each layout.
-elision-browser:
-	python3 tests/elision_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#301 semicolon-expand-cycle` in a real Chromium at a 1280x800 desk: ; four times and : three times step
-# the long messages round Expanded all, Expanded unread, collapsed read, and Collapsed all, judged by whether
-# each message's text overflows its box, with the status line read; the selected message, sampled at every
-# frame after each press, never moves by more than a pixel, at the newest line too; in two columns the keys
-# on the right step the right column's thread alone, its reader at its foot held, and ; in Main is Main's
-# own; Ctrl+;, Cmd+; and Ctrl+: step from the channel's message box at the list's foot, where a typed ;
-# steps nothing, and Ctrl+; in the right column's box steps that column alone, each chord holding the box
-# it was pressed in where it is, shown whole at every frame. Pass WEB_ROOT=dir to run it against another
-# copy of the page, and SCREENSHOTS=dir to keep a PNG of each step.
-fold-steps-browser:
-	python3 tests/fold_steps_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# The live #47 read-aloud-overlong check is opt-in and may consume provider time. Its transcript
-# reconciliation, PCM-duration metric, re-answer separation, privacy boundaries, threshold edges,
-# interruption rejection, and WAV writer are deterministic offline controls, so keep those in the
-# ordinary gate.
-voice-read-acceptance-self-test:
-	python3 scripts/voice-read-acceptance.py --self-test
 
-# The physical-device run is opt-in, but its signal/language evaluator has offline negative
-# controls. Keep those controls in the ordinary gate so a broken harness cannot silently bless a
-# later Android recording.
-android-speech-self-test:
-	python3 scripts/android-device-speech.py --self-test
 
-# The screenshot harness's offline controls: its capture judge and PNG decoder, and its scene table.
-screenshots-self-test:
-	python3 scripts/screenshots.py --self-test
 
-# `#354 live-relay-check`: the verdict logic of the opt-in live check of relays during a call, on
-# synthetic frame logs. No browser, server or bridge.
-live-relay-check-self-test:
-	python3 scripts/live-relay-check.py --self-test
 
 # The live check itself, against the bridge you name: never part of an automated suite, since it
 # makes real calls. BRIDGE=ws://... or wss://... (tools= is refused), or BRIDGE=fake for the
@@ -1041,3 +329,7 @@ container-smoke:
 
 clean:
 	cargo clean
+
+# Per-check targets live with their DAG steps under tests/dag.d/ (#1891):
+# one numbered .mk per check beside its .yaml, so adding a check touches one new file.
+include $(wildcard tests/dag.d/*.mk)

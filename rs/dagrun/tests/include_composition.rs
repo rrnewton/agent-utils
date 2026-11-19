@@ -256,6 +256,52 @@ fn sibling_after_reference_is_independent_of_include_order() {
 }
 
 #[test]
+fn directory_include_and_empty_namespace_inherit_the_includer() {
+    // A namespaced fragment (a test suite under the repository root)
+    // fans out into one file per check under a directory, and an empty
+    // namespace segment keeps the includer's namespace, so step tags
+    // are exactly what the single-file fragment produced.
+    let dir = TestDir::new();
+    fs::create_dir_all(dir.path("checks")).unwrap();
+    dir.write(
+        "checks/b.yaml",
+        "steps:\n  - group: check\n    job: two\n    cmd: \"true\"\n",
+    );
+    dir.write(
+        "checks/a.yaml",
+        "steps:\n  - group: check\n    job: one\n    cmd: \"true\"\n    deps: [check.two]\n",
+    );
+    dir.write(
+        "suite.yaml",
+        "include:\n  - path: checks\n    namespace: \"\"\nsteps:\n  - group: setup\n    job: ready\n    cmd: \"true\"\n",
+    );
+    let root = dir.write(
+        "root.json",
+        r#"{
+          "include":[{"path":"suite.yaml","namespace":"suite"}],
+          "steps":[{"group":"outer","job":"consumer","cmd":"true","deps":["suite.check.one"]}]
+        }"#,
+    );
+
+    let tags: Vec<String> = dag_from_path(root)
+        .unwrap()
+        .steps
+        .iter()
+        .map(|step| step.tag())
+        .collect();
+    // Directory files load in file-name order, under the suite namespace.
+    assert_eq!(
+        tags,
+        [
+            "suite.check.one",
+            "suite.check.two",
+            "suite.setup.ready",
+            "outer.consumer"
+        ]
+    );
+}
+
+#[test]
 fn empty_include_with_valid_after_is_a_noop() {
     let dir = TestDir::new();
     dir.write("empty.json", r#"{"steps":[]}"#);

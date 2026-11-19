@@ -1,0 +1,21 @@
+steps:
+  - group: check
+    job: bridge-gutter-browser
+    desc: on a phone the bridge hugging the left edge with the rows wider for it, a tap on the spine gliding back to the thread's card, and the triangle still packing in place, in current Chromium at 393x852, 412x915 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/bridge_gutter_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 720
+    cpu_timeout: 90
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 20
+
+  # `#522 thread-card-max-lines` in the browser engine, at 393x852 by touch and 1280x800 with a
+  # mouse: a long unsummarised first message split for its card, packed under the collapsed
+  # clamp and unpacked at most K = 5 drawn lines ending "…", the rest of it the first row under
+  # the card, starting "…" with exactly the words the card left out and no row buttons; a summary
+  # landing while it is on screen switching it to the summarised layout with the card unmoved;
+  # Thread card lines at 2 holding the card to two lines; the triangle on the continuation still
+  # packing in place; and a link to the first message landing on its card at the head of the list.

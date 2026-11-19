@@ -1,0 +1,15 @@
+steps:
+  - group: setup
+    job: contract-tools
+    desc: install the contract generator's lockfile-pinned tools (under the provisioned Node 22, #865)
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: scripts/with-node22 scripts/provision-node-packages vibe-talk/contract
+    deps: [setup.node22]
+    jobs_flag: ""
+    timeout: 2400
+    cpu_timeout: 300
+    hint:
+      est_duration_s: 2
+      classification: latency-bound
+      rss_baseline_bytes: 536870912
+

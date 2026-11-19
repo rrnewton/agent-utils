@@ -1,0 +1,20 @@
+steps:
+  - group: check
+    job: in-app-links-browser
+    desc: a link to a message in a channel the app reads opens it in the app, landed on, as one history entry; a real Back returns to the reader's message at the same height, stacked jumps undone one at a time, in current Chromium at 1280x800 and 393x852 with touch
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/in_app_links_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 10
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#1585 linked-message-always-expanded`, in the browser engine: every way of going to a
+  # message — an in-app link, a reply's arrow, a combined row's second constituent, an
+  # `:email:` short ref, and the address the page opens by — lands on a folded long message
+  # opened whole and on screen, at 390x844 with touch and at 1280x800.

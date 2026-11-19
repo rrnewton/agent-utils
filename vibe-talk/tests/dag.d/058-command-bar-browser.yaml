@@ -1,0 +1,18 @@
+steps:
+  - group: check
+    job: command-bar-browser
+    desc: the desk's command bar one row across the window with Thread list and a 120-character thread chosen at 1280x800, 1920x1080 and 900x700, and a 393px phone's as it was, in current Chromium; and the action menu (Expand all, Collapse all, Summaries) from the hamburger left of the channel picker and the view button pressed on the channel, at 393x852 by touch and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/command_bar_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 28
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # The Documents view against the real server binary (`documents-view-client`):
+  # list, touch fetch, reader, and a fetch error on the row, at 393x852.

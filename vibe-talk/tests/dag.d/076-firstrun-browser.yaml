@@ -1,0 +1,22 @@
+steps:
+  - group: check
+    job: firstrun-browser
+    desc: First run in current Chromium at 412x915 and 1280x800, light and dark — Welcome once, Channel the default, saved Voice honoured, guided no-channel setup, deep link wins
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/firstrun_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 20
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#371 channel-search-hash` in the browser engine at 1280x800: one Slack service whose channels are
+  # written `#name`; the bar's picker lists them without the '#', so typing `team` into the focused
+  # picker through CDP chooses `#team-builds`, and the channel browser counts the seconds of a slow
+  # first read, then finds `#team-builds-archive` for `Builds` and `#eng-ops` for `#ops`. The fake-DOM
+  # suite's <select> has no type-ahead, so only this proves typing reaches the channel. Its fake holds
+  # the first directory read for 2.5 s. Measured on 2026-10-19 outside dagrun: about 6s wall.

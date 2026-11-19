@@ -1,0 +1,26 @@
+steps:
+  - group: shots
+    job: screenshots-phones
+    desc: the screenshot harness on the phone profiles — a real server and a real browser
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && ./scripts/run.sh --screenshots --theme dark --profiles iphone15,iphone-se,android-412
+    jobs_flag: ""
+    deps: [build.release, setup.contract-tools]
+    # Wall, not only CPU: a browser waiting on a page that never loads burns no CPU at all, so a
+    # CPU budget alone would let it hang until the run timeout. This is the hang backstop.
+    timeout: 4800
+    cpu_timeout: 600
+    hint:
+      # One browser slot per profile shard: the six device profiles walk in parallel steps
+      # instead of one step holding every browser slot for the whole walk. Together the
+      # three shards photograph every profile, exactly as the single step did.
+      # run.sh claims each shard's four ports (server, +1/+2 for the mock, +3 for the model stub) before binding
+      # them, so shards and other checkouts' gates starting together get distinct ports; a
+      # fixed port per shard collided whenever two gates photographed at once (#1037).
+      resources: {browser: 1}
+      est_duration_s: 120
+      classification: latency-bound
+      preferred_inner_jobs: 4
+      rss_baseline_bytes: 1073741824
+      hard_mem_max_bytes: 3221225472
+

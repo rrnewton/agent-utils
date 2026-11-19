@@ -1,0 +1,17 @@
+steps:
+  - group: check
+    job: contract
+    desc: generated browser contract is current; tsc --checkJs over voice.js, and the page's modules strict and portable
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && ../scripts/with-node22 make contract-check typecheck
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 960
+    cpu_timeout: 120
+    hint:
+      est_duration_s: 8
+      classification: light
+      rss_baseline_bytes: 536870912
+
+  # The physical Android run is opt-in. Its evaluator is not: silence and wrong-language speech
+  # are negative controls here, requiring no phone, browser, capture device or STT service.

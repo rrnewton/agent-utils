@@ -233,6 +233,53 @@ def test_sibling_after_reference_is_independent_of_include_order(tmp_path: Path)
         assert by_tag["b.g.start"].deps == ["a.g.ready"]
 
 
+def test_directory_include_and_empty_namespace_inherit_the_includer(
+    tmp_path: Path,
+) -> None:
+    # A namespaced fragment (a test suite under the repository root)
+    # fans out into one file per check under a directory, and an empty
+    # namespace segment keeps the includer's namespace, so step tags
+    # are exactly what the single-file fragment produced.
+    checks = tmp_path / "checks"
+    checks.mkdir()
+    (checks / "b.yaml").write_text(
+        "steps:\n  - group: check\n    job: two\n    cmd: \"true\"\n", encoding="utf-8"
+    )
+    (checks / "a.yaml").write_text(
+        "steps:\n  - group: check\n    job: one\n    cmd: \"true\"\n    deps: [check.two]\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "suite.yaml").write_text(
+        "include:\n  - path: checks\n    namespace: \"\"\n"
+        "steps:\n  - group: setup\n    job: ready\n    cmd: \"true\"\n",
+        encoding="utf-8",
+    )
+    root = tmp_path / "root.json"
+    _write(
+        root,
+        {
+            "include": [{"path": "suite.yaml", "namespace": "suite"}],
+            "steps": [
+                {
+                    "group": "outer",
+                    "job": "consumer",
+                    "cmd": "true",
+                    "deps": ["suite.check.one"],
+                }
+            ],
+        },
+    )
+
+    tags = [step.tag for step in dag_from_path(root).steps]
+    # Directory files load in file-name order, under the suite namespace.
+    assert tags == [
+        "suite.check.one",
+        "suite.check.two",
+        "suite.setup.ready",
+        "outer.consumer",
+    ]
+
+
 def test_empty_include_with_valid_after_is_a_noop(tmp_path: Path) -> None:
     _write(tmp_path / "empty.json", {"steps": []})
     _write(

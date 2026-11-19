@@ -1,0 +1,21 @@
+steps:
+  - group: check
+    job: pwa-installability
+    desc: current Chromium CDP installability check with an Android viewport, at / and from /voice, against the real server
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/pwa_installability.py
+    jobs_flag: ""
+    deps: [build.release, setup.contract-tools]
+    timeout: 240
+    cpu_timeout: 30
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 5
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#225 enter-to-send` in the browser engine: real keys in the reply box. With the default, Shift+Enter
+  # is a new line and Enter posts the reply; with "Enter to send" turned off in Settings (its hint naming
+  # the key that sends, kept across a real reload), Enter is a new line and posts nothing, and Ctrl+Enter
+  # posts. A step of its own, not another walk in offline-cache-browser, whose CPU is near its cap.
+  # Measured on 2026-10-08: about 2s wall.

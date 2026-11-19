@@ -1,0 +1,20 @@
+steps:
+  - group: check
+    job: undo-chip-stretch-browser
+    desc: the Undo chip keeps its size with the keyboard up and Discuss docked, in current Chromium at a 412x915 phone in light and dark and a 1280x800 desk
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/undo_chip_stretch_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 16
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#1813 vibe-talk-overlays-center-on-channel-pane` in the browser engine: at a 412x915 phone
+  # (device scale 2.6) and a 1280x800 desk, in light and dark, with Discuss docked, the Undo chip,
+  # the Newest pill, the status pill and the pull report all lie inside the channel pane, and on
+  # the phone with the keyboard up the main composer and its Send stay off the Discuss sheet.

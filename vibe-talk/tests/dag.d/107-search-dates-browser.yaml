@@ -1,0 +1,21 @@
+steps:
+  - group: check
+    job: search-dates-browser
+    desc: a search's hits and gaps, the days ruled off and ranged, and the author filter keeping the chosen prompt in place, in current Chromium at 1280x800 and 412x915
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/search_dates_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 6
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#1734 vibe-talk-search-view-scroll-default` in the browser engine: entering a search from
+  # the top of a forty-message channel whose newest fifteen hold the word lands at the foot
+  # with the newest hit on screen, and entering it parked mid-list on a hit leaves the row
+  # under the eye unmoved, in light and dark at 412x915 (Discuss half-pane open) and 1280x800,
+  # with the keyboard closed and open (a shrunken visualViewport).

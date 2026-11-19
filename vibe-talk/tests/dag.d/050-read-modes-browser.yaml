@@ -1,0 +1,16 @@
+steps:
+  - group: check
+    job: read-modes-browser
+    desc: a thread entered on its first unread, a collapsed read run opened by a real tap, and Main's unread-replies count, in current Chromium at 412x915 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/read_modes_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 15
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+

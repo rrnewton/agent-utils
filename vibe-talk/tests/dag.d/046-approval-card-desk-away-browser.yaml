@@ -1,0 +1,23 @@
+steps:
+  - group: check
+    job: approval-card-desk-away-browser
+    desc: the reader kept at the foot after Send, a draft opened by More through two columns and back, the jump back from Settings and a draft arriving while Settings or Help was up, at 1280x800 with a mouse, in current Chromium
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/approval_card_browser.py --part desk-away
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 800
+    cpu_timeout: 100
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 80
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#241 voice-composer` in the browser engine: the message box under the call's transcript and the
+  # Voice/Channel switch on screen and uncovered at idle, focused, in a typed conversation and in a
+  # call, at 412x915 (and with the on-screen keyboard's share of the screen taken away, as the
+  # viewport's `interactive-widget=resizes-content` has Chrome on Android do) and 1280x800; focus and
+  # typing open nothing; the first Enter opens one typed conversation whose message goes once as a
+  # `vibe-talk-v1` prompt, with no microphone; a message during a call goes down its socket. Measured
+  # on 2026-10-12: about 3.3s wall.

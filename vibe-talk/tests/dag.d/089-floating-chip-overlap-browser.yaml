@@ -1,0 +1,33 @@
+steps:
+  - group: check
+    job: floating-chip-overlap-browser
+    desc: floating top chips and the status toast never cover a card's controls, in current Chromium at a 412x915 phone and a 1280x800 desk
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/floating_chip_overlap_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 240
+    cpu_timeout: 30
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 8
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#298 thread-card-header` in the browser engine, at 1280x800 with a mouse, in the dark scheme and the
+  # light: a card's replies button opens its thread on the right under its card at the top of the column,
+  # saying what the card said, at the card's place and height, above the list and not in it, the X on it,
+  # edged, ringed and tinted in the thread's colour by computed colour and by pixels; one line, the
+  # selection's, from the root's right edge level with its Thread(N) to the card's left edge, in its
+  # colour; the card unmoved as the thread scrolls; the root above Main, the line clipped at Main's top;
+  # the mouse crossing the card or resting on it moving nothing for 2.5 s (`#1144 scrollback-typing-jump`); a long
+  # question's card three lines and the same height, opened over the list with the list unmoved to the
+  # pixel, Esc closing it and then the thread. Part 2: the card moving up, watched every frame from
+  # before the press — first drawn on its card, then only upward through several places, the thread
+  # fading in under it, the line following it and the thread's scroll position fixed; real Ctrl+3 and a
+  # card's replies button: the same card heading the thread across the window, fixed while it scrolls,
+  # the X, Esc and <- back to the list; nothing moving under reduced motion; and on a 412x915 phone by
+  # touch, two lines and a 44px X. Measured on 2026-10-14: about 30s wall.
+  # `#284 redraw-keeps-pane`: and a redraw of Main, the channel's re-read brought forward on the page's
+  # clock, leaving the keys in the right column, after its replies button and with the focus lost to the
+  # body, so a real Esc still closes its thread.

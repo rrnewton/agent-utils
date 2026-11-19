@@ -1,0 +1,14 @@
+steps:
+  - group: setup
+    job: node22
+    desc: install the pinned Node 22 release, verified against its published sha256
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: scripts/provision-node22
+    jobs_flag: ""
+    timeout: 2400
+    cpu_timeout: 300
+    hint:
+      est_duration_s: 2
+      classification: latency-bound
+      rss_baseline_bytes: 536870912
+

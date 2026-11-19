@@ -1,0 +1,21 @@
+steps:
+  - group: check
+    job: discord-split-merge-browser
+    desc: a Discord post split at the cap is one combined row in current Chromium at 390x844 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/discord_split_merge_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 6
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#1714 vibe-talk-split-parts-not-regrouped` in the browser engine, at 412x915 by touch and
+  # 1280x800 with a mouse, in a thread: the three parts of one bridge reply (1.4 s and 1.7 s
+  # apart, one bot author) are three rows with Combine messages off — the owner's state — and
+  # one row standing for all three ids when it is turned on, no row wider than the screen, and
+  # no page error.

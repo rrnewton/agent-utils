@@ -1,0 +1,19 @@
+steps:
+  - group: check
+    job: threads-main-browser
+    desc: the Threads view's chips on the search glass's row, Main channel among the cards with the main channel's box last, and a reply under one of them moving the one box, in current Chromium at 1280x800 and 393x852
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/threads_main_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 6
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#1550 thread-list-pins` in the browser engine, at 1280x800 and 390x852: the spool picker's pop-up
+  # with a gold pin on each thread row's left, the bang-bound thread pinned by default as @liteinst,
+  # the group order (fixed, pinned by recency, recent by recency), and pins persisting across reloads.

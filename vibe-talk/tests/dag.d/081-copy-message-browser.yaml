@@ -1,0 +1,21 @@
+steps:
+  - group: check
+    job: copy-message-browser
+    desc: Ctrl+C, Cmd+C and y copy the highlighted message whole, and leave a selection, a text box and nothing highlighted to the browser, read back from the clipboard in current Chromium at 1280x800 and 412x915
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/copy_message_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 8
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#543 in-app-message-links`, in the browser engine: the columns channel with three messages whose
+  # bodies link to earlier messages as the server renders them. At 1280x800 and 393x852 with touch, a
+  # tap on a link to a reply opens its thread and lands on it as one history entry, a real Back closes
+  # it with the reader's message at the height it was; the same for a root up the list, and for two
+  # jumps stacked, each Back undoing one. Nothing leaves for the service.

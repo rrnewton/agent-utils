@@ -1,0 +1,16 @@
+steps:
+  - group: check
+    job: offline-cache-phone-360-browser
+    desc: saved-message snapshot and a read-scope sign-in in current Chromium at a 360x800 Android viewport
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/offline_cache_browser.py --profile phone-360
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 1440
+    cpu_timeout: 180
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 70
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+

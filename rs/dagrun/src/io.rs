@@ -78,7 +78,11 @@ fn include_entries(
         if path.is_empty() {
             return Err(err(format!("{where_}.path: must be non-empty")));
         }
-        if !valid_namespace_segment(&namespace) {
+        // An empty segment inherits the includer's namespace unchanged:
+        // a fragment that is itself namespaced by its parent (a test
+        // suite under the repository root) can fan out into per-check
+        // files without every step gaining another tag segment.
+        if !namespace.is_empty() && !valid_namespace_segment(&namespace) {
             return Err(err(format!(
                 "{where_}.namespace: must match [A-Za-z0-9][A-Za-z0-9_-]*"
             )));
@@ -113,6 +117,8 @@ fn include_entries(
 fn qualify(namespace: &str, value: &str) -> String {
     if namespace.is_empty() {
         value.to_string()
+    } else if value.is_empty() {
+        namespace.to_string()
     } else {
         format!("{namespace}.{value}")
     }
@@ -356,13 +362,62 @@ impl IncludeLoader {
                 self.root_dir.display()
             )));
         }
-        if !resolved.is_file() {
+        if !resolved.is_file() && !resolved.is_dir() {
             return Err(err(format!(
-                "{}: include path '{raw}' does not name a regular file",
+                "{}: include path '{raw}' does not name a regular file or directory",
                 source.display()
             )));
         }
         Ok(resolved)
+    }
+
+    /// The files one include names: itself, or for a directory include
+    /// every `.yaml`/`.yml` file directly inside it, in file-name order
+    /// (a growing per-check directory: each lane adds one file, and no
+    /// two lanes ever append to the same one).
+    fn include_files(
+        &self,
+        resolved: &Path,
+        raw: &str,
+        source: &Path,
+    ) -> Result<Vec<PathBuf>, DagJsonError> {
+        if resolved.is_file() {
+            return Ok(vec![resolved.to_path_buf()]);
+        }
+        let mut files: Vec<PathBuf> = Vec::new();
+        let entries = fs::read_dir(resolved).map_err(|error| {
+            err(format!(
+                "{}: cannot read include directory '{}': {error}",
+                source.display(),
+                resolved.display()
+            ))
+        })?;
+        for entry in entries {
+            let path = entry
+                .map_err(|error| {
+                    err(format!(
+                        "{}: cannot read include directory '{}': {error}",
+                        source.display(),
+                        resolved.display()
+                    ))
+                })?
+                .path();
+            let is_dag = matches!(
+                path.extension().and_then(|value| value.to_str()),
+                Some("yaml") | Some("yml")
+            );
+            if is_dag && path.is_file() {
+                files.push(fs::canonicalize(&path).unwrap_or(path));
+            }
+        }
+        files.sort();
+        if files.is_empty() {
+            return Err(err(format!(
+                "{}: include path '{raw}' names a directory with no .yaml files",
+                source.display()
+            )));
+        }
+        Ok(files)
     }
 
     fn visit(
@@ -484,16 +539,35 @@ impl IncludeLoader {
                     source.display()
                 )));
             }
-            self.include_instances += 1;
             let included = self.resolve_include(&raw_path, &source)?;
             let child_namespace = qualify(&namespace, &segment);
-            let (child_start, child_end) = self.visit(
-                included,
-                child_namespace,
-                None,
-                PathBuf::from(&raw_path),
-                depth + 1,
-            )?;
+            let mut child_start = self.steps.len();
+            let mut child_end = child_start;
+            for included_file in self.include_files(&included, &raw_path, &source)? {
+                if self.include_instances >= MAX_DAG_INCLUDE_INSTANCES {
+                    return Err(err(format!(
+                        "{}: composed DAG exceeds {MAX_DAG_INCLUDE_INSTANCES} include instances",
+                        source.display()
+                    )));
+                }
+                self.include_instances += 1;
+                // The file itself names the syntax for a directory
+                // include; a single-file include keeps the written path.
+                let syntax_path = if included.is_dir() {
+                    included_file.clone()
+                } else {
+                    PathBuf::from(&raw_path)
+                };
+                let (file_start, file_end) = self.visit(
+                    included_file,
+                    child_namespace.clone(),
+                    None,
+                    syntax_path,
+                    depth + 1,
+                )?;
+                child_start = child_start.min(file_start);
+                child_end = child_end.max(file_end);
+            }
             let qualified_after: Vec<String> =
                 after.iter().map(|tag| qualify(&namespace, tag)).collect();
             self.after_references.extend(

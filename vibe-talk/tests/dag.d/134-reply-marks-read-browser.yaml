@@ -1,0 +1,25 @@
+steps:
+  - group: check
+    job: reply-marks-read-browser
+    desc: a docked Reply and a new thread's first reply mark what they answer read, Done and at the provider, and a later thread message marks nothing, in current Chromium at 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/reply_marks_read_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 5
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#306 done-stale-across-views` and `#311 sent-read-waits-for-done` in the browser engine. On a 412x915
+  # phone by touch, with Main and All each read for itself: a Done tapped in All is drawn in Main, and an
+  # Undo in Main drawn in All, on every frame from the switch in the bar's picker on, with no read. At
+  # 1280x800 in two columns, every Done write held on the server: a Reply sent with Enter on a message
+  # whose Done is held asks the provider nothing while it is held, nor after it is refused, and once a
+  # held Done is saved asks it once, after the Done, said on the status line. `#327 done-races-remaining`:
+  # before that, a Done made in All and held, two columns turned on and a thread opened on the right for
+  # the first time draw it Done there on every frame from the first, and once it is saved. Measured on
+  # 2026-10-14: about 7s wall; on 2026-10-15 with the thread opened while the Done is held, about 7s.
