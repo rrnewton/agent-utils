@@ -800,7 +800,7 @@ EOF
         # Beside the store, inside the 0700 throwaway directory the cache check requires.
         SHOTS_DISCUSS=0
         for shots_state in "${SHOTS_ONLY[@]}"; do
-            case "$shots_state" in 73-*|74-*|75-*|76-*|77-*) SHOTS_DISCUSS=1 ;; esac
+            case "$shots_state" in 73-*|74-*|75-*|76-*|78-*) SHOTS_DISCUSS=1 ;; esac
         done
         if [ "$SHOTS_DISCUSS" = 1 ]; then
             cat <<'EOF'

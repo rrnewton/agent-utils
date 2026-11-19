@@ -7277,6 +7277,7 @@ SCENES: tuple[Scene, ...] = (
                 "return r.top >= 0 && r.bottom <= h; })()",
             ),
             ("the switcher cards are not over the page", "!window.__visible('view-cards')"),
+        ),
     ),
     Scene(
         name="78-whole-threads-no-duplicates",
@@ -7571,7 +7572,7 @@ def run_captures(
     # empty pane there is the failure the matrix exists to catch. A wider walk skips those
     # states BY NAME instead — its server is deliberately cacheless (the Settings and Help
     # states photograph exactly that), so Discuss has no window to show there.
-    discuss_scenes = [s for s in scenes if s.name.startswith(("73-", "74-", "75-", "76-", "77-"))]
+    discuss_scenes = [s for s in scenes if s.name.startswith(("73-", "74-", "75-", "76-", "78-"))]
     discuss_only = bool(wanted) and len(wanted) == len(discuss_scenes)
     if discuss_scenes and not seed_discuss_cache(60 if discuss_only else 10):
         if discuss_only:
