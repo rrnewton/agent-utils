@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-thread-naming-from-cache: name threads from the local cache, not Slack'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -29,3 +29,7 @@ Owner report (thread 211, 2026-11-18): the 014 team gives no thread slug names a
 # Notes
 
 Owner-priority, deployed on landing. Coordb checks the live channel read-only after deploy.
+
+## Resolution
+
+[watermelon-full-preview] Landed 7381665f on github/main. SinkThreadCache keeps the proven-whole read first, then names from held thread-scope rows (snapshot root plus at least two held replies, or every reply the root counts) with no freshness/coverage/exact-count proof and zero Slack calls; threads the cache holds too little of keep the one upstream read at naming priority. Backfill is the same path: unnamed threads queued from page reads name from the cache after deploy, no Slack burst. Tests: new unit test for the held-rows rule, thread_reads integration (16 passed, cache-hit asserts zero upstream calls), screenshot matrix /tmp/mu-threadname-shots (22 images, BUILD commit 961fa1d7). Gate: full validate failed only vibe-talk.shots.screenshots-desks (state 59, load-sensitive under gate concurrency; passes solo 4/4 on the gated tree and on clean main); exclusive rerun passed — flake waiver for that untouched step. Top Slack consumers (last 3000 slack_calls windows): conversations.replies:refresh 13977, conversations.history:refresh 6096, history:live-poll 5800, history:poll 2424, replies:poll 2097, replies:backfill 1682. Agent-side check: agentctl carries no thread slug (short-refs.json maps numbers only); the older bridge snapshot already has that writer, so no bridge refresh is needed.
