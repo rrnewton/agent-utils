@@ -36,6 +36,9 @@ export interface FilterHold {
 
 /** Where the reader was before a filter change (`filterAnchor`). */
 export interface FilterAnchor {
+  /** The scroll owner's mark at the anchor's capture (`#1894`): a placement
+   * that would nudge the list asks whether the reader moved since it. */
+  placeMark?: unknown;
   newest: boolean;
   row: HTMLElement | null;
   ids: string[];
@@ -90,6 +93,9 @@ export interface FilterPlaceDependencies {
   /** Move the list by a measured delta, or put it at a measured position, through the scroll owner (`#1251 scroll-single-owner`). */
   nudge(area: HTMLElement, delta: number): void;
   toPosition(area: HTMLElement, top: number): void;
+  /** The scroll owner's mark now, and whether the reader moved since one (`#1894`, guard from `#1880`). Optional for doubles. */
+  capturePlaceMark?(): unknown;
+  userMovedSince?(mark: unknown): boolean;
   renderJumpNewest(): void;
   guardQuietly<A extends unknown[]>(fn: (...args: A) => unknown): (...args: A) => unknown;
   setStatus(text: string): void;
@@ -177,6 +183,7 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
     const ids = idsOf(row);
     const kept = selection ? [selection.id, ...ids.filter((id) => id !== selection.id)] : ids;
     return {
+      placeMark: deps.capturePlaceMark ? deps.capturePlaceMark() : undefined,
       newest: false,
       row,
       ids: kept,
@@ -350,7 +357,8 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
     }
     if (showing && pane && mark && chosen) return anchorAt(chosen, mark);
     if (deps.atBottom(area)) {
-      return { newest: true, row: null, ids: [], selected: null, drawn: false, focused: false, time: NaN, offset: 0,
+      return { placeMark: deps.capturePlaceMark ? deps.capturePlaceMark() : undefined,
+        newest: true, row: null, ids: [], selected: null, drawn: false, focused: false, time: NaN, offset: 0,
         alternate: null };
     }
     const head = pane ? pane.head() : deps.floatingClearance(area);
@@ -454,7 +462,12 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
       return;
     }
     // The message's own top where it is part of a combined row (`messageTop`), the row's otherwise.
-    deps.nudge(area, deps.messageTop(placed, row ? id : null) - deps.listPlaceTop(area) - offset);
+    // `#1894`: never after the reader has moved since the anchor was taken -
+    // a late landing (an extra bucket's hits interleaving) must not take
+    // them back; the rows stand where they landed and the reader stays.
+    const readerMoved = anchor.placeMark !== undefined && deps.userMovedSince
+      ? deps.userMovedSince(anchor.placeMark) : false;
+    if (!readerMoved) deps.nudge(area, deps.messageTop(placed, row ? id : null) - deps.listPlaceTop(area) - offset);
     carrySelection(anchor, placed, substitute !== null);
     const pane = deps.view() === "discord" ? (deps.columnSide() ? deps.sidePane() : deps.channelPane()) : null;
     const mark = pane ? deps.markOf(pane) : null;
