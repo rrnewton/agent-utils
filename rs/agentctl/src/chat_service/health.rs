@@ -16,6 +16,19 @@ use super::{age_text, channel_lock, ChatServiceError};
 
 /// Send attempts at which an unsent reply counts as a retry loop.
 pub const RETRY_LOOP_ATTEMPTS: u64 = 20;
+/// Silence after the last admitted owner request, with the event stream
+/// carrying nothing, past which `chat health` calls the bridge deaf
+/// (#1892: a bridge admitted nothing for six days while reporting ok).
+pub const OWNER_SILENCE_AFTER: Duration = Duration::from_secs(48 * 60 * 60);
+/// How long the owner rescan may be held back by the host listing budget
+/// before `chat health` reports it (#1892).
+pub const RESCAN_BUDGET_HOLD_AFTER: Duration = Duration::from_secs(30 * 60);
+/// A budget hold counts as current only when its last log line is this fresh.
+const RESCAN_BUDGET_HOLD_RECENT: Duration = Duration::from_secs(15 * 60);
+/// An un-carried find counts as current only when its last log line is this fresh.
+const UNCARRIED_FIND_RECENT: Duration = Duration::from_secs(24 * 60 * 60);
+/// Bytes of the plugin diagnostics log's tail `chat health` reads.
+const PLUGIN_LOG_TAIL_BYTES: u64 = 512 * 1024;
 /// Age at which a captured reply that is still not sent counts as stuck.
 const UNSENT_REPLY_STUCK: Duration = Duration::from_secs(10 * 60);
 /// Requests each list in the report names before it counts the rest.
@@ -340,6 +353,62 @@ pub fn choose_registry(given: &Path, bridge: Option<BridgeRegistry>) -> Registry
     }
 }
 
+/// What the bridge's plugin diagnostics log proves about the owner channel
+/// (#1892), from lines every bridge already writes; no new persisted state.
+#[derive(Clone, Copy, Debug, Default)]
+struct PluginLogEvidence {
+    /// Last `event N: request ...` line: the stream last carried a request.
+    last_stream_request_at: Option<u64>,
+    /// First and last `... the stream did not carry` find lines.
+    first_uncarried_found_at: Option<u64>,
+    last_uncarried_found_at: Option<u64>,
+    /// First and last `rescan: the host listing budget holds ...` lines.
+    first_budget_hold_at: Option<u64>,
+    last_budget_hold_at: Option<u64>,
+}
+
+/// Read the tail of the plugin diagnostics log the bridge configuration
+/// names (`backend_configuration.data.diagnostics_log`), when one is named
+/// and readable. Lines are `<unix millis> slack-plugin: <message>`.
+fn plugin_log_evidence(
+    configuration: &chat_runtime::BridgeConfiguration,
+) -> Option<PluginLogEvidence> {
+    use std::io::{Read, Seek, SeekFrom};
+    let path = configuration
+        .backend_configuration
+        .as_ref()?
+        .data
+        .get("diagnostics_log")?
+        .as_str()?;
+    let mut file = std::fs::File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    let start = length.saturating_sub(PLUGIN_LOG_TAIL_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut text = String::new();
+    file.read_to_string(&mut text).ok()?;
+    let mut evidence = PluginLogEvidence::default();
+    for line in text.lines() {
+        let Some((millis, message)) = line.split_once(' ') else {
+            continue;
+        };
+        let Ok(at) = millis.parse::<u64>() else {
+            continue;
+        };
+        if message.contains(": request ") {
+            evidence.last_stream_request_at = Some(at);
+        }
+        if message.contains("the stream did not carry") {
+            evidence.first_uncarried_found_at.get_or_insert(at);
+            evidence.last_uncarried_found_at = Some(at);
+        }
+        if message.contains("rescan: the host listing budget holds") {
+            evidence.first_budget_hold_at.get_or_insert(at);
+            evidence.last_budget_hold_at = Some(at);
+        }
+    }
+    Some(evidence)
+}
+
 /// What `chat health` read, before it judges it.
 struct Observed {
     configuration: chat_runtime::BridgeConfiguration,
@@ -367,6 +436,8 @@ struct Observed {
     reply_source: Option<Value>,
     /// The replies a restart held back as stale.
     held: Vec<chat_runtime::HeldReply>,
+    /// [`plugin_log_evidence`], when a log was named and readable.
+    plugin_log: Option<PluginLogEvidence>,
     now: u64,
 }
 
@@ -381,6 +452,7 @@ pub fn health<A: ManagedApi + ?Sized>(
     let state = BridgeState::inspect(state_root)?;
     let now = chat_runtime::unix_millis();
     let runner = state.runner_pid();
+    let plugin_log = plugin_log_evidence(state.config());
     let observed = Observed {
         status: state.status()?,
         runner,
@@ -400,6 +472,7 @@ pub fn health<A: ManagedApi + ?Sized>(
         ),
         reply_source: state.reply_source_record(),
         held: state.held_replies()?,
+        plugin_log,
         registry,
         now,
     };
@@ -425,6 +498,7 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
         binding,
         reply_source,
         held,
+        plugin_log,
         now,
     } = observed;
     let configuration = &configuration;
@@ -577,6 +651,61 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
 
     let last = |pick: fn(&RequestTimes) -> Option<u64>| times.iter().filter_map(pick).max();
     let last_admitted = last(|request| Some(request.admitted_at_millis));
+
+    // #1892: a running bridge that has admitted no owner request for
+    // OWNER_SILENCE_AFTER while its stream carried nothing (the rescan
+    // still finds messages the stream did not carry) is deaf, not ok; so
+    // is an owner rescan held back by the listing budget past
+    // RESCAN_BUDGET_HOLD_AFTER. Both signals are lines the plugin already
+    // writes, so a pinned older bridge is judged the same way.
+    if runner.is_some() {
+        if let Some(evidence) = plugin_log {
+            let silence_millis = u64::try_from(OWNER_SILENCE_AFTER.as_millis()).unwrap_or(u64::MAX);
+            let admitted_silent = match last_admitted {
+                Some(at) => now.saturating_sub(at) > silence_millis,
+                None => evidence
+                    .first_uncarried_found_at
+                    .zip(evidence.last_uncarried_found_at)
+                    .is_some_and(|(first, last)| last.saturating_sub(first) > silence_millis),
+            };
+            let stream_silent = evidence
+                .last_stream_request_at
+                .is_none_or(|at| now.saturating_sub(at) > silence_millis);
+            let finds_current = evidence.last_uncarried_found_at.is_some_and(|at| {
+                now.saturating_sub(at)
+                    <= u64::try_from(UNCARRIED_FIND_RECENT.as_millis()).unwrap_or(u64::MAX)
+            });
+            if admitted_silent && stream_silent && finds_current {
+                problems.degraded.push(format!(
+                    "no owner request admitted {} while the event stream carried nothing \
+                     (the rescan still finds messages the stream did not carry; last \
+                     stream-carried request {})",
+                    last_admitted.map_or_else(
+                        || "ever".to_owned(),
+                        |at| format!("for {}", age_text(now.saturating_sub(at)))
+                    ),
+                    when(evidence.last_stream_request_at, now)
+                ));
+            }
+            if let (Some(first), Some(last)) =
+                (evidence.first_budget_hold_at, evidence.last_budget_hold_at)
+            {
+                let held_for = last.saturating_sub(first);
+                let hold_after =
+                    u64::try_from(RESCAN_BUDGET_HOLD_AFTER.as_millis()).unwrap_or(u64::MAX);
+                let hold_recent =
+                    u64::try_from(RESCAN_BUDGET_HOLD_RECENT.as_millis()).unwrap_or(u64::MAX);
+                if held_for > hold_after && now.saturating_sub(last) <= hold_recent {
+                    problems.degraded.push(format!(
+                        "the owner rescan has been held back by the host listing budget for \
+                         {} (last hold {} ago)",
+                        age_text(held_for),
+                        age_text(now.saturating_sub(last))
+                    ));
+                }
+            }
+        }
+    }
     let last_delivered = last(|request| request.delivered_at_millis);
     let last_replied = last(|request| request.last_reply_sent_at_millis);
 
@@ -936,6 +1065,14 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
         },
         "target": target,
         "last_admitted_at_millis": last_admitted,
+        "owner_channel": {
+            "last_stream_request_at_millis": plugin_log.and_then(|evidence| evidence.last_stream_request_at),
+            "last_uncarried_found_at_millis": plugin_log.and_then(|evidence| evidence.last_uncarried_found_at),
+            "rescan_budget_hold_first_at_millis": plugin_log.and_then(|evidence| evidence.first_budget_hold_at),
+            "rescan_budget_hold_last_at_millis": plugin_log.and_then(|evidence| evidence.last_budget_hold_at),
+            "silence_after_seconds": OWNER_SILENCE_AFTER.as_secs(),
+            "rescan_budget_hold_after_seconds": RESCAN_BUDGET_HOLD_AFTER.as_secs(),
+        },
         "last_delivered_at_millis": last_delivered,
         "last_reply_sent_at_millis": last_replied,
         "requests": {
@@ -1026,6 +1163,7 @@ mod tests {
             binding: Some(("claude".to_owned(), Some("s-1".to_owned()))),
             reply_source: None,
             held: Vec::new(),
+            plugin_log: None,
             now: NOW,
         }
     }
@@ -1055,6 +1193,58 @@ mod tests {
         HealthOptions {
             stale_after: Duration::from_secs(300),
         }
+    }
+
+    #[test]
+    fn a_deaf_bridge_with_a_silent_stream_is_degraded_not_ok() {
+        // #1892: nothing admitted for six days, the stream carried no
+        // request in that span, and the rescan still finds messages the
+        // stream did not carry: degraded, never ok.
+        let six_days = 6 * 24 * 60 * 60 * 1_000;
+        let mut observed = healthy();
+        observed.times = vec![RequestTimes {
+            admitted_at_millis: NOW - six_days,
+            ..request("a", "delivered", 1)
+        }];
+        observed.plugin_log = Some(PluginLogEvidence {
+            last_stream_request_at: Some(NOW - six_days),
+            first_uncarried_found_at: Some(NOW - six_days),
+            last_uncarried_found_at: Some(NOW - 60_000),
+            first_budget_hold_at: None,
+            last_budget_hold_at: None,
+        });
+        let health = assess(observed, options());
+        assert_eq!(health.verdict, "degraded", "{}", health.text);
+        assert!(
+            health.text.contains("no owner request admitted"),
+            "{}",
+            health.text
+        );
+        assert_eq!(
+            health.document["owner_channel"]["silence_after_seconds"],
+            48 * 60 * 60
+        );
+    }
+
+    #[test]
+    fn an_owner_rescan_held_by_the_budget_is_degraded_not_ok() {
+        // #1892: rescan budget-hold lines spanning over half an hour, the
+        // latest one fresh, mean the owner rescan is being held back.
+        let mut observed = healthy();
+        observed.plugin_log = Some(PluginLogEvidence {
+            last_stream_request_at: Some(NOW - 60_000),
+            first_uncarried_found_at: None,
+            last_uncarried_found_at: None,
+            first_budget_hold_at: Some(NOW - 45 * 60 * 1_000),
+            last_budget_hold_at: Some(NOW - 60_000),
+        });
+        let health = assess(observed, options());
+        assert_eq!(health.verdict, "degraded", "{}", health.text);
+        assert!(
+            health.text.contains("held back by the host listing budget"),
+            "{}",
+            health.text
+        );
     }
 
     #[test]

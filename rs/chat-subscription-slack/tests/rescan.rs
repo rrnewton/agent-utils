@@ -1360,9 +1360,10 @@ fn relay_poll_budget_refusal_backs_off_without_listing() {
     let mut envelope = listed(&root, None, RELAY_PEER, "relay envelope", &[]);
     envelope.subtype = Some("bot_message".to_owned());
     fake.push_history(envelope);
-    // Another bridge of this identity was told to back off.
+    // Another bridge's relay poll was told to back off: the relay budget
+    // holds (#1892: the relay poll's own budget, never the owner rescan's).
     let budget =
-        chat_subscription_slack::budget::CallBudget::at(&directory.join("budget.json"), 20);
+        chat_subscription_slack::budget::CallBudget::at(&directory.join("budget-relay.json"), 20);
     budget.block(T0 + 60_000);
     let mut extra = relay_extra();
     extra["rescan_budget_key"] = json!(directory.to_str().unwrap());
@@ -1442,8 +1443,8 @@ fn relay_poll_leaves_human_posts_to_the_stream_and_general_rescan() {
 
 #[test]
 fn relay_poll_stops_at_half_the_shared_budget() {
-    // #769 review fix 2: once half the per-minute budget is used, the
-    // poll makes no listing, keeping headroom for the general rescan.
+    // #769 review fix 2, on the relay poll's own budget (#1892): once half
+    // its per-minute budget is used, the poll makes no listing.
     let directory = scratch("relay-headroom");
     let fake = FakeTransport::new();
     fake.push_script(vec![FakeStep::Idle; 10]);
@@ -1451,11 +1452,13 @@ fn relay_poll_stops_at_half_the_shared_budget() {
     let mut envelope = listed(&root, None, RELAY_PEER, "relay envelope", &[]);
     envelope.subtype = Some("bot_message".to_owned());
     fake.push_history(envelope);
-    let budget = chat_subscription_slack::budget::CallBudget::at(&directory.join("budget.json"), 2);
-    budget.take(T0).expect("pre-spend half the budget");
+    // The relay allowance is half the configured 4, so 2; spend half of it.
+    let budget =
+        chat_subscription_slack::budget::CallBudget::at(&directory.join("budget-relay.json"), 2);
+    budget.take(T0).expect("pre-spend half the relay budget");
     let mut extra = relay_extra();
     extra["rescan_budget_key"] = json!(directory.to_str().unwrap());
-    extra["rescan_calls_per_minute"] = json!(2);
+    extra["rescan_calls_per_minute"] = json!(4);
     let mut backend = backend(&fake, relay_headroom_clock);
     let mut subscription =
         ChatSubscription::open(&mut backend, &relay_request(&directory, extra)).unwrap();
@@ -1547,6 +1550,7 @@ fn relay_poll_lists_at_most_three_threads_and_keeps_the_rest_due() {
 // --- #805 relay-poll-receipts-during-hold ---
 
 clock!(relay_hold_clock, RELAY_HOLD_NOW);
+clock!(relay_hold_replies_clock, RELAY_HOLD_REPLIES_NOW);
 clock!(relay_hold_bound_clock, RELAY_HOLD_BOUND_NOW);
 clock!(relay_log_clock, RELAY_LOG_NOW);
 
@@ -1564,7 +1568,7 @@ fn drain_batches(subscription: &mut ChatSubscription) {
 
 #[test]
 fn relay_poll_during_budget_hold_reads_receipt_on_tracked_thread() {
-    // #805: with the shared budget holding after a rate limit, the relay
+    // #805: with the relay budget holding after a rate limit, the relay
     // poll still lists the threads of tracked relay posts, so a receipt
     // posted during the hold is read within one poll interval.
     let directory = scratch("relay-hold");
@@ -1575,7 +1579,7 @@ fn relay_poll_during_budget_hold_reads_receipt_on_tracked_thread() {
     fake.push_history(bot_message(&root, None, RELAY_PEER, "relay envelope"));
     fake.push_history(bot_message(&reply, Some(&root), RELAY_PEER, "first reply"));
     let budget =
-        chat_subscription_slack::budget::CallBudget::at(&directory.join("budget.json"), 20);
+        chat_subscription_slack::budget::CallBudget::at(&directory.join("budget-relay.json"), 20);
     let mut extra = relay_extra();
     extra["rescan_budget_key"] = json!(directory.to_str().unwrap());
     let mut backend = backend(&fake, relay_hold_clock);
@@ -1592,8 +1596,8 @@ fn relay_poll_during_budget_hold_reads_receipt_on_tracked_thread() {
         "thread tracked before the hold: {:?}",
         fake.state().scans
     );
-    // Another bridge was rate-limited listing history; the shared
-    // budget now holds, caused by conversations.history.
+    // Another bridge's relay poll was rate-limited listing history; the
+    // relay budget now holds, caused by conversations.history (#1892).
     budget.block_for(T0 + 3_600_000, "conversations.history");
     let receipt = ts(T0 + 13_000);
     fake.push_history(bot_message(
@@ -1643,9 +1647,12 @@ fn relay_poll_during_budget_hold_lists_at_most_three_threads() {
         roots.push(root);
     }
     let budget =
-        chat_subscription_slack::budget::CallBudget::at(&directory.join("budget.json"), 20);
+        chat_subscription_slack::budget::CallBudget::at(&directory.join("budget-relay.json"), 20);
     let mut extra = relay_extra();
     extra["rescan_budget_key"] = json!(directory.to_str().unwrap());
+    // A wide configured allowance (relay gets half, 20) so the bound of
+    // three held listings is what stops the poll, not the budget (#1892).
+    extra["rescan_calls_per_minute"] = json!(40);
     let mut backend = backend(&fake, relay_hold_bound_clock);
     let mut subscription =
         ChatSubscription::open(&mut backend, &relay_request(&directory, extra)).unwrap();
@@ -1691,14 +1698,14 @@ fn relay_poll_during_replies_caused_hold_lists_no_threads() {
     fake.push_history(bot_message(&root, None, RELAY_PEER, "relay envelope"));
     fake.push_history(bot_message(&reply, Some(&root), RELAY_PEER, "first reply"));
     let budget =
-        chat_subscription_slack::budget::CallBudget::at(&directory.join("budget.json"), 20);
+        chat_subscription_slack::budget::CallBudget::at(&directory.join("budget-relay.json"), 20);
     let mut extra = relay_extra();
     extra["rescan_budget_key"] = json!(directory.to_str().unwrap());
-    let mut backend = backend(&fake, relay_hold_clock);
+    let mut backend = backend(&fake, relay_hold_replies_clock);
     let mut subscription =
         ChatSubscription::open(&mut backend, &relay_request(&directory, extra)).unwrap();
     commit_next(&mut subscription);
-    RELAY_HOLD_NOW.store(T0 + 12_000, Ordering::SeqCst);
+    RELAY_HOLD_REPLIES_NOW.store(T0 + 12_000, Ordering::SeqCst);
     drain_batches(&mut subscription);
     let tracked = fake.state().scans.len();
     budget.block_for(T0 + 3_600_000, "conversations.replies");
@@ -1709,7 +1716,7 @@ fn relay_poll_during_replies_caused_hold_lists_no_threads() {
         RELAY_PEER,
         "receipt: delivered",
     ));
-    RELAY_HOLD_NOW.store(T0 + 48_000, Ordering::SeqCst);
+    RELAY_HOLD_REPLIES_NOW.store(T0 + 48_000, Ordering::SeqCst);
     assert!(
         next_batch_within(&mut subscription, 3).is_none(),
         "no receipt is read during a replies-caused hold"
@@ -1749,7 +1756,7 @@ fn tracked_subscription(
     commit_next(&mut subscription);
     now.store(T0 + 12_000, Ordering::SeqCst);
     drain_batches(&mut subscription);
-    let budget_path = directory.join("budget.json");
+    let budget_path = directory.join("budget-relay.json");
     (subscription, fake, directory, budget_path)
 }
 
@@ -1764,7 +1771,7 @@ fn relay_poll_during_hold_reads_receipt_on_fresh_post_with_no_earlier_reply() {
     let root = ts(T0 + 10_000);
     fake.push_history(bot_message(&root, None, RELAY_PEER, "relay envelope"));
     let budget =
-        chat_subscription_slack::budget::CallBudget::at(&directory.join("budget.json"), 20);
+        chat_subscription_slack::budget::CallBudget::at(&directory.join("budget-relay.json"), 20);
     let mut extra = relay_extra();
     extra["rescan_budget_key"] = json!(directory.to_str().unwrap());
     let mut backend = backend(&fake, relay_hold_fresh_clock);
@@ -1912,6 +1919,102 @@ fn rate_limited_listing_logs_method_and_channel() {
     assert!(
         logged.contains("conversations.history") && logged.contains(CHANNEL),
         "rate-limit log line names method and channel: {logged}"
+    );
+    subscription.close().unwrap();
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+clock!(starve_clock, STARVE_NOW);
+
+const OWNER_CHANNEL: &str = "C0OWNER1892";
+const RELAY_CHANNEL: &str = "C0RELAY1892";
+
+#[test]
+fn a_rate_limited_relay_poll_never_starves_the_owner_rescan() {
+    // #1892: a busy relay channel whose poll keeps hitting Slack's rate
+    // limit must not hold the owner channel's rescan back: the relay poll
+    // spends its own smaller budget, and each pass lists the owner channel
+    // first, so the owner message is admitted within one pass.
+    let directory = scratch("relay-starve");
+    let fake = FakeTransport::new();
+    fake.push_script(heartbeats(12));
+    // A relay envelope the poll would carry, and an owner file message the
+    // stream never carries: only the rescan can admit the owner's.
+    let relay_ts = ts(T0 + 10_000);
+    let mut envelope = listed(&relay_ts, None, RELAY_PEER, "relay envelope", &[]);
+    envelope.channel_id = RELAY_CHANNEL.to_owned();
+    envelope.subtype = Some("bot_message".to_owned());
+    fake.push_history(envelope);
+    let owner_ts = ts(T0 + 5_000);
+    let mut owner_message = listed(&owner_ts, None, OWNER, "owner screenshot", &["F0KKKKKKKK1"]);
+    owner_message.channel_id = OWNER_CHANNEL.to_owned();
+    fake.push_history(owner_message);
+    // The relay poll's history listing (and its in-pass retries) all hit
+    // the rate limit, so the poll backs off in its own budget.
+    for _ in 0..4 {
+        fake.state()
+            .scan_failures
+            .push_back(TransportError::not_applied(
+                "slack_rate_limited",
+                "Slack rate-limited request conversations.history. Retry after 0 seconds. \
+                 {\"retry_after_seconds\":0}",
+                true,
+            ));
+    }
+    let extra = json!({
+        "relay_channels": [{"channel": RELAY_CHANNEL, "peer_senders": [RELAY_PEER]}],
+        "relay_poll_seconds": 5,
+        "rescan_budget_key": directory.to_str().unwrap(),
+        "rescan_calls_per_minute": 20,
+    });
+    let request = SubscribeRequest::new(
+        vec![
+            ChannelId::new(OWNER_CHANNEL).unwrap(),
+            ChannelId::new(RELAY_CHANNEL).unwrap(),
+        ],
+        vec![SenderId::new(OWNER).unwrap()],
+        None,
+    )
+    .unwrap()
+    .with_backend_configuration(
+        BackendConfiguration::new("agentctl.slack.v1", data(&directory, extra)).unwrap(),
+    );
+    let mut backend = backend(&fake, starve_clock);
+    let mut subscription = ChatSubscription::open(&mut backend, &request).unwrap();
+    commit_next(&mut subscription);
+    // Past the owner message's grace period: one pass must admit it even
+    // though the relay poll just exhausted its listings on the rate limit.
+    STARVE_NOW.store(T0 + 100_000, Ordering::SeqCst);
+    let batch = next_batch_within(&mut subscription, 10).expect("owner batch within one pass");
+    assert_eq!(
+        single_message(&batch).message_id().as_str(),
+        format!("{OWNER_CHANNEL}/messages/{owner_ts}")
+    );
+    subscription.commit_durable(&batch).unwrap();
+    let logged = log(&directory);
+    assert!(
+        logged.contains(&format!(
+            "listing rate-limited: conversations.history in channel {RELAY_CHANNEL}"
+        )),
+        "the relay listing hit the limit: {logged}"
+    );
+    assert!(
+        !logged.contains("rescan: the host listing budget holds every bridge back"),
+        "the owner rescan was never held back: {logged}"
+    );
+    // The back-off lives only in the relay budget; the owner budget is clean.
+    let relay_state: Value =
+        serde_json::from_slice(&fs::read(directory.join("budget-relay.json")).unwrap()).unwrap();
+    assert!(
+        relay_state["blocked_until_millis"].as_u64().unwrap_or(0) >= T0 + 100_000 + 30_000,
+        "relay budget holds the back-off: {relay_state}"
+    );
+    let owner_state: Value =
+        serde_json::from_slice(&fs::read(directory.join("budget.json")).unwrap()).unwrap();
+    assert_eq!(
+        owner_state["blocked_until_millis"].as_u64().unwrap_or(0),
+        0,
+        "owner budget was never blocked: {owner_state}"
     );
     subscription.close().unwrap();
     fs::remove_dir_all(&directory).unwrap();

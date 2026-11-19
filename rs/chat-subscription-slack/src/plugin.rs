@@ -122,24 +122,28 @@
 //!
 //! Admission, the ledger, and dedup are the rescan's own (`admit`, `consider`, the same
 //! queue and pending record), so a post the general rescan also finds is delivered once.
-//! Every listing spends the same host-wide budget ([`crate::budget`]), and a budget refusal
-//! or a rate limit backs the relay poll off exactly as it backs off a pass. One exception
+//! The relay poll spends its own smaller host-wide budget
+//! ([`crate::budget::CallBudget::for_relay_identity`], half the rescan's allowance), never
+//! the owner rescan's: a rate limit or back-off the poll causes holds only the poll, so a
+//! busy relay channel cannot starve the owner channel's rescan (#1892, where the poll's
+//! history calls exhausted the shared limit and every owner pass then listed nothing).
+//! A general pass likewise lists its non-relay (owner) channels before any relay channel,
+//! so a pass that runs out of budget has already served the owner channel. One exception
 //! keeps delivery receipts from starving during a hold (#805): when the budget is holding
 //! every bridge back, the poll may still list at most three already-tracked relay threads
 //! per poll, spending past the back-off but never past the half-budget headroom — unless
 //! the hold was caused by `conversations.replies` itself, whose Retry-After is honoured in
-//! full. Each rate-limited listing is logged with its method and channel, and the budget
-//! records the causing method with the hold. The poll also
-//! stops for the minute once half the per-minute budget is used, so a burst cannot starve
-//! the owner-channel general rescan. The effective interval is floored at
+//! full. Each rate-limited listing is logged with its method and channel, and the relay
+//! budget records the causing method with the hold. The poll also
+//! stops for the minute once half its own per-minute budget is used. The effective interval is floored at
 //! [`MIN_RELAY_POLL_SECONDS`] seconds whatever was configured (a faster setting is
 //! accepted and clamped, and the clamp is logged), and one poll lists at most
 //! [`MAX_RELAY_THREADS_PER_POLL`] threads, the rest staying due for the next poll
 //! (#1682 slack-rate-limit-budget: the 15 s poll was the bridge's largest listing
 //! spender, duplicating reads of channels another reader also lists). At the floor
 //! one relay channel costs at most 2 history listings a minute plus the capped
-//! thread listings — against the shared default of 20 calls a minute, so several
-//! bridges polling one channel still share one budget.
+//! thread listings — against the relay budget's default of 10 calls a minute, so several
+//! bridges polling one channel still share one relay budget.
 //!
 //! A rescued batch's cursor is the cursor before it with `;rescued:<channel>/<ts>` appended, so a
 //! subscription resumed from it resumes the stream where the cursor before it did. Which messages
@@ -942,6 +946,17 @@ fn open_rescan(
         &config.rescan_budget_key,
         config.rescan_calls_per_minute,
     );
+    // #1892: the relay poll's own smaller budget (half the rescan's
+    // allowance, at least one call a minute), so its rate limits and
+    // back-offs can never hold the owner-channel rescan.
+    let relay_budget = crate::budget::CallBudget::for_relay_identity(
+        &config.rescan_budget_key,
+        if config.rescan_calls_per_minute == 0 {
+            0
+        } else {
+            (config.rescan_calls_per_minute / 2).max(1)
+        },
+    );
     match config.rescan_interval {
         Some(interval) => diagnostics.log(&format!(
             "rescan: every {} s over the last {} s, once the stream has caught up; ledger {}; \
@@ -996,6 +1011,21 @@ fn open_rescan(
                 ""
             }
         ));
+        diagnostics.log(&format!(
+            "relay poll: own listing budget {} (never the owner rescan's)",
+            relay_budget.as_ref().map_or_else(
+                || "unavailable (no runtime directory)".to_owned(),
+                |relay_budget| format!(
+                    "{} calls a minute in {}",
+                    if config.rescan_calls_per_minute == 0 {
+                        "unlimited".to_owned()
+                    } else {
+                        ((config.rescan_calls_per_minute / 2).max(1)).to_string()
+                    },
+                    relay_budget.path().display()
+                )
+            )
+        ));
     }
     Some(Rescan {
         interval: config.rescan_interval,
@@ -1009,6 +1039,7 @@ fn open_rescan(
         postponed: BTreeSet::new(),
         carried_replies: BTreeMap::new(),
         budget,
+        relay_budget,
         queue: VecDeque::new(),
         next_due_millis: now_millis,
         failures: 0,
@@ -1048,6 +1079,9 @@ struct Rescan {
     carried_replies: BTreeMap<String, BTreeSet<u128>>,
     // The host-wide listing budget this bridge shares, when one could be placed.
     budget: Option<crate::budget::CallBudget>,
+    // The relay poll's own smaller budget (#1892): its back-offs never hold
+    // the owner rescan above.
+    relay_budget: Option<crate::budget::CallBudget>,
     // Messages found by the last pass and not yet offered, oldest first.
     queue: VecDeque<SlackMessage>,
     next_due_millis: u64,
@@ -1669,13 +1703,13 @@ impl SlackDriver {
         let mut failure: Option<TransportError> = None;
         let mut yielded = false;
         let mut headroom = false;
-        let budget = rescan.budget.clone();
+        let budget = rescan.relay_budget.clone();
         let mut spend = Spend {
             budget: budget.as_ref(),
             ..Spend::default()
         };
-        // Headroom for the owner-channel general rescan: the poll stops
-        // once half this minute's shared budget is used (#769 review).
+        // The poll stops once half its own per-minute budget is used, so a
+        // burst leaves relay headroom too (#769 review; own budget #1892).
         let over_headroom = |spend: &Spend<'_>| {
             spend.budget.is_some_and(|budget| {
                 let usage = budget.usage(now);
@@ -2247,7 +2281,11 @@ impl SlackDriver {
         let mut listings = 0_usize;
         let mut found = Vec::new();
         let mut failure: Option<TransportError> = None;
-        let channels: Vec<String> = self.channels.iter().cloned().collect();
+        // #1892: owner (non-relay) channels first, relay channels last, so a
+        // pass that spends its budget or hits a rate limit has already
+        // listed the owner channel.
+        let mut channels: Vec<String> = self.channels.iter().cloned().collect();
+        channels.sort_by_key(|channel| self.config.relay_peers.contains_key(channel));
         let mut yielded = false;
         let budget = rescan.budget.clone();
         let mut spend = Spend {

@@ -99,6 +99,24 @@ impl CallBudget {
         ))
     }
 
+    /// The relay poll's own budget for `identity` (#1892): placed beside the
+    /// owner rescan's budget under a relay name, so a rate limit or back-off
+    /// the relay poll causes holds only the relay poll and never starves the
+    /// owner-channel rescan. `None` exactly when [`Self::for_identity`] is.
+    #[must_use]
+    pub fn for_relay_identity(identity: &str, per_minute: u64) -> Option<Self> {
+        if identity == "off" {
+            return None;
+        }
+        if identity.starts_with('/') {
+            return Some(Self::at(
+                &Path::new(identity).join("budget-relay.json"),
+                per_minute,
+            ));
+        }
+        Self::for_identity(&format!("{identity}-relay"), per_minute)
+    }
+
     /// A budget kept in the file `path`.
     #[must_use]
     pub fn at(path: &Path, per_minute: u64) -> Self {
@@ -383,6 +401,31 @@ mod tests {
         );
         assert_eq!(budget.blocked(80_000), None);
         fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_relay_budget_back_off_never_holds_the_owner_budget() {
+        // #1892: the relay poll spends and backs off in its own file; the
+        // owner rescan's budget is untouched by a relay-caused hold.
+        let directory = scratch("relay-split")
+            .parent()
+            .unwrap()
+            .join("relay-split-dir");
+        let _ = fs::remove_dir_all(&directory);
+        let owner = CallBudget::for_identity(directory.to_str().unwrap(), 20).unwrap();
+        let relay = CallBudget::for_relay_identity(directory.to_str().unwrap(), 10).unwrap();
+        relay.block_for(80_000, "conversations.history");
+        assert_eq!(
+            relay.take(10_000),
+            Err(Refusal::Blocked(80_000)),
+            "the relay poll is held by its own back-off"
+        );
+        assert!(
+            owner.take(10_000).is_ok(),
+            "the owner rescan is never held by a relay back-off"
+        );
+        assert!(CallBudget::for_relay_identity("off", 10).is_none());
+        fs::remove_dir_all(&directory).ok();
     }
 
     #[test]
