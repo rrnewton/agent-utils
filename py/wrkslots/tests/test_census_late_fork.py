@@ -109,16 +109,19 @@ class _Host:
 
         self.scans.append(tuple((item.pid, item.start_ticks) for item in processes))
         matches: list[Match] = []
+        indeterminate: list[cli._AbsentProcessObservation] = []
         for process in processes:
             generation = (process.pid, process.start_ticks)
             event = self.before_scanning.pop(generation, None)
             if event is not None:
                 event()
             if self.live.get(process.pid) != process.start_ticks:
-                continue  # it exited: its entries read as missing
+                # It exited before its entries were read: indeterminate.
+                indeterminate.append(process)
+                continue
             if generation in self.holders:
                 matches.append((process.pid, targets[self.slot], "link", str(self.slot)))
-        return tuple(matches), ()
+        return tuple(matches), tuple(indeterminate)
 
 
 @pytest.fixture()
@@ -209,12 +212,13 @@ def test_replaced_pids_never_restart_the_host_wide_scan(
 
     census = _census(host)
 
+    # Since #1883 the replaced generation no longer costs a round:
+    # two proven rounds (the survivors, then the first newcomer) close.
     assert host.scans == [
         ((101, 7), (102, 7), (103, 7)),
         ((100, 12),),
-        ((101, 12),),
     ]
-    assert len(host.inventories) == 3
+    assert len(host.inventories) == 2
     assert census.matches == ()
     census.assert_slot_unused(slot, None, ignore_current_process=False)
 
@@ -371,7 +375,9 @@ def test_endless_unrelated_births_do_not_block_closure(
 def test_endless_holder_births_refuse_within_the_bound(
     monkeypatch: pytest.MonkeyPatch, slot: Path,
 ) -> None:
-    """Every listing hands the target to a new holder, so it never closes."""
+    """Every listing hands the target to a new candidate holder, which
+    forks and exits before its scan completes: the census follows the
+    chain but never closes, and refuses within the bound (#1883)."""
 
     current = [(100, 7)]
     host = _Host(slot, current[0], holders=[current[0]])
@@ -388,7 +394,38 @@ def test_endless_holder_births_refuse_within_the_bound(
     with pytest.raises(cli.Refusal, match="same-UID process census did not close"):
         _census(host)
 
-    assert len(host.inventories) == cli._SAME_UID_CENSUS_INVENTORIES
+
+def test_live_indeterminate_generations_still_refuse_within_the_bound(
+    monkeypatch: pytest.MonkeyPatch, slot: Path,
+) -> None:
+    """Live generations whose evidence never resolves are not proven
+    unrelated: with new ones arriving each round, the census still
+    refuses within the bound (#1883)."""
+
+    host = _Host(slot, (100, 7))
+    births: list[int] = []
+
+    def spawn() -> None:
+        births.append(1)
+        host.spawn((3000 + len(births), 60))
+
+    for listing in range(1, 30):
+        host.after_inventory[listing] = spawn
+    _scripted(monkeypatch, host)
+
+    def indeterminate(
+        processes: Sequence[cli._AbsentProcessObservation],
+        _targets: Mapping[Path, str],
+        _budget: cli._ReadOnlyCommandBudget,
+    ) -> tuple[tuple[Match, ...], tuple[cli._AbsentProcessObservation, ...]]:
+        return (), tuple(processes)
+
+    monkeypatch.setattr(cli, "_same_uid_batched_path_matches", indeterminate)
+
+    with pytest.raises(cli.Refusal, match="same-UID process census did not close"):
+        _census(host)
+
+    assert len(host.inventories) >= cli._SAME_UID_CENSUS_INVENTORIES
 
 
 def test_a_holder_born_after_the_first_listing_still_refuses(

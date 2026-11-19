@@ -87868,15 +87868,16 @@ def _scan_same_uid_generations(
     """Run every observer over ``processes``.
 
     Returns the generations it scanned, those among them that are LIVE
-    and not proven unrelated to the targets (they matched a held
-    reference or a mount, their argv or environ names a target, or they
-    are still live but no longer current, so they may have forked a
-    holder), and a count of generations that were proven gone during
-    the round.  A proven-gone generation is followed, not counted
-    (#1883): it can hold nothing and fork nothing, but anything it
-    forked before dying is a different generation the next inventory
-    must meet, so its round is not proven either.  Positive matches go
-    into ``found`` even when motion then discards the scan.
+    candidate holders not proven unrelated to the targets (they matched
+    a held reference or a mount, their argv or environ names a target,
+    they are still live but no longer current, or their evidence stayed
+    indeterminate while they live), and a count of generations that
+    were proven gone during the round.  A generation that forks or
+    exits mid-scan is not a holder (#1883): it blocks closure only if
+    it was a candidate -- matched, or incompletely scanned while live.
+    Anything it forked is a different generation the next inventories
+    meet and judge on its own evidence.  Positive matches go into
+    ``found`` even when motion then discards the scan.
     """
 
     before_found = set(found)
@@ -87905,6 +87906,11 @@ def _scan_same_uid_generations(
         found.update(dict.fromkeys((*exc.found, *mounts, *direct, *privileged)))
         raise
     found.update(dict.fromkeys((*mounts, *direct, *privileged)))
+    # Generations whose evidence stayed indeterminate after every
+    # reader: candidates while they live, never proof of use.
+    incomplete_pids = {process.pid for process in indeterminate} - {
+        pid for pid, *_rest in privileged
+    } - {pid for pid, *_rest in mounts}
     matched_pids = {
         *(pid for pid, *_rest in set(found) - before_found),
         *(pid for pid, *_rest in naming),
@@ -87921,8 +87927,7 @@ def _scan_same_uid_generations(
             continue
         if process not in scanned_set:
             # The preflight omitted it as terminal or replaced: proven
-            # gone (#1883), followed to whatever it left behind.
-            followed_count += 1
+            # gone and never a candidate (#1883).
             continue
         try:
             current = _process_generation_is_current(process)
@@ -87930,11 +87935,18 @@ def _scan_same_uid_generations(
             current = False
         if not current:
             if _generation_proven_gone(process):
-                followed_count += 1
+                # Exited mid-scan: a holder only if it was a candidate
+                # (its evidence stayed indeterminate); then its fork
+                # must be followed before the census can close.
+                if process.pid in incomplete_pids:
+                    followed_count += 1
             else:
                 # Still live but changed (a fork or exec the next
-                # inventory must meet): followed, and counted (#1883).
+                # inventory must meet): a live candidate, counted.
                 relevant.append(process)
+        elif process.pid in incomplete_pids:
+            # Live with indeterminate evidence: never proven unrelated.
+            relevant.append(process)
     return processes, tuple(relevant), followed_count
 
 
@@ -88042,6 +88054,8 @@ def _capture_same_uid_process_path_census_following(
             handled -= reread
             reread.clear()
         if not relevant and not followed:
+            # Proven-gone motion alone never blocks closure (#1883):
+            # the round still proves every live generation unrelated.
             proven_rounds += 1
             if proven_rounds >= 2:
                 return _ProcessPathCensus(
@@ -88050,18 +88064,17 @@ def _capture_same_uid_process_path_census_following(
             continue
         proven_rounds = 0
         if not relevant:
-            # Only proven-gone generations moved: follow them to the
-            # generations they left behind without counting the round
-            # toward the live bound (#1883).  An endless chain of
-            # handoffs is still a census that never closes, so followed
-            # rounds have their own bound.
+            # A candidate holder vanished mid-scan: follow whatever it
+            # forked before the census can close, bounded like the live
+            # bound so an endless handoff chain still refuses.
             followed_rounds += 1
             if followed_rounds >= _SAME_UID_CENSUS_INVENTORIES:
                 raise Refusal(
                     f"same-UID process census did not close: each of "
                     f"{_SAME_UID_CENSUS_INVENTORIES} process inventories "
-                    "found generations that forked or exited before their "
-                    "scan completed; retry when fewer processes are starting"
+                    "found candidate holders that forked or exited before "
+                    "their scan completed; retry when fewer processes "
+                    "are starting"
                 )
             continue
         followed_rounds = 0
