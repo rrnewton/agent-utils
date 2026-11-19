@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-labels-dropdown-pinned-builtin: pinned threads button becomes a Labels drop-down with Pinned as built-in first label'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
@@ -8,7 +8,7 @@ labels:
 - labels
 - ui
 created_at: 2026-11-18T10:47:41-05:00
-updated_at: 2026-11-18T10:47:41-05:00
+updated_at: 2026-11-19T00:20:00-05:00
 ---
 
 # Description
@@ -56,3 +56,7 @@ Prior work read before filing: #1825 vibe-talk-hashtag-labels (extractor, `Messa
 Open for coordb in the design note (recommendations stated, approval asked): reserving the slug `pinned` against the hashtag extractor; single-select v1 with OR multi-select deferred; keeping the two count denominators worded rather than unified in the API.
 
 No code until coordb approves the design note.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as ee044db6 and deployed (gate pass on 68df8178: full owner gate green except vibe-talk.check.thread-reader-follow-browser, which passed its exclusive rerun, and vibe-talk.check.fmt NO_RESULT, an OOM at the learned cap under contention, owner rule 346/#1763). `label:pinned` matches the channel pin set alone (reserved slug: the hashtag extractor never mints `pinned`, no group may claim it, expansion never touches it), threaded through `Subject.pinned` on server and page, the cache matcher taking each channel's pin set only when a query names it, and the page reading pin state fresh at match time. The bar's `#labels-button` (tooltip "Filter by label", dynamic aria-label) opens `#labels-panel`: All messages, built-in Pinned first (gold, "N in this channel"), then hashtag labels and groups most-used first from the same `GET /api/v1/labels` read Settings browses ("N in loaded history", group counts summed, groups filtering to every spelling). Single-select; re-picking or All clears; AND stays typed `label:a label:b`, OR multi-select deferred. On the combined bar after #1852 landed first, the order is whole-threads, author, links, labels-button, glass, panel after the link-kinds; on a phone the button is the pin square and, while the bar stands open, the field takes its own row with the count beside it and every toggle below, the list's head room and hang-feet counting the second row once. Evidence: Rust extractor/search/corpus/cache tests and the HTTP pin/reservation test in `tests/labels.rs`; page suites; labels, whole-threads, offline-cache, filter-place, search-scroll, search-dates, link-url-chip, reload-place and search-unmatched browser walks; screenshot matrix in /tmp/mu-labelsdrop-shots-final (post-landing, from ee044db6, with BUILD.txt naming that sha and page build voice.abcad8c1fc574365e013a631ed284ac5).
