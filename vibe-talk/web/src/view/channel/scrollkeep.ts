@@ -159,6 +159,8 @@ export interface ScrollKeeping {
   captureScroll(): ScrollMark;
   /** Whether the reader has scrolled or touched since `mark` was captured (`#1880`): holders outside this owner (the filter anchor's) ask it of their own capture instead of tracking input a second time. */
   userMovedSince(mark: ScrollMark): boolean;
+  /** The reader-input stamp alone, cheaply (`#1894`): a `{ inputAt }` mark for `userMovedSince` without a capture's layout reads. */
+  inputStamp(): number;
   /** Put the reader back where `captureScroll` found them. */
   restoreScroll(mark: ScrollMark): void;
   /** A turn arrived: follow it only if the reader had not scrolled away. */
@@ -650,5 +652,5 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     return onScreen;
   }
 
-  return { visibleList, shownChannelList, scrollAnchor, preservingScroll, preservingCollapse, holdingRows, toFoot, nudge, toPosition, wheelBy, glideTo, intoView, holdingReader, captureScroll, restoreScroll, followIfPinned, rowsOnScreen, userMovedSince };
+  return { visibleList, shownChannelList, scrollAnchor, preservingScroll, preservingCollapse, holdingRows, toFoot, nudge, toPosition, wheelBy, glideTo, intoView, holdingReader, captureScroll, restoreScroll, followIfPinned, rowsOnScreen, userMovedSince, inputStamp: () => userInputAt };
 }

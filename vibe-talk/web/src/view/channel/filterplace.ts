@@ -93,8 +93,8 @@ export interface FilterPlaceDependencies {
   /** Move the list by a measured delta, or put it at a measured position, through the scroll owner (`#1251 scroll-single-owner`). */
   nudge(area: HTMLElement, delta: number): void;
   toPosition(area: HTMLElement, top: number): void;
-  /** The scroll owner's mark now, and whether the reader moved since one (`#1894`, guard from `#1880`). Optional for doubles. */
-  capturePlaceMark?(): unknown;
+  /** The scroll owner's reader-input stamp, and whether the reader moved since one (`#1894`, guard from `#1880`). Optional for doubles. */
+  inputStamp?(): number;
   userMovedSince?(mark: unknown): boolean;
   renderJumpNewest(): void;
   guardQuietly<A extends unknown[]>(fn: (...args: A) => unknown): (...args: A) => unknown;
@@ -183,7 +183,7 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
     const ids = idsOf(row);
     const kept = selection ? [selection.id, ...ids.filter((id) => id !== selection.id)] : ids;
     return {
-      placeMark: deps.capturePlaceMark ? deps.capturePlaceMark() : undefined,
+      placeMark: deps.inputStamp ? { inputAt: deps.inputStamp() } : undefined,
       newest: false,
       row,
       ids: kept,
@@ -357,7 +357,7 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
     }
     if (showing && pane && mark && chosen) return anchorAt(chosen, mark);
     if (deps.atBottom(area)) {
-      return { placeMark: deps.capturePlaceMark ? deps.capturePlaceMark() : undefined,
+      return { placeMark: deps.inputStamp ? { inputAt: deps.inputStamp() } : undefined,
         newest: true, row: null, ids: [], selected: null, drawn: false, focused: false, time: NaN, offset: 0,
         alternate: null };
     }
