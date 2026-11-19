@@ -230,6 +230,12 @@ def _muse_normalize(text: str) -> str:
 
 _MUSE_HINT_PREFIX_MIN = 20
 
+# Shortest hint prefix that proves a ghost without an ellipsis or a filled
+# row edge (a hint captured mid-draw or clipped off-edge, #1888); it must
+# also cover at least two-thirds of the hint it prefixes, so a person who
+# typed a tip's opening words and stopped is still a draft.
+_MUSE_HINT_BARE_PREFIX_MIN = 34
+
 
 def _muse_is_hint_prefix(text: str, *, at_edge: bool) -> bool:
     """Whether `text` is a truncated hint prefix (see the Rust reader)."""
@@ -239,11 +245,17 @@ def _muse_is_hint_prefix(text: str, *, at_edge: bool) -> bool:
         if joined.endswith(suffix):
             core, ellipsis = _muse_normalize(joined[: -len(suffix)]), True
             break
-    if len(core) < _MUSE_HINT_PREFIX_MIN or not (ellipsis or at_edge):
+    if len(core) < _MUSE_HINT_PREFIX_MIN:
         return False
     return any(
-        len(_muse_normalize(hint)) > len(core) and _muse_normalize(hint).startswith(core)
-        for hint in _MUSE_PROMPT_HINTS
+        len(hint) > len(core)
+        and hint.startswith(core)
+        and (
+            ellipsis
+            or at_edge
+            or (len(core) >= _MUSE_HINT_BARE_PREFIX_MIN and len(core) * 3 >= len(hint) * 2)
+        )
+        for hint in (_muse_normalize(hint) for hint in _MUSE_PROMPT_HINTS)
     )
 
 

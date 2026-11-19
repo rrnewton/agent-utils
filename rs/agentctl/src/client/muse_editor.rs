@@ -69,9 +69,17 @@ pub(crate) fn is_muse_placeholder_hint(text: &str) -> bool {
 /// could be the start of a typed draft, so they fail closed.
 const HINT_PREFIX_MIN: usize = 20;
 
-/// Whether draft `text` is a truncated hint: an ellipsis-ended prefix, or (when
-/// `at_edge` says the text fills its row to the pane edge) a plain prefix, of at
-/// least [`HINT_PREFIX_MIN`] chars of exactly the hint it prefixes. A prefix of
+/// Shortest hint prefix that proves a ghost without an ellipsis or a filled
+/// row edge: a hint captured mid-draw or clipped off-edge (#1888
+/// agentctl-muse-placeholder-hint-reads-as-staged). It must also cover at
+/// least two-thirds of the hint it prefixes, so a person who typed the
+/// opening words of a tip and stopped is still a draft, never typed over.
+const HINT_BARE_PREFIX_MIN: usize = 34;
+
+/// Whether draft `text` is a truncated hint: an ellipsis-ended prefix, (when
+/// `at_edge` says the text fills its row to the pane edge) a plain prefix, or
+/// a bare prefix long enough under [`HINT_BARE_PREFIX_MIN`], of at least
+/// [`HINT_PREFIX_MIN`] chars of exactly the hint it prefixes. A prefix of
 /// no hint, or a short one, is a draft.
 fn is_hint_prefix(text: &str, at_edge: bool) -> bool {
     let joined = normalize(text);
@@ -82,12 +90,18 @@ fn is_hint_prefix(text: &str, at_edge: bool) -> bool {
         Some(core) => (normalize(core), true),
         None => (joined.clone(), false),
     };
-    if core.chars().count() < HINT_PREFIX_MIN || !(ellipsis || at_edge) {
+    let count = core.chars().count();
+    if count < HINT_PREFIX_MIN {
         return false;
     }
     MUSE_PROMPT_HINTS.iter().any(|hint| {
         let hint = normalize(hint);
-        hint.len() > core.len() && hint.starts_with(&core)
+        let hint_count = hint.chars().count();
+        hint_count > count
+            && hint.starts_with(&core)
+            && (ellipsis
+                || at_edge
+                || (count >= HINT_BARE_PREFIX_MIN && count * 3 >= hint_count * 2))
     })
 }
 
@@ -1983,6 +1997,39 @@ mod tests {
             &frame("❯ /model\n  watermelon-full-preview"),
             "/model"
         ));
+    }
+
+    #[test]
+    fn every_hint_and_a_long_bare_prefix_of_one_read_empty() {
+        // #1888: every ghost in the versioned table, drawn whole, is an empty
+        // composer; and a hint captured mid-draw — a long bare prefix that
+        // reaches neither the pane edge nor an ellipsis — is empty too, while
+        // a shorter prefix or extra words stay a draft.
+        let footer = "m · xhigh · /w · YOLO\n";
+        let wide = "─".repeat(141);
+        let idle_frame =
+            |editor: &str| format!("◆ prior answer\n{wide}\n{editor}\n{wide}\n{footer}");
+        for hint in MUSE_PROMPT_HINTS {
+            let screen = idle_frame(&format!("❯ {hint}"));
+            assert!(muse_verified_process_idle_composer(&screen), "{hint}");
+            assert!(
+                muse_verified_process_editor_draft(&screen).is_none(),
+                "{hint}"
+            );
+            assert_eq!(muse_verified_pane_status("idle", &screen), "idle", "{hint}");
+        }
+        let long_hint = "Ask to monitor a running build or log and get pinged on changes";
+        let bare: String = long_hint.chars().take(44).collect();
+        let screen = idle_frame(&format!("❯ {bare}"));
+        assert!(muse_verified_process_idle_composer(&screen), "{screen}");
+        assert!(muse_verified_process_editor_draft(&screen).is_none());
+        assert_eq!(muse_verified_pane_status("idle", &screen), "idle");
+        // Shorter prefixes of the same hint still fail closed as drafts.
+        let short: String = long_hint.chars().take(30).collect();
+        let screen = idle_frame(&format!("❯ {short}"));
+        assert!(!muse_verified_process_idle_composer(&screen), "{screen}");
+        assert!(muse_verified_process_editor_draft(&screen).is_some());
+        assert_eq!(muse_verified_pane_status("idle", &screen), "staged");
     }
 
     #[test]

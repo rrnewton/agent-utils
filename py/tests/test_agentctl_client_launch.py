@@ -330,6 +330,23 @@ def test_a_muse_placeholder_hint_is_an_empty_editor() -> None:
     )
 
 
+def test_every_muse_hint_and_a_long_bare_prefix_read_empty() -> None:
+    # #1888: every ghost in the versioned table reads empty, and a hint
+    # captured mid-draw (a long bare prefix, no edge, no ellipsis) too.
+    divider = "─" * 141
+    footer = "m · xhigh · /w · YOLO"
+
+    def frame(editor: str) -> str:
+        return f"◆ prior answer\n{divider}\n{editor}\n{divider}\n{footer}"
+
+    for hint in client_module._MUSE_PROMPT_HINTS:
+        assert muse_verified_process_idle_composer(frame(f"❯ {hint}")), hint
+    long_hint = "Ask to monitor a running build or log and get pinged on changes"
+    assert muse_verified_process_idle_composer(frame(f"❯ {long_hint[:44]}"))
+    # A shorter prefix of the same hint still fails closed as a draft.
+    assert not muse_verified_process_idle_composer(frame(f"❯ {long_hint[:30]}"))
+
+
 def test_a_paste_muse_wraps_inside_a_word_or_a_path_is_still_the_exact_editor() -> None:
     # Muse 1.4.14 wraps a long line at any character, inside a word or a path (#505
     # agentctl-muse-followup; rs/agentctl/testdata/muse-busy/muse-wrapped-draft.txt), so a
