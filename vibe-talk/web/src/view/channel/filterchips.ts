@@ -87,7 +87,12 @@ export function mountFilterChips(deps: FilterChipsDependencies): FilterChips {
   // `#1853`: the Labels drop-down beside the glass owns Pinned now
   // (`createLabelsFilter`); this mount keeps the glass and the other toggles.
   // `#211 link-filter`. The same, for links.
-  listen(el("links-filter"), "click", () => deps.setLinksOnly(!deps.linksOnly()));
+  // `#1895`: the cards are filtered by the same act, at once — Links with no
+  // query is the link listing, and it must not wait for a keystroke.
+  listen(el("links-filter"), "click", () => {
+    deps.setLinksOnly(!deps.linksOnly());
+    if (deps.sideColumnUp()) deps.refilterSideCards();
+  });
   // `#251 author-filter`. Everyone, Mine, Theirs, in turn.
   listen(el("author-filter"), "click", () => deps.cycleAuthorFilter());
   // `#212 link-filter`. And each kind of link under it, a toggle of its own.

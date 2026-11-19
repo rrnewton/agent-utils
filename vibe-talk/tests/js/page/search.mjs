@@ -647,6 +647,68 @@ test("`#249 search-highlight`: hits in code, in a link's words, a link's address
   assert.deepStrictEqual(anchors.map((a) => a.hasClass("search-hit-link")), [false, false]);
 });
 
+test("`#1895 vibe-talk-link-search-semantics`: under Links the query reads link addresses and names, and Links alone lists the links", async () => {
+  const page = newPage();
+  await signIn(page);
+  // The owner's shape: a Slack `<url|label>` nested in a markdown `[label](url)`, its address and
+  // label both holding the word inside a longer word; a link whose label word the drawn text
+  // shortens away; and a message with no link at all.
+  const rows = await showDiscord(page, [
+    message({ id: "1", content: "Thanks. Give it a minute, then reload: " +
+      "[<http://interncache-all.example.test/manifold/|interncache-all.example.test/manifold/>…/ipfsmf-test-site-loader.html#…]" +
+      "(<https://interncache-all.example.test/manifold/flat/ipfsmf-test-site-loader.html#bafy>)" }),
+    message({ id: "2", content: "Read [the quarterly plan](https://example.test/x) before Friday",
+      content_html: `<p>Read <a href="https://example.test/x" ${LINK_ATTRS}>the…plan</a> before Friday</p>\n` }),
+    message({ id: "3", content: "no links in this one" }),
+  ]);
+  const shown = () => rows.filter((li) => !li.hasClass("search-hidden")).map((li) => li.getAttribute("data-id"));
+  await search(page, "");
+  await page.el("links-filter").click();
+  await page.settle();
+  assert.deepStrictEqual(shown(), ["1", "2"], "Links with no query did not list just the messages holding a link");
+  assert.ok(rows[0].children.some((node) => node.className === "row-links"), "the listed row drew no link list");
+  await page.el("search-field").setValue("INTERN");
+  await page.settle();
+  assert.deepStrictEqual(shown(), ["1"], "Links did not find the word inside the nested link's address");
+  await page.el("search-field").setValue("quarterly");
+  await page.settle();
+  assert.deepStrictEqual(shown(), ["2"], "Links did not find a word held only in a link's name");
+  await page.el("links-filter").click();
+  await page.settle();
+  assert.deepStrictEqual(shown(), ["2"], "with Links off the name's word is no longer found");
+  await page.el("search-field").setValue("nomatchword");
+  await page.settle();
+  assert.deepStrictEqual(shown(), [], "a word in no link or message matched");
+});
+
+test("`#1895 vibe-talk-link-search-semantics`: cards are chosen by their threads' links, with a query and with none", async () => {
+  const page = newPage();
+  const data = threadData();
+  data.messages[4] = message({ id: "204", content: "second thread answer, see https://interncache-all.example.test/x",
+    thread: data.messages[4].thread });
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await twoColumns(page);
+  const cards = () => page.el("side-cards").children.filter((li) => li.hasAttribute("data-card"));
+  const shownCards = () => cards().filter((li) => !li.hidden && !li.hasClass("search-hidden"))
+    .map((li) => li.getAttribute("data-id"));
+  await search(page, "");
+  await page.el("links-filter").click();
+  await page.settle();
+  assert.deepStrictEqual(shownCards(), ["spaces/A/threads/another"],
+    "Links with no query did not narrow the cards to the thread holding a link");
+  await page.el("search-field").setValue("intern");
+  await page.settle();
+  assert.deepStrictEqual(shownCards(), ["spaces/A/threads/another"],
+    "Links did not find the card whose reply's link holds the word");
+  await page.el("search-field").setValue("quarterly");
+  await page.settle();
+  assert.deepStrictEqual(shownCards(), [], "a word in no thread's link left a card standing");
+  assert.equal(page.el("side-list-state").textContent, "No threads with a link match that search.");
+});
+
 test("`#249 search-highlight`: markup in a message stays text, and a mark is built of text nodes, never parsed", async () => {
   const page = newPage();
   await signIn(page);

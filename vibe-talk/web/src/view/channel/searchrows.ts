@@ -6,6 +6,7 @@
 // their owners'; this asks for them.
 
 import type { Message } from "../../contract/index.ts";
+import { linksIn } from "../../foundation/index.ts";
 import { LINK_KINDS, seamPlan } from "../../present/rows/index.ts";
 import { dayClock, dayKeyOf, messageTimeLabel } from "../../present/time/index.ts";
 import { classWords, setClassWord, setTextIfChanged } from "../dom/index.ts";
@@ -68,6 +69,7 @@ export interface SearchLanguage {
   searchSubject(parts: unknown): unknown;
   searchQueryMatches(node: unknown, subject: unknown, dayStart: unknown): boolean;
   searchQueryTree(node: unknown): unknown;
+  searchFold(text: unknown): string;
 }
 
 /** What searching the rows asks of the page. */
@@ -98,7 +100,8 @@ export interface SearchRowsDependencies {
   selectedChannelId(): string;
   threadOf(message: unknown): string | null;
   messageText(message: Message): string;
-  messageLinks(message: Message): Array<{ href: unknown }>;
+  messageLinks(message: Message): Array<{ href: unknown; name?: unknown }>;
+  rawTextOf(message: Message): string;
   selectionView(): string;
   authorChoosing(): string;
   authorPasses(row: Element, author: string): boolean;
@@ -186,6 +189,16 @@ export interface SearchRows {
   /** `#1825`, on the search bar since `#1852`: "Whole threads" — a thread with any hit shows whole. Off by default. */
   setEntireThreads(on: boolean): void;
   entireThreads(): boolean;
+  /** `#1895 vibe-talk-link-search-semantics`: the query's folded terms while Links is on, else null. */
+  linkTerms(): string[] | null;
+  /** `#1895`: threads holding a held message whose link address or name holds every term. */
+  threadsWithLinkHits(terms: readonly string[]): Set<string>;
+  /** `#1895`: threads holding any link at all, for Links with no query. */
+  threadsWithLinks(): Set<string>;
+  /** `#1895`: whether a row's own links hold every term, in address or name. */
+  rowLinkMatch(row: Element, terms: readonly string[]): boolean;
+  /** `#1895`: whether a row holds any link at all. */
+  rowHasLink(row: Element): boolean;
 }
 
 /** No search open, no seams drawn. */
@@ -215,6 +228,53 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
 
   const subjectByMessage = new WeakMap<object, unknown>();
 
+  // `#1895 vibe-talk-link-search-semantics`. Every link a message holds, for
+  // matching: the drawn anchors and the addresses read from its text as
+  // written, joined by address, the fuller name kept. The drawn anchors alone
+  // lose a name the writing holds (a Slack `<url|label>` nested in a markdown
+  // `[label](url)`, whose drawn words may be shortened), and the text alone
+  // loses what only the rendering drew; together they are the links the
+  // reader could follow.
+  const matchLinksByMessage = new WeakMap<object, Array<{ href: string; name: string }>>();
+
+  function messageMatchLinks(message: Message): Array<{ href: string; name: string }> {
+    let held = matchLinksByMessage.get(message);
+    if (!held) {
+      const byAddress = new Map<string, { href: string; name: string }>();
+      const add = (href: unknown, name: unknown): void => {
+        const address = String(href || "");
+        if (!address) return;
+        const words = String(name || "") || address;
+        const kept = byAddress.get(address);
+        // The fuller name is kept: a drawn name may be the written one cut
+        // short, and the cut words are exactly what a search may ask for.
+        if (!kept) byAddress.set(address, { href: address, name: words });
+        else if (words.length > kept.name.length) kept.name = words;
+      };
+      for (const link of deps.messageLinks(message)) add(link.href, link.name);
+      for (const link of linksIn(deps.rawTextOf(message))) add(link.href, link.name);
+      held = [...byAddress.values()];
+      matchLinksByMessage.set(message, held);
+    }
+    return held;
+  }
+
+  const linkTextByMessage = new WeakMap<object, string>();
+
+  /** A message's link addresses and names, folded as one text (`#1895`). */
+  function messageLinkText(message: Message): string {
+    let text = linkTextByMessage.get(message);
+    if (text === undefined) {
+      text = deps.language.searchFold(messageMatchLinks(message).map((link) => `${link.href}\n${link.name}`).join("\n"));
+      linkTextByMessage.set(message, text);
+    }
+    return text;
+  }
+
+  /** Whether every term is a folded substring of a message's link addresses or names (`#1895`). */
+  const messageLinkMatch = (message: Message, terms: readonly string[]): boolean =>
+    terms.length > 0 && terms.every((term) => messageLinkText(message).includes(term));
+
   function messageSubject(message: Message): unknown {
     let subject = subjectByMessage.get(message);
     if (!subject) {
@@ -222,7 +282,9 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
         author: String(message.author || ""),
         authorId: String((message as { author_id?: unknown }).author_id || ""),
         text: deps.messageText(message),
-        links: deps.messageLinks(message).map((link) => String(link.href)),
+        // `#1895`: a link's name is searchable text beside its address, so a
+        // word held only in a label is found, with Links on or off.
+        links: messageMatchLinks(message).flatMap((link) => [link.href, link.name]),
         createdMs: Date.parse(String((message as { timestamp?: unknown }).timestamp)) || 0,
         inThread: Boolean((message as { thread?: { is_root?: boolean } }).thread && (message as { thread?: { is_root?: boolean } }).thread?.is_root === false),
         // `#1825`: the labels the server derived and served with the message.
@@ -255,6 +317,52 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
       if (id && thread && thread.is_root === false && messageMatches(node, message)) hits.add(String(id));
     }
     return hits;
+  }
+
+  // `#1895 vibe-talk-link-search-semantics`. Under Links the query is read
+  // against the links themselves: a thread holds a hit when any held message
+  // of it — its root or a reply — has a link whose address or name holds the
+  // terms, and with no query every thread holding a link at all is listed.
+  function threadsWithLinkHits(terms: readonly string[]): Set<string> {
+    const hits = new Set<string>();
+    if (terms.length === 0 || !deps.threading() || deps.currentChannel() !== String(deps.selectedChannelId())) return hits;
+    for (const message of deps.heldMessages()) {
+      const id = deps.threadOf(message);
+      if (id && messageLinkMatch(message, terms)) hits.add(String(id));
+    }
+    return hits;
+  }
+
+  function threadsWithLinks(): Set<string> {
+    const hits = new Set<string>();
+    if (!deps.threading() || deps.currentChannel() !== String(deps.selectedChannelId())) return hits;
+    for (const message of deps.heldMessages()) {
+      const id = deps.threadOf(message);
+      if (id && messageMatchLinks(message).length > 0) hits.add(String(id));
+    }
+    return hits;
+  }
+
+  function linkTerms(): string[] | null {
+    if (!searchField.open() || !searchField.links()) return null;
+    return searchParsed(searchField.query()).terms;
+  }
+
+  function rowLinkMatch(row: Element, terms: readonly string[]): boolean {
+    if (terms.length === 0) return false;
+    const messages = rowMessages(row);
+    if (messages.length > 0) return messages.some((message) => messageLinkMatch(message, terms));
+    const text = (row as SearchRow).linkText;
+    if (typeof text !== "string") return false;
+    const folded = deps.language.searchFold(linksIn(text).map((link) => `${link.href}\n${link.name}`).join("\n"));
+    return terms.every((term) => folded.includes(term));
+  }
+
+  function rowHasLink(row: Element): boolean {
+    const messages = rowMessages(row);
+    if (messages.length > 0) return messages.some((message) => messageMatchLinks(message).length > 0);
+    const text = (row as SearchRow).linkText;
+    return typeof text === "string" && linksIn(text).length > 0;
   }
 
   // `#1825` "Whole threads" (the search-bar toggle since `#1852`): off,
@@ -308,6 +416,11 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
       ? threadsWithHits(matchNode) : null;
     const wholeThreads = typed && entireThreadsOn ? entireThreadHits(matchNode) : null;
     const links = searchField.open() && searchField.links();
+    // `#1895`: under Links, the query against the links themselves, and the
+    // threads holding a link, so cards and roots are judged by their threads.
+    const termsForLinks = links ? searchParsed(searchField.query()).terms : [];
+    const linkThreadHits = links && typed ? threadsWithLinkHits(termsForLinks) : null;
+    const linkThreads = links && !typed ? threadsWithLinks() : null;
     const author = deps.authorChoosing();
     if (deps.gatheredParent() !== null && (typed || links || deps.pinsOnly() || author !== "everyone")) deps.putRepliesBack();
     const scope = searchScope();
@@ -333,13 +446,23 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
         if (row.getAttribute("data-server-hit") === "quote") continue;
         const text = row.getAttribute("data-search");
         const shown = links && text !== null ? deps.showRowLinks(row) : deps.takeDownRowLinks(row);
-        const said = !typed || (text !== null && (rowMatches(row, matchNode, text) || (replyHits !== null &&
+        const said = !typed || (text !== null && (rowMatches(row, matchNode, text) ||
+          (links && rowLinkMatch(row, termsForLinks)) || (replyHits !== null &&
           (id === "thread-list" ? replyHits.has(String(row.getAttribute("data-context-id")))
             : id === "discord-log" && rowHeadsHitThread(row, replyHits))) ||
+          (linkThreadHits !== null &&
+            (id === "thread-list" ? linkThreadHits.has(String(row.getAttribute("data-context-id")))
+              : id === "discord-log" && rowHeadsHitThread(row, linkThreadHits))) ||
           (wholeThreads !== null && wholeThreads.size > 0 &&
             (id === "thread-list" ? wholeThreads.has(String(row.getAttribute("data-context-id")))
               : rowInHitThread(row, wholeThreads)))));
-        const hit = said && (!links || shown > 0) && deps.authorPasses(row, author);
+        // `#1895`: a card, and a root heading a thread, hold no link list of
+        // their own; under Links they stand when their thread holds the link.
+        const threadLinkHit = id === "thread-list"
+          ? (linkThreadHits !== null && linkThreadHits.has(String(row.getAttribute("data-context-id")))) ||
+            (linkThreads !== null && linkThreads.has(String(row.getAttribute("data-context-id"))))
+          : id === "discord-log" && linkThreadHits !== null && rowHeadsHitThread(row, linkThreadHits);
+        const hit = said && (!links || shown > 0 || threadLinkHit) && deps.authorPasses(row, author);
         const revealed = !hit && text !== null && (id === "thread-list"
           ? openedCards !== null && openedCards.threads.has(String(row.getAttribute("data-context-id")))
           : inOpenedGap(row, opened));
@@ -832,6 +955,7 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
     applySearch, searchInAll, renderSearchInAll, renderSearchCount, refreshSearchCount,
     listEmptied, drawSeams, seamsAfterMidnight, openSearchGap, inOpenedGap,
     rowsChosen, rowDay, markSearchHits, messageMatches, threadsWithHits, rowMatches,
+    linkTerms, threadsWithLinkHits, threadsWithLinks, rowLinkMatch, rowHasLink,
     setEntireThreads: (on: boolean) => { entireThreadsOn = on; },
     entireThreads: () => entireThreadsOn,
     sayCardCount, openedGaps,

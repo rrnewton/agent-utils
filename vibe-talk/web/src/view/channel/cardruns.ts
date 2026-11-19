@@ -31,6 +31,12 @@ export interface CardRunsDependencies {
   searchOpen(): boolean;
   searchNode(): unknown;
   searchTerms(): string[];
+  /** `#1895 vibe-talk-link-search-semantics`: Links on the search bar, its terms, and the threads its links choose. */
+  linkTerms(): string[] | null;
+  threadsWithLinkHits(terms: readonly string[]): ReadonlySet<string>;
+  threadsWithLinks(): ReadonlySet<string>;
+  rowLinkMatch(row: HTMLElement, terms: readonly string[]): boolean;
+  rowHasLink(row: HTMLElement): boolean;
   threadsWithHits(node: unknown): ReadonlySet<string> | null;
   openedCardGaps(create: boolean): { ids: ReadonlySet<string>; threads: ReadonlySet<string> } | null;
   hidingRead(): boolean;
@@ -88,8 +94,8 @@ export interface CardRuns {
 export function createCardRuns(deps: CardRunsDependencies): CardRuns {
   /**
    * The search text over the cards, as over the Threads list's (`#129 message-search`): a card the
-   * text does not match goes while the search is open. Links leaves them: a card has no links of its
-   * own, and its thread's are in its messages.
+   * text does not match goes while the search is open. A card has no links of its own, and its
+   * thread's are in its messages: under Links (`#1895`) the thread's links choose the card.
    *
    * `#432 read-mode-unify`. And under Hide read a card whose thread is read goes too, its unpacked rows
    * with it (`threadIsRead`: no unread reply held or reported, and its root read), as Unread only did
@@ -117,6 +123,19 @@ export function createCardRuns(deps: CardRunsDependencies): CardRuns {
     const node = deps.searchOpen() ? deps.searchNode() : null;
     const typed = node !== null;
     const marking = deps.searchOpen() ? deps.searchTerms() : [];
+    // `#1895 vibe-talk-link-search-semantics`. Under Links a card stands for
+    // its thread's links: with a query, a link holding the terms; with none,
+    // any link at all — the link-listing the reader asked for by opening
+    // search and tapping URL, before typing a word.
+    const linkTerms = deps.linkTerms();
+    const links = linkTerms !== null;
+    const linkThreads = links ? (typed ? deps.threadsWithLinkHits(linkTerms) : deps.threadsWithLinks()) : null;
+    const linkGate = (row: HTMLElement, textHit: boolean): boolean => {
+      if (!links) return textHit;
+      if (!deps.rowHasLink(row)) return false;
+      if (!typed) return true;
+      return textHit || deps.rowLinkMatch(row, linkTerms as string[]);
+    };
     const allRows = [...deps.leftById("side-cards").children] as HTMLElement[];
     const rows = allRows.filter((row) => row.hasAttribute("data-card"));
     const replyHits = typed ? deps.threadsWithHits(node) : null;
@@ -136,15 +155,17 @@ export function createCardRuns(deps: CardRunsDependencies): CardRuns {
       const kept = (((!deps.hidingRead() || fresh) && row.getAttribute("data-read-run") !== "member") || revealed);
       const own = !typed || deps.rowMatches(row, node, text);
       const inReplies = !own && replyHits !== null && replyHits.has(String(row.getAttribute("data-id")));
-      const said = own || inReplies || revealed;
+      // `#1895`: under Links the card is chosen by its thread's links alone.
+      const linkHit = linkThreads !== null && linkThreads.has(String(row.getAttribute("data-id")));
+      const said = links ? (linkHit || revealed) : (own || inReplies || revealed);
       if (row.hidden === kept) row.hidden = !kept;
       setClassWord(row, "search-hidden", !said);
       deps.markReplyMatch(row, inReplies);
       // `#249 search-highlight`. And where, once the typing pauses (`searchField.marked()`): the card's own
       // words, whatever its replies matched.
-      deps.markSearchHits(row, own || inReplies ? marking : []);
+      deps.markSearchHits(row, own || inReplies || linkHit ? marking : []);
       if (fresh) unread += 1;
-      if (kept && (own || inReplies)) shown += 1;
+      if (kept && (links ? linkHit : (own || inReplies))) shown += 1;
       cardShown.set(String(row.getAttribute("data-id")), kept && said);
     }
     // `#419 threads-view-main-messages`. Main's messages among the cards: the read mode chose them as they
@@ -154,7 +175,7 @@ export function createCardRuns(deps: CardRunsDependencies): CardRuns {
       if (!row.hasAttribute("data-main-row")) continue;
       const revealed = openedCards !== null && deps.inOpenedGap(row, openedCards.ids);
       const kept = row.getAttribute("data-read-run") !== "member" || revealed;
-      const matched = !typed || deps.rowMatches(row, node, row.getAttribute("data-search") || "");
+      const matched = linkGate(row, !typed || deps.rowMatches(row, node, row.getAttribute("data-search") || ""));
       const said = matched || revealed;
       if (row.hidden === kept) row.hidden = !kept;
       setClassWord(row, "search-hidden", !said);
@@ -171,8 +192,8 @@ export function createCardRuns(deps: CardRunsDependencies): CardRuns {
       if (row.hidden === (shownBlock && !folded)) row.hidden = !(shownBlock && !folded);
       // `#606 server-side-search`. Unpacked under a search, a thread shows only its hits, its other
       // messages folded into lines between them (`drawUnpackGaps`), until the reader opens one.
-      const hit = !typed || deps.rowMatches(row, node, row.getAttribute("data-search")) ||
-        (openedCards !== null && deps.inOpenedGap(row, openedCards.ids));
+      const hit = (openedCards !== null && deps.inOpenedGap(row, openedCards.ids)) ||
+        linkGate(row, !typed || deps.rowMatches(row, node, row.getAttribute("data-search")));
       setClassWord(row, "search-hidden", !hit);
       deps.markSearchHits(row, typed && hit ? marking : []);
     }
@@ -198,6 +219,10 @@ export function createCardRuns(deps: CardRunsDependencies): CardRuns {
   function sideListState(cards: number, unread: number, shown: number): string {
     if (cards === 0) return "No threads in this channel yet.";
     if (shown > 0) return "";
+    // `#1895`: Links chose the cards, and none held what it asked for.
+    if (deps.linkTerms() !== null) {
+      return deps.searchNode() !== null ? "No threads with a link match that search." : "No threads with links in the messages loaded so far.";
+    }
     if (deps.hidingRead() && unread === 0) return "No unread threads.";
     // `#262 search-load-older`. How far back the search has looked, where that is the whole channel: until
     // then the way further back under this line says the day (`renderRepliesSearch`).

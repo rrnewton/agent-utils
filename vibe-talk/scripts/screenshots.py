@@ -2551,6 +2551,56 @@ def _act_links_filter(driver: Driver) -> None:
     driver.settle(300)
 
 
+def _act_link_search_intern(driver: Driver) -> None:
+    """`#1895 vibe-talk-link-search-semantics`: the owner's message shape, Links on, "intern" typed.
+
+    A Slack `<url|label>` nested in a markdown `[label](url)` arrives on the
+    stream, then search opens, URL is tapped with nothing typed (the listing),
+    and "intern" — inside the longer word in both the address and the label —
+    keeps just that row, its links drawn.
+    """
+    _act_open_channel(driver)
+    text = (
+        "Thanks. Give it a minute, then reload: "
+        "[<http://interncache-all.example.test/manifold/|interncache-all.example.test/manifold/>"
+        "…/ipfsmf-test-site-loader.html#…]"
+        "(<https://interncache-all.example.test/manifold/flat/ipfsmf-test-site-loader.html#bafy>)"
+    )
+    driver.js(
+        "window.__channelSays('9990000000000000212', 'claude-integ', "
+        + json.dumps(text)
+        + ")"
+    )
+    driver.page.wait_for_function(
+        "() => document.querySelector('#discord-log > li[data-id=\"9990000000000000212\"]') !== null",
+        timeout=10_000,
+    )
+    driver.click("search-toggle")
+    driver.page.wait_for_function("() => window.__visible('links-filter')", timeout=5_000)
+    driver.click("links-filter")
+    driver.page.wait_for_function(
+        "() => document.querySelector('#discord-log > li[data-id=\"9990000000000000212\"]')"
+        ".getAttribute('data-links-view') === 'true'",
+        timeout=5_000,
+    )
+    driver.page.fill("#search-field", "intern")
+    driver.page.wait_for_function(
+        "() => { const row = document.querySelector('#discord-log > li[data-id=\"9990000000000000212\"]'); "
+        "return row && !row.classList.contains('search-hidden') "
+        "&& row.querySelector('.row-links > a') !== null; }",
+        timeout=5_000,
+    )
+    # The kept Discuss panel covers the list on a phone; this state is about
+    # the row, so the panel closes and the row is brought into view.
+    driver.js(
+        "(() => { const panel = document.getElementById('discuss-panel'); "
+        "if (panel && !panel.hidden) document.getElementById('discuss-close').click(); "
+        "const row = document.querySelector('#discord-log > li[data-id=\"9990000000000000212\"]'); "
+        "if (row) row.scrollIntoView({ block: 'center' }); return true; })()"
+    )
+    driver.settle(300)
+
+
 def _act_link_kinds_off(driver: Driver) -> None:
     """`#212 link-filter`: the Links view with PRs turned off under the Links button.
 
@@ -7349,6 +7399,24 @@ SCENES: tuple[Scene, ...] = (
                 "and it is drawn read, not unread",
                 "document.querySelector('#discord-log > li[data-id=\"9990000000000000007\"]')"
                 ".getAttribute('data-archived') === 'true'",
+            ),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="80-link-search-intern",
+        what="Links on and 'intern' typed: the nested Slack-in-markdown link's row stands, links drawn",
+        act=_act_link_search_intern,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            (
+                "the owner's row stands under Links and 'intern', its links drawn",
+                "(() => { const row = document.querySelector('#discord-log > li[data-id=\"9990000000000000212\"]'); "
+                "return Boolean(row) && !row.classList.contains('search-hidden') "
+                "&& row.getAttribute('data-links-view') === 'true' "
+                "&& [...row.querySelectorAll('.row-links > a')].some((a) => "
+                "a.getAttribute('href').includes('interncache-all.example.test')); })()",
             ),
             ("no error banner is up", "!window.__visible('error-wrap')"),
         ),
