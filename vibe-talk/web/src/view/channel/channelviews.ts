@@ -450,10 +450,25 @@ export function createChannelViews(deps: ChannelViewsDependencies): ChannelViews
     const bottom = top + (area.clientHeight || 0);
     const listed = deps.view() === "discord" && deps.selection().view !== "threads" && !deps.pinsView().only
       ? [...deps.el("discord-log").children] : [];
-    const seen = listed
-      .map((row) => ({ row, box: row.getBoundingClientRect() }))
-      .filter(({ box }) => box.bottom > top && box.top < bottom)
-      .map(({ row, box }) => ({ ids: deps.idsOf(row), top: box.top }));
+    // `#1913`: only the screen's neighbourhood is measured. Rows stand in list order, so
+    // among the rows with a box (hidden ones have none) the ones reaching into the band
+    // are found by binary search, not by measuring every row of a long history.
+    const boxed = listed.filter((row) => !(row as HTMLElement).hidden &&
+      !String((row as HTMLElement).className).split(/\s+/).includes("search-hidden"));
+    let lo = 0;
+    let hi = boxed.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if ((boxed[mid] as HTMLElement).getBoundingClientRect().bottom > top) hi = mid;
+      else lo = mid + 1;
+    }
+    const seen: Array<{ ids: string[]; top: number }> = [];
+    for (let at = lo; at < boxed.length; at += 1) {
+      const row = boxed[at] as HTMLElement;
+      const box = row.getBoundingClientRect();
+      if (box.top >= bottom) break;
+      if (box.bottom > top && box.top < bottom) seen.push({ ids: deps.idsOf(row), top: box.top });
+    }
     const card = seen.length === 0 ? channelCard() : null;
     const box = card ? card.getBoundingClientRect() : null;
     const footCard = channelCard();

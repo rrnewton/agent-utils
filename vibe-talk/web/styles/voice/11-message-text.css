@@ -450,6 +450,14 @@
   background: var(--edge);
 }
 
+/* `#1913` (liaison nit on `#1899`): while a bucket chip stands, its pinned panel overlays
+   the head of the list where this signpost sits, and the heading peeks half-cut between
+   the filter row and the panel. The chips already say where the server's hits are, so the
+   signpost stands down until they go. */
+#screen-main:has(> #channel-freshness-anchor .search-bucket-chip:not([hidden])) #search-screen-sep {
+  display: none;
+}
+
 /* `#605`-`#608 server-side-search`, collapsed by `#1762`. The server's copy,
    searched, at the foot of the list: one tappable line, and only once tapped
    the line saying what was searched, All channels, and the server's hits, each

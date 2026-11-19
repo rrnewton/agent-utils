@@ -256,11 +256,30 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
   function scrollAnchor(area: HTMLElement): Element | null {
     const edge = area.getBoundingClientRect().top;
     const items = visibleList().children;
-    for (const li of items) {
-      // A row hidden in a collapsed run of read messages has no box to be looking at. `#221 read-modes`.
-      if (li.getAttribute("data-read-run") === "member") continue;
-      if (li.getBoundingClientRect().bottom > edge) {
-        return li;
+    // `#1913`: a reader parked near the newest line — the common case — is found from the
+    // foot: the first row reaching past the edge stands a screenful above the last row, so
+    // scanning up from there measures the neighbourhood, not the whole history above it.
+    // In the upper half the scan runs from the head as before. Rows with no box (hidden, or
+    // in a collapsed run) are passed over in either direction.
+    const fromFoot = items.length > 0 && area.scrollTop > (area.scrollHeight - (area.clientHeight || 0)) / 2;
+    if (fromFoot) {
+      let anchor: Element | null = null;
+      for (let at = items.length - 1; at >= 0; at -= 1) {
+        const li = items[at] as Element;
+        if (li.getAttribute("data-read-run") === "member") continue;
+        const box = li.getBoundingClientRect();
+        if (box.bottom === 0 && box.top === 0) continue;
+        if (box.bottom <= edge) break;
+        anchor = li;
+      }
+      if (anchor !== null) return anchor;
+    } else {
+      for (const li of items) {
+        // A row hidden in a collapsed run of read messages has no box to be looking at. `#221 read-modes`.
+        if (li.getAttribute("data-read-run") === "member") continue;
+        if (li.getBoundingClientRect().bottom > edge) {
+          return li;
+        }
       }
     }
     return items.length > 0 ? items[items.length - 1] as Element : null;
@@ -641,13 +660,23 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
       foot = Math.min(foot, visual.height);
     }
     if (foot <= head) return [];
+    // `#1913`: the rows handed in stand displayed (the caller leaves out hidden ones, whose
+    // boxes are all zero), in list order, so their bottoms do not decrease: a binary search
+    // finds the first row reaching into the band, and only the rows on screen around it are
+    // measured — noting the screen for a keystroke never measures a long history.
+    let lo = 0;
+    let hi = rows.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if ((rows[mid] as Element).getBoundingClientRect().bottom > head) hi = mid;
+      else lo = mid + 1;
+    }
     const onScreen: Element[] = [];
-    for (const row of rows) {
-      const rect = row.getBoundingClientRect();
-      // Rows stand in list order, so their tops do not decrease: past the
-      // foot, nothing further down can come back onto the screen.
+    for (let at = lo; at < rows.length; at += 1) {
+      const rect = (rows[at] as Element).getBoundingClientRect();
+      // Past the foot, nothing further down can come back onto the screen.
       if (rect.top >= foot && rect.bottom > rect.top) break;
-      if (rect.bottom > rect.top && rect.bottom > head && rect.top < foot) onScreen.push(row);
+      if (rect.bottom > rect.top && rect.bottom > head && rect.top < foot) onScreen.push(rows[at] as Element);
     }
     return onScreen;
   }

@@ -1,0 +1,19 @@
+steps:
+  # `#1913 vibe-talk-search-typing-lag` in the browser engine: typing "lantern" over an
+  # 816-message channel reads a bounded, O(1) number of layouts per keystroke (never one
+  # per row), the settled result is exact, and the pinned bucket chips retire with the
+  # query that earned them, at 412x915 and 1280x800.
+  - group: check
+    job: search-typing-fast-browser
+    desc: typing in search reads bounded layouts per keystroke over a big channel and bucket chips follow the current query, in current Chromium at 412x915 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/search_typing_fast_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 30
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824

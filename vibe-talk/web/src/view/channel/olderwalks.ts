@@ -164,6 +164,8 @@ export interface OlderWalks {
   endRepliesWalk(): void;
   historyReach(): OlderHistoryReach;
   scheduleServerSearch(): void;
+  /** `#1913`: retire the bucket chips when the typed query no longer matches the answered one. */
+  retireStaleBuckets(): void;
   channelViewWords(): string;
   oldestLoadedMs(): number | null;
   toggleServerHits(): void;
@@ -759,11 +761,35 @@ function serverSearchKeyNow() {
 /** The scope the placed server hits were last drawn for (`#1786`). */
 let placedScopeKey = "";
 
+/** `#1913`: the typing-fast pass's note that the words changed: retire the chips the answered
+ * query earned (see `hideBucketChips`). The server ask itself stays with the full pass. */
+function retireStaleBuckets(): void {
+  const key = serverSearchKeyNow();
+  if (key !== "" && key !== serverSearchNow().key) hideBucketChips();
+}
+
+/** `#1913`: take the bucket chips down while a new query's answer is pending, so the previous
+ * query's counts never stand for the words now in the field. One hidden write per chip; the
+ * fresh counts are drawn by `renderServerSearch` when the debounced answer lands. */
+function hideBucketChips(): void {
+  const row = el("search-bucket-row");
+  if (!row.hidden) row.hidden = true;
+  for (const def of searchBucketDefs) {
+    const chip = bucketChip(def.id);
+    if (!chip) continue;
+    if (!chip.hidden) chip.hidden = true;
+    setTextIfChanged(chip, "");
+  }
+}
+
 function scheduleServerSearch() {
   const key = serverSearchKeyNow();
   // A gathering asked for elsewhere, or with the search closed, is no longer watched here; the
   // server's own bump clears itself once the walk reaches the channel's beginning.
   if (gathering.state().channel !== "" && (key === "" || !searchFurtherRunning())) stopSearchFurther();
+  // `#1913` (liaison (B) on `#1899`): a new query retires the standing chips at once; their
+  // counts described the last query, and the server's answer for this one is still to come.
+  if (key !== "" && key !== serverSearchNow().key) hideBucketChips();
   serverSearchOwner.schedule(key, serverCopyOpen());
   // `#1786`: the same search in a new scope (another thread, another channel
   // view) partitions the same hits differently, and the view's redraw took
@@ -1547,7 +1573,7 @@ function renderOlderControl() {
   return {
     renderOlderControl, olderControlPressed, searchOlder, searchOlderFromField,
     searchReplies, searchOffered, searchKey, endSearchWalks, endSearchWalk, stopSearchWalk,
-    renderSearchOlderNote, historyReach, renderServerSearch, searchFurtherPressed, chooseSearchAllChannels, renderRepliesSearch, scheduleServerSearch, channelViewWords, oldestLoadedMs, toggleServerHits, toggleBucket, serviceWords, repliesFloor, repliesSearchOffered, allCover, allLoaded, repliesKey, endRepliesWalk,
+    renderSearchOlderNote, historyReach, renderServerSearch, searchFurtherPressed, chooseSearchAllChannels, renderRepliesSearch, scheduleServerSearch, retireStaleBuckets, channelViewWords, oldestLoadedMs, toggleServerHits, toggleBucket, serviceWords, repliesFloor, repliesSearchOffered, allCover, allLoaded, repliesKey, endRepliesWalk,
     dispose() { disposed = true; },
   };
 }

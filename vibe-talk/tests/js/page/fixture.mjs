@@ -5654,6 +5654,11 @@ const TUNING_BANDS = {
     "the pause after the last keystroke before a search's hits are marked (#249 search-highlight): " +
     "shorter marks and unmarks every match letter by letter as a word is typed at speed, longer and " +
     "the marks visibly trail the rows the search has already chosen"],
+  FULL_SEARCH_PAUSE_MS: [60, 500,
+    "the pause after the last keystroke before a typed search's full filter change lands over a " +
+    "long list (#1913 vibe-talk-search-typing-lag): shorter and the place-keeping, seams and " +
+    "server ask land between keystrokes typed at speed, longer and the settled count, seams and " +
+    "marks visibly trail the rows the fast pass has already chosen"],
   CLEAR_ARMED_MS: [1000, 20000,
     "the second tap that really clears: under a second the confirmation cannot be reached, over " +
     "twenty and a stray later tap still destroys the view"],

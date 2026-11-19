@@ -2935,6 +2935,7 @@ const searchRows = createSearchRows({
   renderReplyLinks,
   renderOlderControl: () => renderOlderControl(),
   scheduleServerSearch: () => scheduleServerSearch(),
+  retireStaleBuckets: () => retireStaleBuckets(),
   placeInlineReply: () => placeInlineReply(),
   placeRowsInPlaceAgain: () => placeRowsInPlaceAgain(),
   replyDocked: () => replyState.docked,
@@ -2969,7 +2970,7 @@ const searchRows = createSearchRows({
 });
 const {
   markSearchSoon, markSearchNow, searchParsed, searchTyped, searchIdentity, searchable,
-  applySearch, searchInAll, renderSearchInAll, renderSearchCount, refreshSearchCount,
+  applySearch, applySearchFast, searchInAll, renderSearchInAll, renderSearchCount, refreshSearchCount,
   listEmptied, drawSeams, seamsAfterMidnight, openSearchGap, inOpenedGap,
   rowsChosen, rowDay, markSearchHits, messageMatches, threadsWithHits, rowMatches,
   linkTerms, threadsWithLinkHits, threadsWithLinks, rowLinkMatch, rowHasLink,
@@ -2985,6 +2986,16 @@ const {
 let enteredSearchIdentity = "";
 let searchScreenRows = [];
 let searchScreenIdentity = null;
+// `#1913 vibe-talk-search-typing-lag`: the full filter change a keystroke schedules, run once
+// the typing pauses. Each keystroke replaces the pending one, so a burst of typing pays for
+// one full pass (place-keeping, seams, tallies, the server ask), never one per key.
+let fullSearchTimer = null;
+const FULL_SEARCH_PAUSE_MS = 150;
+function deferFullSearch(fn) {
+  const clock = clockOnUse();
+  if (fullSearchTimer !== null) clock.clearTimeout(fullSearchTimer);
+  fullSearchTimer = clock.setTimeout(() => { fullSearchTimer = null; fn(); }, FULL_SEARCH_PAUSE_MS);
+}
 function noteSearchScreen() {
   const text = el("search-field").value;
   if (!searchTyped(text)) {
@@ -2997,7 +3008,10 @@ function noteSearchScreen() {
   // A redraw of the search already landed reads no row's layout again.
   if (identity === enteredSearchIdentity) return;
   const list = visibleList();
-  const rows = [...list.children].filter((row) => row.getAttribute("data-search") !== null);
+  // `#1913`: only rows with a box can stand on screen; the hidden ones carry no layout, and
+  // leaving them out lets `rowsOnScreen` measure only the screen's neighbourhood.
+  const rows = [...list.children].filter((row) => row.getAttribute("data-search") !== null &&
+    !(/** @type {any} */ (row)).hidden && !String(row.className).split(/\s+/).includes("search-hidden"));
   searchScreenRows = scrollKeeping.rowsOnScreen(rows);
 }
 function landSearchEntry() {
@@ -7362,7 +7376,7 @@ const olderWalks = mountOlderWalks({
   columnWork, columns, sideShowing, inColumn, columnSteps: () => /** @type {any} */ (columnSteps()), filterChanges,
   replyJumpCurrent: () => replyJumpTicket.current(), idsOf, rowMessages, plainReach, replyTally, providerOfChannel, channelDirectoryName: () => channelDirectory.providerName(),
 });
-const { renderOlderControl, olderControlPressed, searchOlder, searchOlderFromField, searchReplies, searchOffered, searchKey, endSearchWalks, endSearchWalk, stopSearchWalk, renderSearchOlderNote, historyReach, searchFurtherPressed, chooseSearchAllChannels, renderRepliesSearch, renderServerSearch, scheduleServerSearch, channelViewWords, oldestLoadedMs, toggleServerHits, toggleBucket, serviceWords, repliesFloor, repliesSearchOffered, allCover, allLoaded, repliesKey, endRepliesWalk } = olderWalks;
+const { renderOlderControl, olderControlPressed, searchOlder, searchOlderFromField, searchReplies, searchOffered, searchKey, endSearchWalks, endSearchWalk, stopSearchWalk, renderSearchOlderNote, historyReach, searchFurtherPressed, chooseSearchAllChannels, renderRepliesSearch, renderServerSearch, scheduleServerSearch, retireStaleBuckets, channelViewWords, oldestLoadedMs, toggleServerHits, toggleBucket, serviceWords, repliesFloor, repliesSearchOffered, allCover, allLoaded, repliesKey, endRepliesWalk } = olderWalks;
 // `#1608`: the Transcripts view's own search and way back to its index.
 el("transcripts-search").addEventListener("input", () => transcriptsView.searchChanged());
 el("transcripts-back").addEventListener("click", () => transcriptsView.closeDay());
@@ -9546,6 +9560,8 @@ application.track(mountFilterChips({
   setMarked: (text) => searchField.setMarked(text),
   searchTyped: (text) => searchTyped(text),
   renderEveryColumnsTools: () => eachColumn(renderScrollTools),
+  applySearchFast: () => applySearchFast(),
+  deferFullSearch: (fn) => deferFullSearch(fn),
   sideColumnUp: () => sideColumnUp(),
   refilterSideCards: () => refilterSideCards(),
   markSearchSoon: () => markSearchSoon(),

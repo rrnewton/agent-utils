@@ -47,6 +47,9 @@ type SearchRow = HTMLElement & {
   linkView?: { node?: Node } | null;
   foldEntry?: { body: HTMLElement } | null;
   linkText?: string;
+  /** `#1913`: the row's findable text, folded once when the row is drawn (`searchFold`), so the
+   * typing-fast pass matches with substring checks and never re-folds or re-reads a message. */
+  foldedSearch?: string;
   runDays?: string;
   seamLine?: unknown;
 };
@@ -125,6 +128,8 @@ export interface SearchRowsDependencies {
   renderReplyLinks(): void;
   renderOlderControl(): void;
   scheduleServerSearch(): void;
+  /** `#1913`: retire bucket chips earned by an older query (O(1), no fetch). Optional for doubles. */
+  retireStaleBuckets?(): void;
   placeInlineReply(): void;
   placeRowsInPlaceAgain(): void;
   replyDocked(): boolean;
@@ -167,6 +172,8 @@ export interface SearchRows {
   searchIdentity(query: string): string;
   searchable(row: Element, ...parts: unknown[]): void;
   applySearch(): void;
+  /** `#1913`: the typing-fast pass — row visibility from cached folded text only. */
+  applySearchFast(): void;
   searchInAll(): unknown;
   renderSearchInAll(): void;
   renderSearchCount(typed: boolean, links: boolean, author?: boolean): void;
@@ -396,7 +403,59 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
   });
 
   function searchable(row: Element, ...parts: unknown[]): void {
-    row.setAttribute("data-search", parts.filter(Boolean).join(" ").toLowerCase());
+    const text = parts.filter(Boolean).join(" ");
+    row.setAttribute("data-search", text.toLowerCase());
+    // `#1913`: folded once here, at draw time, so a keystroke never pays to fold it again.
+    (row as SearchRow).foldedSearch = deps.language.searchFold(text);
+  }
+
+  /** Whether `tree` (the corpus notation of a parsed query) is only plain words/phrases joined
+   * by AND — the shape the typing-fast pass can answer exactly from cached folded text. Any other
+   * shape (OR, negation, field operators) passes through fast and is settled by the full pass. */
+  function plainAndOnly(tree: unknown): boolean {
+    if (!Array.isArray(tree) || tree.length === 0) return false;
+    const kind = tree[0];
+    if (kind === "word" || kind === "phrase") return true;
+    if (kind === "and") return tree.slice(1).every((child) => plainAndOnly(child));
+    return false;
+  }
+
+  /**
+   * `#1913 vibe-talk-search-typing-lag`: the pass that runs inside the input event. It only
+   * toggles each row's `search-hidden` word from the row's cached folded text (substring checks,
+   * no message re-read, no link/thread scan, no seam draw, no layout read). Everything slower —
+   * the count and empty sentence, thread and link lookups, tallies and link-kind counts, seams,
+   * hit marks, the server ask and the place-keeping hold — is the full `applySearch`, which the
+   * field's typing schedules once the typing pauses, in the same words it uses today. A query
+   * the fast pass cannot answer exactly (operators, Links, an author or Pinned narrowing, Whole
+   * threads) is shown through here and settled exactly by that full pass moments later.
+   */
+  function applySearchFast(): void {
+    const node = searchField.open() ? searchParsed(searchField.query()).node : null;
+    const typed = node !== null;
+    const links = searchField.open() && searchField.links();
+    const author = deps.authorChoosing();
+    const terms = typed ? searchParsed(searchField.query()).terms : [];
+    const exact = typed && !links && author === "everyone" && !deps.pinsOnly() && !entireThreadsOn &&
+      plainAndOnly(deps.language.searchQueryTree(node));
+    for (const id of SEARCH_LISTS) {
+      if (deps.side() && id === "transcript") continue;
+      const list = el(id);
+      for (const row of list.children) {
+        if (row.getAttribute("data-server-hit") === "quote") continue;
+        const text = row.getAttribute("data-search");
+        if (text === null) continue;
+        let hit = true;
+        if (typed && exact) {
+          const folded = (row as SearchRow).foldedSearch ?? text;
+          hit = terms.every((term) => folded.includes(term));
+        }
+        setClassWord(row as never, "search-hidden", !hit);
+      }
+    }
+    // `#1913`: retire the previous query's bucket chips at once (O(1)); the server ask and
+    // its counts stay debounced with the full pass — no fetch, no recompute leaves this event.
+    if (!deps.side() && deps.retireStaleBuckets) deps.retireStaleBuckets();
   }
 
   function searchScope(): string[] {
@@ -952,7 +1011,7 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
 
   return {
     markSearchSoon, markSearchNow, searchParsed, searchTyped, searchIdentity, searchable,
-    applySearch, searchInAll, renderSearchInAll, renderSearchCount, refreshSearchCount,
+    applySearch, applySearchFast, searchInAll, renderSearchInAll, renderSearchCount, refreshSearchCount,
     listEmptied, drawSeams, seamsAfterMidnight, openSearchGap, inOpenedGap,
     rowsChosen, rowDay, markSearchHits, messageMatches, threadsWithHits, rowMatches,
     linkTerms, threadsWithLinkHits, threadsWithLinks, rowLinkMatch, rowHasLink,

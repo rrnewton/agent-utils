@@ -45,6 +45,16 @@ export interface FilterChipsDependencies {
   searchTyped(text: string): boolean;
   /** Draw every column's chips again. */
   renderEveryColumnsTools(): void;
+  /**
+   * `#1913`: the typing-fast pass (row visibility from cached folded text), run inside the input
+   * event. Absent: the full change below runs at once, as before.
+   */
+  applySearchFast?(): void;
+  /**
+   * `#1913`: run the full filter change once the typing pauses (debounced by the page; each call
+   * replaces the pending one). Absent: the full change runs at once, as before.
+   */
+  deferFullSearch?(fn: () => void): void;
   /** Whether the right column is drawn, and filtering its cards again. */
   sideColumnUp(): boolean;
   refilterSideCards(): void;
@@ -119,21 +129,45 @@ export function mountFilterChips(deps: FilterChipsDependencies): FilterChips {
     // is read before the filter moves them: "on screen" names the screen the
     // reader was looking at when they typed, not the compacted list after.
     deps.noteSearchScreen();
-    // `#262 search-load-older`. The first term typed, or the last taken away, may make Hide read step
-    // aside or come back (`liftingHideRead`).
-    deps.keepingFilterPlace(() => deps.liftingHideRead(() => {
-      deps.setQuery((el("search-field") as HTMLInputElement).value);
-      // `#249 search-highlight`. Cleared — no word left to find — the marks go with the words, in this
-      // one redraw; otherwise they follow once the typing pauses (`searchField.marked()`).
-      if (!deps.searchTyped(deps.query())) deps.setMarked(deps.query());
-      deps.renderEveryColumnsTools();
-      if (deps.sideColumnUp()) deps.refilterSideCards();
-    }));
-    // `#1734 vibe-talk-search-view-scroll-default`. After the place-keeper has
-    // put the reader back, a newly entered search lands: on a hit already on
-    // screen nothing moves; with none on screen the reader goes to the foot,
-    // where the most recent hits stand.
-    deps.landSearchEntry();
+    // `#1913 vibe-talk-search-typing-lag`: inside the input event only the cheap work runs —
+    // the query itself, the fast visibility pass from cached folded text, and arming the mark
+    // timer. The full filter change (place-keeping layout reads, thread/link lookups, seams,
+    // tallies, the server ask) is deferred until the typing pauses, so a keystroke never waits
+    // on O(messages) work. Without the fast/deferred pair (a test double) the full change runs
+    // at once, exactly as before.
+    deps.setQuery((el("search-field") as HTMLInputElement).value);
+    // `#249 search-highlight`. Cleared — no word left to find — the marks go with the words, in this
+    // one redraw; otherwise they follow once the typing pauses (`searchField.marked()`).
+    if (!deps.searchTyped(deps.query())) deps.setMarked(deps.query());
+    const fullChange = (): void => {
+      // `#262 search-load-older`. The first term typed, or the last taken away, may make Hide read step
+      // aside or come back (`liftingHideRead`).
+      deps.keepingFilterPlace(() => deps.liftingHideRead(() => {
+        deps.renderEveryColumnsTools();
+        if (deps.sideColumnUp()) deps.refilterSideCards();
+      }));
+      // `#1734 vibe-talk-search-view-scroll-default`. After the place-keeper has
+      // put the reader back, a newly entered search lands: on a hit already on
+      // screen nothing moves; with none on screen the reader goes to the foot,
+      // where the most recent hits stand.
+      deps.landSearchEntry();
+    };
+    // `#1913`: the fast/deferred split is for lists long enough that a full pass can block
+    // typing. A short list's full pass is a few milliseconds and lands at once, exactly as
+    // every reader (and check) expects of a typed filter.
+    let bigList = false;
+    try {
+      const log = el("discord-log") as HTMLElement & { children?: { length: number } };
+      bigList = (log.children?.length ?? 0) > 200;
+    } catch (_error) {
+      bigList = false;
+    }
+    if (bigList && deps.applySearchFast && deps.deferFullSearch) {
+      deps.applySearchFast();
+      deps.deferFullSearch(fullChange);
+    } else {
+      fullChange();
+    }
     deps.markSearchSoon();
   }
   listen(el("search-field"), "input", () => {

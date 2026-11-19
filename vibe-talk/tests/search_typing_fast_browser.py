@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+"""Typing in search stays off the layout path, and bucket chips follow the query (`#1913`).
+
+`#1913 vibe-talk-search-typing-lag`. The owner (thread 224, 2026-11-19): "serious lag while
+typing during search... Anything slow should be async and not slow my typing". This walk serves
+the real page and a fake chat upstream (only the upstream is stubbed; the server search answers
+through the real route) over a channel of 800+ messages with threads and links, and checks, at
+phone and desktop sizes:
+
+  typing "lantern" key by key (real `input` events dispatched on the field) does a bounded,
+  O(1) number of synchronous layout reads (`getBoundingClientRect` calls) per keystroke — the
+  bound does not grow with the 800 rows on screen, where the old per-keystroke full pass read
+  one rectangle per row (800+) plus its seams and place-keeping; after the typing pauses the
+  full result lands exactly ("4 of N loaded", the lantern rows shown);
+  with the pinned bucket chips standing for "lantern" ("1 in main" / "2 in threads"), typing a
+  new query retires those chips at once — the previous query's counts never stand for the new
+  words — and after the debounced server answer the chips stay down for a query with no server
+  hits, while the loaded count speaks for the new query.
+
+The gate is a count of synchronous work per input event, never a wall-clock budget (owner
+rule 346); every wait is a condition wait. Pass --screenshots DIR to keep a PNG of each stage.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import tempfile
+import threading
+import time
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+from typing import TYPE_CHECKING
+from urllib.parse import parse_qs, unquote, urlsplit
+
+import offline_cache_browser as fixture
+from offline_cache_browser import TOKEN, Json, check, handler_for, message
+import page_sources
+import search_unmatched_browser as unmatched
+
+if TYPE_CHECKING:
+    from playwright.sync_api import Page, Playwright
+
+# Synchronous layout reads allowed inside one input event, however many rows stand on screen.
+# The fast pass reads the search panel's own neighbourhood (the noted screen, the scroll
+# anchor): tens, not the 800+ a per-row pass reads. Generous on purpose (rule 346).
+MAX_RECT_READS_PER_KEY = 120
+
+RECT_INSTALL_JS = """() => {
+    window.__rectReads = 0;
+    const orig = Element.prototype.getBoundingClientRect;
+    Element.prototype.getBoundingClientRect = function () {
+        window.__rectReads += 1;
+        return orig.call(this);
+    };
+}"""
+
+TYPE_KEYS_JS = """() => {
+    const field = document.getElementById('search-field');
+    const values = ['l', 'la', 'lan', 'lant', 'lante', 'lanter', 'lantern'];
+    const deltas = [];
+    for (const value of values) {
+        const before = window.__rectReads;
+        field.value = value;
+        field.dispatchEvent(new Event('input', { bubbles: true }));
+        deltas.push(window.__rectReads - before);
+    }
+    return deltas;
+}"""
+
+CHIP_JS = """(id) => {
+    const chip = document.getElementById(id);
+    if (!chip) return null;
+    return { text: (chip.textContent || '').trim(), hidden: chip.hidden,
+             pressed: chip.getAttribute('aria-pressed') };
+}"""
+
+
+class BigApi(unmatched.GapApi):
+    """The lantern channel lengthened to 800 routine messages, every tenth holding a link."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        base = len(self.messages)
+        for extra in range(800):
+            words = (f"Routine lane note {extra}, filed and done. See https://example.test/{extra}."
+                     if extra % 10 == 0 else f"Routine lane note {extra}, filed and done.")
+            self.messages.append(message(base + extra, words))
+
+
+def serve(api: BigApi, web_root: Path) -> tuple[ThreadingHTTPServer, threading.Thread, str]:
+    base = handler_for(api)
+
+    class Handler(base):  # type: ignore[valid-type, misc]
+        def do_GET(self) -> None:  # noqa: N802
+            parts = urlsplit(self.path)
+            path = unquote(parts.path)
+            if path.endswith("/search") or path.endswith("/history"):
+                with api.lock:
+                    api.requests.append(f"GET {self.path}")
+                if path.endswith("/search"):
+                    self.json(200, api.search(path, parse_qs(parts.query)))
+                    return
+                self.json(200, api.history_state())
+                return
+            super().do_GET()
+
+        def do_POST(self) -> None:  # noqa: N802
+            path = unquote(urlsplit(self.path).path)
+            if path.endswith("/history/prioritize"):
+                if not self.authorized():
+                    return
+                self.json(202, api.history_state())
+                return
+            super().do_POST()
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread, f"http://127.0.0.1:{server.server_port}/"
+
+
+def arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--browser-executable", default=os.environ.get("VIBE_TALK_CHROMIUM"),
+                        help="Chrome/Chromium executable (default: Playwright's bundled Chromium)")
+    parser.add_argument("--web-root", type=Path, default=fixture.WEB_ROOT,
+                        help="directory holding the page to serve")
+    parser.add_argument("--screenshots", type=Path, help="directory to write one PNG per stage into")
+    return parser.parse_args()
+
+
+class Walk:
+    def __init__(self, page: Page, label: str, shots: Path | None) -> None:
+        self.page, self.label, self.shots = page, label, shots
+
+    def check(self, condition: bool, why: str) -> None:
+        check(condition, f"{self.label}: {why}")
+
+    def shot(self, name: str) -> None:
+        if self.shots is not None:
+            self.page.screenshot(path=str(self.shots / f"{self.label}-{name}.png"))
+
+    def until(self, script: str, why: str, seconds: float = 20) -> None:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline and not self.page.evaluate(script):
+            self.page.wait_for_timeout(25)
+        self.check(bool(self.page.evaluate(script)), why)
+
+
+def walk_through(walk: Walk, total: int) -> None:
+    page = walk.page
+    page.fill("#api-token", TOKEN)
+    page.click("#save-token")
+    try:
+        page.wait_for_function(
+            "() => !document.getElementById('screen-welcome').hidden || !document.getElementById('screen-main').hidden",
+            timeout=3_000)
+        if page.evaluate("() => !document.getElementById('screen-welcome').hidden"):
+            page.click("#welcome-start")
+    except Exception:
+        pass
+    page.wait_for_selector("#search-toggle", state="visible", timeout=15_000)
+    walk.until(f"() => document.querySelectorAll('#discord-log > li[data-id]').length >= {total - 20}",
+               "the big channel did not open with its messages")
+    page.click("#search-toggle")
+    page.wait_for_selector("#search-field", state="visible", timeout=10_000)
+    page.evaluate(RECT_INSTALL_JS)
+    deltas = page.evaluate(TYPE_KEYS_JS)
+    walk.check(all(isinstance(one, int) for one in deltas) and len(deltas) == 7,
+               f"the typing probe did not run: {deltas}")
+    walk.check(all(one <= MAX_RECT_READS_PER_KEY for one in deltas),
+               f"a keystroke read layout {deltas} times over {total} rows "
+               f"(bound {MAX_RECT_READS_PER_KEY} per key, independent of the row count)")
+    # After the pause the full result lands exactly as the synchronous pass lands it today.
+    walk.until(f"() => document.getElementById('search-count').textContent === '4 of {total} loaded'",
+               "the settled count does not speak for the lantern search")
+    walk.until("() => [...document.querySelectorAll('#discord-log > li[data-id]')]"
+               ".filter((row) => !row.classList.contains('search-hidden') && !row.hasAttribute('data-server-hit'))"
+               ".map((row) => row.getAttribute('data-id')).join(',') === '201,204,209,214'",
+               "the settled rows are not the lantern four")
+    walk.shot("settled-lantern")
+    # The pinned bucket chips for this query, from the server's debounced answer.
+    walk.until("() => { const row = document.getElementById('search-bucket-row');"
+               " return row && !row.hidden && !document.getElementById('search-bucket-main').hidden; }",
+               "the bucket chips never appeared for lantern")
+    main_chip = page.evaluate(CHIP_JS, "search-bucket-main")
+    threads_chip = page.evaluate(CHIP_JS, "search-bucket-threads")
+    walk.check(main_chip is not None and main_chip["text"] == "1 in main",
+               f"the main chip says {main_chip}")
+    walk.check(threads_chip is not None and threads_chip["text"] == "2 in threads",
+               f"the threads chip says {threads_chip}")
+    walk.shot("chips-lantern")
+    # A new query: the standing chips retire inside the input event, before any answer lands.
+    retired = page.evaluate("""() => {
+        const field = document.getElementById('search-field');
+        field.value = 'routine';
+        field.dispatchEvent(new Event('input', { bubbles: true }));
+        const row = document.getElementById('search-bucket-row');
+        const mainChip = document.getElementById('search-bucket-main');
+        return { rowHidden: row ? row.hidden : null, chipHidden: mainChip ? mainChip.hidden : null,
+                 chipText: mainChip ? (mainChip.textContent || '').trim() : null };
+    }""")
+    walk.check(retired["rowHidden"] is True and retired["chipHidden"] is True,
+               f"the lantern chips still stand for 'routine': {retired}")
+    walk.check(retired["chipText"] in ("", "1 in main"),
+               f"the retired chip still speaks with fresh words: {retired}")
+    # Settled on the new query: its loaded count, and no bucket chips (the server holds none).
+    walk.until("() => document.getElementById('search-count').textContent.includes('of')"
+               " && !document.getElementById('search-count').textContent.startsWith('4 of')",
+               "the settled count does not speak for the routine search")
+    walk.until("() => document.getElementById('search-bucket-row').hidden",
+               "the bucket row came back for a query with no server hits")
+    walk.shot("chips-retired")
+
+
+def main() -> int:
+    args = arguments()
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as error:
+        raise SystemExit("Python Playwright is required") from error
+    if args.screenshots is not None:
+        args.screenshots.mkdir(parents=True, exist_ok=True)
+    web_root = page_sources.served(args.web_root)
+    total = 800 + 16
+    runs = (
+        ("dark-phone", 412, 915, True, "dark"),
+        ("light-desk", 1280, 800, False, "light"),
+    )
+    report: list[str] = []
+    with sync_playwright() as playwright:
+        for label, width, height, touch, scheme in runs:
+            api = BigApi()
+            server, thread, url = serve(api, web_root)
+            try:
+                with tempfile.TemporaryDirectory(prefix="vibe-talk-typing-fast-") as profile:
+                    context = playwright.chromium.launch_persistent_context(
+                        profile, headless=True, executable_path=args.browser_executable,
+                        timezone_id="America/New_York",
+                        viewport={"width": width, "height": height}, color_scheme=scheme,  # type: ignore[arg-type]
+                        device_scale_factor=2.625 if touch else 1, is_mobile=touch, has_touch=touch)
+                    page = context.pages[0]
+                    errors: list[str] = []
+                    page.on("pageerror", lambda error: errors.append(str(error)))
+                    page.goto(url, wait_until="load")
+                    walk = Walk(page, label, args.screenshots)
+                    walk_through(walk, total)
+                    check(not errors, f"{label}: the page threw: {errors}")
+                    context.close()
+                    report.append(f"{label} {width}x{height}: typing bounded per key, chips follow the query")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join()
+    for line in report:
+        print(line)
+    print("search typing fast browser walk: ok")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
