@@ -1074,7 +1074,7 @@ pub fn turnover(
                         }
                     }
                 }
-                let only_rollbacks = actions.iter().any(|action| *action == "rolled-back")
+                let only_rollbacks = actions.contains(&"rolled-back")
                     && actions.iter().all(|action| {
                         matches!(
                             *action,
