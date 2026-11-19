@@ -461,13 +461,16 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     } finally {
       holdDepth -= 1;
     }
-    // `#1880`: the reader has scrolled or touched since this hold was captured: no
-    // write of either kind puts the view back.
-    if (userMovedSince(mark)) {
+    if (keepComposerInView(area, composerWas)) {
       if (selection && deps.restoreSelectionIn) deps.restoreSelectionIn(area, selection);
       return;
     }
-    if (keepComposerInView(area, composerWas)) {
+    // `#1880`: the reader has scrolled or touched since this hold was captured, and
+    // no composer keep above answered for the view: no anchor write puts it back.
+    // (A held composer outranks this, #1839: the reader dictating into a box that
+    // stood in view at the capture is kept on it, scrolled-away boxes already are
+    // not, by `composerBefore`.)
+    if (userMovedSince(mark)) {
       if (selection && deps.restoreSelectionIn) deps.restoreSelectionIn(area, selection);
       return;
     }
@@ -536,17 +539,17 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
   function restoreScroll(mark: ScrollMark): void {
     const area = el("scroll-area");
     watchInput(area);
-    // `#1880`: the reader has scrolled or touched since this mark was taken (a live
-    // read landed while they were up the thread): nothing is put back, not the
-    // newest line, not the anchor, not the composer.
-    if (userMovedSince(mark)) {
-      deps.renderJumpNewest();
-      return;
-    }
     // `#1839`: while the composer holds the view and stood in view as the change began,
     // it outranks both the newest line and the message anchor - putting either back can
     // carry the box being dictated into off screen. `mark.composerTop` is its place then.
     if (keepComposerInView(area, typeof mark.composerTop === "number" ? mark.composerTop : null)) return;
+    // `#1880`: the reader has scrolled or touched since this mark was taken (a live
+    // read landed while they were up the thread) and no composer keep answered for
+    // the view: nothing else is put back, not the newest line, not the anchor.
+    if (userMovedSince(mark)) {
+      deps.renderJumpNewest();
+      return;
+    }
     // `#1856`: while Read is following, no restore at all — neither the newest line nor
     // the captured anchor may be put back over the sentence being read.
     if (deps.readFollowing && deps.readFollowing()) return;

@@ -3070,7 +3070,7 @@ test("`#624 voice-page-modularity`: a thread's count comes from its summary befo
     channelCanon: () => canon,
     view: () => "discord",
     threading: () => true,
-    entryState: () => ({ threadOwed: null, threadAwaitsRead: false, readOwed: null, landing: null, backGesture: null, drill: null }),
+    entryState: () => ({ threadOwed: null, threadAwaitsRead: false, readOwed: null, landing: null, backGesture: null, drill: null, drillPlaced: false }),
     selection: () => ({ view: "main", threadId: null, thread: null, origin: null }),
     readMode: () => "show",
     transcriptShown: () => false,
@@ -3144,7 +3144,7 @@ test("`#1838 vibe-talk-reader-continues-into-thread`: a view switch into or out 
     freshAt: 0, dismissed: new Set(), readMode: "show" };
   const contexts = new Map();
   const selection = { view: "main", threadId: null, thread: null, origin: null };
-  const entry = { threadOwed: null, threadAwaitsRead: false, readOwed: null, landing: null, backGesture: null, drill: null };
+  const entry = { threadOwed: null, threadAwaitsRead: false, readOwed: null, landing: null, backGesture: null, drill: null, drillPlaced: false };
   const canon = { channel: "C1", threads: [], messages: [], views: new Map([["thread:t1", { live: true }]]), dismissed: new Set() };
   const snapshot = { id: "m2", parts: ["m2"], part: 0, block: 3, chunk: null, paused: false };
   const calls = { snapshots: 0, resumed: [], modes: [] };
