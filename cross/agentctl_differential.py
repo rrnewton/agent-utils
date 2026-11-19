@@ -183,8 +183,6 @@ def _with_effort(arguments: Sequence[str]) -> tuple[str, ...]:
     args = tuple(arguments)
     if "start" not in args or "--profile" in args:
         return args
-    if "--effort" in args or "--reasoning-effort" in args:
-        return args
     harness = "codex"
     if "--harness" in args:
         # A Herdr-native kind takes no reasoning effort; declaring one is a
@@ -193,9 +191,16 @@ def _with_effort(arguments: Sequence[str]) -> tuple[str, ...]:
         if harness not in ("codex", "claude", "muse"):
             return args
     at = args.index("start")
-    injected: tuple[str, ...] = ("--effort", "medium")
+    # Effort and the bypass flag are injected independently: a start that
+    # already declares an effort still needs its bypass flag, or both
+    # editions refuse it for #1822 before the behaviour under test runs.
+    injected: tuple[str, ...] = ()
+    if "--effort" not in args and "--reasoning-effort" not in args:
+        injected += ("--effort", "medium")
     if not any(flag in argument for argument in args for flag in _BYPASS_FLAGS):
         injected += (_BYPASS[harness],)
+    if not injected:
+        return args
     return (*args[: at + 2], *injected, *args[at + 2:])
 
 

@@ -697,11 +697,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             # profile and ad-hoc alike (a profile was already refused at load).
             # A usage refusal (exit 2), matching the Rust edition.
             if mode == "interactive":
-                label = f"profile {profile.name!r}" if profile else f"agent {name!r} launch"
+                label = f'profile "{profile.name}"' if profile else f'agent "{name}" launch'
                 flag = permission_bypass_flag(harness, harness_args)
                 if flag is not None:
                     raise ValueError(
-                        f"{label} (harness {harness!r}) has no permission-bypass flag: "
+                        f'{label} (harness "{harness}") has no permission-bypass flag: '
                         f"add {flag} to its argv (every agent runs on bypass permissions; "
                         "without it the harness can park on a permission prompt with nobody answering)"
                     )

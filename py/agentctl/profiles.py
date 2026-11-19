@@ -98,7 +98,7 @@ def require_permission_bypass(label: str, harness: str, argv: Sequence[str]) -> 
     flag = permission_bypass_flag(harness, argv)
     if flag is not None:
         raise AgentDeliveryError(
-            f"{label} (harness {harness!r}) has no permission-bypass flag: add {flag} "
+            f'{label} (harness "{harness}") has no permission-bypass flag: add {flag} '
             "to its argv (every agent runs on bypass permissions; without it the "
             "harness can park on a permission prompt with nobody answering)"
         )
@@ -671,7 +671,7 @@ def _profile(name: str, raw: object) -> LaunchProfile:
     # Headless profiles are exempt at load: codex/agy headless argv is
     # empty by rule, and this edition runs no headless Claude.
     if mode == "interactive":
-        require_permission_bypass(f"profile {name!r}", harness, argv)
+        require_permission_bypass(f'profile "{name}"', harness, argv)
     return LaunchProfile(name, harness, mode, model, effort, argv, tuple(environment), agentcloud, required)
 
 
