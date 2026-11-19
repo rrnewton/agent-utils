@@ -1,12 +1,13 @@
 ---
 title: 'agentctl-watch-heartbeat-before-first-pass: heartbeat begins at daemon start, not first pass'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
 - agentctl
 created_at: 2026-11-19T14:48:51-05:00
-updated_at: 2026-11-19T14:48:51-05:00
+updated_at: 2026-11-19T16:58:38-05:00
+closed_at: 2026-11-19T16:58:38-05:00
 ---
 
 # Description
@@ -103,3 +104,33 @@ heartbeat-churn (the lock contention the first pass waits on),
 #701 agentctl-services-refresh. Services and both watch daemons
 are Rust-only, so there is no Python mirror. After landing,
 coordb refreshes the pinned unit and removes the pin.
+
+## Resolution
+
+[watermelon-full-preview] `PassProgress` now writes
+`pass-progress.json` at daemon start (`daemon_started_at`, with
+`pass_started_at` carrying it and `phase: starting` until
+`begin()` flips it to `pass`) in both the CLI arms (before the
+Herdr client, config, designation and coordinator work) and at
+the top of both watch loops (before state reads and, for
+watch-agents, the single-writer lock), and its thread advances
+`heartbeat_at` from daemon start until drop. Services health
+accepts a fresh heartbeat advanced at least twice from a daemon
+started after the restart in either phase, keeps the
+completed-pass and #1900 proofs, and names the proof in the
+report (`health proof completed-pass`, `health proof
+pass-progress`, `health proof daemon-start-progress`), so a
+refresher predating a proof is obvious from its report. Tests:
+the daemon file heartbeats in `starting` before any pass; on
+the fake clock a 600 s lock wait before the first pass refreshes
+both watch kinds (fails before the fix, verified on a clean
+base) and a heartbeat frozen in `starting` still rolls back, as
+the frozen pass-phase and never-begins cases already did.
+Gate: full validate and gate passed (49 steps, no failed
+steps; PARTIAL only for one timing gate with no primary timing
+record). Landed as 968dc698 after verifying the replayed
+combined tree against #1890 (its explicit-timeout and turnover
+tests pass beside the new proofs). Unverified live: no real
+refresh against a daemon blocked in startup has run this build
+yet; that is coordb's post-land refresh, and the pin is already
+removed.
