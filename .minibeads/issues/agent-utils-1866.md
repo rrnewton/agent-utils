@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-read-follow-clears-reader-strip: read follow keeps the lit sentence clear of the reader strip'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 assignee: mu-readerdrill
@@ -8,7 +8,8 @@ labels:
 - vibe-talk
 - ui
 created_at: 2026-11-18T16:25:00-05:00
-updated_at: 2026-11-18T16:25:00-05:00
+updated_at: 2026-11-19T01:10:00-05:00
+closed_at: 2026-11-19T01:10:00-05:00
 ---
 
 # Description
@@ -28,3 +29,7 @@ In the follow (`followReading` in `vibe-talk/web/src/view/voice/read-aloud.ts`),
 # Notes
 
 Owner-priority gate: deployed on landing. Lane mu-readerdrill on branch mu-readerdrill/1866, worktree readerstrip. Follow-up to #1856 vibe-talk-read-aloud-follow-not-yanked-up.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as 6665a5070ef1aa251928a5c3a8a207fec4cef673 (fix replayed as ea5b0b08; gate pass on 0a803fada2a94611d9e40f6796f55208f5d7ed56). The follow band ends above the reader strip and the reading notice, measured live at each follow. Shots on the #1855 harness are in /tmp/mu-readerfollow-shots/harness (device voice: the mock vendor serves only the conversation endpoint, so no sentence is lit there; lit-sentence evidence is the follow walk, whose strip-intersection assertion is green at both sizes, base intersecting at 1280x800).
