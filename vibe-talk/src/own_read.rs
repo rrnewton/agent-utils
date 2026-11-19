@@ -331,6 +331,26 @@ impl Sightings {
             .drain(..)
             .collect()
     }
+
+    /// Put back sightings a decision could not be made for, ahead of newer ones, so the next
+    /// note, read or post that wakes [`run`] decides them then. `#1881 vibe-talk-own-messages-read-on-arrival`:
+    /// a sighting taken while the settings could not be read used to be dropped with the failed
+    /// decision, and an own message the hub had ingested stayed unread until a write-scope read
+    /// happened to meet it again — after a restart, possibly never.
+    fn restore(&self, items: Vec<(ChannelId, Sighting)>) {
+        if items.is_empty() {
+            return;
+        }
+        let mut waiting = self.waiting.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut restored: VecDeque<(ChannelId, Sighting)> = items.into_iter().collect();
+        restored.append(&mut waiting);
+        while restored.len() > MAX_WAITING {
+            restored.pop_back();
+        }
+        *waiting = restored;
+        drop(waiting);
+        self.wake.notify_one();
+    }
 }
 
 /// Decide, in the background, the read state of every message of his the live hub publishes for
@@ -343,7 +363,10 @@ pub async fn run(state: AppState) {
     }
 }
 
-/// Decide whatever the live hub has noted and not yet had decided.
+/// Decide whatever the live hub has noted and not yet had decided. Sightings a decision
+/// could not be made for — the settings unreadable, the store refusing — are put back, not
+/// dropped: the hub's first sight of a message happens once, and losing it left the message
+/// undecided until an unrelated write-scope read met it (`#1881`).
 pub async fn decide_waiting(state: &AppState) {
     let waiting = state.live.own_sightings().take();
     if waiting.is_empty() {
@@ -354,7 +377,11 @@ pub async fn decide_waiting(state: &AppState) {
         by_channel.entry(channel).or_default().push(sighting);
     }
     for (channel, sightings) in by_channel {
-        decide(state, true, &channel, &sightings).await;
+        if decide(state, true, &channel, &sightings).await.is_none() {
+            let back: Vec<(ChannelId, Sighting)> =
+                sightings.into_iter().map(|s| (channel.clone(), s)).collect();
+            state.live.own_sightings().restore(back);
+        }
     }
 }
 
@@ -377,6 +404,8 @@ pub async fn settle(
         .iter()
         .map(|message| Sighting::of(message, state.live.is_self_posted(&message.id)))
         .collect();
+    // A decision that could not be made answers nothing now; the messages stay undecided in
+    // the store, so the next sight — a read, a post, the hub deciding again — decides them.
     decide(
         state,
         caller >= crate::auth::Scope::Write,
@@ -384,6 +413,7 @@ pub async fn settle(
         &sightings,
     )
     .await
+    .unwrap_or_default()
 }
 
 /// Decide what this server just posted to `channel`.
@@ -396,20 +426,22 @@ pub async fn settle_posted(state: &AppState, channel: &ChannelId, posted: &[Mess
 }
 
 /// Decide the first read state of each of `sightings` that is his and not decided yet, recording it
-/// when `write`, and answer those that are Done because of it. A store that cannot answer decides
-/// nothing: a server with no store has no Done at all.
+/// when `write`, and answer those that are Done because of it. `None` when no decision could be
+/// made — the settings did not answer, or the store refused — so the caller can keep the
+/// sightings for the next sight instead of losing them (`#1881`). A store that is absent
+/// (Unavailable) still decides: it answers an empty record, and has no Done at all.
 async fn decide(
     state: &AppState,
     write: bool,
     channel: &ChannelId,
     sightings: &[Sighting],
-) -> HashSet<MessageId> {
+) -> Option<HashSet<MessageId>> {
     if sightings.is_empty() {
-        return HashSet::new();
+        return Some(HashSet::new());
     }
     let Some(choice) = state.own_read.read_choice(state.store.as_ref()).await else {
         // The settings did not answer: nothing is decided now; the next sight decides.
-        return HashSet::new();
+        return None;
     };
     let accounts = accounts_of(state);
     let mut his: Vec<MessageId> = sightings
@@ -420,7 +452,7 @@ async fn decide(
     his.sort();
     his.dedup();
     if his.is_empty() {
-        return HashSet::new();
+        return Some(HashSet::new());
     }
     let decided: HashSet<MessageId> = match state.store.own_decided(channel, &his).await {
         Ok(decided) => decided.into_iter().collect(),
@@ -430,31 +462,38 @@ async fn decide(
                 &error,
                 "read which of the owner's messages were decided",
             );
-            return HashSet::new();
+            // No store at all is a settled answer of nothing; a refused read is not.
+            return match error {
+                StoreError::Unavailable(_) => Some(HashSet::new()),
+                _ => None,
+            };
         }
     };
     let undecided: Vec<MessageId> = his.into_iter().filter(|id| !decided.contains(id)).collect();
     if undecided.is_empty() {
-        return HashSet::new();
+        return Some(HashSet::new());
     }
     if !write {
-        return if choice.on {
+        return Some(if choice.on {
             undecided.into_iter().collect()
         } else {
             HashSet::new()
-        };
+        });
     }
     let _deciding = state.own_read.hold_decisions().await;
     match state.store.decide_own(channel, &undecided, choice.on).await {
-        Ok(fresh) if choice.on => fresh.into_iter().collect(),
-        Ok(_) => HashSet::new(),
+        Ok(fresh) if choice.on => Some(fresh.into_iter().collect()),
+        Ok(_) => Some(HashSet::new()),
         Err(error) => {
             note_failure(
                 channel,
                 &error,
                 "record the first read state of the owner's messages",
             );
-            HashSet::new()
+            match error {
+                StoreError::Unavailable(_) => Some(HashSet::new()),
+                _ => None,
+            }
         }
     }
 }

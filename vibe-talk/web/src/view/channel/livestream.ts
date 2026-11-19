@@ -306,7 +306,10 @@ function receiveLiveMessage(message: Message, selfPosted: boolean, replayed: boo
     // A replayed copy gives the store its thread record and nothing else: the rest of it is older.
     const places = placesHeld(message);
     // `#549 own-read-stored`. One of his, new here, is drawn as it starts: read, when he said so.
-    if (!replayed) noteStartsRead([message]);
+    // `#1881`: a replayed copy too — after a reconnect or restart the stream replays his own
+    // messages, and a copy the store does not hold yet must start read here, not wait for the
+    // read behind it. One already held keeps the state its reads gave it (`noteStartsRead`).
+    noteStartsRead([message]);
     if (document.hidden) {
       // `#226 page-energy-profile`. Into the store, for coming back to draw and read behind; no row
       // and no read for a page nobody can see. A call's agent is told as ever.
@@ -367,7 +370,8 @@ function receiveLiveMessage(message: Message, selfPosted: boolean, replayed: boo
   // Not while a filter change holds a message in place: nothing but the reader moves it. `#243`.
   const wasAtNewest = screens.view() === "discord" && followsNewest(area);
   // `#549 own-read-stored`. One of his is drawn as it starts: read, when he said so.
-  if (!replayed) noteStartsRead([message]);
+  // `#1881`: replayed copies too, as on the threaded path above.
+  noteStartsRead([message]);
   appendChannelRow(message, true);
   listState().newestId = id;
   if (wasAtNewest) {

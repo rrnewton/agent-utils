@@ -244,6 +244,8 @@ export interface TimelineViewDependencies {
   removedAfterRead(canon: ChannelCanon, id: string, versions: unknown): boolean;
   ownPostStands(id: string): boolean;
   foldReadState(payload: TimelineResponse, view: string): boolean;
+  /** Mark the reader's own messages a page carries as starting read (`#1881`). */
+  noteStartsRead(messages: Message[]): void;
   noteReplyGaps(payload: TimelineResponse, view: string, older: boolean, delta: boolean, before: unknown): void;
   noteServerPageBuild(payload: TimelineResponse): void;
   renderColumns(): void;
@@ -472,6 +474,7 @@ export function createTimelineView(deps: TimelineViewDependencies): TimelineView
   const noteServerThreadHuesIn = deps.noteServerThreadHuesIn;
   const renderColumns = deps.renderColumns;
   const foldReadState = deps.foldReadState;
+  const noteStartsRead = deps.noteStartsRead;
   const noteReplyGaps = deps.noteReplyGaps;
   const captureScroll = deps.captureScroll;
   const restoreScroll = deps.restoreScroll;
@@ -792,6 +795,10 @@ function foldTimelinePage(payload: TimelineResponse, older: boolean, view: strin
   // is drawn, so its rows never show a fallback colour the server has already decided.
   noteServerThreadHuesIn(payload.messages || [],
     [...(payload.threads || []), payload.thread].filter((x): x is ThreadSummary => Boolean(x)), channel);
+  // `#1881`: his own messages on any page — history after a restart, backfill after a reload —
+  // start read as the server decided them; this only spares them a pass drawn unread when the
+  // page's own read state has not caught up. Messages already held keep their reads' state.
+  noteStartsRead(payload.messages || []);
   if (channelStore.current().channel !== channel) {
     loadCanon(channel);
     // Copies of another store say nothing of this one's.
@@ -833,6 +840,8 @@ function foldTimelineDelta(payload: TimelineResponse, sent: string | null, view:
   // `#427 server-thread-hues`: a delta's new threads carry their colours, as a page's do.
   noteServerThreadHuesIn(payload.messages || [],
     [...(payload.threads || []), payload.thread].filter((x): x is ThreadSummary => Boolean(x)));
+  // `#1881`: as in `foldTimelinePage`, his own messages a delta carries start read at once.
+  noteStartsRead(payload.messages || []);
   return foldDeltaIn(channelStore.current(), payload, sent, view, viewKey(view, thread), {
     ledger: copyLedger,
     removals: removalRecord,

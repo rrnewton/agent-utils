@@ -300,6 +300,32 @@ async fn a_message_of_his_the_live_hub_publishes_is_done_before_any_read() {
 }
 
 #[tokio::test]
+async fn a_hub_sighting_that_cannot_be_decided_yet_is_decided_at_the_next_sight() {
+    // `#1881`: the hub notes a first sight once. When the settings read failed at that moment
+    // the sighting used to be dropped with the failed decision, and his message stayed unread
+    // until a write-scope read happened to meet it again — after a restart, the settings
+    // round-trip the owner had to make. Kept, it is decided by the next decide pass alone.
+    let b = bridge();
+    let channel = ChannelId(WRITE_CHANNEL.to_owned());
+    let pushed = b.discord.seed(&channel, "ada", "typed in the chat app");
+    b.state
+        .live
+        .publish(&channel, b.discord.message(&pushed).expect("held"));
+    b.store.fail_next("the store is busy");
+    vibe_talk::own_read::decide_waiting(&b.state).await;
+    assert!(
+        !held(&b.store, WRITE_CHANNEL).await.contains(&pushed.0),
+        "a decision was recorded from a failed settings read"
+    );
+    vibe_talk::own_read::decide_waiting(&b.state).await;
+    assert!(
+        held(&b.store, WRITE_CHANNEL).await.contains(&pushed.0),
+        "the kept sighting was not decided at the next sight: {:?}",
+        held(&b.store, WRITE_CHANNEL).await
+    );
+}
+
+#[tokio::test]
 async fn the_setting_decides_only_messages_first_seen_after_it_changes() {
     let b = bridge();
     // Seen while on: his start read.
