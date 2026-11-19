@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-archive-ignored-long-symlink: --archive-ignored dies on a long symlink target'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: mu-archsymlink
@@ -23,3 +23,7 @@ Write the ignored-files archive in PAX format in both editions, byte-identically
 A slot with an ignored symlink whose target is over 100 bytes and an ignored file whose member name is over 255 bytes removes with `remove --archive-ignored` successfully in both editions, and the archive verifies and round-trips (member names, symlink target and file bytes intact). In-limit archives keep the exact bytes they had before (USTAR member layout unchanged).
 
 # Notes
+
+## Resolution
+
+Fixed by 1050721a (PAX in both editions, byte-identical, verified-tree landing for the cli.py overlap; gate pass on 1d55cb9e).
