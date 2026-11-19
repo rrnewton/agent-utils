@@ -1,6 +1,6 @@
 ---
 title: 'agentctl-send-to-manager-and-children: send to my manager or my children without naming them, and mark skip-level sends'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
@@ -38,3 +38,7 @@ Rust edition only: the Python edition has `send` but `manage`/`tree` are already
 # Notes
 
 Owner priority. Reader skew: pinned older builds ignore the new header field by the existing header grammar, and no record field is added, so mixed builds keep reading each other's records.
+
+## Resolution
+
+[watermelon-full-preview] Landed e5fabbac on github/main (gated tree 62e97179, owner-priority gate pass; replayed over the moved main with the combined tree verified). `agentctl send --to-manager` and `send --to-children` resolve the recipient from the proved caller's `managed_by` (flags on `send`, not new subcommands, so `--file`, `--queue-only`, `--ttl`, `--message-id` and urgent delivery all keep working; an explicit `--message-id` is suffixed per child). With no manager, `--to-manager` delivers to the designated coordinator and the header says so; with neither it refuses, as it refuses an unproved caller. Skip-level sends (grandparent/grandchild) carry `skip-level: SENDER -> TARGET via CHAIN` in the existing header grammar, computed at send time with no new persisted field; direct, peer and unrelated sends stay plain. `list`/`status` (and every status-shaped row) gained `children_count` beside `managed_by` in both editions, which the cross-edition differential now covers. Verified by the three-level unit test (`relationship_sends_resolve_manager_children_and_skip_level`), the full agentctl Rust suite, and a real-binary scratch-registry run: lane -> lieutenant via `--to-manager`, lieutenant -> its two lanes only via `--to-children`, unmanaged caller -> coordinator with the fallback header, coordinator -> lane marked skip-level, direct sends plain, unproved caller refused (exit 75). The Python edition's plain `send` is unchanged; the relationship verbs are the Rust edition's, like `manage`/`tree`, and the matrix records that.
