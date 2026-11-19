@@ -188,7 +188,13 @@ class FakeApi:
 
 def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
+        # One request a connection: with keep-alive, a timing report's body left
+        # unread on a shared connection corrupts the next request on it (a 400 the
+        # page reads as a refused ticket), which failed whole reads at random
+        # under load. The real server keeps connections correctly; this fixture
+        # does not need to.
         protocol_version = "HTTP/1.1"
+        close_connection = True
 
         def authorized(self) -> bool:
             if self.headers.get("Authorization") == f"Bearer {TOKEN}":
@@ -197,6 +203,7 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
             return False
 
         def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's API
+            self.close_connection = True
             parts = urlsplit(self.path)
             path = unquote(parts.path)
             if not path.startswith("/api/"):
@@ -221,6 +228,7 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
                 self.json(404, {"error": "not_found", "detail": "not served by this check"})
 
         def do_POST(self) -> None:  # noqa: N802
+            self.close_connection = True
             parts = urlsplit(self.path)
             path = unquote(parts.path)
             if not self.authorized():
@@ -541,7 +549,7 @@ def reader_follow_walk(walk: Walk, api: FakeApi) -> None:
     # A one-block read: the strip is React-only (`#1862`), and neither it nor the
     # reading notice may cover the lit sentence either.
     walk.settled()
-    page.evaluate("() => { const row = document.querySelector('#discord-log > li[data-id=\"211\"]'); if (row) row.scrollIntoView({block: 'center'}); }")
+    page.evaluate("() => { const row = document.querySelector('#discord-log > li[data-id=\"211\"]'); if (row) row.scrollIntoView({block: 'start'}); }")
     walk.settled()
     walk.tap_row("211")
     walk.wait_for("() => !!document.querySelector('#discord-log > li[data-id=\"211\"][data-reading=\"true\"]')",
