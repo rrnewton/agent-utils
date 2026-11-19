@@ -1126,6 +1126,28 @@ class Driver:
 
     def load(self, with_token: bool, placement: str | None = None) -> None:
         script = STUB_JS
+        # One clock for every scene (liaison nit): the page's Date is
+        # anchored to a fixed instant in the seeded era and advances in
+        # real time from there, so relative times in a frame (above all
+        # Discuss's "hours since", computed from the scope start against
+        # now) are the same on every run and every date, never whatever
+        # the host's calendar makes of the fixed seed dates (the
+        # 37936-hours and 0.0-hours frames). Timers are untouched: only
+        # Date is anchored, and it still moves.
+        script += (
+            "\ntry {\n"
+            "  const __anchor = Date.parse('2026-11-18T12:00:00Z');\n"
+            "  const __realDate = Date;\n"
+            "  const __start = __realDate.now();\n"
+            "  class __AnchoredDate extends __realDate {\n"
+            "    constructor(...args) {\n"
+            "      super(...(args.length ? args : [__anchor + (__realDate.now() - __start)]));\n"
+            "    }\n"
+            "    static now() { return __anchor + (__realDate.now() - __start); }\n"
+            "  }\n"
+            "  window.Date = __AnchoredDate;\n"
+            "} catch (e) {}\n"
+        )
         # `#1781 vibe-talk-first-run-welcome-channel-default`. No scene here is the first
         # run itself (that has its own walk), and a load deliberately starts from the
         # default with every saved preference cleared — which is exactly a first run, so
@@ -1214,6 +1236,20 @@ class Driver:
                 "the page's own script threw an uncaught error, so the interface is inert no "
                 "matter how it looks",
                 "; ".join(dict.fromkeys(self.page_errors))[:400],
+            )
+        # Feature scenes are photographed with the Discuss sheet CLOSED
+        # (liaison nit): scenes run back to back in one tab, so a Discuss
+        # scene leaves the panel up over whatever the next scene is
+        # about, and its results photograph hidden behind it. Scenes
+        # whose subject is Discuss itself (its name or its expectations
+        # name it) keep the panel as they left it.
+        discuss_subject = "discuss" in scene.name or "summarised" in scene.name or any(
+            "discuss" in expression for _desc, expression in scene.expect
+        )
+        if not discuss_subject and bool(self.js("window.__visible('discuss-panel')")):
+            self.click("discuss-open")
+            self.page.wait_for_function(
+                "() => !window.__visible('discuss-panel')", timeout=15_000
             )
         # Every expectation at once, looked at again until they all hold or `EXPECT_WAIT_S` has
         # gone by: a state a loaded host brings late is still the state, and is what is captured;
