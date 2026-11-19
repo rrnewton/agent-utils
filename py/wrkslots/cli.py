@@ -87834,6 +87834,31 @@ def _same_uid_target_naming_matches(
     return tuple(dict.fromkeys(matches))
 
 
+def _generation_proven_gone(process: _AbsentProcessObservation) -> bool:
+    """Whether this exact (pid, start_ticks) generation is proven dead (#1883).
+
+    Death is proof, not suspicion: an unassigned PID, a PID now naming
+    another generation, or a terminal generation whose leader released
+    its threads can hold no reference and fork no holder.  Anything
+    inherited lives in a different generation, which the next inventory
+    scans.  A zombie leader whose threads may still run is NOT gone.
+    """
+
+    pid_dir = Path("/proc") / str(process.pid)
+    current = _read_process_stat(pid_dir)
+    if current is None:
+        return True
+    if current.start_ticks != process.start_ticks:
+        return True
+    if _process_is_zombie(pid_dir):
+        try:
+            _assert_leader_released_its_threads(process, pid_dir)
+        except Exception:
+            return False
+        return True
+    return False
+
+
 def _scan_same_uid_generations(
     processes: Sequence[_AbsentProcessObservation],
     targets: Mapping[Path, str],
@@ -87842,12 +87867,15 @@ def _scan_same_uid_generations(
 ) -> tuple[tuple[_AbsentProcessObservation, ...], tuple[_AbsentProcessObservation, ...]]:
     """Run every observer over ``processes``.
 
-    Returns the generations it scanned and those among them that are not
-    proven unrelated to the targets: they matched a held reference or a
-    mount, their argv or environ names a target, they received no
-    complete scan (replaced or terminal before it), or their generation
-    was no longer current when the scan ended (they may have forked a
-    holder that only the next inventory can meet).  Positive matches go
+    Returns the generations it scanned, those among them that are LIVE
+    and not proven unrelated to the targets (they matched a held
+    reference or a mount, their argv or environ names a target, or they
+    are still live but no longer current, so they may have forked a
+    holder), and a count of generations that were proven gone during
+    the round.  A proven-gone generation is followed, not counted
+    (#1883): it can hold nothing and fork nothing, but anything it
+    forked before dying is a different generation the next inventory
+    must meet, so its round is not proven either.  Positive matches go
     into ``found`` even when motion then discards the scan.
     """
 
@@ -87886,17 +87914,28 @@ def _scan_same_uid_generations(
     }
     scanned_set = set(processes)
     relevant: list[_AbsentProcessObservation] = []
+    followed = 0
     for process in inputs:
-        if process.pid in matched_pids or process not in scanned_set:
+        if process.pid in matched_pids:
             relevant.append(process)
+            continue
+        if process not in scanned_set:
+            # The preflight omitted it as terminal or replaced: proven
+            # gone (#1883), followed to whatever it left behind.
+            followed += 1
             continue
         try:
             current = _process_generation_is_current(process)
         except (Refusal, OSError, ValueError):
             current = False
         if not current:
-            relevant.append(process)
-    return processes, tuple(relevant)
+            if _generation_proven_gone(process):
+                followed += 1
+            else:
+                # Still live but changed (a fork or exec the next
+                # inventory must meet): followed, and counted (#1883).
+                relevant.append(process)
+    return processes, tuple(relevant), followed
 
 
 def _capture_same_uid_process_path_census_following(
@@ -87970,6 +88009,7 @@ def _capture_same_uid_process_path_census_following(
     discarded = 0
     relevant: tuple[_AbsentProcessObservation, ...] = ()
     relevant_rounds = 0
+    followed_rounds = 0
     proven_rounds = 0
     while True:
         budget.remaining_seconds()
@@ -87984,7 +88024,7 @@ def _capture_same_uid_process_path_census_following(
                 return _ProcessPathCensus(
                     tuple(scanned), tuple(found), owner_cgroup_complete=False
                 )
-            scanned_round, relevant = _scan_same_uid_generations(
+            scanned_round, relevant, followed = _scan_same_uid_generations(
                 unscanned, targets, budget, found
             )
             scanned.extend(scanned_round)
@@ -88001,7 +88041,7 @@ def _capture_same_uid_process_path_census_following(
             # already scanned (`_REREAD_GENERATIONS`).
             handled -= reread
             reread.clear()
-        if not relevant:
+        if not relevant and not followed:
             proven_rounds += 1
             if proven_rounds >= 2:
                 return _ProcessPathCensus(
@@ -88009,15 +88049,31 @@ def _capture_same_uid_process_path_census_following(
                 )
             continue
         proven_rounds = 0
+        if not relevant:
+            # Only proven-gone generations moved: follow them to the
+            # generations they left behind without counting the round
+            # toward the live bound (#1883).  An endless chain of
+            # handoffs is still a census that never closes, so followed
+            # rounds have their own bound.
+            followed_rounds += 1
+            if followed_rounds >= _SAME_UID_CENSUS_INVENTORIES:
+                raise Refusal(
+                    f"same-UID process census did not close: each of "
+                    f"{_SAME_UID_CENSUS_INVENTORIES} process inventories "
+                    "found generations that forked or exited before their "
+                    "scan completed; retry when fewer processes are starting"
+                )
+            continue
+        followed_rounds = 0
         relevant_rounds += 1
         if relevant_rounds >= _SAME_UID_CENSUS_INVENTORIES:
             sample = ", ".join(str(process.pid) for process in relevant[:5])
             raise Refusal(
                 f"same-UID process census did not close: each of "
                 f"{_SAME_UID_CENSUS_INVENTORIES} process inventories found "
-                "generations that may still use the target and no earlier "
-                f"scan had covered (most recently {len(relevant)}, PIDs "
-                f"{sample}); retry when fewer processes are starting"
+                "live generations that may still use the target and no "
+                f"earlier scan had covered (most recently {len(relevant)}, "
+                f"PIDs {sample}); retry when fewer processes are starting"
             )
 
 

@@ -608,3 +608,37 @@ def test_a_real_holder_that_forks_after_the_listing_and_exits(
         with pytest.raises(cli.Refusal, match=rf"live process {child} uses slot "):
             census.assert_slot_unused(slot, None)
 
+
+
+def test_unrelated_churn_that_dies_before_its_scan_never_blocks_closure(
+    monkeypatch: pytest.MonkeyPatch, slot: Path,
+) -> None:
+    """#1883: unrelated generations that are born and die between rounds
+    are proven gone, not relevant: the census closes under churn.
+
+    Mirrors the consumer seal case: every process the target's records
+    name is dead and the target itself is absent from the host's live
+    set, while unrelated processes keep starting and exiting.
+    """
+
+    bystander = (100, 7)
+    host = _Host(slot, bystander)
+    churn: list[tuple[int, int]] = []
+
+    def spawn_and_retire() -> None:
+        newborn = (2000 + len(churn), 50)
+        churn.append(newborn)
+        host.spawn(newborn)
+        if len(churn) > 2:
+            host.exit(churn[-3])
+
+    for listing in range(1, 12):
+        host.after_inventory[listing] = spawn_and_retire
+    _scripted(monkeypatch, host)
+
+    census = _census(host)
+
+    assert census.matches == ()
+    census.assert_slot_unused(slot, None, ignore_current_process=False)
+    # Closure needed only the proven rounds, not the refusal bound.
+    assert len(host.inventories) < cli._SAME_UID_CENSUS_INVENTORIES + 2
