@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-no-programmatic-scroll-after-user-scroll: no programmatic scroll moves a view the user has scrolled'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 assignee: mu-readerdrill
@@ -8,7 +8,8 @@ labels:
 - vibe-talk
 - ui
 created_at: 2026-11-18T17:50:00-05:00
-updated_at: 2026-11-18T17:50:00-05:00
+updated_at: 2026-11-18T22:05:00-05:00
+closed_at: 2026-11-18T22:05:00-05:00
 ---
 
 # Description
@@ -33,3 +34,7 @@ One rule, in the existing holders, no new writer: once the user has scrolled or 
 # Notes
 
 Owner-priority, lands ahead of #1872. Lane mu-readerdrill on branch mu-readerdrill/1880, worktree readerhold. Related: #1818, #1839, #1856.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as f9bb641c55faf801d6785b40bd0a5a778c8832e9 (gated head b561a035, owner gate validate: OK; verified-tree route, replay tree ead7ca23 verified with typecheck, channel JS and composer-stays). The scroll owner tracks the reader's own input; captures carry it (`ScrollMark.inputAt`, exported `userMovedSince` for other holders, #1894), and restores/holds do not write after it (a focused composer that stood in view is still kept, #1839). The drill anchor is placed once; the next read landing settles the entry and stops its keeper. Trace evidence: a user-scrolled thread held at delta 0 through a live arrival plus growth on the fixed tree, against 627 -> 478 (-149px) on unmodified main; composer-stays passes at both sizes again.
