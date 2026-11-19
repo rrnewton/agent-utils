@@ -633,6 +633,129 @@ def unit_name(config_dir: str) -> str:
     return f"edenfs@{escaped}.service"
 
 
+#: Per-checkout Sapling draft ledger (#1925). The ledger lives in a
+#: sidecar file under the slot's ``.eden-state`` (see cli.py), never in
+#: a slot record, so an older wrkslots reader never parses it.
+DRAFT_LEDGER_SCHEMA = 1
+DRAFT_LEDGER_KIND = "wrkslots-eden-draft-ledger"
+
+_NODE_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+@dataclass(frozen=True)
+class DraftLedger:
+    """Draft nodes one Eden checkout has owned, per wrkslots' own record."""
+
+    slot: str
+    checkout: str
+    generation: int | None
+    nodes: tuple[str, ...]
+    captured_at: str | None
+    last_error: str | None
+
+
+def draft_ledger_payload(ledger: DraftLedger) -> dict[str, object]:
+    """The canonical JSON object for one draft ledger sidecar."""
+
+    return {
+        "schema": DRAFT_LEDGER_SCHEMA,
+        "kind": DRAFT_LEDGER_KIND,
+        "slot": ledger.slot,
+        "checkout": ledger.checkout,
+        "generation": ledger.generation,
+        "nodes": list(ledger.nodes),
+        "captured_at": ledger.captured_at,
+        "last_error": ledger.last_error,
+    }
+
+
+def draft_ledger_from_obj(raw: object, label: str) -> DraftLedger:
+    """Validate one parsed draft ledger object; refuse any other shape."""
+
+    if not isinstance(raw, dict):
+        raise EdenError(f"{label} is not a JSON object")
+    expected = {"schema", "kind", "slot", "checkout", "generation",
+                "nodes", "captured_at", "last_error"}
+    if set(raw) != expected:
+        raise EdenError(f"{label} has unexpected or missing keys")
+    if raw["schema"] != DRAFT_LEDGER_SCHEMA or raw["kind"] != DRAFT_LEDGER_KIND:
+        raise EdenError(f"{label} is not a schema {DRAFT_LEDGER_SCHEMA} draft ledger")
+    slot, checkout = raw["slot"], raw["checkout"]
+    if not isinstance(slot, str) or not slot or not isinstance(checkout, str) or not checkout:
+        raise EdenError(f"{label} lacks a slot or checkout name")
+    generation = raw["generation"]
+    if generation is not None and (
+        not isinstance(generation, int) or isinstance(generation, bool) or generation < 1
+    ):
+        raise EdenError(f"{label} has an invalid generation")
+    nodes_raw = raw["nodes"]
+    if not isinstance(nodes_raw, list) or any(
+        not isinstance(node, str) or not _NODE_RE.fullmatch(node) for node in nodes_raw
+    ):
+        raise EdenError(f"{label} holds a node that is not a full Sapling commit id")
+    if list(nodes_raw) != sorted(set(nodes_raw)):
+        raise EdenError(f"{label} nodes are not sorted and deduplicated")
+    captured_at, last_error = raw["captured_at"], raw["last_error"]
+    if captured_at is not None and not isinstance(captured_at, str):
+        raise EdenError(f"{label} has an invalid captured_at")
+    if last_error is not None and not isinstance(last_error, str):
+        raise EdenError(f"{label} has an invalid last_error")
+    return DraftLedger(
+        slot=slot, checkout=checkout, generation=generation,
+        nodes=tuple(nodes_raw), captured_at=captured_at, last_error=last_error,
+    )
+
+
+def _run_nodes(runner: Runner, mount: str, revset: str) -> tuple[str, ...]:
+    rc, stdout, stderr = runner(
+        ["sl", "-R", mount, "log", "-r", revset, "-T", "{node}\n"]
+    )
+    if rc != 0:
+        raise EdenError(
+            f"Sapling accounting failed (sl -R {mount} log -r {revset!r}): "
+            f"{stderr.strip() or stdout.strip()}"
+        )
+    nodes: list[str] = []
+    for line in stdout.splitlines():
+        node = line.strip()
+        if node and node not in nodes:
+            nodes.append(node)
+    return tuple(nodes)
+
+
+def draft_stack_nodes(runner: Runner, mount: str) -> tuple[str, ...]:
+    """Draft ancestors of this mount's working-copy parent, only.
+
+    This is the per-checkout attribution primitive (#1925): the
+    working-copy parent is per mount even when the backing store is
+    shared, so another checkout's drafts enter only when this
+    checkout stacked or moved onto them.
+    """
+
+    return _run_nodes(runner, mount, "draft() & ::.")
+
+
+def all_draft_nodes(runner: Runner, mount: str) -> tuple[str, ...]:
+    """Every draft in the (possibly shared) backing store; never scoped."""
+
+    return _run_nodes(runner, mount, "draft()")
+
+
+def successor_nodes(
+    runner: Runner, mount: str, nodes: Sequence[str]
+) -> tuple[str, ...]:
+    """Current successors of ``nodes`` (rewrites such as amend), inclusive.
+
+    Children are deliberately not included: another checkout may
+    stack a child on a recorded draft, and that child is not this
+    checkout's work merely for descending from it.
+    """
+
+    if not nodes:
+        return ()
+    return _run_nodes(runner, mount, "successors(" + " + ".join(nodes) + ")")
+
+
 _DIFFREV_RE = re.compile(r"Differential Revision:\s*(?:\S*/)?D(\d+)")
 
 
@@ -642,16 +765,20 @@ def _diffrev(message: str) -> str | None:
 
 
 def classify_drafts(
-    runner: Runner, mount: str, checkout_name: str, head: str
+    runner: Runner, mount: str, checkout_name: str, head: str,
+    own_nodes: Sequence[str] | None = None,
 ) -> dict[str, object]:
-    """Classify one Eden checkout's Sapling drafts (#1702).
+    """Classify one Eden checkout's Sapling drafts (#1702, #1925).
 
-    Drafts are the checkout's non-public commits (`draft()`), which
-    include the journal's recent heads.  A draft is landed when its
-    Differential Revision already appears in public history, open
-    when it carries a bookmark (published for review), and
-    unaccounted otherwise.  The caller's --validation text plays no
-    part: only the `sl` evidence decides.
+    With ``own_nodes`` None this is the legacy store-wide reading:
+    the checkout's non-public commits (`draft()`), which on a shared
+    backing store includes every other checkout's drafts. With
+    ``own_nodes`` given (the per-checkout ledger), only those nodes
+    and their current successors are classified.  A draft is landed
+    when its Differential Revision already appears in public
+    history, open when it carries a bookmark (published for review),
+    and unaccounted otherwise.  The caller's --validation text plays
+    no part: only the `sl` evidence decides.
     """
 
     def run(argv: list[str]) -> str:
@@ -663,13 +790,16 @@ def classify_drafts(
             )
         return stdout
 
-    nodes = [
-        line.strip()
-        for line in run(
-            ["sl", "-R", mount, "log", "-r", "draft()", "-T", "{node}\n"]
-        ).splitlines()
-        if line.strip()
-    ]
+    if own_nodes is None:
+        nodes = [
+            line.strip()
+            for line in run(
+                ["sl", "-R", mount, "log", "-r", "draft()", "-T", "{node}\n"]
+            ).splitlines()
+            if line.strip()
+        ]
+    else:
+        nodes = list(successor_nodes(runner, mount, own_nodes))
     public_text = run(
         ["sl", "-R", mount, "log", "-r", "public()", "-l", "1000",
          "-T", "{desc}\n"]

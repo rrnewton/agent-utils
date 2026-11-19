@@ -2992,6 +2992,26 @@ and the daemon escapes caller scopes). A large backing repo needs
 its own disk and authentication budget, decided before cloning;
 a small local Sapling repo is enough to exercise the path.
 
+Finish accounting for an Eden checkout counts only that
+checkout's own Sapling drafts. All Eden checkouts on a host can
+share one backing store, in which `draft()` names every lane's
+drafts; wrkslots therefore records each checkout's draft stack
+(the draft ancestors of its working-copy parent) in a ledger
+under the slot's `.eden-state/wrkslots-drafts/` at create,
+heartbeat, write-handoff and finish, and accounts only those
+nodes and their rewrites. A slot created before this accounting
+has no ledger: finish refuses it, naming
+`wrkslots capture-drafts <slot>`, which the operator runs once
+with the checkout on its own draft tip as the explicit first
+capture. Drafts another checkout left in the shared store are
+never this slot's unaccounted work and can never be discarded
+as this slot's. One window remains: a wholly new stack built
+off a public revision and abandoned between captures, with the
+working copy never returning to it, is not in the ledger. Those
+commits stay in the shared backing store (finish missing them
+loses accounting, not the commits themselves), and a later
+`capture-drafts` from that stack's tip still records them.
+
 Retirement is `wrkslots remove <slot> --coordinator-pid <pid>
 --expected-generation N` (there is no `retire` verb;
 `retire-pending` only batches `remove`). For an agent slot, remove

@@ -2115,3 +2115,286 @@ def test_finish_accounting_counts_eden_drafts(
     entry = sink[0]
     assert [node for node, _s in entry["landed"]] == [landed_node]  # type: ignore[attr-defined]
     assert entry["unaccounted"] == []
+
+
+# --------------------------------- per-checkout drafts (#1925)
+
+
+def test_classify_drafts_scoped_to_own_nodes() -> None:
+    """Scoped classification never sees another checkout's draft."""
+    own_node = "a" * 40
+    other_node = "b" * 40
+    revsets: list[str] = []
+
+    def runner(argv: Sequence[str]) -> tuple[int, str, str]:
+        args = list(argv)
+        if "-r" in args:
+            revset = args[args.index("-r") + 1]
+            revsets.append(revset)
+            if revset.startswith("successors("):
+                return (0, f"{own_node}\n", "")
+            if revset == "draft()":
+                return (0, f"{own_node}\n{other_node}\n", "")
+            if revset == "public()":
+                return (0, "", "")
+            if revset == "bookmark()":
+                return (0, "", "")
+            return (0, "own loose work\n", "")
+        return (0, "own loose work\n", "")
+
+    entry = eden.classify_drafts(
+        runner, "/slot/checkout", "main", "d" * 40, own_nodes=(own_node,)
+    )
+    assert [node for node, _s in entry["unaccounted"]] == [own_node]  # type: ignore[attr-defined]
+    assert entry["landed"] == [] and entry["open"] == []
+    assert "draft()" not in revsets
+
+
+def test_classify_drafts_scoped_follows_amend_successor() -> None:
+    """A recorded draft is classified at its amended successor."""
+    old_node = "c" * 40
+    new_node = "e" * 40
+
+    def runner(argv: Sequence[str]) -> tuple[int, str, str]:
+        args = list(argv)
+        if "-r" in args:
+            revset = args[args.index("-r") + 1]
+            if revset.startswith("successors("):
+                assert old_node in revset
+                return (0, f"{new_node}\n", "")
+            if revset == "public()":
+                return (0, "", "")
+            if revset == "bookmark()":
+                return (0, "", "")
+            return (0, "amended loose work\n", "")
+        return (0, "amended loose work\n", "")
+
+    entry = eden.classify_drafts(
+        runner, "/slot/checkout", "main", new_node, own_nodes=(old_node,)
+    )
+    assert [node for node, _s in entry["unaccounted"]] == [new_node]  # type: ignore[attr-defined]
+
+
+def test_draft_ledger_round_trip_and_refusals() -> None:
+    ledger = eden.DraftLedger(
+        slot="s1", checkout="main", generation=2,
+        nodes=("a" * 40, "b" * 40), captured_at="2026-11-19T00:00:00+00:00",
+        last_error=None,
+    )
+    parsed = eden.draft_ledger_from_obj(eden.draft_ledger_payload(ledger), "ledger")
+    assert parsed == ledger
+    bad = eden.draft_ledger_payload(ledger)
+    bad["nodes"] = ["b" * 40, "a" * 40]
+    with pytest.raises(eden.EdenError, match="sorted"):
+        eden.draft_ledger_from_obj(bad, "ledger")
+    bad = eden.draft_ledger_payload(ledger)
+    bad["nodes"] = ["not-a-node"]
+    with pytest.raises(eden.EdenError, match="full Sapling"):
+        eden.draft_ledger_from_obj(bad, "ledger")
+
+
+def _scoped_config(tmp_path: Path) -> wrkslots_cli.Config:
+    (tmp_path / "slot" / "checkout").mkdir(parents=True)
+    return wrkslots_cli.Config(
+        config_path=tmp_path / ".wrkslots.yml",
+        root=tmp_path,
+        worktrees=tmp_path,
+        control=tmp_path,
+        machine="node-a",
+        default_remote="origin",
+        default_landed_ref="refs/remotes/origin/main",
+        heartbeat_ttl_seconds=60,
+        liveness_command=tmp_path / "live.py",
+    )
+
+
+def _scoped_runner(own_node: str, other_node: str) -> eden.Runner:
+    def runner(argv: Sequence[str]) -> tuple[int, str, str]:
+        args = list(argv)
+        if "info" in args:
+            return (
+                0,
+                '{"mount": "/slot/checkout", "state_dir": "/slot/.eden-state/c",'
+                f' "backing_repo": "/backing/repo", "checked_out_revision": "{REV}"}}',
+                "",
+            )
+        if "status" in args:
+            return (0, "", "")
+        if "-r" in args:
+            revset = args[args.index("-r") + 1]
+            if revset == "draft() & ::.":
+                return (0, f"{own_node}\n", "")
+            if revset.startswith("successors("):
+                return (0, f"{own_node}\n", "")
+            if revset == "draft()":
+                return (0, f"{own_node}\n{other_node}\n", "")
+            if revset == "public()":
+                return (0, "", "")
+            if revset == "bookmark()":
+                return (0, "", "")
+            return (0, "own loose work\n", "")
+        return (0, "own loose work\n", "")
+
+    return runner
+
+
+def test_finish_accounting_scoped_by_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With a ledger, finish accounts only this checkout's drafts."""
+    config = _scoped_config(tmp_path)
+    checkout = wrkslots_cli._checkout_from_obj(_eden_obj(), "row.checkouts[0]")
+    own_node, other_node = "c" * 40, "e" * 40
+    ledger_path = wrkslots_cli._eden_draft_ledger_path(config, checkout)
+    wrkslots_cli._write_eden_draft_ledger(
+        ledger_path,
+        eden.DraftLedger(
+            slot="slot", checkout="main", generation=1, nodes=(own_node,),
+            captured_at="2026-11-19T00:00:00+00:00", last_error=None,
+        ),
+    )
+    monkeypatch.setattr(
+        wrkslots_cli, "_eden_runner", _scoped_runner(own_node, other_node)
+    )
+    sink: list[dict[str, object]] = []
+    wrkslots_cli._assert_checkout_safe(
+        config, checkout, wrkslots_cli._GitVcs(),
+        accounting=True, accounting_sink=sink,
+        eden_slot="slot", eden_generation=1,
+    )
+    assert len(sink) == 1
+    entry = sink[0]
+    assert [node for node, _s in entry["unaccounted"]] == [own_node]  # type: ignore[attr-defined]
+    assert other_node not in str(entry)
+
+
+def test_finish_accounting_without_ledger_refuses_naming_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pre-#1925 checkout fails closed, naming capture-drafts."""
+    config = _scoped_config(tmp_path)
+    checkout = wrkslots_cli._checkout_from_obj(_eden_obj(), "row.checkouts[0]")
+    monkeypatch.setattr(
+        wrkslots_cli, "_eden_runner", _scoped_runner("c" * 40, "e" * 40)
+    )
+    sink: list[dict[str, object]] = []
+    with pytest.raises(wrkslots_cli.Refusal, match=r"capture-drafts slot"):
+        wrkslots_cli._assert_checkout_safe(
+            config, checkout, wrkslots_cli._GitVcs(),
+            accounting=True, accounting_sink=sink,
+            eden_slot="slot", eden_generation=1,
+        )
+    assert sink == []
+
+
+def test_capture_ledger_create_update_and_no_seed(tmp_path: Path) -> None:
+    """Capture unions stacks, never seeds silently, records failures."""
+    config = _scoped_config(tmp_path)
+    checkout = wrkslots_cli._checkout_from_obj(_eden_obj(), "row.checkouts[0]")
+    path = wrkslots_cli._eden_draft_ledger_path(config, checkout)
+    stack = ["a" * 40]
+
+    def runner(argv: Sequence[str]) -> tuple[int, str, str]:
+        return (0, "".join(f"{node}\n" for node in stack), "")
+
+    assert wrkslots_cli._capture_eden_draft_ledger(
+        config, checkout, slot="slot", generation=1, runner=runner, create=False
+    ) is None
+    assert not path.exists()
+    created = wrkslots_cli._capture_eden_draft_ledger(
+        config, checkout, slot="slot", generation=1, runner=runner, create=True
+    )
+    assert created is not None and created.nodes == ("a" * 40,)
+    stack[:] = ["b" * 40]
+    updated = wrkslots_cli._capture_eden_draft_ledger(
+        config, checkout, slot="slot", generation=1, runner=runner, create=False
+    )
+    assert updated is not None and updated.nodes == ("a" * 40, "b" * 40)
+
+    def failing(argv: Sequence[str]) -> tuple[int, str, str]:
+        return (1, "", "daemon down")
+
+    with pytest.raises(eden.EdenError, match="daemon down"):
+        wrkslots_cli._capture_eden_draft_ledger(
+            config, checkout, slot="slot", generation=1, runner=failing,
+            create=False,
+        )
+    ledger = wrkslots_cli._load_eden_draft_ledger(
+        path, slot="slot", checkout=checkout, generation=1
+    )
+    assert ledger is not None
+    assert ledger.nodes == ("a" * 40, "b" * 40)
+    assert ledger.last_error is not None and "daemon down" in ledger.last_error
+
+
+def test_real_sl_shared_store_scopes_drafts(tmp_path: Path) -> None:
+    """Real Sapling: two working copies, one backing store (#1925).
+
+    The sharedpath construction gives both working copies the same
+    store (the Eden shape), so store-wide draft() leaks the other
+    copy's draft while the per-checkout stack and successors do not.
+    """
+    sl = shutil.which("sl")
+    if sl is None:
+        pytest.skip("sl is not available")
+
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env["HOME"] = str(home)
+
+    def run(*args: str) -> str:
+        result = subprocess.run(
+            [sl, "--config", "ui.username=Test <t@example.invalid>", *args],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        assert result.returncode == 0, result.stderr
+        return result.stdout.strip()
+
+    def runner(argv: Sequence[str]) -> tuple[int, str, str]:
+        result = subprocess.run(
+            [sl, "--config", "ui.username=Test <t@example.invalid>",
+             *[str(item) for item in argv[1:]]],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        return (result.returncode, result.stdout, result.stderr)
+
+    backing = tmp_path / "backing"
+    backing.mkdir()
+    run("init", str(backing))
+    (backing / "a.txt").write_text("a\n")
+    run("-R", str(backing), "add", str(backing / "a.txt"))
+    run("-R", str(backing), "commit", "-m", "public base")
+    copies: dict[str, Path] = {}
+    for name in ("wc1", "wc2"):
+        copy = tmp_path / name
+        run("clone", str(backing), str(copy))
+        shutil.rmtree(copy / ".hg" / "store")
+        (copy / ".hg" / "sharedpath").write_text(str(backing / ".hg") + "\n")
+        copies[name] = copy
+    nodes: dict[str, str] = {}
+    for name, filename in (("wc1", "b.txt"), ("wc2", "c.txt")):
+        copy = copies[name]
+        (copy / filename).write_text(f"{name}\n")
+        run("-R", str(copy), "add", str(copy / filename))
+        run("-R", str(copy), "commit", "-m", f"{name} draft")
+        nodes[name] = run("-R", str(copy), "log", "-r", ".", "-T", "{node}")
+
+    wc1, wc2 = str(copies["wc1"]), str(copies["wc2"])
+    # The defect, reproduced: the shared store leaks wc2's draft.
+    assert set(eden.all_draft_nodes(runner, wc1)) >= {nodes["wc1"], nodes["wc2"]}
+    # The per-checkout stack does not.
+    assert nodes["wc1"] in eden.draft_stack_nodes(runner, wc1)
+    assert nodes["wc2"] not in eden.draft_stack_nodes(runner, wc1)
+    assert nodes["wc2"] in eden.draft_stack_nodes(runner, wc2)
+    assert nodes["wc1"] not in eden.draft_stack_nodes(runner, wc2)
+
+    (copies["wc1"] / "b.txt").write_text("wc1 amended\n")
+    run("-R", wc1, "amend", "-m", "wc1 draft amended")
+    amended = run("-R", wc1, "log", "-r", ".", "-T", "{node}")
+    assert eden.successor_nodes(runner, wc1, (nodes["wc1"],)) == (amended,)
+    entry = eden.classify_drafts(
+        runner, wc1, "main", amended, own_nodes=(nodes["wc1"],)
+    )
+    assert [node for node, _s in entry["unaccounted"]] == [amended]  # type: ignore[attr-defined]
+    assert nodes["wc2"] not in str(entry)

@@ -31382,6 +31382,159 @@ def _assert_cache_policy_untracked(
     )
 
 
+def _eden_draft_ledger_path(config: Config, checkout: Checkout) -> Path:
+    """Sidecar holding one Eden checkout's own draft nodes (#1925).
+
+    Under the slot's ``.eden-state``: already an allowed slot-dir
+    entry, never parsed as part of a slot record, so an older reader
+    ignores it and its finish keeps refusing store-wide (fail-safe).
+    """
+
+    path = _stored_path(config, checkout.path, "checkout path")
+    slot_path = _eden_slot_path(config, path, checkout)
+    return slot_path / ".eden-state" / "wrkslots-drafts" / f"{checkout.name}.json"
+
+
+def _load_eden_draft_ledger(
+    path: Path, *, slot: str, checkout: Checkout, generation: int | None
+) -> eden.DraftLedger | None:
+    """The recorded ledger for one checkout, or None when never captured."""
+
+    if not path.exists() and not path.is_symlink():
+        return None
+    label = f"Eden draft ledger {path}"
+    raw = _strict_json_object(
+        _read_bounded_regular_file(path, label, _JOURNAL_BYTES_LIMIT), label
+    )
+    try:
+        ledger = eden.draft_ledger_from_obj(raw, label)
+    except eden.EdenError as exc:
+        raise StateError(str(exc)) from exc
+    if ledger.slot != slot or ledger.checkout != checkout.name:
+        raise StateError(f"{label} names another slot or checkout")
+    if generation is not None and ledger.generation not in (None, generation):
+        raise StateError(
+            f"{label} belongs to generation {ledger.generation}, not {generation}"
+        )
+    return ledger
+
+
+def _write_eden_draft_ledger(path: Path, ledger: eden.DraftLedger) -> None:
+    payload = eden.draft_ledger_payload(ledger)
+    _atomic_write_json(path, payload)
+    label = f"Eden draft ledger {path}"
+    written = eden.draft_ledger_from_obj(
+        _strict_json_object(
+            _read_bounded_regular_file(path, label, _JOURNAL_BYTES_LIMIT), label
+        ),
+        label,
+    )
+    if not _json_equal(eden.draft_ledger_payload(written), payload):
+        raise StateError(f"Eden draft ledger readback failed: {path}")
+
+
+def _capture_eden_draft_ledger(
+    config: Config,
+    checkout: Checkout,
+    *,
+    slot: str,
+    generation: int | None,
+    runner: eden.Runner,
+    create: bool,
+) -> eden.DraftLedger | None:
+    """Union this mount's current draft stack into its ledger.
+
+    Returns None without writing anything when no ledger exists and
+    ``create`` is false: touchpoints never seed a pre-#1925 checkout
+    silently. A failed capture is recorded as the ledger's
+    ``last_error`` (when a ledger exists or is being created) and
+    re-raised.
+    """
+
+    path = _eden_draft_ledger_path(config, checkout)
+    # Generation is not checked here: a capture restamps the ledger
+    # with the caller's generation, which is how a ledger left by a
+    # previous generation of the same slot is adopted explicitly.
+    existing = _load_eden_draft_ledger(
+        path, slot=slot, checkout=checkout, generation=None
+    )
+    if existing is None and not create:
+        return None
+    mount = str(_stored_path(config, checkout.path, "checkout path"))
+    try:
+        current = eden.draft_stack_nodes(runner, mount)
+    except eden.EdenError as exc:
+        failed = eden.DraftLedger(
+            slot=slot,
+            checkout=checkout.name,
+            generation=generation if generation is not None else (
+                existing.generation if existing is not None else None
+            ),
+            nodes=existing.nodes if existing is not None else (),
+            captured_at=existing.captured_at if existing is not None else None,
+            last_error=str(exc),
+        )
+        try:
+            _write_eden_draft_ledger(path, failed)
+        except (OSError, Refusal, StateError):
+            pass
+        raise
+    ledger = eden.DraftLedger(
+        slot=slot,
+        checkout=checkout.name,
+        generation=generation if generation is not None else (
+            existing.generation if existing is not None else None
+        ),
+        nodes=tuple(sorted(set(existing.nodes if existing is not None else ()) | set(current))),
+        captured_at=_utc_now(),
+        last_error=None,
+    )
+    _write_eden_draft_ledger(path, ledger)
+    return ledger
+
+
+def _eden_scoped_draft_nodes(
+    config: Config,
+    checkout: Checkout,
+    *,
+    slot: str,
+    generation: int | None,
+    runner: eden.Runner,
+) -> tuple[str, ...]:
+    """This checkout's own draft nodes for finish accounting (#1925).
+
+    Captures the current stack into the existing ledger first. A
+    checkout with no ledger predates #1925 (or was never captured):
+    refuse naming the explicit first-capture command rather than
+    attributing the shared store's drafts to it, or silently
+    passing drafts it left off its current stack.
+    """
+
+    path = _eden_draft_ledger_path(config, checkout)
+    existing = _load_eden_draft_ledger(
+        path, slot=slot, checkout=checkout, generation=generation
+    )
+    if existing is None:
+        raise Refusal(
+            f"checkout {checkout.name} has no per-checkout draft ledger, so its "
+            "Sapling drafts cannot be separated from other checkouts sharing "
+            "its backing store. state: REFUSED -- no draft was attributed to "
+            "this slot. remedy: put the checkout on its own draft tip "
+            "(sl goto <draft tip>), run "
+            f"'wrkslots capture-drafts {slot}', then rerun finish"
+        )
+    try:
+        captured = _capture_eden_draft_ledger(
+            config, checkout, slot=slot, generation=generation,
+            runner=runner, create=False,
+        )
+    except eden.EdenError as exc:
+        raise Refusal(str(exc)) from exc
+    if captured is None:  # the ledger was just proven to exist
+        raise StateError(f"Eden draft ledger disappeared: {path}")
+    return captured.nodes
+
+
 def _assert_eden_checkout_safe(
     config: Config, checkout: Checkout, runner: eden.Runner | None = None
 ) -> Checkout:
@@ -31427,18 +31580,33 @@ def _assert_checkout_safe(
     ignored_mode: _IgnoredMode = "refuse",
     ignored_sink: dict[str, tuple[_IgnoredFile, ...]] | None = None,
     expected_ignored: tuple[_IgnoredFile, ...] | None = None,
+    eden_slot: str | None = None,
+    eden_generation: int | None = None,
 ) -> Checkout:
     if checkout.vcs == "eden":
         safe = _assert_eden_checkout_safe(config, checkout)
         if accounting and accounting_sink is not None:
             # Sapling draft accounting (#1702): without this the
             # finish totals rested entirely on the --validation
-            # text for an Eden slot.
+            # text for an Eden slot. Scoped to this checkout's own
+            # draft ledger (#1925) whenever the caller names its
+            # slot; slot-less internal callers keep the legacy
+            # store-wide reading.
             mount = _stored_path(config, safe.path, "checkout path")
             try:
-                acct_entry = eden.classify_drafts(
-                    _eden_runner, str(mount), safe.name, safe.head
-                )
+                if eden_slot is None:
+                    acct_entry = eden.classify_drafts(
+                        _eden_runner, str(mount), safe.name, safe.head
+                    )
+                else:
+                    own_nodes = _eden_scoped_draft_nodes(
+                        config, safe, slot=eden_slot,
+                        generation=eden_generation, runner=_eden_runner,
+                    )
+                    acct_entry = eden.classify_drafts(
+                        _eden_runner, str(mount), safe.name, safe.head,
+                        own_nodes=own_nodes,
+                    )
             except eden.EdenError as exc:
                 raise Refusal(str(exc)) from exc
             accounting_sink.append(acct_entry)
@@ -41609,6 +41777,8 @@ def _handoff_preconditions(
             expected_ignored=(
                 None if expected_ignored is None else expected_ignored.get(item.name, ())
             ),
+            eden_slot=record.slot,
+            eden_generation=record.generation,
         )
         for item in record.checkouts
     )
@@ -46310,6 +46480,32 @@ def _provision_eden_slot(
         containing_remote_refs=(),
         vcs="eden",
     )
+    # Born with a draft ledger (#1925): at the provisioning revision
+    # the draft stack is normally empty. A capture failure must not
+    # fail the create; it is recorded in the ledger and finish will
+    # refuse until a later capture succeeds.
+    ledger_path = slot_path / ".eden-state" / "wrkslots-drafts" / f"{name}.json"
+    try:
+        created_nodes = eden.draft_stack_nodes(_eden_runner, str(mount))
+        _write_eden_draft_ledger(
+            ledger_path,
+            eden.DraftLedger(
+                slot=args.slot, checkout=name, generation=None,
+                nodes=tuple(sorted(set(created_nodes))),
+                captured_at=_utc_now(), last_error=None,
+            ),
+        )
+    except Exception as exc:  # recorded, never fatal to create
+        try:
+            _write_eden_draft_ledger(
+                ledger_path,
+                eden.DraftLedger(
+                    slot=args.slot, checkout=name, generation=None,
+                    nodes=(), captured_at=None, last_error=str(exc),
+                ),
+            )
+        except Exception:
+            pass
     return checkout, tuple(in_slot_targets), tuple(derived_targets)
 
 
@@ -49076,6 +49272,36 @@ def _heartbeat_wait_seconds(args: argparse.Namespace, ttl_seconds: float) -> flo
     return max(1.0, min(10.0, ttl_seconds / 3.0))
 
 
+def _capture_eden_drafts_after_touchpoint(
+    config: Config, record: ActiveRecord, action: str
+) -> None:
+    """Best-effort draft capture after heartbeat or write-handoff (#1925).
+
+    A failed capture never undoes the touchpoint that just succeeded:
+    it warns, the failure is recorded in the checkout's ledger, and
+    finish refuses until a capture succeeds. Slots with no ledger
+    (created before #1925) are left untouched: no silent seeding.
+    """
+
+    for checkout in record.checkouts:
+        if checkout.vcs != "eden":
+            continue
+        try:
+            _capture_eden_draft_ledger(
+                config, checkout, slot=record.slot,
+                generation=record.generation, runner=_eden_runner,
+                create=False,
+            )
+        except (eden.EdenError, Refusal, StateError, OSError) as exc:
+            print(
+                f"WARNING: slot {record.slot} checkout {checkout.name} "
+                f"Sapling draft capture failed after {action} ({exc}); "
+                f"the {action} was recorded anyway and finish will refuse "
+                "until a capture succeeds",
+                file=sys.stderr,
+            )
+
+
 def _cmd_heartbeat(args: argparse.Namespace) -> int:
     _reset_dead_mount_findings()
     config = _load_config(args.project_root, args.machine)
@@ -49369,6 +49595,7 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
                 print(stderr_text, end="", file=sys.stderr)
     for warning in warnings:
         print(warning, file=sys.stderr)
+    _capture_eden_drafts_after_touchpoint(config, updated, "heartbeat")
     print(
         f"heartbeat slot={updated.slot} generation={updated.generation} at={updated.heartbeat_at}"
     )
@@ -49530,6 +49757,53 @@ def _cmd_release(args: argparse.Namespace) -> int:
         "note: leave the slot now; remove refuses while any process, yours included, "
         "has its working directory, an open file or a mapping inside it"
     )
+    return 0
+
+
+def _cmd_capture_drafts(args: argparse.Namespace) -> int:
+    """Explicit first (or repeat) per-checkout draft capture (#1925)."""
+
+    _reset_dead_mount_findings()
+    config = _load_config(args.project_root, args.machine)
+    _validate_name(args.slot, "slot")
+    results: list[tuple[str, eden.DraftLedger, int]] = []
+    with _mutation_locks(config, args.wait_lock):
+        _refuse_partial_state(config)
+        _assert_no_journal(config, target_slot=args.slot)
+        states, _archives = _validate_global_state(config)
+        _assert_command_registry_storage(config, states, args)
+        record = _find_record(_load_active(config), args.slot)
+        _report_dead_for_record(config, states, record)
+        eden_checkouts = [item for item in record.checkouts if item.vcs == "eden"]
+        if not eden_checkouts:
+            raise Refusal(
+                f"slot {record.slot} has no Eden checkout; capture-drafts "
+                "only records Sapling drafts of an Eden slot"
+            )
+        for checkout in eden_checkouts:
+            try:
+                captured = _capture_eden_draft_ledger(
+                    config, checkout, slot=record.slot,
+                    generation=record.generation, runner=_eden_runner,
+                    create=True,
+                )
+                if captured is None:  # create=True always writes one
+                    raise StateError("draft capture wrote no ledger")
+                mount = str(_stored_path(config, checkout.path, "checkout path"))
+                store_total = len(eden.all_draft_nodes(_eden_runner, mount))
+            except eden.EdenError as exc:
+                raise Refusal(
+                    f"draft capture for checkout {checkout.name} failed: {exc}"
+                ) from exc
+            results.append((checkout.name, captured, store_total))
+    for name, captured, store_total in results:
+        print(
+            f"captured-drafts slot={args.slot} checkout={name} "
+            f"nodes={len(captured.nodes)} store_drafts={store_total} "
+            f"not_attributed={max(store_total - len(captured.nodes), 0)}"
+        )
+        for node in captured.nodes:
+            print(f"captured {node}")
     return 0
 
 
@@ -50280,6 +50554,7 @@ def _cmd_write_handoff(args: argparse.Namespace) -> int:
                 "writer": _identity_to_obj(owner),
             },
         )
+    _capture_eden_drafts_after_touchpoint(config, record, "write-handoff")
     print(
         f"wrote handoff slot={record.slot} generation={record.generation} "
         f"sha256={artifact.sha256} path={sidecar_path}"
@@ -99261,6 +99536,25 @@ usage or audit gate unknown, 3 fail-closed refusal.
         help="current slot generation",
     )
     heartbeat.set_defaults(handler=_cmd_heartbeat)
+
+    capture_drafts = subparsers.add_parser(
+        "capture-drafts",
+        help="record an Eden checkout's own Sapling draft stack",
+        description=(
+            "Record the Sapling drafts that belong to one Eden slot's checkout: the draft "
+            "ancestors of its working-copy parent (draft() & ::.), unioned into the "
+            "checkout's ledger under its .eden-state. Run it with the checkout on its own "
+            "draft tip (sl goto <draft tip>) as the explicit first capture for a slot "
+            "created before per-checkout draft accounting existed; finish refuses such a "
+            "slot until this has run. Later heartbeat, write-handoff and finish captures "
+            "update the ledger automatically. Drafts of other checkouts sharing the "
+            "backing store are reported only as a count of not-attributed drafts; they "
+            "are never recorded as this slot's."
+        ),
+        formatter_class=_HelpFormatter,
+    )
+    capture_drafts.add_argument("slot", help="active slot name")
+    capture_drafts.set_defaults(handler=_cmd_capture_drafts)
 
     release = subparsers.add_parser(
         "release",
