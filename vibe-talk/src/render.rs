@@ -1312,6 +1312,20 @@ fn mark_message_links(html: &str) -> String {
         }
         out.push_str(&rest[..=end]);
         if let Some(target) = crate::message_links::recognize(&href) {
+            // A bridge-expanded thread reference (`#1889 vibe-talk-thread-ref-opens-thread-view`):
+            // its address is a plain message permalink, but its whole label is the drawn
+            // `:thread:` reference, so it carries the thread intent a raw reference carries.
+            // Only when the label's number resolves to this very root: a label that names
+            // another thread, or none, keeps the plain message marking.
+            if let Some(thread) = bridge_thread_target(&target, &rest[end + 1..]) {
+                out.push_str(&format!(
+                    " {}=\"{}\" data-shortref=\"thread\"",
+                    crate::message_links::ATTRIBUTE,
+                    thread.attribute()
+                ));
+                rest = &rest[end + 1..];
+                continue;
+            }
             out.push_str(&format!(
                 " {}=\"{}\"",
                 crate::message_links::ATTRIBUTE,
@@ -1327,6 +1341,50 @@ fn mark_message_links(html: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// The thread target a bridge-expanded thread reference names, or `None`: `target` is what
+/// its permalink names (its root message) and `after_tag` is the HTML just past the link's
+/// opening tag, whose text must be the whole drawn label `🧵NNN` (with its filed slug,
+/// `🧵NNN/slug`, when one is held). The number must resolve, through the installed
+/// short references, to this channel and this root; anything else is no thread intent.
+/// `#1889 vibe-talk-thread-ref-opens-thread-view`.
+fn bridge_thread_target(
+    target: &crate::message_links::Target,
+    after_tag: &str,
+) -> Option<crate::message_links::Target> {
+    let message = target.message.as_deref()?;
+    // Past the rest of the opening tag (the sanitizer's own attributes follow `href`).
+    let label = after_tag.split_once('>')?.1;
+    let label = label.split('<').next()?;
+    let digits: String = label
+        .strip_prefix('🧵')?
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    let number: u64 = digits.parse().ok()?;
+    // The label is exactly the drawn reference: its number, then its slug or nothing.
+    let tail = &label['🧵'.len_utf8() + digits.len()..];
+    if !(tail.is_empty() || tail.starts_with('/')) {
+        return None;
+    }
+    let resolved = crate::short_refs::short_refs().thread(number)?;
+    if resolved.channel != target.channel {
+        return None;
+    }
+    let root = resolved.thread.as_deref()?;
+    let root_id = crate::slack::ids::message_id_from_ts(root)
+        .map(|id| id.as_str().to_owned())
+        .unwrap_or_else(|| root.to_owned());
+    if root_id != message && root != message {
+        return None;
+    }
+    Some(crate::message_links::Target {
+        service: crate::message_links::Service::Slack,
+        channel: target.channel.clone(),
+        message: None,
+        thread: Some(root.to_owned()),
+    })
 }
 
 /// A short reference's internal address (`SHORTREF_HOST`) read back into what it names: the
@@ -7060,6 +7118,48 @@ mod short_ref_tests {
         );
         let html = to_html(&read, Markup::Slack);
         assert!(html.contains(">🧵060/runner-wedged</a>"), "{html}");
+    }
+
+    #[test]
+    fn a_bridge_expanded_thread_reference_keeps_thread_intent() {
+        // `#1889 vibe-talk-thread-ref-opens-thread-view`: a bridge-expanded
+        // `:thread:` reference's address is a plain message permalink, but its
+        // label names the thread, so it is marked as a thread link whose
+        // `data-msg` names the thread (no message) — the click opens the
+        // thread view, not a jump to the root message.
+        let refs = ShortRefs::parse(FIXTURE).expect("the fixture parses");
+        let _guard = ShortRefsGuard::set(
+            refs,
+            Some("https://tracker.example.invalid/issues/{n}".to_owned()),
+        );
+        let read = crate::slack::mrkdwn::to_markdown(
+            "poll ([https://acme.slack.com/archives/C0123ABCD/p1700000000000100 :thread:060]\
+             (https://acme.slack.com/archives/C0123ABCD/p1700000000000100%7C:thread:060))",
+        );
+        let html = to_html(&read, Markup::Slack);
+        assert!(html.contains("data-shortref=\"thread\""), "{html}");
+        assert!(
+            html.contains("data-msg=\"slack:C0123ABCD::1700000000.000100\""),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn a_thread_label_on_another_root_stays_a_message_link() {
+        // A label naming a thread its permalink is not the root of earns no
+        // thread intent, and neither does a pasted permalink with no label.
+        let refs = ShortRefs::parse(FIXTURE).expect("the fixture parses");
+        let _guard = ShortRefsGuard::set(
+            refs,
+            Some("https://tracker.example.invalid/issues/{n}".to_owned()),
+        );
+        let read = crate::slack::mrkdwn::to_markdown(
+            "poll ([https://acme.slack.com/archives/C0123ABCD/p1700000050000300 :thread:060]\
+             (https://acme.slack.com/archives/C0123ABCD/p1700000050000300%7C:thread:060)) \
+             and https://acme.slack.com/archives/C0123ABCD/p1700000000000100",
+        );
+        let html = to_html(&read, Markup::Slack);
+        assert!(!html.contains("data-shortref"), "{html}");
     }
 
     #[test]

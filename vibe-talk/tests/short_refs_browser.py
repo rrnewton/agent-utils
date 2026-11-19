@@ -270,13 +270,17 @@ def short_ref_walk(desk: Desk, api: ShortRefApi) -> None:
     desk.settled()
     desk.shot("email-highlight")
 
-    # A thread link drills into the thread.
+    # A thread link drills into the thread, root highlighted (#1877).
     page.click('a[data-shortref="thread"]')
     desk.wait_for("""() => {
       const rows = [...document.querySelectorAll('#discord-log > li[data-id]')];
       return rows.some(r => r.getAttribute('data-id') === '202')
         && (document.body.textContent || '').includes('an answer in the thread');
     }""", "the thread link did not open the thread")
+    desk.wait_for("""() => {
+      const root = document.querySelector('#discord-log > li[data-id="201"]');
+      return root && (root.querySelector('.linked-marker') || root.classList.contains('linked'));
+    }""", "the thread link did not highlight the root message")
     desk.settled()
     desk.shot("thread-open")
     desk.notes.append("short references link, highlight, and drill in")

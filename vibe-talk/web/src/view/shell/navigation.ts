@@ -1249,11 +1249,22 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
    * an `:email:` highlights its message where the current view already shows it, else makes
    * it visible by landing in All. Both reuse the message-link jump and its Back level.
    */
+  /** Highlight a just-opened thread's root: its first row, lit as a linked message is. */
+  async function highlightThreadRoot(channel: string): Promise<void> {
+    await waitForDeepLink(() => deps.visibleList().children.length > 0);
+    const first = deps.visibleList().children[0] as HTMLElement | undefined;
+    if (!first) return;
+    const id = first.getAttribute("data-context-id") || deps.idsOf(first)[0];
+    if (!id) return;
+    deps.setLinkedMark(channel, String(id));
+    deps.revealRow(first, false);
+  }
+
   async function jumpToShortRef(kind: string, ref: MessageLinkRef): Promise<void> {
     if (deps.screens().screen() !== "main" || deps.screens().view() !== "discord") return undefined;
     const here = String(deps.selectedChannelId() || "");
-    if (kind === "thread" && ref.thread && ref.channel === here) {
-      const now = channelPlace();
+    if (kind === "thread" && ref.thread) {
+      const now = ref.channel === here ? channelPlace() : null;
       if (now && now.layout === "two") {
         const spot = linkJumpSpot();
         const under = linkJumps.top();
@@ -1264,6 +1275,7 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
         try {
           arriveAtPlace({ screen: "main", channel: ref.channel, layout: "two", view: null, thread: null, origin: null, side: ref.thread });
           deps.setStatus("Here is the linked thread.");
+          await deps.inColumn(deps.sideColumn(), () => highlightThreadRoot(ref.channel));
         } finally {
           if (jump.landed === null && linkJumps.holds(jump)) {
             jump.landed = screenLevelsNow();
@@ -1272,6 +1284,14 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
         }
         return undefined;
       }
+      // One column, from All, Main or another thread (or another channel): the thread
+      // view itself, root highlighted, with the message jump's Back level.
+      const spot = linkJumpSpot();
+      await deps.inColumn(deps.mainColumn(), async () => {
+        await jumpFromSpot(ref, spot);
+        await highlightThreadRoot(ref.channel);
+      });
+      return undefined;
     }
     if (kind === "email" && ref.message && ref.channel === here && deps.rowHolding(ref.message)) {
       const target = ref.message;
