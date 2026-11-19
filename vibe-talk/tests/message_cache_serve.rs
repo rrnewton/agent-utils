@@ -3785,6 +3785,63 @@ async fn a_transcript_day_reads_newest_first_a_window_at_a_time() {
 }
 
 #[tokio::test]
+async fn a_transcript_older_step_answers_at_once_while_its_provider_read_is_held() {
+    // `#1886` addendum-1 (owner thread 214): a step back whose provider
+    // read is held answers at once from the server's copy - an empty
+    // page that says there is more, at the same cursor - while the read
+    // runs on behind it; once released, the same step takes the chunk
+    // the provider brought. If the route waited on the provider, this
+    // test would hang on the held reply instead of reaching its asserts.
+    let (state, fake, _clock, _dir) = slack_transcript_deployment("transcript-older-race").await;
+    ok(&state, &path(SLACK_CH, "/timeline?view=main&limit=50"), WRITE_TOKEN).await;
+    settled(&state).await;
+    let root_a = slack_fake::ts(600, 0);
+    let day = |query: &str| format!("/api/v1/transcripts/{SLACK_CH}/{root_a}?{query}");
+    let newest = ok(&state, &day("limit=2"), WRITE_TOKEN).await;
+    settled(&state).await;
+    let cursor = newest["next_before"].as_str().expect("a way back").to_owned();
+    let hold = slack_fake::Hold::new(&root_a);
+    fake.with(|fake_state| fake_state.hold_replies = Some(hold.clone()));
+    let stepped = ok(
+        &state,
+        &day(&format!("limit=2&before={}", url_encode(&cursor))),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert!(
+        texts(&stepped).is_empty(),
+        "the held step answered with chunks it could not have read: {stepped}"
+    );
+    assert_eq!(stepped["has_more"], true, "{stepped}");
+    assert_eq!(stepped["next_before"], cursor, "{stepped}");
+    assert!(
+        stepped["refresh_failed"].is_string(),
+        "the fallback is not marked as the server's copy: {stepped}"
+    );
+    hold.release.notify_one();
+    let mut landed = Vec::new();
+    for _ in 0..60 {
+        settled(&state).await;
+        let again = ok(
+            &state,
+            &day(&format!("limit=2&before={}", url_encode(&cursor))),
+            WRITE_TOKEN,
+        )
+        .await;
+        landed = texts(&again);
+        if !landed.is_empty() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        landed,
+        ["liaison main session trace, 2026-11-18 ET"],
+        "the background read never filled the step"
+    );
+}
+
+#[tokio::test]
 async fn a_transcript_day_interleaves_the_sent_messages_v2_names() {
     // `#1886` part C: the day's second entry is v2 and names "message 1"
     // as sent before it. Once a Main read has filled the cache with

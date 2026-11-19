@@ -315,6 +315,19 @@ def walk_through(walk: Walk, keyboard: bool, discuss: bool = False) -> None:
                "return li && li.classList.contains('transcript-sent-open') && "
                "(li.textContent || '').includes('before saying so'); }",
                "tapping the vestigial entry did not open its full card")
+    # The opened card is the regular message card: author and time on
+    # its meta line, the thread's chip and the row actions.
+    card_bits = page.evaluate("""() => {
+      const li = document.querySelector('#transcripts-log .transcript-sent-open');
+      if (!li) return "";
+      const author = li.querySelector('.msg-author');
+      const time = li.querySelector('.msg-time');
+      const buttons = [...li.querySelectorAll('button')].map((b) => b.textContent).join(",");
+      return [author ? author.textContent : "", time ? time.textContent : "", buttons].join("|");
+    }""")
+    walk.check("ci-bot" in card_bits, f"the opened card does not name its author: {card_bits!r}")
+    walk.check("Thread" in card_bits and "Reply" in card_bits and "Done" in card_bits,
+               f"the opened card lacks the row actions: {card_bits!r}")
     page.evaluate("() => document.querySelector('#transcripts-log .transcript-sent')"
                   ".scrollIntoView({block: 'center'})")
     walk.settled()
@@ -340,6 +353,19 @@ def walk_through(walk: Walk, keyboard: bool, discuss: bool = False) -> None:
                ".some((li) => (li.textContent || '').includes('just arrived'))",
                "a chunk that arrived while following did not join the open day")
     walk.shot("transcripts-day-followed")
+    # `#1886` addendum-1 (c): Cmd-2 from inside the Transcripts view
+    # leaves it for All, as picking the view does (it appeared dead
+    # before: the chord chose the view underneath the overlay).
+    page.keyboard.press("Meta+Digit2")
+    walk.until("() => document.getElementById('transcripts-view').hidden "
+               "&& !document.getElementById('discord-log').hidden",
+               "Cmd-2 from the Transcripts view did not leave it for the channel")
+    walk.check(page.evaluate("() => document.getElementById('thread-select').value") == "flat",
+               "Cmd-2 did not choose All")
+    # And back into Transcripts for the search flow below.
+    page.select_option("#thread-select", "transcripts")
+    walk.until("() => !document.getElementById('transcripts-view').hidden",
+               "the Transcripts view did not return")
     # Back to Main for the search: the bucket starts off there.
     page.select_option("#thread-select", "main")
     walk.until("() => document.getElementById('transcripts-view').hidden",

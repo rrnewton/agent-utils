@@ -33,6 +33,9 @@ export interface ViewKeysDependencies<Column> {
   channelOnScreen(): boolean;
   /** Choose the view `which` (`chooseView`). */
   chooseView(which: ViewChoice): void;
+  /** Whether the Transcripts overlay is the view on screen, and leaving it (`#1886` addendum-1). */
+  transcriptsOpen?(): boolean;
+  closeTranscripts?(): void;
   /** Settle the focus after the view changes. */
   settleFocus(): void;
   /** Whether the read toggle button is hidden. */
@@ -158,6 +161,14 @@ export function createViewKeys<Column>(deps: ViewKeysDependencies<Column>): View
     if (covering) deps.closeSettings();
     if (screens.view() !== "discord") deps.pressViewSwitch();
     if (!deps.channelOnScreen()) return false;
+    // `#1886` addendum-1 (owner thread 214): the view keys choose a
+    // channel view, so from the Transcripts overlay they must leave it
+    // first - as picking the view in the picker does. Without this the
+    // chord chose the view underneath and the overlay stayed up, so
+    // Cmd-2 in particular appeared to do nothing there.
+    if (deps.transcriptsOpen && deps.transcriptsOpen() && deps.closeTranscripts) {
+      deps.closeTranscripts();
+    }
     deps.chooseView(which);
     deps.settleFocus();
     return true;

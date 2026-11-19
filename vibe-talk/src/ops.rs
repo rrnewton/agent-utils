@@ -1682,15 +1682,41 @@ pub async fn timeline(
                 crate::cache_first::note(crate::cache_first::Source::Older);
                 return Ok((channel, page));
             }
-            crate::cache_first::note(crate::cache_first::Source::Upstream);
-            (
-                crate::held_replies::scope(
-                    held,
-                    step_back_from_served(state, caller, &channel.id, request, below),
+            // `#1886` addendum-1: a step back the copy cannot prove no
+            // longer waits on the provider in the foreground.
+            let stepped = {
+                let state = state.clone();
+                let channel_id = channel.id.clone();
+                let stepped_request = request.clone();
+                let below = below.clone();
+                race_older(
+                    crate::held_replies::scope(
+                        held,
+                        async move {
+                            step_back_from_served(
+                                &state,
+                                caller,
+                                &channel_id,
+                                &stepped_request,
+                                &below,
+                            )
+                            .await
+                        },
+                    ),
+                    request,
                 )
-                .await?,
-                None,
-            )
+                .await?
+            };
+            match stepped {
+                OlderStep::Upstream(page) => {
+                    crate::cache_first::note(crate::cache_first::Source::Upstream);
+                    (page, None)
+                }
+                OlderStep::Fallback(page) => {
+                    crate::cache_first::note(crate::cache_first::Source::Older);
+                    (*page, None)
+                }
+            }
         }
         (None, stand_in) => {
             let read = UpstreamTimeline {
@@ -1729,8 +1755,19 @@ pub async fn timeline(
                     }
                 }
             } else {
-                crate::cache_first::note(crate::cache_first::Source::Upstream);
-                read.run().await?
+                // `#1886` addendum-1: a step back at a provider cursor
+                // (no copy page to prove from) gets the same bounded
+                // wait as one at a served cursor.
+                match race_older(read.run(), request).await? {
+                    OlderStep::Upstream(answer) => {
+                        crate::cache_first::note(crate::cache_first::Source::Upstream);
+                        answer
+                    }
+                    OlderStep::Fallback(page) => {
+                        crate::cache_first::note(crate::cache_first::Source::Older);
+                        (*page, None)
+                    }
+                }
             }
         }
     };
@@ -1811,6 +1848,90 @@ pub fn stand_in_after(config: &crate::config::Config) -> std::time::Duration {
 /// `#622 cache-first-reads` a page entering a view the cache holds anything of is answered from it at
 /// once; this wait is left for one whose view the cache held nothing of when the read began.
 pub const FIRST_PAINT_WAIT: std::time::Duration = std::time::Duration::from_millis(1_500);
+
+/// How long a step back (`before`) waits on the provider before it is
+/// answered from the server's copy instead (`#1886` addendum-1, owner
+/// thread 214, rule 182/#1847): the owner's log showed foreground older
+/// reads of 16-38 s served from upstream. Past this wait the read runs
+/// on in the background - each provider page it reads fills the cache -
+/// and the answer is an empty page that says there is more, at the same
+/// cursor, marked as the server's copy, so the next step back takes
+/// what landed. The same wait as a first paint's: long enough for a
+/// healthy provider to answer, short enough that a limiting one is
+/// never what the reader waits on.
+pub const OLDER_WAIT: std::time::Duration = FIRST_PAINT_WAIT;
+
+/// The answer to a step back [`race_older`] produced.
+enum OlderStep<T> {
+    /// The provider answered within [`OLDER_WAIT`]: its own answer.
+    Upstream(T),
+    /// It did not: a page from the server's copy (empty, more above, the
+    /// same cursor) while the read runs on in the background. Boxed: a
+    /// whole page beside the upstream answer's pair is a large variant
+    /// to carry for a page with no rows (`clippy::large_enum_variant`).
+    Fallback(Box<crate::threads::TimelinePage>),
+}
+
+/// Run one step back upstream, off the request's task, answering with
+/// the provider's page when it lands within [`OLDER_WAIT`] and with a
+/// fallback page otherwise (`#1886` addendum-1). The read is never
+/// abandoned: spawned, it fills the cache whether or not its answer
+/// was the one served.
+///
+/// Only the page's own step back is raced - the read the reader is
+/// waiting on, which the client sends as `reason=older`. The server's
+/// own older reads (speech preparation, naming, a generic catch-up)
+/// keep the provider's answer exactly as before: they are machinery
+/// that expects it, and several of their clocks are paused in tests,
+/// where a wall-clock race would fire at once. Their reasons are their
+/// own (`Speech`, `Naming`, ...), never `Older`.
+async fn race_older<T, F>(
+    read: F,
+    request: &crate::threads::TimelineRequest,
+) -> Result<OlderStep<T>, OpError>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = Result<T, OpError>> + Send + 'static,
+{
+    let reason = crate::read_reason::ReadReason::current();
+    if reason != crate::read_reason::ReadReason::Older {
+        return Ok(OlderStep::Upstream(read.await?));
+    }
+    // Off this task, with the read's reason, hurry and records carried
+    // over and handed back, as `read_or_stand_in` hands its spawned
+    // read's back - so the request's counting and its one error line
+    // still say what the read did.
+    let hurried = crate::read_reason::hurried();
+    let mut task = tokio::spawn(reason.scope(crate::read_reason::hurry(
+        hurried,
+        async move {
+            crate::cache_first::noting(crate::upstream_profile::noting_failures(read)).await
+        },
+    )));
+    match tokio::time::timeout(OLDER_WAIT, &mut task).await {
+        Ok(joined) => {
+            let ((result, failed), noted) = joined.map_err(|_| {
+                OpError::Chat(ChatError::Transport(
+                    "the older read stopped before it answered".to_owned(),
+                ))
+            })?;
+            if let Some(source) = noted {
+                crate::cache_first::note(source);
+            }
+            if let Some(failed) = failed {
+                crate::upstream_profile::note_failure_of(failed);
+            }
+            Ok(OlderStep::Upstream(result?))
+        }
+        Err(_) => Ok(OlderStep::Fallback(Box::new(crate::threads::TimelinePage {
+            has_more: true,
+            next_before: request.before.clone(),
+            refresh_failed: Some(CACHE_FIRST.to_owned()),
+            as_of: Some(crate::clock::iso_from_ms(crate::store::now_ms())),
+            ..crate::threads::TimelinePage::default()
+        }))),
+    }
+}
 
 /// How long `request` waits on upstream before the cache stands in for it: [`FIRST_PAINT_WAIT`]
 /// for a page entering a view, nothing for a read placing a live message while the provider is
@@ -8692,6 +8813,52 @@ mod tests {
             summary: None,
             hue: None,
         }
+    }
+
+    #[tokio::test]
+    async fn a_slow_step_back_answers_with_the_copy_fallback_and_a_fast_one_with_the_provider_page() {
+        // `#1886` addendum-1: past OLDER_WAIT the answer is the copy's
+        // fallback (empty, more above, the same cursor, marked), and the
+        // provider read is left running; inside the wait it is the
+        // provider's own page. The futures are gated on a Notify, not a
+        // clock, except for the product wait itself.
+        let request = crate::threads::TimelineRequest {
+            view: crate::threads::TimelineView::Flat,
+            thread_id: None,
+            before: Some("cursor-1".to_owned()),
+            after: None,
+            limit: 10,
+        };
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        let held_gate = gate.clone();
+        // Only the page's own reason (`Older`) is raced; say so here.
+        let stepped = crate::read_reason::ReadReason::Older
+            .scope(race_older(
+                async move {
+                    held_gate.notified().await;
+                    Ok(crate::threads::TimelinePage::default())
+                },
+                &request,
+            ))
+            .await
+            .expect("raced");
+        match stepped {
+            OlderStep::Fallback(page) => {
+                assert!(page.messages.is_empty());
+                assert!(page.has_more);
+                assert_eq!(page.next_before.as_deref(), Some("cursor-1"));
+                assert_eq!(page.refresh_failed.as_deref(), Some(CACHE_FIRST));
+            }
+            OlderStep::Upstream(_) => panic!("a gated read answered as the provider's page"),
+        }
+        gate.notify_one();
+        let stepped = race_older(
+            async move { Ok(crate::threads::TimelinePage::default()) },
+            &request,
+        )
+        .await
+        .expect("raced");
+        assert!(matches!(stepped, OlderStep::Upstream(_)));
     }
 
     #[test]

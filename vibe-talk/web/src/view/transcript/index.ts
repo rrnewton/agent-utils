@@ -38,6 +38,8 @@ export interface TranscriptsDependencies {
   setStatus?(text: string): void;
   /** Run `fn` every `ms` until the answer is called; the follow timer. */
   every?(ms: number, fn: () => void): () => void;
+  /** Open a sent message's thread in the channel view (`#1886` part C). */
+  openSentThread?(message: TranscriptMessage): void;
 }
 
 /** Chunks asked for per window, the server's own page size. */
@@ -92,6 +94,11 @@ export function createTranscriptsView(deps: TranscriptsDependencies): Transcript
   const expandedSent = new Set<string>();
   let stopFollow: (() => void) | null = null;
   let listening = false;
+  // `#1886` addendum-1 (b): which showing of the view async reads belong
+  // to. Leaving the view (or a day) bumps it, and a read that lands
+  // after counts for nothing - it neither renders nor moves the
+  // scroller the reader has since taken to another view.
+  let generation = 0;
   let olderBound = false;
 
   const panel = () => deps.el("transcripts-view");
@@ -158,8 +165,49 @@ export function createTranscriptsView(deps: TranscriptsDependencies): Transcript
         }
         const who = chunk.author ? `${chunk.author} sent` : "sent";
         if (open) {
+          // The regular message card (`#1886` part C, owner thread
+          // 213): the rows' own anatomy - author and time on the meta
+          // line, the full words in the body, and the thread's chip
+          // and actions at hand. The chip and Reply go to the message's
+          // thread in the channel view; Done folds the card back.
+          item.classList.add("discord-message");
+          const meta = document.createElement("div");
+          meta.className = "meta";
+          const authorEl = document.createElement("span");
+          authorEl.className = "msg-author";
+          authorEl.textContent = String(chunk.author || "");
+          const timeEl = document.createElement("span");
+          timeEl.className = "msg-time";
+          timeEl.textContent = chunkWhen(chunk);
+          meta.append(authorEl, timeEl);
           body.textContent = chunk.content;
-          item.append(when, body);
+          const actions = document.createElement("div");
+          actions.className = "transcript-sent-actions";
+          const threadId = chunk.thread && chunk.thread.id ? String(chunk.thread.id) : "";
+          const chip = document.createElement("button");
+          chip.setAttribute("type", "button");
+          chip.className = "chip";
+          chip.textContent = "Thread";
+          chip.title = "Open this message's thread";
+          const reply = document.createElement("button");
+          reply.setAttribute("type", "button");
+          reply.textContent = "Reply";
+          const done = document.createElement("button");
+          done.setAttribute("type", "button");
+          done.textContent = "Done";
+          const goThread = (event: Event): void => {
+            event.stopPropagation();
+            if (threadId !== "" && deps.openSentThread) deps.openSentThread(chunk);
+          };
+          chip.addEventListener("click", goThread);
+          reply.addEventListener("click", goThread);
+          done.addEventListener("click", (event) => {
+            event.stopPropagation();
+            expandedSent.delete(String(chunk.id));
+            renderDay();
+          });
+          actions.append(chip, reply, done);
+          item.append(meta, body, actions);
         } else {
           const first = chunk.content.split("\n")[0] || "";
           body.textContent = `${who}: ${first.length > 90 ? `${first.slice(0, 90)}…` : first}`;
@@ -212,7 +260,9 @@ export function createTranscriptsView(deps: TranscriptsDependencies): Transcript
   async function openDay(row: TranscriptThread, atMessage: string): Promise<void> {
     // Read first, swap after: the day on screen stays until its
     // replacement is in hand (no placeholder flash, `#1886` part B).
+    const gen = ++generation;
     const answer = await readWindow(row, null);
+    if (gen !== generation) return;
     openRow = row;
     expandedSent.clear();
     chunks = sortChunks(answer.messages || []);
@@ -224,6 +274,7 @@ export function createTranscriptsView(deps: TranscriptsDependencies): Transcript
     // A search hit below the newest window: step back until it is held.
     while (atMessage !== "" && !chunkHeld(chunks, atMessage) && hasMore) {
       const older = await readWindow(row, nextBefore);
+      if (gen !== generation) return;
       chunks = mergeChunks(chunks, older.messages || []);
       nextBefore = older.next_before ?? null;
       hasMore = older.has_more === true && nextBefore !== null;
@@ -235,24 +286,30 @@ export function createTranscriptsView(deps: TranscriptsDependencies): Transcript
   async function loadOlder(): Promise<void> {
     if (!openRow || !hasMore || loadingOlder || nextBefore === null) return;
     loadingOlder = true;
+    const gen = generation;
     const area = scroller();
     const stay = { top: area.scrollTop, height: area.scrollHeight };
     renderDay(stay);
     try {
       const answer = await readWindow(openRow, nextBefore);
+      // Left the view (or the day) while this read was out: it counts
+      // for nothing here (addendum-1 (b)).
+      if (gen !== generation) return;
       chunks = mergeChunks(chunks, answer.messages || []);
       nextBefore = answer.next_before ?? null;
       hasMore = answer.has_more === true && nextBefore !== null;
     } finally {
       loadingOlder = false;
-      renderDay(stay);
+      if (gen === generation) renderDay(stay);
     }
   }
 
   /** Bring an open day up to its newest chunk, where it is followed. */
   async function followNew(): Promise<void> {
     if (!active || !openRow) return;
+    const gen = generation;
     const answer = await readWindow(openRow, null);
+    if (gen !== generation) return;
     const merged = mergeChunks(chunks, answer.messages || []);
     if (merged.length === chunks.length && chunks.every((chunk, at) => chunk.id === merged[at]?.id)) return;
     chunks = merged;
@@ -304,6 +361,7 @@ export function createTranscriptsView(deps: TranscriptsDependencies): Transcript
     },
     close() {
       active = false;
+      generation += 1;
       panel().hidden = true;
       stopFollow?.();
       stopFollow = null;
@@ -326,6 +384,7 @@ export function createTranscriptsView(deps: TranscriptsDependencies): Transcript
       else renderList();
     },
     closeDay() {
+      generation += 1;
       stopFollow?.();
       stopFollow = null;
       openRow = null;

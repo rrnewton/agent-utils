@@ -995,6 +995,8 @@ test("`#624 voice-page-modularity`: the view, filter and undo keys choose from t
     selectedChannelId: () => state.channel,
     channelOnScreen: () => state.onScreen && state.screen === "main" && state.view === "discord",
     chooseView: (which) => log.push(`view ${which}`),
+    transcriptsOpen: () => state.transcripts === true,
+    closeTranscripts: () => { log.push("close transcripts"); state.transcripts = false; },
     settleFocus: () => log.push("settled"),
     readModeHidden: () => state.readHidden,
     cycleReadMode: () => log.push("cycle read"),
@@ -1033,6 +1035,11 @@ test("`#624 voice-page-modularity`: the view, filter and undo keys choose from t
   state.before = "main";
   state.view = "voice";
   assert.deepStrictEqual(run(() => keys.viewFromKeyboard("columns", false)), [true, "switch", "view columns", "settled"], "the call's view did not give way to the channel");
+  // `#1886` addendum-1: a view chord from the Transcripts overlay leaves
+  // it first (Cmd-2 there appeared to do nothing before this).
+  state.transcripts = true;
+  assert.deepStrictEqual(run(() => keys.viewFromKeyboard("flat", false)), [true, "close transcripts", "view flat", "settled"], "a view chord from Transcripts did not leave the Transcripts view");
+  assert.equal(state.transcripts, false);
   state.channel = "";
   assert.deepStrictEqual(run(() => keys.viewFromKeyboard("main", false)), [false], "a view was chosen with no channel");
   assert.deepStrictEqual(run(() => keys.voiceFromKeyboard(false)), [true, "switch"], "Ctrl+0 needed a channel, or did not go to the call's view");

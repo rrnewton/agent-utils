@@ -2698,7 +2698,20 @@ pub async fn transcript_thread(
         after: None,
         limit,
     };
-    let (channel, mut page) = ops::timeline(&state, caller, &channel_id, &request).await?;
+    // `#1886` addendum-1: opening a day is entering a view, so its read
+    // is cache-first like one (`ReadReason::Enter`): a copy the server
+    // holds answers at once while the provider read runs behind it,
+    // instead of the untagged default that waited out the stand-in
+    // (the owner's 4-9 s thread reads). A step back is the page's own
+    // older read (`ReadReason::Older`), which `ops` now bounds.
+    let reason = if query.before.is_some() {
+        crate::read_reason::ReadReason::Older
+    } else {
+        crate::read_reason::ReadReason::Enter
+    };
+    let (channel, mut page) = reason
+        .scope(ops::timeline(&state, caller, &channel_id, &request))
+        .await?;
     attach_transcript_classes(&state, &channel.id, &mut page).await;
     let is_transcript = class.is_some()
         || page

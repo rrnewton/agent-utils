@@ -3542,6 +3542,8 @@ const keyboard = createKeyboardComposition({
   // Documents between them); the button's press is the three-way `pressViewSwitch`.
   pressViewSwitch: () => chooseMajorView(screens.view() === "voice" ? "discord" : "voice"),
   chooseView: (which) => chooseView(which),
+  transcriptsOpen: () => transcriptsViewActive,
+  closeTranscripts: () => closeTranscripts(),
   cycleReadMode: () => cycleReadMode(),
   readModeSaid: () => READ_MODE_SAID[readModes.mode()],
   searchOpen: () => searchField.open(),
@@ -4521,6 +4523,10 @@ const transcriptsView = createTranscriptsView({
   api: (path) => api(path),
   intoView: (element, block) => scrollKeeping.intoView(element, block),
   setStatus: (text) => setStatus(text),
+  openSentThread: (message) => {
+    closeTranscripts();
+    openThread(String(message.thread.id));
+  },
   every: (ms, fn) => {
     const timer = setInterval(fn, ms);
     return () => clearInterval(timer);

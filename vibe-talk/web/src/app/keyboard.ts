@@ -210,6 +210,9 @@ export interface KeyboardCompositionDependencies<
   closeSettings(): void;
   pressViewSwitch(): void;
   chooseView(which: "main" | "flat" | "threads" | "columns"): void;
+  /** Whether the Transcripts overlay is up, and leaving it (`#1886` addendum-1). */
+  transcriptsOpen?(): boolean;
+  closeTranscripts?(): void;
   cycleReadMode(): void;
   readModeSaid(): string;
   searchOpen(): boolean;
@@ -691,6 +694,8 @@ export function createKeyboardComposition<
     selectedChannelId: () => deps.selectedChannelId(),
     channelOnScreen: () => channelOnScreen(),
     chooseView: (which) => deps.chooseView(which),
+    transcriptsOpen: () => (deps.transcriptsOpen ? deps.transcriptsOpen() : false),
+    closeTranscripts: () => { if (deps.closeTranscripts) deps.closeTranscripts(); },
     settleFocus: () => settleFocus(),
     readModeHidden: () => deps.el("todo-filter").hidden,
     cycleReadMode: () => deps.cycleReadMode(),
