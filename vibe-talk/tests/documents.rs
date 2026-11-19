@@ -89,6 +89,8 @@ fn message(id: &str, at_ms: i64, text: &str) -> Message {
         upstream_app_url: None,
         op_key: None,
         observed_ms: Some(at_ms),
+        sent_refs: Vec::new(),
+        sent_vestigial: false,
     }
 }
 

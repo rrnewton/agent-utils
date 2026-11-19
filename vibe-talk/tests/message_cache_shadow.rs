@@ -308,6 +308,8 @@ async fn a_gap_a_suspect_channel_and_a_blocked_one_each_miss() {
         labels: Vec::new(),
         reactions: None,
         heading: None,
+        sent_refs: Vec::new(),
+        sent_vestigial: false,
     };
     let offered = cache.offer(
         chan.clone(),

@@ -603,6 +603,8 @@ mod summary_schedule_tests {
             upstream_app_url: None,
             op_key: None,
             observed_ms: None,
+            sent_refs: Vec::new(),
+            sent_vestigial: false,
         };
         assert_eq!(
             root_title(&root("> Not Started: x\nPROVENANCE THREAD 2026-11-17 TRY2")),
@@ -735,6 +737,8 @@ mod summary_schedule_tests {
             upstream_app_url: None,
             op_key: None,
             observed_ms: None,
+            sent_refs: Vec::new(),
+            sent_vestigial: false,
         };
         assert!(!root_overflows_card(Some(&root("1\n2\n3\n4\n5")), 5));
         assert!(root_overflows_card(Some(&root("1\n2\n3\n4\n5\n6")), 5));

@@ -180,6 +180,11 @@ pub(crate) struct Extra {
     /// The operation key the provider carried on the message, as [`Message::op_key`]. `#465 replication-c6-op-key-marker`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) op_key: Option<String>,
+    /// A trace entry's v2 `sent` references, as [`Message::sent_refs`]
+    /// (`#1886` part C): kept so a day served from the cache resolves
+    /// the same sent messages a fresh read would.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) sent_refs: Vec<crate::transcripts::SentRef>,
 }
 
 /// Provider creation time, derived as `ops::message_ms` derives it: the id's own time first (a
@@ -244,6 +249,8 @@ pub(crate) fn reconstruct(
         content_html: String::new(),
         noise: false,
         labels: Vec::new(),
+        sent_refs: extra.sent_refs,
+        sent_vestigial: false,
         reactions: extra.reactions,
         heading: None,
         mentions: extra.mentions,

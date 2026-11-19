@@ -262,6 +262,22 @@ pub struct Message {
     /// EMPTY means the text holds no hashtag. Absent from an older server means the same.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
+    /// The chat messages this trace entry says the agent sent before it
+    /// (v2 `sent`, `#1886 vibe-talk-transcripts-view` part C;
+    /// [`crate::transcripts::sent_refs_of_metadata`]). Server-only, like
+    /// `mentions`: the page is never sent the references, only — on a
+    /// transcript day — the resolved messages themselves, marked
+    /// [`Message::sent_vestigial`]. Carried on the message so the cache
+    /// keeps it with the entry that stated it.
+    #[serde(skip)]
+    pub sent_refs: Vec<crate::transcripts::SentRef>,
+    /// On a transcript day answer only: this copy is one of the chat
+    /// messages a trace entry says the agent sent, standing in the
+    /// transcript timeline where it happened, small until tapped
+    /// (`#1886` part C). Formed by this server on that one route; absent
+    /// everywhere else, including from an older server.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sent_vestigial: bool,
     /// The emoji people reacted to this message with, and how many of each. `#219
     /// emoji-reactions`.
     ///
@@ -641,6 +657,8 @@ mod tests {
             upstream_app_url: None,
             op_key: None,
             observed_ms: None,
+            sent_refs: Vec::new(),
+            sent_vestigial: false,
         }
     }
 

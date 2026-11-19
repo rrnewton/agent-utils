@@ -24,6 +24,10 @@ export interface TranscriptMessage {
   timestamp: string;
   content: string;
   author?: string;
+  /** A resolved sent message standing vestigial in the timeline (`#1886` part C). */
+  sent_vestigial?: boolean;
+  /** Its thread, for the tint of a vestigial entry. */
+  thread?: { id?: string; hue?: number | null } | null;
 }
 
 /** What the Transcripts view asks of the page. */
@@ -84,6 +88,8 @@ export function createTranscriptsView(deps: TranscriptsDependencies): Transcript
   let loadingOlder = false;
   let following = true;
   let highlightId = "";
+  /** Sent messages the reader has opened out of their vestigial line. */
+  const expandedSent = new Set<string>();
   let stopFollow: (() => void) | null = null;
   let listening = false;
   let olderBound = false;
@@ -132,15 +138,43 @@ export function createTranscriptsView(deps: TranscriptsDependencies): Transcript
     for (const chunk of chunks) {
       if (!chunkMatches(chunk.content, query)) continue;
       const item = document.createElement("li");
-      item.className = "transcript-chunk";
       item.dataset.transcriptMessage = String(chunk.id);
       const when = document.createElement("div");
       when.className = "transcript-when";
       when.textContent = chunkWhen(chunk);
       const body = document.createElement("div");
       body.className = "transcript-body";
-      body.textContent = chunk.content;
-      item.append(when, body);
+      if (chunk.sent_vestigial) {
+        // `#1886` part C: a chat message the agent sent, standing in
+        // the timeline where it happened - small and tinted with its
+        // thread's colour until tapped, then its full words, as a
+        // regular card shows them.
+        const open = expandedSent.has(String(chunk.id));
+        item.className = open ? "transcript-chunk transcript-sent transcript-sent-open" : "transcript-chunk transcript-sent";
+        item.setAttribute("role", "button");
+        item.setAttribute("aria-expanded", String(open));
+        if (chunk.thread && typeof chunk.thread.hue === "number") {
+          item.style.setProperty("--thread-hue", String(chunk.thread.hue));
+        }
+        const who = chunk.author ? `${chunk.author} sent` : "sent";
+        if (open) {
+          body.textContent = chunk.content;
+          item.append(when, body);
+        } else {
+          const first = chunk.content.split("\n")[0] || "";
+          body.textContent = `${who}: ${first.length > 90 ? `${first.slice(0, 90)}…` : first}`;
+          item.append(body);
+        }
+        item.addEventListener("click", () => {
+          if (open) expandedSent.delete(String(chunk.id));
+          else expandedSent.add(String(chunk.id));
+          renderDay();
+        });
+      } else {
+        item.className = "transcript-chunk";
+        body.textContent = chunk.content;
+        item.append(when, body);
+      }
       log.append(item);
     }
     deps.el("transcripts-title").textContent = openRow ? transcriptLabel(openRow) : "";
@@ -180,6 +214,7 @@ export function createTranscriptsView(deps: TranscriptsDependencies): Transcript
     // replacement is in hand (no placeholder flash, `#1886` part B).
     const answer = await readWindow(row, null);
     openRow = row;
+    expandedSent.clear();
     chunks = sortChunks(answer.messages || []);
     nextBefore = answer.next_before ?? null;
     hasMore = answer.has_more === true && nextBefore !== null;

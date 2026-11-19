@@ -3684,6 +3684,20 @@ async fn slack_transcript_deployment(tag: &str) -> (AppState, slack_fake::Fake, 
     ]);
     if let Some(replies) = fixture.replies.get_mut(&(SLACK_CH.to_owned(), slack_fake::ts(600, 0))) {
         for reply in replies.iter_mut() { reply["metadata"] = trace_meta("entry", "2026-11-18"); }
+        // The second entry is v2 and says what the agent sent (`#1886`
+        // part C): "message 1" of this channel, and one reference
+        // nothing can resolve.
+        if let Some(second) = replies.get_mut(1) {
+            second["metadata"] = serde_json::json!({"event_type": "agentctl_trace",
+                "event_payload": {"v": 2, "kind": "entry", "agent": "liaison", "team": null,
+                                  "session": "s1", "day": "2026-11-18", "seq": 2, "trigger": "owner",
+                                  "sent": [
+                                      {"thread": slack_fake::ts(60, 0), "msg": slack_fake::ts(60, 0),
+                                       "ts": slack_fake::ts(60, 0), "chars": 9},
+                                      {"thread": "1799999999.000100", "msg": "1799999999.000100",
+                                       "ts": "1799999999.000100", "chars": 4},
+                                  ]}});
+        }
     }
     history.push(root_a);
     // Trace root B: fresh daily root, title only, no metadata, no replies yet.
@@ -3768,4 +3782,43 @@ async fn a_transcript_day_reads_newest_first_a_window_at_a_time() {
     assert_eq!(texts(&whole).len(), 3, "{whole}");
     let (status, _body) = call(&state, &day("before="), WRITE_TOKEN).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn a_transcript_day_interleaves_the_sent_messages_v2_names() {
+    // `#1886` part C: the day's second entry is v2 and names "message 1"
+    // as sent before it. Once a Main read has filled the cache with
+    // that message, the day answer stands it in the timeline where it
+    // happened - ahead of the trace root, by its own instant - marked
+    // vestigial; the reference nothing can resolve is simply absent,
+    // and a v1 entry (the first) contributes nothing.
+    let (state, _fake, _clock, _dir) = slack_transcript_deployment("transcript-sent").await;
+    ok(&state, &path(SLACK_CH, "/timeline?view=main&limit=50"), WRITE_TOKEN).await;
+    settled(&state).await;
+    let root_a = slack_fake::ts(600, 0);
+    let body = ok(
+        &state,
+        &format!("/api/v1/transcripts/{SLACK_CH}/{root_a}?limit=50"),
+        WRITE_TOKEN,
+    )
+    .await;
+    settled(&state).await;
+    assert_eq!(
+        texts(&body),
+        [
+            "message 1",
+            "liaison main session trace, 2026-11-18 ET",
+            "thinking about the cache",
+            "still thinking",
+        ],
+        "the sent message does not stand where it happened: {body}"
+    );
+    let vestigial = &body["messages"][0];
+    assert_eq!(vestigial["sent_vestigial"], true, "{body}");
+    assert!(
+        body["messages"].as_array().expect("messages")[1..]
+            .iter()
+            .all(|m| m.get("sent_vestigial").is_none()),
+        "a trace chunk was marked vestigial: {body}"
+    );
 }

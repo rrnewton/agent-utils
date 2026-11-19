@@ -87,6 +87,16 @@ def chunk(index: int, text: str) -> Json:
     }
 
 
+# A resolved sent message standing in the day (`#1886` part C), as the
+# real route marks it: full words, its own thread, its hue on the thread.
+VESTIGIAL = chunk(999, "the cache fix is in and the shard is green again; watching it for one more run before saying so")
+VESTIGIAL["timestamp"] = (datetime(2026, 10, 12, 8, 0, tzinfo=timezone.utc) + timedelta(minutes=218 * 5 + 2)).isoformat().replace("+00:00", "Z")  # between thought 118 and 119
+VESTIGIAL["thread"] = {"id": "1700.000200", "root_message_id": message_id(3), "is_root": False,
+                       "broadcast": False, "reply_count": None, "reply_count_exact": False,
+                       "hue": 200}
+VESTIGIAL["sent_vestigial"] = True
+
+
 CHUNKS = [
     chunk(0, "coordx main session trace, 2026-11-15 ET"),
     chunk(1, "reading the cache code before answering"),
@@ -154,7 +164,7 @@ class TranscriptApi(FakeApi):
         # first without `before`; `before` is the `next_before` an earlier
         # answer carried (here, the oldest chunk id of that window).
         limit = int((query.get("limit") or ["50"])[0])
-        rows = sorted([*CHUNKS, *self.live_chunks], key=lambda m: str(m["timestamp"]))
+        rows = sorted([*CHUNKS, VESTIGIAL, *self.live_chunks], key=lambda m: str(m["timestamp"]))
         raw_before = query.get("before")
         before = raw_before[0] if raw_before else None
         if before is not None:
@@ -288,12 +298,33 @@ def walk_through(walk: Walk, keyboard: bool, discuss: bool = False) -> None:
                              "return Math.abs(a.scrollTop + a.clientHeight - a.scrollHeight) < 120; }"),
                "the day did not open scrolled to its newest chunk")
     walk.shot("transcripts-day")
+    # `#1886` part C: the sent message stands vestigial in the timeline -
+    # small, tinted, one line - and a tap opens its full words.
+    walk.until("() => document.querySelectorAll('#transcripts-log .transcript-sent').length === 1",
+               "no vestigial sent entry stands in the day")
+    vestigial = page.text_content("#transcripts-log .transcript-sent") or ""
+    walk.check("sent:" in vestigial, f"the vestigial entry does not say who sent it: {vestigial!r}")
+    walk.check("before saying so" not in vestigial,
+               f"the vestigial entry shows its full words unopened: {vestigial!r}")
+    page.evaluate("() => document.querySelector('#transcripts-log .transcript-sent')"
+                  ".scrollIntoView({block: 'center'})")
+    walk.settled()
+    walk.shot("transcripts-day-sent")
+    page.click("#transcripts-log .transcript-sent")
+    walk.until("() => { const li = document.querySelector('#transcripts-log .transcript-sent'); "
+               "return li && li.classList.contains('transcript-sent-open') && "
+               "(li.textContent || '').includes('before saying so'); }",
+               "tapping the vestigial entry did not open its full card")
+    page.evaluate("() => document.querySelector('#transcripts-log .transcript-sent')"
+                  ".scrollIntoView({block: 'center'})")
+    walk.settled()
+    walk.shot("transcripts-day-sent-open")
     # Stepping back a window at a time, to the day's root.
     page.click("#transcripts-older")
     walk.until("() => document.querySelectorAll('#transcripts-log .transcript-chunk').length === 100",
                "the first step back did not add a window")
     page.click("#transcripts-older")
-    walk.until("() => document.querySelectorAll('#transcripts-log .transcript-chunk').length === 120",
+    walk.until("() => document.querySelectorAll('#transcripts-log .transcript-chunk').length === 121",
                "the second step back did not reach the day's start")
     first = page.text_content("#transcripts-log .transcript-chunk:first-child") or ""
     walk.check("main session trace" in first, f"the day's root is not at its head: {first!r}")

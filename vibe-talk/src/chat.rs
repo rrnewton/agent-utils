@@ -2634,6 +2634,8 @@ mod lookup_tests {
             upstream_app_url: None,
             op_key: None,
             observed_ms: None,
+            sent_refs: Vec::new(),
+            sent_vestigial: false,
         }
     }
 
@@ -2973,6 +2975,8 @@ mod threads_tests {
             upstream_app_url: None,
             op_key: None,
             observed_ms: None,
+            sent_refs: Vec::new(),
+            sent_vestigial: false,
         }
     }
 

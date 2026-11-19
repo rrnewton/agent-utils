@@ -424,6 +424,8 @@ async fn a_channel_whose_messages_come_back_blank_warns_about_the_message_conten
                 upstream_app_url: None,
                 op_key: None,
                 observed_ms: None,
+                sent_refs: Vec::new(),
+                sent_vestigial: false,
             }])
         }
         async fn post_message(

@@ -397,3 +397,7 @@
 .transcript-chunk { padding: 0.5rem 0.25rem; white-space: pre-wrap; overflow-wrap: anywhere; }
 .transcript-when { opacity: 0.65; font-size: 0.85em; }
 .transcript-highlight { outline: 2px solid currentColor; outline-offset: 2px; }
+/* A sent chat message standing in a transcript day (`#1886` part C):
+   small and tinted with its thread's colour until tapped open. */
+.transcript-sent { border-left: 4px solid hsl(var(--thread-hue, 210) 55% 50%); padding-left: 0.5rem; font-size: 0.85em; opacity: 0.8; cursor: pointer; }
+.transcript-sent-open { font-size: 1em; opacity: 1; }

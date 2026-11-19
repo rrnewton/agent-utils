@@ -2191,6 +2191,8 @@ mod tests {
             upstream_app_url: None,
             op_key: None,
             observed_ms: None,
+            sent_refs: Vec::new(),
+            sent_vestigial: false,
         };
         let root = message("100", 0);
         let held = vec![message("102", 2), message("100", 0), message("101", 1)];
@@ -2339,6 +2341,8 @@ mod tests {
             upstream_app_url: None,
             op_key: None,
             observed_ms: None,
+            sent_refs: Vec::new(),
+            sent_vestigial: false,
         };
         let mut messages = vec![message("0", "THE ROOT: the runner pool is down to one mac")];
         for n in 1..40 {

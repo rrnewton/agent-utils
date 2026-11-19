@@ -1604,6 +1604,14 @@ declare namespace VibeTalk {
      */
     reply_to: MessageId | null;
     /**
+     * On a transcript day answer only: this copy is one of the chat
+     * messages a trace entry says the agent sent, standing in the
+     * transcript timeline where it happened, small until tapped
+     * (`#1886` part C). Formed by this server on that one route; absent
+     * everywhere else, including from an older server.
+     */
+    sent_vestigial?: boolean;
+    /**
      * The same body rewritten for speech by [`crate::speakable`]: markdown off, instants said the
      * way a listener places them, long ids and hashes named. READ THIS ONE ALOUD.
      *

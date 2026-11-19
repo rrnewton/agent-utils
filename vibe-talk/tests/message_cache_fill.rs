@@ -62,6 +62,8 @@ fn message(channel: &str, at_ms: i64, text: &str) -> Message {
         labels: Vec::new(),
         reactions: None,
         heading: None,
+        sent_refs: Vec::new(),
+        sent_vestigial: false,
     }
 }
 

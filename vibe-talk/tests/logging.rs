@@ -1742,6 +1742,8 @@ async fn the_message_cache_switch_logs_numbers_and_never_an_id_or_a_word_it_held
         labels: Vec::new(),
         reactions: None,
         heading: None,
+        sent_refs: Vec::new(),
+        sent_vestigial: false,
     };
     let chan = ChanKey::new(vibe_talk::config::LEGACY_DISCORD_PROVIDER_KEY, READ_CHANNEL);
     cache.offer(

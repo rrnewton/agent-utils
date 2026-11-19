@@ -957,6 +957,8 @@ pub fn parse_message(value: &serde_json::Value) -> Result<Message, ChatError> {
         upstream_app_url: None,
         op_key: None,
         observed_ms: None,
+        sent_refs: Vec::new(),
+        sent_vestigial: false,
     })
 }
 

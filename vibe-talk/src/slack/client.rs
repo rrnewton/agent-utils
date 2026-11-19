@@ -1125,6 +1125,12 @@ impl Raw {
         crate::transcripts::class_of_metadata(&self.value)
     }
 
+    /// This trace entry's v2 `sent` references (`#1886` part C): the chat
+    /// messages the agent sent before this entry, as its metadata states.
+    pub fn sent_refs(&self) -> Vec<crate::transcripts::SentRef> {
+        crate::transcripts::sent_refs_of_metadata(&self.value)
+    }
+
     /// Whether this is a thread reply also sent to the conversation (`thread_broadcast`), which
     /// history lists among the conversation's own messages.
     pub fn is_broadcast(&self) -> bool {
@@ -1281,6 +1287,9 @@ impl Raw {
             content_html: String::new(),
             noise: false,
             labels: Vec::new(),
+            // A trace entry's v2 word on what the agent sent (`#1886` part C).
+            sent_refs: self.sent_refs(),
+            sent_vestigial: false,
             // Absent stays absent: Slack omits the field on a message nobody reacted to, and a
             // bridge that cannot supply reactions omits it on every message. `#312
             // slack-reactions`; see `super::reactions`.

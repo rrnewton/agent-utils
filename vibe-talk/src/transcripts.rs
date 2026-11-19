@@ -169,6 +169,83 @@ fn is_day(text: &str) -> bool {
     (1..=12).contains(&month) && (1..=31).contains(&day)
 }
 
+/// One chat message a v2 trace entry says the agent sent before it
+/// (`#1886 vibe-talk-transcripts-view` part C; the bridge spec is in
+/// #1886's notes): the thread it went into, the message itself, its
+/// instant, and how long it was. The Transcripts timeline stands these
+/// in where they happened, as vestigial entries.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct SentRef {
+    /// The thread the sent message went into (its own `msg` when top-level).
+    pub thread: String,
+    /// The sent message's own id (`ts` on Slack).
+    pub msg: String,
+    /// The sent message's instant (`ts` text), for ordering when the
+    /// message itself cannot be read back.
+    pub ts: String,
+    /// How many characters the sent text held.
+    pub chars: u64,
+}
+
+/// The most `sent` references one entry may carry: the design cap of
+/// section 2.1, which is also what keeps a busy day's metadata inside
+/// the shim's whole-payload budget (the bridge drops its oldest pending
+/// refs past the budget rather than truncating one).
+pub const MAX_SENT_REFS: usize = 8;
+
+/// The `sent` references a trace message's own metadata carries, or an
+/// empty list: v1 metadata, another app's, a malformed list. Only a
+/// payload [`class_of_metadata`] accepts is read at all, and only at
+/// `v: 2` — v1 readers and bridges keep working unchanged, with no
+/// timeline cards (the design's rule).
+#[must_use]
+pub fn sent_refs_of_metadata(value: &serde_json::Value) -> Vec<SentRef> {
+    if class_of_metadata(value).is_none() {
+        return Vec::new();
+    }
+    let Some(payload) = value.get("metadata").and_then(|m| m.get("event_payload")) else {
+        return Vec::new();
+    };
+    if payload.get("v").and_then(serde_json::Value::as_u64) != Some(2) {
+        return Vec::new();
+    }
+    let Some(list) = payload.get("sent").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    list.iter()
+        .filter_map(|item| {
+            let msg = item
+                .get("msg")
+                .and_then(serde_json::Value::as_str)
+                .filter(|text| !text.trim().is_empty())?
+                .to_owned();
+            let thread = item
+                .get("thread")
+                .and_then(serde_json::Value::as_str)
+                .filter(|text| !text.trim().is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| msg.clone());
+            let ts = item
+                .get("ts")
+                .and_then(serde_json::Value::as_str)
+                .filter(|text| !text.trim().is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| msg.clone());
+            let chars = item
+                .get("chars")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            Some(SentRef {
+                thread,
+                msg,
+                ts,
+                chars,
+            })
+        })
+        .take(MAX_SENT_REFS)
+        .collect()
+}
+
 /// Whether a message text opens with the legacy label line old trace posts
 /// carried (`— after: <trigger>`, #833's surviving fragment). Raw and
 /// timeline rendering drop that one leading line in a transcript.
@@ -205,6 +282,32 @@ mod tests {
             assert_eq!(class.day, "2026-11-15");
             assert_eq!(class.source, ClassSource::Metadata);
         }
+    }
+
+    #[test]
+    fn v2_sent_refs_parse_and_v1_has_none() {
+        // `#1886` part C: a v2 entry's `sent` list, parsed whole; a v1
+        // entry - and an entry from the test above with refs missing
+        // parts filled from `msg` - per the bridge spec.
+        let sent = sent_refs_of_metadata(&metadata("liaison", "2026-11-19", "entry"));
+        assert!(sent.is_empty(), "v1 metadata carries no sent refs");
+        let mut v2 = metadata("liaison", "2026-11-19", "entry");
+        v2["metadata"]["event_payload"]["v"] = json!(2);
+        v2["metadata"]["event_payload"]["sent"] = json!([
+            {"thread": "1763510400.000100", "msg": "1763510400.000100", "ts": "1763510400.000100", "chars": 212},
+            {"msg": "1763510460.000300"}
+        ]);
+        let sent = sent_refs_of_metadata(&v2);
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0].chars, 212);
+        assert_eq!(sent[1].thread, "1763510460.000300", "thread falls back to the message");
+        assert_eq!(sent[1].ts, "1763510460.000300");
+        // Past the cap, only the first MAX_SENT_REFS stand.
+        v2["metadata"]["event_payload"]["sent"] = json!((0..20).map(|n| json!({"msg": format!("{n}.1")})).collect::<Vec<_>>());
+        assert_eq!(sent_refs_of_metadata(&v2).len(), MAX_SENT_REFS);
+        // Another app's metadata never yields refs, however v2-shaped.
+        v2["metadata"]["event_type"] = json!("other");
+        assert!(sent_refs_of_metadata(&v2).is_empty());
     }
 
     #[test]

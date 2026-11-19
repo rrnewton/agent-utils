@@ -3813,6 +3813,8 @@ mod tests {
             labels: Vec::new(),
             reactions: None,
             heading: None,
+            sent_refs: Vec::new(),
+            sent_vestigial: false,
         }
     }
 

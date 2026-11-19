@@ -53,6 +53,8 @@ fn message(id: &str) -> Message {
         noise: false,
         labels: Vec::new(),
         reactions: None,
+        sent_refs: Vec::new(),
+        sent_vestigial: false,
     }
 }
 

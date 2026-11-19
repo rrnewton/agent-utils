@@ -496,6 +496,8 @@ pub async fn ingest_event(
                 upstream_app_url: None,
                 op_key: None,
                 observed_ms: None,
+                sent_refs: Vec::new(),
+                sent_vestigial: false,
             };
             (crate::live::LiveKind::Delete, channel_id, tombstone)
         }
@@ -2565,6 +2567,48 @@ fn exclude_transcripts(
     }
 }
 
+/// Stand the chat messages a page's v2 trace entries say the agent sent
+/// into the page, where they happened (`#1886 vibe-talk-transcripts-view`
+/// part C): each reference resolved from this server's own cache copy of
+/// the channel ([`crate::cache::sink::Sink::held_message`]) — no upstream
+/// read starts here, and a reference the cache cannot say is skipped.
+/// A resolved copy is marked `sent_vestigial` and carries no references
+/// of its own. The page then holds the day in time order again.
+async fn interleave_sent_messages(
+    state: &AppState,
+    channel: &crate::model::ChannelId,
+    page: &mut crate::threads::TimelinePage,
+) {
+    let mut additions: Vec<crate::model::Message> = Vec::new();
+    let mut handled: std::collections::HashSet<String> = page
+        .messages
+        .iter()
+        .map(|message| message.id.as_str().to_owned())
+        .collect();
+    for entry in &page.messages {
+        for reference in &entry.sent_refs {
+            let Some(id) = crate::slack::ids::message_id_from_ts(&reference.msg) else {
+                continue;
+            };
+            if !handled.insert(id.as_str().to_owned()) {
+                continue;
+            }
+            let Some(mut sent) = state.message_cache.held_message(channel, &id).await else {
+                continue;
+            };
+            sent.sent_vestigial = true;
+            sent.sent_refs = Vec::new();
+            additions.push(sent);
+        }
+    }
+    if additions.is_empty() {
+        return;
+    }
+    page.messages.extend(additions);
+    page.messages
+        .sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
+}
+
 /// Query parameters for the transcripts routes: a page-size limit, held
 /// to the same shape as every other read's (`?limit=soon` is refused),
 /// and, for one day, the step-back cursor an earlier answer handed out
@@ -2668,11 +2712,20 @@ pub async fn transcript_thread(
             "not a transcript thread",
         ));
     }
+    // `#1886` part C: the messages a v2 entry says the agent sent stand
+    // in this timeline where they happened, resolved from this server's
+    // own cache copy of the channel (never an upstream read here) and
+    // marked vestigial for the page. A reference the cache cannot say
+    // is skipped, never invented; one already on the page stands once.
+    interleave_sent_messages(&state, &channel.id, &mut page).await;
     for message in &mut page.messages {
         let stripped = crate::transcripts::strip_legacy_label(&message.content).to_owned();
         message.content = stripped;
     }
     crate::render::fill_page(&state.config, &state.headings, &channel, &mut page);
+    // Their threads' colours, as a channel read carries them (`#427`),
+    // so the page can tint a vestigial entry with its thread's colour.
+    ops::attach_page_hues(&state, caller, &channel.id, &mut page).await;
     let returned = page.messages.len();
     Ok(no_store(Json(TimelineResponse {
         pins_revision: None,

@@ -1953,6 +1953,7 @@ impl Writer<'_> {
                     mentions: message.mentions.clone(),
                     edited_timestamp: message.edited_timestamp.clone(),
                     op_key: message.op_key.clone(),
+                    sent_refs: message.sent_refs.clone(),
                 })
                 .unwrap_or_else(|_| "{}".to_owned());
                 let search_text = self.search_text(&chan.provider_key, message);
@@ -2164,6 +2165,13 @@ impl Writer<'_> {
                 // A message is posted with one key or none, so a copy that cannot see it never
                 // takes it away. `#465 replication-c6-op-key-marker`.
                 op_key: message.op_key.clone().or(held_extra.op_key),
+                // Nor does a copy that cannot see trace metadata take an
+                // entry's `sent` references away (`#1886` part C).
+                sent_refs: if message.sent_refs.is_empty() {
+                    held_extra.sent_refs
+                } else {
+                    message.sent_refs.clone()
+                },
             })
             .unwrap_or(held.extra.clone());
         }

@@ -72,6 +72,8 @@ fn message(seq: i64, thread: Option<(&str, bool)>, noise: bool) -> Message {
         upstream_app_url: None,
         op_key: None,
         observed_ms: None,
+        sent_refs: Vec::new(),
+        sent_vestigial: false,
     }
 }
 
