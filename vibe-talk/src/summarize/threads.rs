@@ -1942,7 +1942,7 @@ impl ThreadCache for SinkThreadCache {
                 .newest(
                     &chan,
                     &Scope::Thread(thread_id),
-                    usize::try_from(THREAD_FETCH_LIMIT).unwrap_or(50),
+                    usize::from(THREAD_FETCH_LIMIT),
                 )
                 .served()?;
             held_thread_messages(
