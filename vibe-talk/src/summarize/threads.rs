@@ -26,8 +26,11 @@
 //!
 //! # How often the chat provider is read for it
 //!
-//! Each naming reads its thread from the chat provider, and on a bridge one read can cost many
-//! upstream calls, so the reads are budgeted PER CHANNEL (remote-ops-audit W5):
+//! Each naming first reads its thread from the local message cache (`#1563`, held rows
+//! `#1884`): a cache naming makes no chat-provider call and spends no budget below. Only a
+//! thread the cache holds too little of is read from the chat provider, and on a bridge one
+//! read can cost many upstream calls, so those reads are budgeted PER CHANNEL
+//! (remote-ops-audit W5):
 //!
 //! * at most one naming read per channel per `summaries.thread_naming_interval_seconds`
 //!   ([`DEFAULT_NAMING_INTERVAL_SECONDS`] by default). Due threads wait in that channel's queue,
@@ -1884,49 +1887,101 @@ impl ThreadCache for SinkThreadCache {
         let root = snapshot.root.clone()?;
         let reply_count = snapshot
             .reply_count
-            .or_else(|| root.thread.as_ref().and_then(|thread| thread.reply_count))?;
+            .or_else(|| root.thread.as_ref().and_then(|thread| thread.reply_count));
         let cache = self.0.cache()?;
         let chan = self.0.chan_key(channel)?;
         let thread_id = snapshot.id.clone();
         tokio::task::spawn_blocking(move || {
             use crate::cache::Scope;
-            let want = usize::try_from(reply_count)
-                .unwrap_or(usize::MAX)
-                .saturating_add(2);
-            let rows = cache
-                .newest(&chan, &Scope::Thread(thread_id.clone()), want)
-                .served()?;
-            let root_row = rows.iter().find(|row| is_root(&row.message))?;
-            let latest = rows
-                .iter()
-                .filter(|row| !is_root(&row.message))
-                .max_by_key(|row| row.created_ms)?
-                .message
-                .id
-                .clone();
-            let says = crate::held_replies::RootSays {
-                thread_id,
-                root_id: root_row.message.id.clone(),
-                root_ms: root_row.created_ms,
-                reply_count,
-                latest_reply: latest,
-            };
-            // `cache::held::HELD_FRESH_MS`: a read begun within fifteen minutes stands.
-            let replies = cache
-                .whole_thread(&chan, &says, 15 * 60 * 1000)
-                .served()??;
-            let mut messages = vec![root];
-            for message in replies {
-                if !messages.iter().any(|kept| kept.id == message.id) {
-                    messages.push(message);
+            // Proven-whole first (`#1563`): the page-serve proof, when it holds.
+            if let Some(reply_count) = reply_count {
+                let want = usize::try_from(reply_count)
+                    .unwrap_or(usize::MAX)
+                    .saturating_add(2);
+                let rows = cache
+                    .newest(&chan, &Scope::Thread(thread_id.clone()), want)
+                    .served()?;
+                if let Some(found) = (|| {
+                    let root_row = rows.iter().find(|row| is_root(&row.message))?;
+                    let latest = rows
+                        .iter()
+                        .filter(|row| !is_root(&row.message))
+                        .max_by_key(|row| row.created_ms)?
+                        .message
+                        .id
+                        .clone();
+                    let says = crate::held_replies::RootSays {
+                        thread_id: thread_id.clone(),
+                        root_id: root_row.message.id.clone(),
+                        root_ms: root_row.created_ms,
+                        reply_count,
+                        latest_reply: latest,
+                    };
+                    // `cache::held::HELD_FRESH_MS`: a read begun within fifteen minutes stands.
+                    let replies = cache
+                        .whole_thread(&chan, &says, 15 * 60 * 1000)
+                        .served()??;
+                    let mut messages = vec![root.clone()];
+                    for message in replies {
+                        if !messages.iter().any(|kept| kept.id == message.id) {
+                            messages.push(message);
+                        }
+                    }
+                    crate::model::sort_oldest_first(&mut messages);
+                    Some(messages)
+                })() {
+                    return Some(found);
                 }
             }
-            crate::model::sort_oldest_first(&mut messages);
-            Some(messages)
+            // Held-rows fallback (`#1884`): naming needs the thread's text, not a
+            // page-serve proof. A listing older than the freshness window, a reply
+            // held only as a push brought it, or a count that includes a message
+            // the cache never keeps must not send naming upstream to starve on
+            // the shared Slack ceiling; the rows held are enough to name from.
+            let rows = cache
+                .newest(
+                    &chan,
+                    &Scope::Thread(thread_id),
+                    usize::try_from(THREAD_FETCH_LIMIT).unwrap_or(50),
+                )
+                .served()?;
+            held_thread_messages(
+                &root,
+                rows.into_iter().map(|row| row.message).collect(),
+                reply_count,
+            )
         })
         .await
         .ok()?
     }
+}
+
+/// The thread as the cache's held rows give it, root first (`#1884`): the
+/// snapshot's root plus the replies held under the thread's scope, when they
+/// are enough to name from — at least two replies, or every reply the root
+/// counts when it counts fewer. No freshness, coverage or exact-count proof
+/// is asked: this copy names a thread, it is never served as a page.
+fn held_thread_messages(
+    root: &Message,
+    held: Vec<Message>,
+    reply_count: Option<u64>,
+) -> Option<Vec<Message>> {
+    let mut replies: Vec<Message> = Vec::new();
+    for message in held {
+        if message.id != root.id && !replies.iter().any(|kept: &Message| kept.id == message.id) {
+            replies.push(message);
+        }
+    }
+    crate::model::sort_oldest_first(&mut replies);
+    let held_count = u64::try_from(replies.len()).ok()?;
+    let enough =
+        held_count >= 2 || reply_count.is_some_and(|count| count >= 1 && held_count == count);
+    if !enough {
+        return None;
+    }
+    let mut messages = vec![root.clone()];
+    messages.extend(replies);
+    Some(messages)
 }
 
 /// The cache's proven-whole copy of `snapshot`'s thread, root first, when held (`#1563`).
@@ -2108,6 +2163,53 @@ mod tests {
             "a".repeat(20),
             "b".repeat(19)
         )));
+    }
+
+    #[test]
+    fn held_rows_name_a_thread_without_a_page_serve_proof() {
+        // `#1884`: stale or push-held rows still name; too little held does not.
+        let message = |id: &str, minute: u32| Message {
+            edited_timestamp: None,
+            thread: None,
+            id: MessageId(id.to_owned()),
+            channel_id: ChannelId("c".to_owned()),
+            author: "codex-eng".to_owned(),
+            author_id: crate::model::UserId("2".to_owned()),
+            author_is_bot: false,
+            content: format!("text {id}"),
+            spoken_content: String::new(),
+            content_html: String::new(),
+            noise: false,
+            labels: Vec::new(),
+            timestamp: format!("2026-01-01T00:{minute:02}:00Z"),
+            spoken_time: String::new(),
+            reply_to: None,
+            reactions: None,
+            heading: None,
+            mentions: Vec::new(),
+            upstream_url: None,
+            upstream_app_url: None,
+            op_key: None,
+            observed_ms: None,
+        };
+        let root = message("100", 0);
+        let held = vec![message("102", 2), message("100", 0), message("101", 1)];
+        let named = held_thread_messages(&root, held.clone(), Some(9))
+            .expect("two held replies name even when the root counts more");
+        assert_eq!(
+            named.iter().map(|m| m.id.0.as_str()).collect::<Vec<_>>(),
+            ["100", "101", "102"]
+        );
+        assert!(
+            held_thread_messages(&root, vec![message("101", 1)], Some(9)).is_none(),
+            "one of nine held replies is not the thread"
+        );
+        assert!(
+            held_thread_messages(&root, vec![message("101", 1)], Some(1)).is_some(),
+            "the only reply the root counts is the thread"
+        );
+        assert!(held_thread_messages(&root, Vec::new(), Some(0)).is_none());
+        assert!(held_thread_messages(&root, held, None).is_some());
     }
 
     #[test]
