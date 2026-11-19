@@ -1,6 +1,6 @@
 ---
 title: 'agentctl-claude-narrow-pane-typed-not-submitted: a typed prompt in a narrow pane is never submitted'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -67,3 +67,26 @@ harness-agnostic-stuck-paste-backstop, #1546, #884, #720, #1691
 (second Enter, open), #1732, #1773, #1882 (false-failed deliveries, a
 neighbouring lane in the same file area). No lane, host or person is
 named here.
+
+## Resolution
+
+[watermelon-full-preview] Landed b9f5dc99 on github/main (owner-priority
+gate: 62 steps passed on the pre-replay commit, ledger head_sha matched;
+the support matrix had also moved on main, so the replayed combined
+tree was spot-checked before pushing). Root cause: a tall prompt in a
+narrow pane scrolls its head and composer row out of the visible frame,
+leaving only its tail above the separator — no composer reader parses
+that screen, and the lower-region match required the head anchor, so
+the stage wait stranded the paste, later deliveries refused the pane,
+and neither recovery nor the watcher backstop recognised it. Reproduced
+live on a real Claude Code in a 42x12 pane in a Herdr pane created for
+the purpose: tail-only screen, composer unreadable, head anchor absent,
+and one Enter submitted the prompt. The region match now accepts a
+long exact tail run (at least 48 normalised characters, longest first)
+when the head has scrolled off, in the Rust backstop, the delivery-path
+recovery, the in-lock stage wait, and the Python region flush; a fresh
+tail-only paste is submitted in its own delivery with one verified
+Enter, never retyped, and a foreign draft at 30, 42 and 80 columns gets
+no key. Tests at 30/42/80 in both editions plus a watcher case
+(condition-based waits throughout). No persisted queue or record field
+changed. Live deployment is the coordinator's batch.
