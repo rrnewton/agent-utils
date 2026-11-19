@@ -7337,6 +7337,7 @@ SCENES: tuple[Scene, ...] = (
         name="79-own-messages-read",
         what="the owner's own message, replayed after a reconnect, is already marked read",
         act=_act_own_message_read,
+        profiles=("android-412", "laptop-1280"),
         expect=(
             ("the Discord pane is up", "window.__visible('pane-discord')"),
             (
