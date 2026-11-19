@@ -87864,7 +87864,7 @@ def _scan_same_uid_generations(
     targets: Mapping[Path, str],
     budget: _ReadOnlyCommandBudget,
     found: dict[tuple[int, str, str, str], None],
-) -> tuple[tuple[_AbsentProcessObservation, ...], tuple[_AbsentProcessObservation, ...]]:
+) -> tuple[tuple[_AbsentProcessObservation, ...], tuple[_AbsentProcessObservation, ...], int]:
     """Run every observer over ``processes``.
 
     Returns the generations it scanned, those among them that are LIVE
@@ -87914,7 +87914,7 @@ def _scan_same_uid_generations(
     }
     scanned_set = set(processes)
     relevant: list[_AbsentProcessObservation] = []
-    followed = 0
+    followed_count = 0
     for process in inputs:
         if process.pid in matched_pids:
             relevant.append(process)
@@ -87922,7 +87922,7 @@ def _scan_same_uid_generations(
         if process not in scanned_set:
             # The preflight omitted it as terminal or replaced: proven
             # gone (#1883), followed to whatever it left behind.
-            followed += 1
+            followed_count += 1
             continue
         try:
             current = _process_generation_is_current(process)
@@ -87930,12 +87930,12 @@ def _scan_same_uid_generations(
             current = False
         if not current:
             if _generation_proven_gone(process):
-                followed += 1
+                followed_count += 1
             else:
                 # Still live but changed (a fork or exec the next
                 # inventory must meet): followed, and counted (#1883).
                 relevant.append(process)
-    return processes, tuple(relevant), followed
+    return processes, tuple(relevant), followed_count
 
 
 def _capture_same_uid_process_path_census_following(
