@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-search-typing-lag: typing in the search field stays instant while everything slower runs off the input path'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -9,7 +9,8 @@ labels:
 - ui
 - performance
 created_at: 2026-11-19T14:20:00-05:00
-updated_at: 2026-11-19T14:20:00-05:00
+updated_at: 2026-11-19T17:30:00-05:00
+closed_at: 2026-11-19T17:30:00-05:00
 ---
 
 # Description
@@ -44,3 +45,7 @@ Prior search-responsiveness work searched before filing: #1786 vibe-talk-search-
 # Notes
 
 Owner-priority, fast-track: deployed on landing. Related: #1899 vibe-talk-search-bucket-chips-pinned (pinned chips; suspect and (A)/(B) surface), #1894 vibe-talk-search-extra-hits-off-by-default, #1901 vibe-talk-search-late-hits-shift-anchor, #1895 vibe-talk-link-search-semantics, #1898 vibe-talk-nested-slack-link-in-markdown-label, #1846 windowed lists.
+
+## Resolution
+
+[watermelon-full-preview] Landed 397ea3f5 on github/main. Root cause, measured not guessed: one `input` event ran the whole filter synchronously — `threadsWithHits`/link scans over every held message, seams, tallies, and place-keeping that read one layout rectangle per row. On an 816-row fixture a keystroke read 817–1644 rectangles (2016-row probe: 2017–4045, 248–1195 ms, long tasks to 1150 ms); the owner's trace (100k DOM nodes) shows the same shape in navigation (`changeChannelView` → `toPosition`, 349 ms layout) and in `footGap`/`getBoundingClientRect`/`scrollTop` self-time. Fix: over a long list (>200 rows) the input event now runs only cheap work — the query, a visibility pass over each row's once-folded cached text, O(1) bucket-chip retirement, and the mark timer — and the full filter change (place-keeping, thread/link lookups, seams, tallies, server ask) lands once, 150 ms after the last keystroke (`FULL_SEARCH_PAUSE_MS`, pinned in the tuning-bands table). Short lists keep the exact synchronous landing. The screen-noting (`rowsOnScreen`), the view-switch place reader (`readerPlace`), and the scroll anchor now measure only the screen's neighbourhood (binary search / from-the-foot), never the whole history. (B) was real as a transient: while a new query's debounced server answer was pending, the previous query's chips stood; they now retire inside the input event and fresh counts land with the answer. (A) profiled with chips on throughout (fixture + real-data copy). The 'On this screen' signpost stands down while a bucket chip stands, so it never peeks half-cut under the pinned panel. Real-data COPY profile (Slack fully off: dead-loopback `api_base`, fake placeholder credential, `backfill = "off"`, read-only channel; copy deleted after): 484 rows / 26,759 nodes loaded from the copy, search 6–12 layout reads per keystroke; Main→thread navigation still costs ~900 layout reads and a ~700 ms long task (full thread render + entry landings over a large DOM) — reported as the top remaining offender for a follow-up virtualisation slice, not fixed here. Gate: ba2e3971 red only on documents-backfilter/ios-keyboard-send/reload-place, exclusive rerun green (6 passed), each 3/3 solo — host-saturation flakes at load average 286; landed by replay over c59100f0 with the combined tree verified (page-3 641 pass, typing gate green).
