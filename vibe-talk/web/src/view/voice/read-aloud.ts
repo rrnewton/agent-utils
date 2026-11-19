@@ -2914,6 +2914,28 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   let readJumping = false;
 
   /**
+   * `#1872 vibe-talk-read-no-audio-retry`. Segments of the read in progress already given
+   * their one retry, by segment index. Held in this scope, not a read's, because the retry
+   * itself restarts the read (`jumpReading`): a per-read set would be born empty at the
+   * very failure it exists to bound. Cleared when a read stops for any other reason, so a
+   * read the reader starts themselves always has its retry.
+   */
+  const segmentRetries = new Set<number>();
+
+  /**
+   * `#1872`. Try segment `at` once more, on fresh tickets, by the jump path: a part that
+   * arrived with no speech in time (`no_audio`), or truncated or undecodable
+   * (`malformed`), may be a slow vendor or an aborted prefetch rather than a dead one.
+   * False where that segment already had its retry, so the caller gives up as before.
+   */
+  function retrySegmentOnce(at: number): boolean {
+    if (segmentRetries.has(at)) return false;
+    segmentRetries.add(at);
+    forgetPreparedSpeech();
+    return jumpReading(at);
+  }
+
+  /**
    * `#886 voice-page-autoplay`. A read heard to its end, stopped: where autoplay may go on (`goingOn`), as a jump
    * does, keeping the media keys and the audio output, which the next read, started from no gesture (a locked
    * phone, a steering wheel), could not take back.
@@ -3520,6 +3542,9 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
           setTimeout(check, READ_NO_SPEECH_MS);
           return;
         }
+        // `#1872`: one retry at this segment first — a slow vendor's speech can
+        // legitimately follow its first audio by more than the guard allows.
+        if (retrySegmentOnce(at)) return;
         failCloud("no_audio", "", at);
       };
       setTimeout(check, READ_NO_SPEECH_MS);
