@@ -94,6 +94,8 @@ export interface ThreadListDependencies {
   cardView(choice: ThreadChoice): { mode: string; text: string };
   openReplyFromRow(row: HTMLElement): unknown;
   threadReplies(id: string, message: Message): { count: number | null; exact: boolean };
+  /** `#1846` step 4: render window in force, or null/ absent for full rendering (Off = old path). */
+  windowed?(): { prefetchPx: number; rowCap: number } | null;
   /** The channel's explicit thread-pin records (`#1550 thread-list-pins`), as the server lists them. Optional: without it the list reads and writes through the server API itself, with the page's kept token. */
   readThreadPins?(channel: string): Promise<{ records: Array<{ thread_id: string; pinned: boolean }> }>;
   /** Set one thread's pin on the server (`#1550 thread-list-pins`). Optional, as above. */
@@ -753,7 +755,13 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
   const versionless = (value: unknown): string =>
     JSON.stringify(value, (key, held) => (key === "observed_ms" ? undefined : held)) || "";
 
+  // `#1846` step 4: measured card heights (px by thread id) + last summaries for scroll re-slice.
+  const cardHeights = new Map<string, number>();
+  let lastSummaries: readonly unknown[] = [];
+  let threadWinListening = false;
+  const CARD_EST_PX = 76;
   function threadCards(summaries: readonly unknown[]): HTMLElement[] {
+    lastSummaries = summaries;
     const tally = deps.replyTally();
     // Keyed reuse (`#1839`): the cards now on the list, by thread, stand for a summary
     // whose stamp still matches; the rest are built as before. Gone threads' cards are
@@ -769,13 +777,53 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
         else held.set(id, [row as HTMLElement]);
       }
     }
-    return deps.withPendingThreads(summaries).map((summary: unknown) => {
+    const all = deps.withPendingThreads(summaries).map((summary: unknown) => {
       const id = String((summary as { id: unknown }).id);
       const candidates = held.get(id);
       const row = candidates ? candidates.shift() : undefined;
       if (row && cardStampOf(row) === cardStamp(summary, tally)) return row;
       return threadCard(summary, tally);
     });
+    // Off (default S0): exactly the old call sequence — every card, no spacers.
+    const cfg = deps.windowed ? deps.windowed() : null;
+    if (!cfg || !list || all.length <= cfg.rowCap) return all;
+    for (const row of all) {
+      const id = row.getAttribute("data-context-id");
+      if (id && (row as HTMLElement).offsetHeight) cardHeights.set(id, (row as HTMLElement).offsetHeight);
+    }
+    const heights = all.map((row) => cardHeights.get(row.getAttribute("data-context-id") || "") || CARD_EST_PX);
+    // Discuss half-pane narrows width: bucket by list width so heights re-price on change.
+    const offsets: number[] = [0];
+    for (const h of heights) offsets.push((offsets[offsets.length - 1] as number) + h);
+    const top = Math.max(0, (list.scrollTop || 0) - cfg.prefetchPx);
+    const bottom = (list.scrollTop || 0) + (list.clientHeight || 600) + cfg.prefetchPx;
+    let from = 0;
+    while (from < all.length && (offsets[from + 1] as number) <= top) from += 1;
+    let to = from;
+    while (to < all.length && (offsets[to] as number) < bottom) to += 1;
+    if (to - from > cfg.rowCap) to = from + cfg.rowCap;
+    // Pin the open thread's card into the window.
+    const openId = deps.selection().threadId ? String(deps.selection().threadId) : "";
+    const openAt = openId ? all.findIndex((r) => r.getAttribute("data-context-id") === openId) : -1;
+    if (openAt >= 0 && (openAt < from || openAt >= to)) { from = Math.max(0, Math.min(openAt, all.length - cfg.rowCap)); to = Math.min(all.length, from + cfg.rowCap); }
+    const spacer = (kind: string, px: number): HTMLElement => {
+      const node = document.createElement("li");
+      node.dataset.windowSpacer = kind;
+      node.setAttribute("aria-hidden", "true");
+      node.style.height = `${Math.max(0, Math.round(px))}px`;
+      node.style.padding = "0"; node.style.margin = "0"; node.style.border = "none"; node.style.listStyle = "none";
+      return node;
+    };
+    if (!threadWinListening && typeof list.addEventListener === "function") {
+      threadWinListening = true;
+      let queued = false;
+      list.addEventListener("scroll", () => {
+        if (queued) return; queued = true;
+        const run = () => { queued = false; if (deps.windowed && deps.windowed()) list.replaceChildren(...threadCards(lastSummaries)); };
+        if (typeof requestAnimationFrame === "function") requestAnimationFrame(run); else run();
+      }, { passive: true });
+    }
+    return [spacer("top", offsets[from] as number), ...all.slice(from, to), spacer("bottom", (offsets[offsets.length - 1] as number) - (offsets[to] as number))];
   }
 
   /** The stamp of the card `summary` would build now, from its summary and the tally. */

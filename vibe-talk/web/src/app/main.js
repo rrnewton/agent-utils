@@ -4489,6 +4489,7 @@ function createThreadList(deps) {
   };
   return createThreadListView({
     ...deps,
+    windowed: deps.windowed ?? (() => { const cfg = windowedConfig(deviceSettings(), document.documentElement.clientWidth < 900); return cfg.windowed ? { prefetchPx: cfg.prefetchPx, rowCap: cfg.rowCap } : null; }),
     readThreadPins: deps.readThreadPins ?? (async (channel) => {
       const response = await ports.http.fetch(
         `/api/v1/channels/${encodeURIComponent(channel)}/thread-pins`,
