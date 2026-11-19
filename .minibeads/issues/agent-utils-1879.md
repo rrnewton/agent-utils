@@ -1,6 +1,6 @@
 ---
 title: 'agentctl-headless-console-paved-flow: console input urgent, /interrupt MSG with hold, console viewer under systemd unit, headless refusal by real support'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 labels:
@@ -40,3 +40,7 @@ Work:
 # Notes
 
 Owner-priority gate, deployed on landing. Split into 2-3 landings if faster (console input first, then viewer/launch/refusal). Related: the console rename issue, the workspace-cultivation issue, the headless Muse adapter issue (re-scoped here by real-support verification).
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as bd5cb785, f2051be8, f92eb7ea (gate pass on the rebased tree, 2026-11-19). Console input is urgent/deliver-now, `/interrupt MSG` makes MSG the next turn with a bare-interrupt queue hold, the viewer is a recorded console tab (explicit tail viewers heal as console; older records untouched), the wrapper launches under its own systemd user unit (`--detached` is the explicit escape; turnover keeps its supervisor), profile mode switches to headless, and start/restore/turnover refuse harnesses with no headless adapter naming the matrix row. Verified dynamically: a pty console session on a test agent (urgent mid-turn start, interrupt-with-message as turn 2) and a real Muse agent under its unit answering exactly. The harness-support-matrix records Muse headless as supported in the same change.
