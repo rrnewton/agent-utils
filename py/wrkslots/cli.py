@@ -63703,15 +63703,23 @@ def _finish_remove_paths(
         allow_live_validate_owner=finish.allow_live_validate_owner,
         owner_consented=finish.owner_consented,
     )
-    if finish.absent_slot:
-        # Absent-slot closure (B2-A): the recorded owner proven dead
-        # plus two ordinary reference scans, never the following census.
+    if (
+        finish.absent_slot
+        and record.owner is not None
+        and _process_state(record.owner)[0] == "dead"
+        and not _slot_directory(config, record.slot, record.slot_type).exists()
+    ):
+        # Absent-slot closure (B2-A), rechecked after the fence: the
+        # recorded owner proven dead plus two ordinary reference
+        # scans, never the following census.  A path that reappeared
+        # after the fence falls through to the general census.
         _assert_absent_slot_unused(config, record, (fenced_slot,))
     elif (
         record.slot_type == "validate"
         and finish.private_cleanup is not None
         and record.owner is not None
         and _process_state(record.owner)[0] == "dead"
+        and _slice_subtree_state(_validate_slice_name(record.slot)) != "unknown"
     ):
         # Validation teardown closure (B2-B), only where its proof is
         # even available (a proven-dead recorded owner): owner dead,
@@ -67540,9 +67548,28 @@ def _cmd_remove_in_scope(
                     f"{fenced_slot}"
                 )
             private_cleanup.same_uid_census_performed = True
-            private_cleanup.fresh_census = _capture_same_uid_process_path_census(
-                (fenced_slot,), budget=private_cleanup.census_budget
-            )
+            record = prepared_private_finish.record
+            if (
+                record.slot_type == "validate"
+                and record.owner is not None
+                and _process_state(record.owner)[0] == "dead"
+                and _slice_subtree_state(_validate_slice_name(record.slot))
+                != "unknown"
+            ):
+                # Validation teardown closure (B2-B) outside the locks,
+                # like the census it replaces; the locked completion
+                # below sees the proven empty census.
+                _assert_validate_teardown_unused(
+                    config,
+                    record,
+                    (fenced_slot,),
+                    budget=private_cleanup.census_budget,
+                )
+                private_cleanup.fresh_census = _ProcessPathCensus((), ())
+            else:
+                private_cleanup.fresh_census = _capture_same_uid_process_path_census(
+                    (fenced_slot,), budget=private_cleanup.census_budget
+                )
             private_cleanup.census_budget.remaining_seconds()
             if (
                 _private_cleanup_fence_identity(config, fenced_slot)
@@ -74000,6 +74027,9 @@ def _recover_finish(
             live_use_recheck=selected_live_use_recheck,
             owner_consented=owner_waived,
             archive_nested=journal.get("archive_nested_cache_repositories") is True,
+            absent_slot=not _slot_directory(
+                config, record.slot, record.slot_type
+            ).exists(),
         )
         journal = _finish_remove_paths(
             config,
@@ -89148,17 +89178,23 @@ def _assert_absent_slot_unused(
             f"recorded owner for absent slot {record.slot} is not proven "
             f"dead ({state}: {detail}); refusing recovery closure"
         )
+    slot_root = _slot_directory(config, record.slot, record.slot_type)
     for _scan in range(2):
         census = _capture_process_path_census(paths, budget=budget)
-        live = [
-            match for match in census.matches if not match[3].endswith(" (deleted)")
-        ]
-        if live:
-            pid, _slot, kind, target = live[0]
-            raise Refusal(
-                f"live process {pid} may still use absent slot {record.slot}: "
-                f"{kind}={target}"
+        # Only the slot root itself, proven absent, may be exempted: a
+        # "(deleted)" target that is not exactly the absent root (a
+        # spoofed directory name, an unlinked file inside an existing
+        # slot, a removed subdirectory) is a live holder.
+        kept = tuple(
+            match
+            for match in census.matches
+            if not (
+                match[3] == f"{slot_root} (deleted)" and not slot_root.exists()
             )
+        )
+        filtered = dataclasses.replace(census, matches=kept)
+        for path in paths:
+            filtered.assert_slot_unused(path, record)
 
 
 def _validate_slice_name(slot: str) -> str:
@@ -89173,15 +89209,17 @@ def _validate_slice_name(slot: str) -> str:
     return f"validate-{slot}.slice"
 
 
-def _slice_subtree_empty(
+def _slice_subtree_state(
     slice_name: str, *, cgroup_root: Path = Path("/sys/fs/cgroup")
-) -> bool:
-    """Whether no process remains anywhere under a systemd slice.
+) -> str:
+    """``"empty"``, ``"nonempty"`` or ``"unknown"`` for a systemd slice.
 
     Kernel cgroup membership survives forks and reparenting, so an
-    empty subtree (every ``cgroup.procs`` in it empty, or the slice
-    itself already gone) proves no descendant of the slice's work
-    survives, however often it re-scoped inside the subtree.
+    unpopulated subtree proves no descendant of the slice's work
+    survives, however often it re-scoped inside the subtree.  The
+    kernel's recursive ``cgroup.events`` answer is preferred; an
+    absent slice or an unreadable one is ``"unknown"``, never empty:
+    callers fall back to the general census then.
     """
 
     candidates = [
@@ -89190,15 +89228,21 @@ def _slice_subtree_empty(
         if path.is_dir() and not path.is_symlink()
     ]
     if not candidates:
-        return True
+        return "unknown"
     for candidate in candidates:
-        for procs in candidate.rglob("cgroup.procs"):
-            try:
-                if procs.read_text(encoding="ascii").strip():
-                    return False
-            except OSError:
-                continue
-    return True
+        try:
+            events = (candidate / "cgroup.events").read_text(encoding="ascii")
+        except OSError:
+            return "unknown"
+        populated = next(
+            (line.split()[1] for line in events.splitlines() if line.startswith("populated ")),
+            None,
+        )
+        if populated is None:
+            return "unknown"
+        if populated != "0":
+            return "nonempty"
+    return "empty"
 
 
 def _assert_validate_teardown_unused(
@@ -89230,21 +89274,18 @@ def _assert_validate_teardown_unused(
             f"proven dead ({state}: {detail}); refusing teardown closure"
         )
     slice_name = _validate_slice_name(record.slot)
-    if not _slice_subtree_empty(slice_name):
+    if _slice_subtree_state(slice_name) == "nonempty":
         raise Refusal(
-            f"validation slice {slice_name} still has processes for "
+            f"validation slice {slice_name} still has living members for "
             f"slot {record.slot}; refusing teardown closure"
         )
+    # An absent or unreadable slice ("unknown") proves nothing either
+    # way: the ordinary reference census below decides alone.
     census = _capture_process_path_census(paths, budget=budget)
-    live = [
-        match for match in census.matches if not match[3].endswith(" (deleted)")
-    ]
-    if live:
-        pid, _slot, kind, target = live[0]
-        raise Refusal(
-            f"live process {pid} may still use validation slot "
-            f"{record.slot}: {kind}={target}"
-        )
+    if budget is not None:
+        budget.remaining_seconds()
+    for path in paths:
+        census.assert_slot_unused(path, record)
 
 
 def _census_record(record: ActiveRecord | None) -> ActiveRecord | None:

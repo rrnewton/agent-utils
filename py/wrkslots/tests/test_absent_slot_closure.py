@@ -10,6 +10,7 @@ slot, or an owner not proven dead, still refuses.
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import shutil
 import signal
@@ -86,22 +87,60 @@ def _record_with_owner(
         parent.wait(timeout=10)
 
 
+_ROOT_HOLDER = """
+import os, sys, time
+
+os.chdir(sys.argv[1])
+fd = os.open(".", os.O_RDONLY)
+sys.stdout.write("ready\\n")
+sys.stdout.flush()
+if sys.stdin.readline():
+    if os.fork() == 0:
+        sys.stdout.write(f"{os.getpid()}\\n")
+        sys.stdout.flush()
+        while True:
+            time.sleep(60)
+    os._exit(0)
+"""
+
+
 def test_reparented_descendant_holding_a_deleted_fd_does_not_block(
     tmp_path: Path,
 ) -> None:
-    with _record_with_owner(tmp_path) as (config, record, slot_path, parent):
-        assert parent.stdin is not None and parent.stdout is not None
-        parent.stdin.write("fork\n")
-        parent.stdin.flush()
-        child = int(parent.stdout.readline())
-        assert parent.wait(timeout=10) == 0
+    with _record_with_owner(tmp_path) as (config, record, slot_path, _parent):
+        # The fixture's own holder is not part of this case.
+        _parent.kill()
+        _parent.wait(timeout=10)
+        # The exempted reference is the slot root itself, deleted;
+        # the descendant's working directory is that root.
+        root = cli._slot_directory(config, "slot01", record.slot_type)
+        holder = subprocess.Popen(
+            [sys.executable, "-I", "-c", _ROOT_HOLDER, str(root)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            cwd="/",
+        )
         try:
-            shutil.rmtree(slot_path)
-            # The owner is proven dead and the only reference left is
-            # the descendant's descriptor into the deleted tree.
-            cli._assert_absent_slot_unused(config, record, (slot_path,))
+            assert holder.stdout is not None and holder.stdin is not None
+            assert holder.stdout.readline() == "ready\n"
+            record = dataclasses.replace(
+                record, owner=cli._read_process_identity(holder.pid)
+            )
+            holder.stdin.write("fork\n")
+            holder.stdin.flush()
+            child = int(holder.stdout.readline())
+            assert holder.wait(timeout=10) == 0
+            try:
+                shutil.rmtree(root)
+                # The owner is proven dead and the only reference left
+                # is the descendant's descriptor into the deleted root.
+                cli._assert_absent_slot_unused(config, record, (root,))
+            finally:
+                os.kill(child, signal.SIGKILL)
         finally:
-            os.kill(child, signal.SIGKILL)
+            holder.kill()
+            holder.wait(timeout=10)
 
 
 def test_a_live_reference_to_an_existing_slot_still_refuses(tmp_path: Path) -> None:
@@ -112,7 +151,7 @@ def test_a_live_reference_to_an_existing_slot_still_refuses(tmp_path: Path) -> N
         child = int(parent.stdout.readline())
         assert parent.wait(timeout=10) == 0
         try:
-            with pytest.raises(cli.Refusal, match="may still use absent slot"):
+            with pytest.raises(cli.Refusal, match="uses slot "):
                 cli._assert_absent_slot_unused(config, record, (slot_path,))
         finally:
             os.kill(child, signal.SIGKILL)
@@ -122,3 +161,99 @@ def test_an_owner_not_proven_dead_still_refuses(tmp_path: Path) -> None:
     with _record_with_owner(tmp_path) as (config, record, slot_path, _parent):
         with pytest.raises(cli.Refusal, match="not proven dead"):
             cli._assert_absent_slot_unused(config, record, (slot_path,))
+
+
+_SLEEPER = """
+import time
+
+while True:
+    time.sleep(60)
+"""
+
+
+def _interrupt_with_dead_owner(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """Create the sealed validate slot from a short-lived subprocess (so
+    its recorded owner is genuinely dead), then interrupt its private
+    finish after the fence; return the fenced path."""
+    from wrkslots.tests.test_lifecycle import (
+        _FinishInterrupted,
+        finish_journal_path,
+        remove_completed_validation,
+    )
+
+    owner = subprocess.Popen(
+        [sys.executable, "-I", "-c", "import time; time.sleep(60)"], cwd="/"
+    )
+    try:
+        assert (
+            create(
+                project, slot="target", slot_type="validate", branch=None,
+                owner_pid=owner.pid,
+            ).returncode
+            == 0
+        )
+    finally:
+        owner.kill()
+        owner.wait(timeout=10)
+
+    def interrupt(point: str) -> None:
+        if point == "after-path-fence":
+            raise _FinishInterrupted
+
+    monkeypatch.setattr(cli, "_interrupt_for_test", interrupt)
+    with pytest.raises(_FinishInterrupted):
+        remove_completed_validation(project)
+    monkeypatch.setattr(cli, "_interrupt_for_test", lambda _point: None)
+    config = cli._load_config(str(project), "testhost")
+    scoped = json.loads(
+        finish_journal_path(project, "target").read_text(encoding="utf-8")
+    )
+    assert "private_census_identity" in scoped
+    target = cli._slot_directory(config, "target", "validate")
+    fenced = tuple(target.parent.glob(".target.fenced.1.*"))
+    assert len(fenced) == 1
+    return fenced[0]
+
+
+def test_recover_absent_sealed_target_with_a_deleted_fd_descendant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Wiring (A): an interrupted sealed finish whose target is absent,
+    its recorded owner genuinely dead, and the only reference left a
+    descendant's descriptor into the deleted fenced root: recover
+    completes through the absent-slot closure."""
+    from wrkslots.tests.test_lifecycle import recover_scoped_target
+
+    project, _repository, _remote = make_project(tmp_path)
+    fenced = _interrupt_with_dead_owner(project, monkeypatch)
+def test_recover_refuses_a_spoofed_deleted_directory_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Wiring (A): an existing directory literally named
+    "<fenced>/build (deleted)" with a live holder is not the exempted
+    deleted root: recover refuses."""
+    from wrkslots.tests.test_lifecycle import (
+        interrupt_scoped_private_finish,
+        recover_scoped_target,
+    )
+
+    project, _repository, _remote = make_project(tmp_path)
+    fenced = _interrupt_with_dead_owner(project, monkeypatch)
+    spoof = fenced / "build (deleted)"
+    spoof.mkdir()
+    holder = subprocess.Popen(
+        [sys.executable, "-I", "-c", _ROOT_HOLDER, str(spoof)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        cwd="/",
+    )
+    try:
+        assert holder.stdout is not None
+        assert holder.stdout.readline() == "ready\n"
+        assert recover_scoped_target(project) != 0
+    finally:
+        holder.kill()
+        holder.wait(timeout=10)

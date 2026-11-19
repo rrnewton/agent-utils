@@ -44,16 +44,28 @@ if sys.stdin.readline():
 """
 
 
-def test_slice_subtree_emptiness_walks_every_procs_file(tmp_path: Path) -> None:
+def test_slice_subtree_state_reads_the_kernel_populated_answer(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "cgroup"
     slice_dir = root / "user.slice" / "validate-slot01.slice"
-    (slice_dir / "box.scope").mkdir(parents=True)
-    (slice_dir / "cgroup.procs").write_text("", encoding="ascii")
-    (slice_dir / "box.scope" / "cgroup.procs").write_text("", encoding="ascii")
-    assert cli._slice_subtree_empty("validate-slot01.slice", cgroup_root=root)
-    (slice_dir / "box.scope" / "cgroup.procs").write_text("4242\n", encoding="ascii")
-    assert not cli._slice_subtree_empty("validate-slot01.slice", cgroup_root=root)
-    assert cli._slice_subtree_empty("validate-absent.slice", cgroup_root=root)
+    slice_dir.mkdir(parents=True)
+    (slice_dir / "cgroup.events").write_text(
+        "populated 0\nfrozen 0\n", encoding="ascii"
+    )
+    assert cli._slice_subtree_state("validate-slot01.slice", cgroup_root=root) == "empty"
+    (slice_dir / "cgroup.events").write_text(
+        "populated 1\nfrozen 0\n", encoding="ascii"
+    )
+    assert (
+        cli._slice_subtree_state("validate-slot01.slice", cgroup_root=root)
+        == "nonempty"
+    )
+    # An absent slice, or one whose events cannot be read, is unknown:
+    # never evidence of emptiness (the caller falls back).
+    assert cli._slice_subtree_state("validate-absent.slice", cgroup_root=root) == "unknown"
+    (slice_dir / "cgroup.events").unlink()
+    assert cli._slice_subtree_state("validate-slot01.slice", cgroup_root=root) == "unknown"
 
 
 @contextmanager
@@ -111,7 +123,7 @@ def test_teardown_closes_when_the_slice_is_empty_and_owner_dead(
             except ProcessLookupError:
                 pass
             monkeypatch.setattr(
-                cli, "_slice_subtree_empty", lambda _name: True
+                cli, "_slice_subtree_state", lambda _name: "empty"
             )
             cli._assert_validate_teardown_unused(config, record, (slot_path,))
         finally:
@@ -134,9 +146,9 @@ def test_a_sibling_scope_holder_makes_teardown_refuse(
         assert parent.wait(timeout=10) == 0
         try:
             monkeypatch.setattr(
-                cli, "_slice_subtree_empty", lambda _name: True
+                cli, "_slice_subtree_state", lambda _name: "empty"
             )
-            with pytest.raises(cli.Refusal, match="may still use validation slot"):
+            with pytest.raises(cli.Refusal, match="uses slot "):
                 cli._assert_validate_teardown_unused(config, record, (slot_path,))
         finally:
             os.kill(child, signal.SIGKILL)
@@ -149,7 +161,7 @@ def test_a_nonempty_slice_makes_teardown_refuse(
         parent.kill()
         parent.wait(timeout=10)
         monkeypatch.setattr(
-            cli, "_slice_subtree_empty", lambda _name: False
+            cli, "_slice_subtree_state", lambda _name: "nonempty"
         )
-        with pytest.raises(cli.Refusal, match="still has processes"):
+        with pytest.raises(cli.Refusal, match="still has living members"):
             cli._assert_validate_teardown_unused(config, record, (slot_path,))
