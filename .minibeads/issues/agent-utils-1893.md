@@ -1,6 +1,6 @@
 ---
 title: 'agentctl-launch-failed-but-live: Muse hooks-trust dialog fails launches of live panes and promote refuses them'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -31,3 +31,7 @@ Since the Muse update on 2026-11-18, every new Muse session in a workspace with 
 # Notes
 
 Reported 2026-11-18 after the Muse update; five lanes across two teams were recorded `launch_failed` while live. No lane, host or person is named here.
+
+## Resolution
+
+[watermelon-full-preview] Landed 2daf5b2d on github/main (owner-priority gate: 62 passed, 0 failed, 1 no-result in an untouched step class; focused suites: Rust client/subagents, Python launch/launch-spec/subagents). Both editions recognise the dialog (`muse_hooks_trust_prompt`: "Review plugin hooks" + "Continue without trusting", the installed Muse 1.4.24's strings): launch readiness waits while it shows and names `waiting: hooks trust` if the bound expires with it up, status reports the same, and nothing ever answers it. `agentctl promote` now accepts `herdr-pane` records (skipping the Herdr agent-name lookup a custom pane cannot satisfy) on the same pane/tab/workspace/cwd/process identity proofs. Verified live before landing: a real `launch_failed` Muse record was promoted to `running` with the fixed build and then took a send (`promote`, then a delivered prompt). The opt-in to continue without trusting (Esc) remains unbuilt, default off, pending the owner's decision.
