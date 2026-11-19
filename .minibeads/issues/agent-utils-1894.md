@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-search-extra-hits-off-by-default: thread and server extra hits start off, toggled by their chip, and never move the scroll'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -8,7 +8,7 @@ labels:
 - search
 - ui
 created_at: 2026-11-19T00:34:25-05:00
-updated_at: 2026-11-19T00:34:25-05:00
+updated_at: 2026-11-19T01:30:00-05:00
 ---
 
 # Description
@@ -36,3 +36,7 @@ Today the #1797 bucket chips under the search bar (`vibe-talk/web/src/view/chann
 # Notes
 
 Coordinates with #1880 (mu-readerdrill): their `ScrollKeeping.userMovedSince` export is on `mu-readerdrill/1880`, not yet on main at filing; the scroll half of this issue either follows its landing or cherry-picks it with their OK, never a second input tracker in scrollkeep.
+
+## Resolution
+
+[watermelon-full-preview] Both halves landed and the first deployed: default-off as 0bc8a697 (in 597ba683, deployed in the 7d94969e watch), zero-scroll as 253ff5ab + 747cd7a3. At each new search only the home bucket starts on (`searchBucketDefs` in olderwalks.ts); extra buckets stand only from their chip, and the next search resets them off. Late extra-bucket landings interleave through `placeServerHits` as before, but `placeFilterAnchor` no longer nudges the scroll once the reader has moved since the anchor's capture: the anchor carries the scroll owner's reader-input stamp (`ScrollKeeping.inputStamp`, #1880's guard f9bb641c), answered by `userMovedSince`, with no layout reads (the #249 same-search invariant holds). Gate evidence: default-off gate green except approval-card-small-phones (CPU timeout, untouched; exclusive rerun pass) and fmt NO_RESULT (OOM learned cap); zero-scroll gate green except discuss-browser and thread-pin-picker-browser (untouched timeouts; exclusive rerun pass for both). Manual evidence from main 7d94969e in /tmp/mu-labelsdrop-main with harness-format BUILD.txt, as reported to coordb.
