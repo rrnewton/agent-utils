@@ -24,5 +24,6 @@ export {
   linksIn,
   markdownLinkAt,
   trimAddress,
+  unwrappedLabel,
 } from "./addresses.ts";
 export type { FoundLink } from "./addresses.ts";

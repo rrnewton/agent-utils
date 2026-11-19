@@ -195,6 +195,9 @@ pub fn for_speech(content: &str, now_ms: i64, zone: &Zone) -> String {
 #[must_use]
 pub fn for_speech_with(content: &str, now_ms: i64, zone: &Zone, names: &mut Names) -> String {
     let text = drop_timestamp_citations(content);
+    // `#1898`: a link nested in a Markdown label is unwrapped to its words first, so no
+    // raw `<url|label>` or second link's brackets are spoken.
+    let text = crate::slack::mrkdwn::unwrap_links_in_labels(&text, &[]);
     let text = strip_markdown(&text);
     let text = speak_times(&text, now_ms, zone);
     let text = name_opaque_strings(&text, names);
@@ -1301,6 +1304,21 @@ mod tests {
             super::with_mention_names("ask <@U0ADA0001>", &[]),
             std::borrow::Cow::Borrowed(_)
         ));
+    }
+
+    #[test]
+    fn a_link_nested_in_a_markdown_label_is_said_as_its_words() {
+        // `#1898 vibe-talk-nested-slack-link-in-markdown-label`: neither the raw
+        // `<url|label>` nor a second link's brackets are spoken.
+        assert_eq!(
+            say("[<http://interncache-all.example.test/manifold/|interncache-all.example.test/manifold/>\u{2026}/ipfsmf-test-site-loader.html#\u{2026}](<https://interncache-all.example.test/manifold/flat/ipfsmf-test-site-loader.html#bafy>)"),
+            "interncache-all.example.test/manifold/\u{2026}/ipfsmf-test-site-loader.html#\u{2026}"
+        );
+        // The converted shape, a Markdown link inside the label, says the same words.
+        assert_eq!(
+            say("[[interncache-all.example.test/manifold/](http://interncache-all.example.test/manifold/)\u{2026}/ipfsmf-test-site-loader.html#\u{2026}](https://interncache-all.example.test/manifold/flat/ipfsmf-test-site-loader.html#bafy)"),
+            "interncache-all.example.test/manifold/\u{2026}/ipfsmf-test-site-loader.html#\u{2026}"
+        );
     }
 
     #[test]

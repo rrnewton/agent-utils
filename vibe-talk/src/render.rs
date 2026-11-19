@@ -192,9 +192,24 @@ impl Markup {
     /// at all, which almost no message does.
     fn prepare<'t>(self, text: &'t str, options: &Options) -> Cow<'t, str> {
         match self {
-            Self::Discord => Cow::Borrowed(text),
+            Self::Discord => {
+                // `#1898 vibe-talk-nested-slack-link-in-markdown-label`: a Slack link nested
+                // in a Markdown label is unwrapped to its words before comrak reads it, in
+                // every dialect; inside code it is text as written, like a labelled link.
+                if text.contains('[') && text.contains("<http") {
+                    Cow::Owned(
+                        crate::slack::mrkdwn::unwrap_links_in_labels(
+                            text,
+                            &code_ranges(text, options),
+                        )
+                        .into_owned(),
+                    )
+                } else {
+                    Cow::Borrowed(text)
+                }
+            }
             Self::GoogleChat | Self::Slack => {
-                use crate::slack::mrkdwn::angle_links_outside;
+                use crate::slack::mrkdwn::{angle_links_outside, unwrap_links_in_labels};
                 // `#1606 message-rerender-loses-formatting`: a row the cache stored
                 // from a flattened history read still holds that shape; repair it
                 // here too, so a cached row draws as the live event did.
@@ -208,16 +223,26 @@ impl Markup {
                         },
                     };
                     if let Some(repaired) = repaired {
+                        let code = code_ranges(&repaired, options);
+                        let unwrapped = unwrap_links_in_labels(&repaired, &code);
                         return Cow::Owned(
-                            angle_links_outside(&repaired, &code_ranges(&repaired, options))
-                                .into_owned(),
+                            angle_links_outside(&unwrapped, &code).into_owned(),
                         );
                     }
                 }
-                match angle_links_outside(text, &[]) {
+                // `#1898`: unwrap a link nested in a Markdown label first, so the angle
+                // rewrite below cannot make it a second link inside the first.
+                let unwrapped = match unwrap_links_in_labels(text, &[]) {
                     Cow::Borrowed(_) => Cow::Borrowed(text),
                     Cow::Owned(_) => Cow::Owned(
-                        angle_links_outside(text, &code_ranges(text, options)).into_owned(),
+                        unwrap_links_in_labels(text, &code_ranges(text, options)).into_owned(),
+                    ),
+                };
+                match angle_links_outside(&unwrapped, &[]) {
+                    Cow::Borrowed(_) => unwrapped,
+                    Cow::Owned(_) => Cow::Owned(
+                        angle_links_outside(&unwrapped, &code_ranges(&unwrapped, options))
+                            .into_owned(),
                     ),
                 }
             }
@@ -4185,6 +4210,34 @@ mod tests {
 
     fn html(text: &str) -> String {
         to_html(text, Markup::Discord)
+    }
+
+    #[test]
+    fn a_slack_link_nested_in_a_markdown_label_draws_as_its_words() {
+        // `#1898 vibe-talk-nested-slack-link-in-markdown-label`: the owner's shape — a Slack
+        // `<url|label>` inside a Markdown `[label](url)` — drew the raw markup as the link
+        // text. It now draws as one link to the Markdown target, labelled by the words the
+        // nested link carries, in every dialect, and a nested `<url>` by the address.
+        let text = "[<http://interncache-all.example.test/manifold/|interncache-all.example.test/manifold/>\u{2026}/ipfsmf-test-site-loader.html#\u{2026}](<https://interncache-all.example.test/manifold/flat/ipfsmf-test-site-loader.html#bafy>)";
+        let drawn = format!(
+            "<p><a href=\"https://interncache-all.example.test/manifold/flat/ipfsmf-test-site-loader.html#bafy\" {LINK}>interncache-all.example.test/manifold/\u{2026}/ipfsmf-test-site-loader.html#\u{2026}</a></p>\n"
+        );
+        for markup in [Markup::Discord, Markup::Slack, Markup::GoogleChat] {
+            assert_eq!(to_html(text, markup), drawn, "{markup:?} kept the raw label");
+        }
+        assert_eq!(
+            html("look [<https://a.example/x>](https://b.example/y) and [see <https://c.example|the doc>](https://d.example) end"),
+            format!("<p>look <a href=\"https://b.example/y\" {LINK}>https://a.example/x</a> and <a href=\"https://d.example\" {LINK}>see the doc</a> end</p>\n")
+        );
+        // Plain Markdown and plain Slack links draw exactly as before.
+        assert_eq!(
+            html("Read [the quarterly plan](https://example.test/x) before Friday"),
+            format!("<p>Read <a href=\"https://example.test/x\" {LINK}>the quarterly plan</a> before Friday</p>\n")
+        );
+        assert_eq!(
+            to_html("see <https://a.example|A>", Markup::Slack),
+            format!("<p>see <a href=\"https://a.example\" {LINK}>A</a></p>\n")
+        );
     }
 
     #[test]

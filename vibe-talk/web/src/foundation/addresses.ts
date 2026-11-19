@@ -120,7 +120,7 @@ function markdownLinkAt(text: string, start: number): FoundLink | null {
     }
   }
   if (depth !== 0 || text[close] !== "]" || text[close + 1] !== "(") return null;
-  const name = text.slice(start + 1, close).replace(/\s+/g, " ").trim();
+  const name = unwrappedLabel(text.slice(start + 1, close)).replace(/\s+/g, " ").trim();
   let at = close + 2;
   const skipBlanks = (): void => {
     while (text[at] === " " || text[at] === "\t") at += 1;
@@ -162,6 +162,57 @@ function markdownLinkAt(text: string, start: number): FoundLink | null {
   }
   if (text[at] !== ")" || /\s/.test(href) || !HTTP_ADDRESS.test(href)) return null;
   return { href, name, end: at + 1 };
+}
+
+/**
+ * One Markdown label with its nested links unwrapped (`#1898
+ * vibe-talk-nested-slack-link-in-markdown-label`): inside a label, `<https://a|name>` reads as
+ * its name and `<https://a>` as the address, and a nested Markdown link as its own label, so
+ * the words a link shows never carry the raw markup of a link inside it. Anything else —
+ * a mention, no closing bracket — is left as written.
+ */
+function unwrappedLabel(label: string): string {
+  if (!label.includes("<") && !label.includes("[")) return label;
+  let out = "";
+  let copied = 0;
+  let at = 0;
+  while (at < label.length) {
+    const character = label[at];
+    // An escaped bracket is the character itself, as in a file's name.
+    let backslashes = 0;
+    for (let before = at - 1; before >= 0 && label[before] === "\\"; before -= 1) backslashes += 1;
+    if (backslashes % 2 === 1) {
+      at += 1;
+      continue;
+    }
+    if (character === "<") {
+      const close = label.indexOf(">", at);
+      const inner = close > at ? label.slice(at + 1, close) : "";
+      const pipe = inner.indexOf("|");
+      const href = pipe >= 0 ? inner.slice(0, pipe) : inner;
+      const words = pipe >= 0 ? inner.slice(pipe + 1).trim() || href : inner;
+      if (close > at && /^https?:\/\//i.test(href) && !/[\s<]/.test(href)) {
+        out += label.slice(copied, at) + words;
+        at = close + 1;
+        copied = at;
+        continue;
+      }
+      at += 1;
+      continue;
+    }
+    if (character === "[") {
+      const nested = markdownLinkAt(label, at);
+      if (nested) {
+        out += label.slice(copied, at) + nested.name;
+        at = nested.end;
+        copied = at;
+        continue;
+      }
+    }
+    at += 1;
+  }
+  if (copied === 0) return label;
+  return out + label.slice(copied);
 }
 
 /** The `<https://…>` or `<https://…|name>` link at `start`, as `{href, name, end}`, or null. */
@@ -226,5 +277,6 @@ export {
   linksIn,
   markdownLinkAt,
   trimAddress,
+  unwrappedLabel,
 };
 export type { FoundLink };

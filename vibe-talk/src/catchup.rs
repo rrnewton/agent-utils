@@ -204,7 +204,13 @@ pub fn build_context(
 
     let plain_bodies: Vec<String> = entries
         .iter()
-        .map(|entry| neutralize(&entry.message.content))
+        // `#1898`: quote a nested link by the words it shows, not its raw markup.
+        .map(|entry| {
+            neutralize(&crate::slack::mrkdwn::unwrap_links_in_labels(
+                &entry.message.content,
+                &[],
+            ))
+        })
         .collect();
     let bodies = cut_bodies(&entries, &plain_bodies);
     let any_cut = plain_bodies

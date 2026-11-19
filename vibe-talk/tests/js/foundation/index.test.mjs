@@ -36,3 +36,22 @@ test("`#624 voice-page-modularity`: the links a message's text holds as written,
   assert.equal(trimAddress("https://en.wikipedia.org/wiki/Mercury_(planet))."), "https://en.wikipedia.org/wiki/Mercury_(planet)");
   assert.deepStrictEqual(linksIn(null), []);
 });
+
+test("`#1898 vibe-talk-nested-slack-link-in-markdown-label`: a link nested in a Markdown label names the outer link by its words", () => {
+  const { linksIn, unwrappedLabel } = GLYPHS;
+  // The owner's shape: a Slack `<url|label>` inside a Markdown `[label](url)`; the outer
+  // address is the link's, and its name is the nested label's words, never the raw markup.
+  assert.deepStrictEqual(
+    linksIn("[<http://interncache-all.example.test/manifold/|interncache-all.example.test/manifold/>…/ipfsmf-test-site-loader.html#…](<https://interncache-all.example.test/manifold/flat/ipfsmf-test-site-loader.html#bafy>)"),
+    [{ href: "https://interncache-all.example.test/manifold/flat/ipfsmf-test-site-loader.html#bafy", name: "interncache-all.example.test/manifold/…/ipfsmf-test-site-loader.html#…" }]);
+  // A nested `<url>` names the outer link by the address it carries.
+  assert.deepStrictEqual(linksIn("look [<https://a.example/x>](https://b.example/y) end"),
+    [{ href: "https://b.example/y", name: "https://a.example/x" }]);
+  assert.deepStrictEqual(linksIn("[see <https://c.example|the doc>](https://d.example)"),
+    [{ href: "https://d.example", name: "see the doc" }]);
+  // Plain Markdown links and plain Slack links keep the names they always had.
+  assert.deepStrictEqual(linksIn("Read [the quarterly plan](https://example.test/x) and <https://a.example|A>"),
+    [{ href: "https://example.test/x", name: "the quarterly plan" }, { href: "https://a.example", name: "A" }]);
+  assert.equal(unwrappedLabel("see <https://c.example|the doc> and <https://a.example/x>"), "see the doc and https://a.example/x");
+  assert.equal(unwrappedLabel("no links <@U1> [brackets]"), "no links <@U1> [brackets]");
+});

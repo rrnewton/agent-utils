@@ -52,6 +52,9 @@ pub fn to_markdown_with(text: &str, channels: &HashMap<String, String>) -> Strin
     // (`#1606 message-rerender-loses-formatting`); undo that first, so it reads as
     // the live event's mrkdwn does.
     let text = split_glued_bullets(&repair_fallback_links(text)).into_owned();
+    // `#1898`: a Slack link nested in a Markdown label is unwrapped before the token scan
+    // would turn it into a second Markdown link inside the first.
+    let text = unwrap_links_in_labels(&text, &[]).into_owned();
     let text = super::emoji::shortcodes(&text);
     let mut out = String::with_capacity(text.len());
     let mut rest: &str = &text;
@@ -346,6 +349,217 @@ fn angle_link_at(text: &str) -> Option<(usize, &str, &str)> {
     (!label.is_empty()).then_some((inner.len() + 2, href, label))
 }
 
+/// The longest label or target read while looking for a Markdown link inside
+/// [`unwrap_links_in_labels`], so a line of brackets that never closes costs its own length
+/// once, not once per bracket.
+const LABEL_SCAN_MAX: usize = 4096;
+
+/// How deep a link inside a link inside a link is followed before the rest is left as written.
+const LABEL_NEST_MAX: usize = 8;
+
+/// Unwrap the links nested inside a Markdown link's label (`#1898
+/// vibe-talk-nested-slack-link-in-markdown-label`).
+///
+/// A Slack link inside a Markdown label, `[<https://a|name>…](https://b)`, is drawn by the
+/// Markdown reader as raw markup or as a second link inside the first, never as the one link
+/// the writer sent. Inside a label, an angle link is therefore replaced by what it says —
+/// `<https://a|name>` by its name and `<https://a>` by the address — and a Markdown link
+/// already nested there by its own label, which is the shape a converted Slack body holds.
+/// The outer link, its target included, is otherwise exactly as written, and a link that
+/// overlaps one of the `code` ranges is left alone, as in [`angle_links_outside`].
+#[must_use]
+pub fn unwrap_links_in_labels<'t>(text: &'t str, code: &[Range<usize>]) -> Cow<'t, str> {
+    if !text.contains('[') || (!text.contains('<') && !text.contains("](")) {
+        return Cow::Borrowed(text);
+    }
+    let in_code = |at: usize| code.iter().any(|range| range.contains(&at));
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut at = 0;
+    while at < text.len() {
+        if text.as_bytes()[at] != b'[' || in_code(at) {
+            at += text[at..].chars().next().map_or(1, char::len_utf8);
+            continue;
+        }
+        let Some((label_end, link_end)) = markdown_link_span(text, at) else {
+            at += 1;
+            continue;
+        };
+        if let Cow::Owned(label) = unwrapped_label(&text[at + 1..label_end], 0) {
+            out.push_str(&text[copied..at]);
+            out.push('[');
+            out.push_str(&label);
+            out.push_str(&text[label_end..link_end]);
+            copied = link_end;
+        }
+        at = link_end;
+    }
+    if copied == 0 {
+        return Cow::Borrowed(text);
+    }
+    out.push_str(&text[copied..]);
+    Cow::Owned(out)
+}
+
+/// The `[label](target)` span whose `[` is at `start`, as `(label end, link end)`, or `None`
+/// when the brackets open no Markdown link to a web address. The label may hold brackets
+/// that pair and stays on one line; the target may be bracketed (`<…>`) and may hold
+/// parentheses that pair.
+fn markdown_link_span(text: &str, start: usize) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut close = start;
+    while close < text.len() && close - start <= LABEL_SCAN_MAX {
+        match bytes[close] {
+            b'\n' => return None,
+            b'\\' => close += 1,
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        close += 1;
+    }
+    if depth != 0 || bytes.get(close) != Some(&b']') || bytes.get(close + 1) != Some(&b'(') {
+        return None;
+    }
+    let mut at = close + 2;
+    while matches!(bytes.get(at), Some(b' ') | Some(b'\t')) {
+        at += 1;
+    }
+    let target_from = at;
+    if bytes.get(at) == Some(&b'<') {
+        let shut = text[at..].find('>').map(|found| at + found)?;
+        if shut - at > LABEL_SCAN_MAX {
+            return None;
+        }
+        at = shut + 1;
+    } else {
+        let mut parens = 0usize;
+        while at < text.len() && at - target_from <= LABEL_SCAN_MAX {
+            match bytes[at] {
+                b' ' | b'\t' | b'\n' | b'\r' => break,
+                b'(' => parens += 1,
+                b')' => {
+                    if parens == 0 {
+                        break;
+                    }
+                    parens -= 1;
+                }
+                _ => {}
+            }
+            at += 1;
+        }
+    }
+    let target = text[target_from..at].trim_start_matches('<').trim_end_matches('>');
+    let scheme = target.get(..8).unwrap_or(target).to_ascii_lowercase();
+    if !(scheme.starts_with("http://") || scheme.starts_with("https://"))
+        || target.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+    while matches!(bytes.get(at), Some(b' ') | Some(b'\t')) {
+        at += 1;
+    }
+    // A quoted title after the target, as Markdown allows.
+    if let Some(end_quote) = match bytes.get(at) {
+        Some(b'"') => Some(b'"'),
+        Some(b'\'') => Some(b'\''),
+        _ => None,
+    } {
+        let shut = text[at + 1..].find(end_quote as char).map(|found| at + 1 + found)?;
+        if text[at..=shut].contains('\n') {
+            return None;
+        }
+        at = shut + 1;
+        while matches!(bytes.get(at), Some(b' ') | Some(b'\t')) {
+            at += 1;
+        }
+    }
+    (bytes.get(at) == Some(&b')')).then_some((close, at + 1))
+}
+
+/// One Markdown label with its nested links unwrapped (see [`unwrap_links_in_labels`]).
+fn unwrapped_label(label: &str, depth: usize) -> Cow<'_, str> {
+    if depth >= LABEL_NEST_MAX || (!label.contains('<') && !label.contains('[')) {
+        return Cow::Borrowed(label);
+    }
+    let mut out = String::with_capacity(label.len());
+    let mut copied = 0;
+    let mut at = 0;
+    while at < label.len() {
+        // An escaped bracket is the character itself, as in a file's name (`#313`).
+        let escaped = label.as_bytes()[..at]
+            .iter()
+            .rev()
+            .take_while(|&&byte| byte == b'\\')
+            .count()
+            % 2
+            == 1;
+        if escaped {
+            at += 1;
+            continue;
+        }
+        match label.as_bytes()[at] {
+            b'<' => {
+                let Some((length, words)) = angle_words_at(&label[at..]) else {
+                    at += 1;
+                    continue;
+                };
+                out.push_str(&label[copied..at]);
+                out.push_str(words);
+                at += length;
+                copied = at;
+            }
+            b'[' => {
+                let Some((label_end, link_end)) = markdown_link_span(label, at) else {
+                    at += 1;
+                    continue;
+                };
+                out.push_str(&label[copied..at]);
+                match unwrapped_label(&label[at + 1..label_end], depth + 1) {
+                    Cow::Owned(words) => out.push_str(&words),
+                    Cow::Borrowed(words) => out.push_str(words),
+                }
+                at = link_end;
+                copied = at;
+            }
+            _ => at += label[at..].chars().next().map_or(1, char::len_utf8),
+        }
+    }
+    if copied == 0 {
+        return Cow::Borrowed(label);
+    }
+    out.push_str(&label[copied..]);
+    Cow::Owned(out)
+}
+
+/// The words an angle link at the start of `text` stands for: `<https://a|name>` is its name
+/// (the address itself when the name is empty) and `<https://a>` is the address, as
+/// `(length, words)`. Anything else — a mention, a channel, no closing bracket — is `None`.
+fn angle_words_at(text: &str) -> Option<(usize, &str)> {
+    let close = 1 + text[1..].find(['>', '\n', '<'])?;
+    if text.as_bytes()[close] != b'>' {
+        return None;
+    }
+    let inner = &text[1..close];
+    let (href, label) = match inner.split_once('|') {
+        Some((href, label)) => (href, label.trim()),
+        None => (inner, ""),
+    };
+    let scheme = href.get(..8).unwrap_or(href).to_ascii_lowercase();
+    if !(scheme.starts_with("http://") || scheme.starts_with("https://"))
+        || href.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+    Some((close + 1, if label.is_empty() { href } else { label }))
+}
+
 /// Undo a history reader's double conversion of a labelled link, `#1606
 /// message-rerender-loses-formatting`: `<https://x|GH #329>` came back as
 /// `<[https://x GH](https://x%7CGH) #329>` — the address and the label's first word
@@ -520,6 +734,40 @@ mod tests {
             super::to_markdown("<!subteam^S0123|@ops> <!subteam^S0456|eng> <@U0123ABCD>"),
             "@ops @eng <@U0123ABCD>"
         );
+    }
+
+    #[test]
+    fn a_slack_link_nested_in_a_markdown_label_is_unwrapped_to_its_words() {
+        // `#1898 vibe-talk-nested-slack-link-in-markdown-label`.
+        use super::unwrap_links_in_labels;
+        let text = "[<http://interncache-all.example.test/manifold/|interncache-all.example.test/manifold/>\u{2026}/ipfsmf-test-site-loader.html#\u{2026}](<https://interncache-all.example.test/manifold/flat/ipfsmf-test-site-loader.html#bafy>)";
+        assert_eq!(
+            super::to_markdown(text),
+            "[interncache-all.example.test/manifold/\u{2026}/ipfsmf-test-site-loader.html#\u{2026}](https://interncache-all.example.test/manifold/flat/ipfsmf-test-site-loader.html#bafy)"
+        );
+        assert_eq!(
+            unwrap_links_in_labels("look [<https://a.example/x>](https://b.example/y) and [see <https://c.example|the doc>](https://d.example) end", &[]),
+            "look [https://a.example/x](https://b.example/y) and [see the doc](https://d.example) end"
+        );
+        // A converted body holds the nesting as a Markdown link; it flattens the same way.
+        assert_eq!(
+            unwrap_links_in_labels("[[inner words](https://a.example) tail](https://b.example)", &[]),
+            "[inner words tail](https://b.example)"
+        );
+        // Plain Markdown and plain Slack links are exactly as written, and code is left alone.
+        for plain in [
+            "Read [the quarterly plan](https://example.test/x) before Friday",
+            "see <https://a.example|A> or https://b.example/x",
+            "no links at all",
+        ] {
+            assert_eq!(unwrap_links_in_labels(plain, &[]), plain, "{plain:?} was rewritten");
+        }
+        let coded = "`[<https://a.example|name>](https://b.example)`";
+        let code = coded.find('[').map(|at| at..at + 1).unwrap();
+        assert_eq!(unwrap_links_in_labels(coded, &[code]), coded);
+        // An escaped bracket in a label is the character itself, as in a file's name.
+        let named = r"[a \<https://e.test|z\> b](https://b.example)";
+        assert_eq!(unwrap_links_in_labels(named, &[]), named);
     }
 
     #[test]
