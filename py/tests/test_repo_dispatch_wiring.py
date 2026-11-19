@@ -33,6 +33,8 @@ RESOLVER_TOOLS = RUST_TOOLS + PYTHON_ONLY_TOOLS
 NON_PUBLISHED_RUST_BINARIES = (
     "agent-teams",
     "agent-usage",
+    "agentctl-discord-outbound",
+    "agentctl-discord-plugin",
     "agentctl-slack-outbound",
     "agentctl-slack-plugin",
     "change-classify",

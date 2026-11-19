@@ -21,7 +21,7 @@ reports that same complete size.
 Batch limits count compact JSON encoding and string escaping rather than raw
 UTF-8 alone, so bounded process adapters accept the same domain values.
 An optional `MessageRejected` event carries only bounded channel, message, and
-sender IDs plus a typed `SenderNotAllowed` or `IgnoredPrefix` reason. It allows a
+sender IDs plus a typed `SenderNotAllowed`, `IgnoredPrefix` or `TargetRefused` reason. It allows a
 host to persist rejection feedback without retaining rejected text or granting
 request authority. Its channel must remain inside the subscription authority;
 `MessageCreated` still requires an allowed sender. The provider excludes known

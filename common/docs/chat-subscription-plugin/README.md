@@ -157,11 +157,13 @@ A rejection feedback candidate has exactly these fields:
 }
 ```
 
-`reason` is `sender_not_allowed` or `ignored_prefix`. This reference contains no
+`reason` is `sender_not_allowed`, `ignored_prefix` or `target_refused` (the
+message addressed this host but named a target the provider refuses, such as an
+unknown agent). This reference contains no
 message text, thread, timestamp, or provider payload and never authorizes a
 request. Its channel must be in Start's channel authority. A
 `sender_not_allowed` reference must name a sender outside Start's allowed sender
-set; `ignored_prefix` may name an allowed sender. Message-created events retain
+set; `ignored_prefix` and `target_refused` may name an allowed sender. Message-created events retain
 their full channel and sender authority checks.
 
 Providers exclude known bot/app message types, edits, deletions, and non-message

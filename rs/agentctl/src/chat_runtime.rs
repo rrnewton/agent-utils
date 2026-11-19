@@ -24232,6 +24232,98 @@ pub(crate) mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// The Discord provider's shipped example configuration, admitted by the real bridge: the
+    /// owner's channel is not a relay channel, so an owner request there becomes a request,
+    /// and the relay channel still refuses the owner (with rejection feedback). A config that
+    /// put the owner only in the relay channel would deliver nothing (#328
+    /// discord-relay-transport review).
+    #[test]
+    fn discord_example_config_admits_owner_requests_outside_the_relay_channel() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../chat-subscription-discord/examples/bridge-newton-fedora.json");
+        const OWNER_CHANNEL: &str = "1600000000000000001";
+        const OWNER: &str = "111222333444555666";
+        let text = fs::read_to_string(&path)
+            .expect("example config")
+            .replace("<OWNER_CHANNEL_ID>", OWNER_CHANNEL)
+            .replace("<OWNER_DISCORD_USER_ID>", OWNER)
+            .replace("<PEER_HOST>", "peer-host")
+            .replace("<TOKEN_FILE>", "/nonexistent/discord.env");
+        let configuration: BridgeConfiguration =
+            serde_json::from_str(&text).expect("the example parses as a bridge configuration");
+        configuration.validate().expect("the example validates");
+        let relay: Vec<&str> = configuration
+            .relay_channels
+            .iter()
+            .map(|entry| entry.channel.as_str())
+            .collect();
+        assert!(
+            configuration
+                .channel_ids
+                .iter()
+                .any(|channel| !relay.contains(&channel.as_str())),
+            "the example needs an owner channel that is not a relay channel"
+        );
+        let helper = configuration
+            .outbound_command
+            .as_ref()
+            .expect("outbound command");
+        for channel in &configuration.channel_ids {
+            assert!(
+                helper
+                    .arguments
+                    .iter()
+                    .any(|argument| *argument == format!("--channel={channel}")),
+                "the helper may post in {channel}"
+            );
+        }
+        let relay_channel = relay[0].to_owned();
+
+        let root = temporary("discord-example-admission");
+        let state = BridgeState::initialize(&root, configuration).expect("initialize state");
+        // The provider's identifiers: <channel>/messages/<id>, <channel>/threads/<root>.
+        let batch = |sequence: u64, channel: &str, text: &str| {
+            let message = InboundMessage::new(
+                ChannelId::new(channel).expect("channel"),
+                MessageId::new(format!("{channel}/messages/{}", 1_000 + sequence))
+                    .expect("message"),
+                ThreadId::new(format!("{channel}/threads/{}", 1_000 + sequence)).expect("thread"),
+                SenderId::new(OWNER).expect("sender"),
+                text,
+                "2026-11-15T22:00:00.000000+00:00",
+                false,
+            )
+            .expect("normalized message");
+            DeliveryBatch::new(
+                EventSequence::new(sequence).expect("sequence"),
+                ProviderCursor::new(format!("discord.v1;{channel}={}", 1_000 + sequence))
+                    .expect("cursor"),
+                DeliveryId::new(format!("discord-delivery-{sequence}")).expect("delivery"),
+                vec![CommittableEvent::message_created(message)],
+            )
+            .expect("delivery")
+        };
+        let admitted = state
+            .admit_batch(&batch(1, OWNER_CHANNEL, "status?"))
+            .expect("admit owner request");
+        assert_eq!(
+            admitted.new_request_keys.len(),
+            1,
+            "an owner request in the owner channel is a request"
+        );
+        let refused = state
+            .admit_batch(&batch(2, &relay_channel, "status?"))
+            .expect("admit owner post in the relay channel");
+        assert!(refused.new_request_keys.is_empty(), "never typed");
+        assert!(refused.relay_dispatches.is_empty(), "never relayed");
+        assert_eq!(
+            refused.rejection_saves.saved.len(),
+            1,
+            "the owner sees the rejection reaction, not silence"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn relay_posts_are_dispatched_never_typed_and_owner_posts_in_relay_channels_are_refused() {
         // The relay command records its stdin and argv, then reports an outcome.

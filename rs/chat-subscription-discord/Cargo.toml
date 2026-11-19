@@ -1,0 +1,27 @@
+[package]
+name = "chat-subscription-discord"
+version = "0.1.0"
+description = "Discord REST-polling subscription plugin and outbound helper for the agentctl chat bridge and the agent-teams relay"
+readme = "README.md"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+chat-subscription = { version = "0.1.0", path = "../chat-subscription" }
+chat-subscription-plugin = { version = "0.1.0", path = "../chat-subscription-plugin" }
+serde_json = "1"
+
+[[bin]]
+name = "agentctl-discord-plugin"
+path = "src/bin/agentctl-discord-plugin.rs"
+
+[[bin]]
+name = "agentctl-discord-outbound"
+path = "src/bin/agentctl-discord-outbound.rs"
+
+[lints]
+workspace = true
