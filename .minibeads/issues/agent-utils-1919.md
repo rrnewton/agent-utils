@@ -52,7 +52,6 @@ Makefile env only where needed.
 
 # Notes
 
-Lane mu-esbuildcap/1919. Validator identity: hermit-bot3. Nested
-worktree `.muse/worktrees/esbuildcap` on branch `mu-esbuildcap/1919`.
+Lane mu-esbuildcap/1919, on branch `mu-esbuildcap/1919`.
 New vibe-talk checks go in `tests/dag.d/<next-free-NNN>-<job>.yaml`;
 numbers are never reused (next free at filing: 168).
