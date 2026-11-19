@@ -63707,13 +63707,38 @@ def _finish_remove_paths(
         finish.absent_slot
         and record.owner is not None
         and _process_state(record.owner)[0] == "dead"
-        and not _slot_directory(config, record.slot, record.slot_type).exists()
+        and not fenced_slot.exists()
+        and not fenced_slot.is_symlink()
     ):
-        # Absent-slot closure (B2-A), rechecked after the fence: the
-        # recorded owner proven dead plus two ordinary reference
-        # scans, never the following census.  A path that reappeared
-        # after the fence falls through to the general census.
-        _assert_absent_slot_unused(config, record, (fenced_slot,))
+        # Absent-slot closure (B2-A).  The canonical path is always
+        # gone after a fence, so the check that means anything is made
+        # here, on the fenced path: finish.absent_slot records the
+        # caller's finding when it built the finish context (on the
+        # recovery path, after the fence) that the canonical path was
+        # absent, and the fenced tree is still absent now.  A canonical
+        # path that reappeared in between was refused by the fence
+        # itself (both paths existing), and a fenced tree that is
+        # present falls through to the censuses below.  The closure is
+        # the recorded owner proven dead plus two ordinary reference
+        # scans under the census budget, never the following census;
+        # no destructive work begins after the evidence deadline.
+        closure_budget = (
+            finish.private_cleanup.census_budget
+            if finish.private_cleanup is not None
+            else _ReadOnlyCommandBudget.start(
+                timeout_seconds=_VALIDATE_REMOVE_BATCH_CENSUS_SECONDS,
+                stdout_limit=_PROCESS_CENSUS_OUTPUT_BYTES_LIMIT,
+                stderr_limit=64 * 1024,
+                input_limit=_MOUNTINFO_CENSUS_BYTES_LIMIT,
+            )
+        )
+        _assert_absent_slot_unused(
+            config,
+            record,
+            (fenced_slot,),
+            budget=closure_budget,
+        )
+        closure_budget.remaining_seconds()
     elif (
         record.slot_type == "validate"
         and finish.private_cleanup is not None
@@ -63723,10 +63748,17 @@ def _finish_remove_paths(
     ):
         # Validation teardown closure (B2-B), only where its proof is
         # even available (a proven-dead recorded owner): owner dead,
-        # recorded slice subtree empty, one ordinary reference scan.
-        # Ordinary validate finishes with a live owner keep the
-        # following census below.
-        _assert_validate_teardown_unused(config, record, (fenced_slot,))
+        # recorded slice subtree empty, one ordinary reference scan
+        # under the private census budget.  Ordinary validate finishes
+        # with a live owner keep the following census below, and no
+        # destructive work begins after the evidence deadline.
+        _assert_validate_teardown_unused(
+            config,
+            record,
+            (fenced_slot,),
+            budget=finish.private_cleanup.census_budget,
+        )
+        finish.private_cleanup.census_budget.remaining_seconds()
     elif private_fence_identity is not None:
         assert finish.private_cleanup is not None
         fresh_census = finish.private_cleanup.fresh_census
@@ -89146,6 +89178,59 @@ def _capture_same_uid_process_path_census(
         _REREAD_GENERATIONS.reset(reread_token)
         _FOLLOWED_VANISHED_HOLDERS.reset(token)
 
+def _deleted_target_match_is_exempt(
+    match: tuple[int, str, str, str],
+    paths: Sequence[Path],
+) -> bool:
+    """Whether one census match is only a descriptor to an unlinked root.
+
+    The match must be a link whose target text is exactly one censused
+    path (in production the fenced path, never the canonical root) plus
+    " (deleted)", that path must be absent, and every ``/proc`` entry
+    of that process pointing at or under that path must stat to an
+    inode with no links left: a process with one still-linked entry
+    (an open file under the deleted root, say) and one unlinked entry
+    (its working directory) is a live holder for both matches.  An
+    existing directory literally named ``"<path> (deleted)"`` is
+    linked, so it never qualifies.  Anything else, including an entry
+    that vanishes while it is being proved, is a live holder.
+    """
+
+    pid, _slot, kind, detail = match
+    if kind != "link":
+        return False
+    for path in paths:
+        if detail != f"{path} (deleted)":
+            continue
+        if path.exists() or path.is_symlink():
+            return False
+        entries = [
+            Path(f"/proc/{pid}/cwd"),
+            Path(f"/proc/{pid}/root"),
+            Path(f"/proc/{pid}/exe"),
+        ]
+        try:
+            entries.extend(sorted(Path(f"/proc/{pid}/fd").iterdir()))
+        except OSError:
+            return False
+        held: list[os.stat_result] = []
+        for entry in entries:
+            try:
+                target = os.readlink(entry)
+            except OSError:
+                continue
+            observed = Path(target.removesuffix(" (deleted)"))
+            if observed != path and not observed.is_relative_to(path):
+                continue
+            try:
+                held.append(os.stat(entry))
+            except OSError:
+                return False
+        if held and all(item.st_nlink == 0 for item in held):
+            return True
+    return False
+
+
 def _assert_absent_slot_unused(
     config: Config,
     record: ActiveRecord,
@@ -89159,11 +89244,16 @@ def _assert_absent_slot_unused(
     registry rows; nothing on disk remains to protect.  The closure is
     therefore: the recorded owner generation proven dead (pidfd, via
     ``_process_state``), then two ordinary all-process reference scans
-    in a row finding no live holder.  A match whose target text ends in
-    " (deleted)" is not a holder for this purpose: a reparented
-    descendant holding a deleted directory's descriptor cannot recreate
-    the path, cannot be reached by name, and pins only inodes that are
-    already unlinked -- recovery neither deletes nor protects them.
+    in a row finding no live holder.  The one exemption is a holder of
+    the deleted censused root itself, proven by
+    ``_deleted_target_match_is_exempt``: a reparented descendant holding
+    a deleted directory's descriptor pins only inodes that are already
+    unlinked -- recovery neither deletes nor protects them.  It could
+    in principle recreate the path by name (``mkdir("../<fenced>")``
+    from inside the deleted directory); the finish path's own rechecks
+    catch a tree that reappears that way.  Any other match, including
+    an unlinked file inside an existing slot or a spoofed "(deleted)"
+    directory name, is a live holder.
     """
 
     owner = record.owner
@@ -89178,19 +89268,12 @@ def _assert_absent_slot_unused(
             f"recorded owner for absent slot {record.slot} is not proven "
             f"dead ({state}: {detail}); refusing recovery closure"
         )
-    slot_root = _slot_directory(config, record.slot, record.slot_type)
     for _scan in range(2):
         census = _capture_process_path_census(paths, budget=budget)
-        # Only the slot root itself, proven absent, may be exempted: a
-        # "(deleted)" target that is not exactly the absent root (a
-        # spoofed directory name, an unlinked file inside an existing
-        # slot, a removed subdirectory) is a live holder.
         kept = tuple(
             match
             for match in census.matches
-            if not (
-                match[3] == f"{slot_root} (deleted)" and not slot_root.exists()
-            )
+            if not _deleted_target_match_is_exempt(match, paths)
         )
         filtered = dataclasses.replace(census, matches=kept)
         for path in paths:

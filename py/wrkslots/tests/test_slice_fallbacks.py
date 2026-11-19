@@ -137,3 +137,39 @@ def test_teardown_empty_slice_does_not_excuse_a_live_holder(
     finally:
         holder.kill()
         holder.wait(timeout=10)
+
+
+def test_sealed_remove_completes_through_the_teardown_closure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Wiring (B): an interrupted sealed validate finish whose recorded
+    owner is genuinely dead and whose recorded slice is empty completes
+    through recover even when the general following census cannot
+    close at all."""
+    from wrkslots.tests.test_absent_slot_closure import (
+        _interrupt_with_dead_owner,
+    )
+    from wrkslots.tests.test_lifecycle import recover_scoped_target
+
+    project, _repository, _remote = make_project(tmp_path)
+    _interrupt_with_dead_owner(project, monkeypatch)
+    monkeypatch.setattr(cli, "_slice_subtree_state", lambda _name: "empty")
+
+    def _never_closes(*_args: object, **_kwargs: object) -> object:
+        raise cli.Refusal("same-UID process census did not close (test)")
+
+    monkeypatch.setattr(
+        cli, "_capture_same_uid_process_path_census", _never_closes
+    )
+    # The recovery's own preparation censuses can hit the privileged
+    # census stderr bound under unrelated host churn; that refusal
+    # names its remedy (retry), so retry it a bounded number of times.
+    # The teardown closure itself is what this test judges.
+    code = 3
+    for _attempt in range(3):
+        code = recover_scoped_target(project)
+        if code == 0:
+            break
+    assert code == 0
+    config = cli._load_config(str(project), "testhost")
+    assert not cli._slot_directory(config, "target", "validate").exists()

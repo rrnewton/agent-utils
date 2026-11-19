@@ -228,12 +228,51 @@ def test_recover_absent_sealed_target_with_a_deleted_fd_descendant(
 
     project, _repository, _remote = make_project(tmp_path)
     fenced = _interrupt_with_dead_owner(project, monkeypatch)
+    holder = subprocess.Popen(
+        [sys.executable, "-I", "-c", _ROOT_HOLDER, str(fenced)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        cwd="/",
+    )
+    try:
+        assert holder.stdout is not None and holder.stdin is not None
+        assert holder.stdout.readline() == "ready\n"
+        holder.stdin.write("fork\n")
+        holder.stdin.flush()
+        child = int(holder.stdout.readline())
+        assert holder.wait(timeout=10) == 0
+        try:
+            shutil.rmtree(fenced)
+            # The recovery's preparation censuses can hit the
+            # privileged census stderr bound under unrelated host
+            # churn; that refusal names its remedy (retry), so retry
+            # it a bounded number of times.  The absent-slot closure
+            # itself is what this test judges.
+            code = 3
+            for _attempt in range(3):
+                code = recover_scoped_target(project)
+                if code == 0:
+                    break
+            assert code == 0
+            assert active_slots(project) == []
+        finally:
+            os.kill(child, signal.SIGKILL)
+    finally:
+        holder.kill()
+        holder.wait(timeout=10)
+
+
 def test_recover_refuses_a_spoofed_deleted_directory_name(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Wiring (A): an existing directory literally named
+    """Wiring (A), a guard: an existing directory literally named
     "<fenced>/build (deleted)" with a live holder is not the exempted
-    deleted root: recover refuses."""
+    deleted root: recover refuses.  (This also passes on the pre-B2
+    base, where recover refuses for other reasons; the case that shows
+    the exemption itself is not spoofable by name is the unit-level
+    holder in test_slice_fallbacks.py and the deleted-root proof in
+    _deleted_target_match_is_exempt.)"""
     from wrkslots.tests.test_lifecycle import (
         interrupt_scoped_private_finish,
         recover_scoped_target,
@@ -257,3 +296,94 @@ def test_recover_refuses_a_spoofed_deleted_directory_name(
     finally:
         holder.kill()
         holder.wait(timeout=10)
+
+
+def test_a_spoofed_deleted_sibling_directory_still_refuses(
+    tmp_path: Path,
+) -> None:
+    """The exemption is not a name check: a live holder whose working
+    directory is an existing sibling literally named "<root> (deleted)"
+    still refuses, because its inode is linked (the held deleted root's
+    inode has no links left)."""
+    with _record_with_owner(tmp_path) as (config, record, slot_path, parent):
+        parent.kill()
+        parent.wait(timeout=10)
+        root = cli._slot_directory(config, "slot01", record.slot_type)
+        owner = subprocess.Popen(
+            [sys.executable, "-I", "-c", _SLEEPER], cwd="/"
+        )
+        identity = cli._read_process_identity(owner.pid)
+        owner.kill()
+        owner.wait(timeout=10)
+        record = dataclasses.replace(record, owner=identity)
+        spoof = Path(f"{root} (deleted)")
+        spoof.mkdir()
+        holder = subprocess.Popen(
+            [sys.executable, "-I", "-c", _ROOT_HOLDER, str(spoof)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            cwd="/",
+        )
+        try:
+            assert holder.stdout is not None
+            assert holder.stdout.readline() == "ready\n"
+            shutil.rmtree(root)
+            with pytest.raises(cli.Refusal, match="uses slot"):
+                cli._assert_absent_slot_unused(config, record, (root,))
+        finally:
+            holder.kill()
+            holder.wait(timeout=10)
+
+
+_MIXED_HOLDER = """
+import os, sys, time
+
+target = sys.argv[1]
+fd = os.open(target, os.O_RDONLY)
+os.unlink(target)
+os.mkdir(target)
+os.chdir(target)
+sys.stdout.write("ready\\n")
+sys.stdout.flush()
+while True:
+    time.sleep(60)
+"""
+
+
+def test_a_linked_fd_with_the_deleted_roots_text_still_refuses(
+    tmp_path: Path,
+) -> None:
+    """One process holds two entries with the deleted root's text: its
+    working directory is the deleted root (no links left), but a file
+    descriptor names a still-linked file that had that path.  The
+    exemption requires every such entry to be unlinked, so this
+    refuses."""
+    with _record_with_owner(tmp_path) as (config, record, _slot, parent):
+        parent.kill()
+        parent.wait(timeout=10)
+        owner = subprocess.Popen(
+            [sys.executable, "-I", "-c", _SLEEPER], cwd="/"
+        )
+        identity = cli._read_process_identity(owner.pid)
+        owner.kill()
+        owner.wait(timeout=10)
+        record = dataclasses.replace(record, owner=identity)
+        target = tmp_path / ".target.fenced.1.probe"
+        target.write_text("held\n", encoding="utf-8")
+        os.link(target, tmp_path / "held-elsewhere.txt")
+        holder = subprocess.Popen(
+            [sys.executable, "-I", "-c", _MIXED_HOLDER, str(target)],
+            stdout=subprocess.PIPE,
+            text=True,
+            cwd="/",
+        )
+        try:
+            assert holder.stdout is not None
+            assert holder.stdout.readline() == "ready\n"
+            target.rmdir()
+            with pytest.raises(cli.Refusal, match="uses slot"):
+                cli._assert_absent_slot_unused(config, record, (target,))
+        finally:
+            holder.kill()
+            holder.wait(timeout=10)
