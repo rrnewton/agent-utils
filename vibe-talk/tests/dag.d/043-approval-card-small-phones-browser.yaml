@@ -7,10 +7,16 @@ steps:
     jobs_flag: ""
     deps: [setup.contract-tools]
     timeout: 800
-    cpu_timeout: 100
+    # CPU, measured: ~55 CPU-s solo (systemd scope accounting) against
+    # ~180 s wall. Under gate load the wall stretches several-fold and
+    # the open page keeps rendering (and the walk keeps polling) for
+    # all of it, so CPU grows with the stretch; 100 CPU-s only fit an
+    # unloaded host. 300 keeps ~2x headroom over the loaded figure
+    # without letting a runaway step burn unbounded CPU.
+    cpu_timeout: 300
     hint:
       resources: {browser: 1}
-      est_duration_s: 120
+      est_duration_s: 200
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 

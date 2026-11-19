@@ -655,11 +655,17 @@ def check(condition: bool, message: str) -> None:
 
 
 def until(page: Page, condition: Callable[[], bool], what: str, timeout_ms: int = 10_000) -> None:
-    """Wait, while the browser runs (so routed sockets are served), until `condition()` holds."""
-    for _ in range(timeout_ms // 20):
+    """Wait, while the browser runs (so routed sockets are served), until `condition()` holds.
+
+    Polled at 100 ms, not 20 ms: the conditions are server-side events
+    on a human timescale, so a 20 ms poll only buys Playwright round
+    trips; the step's real CPU is the open page's rendering, which the
+    budget in tests.dag.yaml now sizes for (see small-phones there).
+    """
+    for _ in range(timeout_ms // 100):
         if condition():
             return
-        page.wait_for_timeout(20)
+        page.wait_for_timeout(100)
     raise AssertionError(f"timed out waiting for {what}")
 
 
