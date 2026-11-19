@@ -459,18 +459,29 @@
   margin: 0 1rem 0.6rem;
 }
 
-/* `#1797 vibe-talk-search-bucket-toggles`. The bucket chips' row under the
-   search bar, in the list's flow, so it pushes the cards down and never
-   floats over them. Each chip is a toggle and wears it from aria-pressed
-   (the one `.chip[aria-pressed]` rule, as the Documents filters do). */
+/* `#1797 vibe-talk-search-bucket-toggles`, pinned by
+   `#1899 vibe-talk-search-bucket-chips-pinned`. The bucket chips' row stands
+   in the search panel directly under the search field/filter row, outside
+   the scroller (09-to-do-view.css places it), so it stays visible however
+   far the results scroll. Each chip is a toggle worn from `aria-pressed`. */
 .search-bucket-row:not([hidden]) {
   display: flex;
   flex-wrap: wrap;
   gap: 0.4rem;
-  margin: 0.35rem 1rem;
+  align-items: center;
+  justify-content: center;
+  padding: 0.35rem 0.5rem;
+  /* `#1899` (liaison shot review): the pinned row carries the search
+     panel's own opaque ground, edge and shadow, so scrolled content
+     never shows through behind the chips in light or dark, keyboard
+     open or closed. */
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 1rem;
+  box-shadow: 0 1px 6px rgb(0 0 0 / 35%);
   /* `#1852`: one chip tall even while a server answer is pending, so the row
-     the Whole-threads chip used to fill keeps the height its chips give it
-     and the reader's place never moves for it (`#243`). */
+     keeps the height its chips give it and the reader's place never moves
+     for it (`#243`). Counts landing change no height. */
   min-height: 2.5rem;
 }
 
@@ -480,6 +491,35 @@
   border-radius: 999px;
   font-weight: 600;
   cursor: pointer;
+  box-shadow: 0 1px 6px rgb(0 0 0 / 35%);
+}
+
+/* `#1899`: pressed reads at a glance in light and dark — a filled accent
+   ground with AA words and a check — where unpressed stays quiet on the
+   panel. The check's room is kept while unpressed, so a press moves no
+   chip. Dark ground `#5b9dd9` takes near-black words; light ground
+   `#24618f` takes white; each pair is over 4.5:1. */
+.search-bucket-chip::before {
+  content: "✓";
+  margin-right: 0.35rem;
+  font-weight: 700;
+  visibility: hidden;
+}
+
+.search-bucket-chip[aria-pressed="true"] {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #14161a;
+}
+
+.search-bucket-chip[aria-pressed="true"]::before {
+  visibility: visible;
+}
+
+@media (prefers-color-scheme: light) {
+  .search-bucket-chip[aria-pressed="true"] {
+    color: #fff;
+  }
 }
 
 /* The one line: a full-width tap target, quiet until pressed. */

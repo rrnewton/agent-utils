@@ -432,6 +432,26 @@
                 <p id="labels-panel-state" class="hint" role="status"></p>
               </div>
             </div>
+            <!--
+              `#1797 vibe-talk-search-bucket-toggles` (owner 145/146, refining
+              `#1786`), pinned by `#1899 vibe-talk-search-bucket-chips-pinned`.
+              The server's hits by bucket — this thread, main, other threads —
+              counted on toggle chips directly under the search field/filter
+              row, in the search panel and outside #scroll-area, so they stay
+              visible however far the results scroll: one chip per bucket with
+              hits, its words and state drawn by the server search's
+              (`renderServerSearch`). Enabled buckets interleave in the
+              timeline; a tap on a chip brings its first newly shown hit into
+              view. A fourth chip (Agent Transcripts, `#1608`) plugs into this
+              row by the same shape.
+            -->
+            <div id="search-bucket-row" class="search-bucket-row" role="group" aria-label="Where the server's hits are" hidden>
+              <button id="search-bucket-thread" class="chip search-bucket-chip" type="button" aria-pressed="false" hidden>in this thread</button>
+              <button id="search-bucket-main" class="chip search-bucket-chip" type="button" aria-pressed="false" hidden>in main</button>
+              <button id="search-bucket-threads" class="chip search-bucket-chip" type="button" aria-pressed="false" hidden>in threads</button>
+              <button id="search-bucket-transcripts" class="chip search-bucket-chip" type="button" aria-pressed="false" hidden>in Agent Transcripts</button>
+              <!-- `#1852`: Whole threads lives on the search bar as a toggle icon, not here; one control. -->
+            </div>
           </div>
 
           <!-- The Documents reader's outline pop-up (#1038 documents-outline-popup). OUTSIDE
@@ -761,24 +781,9 @@
                    Shown only while a search is typed; one row, set once, so the
                    per-keystroke filter never pays for it. -->
               <div id="search-screen-sep" class="search-sep" role="separator" hidden><span>On this screen</span></div>
-              <!--
-                `#1797 vibe-talk-search-bucket-toggles` (owner 145/146, refining
-                `#1786`). The server's hits by bucket — this thread, main, other
-                threads — counted on toggle chips in their own row under the
-                search bar, pushing the list down: one chip per bucket with
-                hits, styled like the Documents view filters, its words and
-                showing the server search's (`renderServerSearch`). Enabled
-                buckets interleave in the timeline; a tap on a chip brings its
-                first newly shown hit into view. A fourth chip (Agent
-                Transcripts, `#1608`) plugs into this row by the same shape.
-              -->
-              <div id="search-bucket-row" class="search-bucket-row" role="group" aria-label="Where the server's hits are" hidden>
-                <button id="search-bucket-thread" class="chip search-bucket-chip" type="button" aria-pressed="false" hidden>in this thread</button>
-                <button id="search-bucket-main" class="chip search-bucket-chip" type="button" aria-pressed="false" hidden>in main</button>
-                <button id="search-bucket-threads" class="chip search-bucket-chip" type="button" aria-pressed="false" hidden>in threads</button>
-                <button id="search-bucket-transcripts" class="chip search-bucket-chip" type="button" aria-pressed="false" hidden>in Agent Transcripts</button>
-                <!-- `#1852`: Whole threads lives on the search bar as a toggle icon, not here; one control. -->
-              </div>
+              <!-- `#1899`: the bucket chips live in the search panel under the
+                   bar (see #channel-freshness-anchor), pinned outside the
+                   scroller so they never scroll away. -->
               <!-- `#1608 agent-transcripts-timeline`: the Transcripts view.
                    Agent-day trace threads and their chunks; never a thread
                    name, never a raw-feed row. Its own scoped search. -->

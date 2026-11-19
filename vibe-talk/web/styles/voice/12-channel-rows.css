@@ -385,8 +385,9 @@
 }
 
 
-/* `#1608 agent-transcripts-timeline`: bucket chips and the Transcripts view. */
-.search-bucket-row { display: flex; flex-wrap: wrap; gap: 0.4rem; padding: 0.3rem 0; }
+/* `#1608 agent-transcripts-timeline`: bucket chips and the Transcripts view.
+   The row and its pressed dress live with the search panel
+   (`#1899`, 11-message-text.css and 09-to-do-view.css). */
 .search-bucket-chip[aria-pressed="true"] { font-weight: 700; }
 /* The freshness pill floats over the scroller's head (`#1608` review):
    the panel's search input starts below its line, at 412 px and wider,

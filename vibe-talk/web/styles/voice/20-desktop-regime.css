@@ -1838,7 +1838,9 @@ li.discord-message[data-root-continuation] > .thread-replies {
 }
 
 #screen-main[data-columns="list"][data-searching] > #side-column {
-  padding-top: calc(var(--float-line) + var(--search-bar) / 2 + 0.35rem);
+  /* `#1899`: the pinned bucket chips stand under the bar here too, so the
+     heading (Unpack and its chips) starts under them, tappable. */
+  padding-top: calc(var(--float-line) + var(--search-bar) / 2 + 0.35rem + var(--bucket-head, 0px));
 }
 
 /*

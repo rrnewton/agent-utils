@@ -1092,6 +1092,33 @@
   display: none;
 }
 
+/* `#1899` (liaison, scene 80): a centred tooltip over this button runs off
+   the left edge on a phone (its centre is one button from the bar's left
+   end in the two-row bar) — in every scene-80 frame it sat clipped over
+   the kinds row. Edge-align it to its button instead: toward the bar's
+   left cluster on the channel, toward its right cluster over the call,
+   so it always stands inside the viewport. */
+#search-float:has(> #labels-button:not([hidden])) #author-filter .author-tip {
+  left: 0;
+  transform: none;
+}
+
+#search-float:not(:has(> #labels-button:not([hidden]))) #author-filter .author-tip {
+  left: auto;
+  right: 0;
+  transform: none;
+}
+
+/* On touch there is no resting pointer: a tap's sticky hover otherwise
+   leaves this tooltip standing over the list until the next tap, clipped
+   or not. The chip under the button is the touch telling (above), so a
+   hover alone never raises the tooltip there; keyboard focus still does. */
+@media (hover: none) {
+  #author-filter:hover .author-tip {
+    display: none;
+  }
+}
+
 /* `#520 search-whose-toggle-hint`. The chip a press leaves under the button, naming the state it
    landed on in the owner's words (Both, My messages, Their messages). It wears the page's chip
    dress (`.chip`), floats under the button so nothing shifts, and fades once web/voice.js adds
@@ -1191,12 +1218,74 @@
   box-shadow: none;
 }
 
+/* `#1899 vibe-talk-search-bucket-chips-pinned`. The bucket chips are pinned
+   in the search panel directly under the search field/filter row: outside
+   #scroll-area, so they stay visible however far the results scroll, on
+   phone and desktop, keyboard open or closed. The row's stable head room
+   (`--bucket-head`) is reserved whenever a search is typed, so counts
+   landing move nothing (`#243`). */
+#screen-main {
+  --bucket-head: 0px;
+}
+
+#screen-main[data-searching]:has(> #channel-freshness-anchor .search-bucket-chip:not([hidden])) {
+  /* Chip row (2.5rem) + its panel padding and edge (0.7rem) + the gap
+     below it (0.35rem). */
+  --bucket-head: 3.7rem;
+}
+
+#search-bucket-row:not([hidden]) {
+  position: absolute;
+  top: calc(var(--search-bar) / 2 + 0.35rem);
+  left: calc(var(--float-edge) + env(safe-area-inset-left));
+  right: calc(var(--float-edge) + env(safe-area-inset-right));
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  justify-content: center;
+  z-index: var(--z-chips);
+  /* The row's box takes no taps of its own — while an answer is pending it
+     stands empty over the head of the list — so the controls under its
+     gaps stay tappable; each chip takes its own. */
+  pointer-events: none;
+}
+
+.search-bucket-chip {
+  pointer-events: auto;
+}
+
+/* The two-row phone bar is taller: the chips stand under its foot. */
+@media (max-width: 480px) {
+  #screen-main[data-searching]:has(> #channel-freshness-anchor #search-float > #labels-button:not([hidden])) #search-bucket-row:not([hidden]) {
+    top: calc(var(--search-bar) / 2 + var(--toggle-hit) + 11px);
+  }
+}
+
+/* The kinds of link hang under the bar while Links is on: the chips stand
+   under them, never over them. */
+#screen-main[data-link-kinds] #search-bucket-row:not([hidden]) {
+  top: calc(var(--search-bar) / 2 + 0.35rem + var(--toggle-hit) + 3px);
+}
+
+@media (max-width: 480px) {
+  #screen-main[data-link-kinds][data-searching]:has(> #channel-freshness-anchor #search-float > #labels-button:not([hidden])) #search-bucket-row:not([hidden]) {
+    top: calc(var(--search-bar) / 2 + 2 * var(--toggle-hit) + 14px);
+  }
+}
+
+
 /* ...and the list makes room for the bar at its head while it is open, so the first match is never
    under it. This is the only room the head of the list ever makes (`#1320`): the pill is not on
    screen while the bar is, and closed there is no band at all. */
 #screen-main[data-searching] #scroll-area {
   padding-top: calc(var(--float-line) + var(--search-bar) / 2 + 0.35rem);
 }
+
+/* `#1899`: while a bucket chip stands, the head also carries its row. */
+#screen-main[data-searching] #scroll-area {
+  padding-top: calc(var(--float-line) + var(--search-bar) / 2 + 0.35rem + var(--bucket-head));
+}
+
 
 /* The two-row phone bar above takes the second row's room at the head too,
    so its foot never covers the first row. Only where no hang margin already
@@ -1207,6 +1296,11 @@
   #screen-main[data-searching]:not([data-link-kinds]) #scroll-area {
     padding-top: calc(var(--float-line) + var(--search-bar) / 2 + var(--toggle-hit) + 7px + 0.35rem);
   }
+
+  #screen-main[data-searching]:not([data-link-kinds]) #scroll-area {
+    padding-top: calc(var(--float-line) + var(--search-bar) / 2 + var(--toggle-hit) + 7px + 0.35rem + var(--bucket-head));
+  }
+
 }
 
 /* The Threads view's heading stands at its column's head, where the floating
@@ -1376,6 +1470,11 @@
   mask-image: linear-gradient(to bottom, transparent 0, #000 0.35rem);
 }
 
+/* `#1899`: while a bucket chip stands, the head also carries its row. */
+#screen-main[data-searching][data-link-kinds] #scroll-area {
+  padding-top: calc(0.35rem + var(--bucket-head));
+}
+
 /* `#251 author-filter`, on a NARROW phone. A third 44px square on the bar's line would take the field
    under 100px at 360px and leave it a few letters at 313px or under a larger font — the room `#211
    link-filter` fought for. So up to 400px the author filter hangs UNDER the bar's left end, a disc on
@@ -1428,6 +1527,24 @@
   #screen-main[data-searching][data-link-kinds] #scroll-area {
     --hang-foot: calc(var(--float-line) + var(--search-bar) / 2 + 2 * (var(--kinds-gap) + var(--toggle-hit)));
     padding-top: 0.35rem;
+  }
+
+  /* `#1899`: while a bucket chip stands, the head also carries its row,
+     and the chips stand under the hung author filter (or the kinds). */
+  #screen-main[data-searching] #scroll-area {
+    padding-top: calc(0.35rem + var(--bucket-head));
+  }
+
+  #screen-main[data-searching][data-link-kinds] #scroll-area {
+    padding-top: calc(0.35rem + var(--bucket-head));
+  }
+
+  #screen-main[data-searching] #search-bucket-row:not([hidden]) {
+    top: calc(var(--search-bar) / 2 + 0.35rem + var(--toggle-hit) + 3px);
+  }
+
+  #screen-main[data-link-kinds][data-searching] #search-bucket-row:not([hidden]) {
+    top: calc(var(--search-bar) / 2 + 0.35rem + 2 * var(--toggle-hit) + 6px);
   }
 }
 
