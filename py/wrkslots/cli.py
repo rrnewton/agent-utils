@@ -56581,16 +56581,23 @@ def _audit_private_history_absent(
                 f"repository object directory path contains ':': {objects}"
             )
         alternates.append(str(objects))
-    environment = (
-        {"GIT_ALTERNATE_OBJECT_DIRECTORIES": ":".join(alternates)}
-        if alternates
-        else None
-    )
+    # Every walk runs with lazy fetching off, exactly as the full
+    # scan's walks do (#1785): a missing object must stay missing
+    # here, never be fetched into looking durable.
+    environment: dict[str, str] = {"GIT_NO_LAZY_FETCH": "1"}
+    if alternates:
+        environment["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = ":".join(alternates)
+    # Any root the scan itself would report unresolvable (a missing
+    # pseudoref or reflog object, a malformed reflog line) is doubt:
+    # the full scan names it in its own refusal (#1785).
+    unresolvable: list[tuple[str, str, str]] = []
     if _is_shared_submodule_gitdir(git_directory, common):
         positives = _reflog_endpoints(
             _reflog_files_under(git_directory / "logs")
         )
-        positives |= _private_pseudoref_commits(vcs, path)
+        positives |= _private_pseudoref_commits(vcs, path, unresolvable)
+        if unresolvable:
+            return False
         head = vcs._run(path, ["rev-parse", "--verify", "HEAD"], check=False)
         if head.returncode == 0 and head.stdout.strip():
             positives.add(head.stdout.strip())
@@ -56611,7 +56618,9 @@ def _audit_private_history_absent(
             # object and make rev-list refuse; the full scan decides
             # that case with its own refusal (#1794 review F2).
             return False
-    reflog_by_ref = _reflog_entries_by_ref((common, git_directory))
+    reflog_by_ref = _reflog_entries_by_ref((common, git_directory), unresolvable)
+    if unresolvable:
+        return False
     endpoints: set[str] = set()
     for entries in reflog_by_ref.values():
         for entry in entries:
@@ -56623,13 +56632,18 @@ def _audit_private_history_absent(
     if any(not SHA_RE.fullmatch(value) for value in endpoints):
         return False
     positives = set(endpoints)
-    positives |= _private_pseudoref_commits(vcs, path)
+    positives |= _private_pseudoref_commits(vcs, path, unresolvable)
+    if unresolvable:
+        return False
+    # No peeled format: it crashes Git on a ref whose object is
+    # missing, which is exactly the unresolvable case that must fall
+    # through to the scan's own refusal (#1785).
     for line in vcs._run(
-        path, ["for-each-ref", "--format=%(objectname) %(*objectname) %(refname)"]
+        path, ["for-each-ref", "--format=%(objectname) %(refname)"]
     ).stdout.splitlines():
-        fields = line.split(" ", 2)
-        if len(fields) == 3 and fields[0]:
-            positives.add(fields[0])
+        sha, _sp, _refname = line.partition(" ")
+        if sha:
+            positives.add(sha)
     positives.add(kept)
     try:
         if _commit_tips(vcs, path, positives, negatives, env_overrides=environment):

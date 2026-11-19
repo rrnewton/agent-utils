@@ -102,6 +102,59 @@ def test_audit_durable_tips_never_borrow_a_linked_worktrees_refs(tmp_path: Path)
     assert full is not None and private_tip in full.tips
 
 
+def test_audit_precheck_falls_through_on_an_unresolvable_ref_tip(
+    tmp_path: Path,
+) -> None:
+    """A rescue ref naming a missing object reaches the scan's refusal."""
+
+    repo = tmp_path / "unresolvable" / "repo"
+    repo.mkdir(parents=True)
+    _git(repo, "init", "-q", "-b", "main")
+    (repo / "file.txt").write_text("one\n")
+    _git(repo, "add", "file.txt")
+    _git(repo, "commit", "-q", "-m", "one")
+    head = _git(repo, "rev-parse", "HEAD")
+    missing = "c" * 40
+    rescue = repo / ".git" / "refs" / "rescue"
+    rescue.mkdir(parents=True)
+    (rescue / "gone").write_text(missing + "\n")
+    vcs = wrkslots_cli._AuditGitVcs()
+    assert wrkslots_cli._audit_private_history_absent(vcs, repo, head, ()) is False
+    with pytest.raises(wrkslots_cli.Refusal, match="unresolvable"):
+        wrkslots_cli._submodule_private_history(vcs, repo, head, ())
+
+
+def test_audit_precheck_walks_forbid_lazy_fetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pre-check's rev-list walks carry GIT_NO_LAZY_FETCH=1 (#1785)."""
+
+    repo = tmp_path / "lazy" / "repo"
+    repo.mkdir(parents=True)
+    _git(repo, "init", "-q", "-b", "main")
+    (repo / "file.txt").write_text("one\n")
+    _git(repo, "add", "file.txt")
+    _git(repo, "commit", "-q", "-m", "one")
+    head = _git(repo, "rev-parse", "HEAD")
+    seen: list[dict[str, str] | None] = []
+    original = wrkslots_cli._GitVcs._run
+
+    def recording(
+        repository: Path, args: object, **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        if isinstance(args, (list, tuple)) and args and args[0] == "rev-list":
+            seen.append(kwargs.get("env_overrides"))  # type: ignore[arg-type]
+        return original(repository, args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(wrkslots_cli._GitVcs, "_run", staticmethod(recording))
+    vcs = wrkslots_cli._AuditGitVcs()
+    assert wrkslots_cli._audit_private_history_absent(vcs, repo, head, ()) is True
+    assert seen, "pre-check made no rev-list walk"
+    assert all(
+        env is not None and env.get("GIT_NO_LAZY_FETCH") == "1" for env in seen
+    )
+
+
 def test_audit_precheck_falls_through_on_a_missing_reflog_object(tmp_path: Path) -> None:
     """A missing-object reflog endpoint reaches the full scan, never True (F2)."""
 
