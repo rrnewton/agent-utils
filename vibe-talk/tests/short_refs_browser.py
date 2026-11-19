@@ -270,7 +270,7 @@ def short_ref_walk(desk: Desk, api: ShortRefApi) -> None:
     desk.settled()
     desk.shot("email-highlight")
 
-    # A thread link drills into the thread, root highlighted (#1877).
+    # A thread link drills into the thread, root highlighted (#1889).
     page.click('a[data-shortref="thread"]')
     desk.wait_for("""() => {
       const rows = [...document.querySelectorAll('#discord-log > li[data-id]')];
