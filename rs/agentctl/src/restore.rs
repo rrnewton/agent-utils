@@ -62,22 +62,39 @@ pub(crate) const PASS_PROGRESS_FILE: &str = "pass-progress.json";
 /// Schema of `pass-progress.json`.
 pub(crate) const PASS_PROGRESS_SCHEMA: &str = "agentctl-watch-progress/v1";
 
-/// A watch daemon's pass progress (#1900): `begin` records a pass start at once, and a
-/// background thread keeps `heartbeat_at` advancing (every 5 s) until this is dropped,
-/// so a services health check can prove a long first pass is under way instead of
-/// waiting for it to complete. Best-effort: a failed write is never a watch failure.
+/// A watch daemon's progress (#1900, #1914): written at daemon start, before any
+/// pass, and a background thread keeps `heartbeat_at` advancing (every 5 s) until
+/// this is dropped, so a services health check can prove a daemon that is still
+/// in startup, waiting on a lock, or in a long first pass is alive instead of
+/// waiting for a pass to complete. `phase` is `starting` until `begin` records
+/// the first pass, then `pass`; `daemon_started_at` is when this process's
+/// heartbeat began and `pass_started_at` carries it until a pass begins.
+/// Best-effort: a failed write is never a watch failure.
 pub(crate) struct PassProgress {
     path: Option<PathBuf>,
-    started: std::sync::Arc<std::sync::Mutex<f64>>,
+    daemon_started: f64,
+    pass_started: std::sync::Arc<std::sync::Mutex<f64>>,
+    phase: std::sync::Arc<std::sync::Mutex<&'static str>>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl PassProgress {
     pub(crate) fn new(path: Option<PathBuf>) -> Self {
-        let started = std::sync::Arc::new(std::sync::Mutex::new(0.0));
+        let daemon_started = unix_now();
+        let pass_started = std::sync::Arc::new(std::sync::Mutex::new(daemon_started));
+        let phase = std::sync::Arc::new(std::sync::Mutex::new("starting"));
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        if let Some(path) = &path {
-            let thread_started = started.clone();
+        let thread = path.as_ref().map(|path| {
+            Self::write(
+                path,
+                daemon_started,
+                daemon_started,
+                daemon_started,
+                "starting",
+            );
+            let thread_pass_started = pass_started.clone();
+            let thread_phase = phase.clone();
             let thread_stop = stop.clone();
             let thread_path = path.clone();
             std::thread::spawn(move || {
@@ -88,38 +105,54 @@ impl PassProgress {
                         }
                         std::thread::sleep(Duration::from_millis(250));
                     }
-                    let at = *thread_started
+                    let at = *thread_pass_started
                         .lock()
                         .unwrap_or_else(|poison| poison.into_inner());
-                    if at > 0.0 {
-                        Self::write(&thread_path, at, unix_now());
-                    }
+                    let phase = *thread_phase
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    Self::write(&thread_path, daemon_started, at, unix_now(), phase);
                 }
-            });
-        }
+            })
+        });
         Self {
             path,
-            started,
+            daemon_started,
+            pass_started,
+            phase,
             stop,
+            thread,
         }
     }
 
     /// Record that a pass began at `at` (seconds since the epoch, the caller's clock).
     pub(crate) fn begin(&self, at: f64) {
         *self
-            .started
+            .pass_started
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = at;
+        *self
+            .phase
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = "pass";
         if let Some(path) = &self.path {
-            Self::write(path, at, at);
+            Self::write(path, self.daemon_started, at, at, "pass");
         }
     }
 
-    fn write(path: &Path, pass_started_at: f64, heartbeat_at: f64) {
+    fn write(
+        path: &Path,
+        daemon_started_at: f64,
+        pass_started_at: f64,
+        heartbeat_at: f64,
+        phase: &str,
+    ) {
         let report = json!({
             "schema": PASS_PROGRESS_SCHEMA,
+            "daemon_started_at": daemon_started_at,
             "pass_started_at": pass_started_at,
             "heartbeat_at": heartbeat_at,
+            "phase": phase,
         });
         let _ = write_report(path, &report);
     }
@@ -128,7 +161,19 @@ impl PassProgress {
 impl Drop for PassProgress {
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
+}
+
+/// The `pass-progress.json` path for `agentctl watch` with state directory
+/// `state_dir` (its default when `None`), beside its `health.json`.
+pub(crate) fn watch_progress_path(state_dir: &Option<PathBuf>) -> Option<PathBuf> {
+    let directory = state_dir.clone().or_else(|| {
+        default_report_dir().and_then(|dir| dir.parent().map(|parent| parent.join("watch")))
+    })?;
+    Some(directory.join(PASS_PROGRESS_FILE))
 }
 
 fn unix_now() -> f64 {
@@ -5094,6 +5139,9 @@ pub fn watch<A: ManagedApi + ?Sized>(
     config: &RestoreConfig,
     options: &WatchOptions,
 ) -> Result<Value> {
+    // Heartbeat from daemon start (#1914), before any state is read, so a block
+    // in startup or in the first pass still shows an advancing heartbeat.
+    let progress = PassProgress::new(watch_progress_path(&options.state_dir));
     let path = health_path(options);
     let mut alerted: BTreeMap<String, f64> = path
         .as_deref()
@@ -5121,10 +5169,6 @@ pub fn watch<A: ManagedApi + ?Sized>(
     // cooldown is logged once when it starts, not on every pass it spans.
     let mut cooldown_noted: std::collections::BTreeSet<String> = Default::default();
     let mut closed_bare_shells: Vec<Value> = Vec::new();
-    let progress = PassProgress::new(
-        path.as_deref()
-            .and_then(|health| health.parent().map(|dir| dir.join(PASS_PROGRESS_FILE))),
-    );
     let mut pass: u64 = 0;
     loop {
         progress.begin(host.now());
@@ -5239,6 +5283,50 @@ pub fn watch<A: ManagedApi + ?Sized>(
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn pass_progress_heartbeats_from_daemon_start_before_the_first_pass() {
+        // #1914: the file exists in `starting` phase from daemon start, and its
+        // heartbeat advances while startup or a lock wait blocks the first pass.
+        let directory = std::env::temp_dir().join(format!(
+            "agentctl-pass-progress-start-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = directory.join(PASS_PROGRESS_FILE);
+        let progress = PassProgress::new(Some(path.clone()));
+        let read = || -> Value { serde_json::from_slice(&fs::read(&path).unwrap()).unwrap() };
+        let first = read();
+        assert_eq!(first["schema"], PASS_PROGRESS_SCHEMA);
+        assert_eq!(first["phase"], "starting");
+        assert!(first["daemon_started_at"].as_f64().unwrap_or(0.0) > 0.0);
+        assert_eq!(first["pass_started_at"], first["daemon_started_at"]);
+        assert_eq!(first["heartbeat_at"], first["daemon_started_at"]);
+        let began_at = first["heartbeat_at"].as_f64().unwrap();
+        // Condition-based wait: the heartbeat thread must advance the stamp
+        // before any pass begins.
+        let mut advanced = false;
+        for _ in 0..40 {
+            if read()["heartbeat_at"].as_f64().unwrap_or(0.0) > began_at {
+                advanced = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        assert!(advanced, "heartbeat_at never advanced: {}", read());
+        assert_eq!(read()["phase"], "starting");
+        let pass_at = unix_now();
+        progress.begin(pass_at);
+        let in_pass = read();
+        assert_eq!(in_pass["phase"], "pass");
+        assert_eq!(in_pass["pass_started_at"], pass_at);
+        assert_eq!(in_pass["daemon_started_at"], first["daemon_started_at"]);
+        drop(progress);
+        let _ = fs::remove_dir_all(&directory);
+    }
 
     #[test]
     fn pass_progress_records_a_pass_start_and_keeps_its_heartbeat_advancing() {

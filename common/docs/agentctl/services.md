@@ -212,10 +212,16 @@ kind:
   the restart;
 - **watcher / watch daemon**: `agent-watch.json` (or `health.json`) in its
   state directory must show a pass (`checked_at`) completed after the
-  restart, or `pass-progress.json` there must show a pass that began after
-  the restart whose heartbeat has advanced at least twice while the process
-  stays up — a first pass over a large registry can take longer than any
-  health window, and a pass with a frozen heartbeat still fails;
+  restart, or `pass-progress.json` there (written at daemon start, with
+  `daemon_started_at` and a `phase` of `starting` until its first pass
+  begins, then `pass`) must show a daemon that started after the restart
+  whose heartbeat has advanced at least twice while the process stays
+  up — startup, a lock wait before the first pass, and a first pass over
+  a large registry can all take longer than any health window, and a
+  daemon with a frozen heartbeat still fails. The report's health
+  detail names the proof applied (`health proof completed-pass`,
+  `health proof pass-progress` or `health proof daemon-start-progress`),
+  so a refresher too old to apply a proof is obvious from its report;
 - **headless wrapper**: its control socket must answer `status` from that
   process.
 

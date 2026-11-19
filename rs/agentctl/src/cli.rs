@@ -688,7 +688,7 @@ enum ServicesCommand {
     /// restart it on the snapshot's binary with every argument and environment variable kept,
     /// check its health, and roll it back automatically when the check fails. Prints old -> new
     #[command(
-        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl services refresh --dry-run\n  agentctl --registry ~/project/.agentctl services refresh\n  agentctl --registry ~/project/.agentctl services refresh --only chat-bridge --snapshot 1a2b3c4d\n\nOnly the agentctl binary changes, and for a bridge AGENTCTL_HOME, pointed at the snapshot's plugin\nhome so its Slack plugin matches. The outbound helper is part of the bridge's configuration\n(bridge.json) and is left alone; `services list` says when it differs from the snapshot's.\n\nA transient unit (made by systemd-run) is stopped and made again by systemd-run from its own\ndefinition, line for line. First, the same properties start a check unit whose shell only sleeps,\ngiven the planned command as arguments; it must read back as planned, so neither the change nor\nthe rollback can trip on a property systemd-run cannot express. A transient unit with drop-ins is\nrefused. A unit file gets the drop-in DROP_IN_DIR/UNIT.d/zz-agentctl-services.conf, then a daemon\nreload and a restart.\n\nEach service must pass the same health check before it is touched, or it is left alone. After the\nchange, for 30 seconds or more within --health-timeout counted from the new process's start\n(stopping the old process can take its full stop timeout; that time is added to the window and\nsaid in the report; a watcher or watch daemon gets at least its pass budget (or its interval)\nplus 90 s), the unit must stay active with the same main process running the new binary, then a\nbridge's `chat health` (run with the new binary) must not say DOWN, must see that process, which must\nrun with the snapshot's AGENTCTL_HOME, and its event stream must have delivered something since\nthe restart; a watcher or watch daemon must complete a pass\n(agent-watch.json or health.json checked_at after the restart) or show a pass\nbegun after the restart with its heartbeat advancing at least twice\n(pass-progress.json in its state directory); a headless wrapper must answer status on its\ncontrol socket from that process. A headless agent in a turn is waited for (--headless-wait), then\nskipped. Watchers go first, bridges next, headless wrappers last; the first failure stops the run.\n\nBefore changing a unit, ROOT/refreshes/STAMP-COMMIT12/ gets UNIT.before (its `systemctl cat`) and\nthe unit's commands in ROLLBACK.sh; report.json follows. Units that are not active are skipped.\nAn interrupt, hangup or termination signal does not stop a service halfway: the one in hand is\nfinished or rolled back, and the rest are not attempted. A SIGKILL can still leave a service\nstopped: run refresh in a terminal or a pane, not under a tool's timeout.\nExit status: 0 every selected service runs the snapshot and passed; 1 a service was refused or\nfailed and was rolled back (later services untouched); 4 a rollback failed too: run ROLLBACK.sh."
+        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl services refresh --dry-run\n  agentctl --registry ~/project/.agentctl services refresh\n  agentctl --registry ~/project/.agentctl services refresh --only chat-bridge --snapshot 1a2b3c4d\n\nOnly the agentctl binary changes, and for a bridge AGENTCTL_HOME, pointed at the snapshot's plugin\nhome so its Slack plugin matches. The outbound helper is part of the bridge's configuration\n(bridge.json) and is left alone; `services list` says when it differs from the snapshot's.\n\nA transient unit (made by systemd-run) is stopped and made again by systemd-run from its own\ndefinition, line for line. First, the same properties start a check unit whose shell only sleeps,\ngiven the planned command as arguments; it must read back as planned, so neither the change nor\nthe rollback can trip on a property systemd-run cannot express. A transient unit with drop-ins is\nrefused. A unit file gets the drop-in DROP_IN_DIR/UNIT.d/zz-agentctl-services.conf, then a daemon\nreload and a restart.\n\nEach service must pass the same health check before it is touched, or it is left alone. After the\nchange, for 30 seconds or more within --health-timeout counted from the new process's start\n(stopping the old process can take its full stop timeout; that time is added to the window and\nsaid in the report; a watcher or watch daemon gets at least its pass budget (or its interval)\nplus 90 s), the unit must stay active with the same main process running the new binary, then a\nbridge's `chat health` (run with the new binary) must not say DOWN, must see that process, which must\nrun with the snapshot's AGENTCTL_HOME, and its event stream must have delivered something since\nthe restart; a watcher or watch daemon must complete a pass\n(agent-watch.json or health.json checked_at after the restart) or show a daemon\nstarted after the restart with its heartbeat advancing at least twice\n(pass-progress.json in its state directory, written at daemon start;\nphase starting until its first pass begins, then pass); the report's\nhealth detail names the proof applied (health proof completed-pass,\npass-progress or daemon-start-progress); a headless wrapper must answer status on its\ncontrol socket from that process. A headless agent in a turn is waited for (--headless-wait), then\nskipped. Watchers go first, bridges next, headless wrappers last; the first failure stops the run.\n\nBefore changing a unit, ROOT/refreshes/STAMP-COMMIT12/ gets UNIT.before (its `systemctl cat`) and\nthe unit's commands in ROLLBACK.sh; report.json follows. Units that are not active are skipped.\nAn interrupt, hangup or termination signal does not stop a service halfway: the one in hand is\nfinished or rolled back, and the rest are not attempted. A SIGKILL can still leave a service\nstopped: run refresh in a terminal or a pane, not under a tool's timeout.\nExit status: 0 every selected service runs the snapshot and passed; 1 a service was refused or\nfailed and was rolled back (later services untouched); 4 a rollback failed too: run ROLLBACK.sh."
     )]
     Refresh(ServicesRefresh),
     /// Turn every daemon on this host over to main, only where its code changed: build one snapshot, refresh each changed unpinned unit of every registry (bridges last, the global binary last of all), or only report who is behind
@@ -4407,6 +4407,13 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             }
         },
         Commands::Watch(value) => {
+            // Heartbeat from daemon start (#1914): written before the client, the
+            // config load and the designation scan, so a block in any of them
+            // still shows services health an advancing heartbeat. The watch loop
+            // starts its own heartbeat when it takes over below.
+            let startup_progress = crate::restore::PassProgress::new(
+                crate::restore::watch_progress_path(&value.state_dir),
+            );
             let client = HerdrClient::with_executable("direct", &args.herdr_bin)
                 .map_err(AgentError::from)?;
             let mut config = crate::restore::RestoreConfig::load_for_watch(&args.registry)?;
@@ -4430,6 +4437,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     || Some("a pass that was still running".to_owned()),
                 );
             }
+            drop(startup_progress);
             let health = crate::restore::watch(
                 &client,
                 &args.registry,
@@ -4469,6 +4477,13 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             return Ok(0);
         }
         Commands::WatchAgents(value) => {
+            // Heartbeat from daemon start (#1914): written before the client,
+            // the coordinator resolution and the probe and notifier setup, so a
+            // block in any of them still shows services health an advancing
+            // heartbeat. The watch loop starts its own when it takes over.
+            let startup_progress = crate::restore::PassProgress::new(
+                crate::agent_watch::watch_agents_progress_path(&value.state_dir),
+            );
             let client = HerdrClient::with_executable("direct", &args.herdr_bin)
                 .map_err(AgentError::from)?;
             // The probe only looks, so it keeps Herdr's read-only answers for each pass; the
@@ -4552,6 +4567,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     || Some("a pass that was still running".to_owned()),
                 );
             }
+            drop(startup_progress);
             let report = crate::agent_watch::watch_agents(
                 &mut probe,
                 &mut notifier,

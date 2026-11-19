@@ -5478,6 +5478,16 @@ fn write_json_file(path: &Path, value: &Value) -> Result<()> {
     crate::agent::sync_directory(directory)
 }
 
+/// The `pass-progress.json` path for `watch-agents` with state directory
+/// `state_dir` (its default when `None`), beside its `agent-watch.json`.
+pub(crate) fn watch_agents_progress_path(state_dir: &Option<PathBuf>) -> Option<PathBuf> {
+    let directory = state_dir.clone().or_else(|| {
+        crate::restore::default_report_dir()
+            .and_then(|dir| dir.parent().map(|parent| parent.join("agent-watch")))
+    })?;
+    Some(directory.join(crate::restore::PASS_PROGRESS_FILE))
+}
+
 /// Run the agent watch: one pass with `once`, otherwise forever, one pass per interval.
 pub fn watch_agents(
     probe: &mut dyn Probe,
@@ -5487,6 +5497,12 @@ pub fn watch_agents(
 ) -> Result<Value> {
     use fs2::FileExt;
     let paths = state_paths(options);
+    // Heartbeat from daemon start (#1914), before the single-writer lock and the
+    // state load, so a block in startup or before the first pass still shows an
+    // advancing heartbeat. If the lock is already held this process exits and
+    // its heartbeat freezes; the holder's thread rewrites the file on its tick.
+    let progress =
+        crate::restore::PassProgress::new(watch_agents_progress_path(&options.state_dir));
     // One watcher per state directory: two writers would take turns overwriting
     // each other's episode memory. The lock is held for the process's lifetime.
     let _lock = match paths.as_ref() {
@@ -5522,12 +5538,6 @@ pub fn watch_agents(
     // Episode rows already written to the log, as (agent, kind, detail, owed)
     // signatures, so an unchanged episode is logged once, not on every pass (#932).
     let mut logged_episodes: BTreeMap<(String, String, String, bool), ()> = BTreeMap::new();
-    let progress = crate::restore::PassProgress::new(paths.as_ref().map(|(_, report_path)| {
-        report_path
-            .parent()
-            .map(|dir| dir.join(crate::restore::PASS_PROGRESS_FILE))
-            .unwrap_or_else(|| PathBuf::from(crate::restore::PASS_PROGRESS_FILE))
-    }));
     loop {
         let now = clock.now();
         progress.begin(now);

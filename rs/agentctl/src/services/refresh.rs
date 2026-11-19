@@ -605,7 +605,7 @@ enum ProbeFailure {
 }
 use ProbeFailure::{Fatal, Pending};
 
-/// Heartbeats seen from one process's `pass-progress.json`, across probes (#1900).
+/// Heartbeats seen from one process's `pass-progress.json`, across probes (#1900, #1914).
 #[derive(Default)]
 struct ProgressSeen {
     heartbeat: Option<f64>,
@@ -618,10 +618,14 @@ const PROGRESS_FRESH: f64 = 60.0;
 /// Heartbeat advances a pass in progress must show before it proves health.
 const PROGRESS_ADVANCES: u32 = 2;
 
-/// Progress proof for a watch pass (#1900): a pass that began after `started`, whose
-/// heartbeat is fresh and has advanced at least twice across probes. `Ok` is the health
-/// detail; `Err` is why the pass does not prove health yet. A frozen heartbeat never
-/// proves health, so a daemon stuck in its first pass still fails.
+/// Progress proof for a watch daemon (#1900, #1914): a daemon that started after
+/// `started`, whose heartbeat is fresh and has advanced at least twice across
+/// probes. The daemon may still be in its `starting` phase (startup, a lock wait
+/// or setup before its first pass) or in a `pass`; either proves liveness, so a
+/// block before the first pass no longer fails a healthy daemon. `Ok` is the
+/// health detail; `Err` is why it does not prove health yet. A frozen heartbeat
+/// never proves health, so a stuck daemon still fails. Files written before
+/// #1914 have no `daemon_started_at` or `phase`: their pass start is the begin.
 fn progress_proof(
     host: &dyn Host,
     directory: &Path,
@@ -634,16 +638,24 @@ fn progress_proof(
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .ok_or_else(|| {
             format!(
-                "no watch pass has begun since the restart ({} unreadable)",
+                "no watch daemon has started since the restart ({} unreadable)",
                 path.display()
             )
         })?;
     let pass_started = report["pass_started_at"].as_f64().unwrap_or(0.0);
+    let daemon_started = report["daemon_started_at"]
+        .as_f64()
+        .filter(|at| *at > 0.0)
+        .unwrap_or(pass_started);
+    let starting = report["phase"].as_str() == Some("starting");
     let heartbeat = report["heartbeat_at"].as_f64().unwrap_or(0.0);
-    if pass_started < unix_seconds(started) {
-        return Err("the watch pass in progress began before the restart".to_owned());
+    if daemon_started < unix_seconds(started) {
+        return Err("the watch daemon in progress began before the restart".to_owned());
     }
-    if heartbeat < pass_started {
+    if heartbeat < daemon_started {
+        return Err("the watch progress heartbeat predates its daemon start".to_owned());
+    }
+    if !starting && heartbeat < pass_started {
         return Err("the watch progress heartbeat predates its pass start".to_owned());
     }
     let now = unix_seconds(host.now());
@@ -652,7 +664,7 @@ fn progress_proof(
     }
     if now - heartbeat > PROGRESS_FRESH {
         return Err(format!(
-            "the watch pass heartbeat is {:.0} s old (stuck pass?)",
+            "the watch heartbeat is {:.0} s old (stuck daemon?)",
             now - heartbeat
         ));
     }
@@ -663,9 +675,21 @@ fn progress_proof(
     }
     seen.heartbeat = Some(heartbeat);
     if seen.advances >= PROGRESS_ADVANCES {
-        Ok(format!(
-            "watch pass in progress (began {:.0} s ago, heartbeat advancing)",
-            (now - pass_started).max(0.0)
+        if starting {
+            Ok(format!(
+                "health proof daemon-start-progress: watch daemon starting (began {:.0} s ago, heartbeat advancing)",
+                (now - daemon_started).max(0.0)
+            ))
+        } else {
+            Ok(format!(
+                "health proof pass-progress: watch pass in progress (began {:.0} s ago, heartbeat advancing)",
+                (now - pass_started).max(0.0)
+            ))
+        }
+    } else if starting {
+        Err(format!(
+            "watch daemon starting; heartbeat has advanced {} of {PROGRESS_ADVANCES} times",
+            seen.advances
         ))
     } else {
         Err(format!(
@@ -820,7 +844,12 @@ fn probe(
                 .filter(|report| {
                     report["checked_at"].as_f64().unwrap_or(0.0) >= unix_seconds(started)
                 })
-                .map(|report| format!("watch pass completed ({} agents)", report["agents"]));
+                .map(|report| {
+                    format!(
+                        "health proof completed-pass: watch pass completed ({} agents)",
+                        report["agents"]
+                    )
+                });
             if let Some(detail) = completed {
                 Ok(detail)
             } else {
@@ -845,7 +874,7 @@ fn probe(
                     report["checked_at"].as_f64().unwrap_or(0.0) >= unix_seconds(started)
                 });
             if completed.is_some() {
-                Ok("watch health pass completed".to_owned())
+                Ok("health proof completed-pass: watch health pass completed".to_owned())
             } else {
                 match progress_proof(host, directory, started, progress) {
                     Ok(detail) => Ok(detail),
