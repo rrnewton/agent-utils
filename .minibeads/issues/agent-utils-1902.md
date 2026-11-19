@@ -1,6 +1,6 @@
 ---
 title: 'agentctl-muse-hint-wordwrap-clip: word-wrapped Muse hints on narrow panes still read as staged'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -28,3 +28,7 @@ Recovery is the same as #1888: held prompts were never typed, so the next drain 
 # Notes
 
 Follow-up to #1888 at the coordinator's request. No lane, host or person is named here.
+
+## Resolution
+
+[watermelon-full-preview] Landed 2084114d on github/main (owner-priority gate passed; combined tree with main verified: Rust muse_editor 27, Python launch hint/wrap 6). Both editions read a single-row, word-boundary hint prefix as empty when the hint's next word would cross the frame's inner edge (`is_hint_prefix` clip case / `_muse_is_hint_prefix`), with no threshold lowered; widths 30/42/80 fixtures cover every table hint. The affected lane's captured frame reads idle, and its real-CLI status flipped staged to idle under the fixed build with no typing. Held prompts were never typed, so the next drain delivers each once. First filed as #1894, renumbered to #1902 on the coordinator's notice (the earlier number was already taken on main).
