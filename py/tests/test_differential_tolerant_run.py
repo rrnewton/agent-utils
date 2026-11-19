@@ -160,3 +160,75 @@ def test_sigterm_removes_the_fixture_temp_root(tmp_path: Path) -> None:
     assert proc.returncode == 128 + signal.SIGTERM
     assert not root.exists()
     assert not list(tmp_path.glob("agentctl-cross-test-*"))
+
+
+def _run_tempdir_script(tmp_path: Path, body: str, keep: bool) -> tuple[int, str, Path]:
+    """Run one `_signal_cleaned_tempdir` script in a private TMPDIR (#1917).
+
+    The child prints its temp root (the condition the parent waits on,
+    by blocking read), then `body` runs. Returns (exit, stderr, root).
+    """
+    cross_dir = Path(__file__).resolve().parents[2] / "cross"
+    script = (
+        f"import sys\nsys.path.insert(0, {str(cross_dir)!r})\n"
+        "from herdr_agent_differential import _signal_cleaned_tempdir\n"
+        "cleaned = _signal_cleaned_tempdir('agentctl-cross-test-')\n"
+        "with cleaned as root:\n"
+        "    (root / 'marker').write_text('x')\n"
+        "    print(root, flush=True)\n"
+        + body
+    )
+    env = {**os.environ, "TMPDIR": str(tmp_path)}
+    if keep:
+        env["AGENT_UTILS_KEEP_TEST_TMP"] = "1"
+    else:
+        env.pop("AGENT_UTILS_KEEP_TEST_TMP", None)
+    proc = subprocess.Popen(
+        [PY, "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    assert proc.stdout is not None
+    root = Path(proc.stdout.readline().strip())
+    _, stderr = proc.communicate()
+    assert proc.returncode is not None
+    return proc.returncode, stderr, root
+
+
+def test_temp_root_removed_after_a_passing_and_after_a_failing_run(
+    tmp_path: Path,
+) -> None:
+    # Passing run: no tree left (#1917).
+    code, _, root = _run_tempdir_script(tmp_path, "", keep=False)
+    assert code == 0
+    assert not root.exists()
+    assert not list(tmp_path.glob("agentctl-cross-test-*"))
+    # Failing run (exception): still no tree left without the opt-in.
+    code, _, root = _run_tempdir_script(
+        tmp_path, "    raise SystemExit(3)\n", keep=False
+    )
+    assert code == 3
+    assert not root.exists()
+    assert not list(tmp_path.glob("agentctl-cross-test-*"))
+    # A divergent verdict marked failed behaves like the exception.
+    code, _, root = _run_tempdir_script(
+        tmp_path, "    cleaned.fail()\n", keep=False
+    )
+    assert code == 0
+    assert not root.exists()
+    assert not list(tmp_path.glob("agentctl-cross-test-*"))
+
+
+def test_failing_run_keeps_its_tree_only_with_the_opt_in(tmp_path: Path) -> None:
+    code, stderr, root = _run_tempdir_script(
+        tmp_path, "    raise SystemExit(3)\n", keep=True
+    )
+    assert code == 3
+    assert root.exists(), stderr
+    assert str(root) in stderr
+    # A passing run never keeps its tree, even with the opt-in set.
+    code, _, root = _run_tempdir_script(tmp_path, "", keep=True)
+    assert code == 0
+    assert not root.exists()

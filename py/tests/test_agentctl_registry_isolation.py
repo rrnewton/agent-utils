@@ -104,3 +104,66 @@ def test_gate_child_env_isolates_rust_and_python_registries(
     assert environment["AGENTCTL_LAYOUT_AUTO_MIGRATE"] == "0"
     monkeypatch.setenv("AGENTCTL_REGISTRY", "/caller/chosen")
     assert gate._child_environment()["AGENTCTL_REGISTRY"] == "/caller/chosen"
+
+
+def _run_direct_pytest(tmp_path: Path, source: str, keep: bool) -> subprocess.CompletedProcess[str]:
+    """One direct ``pytest -p run_pytest_shard`` run in a private TMPDIR (#1917)."""
+    (tmp_path / "test_one.py").write_text(source, encoding="utf-8")
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in ("AGENTCTL_REGISTRY", "AGENT_UTILS_KEEP_TEST_TMP")
+    }
+    environment["TMPDIR"] = str(tmp_path)
+    environment["PYTHONPATH"] = str(REPO_ROOT / "scripts")
+    if keep:
+        environment["AGENT_UTILS_KEEP_TEST_TMP"] = "1"
+    return subprocess.run(
+        [sys.executable, "-m", "pytest", "-p", "run_pytest_shard",
+         "-q", "-p", "no:cacheprovider", "test_one.py"],
+        cwd=tmp_path, env=environment, capture_output=True, text=True, timeout=300,
+    )
+
+
+def test_direct_pytest_registry_removed_after_pass_and_failure(tmp_path: Path) -> None:
+    # Passing run: the plugin's scratch registry is gone afterwards.
+    run = _run_direct_pytest(tmp_path, "def test_ok():\n    assert True\n", keep=False)
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert not list(tmp_path.glob("agent-utils-agentctl-registry-*"))
+    # Failing run without the opt-in: still gone.
+    run = _run_direct_pytest(tmp_path, "def test_bad():\n    assert False\n", keep=False)
+    assert run.returncode == 1, run.stdout + run.stderr
+    assert not list(tmp_path.glob("agent-utils-agentctl-registry-*"))
+
+
+def test_direct_pytest_registry_kept_only_for_a_failed_run_with_opt_in(
+    tmp_path: Path,
+) -> None:
+    run = _run_direct_pytest(tmp_path, "def test_bad():\n    assert False\n", keep=True)
+    assert run.returncode == 1, run.stdout + run.stderr
+    kept = list(tmp_path.glob("agent-utils-agentctl-registry-*"))
+    assert len(kept) == 1, run.stdout + run.stderr
+    assert str(kept[0]) in run.stderr
+
+
+def test_gate_child_registries_are_removed_by_cleanup() -> None:
+    """Gate scratch registries are tracked and removed at the gate's end (#1917)."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "gate_cleanup", REPO_ROOT / "scripts" / "gate.py"
+    )
+    assert spec is not None and spec.loader is not None
+    gate = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = gate
+    spec.loader.exec_module(gate)
+    environment = dict(os.environ)
+    environment.pop("AGENTCTL_REGISTRY", None)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(os, "environ", environment)
+        first = Path(gate._child_environment()["AGENTCTL_REGISTRY"]).parent
+        second = Path(gate._child_environment()["AGENTCTL_REGISTRY"]).parent
+    assert first.exists() and second.exists()
+    gate._CHILD_REGISTRIES_FAILED = False
+    gate._cleanup_child_registries()
+    assert not first.exists() and not second.exists()

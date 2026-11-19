@@ -295,6 +295,7 @@ for tests.
 from __future__ import annotations
 
 import argparse
+import atexit
 import dataclasses
 import datetime as dt
 import fcntl
@@ -336,6 +337,35 @@ def state_dir() -> Path:
     return Path(os.environ.get("GATE_ADMISSION_DIR") or DEFAULT_DIR)
 
 
+#: Keep a failing gate's child registries when this is 1 (#1917).
+KEEP_TEST_TMP_ENV = "AGENT_UTILS_KEEP_TEST_TMP"
+_CHILD_REGISTRIES: list[Path] = []
+_CHILD_REGISTRIES_FAILED = True
+
+
+def _cleanup_child_registries() -> None:
+    """Remove the scratch registries `_child_environment` made (#1917).
+
+    A failed run keeps them only under AGENT_UTILS_KEEP_TEST_TMP=1, and
+    says where; every other run removes them. Registered with atexit as
+    a backstop; `main` finishes them explicitly with the verdict known.
+    """
+    registries = list(_CHILD_REGISTRIES)
+    _CHILD_REGISTRIES.clear()
+    if _CHILD_REGISTRIES_FAILED and os.environ.get(KEEP_TEST_TMP_ENV) == "1":
+        for path in registries:
+            print(
+                f"gate: kept test temp tree at {path} ({KEEP_TEST_TMP_ENV}=1)",
+                file=sys.stderr,
+            )
+        return
+    for path in registries:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+atexit.register(_cleanup_child_registries)
+
+
 def _child_environment(**overrides: str) -> dict[str, str]:
     """Environment for the preflight and the admitted command (#1170).
 
@@ -359,10 +389,12 @@ def _child_environment(**overrides: str) -> dict[str, str]:
     # Tests must never resolve the live harness registry (#1499
     # tests-touch-live-registry): default agentctl to a per-child scratch
     # with auto-migrate off, unless the caller already chose a registry.
+    # A scratch made here is tracked for removal when the gate ends
+    # (#1917); a caller-chosen registry is left alone.
     if "AGENTCTL_REGISTRY" not in env:
-        env["AGENTCTL_REGISTRY"] = str(
-            Path(tempfile.mkdtemp(prefix="agent-utils-gate-agentctl-")) / "registry"
-        )
+        registry_base = Path(tempfile.mkdtemp(prefix="agent-utils-gate-agentctl-"))
+        _CHILD_REGISTRIES.append(registry_base)
+        env["AGENTCTL_REGISTRY"] = str(registry_base / "registry")
     env.setdefault("AGENTCTL_LAYOUT_AUTO_MIGRATE", "0")
     return {
         **env,
@@ -3735,7 +3767,29 @@ def main(argv: list[str] | None = None) -> int:
         command = [sys.executable, str(Path(__file__).with_name("validate.py")), *rest]
     if not command:
         parser.error("no command to run")
-    return run_admitted(args, command)
+    global _CHILD_REGISTRIES_FAILED
+    _CHILD_REGISTRIES_FAILED = True
+
+    def _on_term(signum: int, _frame: object) -> None:
+        _cleanup_child_registries()
+        raise SystemExit(128 + signum)
+
+    _previous_term: object = None
+    try:
+        _previous_term = signal.signal(signal.SIGTERM, _on_term)
+    except (ValueError, OSError):
+        pass  # Not the main thread: the finally below still applies.
+    try:
+        exit_code = run_admitted(args, command)
+        _CHILD_REGISTRIES_FAILED = exit_code != 0
+        return exit_code
+    finally:
+        _cleanup_child_registries()
+        if _previous_term is not None:
+            try:
+                signal.signal(signal.SIGTERM, _previous_term)  # type: ignore[arg-type]
+            except (ValueError, OSError):
+                pass
 
 
 if __name__ == "__main__":

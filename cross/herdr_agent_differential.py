@@ -9,7 +9,6 @@ compares durable queue transitions and crash-sensitive machine outcomes.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import hashlib
 import os
@@ -22,7 +21,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
@@ -1294,36 +1293,82 @@ def herdr_refusal(root: Path, arguments: Sequence[str]) -> str | None:
     )
 
 
-@contextlib.contextmanager
-def _signal_cleaned_tempdir(prefix: str) -> Iterator[Path]:
+#: Keep a failing run's fixture tree for inspection when this is 1 (#1917).
+KEEP_TEST_TMP_ENV = "AGENT_UTILS_KEEP_TEST_TMP"
+
+
+class _SignalCleanedTempDir:
     """A fixture temp root removed on exit, including on SIGTERM/SIGINT.
 
     A CPU-timeout kill (SIGTERM) otherwise leaks the whole fixture tree
     under /tmp (about a gigabyte per step) because the usual context
     cleanup never runs. The handler removes the tree, then exits with
-    the conventional 128+signal status.
+    the conventional 128+signal status. A failed run (an exception, a
+    divergent verdict marked with `fail`, or a signal) keeps its tree
+    only when AGENT_UTILS_KEEP_TEST_TMP=1, and says where; a passing
+    run never keeps it (#1917 cross-test-tmp-cleanup-and-snapshot-prune).
     """
-    root = Path(tempfile.mkdtemp(prefix=prefix))
 
-    def _terminate(signum: int, _frame: object) -> None:
-        shutil.rmtree(root, ignore_errors=True)
-        os._exit(128 + signum)
+    def __init__(self, prefix: str) -> None:
+        self._prefix = prefix
+        self.root: Path | None = None
+        self._failed = False
+        self._previous: dict[int, object] = {}
 
-    previous: dict[int, object] = {}
-    for name in ("SIGTERM", "SIGINT"):
-        sig = getattr(signal, name, None)
-        if sig is None:
-            continue
-        try:
-            previous[sig] = signal.signal(sig, _terminate)
-        except (ValueError, OSError):
-            pass  # Not the main thread: normal cleanup still applies.
-    try:
-        yield root
-    finally:
-        for sig, handler in previous.items():
+    def fail(self) -> None:
+        """Mark the verdict failed, so the keep opt-in can retain the tree."""
+        self._failed = True
+
+    def __enter__(self) -> Path:
+        root = Path(tempfile.mkdtemp(prefix=self._prefix))
+        self.root = root
+
+        def _terminate(signum: int, _frame: object) -> None:
+            if os.environ.get(KEEP_TEST_TMP_ENV) == "1":
+                print(
+                    f"kept test temp tree at {root} ({KEEP_TEST_TMP_ENV}=1)",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                shutil.rmtree(root, ignore_errors=True)
+            os._exit(128 + signum)
+
+        for name in ("SIGTERM", "SIGINT"):
+            sig = getattr(signal, name, None)
+            if sig is None:
+                continue
+            try:
+                self._previous[sig] = signal.signal(sig, _terminate)
+            except (ValueError, OSError):
+                pass  # Not the main thread: normal cleanup still applies.
+        return root
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: object,
+    ) -> None:
+        del exc, traceback
+        if exc_type is not None:
+            self._failed = True
+        for sig, handler in self._previous.items():
             signal.signal(sig, handler)  # type: ignore[arg-type]
-        shutil.rmtree(root, ignore_errors=True)
+        self._previous.clear()
+        if self.root is not None:
+            if self._failed and os.environ.get(KEEP_TEST_TMP_ENV) == "1":
+                print(
+                    f"kept test temp tree at {self.root} ({KEEP_TEST_TMP_ENV}=1)",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                shutil.rmtree(self.root, ignore_errors=True)
+
+
+def _signal_cleaned_tempdir(prefix: str) -> _SignalCleanedTempDir:
+    return _SignalCleanedTempDir(prefix)
 
 
 class Harness:
@@ -2873,7 +2918,8 @@ def build_report(python_command: Sequence[str], rust_command: Sequence[str]) -> 
     """Run the complete black-box differential."""
 
     report = Report()
-    with _signal_cleaned_tempdir("herdr-agent-cross-") as temporary:
+    cleaned = _signal_cleaned_tempdir("herdr-agent-cross-")
+    with cleaned as temporary:
         harness = Harness(temporary, python_command, rust_command)
         try:
             _bootstrap(harness, report)
@@ -2888,6 +2934,8 @@ def build_report(python_command: Sequence[str], rust_command: Sequence[str]) -> 
             harness.require_no_host_cli(report)
         finally:
             harness.close()
+        if report.failures:
+            cleaned.fail()
     return report
 
 

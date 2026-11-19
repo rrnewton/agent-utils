@@ -263,6 +263,37 @@ when the run was interrupted; 4 when a rollback failed too,
 so a service may be down: run the commands in the run's `ROLLBACK.sh`. Errors
 before any service is touched (no snapshot, another refresh running) exit 75.
 
+## services prune
+
+```sh
+agentctl services prune
+agentctl services prune --keep 5
+agentctl services prune --apply
+```
+
+Snapshots accumulate one per build. `prune` deletes the ones nothing
+needs. Discovery is host-wide, like turnover. A snapshot is kept when:
+
+- a live (active) unit runs it;
+- a rollback record under `ROOT/refreshes/` names it: the record's
+  directory name, `report.json`, a `UNIT.before`, or `ROLLBACK.sh`
+  mentioning its commit or path, because rolling back must find the
+  old binary still there;
+- a turnover pin protects the unit that runs it
+  (`REGISTRY/turnover.pin`, `REGISTRY/turnover-pins/<unit>.pin`, or
+  `ROOT/global.pin` for the global binary), because turnover will
+  never move that unit off its build;
+- it is among the newest `--keep` snapshots by commit time (default 3).
+
+Everything else is deleted. The default is a dry run: it lists each
+snapshot it would delete and why each kept snapshot is kept, and
+changes nothing; `--apply` deletes. A unit that runs agentctl but
+cannot be read blocks the run: nothing is deleted and the exit status
+is 1. `--json` prints the whole plan (schema
+`agentctl-services-prune/v1`). Prune is its own subcommand, not a step
+at the end of build or refresh, so it can be audited and run in an
+emergency without building anything or restarting a service.
+
 ## services turnover
 
 ```sh

@@ -4084,7 +4084,8 @@ def build_report(
 ) -> Report:
     """Compare the canonical interface through independent executable clients."""
     report = Report()
-    with _signal_cleaned_tempdir("agentctl-cross-") as temporary:
+    cleaned = _signal_cleaned_tempdir("agentctl-cross-")
+    with cleaned as temporary:
         harness = Harness(temporary, python_command, rust_command)
         try:
             for _name, run_group in shard_groups(shard, shards):
@@ -4092,6 +4093,8 @@ def build_report(
             harness.require_no_host_cli(report)
         finally:
             harness.close()
+        if report.failures:
+            cleaned.fail()
     return report
 
 

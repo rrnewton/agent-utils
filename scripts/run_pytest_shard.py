@@ -51,6 +51,11 @@ _TEMP_PREFIX = "agent-utils-pytest-"
 _OWNER_SUFFIX = ".owner"
 #: Keep a failed shard's basetemp for inspection when this is set to 1; it is removed otherwise.
 KEEP_ENV = "AGENT_UTILS_KEEP_PYTEST_BASETEMP"
+#: Keep a failing run's isolated agentctl registry when this is 1 (#1917);
+#: every other run's registry is removed when the session ends.
+KEEP_TEST_TMP_ENV = "AGENT_UTILS_KEEP_TEST_TMP"
+_PLUGIN_REGISTRY: Path | None = None
+_PLUGIN_SIGNAL_INSTALLED = False
 #: How long an unowned basetemp from an older wrapper, or a kept one, survives the sweep.
 _STALE_SECONDS = 24 * 3600
 _POLL_SECONDS = 0.01
@@ -369,16 +374,61 @@ class _TestTimeoutPlugin:
                 signal.setitimer(signal.ITIMER_REAL, previous_timer[0], previous_timer[1])
 
 
+def _cleanup_plugin_registry(exitstatus: int) -> None:
+    """Remove the registry `_isolate_agentctl_registry` made (#1917).
+
+    A failed run keeps it only under AGENT_UTILS_KEEP_TEST_TMP=1, and says
+    where; every other run removes it, so direct runs stop leaving the
+    registry trees the shard wrapper's basetemp cleanup cannot see.
+    """
+    global _PLUGIN_REGISTRY
+    registry, _PLUGIN_REGISTRY = _PLUGIN_REGISTRY, None
+    if registry is None:
+        return
+    if exitstatus != 0 and os.environ.get(KEEP_TEST_TMP_ENV) == "1":
+        print(
+            f"run_pytest_shard: kept the failed run's agentctl registry at {registry} "
+            f"({KEEP_TEST_TMP_ENV}=1)",
+            file=sys.stderr,
+        )
+        return
+    shutil.rmtree(registry, ignore_errors=True)
+
+
+def _terminate_plugin(signum: int, _frame: FrameType | None) -> None:
+    del _frame
+    _cleanup_plugin_registry(1)
+    os._exit(128 + signum)
+
+
 def _isolate_agentctl_registry() -> None:
     """Default agentctl tests to a scratch registry (#1499 tests-touch-live-registry).
 
     Direct ``-p run_pytest_shard`` runs have no wrapper to set the guarded
     environment, so the plugin sets the same defaults at configure time. A
-    registry the caller or a test already chose is kept.
+    registry the caller or a test already chose is kept (and left alone:
+    only a registry this function made is ever removed, by
+    `pytest_sessionfinish` or the SIGTERM handler below).
     """
+    global _PLUGIN_REGISTRY, _PLUGIN_SIGNAL_INSTALLED
     if not os.environ.get("AGENTCTL_REGISTRY"):
-        os.environ["AGENTCTL_REGISTRY"] = tempfile.mkdtemp(prefix="agent-utils-agentctl-registry-")
+        created = Path(tempfile.mkdtemp(prefix="agent-utils-agentctl-registry-"))
+        _PLUGIN_REGISTRY = created
+        os.environ["AGENTCTL_REGISTRY"] = str(created)
+        if not _PLUGIN_SIGNAL_INSTALLED:
+            try:
+                # A timeout's SIGTERM bypasses pytest_sessionfinish (#1917).
+                signal.signal(signal.SIGTERM, _terminate_plugin)
+                _PLUGIN_SIGNAL_INSTALLED = True
+            except (ValueError, OSError):
+                pass  # Not the main thread: sessionfinish still applies.
     os.environ.setdefault("AGENTCTL_LAYOUT_AUTO_MIGRATE", "0")
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """Remove a direct run's isolated registry when its session ends (#1917)."""
+    del session
+    _cleanup_plugin_registry(int(exitstatus))
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -438,6 +488,7 @@ class _ShardPlugin:
     def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int) -> None:
         if self.timing is not None:
             self.timing.pytest_sessionfinish(session, exitstatus)
+        _cleanup_plugin_registry(int(exitstatus))
 
     def pytest_collection_modifyitems(
         self,

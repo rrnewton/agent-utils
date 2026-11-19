@@ -28,6 +28,7 @@ import argparse
 import json
 import shlex
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -595,13 +596,47 @@ def _run_component(
     print(f"component-tests: {shlex.join(command)}", flush=True)
     # Direct (non-shard) runs have no shard wrapper to isolate agentctl
     # (#1499 tests-touch-live-registry); apply the same defaults here.
+    # The registry made here is removed when the run ends (#1917); a
+    # failing run keeps it only under AGENT_UTILS_KEEP_TEST_TMP=1. A
+    # registry the caller chose is left alone.
     environment = dict(os.environ)
+    registry: str | None = None
     if not environment.get("AGENTCTL_REGISTRY"):
-        environment["AGENTCTL_REGISTRY"] = tempfile.mkdtemp(
-            prefix="agent-utils-component-agentctl-"
-        )
+        registry = tempfile.mkdtemp(prefix="agent-utils-component-agentctl-")
+        environment["AGENTCTL_REGISTRY"] = registry
     environment.setdefault("AGENTCTL_LAYOUT_AUTO_MIGRATE", "0")
-    return subprocess.run(command, cwd=PY_ROOT, check=False, env=environment).returncode
+    returncode = 1
+
+    def _on_term(signum: int, _frame: object) -> None:
+        del _frame
+        raise SystemExit(128 + signum)
+
+    _previous_term: object = None
+    try:
+        # A timeout's SIGTERM bypasses the finally below (#1917).
+        _previous_term = signal.signal(signal.SIGTERM, _on_term)
+    except (ValueError, OSError):
+        pass  # Not the main thread: the finally below still applies.
+    try:
+        returncode = subprocess.run(
+            command, cwd=PY_ROOT, check=False, env=environment
+        ).returncode
+    finally:
+        if _previous_term is not None:
+            try:
+                signal.signal(signal.SIGTERM, _previous_term)  # type: ignore[arg-type]
+            except (ValueError, OSError):
+                pass
+        if registry is not None:
+            if returncode != 0 and os.environ.get("AGENT_UTILS_KEEP_TEST_TMP") == "1":
+                print(
+                    f"component-tests: kept the failed run's agentctl registry at {registry} "
+                    "(AGENT_UTILS_KEEP_TEST_TMP=1)",
+                    file=sys.stderr,
+                )
+            else:
+                shutil.rmtree(registry, ignore_errors=True)
+    return returncode
 
 
 def main(argv: Sequence[str] | None = None) -> int:

@@ -172,7 +172,7 @@ enum Commands {
         after_help = "Examples:\n  agentctl --registry ~/project/.agentctl --herdr-bin ~/bin/herdr install-units --dest ~/.config/systemd/user --bridge-unit chat-bridge.service --dry-run\n  agentctl --registry ~/project/.agentctl install-units --dest ~/.config/systemd/user --bridge coordinator\n  agentctl --registry ~/project/.agentctl install-units --dest ~/.config/systemd/user --scheduled\n  agentctl install-units --dest ~/.config/systemd/user --teams-config ~/.config/agentctl/teams.json\n\nWith --teams-config PATH, only agent-restore-teams.service is written: a oneshot after\nherdr-server.service that runs `restore-teams --config PATH --boot`, treats exit 74 as\nsuccess, and retries only temporary failures, bounded. With --scheduled, every `scheduled` entry in REGISTRY/restore.json ({name, on_calendar,\ncommand}, command an argv whose first element is an absolute path; on_calendar may name a timezone such as *-*-* 05:30:00 America/New_York, and an entry may also declare timeout_start_seconds, environment, after and success_exit_status, rendered into the service) renders as\nagentctl-scheduled-NAME.service plus agentctl-scheduled-NAME.timer under --dest, each with\nConditionHost set to this host and the timer Persistent=true, so the pair replaces a\nsystemd-run transient and survives reboots. Paths are rendered absolute: --agentctl\n(default: this executable), --herdr-bin (looked up on PATH when it is a bare name), and\n--registry. A file that exists with different contents is refused unless --force. The\noutput lists the files and the systemctl commands an operator runs next."
     )]
     InstallUnits(InstallUnits),
-    /// Build compiled snapshots of agentctl and move this registry's long-running services (chat bridges, the agent watcher, headless wrappers run as systemd user units) onto them: list, build, refresh
+    /// Build compiled snapshots of agentctl and move this registry's long-running services (chat bridges, the agent watcher, headless wrappers run as systemd user units) onto them: list, build, refresh, prune, turnover
     #[command(
         after_help = "Examples:\n  agentctl --registry ~/project/.agentctl services list\n  agentctl services build --from ~/project/agent-utils\n  agentctl --registry ~/project/.agentctl services refresh --dry-run\n  agentctl --registry ~/project/.agentctl services refresh --only chat-bridge\n\nA service is a systemd user unit whose one ExecStart= command runs an agentctl binary, directly\nor as the command of a `sh -c` script, with --registry resolving to this registry and the\nsubcommand chat run, watch-agents, or run-headless NAME. Snapshots and refresh records live under\n--root (default $XDG_STATE_HOME/agentctl/services): ROOT/snapshots/COMMIT12/ and\nROOT/refreshes/STAMP-COMMIT12/. `agentctl services userguide` explains the whole flow."
     )]
@@ -691,6 +691,11 @@ enum ServicesCommand {
         after_help = "Examples:\n  agentctl --registry ~/project/.agentctl services refresh --dry-run\n  agentctl --registry ~/project/.agentctl services refresh\n  agentctl --registry ~/project/.agentctl services refresh --only chat-bridge --snapshot 1a2b3c4d\n\nOnly the agentctl binary changes, and for a bridge AGENTCTL_HOME, pointed at the snapshot's plugin\nhome so its Slack plugin matches. The outbound helper is part of the bridge's configuration\n(bridge.json) and is left alone; `services list` says when it differs from the snapshot's.\n\nA transient unit (made by systemd-run) is stopped and made again by systemd-run from its own\ndefinition, line for line. First, the same properties start a check unit whose shell only sleeps,\ngiven the planned command as arguments; it must read back as planned, so neither the change nor\nthe rollback can trip on a property systemd-run cannot express. A transient unit with drop-ins is\nrefused. A unit file gets the drop-in DROP_IN_DIR/UNIT.d/zz-agentctl-services.conf, then a daemon\nreload and a restart.\n\nEach service must pass the same health check before it is touched, or it is left alone. After the\nchange, for 30 seconds or more within --health-timeout counted from the new process's start\n(stopping the old process can take its full stop timeout; that time is added to the window and\nsaid in the report; a watcher or watch daemon gets at least its pass budget (or its interval)\nplus 90 s), the unit must stay active with the same main process running the new binary, then a\nbridge's `chat health` (run with the new binary) must not say DOWN, must see that process, which must\nrun with the snapshot's AGENTCTL_HOME, and its event stream must have delivered something since\nthe restart; a watcher or watch daemon must complete a pass\n(agent-watch.json or health.json checked_at after the restart) or show a daemon\nstarted after the restart with its heartbeat advancing at least twice\n(pass-progress.json in its state directory, written at daemon start;\nphase starting until its first pass begins, then pass); the report's\nhealth detail names the proof applied (health proof completed-pass,\npass-progress or daemon-start-progress); a headless wrapper must answer status on its\ncontrol socket from that process. A headless agent in a turn is waited for (--headless-wait), then\nskipped. Watchers go first, bridges next, headless wrappers last; the first failure stops the run.\n\nBefore changing a unit, ROOT/refreshes/STAMP-COMMIT12/ gets UNIT.before (its `systemctl cat`) and\nthe unit's commands in ROLLBACK.sh; report.json follows. Units that are not active are skipped.\nAn interrupt, hangup or termination signal does not stop a service halfway: the one in hand is\nfinished or rolled back, and the rest are not attempted. A SIGKILL can still leave a service\nstopped: run refresh in a terminal or a pane, not under a tool's timeout.\nExit status: 0 every selected service runs the snapshot and passed; 1 a service was refused or\nfailed and was rolled back (later services untouched); 4 a rollback failed too: run ROLLBACK.sh."
     )]
     Refresh(ServicesRefresh),
+    /// Delete snapshots nothing needs: keep every snapshot a live unit runs, a refresh rollback record names, a turnover pin protects, and the newest few; list the rest. Changes nothing without --apply
+    #[command(
+        after_help = "Examples:\n  agentctl services prune\n  agentctl services prune --keep 5\n  agentctl services prune --apply\n\nDiscovery is host-wide, like turnover: a snapshot is kept when a live (active) unit runs it, when a rollback record under ROOT/refreshes/ names it (its run directory, report.json, a UNIT.before, or ROLLBACK.sh), when a turnover pin (REGISTRY/turnover.pin, REGISTRY/turnover-pins/<unit>.pin, or ROOT/global.pin for the global binary) protects the unit that runs it, or when it is among the newest --keep snapshots (by commit time). Everything else is deleted. The default is a dry run: it lists each snapshot it would delete and why each kept snapshot is kept, and changes nothing; --apply deletes. A unit that runs agentctl but cannot be read blocks the run: nothing is deleted and the exit status is 1. --json prints schema agentctl-services-prune/v1. Exit status: 0 the plan is safe (and, with --apply, was carried out); 1 blocked or a deletion failed."
+    )]
+    Prune(ServicesPrune),
     /// Turn every daemon on this host over to main, only where its code changed: build one snapshot, refresh each changed unpinned unit of every registry (bridges last, the global binary last of all), or only report who is behind
     #[command(
         after_help = "Examples:\n  agentctl services turnover --report\n  agentctl services turnover --from ~/project/agent-utils --dry-run\n  agentctl services turnover --from ~/project/agent-utils --notify 'agentctl send coordinator'\n\nDiscovery is host-wide: every user unit running an agentctl binary, whatever registry it names (chat run, watch-agents, watch, restore, restore-teams, run-headless), plus other agent-utils daemons by binary name (reported; no snapshot carries them). Scope is opt-out: a pin at REGISTRY/turnover.pin or REGISTRY/turnover-pins/<unit>.pin (contents are the reason; an empty pin is refused) skips that registry or unit, and ROOT/global.pin pins the global binary. A service refreshes only when paths affecting it changed between its running commit (its binary's --version) and the candidate (--from at --revision); unchanged services are not restarted. Per registry, restore, watchers and headless wrappers go first and bridges last; the global binary (--global-binary, default ~/.local/bin/agentctl) moves last of all, with a backup under ROOT/global-backups/. --notify COMMAND (or a registry's turnover-notify file, which wins) runs before a registry's first refresh and after each of its units with TURNOVER_PHASE, TURNOVER_REGISTRY, TURNOVER_UNIT, TURNOVER_OLD_SHA, TURNOVER_NEW_SHA and TURNOVER_VERDICT in its environment; its failure is reported, never fatal.\n\n--report changes nothing: one line per unit (kind, registry, unit, running and candidate commits, changed-path count, decision), exit 0 all current, 74 some behind, 75 errors or unknown commits. --dry-run prints the ordered plan including pins and notify calls. A watch or watch-agents unit's health window scales from its configured pass budget or interval (plus 90 s) unless --health-timeout-for names it exactly. A turnover run exits 0 when everything current or refreshed is healthy, 1 when a refresh failed and rolled back, 4 when a rollback failed; a completed rollback leaves that unit on its old binary and the run continues with the remaining units, naming the rolled-back ones at the end. For a scheduled (timer) run, exits 0 and 74 are successes and 1, 4 and 75 are failures that alert the coordinator through the notify command (use 'agentctl services turnover-notify', which sends under the turnover-timer identity). --json prints schema agentctl-services-turnover/v1."
@@ -768,6 +773,22 @@ struct ServicesRefresh {
     #[arg(long, value_name = "DIR")]
     drop_in_dir: Option<PathBuf>,
     /// Print the report as JSON (schema agentctl-services-refresh/v1) instead of text
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct ServicesPrune {
+    /// How many of the newest otherwise-unreferenced snapshots to keep (default: 3)
+    #[arg(long, default_value_t = 3, value_name = "N")]
+    keep: usize,
+    /// Delete the snapshots the report names; without this the run changes nothing
+    #[arg(long)]
+    apply: bool,
+    /// The global agentctl binary a ROOT/global.pin can protect (default: ~/.local/bin/agentctl; an empty value skips it)
+    #[arg(long, value_name = "PATH")]
+    global_binary: Option<String>,
+    /// Print the report as JSON (schema agentctl-services-prune/v1) instead of text
     #[arg(long)]
     json: bool,
 }
@@ -3678,6 +3699,31 @@ fn run_services(registry: &Path, value: Services) -> Result<i32, Failure> {
                 crate::services::refresh(&host, &CliOptionTables, &registry, &root, &options)
                     .map_err(failed)?;
             if refresh.json {
+                write_json(&report.document).map_err(Failure::Output)?;
+            } else {
+                write_text(&report.text).map_err(Failure::Output)?;
+            }
+            Ok(report.exit_code)
+        }
+        ServicesCommand::Prune(prune) => {
+            let global_binary = match prune.global_binary {
+                Some(path) if path.is_empty() => None,
+                Some(path) => Some(absolute(Path::new(&path))?),
+                None => std::env::var_os("HOME")
+                    .map(|home| PathBuf::from(home).join(".local/bin/agentctl")),
+            };
+            let report = crate::services::prune::prune(
+                &host,
+                &CliOptionTables,
+                &crate::services::prune::PruneOptions {
+                    root,
+                    keep_newest: prune.keep,
+                    apply: prune.apply,
+                    global_binary,
+                },
+            )
+            .map_err(failed)?;
+            if prune.json {
                 write_json(&report.document).map_err(Failure::Output)?;
             } else {
                 write_text(&report.text).map_err(Failure::Output)?;

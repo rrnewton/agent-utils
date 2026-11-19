@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 
 use super::discover::{discover, discover_all, Kind, OptionTables};
 use super::host::{Host, UnitState};
+use super::prune::{prune, PruneOptions};
 use super::refresh::{definition, refresh, RefreshOptions, DROP_IN};
 use super::snapshot::{self, Snapshot};
 use super::turnover::{
@@ -2495,5 +2496,220 @@ fn turnover_skips_an_unknown_unit_and_refreshes_the_rest() {
             .iter()
             .any(|(name, value)| name == "TURNOVER_UNIT" && value == "mystery-watch.service")),
         "{calls:?}"
+    );
+}
+
+// #1917: prune keeps referenced snapshots and deletes only the rest.
+
+const PRUNE_STALE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const PRUNE_LIVE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const PRUNE_ROLLBACK: &str = "cccccccccccccccccccccccccccccccccccccccc";
+const PRUNE_PINNED: &str = "dddddddddddddddddddddddddddddddddddddddd";
+const PRUNE_TARGET: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+const PRUNE_NEWEST: &str = "ffffffffffffffffffffffffffffffffffffffff";
+
+fn write_test_snapshot(root: &Path, commit: &str, committed_at: u64) -> PathBuf {
+    let directory = root.join("snapshots").join(&commit[..12]);
+    fs::create_dir_all(directory.join("bin")).unwrap();
+    fs::write(directory.join("bin/agentctl"), "#!/bin/sh\n").unwrap();
+    let document = json!({
+        "schema": snapshot::SNAPSHOT_SCHEMA,
+        "commit": commit,
+        "built_at": committed_at + 1000,
+        "source": {"committed_at": committed_at},
+        "files": {},
+    });
+    fs::write(
+        directory.join("snapshot.json"),
+        serde_json::to_vec(&document).unwrap(),
+    )
+    .unwrap();
+    directory
+}
+
+fn watch_on_snapshot(fake: &Fake, unit: &str, snapshot_dir: &Path, registry: &Path) {
+    let binary = snapshot_dir.join("bin/agentctl");
+    fake.systemd_run(&transient_args(
+        unit,
+        " prune test watcher",
+        &[&format!(
+            "WorkingDirectory={}",
+            registry.parent().unwrap().display()
+        )],
+        &[
+            &binary.to_string_lossy(),
+            "--registry",
+            &registry.to_string_lossy(),
+            "watch-agents",
+            "--state-dir",
+            "/state/prune-watch",
+        ],
+    ))
+    .unwrap();
+}
+
+struct PruneWorld {
+    _temporary: Temporary,
+    root: PathBuf,
+    registry: PathBuf,
+    fake: Fake,
+    directories: BTreeMap<String, PathBuf>,
+}
+
+fn prune_world() -> PruneWorld {
+    let temporary = temporary("prune");
+    let base = temporary.0.clone();
+    let root = base.join("root");
+    let registry = base.join("team/.agentctl");
+    fs::create_dir_all(&registry).unwrap();
+    let fake = Fake::new(base.join("drop-ins"));
+    let mut directories = BTreeMap::new();
+    for (label, commit, committed_at) in [
+        ("stale", PRUNE_STALE, 10),
+        ("live", PRUNE_LIVE, 20),
+        ("rollback", PRUNE_ROLLBACK, 30),
+        ("pinned", PRUNE_PINNED, 40),
+        ("target", PRUNE_TARGET, 50),
+        ("newest", PRUNE_NEWEST, 60),
+    ] {
+        directories.insert(
+            label.to_owned(),
+            write_test_snapshot(&root, commit, committed_at),
+        );
+    }
+    // A live watcher runs the "live" snapshot.
+    watch_on_snapshot(&fake, "live.service", &directories["live"], &registry);
+    // An inactive watcher runs the "pinned" snapshot, protected by its pin.
+    watch_on_snapshot(&fake, "pinned.service", &directories["pinned"], &registry);
+    fake.units
+        .borrow_mut()
+        .get_mut("pinned.service")
+        .unwrap()
+        .active = "inactive".into();
+    let pins = registry.join("turnover-pins");
+    fs::create_dir_all(&pins).unwrap();
+    fs::write(
+        pins.join("pinned.service.pin"),
+        "do not move this watcher\n",
+    )
+    .unwrap();
+    // A refresh record onto "target" rolls back to the "rollback" snapshot.
+    let record = root
+        .join("refreshes")
+        .join(format!("20260101T000000Z-{}", &PRUNE_TARGET[..12]));
+    fs::create_dir_all(&record).unwrap();
+    fs::write(
+        record.join("ROLLBACK.sh"),
+        format!(
+            "#!/bin/sh\n# back to {}\n",
+            directories["rollback"].join("bin/agentctl").display()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        record.join("report.json"),
+        serde_json::to_vec(&json!({
+            "schema": "agentctl-services-refresh/v1",
+            "snapshot": {"commit": PRUNE_TARGET},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    PruneWorld {
+        _temporary: temporary,
+        root,
+        registry,
+        fake,
+        directories,
+    }
+}
+
+fn prune_options(world: &PruneWorld, apply: bool) -> PruneOptions {
+    PruneOptions {
+        root: world.root.clone(),
+        keep_newest: 1,
+        apply,
+        global_binary: None,
+    }
+}
+
+#[test]
+fn prune_dry_run_deletes_nothing_and_names_every_keep_reason() {
+    let world = prune_world();
+    let report = prune(&world.fake, &Tables, &prune_options(&world, false)).unwrap();
+    assert_eq!(report.exit_code, 0, "{}", report.text);
+    assert_eq!(report.document["dry_run"], true);
+    for directory in world.directories.values() {
+        assert!(
+            directory.exists(),
+            "dry run removed {}",
+            directory.display()
+        );
+    }
+    let rows = report.document["snapshots"].as_array().unwrap();
+    let kept = |commit: &str| {
+        rows.iter()
+            .find(|row| row["commit"] == commit)
+            .unwrap_or_else(|| panic!("no row for {commit}"))
+    };
+    assert_eq!(kept(PRUNE_STALE)["kept"], false, "{}", report.text);
+    for (commit, reason) in [
+        (PRUNE_LIVE, "live unit"),
+        (PRUNE_ROLLBACK, "rollback record"),
+        (PRUNE_TARGET, "rollback record"),
+        (PRUNE_PINNED, "turnover pin"),
+        (PRUNE_NEWEST, "newest"),
+    ] {
+        let row = kept(commit);
+        assert_eq!(row["kept"], true, "{commit}: {}", report.text);
+        assert!(
+            row["reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|kept_reason| kept_reason.as_str().unwrap().contains(reason)),
+            "{commit} kept without {reason:?}: {}",
+            report.text
+        );
+        assert!(
+            report.text.contains(reason),
+            "text names no {reason:?}: {}",
+            report.text
+        );
+    }
+}
+
+#[test]
+fn prune_apply_never_deletes_a_referenced_snapshot() {
+    let world = prune_world();
+    let report = prune(&world.fake, &Tables, &prune_options(&world, true)).unwrap();
+    assert_eq!(report.exit_code, 0, "{}", report.text);
+    assert!(
+        !world.directories["stale"].exists(),
+        "unreferenced stale snapshot survived --apply"
+    );
+    for label in ["live", "rollback", "pinned", "target", "newest"] {
+        assert!(
+            world.directories[label].exists(),
+            "referenced snapshot {label} was deleted: {}",
+            report.text
+        );
+    }
+    // Even keeping none of the newest, a referenced snapshot survives.
+    let mut options = prune_options(&world, true);
+    options.keep_newest = 0;
+    let report = prune(&world.fake, &Tables, &options).unwrap();
+    assert_eq!(report.exit_code, 0, "{}", report.text);
+    for label in ["live", "rollback", "pinned", "target"] {
+        assert!(
+            world.directories[label].exists(),
+            "referenced snapshot {label} deleted with --keep 0: {}",
+            report.text
+        );
+    }
+    assert!(
+        !world.directories["newest"].exists(),
+        "with --keep 0 the merely-newest snapshot is deleted: {}",
+        report.text
     );
 }

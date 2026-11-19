@@ -58,6 +58,7 @@ environment wins. Each run prints the file and the keys it set, never their valu
 from __future__ import annotations
 
 import argparse
+import atexit
 import contextlib
 import json
 import os
@@ -1043,6 +1044,45 @@ def run(
     extra = os.environ.get("VALIDATE_DAGRUN_FLAGS", os.environ.get("BOX_FLAGS", ""))
     env = dict(os.environ)
     env.update(host or {})
+    # Scratch trees this run makes (the gitconfig home and the agentctl
+    # registry below) are removed when the run ends (#1917); a failed run
+    # keeps them only under AGENT_UTILS_KEEP_TEST_TMP=1, and says where.
+    scratch: list[Path] = []
+    scratch_done = False
+
+    def _finish_scratch(failed: bool) -> None:
+        nonlocal scratch_done
+        if scratch_done:
+            return
+        scratch_done = True
+        if failed and os.environ.get("AGENT_UTILS_KEEP_TEST_TMP") == "1":
+            for path in scratch:
+                print(
+                    f"validate: kept test temp tree at {path} "
+                    "(AGENT_UTILS_KEEP_TEST_TMP=1)",
+                    file=sys.stderr,
+                )
+            return
+        for path in scratch:
+            try:
+                remove_test_tree(path)
+            except OSError as error:
+                print(
+                    f"validate: could not remove test temp tree {path}: {error}",
+                    file=sys.stderr,
+                )
+
+    atexit.register(_finish_scratch, True)
+    _previous_term: object = None
+
+    def _on_term(signum: int, _frame: FrameType | None) -> None:
+        _finish_scratch(True)
+        raise SystemExit(128 + signum)
+
+    try:
+        _previous_term = signal.signal(signal.SIGTERM, _on_term)
+    except (ValueError, OSError):
+        pass  # Not the main thread: the finally below still applies.
     # Every step in the graph -- pytest shards and the Rust test harnesses
     # alike -- inherits a throwaway global git config, so no test can write
     # the operator's real ~/.gitconfig (#1474 tests-rewrite-global-gitconfig).
@@ -1051,6 +1091,7 @@ def run(
     # GIT_CONFIG_GLOBAL is kept.
     if "GIT_CONFIG_GLOBAL" not in env:
         gitconfig_dir = Path(tempfile.mkdtemp(prefix="agent-utils-validate-gitconfig-"))
+        scratch.append(gitconfig_dir)
         gitconfig_sentinel = gitconfig_dir / "gitconfig"
         gitconfig_sentinel.write_bytes(
             b"[user]\n\tname = Agent Utils Tests\n"
@@ -1064,9 +1105,9 @@ def run(
     # tests-touch-live-registry): default agentctl to a per-run scratch
     # with auto-migrate off, unless the caller already chose a registry.
     if "AGENTCTL_REGISTRY" not in env:
-        env["AGENTCTL_REGISTRY"] = str(
-            Path(tempfile.mkdtemp(prefix="agent-utils-validate-agentctl-")) / "registry"
-        )
+        registry_base = Path(tempfile.mkdtemp(prefix="agent-utils-validate-agentctl-"))
+        scratch.append(registry_base)
+        env["AGENTCTL_REGISTRY"] = str(registry_base / "registry")
     env.setdefault("AGENTCTL_LAYOUT_AUTO_MIGRATE", "0")
     if coverage_dir is not None:
         env[CROSS_COVERAGE_ENV] = str(coverage_dir)
@@ -1151,6 +1192,12 @@ def run(
             result = done.returncode
     if result != 0:
         print("\nvalidate: FAILED in flattened validation DAG", file=sys.stderr)
+    _finish_scratch(result != 0)
+    if _previous_term is not None:
+        try:
+            signal.signal(signal.SIGTERM, _previous_term)  # type: ignore[arg-type]
+        except (ValueError, OSError):
+            pass
     return result
 
 

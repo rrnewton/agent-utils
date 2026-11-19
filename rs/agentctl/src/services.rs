@@ -20,6 +20,7 @@
 
 pub mod discover;
 pub mod host;
+pub mod prune;
 pub mod refresh;
 pub mod snapshot;
 pub mod turnover;
