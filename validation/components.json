@@ -407,6 +407,7 @@
         "py/tests/test_wrkslots_soak.py",
         "py/tests/test_wrkslots_state_schema.py",
         "py/tests/test_wrkslotsd_source_contract.py",
+        "py/wrkslots/tests/test_absent_slot_closure.py",
         "py/wrkslots/tests/test_active_state_rust.py",
         "py/wrkslots/tests/test_adopt_write_rust.py",
         "py/wrkslots/tests/test_agentctl_liveness_probe.py",

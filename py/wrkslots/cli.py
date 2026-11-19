@@ -63703,7 +63703,11 @@ def _finish_remove_paths(
         allow_live_validate_owner=finish.allow_live_validate_owner,
         owner_consented=finish.owner_consented,
     )
-    if private_fence_identity is not None:
+    if finish.absent_slot:
+        # Absent-slot closure (B2-A): the recorded owner proven dead
+        # plus two ordinary reference scans, never the following census.
+        _assert_absent_slot_unused(config, record, (fenced_slot,))
+    elif private_fence_identity is not None:
         assert finish.private_cleanup is not None
         fresh_census = finish.private_cleanup.fresh_census
         if fresh_census is None:
@@ -67067,6 +67071,9 @@ def _cmd_remove_in_scope(
                 agent_batch=agent_batch,
                 stale_copy_discard_sequence=None,
                 prepared_lock_free=True,
+                absent_slot=not _slot_directory(
+                    config, record.slot, record.slot_type
+                ).exists(),
             )
             prepared_finish = _begin_finish(
                 config,
@@ -67445,6 +67452,9 @@ def _cmd_remove_in_scope(
                 owner_consented=owner_consent is not None or owner_release is not None,
                 agent_batch=agent_batch,
                 stale_copy_discard_sequence=stale_copy_discard_sequence,
+                absent_slot=not _slot_directory(
+                    config, record.slot, record.slot_type
+                ).exists(),
             )
             # An ordinary removal fences and journals under the lock, deletes
             # the fenced tree with the lock released, and re-takes the lock only
@@ -89094,6 +89104,51 @@ def _capture_same_uid_process_path_census(
         _REREAD_GENERATIONS.reset(reread_token)
         _FOLLOWED_VANISHED_HOLDERS.reset(token)
 
+def _assert_absent_slot_unused(
+    config: Config,
+    record: ActiveRecord,
+    paths: Sequence[Path],
+    *,
+    budget: _ReadOnlyCommandBudget | None = None,
+) -> None:
+    """Absent-slot recovery closure (B2-A): owners dead + two clean scans.
+
+    For a slot whose storage is already absent, recovery retires only
+    registry rows; nothing on disk remains to protect.  The closure is
+    therefore: the recorded owner generation proven dead (pidfd, via
+    ``_process_state``), then two ordinary all-process reference scans
+    in a row finding no live holder.  A match whose target text ends in
+    " (deleted)" is not a holder for this purpose: a reparented
+    descendant holding a deleted directory's descriptor cannot recreate
+    the path, cannot be reached by name, and pins only inodes that are
+    already unlinked -- recovery neither deletes nor protects them.
+    """
+
+    owner = record.owner
+    if owner is None:
+        raise Refusal(
+            f"absent slot {record.slot} has no recorded owner generation "
+            "to prove dead; refusing recovery closure"
+        )
+    state, detail = _process_state(owner)
+    if state != "dead":
+        raise Refusal(
+            f"recorded owner for absent slot {record.slot} is not proven "
+            f"dead ({state}: {detail}); refusing recovery closure"
+        )
+    for _scan in range(2):
+        census = _capture_process_path_census(paths, budget=budget)
+        live = [
+            match for match in census.matches if not match[3].endswith(" (deleted)")
+        ]
+        if live:
+            pid, _slot, kind, target = live[0]
+            raise Refusal(
+                f"live process {pid} may still use absent slot {record.slot}: "
+                f"{kind}={target}"
+            )
+
+
 def _census_record(record: ActiveRecord | None) -> ActiveRecord | None:
     """Record for a batch census: Eden rows keep their identity so
     the slot's own daemon is exempt, owner evidence stays dropped
@@ -91469,6 +91524,11 @@ class _FinishContext:
     # its census and fleet validation already ran, so the fence skips its
     # own use check; the post-fence census outside the lock still decides.
     prepared_lock_free: bool = False
+    # True when the slot's storage was already absent before the fence
+    # (B2-A): its unused proof is the absent-slot closure (recorded
+    # owner proven dead + two ordinary reference scans), never the
+    # following census.  In-memory only; never journaled.
+    absent_slot: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
