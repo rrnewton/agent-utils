@@ -31,6 +31,7 @@ import mimetypes
 import os
 import tempfile
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -202,13 +203,31 @@ def main() -> int:
     reply = QUESTION["id"]
 
     def open_reply(page: Page) -> None:
-        """From wherever the page is, to Reply on the one message, its box open in the list and focused."""
+        """From wherever the page is, to Reply on the one message, its box open in the list and focused.
+
+        Wait on the condition -- the message's Reply button attached and
+        visible -- not on a fixed ten seconds: the button lives in the
+        channel view, which is not always the view on show (Voice is,
+        until the switch is pressed), and its row renders asynchronously
+        after a switch, so on a loaded host the render can take far
+        longer than ten seconds while nothing is wrong. Poll: if the
+        call view is the one showing, press the switch once (its
+        aria-pressed says which view is up), then wait for the button
+        itself behind a generous hang backstop.
+        """
         button = page.locator(f'#discord-log li[data-id="{reply}"] .reply-button').first
-        if not button.is_visible():
-            page.click("#view-switch")
-        button.wait_for(state="visible", timeout=10_000)
+        deadline = time.monotonic() + 120
+        while not button.is_visible():
+            check(time.monotonic() < deadline,
+                  "the Reply button never became visible after its row rendered")
+            if page.evaluate(
+                "() => document.getElementById('view-switch')"
+                "?.getAttribute('aria-pressed')"
+            ) == "true":
+                page.click("#view-switch")
+            page.wait_for_timeout(200)
         button.click()
-        page.locator("#column-reply").wait_for(state="visible", timeout=5000)
+        page.locator("#column-reply").wait_for(state="visible", timeout=120_000)
         page.click("#reply-text")
 
     def box(page: Page) -> object:
