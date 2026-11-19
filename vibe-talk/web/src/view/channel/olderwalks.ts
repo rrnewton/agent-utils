@@ -1218,9 +1218,15 @@ function renderServerSearch() {
   // reader's anchor with scrollTop unchanged, shifting what they read down
   // (+105.9 / +287 px measured). Hold the anchor through the placement with
   // the #1880 scroll owner's hold (`preservingScroll`): it restores the
-  // anchor's rect.top after, moves nothing for insertions below it, and
-  // follows the newest line instead when the reader is pinned there.
+  // anchor's rect.top after, moves nothing for insertions below it, and a
+  // reader pinned at the newest end follows it there instead. The hold's
+  // own scroll pass can unmark a placed card (it holds no loaded search
+  // text for the filter to mark by), so the placed cards are marked again
+  // after it, as `placeServerHits` marked them inside it.
   preservingScroll(() => placeServerHits(grouped));
+  for (const row of el("discord-log").children) {
+    if (row.getAttribute(SERVER_HIT_MARK) === "card") markSearchHits(row, searchParsed(searchField.query()).terms);
+  }
   if (!serverExpanded) return;
   setTextIfChanged(el("search-scope"), searchScopeLine());
   const checkbox = el("search-all-channels") as HTMLInputElement;
