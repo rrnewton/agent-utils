@@ -1542,6 +1542,18 @@ impl LiveHub {
         replaces: Option<&Message>,
         check: CreatedCheck,
     ) -> Published {
+        // `#1886 vibe-talk-transcripts-view` (part A): an agent transcript
+        // message is never live news. Every producer funnels through here,
+        // so this one check keeps trace roots and entries out of every
+        // page's stream, replay tail, held windows and call relay — the
+        // paths the timeline route's exclusion cannot reach, which is how
+        // a fresh daily root still reached Main on a reload. A deletion is
+        // still published, so a copy a page saved before this rule is
+        // taken out. The class is the one the timeline reads use: the
+        // thread record's, or the fixed root title's.
+        if live.kind != LiveKind::Delete && transcript_class(&live.message).is_some() {
+            return Published::Known;
+        }
         // This copy's version on this server's clock: when the read that found it began, or now
         // for a change pushed to this server. `#473 replication-c7-server-versions`.
         let observed_ms = read
@@ -1891,7 +1903,14 @@ pub fn events(
             state.done = true;
             return Some((Ok(reset_event(0)), state));
         }
-        if let Some(mut held) = state.replay.pop_front() {
+        while let Some(mut held) = state.replay.pop_front() {
+            // `#1886` part A: a transcript message in the tail is not
+            // replayed to a page either (the hub never publishes one now;
+            // this covers a tail held from before, and a thread known only
+            // by its stored class).
+            if stream_transcript(&state.app, &state.channel.clone(), &held).await {
+                continue;
+            }
             if state.replay_noise.is_none() {
                 state.replay_noise =
                     Some(crate::noise::filter_for(&state.app, &state.channel).await);
@@ -1929,19 +1948,28 @@ pub fn events(
         // Messages and settings changes, whichever comes first. A settings receiver
         // that fell behind loses only settings frames — the page re-reads the whole
         // document when it reconnects or refocuses — so lag there is skipped, never
-        // the reset a lagged message receiver earns.
+        // the reset a lagged message receiver earns. A transcript message
+        // (`#1886` part A) is skipped the same way: wait for the next event.
         let live = loop {
-            tokio::select! {
-                message = state.receiver.recv() => break message,
-                settings = state.settings_receiver.recv() => {
-                    match settings {
-                        Ok(changed) => return Some((Ok(settings_event(changed)), state)),
-                        Err(broadcast::error::RecvError::Lagged(_))
-                        | Err(broadcast::error::RecvError::Closed) => {
-                            state.settings_receiver = state.app.live.subscribe_settings();
+            let next = loop {
+                tokio::select! {
+                    message = state.receiver.recv() => break message,
+                    settings = state.settings_receiver.recv() => {
+                        match settings {
+                            Ok(changed) => return Some((Ok(settings_event(changed)), state)),
+                            Err(broadcast::error::RecvError::Lagged(_))
+                            | Err(broadcast::error::RecvError::Closed) => {
+                                state.settings_receiver = state.app.live.subscribe_settings();
+                            }
                         }
                     }
                 }
+            };
+            match next {
+                Ok(held) if stream_transcript(&state.app, &state.channel.clone(), &held).await => {
+                    continue;
+                }
+                other => break other,
             }
         };
         match live {
@@ -2065,6 +2093,12 @@ pub fn all_events(
         let Some(channel) = state.app.channel(arrival.channel.as_str()) else {
             return Some((Ok(axum::response::sse::Event::default().id(cursor)), state));
         };
+        // `#1886` part A: a transcript message goes out as a bare cursor,
+        // as a message for a channel off the list does — it is never
+        // relayed to a call or a page.
+        if stream_transcript(&state.app, &channel.id.clone(), &arrival.live).await {
+            return Some((Ok(axum::response::sse::Event::default().id(cursor)), state));
+        }
         let mut live = arrival.live;
         if live.kind != LiveKind::Delete {
             crate::ops::attach_message_hues(
@@ -2138,6 +2172,50 @@ fn judge(
             client.upstream_app_url(&message.channel_id, &message.id, message.thread.as_ref())
         });
     }
+}
+
+/// The transcript class of `message`, when it belongs to an agent
+/// transcript thread (`#1886 vibe-talk-transcripts-view`, `#1608
+/// agent-transcripts-timeline`): the class its thread record carries, or,
+/// for a root a path brought without one, the class of its fixed title.
+fn transcript_class(message: &Message) -> Option<crate::transcripts::ThreadClass> {
+    let thread = message.thread.as_ref()?;
+    if let Some(class) = &thread.class {
+        return Some(class.clone());
+    }
+    if thread.is_root {
+        return crate::transcripts::class_of_title(&message.content);
+    }
+    None
+}
+
+/// Whether `live` is a transcript message a stream must not emit
+/// (`#1886 vibe-talk-transcripts-view` part A): classed on its own record
+/// or by its root title ([`transcript_class`]), or in a thread the store
+/// has already classed — an entry a producer brought without a class of
+/// its own. A class learned here is recorded, so the Transcripts index
+/// and later reads know the thread even if no timeline read has carried
+/// it yet. Deletions are never skipped: a page saved before this rule
+/// must still hear that its copy is gone.
+async fn stream_transcript(app: &AppState, channel: &ChannelId, live: &LiveMessage) -> bool {
+    if live.kind == LiveKind::Delete {
+        return false;
+    }
+    if let Some(class) = transcript_class(&live.message) {
+        if let Some(thread) = &live.message.thread {
+            let _ = app
+                .store
+                .set_thread_class(channel, &thread.id, &class)
+                .await;
+        }
+        return true;
+    }
+    if let Some(thread) = &live.message.thread {
+        if let Ok(Some(_)) = app.store.thread_class(channel, &thread.id).await {
+            return true;
+        }
+    }
+    false
 }
 
 fn message_event(live: &LiveMessage, from_tail: bool) -> axum::response::sse::Event {
@@ -3196,6 +3274,65 @@ mod tests {
             Some(parent),
             "a live event of the reply lost what it answers"
         );
+    }
+
+    #[test]
+    fn a_transcript_message_is_never_published_but_its_deletion_is() {
+        // `#1886 vibe-talk-transcripts-view` part A: the hub is the one
+        // funnel every live producer reaches, so a classed entry, a
+        // classed root and a title-only fresh daily root publish
+        // nothing — no stream event, no replay-tail copy, no held
+        // window — while an ordinary message beside them goes out.
+        let hub = LiveHub::new();
+        let channel = ChannelId("1111".to_owned());
+        let class = crate::transcripts::ThreadClass {
+            agent: "liaison".to_owned(),
+            team: None,
+            day: "2026-11-19".to_owned(),
+            source: crate::transcripts::ClassSource::Metadata,
+        };
+        let traced = |id: &str, content: &str, root: bool, classed: bool| {
+            let mut message = crate::cache::fixtures::message(id, "liaison", content, 1_000);
+            message.thread = Some(crate::threads::MessageThread {
+                class: classed.then(|| class.clone()),
+                hue: None,
+                display_name: None,
+                summary: None,
+                id: "1700.0001".to_owned(),
+                root_message_id: None,
+                is_root: root,
+                broadcast: false,
+                reply_count: Some(2),
+                reply_count_exact: true,
+            });
+            message
+        };
+        hub.publish(&channel, traced("1", "liaison main session trace, 2026-11-19 ET", true, true));
+        hub.publish(&channel, traced("2", "thinking", false, true));
+        hub.publish(&channel, traced("3", "liaison main session trace, 2026-11-19 ET", true, false));
+        hub.publish(
+            &channel,
+            crate::cache::fixtures::message("4", "owner", "hello", 1_000),
+        );
+        let subscription = hub.subscribe(&channel, None);
+        let contents: Vec<&str> = subscription
+            .replay
+            .iter()
+            .map(|live| live.message.content.as_str())
+            .collect();
+        assert_eq!(contents, ["hello"], "a transcript message reached the replay tail");
+        // A deletion of a transcript message is still published, so a
+        // page that saved a copy before this rule is told it is gone.
+        let mut gone = traced("1", "liaison main session trace, 2026-11-19 ET", true, true);
+        gone.content = String::new();
+        let published = hub.publish_ingested(
+            "gone-1".to_owned(),
+            LiveKind::Delete,
+            false,
+            &channel,
+            gone,
+        );
+        assert!(published, "a transcript deletion was not published");
     }
 
     fn fake_with(channel: &ChannelId) -> Arc<FakeDiscord> {

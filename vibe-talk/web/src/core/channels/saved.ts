@@ -4,6 +4,7 @@
 // page; this is only the store's side of it.
 
 import type { Message, ThreadSummary } from "../../contract/index.ts";
+import { isTranscriptMessage, isTranscriptSummary } from "../transcripts/index.ts";
 import type { ChannelCanon } from "./canon.ts";
 import { threadOf } from "./canon.ts";
 
@@ -44,11 +45,25 @@ export function savedTimelineOf(canon: ChannelCanon, usedAt: number, bookmark: u
   }
   const held = new Set(canon.messages.map((message) => String(message.id)));
   const heldThreads = new Set(canon.messages.map(threadOf).filter((id) => id !== null));
+  // `#1886` part A: transcript rows are never saved for a reload either.
+  const dropped = new Set<string>();
+  for (const message of canon.messages) {
+    if (isTranscriptMessage(message)) {
+      const thread = threadOf(message);
+      if (thread) dropped.add(thread);
+    }
+  }
+  for (const summary of canon.threads) {
+    if (isTranscriptSummary(summary)) dropped.add(String(summary.id));
+  }
   return {
     mode: "timeline",
     usedAt,
-    messages: canon.messages.slice(),
-    threads: canon.threads.slice(),
+    messages: canon.messages.filter((message) => {
+      const thread = threadOf(message);
+      return !isTranscriptMessage(message) && !(thread !== null && dropped.has(thread));
+    }),
+    threads: canon.threads.filter((summary) => !isTranscriptSummary(summary)),
     views,
     hasThreads: canon.hasThreads,
     scope: canon.scope,
@@ -67,8 +82,25 @@ export function savedTimelineOf(canon: ChannelCanon, usedAt: number, bookmark: u
 
 /** Fill `canon` (a fresh, empty store) from what this device saved of its channel, `entry`. */
 export function restoreCanon(canon: ChannelCanon, entry: SavedTimeline): void {
-  canon.messages = entry.messages;
-  canon.threads = entry.threads;
+  // `#1886 vibe-talk-transcripts-view` part A: a copy saved before
+  // transcript threads were kept out of the raw feed does not bring
+  // them back on a reload: classed messages, trace-titled roots, their
+  // threads' other messages, and their summaries are left behind.
+  const dropped = new Set<string>();
+  for (const message of entry.messages) {
+    if (isTranscriptMessage(message)) {
+      const thread = threadOf(message);
+      if (thread) dropped.add(thread);
+    }
+  }
+  for (const summary of entry.threads) {
+    if (isTranscriptSummary(summary)) dropped.add(String(summary.id));
+  }
+  canon.messages = entry.messages.filter((message) => {
+    const thread = threadOf(message);
+    return !isTranscriptMessage(message) && !(thread !== null && dropped.has(thread));
+  });
+  canon.threads = entry.threads.filter((summary) => !isTranscriptSummary(summary));
   canon.hasThreads = entry.hasThreads;
   canon.scope = entry.scope || null;
   canon.dismissed = new Set(entry.dismissed.map(String));

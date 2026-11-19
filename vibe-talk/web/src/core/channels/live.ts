@@ -2,6 +2,7 @@
 // moved from the legacy script; plan step 10).
 
 import type { Message, MessageThread } from "../../contract/index.ts";
+import { isTranscriptMessage } from "../transcripts/index.ts";
 import type { ChannelCanon } from "./canon.ts";
 import { threadOf, timeOf } from "./canon.ts";
 import { insertSorted, messageIndex, noteMessageChanged } from "./incremental.ts";
@@ -66,6 +67,11 @@ export function foldLiveIn(
   read: number | null,
   deps: LiveFoldDependencies,
 ): Message {
+  // `#1886 vibe-talk-transcripts-view` part A: a transcript arrival is
+  // never folded into the raw feed's store — not drawn, not counted, not
+  // saved for a reload. (Its thread's counts are not moved either: the
+  // early return is before every count below.)
+  if (isTranscriptMessage(message)) return message;
   const id = String(message.id);
   const held = messageIndex(canon).get(id);
   let kept: Message = !threadOf(message) && threadOf(held) ? { ...message, thread: (held as Message).thread } : message;

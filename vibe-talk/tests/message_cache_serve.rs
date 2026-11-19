@@ -3661,3 +3661,70 @@ async fn served_replies_keep_their_parents(drops_metadata: bool) {
         }
     }
 }
+
+// --- `#1886 vibe-talk-transcripts-view` part A: transcript threads hidden everywhere ---
+
+fn trace_meta(kind: &str, day: &str) -> Value {
+    serde_json::json!({"event_type": "agentctl_trace",
+        "event_payload": {"v": 1, "kind": kind, "agent": "liaison", "team": null,
+                          "session": "s1", "day": day, "seq": 1, "trigger": "owner"}})
+}
+
+async fn slack_transcript_deployment(tag: &str) -> (AppState, slack_fake::Fake, Arc<ManualClock>, TempDir) {
+    let mut fixture = slack_fake::FakeState::default();
+    let mut history: Vec<Value> = (0..3)
+        .map(|n| slack_fake::profiled(&slack_fake::ts(n * 60, 0), "UADA00001", "Ada", &format!("message {n}")))
+        .collect();
+    // Trace thread A: root with metadata + title, two entry replies with metadata.
+    let mut root_a = slack_fake::profiled(&slack_fake::ts(600, 0), "ULIAISON1", "liaison-bot", "liaison main session trace, 2026-11-18 ET");
+    root_a["metadata"] = trace_meta("root", "2026-11-18");
+    slack_fake::thread(&mut fixture, SLACK_CH, &mut root_a, &[
+        (slack_fake::ts(660, 0), "thinking about the cache".to_owned()),
+        (slack_fake::ts(720, 0), "still thinking".to_owned()),
+    ]);
+    if let Some(replies) = fixture.replies.get_mut(&(SLACK_CH.to_owned(), slack_fake::ts(600, 0))) {
+        for reply in replies.iter_mut() { reply["metadata"] = trace_meta("entry", "2026-11-18"); }
+    }
+    history.push(root_a);
+    // Trace root B: fresh daily root, title only, no metadata, no replies yet.
+    let root_b = slack_fake::profiled(&slack_fake::ts(900, 0), "ULIAISON1", "liaison-bot", "liaison main session trace, 2026-11-19 ET");
+    history.push(root_b);
+    history.push(slack_fake::profiled(&slack_fake::ts(960, 0), "UADA00001", "Ada", "message after traces"));
+    fixture.history.insert(SLACK_CH.to_owned(), history);
+    let fake = slack_fake::Fake::start(fixture, 10).await;
+    let dir = TempDir::new(tag);
+    let clock = ManualClock::at(slack_ms(3_600));
+    let text = format!(
+        "[auth]\nread_token = \"{READ_TOKEN}\"\nwrite_token = \"{WRITE_TOKEN}\"\n\n[[providers]]\nkey = \"{SLACK}\"\nkind = \"slack\"\napi_base = \"{base}\"\ntoken = \"{token}\"\n\n[[channels]]\nid = \"{SLACK_CH}\"\nlabel = \"team\"\nwritable = true\n",
+        base = fake.base, token = slack_fake::TOKEN,
+    );
+    let (mut state, _d, _s) = testing::state_with_store_from_toml(&text);
+    let router = ChatRouter::from_config(&state.config).expect("providers build");
+    state.replace_providers(Arc::new(router));
+    let state = testing::with_message_cache(state, dir.path(), clock.clone()).await;
+    (state, fake, clock, dir)
+}
+
+#[tokio::test]
+async fn transcript_threads_are_hidden_from_every_timeline_view_but_listed_for_transcripts() {
+    let (state, _fake, clock, _dir) = slack_transcript_deployment("probe-transcripts").await;
+    for serve in [false, true] {
+        if serve { state.message_cache.set_serve(true); clock.advance(HOUR); }
+        for view in ["main", "flat"] {
+            let body = ok(&state, &path(SLACK_CH, &format!("/timeline?view={view}&limit=50")), WRITE_TOKEN).await;
+            settled(&state).await;
+            let found = texts(&body);
+            assert!(!found.iter().any(|t| t.contains("main session trace") || t.contains("thinking")), "serve={serve} view={view} leaked: {found:?} body={body}");
+        }
+        let body = ok(&state, &path(SLACK_CH, "/timeline?view=threads&limit=50"), WRITE_TOKEN).await;
+        settled(&state).await;
+        let raw = body.to_string();
+        assert!(!raw.contains("main session trace"), "serve={serve} threads leaked: {raw}");
+        let root_a = slack_fake::ts(600, 0);
+        let body = ok(&state, &path(SLACK_CH, &format!("/timeline?view=thread&thread_id={root_a}&limit=50")), WRITE_TOKEN).await;
+        settled(&state).await;
+        assert!(texts(&body).is_empty(), "serve={serve} thread view leaked: {body}");
+        let body = ok(&state, "/api/v1/transcripts", WRITE_TOKEN).await;
+        assert!(body.to_string().contains("liaison"), "transcripts index missing liaison: {body}");
+    }
+}

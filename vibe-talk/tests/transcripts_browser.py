@@ -118,8 +118,11 @@ class TranscriptApi(FakeApi):
                                   "messages": LOADED}}
 
     def timeline(self, query: dict[str, list[str]]) -> Json:
+        # `#1886` part A: the trace thread's chunks ride on the raw feed's
+        # answers too, as a path that had not kept them out would send
+        # them; the page must draw none of them in Main or All.
         answer = super().timeline(query)
-        rows = list(self.messages)
+        rows = [*self.messages, *CHUNKS]
         return {**answer, "messages": rows, "returned": len(rows)}
 
     def search(self, query: dict[str, list[str]]) -> Json:
@@ -216,11 +219,27 @@ def walk_through(walk: Walk, keyboard: bool, discuss: bool = False) -> None:
         walk.settled()
     page.fill("#api-token", TOKEN)
     page.click("#save-token")
+    # The welcome screen newer builds show first (as `bookmark_browser`
+    # handles it): start through it where it is up.
+    page.wait_for_function(
+        "() => !document.getElementById('screen-welcome').hidden || !document.getElementById('screen-main').hidden",
+        timeout=10_000)
+    if page.evaluate("() => !document.getElementById('screen-welcome').hidden"):
+        page.click("#welcome-start")
     page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
-    page.click("#view-switch")
+    # `#1781`: sign-in lands on the channel already; the old build's
+    # view-switch click would now cycle away from it (to Documents).
     walk.until(f"() => document.querySelectorAll('#discord-log > li[data-id]').length === {LOADED}",
                "the channel did not open with its messages")
     walk.settled()
+    # `#1886` part A: no transcript root or entry is drawn in the raw feed,
+    # though the feed's answers carried them (see TranscriptApi.timeline).
+    drawn = page.text_content("#discord-log") or ""
+    walk.check("main session trace" not in drawn, "a transcript root was drawn in the raw feed")
+    walk.check("reading the cache code before answering" not in drawn,
+               "a transcript entry was drawn in the raw feed")
+    walk.check("lantern transcript thought" not in drawn,
+               "a transcript entry was drawn in the raw feed")
     if discuss:
         if page.locator("#discuss-open").is_visible():
             page.click("#discuss-open")
@@ -253,6 +272,8 @@ def walk_through(walk: Walk, keyboard: bool, discuss: bool = False) -> None:
     page.type("#search-field", "lantern", delay=30)
     walk.until("() => { const chip = document.getElementById('search-bucket-transcripts'); return chip && !document.getElementById('search-bucket-row').hidden; }",
                "the Agent Transcripts chip did not appear in the bucket row")
+    walk.until("() => (document.getElementById('search-bucket-transcripts').textContent || '').includes('1')",
+               "the Agent Transcripts chip did not count its hit")
     page.evaluate("() => document.getElementById('search-bucket-transcripts').scrollIntoView({block: 'center'})")
     walk.settled()
     chip = page.text_content("#search-bucket-transcripts") or ""

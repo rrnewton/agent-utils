@@ -2,6 +2,7 @@
 // the legacy script a group at a time; plan step 10). Each takes the store it works on.
 
 import type { Message, MessageThread, ThreadSummary, TimelineDelta, TimelineResponse } from "../../contract/index.ts";
+import { isTranscriptMessage, isTranscriptSummary } from "../transcripts/index.ts";
 import type { ChannelCanon, ViewCover } from "./canon.ts";
 import type { CopyOrder } from "./order.ts";
 import type { Removals } from "./removals.ts";
@@ -24,6 +25,48 @@ import {
 
 /** A row of either list the store holds. */
 type Row = Message | ThreadSummary;
+
+/**
+ * Take transcript threads out of a page's rows before they fold
+ * (`#1886 vibe-talk-transcripts-view` part A): the server's timeline
+ * route already keeps them out, and this is the store's own rule for a
+ * page that carries them anyway (an older server, a counts read, a
+ * saved copy's neighbour). Answers the rows that remain; any transcript
+ * copies the store already holds, and every message of a thread this
+ * page classes, are removed as well, so a fold also heals a store a
+ * live arrival filled before this rule. The Transcripts view never
+ * folds through here, so nothing it reads is lost.
+ */
+function withoutTranscripts(
+  canon: ChannelCanon,
+  messages: Message[],
+  summaries: ThreadSummary[],
+): { messages: Message[]; threads: ThreadSummary[] } {
+  const dropped = new Set<string>();
+  for (const message of messages) {
+    if (isTranscriptMessage(message)) {
+      const thread = threadOf(message);
+      if (thread) dropped.add(thread);
+    }
+  }
+  for (const summary of summaries) {
+    if (isTranscriptSummary(summary)) dropped.add(String(summary.id));
+  }
+  if (dropped.size === 0 && !messages.some(isTranscriptMessage)) return { messages, threads: summaries };
+  for (const held of [...canon.messages]) {
+    const thread = threadOf(held);
+    if (isTranscriptMessage(held) || (thread !== null && dropped.has(thread))) {
+      removeMessage(canon, String(held.id));
+    }
+  }
+  return {
+    messages: messages.filter((message) => {
+      const thread = threadOf(message);
+      return !isTranscriptMessage(message) && !(thread !== null && dropped.has(thread));
+    }),
+    threads: summaries.filter((summary) => !isTranscriptSummary(summary)),
+  };
+}
 
 
 /**
@@ -462,6 +505,11 @@ export function foldDeltaIn(
   }
   // Never a message removed upstream after it was sent (`removedSince`, `#316 late-counts-resurrect`).
   const number = deps.numberOf();
+  // `#1886` part A: no transcript row folds in from a delta either.
+  const cleanDelta = withoutTranscripts(canon, payload.messages || [], payload.threads || []);
+  payload.messages = cleanDelta.messages;
+  payload.threads = cleanDelta.threads;
+  if (payload.thread && isTranscriptSummary(payload.thread)) payload.thread = null;
   const unfiltered = (payload.messages || []).filter((message) => !removedSince(canon, String(message.id), number));
   const before = heldCopies(canon, unfiltered);
   // `#408 copy-upstream-link`: as in `foldLiveMessage`, a copy formed without the message's
@@ -557,6 +605,16 @@ export function foldPageIn(
   deps: PageFoldInDependencies,
 ): void {
   const hasMore = payload.has_more === true;
+  // `#1886` part A: no transcript row folds in from a page either, and
+  // held copies of its threads come out (see `withoutTranscripts`).
+  const cleanPage = withoutTranscripts(
+    canon,
+    payload.messages || [],
+    [...(payload.threads || []), ...(payload.thread ? [payload.thread] : [])],
+  );
+  payload.messages = cleanPage.messages;
+  payload.threads = (payload.threads || []).filter((summary) => !isTranscriptSummary(summary));
+  if (payload.thread && isTranscriptSummary(payload.thread)) payload.thread = null;
   // Outside the thread view a page names a thread only when the channel IS that one thread.
   const scopeWas = canon.scope;
   if (view !== "thread") canon.scope = payload.thread ? String(payload.thread.id) : null;

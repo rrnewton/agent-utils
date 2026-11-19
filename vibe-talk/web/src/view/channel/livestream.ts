@@ -6,6 +6,7 @@
 // reads asked for here go through the page's own `loadDiscord` name, passed in.
 
 import type { Message } from "../../contract/index.ts";
+import { isTranscriptMessage } from "../../core/transcripts/index.ts";
 import { isNoise } from "../../present/rows/index.ts";
 import type { ChannelStore } from "../../core/channels/index.ts";
 import { changedIdsSince, clockOf } from "../../core/channels/index.ts";
@@ -155,6 +156,18 @@ export function createLiveStream(deps: LiveStreamDependencies): LiveStream {
   const foldLiveMessage = deps.foldLiveMessage;
   const appendChannelRow = deps.appendChannelRow;
   const appendToColumns = deps.appendToColumns;
+  // `#1886` part A: threads known to be transcripts, by a classed copy or
+  // a trace-titled root seen on this stream — so an entry that arrives
+  // without a class of its own is dropped by its thread too.
+  const transcriptThreads = new Set<string>();
+  const isTranscriptArrival = (message: Message): boolean => {
+    const threadId = message.thread ? String(message.thread.id) : "";
+    if (isTranscriptMessage(message) || (threadId !== "" && transcriptThreads.has(threadId))) {
+      if (threadId !== "") transcriptThreads.add(threadId);
+      return true;
+    }
+    return false;
+  };
   // `#1251 scroll-single-owner`: every outgoing redraw is held by the owner, as the browser's
   // scroll anchoring used to hold it silently.
   const renderOutgoingEverywhere = deps.renderOutgoingEverywhere;
@@ -214,6 +227,11 @@ function onStreamFrame(frame: LiveFrame): void {
     abandonedReads.noteLiveEvent(about, payload.from_tail === true);
   }
   if (frame.event === "message_update" || frame.event === "message_delete") {
+    // `#1886` part A: an edit of a transcript message is not channel news
+    // either; a deletion still goes through, so a stale saved copy goes.
+    if (frame.event === "message_update" && payload && payload.message && isTranscriptArrival(payload.message)) {
+      return;
+    }
     // `#308 live-reply-in-main`. An edit is a copy too: one that names the thread of a message the
     // store holds without one places it at once, whatever the read below brings.
     if (providerFacts.threading() && frame.event === "message_update" && VibeTalkContract.is("LiveMessageEvent", payload) &&
@@ -265,6 +283,11 @@ function onStreamFrame(frame: LiveFrame): void {
 // reads again for edits arriving during it: web/src/core/sync/coalesce.ts (`#624 voice-page-modularity`).
 
 function receiveLiveMessage(message: Message, selfPosted: boolean, replayed: boolean, fromTail: boolean): void {
+  // `#1886 vibe-talk-transcripts-view` part A: a transcript arrival is
+  // not channel news — not folded, not drawn, not counted as unread, no
+  // jump-to-newest, and never relayed to a call. Its home is the
+  // Transcripts view.
+  if (isTranscriptArrival(message)) return;
   // `#337 voice-relay-silent`. How it came, for whether a call that may have missed it hears it.
   const arrival = { fromTail: fromTail === true, resumed: liveFollow.resumed() };
   // `#466 reply-promotes-thread`. Not a read's observation, which retires a sent receipt at once: the

@@ -69,6 +69,57 @@ test("server search keeps transcript hits apart and clears them on a new search"
   assert.deepEqual(owner.state().transcriptHits, [], "a new search forgets the old transcript hits");
 });
 
+test("part A: a transcript message is known by its class or its root title, and only then", () => {
+  const klass = { agent: "liaison", team: null, day: "2026-11-19", source: "metadata" };
+  // Classed root and classed entry.
+  assert.equal(CORE.isTranscriptMessage({ content: "anything", thread: { id: "t1", is_root: true, class: klass } }), true);
+  assert.equal(CORE.isTranscriptMessage({ content: "thinking", thread: { id: "t1", is_root: false, class: klass } }), true);
+  // A fresh daily root with no metadata: its whole text is the trace title.
+  assert.equal(CORE.isTranscriptMessage({ content: "liaison main session trace, 2026-11-19 ET", thread: { id: "t2", is_root: true } }), true);
+  // Near misses stay ordinary conversation.
+  assert.equal(CORE.isTranscriptMessage({ content: "liaison main session trace, 2026-11-19 ET and more", thread: { id: "t3", is_root: true } }), false);
+  assert.equal(CORE.isTranscriptMessage({ content: "liaison main session trace, 2026-11-19 ET", thread: { id: "t4", is_root: false } }), false);
+  assert.equal(CORE.isTranscriptMessage({ content: "hello", thread: { id: "t5", is_root: true } }), false);
+  assert.equal(CORE.isTranscriptMessage({ content: "hello" }), false);
+  assert.equal(CORE.isTranscriptSummary({ id: "t1", class: klass }), true);
+  assert.equal(CORE.isTranscriptSummary({ id: "t1" }), false);
+});
+
+test("part A: live folds, saved copies and restores keep transcript threads out of the raw feed", async () => {
+  const CHANNELS = await moduleForTests("src/core/channels/index.ts");
+  const { emptyCanon, foldLiveIn, createCopyOrder, restoreCanon, savedTimelineOf } = CHANNELS;
+  const at = (s) => `2026-11-19T00:00:${String(s).padStart(2, "0")}Z`;
+  const klass = { agent: "liaison", team: null, day: "2026-11-19", source: "metadata" };
+  const root = { id: "r", timestamp: at(1), content: "liaison main session trace, 2026-11-19 ET", thread: { id: "tr", is_root: true, reply_count: 1, reply_count_exact: true, class: klass } };
+  const entry = { id: "e", timestamp: at(2), content: "thinking", thread: { id: "tr", is_root: false, class: klass } };
+  const plain = { id: "p", timestamp: at(3), content: "hello", thread: { id: "tp", is_root: true, reply_count: 0, reply_count_exact: true } };
+  const canon = emptyCanon("c");
+  let arrivals = 0;
+  const deps = { ledger: createCopyOrder(), orderNow: () => 1, nextArrival: () => ++arrivals };
+  foldLiveIn(canon, root, true, false, null, deps);
+  foldLiveIn(canon, entry, true, false, null, deps);
+  foldLiveIn(canon, plain, true, false, null, deps);
+  assert.deepEqual(canon.messages.map((m) => m.id), ["p"], "a live transcript root or entry folded into the store");
+  assert.equal(canon.threads.length, 0, "a live transcript entry moved a thread summary");
+  // A store saved with transcript rows (an older build) restores without them.
+  const polluted = emptyCanon("c");
+  restoreCanon(polluted, {
+    mode: "timeline", usedAt: 1, hasThreads: true, scope: null,
+    messages: [root, entry, plain],
+    threads: [{ id: "tr", updated_at: at(2), class: klass }, { id: "tp", updated_at: at(3) }],
+    views: {}, dismissed: [], unplaced: [], removed: [], replyGaps: {}, passedOver: [], settledByDone: {},
+  });
+  assert.deepEqual(polluted.messages.map((m) => m.id), ["p"], "a restored saved copy brought transcript rows back");
+  assert.deepEqual(polluted.threads.map((t) => t.id), ["tp"], "a restored saved copy brought the transcript summary back");
+  // And a store holding them does not save them again.
+  const held = emptyCanon("c");
+  held.messages = [root, entry, plain];
+  held.threads = [{ id: "tr", updated_at: at(2), class: klass }, { id: "tp", updated_at: at(3) }];
+  const saved = savedTimelineOf(held, 1, null);
+  assert.deepEqual(saved.messages.map((m) => m.id), ["p"]);
+  assert.deepEqual(saved.threads.map((t) => t.id), ["tp"]);
+});
+
 test("a chunk's time is said the channel rows' way in Eastern, never as a raw ISO stamp", () => {
   const was = process.env.TZ;
   process.env.TZ = "America/New_York";

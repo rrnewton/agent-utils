@@ -45,7 +45,9 @@ export const PACKAGES = Object.freeze({
   "core/annotations": BASE,
   "core/api": BASE,
   "core/call": BASE,
-  "core/channels": BASE,
+  // `#1886` part A: the channel store must know a transcript message to
+  // keep it out of the raw feed, so it names the transcripts core.
+  "core/channels": [...BASE, "core/transcripts"],
   "core/navigation": BASE,
   "core/outbox": BASE,
   "core/search": BASE,
@@ -59,7 +61,7 @@ export const PACKAGES = Object.freeze({
   "present/rows": [...BASE, "core/channels", "present/time"],
   "present/settings": [...BASE, "core/outbox", "core/settings", "present/notices", "present/rows", "present/time"],
   "present/time": BASE,
-  "view/channel": [...BASE, "view/dom", "core/annotations", "core/channels", "present/rows", "present/time", "present/notices"],
+  "view/channel": [...BASE, "view/dom", "core/annotations", "core/channels", "core/transcripts", "present/rows", "present/time", "present/notices"],
   "view/composer": [...BASE, "view/dom"],
   "view/voice": [...BASE, "view/dom", "view/channel", "view/composer", "core/api", "core/call", "core/settings", "core/speech", "present/call", "present/notices", "present/rows", "present/time"],
   "view/dom": BASE,
