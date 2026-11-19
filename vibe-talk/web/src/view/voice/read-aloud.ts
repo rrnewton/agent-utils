@@ -1182,6 +1182,9 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     // Invalidate every read in flight, not only the one that is audible. A fetch that has not come
     // back yet is still going to build a player unless its ticket is stale.
     readingTicket += 1;
+    // `#1872`: an ordinary stop (not a retry's own restart, which jumps) frees every
+    // segment's one retry for the next read the reader starts.
+    if (!readJumping) segmentRetries.clear();
     // `#821 voice-page-read-aloud-react`. Nothing is held once the read is gone.
     heldSentence = null;
     heldAnchor = null;
