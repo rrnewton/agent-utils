@@ -733,6 +733,19 @@ pub(crate) fn muse_trust_prompt(screen: &str) -> bool {
         || lowered.contains("workspace trust")
 }
 
+/// Whether `screen` shows Muse 1.4.24's plugin-hooks trust dialog ("Review plugin
+/// hooks", with "Trust all and continue" and "Continue without trusting"; Esc
+/// continues without trusting) (#1893 agentctl-launch-failed-but-live).
+///
+/// The dialog takes the pane before any composer exists, so a launch that only
+/// waits for an idle composer reads it as a launch that never came up. It is a
+/// pane waiting on a person: recognised here so launch and status can name it.
+/// Nothing in agentctl ever answers it.
+pub(crate) fn muse_hooks_trust_prompt(screen: &str) -> bool {
+    let lowered = screen.to_ascii_lowercase();
+    lowered.contains("review plugin hooks") && lowered.contains("continue without trusting")
+}
+
 /// Muse's ruled editor, its status order and the proofs that input reached it.
 mod muse_editor;
 pub(crate) use muse_editor::*;
@@ -2303,6 +2316,7 @@ impl HerdrClient {
         // enough kernel identity to close only this observed process's pane.
         persist_identity(observed.clone())?;
         let mut ready = false;
+        let mut hooks_waiting = false;
         while Instant::now() < deadline {
             if !self.recorded_custom_harness_observed(pane_id, &observed, &|| false)? {
                 return Err(AdapterError::unavailable(format!(
@@ -2317,6 +2331,12 @@ impl HerdrClient {
                     "{kind} workspace trust prompt requires human attention; no input was submitted"
                 )));
             }
+            // The hooks-trust dialog is a known startup state, not a composer
+            // that never comes up: keep waiting while it shows (a person may
+            // clear it mid-launch), and name it if the bound expires with it
+            // still up (#1893 agentctl-launch-failed-but-live). Nothing ever
+            // answers it.
+            hooks_waiting = muse_hooks_trust_prompt(&screen);
             // The process generation is pinned and re-verified around every
             // read, so the headerless verified-process proof applies: a
             // resumed Muse scrolls its version header off screen (#946).
@@ -2329,9 +2349,16 @@ impl HerdrClient {
             );
         }
         if !ready {
-            return Err(AdapterError::unavailable(format!(
-                "custom harness {kind:?} did not reach a verified idle composer in pane {pane_id}"
-            )));
+            return Err(AdapterError::unavailable(if hooks_waiting {
+                format!(
+                    "pane {pane_id} is waiting: hooks trust ({kind} plugin-hooks trust prompt \
+                     requires human attention; no input was submitted)"
+                )
+            } else {
+                format!(
+                    "custom harness {kind:?} did not reach a verified idle composer in pane {pane_id}"
+                )
+            }));
         }
         if !self.recorded_custom_harness_observed(pane_id, &observed, &|| false)? {
             return Err(AdapterError::unavailable(format!(
@@ -2707,6 +2734,11 @@ impl HerdrClient {
             let (agent, observed_state) = self.explain_agent(pane_id)?;
             let screen = self.read_screen_with_cancellation(pane_id, &|| false)?;
             state = relay_screen_state(kind, &observed_state, &screen);
+            // The hooks-trust dialog names the wait in the bound's error
+            // below; nothing ever answers it (#1893).
+            if muse_hooks_trust_prompt(&crate::harness_tui::plain(&screen)) {
+                state = "waiting: hooks trust".to_owned();
+            }
             // Herdr's title rule can read idle before the harness has drawn anything; the
             // verified composer on screen is the ready signal. Muse has no
             // composer view; its verified-process editor proof serves instead
@@ -4201,6 +4233,43 @@ mod tests {
             !herdr.root.join("args").exists(),
             "liveness must not invoke Herdr"
         );
+    }
+
+    // Muse 1.4.24's plugin-hooks trust dialog, in the strings the installed
+    // Muse draws ("Review hooks", "Trust all and continue", "Continue without
+    // trusting"; Esc continues without trusting) (#1893).
+    const HOOKS_TRUST_DIALOG: &str = "Review plugin hooks\n\
+        39 new or changed hooks need your trust\n\
+        \n\
+        Hooks run commands on your machine when their event matches.\n\
+        Approval follows the declaration, including after script updates.\n\
+        \n\
+        ❯ Review hooks\n\
+        \x20 Trust all and continue\n\
+        \x20 Continue without trusting\n\
+        \n\
+        Up/Down to choose, Enter to confirm. Esc continues without trusting.\n";
+
+    #[test]
+    fn a_muse_hooks_trust_dialog_is_a_waiting_pane_never_a_composer() {
+        assert!(muse_hooks_trust_prompt(HOOKS_TRUST_DIALOG));
+        for reported in ["idle", "done", "working"] {
+            assert_eq!(
+                muse_verified_pane_status(reported, HOOKS_TRUST_DIALOG),
+                "waiting: hooks trust",
+                "{reported}"
+            );
+        }
+        // No composer frame exists behind the dialog, and the dialog's own
+        // words are neither an idle composer nor a draft.
+        assert!(!muse_verified_process_idle_composer(HOOKS_TRUST_DIALOG));
+        assert!(!muse_verified_process_composer(HOOKS_TRUST_DIALOG));
+        assert!(!muse_hooks_trust_prompt("Do you trust this workspace?\n"));
+        assert!(!muse_hooks_trust_prompt(&format!(
+            "Muse Code 1.4.24\n{}\n❯\n{}\n  kiki · high · /work · YOLO\n",
+            "─".repeat(40),
+            "─".repeat(40)
+        )));
     }
 
     #[test]

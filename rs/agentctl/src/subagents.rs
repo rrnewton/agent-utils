@@ -9360,8 +9360,10 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 record.lifecycle
             )));
         }
-        if !(matches!(record.adapter.as_str(), "herdr" | "herdr-relay")
-            && record.backend == "herdr"
+        if !(matches!(
+            record.adapter.as_str(),
+            "herdr" | "herdr-relay" | "herdr-pane"
+        ) && record.backend == "herdr"
             || record.adapter == "tmux" && record.backend == "tmux")
             || record.mode != "interactive"
             || record.nested.is_some()
@@ -9406,7 +9408,11 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 info.agent, record.harness
             )));
         }
-        if self.client.agent_pane(agent_name)? != pane {
+        // A custom (`herdr-pane`) pane is reported to Herdr under its harness
+        // kind, not the agent's name, so no name lookup can find it: the
+        // recorded pane, its presentation and the pinned process below are
+        // its identity (#1893 agentctl-launch-failed-but-live).
+        if record.adapter != "herdr-pane" && self.client.agent_pane(agent_name)? != pane {
             return Err(fail(format!(
                 "agent name {agent_name:?} points to another pane"
             )));
@@ -20749,6 +20755,35 @@ fi
             Some("launch failed with caller-supplied environment; details omitted from status")
         );
         assert!(!serde_json::to_string(&record).unwrap().contains(secret));
+    }
+
+    #[test]
+    fn promote_marks_a_live_herdr_pane_launch_running() {
+        // #1893 agentctl-launch-failed-but-live: the standard record adapter
+        // ("herdr-pane") promotes like a native launch when its pane proves
+        // live behind the failed readiness wait.
+        let fixture = Fixture::new();
+        fixture
+            .client
+            .fail_ready_once
+            .store(true, Ordering::Relaxed);
+        let started = fixture.manager().start(
+            "worker",
+            &fixture.root,
+            StartOptions {
+                harness: "muse".to_owned(),
+                ..StartOptions::default()
+            },
+        );
+        assert!(started.is_err(), "{started:?}");
+        let record = fixture.manager().load("worker").unwrap();
+        assert_eq!(record.lifecycle, "launch_failed");
+        assert_eq!(record.adapter, "herdr-pane");
+        let promoted = fixture.manager().promote("worker", None).unwrap();
+        assert_eq!(promoted["promoted"], true);
+        let record = fixture.manager().load("worker").unwrap();
+        assert_eq!(record.lifecycle, "running");
+        assert!(record.error.is_none());
     }
 
     #[test]

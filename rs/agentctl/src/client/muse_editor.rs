@@ -683,6 +683,12 @@ pub(crate) fn muse_screen_has_composer(screen: &str) -> bool {
 /// reports the pane idle or done; a frame with the versioned header is idle on its own
 /// evidence.
 pub(crate) fn muse_verified_pane_status(reported_status: &str, screen: &str) -> &'static str {
+    // The plugin-hooks trust dialog is a pane waiting on a person, named as
+    // itself whatever the terminal host reports (#1893
+    // agentctl-launch-failed-but-live). Nothing ever answers it.
+    if crate::client::muse_hooks_trust_prompt(screen) {
+        return "waiting: hooks trust";
+    }
     let reported_idle = matches!(reported_status, "idle" | "done");
     if muse_idle_composer(screen) || (reported_idle && muse_verified_process_idle_composer(screen))
     {

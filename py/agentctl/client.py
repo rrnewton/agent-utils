@@ -180,6 +180,18 @@ def muse_trust_prompt(screen: str) -> bool:
     )
 
 
+def muse_hooks_trust_prompt(screen: str) -> bool:
+    """Whether `screen` shows Muse 1.4.24's plugin-hooks trust dialog.
+
+    "Review plugin hooks" with "Continue without trusting" (Esc continues
+    without trusting) takes the pane before any composer exists (#1893
+    agentctl-launch-failed-but-live). It is a pane waiting on a person;
+    nothing in agentctl ever answers it.
+    """
+    lowered = screen.lower()
+    return "review plugin hooks" in lowered and "continue without trusting" in lowered
+
+
 # Placeholder hints Muse draws dim inside an empty composer (Muse 1.4.23,
 # `crates/tui/src/state/prompt_hint.rs`); one versioned table shared with the Rust
 # reader in principle and pinned to the same strings. Only an exact whole-editor
@@ -2272,6 +2284,10 @@ class HerdrClient:
             agent_kind, state = self.explain_agent(pane_id)
             screen = self.read_screen(pane_id)
             state = self.relay_screen_state(kind, state, screen)
+            # The hooks-trust dialog names the wait in the bound's error
+            # below; nothing ever answers it (#1893).
+            if muse_hooks_trust_prompt(self.read(pane_id, source="visible", lines=200)):
+                state = "waiting: hooks trust"
             # Herdr's title rule can read idle before the harness has drawn
             # anything; the verified composer on screen is the ready signal.
             # Muse has no composer view; its verified editor proof serves
@@ -2372,6 +2388,7 @@ class HerdrClient:
         finally:
             os.close(descriptor)
         ready = False
+        hooks_waiting = False
         while time.monotonic() < deadline:
             self.verify_custom_harness(pane_id, kind, observed)
             screen = self.read(pane_id, source="visible", lines=200)
@@ -2379,6 +2396,10 @@ class HerdrClient:
                 raise HerdrUnavailable(
                     f"{kind} workspace trust prompt requires human attention; no input was submitted"
                 )
+            # The hooks-trust dialog is a known startup state, not a composer
+            # that never comes up: keep waiting while it shows, and name it if
+            # the bound expires with it still up (#1893). Nothing answers it.
+            hooks_waiting = muse_hooks_trust_prompt(screen)
             # An arrow alone is also used by choice dialogs. Muse's idle screen couples its
             # composer marker with exactly one status footer, whatever its mode says.
             # The process generation is pinned and re-verified around every
@@ -2389,6 +2410,11 @@ class HerdrClient:
                 break
             self._sleep(min(0.05, max(0.0, deadline - time.monotonic())))
         if not ready:
+            if hooks_waiting:
+                raise HerdrUnavailable(
+                    f"pane {pane_id} is waiting: hooks trust ({kind} plugin-hooks trust prompt "
+                    "requires human attention; no input was submitted)"
+                )
             raise HerdrUnavailable(
                 f"custom harness {kind!r} did not reach a verified idle composer in pane {pane_id}"
             )

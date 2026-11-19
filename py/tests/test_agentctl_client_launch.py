@@ -22,6 +22,7 @@ from agentctl.client import (
     HerdrClient,
     ProcessInfo,
     muse_auto_review_idle_composer,
+    muse_hooks_trust_prompt,
     muse_idle_composer,
     muse_prompt_in_composer,
     muse_prompt_in_transcript,
@@ -781,6 +782,34 @@ def test_custom_muse_launch_never_accepts_a_trust_prompt() -> None:
     with pytest.raises(HerdrUnavailable, match="trust prompt.*no input"):
         client.start_pane_agent("worker", "muse", "p1", (), timeout=1)
     assert not any(call[1:3] == ["pane", "report-agent"] for call in calls)
+
+
+# Muse 1.4.24's plugin-hooks trust dialog, in the strings the installed Muse
+# draws (#1893 agentctl-launch-failed-but-live).
+HOOKS_TRUST_DIALOG = (
+    "Review plugin hooks\n"
+    "39 new or changed hooks need your trust\n"
+    "\n"
+    "Hooks run commands on your machine when their event matches.\n"
+    "Approval follows the declaration, including after script updates.\n"
+    "\n"
+    "❯ Review hooks\n"
+    "  Trust all and continue\n"
+    "  Continue without trusting\n"
+    "\n"
+    "Up/Down to choose, Enter to confirm. Esc continues without trusting.\n"
+)
+
+
+def test_custom_muse_launch_names_the_hooks_trust_dialog_and_never_answers_it() -> None:
+    assert muse_hooks_trust_prompt(HOOKS_TRUST_DIALOG)
+    assert not muse_hooks_trust_prompt("Do you trust this workspace?\n")
+    client, calls = _custom_runner(HOOKS_TRUST_DIALOG)
+    with pytest.raises(HerdrUnavailable, match="waiting: hooks trust"):
+        client.start_pane_agent("worker", "muse", "p1", (), timeout=0.01)
+    # Nothing was typed and no agent was reported: the dialog is only named.
+    assert not any(call[1:3] == ["pane", "report-agent"] for call in calls)
+    assert not any(call[1:2] == ["pane"] and "send" in call[2] for call in calls)
 
 
 def test_custom_muse_launch_rejects_bare_prompt_without_idle_footer() -> None:

@@ -305,6 +305,19 @@ def failed_codex_launch(
     return sessions, fake, record
 
 
+def test_promote_accepts_a_herdr_pane_record_of_a_live_harness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The standard Muse record adapter is "herdr-pane"; a launch_failed one
+    # whose pane proves live promotes like a native launch (#1893).
+    sessions, fake, record = failed_codex_launch(tmp_path, monkeypatch)
+    sessions._save(replace(record, adapter="herdr-pane"))
+    result = sessions.promote("liteinst", expected_token=record.token)
+    promoted = sessions.get("liteinst")
+    assert result["promoted"] is True and promoted.lifecycle == "running"
+    assert fake.closed == [] and fake.submitted == []
+
+
 def test_promote_pins_a_live_harness_behind_a_failed_launch_without_touching_its_tab(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

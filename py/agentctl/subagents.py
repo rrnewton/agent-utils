@@ -39,6 +39,7 @@ from agentctl.client import (
     boxed_arguments,
     herdr_error_code,
     muse_effort_word,
+    muse_hooks_trust_prompt,
     muse_idle_composer,
     muse_screen_has_composer,
     muse_startup_metadata,
@@ -2096,8 +2097,12 @@ class _WorkspaceClient:
                     agent=info.agent,
                     # A paused Muse goal is a planning state, not a hold (#734
                     # chat-status-disagreement): an empty editor reads idle.
+                    # The plugin-hooks trust dialog is a pane waiting on a
+                    # person, named as itself (#1893); nothing answers it.
                     status=(
-                        "idle"
+                        "waiting: hooks trust"
+                        if muse_hooks_trust_prompt(screen)
+                        else "idle"
                         if (
                             muse_idle_composer(screen)
                             or (
@@ -3594,7 +3599,7 @@ class ManagedAgents:
                 raise AgentDeliveryError(
                     f"promote applies to a launch_failed record; {name!r} is {record.lifecycle}"
                 )
-            if (record.adapter not in ("herdr", "herdr-relay") or record.mode != "interactive"
+            if (record.adapter not in ("herdr", "herdr-relay", "herdr-pane") or record.mode != "interactive"
                     or record.backend != "herdr" or record._nested_storage is not None):
                 raise AgentDeliveryError(
                     "promote applies to native and root-slot-relay interactive Herdr launches"
@@ -3616,7 +3621,11 @@ class ManagedAgents:
                     raise AgentDeliveryError(
                         f"pane {pane_id} reports agent {info.agent!r}, not the launched {record.harness!r}"
                     )
-                if self.client.agent_pane(name) != pane_id:
+                # A custom ("herdr-pane") pane is reported to Herdr under its
+                # harness kind, not the agent's name, so no name lookup can
+                # find it: the recorded pane, its presentation and the pinned
+                # process below are its identity (#1893).
+                if record.adapter != "herdr-pane" and self.client.agent_pane(name) != pane_id:
                     raise AgentDeliveryError(f"Herdr agent name {name!r} points to another pane")
                 identity = self.client.harness_identity(pane_id, record.harness)
                 if identity is None:

@@ -349,7 +349,14 @@ managed send checks for it before typing into an idle pane.
 - **Muse**: partial — Muse's trust phrases are in the cross-harness
   approval table the watcher scans, so a Muse trust prompt is reported,
   but the Muse adapter has no `trust_prompt` check of its own, so the
-  managed-send guard does not name it.
+  managed-send guard does not name it. Muse 1.4.24's plugin-hooks trust
+  dialog ("Review plugin hooks") is recognised as its own startup state
+  (#1893 agentctl-launch-failed-but-live): launch readiness waits while
+  it shows and names it (`waiting: hooks trust`) instead of timing out
+  as a missing idle composer, status reports the same, and nothing ever
+  answers it (`muse_hooks_trust_prompt` in `rs/agentctl/src/client.rs`,
+  `py/agentctl/client.py`; `agentctl promote` repairs the
+  `launch_failed` record once a person clears it).
 - **Unknown TUI**: none.
 
 ### Headless mode itself
