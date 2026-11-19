@@ -1,6 +1,6 @@
 ---
 title: 'agentctl-narrow-pane-stranded-paste-other-sender: stranded prompts from other senders are not recovered'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -83,3 +83,25 @@ pane-lock-held-by-stuck-sender, #1560
 harness-agnostic-stuck-paste-backstop, #884, #720. Evidence read
 read-only from the affected registry (queue records of the three
 lanes); no lane, host or person is named here.
+
+## Resolution
+
+[watermelon-full-preview] Landed 522f4b4c on github/main. The stranded
+records were all in the recipients' own queues (not cross-registry, so
+#1683's per-registry attribution is unchanged); the match sets simply
+stopped considering them. `delivered_prompts` now times a record
+carrying `stranded_at`, marked `possibly_submitted`, or holding a
+`late_paste_lost` error by the later of its typing and its stranding,
+and such records are never evicted by the newest-20 cap (other
+candidates keep it), and `stale_draft::find` treats a stranded record
+as not proved delivered for vouching and searches stranded records
+beyond the latest five deliveries, within the existing lookbacks.
+Sender is never a filter. Tests cover a processed possibly-submitted
+record from another sender recovered at widths 30, 42 and 80 with its
+record noted recovered, the same beyond the latest five where a
+composer parses, and the candidate cap; a foreign draft still gets no
+key and nothing is retyped. Gate: owner-priority full gate had one
+red step untouched by this change (`repository.check.wrkslots-debug-test`,
+CPU timeout while the agentctl suite passed); its single solo rerun
+passed and land-main accepted it naming that step. No persisted queue
+or record field changed. Live deployment is the coordinator's batch.
