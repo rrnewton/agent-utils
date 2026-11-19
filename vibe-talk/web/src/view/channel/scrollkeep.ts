@@ -227,6 +227,11 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
    * classic hold exactly.
    */
   function compensatedDelta(area: HTMLElement, mark: ScrollMark, topNow: number): number {
+    // Only a view the reader themselves scrolled since the capture is compensated
+    // (`#1880b`, scoped): deliberate flows (a filter walk, an older-page load) move
+    // the list between capture and restore by their own writes, and counting those
+    // as the reader's scroll over-compensates exactly the places they anchor.
+    if (!userMovedSince(mark)) return topNow - mark.top;
     const userDelta = mark.scrollTop !== undefined ? area.scrollTop - mark.scrollTop : 0;
     return (topNow - mark.top) + userDelta;
   }
@@ -482,7 +487,7 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     } finally {
       holdDepth -= 1;
     }
-    if (keepComposerInView(area, composerWas, mark.scrollTop !== undefined ? area.scrollTop - mark.scrollTop : 0)) {
+    if (keepComposerInView(area, composerWas, userMovedSince(mark) && mark.scrollTop !== undefined ? area.scrollTop - mark.scrollTop : 0)) {
       if (selection && deps.restoreSelectionIn) deps.restoreSelectionIn(area, selection);
       return;
     }
@@ -554,7 +559,7 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     // `#1839`: while the composer holds the view and stood in view as the change began,
     // it outranks both the newest line and the message anchor - putting either back can
     // carry the box being dictated into off screen. `mark.composerTop` is its place then.
-    if (keepComposerInView(area, typeof mark.composerTop === "number" ? mark.composerTop : null, mark.scrollTop !== undefined ? area.scrollTop - mark.scrollTop : 0)) return;
+    if (keepComposerInView(area, typeof mark.composerTop === "number" ? mark.composerTop : null, userMovedSince(mark) && mark.scrollTop !== undefined ? area.scrollTop - mark.scrollTop : 0)) return;
     // `#1880`: the reader has scrolled or touched since this mark was taken (a live
     // read landed while they were up the thread) and no composer keep answered for
     // the view: the newest line is not followed, and with no anchor there is
