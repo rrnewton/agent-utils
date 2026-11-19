@@ -183,6 +183,15 @@ impl HarnessAdapter for Codex {
         transcript_model(lines)
     }
 
+    fn transcript_took(
+        &self,
+        hints: &super::transcript::Hints<'_>,
+        prompt: &str,
+        since: f64,
+    ) -> Option<&'static str> {
+        rollout_took_prompt(&transcript_path(hints)?, prompt, since)
+    }
+
     /// The main-thread rollouts the process holds open (sub-agent threads excepted): each
     /// one's thread id.
     fn held_sessions(&self, held: &[PathBuf]) -> Vec<String> {
@@ -638,6 +647,63 @@ fn transcript_path(hints: &super::transcript::Hints<'_>) -> Option<PathBuf> {
     })
 }
 
+/// The most rollout bytes, from its end, that [`rollout_took_prompt`] reads.
+const TOOK_PROMPT_TAIL: u64 = 8 * 1024 * 1024;
+
+/// How Codex's rollout at `path` shows that it took `prompt` as a user turn at or
+/// after `since` (Unix seconds), or `None` when it does not (#1882
+/// agentctl-false-failed-deliveries).
+///
+/// Codex records a taken prompt two ways: a `response_item` `message` with role
+/// `user` (its text blocks joined) and an `event_msg` `user_message`. Either, with
+/// the prompt's text (runs of whitespace collapsed), at or after `since`, is the
+/// proof. Assistant messages, tool results and earlier identical prompts are not.
+pub(crate) fn rollout_took_prompt(
+    path: &Path,
+    prompt: &str,
+    since: f64,
+) -> Option<&'static str> {
+    use serde_json::Value;
+    let collapse = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let wanted = collapse(prompt);
+    if wanted.is_empty() {
+        return None;
+    }
+    let lines = super::transcript::tail_lines(path, TOOK_PROMPT_TAIL).ok()?;
+    for line in &lines {
+        let Ok(entry) = serde_json::from_slice::<Value>(line) else {
+            continue;
+        };
+        let at = entry["timestamp"]
+            .as_str()
+            .and_then(super::transcript::parse_utc);
+        if at.is_none_or(|at| at < since) {
+            continue;
+        }
+        let payload = &entry["payload"];
+        let shown = match (entry["type"].as_str(), payload["type"].as_str()) {
+            (Some("response_item"), Some("message")) if payload["role"] == "user" => {
+                let texts: Vec<&str> = payload["content"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|block| matches!(block["type"].as_str(), Some("input_text" | "text")))
+                    .filter_map(|block| block["text"].as_str())
+                    .collect();
+                (!texts.is_empty()).then(|| texts.join("\n"))
+            }
+            (Some("event_msg"), Some("user_message")) => {
+                payload["message"].as_str().map(str::to_owned)
+            }
+            _ => continue,
+        };
+        if shown.is_some_and(|shown| collapse(&shown) == wanted) {
+            return Some("Codex's rollout records the prompt as a user turn");
+        }
+    }
+    None
+}
+
 fn rollout_name(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -858,6 +924,62 @@ mod tests {
         let mut activity = Activity::default();
         read_transcript(&all[..lines.min(all.len())], &mut activity);
         activity
+    }
+
+    #[test]
+    fn a_rollout_proves_a_prompt_taken_only_by_its_text_after_the_claim() {
+        // #1882 agentctl-false-failed-deliveries: Codex records a taken prompt
+        // as a user `response_item` message or an `event_msg` `user_message`.
+        let prompt = "[from lead via agentctl · reply: agentctl send lead]\nShip it.";
+        let directory = std::env::temp_dir().join(format!(
+            "agentctl-codex-took-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("rollout.jsonl");
+        let write = |entries: &[serde_json::Value]| {
+            let lines: Vec<String> = entries.iter().map(|entry| entry.to_string()).collect();
+            std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        };
+        let at = "2026-11-08T20:41:45.972Z";
+        let since = super::super::transcript::parse_utc("2026-11-08T20:40:00Z").unwrap();
+        for entry in [
+            serde_json::json!({"timestamp": at, "type": "response_item",
+                               "payload": {"type": "message", "role": "user",
+                                           "content": [{"type": "input_text", "text": prompt}]}}),
+            serde_json::json!({"timestamp": at, "type": "event_msg",
+                               "payload": {"type": "user_message", "message": prompt}}),
+        ] {
+            write(std::slice::from_ref(&entry));
+            assert!(
+                rollout_took_prompt(&path, prompt, since).is_some(),
+                "{entry}"
+            );
+        }
+        for entry in [
+            // Before the claim: an identical older prompt is not this one.
+            serde_json::json!({"timestamp": "2026-11-08T20:39:59Z", "type": "response_item",
+                               "payload": {"type": "message", "role": "user",
+                                           "content": [{"type": "input_text", "text": prompt}]}}),
+            // The assistant saying the words back is not taking the prompt.
+            serde_json::json!({"timestamp": at, "type": "response_item",
+                               "payload": {"type": "message", "role": "assistant",
+                                           "content": [{"type": "output_text", "text": prompt}]}}),
+            // A prefix, or the prompt as a tool result, is not the user turn.
+            serde_json::json!({"timestamp": at, "type": "event_msg",
+                               "payload": {"type": "user_message", "message": "[from lead via agentctl"}}),
+            serde_json::json!({"timestamp": at, "type": "response_item",
+                               "payload": {"type": "function_call_output", "output": prompt}}),
+        ] {
+            write(std::slice::from_ref(&entry));
+            assert_eq!(rollout_took_prompt(&path, prompt, since), None, "{entry}");
+        }
+        assert_eq!(
+            rollout_took_prompt(&directory.join("missing.jsonl"), prompt, since),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]

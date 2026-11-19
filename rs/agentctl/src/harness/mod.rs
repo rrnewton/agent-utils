@@ -227,6 +227,21 @@ pub trait HarnessAdapter: Sync {
     fn transcript_model(&self, _lines: &[&[u8]]) -> Option<String> {
         None
     }
+    /// How this harness's transcript shows that it took `prompt` as an accepted user
+    /// turn at or after `since` (Unix seconds), or `None` when it does not (#1882
+    /// agentctl-false-failed-deliveries). A queue drain consults this only when
+    /// screen verification is about to file the delivery failed: the harness's own
+    /// record is an extra positive proof of delivery, never a reason to type again.
+    /// The transcript is the one [`Self::transcript_path`] pins to the agent's own
+    /// session, so an identical prompt in another session never counts.
+    fn transcript_took(
+        &self,
+        _hints: &transcript::Hints<'_>,
+        _prompt: &str,
+        _since: f64,
+    ) -> Option<&'static str> {
+        None
+    }
     /// The native conversation ids of the agent's own sessions among `held`, the files its
     /// process and their descendants hold open, each once, in the order found (#916
     /// muse-native-session-id). Exactly one names the agent's conversation; several are more

@@ -3318,11 +3318,22 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         runtime: &dyn agent::AgentRuntime,
     ) -> Option<&'static str> {
         let since = runtime.stranded_since()? - CLAUDE_STRANDED_SLACK.as_secs_f64();
+        self.transcript_took_since(text, since)
+    }
+
+    /// How this agent's harness transcript shows that it took `text` as an accepted
+    /// user turn at or after `since`, or `None` (#1882
+    /// agentctl-false-failed-deliveries). The lookup is the stranded Claude Code
+    /// one's, generalised by adapter: the record's conversation id and pinned
+    /// process locate the one transcript of this agent's own session, in any
+    /// project directory, since the session may have begun in another working
+    /// directory.
+    fn transcript_took_since(&self, text: &str, since: f64) -> Option<&'static str> {
         let session = self
             .record
             .effective_native_session()
             .map(|native| native.value)
-            .or_else(|| self.record.session_value.clone())?;
+            .or_else(|| self.record.session_value.clone());
         #[cfg(test)]
         let test_home = TEST_HARNESS_HOME.with(|home| home.borrow().clone());
         #[cfg(not(test))]
@@ -3337,7 +3348,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         let home = test_home.or_else(crate::harness::home);
         let cwd = Path::new(&self.record.cwd);
         let hints = crate::harness::transcript::Hints {
-            session: Some(&session),
+            session: session.as_deref(),
             cwd: Some(cwd),
             home: home.as_deref(),
             pid: self
@@ -3346,8 +3357,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                 .and_then(|anchor| u32::try_from(anchor.pid).ok()),
             proc,
         };
-        let path = crate::harness::adapter("claude")?.transcript_path(&hints)?;
-        crate::harness::claude::transcript_took_prompt(&path, text, since)
+        crate::harness::adapter(&self.record.harness)?.transcript_took(&hints, text, since)
     }
 
     /// After a paste that never showed as the whole Muse editor, and before any Enter, take what
@@ -5903,6 +5913,15 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
         // The Muse `working` wait reads the screen for the submitted prompt (see
         // `wait_agent_status_with_runtime_unchecked`), never Herdr's state alone.
         self.uses_muse_composer()
+    }
+    fn transcript_took_with_runtime(
+        &self,
+        _info: &AgentPaneInfo,
+        text: &str,
+        since: f64,
+        _runtime: &dyn agent::AgentRuntime,
+    ) -> Option<String> {
+        self.transcript_took_since(text, since).map(str::to_owned)
     }
     fn codex_idle_ready_with_runtime(
         &self,

@@ -133,6 +133,15 @@ impl HarnessAdapter for ClaudeCode {
         transcript_model(lines)
     }
 
+    fn transcript_took(
+        &self,
+        hints: &super::transcript::Hints<'_>,
+        prompt: &str,
+        since: f64,
+    ) -> Option<&'static str> {
+        transcript_took_prompt(&transcript_path(hints)?, prompt, since)
+    }
+
     /// Claude Code writes each sub-agent's conversation to `<session>/subagents/*.jsonl` beside
     /// the session's own transcript.
     fn related_transcripts(

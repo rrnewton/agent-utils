@@ -140,6 +140,18 @@ on is #609 sender-header-mandatory).
 - **Muse**: supported, from a new user turn above the editor or Muse's
   journal recording `runtime.user_intent.accepted`
   (`rs/agentctl/src/harness/muse.rs`, `JournalWatch`).
+- **Before a drain files any of the three as failed** (#1882
+  agentctl-false-failed-deliveries, Rust edition), it asks the harness's
+  own transcript — the session file its adapter already locates
+  (`HarnessAdapter::transcript_took`): a prompt recorded there as an
+  accepted user turn at or after the delivery's claim is delivered
+  (recorded `queued` with a `transcript_proof` note on the processed
+  record), never filed `possibly_submitted` and never retyped. The
+  screen stays primary; the transcript is only a positive proof
+  consulted when the screen path is about to give up, generalising the
+  stranded-paste proof of #1099 claude-stranded-false-lost. The Python
+  edition keeps the screen-only rule; that divergence is recorded under
+  [The Python edition](#the-python-edition).
 - **Unknown TUI**: partial. A receipt needs the prompt shown as
   submitted; text that only left the bottom of the screen proves
   nothing, and the send stays possibly-submitted (#852, cited from
@@ -769,6 +781,10 @@ differential lockstep for the interactive core, but it is not identical:
   adapters are likewise Claude and Codex only
   (`py/agentctl/harness_tui/`). Muse delivery refinements land in the
   Rust edition first.
+- The transcript proof before filing a delivery failed (#1882
+  agentctl-false-failed-deliveries) is **Rust-only**: a Python drain
+  still files a screen-unverified delivery `possibly_submitted` without
+  asking the harness transcript. See the delivery-receipts row.
 - The lower-region recovery for an unparseable composer (#1683) covers
   the prompt being delivered (`_region_match` and `_flush_region_draft`
   in `py/agentctl/submission.py`, Claude Code and Codex), as does the

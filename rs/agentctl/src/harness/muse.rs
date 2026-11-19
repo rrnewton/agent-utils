@@ -126,6 +126,15 @@ impl HarnessAdapter for Muse {
         transcript_model(lines)
     }
 
+    fn transcript_took(
+        &self,
+        hints: &super::transcript::Hints<'_>,
+        prompt: &str,
+        since: f64,
+    ) -> Option<&'static str> {
+        journal_took_prompt(&transcript_path(hints)?, prompt, since)
+    }
+
     /// The sessions the runtime holds locked, sub-agents' excepted: each one's directory name.
     fn held_sessions(&self, held: &[PathBuf]) -> Vec<String> {
         let mut ids: Vec<String> = Vec::new();
@@ -514,6 +523,46 @@ impl JournalWatch {
     }
 }
 
+/// The most journal bytes, from its end, that [`journal_took_prompt`] reads.
+const TOOK_PROMPT_TAIL: u64 = 8 * 1024 * 1024;
+
+/// How Muse's journal at `path` shows that it took `prompt` as an accepted user
+/// intent at or after `since` (Unix seconds), or `None` when it does not (#1882
+/// agentctl-false-failed-deliveries). The post-hoc form of [`JournalWatch`]: where
+/// the watch reads forward from a point fixed before submission, this scans the
+/// journal's tail for an accepted record of the prompt written since the drain
+/// claimed it. Muse writes the record the moment it takes a submitted or steered
+/// prompt, including one it only queues or absorbs mid-turn, so a `/compact` or a
+/// mid-turn steer the screen never drew as a user turn is still proved here.
+pub(crate) fn journal_took_prompt(
+    path: &std::path::Path,
+    prompt: &str,
+    since: f64,
+) -> Option<&'static str> {
+    let wanted = collapse(prompt);
+    if wanted.is_empty() {
+        return None;
+    }
+    let lines = super::transcript::tail_lines(path, TOOK_PROMPT_TAIL).ok()?;
+    for line in &lines {
+        for record in records(line) {
+            if record["payload_type"] != ACCEPTED {
+                continue;
+            }
+            let at = record["recorded_at"].as_f64().map(|micros| micros / 1e6);
+            if at.is_none_or(|at| at < since) {
+                continue;
+            }
+            if accepted_text(&record).is_some_and(|text| text == wanted) {
+                return Some(
+                    "Muse's journal records the prompt accepted (runtime.user_intent.accepted)",
+                );
+            }
+        }
+    }
+    None
+}
+
 /// The journal record of a user intent Muse accepted.
 const ACCEPTED: &str = "runtime.user_intent.accepted";
 
@@ -582,6 +631,55 @@ mod tests {
         let mut activity = Activity::default();
         read_transcript(&all[..lines.min(all.len())], &mut activity);
         activity
+    }
+
+    #[test]
+    fn a_journal_proves_a_prompt_taken_only_by_its_text_after_the_claim() {
+        // #1882 agentctl-false-failed-deliveries: Muse records a taken prompt
+        // as `runtime.user_intent.accepted` the moment it accepts it, including
+        // a mid-turn steer or a queued `/compact` the screen never drew.
+        let prompt = "[from lead via agentctl · reply: agentctl send lead]\nShip it.";
+        let directory = std::env::temp_dir().join(format!(
+            "agentctl-muse-took-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("session.jsonl");
+        let accepted = |text: &str, micros: f64| {
+            serde_json::json!({"payload_type": "runtime.user_intent.accepted",
+                               "recorded_at": micros,
+                               "payload": {"model_messages": [
+                                   {"content": [{"kind": "text", "text": text}]}]}})
+        };
+        // 2026-11-08T20:41:45Z in microseconds.
+        let at = 1_794_187_305_000_000.0;
+        let since = at / 1e6 - 105.0;
+        let write = |lines: &[String]| std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        write(&[accepted(prompt, at).to_string()]);
+        assert!(journal_took_prompt(&path, prompt, since).is_some());
+        // The same record inside a transaction frame counts too.
+        let framed = serde_json::json!({"children": [
+            {"record_json": accepted(prompt, at).to_string()}]});
+        write(&[framed.to_string()]);
+        assert!(journal_took_prompt(&path, prompt, since).is_some());
+        for record in [
+            // Before the claim: an identical older acceptance is not this one.
+            accepted(prompt, at - 200_000_000.0),
+            // Another prompt, or a different record kind carrying the words.
+            accepted("another prompt entirely", at),
+            serde_json::json!({"payload_type": "runtime.session", "recorded_at": at,
+                               "payload": {"model_messages": [
+                                   {"content": [{"kind": "text", "text": prompt}]}]}}),
+        ] {
+            write(&[record.to_string()]);
+            assert_eq!(journal_took_prompt(&path, prompt, since), None, "{record}");
+        }
+        assert_eq!(
+            journal_took_prompt(&directory.join("missing.jsonl"), prompt, since),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]

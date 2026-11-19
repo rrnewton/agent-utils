@@ -413,6 +413,21 @@ pub trait AgentApi: Send + Sync {
     fn working_wait_proves_printed(&self) -> bool {
         false
     }
+    /// How the harness's own transcript proves it took `text` as an accepted user
+    /// turn at or after `since` (Unix seconds), when it does (#1882
+    /// agentctl-false-failed-deliveries). A drain consults this only when screen
+    /// verification is about to file the delivery failed: the transcript is an
+    /// extra positive proof, never a reason to type again. The default client
+    /// cannot tell.
+    fn transcript_took_with_runtime(
+        &self,
+        _info: &AgentPaneInfo,
+        _text: &str,
+        _since: f64,
+        _runtime: &dyn AgentRuntime,
+    ) -> Option<String> {
+        None
+    }
     /// Submit a draft that agentctl itself typed and the harness left unsent in the pane's
     /// editor, so that it no longer holds every later prompt (#720 agentctl-muse-stale-draft).
     /// `Ok(Some(evidence))` once one was submitted; `Ok(None)` when the editor holds no draft,
@@ -2580,6 +2595,39 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                                 }
                             }
                         }
+                        // As for a single prompt: the harness transcript has
+                        // the last word before the batch is filed failed
+                        // (#1882 agentctl-false-failed-deliveries).
+                        let outcome = match outcome {
+                            Err(failed) if !failed.probable_misroute => {
+                                let proof = documents.first().and_then(|first| {
+                                    transcript_delivery_proof(
+                                        client,
+                                        &info,
+                                        &combined,
+                                        first,
+                                        runtime,
+                                    )
+                                });
+                                match proof {
+                                    Some(proof) => {
+                                        for document in &mut documents {
+                                            document.insert(
+                                                "transcript_proof".to_owned(),
+                                                json!(proof),
+                                            );
+                                        }
+                                        Ok(Delivered::Confirmed {
+                                            verified: true,
+                                            evidence: Some(proof),
+                                            queued: true,
+                                        })
+                                    }
+                                    None => Err(failed),
+                                }
+                            }
+                            other => other,
+                        };
                         match outcome {
                             Ok(Delivered::Confirmed {
                                 verified, queued, ..
@@ -2885,6 +2933,27 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                     document.insert("paste_label".to_owned(), json!(label));
                 }
             }
+            // Screen verification gave up after typing may have begun: before
+            // the prompt is filed failed, the harness's own transcript has the
+            // last word (#1882 agentctl-false-failed-deliveries). A prompt it
+            // records as an accepted user turn was delivered, however the
+            // screen looked; it is never typed again.
+            let outcome = match outcome {
+                Err(failed) if !failed.probable_misroute => {
+                    match transcript_delivery_proof(client, &info, &typed, &document, runtime) {
+                        Some(proof) => {
+                            document.insert("transcript_proof".to_owned(), json!(proof));
+                            Ok(Delivered::Confirmed {
+                                verified: true,
+                                evidence: Some(proof),
+                                queued: true,
+                            })
+                        }
+                        None => Err(failed),
+                    }
+                }
+                other => other,
+            };
             match outcome {
                 Ok(Delivered::NotStaged(detail)) => {
                     // A cancel that landed while typing wins over the
@@ -2923,7 +2992,31 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                             .unwrap_or(0)
                             >= MAX_LOST_PASTE_PASSES
                     {
-                        // The bound is reached: the paste is reported possibly
+                        // The bound is reached — but the harness transcript
+                        // has the last word before the paste is filed failed
+                        // (#1882 agentctl-false-failed-deliveries): a prompt
+                        // it records as taken was delivered, never lost.
+                        if let Some(proof) =
+                            transcript_delivery_proof(client, &info, &typed, &document, runtime)
+                        {
+                            document.insert("transcript_proof".to_owned(), json!(proof));
+                            document.remove("possibly_submitted");
+                            strip_paste_stamps(&mut document);
+                            document
+                                .insert("delivery_state".to_owned(), json!("queued"));
+                            document.insert("confirmed_at".to_owned(), json!(unix_seconds()));
+                            atomic_json(&inflight_path, &Value::Object(document))?;
+                            transition(
+                                &inflight_path,
+                                &directories
+                                    .processed
+                                    .join(path.file_name().expect("validated queued filename")),
+                            )?;
+                            runtime.prompt_printed(&identifier);
+                            delivered.push(identifier.clone());
+                            break 'retry;
+                        }
+                        // The paste is reported possibly
                         // submitted, never retyped, and later inbox items are
                         // not held behind it.
                         document.insert("possibly_submitted".to_owned(), Value::Bool(true));
@@ -4144,6 +4237,28 @@ fn pace_burst<A: AgentApi + ?Sized>(
     }
 }
 
+/// Seconds before a delivery's claim stamp a transcript entry may be written
+/// and still prove this delivery: the harness records the prompt as it takes
+/// the paste, which the claim stamp follows by moments (#1882
+/// agentctl-false-failed-deliveries; the stranded check's slack, #1099).
+const TRANSCRIPT_PROOF_SLACK: f64 = 60.0;
+
+/// The harness transcript's proof that it took `text`, claimed in `document`, as
+/// an accepted user turn, when it did (#1882 agentctl-false-failed-deliveries).
+/// Consulted only when screen verification is about to file the delivery
+/// failed; `None` — no claim stamp, no adapter, no matching entry — leaves the
+/// screen's verdict standing.
+fn transcript_delivery_proof<A: AgentApi + ?Sized>(
+    client: &A,
+    info: &AgentPaneInfo,
+    text: &str,
+    document: &Map<String, Value>,
+    runtime: &dyn AgentRuntime,
+) -> Option<String> {
+    let claimed = document.get("inflight_at").and_then(Value::as_f64)?;
+    client.transcript_took_with_runtime(info, text, claimed - TRANSCRIPT_PROOF_SLACK, runtime)
+}
+
 fn deliver_one<A: AgentApi + ?Sized>(
     client: &A,
     info: &AgentPaneInfo,
@@ -5272,6 +5387,8 @@ mod tests {
         submit_spent: Vec<Duration>,
         verify_muse: bool,
         working_proves_printed: bool,
+        /// How the fake harness transcript proves it took a prompt (#1882).
+        transcript_proof: Option<String>,
     }
 
     struct FakeAgent {
@@ -5385,6 +5502,16 @@ mod tests {
 
         fn working_wait_proves_printed(&self) -> bool {
             self.state.lock().unwrap().working_proves_printed
+        }
+
+        fn transcript_took_with_runtime(
+            &self,
+            _info: &AgentPaneInfo,
+            _text: &str,
+            _since: f64,
+            _runtime: &dyn AgentRuntime,
+        ) -> Option<String> {
+            self.state.lock().unwrap().transcript_proof.clone()
         }
 
         fn codex_idle_ready_with_runtime(
@@ -9313,6 +9440,77 @@ mod tests {
         tracking.input_started();
         let restamped = load_message(&path).unwrap();
         assert_eq!(restamped["paste_started_at"].as_f64(), Some(first));
+    }
+
+    #[test]
+    fn a_prompt_the_transcript_proves_taken_is_delivered_never_quarantined() {
+        // #1882 agentctl-false-failed-deliveries: screen verification gave up
+        // after typing (the run failed, or the working wait timed out), but
+        // the harness transcript records the prompt as an accepted user turn.
+        for failure in ["run", "wait"] {
+            let directory = TestDirectory::new("transcript-proof");
+            let fake = FakeAgent::new(&["idle"]);
+            {
+                let mut state = fake.state.lock().unwrap();
+                state.fail_run = failure == "run";
+                state.fail_wait = failure == "wait";
+                state.transcript_proof =
+                    Some("the fake transcript records the prompt as a user turn".to_owned());
+            }
+            let result = send(
+                &fake,
+                &target(),
+                directory.path(),
+                "only once",
+                DrainOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(result.outcome, QueueOutcome::Delivered, "{failure}");
+            assert_eq!(result.delivered.len(), 1, "{failure}");
+            assert!(result.quarantined.is_empty(), "{failure}");
+            // Typed exactly once: the proof never causes a retype.
+            assert_eq!(fake.runs(), ["only once"], "{failure}");
+            let processed = json_paths(&directory.path().join("processed")).unwrap();
+            assert_eq!(processed.len(), 1, "{failure}");
+            let document = read_json(&processed[0]).unwrap();
+            assert_eq!(
+                document["transcript_proof"],
+                "the fake transcript records the prompt as a user turn",
+                "{failure}"
+            );
+            assert_eq!(document["delivery_state"], "queued", "{failure}");
+            assert!(
+                json_paths(&directory.path().join("failed"))
+                    .unwrap()
+                    .is_empty(),
+                "{failure}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_processed_record_carrying_transcript_proof_still_loads() {
+        // Forward compatibility (#809/#813 via #1882): queue records are
+        // free-form documents an older build reads by the keys it knows, so a
+        // processed record carrying the newer `transcript_proof` key loads
+        // unchanged for a reader that has never heard of it.
+        let directory = TestDirectory::new("transcript-proof-compat");
+        let path = directory.path().join("processed.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "id": "m1",
+                "text": "hello",
+                "delivery_state": "queued",
+                "confirmed_at": 1.0,
+                "transcript_proof": "the harness journal records the prompt accepted",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let document = agent_queue::queue::load_message(&path).unwrap();
+        assert_eq!(document["delivery_state"], "queued");
+        assert_eq!(document["text"], "hello");
     }
 
     #[test]
