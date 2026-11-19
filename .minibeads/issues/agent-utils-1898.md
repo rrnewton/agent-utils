@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-nested-slack-link-in-markdown-label: a Slack link nested in a markdown link label draws as raw markup'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -8,7 +8,7 @@ labels:
 - ui
 - links
 created_at: 2026-11-19T04:18:00-05:00
-updated_at: 2026-11-19T04:18:00-05:00
+updated_at: 2026-11-19T08:21:29-05:00
 ---
 
 # Description
@@ -31,3 +31,9 @@ updated_at: 2026-11-19T04:18:00-05:00
 # Notes
 
 Lane mu-nestedlink on branch mu-nestedlink/1898. Follows #1895 (mu-linksearch), which made Links search match link names; this issue is the drawing of the same nested shape. Functions expected to change: the shared link/text rendering in `vibe-talk/web/src/` and tests under `vibe-talk/tests/js/`.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as 7b9f8dbb + 952d59d3 (tip 952d59d3). A new `unwrap_links_in_labels` in `vibe-talk/src/slack/mrkdwn.rs` replaces, inside a markdown link's label only, a nested `<url|label>` with its label, a nested `<url>` with the url, and a nested markdown link with its label; escaped brackets and code stay literal. It runs in the Slack reader (`to_markdown`), in the renderer's prepare step for every dialect, in speech (`for_speech_with`), and in the Discuss context quote, so the owner's shape draws, speaks, and quotes as one link to the markdown target. The page's `linksIn` names the outer link by the same unwrapped words (`unwrappedLabel` in `vibe-talk/web/src/foundation/addresses.ts`), keeping #1895 Links search matching "intern" in address and label.
+
+Evidence: Rust tests in `slack::mrkdwn`, `render` (all three dialects), and `speakable`; full lib suite 1986 passed. JS tests in `tests/js/foundation/index.test.mjs` plus page search/links suites; typecheck clean. Dynamic: shared screenshot harness against the real throwaway server (fake upstream and model stub only), scene 80-link-search-intern plus Discuss scenes 73–76, light/dark at 412x915 and 1280x800, before (main 8d190338) in /tmp/mu-nestedlink-before and after in /tmp/mu-nestedlink-after, every scene-80 image inspected — before shows the raw `<http://interncache-all…|interncache-all…`, after shows `interncache-all.example.test/manifold/…/ipfsmf-test-site-loader.html#…`. Gate on 6b8d81e0 green (validate OK); the one earlier red, `vibe-talk.check.thread-reader-follow-browser`, fails identically on pristine main and was disabled in #1903 (f404b565), which this change rebased onto before gating.
