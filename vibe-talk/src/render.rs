@@ -225,9 +225,7 @@ impl Markup {
                     if let Some(repaired) = repaired {
                         let code = code_ranges(&repaired, options);
                         let unwrapped = unwrap_links_in_labels(&repaired, &code);
-                        return Cow::Owned(
-                            angle_links_outside(&unwrapped, &code).into_owned(),
-                        );
+                        return Cow::Owned(angle_links_outside(&unwrapped, &code).into_owned());
                     }
                 }
                 // `#1898`: unwrap a link nested in a Markdown label first, so the angle
@@ -4223,7 +4221,11 @@ mod tests {
             "<p><a href=\"https://interncache-all.example.test/manifold/flat/ipfsmf-test-site-loader.html#bafy\" {LINK}>interncache-all.example.test/manifold/\u{2026}/ipfsmf-test-site-loader.html#\u{2026}</a></p>\n"
         );
         for markup in [Markup::Discord, Markup::Slack, Markup::GoogleChat] {
-            assert_eq!(to_html(text, markup), drawn, "{markup:?} kept the raw label");
+            assert_eq!(
+                to_html(text, markup),
+                drawn,
+                "{markup:?} kept the raw label"
+            );
         }
         assert_eq!(
             html("look [<https://a.example/x>](https://b.example/y) and [see <https://c.example|the doc>](https://d.example) end"),

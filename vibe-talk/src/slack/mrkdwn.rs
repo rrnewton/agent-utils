@@ -455,7 +455,9 @@ fn markdown_link_span(text: &str, start: usize) -> Option<(usize, usize)> {
             at += 1;
         }
     }
-    let target = text[target_from..at].trim_start_matches('<').trim_end_matches('>');
+    let target = text[target_from..at]
+        .trim_start_matches('<')
+        .trim_end_matches('>');
     let scheme = target.get(..8).unwrap_or(target).to_ascii_lowercase();
     if !(scheme.starts_with("http://") || scheme.starts_with("https://"))
         || target.chars().any(char::is_whitespace)
@@ -471,7 +473,9 @@ fn markdown_link_span(text: &str, start: usize) -> Option<(usize, usize)> {
         Some(b'\'') => Some(b'\''),
         _ => None,
     } {
-        let shut = text[at + 1..].find(end_quote as char).map(|found| at + 1 + found)?;
+        let shut = text[at + 1..]
+            .find(end_quote as char)
+            .map(|found| at + 1 + found)?;
         if text[at..=shut].contains('\n') {
             return None;
         }
@@ -751,7 +755,10 @@ mod tests {
         );
         // A converted body holds the nesting as a Markdown link; it flattens the same way.
         assert_eq!(
-            unwrap_links_in_labels("[[inner words](https://a.example) tail](https://b.example)", &[]),
+            unwrap_links_in_labels(
+                "[[inner words](https://a.example) tail](https://b.example)",
+                &[]
+            ),
             "[inner words tail](https://b.example)"
         );
         // Plain Markdown and plain Slack links are exactly as written, and code is left alone.
@@ -760,7 +767,11 @@ mod tests {
             "see <https://a.example|A> or https://b.example/x",
             "no links at all",
         ] {
-            assert_eq!(unwrap_links_in_labels(plain, &[]), plain, "{plain:?} was rewritten");
+            assert_eq!(
+                unwrap_links_in_labels(plain, &[]),
+                plain,
+                "{plain:?} was rewritten"
+            );
         }
         let coded = "`[<https://a.example|name>](https://b.example)`";
         let code = coded.find('[').map(|at| at..at + 1).unwrap();
