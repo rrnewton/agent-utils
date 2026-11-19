@@ -383,7 +383,7 @@ test("`#1846 vibe-talk-windowed-rendering`: two knobs apart — data reach-back 
   const settings = createDeviceSettings(storage);
   const phone = windowedConfig(settings, true);
   const desk = windowedConfig(settings, false);
-  assert.deepEqual([phone.dataReach, phone.rowCap, phone.prefetchPx, phone.windowed], [DATA_REACH_PHONE, RENDER_CAP_PHONE, 1200, true], "S1: phone defaults On");
+  assert.deepEqual([phone.dataReach, phone.rowCap, phone.prefetchPx, phone.windowed], [DATA_REACH_PHONE, RENDER_CAP_PHONE, 1200, false], "S1 pending: phone defaults Off until suite variants land");
   assert.deepEqual([desk.dataReach, desk.rowCap, desk.prefetchPx], [DATA_REACH_DESKTOP, RENDER_CAP_DESKTOP, 1600]);
   assert.ok(desk.dataReach > desk.rowCap * 50, "desktop data reach is not deep beside the render cap");
   assert.ok(WINDOWED_LISTS_HELP.includes("find"), "the find-in-page limit is not in the help text");
