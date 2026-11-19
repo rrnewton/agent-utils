@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-remove-silently-skips-unresolvable-rescue-tips: remove silently drops rescue-ref private history'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: mu-rescuetips
@@ -34,3 +34,6 @@ Deferred and follow-up (from the independent data-safety review, not fixed in th
 
 Two addenda while the scan was rewritten: (1) a thin salvage bundle could record prerequisites that exist only as refs inside the slot's own store, so `git bundle verify` passed there and failed in every surviving store once the slot was deleted — thin prerequisites must now be proven, in one batch, in a store that survives removal (otherwise the bundle is thinned only against surviving tips, i.e. fuller or complete), and every salvage bundle in the remove/finish paths is additionally verified against surviving stores only, refusing before anything is deleted when that fails; (2) a large remove in this scan's last phase ran roughly one Git process per tip (about 720 rescue tips) — ref enumeration, peeling, ancestry and remote lookups in the rewritten scan are batched (one `for-each-ref`, `cat-file --batch-check` peels, one parent walk), with a subprocess-count regression test on 60 rescue refs.
 
+## Resolution
+
+Landed as f0a7f148 ('wrkslots: never silently drop rescue-ref private history'). Follow-ups filed as #1877 wrkslots-rescue-partition-lows and #1878 wrkslots-nested-module-name-vs-path.
