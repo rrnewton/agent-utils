@@ -1,12 +1,13 @@
 ---
 title: 'wrkslots-dead-fuse-entry-refuses-host-wide: a dead FUSE entry in one slot refuses every other slot'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-11-17T16:25:58-05:00
-updated_at: 2026-11-17T16:25:58-05:00
+updated_at: 2026-11-19T00:32:10-05:00
+closed_at: 2026-11-19T00:32:10-05:00
 ---
 
 # Description
@@ -58,3 +59,25 @@ unreachable mount point raises before any per-slot scoping applies.
   budgets).
 
 # Notes
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as b8d422cc
+(replay of gated head 5a6bdbe2; five commits e27c85cb..b8d422cc).
+Heartbeat, create and classify-create-journals — and every other
+slot-acting command — now treat ENOTCONN/EIO at a table-listed
+`fuse*` mount as a dead mount: scans record and skip it, the
+registry storage census reports a row-scoped `dead-fuse-entry`
+finding ("dead FUSE entry at <path>, owning slot <slot>"), other
+slots' commands warn and proceed, and only the acted-on slot (or
+a create target, or the classified journal's own slot) refuses,
+naming the entry. Every dead-mount probe stats in a short-lived
+child process abandoned at a 5-second bound, so a hung FUSE
+server cannot stall or pin a command. No persisted field was
+added or changed. Full gate on 5a6bdbe2 failed only the
+untouched python.agentctl.shard-0 (process-reaping timing under
+load); its exclusive rerun passed. Combined-tree verification
+after each main move: test_dead_fuse_entry 14 passed,
+heartbeat/classify differentials 26 passed, Rust storage_state
+3 passed. No real FUSE mount was created; all tests use a fake
+mountinfo plus injected stat failures.
