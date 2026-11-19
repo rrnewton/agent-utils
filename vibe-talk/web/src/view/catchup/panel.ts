@@ -1581,12 +1581,12 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         details.appendChild(summary);
         const body = document.createElement("div");
         body.className = "discuss-qa-body";
-        for (const turn of pair) {
-          if (turn.kind !== "turn") continue;
+        for (const entry of pair) {
+          if (entry.kind !== "turn") continue;
           const line = document.createElement("p");
-          line.className = turn.speaker === "you" ? "discuss-turn discuss-you" : "discuss-turn discuss-agent";
-          if (turn.text_html !== "") insertSanitizedHtml(line, turn.text_html);
-          else line.textContent = turn.text;
+          line.className = entry.speaker === "you" ? "discuss-turn discuss-you" : "discuss-turn discuss-agent";
+          if (entry.text_html !== "") insertSanitizedHtml(line, entry.text_html);
+          else line.textContent = entry.text;
           body.appendChild(line);
         }
         details.appendChild(body);
