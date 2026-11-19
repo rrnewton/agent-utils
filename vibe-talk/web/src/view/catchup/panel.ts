@@ -1322,6 +1322,33 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
    * markup when it sent one, the shaped text as text otherwise. Model text reaches
    * innerHTML only through `text_html` — never directly.
    */
+  /**
+   * `#1911 vibe-talk-discuss-message-link-opens-new-window`: an in-app citation
+   * anchor never opens a new window. The server's renderer stamps every anchor
+   * with `target="_blank"`; a citation whose address is one of this app's own
+   * (`?c=…&m=…`, the shape `answerTap` routes) has that stamp taken off as it is
+   * drawn, so even a tap the routing somehow misses follows the address in this
+   * window — where the page applies it as a deep link — instead of opening a
+   * second vibe-talk window. External addresses keep their stamp.
+   */
+  function keepCitationsInApp(root: HTMLElement): void {
+    const walk = (node: HTMLElement): void => {
+      for (const kid of Array.from(node.children)) {
+        const el = kid as HTMLElement;
+        if (typeof el.tagName === "string" && el.tagName.toLowerCase() === "a") {
+          const href = el.getAttribute("href") ?? "";
+          const queryAt = href.indexOf("?");
+          if (!href.startsWith("http") && queryAt >= 0
+              && deepLinkRefFrom(new URLSearchParams(href.slice(queryAt + 1)).get("m") ?? "") !== null) {
+            el.removeAttribute("target");
+          }
+        }
+        walk(el);
+      }
+    };
+    walk(root);
+  }
+
   function drawAnswer(answer: CatchupAnswer, record: string | null): void {
     // `#1497`: a different record than the one standing starts from its own
     // kept folds (none for a fresh summary); the same record redrawn keeps
@@ -1336,6 +1363,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     if (answer.text_html !== "") {
       setClassWord(box, "discuss-answer--plain", false);
       insertSanitizedHtml(box, answer.text_html);
+      keepCitationsInApp(box);
       // `#1387 discuss-collapsible-sections`: workstream sections fold, all
       // collapsed, with one Expand/Collapse-all bar at the top of the answer.
       const folds = foldSectionsByHeading(box as never, (tag) => document.createElement(tag) as never, foldOpen);
@@ -1407,14 +1435,15 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
   }
 
   /**
-   * A tap inside the answer (`#1395 discuss-scope-binding`): the single
+   * A tap inside the answer or the timeline (`#1395 discuss-scope-binding`;
+   * `#1911` for the timeline): the single
    * tap-routing function. An in-app citation link is routed — through the
    * view's binding decision when wired, as a plain jump otherwise — and
    * anything else goes on. The server marks a cache-resolved citation
    * outside the window with `scope=out` in its address; that flag, and
    * only that, makes the tap out-of-scope.
    */
-  function answerTap(event: Event): void {
+  function answerTap(event: Event, container: HTMLElement): void {
     let node: unknown = event.target;
     while (node !== null && node !== undefined) {
       const el = node as HTMLElement;
@@ -1441,9 +1470,12 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         }
         return;
       }
-      if (el === (deps.byId("discuss-answer") as unknown)) break;
+      if (el === (container as unknown)) break;
       node = (el as { parentNode?: unknown }).parentNode;
     }
+    // The timeline (earlier summaries, follow-up turns) has no read-aloud
+    // blocks: a tap no citation took is simply not the panel's (`#1911`).
+    if (container !== (deps.byId("discuss-answer") as unknown as HTMLElement)) return;
     // `#1501 discuss-read-aloud-parity`. No citation took the tap: a tap on
     // a drawn block reads from that block only while this summary's read is
     // already active (`#1543`); an inactive tap selects or does nothing. A
@@ -1510,6 +1542,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         box.appendChild(details);
       }
     }
+    keepCitationsInApp(box);
     void scope;
   }
 
@@ -2093,7 +2126,15 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
           boundStartMs = boundForCount(previewUnread, boundCount).sinceMs;
           drawBound();
         });
-        listening.listen(deps.byId("discuss-answer"), "click", (event) => answerTap(event));
+        listening.listen(deps.byId("discuss-answer"), "click",
+          (event) => answerTap(event, deps.byId("discuss-answer")));
+        // `#1911`: citations in the timeline (earlier summaries, follow-up
+        // turns) jump in this window too; without this they followed their
+        // `target="_blank"` address into a new vibe-talk window.
+        const timelineBox = maybe("discuss-timeline");
+        if (timelineBox !== null) {
+          listening.listen(timelineBox, "click", (event) => answerTap(event, timelineBox));
+        }
         listening.listen(deps.byId("discuss-mark-read"), "click", () => mark(true));
         listening.listen(deps.byId("discuss-mark-unread"), "click", () => mark(false));
         // `#1383`: the header's two layout toggles beside Close. Dock switches

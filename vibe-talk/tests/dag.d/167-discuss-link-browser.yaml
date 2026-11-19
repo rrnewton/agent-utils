@@ -1,0 +1,19 @@
+steps:
+  # `#1911 vibe-talk-discuss-message-link-opens-new-window` against the real server binary: a
+  # Discuss citation (answer and timeline) to a message outside the loaded
+  # window jumps in the same window — no new page, no target=_blank — landing
+  # visible and marked "Linked message", at phone and desk.
+  - group: check
+    job: discuss-link-browser
+    desc: the Discuss message link (a citation in the answer and in the timeline jumps in the same window, landing visible and marked, never a new window), against the real server (fake chat upstream) in current Chromium at 412x915 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/discuss_link_browser.py
+    jobs_flag: ""
+    deps: [build.release, setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 90
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824

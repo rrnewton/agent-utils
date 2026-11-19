@@ -231,7 +231,16 @@ function fixture({ selection = { view: "flat", threadId: null, thread: null }, r
         content: null,
         set innerHTML(value) {
           this._html = String(value);
-          this.content = { childNodes: [fakeElement("span")] };
+          const nodes = [fakeElement("span")];
+          // Anchors in the handed markup, as elements with their attributes:
+          // a drawn link's own attributes are observable behaviour (`#1911`).
+          for (const match of this._html.matchAll(/<a\s+([^>]*)>([^<]*)<\/a>/g)) {
+            const anchor = fakeElement("a");
+            for (const attr of match[1].matchAll(/([\w-]+)="([^"]*)"/g)) anchor.setAttribute(attr[1], attr[2]);
+            anchor.textContent = match[2];
+            nodes.push(anchor);
+          }
+          this.content = { childNodes: nodes };
         },
         get innerHTML() { return this._html; },
       };
@@ -902,6 +911,44 @@ test("catchup: a citation tap in the answer jumps; unknown terms draw collapsed"
     for (const listener of [...(fx.els["discuss-answer"].listeners.click || [])]) listener(ev);
     assert.equal(prevented, true, "the citation tap was not taken in-app");
     assert.deepEqual(fx.calls.jumps, [{ service: "discord", channel: "chan-1", message: "m1", thread: null }]);
+  } finally { fx.restore(); }
+});
+
+test("catchup: a citation tap in the timeline jumps in this window, not a new one (#1911)", async () => {
+  const fx = fixture();
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    await openAndSummarize(view, fx);
+    await flush();
+    const anchor = fakeElement("a");
+    anchor.setAttribute("href", "?c=chan-1&v=all&m=discord:chan-1:m9");
+    anchor.setAttribute("target", "_blank");
+    fx.els["discuss-timeline"].appendChild(anchor);
+    let prevented = false;
+    const ev = { target: anchor, preventDefault() { prevented = true; }, stopPropagation() {} };
+    for (const listener of [...(fx.els["discuss-timeline"].listeners.click || [])]) listener(ev);
+    assert.equal(prevented, true, "the timeline citation tap was not taken in-app");
+    assert.deepEqual(fx.calls.jumps, [{ service: "discord", channel: "chan-1", message: "m9", thread: null }]);
+  } finally { fx.restore(); }
+});
+
+test("catchup: a drawn in-app citation loses target=_blank; an external link keeps it (#1911)", async () => {
+  const fx = fixture({
+    respond: () => Promise.resolve(answer({
+      text_html: "<p>Old <a href=\"?c=chan-1&v=all&m=discord:chan-1:m1\" target=\"_blank\">(09:51)</a>"
+        + " and <a href=\"https://example.test/x\" target=\"_blank\">out</a>.</p>",
+    })),
+  });
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    await openAndSummarize(view, fx);
+    await flush();
+    const anchors = fx.els["discuss-answer"].children.filter((kid) => kid.tagName === "A");
+    assert.equal(anchors.length, 2, "the drawn links were not found");
+    assert.equal(anchors[0].getAttribute("target"), null, "the in-app citation still opens a new window");
+    assert.equal(anchors[1].getAttribute("target"), "_blank", "an external link lost its new-window stamp");
   } finally { fx.restore(); }
 });
 
