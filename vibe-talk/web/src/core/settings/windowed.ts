@@ -60,7 +60,8 @@ export function windowedConfig(settings: DeviceSettings, phone: boolean): Window
   const prefetch = settings.get(DEVICE_SETTINGS.renderPrefetchPx);
   const cap = settings.get(DEVICE_SETTINGS.renderRowCap);
   return {
-    windowed: settings.get(DEVICE_SETTINGS.windowedLists),
+    // S1 (step 6): On by default at phone widths unless the owner explicitly turned it Off.
+    windowed: settings.get(DEVICE_SETTINGS.windowedLists) || (phone && !settings.get(DEVICE_SETTINGS.windowedListsOff)),
     prefetchPx: prefetch > 0 ? prefetch : phone ? RENDER_PREFETCH_PHONE_PX : RENDER_PREFETCH_DESKTOP_PX,
     rowCap: cap > 0 ? cap : phone ? RENDER_CAP_PHONE : RENDER_CAP_DESKTOP,
     dataReach: reach > 0 ? reach : phone ? DATA_REACH_PHONE : DATA_REACH_DESKTOP,

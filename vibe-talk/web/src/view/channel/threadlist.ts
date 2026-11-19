@@ -823,7 +823,9 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
         if (typeof requestAnimationFrame === "function") requestAnimationFrame(run); else run();
       }, { passive: true });
     }
-    return [spacer("top", offsets[from] as number), ...all.slice(from, to), spacer("bottom", (offsets[offsets.length - 1] as number) - (offsets[to] as number))];
+    const mounted = all.slice(from, to);
+    mounted.forEach((row, at) => { row.setAttribute("aria-setsize", String(all.length)); row.setAttribute("aria-posinset", String(from + at + 1)); });
+    return [spacer("top", offsets[from] as number), ...mounted, spacer("bottom", (offsets[offsets.length - 1] as number) - (offsets[to] as number))];
   }
 
   /** The stamp of the card `summary` would build now, from its summary and the tally. */

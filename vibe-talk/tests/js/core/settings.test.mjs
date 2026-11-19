@@ -155,6 +155,7 @@ test("`#624 voice-page-modularity`: each device setting reads, keeps and refuses
     ["discussPanel", "vibe-talk.voice.discuss-panel", null, [[{ open: true, channelId: "chan-1", threadId: null, view: "flat" }, "{\"open\":true,\"channelId\":\"chan-1\",\"threadId\":null,\"view\":\"flat\"}"], [{ open: false, channelId: "chan-1", threadId: "t9", view: "main" }, "{\"open\":false,\"channelId\":\"chan-1\",\"threadId\":\"t9\",\"view\":\"main\"}"], [null, null]], null],
     ["discussCoverage", "vibe-talk.voice.discuss-coverage", {}, [[{ "chan-1:main": { ranges: [{ start: 100, end: 200 }] } }, "{\"chan-1:main\":{\"ranges\":[{\"start\":100,\"end\":200}]}}"]], {}],
     ["windowedLists", "vibe-talk.voice.windowed-lists", false, [[true, "1"], [false, "0"]], false],
+    ["windowedListsOff", "vibe-talk.voice.windowed-lists-off", false, [[true, "1"], [false, "0"]], false],
     ["dataReachBack", "vibe-talk.voice.data-reach-back", 0, [[5000, "5000"], [0, "0"]], 0],
     ["renderPrefetchPx", "vibe-talk.voice.render-prefetch-px", 0, [[1600, "1600"], [0, "0"]], 0],
     ["renderRowCap", "vibe-talk.voice.render-row-cap", 0, [[80, "80"], [0, "0"]], 0],
@@ -382,7 +383,7 @@ test("`#1846 vibe-talk-windowed-rendering`: two knobs apart — data reach-back 
   const settings = createDeviceSettings(storage);
   const phone = windowedConfig(settings, true);
   const desk = windowedConfig(settings, false);
-  assert.deepEqual([phone.dataReach, phone.rowCap, phone.prefetchPx, phone.windowed], [DATA_REACH_PHONE, RENDER_CAP_PHONE, 1200, false]);
+  assert.deepEqual([phone.dataReach, phone.rowCap, phone.prefetchPx, phone.windowed], [DATA_REACH_PHONE, RENDER_CAP_PHONE, 1200, true], "S1: phone defaults On");
   assert.deepEqual([desk.dataReach, desk.rowCap, desk.prefetchPx], [DATA_REACH_DESKTOP, RENDER_CAP_DESKTOP, 1600]);
   assert.ok(desk.dataReach > desk.rowCap * 50, "desktop data reach is not deep beside the render cap");
   assert.ok(WINDOWED_LISTS_HELP.includes("find"), "the find-in-page limit is not in the help text");

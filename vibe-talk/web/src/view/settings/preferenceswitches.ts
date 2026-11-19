@@ -26,6 +26,8 @@ export interface PreferenceSwitchesDependencies {
   summariesChanged(): unknown;
   /** `#225 enter-to-send`. Whether Enter sends, as the switch now says. */
   enterSendsChanged(on: boolean): unknown;
+  /** `#1846` step 6: windowed-lists switch or either knob changed. */
+  windowedChanged(on: boolean): unknown;
   /** Mark read on reply: the No/Yes choice and each guard below it. */
   markReadChanged(): unknown;
   markReadQuoteGuardChanged(): unknown;
@@ -74,6 +76,9 @@ export function mountPreferenceSwitches(deps: PreferenceSwitchesDependencies): P
   // `#225 enter-to-send`. Nothing to redraw and nothing to say on the status line: the hint under the switch changes in
   // place, and the next Enter in any box follows it.
   listen<Event>(el("enter-sends"), "change", () => deps.enterSendsChanged((el("enter-sends") as HTMLInputElement).checked));
+  listen<Event>(el("windowed-lists"), "change", () => deps.windowedChanged((el("windowed-lists") as HTMLInputElement).checked));
+  listen<Event>(el("data-reach-back"), "change", () => deps.windowedChanged((el("windowed-lists") as HTMLInputElement).checked));
+  listen<Event>(el("render-row-cap"), "change", () => deps.windowedChanged((el("windowed-lists") as HTMLInputElement).checked));
   listen<Event>(el("mark-read-on-reply"), "change", () => deps.markReadChanged());
   listen<Event>(el("mark-read-quote-guard"), "change", () => deps.markReadQuoteGuardChanged());
   listen<Event>(el("mark-read-fold-guard"), "change", () => deps.markReadFoldGuardChanged());

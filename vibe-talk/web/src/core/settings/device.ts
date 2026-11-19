@@ -428,6 +428,8 @@ export const DEVICE_SETTINGS = Object.freeze({
    * The Settings help for this switch states the browser find-in-page limitation (Q3).
    */
   windowedLists: offUnlessOn("vibe-talk.voice.windowed-lists", false),
+  /** `#1846` S1: explicit Off on phone (unset = On at phone widths, Off on desktop). */
+  windowedListsOff: offUnlessOn("vibe-talk.voice.windowed-lists-off", false),
   /** `#1846`. Messages held as DATA for local search/filtering; 0 = per-device default. */
   dataReachBack: {
     key: "vibe-talk.voice.data-reach-back",

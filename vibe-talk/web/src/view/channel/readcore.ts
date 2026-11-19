@@ -592,6 +592,13 @@ export function createTimelineView(deps: TimelineViewDependencies): TimelineView
       }
       next.push(row ?? discordNode(group));
     }
+    // A11y (step 6): true position in the full list from a windowed DOM.
+    next.forEach((row, at) => {
+      if ((row as HTMLElement).dataset.windowSpacer) return;
+      const groupAt = slice.from + (at - 1);
+      (row as HTMLElement).setAttribute("aria-setsize", String(groups.length));
+      (row as HTMLElement).setAttribute("aria-posinset", String(groupAt + 1));
+    });
     next.push(spacer("bottom", (offsets[offsets.length - 1] as number) - (offsets[slice.to] as number)));
     const keep = new Set(next);
     for (const row of [...list.children]) {

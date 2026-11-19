@@ -225,6 +225,9 @@ export interface ElementById {
   "empty-line": HTMLParagraphElement;
   "empty-state": HTMLDivElement;
   "enter-sends": HTMLInputElement;
+  "windowed-lists": HTMLInputElement;
+  "data-reach-back": HTMLInputElement;
+  "render-row-cap": HTMLInputElement;
   "enter-sends-hint": HTMLParagraphElement;
   "error": HTMLSpanElement;
   "error-wrap": HTMLDivElement;
