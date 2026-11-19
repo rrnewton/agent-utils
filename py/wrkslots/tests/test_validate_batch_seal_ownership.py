@@ -8,6 +8,7 @@ import os
 import stat
 import subprocess
 import sys
+import time
 from collections.abc import MutableMapping, MutableSequence, Sequence
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from wrkslots import cli as wrkslots
 from wrkslots.tests.test_lifecycle import (
     active_slots,
     allow_test_host_for_absent_validate_recovery,
+    command,
     create,
     make_project,
     make_validate_row_absent,
@@ -534,19 +536,35 @@ def _crashed_seal(
     return project, target, seal, original
 
 
+def _host_pidns() -> str:
+    return f"pid:[{wrkslots._namespace_inode('pid')}]"
+
+
 def _rewrite_actor(seal: Path, **fields: object) -> None:
     raw = json.loads(seal.read_text())
     raw["actor"].update(fields)
     if isinstance(raw.get("x"), dict) and isinstance(raw["x"].get("operator"), dict):
         raw["x"]["operator"].update(fields)
+        # Fixtures simulate the batch writer, which stamps its PID
+        # namespace (#1869); a rewrite that names one explicitly wins.
+        if raw["x"]["operator"].get("pidns_inode") is None:
+            raw["x"]["operator"]["pidns_inode"] = _host_pidns()
     seal.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
 
 
 def _rewrite_operator(seal: Path, pid: int) -> None:
     raw = json.loads(seal.read_text())
     raw.setdefault("x", {})["operator"] = wrkslots._identity_to_obj(
-        wrkslots._read_process_identity(pid)
+        dataclasses.replace(
+            wrkslots._read_process_identity(pid), pidns_inode=_host_pidns()
+        )
     )
+    seal.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
+
+
+def _rewrite_operator_fields(seal: Path, **fields: object) -> None:
+    raw = json.loads(seal.read_text())
+    raw["x"]["operator"].update(fields)
     seal.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
 
 
@@ -572,9 +590,12 @@ def test_a_dead_actors_seal_is_retired_by_the_next_create(
 
     The seal records the process that authorized the removal, which in
     production is the killed publisher itself. "exited" records a process that
-    has since exited; "pid-reused" names a live PID with another start time,
-    so the recorded generation exited. "earlier-boot" ran on this host in
-    an earlier boot, which no process survives (#1764).
+    has since exited, which the PID's absence proves. "earlier-boot" ran on
+    this host in an earlier boot, which no process survives (#1764).
+    "pid-reused" names a live PID with another start time, so the
+    recorded generation exited (the fixture carries this host's
+    PID-namespace stamp; a namespace-local recording would instead
+    prove nothing since the #1869 cold review).
     """
     project, target, seal, original = _crashed_seal(tmp_path, monkeypatch)
     if actor == "earlier-boot":
@@ -628,6 +649,694 @@ def test_a_live_coordinators_seal_is_retired_when_its_batch_is_dead(
     assert "recovered the validation-batch seal" in made.stderr
     assert not seal.exists()
     assert target.stat().st_mode & 0o777 == original
+
+
+def _crashed_seal_beside_an_ownerless_agent_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, Path, Path, int]:
+    """#1869's registry shape: an orphaned seal beside a slot awaiting adoption."""
+
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project, slot="target", slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+    agent = create(project, bind_owner=False)
+    assert agent.returncode == 0, agent.stderr
+    mark_owner_dead(project, slot="target")
+    set_liveness(project, "dead")
+    stub_validate_batch_censuses(monkeypatch)
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_a, **_k: None)
+    config = wrkslots._load_config(str(project), "testhost")
+    target = wrkslots._slot_directory(config, "target", "validate")
+    seal = wrkslots._validate_batch_seal_journal_path(config)
+    original = target.stat().st_mode & 0o777
+    crashed = raw_command_with_census_authority_stub(
+        project,
+        *_remove_command(),
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-validate-batch-seal-target"},
+    )
+    assert crashed.returncode == 86, crashed.stderr
+    assert seal.is_file()
+    return project, target, seal, original
+
+
+def _agent_row(project: Path) -> dict[str, object]:
+    rows = [
+        row
+        for row in active_slots(project)
+        if isinstance(row, dict) and row.get("slot") == "slot01"
+    ]
+    assert len(rows) == 1
+    return rows[0]
+
+
+@pytest.mark.ordinary_environment
+def test_adopt_recovers_an_orphaned_seal_and_binds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1869: a dead batch's seal must not block an unrelated adopt."""
+
+    project, target, seal, original = _crashed_seal_beside_an_ownerless_agent_slot(
+        tmp_path, monkeypatch
+    )
+    assert _agent_row(project)["owner"] is None
+
+    adopted = command(
+        project,
+        "adopt",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+
+    assert adopted.returncode == 0, adopted.stderr
+    assert "adopted slot=slot01" in adopted.stdout
+    assert "recovered the validation-batch seal" in adopted.stderr
+    assert not seal.exists()
+    assert target.stat().st_mode & 0o777 == original
+    assert _agent_row(project)["owner"] is not None
+
+
+@pytest.mark.ordinary_environment
+def test_adopt_proceeds_beside_a_live_seal_on_a_disjoint_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1869: a live seal binds only its targets; a disjoint adopt proceeds."""
+
+    project, target, seal, _original = (
+        _crashed_seal_beside_an_ownerless_agent_slot(tmp_path, monkeypatch)
+    )
+    _rewrite_actor(
+        seal, **dataclasses.asdict(wrkslots._read_process_identity(os.getpid()))
+    )
+    sealed_mode = target.stat().st_mode & 0o777
+
+    adopted = command(
+        project,
+        "adopt",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+
+    assert adopted.returncode == 0, adopted.stderr
+    assert "proceeding beside the validation-batch seal" in adopted.stderr
+    assert seal.is_file()
+    assert target.stat().st_mode & 0o777 == sealed_mode
+    assert _agent_row(project)["owner"] is not None
+
+
+@pytest.mark.ordinary_environment
+def test_adopt_of_a_sealed_slot_still_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1869: the sealed slot itself is never adopted beside its seal."""
+
+    project, _target, seal, _original = (
+        _crashed_seal_beside_an_ownerless_agent_slot(tmp_path, monkeypatch)
+    )
+    _rewrite_actor(
+        seal, **dataclasses.asdict(wrkslots._read_process_identity(os.getpid()))
+    )
+
+    refused = command(
+        project,
+        "adopt",
+        "target",
+        "--agent",
+        "codex-1",
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+
+    assert refused.returncode == 3, refused.stderr
+    assert "validation-batch seal" in refused.stderr
+    assert seal.is_file()
+
+
+def _adopt_slot01(project: Path, *, generation: str = "1") -> subprocess.CompletedProcess[str]:
+    return command(
+        project,
+        "adopt",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        generation,
+    )
+
+
+@pytest.mark.ordinary_environment
+def test_adopt_never_retires_a_seal_whose_operator_only_moved_cgroup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cold-review D2: a cgroup move is the same live generation, not a reuse."""
+
+    project, _target, seal, _original = (
+        _crashed_seal_beside_an_ownerless_agent_slot(tmp_path, monkeypatch)
+    )
+    _rewrite_operator(seal, os.getpid())
+    _rewrite_operator_fields(seal, cgroup_path="/user.slice/moved-elsewhere.scope")
+
+    adopted = _adopt_slot01(project)
+
+    assert adopted.returncode == 0, adopted.stderr
+    assert "recovered the validation-batch seal" not in adopted.stderr
+    assert seal.is_file()
+    assert _agent_row(project)["owner"] is not None
+
+
+@pytest.mark.ordinary_environment
+def test_adopt_never_retires_a_seal_recording_no_operator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cold-review D3: a dead actor alone cannot prove the batch is gone."""
+
+    project, _target, seal, _original = (
+        _crashed_seal_beside_an_ownerless_agent_slot(tmp_path, monkeypatch)
+    )
+    raw = json.loads(seal.read_text())
+    del raw["x"]["operator"]
+    seal.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
+    _rewrite_actor(seal, pid=2_147_483_647)
+
+    adopted = _adopt_slot01(project)
+
+    assert adopted.returncode == 0, adopted.stderr
+    assert "recovered the validation-batch seal" not in adopted.stderr
+    assert seal.is_file()
+    assert _agent_row(project)["owner"] is not None
+
+
+@pytest.mark.ordinary_environment
+def test_refused_adopt_never_retires_an_orphaned_seal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cold-review D6: recovery waits until every precondition has passed."""
+
+    project, target, seal, original = _crashed_seal_beside_an_ownerless_agent_slot(
+        tmp_path, monkeypatch
+    )
+
+    refused = _adopt_slot01(project, generation="7")
+    assert refused.returncode == 3, refused.stderr
+    assert seal.is_file()
+
+    adopted = _adopt_slot01(project)
+    assert adopted.returncode == 0, adopted.stderr
+    assert not seal.exists()
+    assert target.stat().st_mode & 0o777 == original
+
+
+def _unshare_available() -> bool:
+    probe = subprocess.run(
+        ["unshare", "--user", "--map-root-user", "--pid", "--fork", "--mount-proc", "true"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return probe.returncode == 0
+
+
+def _judge_orphaned_in_namespace(project: Path, seal: Path) -> tuple[bool, str]:
+    from wrkslots.tests.test_lifecycle import source_environment
+
+    py_root = str(Path(wrkslots.__file__).resolve().parents[1])
+    helper = (
+        "import json, pathlib, sys\n"
+        f"sys.path.insert(0, {py_root!r})\n"
+        "from wrkslots import cli\n"
+        "config = cli._load_config(sys.argv[1], 'testhost')\n"
+        "orphaned, reason = cli._validate_batch_seal_orphaned(\n"
+        "    config, pathlib.Path(sys.argv[2]))\n"
+        "print(json.dumps([orphaned, reason]))\n"
+    )
+    completed = subprocess.run(
+        [
+            "unshare", "--user", "--map-root-user", "--pid", "--fork",
+            "--mount-proc", sys.executable, "-c", helper, str(project), str(seal),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=source_environment(),
+        timeout=300,
+    )
+    assert completed.returncode == 0, completed.stderr
+    orphaned, reason = json.loads(completed.stdout.strip().splitlines()[-1])
+    return bool(orphaned), str(reason)
+
+
+@pytest.mark.ordinary_environment
+def test_orphan_judgment_from_inside_a_pid_namespace_proves_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cold-review D1: from a namespace, a live host operator looks absent."""
+
+    if not _unshare_available():
+        pytest.skip("user+PID namespaces are unavailable here")
+    project, _target, seal, _original = (
+        _crashed_seal_beside_an_ownerless_agent_slot(tmp_path, monkeypatch)
+    )
+    operator = subprocess.Popen(["sleep", "3600"], text=True)
+    try:
+        _rewrite_operator(seal, operator.pid)
+        orphaned, _reason = _judge_orphaned_in_namespace(project, seal)
+    finally:
+        terminate_process(operator)
+    assert orphaned is False
+    assert seal.is_file()
+
+
+@pytest.mark.ordinary_environment
+def test_namespace_local_operator_pid_is_not_proven_dead_from_the_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cold-review D4: a namespace-local PID names another process from the host.
+
+    The operator identity is captured live inside a PID namespace (a
+    real batch and its sleeper, both alive in there), then recorded
+    under a PID number that does not exist on the host. Before the
+    PID-namespace stamp was judged, that missing host PID counted as
+    proof of death and the seal was recovered under the live batch.
+    The identity capture runs in a raw namespace subprocess (never
+    through wrkslots.tests.idle_validation_host); the judgment itself
+    runs in this process, where the suite's host-view stub stands in
+    for the host check the D1 test exercises for real.
+    """
+
+    if not _unshare_available():
+        pytest.skip("user+PID namespaces are unavailable here")
+    from wrkslots.tests.test_lifecycle import source_environment
+
+    project, _target, seal, _original = (
+        _crashed_seal_beside_an_ownerless_agent_slot(tmp_path, monkeypatch)
+    )
+    identity_path = tmp_path / "ns-operator.json"
+    py_root = str(Path(wrkslots.__file__).resolve().parents[1])
+    helper = (
+        "import json, os, pathlib, subprocess, sys, time\n"
+        f"sys.path.insert(0, {py_root!r})\n"
+        "from wrkslots import cli\n"
+        "child = subprocess.Popen(['sleep', '3600'])\n"
+        "identity = cli._read_process_identity(child.pid)\n"
+        "pathlib.Path(sys.argv[1]).write_text(json.dumps({\n"
+        "    'start_ticks': identity.start_ticks,\n"
+        "    'boot_id': identity.boot_id, 'host_id': identity.host_id,\n"
+        "    'cgroup_path': identity.cgroup_path,\n"
+        "    'pidns_inode': 'pid:[%d]' % os.stat('/proc/self/ns/pid').st_ino}))\n"
+        "time.sleep(3600)\n"
+    )
+    namespace = subprocess.Popen(
+        [
+            "unshare", "--user", "--map-root-user", "--pid", "--fork",
+            "--kill-child", "--mount-proc", sys.executable, "-c", helper,
+            str(identity_path),
+        ],
+        env=source_environment(),
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 60
+        while not identity_path.exists():
+            assert time.monotonic() < deadline, "namespace helper never reported"
+            time.sleep(0.05)
+        recorded = json.loads(identity_path.read_text())
+        assert recorded["pidns_inode"] != _host_pidns()
+        absent_pid = 4_500_000
+        assert not Path(f"/proc/{absent_pid}").exists()
+        _rewrite_operator_fields(seal, pid=absent_pid, **recorded)
+        config = wrkslots._load_config(str(project), "testhost")
+        orphaned, reason = wrkslots._validate_batch_seal_orphaned(config, seal)
+        assert orphaned is False
+        assert "another PID namespace" in reason
+        assert seal.is_file()
+        # The same record stamped as host-recorded proves death by the
+        # missing PID, so the refusal above is the namespace judgment,
+        # not the fixture: the batch it names is alive in its namespace.
+        _rewrite_operator_fields(seal, pidns_inode=_host_pidns())
+        orphaned, _reason = wrkslots._validate_batch_seal_orphaned(config, seal)
+        assert orphaned is True
+    finally:
+        terminate_process(namespace)
+
+
+def _run_main_in_namespace(
+    project: Path, *argv: str
+) -> subprocess.CompletedProcess[str]:
+    """Run wrkslots.main in a user+PID namespace, bypassing the test entry stub."""
+
+    from wrkslots.tests.test_lifecycle import source_environment
+
+    py_root = str(Path(wrkslots.__file__).resolve().parents[1])
+    helper = (
+        "import os, sys\n"
+        f"sys.path.insert(0, {py_root!r})\n"
+        "from wrkslots import cli\n"
+        "raise SystemExit(cli.main(['--project-root', sys.argv[1],\n"
+        "    '--machine', 'testhost', *sys.argv[2:]]))\n"
+    )
+    return subprocess.run(
+        [
+            "unshare", "--user", "--map-root-user", "--pid", "--fork",
+            "--kill-child", "--mount-proc", sys.executable, "-c", helper,
+            str(project), *argv,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=source_environment(),
+        timeout=300,
+    )
+
+
+@pytest.mark.ordinary_environment
+def test_recover_from_inside_a_pid_namespace_never_retires_a_live_seal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cold-review N1a: from a namespace, a live host batch looks gone."""
+
+    if not _unshare_available():
+        pytest.skip("user+PID namespaces are unavailable here")
+    project, target, seal, _original = (
+        _crashed_seal_beside_an_ownerless_agent_slot(tmp_path, monkeypatch)
+    )
+    operator = subprocess.Popen(["sleep", "3600"], text=True)
+    try:
+        _rewrite_operator(seal, operator.pid)
+        sealed_mode = target.stat().st_mode & 0o777
+        refused = _run_main_in_namespace(
+            project, "recover", "--coordinator-pid", "1"
+        )
+        assert refused.returncode == 3, refused.stderr
+        # The reviewer's exact repro: even the explicit override may
+        # not retire a live host batch from inside a namespace.
+        overridden = _run_main_in_namespace(
+            project,
+            "recover",
+            "--coordinator-pid",
+            "1",
+            "--coordinator-authorized",
+            "--override-unjudgeable-seal",
+        )
+    finally:
+        terminate_process(operator)
+    assert overridden.returncode == 3, overridden.stderr
+    assert seal.is_file()
+    assert target.stat().st_mode & 0o777 == sealed_mode
+
+
+@pytest.mark.ordinary_environment
+def test_host_recover_never_retires_a_live_namespace_batchs_seal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cold-review N1b+D: a live namespace batch survives host recover and its override.
+
+    The operator identity is captured live inside a held PID
+    namespace, then recorded under a PID number that does not exist
+    on the host (the reviewer's shape: a namespace batch has no host
+    PID to find). Plain recover reads it as unjudgeable and refuses;
+    even the explicit override retires nothing, because the batch it
+    records is alive in its namespace.
+    """
+
+    if not _unshare_available():
+        pytest.skip("user+PID namespaces are unavailable here")
+    from wrkslots.tests.test_lifecycle import source_environment
+
+    project, target, seal, _original = (
+        _crashed_seal_beside_an_ownerless_agent_slot(tmp_path, monkeypatch)
+    )
+    identity_path = tmp_path / "ns-batch.json"
+    py_root = str(Path(wrkslots.__file__).resolve().parents[1])
+    helper = (
+        "import json, os, pathlib, subprocess, sys, time\n"
+        f"sys.path.insert(0, {py_root!r})\n"
+        "from wrkslots import cli\n"
+        "child = subprocess.Popen(['sleep', '3600'])\n"
+        "identity = cli._read_process_identity(child.pid)\n"
+        "pathlib.Path(sys.argv[1]).write_text(json.dumps({\n"
+        "    'pid': identity.pid, 'start_ticks': identity.start_ticks,\n"
+        "    'boot_id': identity.boot_id, 'host_id': identity.host_id,\n"
+        "    'cgroup_path': identity.cgroup_path,\n"
+        "    'pidns_inode': 'pid:[%d]' % os.stat('/proc/self/ns/pid').st_ino}))\n"
+        "time.sleep(3600)\n"
+    )
+    namespace = subprocess.Popen(
+        [
+            "unshare", "--user", "--map-root-user", "--pid", "--fork",
+            "--kill-child", "--mount-proc", sys.executable, "-c", helper,
+            str(identity_path),
+        ],
+        env=source_environment(),
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 60
+        while not identity_path.exists():
+            assert time.monotonic() < deadline, "namespace helper never reported"
+            time.sleep(0.05)
+        recorded = json.loads(identity_path.read_text())
+        # Liveness comes from the real NSpid scan, not from any host
+        # /proc lookup of the namespace-local number: stubbing the
+        # scan out must fail this test.
+        live_operator = wrkslots._seal_operator(json.loads(seal.read_text()))
+        assert live_operator is not None
+        _rewrite_operator_fields(seal, **recorded)
+        live_operator = wrkslots._seal_operator(json.loads(seal.read_text()))
+        assert live_operator is not None
+        assert wrkslots._namespace_operator_live(live_operator) is True
+        absent_pid = 4_500_000
+        assert not Path(f"/proc/{absent_pid}").exists()
+        _rewrite_operator_fields(seal, **recorded | {"pid": absent_pid})
+        sealed_mode = target.stat().st_mode & 0o777
+        refused = raw_command_with_census_authority_stub(
+            project,
+            "recover",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+        )
+        assert refused.returncode == 3, refused.stderr
+        assert seal.is_file()
+        # With the batch's real namespace-local PID recorded, even the
+        # explicit override retires nothing: the pidns scan finds the
+        # recorded generation alive in its namespace.
+        _rewrite_operator_fields(seal, pid=recorded["pid"])
+        overridden = raw_command_with_census_authority_stub(
+            project,
+            "recover",
+            "--coordinator-authorized",
+            "--override-unjudgeable-seal",
+            "--coordinator-pid",
+            str(os.getpid()),
+        )
+    finally:
+        terminate_process(namespace)
+    assert overridden.returncode == 3, overridden.stderr
+    assert "alive in its PID namespace" in overridden.stderr
+    assert seal.is_file()
+    assert target.stat().st_mode & 0o777 == sealed_mode
+
+
+def test_a_namespace_batch_still_seals_stamped_with_its_own_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cold-review N3: a namespace writer still seals, stamped as non-host.
+
+    The seal writer itself does not refuse inside a PID namespace: it
+    writes the seal with the operator's real (namespace) inode, and a
+    host reader never counts that recording as provable death. (The
+    remove-validate-batch command separately refuses in a namespace
+    on validation-run evidence; that guard predates this change.)
+    """
+
+    if not _unshare_available():
+        pytest.skip("user+PID namespaces are unavailable here")
+    from wrkslots.tests.test_lifecycle import source_environment
+
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project, slot="target", slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    seal = wrkslots._validate_batch_seal_journal_path(config)
+
+    py_root = str(Path(wrkslots.__file__).resolve().parents[1])
+    helper = (
+        "import dataclasses, os, sys\n"
+        f"sys.path.insert(0, {py_root!r})\n"
+        "from wrkslots import cli\n"
+        "config = cli._load_config(sys.argv[1], 'testhost')\n"
+        "operator = dataclasses.replace(\n"
+        "    cli._read_process_identity(os.getpid()),\n"
+        "    pidns_inode='pid:[%d]' % os.stat('/proc/self/ns/pid').st_ino)\n"
+        "payload = {'schema': 1, 'kind': 'validate-batch-seal',\n"
+        "    'machine': 'testhost', 'created_at': cli._utc_now(),\n"
+        "    'actor': cli._identity_to_obj(cli._read_process_identity(os.getpid())),\n"
+        "    'x': {'operator': cli._identity_to_obj(operator)}, 'targets': []}\n"
+        "cli._write_validate_batch_seal_journal(config, payload)\n"
+    )
+    written = subprocess.run(
+        [
+            "unshare", "--user", "--map-root-user", "--pid", "--fork",
+            "--kill-child", "--mount-proc", sys.executable, "-c", helper,
+            str(project),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=source_environment(),
+        timeout=300,
+    )
+    assert written.returncode == 0, written.stderr
+    assert seal.is_file()
+    raw = json.loads(seal.read_text())
+    operator = raw["x"]["operator"]
+    assert operator["pidns_inode"] != _host_pidns()
+    orphaned, _reason = wrkslots._validate_batch_seal_orphaned(config, seal)
+    assert orphaned is False
+
+
+@pytest.mark.ordinary_environment
+def test_a_killed_namespace_batch_is_recoverable_with_the_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cold-review F1: once the namespace is gone, its batch is dead.
+
+    The seal records a batch in a PID namespace (local pid 1 in the
+    reviewer's repro shape); while the namespace lives the override
+    refuses, and once it is killed no process carries its inode, so
+    the override may retire the seal.
+    """
+
+    if not _unshare_available():
+        pytest.skip("user+PID namespaces are unavailable here")
+    from wrkslots.tests.test_lifecycle import source_environment
+
+    project, target, seal, _original = (
+        _crashed_seal_beside_an_ownerless_agent_slot(tmp_path, monkeypatch)
+    )
+    identity_path = tmp_path / "ns-dead-batch.json"
+    py_root = str(Path(wrkslots.__file__).resolve().parents[1])
+    helper = (
+        "import json, os, pathlib, subprocess, sys, time\n"
+        f"sys.path.insert(0, {py_root!r})\n"
+        "from wrkslots import cli\n"
+        "child = subprocess.Popen(['sleep', '3600'])\n"
+        "identity = cli._read_process_identity(child.pid)\n"
+        "pathlib.Path(sys.argv[1]).write_text(json.dumps({\n"
+        "    'pid': identity.pid, 'start_ticks': identity.start_ticks,\n"
+        "    'boot_id': identity.boot_id, 'host_id': identity.host_id,\n"
+        "    'cgroup_path': identity.cgroup_path,\n"
+        "    'pidns_inode': 'pid:[%d]' % os.stat('/proc/self/ns/pid').st_ino}))\n"
+        "time.sleep(3600)\n"
+    )
+    namespace = subprocess.Popen(
+        [
+            "unshare", "--user", "--map-root-user", "--pid", "--fork",
+            "--kill-child", "--mount-proc", sys.executable, "-c", helper,
+            str(identity_path),
+        ],
+        env=source_environment(),
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 60
+        while not identity_path.exists():
+            assert time.monotonic() < deadline, "namespace helper never reported"
+            time.sleep(0.05)
+        recorded = json.loads(identity_path.read_text())
+        _rewrite_operator_fields(seal, **recorded)
+    finally:
+        terminate_process(namespace)
+    # The namespace (and its batch) is gone: no process carries the
+    # recorded inode, so the recorded generation is dead from here.
+    operator = wrkslots._seal_operator(json.loads(seal.read_text()))
+    assert operator is not None
+    deadline = time.monotonic() + 60
+    while wrkslots._namespace_operator_live(operator):
+        assert time.monotonic() < deadline, "killed namespace still reads live"
+        time.sleep(0.05)
+    assert wrkslots._namespace_operator_live(operator) is False
+
+    recovered = raw_command_with_census_authority_stub(
+        project,
+        "recover",
+        "--coordinator-authorized",
+        "--override-unjudgeable-seal",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+    assert recovered.returncode == 0, recovered.stderr
+    assert not seal.exists()
+    assert target.exists()
+
+
+@pytest.mark.ordinary_environment
+def test_writer_refuses_when_proc_is_not_its_own_namespaces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cold-review F2: without --mount-proc the writer's /proc is the host's.
+
+    _write_validate_batch_seal_journal is the real writer; the check
+    it relies on refuses when /proc/self does not resolve to the
+    writer's own pid (the visible table is the host's, and its
+    numbers are not the writer's), and passes with --mount-proc.
+    """
+
+    if not _unshare_available():
+        pytest.skip("user+PID namespaces are unavailable here")
+    from wrkslots.tests.test_lifecycle import source_environment
+
+    py_root = str(Path(wrkslots.__file__).resolve().parents[1])
+    helper = (
+        "import sys\n"
+        f"sys.path.insert(0, {py_root!r})\n"
+        "from wrkslots import cli\n"
+        "try:\n"
+        "    cli._assert_proc_consistent()\n"
+        "except cli.Refusal as exc:\n"
+        "    print(f'refused: {exc}')\n"
+        "    raise SystemExit(3)\n"
+        "print('consistent')\n"
+    )
+    without_mount = subprocess.run(
+        [
+            "unshare", "--user", "--map-root-user", "--pid", "--fork",
+            "--kill-child", sys.executable, "-c", helper,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=source_environment(),
+        timeout=300,
+    )
+    assert without_mount.returncode == 3, without_mount.stdout + without_mount.stderr
+    assert "refused:" in without_mount.stdout
+    with_mount = subprocess.run(
+        [
+            "unshare", "--user", "--map-root-user", "--pid", "--fork",
+            "--kill-child", "--mount-proc", sys.executable, "-c", helper,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=source_environment(),
+        timeout=300,
+    )
+    assert with_mount.returncode == 0, with_mount.stdout + with_mount.stderr
+    assert "consistent" in with_mount.stdout
 
 
 @pytest.mark.parametrize("actor", ("live", "other-host"))
@@ -946,12 +1655,9 @@ def test_earlier_boot_actor_is_orphaned_regardless_of_pid(
     project, _target, seal = _prepare(tmp_path, monkeypatch)
     _crash_sealed(project, seal)
     config = wrkslots._load_config(str(project), "testhost")
-    monkeypatch.setattr(
-        wrkslots, "_process_state", lambda _identity: ("live", "pid reused live")
-    )
-    monkeypatch.setattr(
-        wrkslots, "_validate_batch_seal_paired_finish", lambda *_a: None
-    )
+    # The operator is this live process, so nothing about it is proven
+    # dead while the journal's own boot is the current one.
+    _rewrite_operator(seal, os.getpid())
 
     orphaned, _reason = wrkslots._validate_batch_seal_orphaned(config, seal)
     assert orphaned is False  # journal actor boot is the real (later) boot here
@@ -1312,7 +2018,13 @@ def test_zombie_and_reused_pid_operators_are_dead_not_live(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A zombie operator, and a reused pid, are both dead (#1736)."""
+    """A zombie operator, and a reused pid, are both dead (#1736).
+
+    The reused PID proves death because the fixture's recording
+    carries this host's PID-namespace stamp (#1869 fix C): the number
+    was recorded here, and it now names a different generation. A
+    namespace-local recording would prove nothing instead.
+    """
 
     import time as _time
 

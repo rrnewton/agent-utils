@@ -15667,6 +15667,17 @@ def _all_journal_row(
     kind = text(raw.get("kind")) or ("validate-batch-seal" if seal else "unknown")
     identity = _journal_report_identity(raw) if raw else None
     owner_state = _process_state(identity)[0] if identity is not None else "unknown"
+    if seal and raw:
+        # The row's state names the batch (the recorded operator),
+        # not the authorizing actor, when the seal records one (#1869).
+        seal_operator = _seal_operator(raw)
+        if seal_operator is not None:
+            identity = seal_operator
+            owner_state = (
+                "dead"
+                if _seal_operator_proven_dead(seal_operator)[0]
+                else _process_state(seal_operator)[0]
+            )
     targets: list[str] = []
     if seal:
         try:
@@ -27318,18 +27329,8 @@ def _proc_superblock_options() -> tuple[str, ...]:
 _PROC_PROCESS_MOUNT = re.compile(r"/proc/[0-9]+(?:/.*)?", re.DOTALL)
 
 
-def _assert_host_process_view() -> None:
-    """Refuse unless ``/proc`` and control-group paths show the whole host.
-
-    Matching machine and boot identities do not show that this process can
-    see a host run.  In a child PID namespace the run and its children are
-    absent from /proc; in a child cgroup namespace their control-group paths
-    are rewritten relative to another root; procfs mounted with ``hidepid``
-    hides processes; and a mount over ``/proc/<pid>``, or a path inside it,
-    replaces that process's entries with another file system's.  Any of
-    them makes an absent run look ``dead``.  A mount there that a later
-    mount over ``/proc`` hides replaces nothing that path lookup reaches.
-    """
+def _assert_host_namespaces() -> None:
+    """Refuse unless this process is in the host's initial namespaces."""
 
     for name, initial in _INITIAL_NAMESPACE_INODES:
         try:
@@ -27341,6 +27342,18 @@ def _assert_host_process_view() -> None:
                 f"this process is not in the host's initial {name} namespace (inode "
                 f"{inode}), so its process table need not show the recorded runs"
             )
+
+
+def _assert_proc_consistent() -> None:
+    """Refuse unless ``/proc`` is this process's own namespace's procfs.
+
+    The non-namespace half of ``_assert_host_process_view``: /proc/self
+    resolves to our own pid, procfs is not mounted with ``hidepid``,
+    and no mount masks a process's entries. A judge stamping its own
+    PID namespace (#1869) still needs this: without ``--mount-proc``
+    the visible /proc is the host's, and its numbers are not ours.
+    """
+
     try:
         own = os.readlink("/proc/self")
     except OSError as exc:
@@ -27367,6 +27380,23 @@ def _assert_host_process_view() -> None:
                 f"a {entry.fstype} mount at {entry.point} masks that process's "
                 "entries in /proc, so its process table need not show the recorded runs"
             )
+
+
+def _assert_host_process_view() -> None:
+    """Refuse unless ``/proc`` and control-group paths show the whole host.
+
+    Matching machine and boot identities do not show that this process can
+    see a host run.  In a child PID namespace the run and its children are
+    absent from /proc; in a child cgroup namespace their control-group paths
+    are rewritten relative to another root; procfs mounted with ``hidepid``
+    hides processes; and a mount over ``/proc/<pid>``, or a path inside it,
+    replaces that process's entries with another file system's.  Any of
+    them makes an absent run look ``dead``.  A mount there that a later
+    mount over ``/proc`` hides replaces nothing that path lookup reaches.
+    """
+
+    _assert_host_namespaces()
+    _assert_proc_consistent()
 
 
 def _validation_run_host_evidence() -> tuple[
@@ -27945,7 +27975,13 @@ def _is_wrkslots_command(argv: Sequence[str]) -> bool:
     for index, argument in enumerate(argv):
         if argument == "wrkslots" and index > 0 and argv[index - 1] == "-m":
             runs_wrkslots = True
+        elif argument == "-mwrkslots":
+            runs_wrkslots = True
+        elif argument == "wrkslots.cli" and index > 0 and argv[index - 1] == "-m":
+            runs_wrkslots = True
         elif argument.endswith("/wrkslots/__main__.py"):
+            runs_wrkslots = True
+        elif argument.endswith("/wrkslots/cli.py"):
             runs_wrkslots = True
         elif os.path.basename(argument) == "wrkslots" and index <= 1:
             runs_wrkslots = True
@@ -28027,9 +28063,17 @@ def _other_live_wrkslots_processes(
         argv = [part.decode(errors="surrogateescape") for part in raw.split(b"\0") if part]
         if not _is_wrkslots_command(argv):
             continue
-        if targets and not any(
+        # A --slots-file names its slots in a file, not on the
+        # command line: it may act on any target, so it always counts.
+        if targets and "--slots-file" not in argv and not any(
             part == target
             or part.partition("=")[0] == target
+            or part.endswith(f"={target}")
+            or part.startswith(f"{target}=")
+            or (
+                part.startswith("--slot=")
+                and part.removeprefix("--slot=").split("=")[0] == target
+            )
             or f"/{target}/" in part
             or part.endswith(f"/{target}")
             for target in targets
@@ -28147,6 +28191,21 @@ def _process_state_legacy(identity: ProcessIdentity | None) -> tuple[str, str]:
         # A zombie has exited: its generation is dead even though the
         # unreaped /proc entry still matches (#1736 review). A pidfd on
         # it is already readable, so calling it live would spin waiters.
+        try:
+            stat = _read_process_stat(Path("/proc") / str(identity.pid))
+        except Refusal:
+            stat = None
+        if stat is not None and stat.state in {"Z", "X"}:
+            return "dead", f"PID {identity.pid} exited and awaits reaping"
+        return "live", f"PID {identity.pid} generation is live"
+    if (current.start_ticks, current.boot_id, current.host_id) == (
+        identity.start_ticks,
+        identity.boot_id,
+        identity.host_id,
+    ):
+        # The same generation in another cgroup (#1869): a cgroup move
+        # does not end a process, so only its cgroup path differing
+        # never reads as a reuse.
         try:
             stat = _read_process_stat(Path("/proc") / str(identity.pid))
         except Refusal:
@@ -41872,53 +41931,227 @@ def _seal_actor_crossed_boot(raw: Mapping[str, object]) -> bool:
         return False
 
 
+def _own_pidns_stamp() -> str:
+    """This process's own PID-namespace stamp, as seal writers record it."""
+
+    return f"pid:[{_namespace_inode('pid')}]"
+
+
+def _own_pidns_stamp_or_none() -> str | None:
+    try:
+        return _own_pidns_stamp()
+    except OSError:
+        return None
+
+
+def _seal_operator_proven_dead(identity: ProcessIdentity) -> tuple[bool, str]:
+    """Proven-dead evidence for one seal operator, or why it is not proven.
+
+    The judge is relative to the JUDGE's own PID namespace (#1869):
+    a missing or reused PID proves death only when the seal was
+    recorded in the judge's own namespace (its stamp equals the
+    judge's), because only then is the judge's PID view authoritative
+    for the recording. A seal stamped with another namespace is
+    unjudgeable from here (only an ended boot still proves death,
+    since nothing survives a reboot), and an unstamped legacy seal is
+    judged as before, under a verified whole-host process view. The
+    exact recorded generation (PID, start ticks, boot, host) as an
+    unreaped zombie also proves death; a generation that differs only
+    in its cgroup path moved cgroup and is the same live process.
+    """
+
+    try:
+        host_id = _host_id()
+        boot_id = _boot_id(Path("/proc"))
+    except Refusal as exc:
+        return False, f"the host identity is unverifiable: {exc}"
+    if identity.host_id != host_id:
+        return False, "the seal's batch belongs to another machine identity"
+    if identity.boot_id != boot_id:
+        # An earlier boot on this host: no process survives a reboot (#1764).
+        return True, "the seal's batch ran in an earlier boot"
+    stamp = identity.pidns_inode
+    own_stamp = _own_pidns_stamp_or_none()
+    if own_stamp is None:
+        return False, "this process's own PID namespace cannot be read"
+    if stamp is not None and stamp != own_stamp:
+        return False, (
+            "the seal's operator was recorded in another PID namespace "
+            f"({stamp}), so its PID proves nothing from here"
+        )
+    if stamp is None:
+        try:
+            _assert_host_process_view()
+        except Refusal as exc:
+            return False, f"the host process view is unverifiable: {exc}"
+    else:
+        try:
+            _assert_proc_consistent()
+        except Refusal as exc:
+            return False, f"the process view is unverifiable: {exc}"
+    try:
+        current = _read_process_identity(identity.pid)
+    except Refusal as exc:
+        if "is not live" in str(exc):
+            return True, f"its batch PID {identity.pid} is dead: {exc}"
+        return False, f"the seal's batch cannot be judged: {exc}"
+    if (current.start_ticks, current.boot_id, current.host_id) != (
+        identity.start_ticks,
+        identity.boot_id,
+        identity.host_id,
+    ):
+        return True, f"PID {identity.pid} was reused; the recorded generation exited"
+    try:
+        stat = _read_process_stat(Path("/proc") / str(identity.pid))
+    except Refusal:
+        stat = None
+    if stat is not None and stat.state in {"Z", "X"}:
+        return True, f"its batch PID {identity.pid} exited and awaits reaping"
+    return False, f"the seal's batch is live: PID {identity.pid} generation is live"
+
+
+def _namespace_operator_live(operator: ProcessIdentity) -> bool:
+    """Whether the batch a namespace-stamped seal records is alive in it.
+
+    Resolves the recorded namespace through ``/proc/*/ns/pid``: a
+    process in that namespace whose innermost namespace PID (``NSpid``)
+    and start ticks match the recording is the recorded generation,
+    alive in its namespace however invisible its work is from here.
+    """
+
+    if operator.pidns_inode is None:
+        return False
+    match = re.fullmatch(r"pid:\[(\d+)\]", operator.pidns_inode)
+    if match is None:
+        return False
+    inode = int(match.group(1))
+    # Only the NSpid scan judges: the recorded PID is namespace-local
+    # and is never looked up in this process table (its number here
+    # names other processes entirely). If no process carries the
+    # recorded namespace inode, that namespace is gone and so is its
+    # batch; an unreadable namespace link on a matching process
+    # counts as live (fail closed) via the status read below.
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            if os.stat(entry / "ns" / "pid").st_ino != inode:
+                continue
+        except OSError:
+            continue
+        try:
+            status = (entry / "status").read_text(encoding="utf-8")
+        except FileNotFoundError:
+            continue
+        except OSError:
+            # A process in the recorded namespace whose status cannot
+            # be read might be the batch: unreadable means live.
+            return True
+        nspid: int | None = None
+        for line in status.splitlines():
+            if line.startswith("NSpid:"):
+                fields = line.split()[1:]
+                if fields:
+                    try:
+                        nspid = int(fields[-1])
+                    except ValueError:
+                        nspid = None
+                break
+        if nspid != operator.pid:
+            continue
+        try:
+            stat = _read_process_stat(entry)
+        except Refusal:
+            continue
+        if stat is not None and stat.start_ticks == operator.start_ticks:
+            return True
+    return False
+
+
+def _assert_no_live_batch_for_seal_override(
+    config: Config,
+    raw: Mapping[str, object],
+    targets: Sequence[tuple[str, int, _PrivateCleanupTarget]],
+) -> None:
+    """Refuse an override retirement while any batch may still act (#1869)."""
+
+    names = tuple(
+        dict.fromkeys(
+            [slot for slot, _generation, _target in targets]
+            + [str(target.path) for _slot, _generation, target in targets]
+        )
+    )
+    unreadable: list[int] = []
+    operators = _other_live_wrkslots_processes(
+        config.root, targets=names, unreadable=unreadable
+    )
+    if operators == [-1]:
+        raise Refusal(
+            "the process list cannot be read, so no batch acting on the "
+            "sealed targets can be ruled out; the override retires nothing"
+        )
+    if operators:
+        raise Refusal(
+            f"a wrkslots process (pid {operators[0]}) is still acting on "
+            "the sealed targets; the override retires nothing while a "
+            "batch may be running"
+        )
+    operator = _seal_operator(raw)
+    if operator is not None and _namespace_operator_live(operator):
+        raise Refusal(
+            "the batch the seal records is alive in its PID namespace "
+            f"(recorded pid {operator.pid}); the override retires nothing"
+        )
+
+
 def _validate_batch_seal_orphaned(config: Config, path: Path) -> tuple[bool, str]:
     """Whether the seal journal at ``path`` was left by a batch proven gone.
 
     The batch process recorded in the seal's extension slot governs
-    (#1736): the seal is orphaned when that operator is proven dead
-    or ran in an earlier boot on this host (#1764: dead regardless of
-    any pid check), whatever the authorizing coordinator -- routinely
-    a long-lived harness -- is still doing. Coordinator liveness alone
-    never keeps a seal alive. A seal recording no operator (written
-    before the slot existed) is judged by its actor the old way. A
-    live or indeterminate operator, an operator from another machine,
-    an unreadable journal, or a paired finish all keep the seal
-    binding. Such an orphan is what a validate-batch removal leaves
-    when its process is killed before its ``finally`` retires the
-    seal: nothing can still be using it
+    (#1736): the seal is orphaned only when that operator is proven
+    dead under ``_seal_operator_proven_dead``, whatever the authorizing
+    coordinator -- routinely a long-lived harness -- is still doing.
+    Coordinator liveness alone never keeps a seal alive, and a seal
+    recording no operator is never auto-recovered: only ``recover``
+    retires it, because its actor alone cannot prove the batch is gone
+    (#1869). A live or indeterminate operator, an operator from
+    another machine, an unreadable journal, or a paired finish all
+    keep the seal binding. Such an orphan is what a validate-batch
+    removal leaves when its process is killed before its ``finally``
+    retires the seal: nothing can still be using it
     (https://github.com/rrnewton/agent-utils/issues/236).
     """
     try:
         _raw, targets = _validate_batch_seal_journal(
             config, path, _read_json(path, "validation-batch seal journal")
         )
+        operator = _seal_operator(_raw)
+        if operator is None:
+            return False, "the seal records no operator; only recover retires it"
         identity = _identity_from_obj(
             _raw["actor"], "validation-batch seal journal.actor"
         )
-        if identity is None:
-            return False, "the seal records no actor"
-        host_id = _host_id()
-        boot_id = _boot_id(Path("/proc"))
-        operator = _seal_operator(_raw)
-        judged = operator if operator is not None else identity
-        if judged.host_id != host_id:
-            return False, "the seal's batch belongs to another machine identity"
-        if judged.boot_id != boot_id or (
-            identity.host_id == host_id and identity.boot_id != boot_id
-        ):
-            # An earlier boot on this host, on either recorded
-            # identity: no process survives a reboot (#1764).
-            reason = "the seal's batch ran in an earlier boot"
-        else:
-            state, reason = _process_state(judged)
-            if state != "dead":
-                return False, f"the seal's batch is {state}: {reason}"
+        if identity is not None:
+            try:
+                actor_boot_ended = identity.host_id == _host_id() and (
+                    identity.boot_id != _boot_id(Path("/proc"))
+                )
+            except Refusal:
+                actor_boot_ended = False
+            if actor_boot_ended:
+                # The journal itself predates this boot: nothing it
+                # records survived the reboot, whatever its PID says now.
+                if _validate_batch_seal_paired_finish(config, targets) is not None:
+                    return False, "a finish journal is paired with the seal"
+                return True, "the seal's batch ran in an earlier boot"
+        dead, reason = _seal_operator_proven_dead(operator)
+        if not dead:
+            return False, reason
         if _validate_batch_seal_paired_finish(config, targets) is not None:
             return False, "a finish journal is paired with the seal"
     except (Refusal, StateError) as exc:
         return False, f"the seal cannot be judged: {exc}"
-    return True, f"its batch PID {judged.pid} is dead: {reason}"
+    return True, reason
 
 
 def _validate_batch_seal_owner_liveness(
@@ -41959,6 +42192,20 @@ def _validate_batch_seal_owner_liveness(
     except Refusal as exc:
         return "unknown", identity.pid, since, str(exc)
     operator = _seal_operator(raw)
+    if operator is not None and operator.pidns_inode == _own_pidns_stamp_or_none():
+        try:
+            _assert_proc_consistent()
+        except Refusal as exc:
+            return "unknown", identity.pid, since, str(exc)
+    elif operator is None or operator.pidns_inode != _own_pidns_stamp_or_none():
+        try:
+            _assert_host_process_view()
+        except Refusal as exc:
+            # From inside a namespace every host batch looks gone; no
+            # liveness answer from here may retire a seal (#1869). A
+            # seal stamped with this namespace needs no host view:
+            # this process table is authoritative for it.
+            return "unknown", identity.pid, since, str(exc)
     if operator is not None and operator.pid == os.getpid():
         # This process is the batch itself (or its in-process
         # continuation): it never blocks itself, exactly as the
@@ -41967,6 +42214,8 @@ def _validate_batch_seal_owner_liveness(
     if operator is not None:
         # The recorded batch process is the proven identity (#1736):
         # judge it alone, with no pid-reuse risk from a cmdline scan.
+        # "dead" takes the orphan proof (#1869): a reused PID, a
+        # cgroup move, or a namespace-local recording never counts.
         if operator.host_id != host_id:
             return (
                 "unknown",
@@ -41976,16 +42225,17 @@ def _validate_batch_seal_owner_liveness(
             )
         if operator.boot_id != boot_id:
             return "dead", operator.pid, since, "the recorded machine boot ended"
+        dead, dreason = _seal_operator_proven_dead(operator)
+        if dead:
+            return "dead", operator.pid, since, dreason
         ostate, oreason = _process_state(operator)
         if ostate == "live":
             return "live", operator.pid, since, oreason
-        if ostate == "dead":
-            return "dead", operator.pid, since, oreason
         return (
             "unknown",
             operator.pid,
             since,
-            f"the seal's operator is {ostate}: {oreason}",
+            f"the seal's operator is not proven dead: {dreason}",
         )
     if identity.host_id != host_id:
         return (
@@ -42075,12 +42325,19 @@ def _classify_blocking_seal_reasons(config: Config) -> list[dict[str, object]]:
             kind = "validate-batch-seal"
             operation = "remove-validate-batch"
             targets = [slot for slot, _gen, _t in parsed_targets]
-            identity = _identity_from_obj(
+            # The state names the batch (the recorded operator), not
+            # the authorizing actor, whenever the seal records one
+            # (#1869): the actor routinely outlives the batch.
+            operator = _seal_operator(raw)
+            identity = operator or _identity_from_obj(
                 raw.get("actor"), "validation-batch seal journal.actor"
             )
             if identity is not None:
-                state, _reason = _process_state(identity)
-                actor_state = state if state in {"live", "dead"} else "unknown"
+                if operator is not None and _seal_operator_proven_dead(operator)[0]:
+                    actor_state = "dead"
+                else:
+                    state, _reason = _process_state(identity)
+                    actor_state = state if state in {"live", "dead"} else "unknown"
         reasons.append(
             {
                 "actor_state": actor_state,
@@ -42096,7 +42353,7 @@ def _classify_blocking_seal_reasons(config: Config) -> list[dict[str, object]]:
 def _recover_orphaned_validate_batch_seal(config: Config) -> None:
     """Retire this machine's seal journal when its actor is proven dead.
 
-    Called only under the mutation locks of ``create``. The recovery is the
+    Called under the mutation locks of ``create`` and ``adopt``. The recovery is the
     seal-only one ``wrkslots recover`` performs: it restores each sealed
     directory's mode, or resolves a target that is already gone. A failed
     recovery leaves the seal in place and does not stop the create, which
@@ -42124,6 +42381,87 @@ def _recover_orphaned_validate_batch_seal(config: Config) -> None:
         f"wrkslots: recovered the validation-batch seal {path.name}; {reason}",
         file=sys.stderr,
     )
+
+
+def _assert_adopt_seal_overlap(config: Config, record: ActiveRecord) -> None:
+    """Refuse an adopt whose slot a validation-batch seal protects (#1869).
+
+    Runs as soon as the record is loaded and retires nothing: the
+    sealed slot itself, a directory containing or inside a sealed
+    path, or the sealed directory itself under another name (the
+    recorded (device, inode) decides, so a bind mount cannot rename
+    it away) keeps the canonical partial-state refusal, which names
+    'wrkslots recover' for a dead batch and never for a live one.
+    """
+
+    try:
+        loaded = _load_validate_batch_seal_journal(config)
+    except (Refusal, StateError):
+        _refuse_partial_state(config)
+        return
+    if loaded is None:
+        return
+    _path, _raw, targets = loaded
+    slot_path = _slot_directory(config, record.slot, record.slot_type)
+    try:
+        slot_stat = slot_path.stat()
+        slot_identity: tuple[int, int] | None = (slot_stat.st_dev, slot_stat.st_ino)
+    except OSError:
+        slot_identity = None
+    for sealed_slot, _generation, target in targets:
+        same_directory = slot_identity is not None and (
+            target.identity[0],
+            target.identity[1],
+        ) == slot_identity
+        if (
+            sealed_slot == record.slot
+            or same_directory
+            or _path_is_within(slot_path, target.path)
+            or _path_is_within(target.path, slot_path)
+        ):
+            _refuse_partial_state(config)
+            raise StateError("seal overlap refusal did not raise")
+
+
+def _recover_adopt_beside_seal(config: Config, record: ActiveRecord) -> None:
+    """Retire or pass a seal the adopted slot is disjoint from (#1869).
+
+    Runs only after every adopt precondition has passed, just before
+    the write, so a refused adopt never retires a seal: an orphaned
+    seal (operator proven dead, no paired finish) is recovered
+    seal-only; a seal that remains -- live, unjudgeable, or paired --
+    is proceeded beside, with a note naming it and its remedy.
+    """
+
+    try:
+        loaded = _load_validate_batch_seal_journal(config)
+    except (Refusal, StateError):
+        _refuse_partial_state(config)
+        return
+    if loaded is None:
+        return
+    path, raw, targets = loaded
+    _recover_orphaned_validate_batch_seal(config)
+    if path.is_file():
+        operator = _seal_operator(raw)
+        proven_dead = (
+            operator is not None and _seal_operator_proven_dead(operator)[0]
+        )
+        # The recover remedy is named only for a batch proven dead
+        # (#1869): for a live or unjudgeable one it would invite
+        # retiring a running batch's seal.
+        remedy = (
+            "recover it with 'wrkslots recover --coordinator-pid "
+            "<coordinator-pid>'"
+            if proven_dead
+            else "it still binds its sealed targets; this slot is disjoint from them"
+        )
+        print(
+            f"wrkslots: proceeding beside the validation-batch seal in {path.name} "
+            f"({len(targets)} sealed target(s), none overlapping slot {record.slot}); "
+            f"{remedy}",
+            file=sys.stderr,
+        )
 
 
 def _refuse_partial_state(
@@ -47748,7 +48086,12 @@ def _cmd_adopt(args: argparse.Namespace) -> int:
         reference: _RegistryIdentity | None,
         prepared: tuple[list[ActiveState], list[ArchiveState]] | None,
     ) -> ActiveRecord | None:
-        _refuse_partial_state(config)
+        # A validation-batch seal (#1869) is allowed past the
+        # partial-state check: _assert_adopt_seal_overlap refuses an
+        # overlapping slot once the record is loaded, and
+        # _recover_adopt_beside_seal recovers or passes a disjoint
+        # one only after every precondition has passed.
+        _refuse_partial_state(config, allow_validate_batch_seals=True)
         if prepared is None:
             _assert_no_journal(config)
             states, archives = validate()
@@ -47765,6 +48108,7 @@ def _cmd_adopt(args: argparse.Namespace) -> int:
         state = _load_active(config) if local is None else local.active
         record = _find_record(state, args.slot)
         _report_dead_for_record(config, states, record)
+        _assert_adopt_seal_overlap(config, record)
         _expected_generation(record, args.expected_generation)
         if record.agent != args.agent:
             raise Refusal(
@@ -47795,6 +48139,9 @@ def _cmd_adopt(args: argparse.Namespace) -> int:
         _assert_caller_process(confirmed_owner, "owner")
         if task_scope is not None:
             _verify_task_scope_invocation(task_scope)
+        # Every adopt precondition has passed; only now may the seal be
+        # recovered or passed, so a refused adopt never retires one (#1869).
+        _recover_adopt_beside_seal(config, record)
         now = _utc_now()
         adopted = dataclasses.replace(
             record,
@@ -68793,6 +69140,16 @@ def _seal_validate_batch_targets(
             selected_record = None
             create_rows = ()
         _assert_remove_processes(coordinator, runner, handoff_writer, proof_fd)
+        # The seal records this process's identity from /proc: refuse
+        # when /proc is not this namespace's own (an unmounted-proc
+        # namespace would record host numbers under a namespace stamp).
+        try:
+            _assert_proc_consistent()
+        except Refusal as exc:
+            raise Refusal(
+                "validation-batch seals are written only when /proc is "
+                f"the writer's own namespace's: {exc}"
+            ) from exc
         seal_journal: dict[str, object] = {
             "schema": _VALIDATE_BATCH_SEAL_SCHEMA,
             "kind": "validate-batch-seal",
@@ -68804,9 +69161,18 @@ def _seal_validate_batch_targets(
             # exact keys and ignore "x", still parse and can retire
             # this seal: the actor above is the authorizing
             # coordinator, which routinely outlives the batch, so
-            # liveness judges this proven identity instead.
+            # liveness judges this proven identity instead. The PID
+            # namespace inode is stamped (whatever namespace this
+            # batch runs in) so a later reader can tell a host-recorded
+            # PID from a namespace-local one, and never counts the
+            # latter's absence as death.
             "x": {
-                "operator": _identity_to_obj(_read_process_identity(os.getpid()))
+                "operator": _identity_to_obj(
+                    dataclasses.replace(
+                        _read_process_identity(os.getpid()),
+                        pidns_inode=f"pid:[{_namespace_inode('pid')}]",
+                    )
+                )
             },
             "targets": [],
         }
@@ -96057,6 +96423,7 @@ def _cmd_recover(
     emit: bool = True,
 ) -> int:
     _reset_dead_mount_findings()
+    seal_override: dict[str, object] | None = None
     config = _load_config(args.project_root, args.machine)
     coordinator, runner, handoff_writer, proof_fd = _capture_remove_processes(
         args.coordinator_pid
@@ -96318,6 +96685,21 @@ def _cmd_recover(
                     # --coordinator-authorized every coordinator run
                     # passes -- is the coordinator's explicit decision,
                     # given only after confirming no batch is running.
+                    # A namespace-stamped seal is never pointed at it:
+                    # its batch cannot be judged from here at all.
+                    seal_ns_operator = _seal_operator(_seal_raw)
+                    if seal_ns_operator is not None and seal_ns_operator.pidns_inode not in (
+                        None,
+                        _own_pidns_stamp_or_none(),
+                    ):
+                        raise Refusal(
+                            f"validation-batch seal recorded in {_seal_path}; "
+                            "it was recorded under a different PID namespace "
+                            f"({seal_ns_operator.pidns_inode}) than this "
+                            "process's, so its batch cannot be judged from "
+                            "here; judge it from the namespace that "
+                            "recorded it, or leave it binding"
+                        )
                     raise Refusal(
                         f"validation-batch seal recorded in {_seal_path}; "
                         f"its owner cannot be proven dead here "
@@ -96332,6 +96714,42 @@ def _cmd_recover(
                         "--override-unjudgeable-seal requires "
                         "--coordinator-authorized as well"
                     )
+                if _seal_state != "dead":
+                    # An override retirement is auditable and never
+                    # blind (#1869): it may judge only its own
+                    # namespace's seals, or any seal from a verified
+                    # host view; no live batch may be acting on the
+                    # sealed targets, including one inside the PID
+                    # namespace the seal records, and the decision is
+                    # recorded in the recovery event's free-form
+                    # evidence (no new event kind or field).
+                    stamp_operator = _seal_operator(_seal_raw)
+                    if (
+                        stamp_operator is None
+                        or stamp_operator.pidns_inode != _own_pidns_stamp()
+                    ):
+                        try:
+                            _assert_host_process_view()
+                        except Refusal as exc:
+                            raise Refusal(
+                                "the override cannot judge a seal recorded "
+                                f"outside this PID namespace from here: {exc}"
+                            ) from exc
+                    _assert_no_live_batch_for_seal_override(
+                        config, _seal_raw, sealed_targets
+                    )
+                    # Written only once the retirement below succeeds.
+                    seal_override = {
+                        "seal": _seal_path.name,
+                        "operator": (
+                            _identity_to_obj(stamp_operator)
+                            if stamp_operator is not None
+                            else None
+                        ),
+                        "recorded_at": _utc_now(),
+                        "reason": "override-unjudgeable-seal",
+                        "detail": _seal_detail,
+                    }
                 # #885: an exact-slot create journal that overlaps no seal
                 # target is recovered before the seal, whose pairing would
                 # otherwise classify (and possibly refuse on) that journal
@@ -96417,6 +96835,18 @@ def _cmd_recover(
                         config,
                         recovery_kind=_ValidateBatchSealRecoveryKind.SEAL_ONLY,
                     )
+                    if seal_override is not None:
+                        _ensure_event_log(config)
+                        _write_event_file(
+                            config,
+                            config.machine,
+                            "partial-updates-recovered",
+                            {
+                                "actor": _identity_to_obj(coordinator),
+                                "coordinator_authorized": True,
+                                "seal_override": seal_override,
+                            },
+                        )
                     return 0
                 elif paired_finish is not None:
                     paired_slots = {
@@ -96714,6 +97144,18 @@ def _cmd_recover(
                     config,
                     recovery_kind=_ValidateBatchSealRecoveryKind.SEAL_ONLY,
                 )
+                if seal_override is not None:
+                    _ensure_event_log(config)
+                    _write_event_file(
+                        config,
+                        config.machine,
+                        "partial-updates-recovered",
+                        {
+                            "actor": _identity_to_obj(coordinator),
+                            "coordinator_authorized": True,
+                            "seal_override": seal_override,
+                        },
+                    )
         if kind == "finish" and seal_journals:
             after_states, after_archives = (
                 _validate_global_state_for_finish_recovery(config, raw)

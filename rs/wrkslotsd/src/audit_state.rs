@@ -5633,19 +5633,7 @@ fn audit_mount_entries() -> Result<Vec<AuditMountEntry>> {
 /// The host process/cgroup view proof: retained-handle `dead`
 /// judgements are only as good as the process table and the
 /// whole cgroup hierarchy being visible from here.
-fn assert_host_process_view() -> Result<()> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    for (name, expected) in [("pid", 0xEFFF_FFFCu64), ("cgroup", 0xEFFF_FFFBu64)] {
-        let metadata = std::fs::metadata(format!("/proc/self/ns/{name}"))
-            .map_err(|error| format!("cannot read this process's {name} namespace: {error}"))?;
-        if metadata.ino() != expected {
-            return Err(format!(
-                "this process is not in the host's initial {name} namespace (inode {}), so its process table need not show the recorded runs",
-                metadata.ino()
-            ));
-        }
-    }
+pub(crate) fn assert_proc_consistent() -> Result<()> {
     let own = std::fs::read_link("/proc/self")
         .map_err(|error| format!("cannot resolve /proc/self: {error}"))?;
     if own.to_string_lossy() != std::process::id().to_string() {
@@ -5688,6 +5676,31 @@ fn assert_host_process_view() -> Result<()> {
             ));
         }
     }
+    let _ = std::fs::metadata("/proc/self/ns/pid")
+        .map_err(|error| format!("cannot read this process's pid namespace: {error}"))?;
+    Ok(())
+}
+
+pub(crate) fn assert_host_namespaces() -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    for (name, expected) in [("pid", 0xEFFF_FFFCu64), ("cgroup", 0xEFFF_FFFBu64)] {
+        let metadata = std::fs::metadata(format!("/proc/self/ns/{name}"))
+            .map_err(|error| format!("cannot read this process's {name} namespace: {error}"))?;
+        if metadata.ino() != expected {
+            return Err(format!(
+                "this process is not in the host's initial {name} namespace (inode {}), so its process table need not show the recorded runs",
+                metadata.ino()
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn assert_host_process_view() -> Result<()> {
+    assert_host_namespaces()?;
+    assert_proc_consistent()?;
+    let entries = audit_mount_entries()?;
     let cgroup_root = "/sys/fs/cgroup";
     let cgroup_index = entries
         .iter()
@@ -6626,7 +6639,11 @@ fn cleanup_target(cfg: &Cfg, value: &Value, label: &str) -> Result<(String, i64,
         label,
     )?;
     if let Some(fs_id) = raw.get("fs_id") {
-        as_int(fs_id, &format!("{label}.fs_id"), 0)?;
+        // A filesystem id is an unsigned 64-bit value (#1869): it
+        // routinely exceeds i64, which the writer's integers do not.
+        if fs_id.as_u64().is_none() {
+            return Err(format!("{label}.fs_id must be a non-negative integer"));
+        }
     }
     let slot = validate_name(as_str(&raw["slot"], &format!("{label}.slot"))?, "slot")?;
     let generation = as_int(&raw["generation"], &format!("{label}.generation"), 1)?;

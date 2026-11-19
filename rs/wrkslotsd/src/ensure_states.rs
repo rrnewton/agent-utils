@@ -781,15 +781,45 @@ pub(crate) fn seal_owner_liveness(
             let Some(operator) = crate::status_state::identity_from_value(operator_value) else {
                 return unknown("the seal records no operator".to_string());
             };
+            // "dead" takes the orphan proof (#1869), judged
+            // relative to this process's own PID namespace: only a
+            // recording from this namespace (or an unstamped legacy
+            // seal under the verified host view) lets a missing or
+            // reused PID count.
+            let own_stamp = {
+                use std::os::unix::fs::MetadataExt as _;
+                std::fs::metadata("/proc/self/ns/pid")
+                    .map(|metadata| format!("pid:[{}]", metadata.ino()))
+                    .unwrap_or_default()
+            };
+            if (operator.pidns_inode.as_deref() == Some(own_stamp.as_str())
+                && crate::audit_state::assert_proc_consistent().is_err())
+                || (operator.pidns_inode.as_deref() != Some(own_stamp.as_str())
+                    && crate::audit_state::assert_host_process_view().is_err())
+            {
+                return (
+                    "unknown".to_string(),
+                    Some(operator.pid),
+                    since,
+                    "the host process view is unverifiable".to_string(),
+                );
+            }
+            if crate::classify_journals::seal_operator_proven_dead(&operator) {
+                return (
+                    "dead".to_string(),
+                    Some(operator.pid),
+                    since,
+                    "the seal's operator is proven dead".to_string(),
+                );
+            }
             let (ostate, odetail) = crate::status_state::process_state(Some(&operator));
             return match ostate.as_str() {
                 "live" => ("live".to_string(), Some(operator.pid), since, odetail),
-                "dead" => ("dead".to_string(), Some(operator.pid), since, odetail),
                 _ => (
                     "unknown".to_string(),
                     Some(operator.pid),
                     since,
-                    format!("the seal's operator is {ostate}: {odetail}"),
+                    format!("the seal's operator is not proven dead: {odetail}"),
                 ),
             };
         }

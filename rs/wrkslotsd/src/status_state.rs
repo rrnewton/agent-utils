@@ -87,7 +87,7 @@ pub(crate) fn optional_pidns_inode(value: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-fn host_id() -> std::result::Result<String, String> {
+pub(crate) fn host_id() -> std::result::Result<String, String> {
     let candidates = ["/etc/machine-id", "/var/lib/dbus/machine-id"];
     let mut failures: Vec<String> = Vec::new();
     for path in candidates {
@@ -540,12 +540,13 @@ pub(crate) fn process_state(identity: Option<&Identity>) -> (String, String) {
         Ok(current) => {
             // The dual namespace fields are evidence, not generation:
             // a pre-namespace record must compare equal to a current
-            // reading of the same generation (#1300 Phase 2a).
+            // reading of the same generation (#1300 Phase 2a). The
+            // cgroup path is not generation either (#1869): a process
+            // that moved cgroup is the same live generation.
             let same_generation = current.pid == identity.pid
                 && current.start_ticks == identity.start_ticks
                 && current.boot_id == identity.boot_id
-                && current.host_id == identity.host_id
-                && current.cgroup_path == identity.cgroup_path;
+                && current.host_id == identity.host_id;
             if same_generation {
                 // A zombie has exited (#1736 review): dead even
                 // though the unreaped /proc entry still matches.

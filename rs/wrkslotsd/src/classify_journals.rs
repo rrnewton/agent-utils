@@ -788,9 +788,21 @@ fn all_journal_row(cfg: &Cfg, path: &Path, seal: bool) -> Value {
     } else {
         report_identity(&raw)
     };
-    let owner_state = match &identity {
-        Some(identity) => process_state(Some(identity)).0,
-        None => "unknown".to_string(),
+    // For a seal the row names the batch (the recorded operator),
+    // not the authorizing actor, when one is recorded (#1869).
+    let seal_operator = if seal {
+        raw.get("x")
+            .and_then(|extension| extension.get("operator"))
+            .and_then(crate::status_state::identity_from_value)
+    } else {
+        None
+    };
+    let owner_state = match &seal_operator {
+        Some(operator) if seal_operator_proven_dead(operator) => "dead".to_string(),
+        _ => match &identity {
+            Some(identity) => process_state(Some(identity)).0,
+            None => "unknown".to_string(),
+        },
     };
     let mut targets: Vec<String> = Vec::new();
     let blocks = if seal {
@@ -820,7 +832,10 @@ fn all_journal_row(cfg: &Cfg, path: &Path, seal: bool) -> Value {
         "journal": absolute_path(path).to_string_lossy(),
         "kind": kind,
         "machine": text("machine"),
-        "owner_pid": identity.as_ref().map(|identity| identity.pid),
+        "owner_pid": seal_operator
+            .as_ref()
+            .map(|operator| operator.pid)
+            .or_else(|| identity.as_ref().map(|identity| identity.pid)),
         "owner_state": owner_state,
         "slot": text("slot"),
         "targets": targets,
@@ -933,10 +948,68 @@ fn classify_all_journals(
     Ok(out)
 }
 
+/// Proven-dead evidence for one seal operator, mirroring
+/// `_seal_operator_proven_dead`, judged relative to this process's
+/// own PID namespace: only a recorded boot that ended, a PID absent
+/// or reused under the seal's own namespace stamp (an unstamped
+/// legacy seal under a verified whole-host view), or the exact
+/// recorded generation as an unreaped zombie counts.
+pub(crate) fn seal_operator_proven_dead(identity: &crate::status_state::Identity) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let (Ok(host), Ok(boot)) = (
+        crate::status_state::host_id(),
+        crate::status_state::boot_id(),
+    ) else {
+        return false;
+    };
+    if identity.host_id != host {
+        return false;
+    }
+    if identity.boot_id != boot {
+        return true;
+    }
+    // Relative to the judge's own PID namespace (#1869): only a
+    // recording from this namespace lets a missing or reused PID
+    // prove death; a foreign stamp is unjudgeable from here, and an
+    // unstamped legacy seal needs the verified host view.
+    let own_stamp = std::fs::metadata("/proc/self/ns/pid")
+        .map(|metadata| format!("pid:[{}]", metadata.ino()))
+        .unwrap_or_default();
+    match identity.pidns_inode.as_deref() {
+        Some(stamp) if stamp != own_stamp => return false,
+        None if crate::audit_state::assert_host_process_view().is_err() => return false,
+        Some(_) if crate::audit_state::assert_proc_consistent().is_err() => return false,
+        _ => {}
+    }
+    match crate::status_state::read_process_identity(identity.pid) {
+        Err(message) => message.contains("is not live"),
+        Ok(current) => {
+            if (current.start_ticks, current.boot_id, current.host_id)
+                != (
+                    identity.start_ticks,
+                    identity.boot_id.clone(),
+                    identity.host_id.clone(),
+                )
+            {
+                return true;
+            }
+            std::fs::read_to_string(format!("/proc/{}/stat", identity.pid))
+                .ok()
+                .and_then(|text| {
+                    text.rsplit_once(')')
+                        .map(|(_, rest)| rest.trim_start().starts_with(['Z', 'X']))
+                })
+                .unwrap_or(false)
+        }
+    }
+}
+
 /// Whether the seal at `path` was left by a process proven dead,
-/// mirroring `_validate_batch_seal_orphaned`: valid seal, actor on
-/// this host and boot, process dead, and no finish journal paired
-/// with it. Any doubt keeps the seal binding.
+/// mirroring `_validate_batch_seal_orphaned`: valid seal, a recorded
+/// operator proven dead (or a journal from an earlier boot), and no
+/// finish journal paired with it. A seal recording no operator is
+/// never orphaned here. Any doubt keeps the seal binding.
 fn seal_orphaned(cfg: &Cfg, path: &Path) -> bool {
     let Ok(value) = crate::audit_state::read_seal_json(path) else {
         return false;
@@ -950,15 +1023,22 @@ fn seal_orphaned(cfg: &Cfg, path: &Path) -> bool {
     let Some(identity) = crate::status_state::identity_from_value(actor) else {
         return false;
     };
-    // The recorded batch process governs (#1736): orphaned iff it is
-    // dead (an earlier boot is dead via process_state), whatever the
-    // authorizing coordinator is still doing.
-    let operator = value
+    // The recorded batch process governs (#1736), and only it: a
+    // seal recording no operator is never auto-judged orphaned.
+    let Some(operator) = value
         .get("x")
         .and_then(|extension| extension.get("operator"))
-        .and_then(crate::status_state::identity_from_value);
-    let judged = operator.as_ref().unwrap_or(&identity);
-    if crate::status_state::process_state(Some(judged)).0 != "dead" {
+        .and_then(crate::status_state::identity_from_value)
+    else {
+        return false;
+    };
+    // A journal from an earlier boot predates every process now
+    // running, whatever its recorded PID says (#1869).
+    let actor_boot_ended = crate::status_state::host_id().is_ok_and(|host| {
+        identity.host_id == host
+            && crate::status_state::boot_id().is_ok_and(|boot| identity.boot_id != boot)
+    });
+    if !actor_boot_ended && !seal_operator_proven_dead(&operator) {
         return false;
     }
     // A paired finish keeps the seal binding; any outstanding finish
@@ -998,9 +1078,21 @@ fn seal_blocking_reasons(cfg: &Cfg) -> Vec<Value> {
                 kind = "validate-batch-seal".to_string();
                 operation = "remove-validate-batch".to_string();
                 targets = parsed.1.iter().map(|(slot, _g, _p)| slot.clone()).collect();
-                if let Some(actor) = value.get("actor") {
-                    if let Some(identity) = crate::status_state::identity_from_value(actor) {
-                        let state = crate::status_state::process_state(Some(&identity)).0;
+                let operator = value
+                    .get("x")
+                    .and_then(|extension| extension.get("operator"))
+                    .and_then(crate::status_state::identity_from_value);
+                let proven_dead = operator.as_ref().is_some_and(seal_operator_proven_dead);
+                let judged = operator.or_else(|| {
+                    value
+                        .get("actor")
+                        .and_then(crate::status_state::identity_from_value)
+                });
+                if let Some(identity) = &judged {
+                    if proven_dead {
+                        actor_state = "dead".to_string();
+                    } else {
+                        let state = crate::status_state::process_state(Some(identity)).0;
                         if state == "live" || state == "dead" {
                             actor_state = state;
                         }

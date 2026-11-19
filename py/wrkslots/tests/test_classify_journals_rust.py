@@ -402,6 +402,9 @@ def _write_seal(
                 "path": "worktrees/validate/target",
                 "original_mode": 0o755,
                 "identity": [info.st_dev, info.st_ino, 0o40755],
+                # Real seals carry the filesystem id (#1869 N2): an
+                # unsigned 64-bit value beyond i64 range.
+                "fs_id": 17679763788836989252,
             }
         ]
     seal = control / "VALIDATE-BATCH-SEAL.node-a.journal"
@@ -461,13 +464,61 @@ def test_classify_live_seal_structured_blocking_reason_matches_python(
     assert reasons[0]["targets"] == ["target"]
 
 
+@pytest.mark.parametrize(
+    "shape,blocking",
+    (
+        ("no-operator", True),
+        ("operator-reused", False),
+        ("operator-moved-cgroup", True),
+    ),
+)
+def test_classify_unproven_dead_seal_blocks_in_both_editions(
+    tmp_path: Path, shape: str, blocking: bool
+) -> None:
+    """#1869: seal classification agrees across editions, by proof strength.
+
+    The shapes the cold reviews found diverging: a seal recording no
+    operator (its dead actor proves nothing) and a live operator that
+    only moved cgroup block in both editions; an operator whose PID
+    was reused under this host's own namespace stamp is proven dead
+    in both, so it does not block.
+    """
+
+    rust_root = _fixture(tmp_path / "rust")
+    oracle_root = _fixture(tmp_path / "oracle")
+    for root in (rust_root, oracle_root):
+        if shape == "no-operator":
+            _write_seal(root, _dead_identity())
+            continue
+        live = _live_identity(os.getpid())
+        operator = dict(live)
+        if shape == "operator-reused":
+            operator["start_ticks"] = int(str(live["start_ticks"])) + 1
+        else:
+            operator["cgroup_path"] = "/user.slice/moved-elsewhere.scope"
+        operator["pidns_inode"] = "pid:[4026531836]"
+        seal = _write_seal(root, _dead_identity())
+        raw = json.loads(seal.read_text(encoding="utf-8"))
+        raw["x"] = {"operator": operator}
+        seal.write_text(
+            json.dumps(raw, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+    rc, out, err = _python_main_classify(oracle_root)
+    assert rc == (3 if blocking else 0), err
+    assert json.loads(out)["blocking"] is blocking
+    result = _rust_classify(rust_root, fmt="json")
+    assert result.returncode == (3 if blocking else 0), result.stderr
+    assert json.loads(result.stdout)["blocking"] is blocking
+    assert _scrub_report(result.stdout, rust_root) == _scrub_report(out, oracle_root)
+
+
 def test_classify_dead_seal_is_not_blocking_in_both_editions(
     tmp_path: Path,
 ) -> None:
     rust_root = _fixture(tmp_path / "rust")
     oracle_root = _fixture(tmp_path / "oracle")
-    _write_seal(rust_root, _dead_identity())
-    _write_seal(oracle_root, _dead_identity())
+    _write_dead_operator_seal(rust_root)
+    _write_dead_operator_seal(oracle_root)
     rc, out, err = _python_main_classify(oracle_root)
     assert rc == 0, err
     result = _rust_classify(rust_root, fmt="json")
@@ -774,6 +825,27 @@ def test_all_kinds_reports_create_and_live_seal_read_only_in_both_editions(
     )
 
 
+def _write_dead_operator_seal(
+    root: Path, dead: dict[str, object] | None = None
+) -> Path:
+    """A dead seal whose batch operator is recorded dead (#1869 D3).
+
+    A seal recording no operator is never auto-judged orphaned since
+    the cold review, so the nonblocking fixture names its operator.
+    """
+
+    identity = _dead_identity() if dead is None else dead
+    seal = _write_seal(root, identity)
+    raw = json.loads(seal.read_text(encoding="utf-8"))
+    # The batch writer stamps its host PID namespace (#1869); without
+    # the stamp a missing operator PID would prove nothing.
+    raw["x"] = {
+        "operator": {**identity, "pidns_inode": "pid:[4026531836]"}
+    }
+    seal.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return seal
+
+
 def _write_finish_journal(root: Path, owner: dict[str, object]) -> Path:
     active = root / "worktrees" / "ACTIVE.node-a.json"
     document = json.loads(active.read_text(encoding="utf-8"))
@@ -832,8 +904,8 @@ def test_all_kinds_reports_dead_seal_as_nonblocking_in_both_editions(
     rust_root = _fixture(tmp_path / "rust")
     oracle_root = _fixture(tmp_path / "oracle")
     dead = _dead_identity()
-    _write_seal(rust_root, dead)
-    _write_seal(oracle_root, dead)
+    _write_dead_operator_seal(rust_root, dead)
+    _write_dead_operator_seal(oracle_root, dead)
     rc, out, err = _python_main_all_kinds(oracle_root)
     assert rc == 0, err
     payload = json.loads(out)
@@ -846,23 +918,26 @@ def test_all_kinds_reports_dead_seal_as_nonblocking_in_both_editions(
     assert _scrub_report(result.stdout, rust_root) == _scrub_report(out, oracle_root)
 
 
-def test_adopt_refusal_names_live_seal_and_the_all_kinds_report(
+def test_adopt_proceeds_beside_disjoint_live_seal_and_the_all_kinds_report(
     tmp_path: Path,
 ) -> None:
-    oracle_root = _fixture(tmp_path / "oracle")
+    oracle_root = _transfer_fixture(tmp_path / "oracle", None)
     seal = _write_seal(oracle_root, _live_identity(os.getpid()))
+    sealed = seal.read_bytes()
+    # The seal covers a validate target, never this agent slot: the adopt
+    # proceeds beside it (#1869) instead of refusing with the seal text.
     out, err = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         rc = wrkslots_cli.main(
             [
                 "--project-root", str(oracle_root), "--machine", "node-a",
-                "adopt", "slot-a", "--agent", "agent-new",
+                "adopt", "slot-a", "--agent", "agent-slot-a",
                 "--owner-pid", str(os.getpid()), "--expected-generation", "1",
             ]
         )
-    assert rc == 3, err.getvalue()
-    assert seal.name in err.getvalue()
-    assert "classify-create-journals --all-kinds" in err.getvalue()
+    assert rc == 0, err.getvalue()
+    assert "proceeding beside the validation-batch seal" in err.getvalue()
+    assert seal.read_bytes() == sealed
     # The default classify seal refusal keeps its text and gains the pointer,
     # in both editions.
     rc_c, _out_c, err_c = _python_main_classify(oracle_root)
