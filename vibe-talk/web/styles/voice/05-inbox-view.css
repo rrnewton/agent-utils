@@ -374,6 +374,16 @@
   filter: none;
 }
 
+/* `#1906`: a root with replies still unread is not done, however read the root itself is:
+   an accent bar down its edge says so at the list's glance, where the faded read styling
+   alone read as finished. The root's own words keep the read veil (`#222`); the bar, the
+   count and the newest reply's preview are at full strength over it. */
+#side-log li.discord-message[data-unread-replies],
+#side-cards li.discord-message[data-unread-replies],
+#discord-log li.discord-message[data-unread-replies] {
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
 /* Over the padding box, and over the border by a one-pixel shadow rather than a negative inset: a
    shadow is not scrollable overflow, and the agent's tile meets the edge of the list. The second
    shadow, under the veil, is the border's colour drained: the neutral edge in place of a speaker's

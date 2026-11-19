@@ -1876,6 +1876,9 @@ test("`#1906`: A LIVE REPLY TO THE OWNER'S OWN ROOT shows its words on the root'
   }
   assert.deepStrictEqual(landed, [inboxId(7), inboxId(5), inboxId(2)],
     "Shift+Up did not land on the roots with unread replies");
+  // The root is not drawn as done while replies wait: an accent bar down its edge.
+  assert.match(cssBlock("#discord-log li.discord-message[data-unread-replies]"),
+    /box-shadow:\s*inset 3px 0 0 var\(--accent\)/, "a root with unread replies has no accent bar");
   // The preview is the way in, as the count is: it opens the thread.
   await preview.click();
   await page.settle();
