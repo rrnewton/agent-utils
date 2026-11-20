@@ -2992,6 +2992,109 @@ class ManagedAgents:
                 and record.mode == "interactive" and record.backend == "herdr"
                 and record.harness_anchor is not None)
 
+    @staticmethod
+    def _previous_boot_proven_dead(record: AgentRecord) -> bool:
+        """Proven dead by boot change (#1944); fail closed on any unreadable boot."""
+        identity = record.harness_anchor or record.harness_identity or record.custom_process_identity
+        if identity is None:
+            return False
+        try:
+            with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as stream:
+                current = stream.read(129).strip()
+        except (OSError, UnicodeError, ValueError):
+            return False
+        if re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", current) is None:
+            return False
+        return identity.boot_id != current
+
+    def _recorded_pane_missing(self, record: AgentRecord) -> bool:
+        if not record.pane_id:
+            return False
+        try:
+            return all(pane.pane_id != record.pane_id for pane in self.client.panes())
+        except Exception:
+            return False
+
+    def _recorded_pane_proven_missing(self, record: AgentRecord) -> bool:
+        if not self._recorded_pane_missing(record):
+            return False
+        try:
+            self.client.pane_info(record.pane_id)  # type: ignore[arg-type]
+        except HerdrUnavailable as exc:
+            return _missing_target(exc) in ("pane-missing", "workspace-missing", "tab-missing")
+        except Exception:
+            return False
+        return False
+
+    def _require_dead_native(self, record: AgentRecord) -> None:
+        """A native agent is gone only when Herdr says so, or boot proof (#1944) applies.
+
+        Herdr offers no agent-object deletion, so a stale object naming a gone
+        pane is ignored when the previous-boot proof holds.
+        """
+        if (record.lifecycle not in ("running", "launch_failed") or record.mode != "interactive"
+                or record.backend != "herdr" or record.adapter not in ("herdr", "herdr-pane", "herdr-relay")):
+            raise AgentDeliveryError(
+                "--retire-dead-native applies only to a running or launch-failed interactive herdr record"
+            )
+        if self._previous_boot_proven_dead(record) and self._recorded_pane_proven_missing(record):
+            return
+        try:
+            self.client.agent_pane(record.name)
+        except HerdrUnavailable as exc:
+            if herdr_error_code(str(exc)) == "agent_not_found":
+                return
+            raise AgentDeliveryError(f"cannot prove the recorded Herdr agent is gone: {exc}") from exc
+        if self._recorded_pane_missing(record):
+            raise AgentDeliveryError(
+                f"the recorded Herdr agent still exists; a missing pane in the current boot is not proof of death (no previous-boot identity proof) — remedy: prove the recorded harness process is gone, then retry `agentctl stop {record.name} --retire-dead-native --expected-token {record.token} --expected-record-sha256 <sha256-of-agent.json>`, or revive it with `agentctl revive {record.name}` once its process is gone"
+            )
+        raise AgentDeliveryError("the recorded Herdr agent still exists")
+
+    def _retire_dead_native(
+        self, record: AgentRecord, *, expected_token: str,
+        expected_record_sha256: str,
+    ) -> dict[str, object]:
+        """Archive a native record whose Herdr agent is gone; closes nothing."""
+        with self._identity_transaction():
+            self._dead_adoption_pending(record)
+            with self._pinned_agent_directory(record.name) as pinned:
+                with self._dead_adoption_queue_locks(pinned) as verify_queue:
+                    initial = self._managed_record_snapshot(pinned, expected_token=expected_token)
+                    digest = hashlib.sha256(initial.content).hexdigest()
+                    if (initial.record.to_document() != record.to_document()
+                            or digest != expected_record_sha256):
+                        raise AgentDeliveryError(
+                            f"agent {record.name!r} record changed before dead-native retirement"
+                        )
+                    self._require_dead_native(initial.record)
+                    _archive, destination = self._archive_destination(initial.record)
+
+                    def before_publish() -> None:
+                        self._dead_adoption_pending(initial.record)
+                        verify_queue()
+                        final = self._managed_record_snapshot(pinned, expected_token=expected_token)
+                        if final != initial:
+                            raise AgentDeliveryError(
+                                f"agent {record.name!r} record changed before dead-native publication"
+                            )
+                        self._require_dead_native(final.record)
+                        if self._record_bytes(pinned) != initial.content:
+                            raise AgentDeliveryError(
+                                f"agent {record.name!r} record changed during final death proof"
+                            )
+                        verify_queue()
+
+                    self._publish_pinned_directory(
+                        pinned, destination, expected_record=initial.content,
+                        before_publish=before_publish,
+                    )
+        return {
+            "name": record.name, "archive": str(destination), "pane_closed": False,
+            "tab_closed": False, "runtime_preserved": True, "retired_dead_native": True,
+            "record_sha256": digest,
+        }
+
     def _require_dead_adoption(self, record: AgentRecord) -> None:
         """Prove the stored harness generation dead without querying Herdr."""
         if not self._dead_adoption_eligible(record):
@@ -6288,6 +6391,7 @@ class ManagedAgents:
         recover_legacy_adoption: bool = False,
         expected_record_sha256: str | None = None,
         retire_dead_adoption: bool = False,
+        retire_dead_native: bool = False,
     ) -> dict[str, object]:
         """Retire one exact registered generation or recover an adopted runtime."""
         return self._stop(
@@ -6297,6 +6401,7 @@ class ManagedAgents:
             expected_record_sha256=expected_record_sha256,
             expected_token_explicit=expected_token is not None,
             retire_dead_adoption=retire_dead_adoption,
+            retire_dead_native=retire_dead_native,
         )
 
     def _stop(
@@ -6305,16 +6410,33 @@ class ManagedAgents:
         expected_record_sha256: str | None,
         expected_token_explicit: bool,
         retire_dead_adoption: bool = False,
+        retire_dead_native: bool = False,
     ) -> dict[str, object]:
         """Close only the owned single-pane tab and archive the complete record/queue.
 
         A confirmed missing pane permits archival. A probe failure, changed agent
         identity, or extra human-created panes refuses teardown and keeps state.
         """
+        if retire_dead_native and (retire_dead_adoption or recover_legacy_adoption):
+            raise AgentDeliveryError(
+                "--retire-dead-native excludes --retire-dead-adoption and --recover-legacy-adoption"
+            )
         if retire_dead_adoption and recover_legacy_adoption:
             raise AgentDeliveryError(
                 "--retire-dead-adoption and --recover-legacy-adoption are mutually exclusive"
             )
+        if retire_dead_native:
+            if (not expected_token_explicit or expected_token is None
+                    or expected_record_sha256 is None):
+                raise AgentDeliveryError(
+                    "dead-native retirement requires --expected-token and --expected-record-sha256"
+                )
+            if re.fullmatch(r"[a-z0-9-]{1,80}", expected_token) is None:
+                raise AgentDeliveryError("expected-token must be a valid recorded generation token")
+            if _SHA256.fullmatch(expected_record_sha256) is None:
+                raise AgentDeliveryError(
+                    "expected-record-sha256 must be exactly 64 lowercase hexadecimal characters"
+                )
         if retire_dead_adoption:
             if (not expected_token_explicit or expected_token is None
                     or expected_record_sha256 is None):
@@ -6338,6 +6460,12 @@ class ManagedAgents:
                 raise _with_recovery(AgentDeliveryError(
                     f"refusing to stop {name!r}: move is incomplete"
                 ), RecoveryAction("move", name=name, token=record.token))
+            if retire_dead_native:
+                assert expected_token is not None and expected_record_sha256 is not None
+                return self._retire_dead_native(
+                    record, expected_token=expected_token,
+                    expected_record_sha256=expected_record_sha256,
+                )
             if retire_dead_adoption:
                 assert expected_token is not None and expected_record_sha256 is not None
                 return self._retire_dead_adoption(
@@ -6352,7 +6480,7 @@ class ManagedAgents:
                 )
             if expected_record_sha256 is not None:
                 raise AgentDeliveryError(
-                    "--expected-record-sha256 requires --recover-legacy-adoption or --retire-dead-adoption"
+                    "--expected-record-sha256 requires --recover-legacy-adoption, --retire-dead-adoption, or --retire-dead-native"
                 )
             recovery = self._dead_adoption_stop_recovery(record)
             try:
@@ -7468,6 +7596,9 @@ class ManagedAgents:
                     else:
                         rows.append({"name": other_name, "findings": ["record-unreadable"],
                                      "detail": str(exc)})
+        # Progress (#1944): each Herdr probe is bounded but the total is not;
+        # report progress on stderr so a slow registry never hangs silently.
+        print(f"agentctl doctor: checking {len(records)} record(s) against live Herdr state", file=sys.stderr)
         panes = {pane.pane_id: pane for pane in self.client.panes()}
         agent_names = self.client.agent_names()
         workspaces = sorted({record.workspace_id for record in records if record.workspace_id})
@@ -7486,7 +7617,8 @@ class ManagedAgents:
                 if key is not None:
                     claims.setdefault(key, []).append(record.name)
         shared_terminals = self._shared_terminal_findings(records)
-        for record in records:
+        for index, record in enumerate(records):
+            print(f"agentctl doctor: {index + 1}/{len(records)} {record.name}", file=sys.stderr)
             if record.workspace_id in missing_workspaces:
                 findings = ["workspace-missing"]
             else:

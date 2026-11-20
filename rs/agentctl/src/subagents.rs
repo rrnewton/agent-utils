@@ -10120,6 +10120,13 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 }
             }
         }
+        // Progress (#1944): doctor probes Herdr once per record/workspace and
+        // each probe is bounded (30 s), but the total is not; report progress
+        // on stderr so a slow registry never hangs silently.
+        eprintln!(
+            "agentctl doctor: checking {} record(s) against live Herdr state",
+            records.len()
+        );
         let panes: BTreeMap<String, Pane> = self
             .client
             .panes()?
@@ -10153,7 +10160,13 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             }
         }
         let shared_terminals = self.shared_terminal_findings(&records);
-        for record in &records {
+        for (index, record) in records.iter().enumerate() {
+            eprintln!(
+                "agentctl doctor: {}/{} {}",
+                index + 1,
+                records.len(),
+                record.name
+            );
             let mut findings = if self.require_record_backend(record).is_err() {
                 // This census cannot see the other backend's panes; say
                 // that instead of reporting the agent missing.
@@ -16324,10 +16337,51 @@ its drain would also type, so it was not queued",
         }
     }
 
+    /// Proven dead by boot change (#1944): a valid recorded harness identity
+    /// whose boot differs from the current boot cannot be running, whatever
+    /// any pane or Herdr-agent lookup says. Fail closed: no valid identity,
+    /// or an unreadable/invalid current boot, is not proof.
+    fn previous_boot_proven_dead(record: &AgentRecord) -> bool {
+        let identity = record
+            .harness_anchor()
+            .or(record.harness_identity.as_ref())
+            .or(record.custom_process_identity.as_ref());
+        let Some(identity) = identity.filter(|identity| identity.valid()) else {
+            return false;
+        };
+        agent_queue::identity::current_boot_id().is_ok_and(|current| identity.boot_id != current)
+    }
+
+    /// The recorded pane is absent from the live pane census.
+    fn recorded_pane_missing(&self, record: &AgentRecord) -> bool {
+        let Some(pane) = record.pane_id.as_deref() else {
+            return false;
+        };
+        self.client
+            .panes()
+            .is_ok_and(|panes| !panes.iter().any(|item| item.pane_id == pane))
+    }
+
+    /// Census absence plus Herdr's own positive pane_not_found for the pane.
+    fn recorded_pane_proven_missing(&self, record: &AgentRecord) -> bool {
+        self.recorded_pane_missing(record)
+            && record.pane_id.as_deref().is_some_and(|pane| {
+                self.client
+                    .pane_info(pane)
+                    .is_err_and(|error| missing_target(&error).is_some())
+            })
+    }
+
     /// A native agent is gone only when Herdr's own lookup says so. Any other
     /// answer (a live pane, an unavailable server) cannot prove death.
+    /// Previous-boot proof (#1944) overrides a stale Herdr agent object when
+    /// the recorded pane is gone: Herdr offers no agent-object deletion, so
+    /// the stale object is ignored (it names no live pane).
     fn require_dead_native(&self, record: &AgentRecord) -> Result<()> {
         Self::dead_native_anchor(record)?;
+        if Self::previous_boot_proven_dead(record) && self.recorded_pane_proven_missing(record) {
+            return Ok(());
+        }
         match self.client.agent_pane(&record.name) {
             // Herdr restored a custom pane as a plain shell after a reboot (#744): the
             // shell occupying it is proof the harness exited, not that the agent lives.
@@ -16339,6 +16393,10 @@ its drain would also type, so it was not queued",
             {
                 Ok(())
             }
+            Ok(_) if self.recorded_pane_missing(record) => Err(fail(format!(
+                "the recorded Herdr agent still exists; a missing pane in the current boot is not proof of death (no previous-boot identity proof) — remedy: prove the recorded harness process is gone, then retry `agentctl stop {} --retire-dead-native --expected-token {} --expected-record-sha256 <sha256-of-agent.json>`, or revive it with `agentctl revive {}` once its process is gone",
+                record.name, record.token, record.name
+            ))),
             Ok(_) => Err(fail("the recorded Herdr agent still exists")),
             Err(error)
                 if crate::client::herdr_error_code(&error.to_string()).as_deref()

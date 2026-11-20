@@ -379,10 +379,12 @@ def parser() -> argparse.ArgumentParser:
     adoption_recovery = stop.add_mutually_exclusive_group()
     adoption_recovery.add_argument("--recover-legacy-adoption", action="store_true",
         help="recover an identity-less dead adopted row without changing its pane; requires --expected-token and --expected-record-sha256")
+    adoption_recovery.add_argument("--retire-dead-native", action="store_true",
+        help="archive a running or launch-failed native record whose Herdr agent is gone (previous-boot proof overrides a stale Herdr agent object) (stop only)")
     adoption_recovery.add_argument("--retire-dead-adoption", action="store_true",
         help="archive a running adopted record whose pinned harness is dead, without querying Herdr; requires --expected-token and --expected-record-sha256")
     stop.add_argument("--expected-record-sha256", metavar="SHA256",
-        help="exact lowercase 64-hex SHA-256 of raw agent.json bytes; requires --recover-legacy-adoption or --retire-dead-adoption")
+        help="exact lowercase 64-hex SHA-256 of raw agent.json bytes; requires --recover-legacy-adoption, --retire-dead-adoption, or --retire-dead-native")
     attach_self = command("attach-self",
         "Show the agentcloud session this process runs in through its viewer in a Herdr tab and "
         "register it (Rust edition only; this edition refuses).",
@@ -820,6 +822,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = sessions.attach(name)
         elif args.command == "stop":
             recovery_selector = ("--retire-dead-adoption" if args.retire_dead_adoption
+                                 else "--retire-dead-native" if args.retire_dead_native
                                  else "--recover-legacy-adoption" if args.recover_legacy_adoption
                                  else None)
             if recovery_selector is not None and (
@@ -832,13 +835,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             if (recovery_selector is None
                     and args.expected_record_sha256 is not None):
                 raise ValueError(
-                    "--expected-record-sha256 requires --recover-legacy-adoption "
-                    "or --retire-dead-adoption"
+                    "--expected-record-sha256 requires --recover-legacy-adoption, "
+                    "--retire-dead-adoption, or --retire-dead-native"
                 )
             result = sessions.stop(
                 name, expected_token=args.expected_token,
                 recover_legacy_adoption=args.recover_legacy_adoption,
                 retire_dead_adoption=args.retire_dead_adoption,
+                retire_dead_native=args.retire_dead_native,
                 expected_record_sha256=args.expected_record_sha256,
             )
         elif args.command in ("reset", "repair"):

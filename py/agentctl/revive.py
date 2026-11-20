@@ -581,8 +581,20 @@ def _census(manager: ManagedAgents) -> tuple[Pane, ...]:
 
 
 def _proof(manager: ManagedAgents, record: AgentRecord) -> dict[str, object]:
+    # Previous-boot proof (#1944): boot change proves death; a missing pane
+    # plus a stale Herdr agent object cannot block revive.
+    if (manager._previous_boot_proven_dead(record) and manager._recorded_pane_proven_missing(record)
+            and all(pane.tab_id != record.tab_id for pane in manager.client.panes())):
+        if not record.pane_id or not record.tab_id or not record.workspace_id:
+            raise AgentDeliveryError("record lacks its owned pane, tab, or workspace")
+        return {
+            "kind": "missing", "pane_id": record.pane_id, "tab_id": record.tab_id,
+            "workspace_id": record.workspace_id, "cwd": record.cwd, "terminal_id": None,
+            "reported_agent": None, "reported_session_agent": None, "reported_session_value": None,
+            "shell": None, "shell_executable": None,
+        }
     if manager.client.process_liveness(_old_process(record)) != "dead":
-        raise AgentDeliveryError("recorded harness is still alive or its process death cannot be proved")
+        raise AgentDeliveryError(f"recorded harness is still alive or its process death cannot be proved; a missing pane in the current boot is not proof of death — remedy: retire this generation with `agentctl stop {record.name} --retire-dead-native --expected-token {record.token} --expected-record-sha256 <sha256-of-agent.json>` once its harness process is gone, then start a fresh agent")
     if not record.pane_id or not record.tab_id or not record.workspace_id:
         raise AgentDeliveryError("record lacks its owned pane, tab, or workspace")
     panes = _census(manager)
@@ -623,6 +635,13 @@ def _proof(manager: ManagedAgents, record: AgentRecord) -> dict[str, object]:
 
 
 def _name_available(manager: ManagedAgents, record: AgentRecord) -> None:
+    # Previous-boot proof (#1944): ignore a stale Herdr agent object (Herdr
+    # offers no agent-object deletion) when the recorded pane is gone.
+    if manager._previous_boot_proven_dead(record) and manager._recorded_pane_proven_missing(record):
+        owner = manager._identity_owner(record.harness, _revive_conversation(record), exclude=record.name)
+        if owner is not None:
+            raise AgentDeliveryError(f"native conversation is already registered as {owner.name!r}")
+        return
     try:
         pane = manager.client.agent_pane(record.name)
     except HerdrUnavailable as exc:

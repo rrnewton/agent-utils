@@ -2069,6 +2069,11 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
     }
 
     fn revive_liveness(&self, record: &AgentRecord) -> ProcessLiveness {
+        // Previous-boot proof (#1944): a boot change plus a proven-missing
+        // pane proves death even when a stale Herdr agent object remains.
+        if Self::previous_boot_proven_dead(record) && self.recorded_pane_proven_missing(record) {
+            return ProcessLiveness::Dead;
+        }
         let identity = if record.anchors_with_harness_identity() {
             record.harness_anchor()
         } else if record.adapter == "harness-wrapper" {
@@ -2085,9 +2090,10 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
 
     fn revive_proof(&self, record: &AgentRecord) -> Result<Proof> {
         if self.revive_liveness(record) != ProcessLiveness::Dead {
-            return Err(fail(
-                "recorded harness process death is unverifiable during recovery proof",
-            ));
+            return Err(fail(format!(
+                "recorded harness process death is unverifiable during recovery proof; a missing pane in the current boot is not proof of death — remedy: retire this generation with `agentctl stop {} --retire-dead-native --expected-token {} --expected-record-sha256 <sha256-of-agent.json>` once its harness process is gone, then start a fresh agent",
+                record.name, record.token
+            )));
         }
         let pane = record
             .pane_id
@@ -2104,6 +2110,31 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             .as_deref()
             .filter(|value| valid_metadata_text(value))
             .ok_or_else(|| fail("record lacks an owned workspace identity"))?;
+        // Previous-boot proof (#1944): the pane is gone and the boot changed,
+        // so a stale Herdr agent object cannot block revive. A census pane
+        // reusing the recorded tab still blocks (the normal proof refuses).
+        if Self::previous_boot_proven_dead(record)
+            && self.recorded_pane_proven_missing(record)
+            && self
+                .client
+                .panes()
+                .is_ok_and(|panes| !panes.iter().any(|item| item.tab_id == tab))
+        {
+            return Ok(Proof {
+                unknown: Default::default(),
+                kind: "missing".to_owned(),
+                pane_id: pane.to_owned(),
+                tab_id: tab.to_owned(),
+                workspace_id: workspace.to_owned(),
+                cwd: record.cwd.clone(),
+                terminal_id: None,
+                reported_agent: None,
+                reported_session_agent: None,
+                reported_session_value: None,
+                shell: None,
+                shell_executable: None,
+            });
+        }
         let missing = || -> Result<Option<Proof>> {
             match self.client.pane_info(pane) {
                 Err(error) if missing_target(&error).is_some() => {
@@ -2688,9 +2719,17 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
     ) -> Result<(LaunchPlan, Proof)> {
         match self.revive_liveness(record) {
             ProcessLiveness::Dead => {}
-            ProcessLiveness::Alive => return Err(fail("recorded harness process is alive")),
+            ProcessLiveness::Alive => {
+                return Err(fail(format!(
+                    "recorded harness process is alive — remedy: stop it first with `agentctl stop {}`, or retire a proven-dead generation with `agentctl stop {} --retire-dead-native --expected-token {} --expected-record-sha256 <sha256-of-agent.json>`",
+                    record.name, record.name, record.token
+                )))
+            }
             ProcessLiveness::Unknown => {
-                return Err(fail("recorded harness process death is unverifiable"))
+                return Err(fail(format!(
+                    "recorded harness process death is unverifiable; a missing pane in the current boot is not proof of death — remedy: retire this generation with `agentctl stop {} --retire-dead-native --expected-token {} --expected-record-sha256 <sha256-of-agent.json>` once its harness process is gone, then start a fresh agent",
+                    record.name, record.token
+                )))
             }
         }
         let proof = self.revive_proof(record)?;

@@ -1098,6 +1098,55 @@ fn revive_requires_positive_missing_target_and_absent_unambiguous_census() {
 }
 
 #[test]
+fn revive_previous_boot_missing_pane_with_stale_agent_revives() {
+    // #1944: previous boot + pane_not_found + stale Herdr agent object revives.
+    let (fixture, mut old) = recoverable("claude", false);
+    let pane = old.pane_id.clone().unwrap();
+    old.harness_identity.as_mut().unwrap().boot_id =
+        "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_owned();
+    fixture.manager().save(&old).unwrap();
+    fixture
+        .client
+        .panes
+        .lock()
+        .unwrap()
+        .retain(|item| item.pane_id != pane);
+    fixture.client.herdr_closed.lock().unwrap().insert(pane);
+    let result = fixture
+        .manager()
+        .revive("worker", false, None, TIMEOUT)
+        .unwrap();
+    assert_eq!(result["revived"], true);
+}
+
+#[test]
+fn revive_same_boot_missing_pane_refuses_with_remedy() {
+    // #1944: same boot + missing pane is not proof; the refusal names the remedy.
+    let (fixture, mut old) = recoverable("claude", false);
+    let pane = old.pane_id.clone().unwrap();
+    old.harness_identity.as_mut().unwrap().boot_id =
+        fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .unwrap()
+            .trim()
+            .to_owned();
+    fixture.manager().save(&old).unwrap();
+    fixture
+        .client
+        .panes
+        .lock()
+        .unwrap()
+        .retain(|item| item.pane_id != pane);
+    fixture.client.herdr_closed.lock().unwrap().insert(pane);
+    let error = fixture
+        .manager()
+        .revive("worker", false, None, TIMEOUT)
+        .unwrap_err();
+    assert!(error.to_string().contains("remedy"), "{error}");
+    assert!(error.to_string().contains("current boot"), "{error}");
+    assert!(!journal_path(&fixture, &old).exists());
+}
+
+#[test]
 fn revive_refuses_a_missing_old_pane_when_its_tab_has_been_reused() {
     let (fixture, old) = recoverable("claude", false);
     let pane = old.pane_id.as_ref().unwrap();

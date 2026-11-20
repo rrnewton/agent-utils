@@ -334,8 +334,13 @@ class Sessions(ManagedAgents):
         recover_legacy_adoption: bool = False,
         expected_record_sha256: str | None = None,
         retire_dead_adoption: bool = False,
+        retire_dead_native: bool = False,
     ) -> dict[str, object]:
         """Retire a runtime, then archive its canonical identity and artifacts."""
+        if retire_dead_native and (retire_dead_adoption or recover_legacy_adoption):
+            raise AgentDeliveryError(
+                "--retire-dead-native excludes --retire-dead-adoption and --recover-legacy-adoption"
+            )
         if retire_dead_adoption and recover_legacy_adoption:
             raise AgentDeliveryError(
                 "--retire-dead-adoption and --recover-legacy-adoption are mutually exclusive"
@@ -348,6 +353,11 @@ class Sessions(ManagedAgents):
                 expected_record_sha256=expected_record_sha256,
                 expected_token_explicit=expected_token is not None,
                 retire_dead_adoption=retire_dead_adoption,
+                retire_dead_native=retire_dead_native,
+            )
+        if retire_dead_native:
+            raise AgentDeliveryError(
+                "dead-native retirement is supported only for interactive herdr records"
             )
         if retire_dead_adoption:
             raise AgentDeliveryError(

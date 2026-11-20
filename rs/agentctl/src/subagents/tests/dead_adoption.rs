@@ -1223,6 +1223,67 @@ fn dead_native_retirement_refuses_while_the_herdr_agent_still_exists() {
 }
 
 #[test]
+fn dead_native_retirement_previous_boot_missing_pane_stale_agent_archives() {
+    // #1944: previous boot + pane gone (pane_not_found) + stale Herdr agent object.
+    let fixture = Fixture::new();
+    fixture.start(None);
+    let mut record = fixture.manager().load("worker").unwrap();
+    let pane = record.pane_id.clone().unwrap();
+    record.harness_identity.as_mut().unwrap().boot_id =
+        "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_owned();
+    fixture.manager().save(&record).unwrap();
+    let record = fixture.manager().load("worker").unwrap();
+    fixture
+        .client
+        .panes
+        .lock()
+        .unwrap()
+        .retain(|item| item.pane_id != pane);
+    fixture.client.herdr_closed.lock().unwrap().insert(pane);
+    // agent_pane still returns the stale object (named_pane default).
+    let result = fixture
+        .manager()
+        .stop_with_options("worker", native_options(&fixture, &record))
+        .unwrap();
+    assert_eq!(result["retired_dead_native"], true);
+    assert!(!fixture.root.join("registry/agents/worker").exists());
+}
+
+#[test]
+fn dead_native_retirement_same_boot_missing_pane_refuses_with_remedy() {
+    // #1944: same boot + missing pane is not proof, even with a stale agent object.
+    let fixture = Fixture::new();
+    fixture.start(None);
+    let mut record = fixture.manager().load("worker").unwrap();
+    let pane = record.pane_id.clone().unwrap();
+    record.harness_identity.as_mut().unwrap().boot_id =
+        fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .unwrap()
+            .trim()
+            .to_owned();
+    fixture.manager().save(&record).unwrap();
+    let record = fixture.manager().load("worker").unwrap();
+    fixture
+        .client
+        .panes
+        .lock()
+        .unwrap()
+        .retain(|item| item.pane_id != pane);
+    fixture.client.herdr_closed.lock().unwrap().insert(pane);
+    let error = fixture
+        .manager()
+        .stop_with_options("worker", native_options(&fixture, &record))
+        .unwrap_err();
+    assert!(error.to_string().contains("still exists"), "{error}");
+    assert!(error.to_string().contains("remedy"), "{error}");
+    assert!(error.to_string().contains("current boot"), "{error}");
+    assert!(fixture
+        .root
+        .join("registry/agents/worker/agent.json")
+        .exists());
+}
+
+#[test]
 fn dead_native_retirement_archives_a_custom_record_whose_pane_is_a_plain_shell() {
     // Herdr restored the Muse pane as /bin/bash after a reboot (#744).
     let fixture = Fixture::new();
