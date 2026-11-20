@@ -2622,6 +2622,13 @@ def test_capture_drafts_needs_owner_and_rebuild_repairs_corrupt(
         "--owner-pid", str(os.getpid()), "--expected-generation", "1",
         "--rebuild",
     )
+    with pytest.raises(wrkslots_cli.Refusal, match="unreadable"):
+        rebuild.handler(rebuild)
+    rebuild = _cli_args(
+        root, "capture-drafts", "eden-a", "--agent", "agent-eden",
+        "--owner-pid", str(os.getpid()), "--expected-generation", "1",
+        "--rebuild", "--acknowledge-unreadable-ledger",
+    )
     assert rebuild.handler(rebuild) == 0
     ledger = wrkslots_cli._load_eden_draft_ledger(
         ledger_path, slot="eden-a", checkout=record.checkouts[0], generation=1
@@ -2762,6 +2769,75 @@ def test_capture_after_real_transfer_owner(
     assert ledger is not None and ledger.nodes == (node,)
 
 
+def test_capture_none_needs_shown_list_and_never_covers_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--none-of-these-are-mine: two-step, and never over recorded."""
+    root = _eden_project(tmp_path)
+    config = wrkslots_cli._load_config(str(root), "node-a")
+    stub = _EdenDraftStub()
+    monkeypatch.setattr(wrkslots_cli, "_eden_runner", stub)
+    own, foreign = "c" * 40, "e" * 40
+    stub.subjects = {own: "own work", foreign: "other lane work"}
+    stub.authors = {own: "Lane <l@example.invalid>",
+                    foreign: "Other <o@example.invalid>"}
+    assert wrkslots_cli._cmd_create(_eden_create_args(root)) == 0
+    record = wrkslots_cli._load_active(config).slots[0]
+    ledger_path = wrkslots_cli._eden_draft_ledger_path(config, record.checkouts[0])
+    ledger_path.unlink()
+    stub.candidates = [(foreign, stub.authors[foreign], 4_000_000_000,
+                        "other lane work")]
+
+    def capture(*extra: str) -> argparse.Namespace:
+        return _cli_args(
+            root, "capture-drafts", "eden-a", "--agent", "agent-eden",
+            "--owner-pid", str(os.getpid()), "--expected-generation", "1",
+            *extra,
+        )
+
+    first = capture("--none-of-these-are-mine")
+    with pytest.raises(wrkslots_cli.Refusal, match="has now been shown"):
+        first.handler(first)
+    assert not ledger_path.exists()
+    second = capture("--none-of-these-are-mine")
+    assert second.handler(second) == 0
+    ledger = wrkslots_cli._load_eden_draft_ledger(
+        ledger_path, slot="eden-a", checkout=record.checkouts[0], generation=1
+    )
+    assert ledger is not None and ledger.nodes == ()
+    assert [n for n, _b, _a in ledger.disowned] == [foreign]
+
+    # A recorded draft is never covered by the blanket: it needs
+    # its own per-node --disown, so the blanket run refuses.
+    stub.stack = [own]
+    stub.candidates = [(own, stub.authors[own], 4_000_000_000, "own work")]
+    repeat = capture()
+    assert repeat.handler(repeat) == 0
+    stub.stack = []
+    blanket = capture("--rebuild", "--none-of-these-are-mine")
+    with pytest.raises(wrkslots_cli.Refusal, match="Judge every listed"):
+        blanket.handler(blanket)
+    ledger = wrkslots_cli._load_eden_draft_ledger(
+        ledger_path, slot="eden-a", checkout=record.checkouts[0], generation=1
+    )
+    assert ledger is not None and ledger.nodes == (own,)
+
+
+def test_draft_ledger_tmp_leftover_names_manual_remedy(tmp_path: Path) -> None:
+    """A crashed capture's .tmp file names its real remedy."""
+    config = _scoped_config(tmp_path)
+    checkout = wrkslots_cli._checkout_from_obj(_eden_obj(), "row.checkouts[0]")
+    path = wrkslots_cli._eden_draft_ledger_path(config, checkout)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    (path.parent / f"{path.name}.tmp.123").write_text("partial")
+    with pytest.raises(wrkslots_cli.StateError, match="remove that .tmp file by hand"):
+        wrkslots_cli._write_eden_draft_ledger(
+            path,
+            eden.DraftLedger(slot="slot", checkout="main", generation=1,
+                             nodes=(), captured_at=None, last_error=None),
+        )
+
+
 def test_real_sl_shared_store_scopes_drafts(tmp_path: Path) -> None:
     """Real Sapling: two working copies, one backing store (#1925).
 
@@ -2864,6 +2940,71 @@ def test_real_sl_shared_store_scopes_drafts(tmp_path: Path) -> None:
     )
     assert set(scoped) >= {amended, second}
     assert nodes["wc2"] not in scoped
+
+    def fresh_scoped() -> tuple[str, ...]:
+        wrkslots_cli._write_eden_draft_ledger(
+            ledger_path,
+            eden.DraftLedger(
+                slot="slot", checkout="main", generation=1, nodes=(),
+                captured_at="2026-11-19T00:00:00+00:00", last_error=None,
+            ),
+        )
+        return wrkslots_cli._eden_scoped_draft_nodes(
+            config, checkout, slot="slot", generation=1, runner=runner
+        )
+
+    def draft_by_subject(subject: str) -> str:
+        for line in run(
+            "-R", wc1, "log", "-r", "draft()", "-T", "{node} {desc|firstline}\n"
+        ).splitlines():
+            node, _, found = line.partition(" ")
+            if found == subject:
+                return node
+        raise AssertionError(f"no draft with subject {subject!r}")
+
+    # N3b, metaedit variant: a draft rewritten while not checked
+    # out is hidden at the journal node; its visible successor is
+    # still this checkout's and must be accounted.
+    (copies["wc1"] / "f.txt").write_text("wc1 third\n")
+    run("-R", wc1, "add", str(copies["wc1"] / "f.txt"))
+    run("-R", wc1, "commit", "-m", "wc1 third draft")
+    third = run("-R", wc1, "log", "-r", ".", "-T", "{node}")
+    run("-R", wc1, "goto", base_node)
+    result = subprocess.run(
+        [sl, "--config", "ui.username=Test <t@example.invalid>",
+         "--config", "ui.editor=sed -i 's/third draft/third edited/'",
+         "-R", wc1, "metaedit", "-r", third],
+        capture_output=True, text=True, env=env, timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    edited = draft_by_subject("wc1 third edited")
+    assert edited in fresh_scoped()
+    assert nodes["wc2"] not in fresh_scoped()
+
+    # N3b, rebase variant: same shape through a rebase off the
+    # checked-out parent.
+    (copies["wc1"] / "g.txt").write_text("wc1 rebase\n")
+    run("-R", wc1, "add", str(copies["wc1"] / "g.txt"))
+    run("-R", wc1, "commit", "-m", "wc1 rebase draft")
+    rebased_from = run("-R", wc1, "log", "-r", ".", "-T", "{node}")
+    run("-R", wc1, "goto", base_node)
+    run("-R", wc1, "rebase", "-s", rebased_from, "-d", second)
+    rebased = draft_by_subject("wc1 rebase draft")
+    assert rebased != rebased_from and rebased in fresh_scoped()
+
+    # N1: a draft made and hidden between captures is included
+    # as itself, so classification names it hidden.
+    (copies["wc1"] / "h.txt").write_text("wc1 hidden\n")
+    run("-R", wc1, "add", str(copies["wc1"] / "h.txt"))
+    run("-R", wc1, "commit", "-m", "wc1 hidden draft")
+    hidden_node = run("-R", wc1, "log", "-r", ".", "-T", "{node}")
+    run("-R", wc1, "goto", base_node)
+    run("-R", wc1, "hide", hidden_node)
+    assert hidden_node in fresh_scoped()
+    entry = eden.classify_drafts(
+        runner, wc1, "main", hidden_node, own_nodes=(hidden_node,)
+    )
+    assert entry["hidden"] == [(hidden_node, "wc1 hidden draft")]  # type: ignore[attr-defined]
 
     # A hidden own draft is named as hidden, never silently dropped.
     run("-R", wc1, "hide", amended)

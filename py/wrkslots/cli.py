@@ -31444,7 +31444,17 @@ def _load_eden_draft_ledger(
 
 def _write_eden_draft_ledger(path: Path, ledger: eden.DraftLedger) -> None:
     payload = eden.draft_ledger_payload(ledger)
-    _atomic_write_json(path, payload)
+    try:
+        _atomic_write_json(path, payload)
+    except StateError as exc:
+        leftovers = sorted(path.parent.glob(f"{path.name}.tmp.*"))
+        if leftovers:
+            raise StateError(
+                f"partial draft ledger update exists: {leftovers[0]}; "
+                "check that no wrkslots capture is running for this "
+                "checkout, then remove that .tmp file by hand and retry"
+            ) from exc
+        raise
     label = f"Eden draft ledger {path}"
     written = eden.draft_ledger_from_obj(
         _strict_json_object(
@@ -31551,6 +31561,41 @@ def _capture_eden_draft_ledger(
         return ledger
 
 
+def _draft_listing_marker_path(ledger_path: Path, checkout_name: str) -> Path:
+    """Where a shown candidate listing is remembered (#1925 review).
+
+    ``--none-of-these-are-mine`` is accepted only for the exact
+    candidate set a previous capture already listed, so the
+    blanket declaration can never cover drafts nobody saw.
+    """
+
+    return ledger_path.parent / f"{checkout_name}.listing.json"
+
+
+def _load_draft_listing_marker(path: Path) -> tuple[str, ...] | None:
+    if not path.exists() and not path.is_symlink():
+        return None
+    try:
+        raw = _strict_json_object(
+            _read_bounded_regular_file(path, "draft listing marker", _JOURNAL_BYTES_LIMIT),
+            "draft listing marker",
+        )
+        nodes = raw["nodes"]
+        if not isinstance(nodes, list) or any(
+            not isinstance(node, str) for node in nodes
+        ):
+            return None
+        return tuple(nodes)
+    except (OSError, Refusal, StateError, KeyError):
+        return None
+
+
+def _write_draft_listing_marker(path: Path, nodes: Sequence[str]) -> None:
+    _atomic_write_json(
+        path, {"nodes": sorted(nodes), "shown_at": _utc_now()}
+    )
+
+
 def _eden_scoped_draft_nodes(
     config: Config,
     checkout: Checkout,
@@ -31605,11 +31650,30 @@ def _eden_scoped_draft_nodes(
     except eden.EdenError:
         visited, store_drafts = (), set()
     disowned = {node for node, _by, _at in captured.disowned}
-    extra = tuple(
-        node for node in visited
-        if node in store_drafts and node not in captured.nodes
-        and node not in disowned
-    )
+    # Expand every visited node: a draft rewritten while not
+    # checked out (metaedit, rebase) is hidden at its recorded
+    # node, so filtering the journal by draft() would drop its
+    # visible successor; a draft hidden with no visible successor
+    # is included as itself so classification names it hidden.
+    extra_list: list[str] = []
+    try:
+        for node in visited:
+            if node in disowned or node in captured.nodes:
+                continue
+            successors = eden.present_successor_nodes(runner, mount, node)
+            visible = [item for item in successors if item in store_drafts]
+            if visible:
+                extra_list.extend(
+                    item for item in visible if item not in extra_list
+                )
+            elif not successors and eden.hidden_node_subject(
+                runner, mount, node
+            ) is not None:
+                if node not in extra_list:
+                    extra_list.append(node)
+    except eden.EdenError:
+        extra_list = []
+    extra = tuple(extra_list)
     if extra:
         try:
             captured = _capture_eden_draft_ledger(
@@ -49924,21 +49988,59 @@ def _cmd_capture_drafts(args: argparse.Namespace) -> int:
             judgement = bool(args.rebuild) or not ledger_path.exists()
             chosen: tuple[str, ...] = ()
             disowned_now: tuple[str, ...] = ()
-            if judgement or includes or disowns:
+            journal_include: tuple[str, ...] = ()
+            if judgement or includes or disowns or args.none_of_these_are_mine:
+                if args.none_of_these_are_mine and not judgement:
+                    raise Refusal(
+                        "--none-of-these-are-mine only applies to a first "
+                        "capture or a --rebuild candidate listing"
+                    )
                 try:
                     candidates = eden.draft_candidate_info(_eden_runner, mount)
-                    existing = _load_eden_draft_ledger(
-                        ledger_path, slot=record.slot, checkout=checkout,
-                        generation=None,
-                    )
                 except eden.EdenError as exc:
                     raise Refusal(
                         f"draft capture for checkout {checkout.name} failed: {exc}"
                     ) from exc
-                except (StateError, Refusal, OSError):
+                unreadable = False
+                try:
+                    existing = _load_eden_draft_ledger(
+                        ledger_path, slot=record.slot, checkout=checkout,
+                        generation=None,
+                    )
+                except (StateError, Refusal, OSError) as exc:
                     if not args.rebuild:
                         raise
+                    unreadable = True
                     existing = None
+                    hidden_journal: list[str] = []
+                    try:
+                        for visited in eden.journal_visited_nodes(
+                            _eden_runner, mount
+                        ):
+                            if not eden.present_successor_nodes(
+                                _eden_runner, mount, visited
+                            ) and eden.hidden_node_subject(
+                                _eden_runner, mount, visited
+                            ) is not None and visited not in hidden_journal:
+                                hidden_journal.append(visited)
+                    except eden.EdenError:
+                        hidden_journal = []
+                    if not getattr(args, "acknowledge_unreadable_ledger", False):
+                        listed = (
+                            ", ".join(hidden_journal)
+                            if hidden_journal else "none found"
+                        )
+                        raise Refusal(
+                            f"the draft ledger for checkout {checkout.name} "
+                            f"is unreadable ({exc}) and --rebuild cannot "
+                            "carry its recorded nodes. Hidden drafts found "
+                            f"in this working copy's journal: {listed}. "
+                            "state: REFUSED -- the ledger was left as-is. "
+                            "remedy: rerun the --rebuild with "
+                            "--acknowledge-unreadable-ledger to rebuild "
+                            "carrying those hidden drafts"
+                        ) from exc
+                    journal_include = tuple(hidden_journal)
                 recorded = set(existing.nodes) if existing is not None else set()
                 by_node = {item[0]: item for item in candidates}
                 for node in includes:
@@ -49965,11 +50067,22 @@ def _cmd_capture_drafts(args: argparse.Namespace) -> int:
                             f"'sl unhide {node}' in the checkout first"
                         )
                 if judgement:
-                    decided = set(includes) | set(disowns)
-                    if args.none_of_these_are_mine:
-                        decided |= set(by_node)
+                    # The blanket declaration never covers a node
+                    # already recorded in the ledger: those need a
+                    # per-node --disown, always.
+                    none_decided = (
+                        set(by_node) - recorded
+                        if args.none_of_these_are_mine else set()
+                    )
+                    decided = set(includes) | set(disowns) | none_decided
                     undecided = [node for node in by_node if node not in decided]
+                    marker_path = _draft_listing_marker_path(
+                        ledger_path, checkout.name
+                    )
                     if undecided:
+                        _write_draft_listing_marker(
+                            marker_path, sorted(by_node)
+                        )
                         lines = [
                             f"draft capture for slot {record.slot} checkout "
                             f"{checkout.name}: the shared store holds "
@@ -49994,17 +50107,28 @@ def _cmd_capture_drafts(args: argparse.Namespace) -> int:
                             "state: REFUSED -- no ledger was written. Judge "
                             "every listed draft: '--include NODE' for this "
                             "slot's (repeatable), '--disown NODE' for each "
-                            "one that is not (recorded in the ledger), or "
-                            "'--none-of-these-are-mine' to declare every "
-                            "draft listed in this run not this slot's "
-                            "(also recorded per node)"
+                            "one that is not (recorded in the ledger; a "
+                            "recorded draft always needs its own --disown), "
+                            "or '--none-of-these-are-mine' for the "
+                            "unrecorded drafts in a list already shown by "
+                            "an earlier capture (also recorded per node)"
                         )
                         raise Refusal("\n".join(lines))
-                    chosen = includes
-                    disowned_now = tuple(sorted(
-                        set(disowns)
-                        | (set(by_node) if args.none_of_these_are_mine else set())
-                    ))
+                    if args.none_of_these_are_mine and _load_draft_listing_marker(
+                        marker_path
+                    ) != tuple(sorted(by_node)):
+                        _write_draft_listing_marker(
+                            marker_path, sorted(by_node)
+                        )
+                        raise Refusal(
+                            "the candidate list for checkout "
+                            f"{checkout.name} has now been shown in full; "
+                            "rerun the same '--none-of-these-are-mine' "
+                            "command to declare exactly that list, so the "
+                            "declaration can never cover drafts nobody saw"
+                        )
+                    chosen = tuple(sorted(set(includes) | set(journal_include)))
+                    disowned_now = tuple(sorted(set(disowns) | none_decided))
                 else:
                     chosen = includes
                     disowned_now = disowns
@@ -99823,8 +99947,13 @@ usage or audit gate unknown, 3 fail-closed refusal.
     )
     capture_drafts.add_argument(
         "--rebuild", action="store_true",
-        help="discard the recorded ledger (repairing a corrupt one) and capture again "
-        "through the first-capture candidate listing",
+        help="re-run the candidate judgement, carrying every recorded node; a corrupt "
+        "ledger is repaired only with --acknowledge-unreadable-ledger",
+    )
+    capture_drafts.add_argument(
+        "--acknowledge-unreadable-ledger", action="store_true",
+        help="with --rebuild on an unreadable ledger: rebuild carrying the hidden "
+        "drafts the refusal listed from this working copy's journal",
     )
     capture_drafts.add_argument("--agent", metavar="AGENT", help="recorded agent name (owner authorisation)")
     capture_drafts.add_argument(
