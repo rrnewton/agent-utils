@@ -430,7 +430,10 @@ pub(crate) fn doctor_stray_worktrees(
             };
             for record in records {
                 if key == "slots" {
-                    let slot = record.get("slot").and_then(Value::as_str).unwrap_or_default();
+                    let slot = record
+                        .get("slot")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
                     let slot_type = record
                         .get("slot_type")
                         .and_then(Value::as_str)
@@ -555,7 +558,11 @@ pub(crate) fn doctor_stray_worktrees(
                 &path,
                 &branch,
                 entry.get("HEAD").map(String::as_str).unwrap_or_default(),
-                if enclosing.is_some() { "nested-in-slot" } else { "outside-slot" },
+                if enclosing.is_some() {
+                    "nested-in-slot"
+                } else {
+                    "outside-slot"
+                },
                 enclosing.map(|(_, name)| name.as_str()),
                 &mut rows,
             );

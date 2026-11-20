@@ -382,7 +382,10 @@ fn evidence_value(slot_type: &str, coordinator: &Identity, offline_reason: Optio
     });
     if let Some(reason) = offline_reason {
         if let Some(object) = evidence.as_object_mut() {
-            object.insert("offline_reason".to_string(), Value::String(reason.to_string()));
+            object.insert(
+                "offline_reason".to_string(),
+                Value::String(reason.to_string()),
+            );
         }
     }
     evidence
