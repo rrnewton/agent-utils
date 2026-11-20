@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-recover-absent-stream-history: stream the event history in recover-absent-validate-rows and die with the launcher'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
