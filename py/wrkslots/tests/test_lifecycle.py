@@ -10003,8 +10003,12 @@ def test_ownerless_checkout_refuses_remote_change_during_fetch(
         remote: str,
         landed_ref: str,
         authority: wrkslots._RemoteAuthority,
+        *,
+        ssh_command: str | None = None,
     ) -> None:
-        original_fetch(vcs, checkout, remote, landed_ref, authority)
+        original_fetch(
+            vcs, checkout, remote, landed_ref, authority, ssh_command=ssh_command
+        )
         git(checkout, "remote", "set-url", remote, str(alternate))
 
     monkeypatch.setattr(wrkslots._GitVcs, "fetch_remote", mutate_remote_after_fetch)

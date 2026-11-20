@@ -1850,6 +1850,132 @@ pub(crate) fn load_config(root: Option<&Path>, machine_override: Option<&str>) -
     Ok(payload)
 }
 
+/// One declared SSH path field (#1940): absolute, no shell metacharacters.
+fn ssh_path(value: &Value, label: &str) -> Result<String> {
+    let text = as_str(value, label)?;
+    const FORBIDDEN: &[char] = &[
+        ' ', '\t', '\r', '\n', '\0', '"', '\'', '`', '$', '\\', ';', '|', '&', '<', '>', '(', ')',
+        '{', '}', '[', ']', '!', '#', '~', '*', '?',
+    ];
+    if !text.starts_with('/') || text.chars().any(|c| FORBIDDEN.contains(&c)) {
+        return Err(format!(
+            "{label} must be one absolute path with no spaces or shell metacharacters"
+        ));
+    }
+    Ok(text.to_string())
+}
+
+fn parse_remote_ssh_commands(raw: &Map<String, Value>) -> Result<Vec<Value>> {
+    let Some(value) = raw.get("remote_ssh_commands") else {
+        return Ok(Vec::new());
+    };
+    let map = value
+        .as_object()
+        .ok_or("configuration.remote_ssh_commands must be a mapping")?;
+    let mut remotes: Vec<&String> = map.keys().collect();
+    remotes.sort();
+    let mut result = Vec::new();
+    for remote in remotes {
+        validate_remote(remote)?;
+        let label = format!("configuration.remote_ssh_commands.{remote}");
+        let entry = map[remote]
+            .as_object()
+            .ok_or_else(|| format!("{label} must be a mapping"))?;
+        for key in entry.keys() {
+            if !matches!(
+                key.as_str(),
+                "identity_file" | "identity_agent" | "proxy_command"
+            ) {
+                return Err(format!("{label} has unknown field {key}"));
+            }
+        }
+        let identity_file = match entry.get("identity_file") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(ssh_path(value, &format!("{label}.identity_file"))?),
+        };
+        let identity_agent = match entry.get("identity_agent") {
+            None | Some(Value::Null) => None,
+            Some(value) => {
+                let agent = as_str(value, &format!("{label}.identity_agent"))?;
+                if agent == "none" {
+                    Some("none".to_string())
+                } else {
+                    Some(ssh_path(value, &format!("{label}.identity_agent"))?)
+                }
+            }
+        };
+        let proxy_command = match entry.get("proxy_command") {
+            None | Some(Value::Null) => None,
+            Some(value) => {
+                let proxy = as_str(value, &format!("{label}.proxy_command"))?;
+                // Python's str.strip also strips \x1c-\x1f; match it.
+                let blank = proxy
+                    .chars()
+                    .all(|c| c.is_whitespace() || matches!(c, '\u{1c}'..='\u{1f}'));
+                if blank || proxy.chars().any(|c| matches!(c, '\r' | '\n' | '\0')) {
+                    return Err(format!(
+                        "{label}.proxy_command must be one non-empty command with no newline"
+                    ));
+                }
+                Some(proxy.to_string())
+            }
+        };
+        if identity_file.is_none() && identity_agent.is_none() && proxy_command.is_none() {
+            return Err(format!("{label} must set at least one SSH field"));
+        }
+        result.push(json!({
+            "remote": remote,
+            "identity_file": identity_file,
+            "identity_agent": identity_agent,
+            "proxy_command": proxy_command,
+        }));
+    }
+    Ok(result)
+}
+
+/// shlex-style quoting for one GIT_SSH_COMMAND token (#1940).
+pub(crate) fn ssh_quote(token: &str) -> String {
+    if !token.is_empty()
+        && token.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '_' | '@' | '%' | '+' | '=' | ':' | ',' | '.' | '/' | '-')
+        })
+    {
+        return token.to_string();
+    }
+    format!("'{}'", token.replace('\'', "'\\''"))
+}
+
+/// The GIT_SSH_COMMAND for one remote from normalized entries (#1940).
+pub(crate) fn remote_ssh_command_for(entries: &[Value], remote: &str) -> Option<String> {
+    for entry in entries {
+        if entry.get("remote").and_then(Value::as_str) != Some(remote) {
+            continue;
+        }
+        let mut tokens = vec!["ssh".to_string()];
+        if let Some(file) = entry.get("identity_file").and_then(Value::as_str) {
+            tokens.push("-i".to_string());
+            tokens.push(file.to_string());
+        }
+        if let Some(agent) = entry.get("identity_agent").and_then(Value::as_str) {
+            tokens.push("-o".to_string());
+            tokens.push(format!("IdentityAgent={agent}"));
+        }
+        if let Some(proxy) = entry.get("proxy_command").and_then(Value::as_str) {
+            tokens.push("-o".to_string());
+            tokens.push(format!("ProxyCommand={proxy}"));
+        }
+        return Some(
+            tokens
+                .iter()
+                .map(|token| ssh_quote(token))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1951,134 +2077,3 @@ mod tests {
     }
 }
 
-/// One declared SSH path field (#1940): absolute, no shell metacharacters.
-fn ssh_path(value: &Value, label: &str) -> Result<String> {
-    let text = as_str(value, label)?;
-    const FORBIDDEN: &[char] = &[
-        ' ', '\t', '\r', '\n', '\0', '"', '\'', '`', '$', '\\', ';', '|', '&', '<', '>', '(', ')',
-        '{', '}', '[', ']', '!', '#', '~', '*', '?',
-    ];
-    if !text.starts_with('/') || text.chars().any(|c| FORBIDDEN.contains(&c)) {
-        return Err(format!(
-            "{label} must be one absolute path with no spaces or shell metacharacters"
-        ));
-    }
-    Ok(text.to_string())
-}
-
-fn parse_remote_ssh_commands(raw: &Map<String, Value>) -> Result<Vec<Value>> {
-    let Some(value) = raw.get("remote_ssh_commands") else {
-        return Ok(Vec::new());
-    };
-    let map = value
-        .as_object()
-        .ok_or("configuration.remote_ssh_commands must be a mapping")?;
-    let mut remotes: Vec<&String> = map.keys().collect();
-    remotes.sort();
-    let mut result = Vec::new();
-    for remote in remotes {
-        validate_remote(remote)?;
-        let label = format!("configuration.remote_ssh_commands.{remote}");
-        let entry = map[remote]
-            .as_object()
-            .ok_or_else(|| format!("{label} must be a mapping"))?;
-        for key in entry.keys() {
-            if !matches!(
-                key.as_str(),
-                "identity_file" | "identity_agent" | "proxy_command"
-            ) {
-                return Err(format!("{label} has unknown field {key}"));
-            }
-        }
-        let identity_file = match entry.get("identity_file") {
-            None | Some(Value::Null) => None,
-            Some(value) => Some(ssh_path(value, &format!("{label}.identity_file"))?),
-        };
-        let identity_agent = match entry.get("identity_agent") {
-            None | Some(Value::Null) => None,
-            Some(value) => {
-                let agent = as_str(value, &format!("{label}.identity_agent"))?;
-                if agent == "none" {
-                    Some("none".to_string())
-                } else {
-                    Some(ssh_path(value, &format!("{label}.identity_agent"))?)
-                }
-            }
-        };
-        let proxy_command = match entry.get("proxy_command") {
-            None | Some(Value::Null) => None,
-            Some(value) => {
-                let proxy = as_str(value, &format!("{label}.proxy_command"))?;
-                // Python's str.strip also strips \x1c-\x1f; match it.
-                let blank = proxy
-                    .chars()
-                    .all(|c| c.is_whitespace() || matches!(c, '\u{1c}'..='\u{1f}'));
-                if blank || proxy.chars().any(|c| matches!(c, '\r' | '\n' | '\0')) {
-                    return Err(format!(
-                        "{label}.proxy_command must be one non-empty command with no newline"
-                    ));
-                }
-                Some(proxy.to_string())
-            }
-        };
-        if identity_file.is_none() && identity_agent.is_none() && proxy_command.is_none() {
-            return Err(format!("{label} must set at least one SSH field"));
-        }
-        result.push(json!({
-            "remote": remote,
-            "identity_file": identity_file,
-            "identity_agent": identity_agent,
-            "proxy_command": proxy_command,
-        }));
-    }
-    Ok(result)
-}
-
-/// shlex-style quoting for one GIT_SSH_COMMAND token (#1940).
-pub(crate) fn ssh_quote(token: &str) -> String {
-    if !token.is_empty()
-        && token.chars().all(|c| {
-            c.is_ascii_alphanumeric()
-                || matches!(c, '_' | '@' | '%' | '+' | '=' | ':' | ',' | '.' | '/' | '-')
-        })
-    {
-        return token.to_string();
-    }
-    format!("'{}'", token.replace('\'', "'\\''"))
-}
-
-/// The GIT_SSH_COMMAND for one remote from the normalized config payload.
-pub(crate) fn remote_ssh_command(config: &Value, remote: &str) -> Option<String> {
-    let entries = config.get("remote_ssh_commands")?.as_array()?;
-    remote_ssh_command_for(entries, remote)
-}
-
-/// The GIT_SSH_COMMAND for one remote from normalized entries (#1940).
-pub(crate) fn remote_ssh_command_for(entries: &[Value], remote: &str) -> Option<String> {
-    for entry in entries {
-        if entry.get("remote").and_then(Value::as_str) != Some(remote) {
-            continue;
-        }
-        let mut tokens = vec!["ssh".to_string()];
-        if let Some(file) = entry.get("identity_file").and_then(Value::as_str) {
-            tokens.push("-i".to_string());
-            tokens.push(file.to_string());
-        }
-        if let Some(agent) = entry.get("identity_agent").and_then(Value::as_str) {
-            tokens.push("-o".to_string());
-            tokens.push(format!("IdentityAgent={agent}"));
-        }
-        if let Some(proxy) = entry.get("proxy_command").and_then(Value::as_str) {
-            tokens.push("-o".to_string());
-            tokens.push(format!("ProxyCommand={proxy}"));
-        }
-        return Some(
-            tokens
-                .iter()
-                .map(|token| ssh_quote(token))
-                .collect::<Vec<_>>()
-                .join(" "),
-        );
-    }
-    None
-}
