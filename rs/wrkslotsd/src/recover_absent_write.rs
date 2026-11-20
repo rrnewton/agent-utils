@@ -118,26 +118,28 @@ fn recovery_matches(
         &cfg.control.join(format!("EVENTS.{selected}")),
         selected,
         |event| {
-        let payload = event.get("payload").cloned().unwrap_or(Value::Null);
-        let record = payload.get("record").cloned().unwrap_or(Value::Null);
-        let evidence = payload.get("evidence").cloned().unwrap_or(Value::Null);
-        let evidence_keys: Vec<&String> = evidence
-            .as_object()
-            .map(|object| object.keys().collect())
-            .unwrap_or_default();
-        event.get("kind").and_then(Value::as_str) == Some("archive-state-recorded")
-            && payload.get("action").and_then(Value::as_str) == Some("absent-agent-row-recovered")
-            && payload.get("slot").and_then(Value::as_str) == Some(slot)
-            && record.get("archive_id").and_then(Value::as_str) == Some(archive_id)
-            && record.get("slot").and_then(Value::as_str) == Some(slot)
-            && record.get("machine").and_then(Value::as_str) == Some(selected)
-            && record.get("generation").and_then(Value::as_i64) == Some(generation)
-            && record.get("slot_type").and_then(Value::as_str) == Some("agent")
-            && record.get("physical_storage").and_then(Value::as_str) == Some("removed")
-            && evidence_keys.len() == 3
-            && evidence.get("archive_id").and_then(Value::as_str) == Some(archive_id)
-            && evidence.get("source_record_sha256").and_then(Value::as_str) == Some(sha)
-            && evidence.get("physical_storage").and_then(Value::as_str) == Some("externally-absent")
+            let payload = event.get("payload").cloned().unwrap_or(Value::Null);
+            let record = payload.get("record").cloned().unwrap_or(Value::Null);
+            let evidence = payload.get("evidence").cloned().unwrap_or(Value::Null);
+            let evidence_keys: Vec<&String> = evidence
+                .as_object()
+                .map(|object| object.keys().collect())
+                .unwrap_or_default();
+            event.get("kind").and_then(Value::as_str) == Some("archive-state-recorded")
+                && payload.get("action").and_then(Value::as_str)
+                    == Some("absent-agent-row-recovered")
+                && payload.get("slot").and_then(Value::as_str) == Some(slot)
+                && record.get("archive_id").and_then(Value::as_str) == Some(archive_id)
+                && record.get("slot").and_then(Value::as_str) == Some(slot)
+                && record.get("machine").and_then(Value::as_str) == Some(selected)
+                && record.get("generation").and_then(Value::as_i64) == Some(generation)
+                && record.get("slot_type").and_then(Value::as_str) == Some("agent")
+                && record.get("physical_storage").and_then(Value::as_str) == Some("removed")
+                && evidence_keys.len() == 3
+                && evidence.get("archive_id").and_then(Value::as_str) == Some(archive_id)
+                && evidence.get("source_record_sha256").and_then(Value::as_str) == Some(sha)
+                && evidence.get("physical_storage").and_then(Value::as_str)
+                    == Some("externally-absent")
         },
     ) else {
         return false;

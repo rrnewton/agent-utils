@@ -7709,11 +7709,7 @@ mod slice_option_tests {
 
     #[test]
     fn slice_option_parses_and_validates() {
-        let parsed = parse_run_args(&[
-            "--slice".into(),
-            "validate-slot01.slice".into(),
-        ])
-        .unwrap();
+        let parsed = parse_run_args(&["--slice".into(), "validate-slot01.slice".into()]).unwrap();
         assert_eq!(parsed.slice.as_deref(), Some("validate-slot01.slice"));
         let inline = parse_run_args(&["--slice=validate-slot01.slice".into()]).unwrap();
         assert_eq!(inline.slice.as_deref(), Some("validate-slot01.slice"));

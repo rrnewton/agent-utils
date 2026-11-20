@@ -288,11 +288,7 @@ fn eden_backing_name_invalid(name: &str) -> bool {
 }
 
 pub(crate) fn parse_eden_backing(value: &Value) -> Result<Vec<(String, String)>, String> {
-    let invalid = |what: &str| {
-        format!(
-            "configuration.worktrees_image.eden_backing_repo {what}"
-        )
-    };
+    let invalid = |what: &str| format!("configuration.worktrees_image.eden_backing_repo {what}");
     let mut pairs: Vec<(String, String)> = Vec::new();
     match value {
         Value::String(name) => pairs.push((name.clone(), name.clone())),
@@ -309,7 +305,9 @@ pub(crate) fn parse_eden_backing(value: &Value) -> Result<Vec<(String, String)>,
         Value::Object(map) => {
             for (name, suffix) in map {
                 let Some(suffix) = suffix.as_str() else {
-                    return Err(invalid("paths must be non-empty relative paths under .eden-backing/"));
+                    return Err(invalid(
+                        "paths must be non-empty relative paths under .eden-backing/",
+                    ));
                 };
                 pairs.push((name.clone(), suffix.to_string()));
             }
@@ -338,7 +336,9 @@ pub(crate) fn parse_eden_backing(value: &Value) -> Result<Vec<(String, String)>,
             || suffix.trim() != suffix.as_str()
             || suffix.contains('\\')
             || suffix.starts_with('/')
-            || parts.iter().any(|part| part.is_empty() || *part == "." || *part == "..")
+            || parts
+                .iter()
+                .any(|part| part.is_empty() || *part == "." || *part == "..")
             || parts[0] == "validate"
         {
             return Err(invalid(
