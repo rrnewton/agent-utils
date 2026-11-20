@@ -9,7 +9,7 @@ not), then at phone 412 and desktop 1280, in dark and light schemes:
 2. Downloaded shows only the fetched documents, Starred only the starred
    ones, both together only the starred fetched one, and each composes
    with the bucket chips.
-3. Both toggles work from the keyboard and survive a reload.
+3. Both toggles work from the keyboard; a reload resets them to the full list, as the star filter does today, while each document's own star and fetched state survive.
 
 Run where a browser works (headless shell is enough):
 `python3 tests/documents_toolbar_browser.py [--screenshots DIR]`
@@ -238,15 +238,15 @@ def functional_walk(page: Page, base: str, label: str) -> None:
     page.keyboard.press("Space")
     check(pressed(page, "docs-downloaded-toggle"), f"{label}: Space did not press Downloaded")
     wait_names(page, FETCHED, f"{label} keyboard downloaded")
-    # Reload: both the pressed dress and the filtered list survive.
+    # Reload, as the star filter behaves today: the toggle is session state
+    # and resets to the full list, while each document's own star and
+    # fetched state — the state that has always persisted — remain.
     page.reload(wait_until="load")
     page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
-    check(pressed(page, "docs-downloaded-toggle"), f"{label}: Downloaded did not survive a reload")
-    check(page.evaluate("() => localStorage.getItem('vibe-talk.voice.doc-filters')") == '{"d":1}',
-          f"{label}: the persisted filter value is not the downloaded toggle")
-    wait_names(page, FETCHED, f"{label} reloaded downloaded")
+    check(not pressed(page, "docs-downloaded-toggle"), f"{label}: Downloaded stayed on across a reload")
+    wait_names(page, [f"doc-00{i}" for i in range(DOCS)], f"{label} reloaded full list")
     page.locator("#docs-downloaded-toggle").click()
-    wait_names(page, [f"doc-00{i}" for i in range(DOCS)], f"{label} downloaded cleared")
+    wait_names(page, FETCHED, f"{label} reloaded downloaded")
 
 
 def main() -> int:
@@ -321,12 +321,18 @@ def main() -> int:
                     page.goto(base + "/?v=docs", wait_until="load")
                     walk(page, label, shots)
                     if touch:
-                        # The audio choice the phone list bar gave up (`#2001`):
-                        # one tap on the gear, the same Settings select.
-                        page.locator("#open-settings").click()
-                        page.wait_for_selector("#settings-audio-source", state="visible", timeout=20_000)
-                        page.screenshot(path=str(shots / "documents-toolbar-settings-audio.png"))
-                        page.locator("#close-settings").click()
+                        # The audio toggle the phone list bar gave up (`#2001`):
+                        # one tap on a document, and it stands in the reader's
+                        # controls; Settings keeps the same choice too.
+                        page.locator("#documents-list .doc-card", has_text="doc-000").first.click()
+                        page.wait_for_selector("#doc-body h1", timeout=20_000)
+                        page.wait_for_function(
+                            "() => { const a = document.getElementById('audio-source');"
+                            " return a && !a.hidden && a.parentElement && a.parentElement.id === 'control-pane'; }",
+                            timeout=20_000)
+                        page.screenshot(path=str(shots / "documents-toolbar-reader-audio.png"))
+                        page.locator("#doc-back").click()
+                        page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
                     if folder_name == "dark-phone-412":
                         functional_walk(page, base, label)
                     ctx.close()

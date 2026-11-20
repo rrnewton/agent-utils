@@ -1,7 +1,7 @@
 steps:
   - group: check
     job: documents-toolbar-browser
-    desc: the Documents toolbar Downloaded/Starred pair beside the hamburger (placement order, both filters alone and combined with chips, keyboard and reload persistence), against the real server (fake chat upstream) in current Chromium at 412x915 and 1280x800, dark and light
+    desc: the Documents toolbar Downloaded/Starred pair beside the hamburger (placement order, both filters alone and combined with chips, keyboard and reload behaviour), against the real server (fake chat upstream) in current Chromium at 412x915 and 1280x800, dark and light
     labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/documents_toolbar_browser.py
     jobs_flag: ""

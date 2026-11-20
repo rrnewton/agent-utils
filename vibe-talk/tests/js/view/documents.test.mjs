@@ -3086,14 +3086,13 @@ test("documents list: the card star toggles, writes the synced value, and the St
   });
 });
 
-test("documents list: Downloaded filters to fetched rows, composes with buckets and Starred, and both toggles persist (#2001)", async () => {
+test("documents list: Downloaded filters to fetched rows, composes with buckets and Starred, and reload keeps the documents' own state (#2001)", async () => {
   const listMod = requireModule(LIST, "src/view/documents/list.ts");
   const rows = [
     { ...docRow("md-doc", 100), kind: "github_markdown", fetched: true },
     { ...docRow("paste-doc", 200), kind: "paste", fetched: false, fetched_ms: null },
     { ...docRow("md-unfetched", 300), kind: "github_markdown", fetched: false, fetched_ms: null },
   ];
-  const filterStorage = memoryStorage();
   const stateMod = requireModule(DOCSTATE, "src/view/documents/docstate.ts");
   const docStates = stateMod.createDocStatesStore(memoryStorage());
   const makeList = (seen) => {
@@ -3113,7 +3112,6 @@ test("documents list: Downloaded filters to fetched rows, composes with buckets 
       })[id],
       onOpen: () => {},
       onDownloadedOnlyChange: (on) => seen.push(on),
-      filterStorage,
       docStates,
     });
     return { list, listEl, filterBar };
@@ -3151,22 +3149,22 @@ test("documents list: Downloaded filters to fetched rows, composes with buckets 
     first.list.setStarred("md-doc", true);
     first.list.setStarredOnly(true);
     assert.deepEqual(keys(), ["md-doc"], "Starred+Downloaded did not show only the starred fetched document");
-    assert.equal(filterStorage.held.get(listMod.DOC_FILTERS_KEY), '{"s":1,"d":1}',
-      "the toggles did not persist to device storage");
     first.list.unmount();
-    // A fresh list over the same storage (a reload) restores both toggles.
+    // A fresh list (a reload) behaves as the star filter does today: both
+    // toggles are session state and reset, while the document's own star
+    // and fetched state — the state that has always persisted — remain.
     const secondSeen = [];
     const second = makeList(secondSeen);
-    assert.equal(second.list.starredOnly(), true, "Starred did not survive a reload");
-    assert.equal(second.list.downloadedOnly(), true, "Downloaded did not survive a reload");
+    assert.equal(second.list.starredOnly(), false, "Starred stayed on across a reload");
+    assert.equal(second.list.downloadedOnly(), false, "Downloaded stayed on across a reload");
     await second.list.refresh();
     const keys2 = () => second.listEl.children
       .filter((kid) => String(kid.className).includes("doc-card"))
       .map((kid) => kid.getAttribute("data-key"));
-    assert.deepEqual(keys2(), ["md-doc"], "the reloaded list did not apply both persisted filters");
-    second.list.setDownloadedOnly(false);
-    assert.equal(filterStorage.held.get(listMod.DOC_FILTERS_KEY), '{"s":1}',
-      "clearing Downloaded did not persist");
+    assert.deepEqual(keys2(), ["md-doc", "paste-doc", "md-unfetched"], "the reloaded list is not the full list");
+    assert.equal(second.list.isStarred("md-doc"), true, "the document's star did not survive a reload");
+    second.list.setDownloadedOnly(true);
+    assert.deepEqual(keys2(), ["md-doc"], "the reloaded list does not filter by the persisted fetched state");
     second.list.unmount();
   } finally {
     if (savedDocument === undefined) delete globalThis.document; else globalThis.document = savedDocument;

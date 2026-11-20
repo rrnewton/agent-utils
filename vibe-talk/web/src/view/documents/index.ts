@@ -2,7 +2,7 @@
 // documents linked in chat, and the full-screen reader for one of them. Its
 // public interface; the page mounts it once and shows it as the `docs` view.
 
-export { createDocumentsList, dedupeDocumentRows, documentIdentity, documentMatchesNameFilter, DOC_FILTERS_KEY } from "./list.ts";
+export { createDocumentsList, dedupeDocumentRows, documentIdentity, documentMatchesNameFilter } from "./list.ts";
 export type { DocumentsList, DocumentsListDependencies, DocumentsListPlace } from "./list.ts";
 export { DOC_STATES_KEY, parseDocStates, serializeDocStates, withDocFlag } from "./docstate.ts";
 export { createDocumentsReader, currentOutlineIndex, highlightSearchTerms, openDocumentNotice } from "./reader.ts";
@@ -304,12 +304,6 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
         // A host without the bar toggle keeps the filter as it was.
       }
     },
-    filterStorage: deps.storage
-      ? {
-          getItem: (key) => deps.storage?.().getItem(key) ?? null,
-          setItem: (key, value) => deps.storage?.().setItem(key, value),
-        }
-      : null,
   });
   const search = createDocumentsSearch({
     api: deps.api,

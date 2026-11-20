@@ -17,12 +17,12 @@ updated_at: 2026-11-20T16:54:00.000000000+00:00
 
 - On the Documents list the two filter toggles stand as a pair immediately left of the hamburger, outside the scrolling pack, in the order [downloaded][star][hamburger][Fetch][Documents]. The star stays immediately left of the hamburger because the owner named that adjacency; the downloaded toggle sits left of the star rather than between the star and the hamburger, so that adjacency is literal.
 - Downloaded means a fetched local copy (`row.fetched`, the same state the row's download button shows as fetched). The toggle uses the row's download glyph, with `aria-label` and `aria-pressed`; the star keeps `aria-label`/pressed and its outline/filled glyphs. Both are native buttons, so keyboard operation follows.
-- Both toggles compose with each other and with the All/Markdown/Pastes/Issues chips. Both persist across a reload in device storage (the star filter is in-memory today, so this also gives it the reload survival the owner expects).
+- Both toggles compose with each other and with the All/Markdown/Pastes/Issues chips. Both are page-session state exactly as the star filter is today: a reload returns the full list, and what survives a reload is the per-document state itself (a document's star and its fetched copy), as the existing browser walk asserts.
 - No list scroll behaviour changes. Phone 393/412 and desktop 1280 must fit without wrapping or overflowing.
 
 # Acceptance Criteria
 
-- Page tests cover placement order, both filters alone and combined with the chips, and persistence across a reload.
+- Page tests cover placement order, both filters alone and combined with the chips, and the reload behaviour the star filter has today (session toggles, persistent per-document state).
 - Phone 393/412 and desktop 1280 toolbars fit without wrapping or overflowing, in the page fit pricing and in browser screenshots.
 - Screenshot matrix (light and dark, phone 412 and desktop 1280, keyboard closed, plus the toolbar with each filter on), with BUILD.txt in every folder.
 

@@ -32,12 +32,7 @@ export interface DocumentsListDependencies {
   onStarredOnlyChange?(on: boolean): unknown;
   /** The bottom bar's Downloaded toggle (`#2001`): told whenever the downloaded-only state changes, so its pressed dress follows. */
   onDownloadedOnlyChange?(on: boolean): unknown;
-  /** Device storage the toolbar filter toggles persist in (`#2001`); memory alone without one. */
-  filterStorage?: { getItem(key: string): string | null; setItem(key: string, value: string): void } | null;
 }
-
-/** The device-storage key the Documents toolbar filter toggles persist under (`#2001`). */
-export const DOC_FILTERS_KEY = "vibe-talk.voice.doc-filters";
 
 /** A list place a return lands on (`#1264 documents-scroll-landings`). */
 export interface DocumentsListPlace {
@@ -355,30 +350,12 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
   // persistence key): `#1176 doc-kind-buckets`.
   let bucketFilter: DocumentBucket | "all" = "all";
   // Starred-only (`#1265`, on the bottom bar since `#1909`): a row must pass it and the bucket both.
-  // Both toolbar toggles persist across a reload in device storage (`#2001`); without storage they are this session's memory.
-  const readFilters = (): { starred: boolean; downloaded: boolean } => {
-    try {
-      const raw = deps.filterStorage?.getItem(DOC_FILTERS_KEY);
-      const parsed = raw ? (JSON.parse(raw) as { s?: unknown; d?: unknown }) : null;
-      return { starred: parsed?.s === 1, downloaded: parsed?.d === 1 };
-    } catch {
-      return { starred: false, downloaded: false };
-    }
-  };
-  const persistFilters = (): void => {
-    try {
-      deps.filterStorage?.setItem(
-        DOC_FILTERS_KEY,
-        JSON.stringify({ ...(starredOnly ? { s: 1 } : {}), ...(downloadedOnly ? { d: 1 } : {}) }),
-      );
-    } catch {
-      // Storage refused: the in-memory filters still serve this session.
-    }
-  };
-  const heldFilters = readFilters();
-  let starredOnly = heldFilters.starred;
+  // Both toolbar toggles are this page session's state, as Starred has always
+  // been: a reload returns the full list, and what survives a reload is the
+  // per-document state itself (a document's star, its fetched copy).
+  let starredOnly = false;
   // Downloaded-only (`#2001`): a row must be fetched, as its download button shows.
-  let downloadedOnly = heldFilters.downloaded;
+  let downloadedOnly = false;
   // Hidden documents shown dimmed (the hamburger's "Show hidden"); this device only.
   let showingHidden = false;
   // The local name filter (`#1767`): narrows by file name/title as the owner
@@ -1475,13 +1452,11 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
     starredOnly: () => starredOnly,
     setStarredOnly(on: boolean): void {
       starredOnly = on === true;
-      persistFilters();
       render(rowsNow);
     },
     downloadedOnly: () => downloadedOnly,
     setDownloadedOnly(on: boolean): void {
       downloadedOnly = on === true;
-      persistFilters();
       render(rowsNow);
     },
     setNameFilter(text: string): void {
