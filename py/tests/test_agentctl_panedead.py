@@ -72,6 +72,99 @@ def test_retire_same_boot_missing_pane_refuses_with_remedy(
     assert (manager._directory("worker") / "agent.json").exists()
 
 
+def test_retire_name_at_other_live_pane_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # F1: the Herdr name pointing at a different live pane is not stale.
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch, harness="claude")
+    assert old.pane_id is not None and old.harness_anchor is not None
+    object.__setattr__(old.harness_anchor, "boot_id", OLD_BOOT)
+    manager._save(old)
+    fake.presentations = [item for item in fake.presentations if item.pane_id != old.pane_id]
+    from agentctl.client import Pane
+    fake.presentations.append(Pane("w9:other", old.tab_id or "w1:t9", "w1"))
+    monkeypatch.setattr(fake, "agent_pane", lambda _name: "w9:other")
+    with pytest.raises(AgentDeliveryError, match="w9:other"):
+        _retire(manager)
+    assert (manager._directory("worker") / "agent.json").exists()
+
+
+def test_revive_name_at_other_live_pane_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch, harness="claude")
+    assert old.pane_id is not None and old.harness_anchor is not None
+    object.__setattr__(old.harness_anchor, "boot_id", OLD_BOOT)
+    manager._save(old)
+    fake.presentations = [item for item in fake.presentations if item.pane_id != old.pane_id]
+    from agentctl.client import Pane
+    fake.presentations.append(Pane("w9:other", old.tab_id or "w1:t9", "w1"))
+    monkeypatch.setattr(fake, "agent_pane", lambda _name: "w9:other")
+    with pytest.raises(AgentDeliveryError, match="w9:other"):
+        manager.revive("worker", expected_token=old.token)
+
+
+def test_retire_herdr_unavailable_is_unproven(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path))
+    record = manager.get("worker")
+    assert record.pane_id is not None
+    mutated = manager.get("worker")
+    assert mutated.harness_anchor is not None
+    object.__setattr__(mutated.harness_anchor, "boot_id", OLD_BOOT)
+    manager._save(mutated)
+    _make_pane_gone(fake, record.pane_id, monkeypatch)
+
+    def down(**_kwargs):  # type: ignore[no-untyped-def]
+        raise HerdrUnavailable("server unavailable")
+
+    monkeypatch.setattr(fake, "panes", down)
+    with pytest.raises(AgentDeliveryError):
+        _retire(manager)
+    assert (manager._directory("worker") / "agent.json").exists()
+
+
+def test_retire_missing_identity_is_unproven(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path))
+    record = manager.get("worker")
+    assert record.pane_id is not None
+    record.harness_identity = None
+    record.custom_process_identity = None
+    manager._save(record)
+    _make_pane_gone(fake, record.pane_id, monkeypatch)
+    with pytest.raises(AgentDeliveryError):
+        _retire(manager)
+    assert (manager._directory("worker") / "agent.json").exists()
+
+
+def test_revive_live_session_holder_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # F2: a live process carrying the recorded session in its environment.
+    import subprocess
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch, harness="claude")
+    assert old.pane_id is not None and old.harness_anchor is not None
+    object.__setattr__(old.harness_anchor, "boot_id", OLD_BOOT)
+    token = "panedead-holder-session-1944"
+    old.session_value = token
+    if old.native_session is not None:
+        old.native_session = {**old.native_session, "value": token}
+    manager._save(old)
+    fake.presentations = [item for item in fake.presentations if item.pane_id != old.pane_id]
+    holder = subprocess.Popen(["sleep", "30"], env={"HOLDER_SESSION": token, "PATH": "/usr/bin:/bin"})
+    try:
+        with pytest.raises(AgentDeliveryError, match="live process"):
+            manager.revive("worker", expected_token=old.token)
+    finally:
+        holder.kill()
+        holder.wait()
+
+
 def test_revive_previous_boot_missing_pane_revives(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

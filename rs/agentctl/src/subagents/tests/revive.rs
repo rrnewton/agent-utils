@@ -1147,6 +1147,91 @@ fn revive_same_boot_missing_pane_refuses_with_remedy() {
 }
 
 #[test]
+fn revive_name_at_other_live_pane_refuses() {
+    // F1: the Herdr name pointing at a different live pane is not stale.
+    let (fixture, mut old) = recoverable("claude", false);
+    let pane = old.pane_id.clone().unwrap();
+    old.harness_identity.as_mut().unwrap().boot_id =
+        "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_owned();
+    fixture.manager().save(&old).unwrap();
+    fixture
+        .client
+        .panes
+        .lock()
+        .unwrap()
+        .retain(|item| item.pane_id != pane);
+    fixture.client.herdr_closed.lock().unwrap().insert(pane);
+    fixture
+        .client
+        .panes
+        .lock()
+        .unwrap()
+        .push(Fake::pane("human"));
+    *fixture.client.named_pane.lock().unwrap() = "human".to_owned();
+    fixture
+        .client
+        .herdr_names
+        .lock()
+        .unwrap()
+        .insert("worker".to_owned(), "human".to_owned());
+    let error = fixture
+        .manager()
+        .revive("worker", false, None, TIMEOUT)
+        .unwrap_err();
+    assert!(error.to_string().contains("human"), "{error}");
+    assert!(!journal_path(&fixture, &old).exists());
+}
+
+#[test]
+fn revive_same_boot_live_process_refuses() {
+    // Same boot, harness process alive: revive refuses and names the remedy.
+    let (fixture, old) = recoverable("claude", false);
+    let pane = old.pane_id.clone().unwrap();
+    fixture.client.dead_panes.lock().unwrap().remove(&pane);
+    fixture.client.started.store(true, Ordering::Relaxed);
+    let error = fixture
+        .manager()
+        .revive("worker", false, None, TIMEOUT)
+        .unwrap_err();
+    assert!(error.to_string().contains("alive"), "{error}");
+    assert!(error.to_string().contains("remedy"), "{error}");
+    assert!(!journal_path(&fixture, &old).exists());
+}
+
+#[test]
+fn revive_live_session_holder_refuses() {
+    // F2: a live process carrying the recorded session in its environment.
+    let (fixture, mut old) = recoverable("claude", false);
+    let pane = old.pane_id.clone().unwrap();
+    old.harness_identity.as_mut().unwrap().boot_id =
+        "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_owned();
+    let token = "panedead-revive-holder-1944";
+    old.session_value = Some(token.to_owned());
+    if let Some(native) = old.native_session.as_mut() {
+        native.value = token.to_owned();
+    }
+    fixture.manager().save(&old).unwrap();
+    fixture
+        .client
+        .panes
+        .lock()
+        .unwrap()
+        .retain(|item| item.pane_id != pane);
+    fixture.client.herdr_closed.lock().unwrap().insert(pane);
+    let mut holder = std::process::Command::new("sleep")
+        .arg("30")
+        .env("HOLDER_SESSION", token)
+        .spawn()
+        .unwrap();
+    let result = fixture.manager().revive("worker", false, None, TIMEOUT);
+    let _ = holder.kill();
+    let _ = holder.wait();
+    let error = result.unwrap_err();
+    assert!(error.to_string().contains("live process"), "{error}");
+    assert!(!journal_path(&fixture, &old).exists());
+}
+
+#[test]
 fn revive_refuses_a_missing_old_pane_when_its_tab_has_been_reused() {
     let (fixture, old) = recoverable("claude", false);
     let pane = old.pane_id.as_ref().unwrap();

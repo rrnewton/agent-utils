@@ -1283,6 +1283,114 @@ fn dead_native_retirement_same_boot_missing_pane_refuses_with_remedy() {
         .exists());
 }
 
+fn previous_boot_missing_pane(fixture: &Fixture) -> AgentRecord {
+    let mut record = fixture.manager().load("worker").unwrap();
+    let pane = record.pane_id.clone().unwrap();
+    record.harness_identity.as_mut().unwrap().boot_id =
+        "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_owned();
+    fixture.manager().save(&record).unwrap();
+    let record = fixture.manager().load("worker").unwrap();
+    fixture
+        .client
+        .panes
+        .lock()
+        .unwrap()
+        .retain(|item| item.pane_id != pane);
+    fixture.client.herdr_closed.lock().unwrap().insert(pane);
+    record
+}
+
+#[test]
+fn dead_native_name_at_other_live_pane_refuses() {
+    // F1: the Herdr name pointing at a different live pane is not stale.
+    let fixture = Fixture::new();
+    fixture.start(None);
+    let record = previous_boot_missing_pane(&fixture);
+    fixture
+        .client
+        .panes
+        .lock()
+        .unwrap()
+        .push(Fake::pane("human"));
+    *fixture.client.named_pane.lock().unwrap() = "human".to_owned();
+    let error = fixture
+        .manager()
+        .stop_with_options("worker", native_options(&fixture, &record))
+        .unwrap_err();
+    assert!(error.to_string().contains("human"), "{error}");
+    assert!(fixture
+        .root
+        .join("registry/agents/worker/agent.json")
+        .exists());
+}
+
+#[test]
+fn dead_native_herdr_unavailable_is_unproven() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    let record = previous_boot_missing_pane(&fixture);
+    fixture.client.fail_panes.store(true, Ordering::Relaxed);
+    assert!(fixture
+        .manager()
+        .stop_with_options("worker", native_options(&fixture, &record))
+        .is_err());
+    assert!(fixture
+        .root
+        .join("registry/agents/worker/agent.json")
+        .exists());
+}
+
+#[test]
+fn dead_native_missing_identity_is_unproven() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    let mut record = previous_boot_missing_pane(&fixture);
+    record.harness_identity = None;
+    record.custom_process_identity = None;
+    record.anchor_rule = None;
+    fixture.manager().save(&record).unwrap();
+    let record = fixture.manager().load("worker").unwrap();
+    assert!(fixture
+        .manager()
+        .stop_with_options("worker", native_options(&fixture, &record))
+        .is_err());
+    assert!(fixture
+        .root
+        .join("registry/agents/worker/agent.json")
+        .exists());
+}
+
+#[test]
+fn dead_native_live_session_holder_refuses() {
+    // F2: a live process carrying the recorded session in its environment.
+    let fixture = Fixture::new();
+    fixture.start(None);
+    let mut record = previous_boot_missing_pane(&fixture);
+    let token = "panedead-holder-session-1944";
+    record.session_value = Some(token.to_owned());
+    if let Some(native) = record.native_session.as_mut() {
+        native.value = token.to_owned();
+    }
+    fixture.manager().save(&record).unwrap();
+    let record = fixture.manager().load("worker").unwrap();
+    let mut holder = std::process::Command::new("sleep")
+        .arg("30")
+        .env("HOLDER_SESSION", token)
+        .spawn()
+        .unwrap();
+    let result = fixture
+        .manager()
+        .stop_with_options("worker", native_options(&fixture, &record));
+    let _ = holder.kill();
+    let _ = holder.wait();
+    let error = result.unwrap_err();
+    assert!(error.to_string().contains("live process"), "{error}");
+    assert!(fixture
+        .root
+        .join("registry/agents/worker/agent.json")
+        .exists());
+}
+
 #[test]
 fn dead_native_retirement_archives_a_custom_record_whose_pane_is_a_plain_shell() {
     // Herdr restored the Muse pane as /bin/bash after a reboot (#744).

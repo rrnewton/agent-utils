@@ -583,10 +583,21 @@ def _census(manager: ManagedAgents) -> tuple[Pane, ...]:
 def _proof(manager: ManagedAgents, record: AgentRecord) -> dict[str, object]:
     # Previous-boot proof (#1944): boot change proves death; a missing pane
     # plus a stale Herdr agent object cannot block revive.
-    if (manager._previous_boot_proven_dead(record) and manager._recorded_pane_proven_missing(record)
-            and all(pane.tab_id != record.tab_id for pane in manager.client.panes())):
+    override, message = manager._boot_override(record)
+    if override == "refuse" and any(journal["name"] == record.name for journal in journals(manager)):
+        override = "applies"  # this revive's own candidate holds the name (F1)
+    if override == "refuse":
+        raise AgentDeliveryError(message or "the recorded Herdr agent name points at a live pane")
+    if override == "applies":
+        refusal = manager._live_session_holder_refusal(record)
+        if refusal is not None:
+            raise AgentDeliveryError(refusal)
         if not record.pane_id or not record.tab_id or not record.workspace_id:
             raise AgentDeliveryError("record lacks its owned pane, tab, or workspace")
+        # Keep the validated, repeated census (F4).
+        for panes in (_census(manager), _census(manager)):
+            if any(pane.pane_id == record.pane_id or pane.tab_id == record.tab_id for pane in panes):
+                raise AgentDeliveryError("recorded presentation changed during the missing-pane proof")
         return {
             "kind": "missing", "pane_id": record.pane_id, "tab_id": record.tab_id,
             "workspace_id": record.workspace_id, "cwd": record.cwd, "terminal_id": None,
@@ -635,9 +646,14 @@ def _proof(manager: ManagedAgents, record: AgentRecord) -> dict[str, object]:
 
 
 def _name_available(manager: ManagedAgents, record: AgentRecord) -> None:
-    # Previous-boot proof (#1944): ignore a stale Herdr agent object (Herdr
-    # offers no agent-object deletion) when the recorded pane is gone.
-    if manager._previous_boot_proven_dead(record) and manager._recorded_pane_proven_missing(record):
+    # Previous-boot proof (#1944): ignore a stale-only Herdr agent object
+    # (Herdr offers no agent-object deletion) when the recorded pane is gone.
+    override, message = manager._boot_override(record)
+    if override == "refuse" and any(journal["name"] == record.name for journal in journals(manager)):
+        override = "applies"  # this revive's own candidate holds the name (F1)
+    if override == "refuse":
+        raise AgentDeliveryError(message or "the recorded Herdr agent name points at a live pane")
+    if override == "applies":
         owner = manager._identity_owner(record.harness, _revive_conversation(record), exclude=record.name)
         if owner is not None:
             raise AgentDeliveryError(f"native conversation is already registered as {owner.name!r}")

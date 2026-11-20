@@ -2068,27 +2068,43 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         })
     }
 
+    /// `boot_override` for revive: while a revive journal for this name is
+    /// open, the name may legitimately point at this revive's own candidate
+    /// pane, so a Refuse there is the candidate, not a foreign pane (F1).
+    fn revive_boot_override(&self, record: &AgentRecord) -> BootOverride {
+        match self.boot_override(record) {
+            BootOverride::Refuse(message) => {
+                let journal_open = journals(&self.registry)
+                    .is_ok_and(|all| all.iter().any(|journal| journal.name == record.name));
+                if journal_open {
+                    BootOverride::Applies
+                } else {
+                    BootOverride::Refuse(message)
+                }
+            }
+            other => other,
+        }
+    }
+
     fn revive_liveness(&self, record: &AgentRecord) -> ProcessLiveness {
-        // Previous-boot proof (#1944): a boot change plus a proven-missing
-        // pane proves death even when a stale Herdr agent object remains.
-        if Self::previous_boot_proven_dead(record) && self.recorded_pane_proven_missing(record) {
+        // Previous-boot proof (#1944): boot change + proven-missing pane +
+        // a stale-only Herdr name proves death (see `boot_override`).
+        if matches!(self.revive_boot_override(record), BootOverride::Applies)
+            && Self::live_session_holder_refusal(record).is_none()
+        {
             return ProcessLiveness::Dead;
         }
-        let identity = if record.anchors_with_harness_identity() {
-            record.harness_anchor()
-        } else if record.adapter == "harness-wrapper" {
-            // The wrapper records the harness process it spawned itself;
-            // there is no pane pin, so no anchor rule gates this identity.
-            record.harness_identity.as_ref()
-        } else {
-            record.custom_process_identity.as_ref()
-        };
-        identity.map_or(ProcessLiveness::Unknown, |identity| {
+        Self::liveness_identity(record).map_or(ProcessLiveness::Unknown, |identity| {
             self.client.process_liveness(identity)
         })
     }
 
     fn revive_proof(&self, record: &AgentRecord) -> Result<Proof> {
+        if matches!(self.revive_boot_override(record), BootOverride::Applies) {
+            if let Some(refusal) = Self::live_session_holder_refusal(record) {
+                return Err(fail(refusal));
+            }
+        }
         if self.revive_liveness(record) != ProcessLiveness::Dead {
             return Err(fail(format!(
                 "recorded harness process death is unverifiable during recovery proof; a missing pane in the current boot is not proof of death — remedy: retire this generation with `agentctl stop {} --retire-dead-native --expected-token {} --expected-record-sha256 <sha256-of-agent.json>` once its harness process is gone, then start a fresh agent",
@@ -2110,16 +2126,39 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             .as_deref()
             .filter(|value| valid_metadata_text(value))
             .ok_or_else(|| fail("record lacks an owned workspace identity"))?;
-        // Previous-boot proof (#1944): the pane is gone and the boot changed,
-        // so a stale Herdr agent object cannot block revive. A census pane
-        // reusing the recorded tab still blocks (the normal proof refuses).
-        if Self::previous_boot_proven_dead(record)
-            && self.recorded_pane_proven_missing(record)
-            && self
-                .client
-                .panes()
-                .is_ok_and(|panes| !panes.iter().any(|item| item.tab_id == tab))
-        {
+        // Previous-boot proof (#1944): the pane is gone and the boot changed.
+        // Keep the census validation and the repeated census (F4), the
+        // stale-name check (F1) and the live-session-holder check (F2).
+        let boot_override = self.revive_boot_override(record);
+        if let BootOverride::Refuse(message) = &boot_override {
+            return Err(fail(message.clone()));
+        }
+        if matches!(boot_override, BootOverride::Applies) {
+            if let Some(refusal) = Self::live_session_holder_refusal(record) {
+                return Err(fail(refusal));
+            }
+            let panes = self.client.panes()?;
+            validate_census(&panes)?;
+            if panes
+                .iter()
+                .any(|item| item.pane_id == pane || item.tab_id == tab)
+            {
+                return Err(fail(
+                    "missing pane or its recorded tab still appears in the pane census",
+                ));
+            }
+            let repeated = self.client.panes()?;
+            validate_census(&repeated)?;
+            if repeated
+                .iter()
+                .any(|item| item.pane_id == pane || item.tab_id == tab)
+            {
+                return Err(fail(
+                    "missing pane presentation changed during recovery proof",
+                ));
+            }
+        }
+        if matches!(boot_override, BootOverride::Applies) {
             return Ok(Proof {
                 unknown: Default::default(),
                 kind: "missing".to_owned(),
@@ -2717,6 +2756,14 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         record: &AgentRecord,
         timeout: Duration,
     ) -> Result<(LaunchPlan, Proof)> {
+        if let BootOverride::Refuse(message) = self.revive_boot_override(record) {
+            return Err(fail(message));
+        }
+        if matches!(self.revive_boot_override(record), BootOverride::Applies) {
+            if let Some(refusal) = Self::live_session_holder_refusal(record) {
+                return Err(fail(refusal));
+            }
+        }
         match self.revive_liveness(record) {
             ProcessLiveness::Dead => {}
             ProcessLiveness::Alive => {

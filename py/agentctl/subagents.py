@@ -2993,9 +2993,18 @@ class ManagedAgents:
                 and record.harness_anchor is not None)
 
     @staticmethod
+    def _liveness_identity(record: AgentRecord) -> CustomProcessIdentity | None:
+        """The one identity selector (#1944 F3): boot proof and liveness agree."""
+        if record.adapter in ("herdr", "herdr-foreign"):
+            return record.harness_anchor
+        if record.adapter == "harness-wrapper":
+            return record.harness_identity
+        return record.custom_process_identity
+
+    @staticmethod
     def _previous_boot_proven_dead(record: AgentRecord) -> bool:
         """Proven dead by boot change (#1944); fail closed on any unreadable boot."""
-        identity = record.harness_anchor or record.harness_identity or record.custom_process_identity
+        identity = ManagedAgents._liveness_identity(record)
         if identity is None:
             return False
         try:
@@ -3026,6 +3035,120 @@ class ManagedAgents:
             return False
         return False
 
+    def _boot_override(self, record: AgentRecord) -> tuple[str, str | None]:
+        """Previous-boot override (#1944 F1): (applies|not|refuse, message)."""
+        if not self._previous_boot_proven_dead(record) or not self._recorded_pane_proven_missing(record):
+            return ("not", None)
+        try:
+            pane = self.client.agent_pane(record.name)
+        except HerdrUnavailable as exc:
+            if herdr_error_code(str(exc)) == "agent_not_found":
+                return ("applies", None)
+            return ("not", None)
+        if pane == record.pane_id:
+            return ("applies", None)
+        try:
+            in_census = any(item.pane_id == pane for item in self.client.panes())
+        except Exception:
+            return ("not", None)
+        if in_census:
+            # A revive candidate launched by this very revive reports the
+            # recorded session in its new pane; it is not foreign.
+            session = None
+            if record.native_session is not None:
+                session = record.native_session.get("value")
+            session = session or record.session_value
+            try:
+                info = self.client.pane_info(pane)
+                if session is not None and info.session_value == session:
+                    return ("applies", None)
+            except Exception:
+                pass
+            return ("refuse", (
+                f"the recorded Herdr agent name points at live pane {pane}, not the recorded pane {record.pane_id!r}; "
+                "refusing to retire or revive over it — remedy: stop that pane's agent first, or rename it, then retry"
+            ))
+        return ("applies", None)
+
+    @staticmethod
+    def _live_session_holder_refusal(record: AgentRecord) -> str | None:
+        """Refusal when a live process holds the recorded session (#1944 F2)."""
+        session = None
+        if record.native_session is not None:
+            session = record.native_session.get("value")
+        session = session or record.session_value
+        if not isinstance(session, str) or len(session) < 8:
+            return None
+        needle = session.encode()
+        uid = os.getuid()
+        try:
+            pids = [name for name in os.listdir("/proc") if name.isdigit()]
+        except OSError:
+            return None
+        for pid_text in pids:
+            pid = int(pid_text)
+            if pid == os.getpid():
+                continue
+            base = f"/proc/{pid}"
+            try:
+                if os.stat(base).st_uid != uid:
+                    continue
+            except OSError:
+                continue
+
+            def unreadable(what: str) -> str:
+                return (f"cannot inspect {what} of same-uid process {pid} while proving no live holder "
+                        "of the recorded session; refusing (fail closed) — remedy: retry once that process "
+                        "exits or is inspectable")
+            cmdline = b""
+            for what in ("cmdline", "environ"):
+                try:
+                    with open(f"{base}/{what}", "rb") as stream:
+                        data = stream.read()
+                except OSError:
+                    if what == "cmdline":
+                        # A process that vanished mid-scan is not a holder.
+                        if os.path.exists(base):
+                            return unreadable(what)
+                        break
+                    # Fail closed on an unreadable environ only for a harness
+                    # candidate (see the Rust edition): a readable non-harness
+                    # cmdline such as systemd --user cannot be the harness.
+                    try:
+                        with open(f"{base}/cmdline", "rb") as stream:
+                            same = stream.read() == cmdline
+                    except OSError:
+                        same = False
+                    if same and any(name in cmdline.lower() for name in (b"claude", b"codex", b"muse")):
+                        return unreadable(what)
+                    break
+                if what == "cmdline":
+                    cmdline = data
+                if needle in data:
+                    return (f"live process {pid} holds the recorded native session (its {what} carries it); "
+                            f"refusing to retire or revive over it — remedy: stop process {pid} first")
+            try:
+                fds = os.listdir(f"{base}/fd")
+            except OSError:
+                # Fail closed only if still this same generation at refusal.
+                try:
+                    with open(f"{base}/cmdline", "rb") as stream:
+                        same = stream.read() == cmdline
+                except OSError:
+                    same = False
+                if same and any(name in cmdline.lower() for name in (b"claude", b"codex", b"muse")):
+                    return unreadable("fd directory")
+                fds = []
+            for fd in fds:
+                try:
+                    target = os.readlink(f"{base}/fd/{fd}")
+                except OSError:
+                    continue
+                if session in target:
+                    return (f"live process {pid} holds the recorded native session (an open file names it); "
+                            f"refusing to retire or revive over it — remedy: stop process {pid} first")
+        return None
+
     def _require_dead_native(self, record: AgentRecord) -> None:
         """A native agent is gone only when Herdr says so, or boot proof (#1944) applies.
 
@@ -3037,7 +3160,13 @@ class ManagedAgents:
             raise AgentDeliveryError(
                 "--retire-dead-native applies only to a running or launch-failed interactive herdr record"
             )
-        if self._previous_boot_proven_dead(record) and self._recorded_pane_proven_missing(record):
+        override, message = self._boot_override(record)
+        if override == "refuse":
+            raise AgentDeliveryError(message or "the recorded Herdr agent name points at a live pane")
+        if override == "applies":
+            refusal = self._live_session_holder_refusal(record)
+            if refusal is not None:
+                raise AgentDeliveryError(refusal)
             return
         try:
             self.client.agent_pane(record.name)
@@ -7598,7 +7727,7 @@ class ManagedAgents:
                                      "detail": str(exc)})
         # Progress (#1944): each Herdr probe is bounded but the total is not;
         # report progress on stderr so a slow registry never hangs silently.
-        print(f"agentctl doctor: checking {len(records)} record(s) against live Herdr state", file=sys.stderr)
+        print(f"agentctl doctor: checking {len(records)} record(s) against live Herdr state", file=sys.stderr) if sys.stderr.isatty() else None
         panes = {pane.pane_id: pane for pane in self.client.panes()}
         agent_names = self.client.agent_names()
         workspaces = sorted({record.workspace_id for record in records if record.workspace_id})
@@ -7618,7 +7747,7 @@ class ManagedAgents:
                     claims.setdefault(key, []).append(record.name)
         shared_terminals = self._shared_terminal_findings(records)
         for index, record in enumerate(records):
-            print(f"agentctl doctor: {index + 1}/{len(records)} {record.name}", file=sys.stderr)
+            print(f"agentctl doctor: {index + 1}/{len(records)} {record.name}", file=sys.stderr) if sys.stderr.isatty() else None
             if record.workspace_id in missing_workspaces:
                 findings = ["workspace-missing"]
             else:

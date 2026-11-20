@@ -632,6 +632,13 @@ const MAX_FORMER_NAMES: usize = 4096;
 /// written under an earlier rule (none, or a launcher-capable one) do not count.
 const ANCHOR_RULE: u32 = 2;
 
+/// Whether the previous-boot dead proof (#1944) overrides Herdr lookups.
+enum BootOverride {
+    Applies,
+    NotApplies,
+    Refuse(String),
+}
+
 /// How long `stop` waits for a Muse runtime it asked to exit before closing its pane.
 const HARNESS_END_GRACE: Duration = Duration::from_secs(10);
 
@@ -10123,10 +10130,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         // Progress (#1944): doctor probes Herdr once per record/workspace and
         // each probe is bounded (30 s), but the total is not; report progress
         // on stderr so a slow registry never hangs silently.
-        eprintln!(
-            "agentctl doctor: checking {} record(s) against live Herdr state",
-            records.len()
-        );
+        if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+            eprintln!(
+                "agentctl doctor: checking {} record(s) against live Herdr state",
+                records.len()
+            );
+        }
         let panes: BTreeMap<String, Pane> = self
             .client
             .panes()?
@@ -10161,12 +10170,14 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
         let shared_terminals = self.shared_terminal_findings(&records);
         for (index, record) in records.iter().enumerate() {
-            eprintln!(
-                "agentctl doctor: {}/{} {}",
-                index + 1,
-                records.len(),
-                record.name
-            );
+            if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+                eprintln!(
+                    "agentctl doctor: {}/{} {}",
+                    index + 1,
+                    records.len(),
+                    record.name
+                );
+            }
             let mut findings = if self.require_record_backend(record).is_err() {
                 // This census cannot see the other backend's panes; say
                 // that instead of reporting the agent missing.
@@ -16337,19 +16348,167 @@ its drain would also type, so it was not queued",
         }
     }
 
+    /// The one identity selector (#1944 F3): boot proof and liveness agree.
+    fn liveness_identity(record: &AgentRecord) -> Option<&CustomProcessIdentity> {
+        if record.anchors_with_harness_identity() {
+            record.harness_anchor()
+        } else if record.adapter == "harness-wrapper" {
+            record.harness_identity.as_ref()
+        } else {
+            record.custom_process_identity.as_ref()
+        }
+    }
+
     /// Proven dead by boot change (#1944): a valid recorded harness identity
-    /// whose boot differs from the current boot cannot be running, whatever
-    /// any pane or Herdr-agent lookup says. Fail closed: no valid identity,
-    /// or an unreadable/invalid current boot, is not proof.
+    /// whose boot differs from the current boot cannot be running. Fail
+    /// closed: no valid identity, or an unreadable/invalid current boot, is
+    /// not proof.
     fn previous_boot_proven_dead(record: &AgentRecord) -> bool {
-        let identity = record
-            .harness_anchor()
-            .or(record.harness_identity.as_ref())
-            .or(record.custom_process_identity.as_ref());
-        let Some(identity) = identity.filter(|identity| identity.valid()) else {
+        let Some(identity) = Self::liveness_identity(record).filter(|identity| identity.valid())
+        else {
             return false;
         };
         agent_queue::identity::current_boot_id().is_ok_and(|current| identity.boot_id != current)
+    }
+
+    /// Whether the previous-boot override applies (#1944 F1): the Herdr name
+    /// must be gone, point at the recorded pane, or point at a pane absent
+    /// from the census. A name pointing at a different live pane refuses.
+    fn boot_override(&self, record: &AgentRecord) -> BootOverride {
+        if !Self::previous_boot_proven_dead(record) || !self.recorded_pane_proven_missing(record) {
+            return BootOverride::NotApplies;
+        }
+        match self.client.agent_pane(&record.name) {
+            Err(error)
+                if crate::client::herdr_error_code(&error.to_string()).as_deref()
+                    == Some("agent_not_found") =>
+            {
+                BootOverride::Applies
+            }
+            Ok(pane) if Some(pane.as_str()) == record.pane_id.as_deref() => BootOverride::Applies,
+            Ok(pane) => {
+                let in_census = self
+                    .client
+                    .panes()
+                    .is_ok_and(|panes| panes.iter().any(|item| item.pane_id == pane));
+                // A revive candidate launched by this very revive reports
+                // the recorded session in its new pane; it is not foreign.
+                let candidate = in_census
+                    && self.client.pane_info(&pane).is_ok_and(|info| {
+                        let session = record
+                            .native_session
+                            .as_ref()
+                            .map(|native| native.value.as_str())
+                            .or(record.session_value.as_deref());
+                        session.is_some() && info.session_value.as_deref() == session
+                    });
+                if candidate {
+                    BootOverride::Applies
+                } else if in_census {
+                    BootOverride::Refuse(format!(
+                        "the recorded Herdr agent name points at live pane {pane}, not the recorded pane {:?}; refusing to retire or revive over it — remedy: stop that pane's agent first, or rename it, then retry",
+                        record.pane_id
+                    ))
+                } else {
+                    BootOverride::Applies
+                }
+            }
+            Err(_) => BootOverride::NotApplies,
+        }
+    }
+
+    /// Refusal when a live process holds the recorded native session (#1944
+    /// F2), or when a same-uid process cannot be inspected (fail closed).
+    /// Scans /proc cmdline, environ and fd targets for the session id.
+    fn live_session_holder_refusal(record: &AgentRecord) -> Option<String> {
+        let session = record
+            .native_session
+            .as_ref()
+            .map(|native| native.value.clone())
+            .or_else(|| record.session_value.clone())?;
+        if session.len() < 8 {
+            return None;
+        }
+        let needle = session.as_bytes();
+        let contains = |bytes: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+        let self_uid = fs::metadata("/proc/self").ok()?.uid();
+        let entries = fs::read_dir("/proc").ok()?;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(pid) = name.to_str().and_then(|text| text.parse::<u32>().ok()) else {
+                continue;
+            };
+            if pid == std::process::id() {
+                continue;
+            }
+            let base = PathBuf::from("/proc").join(pid.to_string());
+            let Ok(meta) = fs::metadata(&base) else {
+                continue;
+            };
+            if meta.uid() != self_uid {
+                continue;
+            }
+            let unreadable = |what: &str| {
+                Some(format!(
+                    "cannot inspect {what} of same-uid process {pid} while proving no live holder of the recorded session; refusing (fail closed) — remedy: retry once that process exits or is inspectable"
+                ))
+            };
+            let first_cmdline = match fs::read(base.join("cmdline")) {
+                Ok(bytes) if contains(&bytes) => {
+                    return Some(format!(
+                        "live process {pid} holds the recorded native session (its command line carries it); refusing to retire or revive over it — remedy: stop process {pid} first"
+                    ));
+                }
+                Ok(bytes) => bytes,
+                // A process that vanished mid-scan is not a holder.
+                Err(_) if fs::metadata(&base).is_ok() => return unreadable("cmdline"),
+                Err(_) => continue,
+            };
+            // Fail closed only if the process is still this same generation
+            // at the moment of refusal: a candidate exiting mid-scan (its fd
+            // or environ going unreadable as it dies) is not a holder.
+            let still_same = |base: &PathBuf, first: &[u8]| {
+                fs::read(base.join("cmdline")).is_ok_and(|again| again == first)
+            };
+            // Fail closed on an unreadable environ/fd only for a harness
+            // candidate: a readable non-harness cmdline (systemd --user and
+            // other dumpable=0 daemons) cannot be the recorded harness, and
+            // refusing on it would make the override unusable on any host.
+            let cmdline_text = String::from_utf8_lossy(&first_cmdline).to_lowercase();
+            let harness_candidate = ["claude", "codex", "muse"]
+                .iter()
+                .any(|name| cmdline_text.contains(name));
+            match fs::read(base.join("environ")) {
+                Ok(bytes) if contains(&bytes) => {
+                    return Some(format!(
+                        "live process {pid} holds the recorded native session (its environment carries it); refusing to retire or revive over it — remedy: stop process {pid} first"
+                    ));
+                }
+                Ok(_) => {}
+                Err(_) if harness_candidate && still_same(&base, &first_cmdline) => {
+                    return unreadable("environ")
+                }
+                Err(_) => {}
+            }
+            match fs::read_dir(base.join("fd")) {
+                Ok(fds) => {
+                    for fd in fds.flatten() {
+                        if let Ok(target) = fs::read_link(fd.path()) {
+                            if contains(target.to_string_lossy().as_bytes()) {
+                                return Some(format!(
+                                    "live process {pid} holds the recorded native session (an open file names it); refusing to retire or revive over it — remedy: stop process {pid} first"
+                                ));
+                            }
+                        }
+                    }
+                }
+                Err(_) if harness_candidate && still_same(&base, &first_cmdline) => {
+                    return unreadable("fd directory")
+                }
+                Err(_) => {}
+            }
+        }
+        None
     }
 
     /// The recorded pane is absent from the live pane census.
@@ -16379,8 +16538,15 @@ its drain would also type, so it was not queued",
     /// the stale object is ignored (it names no live pane).
     fn require_dead_native(&self, record: &AgentRecord) -> Result<()> {
         Self::dead_native_anchor(record)?;
-        if Self::previous_boot_proven_dead(record) && self.recorded_pane_proven_missing(record) {
-            return Ok(());
+        match self.boot_override(record) {
+            BootOverride::Applies => {
+                if let Some(refusal) = Self::live_session_holder_refusal(record) {
+                    return Err(fail(refusal));
+                }
+                return Ok(());
+            }
+            BootOverride::Refuse(message) => return Err(fail(message)),
+            BootOverride::NotApplies => {}
         }
         match self.client.agent_pane(&record.name) {
             // Herdr restored a custom pane as a plain shell after a reboot (#744): the
