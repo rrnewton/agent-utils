@@ -76,7 +76,7 @@
 <a class="button button-secondary" href="https://github.com/rrnewton/agent-utils">Source</a>
 </div>
 <ul class="facts" aria-label="At a glance">
-<li>Core tools: Linux only, Python 3.10+ and a Rust toolchain; nothing to install (Cargo builds on first use)</li>
+<li>Free, MIT, runs on your Linux machine; your agents use your existing Claude Code / Codex logins</li>
 <li>Needs Herdr, a separate terminal server</li>
 <li>Pre-1.0; the session tool, agentctl, is beta</li>
 </ul>
@@ -114,12 +114,12 @@
 <article class="card problem">
 <h3>Prompts get lost or sent twice</h3>
 <p>A follow-up typed into the wrong terminal, or resent because the first attempt looked like it failed, is easy to miss and hard to undo.</p>
-<p class="answer"><strong><a href="tools.html#agentctl">agentctl</a></strong> delivers through a durable queue, checks the recipient before and after every keystroke, and sets aside a delivery it cannot confirm instead of replaying it.</p>
+<p class="answer"><strong><a href="tools.html#agentctl">agentctl</a></strong> queues every prompt durably and never replays one it cannot confirm.</p>
 </article>
 <article class="card problem">
 <h3>Background agents are hard to trust</h3>
 <p>An agent you cannot watch or interrupt is an agent you have to take on faith.</p>
-<p class="answer">Every agent runs as its own terminal interface in a tab of <strong><a href="tools.html#herdr">Herdr</a></strong>, a persistent terminal server, so you can attach to any of them and type.</p>
+<p class="answer">Every agent runs in its own <strong><a href="tools.html#herdr">Herdr</a></strong> tab; attach and type at any time.</p>
 </article>
 <article class="card problem">
 <h3>Cleanup destroys work</h3>
@@ -139,17 +139,17 @@
 <article class="card problem">
 <h3>A sandbox blocks the last step</h3>
 <p>An agent confined from the network can do all the work and still be unable to push it.</p>
-<p class="answer"><strong><a href="tools.html#herdr-run">herdr-run</a></strong> runs an allowlisted command, such as <code>git push</code>, in a visible Herdr pane outside the sandbox and records every run. The allowlist is yours to set.</p>
+<p class="answer"><strong><a href="tools.html#herdr-run">herdr-run</a></strong> runs your allowlisted commands in a visible pane outside the sandbox.</p>
 </article>
 <article class="card problem">
 <h3>Shared limits run out quietly</h3>
 <p>Several agents share one machine's CPUs and memory, and often one GitHub account.</p>
-<p class="answer"><strong><a href="tools.html#dagrun">dagrun</a></strong> runs validation as a graph under CPU and memory limits. <strong><a href="tools.html#gh-paced">gh-paced</a></strong> paces <code>gh</code> calls, and <strong><a href="tools.html#agent-usage">agent-usage</a></strong> reads plan usage without a model call.</p>
+<p class="answer"><strong><a href="tools.html#dagrun">dagrun</a></strong> caps validation CPU and memory; <strong><a href="tools.html#gh-paced">gh-paced</a></strong> paces shared GitHub calls.</p>
 </article>
 <article class="card problem">
 <h3>Tasks get dropped</h3>
 <p>Work handed to an agent lives in a chat message or a notes file, nobody can see what is in flight, and nothing is closed when it lands.</p>
-<p class="answer"><strong><a href="tools.html#minibeads">minibeads</a></strong> keeps tasks as Markdown files in the repository, with claims and dependencies, so the coordinator dispatches from a queue and each subagent closes its own task. Any other tracker works too; nothing in the suite depends on it.</p>
+<p class="answer"><strong><a href="tools.html#minibeads">minibeads</a></strong> keeps tasks as Markdown files in the repo; any other tracker works too.</p>
 </article>
 </div>
 </div>
@@ -405,10 +405,13 @@
 <p>A check the host cannot run is reported as skipped, never as a pass. CI reports to a person; it does not block merges.</p>
 <p class="card-links"><a href="https://github.com/rrnewton/agent-utils/blob/main/cross/README.md#skipped-checks-and-partial-runs">Skipped is not passed</a> <a href="https://github.com/rrnewton/agent-utils/blob/main/README.md#the-suite">Suite status table</a></p>
 </article>
-<article class="card">
-<h3>Quickstart: self-documenting CLIs</h3>
-<p>Each tool's <code>quickstart</code>, embedded guide, and <code>--help</code> are its documentation. The agent skills point to them instead of copying them.</p>
-<p class="card-links"><a href="https://github.com/rrnewton/agent-utils/blob/main/AGENTS.md#documentation">Documentation policy</a> <a href="https://github.com/rrnewton/agent-utils/blob/main/skills/README.md">Skills</a> <a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/agentctl/RELATED_WORK.md">An example comparison</a></p>
+<article class="card card-warn">
+<h3>Limits</h3>
+<ul>
+<li>Linux only. Pre-1.0; agentctl is beta.</li>
+<li>Needs Herdr, a separate terminal server (last tested at 0.8).</li>
+<li>The slot sandbox and herdr-run allowlist guard against accidents, not attacks.</li>
+</ul>
 </article>
 </div>
 </div>
