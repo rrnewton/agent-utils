@@ -1,13 +1,14 @@
 ---
 title: 'vibe-talk-reader-pause-on-any-composer: pause the read on any path into a reply composer'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 - read-aloud
 created_at: 2026-11-20T10:34:00-05:00
-updated_at: 2026-11-20T10:34:00-05:00
+updated_at: 2026-11-20T13:21:00-05:00
+closed_at: 2026-11-20T13:21:00-05:00
 ---
 
 # Description
@@ -39,3 +40,7 @@ Cancel or close leaves reading paused (existing behaviour, kept and stated here)
 # Notes
 
 Owner UI fast-track (owner-priority gate, deployed on landing). Lane mu-pausecompose from coordb. Prior work: #554 read-pause-reply-resume, #547 car mode, #1250 (browser-check robustness rules), #1503, #821, #828. #297 is unrelated (cache races), noted as checked.
+
+## Resolution
+
+[watermelon-full-preview] Landed 2026-11-20 13:21 ET as e9ae38cd on github/main (replayed 0e5b7d85 onto 64b22634; coordb waiver for devbig014's missing Chromium library). Built as designed: pauseForComposer choke point + one document focusin in the read controls + guard inside dictation start; Send from a composer-held pause resumes from the held place, hand-paused reads keep the #554 flow, Cancel/close leaves the read paused. Module tests green; whole browser walk green on devbig030 (every enumerated path paused while playing at tap-to-pause 25-91ms; Send resumed from the held place at phone and desktop, both voices); the screenshot matrix reviewed and approved by coordb.
