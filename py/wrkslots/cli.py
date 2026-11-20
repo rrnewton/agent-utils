@@ -1244,6 +1244,10 @@ def _agent_remove_batch_item_seconds(
 # are re-fetched.  Across removals nothing is kept, so this bound is also the
 # oldest evidence any removal starts from.
 _REMOTE_CONTAINMENT_EVIDENCE_MAX_AGE_SECONDS = 300.0
+# A caller-supplied remote proof (#1876) substitutes for the apply-time
+# ls-remote under per-agent egress filtering; older than this it proves
+# nothing about what the remote advertises now.
+_REMOTE_PROOF_MAX_AGE_SECONDS = 600.0
 # When the GitHub credential helper's pacing bucket is full it tells Git to
 # quit; a network Git command then waits, bounded, for a credential slot
 # instead of refusing at once (#894).  The wait is also bounded by any item
@@ -17241,6 +17245,164 @@ class _RemoteAuthority:
     sha256: str
 
 
+@dataclasses.dataclass(frozen=True)
+class _RemoteProof:
+    """A fresh `ls-remote` listing captured by wrkslots itself (#1876).
+
+    `capture-remote-proof` produces the file on a host with egress,
+    listing the URL under the tool's clean environment
+    (GIT_CONFIG_GLOBAL=/dev/null, so no `insteadOf` rewrite can send
+    the listing to a local mirror), and refusing local or file URLs.
+    The consumer binds the URL by digest to the authorization's
+    ``remote_url_sha256`` and re-checks freshness where the proof is
+    used. Only the listing comes from the capture: whether a listed
+    tip contains the HEAD is still proven against the checkout's own
+    object store, and a tip the store does not hold counts as not
+    containing, never as containing.
+    """
+
+    url: str
+    captured_at: str
+    refs: dict[str, str]
+    sha256: str
+
+
+def _load_remote_proof(value: str, expected_url_sha256: str) -> _RemoteProof:
+    """Load and bind one remote proof file; every defect refuses before any write."""
+
+    path = Path(value)
+    raw = _read_bounded_regular_file(path, "remote proof", _JOURNAL_BYTES_LIMIT)
+    try:
+        document = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, ValueError) as exc:
+        raise Refusal(f"remote proof {path} is not UTF-8 JSON: {exc}") from exc
+    if not isinstance(document, Mapping):
+        raise Refusal(f"remote proof {path} is not a JSON object")
+    if (
+        document.get("schema") != 2
+        or document.get("kind") != "wrkslots-remote-proof"
+        or document.get("captured_by") != "wrkslots capture-remote-proof"
+    ):
+        raise Refusal(
+            f"remote proof {path} is not a schema-2 proof written by "
+            "'wrkslots capture-remote-proof'"
+        )
+    url = _as_str(document.get("remote_url"), "remote proof.remote_url")
+    _assert_provable_remote_url(url)
+    captured_at = _as_str(document.get("captured_at"), "remote proof.captured_at")
+    listing = _as_str(document.get("ls_remote"), "remote proof.ls_remote")
+    digest = _as_str(document.get("ls_remote_sha256"), "remote proof.ls_remote_sha256")
+    if hashlib.sha256(url.encode("utf-8")).hexdigest() != expected_url_sha256:
+        raise Refusal(
+            "remote proof names a different remote URL than --remote-url-sha256 "
+            "binds; capture the proof from the exact URL the recovery names, "
+            "resolved without any insteadOf rewrite"
+        )
+    if hashlib.sha256(listing.encode("utf-8")).hexdigest() != digest:
+        raise Refusal("remote proof ls_remote_sha256 does not match its ls_remote text")
+    proof = _RemoteProof(
+        url=url,
+        captured_at=captured_at,
+        refs=_GitVcs()._parse_remote_ref_inventory(listing, "remote proof ref"),
+        sha256=digest,
+    )
+    _assert_remote_proof_fresh(proof)
+    return proof
+
+
+def _assert_remote_proof_fresh(proof: _RemoteProof) -> None:
+    """Refuse a stale or future-dated proof, wherever it is checked."""
+
+    captured = _parse_timestamp(proof.captured_at, "remote proof.captured_at")
+    now = dt.datetime.now(dt.timezone.utc)
+    age = (now - captured).total_seconds()
+    if age < -60.0 or age > _REMOTE_PROOF_MAX_AGE_SECONDS:
+        raise Refusal(
+            f"remote proof captured at {proof.captured_at} is {age:.0f} seconds "
+            f"old; a proof must be under {_REMOTE_PROOF_MAX_AGE_SECONDS:.0f} "
+            "seconds old and not from the future; capture a fresh one with "
+            "'wrkslots capture-remote-proof'"
+        )
+
+
+def _assert_provable_remote_url(url: str) -> None:
+    """Refuse a URL a capture could satisfy locally instead of remotely."""
+
+    if url.startswith(("file:", "/", "./", "../", "~")) or (
+        "://" not in url and "@" not in url
+    ):
+        raise Refusal(
+            f"remote proof URL {url!r} is a local or file URL; capture the "
+            "proof from the exact network URL the recovery names"
+        )
+
+
+def _cmd_capture_remote_proof(args: argparse.Namespace) -> int:
+    _load_config(args.project_root, args.machine)
+    url = _as_str(args.url, "capture URL")
+    _assert_provable_remote_url(url)
+    refs = _GitVcs()._ls_remote_inventory(
+        Path.cwd(),
+        url,
+        heads_only=True,
+        env_overrides={
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+        },
+        timeout_seconds=_REMOTE_CONTAINMENT_LIST_SECONDS,
+    )
+    listing = "".join(f"{sha} {ref}\n" for ref, sha in sorted(refs.items()))
+    document = {
+        "schema": 2,
+        "kind": "wrkslots-remote-proof",
+        "captured_by": "wrkslots capture-remote-proof",
+        "remote_url": url,
+        "captured_at": _utc_now(),
+        "ls_remote": listing,
+        "ls_remote_sha256": hashlib.sha256(listing.encode("utf-8")).hexdigest(),
+    }
+    output = Path(args.output)
+    if output.is_symlink():
+        raise Refusal(f"remote proof output {output} is a symlink; refusing to follow it")
+    _atomic_write_json(output, document)
+    print(
+        f"captured remote proof url={url} refs={len(refs)} "
+        f"sha256={document['ls_remote_sha256']} at={document['captured_at']}"
+    )
+    return 0
+
+
+def _proof_heads_containing(
+    vcs: _GitVcs, checkout: Path, remote: str, head: str, proof: _RemoteProof
+) -> tuple[str, ...]:
+    """Tracking refs whose proof-listed tip provably contains ``head``, locally.
+
+    Mirrors remote_heads_containing's answer shape without contacting
+    the remote: the tip must be listed in the proof, and containment is
+    proven with the checkout's own objects. A tip the checkout does not
+    hold cannot be walked, so it counts as not containing.
+    """
+
+    containing: list[str] = []
+    heads_prefix = "refs/heads/"
+    for ref, tip in sorted(proof.refs.items()):
+        if not ref.startswith(heads_prefix):
+            continue
+        tracking = f"refs/remotes/{remote}/{ref.removeprefix(heads_prefix)}"
+        if tip == head:
+            containing.append(tracking)
+            continue
+        if not vcs.commit_present(checkout, tip):
+            continue
+        result = vcs._run(
+            checkout, ["merge-base", "--is-ancestor", head, tip], check=False
+        )
+        if result.returncode == 0:
+            containing.append(tracking)
+    return tuple(containing)
+
+
 def _assert_registry_storage_consistent(
     config: Config,
     states: Sequence[ActiveState],
@@ -18105,6 +18267,23 @@ class _RemoteContainmentEvidence:
 _REMOTE_CONTAINMENT_MEMO: contextvars.ContextVar[
     dict[tuple[str, str, str, bool], _RemoteContainmentEvidence] | None
 ] = contextvars.ContextVar("wrkslots_remote_containment_memo", default=None)
+
+# A caller-supplied remote proof in force for one recovery (#1876): while
+# set, remote listings are answered from the proof and any network write
+# refuses, so an apply under egress filtering never silently falls back
+# to the network. None outside such a recovery.
+_REMOTE_PROOF_SCOPE: contextvars.ContextVar[_RemoteProof | None] = (
+    contextvars.ContextVar("wrkslots_remote_proof_scope", default=None)
+)
+
+
+@contextlib.contextmanager
+def _remote_proof_scope(proof: _RemoteProof | None) -> Iterator[None]:
+    token = _REMOTE_PROOF_SCOPE.set(proof)
+    try:
+        yield
+    finally:
+        _REMOTE_PROOF_SCOPE.reset(token)
 
 # Root of the host-wide proof mirrors (#1692), set while one removal runs:
 # <control>/proof-mirrors. None outside a removal, or when the control
@@ -22771,6 +22950,11 @@ class _GitVcs:
     ) -> None:
         _validate_remote(remote)
         _validate_full_ref(landed_ref, "landed ref")
+        if _REMOTE_PROOF_SCOPE.get() is not None:
+            raise Refusal(
+                "fetching needs the network a remote proof cannot provide "
+                "(#1876); the worktree is preserved"
+            )
         prefix = f"refs/remotes/{remote}/"
         if not landed_ref.startswith(prefix):
             raise Refusal(f"landed ref must be under {prefix}: {landed_ref}")
@@ -23596,6 +23780,18 @@ class _GitVcs:
             raise Refusal(
                 f"remote {remote!r} URL cannot begin with '-' for isolated transport"
             )
+        proof = _REMOTE_PROOF_SCOPE.get()
+        if proof is not None:
+            _assert_remote_proof_fresh(proof)
+            if expected_digest != hashlib.sha256(
+                proof.url.encode("utf-8")
+            ).hexdigest():
+                raise Refusal(
+                    f"remote proof covers {proof.url}, not remote {remote!r} "
+                    f"at {target.url}; capture a proof for that URL or run "
+                    "where the tool can reach it"
+                )
+            return _proof_heads_containing(self, checkout, remote, head, proof)
         common = self.common_directory(checkout)
         objects = common / "objects"
         memo = _REMOTE_CONTAINMENT_MEMO.get()
@@ -23675,6 +23871,11 @@ class _GitVcs:
             raise Refusal(
                 f"remote {remote!r} URL cannot begin with '-' for isolated transport"
             )
+        if _REMOTE_PROOF_SCOPE.get() is not None:
+            # A heads listing proves nothing about tags (#1876): under a
+            # proof, no tag counts as containing, and the network is
+            # never asked.
+            return ()
         common = self.common_directory(checkout)
         objects = common / "objects"
         memo = _REMOTE_CONTAINMENT_MEMO.get()
@@ -25103,6 +25304,12 @@ class _GitVcs:
     ) -> None:
         _validate_remote(remote)
         _validate_full_ref(ref, "remote salvage ref")
+        if _REMOTE_PROOF_SCOPE.get() is not None:
+            raise Refusal(
+                "a salvage push needs the network a remote proof cannot "
+                "provide (#1876); the worktree is preserved: publish the "
+                "work first, then recover"
+            )
         with self._isolated_remote(checkout, remote, authority) as (
             isolated,
             object_env,
@@ -81786,13 +81993,31 @@ def _assert_ownerless_salvage_reachable(
             ownerless_recorded_at=authorization.recorded_at,
             detached_root=not detached and authorization.branch is None,
         )
-        vcs.remote_heads_containing(
+        containing = vcs.remote_heads_containing(
             candidate_path,
             candidate.remote,
             facts.head,
             facts.remote_authority,
             network_authority=facts.network_authority,
         )
+        if _REMOTE_PROOF_SCOPE.get() is not None:
+            # A proof apply proves coverage before anything is
+            # recorded (#1876): a dirty checkout would need a push,
+            # and an uncovered HEAD must refuse here, not after the
+            # recovery journal is written.
+            if facts.dirty:
+                raise Refusal(
+                    f"checkout {candidate.name} is dirty; a remote-proof "
+                    "apply requires a clean worktree: publish the work "
+                    "first, then recover"
+                )
+            if not containing:
+                raise Refusal(
+                    f"remote proof does not show checkout {candidate.name} "
+                    f"HEAD {facts.head} contained in any branch it lists; "
+                    "nothing was recorded: publish the work, or capture "
+                    "a proof listing a containing branch"
+                )
         vcs.assert_remote_authority(candidate_path, candidate.remote, facts.remote_authority)
 
 
@@ -81991,6 +82216,14 @@ def _cmd_recover_ownerless_agent_worktree(args: argparse.Namespace) -> int:
         return _abandon_prepared_ownerless_agent_journal(config, args)
     if getattr(args, "journal_sha256", None) is not None:
         raise Refusal("--journal-sha256 applies only with --abandon-prepared")
+    remote_proof: _RemoteProof | None = None
+    if getattr(args, "remote_proof", None) is not None:
+        if not args.apply:
+            raise Refusal("--remote-proof applies only with --apply")
+        remote_proof = _load_remote_proof(
+            str(args.remote_proof),
+            _as_str(args.remote_url_sha256, "ownerless agent remote digest"),
+        )
     processes: _RecoveryProcesses | None = None
     if args.apply:
         processes = _capture_ownerless_apply_processes(
@@ -81999,7 +82232,7 @@ def _cmd_recover_ownerless_agent_worktree(args: argparse.Namespace) -> int:
         coordinator = processes.coordinator
     else:
         coordinator = _read_process_identity(os.getpid())
-    with _mutation_locks(config, args.wait_lock):
+    with _mutation_locks(config, args.wait_lock), _remote_proof_scope(remote_proof):
         if processes is not None:
             processes.assert_current(coordinator)
         _refuse_partial_state(config)
@@ -82075,6 +82308,16 @@ def _cmd_recover_ownerless_agent_worktree(args: argparse.Namespace) -> int:
             "authorization": _ownerless_agent_authorization_to_obj(authorization),
             "salvage": [],
         }
+        if remote_proof is not None:
+            # Recorded in the journal's free-form extension slot (#1124),
+            # not a new persisted field: old readers ignore it.
+            journal["x"] = {
+                "remote_proof": {
+                    "sha256": remote_proof.sha256,
+                    "captured_at": remote_proof.captured_at,
+                    "remote_url_sha256": digest,
+                }
+            }
         _write_journal(config, journal)
         _interrupt_for_test("after-ownerless-agent-journal")
         before = _global_rows(states, archives)
@@ -101260,6 +101503,20 @@ usage or audit gate unknown, 3 fail-closed refusal.
     )
     recover_ownerless_agent.add_argument("--apply", action="store_true")
     recover_ownerless_agent.add_argument(
+        "--remote-proof",
+        metavar="FILE",
+        help=(
+            "with --apply: a schema-2 wrkslots-remote-proof JSON file {remote_url, "
+            "captured_at, ls_remote, ls_remote_sha256} whose fresh (under 10 minutes) "
+            "ls-remote listing replaces the apply step's own listing when this process "
+            "has no egress to the remote; containment is still proven against the "
+            "worktree's own objects. Produce it with 'wrkslots capture-remote-proof' "
+            "where egress works, for the exact URL --remote-url-sha256 binds, e.g. "
+            "through herdr-run: herdr-run run --cwd <dir> \"wrkslots "
+            "capture-remote-proof --url <url> --output <file>\""
+        ),
+    )
+    recover_ownerless_agent.add_argument(
         "--coordinator-authorized", action="store_true"
     )
     recover_ownerless_agent.add_argument(
@@ -101287,6 +101544,29 @@ usage or audit gate unknown, 3 fail-closed refusal.
     recover_ownerless_agent.set_defaults(
         handler=_cmd_recover_ownerless_agent_worktree
     )
+
+    capture_remote_proof = subparsers.add_parser(
+        "capture-remote-proof",
+        help="capture a fresh remote listing as a proof file where this host has egress",
+        description=(
+            "List one remote's branches under the tool's clean environment "
+            "(GIT_CONFIG_GLOBAL=/dev/null, no system config, so no insteadOf rewrite "
+            "can redirect the listing) and write the schema-1 proof file that "
+            "recover-ownerless-agent-worktree --remote-proof consumes. Local and "
+            "file URLs refuse. Run it where egress works, for example through "
+            "herdr-run: herdr-run run --cwd <dir> \"wrkslots capture-remote-proof "
+            "--url <url> --output <file>\"; the proof stays valid for 10 minutes."
+        ),
+    )
+    capture_remote_proof.add_argument(
+        "--url", required=True, metavar="URL",
+        help="exact network remote URL to list (no insteadOf rewrite is applied)",
+    )
+    capture_remote_proof.add_argument(
+        "--output", required=True, metavar="FILE",
+        help="proof file to write (schema-2 wrkslots-remote-proof JSON)",
+    )
+    capture_remote_proof.set_defaults(handler=_cmd_capture_remote_proof)
 
     recover_ownerless_clone = subparsers.add_parser(
         "recover-ownerless-agent-clone",

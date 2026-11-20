@@ -1850,6 +1850,7 @@ const PY_IDENTITY: &[&str] = &[
 /// Python commands with no Rust port yet; compat mode refuses them by name.
 const PY_ONLY: &[&str] = &[
     "box",
+    "capture-remote-proof",
     "clean-caches",
     "host-alias",
     "image",

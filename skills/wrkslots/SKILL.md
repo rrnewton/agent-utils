@@ -245,7 +245,16 @@ stale Git registration, then archives before changing ACTIVE. For a real unregis
 worktree, use `recover-ownerless-agent-worktree` with its exact path, repository, HEAD, branch,
 remote, and remote URL digest. This path deliberately records no owner, task, or handoff. If
 HANDOFF.md exists, read it and supply its exact `--handoff-sha256`; the command rechecks and
-preserves it, while an unread or changed handoff refuses. The exact non-worktree
+preserves it, while an unread or changed handoff refuses. When the applying process has no egress
+to the remote (per-agent egress filtering answers its `ls-remote` with 403), pass
+`--remote-proof FILE` with `--apply`: a schema-2 `wrkslots-remote-proof` JSON
+{remote_url, captured_at, ls_remote, ls_remote_sha256} produced by `wrkslots capture-remote-proof`
+under 10 minutes earlier for the exact URL the digest binds, e.g. through herdr-run:
+`herdr-run run --cwd <dir> "wrkslots capture-remote-proof --url <url> --output <file>"` (the capture
+lists under the tool's clean environment, so no `insteadOf` rewrite can redirect it, and local or
+file URLs refuse). The tool checks containment
+against the worktree's own objects, records the proof's digest in the journal, and refuses a
+stale, wrong-URL, or non-containing proof with the worktree preserved. The exact non-worktree
 `worktrees/slots/ignored` rust-script cache uses
 `recover-ownerless-agent-cache`; it is relocated intact and is not a general directory exemption.
 

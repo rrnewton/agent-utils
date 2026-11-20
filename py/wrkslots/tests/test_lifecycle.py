@@ -50449,6 +50449,263 @@ def test_recover_ownerless_agent_worktree_salvages_dirty_tree_without_owner(
     assert git(remote, "show", f"{salvage_commit}:uncommitted.txt").stdout == "preserve me\n"
 
 
+def _network_shaped_remote(project: Path, target: Path) -> tuple[str, str]:
+    """Point the fixture worktree's origin at a network-shaped URL.
+
+    Production proofs bind network URLs (local paths refuse), so the
+    fixture remote is renamed to an https URL whose digest the proof
+    binds. Nothing in these tests contacts the remote (the listing is
+    stubbed and a proof apply never fetches or pushes), so the URL
+    never has to resolve.
+    """
+
+    url = "https://example.invalid/repo.git"
+    git(target, "remote", "set-url", "origin", url)
+    return url, hashlib.sha256(url.encode("utf-8")).hexdigest()
+
+
+def _write_remote_proof(
+    path: Path,
+    url: str,
+    refs: dict[str, str],
+    *,
+    captured_at: str | None = None,
+) -> Path:
+    listing = "".join(f"{sha} {ref}\n" for ref, sha in sorted(refs.items()))
+    payload = {
+        "schema": 2,
+        "kind": "wrkslots-remote-proof",
+        "captured_by": "wrkslots capture-remote-proof",
+        "remote_url": url,
+        "captured_at": captured_at or wrkslots._utc_now(),
+        "ls_remote": listing,
+        "ls_remote_sha256": hashlib.sha256(listing.encode("utf-8")).hexdigest(),
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def _run_ownerless_with_proof(
+    project: Path,
+    target: Path,
+    head: str,
+    remote_digest: str,
+    proof: Path | None,
+    *,
+    apply: bool = True,
+) -> int:
+    args = [
+        "--project-root",
+        str(project),
+        "recover-ownerless-agent-worktree",
+        target.relative_to(project).as_posix(),
+        "--repository",
+        "repo",
+        "--head",
+        head,
+        "--branch",
+        f"agent/{target.name}",
+        "--remote",
+        "origin",
+        "--remote-url-sha256",
+        remote_digest,
+    ]
+    if proof is not None:
+        args.extend(("--remote-proof", str(proof)))
+    if apply:
+        args.extend(
+            (
+                "--apply",
+                "--coordinator-authorized",
+                "--coordinator-pid",
+                str(os.getpid()),
+            )
+        )
+    return wrkslots.main(args)
+
+
+def _no_egress(monkeypatch: pytest.MonkeyPatch) -> None:
+    def refuse_egress(*_args: object, **_kwargs: object) -> dict[str, str]:
+        raise wrkslots.Refusal("the apply step contacted the remote")
+
+    monkeypatch.setattr(wrkslots._GitVcs, "_ls_remote_inventory", refuse_egress)
+
+
+@pytest.mark.ordinary_environment
+def test_ownerless_apply_with_remote_proof_needs_no_egress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1876: a fresh exact proof replaces the apply step's own ls-remote."""
+
+    project, repository, _remote = make_project(tmp_path)
+    target, head, remote_digest = prepare_ownerless_agent_worktree(project, repository)
+    allow_test_host_for_ownerless_agent_recovery(monkeypatch)
+    _no_egress(monkeypatch)
+
+    # Without a proof the apply cannot prove containment and refuses.
+    assert _run_ownerless_with_proof(project, target, head, remote_digest, None) == 3
+    assert target.exists()
+
+    url, remote_digest = _network_shaped_remote(project, target)
+    proof = _write_remote_proof(
+        tmp_path / "proof.json", url, {"refs/heads/main": head}
+    )
+    journals_seen: list[dict[str, object]] = []
+    config = wrkslots._load_config(str(project), "testhost")
+
+    def snapshot_journal(point: str) -> None:
+        if point == "after-ownerless-agent-journal":
+            journals_seen.append(
+                json.loads(wrkslots._journal_path(config).read_text(encoding="utf-8"))
+            )
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", snapshot_journal)
+    assert _run_ownerless_with_proof(project, target, head, remote_digest, proof) == 0
+    assert not target.exists()
+    assert len(journals_seen) == 1
+    extension = wrkslots._as_mapping(journals_seen[0]["x"], "journal extension")
+    recorded = wrkslots._as_mapping(extension["remote_proof"], "recorded proof")
+    assert recorded["sha256"] == wrkslots._as_str(
+        json.loads(proof.read_text(encoding="utf-8"))["ls_remote_sha256"],
+        "proof digest",
+    )
+    assert recorded["remote_url_sha256"] == remote_digest
+
+
+@pytest.mark.ordinary_environment
+def test_capture_remote_proof_refuses_local_and_file_urls(
+    tmp_path: Path,
+) -> None:
+    """#1876: the capture cannot be produced for a local mirror."""
+
+    project, _repository, _remote = make_project(tmp_path)
+    for url in ("/srv/mirror.git", "file:///srv/mirror.git", "./mirror.git"):
+        rc = wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "capture-remote-proof",
+                "--url",
+                url,
+                "--output",
+                str(tmp_path / "proof.json"),
+            ]
+        )
+        assert rc == 3, url
+    assert not (tmp_path / "proof.json").exists()
+
+
+@pytest.mark.ordinary_environment
+def test_capture_ignores_an_insteadof_rule_in_the_global_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1876: the capture lists the named URL, never an insteadOf mirror."""
+
+    project, repository, _remote = make_project(tmp_path)
+    target, _head, _digest = prepare_ownerless_agent_worktree(project, repository)
+    real = git(target, "remote", "get-url", "origin").stdout.strip()
+    config = tmp_path / "gitconfig"
+    config.write_text(
+        f'[url "{real}"]\n\tinsteadOf = https://127.0.0.1:1/repo.git\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "capture-remote-proof",
+            "--url",
+            "https://127.0.0.1:1/repo.git",
+            "--output",
+            str(tmp_path / "proof.json"),
+        ]
+    )
+    assert rc == 3
+    assert not (tmp_path / "proof.json").exists()
+
+
+@pytest.mark.ordinary_environment
+def test_ownerless_proof_apply_refuses_a_dirty_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1876: a proof apply needs a clean tree, proven before the journal."""
+
+    project, repository, _remote = make_project(tmp_path)
+    target, head, remote_digest = prepare_ownerless_agent_worktree(project, repository)
+    (target / "uncommitted.txt").write_text("keep me\n", encoding="utf-8")
+    allow_test_host_for_ownerless_agent_recovery(monkeypatch)
+    _no_egress(monkeypatch)
+    url, remote_digest = _network_shaped_remote(project, target)
+    proof = _write_remote_proof(
+        tmp_path / "proof.json", url, {"refs/heads/main": head}
+    )
+    assert _run_ownerless_with_proof(project, target, head, remote_digest, proof) == 3
+    assert target.exists()
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._journal_path(config).exists()
+
+
+@pytest.mark.ordinary_environment
+def test_ownerless_remote_proof_refusals_preserve_the_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1876: stale, wrong-URL and non-containing proofs refuse, changing nothing."""
+
+    project, repository, _remote = make_project(tmp_path)
+    target, head, remote_digest = prepare_ownerless_agent_worktree(project, repository)
+    allow_test_host_for_ownerless_agent_recovery(monkeypatch)
+    _no_egress(monkeypatch)
+    url, remote_digest = _network_shaped_remote(project, target)
+
+    stale_at = (
+        dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=601)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    stale = _write_remote_proof(
+        tmp_path / "stale.json", url, {"refs/heads/main": head}, captured_at=stale_at
+    )
+    assert _run_ownerless_with_proof(project, target, head, remote_digest, stale) == 3
+    assert target.exists()
+
+    wrong_url = _write_remote_proof(
+        tmp_path / "wrong.json", f"{url}-mirror", {"refs/heads/main": head}
+    )
+    assert _run_ownerless_with_proof(project, target, head, remote_digest, wrong_url) == 3
+    assert target.exists()
+
+    future_at = (
+        dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=3600)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    future = _write_remote_proof(
+        tmp_path / "future.json", url, {"refs/heads/main": head}, captured_at=future_at
+    )
+    assert _run_ownerless_with_proof(project, target, head, remote_digest, future) == 3
+    assert target.exists()
+
+    fresh = _write_remote_proof(
+        tmp_path / "fresh.json", url, {"refs/heads/main": head}
+    )
+    assert (
+        _run_ownerless_with_proof(
+            project, target, head, remote_digest, fresh, apply=False
+        )
+        == 3
+    )
+    assert target.exists()
+
+    # Every refusal here happens before anything is recorded: the
+    # non-containing proof is refused by the pre-journal coverage
+    # check, not during salvage.
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._journal_path(config).exists()
+    missing = _write_remote_proof(
+        tmp_path / "missing.json", url, {"refs/heads/main": "1" * 40}
+    )
+    assert _run_ownerless_with_proof(project, target, head, remote_digest, missing) == 3
+    assert target.exists()
+    assert not wrkslots._journal_path(config).exists()
+
+
 def test_recover_ownerless_agent_worktree_refuses_ignored_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
