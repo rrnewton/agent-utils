@@ -1149,13 +1149,40 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
     }
     render(fresh);
     if (scroller && listOnScreen()) {
-      if (follow) deps.toFoot(scroller);
+      if (follow) landAtFoot(scroller);
       // A named place (Back) always wins. Otherwise the redraw's own
       // relative anchor (`#1908`) already holds the reader where the
       // reflow left them; the absolute offset captured before the reads
       // would undo it wherever a card above changed height (`#1999`).
       else if (place || !anchoredOnRender) deps.toPosition(scroller, top);
     }
+  }
+
+  /**
+   * Land at the foot and stay there (`#2002 vibe-talk-documents-fresh-load-bottom`):
+   * heights that settle in the frames just after the landing (cards
+   * finishing their dress, an older page paging in above) grow the list
+   * under a parked reader, so the foot is re-asserted on the next frames
+   * while the scroller still stands where the landing left it. A reader
+   * who scrolls away in those frames keeps their place: their offset no
+   * longer matches the landing's.
+   */
+  function landAtFoot(scroller: HTMLElement): void {
+    deps.toFoot(scroller);
+    let landedTop = scroller.scrollTop;
+    const raf = (globalThis as { requestAnimationFrame?: unknown }).requestAnimationFrame;
+    if (typeof raf !== "function") return;
+    let frames = 0;
+    const again = (): void => {
+      frames += 1;
+      if (!listOnScreen()) return;
+      if (Math.abs(scroller.scrollTop - landedTop) <= 1 && !atBottom(scroller, 1)) {
+        deps.toFoot(scroller);
+        landedTop = scroller.scrollTop;
+      }
+      if (frames < 3) (raf as (callback: () => void) => void)(again);
+    };
+    (raf as (callback: () => void) => void)(again);
   }
 
   /**
