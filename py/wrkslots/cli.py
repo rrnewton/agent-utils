@@ -25664,11 +25664,13 @@ def _host_alias_path(*, judge: bool = False) -> Path:
     if override:
         return Path(override).expanduser()
     state_home = os.environ.get("XDG_STATE_HOME")
-    base = (
-        Path(state_home).expanduser()
-        if state_home
-        else Path.home() / ".local" / "state"
-    )
+    base = Path.home() / ".local" / "state"
+    if state_home:
+        # Per the XDG specification a relative XDG_STATE_HOME is invalid
+        # and is ignored, never resolved against the working directory.
+        candidate = Path(state_home).expanduser()
+        if candidate.is_absolute():
+            base = candidate
     return base / "wrkslots" / "host-aliases.json"
 
 
@@ -47715,6 +47717,13 @@ def _cmd_host_alias_add(args: argparse.Namespace) -> int:
         "previous_boot_ids": sorted(previous_boots),
         "current_boot_id": current_boot,
     }
+    try:
+        parent_existed = path.parent.exists()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not parent_existed:
+            os.chmod(path.parent, 0o700)
+    except OSError as exc:
+        raise Refusal(f"cannot prepare host-alias directory {path.parent}: {exc}") from exc
     with _host_alias_write_lock(path):
         entries = _load_host_aliases(path)
         if any(item["previous_host_id"] == previous for item in entries):

@@ -1309,7 +1309,9 @@ identity, and no coordinator recorded under that identity is live now.
 The alias is host-local evidence in `$XDG_STATE_HOME/wrkslots/host-aliases.json` (by default
 `~/.local/state/wrkslots/host-aliases.json`). It is not registry state: no slot record, journal, or
 event changes, and a reader without host-alias support never opens the file, so it keeps failing
-closed on those owners exactly as before. With the alias recorded, the recorded identity counts as
+closed on those owners exactly as before. Setting `XDG_STATE_HOME` moves where the file is written
+and read; it stays under your own account, and an alias can only ever prove old-boot owners dead.
+With the alias recorded, the recorded identity counts as
 this host only across a boot change: the ordinary boot check proves an old-boot owner dead, while
 an owner recorded in the current boot under the previous identity stays indeterminate.
 `transfer-owner`, `adopt`, and `recover` then work as usual for the old-boot owners. An identity

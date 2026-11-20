@@ -173,6 +173,18 @@ def test_transitive_alias_counts_and_cycles_stop(
     )
 
 
+def test_relative_xdg_state_home_is_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_STATE_HOME", "relative/state")
+    monkeypatch.delenv("WRKSLOTS_HOST_ALIAS_PATH", raising=False)
+    expected = tmp_path / ".local" / "state" / "wrkslots" / "host-aliases.json"
+
+    assert cli._host_alias_path(judge=True) == expected
+    assert cli._host_alias_path() == expected
+
+
 def test_malformed_alias_file_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -255,6 +267,7 @@ def test_host_alias_add_unblocks_old_owner_only(
     assert "recorded host alias" in capsys.readouterr().out
     payload = json.loads(alias_path.read_text(encoding="utf-8"))
     assert stat.S_IMODE(alias_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(alias_path.parent.stat().st_mode) == 0o700
     assert payload["aliases"][0]["previous_boot_ids"] == [BOOT_A]
     assert cli._process_state(old_owner) == ("dead", "the recorded machine boot ended")
     assert cli._process_state(_identity(MACHINE_C, BOOT_A))[0] == "indeterminate"
