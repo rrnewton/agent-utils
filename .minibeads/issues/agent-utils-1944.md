@@ -30,6 +30,12 @@ whose failure was "agent get: agent_not_found" revived fine.
   command, or revive with an explicit override if one exists).
 - `stop --retire-dead-native` accepts a record whose pane is gone,
   so a replaced seat's stale record can be archived.
+- The same applies when the Herdr agent object outlived its pane
+  after a reboot: retire currently refuses with "the recorded Herdr
+  agent still exists" on pane_not_found. A previous-boot harness
+  identity plus a missing pane lets both retire and revive proceed
+  even if the stale Herdr agent object remains; clean it up, or
+  ignore it (coordb, consumer case, 2026-11-20).
 
 # Acceptance Criteria
 
@@ -37,7 +43,8 @@ whose failure was "agent get: agent_not_found" revived fine.
   pane.
 - A same-boot identity plus a missing pane refuses, with the remedy
   named in the refusal.
-- `stop --retire-dead-native` archives a record whose pane is gone.
+- `stop --retire-dead-native` archives a record whose pane is gone,
+  including when a stale Herdr agent object remains for it.
 - Tests cover both boot cases.
 
 # Notes
