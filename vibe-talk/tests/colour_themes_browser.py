@@ -121,6 +121,31 @@ def main() -> int:
                         check(drawn["head"] in (None, want[2 + at]), f"{scheme}/{preset}: Discuss head {drawn['head']}")
                         if args.screenshots:
                             args.screenshots.mkdir(parents=True, exist_ok=True)
+                            # The fold chevrons turn on a 0.12s transition; blue is shot
+                            # first, right after the folds open, and was caught
+                            # half-rotated. Wait for those turns to finish — a
+                            # condition on the chevrons' own transitions, not a sleep.
+                            page.wait_for_function("""() => [...document.querySelectorAll('.fold-toggle')]
+                              .every((el) => [...el.getAnimations(), ...el.getAnimations({ pseudoElement: '::before' })]
+                                .every((a) => a.playState !== 'running'))""", timeout=STATE_MS)
+                            stamp = args.screenshots / "BUILD.txt"
+                            if not stamp.exists():
+                                import subprocess
+
+                                def git(*argv: str) -> str:
+                                    return subprocess.run(["git", "-C", str(ROOT.parent), *argv],
+                                                          capture_output=True, text=True).stdout.strip() or "unknown"
+
+                                build = page.evaluate("""() => {
+                                  const m = document.body.innerText.match(/build\\s+(\\d+)/i);
+                                  return m ? m[1] : 'unknown';
+                                }""")
+                                stamp.write_text(
+                                    f"commit {git('rev-parse', 'HEAD')}\n"
+                                    f"commit-date {git('log', '-1', '--format=%cI', 'HEAD')}\n"
+                                    f"page-build {build}\n",
+                                    encoding="utf-8",
+                                )
                             page.screenshot(path=str(args.screenshots / f"colour-{scheme}-{preset}.png"))
                         print(f"{scheme}/{preset}: accent var {drawn['accent']}, head {drawn['head']}")
                     # A reload restores the last preset (amber) through the pre-paint script.
