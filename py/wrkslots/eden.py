@@ -10,6 +10,7 @@ runner. Nothing here creates or removes a checkout by itself.
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import re
@@ -529,21 +530,44 @@ def seed_backing_repo(
         )
 
 
+def _runner_accepts_timeout(runner: Runner) -> bool:
+    """Whether ``runner`` can be called with a ``timeout`` keyword.
+
+    Decided from the signature up front, never by trying the capped
+    call and retrying uncapped on ``TypeError``: that retry would
+    re-run the command with no cap at all.
+    """
+
+    try:
+        parameters = inspect.signature(runner).parameters
+    except (TypeError, ValueError):
+        return False
+    return "timeout" in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+
+
 def _run_with_timeout(
     runner: Runner, argv: Sequence[str], timeout: float
 ) -> tuple[int, str, str]:
     """Run one Eden call under ``timeout`` seconds.
 
-    The real CLI runner accepts a ``timeout`` keyword; simple fake
-    runners that take only ``argv`` are called without it. A timeout
-    raised by either form propagates as ``subprocess.TimeoutExpired``
-    for the caller to turn into that slot's refusal.
+    Only a runner whose signature accepts a ``timeout`` keyword is
+    called, and only in that capped shape. A runner that cannot take
+    a timeout is refused with :class:`EdenError` before anything runs,
+    so a call (above all an ``eden start``) never silently loses its
+    cap. A timeout raised by the runner propagates as
+    ``subprocess.TimeoutExpired`` for the caller to turn into that
+    slot's refusal.
     """
 
-    try:
-        return runner(argv, timeout=timeout)  # type: ignore[call-arg]
-    except TypeError:
-        return runner(argv)
+    if not _runner_accepts_timeout(runner):
+        raise EdenError(
+            f"eden runner {runner!r} does not accept a timeout; refusing "
+            f"to run {' '.join(argv)!r} without its {timeout:g}s cap"
+        )
+    return runner(argv, timeout=timeout)  # type: ignore[call-arg]
 
 
 def eden_state_containment_problem(
@@ -591,8 +615,10 @@ def restart_slot_daemon(
     """Restart one slot's Eden daemon when it is dead (#1977).
 
     Returns ``already-healthy`` when ``eden info`` already answers for
-    ``mount``, ``restarted`` when a start made it answer, or, with
-    ``dry_run``, ``would-restart`` for a dead daemon (no start is run).
+    ``mount``, ``restarted`` when our own start made it answer,
+    ``started-elsewhere`` when our start failed but the re-query
+    answers (someone else started it), or, with ``dry_run``,
+    ``would-restart`` for a dead daemon (no start is run).
     Starting uses ``eden --config-dir <dir> start --if-not-running``, the
     per-config-dir start the host Eden CLI provides (``eden start
     --help``); provisioning started this daemon implicitly through
@@ -686,14 +712,15 @@ def restart_slot_daemon(
                 f"daemon before start: {initial}"
             )
         # The start failed, but another starter may have won meanwhile:
-        # query once more before refusing this slot.
+        # query once more before refusing this slot. It answering now
+        # is not our restart, so it is labelled accordingly.
         try:
             query()
         except EdenError as after:
             raise EdenError(
                 f"{start_error}; re-query after the failed start: {after}"
             ) from after
-        return "restarted"
+        return "started-elsewhere"
     return "already-healthy"
 
 

@@ -479,11 +479,80 @@ def test_failed_start_requeries_before_refusing(
     log = _install_fake_eden(tmp_path, monkeypatch, {raced: "rival"})
 
     # Our start reports failure, but another starter brought the daemon
-    # up meanwhile: the re-query proves it, so the slot is not refused.
+    # up meanwhile: the re-query proves it, so the slot is not refused,
+    # but it is not our restart either.
     assert _run(root) == 0
     report = json.loads(capsys.readouterr().out)
     rows = {row["slot"]: row["status"] for row in report["eden_daemons"]}
-    assert rows == {"eden-race": "restarted"}
+    assert rows == {"eden-race": "started-elsewhere"}
     assert report["refused"] == 0
     assert _starts(log, raced) == 1
     assert _infos(log, raced) >= 2, "a failed start is re-queried once"
+
+
+def test_runner_without_a_timeout_is_refused_before_anything_runs() -> None:
+    # A runner that cannot take a timeout must never be retried
+    # uncapped: the signature is checked up front and the call refused.
+    calls: list[list[str]] = []
+
+    def argv_only(argv: object) -> tuple[int, str, str]:
+        calls.append(list(argv))  # type: ignore[arg-type]
+        return (1, "", "daemon is not running")
+
+    with pytest.raises(eden.EdenError, match="does not accept a timeout"):
+        eden.restart_slot_daemon(argv_only, "/state", "/mount")  # type: ignore[arg-type]
+    assert calls == [], "an uncappable runner is never invoked at all"
+
+    with pytest.raises(eden.EdenError, match="does not accept a timeout"):
+        eden._run_with_timeout(argv_only, ["eden", "info", "/mount"], 15.0)  # type: ignore[arg-type]
+    assert calls == []
+
+
+def test_runner_timeout_shapes_receive_the_cap() -> None:
+    seen: list[float | None] = []
+
+    def with_timeout(argv: object, timeout: float | None = None) -> tuple[int, str, str]:
+        seen.append(timeout)
+        return (0, "ok", "")
+
+    def with_kwargs(argv: object, **kwargs: float) -> tuple[int, str, str]:
+        seen.append(kwargs["timeout"])
+        return (0, "ok", "")
+
+    assert eden._run_with_timeout(with_timeout, ["eden", "info", "/m"], 15.0) == (0, "ok", "")
+    assert eden._run_with_timeout(with_kwargs, ["eden", "info", "/m"], 60.0) == (0, "ok", "")
+    assert seen == [15.0, 60.0]
+
+
+def test_restart_uses_the_capped_runner_for_info_and_start() -> None:
+    timeouts: list[float | None] = []
+    starts = 0
+
+    def runner(argv: object, timeout: float | None = None) -> tuple[int, str, str]:
+        nonlocal starts
+        timeouts.append(timeout)
+        args = list(argv)  # type: ignore[arg-type]
+        if "start" in args:
+            starts += 1
+            return (0, "", "")
+        if starts:
+            return (
+                0,
+                json.dumps(
+                    {
+                        "mount": "/mount",
+                        "state_dir": "/state/client",
+                        "backing_repo": "/backing/repo",
+                        "checked_out_revision": REV,
+                    }
+                ),
+                "",
+            )
+        return (1, "", "daemon is not running")
+
+    assert eden.restart_slot_daemon(runner, "/state", "/mount") == "restarted"
+    assert timeouts == [
+        eden.INFO_TIMEOUT_SECONDS,
+        eden.START_TIMEOUT_SECONDS,
+        eden.INFO_TIMEOUT_SECONDS,
+    ]
