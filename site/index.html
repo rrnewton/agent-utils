@@ -91,7 +91,7 @@
 <li>It checks your project and the tools installed on your machine.</li>
 <li>You choose the agents, worktree storage and chat connection.</li>
 <li>You approve the setup before it changes anything.</li>
-<li>It sets up the project folder, checks the tools and starts your coordinator.</li>
+<li>It moves your checkout into a new project folder, the harness, checks the tools and starts your coordinator.</li>
 </ol>
 </div>
 </figure>
@@ -184,7 +184,7 @@
 <div class="section-head">
 <p class="eyebrow">Architecture</p>
 <h2 id="arch-title">How it fits together</h2>
-<p class="lead">One coordinator delegates work to agents in separate worktrees. A project folder holds your checkout, the tools and the instructions they share.</p>
+<p class="lead">One coordinator delegates work to agents in separate worktrees. A project that adopts the suite gets a <em>harness</em>: a folder that holds your checkout, the tools and the instructions they share.</p>
 </div>
 
 <figure class="arch" aria-labelledby="arch-caption">
@@ -207,7 +207,7 @@
 </div>
 <p class="arch-edge">typed into the coordinator's pane</p>
 <div class="arch-layer arch-coordinator">
-<p class="arch-label">Coordinator<span>one agent, project folder</span></p>
+<p class="arch-label">Coordinator<span>one agent, harness root</span></p>
 <ul class="arch-row">
 <li class="arch-node is-wide"><b>Coordinator agent</b><span>reads <code>AGENTS.md</code> and the coordinator skill; plans, delegates, checks, lands, reports</span></li>
 <li class="arch-node is-optional"><b><code>tick-hub</code> timer<span class="vh"> (optional)</span></b><span>recurring duties, sent with <code>agentctl send</code></span></li>
@@ -254,7 +254,7 @@
 <ul class="arch-legend" aria-label="Legend">
 <li><span class="swatch is-core"></span>core: set up by default; chat can be connected later</li>
 <li><span class="swatch is-optional"></span>optional: offered by setup, or added later</li>
-<li><span class="swatch"></span>part of the project or Herdr</li>
+<li><span class="swatch"></span>part of the harness, the project, or Herdr</li>
 </ul>
 </div>
 <figcaption id="arch-caption">Talk to the coordinator in its terminal or over chat. It starts subagents in separate worktrees, checks their work and lands it under your project's rules.</figcaption>
@@ -392,7 +392,7 @@
 </div>
 <div class="adopt-aside">
 <h3>What you end up with</h3>
-<pre class="tree" tabindex="0" role="region" aria-label="The harness directory setup produces"><code>~/work/foobar/             <span class="c">project folder; the coordinator runs here</span>
+<pre class="tree" tabindex="0" role="region" aria-label="The harness directory setup produces"><code>~/work/foobar/             <span class="c">the harness; the coordinator runs here</span>
   AGENTS.md                <span class="c">makes the agent here the coordinator</span>
   foobar/                  <span class="c">your checkout, moved in unchanged</span>
   agent-utils/             <span class="c">tools in bin/, skills in skills/</span>
@@ -402,7 +402,7 @@
   .claude/skills -&gt; ../.agents/skills
   .agentctl/profiles.json  <span class="c">launch profiles; private</span>
   .wrkslots.yml            <span class="c">slot policy, commented</span></code></pre>
-<p>The project folder has its own Git history; your checkout keeps its existing history inside it. Tools run from the agent-utils checkout, with Rust tools built on first use. Later, ask the coordinator to "connect this to Slack" or "add dagrun for our tests".</p>
+<p>The harness has its own Git history; your checkout keeps its existing history inside it. Tools run from the agent-utils checkout, with Rust tools built on first use. Later, ask the coordinator to "connect this to Slack" or "add dagrun for our tests".</p>
 <p><a href="https://github.com/rrnewton/agent-utils/blob/main/QUICKSTART.md">The quickstart</a> walks through one recorded run. The <a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-setup/SKILL.md">setup skill</a> is the procedure itself.</p>
 </div>
 </div>
@@ -416,6 +416,11 @@
 <h2 id="built-title">How it is built</h2>
 </div>
 <div class="grid grid-2">
+<article class="card">
+<h3>Quickstart: self-documenting CLIs</h3>
+<p>Every tool carries its own <code>quickstart</code>, user guide and <code>--help</code>, so you and your agents read the same instructions as the installed version. The agent skills point to them instead of copying them.</p>
+<p class="card-links"><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/README.md">Tool documentation</a> <a href="https://github.com/rrnewton/agent-utils/blob/main/skills/README.md">Skills</a></p>
+</article>
 <article class="card">
 <h3>Two editions, one contract</h3>
 <p>Tools with Python and Rust editions share core commands. Differential tests run both on the same inputs and compare output, exit codes and state.</p>

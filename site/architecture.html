@@ -112,7 +112,7 @@
 
 <div class="layer-block arch-coordinator">
 <h3 id="coordinator">The coordinator</h3>
-<p>The coordinator is an ordinary coding agent started in the project folder. Its <code>AGENTS.md</code> and coordinator skill describe how to delegate, check and land work. Your project's rules take precedence.</p>
+<p>The coordinator is an ordinary coding agent started in the harness root. The harness <code>AGENTS.md</code> and the coordinator skill describe how to delegate, check and land work. Your project's rules take precedence.</p>
 <p>Its priorities are your requests, a failing main branch, work in progress, then the backlog. Reach it with <code>agentctl send coordinator</code>; use <a href="tools.html#agent-teams">agent-teams</a> to reach coordinators on other machines.</p>
 <p class="small"><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-coordinator/SKILL.md#priorities">Priorities</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-setup/templates/AGENTS.md">Harness AGENTS.md template</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-setup/SKILL.md#phase-7-hand-off-to-the-owner">How setup starts it</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/agent-teams/QUICKSTART.md">agent-teams quickstart</a></p>
 </div>
@@ -120,7 +120,7 @@
 <div class="layer-block arch-sessions">
 <h3 id="sessions">Sessions: agentctl on Herdr</h3>
 <p>Interactive agents run in Herdr tabs or tmux panes you can attach to. Headless workers use the same named agentctl commands.</p>
-<p>agentctl stores named sessions and pending prompts in the private <code>.agentctl/</code> directory. <code>agentctl drain</code> retries pending prompts; uncertain deliveries are set aside for inspection. Use <code>start --slot</code> to launch an agent in a worktree and <code>restore</code> to restart a saved team.</p>
+<p>agentctl stores named sessions and pending prompts in the harness's private <code>.agentctl/</code> directory. <code>agentctl drain</code> retries pending prompts; uncertain deliveries are set aside for inspection. Use <code>start --slot</code> to launch an agent in a worktree and <code>restore</code> to restart a saved team.</p>
 <p class="small"><a href="https://github.com/rrnewton/agent-utils/blob/main/py/agentctl/USER_GUIDE.md">agentctl user guide</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/py/agentctl/USER_GUIDE.md#observe-and-take-over">Observe and take over</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/py/agentctl/USER_GUIDE.md#boxing-an-agent-to-a-wrkslots-slot">Boxing an agent to a slot</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/py/agentctl/USER_GUIDE.md#restore-a-team-after-the-host-restarts-rust-edition">Restore after a restart</a></p>
 </div>
 
@@ -229,7 +229,7 @@ $WS remove &lt;slot&gt; --coordinator-pid &lt;pid&gt; --expected-generation &lt;
 ├── .agentctl/                  <span class="c">session registry and launch profiles; private</span>
 └── .wrkslots.yml               <span class="c">slot policy, commented key by key</span></code></pre>
 <div class="prose">
-<p>The project folder has its own Git history for configuration and skill links. Checkouts, worktrees, session state and chat credentials stay outside that history. agentctl requires <code>.agentctl/</code> to be ignored.</p>
+<p>The harness has its own Git history for configuration and skill links. Checkouts, worktrees, session state and chat credentials stay outside that history. agentctl requires <code>.agentctl/</code> to be ignored.</p>
 <p>Updating agent-utils also updates the linked skills. Most tools with two editions default to Rust and build on first use, so <code>cargo</code> must be on <code>PATH</code>, including in timer services. Set <code>AGENT_UTILS_ENGINE=python</code> to use Python.</p>
 <p class="small"><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-setup/SKILL.md#what-setup-produces">What setup produces</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/QUICKSTART.md#6-the-result">A real result</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/common/bin/engine-resolver">The dispatcher</a></p>
 </div>
