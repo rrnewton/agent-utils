@@ -1732,11 +1732,14 @@ def prepare_revive(
         def custom(
             name: str, kind: str, pane_id: str, arguments: tuple[str, ...], *, timeout: float,
             on_observed: Callable[[CustomProcessIdentity], None] | None = None,
-            **hooks: object,
+            hooks_trust: str | None = None,
+            on_hooks_trust: object = None,
+            on_hooks_trust_refused: object = None,
         ) -> CustomProcessIdentity:
             fake.custom_identity = replace(fake.custom_identity, pid=200 + fake.serial,
                                            starttime_ticks=200 + fake.serial)
-            identity = original_custom(name, kind, pane_id, arguments, timeout=timeout, on_observed=on_observed, **hooks)
+            identity = original_custom(name, kind, pane_id, arguments, timeout=timeout, on_observed=on_observed, hooks_trust=hooks_trust,
+                on_hooks_trust=on_hooks_trust, on_hooks_trust_refused=on_hooks_trust_refused)
             conversation = arguments[-1] if len(arguments) >= 2 and arguments[-2] == "resume" else "muse-native"
             fake.infos[pane_id] = replace(fake.infos[pane_id], session_agent="muse", session_value=conversation)
             return identity

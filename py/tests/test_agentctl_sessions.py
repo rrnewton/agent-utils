@@ -116,9 +116,12 @@ def test_native_conversation_is_captured_only_from_the_launched_harness(
 
         def start(name: str, kind: str, pane_id: str, arguments: tuple[str, ...], *, timeout: float,
                   on_observed: Callable[[CustomProcessIdentity], None] | None = None,
-                  **hooks: object) -> CustomProcessIdentity:
+                  hooks_trust: str | None = None,
+                  on_hooks_trust: object = None,
+                  on_hooks_trust_refused: object = None) -> CustomProcessIdentity:
             # The fake's custom launcher reports no conversation unless the test supplies one.
-            identity = original_start(name, kind, pane_id, arguments, timeout=timeout, on_observed=on_observed, **hooks)
+            identity = original_start(name, kind, pane_id, arguments, timeout=timeout, on_observed=on_observed, hooks_trust=hooks_trust,
+                on_hooks_trust=on_hooks_trust, on_hooks_trust_refused=on_hooks_trust_refused)
             fake.infos[pane_id] = replace(fake.infos[pane_id], session_agent=kind, session_value="reported-conversation")
             return identity
 
@@ -1179,7 +1182,9 @@ def test_root_slot_starts_the_harness_behind_the_relay(tmp_path: Path, monkeypat
     launched: list[tuple[str, str, str]] = []
 
     def start_relay(kind: str, pane_id: str, line: str, *, timeout: float = 30.0,
-                    on_observed: object = None, **hooks: object) -> CustomProcessIdentity:
+                    on_observed: object = None, hooks_trust: str | None = None,
+                    on_hooks_trust: object = None,
+                    on_hooks_trust_refused: object = None) -> CustomProcessIdentity:
         launched.append((kind, pane_id, line))
         assert callable(on_observed)
         on_observed(identity)
@@ -1480,10 +1485,13 @@ def _profile_resume_native_report(
         def custom(
             name: str, kind: str, pane_id: str, arguments: tuple[str, ...], *,
             timeout: float, on_observed: Callable[[CustomProcessIdentity], None] | None = None,
-            **hooks: object,
+            hooks_trust: str | None = None,
+            on_hooks_trust: object = None,
+            on_hooks_trust_refused: object = None,
         ) -> CustomProcessIdentity:
             identity = original_custom(name, kind, pane_id, arguments,
-                timeout=timeout, on_observed=on_observed, **hooks)
+                timeout=timeout, on_observed=on_observed, hooks_trust=hooks_trust,
+                on_hooks_trust=on_hooks_trust, on_hooks_trust_refused=on_hooks_trust_refused)
             fake.infos[pane_id] = replace(fake.infos[pane_id],
                 session_agent=provider or kind, session_value=value)
             return identity

@@ -831,7 +831,7 @@ def _hooks_trust_setting(value: object, label: str) -> str | None:
         raise AgentDeliveryError(
             f"{label} muse_hooks_trust must be \"decline\" or \"trust\", not {value!r}"
         )
-    return cast(str, value)
+    return value
 
 
 def hooks_trust_policy(
