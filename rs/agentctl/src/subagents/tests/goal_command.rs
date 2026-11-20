@@ -241,14 +241,27 @@ fn the_registered_run_path_also_refuses_over_an_open_picker() {
     fixture.start(None);
     *fixture.client.screen.lock().unwrap() = Some(codex_picker("a different task"));
     let manager = fixture.manager();
-    let record = manager.load("worker").unwrap();
+    let mut record = manager.load("worker").unwrap();
     let pane = record.pane_id.clone().unwrap();
+    // Claim the registered goal the way a drain does: its inflight
+    // message names this objective, so this run may type it.
+    record
+        .goal_messages
+        .insert("m-1".to_owned(), "ship the release".to_owned());
+    let queue = manager.queue("worker").unwrap();
+    let inflight = queue.join("inflight");
+    fs::create_dir_all(&inflight).unwrap();
+    agent::atomic_json(
+        &inflight.join("m-1.json"),
+        &json!({"id": "m-1", "text": "/goal ship the release"}),
+    )
+    .unwrap();
     let client = WorkspaceClient {
         client: &fixture.client,
         record: &record,
         goal_objective: Mutex::new(None),
         custom_submission: Mutex::new(None),
-        queue: None,
+        queue: Some(&queue),
         registry: None,
         check_prompt: false,
         expected_workspace: None,

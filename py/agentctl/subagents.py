@@ -2261,22 +2261,6 @@ class _WorkspaceClient:
 
     def prompt_agent(self, pane_id: str, command: str) -> SubmissionReceipt | None:
         self.goal_objective = None
-        # Never type a goal command over a picker already open
-        # (#1939 D4): its Enter would answer the other goal's picker.
-        # This edition never cancels a picker; it only ever confirms
-        # its own registered goal in wait_agent_status below.
-        stripped = command.lstrip()
-        is_goal = (stripped.startswith("/goal") and len(stripped) > 5
-                   and stripped[5] in (" ", "\t"))
-        if self.record.harness == "codex" and is_goal:
-            from agentctl.harness_tui.codex import read_replace_goal_picker
-
-            screen = self.client.read(pane_id, source="visible", lines=200)
-            if read_replace_goal_picker(screen) is not None:
-                raise PromptNotStaged(
-                    "a Codex Replace-goal picker is already open; nothing was typed; "
-                    "answer it with `agentctl answer` or in the pane, then resend the goal"
-                )
         if self.queue is not None:
             for identifier, objective in self.record.goal_messages.items():
                 path = Path(self.queue) / "inflight" / f"{identifier}.json"
@@ -2285,6 +2269,23 @@ class _WorkspaceClient:
                     if isinstance(document, dict) and document.get("text") == command:
                         self.goal_objective = objective
                         break
+        # Never type a registered goal over a picker already open
+        # (#1939 D4): its Enter would answer the other goal's picker.
+        # Only a delivery that just claimed the registered goal (above)
+        # is refused; ordinary text that merely looks like a goal
+        # keeps its base behaviour. This edition never cancels a
+        # picker; it only ever confirms its own registered goal in
+        # wait_agent_status below.
+        if self.record.harness == "codex" and self.goal_objective is not None:
+            from agentctl.harness_tui.codex import read_replace_goal_picker
+
+            screen = self.client.read(pane_id, source="visible", lines=200)
+            if read_replace_goal_picker(screen) is not None:
+                self.goal_objective = None
+                raise PromptNotStaged(
+                    "a Codex Replace-goal picker is already open; nothing was typed; "
+                    "answer it with `agentctl answer` or in the pane, then resend the goal"
+                )
         if self.record.adapter == "herdr-relay":
             if command.lstrip().startswith("/"):
                 raise HerdrUnavailable(

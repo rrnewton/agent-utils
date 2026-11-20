@@ -6358,9 +6358,19 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                 }
             }
         }
-        // Never type a goal command over a picker already open
+        // Never type a registered goal over a picker already open
         // (#1939 D4): its Enter would answer the other goal's picker.
-        if self.record.harness == "codex" && crate::goal_command::argument(text).is_some() {
+        // Only a delivery this run just claimed as the registered
+        // goal (goal_objective set above) is refused; ordinary text
+        // that merely looks like a goal keeps its base behaviour.
+        if self.record.harness == "codex"
+            && crate::goal_command::argument(text).is_some()
+            && self
+                .goal_objective
+                .lock()
+                .expect("goal operation lock poisoned")
+                .is_some()
+        {
             let screen = self.client.read(pane_id, "visible", Some(200))?;
             if crate::goal_command::CodexReplacement::read(&crate::harness_tui::plain(&screen))
                 .is_some()
@@ -6612,9 +6622,19 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                 }
             }
         }
-        // Never type a goal command over a picker already open
+        // Never type a registered goal over a picker already open
         // (#1939 D4): its Enter would answer the other goal's picker.
-        if self.record.harness == "codex" && crate::goal_command::argument(text).is_some() {
+        // Only a delivery this run just claimed as the registered
+        // goal (goal_objective set above) is refused; ordinary text
+        // that merely looks like a goal keeps its base behaviour.
+        if self.record.harness == "codex"
+            && crate::goal_command::argument(text).is_some()
+            && self
+                .goal_objective
+                .lock()
+                .expect("goal operation lock poisoned")
+                .is_some()
+        {
             let screen = self.client.read_with_runtime(pane_id, "visible", Some(200), runtime)?;
             if crate::goal_command::CodexReplacement::read(&crate::harness_tui::plain(&screen))
                 .is_some()

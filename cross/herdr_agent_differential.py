@@ -811,7 +811,15 @@ elif args[:2] == ["pane", "read"]:
     if source == "visible" and state.get("terminal_on_visible_read"):
         state["terminal_id"] = state["terminal_on_visible_read"]
     if source == "visible" and state.get("screen"):
-        sys.stdout.write(state["screen"])
+        # A goal picker stands only once its goal is typed (#1939:
+        # typing over an already-open picker is refused, so the menu
+        # this fixture models appears after the command, like Codex).
+        if state.get("goal_menu") and not any(
+            text.startswith("/goal ") for text in state.get("submitted", [])
+        ):
+            sys.stdout.write("› Ask Codex to do anything\n  GPT · /work\n")
+        else:
+            sys.stdout.write(state["screen"])
     elif source == "visible" and verified_composer():
         sys.stdout.write(composer_screen())
     elif source == "visible" and state.get("custom_harness"):
