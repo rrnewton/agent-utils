@@ -975,7 +975,7 @@ stay its owner's (#1524). The pane itself already ends above the
    * (8px + 8px padding around its one row); the panel's solid ground
    * keeps scrolled text from showing through, and the composer's later
    * place in the panel paints it above the bar if they ever touch. */
-  .discuss-compose {
+  #discuss-panel .discuss-compose {
     position: sticky;
     bottom: calc(2.2rem + env(safe-area-inset-bottom));
     z-index: 1;
