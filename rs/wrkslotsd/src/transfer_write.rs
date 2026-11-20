@@ -424,7 +424,7 @@ struct TransferJudgement {
 
 enum TransferDecision {
     Already { generation: i64 },
-    Proceed(TransferJudgement),
+    Proceed(Box<TransferJudgement>),
 }
 
 /// Single-record transfer refusals, judged identically before the
@@ -530,7 +530,7 @@ fn judge_transfer(
     } else {
         Vec::new()
     };
-    Ok(TransferDecision::Proceed(TransferJudgement {
+    Ok(TransferDecision::Proceed(Box::new(TransferJudgement {
         generation,
         record_agent,
         rename,
@@ -540,7 +540,7 @@ fn judge_transfer(
         basis,
         release_event,
         ignored_transferred,
-    }))
+    })))
 }
 
 /// Transfer the named slot to a live successor owner.
@@ -673,7 +673,7 @@ pub(crate) fn transfer_owner(
         basis,
         release_event,
         ignored_transferred,
-    } = judged;
+    } = *judged;
     ensure_event_log(root, &cfg, &selected)?;
     let previous_revision = active.get("revision").and_then(Value::as_i64).unwrap_or(0);
     let new_generation = if reopen || rename {

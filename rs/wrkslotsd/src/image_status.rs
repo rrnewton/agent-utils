@@ -69,13 +69,12 @@ fn file_entry(
                     entry.insert("free_bytes".to_string(), json!(vfs.free_bytes));
                     entry.insert("used_inodes".to_string(), json!(vfs.used_inodes));
                 }
-                Some(Err(message)) => {
+                Some(Err(message)) if !entry.contains_key("error") => {
                     // First error wins, as in Python: an earlier stat
                     // failure for this entry is not overwritten.
-                    if !entry.contains_key("error") {
-                        entry.insert("error".to_string(), json!(message));
-                    }
+                    entry.insert("error".to_string(), json!(message));
                 }
+                Some(Err(_)) => {}
                 None => {}
             }
         }
