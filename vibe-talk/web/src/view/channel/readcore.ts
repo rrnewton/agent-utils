@@ -718,10 +718,13 @@ export function createTimelineView(deps: TimelineViewDependencies): TimelineView
       const first = rowMessages(row)[0];
       if (first) noteMeasured(canon, String(first.id), (row as HTMLElement).offsetHeight, bucket, rowClassOf(first, false));
     }
-    // `#1985` coverage shift: estimated heights can be a multiple of the real
-    // rows, leaving the mounted slice standing entirely above or below the
-    // band the reader is looking at (a screen of spacer). Shift the slice by
-    // the gap, priced from the mounted rows' real heights, once per render.
+    // `#1985` coverage shift: the mounted rows must fill the reader's band.
+    // The window is priced in estimated heights, so after a fold (rows
+    // changing height everywhere) or with stale prices, the slice can end
+    // far above the band's foot while more list stands below it as spacer:
+    // a settled screen of nothing under the reader's row. Shift the slice
+    // to fill the band, a few times per render at most; a shift of one
+    // group moves the window by that group's estimated height.
     if (winShiftDepth < 3 && !atFoot) {
       const mountedRows = next.filter((row) => !(row as HTMLElement).dataset.windowSpacer);
       if (mountedRows.length > 0) {
@@ -729,14 +732,11 @@ export function createTimelineView(deps: TimelineViewDependencies): TimelineView
         const bandBottom = bandTop + (area.clientHeight || 0);
         const firstTop = (mountedRows[0] as HTMLElement).getBoundingClientRect().top;
         const lastBottom = (mountedRows[mountedRows.length - 1] as HTMLElement).getBoundingClientRect().bottom;
-        const avg = Math.max(1, (lastBottom - firstTop) / mountedRows.length);
-        // Less than one real row of the band is covered: the slice is priced
-        // in estimates and standing somewhere else. A shift of one group
-        // moves the mounted rows by that group's estimated height (the
-        // spacer's), so the gap is priced in estimated heights.
-        if (lastBottom - bandTop < avg || bandBottom - firstTop < avg) {
-          const dir = lastBottom - bandTop < avg ? 1 : -1;
-          const gap = dir > 0 ? bandTop - lastBottom + avg : firstTop - bandBottom + avg;
+        const endsShort = slice.to < groups.length && lastBottom < bandBottom - 1;
+        const startsLate = slice.from > 0 && firstTop > bandTop + 1;
+        if (endsShort || startsLate) {
+          const dir = endsShort ? 1 : -1;
+          const gap = endsShort ? bandBottom - lastBottom : firstTop - bandTop;
           const estAvg = Math.max(1, ((offsets[slice.to] as number) - (offsets[slice.from] as number)) / Math.max(1, slice.to - slice.from));
           const size = slice.to - slice.from;
           const from = Math.max(0, Math.min(slice.from + dir * Math.max(1, Math.ceil(gap / estAvg)),

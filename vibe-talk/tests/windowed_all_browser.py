@@ -335,6 +335,23 @@ def all_walk(walk: Walk, windowed: bool) -> None:
         walk.check(top is not None and abs(top - anchor["top"]) <= 8,
                    f"';' moved the anchor from {anchor['top']} to {top}")
         walk.notes.append(f"';' kept the anchor within {abs((top or 0) - anchor['top']):.1f}px")
+    if windowed:
+        # #2009: no settled empty viewport band after the fold - the point
+        # 3/4 down the band must be a message row, never the bottom spacer.
+        filled = page.evaluate("""() => {
+          const a = document.getElementById('scroll-area');
+          const list = document.getElementById('discord-log');
+          const band = a.getBoundingClientRect();
+          const rows = [...document.querySelectorAll('#discord-log > li:not([data-window-spacer])')];
+          const el = document.elementFromPoint(band.left + band.width / 2, band.top + a.clientHeight * 0.75);
+          const li = el ? el.closest('li') : null;
+          return { onRow: Boolean(li && li.getAttribute('data-id')),
+                   lastBottom: rows.length ? rows[rows.length - 1].getBoundingClientRect().bottom : 0,
+                   bandBottom: band.top + a.clientHeight };
+        }""")
+        walk.check(filled["onRow"] or filled["lastBottom"] >= filled["bandBottom"] - 1,
+                   f"after ';' the viewport band stands empty below the anchor: {filled}")
+        walk.notes.append("after ';' the viewport band is filled with rows")
     walk.shot("2-fold-anchor")
     # (c) END lands at the bottom, and (bug 5) does not bounce afterwards.
     page.keyboard.press("End")
