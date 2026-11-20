@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-recover-late-census-rollback: a late census refusal in recover leaves the slot fenced and the seal blocking the host'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -8,7 +8,8 @@ labels:
 - recover
 - census
 created_at: 2026-11-19T17:52:25-05:00
-updated_at: 2026-11-19T17:52:25-05:00
+updated_at: 2026-11-20T05:12:06-05:00
+closed_at: 2026-11-20T05:12:06-05:00
 ---
 
 # Description
@@ -32,3 +33,7 @@ updated_at: 2026-11-19T17:52:25-05:00
 # Notes
 
 Priority high; consumer-reported. Related: the census redesign lane (slice-based closure for validate-complete finishes plus an absent-slot closure) is separate and under cold review; this issue is only the rollback and the usability fix. Cold review runs before landing because this touches remove/recover safety.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as 8d932b8c (replayed from gated bdc6d96d; combined tree 4ab2f1b0 verified: full strict mypy, new recover tests, census and recover-absent suites). A late same-UID census refusal in recover now rolls the fence back with the finish journal retained at phase=prepared and the seal byte-identical, and the earlier all-process census rollback retains the journal the same way, so a refused recover leaves the checkout unfenced while the batch evidence waits for a retry; `--recovery-note` alone is no longer a cleanup flag in either edition. No new persisted field, journal key or event kind: the finish journal keeps its existing keys, only its phase returns to prepared on rollback, and the note is never written. Grouped-batch completion rollback and a deterministic real-churn test are deferred to #1943 wrkslots-recover-churn-deterministic; the churn test carries `load_quarantine` until then. Old tests (74549a37) pass on the new code for the recover/census/seal area; the new tests fail on the old code and on the pre-fix commit.
