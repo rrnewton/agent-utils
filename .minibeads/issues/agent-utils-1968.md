@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-search-close-x: a prominent X closes the search area on phone and desktop'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 labels:
@@ -8,7 +8,8 @@ labels:
 - search
 - ui
 created_at: 2026-11-20T11:08:00-05:00
-updated_at: 2026-11-20T11:08:00-05:00
+updated_at: 2026-11-20T13:44:26-05:00
+closed_at: 2026-11-20T13:44:26-05:00
 ---
 
 # Description
@@ -35,3 +36,7 @@ The magnifier toggle already closes search (clearing the query and its filters a
 # Notes
 
 Owner-priority, fast-track: deployed on landing. Browsers cannot run on this host: the browser check and screenshot commands are handed to coordb with the exact SHA. Related: #129 message-search, #197 floating-search, #1852 vibe-talk-search-whole-threads-toggle, #1899 vibe-talk-search-bucket-chips-pinned.
+
+## Resolution
+
+[watermelon-full-preview] Landed 396cff15 on github/main (replay of gated 36ea3eb2 over 81dd56b1, tree 0d302054; coordb deployed on landing). The open search bar has a prominent X (`search-close`, "Close search", 44px, rightmost, held right on wrapped phone rows by `margin-left:auto`) that closes through the one `setSearchOpen(false)` path shared with the magnifier and Escape. The devbig030 browser run caught and the fix closed a real place bug: a typed search whose entry landing moved the reader to the newest hits now gives the pre-typing place back on close (only when the entry moved them, never over a chosen result row). Evidence: page tests (X behaviour plus entry-restore, the latter verified failing pre-fix), filter-chips and search-open unit tests, `make typecheck` and `make scripts-check` green; real-Chromium `search_close_browser.py` rc=0 in all six walks (light/dark, phone keyboard open and closed, desk) and screenshot scenes 35, 73-76 and 87 rc=0 with shots reviewed, both run by coordb on devbig030. Owner gate on 36ea3eb2: only browser/shots/pwa environment reds (libnspr4 missing on this host); landed under coordb's waiver naming that ledger row, with the combined tree verified locally (page search, channel, channel-next11, typecheck green).
