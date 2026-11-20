@@ -124,12 +124,12 @@
 <article class="card problem">
 <h3>Cleanup destroys work</h3>
 <p>Deleting a worktree that a process still uses, or one that holds unpushed commits, throws away work.</p>
-<p class="answer"><strong><a href="tools.html#wrkslots">wrkslots</a></strong> deletes a slot only when the evidence shows nothing still uses it: its time-to-live has run out and its owner is dead, or the owner handed it back with a handoff note. Independent process, Git and path checks must agree, unpushed commits are saved first, and if a check cannot be made, it refuses.</p>
+<p class="answer"><strong><a href="tools.html#wrkslots">wrkslots</a></strong> deletes a slot only when nothing still uses it. Unpushed commits are saved first; if it cannot tell, it refuses.</p>
 </article>
 <article class="card problem">
-<h3>"Done" is only a claim</h3>
-<p>A subagent that reports "tests pass" has said something. It has not shown it.</p>
-<p class="answer">The coordinator follows the <strong><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-coordinator/SKILL.md">coordinator skill</a></strong>, a Markdown file of instructions it reads at start-up. It reads the diff, the test output and the pushed commit itself before calling work done, lands it under the project's own rules, and tells you what it did not check.</p>
+<h3>The coordinator checks the work</h3>
+<p>A subagent's "tests pass" is not taken on trust.</p>
+<p class="answer">The <strong><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-coordinator/SKILL.md">coordinator</a></strong> reads the diff, the test output, and the pushed commit itself before calling work done, and says what it did not check.</p>
 </article>
 <article class="card problem">
 <h3>The supervisor is away</h3>
@@ -382,46 +382,33 @@
 <div class="section-head">
 <p class="eyebrow">Engineering</p>
 <h2 id="built-title">How it is built</h2>
-<p class="lead">Each of these is a mechanism you can read in the repository.</p>
+<p class="lead">How the suite is built and checked.</p>
 </div>
 <div class="grid grid-2">
 <article class="card">
 <h3>Two editions, one contract</h3>
-<p>Five tools (dagrun with its cpuset-alloc companion, tick-hub, pr-landing-planner, herdr-run and agentctl) are written twice, in Python and in Rust, as independent implementations. Differential tests run both editions on the same representative, adversarial, boundary and seeded-random inputs, and compare machine output, exit behavior and state.</p>
-<p>They share core contracts, not every feature. Each edition's extensions are listed, and an audit in October 2026 found the editions differing in places the differential tests do not compare.</p>
+<p>Five tools are written twice, in Python and in Rust. Differential tests run both editions on the same inputs and compare output, exit behavior, and state.</p>
 <p class="card-links"><a href="https://github.com/rrnewton/agent-utils/blob/main/cross/README.md#what-is-compared">What is compared</a> <a href="https://github.com/rrnewton/agent-utils/blob/main/README.md#implementations">Editions</a></p>
 </article>
 <article class="card">
 <h3>One validation graph</h3>
-<p>Every portable check (Python, Rust, cross-language, packaging, browser tests and the vibe-talk service) is one dependency graph, run by the suite's own dagrun under shared CPU, memory and named-resource limits.</p>
-<p><code>make validate</code> runs only what a change can affect and names what it skipped. A path nobody has classified runs everything. <code>make validate-all</code> and a nightly job run the whole graph.</p>
+<p>Every portable check is one dependency graph, run by dagrun under CPU and memory limits. <code>make validate</code> runs only what a change can affect and names what it skipped.</p>
 <p class="card-links"><a href="https://github.com/rrnewton/agent-utils/blob/main/validation.dag.yaml">validation.dag.yaml</a> <a href="https://github.com/rrnewton/agent-utils/blob/main/scripts/validate.py">The selector</a> <a href="https://github.com/rrnewton/agent-utils/blob/main/AGENTS.md#validate-before-you-push">Policy</a></p>
 </article>
 <article class="card">
 <h3>Fail closed</h3>
-<p>When evidence is missing, the tools refuse and say why. wrkslots will not remove a slot it cannot prove idle. cpuset-alloc will not fall back to an affinity mask a process can escape. gh-paced charges a command it cannot classify as a write. The source-checkout dispatcher never silently swaps one edition for the other.</p>
+<p>When the tools cannot tell, they refuse and say why: no slot removal without proof it is idle, no fallback a process can escape.</p>
 <p class="card-links"><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/wrkslots/README.md">wrkslots</a> <a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/dagrun/rendered/python/USER_GUIDE.md#collision-free-cpu-reservations">CPU reservations</a> <a href="https://github.com/rrnewton/agent-utils/blob/main/common/bin/engine-resolver">The dispatcher</a></p>
 </article>
 <article class="card">
 <h3>How status is reported</h3>
-<p>Badges use plain words such as core, optional, experimental and beta. A check the host cannot run is reported as skipped and never counted as a pass, and hosted CI declares itself partial for the checks it cannot run. Guards come with self-tests that prove they can fail. This repository's own CI reports to a person; it does not block merges.</p>
+<p>A check the host cannot run is reported as skipped, never as a pass. CI reports to a person; it does not block merges.</p>
 <p class="card-links"><a href="https://github.com/rrnewton/agent-utils/blob/main/cross/README.md#skipped-checks-and-partial-runs">Skipped is not passed</a> <a href="https://github.com/rrnewton/agent-utils/blob/main/README.md#the-suite">Suite status table</a></p>
 </article>
 <article class="card">
-<h3>The tool is the manual</h3>
-<p>Each tool's <code>quickstart</code>, embedded user guide and <code>--help</code> are its primary documentation. The agent skills point to them instead of copying them. Seven tools have a public related-work comparison that says what is not new and when an existing project fits better; dagrun, tick-hub, pr-landing-planner and parallel-experiment-runner do not have one yet.</p>
+<h3>Quickstart: self-documenting CLIs</h3>
+<p>Each tool's <code>quickstart</code>, embedded guide, and <code>--help</code> are its documentation. The agent skills point to them instead of copying them.</p>
 <p class="card-links"><a href="https://github.com/rrnewton/agent-utils/blob/main/AGENTS.md#documentation">Documentation policy</a> <a href="https://github.com/rrnewton/agent-utils/blob/main/skills/README.md">Skills</a> <a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/agentctl/RELATED_WORK.md">An example comparison</a></p>
-</article>
-<article class="card card-warn">
-<h3>Maturity, plainly</h3>
-<ul>
-<li>Linux only for the harness tools, which rely on a user systemd manager, cgroup v2 and <code>/proc</code>. agent-usage also runs on macOS.</li>
-<li>Every version is below 1.0, and agentctl calls itself beta.</li>
-<li>Herdr is a separate project, last tested at 0.8.</li>
-<li>The chat bridge's working transport is Google Chat. It polls the space, once an hour by default, and setup asks whether to shorten that. The plugin protocol for other providers has no provider yet.</li>
-<li>The slot sandbox and the herdr-run allowlist guard against accidents by cooperative agents. They are not security boundaries.</li>
-<li>Packages install from this repository; this site claims no package-index release.</li>
-</ul>
 </article>
 </div>
 </div>
