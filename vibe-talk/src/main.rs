@@ -466,8 +466,7 @@ async fn main() -> anyhow::Result<()> {
         // providers) never fills this router's channels, and cache-only
         // readers such as Discuss see an empty window on a fake server.
         Arc::new(
-            ChatRouter::single(fake.clone(), "discord", config.live_poll_seconds())
-                .with_fake(fake),
+            ChatRouter::single(fake.clone(), "discord", config.live_poll_seconds()).with_fake(fake),
         )
     } else {
         Arc::new(ChatRouter::from_config(&config).context("building the chat providers")?)

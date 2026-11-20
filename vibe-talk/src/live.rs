@@ -3308,9 +3308,20 @@ mod tests {
             });
             message
         };
-        hub.publish(&channel, traced("1", "liaison main session trace, 2026-11-19 ET", true, true));
+        hub.publish(
+            &channel,
+            traced("1", "liaison main session trace, 2026-11-19 ET", true, true),
+        );
         hub.publish(&channel, traced("2", "thinking", false, true));
-        hub.publish(&channel, traced("3", "liaison main session trace, 2026-11-19 ET", true, false));
+        hub.publish(
+            &channel,
+            traced(
+                "3",
+                "liaison main session trace, 2026-11-19 ET",
+                true,
+                false,
+            ),
+        );
         hub.publish(
             &channel,
             crate::cache::fixtures::message("4", "owner", "hello", 1_000),
@@ -3321,18 +3332,17 @@ mod tests {
             .iter()
             .map(|live| live.message.content.as_str())
             .collect();
-        assert_eq!(contents, ["hello"], "a transcript message reached the replay tail");
+        assert_eq!(
+            contents,
+            ["hello"],
+            "a transcript message reached the replay tail"
+        );
         // A deletion of a transcript message is still published, so a
         // page that saved a copy before this rule is told it is gone.
         let mut gone = traced("1", "liaison main session trace, 2026-11-19 ET", true, true);
         gone.content = String::new();
-        let published = hub.publish_ingested(
-            "gone-1".to_owned(),
-            LiveKind::Delete,
-            false,
-            &channel,
-            gone,
-        );
+        let published =
+            hub.publish_ingested("gone-1".to_owned(), LiveKind::Delete, false, &channel, gone);
         assert!(published, "a transcript deletion was not published");
     }
 

@@ -159,7 +159,11 @@ async fn main() -> anyhow::Result<()> {
     if let Some(path) = &args.ports_file {
         std::fs::write(
             path,
-            format!("http={}\nws={}\n", mock.http_addr().port(), mock.ws_addr().port()),
+            format!(
+                "http={}\nws={}\n",
+                mock.http_addr().port(),
+                mock.ws_addr().port()
+            ),
         )
         .with_context(|| format!("writing the bound ports to {}", path.display()))?;
     }

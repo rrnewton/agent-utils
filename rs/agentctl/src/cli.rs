@@ -141,7 +141,9 @@ enum Commands {
     #[command(after_help = "Example: agentctl move reviewer")]
     Move(Named),
     /// Rename a running native or adopted agent: registry entry, Herdr agent name, and tab label together. Use it when an agent's warm context is still useful but its purpose changed; prefer a new agent otherwise. An interrupted rename refuses both names until the same command is rerun
-    #[command(after_help = "Examples:\n  agentctl rename reviewer release-reviewer\n  agentctl rename reviewer release-reviewer --keep-alias 14d\n\nWith --keep-alias DURATION the old name stays as an alias (REGISTRY/aliases/OLD.json) until\nit expires: commands addressed to OLD reach the same agent, printing one note on standard\nerror, and no new agent may register as OLD while the alias lives. Without it the old name\nis gone at once, as before. `agentctl alias list` shows live aliases, `agentctl alias rm\nOLD` removes one early; an expired alias is removed the next time it is met.")]
+    #[command(
+        after_help = "Examples:\n  agentctl rename reviewer release-reviewer\n  agentctl rename reviewer release-reviewer --keep-alias 14d\n\nWith --keep-alias DURATION the old name stays as an alias (REGISTRY/aliases/OLD.json) until\nit expires: commands addressed to OLD reach the same agent, printing one note on standard\nerror, and no new agent may register as OLD while the alias lives. Without it the old name\nis gone at once, as before. `agentctl alias list` shows live aliases, `agentctl alias rm\nOLD` removes one early; an expired alias is removed the next time it is met."
+    )]
     Rename(Rename),
     /// Show or remove the old names kept by `rename --keep-alias`
     #[command(after_help = "Examples:\n  agentctl alias list\n  agentctl alias rm reviewer")]
@@ -5701,8 +5703,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             // the extra header fields each copy carries. (target, fields,
             // per-target message id, via designated coordinator)
             let mut via_coordinator = false;
-            let targets: SendTargets = if value.to_manager
-            {
+            let targets: SendTargets = if value.to_manager {
                 let caller = manager.proved_caller()?;
                 let (target, fallback) = manager.manager_target(&caller)?;
                 via_coordinator = fallback;

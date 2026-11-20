@@ -18,9 +18,9 @@ impl HarnessTui for ClaudeTui {
         // `answer_plan` refuses it: nothing answers it automatically.
         {
             let rows: Vec<_> = clean.lines().collect();
-            let hook = rows.iter().position(|row| {
-                row.to_lowercase().contains("requires confirmation")
-            });
+            let hook = rows
+                .iter()
+                .position(|row| row.to_lowercase().contains("requires confirmation"));
             if let Some(hook) = hook {
                 let mut options = vec![];
                 let mut selected = None;

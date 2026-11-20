@@ -766,11 +766,7 @@ fn an_expired_alias_refuses_and_is_pruned() {
     let mut alias = alias_document(&fixture, "worker");
     alias["created"] = json!(0.5);
     alias["expires"] = json!(1.0);
-    agent::atomic_json(
-        &registry(&fixture).join("aliases/worker.json"),
-        &alias,
-    )
-    .unwrap();
+    agent::atomic_json(&registry(&fixture).join("aliases/worker.json"), &alias).unwrap();
     let error = fixture
         .manager()
         .status("worker")

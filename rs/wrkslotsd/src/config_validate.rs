@@ -1060,7 +1060,10 @@ fn tmp_size_within_cap(value: &str, host_memory_bytes: u128) -> bool {
             "T" => 1 << 40,
             _ => return false,
         };
-        amount > 0 && amount.checked_mul(multiplier).is_some_and(|bytes| bytes <= cap)
+        amount > 0
+            && amount
+                .checked_mul(multiplier)
+                .is_some_and(|bytes| bytes <= cap)
     }
 }
 

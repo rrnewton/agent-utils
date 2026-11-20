@@ -378,8 +378,10 @@ pub async fn decide_waiting(state: &AppState) {
     }
     for (channel, sightings) in by_channel {
         if decide(state, true, &channel, &sightings).await.is_none() {
-            let back: Vec<(ChannelId, Sighting)> =
-                sightings.into_iter().map(|s| (channel.clone(), s)).collect();
+            let back: Vec<(ChannelId, Sighting)> = sightings
+                .into_iter()
+                .map(|s| (channel.clone(), s))
+                .collect();
             state.live.own_sightings().restore(back);
         }
     }

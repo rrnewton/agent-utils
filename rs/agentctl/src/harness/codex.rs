@@ -658,11 +658,7 @@ const TOOK_PROMPT_TAIL: u64 = 8 * 1024 * 1024;
 /// `user` (its text blocks joined) and an `event_msg` `user_message`. Either, with
 /// the prompt's text (runs of whitespace collapsed), at or after `since`, is the
 /// proof. Assistant messages, tool results and earlier identical prompts are not.
-pub(crate) fn rollout_took_prompt(
-    path: &Path,
-    prompt: &str,
-    since: f64,
-) -> Option<&'static str> {
+pub(crate) fn rollout_took_prompt(path: &Path, prompt: &str, since: f64) -> Option<&'static str> {
     use serde_json::Value;
     let collapse = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
     let wanted = collapse(prompt);

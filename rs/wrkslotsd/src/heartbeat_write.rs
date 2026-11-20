@@ -19,9 +19,7 @@ use crate::ensure_states::{
     require_fixture, utc_now,
 };
 use crate::global_state::{event_log_status, load_event_chain, EventLogStatus};
-use crate::hold_write::{
-    active_document, refuse_target_storage_except_nested, validate_global,
-};
+use crate::hold_write::{active_document, refuse_target_storage_except_nested, validate_global};
 use crate::journals_state::parse_journals;
 use crate::status_state::{process_state, read_process_identity, Identity};
 

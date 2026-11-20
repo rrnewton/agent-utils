@@ -460,7 +460,11 @@ pub(crate) fn blocked_finding_for(
     if let Some(view) = crate::harness_tui::harness_tui(harness) {
         let view = view.classify(screen);
         if let Some(question) = &view.question {
-            if question.text.to_lowercase().contains("requires confirmation") {
+            if question
+                .text
+                .to_lowercase()
+                .contains("requires confirmation")
+            {
                 return Some((EpisodeKind::ApprovalPrompt, question.text.trim().to_owned()));
             }
         }
@@ -3552,14 +3556,15 @@ fn report_hook_confirmations(
     options: &WatchAgentsOptions,
 ) -> Vec<Value> {
     let window = options.min_notice_interval.as_secs_f64().max(60.0);
-    state.hook_owner_alarmed.retain(|_, at| now - *at < 86_400.0);
+    state
+        .hook_owner_alarmed
+        .retain(|_, at| now - *at < 86_400.0);
     let mut rows = Vec::new();
     for observation in observations {
         let Some(screen) = observation.screen.as_deref() else {
             continue;
         };
-        let Some((_, detail)) = blocked_finding_for(screen, observation.harness.as_deref())
-        else {
+        let Some((_, detail)) = blocked_finding_for(screen, observation.harness.as_deref()) else {
             continue;
         };
         if !detail.to_lowercase().contains("requires confirmation") {
@@ -3595,16 +3600,12 @@ fn report_hook_confirmations(
              hook confirmation: {detail}. Only you can answer this in that pane — \
              answer it there; agentctl will not answer it."
         );
-        let alarm_id = format!(
-            "agent-watch-hook-{}-{:016x}",
-            agent,
-            {
-                use std::hash::{Hash, Hasher};
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                detail.hash(&mut hasher);
-                hasher.finish()
-            }
-        );
+        let alarm_id = format!("agent-watch-hook-{}-{:016x}", agent, {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            detail.hash(&mut hasher);
+            hasher.finish()
+        });
         // Record the attempt either way: a missing bridge route retries
         // after the window, not on every pass.
         state.hook_owner_alarmed.insert(key, now);
@@ -8723,14 +8724,23 @@ mod tests {
         let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 1_000.0, &options);
         assert_eq!(notifier.alarms.len(), 1, "{report}");
         let (alarm_id, text) = &notifier.alarms[0];
-        assert!(alarm_id.starts_with("agent-watch-hook-liaison-"), "{alarm_id}");
+        assert!(
+            alarm_id.starts_with("agent-watch-hook-liaison-"),
+            "{alarm_id}"
+        );
         assert!(text.contains("liaison"), "{text}");
         assert!(
             text.contains("Running this command may delete files"),
             "the owner is told the first reason line: {text}"
         );
-        assert!(text.contains("Only you can answer this in that pane"), "{text}");
-        assert_eq!(report["hook_confirmations"][0]["reported"], true, "{report}");
+        assert!(
+            text.contains("Only you can answer this in that pane"),
+            "{text}"
+        );
+        assert_eq!(
+            report["hook_confirmations"][0]["reported"], true,
+            "{report}"
+        );
         let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 1_030.0, &options);
         assert_eq!(
             notifier.alarms.len(),

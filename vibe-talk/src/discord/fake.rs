@@ -1372,15 +1372,14 @@ mod tests {
         for i in 0..6 {
             ids.push(fake.seed(&channel(), "a", &format!("m{i}")));
         }
-        let request = |before: Option<String>, after: Option<String>| {
-            crate::threads::TimelineRequest {
+        let request =
+            |before: Option<String>, after: Option<String>| crate::threads::TimelineRequest {
                 view: crate::threads::TimelineView::Main,
                 thread_id: None,
                 before,
                 after,
                 limit: 2,
-            }
-        };
+            };
         let contents = |page: &crate::threads::TimelinePage| {
             page.messages
                 .iter()
@@ -1397,14 +1396,10 @@ mod tests {
         assert_eq!(newest.next_before.as_deref(), Some(ids[4].as_str()));
 
         let back = fake
-            .fetch_timeline(
-                &channel(),
-                &request(Some(ids[4].to_string()), None),
-            )
+            .fetch_timeline(&channel(), &request(Some(ids[4].to_string()), None))
             .await
             .expect("timeline before");
         assert_eq!(contents(&back), vec!["m2", "m3"]);
-
     }
 
     #[tokio::test]

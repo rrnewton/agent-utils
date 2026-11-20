@@ -300,10 +300,15 @@ mod tests {
         let sent = sent_refs_of_metadata(&v2);
         assert_eq!(sent.len(), 2);
         assert_eq!(sent[0].chars, 212);
-        assert_eq!(sent[1].thread, "1763510460.000300", "thread falls back to the message");
+        assert_eq!(
+            sent[1].thread, "1763510460.000300",
+            "thread falls back to the message"
+        );
         assert_eq!(sent[1].ts, "1763510460.000300");
         // Past the cap, only the first MAX_SENT_REFS stand.
-        v2["metadata"]["event_payload"]["sent"] = json!((0..20).map(|n| json!({"msg": format!("{n}.1")})).collect::<Vec<_>>());
+        v2["metadata"]["event_payload"]["sent"] = json!((0..20)
+            .map(|n| json!({"msg": format!("{n}.1")}))
+            .collect::<Vec<_>>());
         assert_eq!(sent_refs_of_metadata(&v2).len(), MAX_SENT_REFS);
         // Another app's metadata never yields refs, however v2-shaped.
         v2["metadata"]["event_type"] = json!("other");

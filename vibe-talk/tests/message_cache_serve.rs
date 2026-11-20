@@ -3670,40 +3670,77 @@ fn trace_meta(kind: &str, day: &str) -> Value {
                           "session": "s1", "day": day, "seq": 1, "trigger": "owner"}})
 }
 
-async fn slack_transcript_deployment(tag: &str) -> (AppState, slack_fake::Fake, Arc<ManualClock>, TempDir) {
+async fn slack_transcript_deployment(
+    tag: &str,
+) -> (AppState, slack_fake::Fake, Arc<ManualClock>, TempDir) {
     let mut fixture = slack_fake::FakeState::default();
     let mut history: Vec<Value> = (0..3)
-        .map(|n| slack_fake::profiled(&slack_fake::ts(n * 60, 0), "UADA00001", "Ada", &format!("message {n}")))
+        .map(|n| {
+            slack_fake::profiled(
+                &slack_fake::ts(n * 60, 0),
+                "UADA00001",
+                "Ada",
+                &format!("message {n}"),
+            )
+        })
         .collect();
     // Trace thread A: root with metadata + title, two entry replies with metadata.
-    let mut root_a = slack_fake::profiled(&slack_fake::ts(600, 0), "ULIAISON1", "liaison-bot", "liaison main session trace, 2026-11-18 ET");
+    let mut root_a = slack_fake::profiled(
+        &slack_fake::ts(600, 0),
+        "ULIAISON1",
+        "liaison-bot",
+        "liaison main session trace, 2026-11-18 ET",
+    );
     root_a["metadata"] = trace_meta("root", "2026-11-18");
-    slack_fake::thread(&mut fixture, SLACK_CH, &mut root_a, &[
-        (slack_fake::ts(660, 0), "thinking about the cache".to_owned()),
-        (slack_fake::ts(720, 0), "still thinking".to_owned()),
-    ]);
-    if let Some(replies) = fixture.replies.get_mut(&(SLACK_CH.to_owned(), slack_fake::ts(600, 0))) {
-        for reply in replies.iter_mut() { reply["metadata"] = trace_meta("entry", "2026-11-18"); }
+    slack_fake::thread(
+        &mut fixture,
+        SLACK_CH,
+        &mut root_a,
+        &[
+            (
+                slack_fake::ts(660, 0),
+                "thinking about the cache".to_owned(),
+            ),
+            (slack_fake::ts(720, 0), "still thinking".to_owned()),
+        ],
+    );
+    if let Some(replies) = fixture
+        .replies
+        .get_mut(&(SLACK_CH.to_owned(), slack_fake::ts(600, 0)))
+    {
+        for reply in replies.iter_mut() {
+            reply["metadata"] = trace_meta("entry", "2026-11-18");
+        }
         // The second entry is v2 and says what the agent sent (`#1886`
         // part C): "message 1" of this channel, and one reference
         // nothing can resolve.
         if let Some(second) = replies.get_mut(1) {
             second["metadata"] = serde_json::json!({"event_type": "agentctl_trace",
-                "event_payload": {"v": 2, "kind": "entry", "agent": "liaison", "team": null,
-                                  "session": "s1", "day": "2026-11-18", "seq": 2, "trigger": "owner",
-                                  "sent": [
-                                      {"thread": slack_fake::ts(60, 0), "msg": slack_fake::ts(60, 0),
-                                       "ts": slack_fake::ts(60, 0), "chars": 9},
-                                      {"thread": "1799999999.000100", "msg": "1799999999.000100",
-                                       "ts": "1799999999.000100", "chars": 4},
-                                  ]}});
+            "event_payload": {"v": 2, "kind": "entry", "agent": "liaison", "team": null,
+                              "session": "s1", "day": "2026-11-18", "seq": 2, "trigger": "owner",
+                              "sent": [
+                                  {"thread": slack_fake::ts(60, 0), "msg": slack_fake::ts(60, 0),
+                                   "ts": slack_fake::ts(60, 0), "chars": 9},
+                                  {"thread": "1799999999.000100", "msg": "1799999999.000100",
+                                   "ts": "1799999999.000100", "chars": 4},
+                              ]}});
         }
     }
     history.push(root_a);
     // Trace root B: fresh daily root, title only, no metadata, no replies yet.
-    let root_b = slack_fake::profiled(&slack_fake::ts(900, 0), "ULIAISON1", "liaison-bot", "liaison main session trace, 2026-11-19 ET");
+    let root_b = slack_fake::profiled(
+        &slack_fake::ts(900, 0),
+        "ULIAISON1",
+        "liaison-bot",
+        "liaison main session trace, 2026-11-19 ET",
+    );
     history.push(root_b);
-    history.push(slack_fake::profiled(&slack_fake::ts(960, 0), "UADA00001", "Ada", "message after traces"));
+    history.push(slack_fake::profiled(
+        &slack_fake::ts(960, 0),
+        "UADA00001",
+        "Ada",
+        "message after traces",
+    ));
     fixture.history.insert(SLACK_CH.to_owned(), history);
     let fake = slack_fake::Fake::start(fixture, 10).await;
     let dir = TempDir::new(tag);
@@ -3723,23 +3760,58 @@ async fn slack_transcript_deployment(tag: &str) -> (AppState, slack_fake::Fake, 
 async fn transcript_threads_are_hidden_from_every_timeline_view_but_listed_for_transcripts() {
     let (state, _fake, clock, _dir) = slack_transcript_deployment("probe-transcripts").await;
     for serve in [false, true] {
-        if serve { state.message_cache.set_serve(true); clock.advance(HOUR); }
+        if serve {
+            state.message_cache.set_serve(true);
+            clock.advance(HOUR);
+        }
         for view in ["main", "flat"] {
-            let body = ok(&state, &path(SLACK_CH, &format!("/timeline?view={view}&limit=50")), WRITE_TOKEN).await;
+            let body = ok(
+                &state,
+                &path(SLACK_CH, &format!("/timeline?view={view}&limit=50")),
+                WRITE_TOKEN,
+            )
+            .await;
             settled(&state).await;
             let found = texts(&body);
-            assert!(!found.iter().any(|t| t.contains("main session trace") || t.contains("thinking")), "serve={serve} view={view} leaked: {found:?} body={body}");
+            assert!(
+                !found
+                    .iter()
+                    .any(|t| t.contains("main session trace") || t.contains("thinking")),
+                "serve={serve} view={view} leaked: {found:?} body={body}"
+            );
         }
-        let body = ok(&state, &path(SLACK_CH, "/timeline?view=threads&limit=50"), WRITE_TOKEN).await;
+        let body = ok(
+            &state,
+            &path(SLACK_CH, "/timeline?view=threads&limit=50"),
+            WRITE_TOKEN,
+        )
+        .await;
         settled(&state).await;
         let raw = body.to_string();
-        assert!(!raw.contains("main session trace"), "serve={serve} threads leaked: {raw}");
+        assert!(
+            !raw.contains("main session trace"),
+            "serve={serve} threads leaked: {raw}"
+        );
         let root_a = slack_fake::ts(600, 0);
-        let body = ok(&state, &path(SLACK_CH, &format!("/timeline?view=thread&thread_id={root_a}&limit=50")), WRITE_TOKEN).await;
+        let body = ok(
+            &state,
+            &path(
+                SLACK_CH,
+                &format!("/timeline?view=thread&thread_id={root_a}&limit=50"),
+            ),
+            WRITE_TOKEN,
+        )
+        .await;
         settled(&state).await;
-        assert!(texts(&body).is_empty(), "serve={serve} thread view leaked: {body}");
+        assert!(
+            texts(&body).is_empty(),
+            "serve={serve} thread view leaked: {body}"
+        );
         let body = ok(&state, "/api/v1/transcripts", WRITE_TOKEN).await;
-        assert!(body.to_string().contains("liaison"), "transcripts index missing liaison: {body}");
+        assert!(
+            body.to_string().contains("liaison"),
+            "transcripts index missing liaison: {body}"
+        );
     }
 }
 
@@ -3751,9 +3823,7 @@ async fn a_transcript_day_reads_newest_first_a_window_at_a_time() {
     // entries; a window of two shows the pair at a time.)
     let (state, _fake, _clock, _dir) = slack_transcript_deployment("transcript-windows").await;
     let root_a = slack_fake::ts(600, 0);
-    let day = |query: &str| {
-        format!("/api/v1/transcripts/{SLACK_CH}/{root_a}?{query}")
-    };
+    let day = |query: &str| format!("/api/v1/transcripts/{SLACK_CH}/{root_a}?{query}");
     let newest = ok(&state, &day("limit=2"), WRITE_TOKEN).await;
     settled(&state).await;
     assert_eq!(
@@ -3762,7 +3832,10 @@ async fn a_transcript_day_reads_newest_first_a_window_at_a_time() {
         "the newest window is not the day's newest chunks: {newest}"
     );
     assert_eq!(newest["has_more"], true, "{newest}");
-    let cursor = newest["next_before"].as_str().expect("a way back").to_owned();
+    let cursor = newest["next_before"]
+        .as_str()
+        .expect("a way back")
+        .to_owned();
     let older = ok(
         &state,
         &day(&format!("limit=2&before={}", url_encode(&cursor))),
@@ -3850,7 +3923,12 @@ async fn a_transcript_day_interleaves_the_sent_messages_v2_names() {
     // vestigial; the reference nothing can resolve is simply absent,
     // and a v1 entry (the first) contributes nothing.
     let (state, _fake, _clock, _dir) = slack_transcript_deployment("transcript-sent").await;
-    ok(&state, &path(SLACK_CH, "/timeline?view=main&limit=50"), WRITE_TOKEN).await;
+    ok(
+        &state,
+        &path(SLACK_CH, "/timeline?view=main&limit=50"),
+        WRITE_TOKEN,
+    )
+    .await;
     settled(&state).await;
     let root_a = slack_fake::ts(600, 0);
     let body = ok(

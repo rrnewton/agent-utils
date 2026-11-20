@@ -825,8 +825,7 @@ impl AliasRecord {
             || old == new
             || token.is_empty()
             || expires <= created
-            || path.file_name().and_then(|name| name.to_str())
-                != Some(&format!("{old}.json"))
+            || path.file_name().and_then(|name| name.to_str()) != Some(&format!("{old}.json"))
         {
             return Err(invalid());
         }
@@ -897,10 +896,16 @@ pub(crate) fn format_et(unix: f64) -> String {
     };
     let edt_start = nth_sunday(3, 2) + chrono::Duration::hours(7);
     let edt_end = nth_sunday(11, 1) + chrono::Duration::hours(6);
-    let offset_hours = if utc >= edt_start && utc < edt_end { -4 } else { -5 };
+    let offset_hours = if utc >= edt_start && utc < edt_end {
+        -4
+    } else {
+        -5
+    };
     let zone = chrono::FixedOffset::east_opt(offset_hours * 3_600)
         .unwrap_or_else(|| chrono::FixedOffset::east_opt(0).expect("zero offset is valid"));
-    utc.with_timezone(&zone).format("%Y-%m-%d %H:%M ET").to_string()
+    utc.with_timezone(&zone)
+        .format("%Y-%m-%d %H:%M ET")
+        .to_string()
 }
 
 /// A fresh random rename journal id (32 lowercase hexadecimal digits, like a UUID4 hex).
@@ -7074,7 +7079,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         match fs::symlink_metadata(&path) {
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(fail(format!("cannot inspect alias {}: {error}", path.display()))),
+            Err(error) => {
+                return Err(fail(format!(
+                    "cannot inspect alias {}: {error}",
+                    path.display()
+                )))
+            }
         }
         let document = agent::read_private_json(&path)?;
         AliasRecord::parse(&document, &path).map(Some)
@@ -7086,7 +7096,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         match fs::remove_file(&path) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(fail(format!("cannot remove alias {}: {error}", path.display()))),
+            Err(error) => {
+                return Err(fail(format!(
+                    "cannot remove alias {}: {error}",
+                    path.display()
+                )))
+            }
         }
         agent::sync_directory(&agent_queue::registry::aliases_directory(&self.registry))
     }
@@ -7152,8 +7167,10 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
 
     /// Print the one alias note for this process and remember it for JSON.
     fn note_alias(&self, requested: &str, alias: &AliasRecord) {
-        *self.alias_used.lock().unwrap_or_else(|poison| poison.into_inner()) =
-            Some(alias.clone());
+        *self
+            .alias_used
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(alias.clone());
         if !self.alias_noted.swap(true, Ordering::Relaxed) {
             eprintln!(
                 "agentctl: '{requested}' is an alias of '{}' until {}; use {}",
@@ -9602,12 +9619,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         self.rename_inner(old, new, seconds)
     }
 
-    fn rename_inner(
-        &self,
-        old: &str,
-        new: &str,
-        keep_alias_seconds: Option<f64>,
-    ) -> Result<Value> {
+    fn rename_inner(&self, old: &str, new: &str, keep_alias_seconds: Option<f64>) -> Result<Value> {
         let mut result = self.rename_record(old, new, keep_alias_seconds)?;
         // The designation follows the agent by token whatever its name; this keeps the name it
         // records readable.

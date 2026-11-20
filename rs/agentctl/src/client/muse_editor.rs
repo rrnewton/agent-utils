@@ -2115,13 +2115,15 @@ mod tests {
         }
         // The live 42-column frame, and its wide-pane twin as a draft.
         let rule = "─".repeat(42);
-        let screen =
-            format!("◆ prior answer\n{rule}\n❯ Paste an image with Ctrl+V — file\n{rule}\n{footer}");
+        let screen = format!(
+            "◆ prior answer\n{rule}\n❯ Paste an image with Ctrl+V — file\n{rule}\n{footer}"
+        );
         assert!(muse_verified_process_idle_composer(&screen));
         assert_eq!(muse_verified_pane_status("idle", &screen), "idle");
         let wide = "─".repeat(141);
-        let screen =
-            format!("◆ prior answer\n{wide}\n❯ Paste an image with Ctrl+V — file\n{wide}\n{footer}");
+        let screen = format!(
+            "◆ prior answer\n{wide}\n❯ Paste an image with Ctrl+V — file\n{wide}\n{footer}"
+        );
         assert!(!muse_verified_process_idle_composer(&screen));
         assert_eq!(muse_verified_pane_status("idle", &screen), "staged");
     }

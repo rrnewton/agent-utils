@@ -3081,7 +3081,9 @@ pub async fn catchup(
     // `#1843`: an explicitly named uncovered set covers exactly those messages.
     if let Some(ids) = &body.message_ids {
         let named: std::collections::HashSet<&str> = ids.iter().map(|id| id.0.as_str()).collect();
-        fetched.messages.retain(|message| named.contains(message.id.0.as_str()));
+        fetched
+            .messages
+            .retain(|message| named.contains(message.id.0.as_str()));
     }
     let owner = crate::owner::Owner::of(&state);
     let mut built = crate::catchup::build_context(&fetched.messages, &fetched.read, &owner);
@@ -7379,9 +7381,12 @@ pub async fn fake_seed(
             request.thread_root,
             request.root_message_id.as_ref(),
         ),
-        None => state
-            .providers
-            .seed_fake_message(&channel, &request.author, &request.text, request.at_ms),
+        None => state.providers.seed_fake_message(
+            &channel,
+            &request.author,
+            &request.text,
+            request.at_ms,
+        ),
     };
     match seeded {
         Some(id) => Ok(Json(FakeSeedResponse { id })),

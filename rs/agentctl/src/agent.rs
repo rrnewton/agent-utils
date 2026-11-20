@@ -2602,11 +2602,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                             Err(failed) if !failed.probable_misroute => {
                                 let proof = documents.first().and_then(|first| {
                                     transcript_delivery_proof(
-                                        client,
-                                        &info,
-                                        &combined,
-                                        first,
-                                        runtime,
+                                        client, &info, &combined, first, runtime,
                                     )
                                 });
                                 match proof {
@@ -3002,8 +2998,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                             document.insert("transcript_proof".to_owned(), json!(proof));
                             document.remove("possibly_submitted");
                             strip_paste_stamps(&mut document);
-                            document
-                                .insert("delivery_state".to_owned(), json!("queued"));
+                            document.insert("delivery_state".to_owned(), json!("queued"));
                             document.insert("confirmed_at".to_owned(), json!(unix_seconds()));
                             atomic_json(&inflight_path, &Value::Object(document))?;
                             transition(
@@ -3945,17 +3940,15 @@ fn composer_occupied_error<A: AgentApi + ?Sized>(
         // agentctl's own text, already in the queue); a person's draft is
         // only described, never quoted, as everywhere else in agentctl.
         .map(|draft| {
-            let ours = runtime
-                .typed_prompts_queue()
-                .is_some_and(|queue| {
-                    crate::stale_draft::find(
-                        &queue,
-                        &draft,
-                        crate::stale_draft::Vouching::Unproven,
-                        std::time::SystemTime::now(),
-                    )
-                    .is_some()
-                });
+            let ours = runtime.typed_prompts_queue().is_some_and(|queue| {
+                crate::stale_draft::find(
+                    &queue,
+                    &draft,
+                    crate::stale_draft::Vouching::Unproven,
+                    std::time::SystemTime::now(),
+                )
+                .is_some()
+            });
             match (&draft, ours) {
                 (crate::stale_draft::Draft::Text(text), true) => {
                     text.chars().take(40).collect::<String>()

@@ -1145,10 +1145,7 @@ mod lock_wait_tests {
     fn flock_wait_past_deadline_releases_its_late_acquisition() {
         // #1808-C: a waiter whose deadline passes while the holder still
         // holds must never keep the lock when it eventually acquires.
-        let dir = std::env::temp_dir().join(format!(
-            "wrkslots-lock-late-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("wrkslots-lock-late-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("lock");
         let holder = std::fs::OpenOptions::new()
@@ -1198,10 +1195,8 @@ mod lock_wait_tests {
     fn one_deadline_bounds_every_lock_in_a_mutation() {
         // #1808 review: heartbeat's locks share one deadline, so three
         // held locks cost one wait, not one wait each.
-        let dir = std::env::temp_dir().join(format!(
-            "wrkslots-shared-deadline-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("wrkslots-shared-deadline-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let subject_a = dir.join("ACTIVE");
         let subject_b = dir.join("ACTIVE.node.json");
@@ -1236,10 +1231,8 @@ mod lock_wait_tests {
         // A descriptor flock cannot act on (an O_PATH fd) fails both the
         // non-blocking attempt and the blocking waiter; that error must
         // reach the caller, never an Ok that writes without the lock.
-        let target = std::env::temp_dir().join(format!(
-            "wrkslots-opath-target-{}",
-            std::process::id()
-        ));
+        let target =
+            std::env::temp_dir().join(format!("wrkslots-opath-target-{}", std::process::id()));
         std::fs::write(&target, b"").unwrap();
         let path_fd = rustix::fs::openat(
             rustix::fs::CWD,
@@ -1253,7 +1246,10 @@ mod lock_wait_tests {
             &file,
             std::time::Instant::now() + std::time::Duration::from_secs(2),
         );
-        assert!(result.is_err(), "flock on an O_PATH descriptor must not report acquired");
+        assert!(
+            result.is_err(),
+            "flock on an O_PATH descriptor must not report acquired"
+        );
     }
 
     fn turnstile_fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
