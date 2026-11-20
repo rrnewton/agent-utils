@@ -51446,6 +51446,233 @@ def _cmd_reap_stray_worktrees(args: argparse.Namespace) -> int:
     return 1 if args.apply and retained else 0
 
 
+#: Entry budget for one stray worktree's size walk (#1930). The census
+#: is meant to run on a timer, so size is a bounded walk, never a deep
+#: ``du``: past the budget the size is reported truncated.
+_STRAY_SIZE_ENTRY_LIMIT = 20000
+
+
+def _bounded_tree_size(path: Path) -> tuple[int, bool]:
+    """Sum regular-file sizes under ``path`` within the entry budget."""
+
+    total = 0
+    seen = 0
+    truncated = False
+    for directory, names, files in os.walk(path):
+        names[:] = [name for name in names if name != ".git"]
+        for name in files:
+            seen += 1
+            if seen > _STRAY_SIZE_ENTRY_LIMIT:
+                return total, True
+            try:
+                total += os.lstat(os.path.join(directory, name)).st_size
+            except OSError:
+                continue
+    return total, truncated
+
+
+def _stray_age_seconds(vcs: _GitVcs, path: Path) -> int | None:
+    """Age of a worktree from its HEAD commit time (fallback: dir mtime)."""
+
+    moment: float | None = None
+    result = vcs._run(path, ["log", "-1", "--format=%ct", "HEAD"], check=False)
+    if result.returncode == 0:
+        try:
+            moment = float(result.stdout.strip())
+        except ValueError:
+            moment = None
+    if moment is None:
+        try:
+            moment = path.stat().st_mtime
+        except OSError:
+            return None
+    return max(0, int(time.time() - moment))
+
+
+def _doctor_stray_worktrees(config: Config, extra: Sequence[str]) -> list[dict[str, object]]:
+    """Read-only census of worktrees wrkslots does not manage (#1930).
+
+    For every managed repository, ``git worktree list --porcelain``
+    registrations that are no slot checkout, plus nested worktrees
+    under a slot directory that no slot record names. Deletes nothing.
+    """
+
+    states = _load_all_active(config)
+    archives, _malformed = _load_archives_tolerant(config)
+    owned: set[Path] = set()
+    slot_dirs: dict[Path, str] = {}
+    repositories: set[Path] = set()
+    for state in states:
+        for record in state.slots:
+            slot_dir = _slot_directory(config, record.slot, record.slot_type)
+            owned.add(slot_dir)
+            slot_dirs[slot_dir] = record.slot
+            for checkout in record.checkouts:
+                owned.add(_stored_path(config, checkout.path, "checkout path"))
+                if checkout.vcs != "eden":
+                    repositories.add(
+                        _stored_repository_path(config, checkout.repository)[1]
+                    )
+    for archive in archives:
+        for raw_record in archive.records:
+            for checkout_value in _as_list(
+                raw_record.get("checkouts", []), "archived record.checkouts"
+            ):
+                checkout = _checkout_from_obj(checkout_value, "archived checkout")
+                if checkout.vcs != "eden":
+                    try:
+                        repositories.add(
+                            _stored_repository_path(config, checkout.repository)[1]
+                        )
+                    except Refusal:
+                        continue
+    for raw in extra:
+        candidate = Path(raw)
+        repositories.add(
+            candidate if candidate.is_absolute() else config.root / candidate
+        )
+    vcs = _GitVcs()
+    rows: list[dict[str, object]] = []
+    reported: set[Path] = set()
+
+    def add_row(
+        repository: Path, path: Path, branch: str, head: str, kind: str, slot: str | None
+    ) -> None:
+        if path in reported:
+            return
+        reported.add(path)
+        size, truncated = _bounded_tree_size(path) if path.is_dir() else (0, False)
+        unpushed: bool | None = None
+        if re.fullmatch(r"[0-9a-f]{40}", head):
+            probe = vcs._run(
+                repository, ["branch", "-r", "--contains", head], check=False
+            )
+            if probe.returncode == 0:
+                unpushed = not bool(probe.stdout.strip())
+        rows.append(
+            {
+                "repository": str(repository),
+                "path": str(path),
+                "branch": branch,
+                "head": head,
+                "kind": kind,
+                "slot": slot,
+                "age_seconds": _stray_age_seconds(vcs, path),
+                "size_bytes": size,
+                "size_truncated": truncated,
+                "has_unpushed_commits": unpushed,
+            }
+        )
+
+    for repository in sorted(repositories, key=str):
+        listed = vcs._run(
+            repository, ["worktree", "list", "--porcelain", "-z"], check=False
+        )
+        if listed.returncode != 0:
+            raise Refusal(
+                f"cannot list worktrees of {repository}: {listed.stderr.strip()}"
+            )
+        entries: list[dict[str, object]] = []
+        current: dict[str, object] = {}
+        for field in listed.stdout.split("\0"):
+            if not field:
+                if current:
+                    entries.append(current)
+                    current = {}
+                continue
+            key, _, value = field.partition(" ")
+            current[key] = value if value else True
+        if current:
+            entries.append(current)
+        for entry in entries:
+            raw_path = entry.get("worktree")
+            if not isinstance(raw_path, str) or entry.get("bare"):
+                continue
+            path = Path(raw_path).absolute()
+            if path == repository.absolute() or path in owned:
+                continue
+            enclosing = next(
+                (
+                    (slot_dir, name)
+                    for slot_dir, name in slot_dirs.items()
+                    if _path_is_within(path, slot_dir)
+                ),
+                None,
+            )
+            branch = str(entry.get("branch", ""))
+            if branch.startswith("refs/heads/"):
+                branch = branch.removeprefix("refs/heads/")
+            add_row(
+                repository,
+                path,
+                branch,
+                str(entry.get("HEAD", "")),
+                "nested-in-slot" if enclosing else "outside-slot",
+                enclosing[1] if enclosing else None,
+            )
+    # Nested worktrees whose repository is not managed: a `.git` marker
+    # directly under a slot directory that no checkout record names.
+    for slot_dir, slot in sorted(slot_dirs.items(), key=lambda item: str(item[0])):
+        if not slot_dir.is_dir():
+            continue
+        for child in sorted(slot_dir.iterdir()):
+            if child in owned or not (child / ".git").exists():
+                continue
+            head_result = vcs._run(child, ["rev-parse", "HEAD"], check=False)
+            if head_result.returncode != 0:
+                continue
+            branch_result = vcs._run(
+                child, ["branch", "--show-current"], check=False
+            )
+            common_result = vcs._run(
+                child,
+                ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                check=False,
+            )
+            repository = (
+                Path(common_result.stdout.strip()).parent
+                if common_result.returncode == 0
+                else child
+            )
+            add_row(
+                repository,
+                child,
+                branch_result.stdout.strip() if branch_result.returncode == 0 else "",
+                head_result.stdout.strip(),
+                "nested-in-slot",
+                slot,
+            )
+    return sorted(rows, key=lambda row: str(row["path"]))
+
+
+def _cmd_doctor_stray_worktrees(
+    args: argparse.Namespace, config: Config
+) -> int:
+    """`doctor --stray-worktrees`: report unmanaged worktrees (#1930)."""
+
+    rows = _doctor_stray_worktrees(config, getattr(args, "repository", None) or ())
+    if args.format == "json":
+        print(
+            json.dumps(
+                {"schema": 1, "stray_worktrees": rows},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    else:
+        print(f"stray_worktrees={len(rows)}")
+        for row in rows:
+            print(
+                f"STRAY-WORKTREE: path={row['path']} repository={row['repository']} "
+                f"branch={row['branch'] or '-'} head={row['head']} kind={row['kind']} "
+                f"slot={row['slot'] or '-'} age_seconds={row['age_seconds']} "
+                f"size_bytes={row['size_bytes']} "
+                f"size_truncated={str(row['size_truncated']).lower()} "
+                f"has_unpushed_commits={row['has_unpushed_commits']}"
+            )
+    return 0
+
+
 class _CachePlanExhausted(Refusal):
     """Cache-glob planning spent its allowance; the subject's total is unknown."""
 
@@ -60616,6 +60843,8 @@ def _doctor_quick(args: argparse.Namespace, config: Config) -> int:
 
 def _cmd_doctor_scan(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
+    if getattr(args, "stray_worktrees", False):
+        return _cmd_doctor_stray_worktrees(args, config)
     if getattr(args, "quick", False):
         return _doctor_quick(args, config)
     try:
@@ -97423,6 +97652,23 @@ usage or audit gate unknown, 3 fail-closed refusal.
         ),
     )
     doctor.add_argument("--format", choices=("human", "json"), default="human")
+    doctor.add_argument(
+        "--stray-worktrees",
+        action="store_true",
+        help=(
+            "read-only (#1930): list Git worktrees wrkslots does not manage "
+            "(registrations of each managed repository, and nested worktrees "
+            "under a slot) with path, branch, age, bounded size and unpushed "
+            "state; deletes nothing and runs no other doctor check, so it is "
+            "cheap enough for a timer"
+        ),
+    )
+    doctor.add_argument(
+        "--repository",
+        action="append",
+        metavar="PATH",
+        help="extra source repository for --stray-worktrees (repeatable)",
+    )
     doctor.add_argument(
         "--scan-timeout",
         type=float,

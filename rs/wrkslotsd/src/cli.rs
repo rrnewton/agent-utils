@@ -394,6 +394,12 @@ pub(crate) enum Readers {
         /// Snapshot-only fast mode for periodic gates (#1706)
         #[arg(long)]
         quick: bool,
+        /// Read-only: list Git worktrees wrkslots does not manage (#1930); deletes nothing
+        #[arg(long = "stray-worktrees")]
+        stray_worktrees: bool,
+        /// Extra source repository for --stray-worktrees (repeatable)
+        #[arg(long, value_name = "PATH")]
+        repository: Vec<String>,
         /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
         #[arg(long, value_name = "DIR")]
         root: Option<PathBuf>,
@@ -2632,6 +2638,8 @@ pub fn run() -> u8 {
         Command::Readers(inner) => match inner {
             Readers::DoctorText {
                 quick,
+                stray_worktrees,
+                repository,
                 root,
                 machine,
                 all_machines,
@@ -2642,6 +2650,8 @@ pub fn run() -> u8 {
                 all_machines,
                 format == "human",
                 quick,
+                stray_worktrees,
+                &repository,
             ) {
                 Ok(text) => {
                     print!("{text}");

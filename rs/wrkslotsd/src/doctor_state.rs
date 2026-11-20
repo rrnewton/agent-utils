@@ -286,7 +286,17 @@ pub(crate) fn doctor_cli(
     all_machines: bool,
     human: bool,
     quick: bool,
+    stray_worktrees: bool,
+    repositories: &[String],
 ) -> Result<String> {
+    if stray_worktrees {
+        return crate::reap_strays::doctor_stray_worktrees(
+            root,
+            machine_override,
+            repositories,
+            !human,
+        );
+    }
     if quick {
         return doctor_quick(root, machine_override, all_machines, human);
     }

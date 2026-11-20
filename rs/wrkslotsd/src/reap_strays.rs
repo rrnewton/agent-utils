@@ -349,3 +349,295 @@ pub(crate) fn reap_stray_worktrees(
     }
     Ok((out, !retained.is_empty()))
 }
+
+/// Entry budget for one stray worktree's size walk (#1930), as in Python.
+const STRAY_SIZE_ENTRY_LIMIT: usize = 20000;
+
+fn bounded_tree_size(path: &Path) -> (u64, bool) {
+    fn walk(dir: &Path, total: &mut u64, seen: &mut usize) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            let Ok(metadata) = std::fs::symlink_metadata(&entry_path) else {
+                continue;
+            };
+            if metadata.is_dir() {
+                if entry.file_name() == ".git" {
+                    continue;
+                }
+                if walk(&entry_path, total, seen) {
+                    return true;
+                }
+            } else {
+                *seen += 1;
+                if *seen > STRAY_SIZE_ENTRY_LIMIT {
+                    return true;
+                }
+                *total += metadata.len();
+            }
+        }
+        false
+    }
+    let mut total = 0u64;
+    let mut seen = 0usize;
+    let truncated = walk(path, &mut total, &mut seen);
+    (total, truncated)
+}
+
+fn stray_age_seconds(path: &Path) -> Option<i64> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if let Ok(out) = git(path, &["log", "-1", "--format=%ct", "HEAD"]) {
+        if let Ok(moment) = out.trim().parse::<i64>() {
+            return Some((now - moment).max(0));
+        }
+    }
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| (now - d.as_secs() as i64).max(0))
+}
+
+/// Read-only `doctor --stray-worktrees` census (#1930), mirroring Python.
+pub(crate) fn doctor_stray_worktrees(
+    root: Option<&Path>,
+    machine_override: Option<&str>,
+    repositories_in: &[String],
+    format_json: bool,
+) -> Result<String> {
+    let (cfg, _selected) = load_cfg(root, machine_override)?;
+    let mut owned: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut slot_dirs: Vec<(PathBuf, String)> = Vec::new();
+    let mut repositories: BTreeSet<PathBuf> = BTreeSet::new();
+    for machine in discover_machines(&cfg.control)? {
+        for (doc_name, key) in [
+            (format!("ACTIVE.{machine}.json"), "slots"),
+            (format!("ARCHIVED.{machine}.json"), "records"),
+        ] {
+            let Ok(text) = std::fs::read_to_string(cfg.control.join(&doc_name)) else {
+                continue;
+            };
+            let Ok(doc) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            let Some(records) = doc.get(key).and_then(Value::as_array) else {
+                continue;
+            };
+            for record in records {
+                if key == "slots" {
+                    let slot = record.get("slot").and_then(Value::as_str).unwrap_or_default();
+                    let slot_type = record
+                        .get("slot_type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("agent");
+                    if let Ok(dir) = slot_directory(&cfg, slot, slot_type) {
+                        owned.insert(dir.clone());
+                        slot_dirs.push((dir, slot.to_string()));
+                    }
+                }
+                if let Some(checkouts) = record.get("checkouts").and_then(Value::as_array) {
+                    for checkout in checkouts {
+                        if checkout.get("vcs").and_then(Value::as_str) == Some("eden") {
+                            continue;
+                        }
+                        if key == "slots" {
+                            if let Some(raw) = checkout.get("path").and_then(Value::as_str) {
+                                if let Ok(path) = stored_path(&cfg, raw, "checkout path") {
+                                    owned.insert(path);
+                                }
+                            }
+                        }
+                        if let Some(raw) = checkout.get("repository").and_then(Value::as_str) {
+                            if let Ok((_, repo)) =
+                                crate::finish_write::stored_repository_path(&cfg, raw)
+                            {
+                                repositories.insert(repo);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for raw in repositories_in {
+        let candidate = PathBuf::from(raw);
+        repositories.insert(if candidate.is_absolute() {
+            candidate
+        } else {
+            cfg.root.join(candidate)
+        });
+    }
+    let mut rows: Vec<Value> = Vec::new();
+    let mut reported: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut add_row = |repository: &Path,
+                       path: &Path,
+                       branch: &str,
+                       head: &str,
+                       kind: &str,
+                       slot: Option<&str>,
+                       rows: &mut Vec<Value>| {
+        if !reported.insert(path.to_path_buf()) {
+            return;
+        }
+        let (size, truncated) = if path.is_dir() {
+            bounded_tree_size(path)
+        } else {
+            (0, false)
+        };
+        let is_sha = head.len() == 40 && head.chars().all(|c| c.is_ascii_hexdigit());
+        let unpushed = if is_sha {
+            git(repository, &["branch", "-r", "--contains", head])
+                .ok()
+                .map(|out| out.trim().is_empty())
+        } else {
+            None
+        };
+        rows.push(json!({
+            "repository": repository.to_string_lossy(),
+            "path": path.to_string_lossy(),
+            "branch": branch,
+            "head": head,
+            "kind": kind,
+            "slot": slot,
+            "age_seconds": stray_age_seconds(path),
+            "size_bytes": size,
+            "size_truncated": truncated,
+            "has_unpushed_commits": unpushed,
+        }));
+    };
+    for repository in &repositories {
+        let listed = git(repository, &["worktree", "list", "--porcelain", "-z"])
+            .map_err(|e| format!("cannot list worktrees of {}: {e}", repository.display()))?;
+        let mut entries: Vec<std::collections::BTreeMap<String, String>> = Vec::new();
+        let mut current = std::collections::BTreeMap::new();
+        for field in listed.split('\0') {
+            if field.is_empty() {
+                if !current.is_empty() {
+                    entries.push(current);
+                    current = std::collections::BTreeMap::new();
+                }
+                continue;
+            }
+            for line in field.lines() {
+                let (key, value) = line.split_once(' ').unwrap_or((line, ""));
+                current.insert(key.to_string(), value.to_string());
+            }
+        }
+        if !current.is_empty() {
+            entries.push(current);
+        }
+        for entry in &entries {
+            let Some(raw_path) = entry.get("worktree") else {
+                continue;
+            };
+            if entry.contains_key("bare") {
+                continue;
+            }
+            let path = PathBuf::from(raw_path);
+            if path == *repository || owned.contains(&path) {
+                continue;
+            }
+            let enclosing = slot_dirs.iter().find(|(dir, _)| within(&path, dir));
+            let branch = entry
+                .get("branch")
+                .cloned()
+                .unwrap_or_default()
+                .strip_prefix("refs/heads/")
+                .map(str::to_string)
+                .unwrap_or_else(|| entry.get("branch").cloned().unwrap_or_default());
+            add_row(
+                repository,
+                &path,
+                &branch,
+                entry.get("HEAD").map(String::as_str).unwrap_or_default(),
+                if enclosing.is_some() { "nested-in-slot" } else { "outside-slot" },
+                enclosing.map(|(_, name)| name.as_str()),
+                &mut rows,
+            );
+        }
+    }
+    slot_dirs.sort();
+    for (slot_dir, slot) in &slot_dirs {
+        let Ok(children) = std::fs::read_dir(slot_dir) else {
+            continue;
+        };
+        let mut children: Vec<PathBuf> = children.flatten().map(|e| e.path()).collect();
+        children.sort();
+        for child in children {
+            if owned.contains(&child) || !child.join(".git").exists() {
+                continue;
+            }
+            let Ok(head) = git(&child, &["rev-parse", "HEAD"]) else {
+                continue;
+            };
+            let branch = git(&child, &["branch", "--show-current"]).unwrap_or_default();
+            let repository = git(
+                &child,
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            )
+            .ok()
+            .map(|out| {
+                PathBuf::from(out.trim())
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| child.clone())
+            })
+            .unwrap_or_else(|| child.clone());
+            add_row(
+                &repository,
+                &child,
+                branch.trim(),
+                head.trim(),
+                "nested-in-slot",
+                Some(slot),
+                &mut rows,
+            );
+        }
+    }
+    rows.sort_by(|a, b| {
+        a.get("path")
+            .and_then(Value::as_str)
+            .cmp(&b.get("path").and_then(Value::as_str))
+    });
+    if format_json {
+        let payload = json!({"schema": 1, "stray_worktrees": rows});
+        return Ok(format!(
+            "{}\n",
+            serde_json::to_string_pretty(&sort_keys(&payload)).unwrap_or_default()
+        ));
+    }
+    let bool_text = |value: Option<bool>| match value {
+        Some(true) => "True",
+        Some(false) => "False",
+        None => "None",
+    };
+    let mut out = format!("stray_worktrees={}\n", rows.len());
+    for row in &rows {
+        let text = |key: &str| row.get(key).and_then(Value::as_str).unwrap_or_default();
+        out.push_str(&format!(
+            "STRAY-WORKTREE: path={} repository={} branch={} head={} kind={} slot={} age_seconds={} size_bytes={} size_truncated={} has_unpushed_commits={}\n",
+            text("path"),
+            text("repository"),
+            if text("branch").is_empty() { "-" } else { text("branch") },
+            text("head"),
+            text("kind"),
+            row.get("slot").and_then(Value::as_str).unwrap_or("-"),
+            row.get("age_seconds")
+                .and_then(Value::as_i64)
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "None".to_string()),
+            row.get("size_bytes").and_then(Value::as_u64).unwrap_or_default(),
+            match row.get("size_truncated").and_then(Value::as_bool) {
+                Some(true) => "true",
+                _ => "false",
+            },
+            bool_text(row.get("has_unpushed_commits").and_then(Value::as_bool)),
+        ));
+    }
+    Ok(out)
+}
