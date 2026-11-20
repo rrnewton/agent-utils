@@ -342,21 +342,41 @@
   }
 }
 
-/* The thread picker's own pop-up (`#1550 thread-list-pins`): fixed options,
-   then pinned threads, then recent threads. The pin on each thread row's
-   left wears the documents star's dress (`#1306 doc-star-gold`): muted
-   outline off, filled gold on `--pin-*` on. */
+/* The thread picker's own pop-up (`#1550 thread-list-pins`, overhauled by
+   `#1887` on owner thread 277): the threads chronological in a scrollable
+   pane (`.thread-picker-threads`), the fixed options bigger, centred and
+   pill-dressed in a bar under them (`.thread-picker-fixedbar`), where the
+   thumb is. The popup wears the messages' own font: it hangs off the
+   document root, whose default font is not the body's. Each thread row
+   carries its colour on its left edge, as its thread card does. The pin on
+   each row's left wears the documents star's dress (`#1306 doc-star-gold`):
+   muted outline off, filled gold on `--pin-*` on. */
 .thread-picker-popup {
   position: absolute;
   z-index: 60;
+  display: flex;
+  flex-direction: column;
   max-height: 60vh;
-  overflow-y: auto;
+  overflow: hidden;
   background: var(--panel, Canvas);
   color: var(--ink, CanvasText);
   border: 1px solid var(--edge, currentColor);
   border-radius: 0.6rem;
-  padding: 0.3rem;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  font: 1rem/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+.thread-picker-threads {
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0.4rem;
+}
+.thread-picker-group {
+  padding: 0.3rem 0.4rem;
+  color: var(--muted, CanvasText);
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
 }
 .thread-picker-row {
   display: flex;
@@ -372,6 +392,19 @@
   text-align: left;
   cursor: pointer;
   font: inherit;
+}
+.thread-picker-thread {
+  margin: 0.3rem 0;
+  border: 1px solid var(--edge, currentColor);
+  border-inline-start: 3px solid hsl(var(--thread-hue, 210) 55% 50%);
+  border-radius: 0.6rem;
+}
+.thread-picker-thread[data-read] {
+  opacity: 0.6;
+}
+.thread-picker-thread[data-current] {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 .thread-picker-open {
   flex: 1 1 auto;
@@ -397,6 +430,42 @@
 .thread-picker-slug + .thread-picker-title::before {
   content: " · ";
   font-weight: 400;
+}
+.thread-picker-title {
+  color: var(--muted, CanvasText);
+}
+.thread-picker-unread {
+  flex: none;
+  padding: 0.1rem 0.55rem;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 0.85rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.thread-picker-fixedbar {
+  flex: none;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(6.5rem, 1fr));
+  gap: 0.4rem;
+  padding: 0.5rem;
+  border-top: 1px solid var(--edge, currentColor);
+  background: var(--panel, Canvas);
+}
+.thread-picker-fixed {
+  justify-content: center;
+  min-height: 48px;
+  padding: 0.4rem 0.5rem;
+  border: 1px solid var(--edge, currentColor);
+  border-radius: 999px;
+  font-size: 1.02rem;
+  text-align: center;
+}
+.thread-picker-fixed[data-current] {
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 700;
 }
 .thread-pin {
   flex: none;

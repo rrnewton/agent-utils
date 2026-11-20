@@ -436,10 +436,10 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
 
   // The picker's own pop-up (`#1550 thread-list-pins`): the native select's
   // menu cannot hold a pin button on each row, so a pointer press opens this
-  // list instead — fixed options first, then pinned threads, then recent
-  // threads, each group newest first. The select stays the value's owner:
-  // choosing a row sets it and fires its change, as a native pick does.
-  // Keyboard use keeps the native menu.
+  // list instead — threads chronological in a scrollable pane, the fixed
+  // options bigger and centred under them (`#1887`, owner thread 277). The
+  // select stays the value's owner: choosing a row sets it and fires its
+  // change, as a native pick does. Keyboard use keeps the native menu.
   let pickerPopup: HTMLElement | null = null;
   let pickerPopupMounted = false;
 
@@ -473,9 +473,17 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
     return button;
   }
 
+  // The popup's two parts (`#1887 vibe-talk-thread-picker-overhaul`, owner
+  // thread 277): the threads in their own scrollable pane, chronological as
+  // the messages stand (most recently modified at the bottom), and under
+  // them the fixed options, bigger and centred where the thumb is. Built
+  // once in `mountThreadPickerPopup`; `drawThreadPickerPopup` fills them.
+  let pickerThreadsPane: HTMLElement | null = null;
+  let pickerFixedBar: HTMLElement | null = null;
+
   function drawThreadPickerPopup(select: HTMLSelectElement): void {
-    if (!pickerPopup) return;
-    const rows: HTMLElement[] = [];
+    if (!pickerPopup || !pickerThreadsPane || !pickerFixedBar) return;
+    const current = viewChoiceOnScreen();
     const fixed: Array<[string, string]> = [["main", "Main"]];
     if (deps.threading()) {
       fixed.push(["flat", "All"]);
@@ -485,26 +493,46 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
       }
     }
     if (deps.threading()) fixed.push(["transcripts", "Transcripts"]);
-    for (const [value, label] of fixed) {
+    pickerFixedBar.replaceChildren(...fixed.map(([value, label]) => {
       const row = document.createElement("button");
       row.setAttribute("type", "button");
-      row.className = "thread-picker-row";
+      row.className = "thread-picker-row thread-picker-fixed";
       row.setAttribute("role", "option");
+      row.setAttribute("data-value", value);
+      if (value === current) {
+        row.setAttribute("aria-selected", "true");
+        row.setAttribute("data-current", "");
+      }
       row.textContent = label;
       row.addEventListener("click", () => choosePickerValue(select, value));
-      rows.push(row);
-    }
+      return row;
+    }));
+    const rows: HTMLElement[] = [];
     if (deps.threading()) {
+      const heading = document.createElement("div");
+      heading.className = "thread-picker-group";
+      heading.textContent = "Threads";
+      rows.push(heading);
       const choices = orderedThreadChoices();
       const shown = choices.slice(0, THREAD_SELECT_LIMIT);
       const open = openThreadChoice();
       const listed = open && !shown.some((choice) => choice.id === open.id) ? [...shown, open] : shown;
+      // Chronological, oldest at the top: the most recently modified thread
+      // stands at the bottom of the pane, next to the fixed options. A pin
+      // still marks its thread (and still toggles); it no longer reorders.
+      const chronological = [...listed].sort((a, b) =>
+        (Number.isFinite(a.at) ? a.at : 0) - (Number.isFinite(b.at) ? b.at : 0));
       const tally = deps.replyTally();
-      for (const choice of listed) {
+      for (const choice of chronological) {
         const row = document.createElement("div");
         row.className = "thread-picker-row thread-picker-thread";
         row.setAttribute("role", "option");
+        row.style.setProperty("--thread-hue", deps.threadHue(choice.id));
         if (threadIsPinned(choice)) row.setAttribute("data-pinned", "");
+        if (`thread:${choice.id}` === current) {
+          row.setAttribute("aria-selected", "true");
+          row.setAttribute("data-current", "");
+        }
         // `#1906 vibe-talk-agent-replies-to-owner-root-not-surfaced`: a pinned (or any)
         // thread with replies the owner has not read says so on its picker row, beside
         // its pin, in the same words its thread card uses (`sideCardUnread`). Without
@@ -512,6 +540,7 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
         // inside it — the owner must open it to learn a reply exists.
         const unread = deps.sideCardUnread(choice, tally);
         if (unread) row.setAttribute("data-unread-replies", unread);
+        if (deps.threadIsRead(choice, unread)) row.setAttribute("data-read", "");
         const openButton = document.createElement("button");
         openButton.setAttribute("type", "button");
         openButton.className = "thread-picker-open";
@@ -546,7 +575,19 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
         rows.push(row);
       }
     }
-    pickerPopup.replaceChildren(...rows);
+    // A redraw while the popup stands (a pin toggled, a directory read
+    // landed) keeps the reader's place in the pane: at the bottom it stays
+    // at the bottom (the pane commonly grows just after opening, when the
+    // directory read lands fuller rows than the store first drew), and
+    // anywhere else the place is restored once the new rows have been laid
+    // out (reading `scrollHeight` makes the browser do it — restoring into
+    // a still-empty pane would be clamped to the top and stay there).
+    // Opening afresh starts at the bottom, in `mountThreadPickerPopup`.
+    const hold = pickerThreadsPane.scrollTop;
+    const atBottom = hold + pickerThreadsPane.clientHeight >= pickerThreadsPane.scrollHeight - 2;
+    pickerThreadsPane.replaceChildren(...rows);
+    const max = Math.max(0, pickerThreadsPane.scrollHeight - pickerThreadsPane.clientHeight);
+    pickerThreadsPane.scrollTop = atBottom ? max : Math.min(hold, max);
   }
 
   function choosePickerValue(select: HTMLSelectElement, value: string): void {
@@ -568,8 +609,15 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
     popup.setAttribute("role", "listbox");
     popup.setAttribute("aria-label", "view");
     popup.hidden = true;
+    const pane = document.createElement("div");
+    pane.className = "thread-picker-threads";
+    const bar = document.createElement("div");
+    bar.className = "thread-picker-fixedbar";
+    popup.append(pane, bar);
     document.documentElement.append(popup);
     pickerPopup = popup;
+    pickerThreadsPane = pane;
+    pickerFixedBar = bar;
     select.addEventListener("pointerdown", (event?: PointerEvent) => {
       if (select.disabled) return;
       if (event && typeof event.preventDefault === "function") event.preventDefault();
@@ -585,6 +633,9 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
       const top = below + height <= viewHeight ? below : Math.max(8, rect.top - height - 4);
       popup.style.top = `${top + window.scrollY}px`;
       popup.style.left = `${Math.max(8, Math.min(rect.left, viewWidth - popup.offsetWidth - 8)) + window.scrollX}px`;
+      // Opens at the bottom of the thread pane: the most recently modified
+      // thread, beside the fixed options (`#1887`, owner thread 277).
+      pane.scrollTop = pane.scrollHeight;
     });
     document.addEventListener("pointerdown", (event) => {
       if (popup.hidden) return;

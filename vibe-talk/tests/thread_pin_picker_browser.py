@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Pinnable threads in the thread picker, in real Chromium at 1280x800 and 390x852.
 
-`#1550 thread-list-pins`. The spool picker opens its own pop-up list: a pin
-on the LEFT of each thread row, gold while pinned (the documents star's
-dress), threads bound to a subagent (root `!@liteinst`, #917) pinned by
-default and labelled `@liteinst`, pinned threads grouped after the fixed
-options and before the recent threads, each group newest first. Pins live
-on the server (this fake keeps them as the store does, unpins recorded), so
-they survive a reload; message pins stay a separate list.
+`#1550 thread-list-pins`, overhauled by `#1887` (owner thread 277). The
+spool picker opens its own pop-up: the threads chronological in a scrollable
+pane (oldest at the top, most recently modified at the bottom, where the
+pane opens), and under them the fixed options, bigger with their labels
+centred. A pin on the LEFT of each thread row, gold while pinned (the
+documents star's dress), marks its thread without reordering it; a thread
+bound to a subagent (root `!@liteinst`, #917) is pinned by default and
+labelled `@liteinst`. Pins live on the server (this fake keeps them as the
+store does, unpins recorded), so they survive a reload; message pins stay
+a separate list.
 
 Pass --screenshots DIR to keep a PNG of each step for review.
 """
@@ -61,6 +64,15 @@ class PinApi(fixture.FakeApi):
             message(4, "release checklist", release),
             message(5, "the newest reply", {**release, "is_root": False}),
         ]
+        # Distinct ages (`#1887`): the bang thread last moved in January, the
+        # incident in August, the release two days ago, so the chronological
+        # order the picker must show (oldest top, most recent at the bottom)
+        # is visible in each row's own facts, not only in their names.
+        for row, stamp in ((self.messages[2], "2026-08-10T09:02:00Z"),
+                           (self.messages[3], "2026-08-10T09:03:00Z"),
+                           (self.messages[4], "2026-11-18T09:04:00Z"),
+                           (self.messages[5], "2026-11-18T09:05:00Z")):
+            row["timestamp"] = stamp
         for row, thread_id in ((self.messages[0], BANG), (self.messages[2], INCIDENT),
                                (self.messages[4], RELEASE)):
             thread = row["thread"]
@@ -214,14 +226,24 @@ POPUP_JS = """() => {
             unread: badge ? badge.textContent.trim() : null,
             pinUnread: pin ? pin.getAttribute('data-unread-replies') : null,
             pinned: pin ? pin.getAttribute('aria-pressed') : null,
+            fixed: row.classList.contains('thread-picker-fixed'),
+            centred: getComputedStyle(row).textAlign,
+            rowTop: row.getBoundingClientRect().top,
             pinLeft: pinRect ? pinRect.left : null,
             openLeft: openRect ? openRect.left : null,
             gold: pin ? getComputedStyle(pin).color : null,
             goldBg: pin ? getComputedStyle(pin).backgroundColor : null,
         };
     });
+    const pane = popup.querySelector('.thread-picker-threads');
+    const bar = popup.querySelector('.thread-picker-fixedbar');
     return {rows, overflow: document.documentElement.scrollWidth - window.innerWidth,
-            popupWidth: popup.getBoundingClientRect().width, innerWidth: window.innerWidth};
+            popupWidth: popup.getBoundingClientRect().width, innerWidth: window.innerWidth,
+            paneTop: pane ? pane.getBoundingClientRect().top : null,
+            barTop: bar ? bar.getBoundingClientRect().top : null,
+            paneScrollTop: pane ? pane.scrollTop : null,
+            paneClientHeight: pane ? pane.clientHeight : null,
+            paneScrollHeight: pane ? pane.scrollHeight : null};
 }"""
 
 
@@ -321,12 +343,29 @@ def picker_walk(desk: Desk, api: PinApi) -> None:
 
     rows = open_popup(desk)
     names = texts(rows)
-    desk.check(names[:2] == ["Main", "All"], f"fixed options are not first: {names}")
     thread_rows = [r for r in rows if r["pinned"] is not None]
+    fixed_rows = [r for r in rows if r["fixed"]]
     desk.check(len(thread_rows) == 3, f"expected three thread rows: {rows}")
-    # Pinned first: the bang-bound thread, oldest of all, leads the threads.
+    # `#1887` (owner thread 277): the fixed options stand at the BOTTOM of the
+    # popup, under every thread, their labels centred.
+    desk.check(bool(fixed_rows) and rows.index(fixed_rows[0]) == len(thread_rows),
+               f"fixed options are not below the threads: {names}")
+    desk.check(texts(fixed_rows)[:2] == ["Main", "All"],
+               f"fixed options are not Main then All: {texts(fixed_rows)}")
+    for row in fixed_rows:
+        desk.check(row["centred"] == "center",
+                   f"a fixed option's label is not centred: {row}")
+    found_now = page.evaluate(POPUP_JS)
+    desk.check(float(found_now["barTop"]) >= float(found_now["paneTop"]),
+               "the fixed bar does not stand under the thread pane")
+    desk.check(float(found_now["paneScrollTop"]) + float(found_now["paneClientHeight"])
+               >= float(found_now["paneScrollHeight"]) - 2,
+               "the thread pane did not open scrolled to its bottom")
+    desk.notes.append("fixed options centred at the bottom; the pane opens at its bottom")
+    # Chronological: the bang-bound thread, oldest of all, stands at the top;
+    # the most recently modified stands at the bottom, beside the fixed bar.
     desk.check("@liteinst" in str(thread_rows[0]["text"]),
-               f"the bang-bound thread is not first with its @label: {names}")
+               f"the oldest thread is not first with its @label: {names}")
     desk.check(thread_rows[0]["pinned"] == "true",
                f"the bang-bound thread is not pinned by default: {thread_rows[0]}")
     # `#1906`: each thread's one reply is unread, and its row and its pin say so.
@@ -336,9 +375,15 @@ def picker_walk(desk: Desk, api: PinApi) -> None:
         desk.check(row["pinUnread"] == "1 unread",
                    f"the pin does not carry the thread's unread replies: {row}")
     desk.notes.append("every picker thread row and pin shows its 1 unread reply")
-    desk.check("release" in str(thread_rows[1]["text"]).lower()
-               and "incident" in str(thread_rows[2]["text"]).lower(),
-               f"recent threads are not newest first after the pinned group: {names}")
+    desk.check("incident" in str(thread_rows[1]["text"]).lower()
+               and "release" in str(thread_rows[2]["text"]).lower(),
+               f"threads are not chronological, most recent at the bottom: {names}")
+    # The fixture's ages differ (45w, 14w, days), so the order just asserted
+    # is chronological in the rows' own facts, not only in their names.
+    desk.check(str(thread_rows[0]["text"]).startswith("45w")
+               and str(thread_rows[1]["text"]).startswith("14w")
+               and re.match(r"^\d+d", str(thread_rows[2]["text"])) is not None,
+               f"thread facts do not run oldest to most recent: {texts(thread_rows)}")
     for row in thread_rows:
         desk.check(row["pinLeft"] is not None and row["openLeft"] is not None
                    and float(str(row["pinLeft"])) < float(str(row["openLeft"])),
@@ -360,16 +405,31 @@ def picker_walk(desk: Desk, api: PinApi) -> None:
     desk.shot("1-popup-bang-pinned")
     desk.notes.append(f"pop-up order {names}; @liteinst pinned by default, gold, pin left")
 
-    # Pin the newest plain thread: it joins the pinned group, ahead by recency.
+    # Keyboard use keeps the native menu (`#1887`): Escape closes the pop-up,
+    # and the select itself still takes the keyboard and changes its value.
+    page.keyboard.press("Escape")
+    desk.wait_for("() => document.querySelector('.thread-picker-popup').hidden",
+                  "Escape did not close the pop-up", seconds=120)
+    before = page.evaluate("() => document.getElementById('thread-select').value")
+    page.focus("#thread-select")
+    page.keyboard.press("ArrowDown")
+    page.wait_for_function(
+        f"() => document.getElementById('thread-select').value !== {json.dumps(before)}",
+        timeout=120_000)
+    desk.notes.append("keyboard: Escape closes the pop-up and the native select still steps")
+
+    rows = open_popup(desk)
+    # Pin the newest plain thread: the pin marks it; the order does not move.
     page.click(".thread-picker-popup .thread-pin[aria-label^='Pin release']")
     desk.wait_for("() => document.querySelector(\".thread-pin[aria-label^='Unpin release']\") !== null",
                   "pinning the release thread did not take", seconds=120)
     desk.settled()
     rows = open_popup_rows(page)
     thread_rows = [r for r in rows if r["pinned"] is not None]
-    desk.check("release" in str(thread_rows[0]["text"]).lower()
-               and "@liteinst" in str(thread_rows[1]["text"]),
-               f"pinned group is not recency-ordered: {texts(rows)}")
+    desk.check("release" in str(thread_rows[2]["text"]).lower()
+               and thread_rows[2]["pinned"] == "true"
+               and "@liteinst" in str(thread_rows[0]["text"]),
+               f"pinning a thread reordered the chronological list: {texts(rows)}")
     desk.shot("2-popup-two-pinned")
 
     # Persistence: a reload reads the server's records back.
@@ -379,22 +439,31 @@ def picker_walk(desk: Desk, api: PinApi) -> None:
                   "the channel did not reopen after reload", seconds=120)
     desk.settled()
     rows = open_popup(desk)
+    # The pin records are read back after the pop-up first draws, and their
+    # landing redraws it: wait for the release pin to stand pressed, on that
+    # condition, rather than reading the first draw.
+    page.wait_for_function(
+        "() => [...document.querySelectorAll('.thread-picker-thread')]"
+        ".some((row) => row.textContent.includes('release-day')"
+        " && row.querySelector('.thread-pin')?.getAttribute('aria-pressed') === 'true')",
+        timeout=120_000)
+    rows = open_popup_rows(page)
     thread_rows = [r for r in rows if r["pinned"] is not None]
-    desk.check(thread_rows[0]["pinned"] == "true" and "release" in str(thread_rows[0]["text"]).lower(),
+    desk.check(thread_rows[2]["pinned"] == "true" and "release" in str(thread_rows[2]["text"]).lower(),
                f"the pin did not survive a reload: {texts(rows)}")
     desk.notes.append("pins survive a reload from the server's records")
 
-    # Unpin the bang-bound thread: it leaves the group and stays unpinned.
+    # Unpin the bang-bound thread: it stays where chronology puts it, unpinned.
     page.click(".thread-picker-popup .thread-pin[aria-label^='Unpin @liteinst']")
     desk.wait_for("() => document.querySelector(\".thread-pin[aria-label^='Pin @liteinst']\") !== null",
                   "unpinning the bang-bound thread did not take", seconds=120)
     desk.settled()
     rows = open_popup_rows(page)
     thread_rows = [r for r in rows if r["pinned"] is not None]
-    desk.check(thread_rows[0]["pinned"] == "true" and "release" in str(thread_rows[0]["text"]).lower()
-               and "@liteinst" in str(thread_rows[-1]["text"])
-               and thread_rows[-1]["pinned"] == "false",
-               f"the unpinned bang thread did not fall to the recents: {texts(rows)}")
+    desk.check(thread_rows[2]["pinned"] == "true" and "release" in str(thread_rows[2]["text"]).lower()
+               and "@liteinst" in str(thread_rows[0]["text"])
+               and thread_rows[0]["pinned"] == "false",
+               f"the unpinned bang thread moved or stayed pinned: {texts(rows)}")
     desk.shot("3-popup-bang-unpinned")
     page.reload(wait_until="load")
     page.wait_for_selector("#search-toggle", state="visible", timeout=120_000)
@@ -404,12 +473,12 @@ def picker_walk(desk: Desk, api: PinApi) -> None:
     rows = open_popup(desk)
     page.wait_for_function(
         "() => { const rows = [...document.querySelectorAll('.thread-picker-thread')];"
-        " const last = rows[rows.length - 1];"
-        " return last && last.querySelector('.thread-pin')?.getAttribute('aria-pressed') === 'false'"
-        " && last.textContent.includes('@liteinst'); }", timeout=120_000)
+        " const first = rows[0];"
+        " return first && first.querySelector('.thread-pin')?.getAttribute('aria-pressed') === 'false'"
+        " && first.textContent.includes('@liteinst'); }", timeout=120_000)
     rows = open_popup_rows(page)
     thread_rows = [r for r in rows if r["pinned"] is not None]
-    desk.check(thread_rows[-1]["pinned"] == "false" and "@liteinst" in str(thread_rows[-1]["text"]),
+    desk.check(thread_rows[0]["pinned"] == "false" and "@liteinst" in str(thread_rows[0]["text"]),
                f"the bang thread's unpin did not stick across a reload: {texts(rows)}")
     desk.notes.append("a bang-bound thread's unpin sticks across a reload")
 
