@@ -368,6 +368,16 @@ mod tests {
     }
 
     #[test]
+    fn a_quoted_picker_above_the_composer_is_not_a_question() {
+        // #1939 D2: transcript text quoting the picker, with the live
+        // composer below it, must not be answerable.
+        let quoted = format!("{PICKER}› Ask Codex to do anything\n  GPT · /work\n");
+        let view = CodexTui.classify(&quoted);
+        assert_ne!(view.state, State::BlockingQuestion, "{view:?}");
+        assert!(view.question.is_none(), "{view:?}");
+    }
+
+    #[test]
     fn a_near_miss_picker_stays_an_unanswerable_menu() {
         for screen in [
             PICKER.replace("Press enter to confirm or esc to go back", "esc to go back"),

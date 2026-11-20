@@ -13,13 +13,20 @@ def read_replace_goal_picker(screen: str) -> tuple[str, bool, int | None, str, s
     option 1 text, option 2 text). The objective wraps at the pane edge,
     so a showing cut there (or ended with an ellipsis) counts as cut."""
     lines = [line.rstrip() for line in screen.splitlines()]
-    width = max((len(line) for line in lines), default=0)
-    try:
-        start = next(i for i, line in enumerate(lines) if line.strip() == "Replace goal?")
-    except StopIteration:
+    # The LAST title: a quoted picker in the transcript above a live
+    # one is history, never the live question (#1939 D2).
+    starts = [i for i, line in enumerate(lines) if line.strip() == "Replace goal?"]
+    if not starts:
         return None
+    start = starts[-1]
     rest = lines[start + 1:]
-    if not any(line.strip() == "Press enter to confirm or esc to go back" for line in rest):
+    # The footer must end the picker: only status rows may follow it,
+    # and no composer may stand below it (#1939 D2).
+    footers = [i for i, line in enumerate(rest)
+               if line.strip() == "Press enter to confirm or esc to go back"]
+    if not footers:
+        return None
+    if any(line.strip() and " · " not in line for line in rest[footers[0] + 1:]):
         return None
     objective_at = next(
         (i for i, line in enumerate(rest)
@@ -39,7 +46,14 @@ def read_replace_goal_picker(screen: str) -> tuple[str, bool, int | None, str, s
     shown = rows[0].lstrip().removeprefix("New objective:").strip()
     for row in rows[1:]:
         shown += " " + row.strip()
-    cut = len(rows[-1]) >= width or shown.endswith("…")
+    # Cut only on a trailing ellipsis, or when the last objective row
+    # reaches the widest non-objective line (the pane edge, as far as
+    # screen text can say) (#1939 D3).
+    objective_rows = set(range(start + 1 + objective_at,
+                               start + 1 + objective_at + len(rows)))
+    width = max((len(line) for i, line in enumerate(lines) if i not in objective_rows),
+                default=0)
+    cut = shown.endswith("…") or (width > 0 and len(rows[-1]) >= width)
     if shown.endswith("…"):
         shown = shown[:-1].rstrip()
     if not shown:

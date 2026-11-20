@@ -1348,10 +1348,23 @@ def _goal_replacement_selected(screen: str, objective: str) -> bool:
     if picker is None:
         return False
     shown, cut, selected, _replace, _cancel = picker
-    shown_words = " ".join(shown.split())
-    wanted = " ".join(objective.split())
-    matches = wanted.startswith(shown_words) if cut and shown_words else shown_words == wanted
-    return matches and selected == 1
+    if selected != 1:
+        return False
+    shown_words, wanted_words = shown.split(), objective.split()
+    if not cut:
+        return shown_words == wanted_words
+    # Cut: whole words must agree except a cut last word, and the
+    # whole-word agreement must reach 3 words or 16 characters, so a
+    # short prefix never confirms a different longer goal (#1939 D3).
+    whole = 0
+    while (whole < len(shown_words) and whole < len(wanted_words)
+           and shown_words[whole] == wanted_words[whole]):
+        whole += 1
+    if whole < 3 and sum(len(word) for word in shown_words[:whole]) < 16:
+        return False
+    return (whole == len(shown_words)
+            or (whole + 1 == len(shown_words) and whole < len(wanted_words)
+                and wanted_words[whole].startswith(shown_words[whole])))
 
 
 #: Longest wait for a sent prompt to appear in the target pane's scrollback.
@@ -2247,6 +2260,19 @@ class _WorkspaceClient:
         return self.client.workspace_label(workspace_id)
 
     def prompt_agent(self, pane_id: str, command: str) -> SubmissionReceipt | None:
+        # Never type a goal command over a picker already open
+        # (#1939 D4): its Enter would answer the other goal's picker.
+        # This edition never cancels a picker; it only ever confirms
+        # its own registered goal in wait_agent_status below.
+        if self.record.harness == "codex" and command.startswith("/goal "):
+            from agentctl.harness_tui.codex import read_replace_goal_picker
+
+            screen = self.client.read(pane_id, source="visible", lines=200)
+            if read_replace_goal_picker(screen) is not None:
+                raise PromptNotStaged(
+                    "a Codex Replace-goal picker is already open; nothing was typed; "
+                    "answer it with `agentctl answer` or in the pane, then resend the goal"
+                )
         self.goal_objective = None
         if self.queue is not None:
             for identifier, objective in self.record.goal_messages.items():

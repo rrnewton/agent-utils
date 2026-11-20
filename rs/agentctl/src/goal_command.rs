@@ -307,19 +307,25 @@ impl CodexReplacement {
     #[must_use]
     pub fn read(screen: &str) -> Option<Self> {
         let lines: Vec<&str> = screen.lines().map(str::trim_end).collect();
-        let width = lines
-            .iter()
-            .map(|line| line.chars().count())
-            .max()
-            .unwrap_or(0);
-        let start = lines.iter().position(|line| line.trim() == "Replace goal?")?;
+        // The LAST title on screen: a quoted picker in the transcript
+        // above a live one is history, never the live question (#1939 D2).
+        let start = lines.iter().rposition(|line| line.trim() == "Replace goal?")?;
         let rest = &lines[start + 1..];
-        if !rest
+        // The footer must end the picker: only status rows may follow
+        // it, and no composer may stand below it, or the block is a
+        // quote in the transcript rather than a live picker (#1939 D2).
+        let footer_at = rest
             .iter()
-            .any(|line| line.trim() == "Press enter to confirm or esc to go back")
-        {
+            .position(|line| line.trim() == "Press enter to confirm or esc to go back")?;
+        let status_row = |line: &str| {
+            let line = line.trim();
+            line.is_empty() || line.contains(" · ")
+        };
+        if !rest[footer_at + 1..].iter().all(|line| status_row(line)) {
             return None;
         }
+        // The pane-width proxy for a cut showing is computed with the
+        // objective rows, below (#1939 D3).
         // The objective line, plus any rows it wraps onto, up to option 1.
         let objective_at = rest.iter().position(|line| {
             line.trim_start()
@@ -349,7 +355,19 @@ impl CodexReplacement {
             new.push_str(row.trim());
         }
         let last_row = objective_rows.last()?;
-        let new_cut = last_row.chars().count() >= width || new.ends_with('…');
+        // Cut only on a trailing ellipsis, or when the last objective
+        // row reaches the widest non-objective line on screen (the
+        // pane edge, as far as screen text can say) (#1939 D3).
+        let objective_range =
+            (start + 1 + objective_at)..(start + 1 + objective_at + objective_rows.len());
+        let width = lines
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !objective_range.contains(index))
+            .map(|(_, line)| line.chars().count())
+            .max()
+            .unwrap_or(0);
+        let new_cut = new.ends_with('…') || (width > 0 && last_row.chars().count() >= width);
         if new.ends_with('…') {
             new = new.trim_end_matches('…').trim_end().to_owned();
         }
@@ -398,7 +416,7 @@ impl CodexReplacement {
     /// goal` is selected. Anything else is never auto-answered.
     #[must_use]
     pub fn choice(&self, objective: &str) -> ReplacementChoice {
-        if !shows(&self.new, self.new_cut, objective) {
+        if !codex_shows(&self.new, self.new_cut, objective) {
             return ReplacementChoice::Cancel(
                 "Codex asked about replacing the goal, but the new objective it showed is not \
                  the one sent"
@@ -416,13 +434,47 @@ impl CodexReplacement {
     }
 }
 
+/// Whether Codex's showing, cut or not, is `objective` (#1939 D3): uncut
+/// must equal it word for word; cut must agree on every whole word shown
+/// except a cut last word, and the whole-word agreement must amount to
+/// at least three words or sixteen characters, so a one-word or
+/// one-character prefix never confirms a different longer goal.
+fn codex_shows(shown: &str, cut: bool, objective: &str) -> bool {
+    let (shown, objective) = (words(shown), words(objective));
+    if !cut {
+        return shown == objective;
+    }
+    let shown_words: Vec<&str> = shown.split(' ').filter(|word| !word.is_empty()).collect();
+    let objective_words: Vec<&str> =
+        objective.split(' ').filter(|word| !word.is_empty()).collect();
+    let mut whole = 0;
+    while whole < shown_words.len()
+        && whole < objective_words.len()
+        && shown_words[whole] == objective_words[whole]
+    {
+        whole += 1;
+    }
+    let whole_chars: usize = shown_words[..whole]
+        .iter()
+        .map(|word| word.chars().count())
+        .sum();
+    if whole < 3 && whole_chars < 16 {
+        return false;
+    }
+    // Every shown word agrees whole, or only the last one is cut short.
+    whole == shown_words.len()
+        || (whole + 1 == shown_words.len()
+            && whole < objective_words.len()
+            && objective_words[whole].starts_with(shown_words[whole]))
+}
+
 /// Whether `screen` shows a question about replacing a goal, Muse's or Codex's, that a command
 /// left open.
 #[must_use]
 pub fn replacement_question_open(screen: &str) -> bool {
-    MuseReplacement::read(screen).is_some()
-        || CodexReplacement::read(screen).is_some()
-        || compact(screen).contains("Replacegoal?")
+    // Strict only (#1939 D5): loose text matching here once let a
+    // timeout Escape over transcript text that merely quoted a picker.
+    MuseReplacement::read(screen).is_some() || CodexReplacement::read(screen).is_some()
 }
 
 #[cfg(test)]
@@ -672,6 +724,58 @@ mod tests {
         .is_none());
         assert!(CodexReplacement::read(&screen.replace("New objective: ", "Objective: ")).is_none());
         assert!(CodexReplacement::read("Replace goal?\n").is_none());
+    }
+
+    #[test]
+    fn a_quoted_picker_in_the_transcript_is_not_a_live_picker() {
+        // #1939 D2: a picker quoted above the composer is history.
+        let quoted = format!(
+            "{}\n› Ask Codex to do anything\n  GPT · /work\n",
+            codex_picker("finish this task", 1)
+        );
+        assert!(CodexReplacement::read(&quoted).is_none());
+        // A status row below the footer keeps it live.
+        let live = format!(
+            "{}\n  GPT-6 · /work   Pursuing goal (3s)\n",
+            codex_picker("finish this task", 1)
+        );
+        assert!(CodexReplacement::read(&live).is_some());
+        // Quoted (Cancel marked) above live (Replace marked): the
+        // last block is the live one.
+        let both = format!(
+            "{}\n{}\n",
+            codex_picker("an older task", 2),
+            codex_picker("finish this task", 1)
+        );
+        let question = CodexReplacement::read(&both).expect("live picker");
+        assert_eq!(question.new, "finish this task");
+        assert_eq!(question.selected, Some(1));
+        assert_eq!(
+            question.choice("finish this task"),
+            ReplacementChoice::Replace
+        );
+    }
+
+    #[test]
+    fn a_short_cut_showing_never_confirms_a_different_goal() {
+        // #1939 D3: "f…" is not "force-push main", and one whole word
+        // is not the longer goal it prefixes.
+        let one_char = CodexReplacement::read(&codex_picker("f…", 1)).expect("picker");
+        assert!(matches!(
+            one_char.choice("force-push main"),
+            ReplacementChoice::Cancel(_)
+        ));
+        let one_word = CodexReplacement::read(&codex_picker("ship…", 1)).expect("picker");
+        assert!(matches!(
+            one_word.choice("ship the release and report back"),
+            ReplacementChoice::Cancel(_)
+        ));
+        let enough = CodexReplacement::read(&codex_picker("ship the release and report…", 1))
+            .expect("picker");
+        assert_eq!(
+            enough.choice("ship the release and report back when green"),
+            ReplacementChoice::Replace
+        );
     }
 
     #[test]

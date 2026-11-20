@@ -5461,6 +5461,16 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         let before = self
             .goal_screen(pane_id, runtime)
             .map_err(|error| AdapterError::not_staged(format!("{error}; nothing was typed")))?;
+        // A picker already open is never typed over (#1939 D1): in a
+        // real picker the Enter that submits a command would confirm
+        // Replace for the other goal. Refuse before anything is staged.
+        if crate::goal_command::CodexReplacement::read(&before).is_some() {
+            return Ok(Submission::NotStaged(
+                "a Codex Replace-goal picker is already open; nothing was typed; answer it \
+                 with `agentctl answer` or in the pane, then resend the goal"
+                    .to_owned(),
+            ));
+        }
         let text = text.trim();
         if self.uses_muse_composer() {
             self.run_with_runtime(pane_id, text, runtime)?;
@@ -5686,6 +5696,18 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         reason: &str,
         runtime: &dyn agent::AgentRuntime,
     ) -> AdapterError {
+        // Re-read and strict-match before any Escape (#1939 D5): a
+        // question that changed or closed since the deciding read is
+        // never Escaped over.
+        let still_open = self
+            .goal_screen(pane_id, runtime)
+            .is_ok_and(|screen| crate::goal_command::replacement_question_open(&screen));
+        if !still_open {
+            return AdapterError::unavailable(format!(
+                "{reason}; the question is no longer shown, so nothing was cancelled; \
+                 inspect the pane"
+            ));
+        }
         let cleared = self
             .goal_key(pane_id, "Escape", runtime)
             .and_then(|()| self.clear_goal_draft(pane_id, runtime));
@@ -6336,6 +6358,19 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                 }
             }
         }
+        // Never type a goal command over a picker already open
+        // (#1939 D4): its Enter would answer the other goal's picker.
+        if self.record.harness == "codex" && crate::goal_command::argument(text).is_some() {
+            let screen = self.client.read(pane_id, "visible", Some(200))?;
+            if crate::goal_command::CodexReplacement::read(&crate::harness_tui::plain(&screen))
+                .is_some()
+            {
+                return Err(crate::error::AdapterError::unavailable(
+                    "a Codex Replace-goal picker is already open; nothing was typed; answer \
+                     it with `agentctl answer` or in the pane, then resend the goal",
+                ));
+            }
+        }
         if self.record.adapter == "herdr-relay" {
             return self.relay_refuses_raw_input(text);
         }
@@ -6568,6 +6603,19 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                         break;
                     }
                 }
+            }
+        }
+        // Never type a goal command over a picker already open
+        // (#1939 D4): its Enter would answer the other goal's picker.
+        if self.record.harness == "codex" && crate::goal_command::argument(text).is_some() {
+            let screen = self.client.read_with_runtime(pane_id, "visible", Some(200), runtime)?;
+            if crate::goal_command::CodexReplacement::read(&crate::harness_tui::plain(&screen))
+                .is_some()
+            {
+                return Err(crate::error::AdapterError::unavailable(
+                    "a Codex Replace-goal picker is already open; nothing was typed; answer \
+                     it with `agentctl answer` or in the pane, then resend the goal",
+                ));
             }
         }
         if self.record.adapter == "herdr-relay" {

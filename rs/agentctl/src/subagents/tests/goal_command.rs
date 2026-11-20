@@ -170,37 +170,63 @@ fn a_codex_picker_offering_another_goal_is_cancelled_never_confirmed() {
 }
 
 #[test]
-fn a_picker_already_open_is_never_cancelled_by_a_goal_command() {
-    // #1939 review: a picker this command did not trigger (it was
-    // already open before typing) is left open, never cancelled.
-    let fixture = Fixture::new();
-    fixture.start(None);
-    *fixture.client.screen.lock().unwrap() = Some(codex_picker("a different task"));
-    *fixture.client.screen_after_run.lock().unwrap() =
-        Some(codex_picker("a different task"));
-    let manager = fixture.manager();
-    let error = manager
-        .send_identified_with_runtime(
+fn a_picker_already_open_is_never_typed_over_nor_cancelled() {
+    // #1939 D1: a picker already open before typing is refused before
+    // anything is staged — typing "/goal X" plus Enter over it would
+    // confirm Replace for the other goal. Whether it offers the sent
+    // goal or another one, nothing is typed and no key is sent.
+    for offered in ["ship the release", "a different task"] {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        *fixture.client.screen.lock().unwrap() = Some(codex_picker(offered));
+        *fixture.client.screen_after_run.lock().unwrap() = Some(codex_picker(offered));
+        let manager = fixture.manager();
+        let outcome = manager.send_identified_with_runtime(
             "worker",
             "/goal ship the release",
             quick(),
             "goal",
             &Clock::default(),
-        )
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("did not trigger"),
-        "{error}"
+        );
+        assert!(
+            fixture.client.runs.lock().unwrap().is_empty(),
+            "typed over an open picker offering {offered}"
+        );
+        assert!(
+            fixture.client.keys_sent.lock().unwrap().is_empty(),
+            "sent keys over an open picker offering {offered}"
+        );
+        if let Err(error) = outcome {
+            assert!(
+                error.to_string().contains("already open"),
+                "{error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_registered_goal_never_types_over_an_open_picker() {
+    // #1939 D4: the registered-goal delivery path refuses the same
+    // way, before typing, and confirms nothing.
+    let fixture = Fixture::new();
+    fixture.start(None);
+    *fixture.client.screen.lock().unwrap() = Some(codex_picker("a different task"));
+    let manager = fixture.manager();
+    let outcome = manager.goal(
+        "worker",
+        Some("ship the release"),
+        quick(),
+        None,
     );
-    let keys: Vec<String> = fixture
-        .client
-        .keys_sent
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|(_, key)| key.clone())
-        .collect();
-    assert!(!keys.contains(&"Escape".to_owned()), "{keys:?}");
+    assert!(fixture.client.runs.lock().unwrap().is_empty());
+    assert!(fixture.client.keys_sent.lock().unwrap().is_empty());
+    if let Err(error) = outcome {
+        assert!(
+            error.to_string().contains("already open"),
+            "{error}"
+        );
+    }
 }
 
 #[test]

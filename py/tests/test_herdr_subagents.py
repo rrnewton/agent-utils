@@ -2351,7 +2351,9 @@ def test_goal_confirms_only_its_exact_replacement_menu(tmp_path: Path, monkeypat
     monkeypatch.setattr(fake, "send_keys", lambda _pane, key: keys.append(key))
     objective = "finish this task" if correct_objective else "a different task"
     screen = f"Replace goal?\nNew objective: {objective}\n› 1. Replace current goal  Set the new objective and start it now\n2. Cancel  Keep the current goal\nPress enter to confirm or esc to go back"
-    monkeypatch.setattr(fake, "read", lambda *_args, **_kwargs: screen)
+    # The picker appears only once the goal is typed (#1939 D1: a
+    # picker already open before typing would refuse it instead).
+    monkeypatch.setattr(fake, "read", lambda *_args, **_kwargs: screen if fake.submitted else "› Ask Codex to do anything")
     if correct_objective:
         assert manager.goal("worker", "finish this task")["native_status"] == "active"
         assert keys == ["Enter"]
@@ -2388,6 +2390,38 @@ def test_replace_goal_picker_is_an_answerable_question() -> None:
                  screen.replace("New objective: ", "Objective: ")):
         assert read_replace_goal_picker(near) is None
         assert CodexTui().classify(near).question is None
+    # #1939 D2: a quoted picker above the live composer is history.
+    quoted = screen + "\n› Ask Codex to do anything\n  GPT · /work"
+    assert read_replace_goal_picker(quoted) is None
+    assert CodexTui().classify(quoted).question is None
+    # #1939 D3: a short cut showing never matches a different goal.
+    from agentctl.subagents import _goal_replacement_selected
+
+    short = screen.replace("finish this task", "f…")
+    assert not _goal_replacement_selected(short, "force-push main")
+    assert not _goal_replacement_selected(
+        screen.replace("finish this task", "ship…"), "ship the release and report back")
+    assert _goal_replacement_selected(
+        screen.replace("finish this task", "ship the release and report…"),
+        "ship the release and report back when green")
+
+
+def test_goal_never_types_over_an_open_picker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # #1939 D1/D4 (Python): a goal command is refused before typing
+    # when a picker is already open; nothing is submitted, no key sent.
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path))
+    screen = ("Replace goal?\nNew objective: a different task\n"
+              "› 1. Replace current goal  Set the new objective and start it now\n"
+              "2. Cancel  Keep the current goal\n"
+              "Press enter to confirm or esc to go back")
+    monkeypatch.setattr(fake, "read", lambda *_args, **_kwargs: screen)
+    keys: list[str] = []
+    monkeypatch.setattr(fake, "send_keys", lambda _pane, key: keys.append(key))
+    with pytest.raises(Exception):
+        manager.goal("worker", "finish this task")
+    assert fake.submitted == []
+    assert keys == []
 
 
 def test_queued_goals_keep_confirmation_authority_across_restart(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2406,6 +2440,11 @@ def test_queued_goals_keep_confirmation_authority_across_restart(tmp_path: Path,
         if len(confirmations) < len(fake.submitted):
             raise HerdrUnavailable("working transition not observed")
     def screen(*_args: object, **_kwargs: object) -> str:
+        # The picker shows for the latest typed goal until its
+        # confirmation Enter closes it (#1939 D1: typing over an open
+        # picker would be refused, so the fake closes it like Codex).
+        if not fake.submitted or len(confirmations) >= len(fake.submitted):
+            return "› Ask Codex to do anything"
         objective = fake.submitted[-1][6:]
         return f"Replace goal?\nNew objective: {objective}\n› 1. Replace current goal  Set the new objective and start it now\n2. Cancel  Keep the current goal\nPress enter to confirm or esc to go back"
     monkeypatch.setattr(fake, "wait_agent_status", wait)
