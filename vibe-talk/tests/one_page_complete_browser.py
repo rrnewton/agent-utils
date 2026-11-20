@@ -38,8 +38,14 @@ THREAD = "spaces/A/threads/big"
 
 
 def _thread(root_id: str, is_root: bool, count: int) -> dict[str, object]:
-    return {"id": THREAD, "root_message_id": root_id,
-            "is_root": is_root, "reply_count": count, "reply_count_exact": True}
+    record: dict[str, object] = {"id": THREAD, "root_message_id": root_id,
+                                 "is_root": is_root, "reply_count": count, "reply_count_exact": True}
+    if is_root:
+        # As the real server serves a filed name: on the root's own record, on
+        # every timeline answer (summarize annotate's root naming), not only
+        # on the thread list's summary.
+        record["display_name"] = "runner-wedged"
+    return record
 
 
 class OnePageApi(LabelsApi):
@@ -106,6 +112,11 @@ def walk_through(walk: Walk, api: OnePageApi) -> None:
     walk.until("""() => { const row = document.querySelector('#discord-log > li[data-id="210"]');
       return !!row && row.textContent.includes('120'); }""",
                "the row does not say 120 replies on the first page")
+    # The unread chip stands on Main, where thread chips live; the thread
+    # directory (a summaries page, not a message reach-back) lands behind it
+    # when the reader touches the thread picker, as it does for a person.
+    page.evaluate("() => document.getElementById('channel-view-main')?.click()")
+    page.focus("#thread-select")
     walk.until("""() => { const chip = document.querySelector('#discord-log > li[data-id="210"] .thread-unread');
       return !!chip && chip.textContent.trim() === '7 unread'; }""",
                "the unread chip is not the server's 7 on the first page")
