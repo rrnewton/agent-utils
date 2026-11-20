@@ -270,10 +270,17 @@ def parser() -> argparse.ArgumentParser:
         help="with --new-conversation: cancel the prompts queued for the old conversation, untyped (the "
         "Rust edition only; this edition refuses it while prompts wait)")
     redact = command("redact", "Rewrite a literal string to [redacted] across one agent's processed queue and events "
-        "(and, with --include-archived, its archived records' processed queues). Never touches the live inbox or "
-        "in-flight entries; refuses while the agent is mid-delivery.",
+        "(and, with --include-archived, its archived records' processed queues). Event logs are rewritten only when "
+        "the agent is stopped. Never touches the live inbox or in-flight entries; refuses while the agent is "
+        "mid-delivery. Uncovered: queue/failed and queue/cancelled, agent.json, misroutes/readback, chat bridge "
+        "state, harness transcripts.",
         "agentctl redact reviewer --literal SECRET --dry-run", named=True)
-    redact.add_argument("--literal", required=True, help="literal string to rewrite to [redacted] inside JSON string values")
+    redact_group = redact.add_mutually_exclusive_group(required=True)
+    redact_group.add_argument("--literal", help="literal string to rewrite to [redacted] inside JSON string values. WARNING: visible in argv, process listings and shell history — prefer --literal-file")
+    redact_group.add_argument("--literal-file", help="read the literal from a file (one trailing newline stripped); keeps it out of argv")
+    redact_group.add_argument("--literal-stdin", action="store_true", help="read the literal from standard input (one trailing newline stripped)")
+    redact.add_argument("--no-backup", action="store_true",
+        help="do not back up touched files first (backups contain the literal; retention is yours to manage)")
     redact.add_argument("--include-archived", action="store_true",
         help="also rewrite the agent's archived records' processed queues and events")
     redact.add_argument("--dry-run", action="store_true", help="list the files and match counts without writing anything")
@@ -819,7 +826,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 result = sessions.anchor(name, replace=args.replace, session=args.session_id)
         elif args.command == "redact":
-            result = sessions.redact(name, args.literal, include_archived=args.include_archived, dry_run=args.dry_run)
+            if args.literal is not None:
+                print("agentctl: warning: --literal is visible in argv, process listings and shell history; prefer --literal-file or --literal-stdin", file=sys.stderr)
+                literal = args.literal
+            elif args.literal_file is not None:
+                literal = Path(args.literal_file).read_text(encoding="utf-8")
+                literal = literal[:-1] if literal.endswith("\n") else literal
+            else:
+                literal = sys.stdin.read()
+                literal = literal[:-1] if literal.endswith("\n") else literal
+            result = sessions.redact(name, literal, include_archived=args.include_archived, dry_run=args.dry_run, no_backup=args.no_backup)
         elif args.command == "doctor":
             report = sessions.doctor(repair_labels=args.repair_labels)
             print(json.dumps(report, indent=2, sort_keys=True))

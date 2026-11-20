@@ -7706,16 +7706,41 @@ class ManagedAgents:
         return found
 
     def redact(self, name: str, literal: str, *, include_archived: bool = False,
-               dry_run: bool = False) -> dict[str, object]:
+               dry_run: bool = False, no_backup: bool = False) -> dict[str, object]:
         """Rewrite `literal` in one agent's processed history (#1963).
 
-        Never touches the live inbox or in-flight entries; refuses while an
-        inflight entry exists. Backups (0600) and an audit line that never
-        holds the literal go under the registry's `backups/` directory.
+        Event logs are rewritten only when the agent is stopped. Backups
+        (0600, created private) and started/completed audit lines that never
+        hold the literal go under the registry's `backups/` directory.
         """
-        if not literal:
-            raise AgentDeliveryError("redact literal must not be empty")
         replacement = "[redacted]"
+        common = {"true", "false", "null", "idle", "running", "stopped", "unknown",
+                  "string", "number", "object", "array", "text", "message", "agent",
+                  "session", "token", "type", "state", "status", "name", "value"}
+        if len(literal) < 12:
+            raise AgentDeliveryError(
+                "redact literal must be at least 12 characters — remedy: pass a longer, specific string (a full token or id), not a short fragment"
+            )
+        if literal.lower() in common or replacement in literal or literal in replacement:
+            raise AgentDeliveryError(
+                "redact literal is a common JSON word or the replacement itself — remedy: pass the specific string to remove, not a JSON keyword, number, or [redacted]"
+            )
+        try:
+            float(literal)
+        except ValueError:
+            pass
+        else:
+            raise AgentDeliveryError(
+                "redact literal is a common JSON word or the replacement itself — remedy: pass the specific string to remove, not a JSON keyword, number, or [redacted]"
+            )
+        uncovered = [
+            "queue/inbox and queue/inflight (live delivery state)",
+            "queue/failed and queue/cancelled",
+            "agent.json (the registry record)",
+            "misroutes.jsonl and readback.jsonl",
+            "chat bridge state",
+            "harness transcripts and session files (clean those with the harness's own tooling)",
+        ]
 
         def count_in(value: object) -> int:
             if isinstance(value, str):
@@ -7726,107 +7751,170 @@ class ManagedAgents:
                 return sum(count_in(item) for item in value.values())
             return 0
 
-        def apply(value: object) -> tuple[object, int]:
-            total = count_in(value)
-            if total:
-                # Strings are immutable: rebuild with replacements.
-                def rebuild(item: object) -> object:
-                    if isinstance(item, str):
-                        return item.replace(literal, replacement)
-                    if isinstance(item, list):
-                        return [rebuild(child) for child in item]
-                    if isinstance(item, dict):
-                        return {key: rebuild(child) for key, child in item.items()}
-                    return item
-                return rebuild(value), total
-            return value, 0
+        def count_keys(value: object) -> int:
+            if isinstance(value, list):
+                return sum(count_keys(item) for item in value)
+            if isinstance(value, dict):
+                return sum(key.count(literal) + count_keys(item) for key, item in value.items())
+            return 0
 
-        with self._lock(name):
-            self._load(name)
-            agent_dir = self._directory(name)
+        def rebuild(value: object) -> object:
+            if isinstance(value, str):
+                return value.replace(literal, replacement)
+            if isinstance(value, list):
+                return [rebuild(item) for item in value]
+            if isinstance(value, dict):
+                return {key: rebuild(item) for key, item in value.items()}
+            return value
+
+        def archive_dirs() -> list[Path]:
+            archive = self.registry / "archive"
+            if not archive.is_dir():
+                return []
+            pattern = re.compile(re.escape(name) + r"-\d+-\d+\Z")
+            return sorted(path for path in archive.iterdir() if path.is_dir() and pattern.fullmatch(path.name))
+
+        # Resolve aliases as a load does; support retired agents (archive only).
+        try:
+            record = self._load(name)
+            record_name = record.name
+            agent_dir = self._directory(record_name)
+            stopped = record.lifecycle == "stopped"
+        except AgentDeliveryError:
+            dirs = archive_dirs()
+            if not dirs:
+                raise
+            record_name = name
+            agent_dir = dirs[-1]
+            stopped = True
+        with self._lock(record_name):
             inflight = agent_dir / "queue" / "inflight"
             if inflight.is_dir() and any(path.suffix == ".json" for path in inflight.iterdir()):
                 raise AgentDeliveryError(
-                    f"agent {name!r} is mid-delivery (an inflight entry exists); refusing to redact — remedy: wait for the delivery to finish, then retry"
+                    f"agent {record_name!r} is mid-delivery (an inflight entry exists); refusing to redact — remedy: wait for the delivery to finish, then retry"
                 )
             targets: list[Path] = []
             for base, extension in ((agent_dir / "queue" / "processed", ".json"),
                                     (agent_dir / "events", ".jsonl")):
                 if base.is_dir():
                     targets.extend(sorted(path for path in base.iterdir() if path.suffix == extension and path.is_file()))
-            if include_archived:
-                archive = self.registry / "archive"
-                if archive.is_dir():
-                    for directory in sorted(path for path in archive.iterdir()
-                                            if path.is_dir() and path.name.startswith(f"{name}-")):
-                        for base, extension in ((directory / "queue" / "processed", ".json"),
-                                                (directory / "events", ".jsonl")):
-                            if base.is_dir():
-                                targets.extend(sorted(path for path in base.iterdir() if path.suffix == extension and path.is_file()))
-            planned: list[tuple[Path, int, str]] = []
+            if include_archived and agent_dir.parent.name != "archive":
+                for directory in archive_dirs():
+                    for base, extension in ((directory / "queue" / "processed", ".json"),
+                                            (directory / "events", ".jsonl")):
+                        if base.is_dir():
+                            targets.extend(sorted(path for path in base.iterdir() if path.suffix == extension and path.is_file()))
+            planned: list[tuple[Path, int, object]] = []
+            left_keys = 0
+            left_unparseable = 0
             for path in targets:
-                text = path.read_text(encoding="utf-8")
+                try:
+                    text = path.read_bytes().decode("utf-8")
+                except (OSError, UnicodeDecodeError) as exc:
+                    raise AgentDeliveryError(f"cannot redact {path}: it is not valid UTF-8") from exc
                 if path.suffix == ".jsonl":
                     total = 0
                     lines: list[str] = []
-                    for line in text.splitlines():
+                    for line in text.split("\n"):
+                        if not line:
+                            lines.append(line)
+                            continue
                         try:
                             value = json.loads(line)
                         except ValueError:
+                            left_unparseable += line.count(literal)
                             lines.append(line)
                             continue
-                        new_value, count = apply(value)
+                        left_keys += count_keys(value)
+                        count = count_in(value)
                         total += count
-                        lines.append(json.dumps(new_value, ensure_ascii=False, separators=(",", ":")) if count else line)
+                        lines.append(json.dumps(rebuild(value), ensure_ascii=True, separators=(",", ":")) if count else line)
                     if total:
-                        planned.append((path, total, "\n".join(lines) + "\n"))
+                        planned.append((path, total, lines))
                 else:
                     try:
                         value = json.loads(text)
                     except ValueError as exc:
                         raise AgentDeliveryError(f"cannot redact {path}: it is not valid JSON") from exc
-                    new_value, total = apply(value)
+                    left_keys += count_keys(value)
+                    total = count_in(value)
                     if total:
-                        planned.append((path, total, json.dumps(new_value, ensure_ascii=False, separators=(",", ":"))))
-            total_matches = sum(count for _path, count, _content in planned)
+                        planned.append((path, total, rebuild(value)))
+            if not dry_run and not stopped and any(path.suffix == ".jsonl" for path, _c, _v in planned):
+                raise AgentDeliveryError(
+                    f"agent {record_name!r} is not stopped and its events would be rewritten; the event log is appended live — remedy: stop the agent first (`agentctl stop {record_name}`), then redact"
+                )
+            total_matches = sum(count for _p, count, _v in planned)
             file_rows = [{"file": str(path.relative_to(self.registry)), "matches": count}
-                         for path, count, _content in planned]
-            if dry_run:
-                return {"name": name, "dry_run": True, "files": file_rows,
-                        "total_matches": total_matches}
-            backup_value: object = None
-            if planned:
-                now = int(time.time())
-                backups_root = self.registry / "backups"
-                backup_dir = backups_root / f"redact-{name}-{now}"
-                suffix = 0
-                while backup_dir.exists():
-                    suffix += 1
-                    backup_dir = backups_root / f"redact-{name}-{now}-{suffix}"
-                backup_dir.mkdir(parents=True, exist_ok=False)
-                os.chmod(backups_root, 0o700)
-                os.chmod(backup_dir, 0o700)
-                written: list[str] = []
-                for index, (path, _count, content) in enumerate(planned):
-                    backup = backup_dir / f"{index:04}.bak"
-                    backup.write_bytes(path.read_bytes())
-                    os.chmod(backup, 0o600)
-                    path.write_text(content, encoding="utf-8")
-                    written.append(str(path.relative_to(self.registry)))
-                audit = {
-                    "schema": "agentctl-redact-audit/v1", "agent": name,
-                    "who": os.environ.get("USER", "unknown"), "at": now,
-                    "files": written, "total_matches": total_matches,
-                    "backup": str(backup_dir.relative_to(self.registry)),
-                }
-                audit_path = backups_root / "redact-audit.jsonl"
-                with open(audit_path, "a", encoding="utf-8") as stream:
-                    stream.write(json.dumps(audit, ensure_ascii=False) + "\n")
-                os.chmod(audit_path, 0o600)
-                backup_value = str(backup_dir.relative_to(self.registry))
-            return {"name": name, "dry_run": False, "files": file_rows,
-                    "total_matches": total_matches, "backup": backup_value}
+                         for path, count, _v in planned]
 
+            def result(backup: object) -> dict[str, object]:
+                return {"name": record_name, "dry_run": dry_run, "files": file_rows,
+                        "total_matches": total_matches,
+                        "left_behind": {"keys": left_keys, "unparseable_lines": left_unparseable},
+                        "clean": left_keys == 0 and left_unparseable == 0,
+                        "backup": backup, "uncovered": uncovered}
+
+            if dry_run or not planned:
+                return result(None)
+            now = int(time.time())
+            who = os.environ.get("USER", "unknown")
+            backups_root = self.registry / "backups"
+            backups_root.mkdir(parents=True, exist_ok=True)
+            os.chmod(backups_root, 0o700)
+            audit_path = backups_root / "redact-audit.jsonl"
+
+            def append_audit(phase: str, backup: str) -> None:
+                audit = {"schema": "agentctl-redact-audit/v1", "phase": phase,
+                         "agent": record_name, "who": who, "at": now,
+                         "files": [row["file"] for row in file_rows],
+                         "total_matches": total_matches, "backup": backup}
+                descriptor = os.open(audit_path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
+                with os.fdopen(descriptor, "a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(audit, ensure_ascii=False) + "\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+
+            def atomic_write(path: Path, content: str) -> None:
+                temporary = path.parent / f".redact-{os.getpid()}-{path.name}.tmp"
+                with open(temporary, "w", encoding="utf-8") as stream:
+                    stream.write(content)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, path)
+                directory_descriptor = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_descriptor)
+                finally:
+                    os.close(directory_descriptor)
+
+            backup_name = "none (--no-backup)"
+            backup_dir: Path | None = None
+            if not no_backup:
+                backup_name = f"redact-{record_name}-{now}"
+                suffix = 0
+                while (backups_root / backup_name).exists():
+                    suffix += 1
+                    backup_name = f"redact-{record_name}-{now}-{suffix}"
+                backup_dir = backups_root / backup_name
+                backup_dir.mkdir(mode=0o700)
+                os.chmod(backup_dir, 0o700)
+            append_audit("started", backup_name if backup_dir is not None else backup_name)
+            for index, (path, _count, value) in enumerate(planned):
+                if backup_dir is not None:
+                    backup = backup_dir / f"{index:04}.bak"
+                    descriptor = os.open(backup, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                    with os.fdopen(descriptor, "wb") as stream:
+                        stream.write(path.read_bytes())
+                if isinstance(value, list):
+                    content = "\n".join(value)
+                    if not content.endswith("\n"):
+                        content += "\n"
+                    atomic_write(path, content)
+                else:
+                    atomic_write(path, agent._json_text(value))  # type: ignore[arg-type]
+            append_audit("completed", backup_name)
+            return result(f"backups/{backup_name}" if backup_dir is not None else None)
     def doctor(self, *, repair_labels: bool = False) -> dict[str, object]:
         """Compare every registry record with live Herdr state; read-only unless repairing labels."""
         rows: list[dict[str, object]] = []

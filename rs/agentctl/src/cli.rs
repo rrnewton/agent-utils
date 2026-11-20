@@ -213,7 +213,7 @@ enum Commands {
     /// Compare every registry record with live Herdr state and report each mismatch. Read-only unless --repair-labels. Exit 0 when clean, 1 with findings
     #[command(after_help = "Example: agentctl doctor")]
     Doctor(Doctor),
-    /// Rewrite a literal string to [redacted] across one agent's processed queue and events (and, with --include-archived, its archived records' processed queues). Never touches the live inbox or in-flight entries; refuses while the agent is mid-delivery. Backs up each touched file (0600) under REGISTRY/backups and appends an audit line that never contains the string
+    /// Rewrite a literal string to [redacted] across one agent's processed queue and events (and, with --include-archived, its archived records' processed queues). Event logs are rewritten only when the agent is stopped. Never touches the live inbox or in-flight entries; refuses while the agent is mid-delivery. Backs up each touched file (0600) under REGISTRY/backups and appends audit lines that never contain the string. Uncovered: queue/failed and queue/cancelled, agent.json, misroutes/readback, chat bridge state, harness transcripts
     #[command(
         after_help = "Examples:\n  agentctl redact reviewer --literal SECRET --dry-run\n  agentctl redact reviewer --literal SECRET --include-archived"
     )]
@@ -1511,15 +1511,24 @@ struct Anchor {
 struct RedactArgs {
     #[command(flatten)]
     agent: Named,
-    /// Literal string to rewrite to [redacted] inside JSON string values
-    #[arg(long, value_name = "STRING")]
-    literal: String,
+    /// Literal string to rewrite to [redacted] inside JSON string values. WARNING: it is visible in argv, process listings and shell history — prefer --literal-file
+    #[arg(long, value_name = "STRING", conflicts_with_all = ["literal_file", "literal_stdin"])]
+    literal: Option<String>,
+    /// Read the literal from a file (one trailing newline is stripped); keeps it out of argv
+    #[arg(long, value_name = "FILE", conflicts_with = "literal_stdin")]
+    literal_file: Option<std::path::PathBuf>,
+    /// Read the literal from standard input (one trailing newline is stripped)
+    #[arg(long)]
+    literal_stdin: bool,
     /// Also rewrite the agent's archived records' processed queues and events
     #[arg(long)]
     include_archived: bool,
     /// List the files and match counts without writing anything
     #[arg(long)]
     dry_run: bool,
+    /// Do not back up touched files first (backups contain the literal; retention is yours to manage)
+    #[arg(long)]
+    no_backup: bool,
 }
 
 #[derive(Args)]
@@ -5430,12 +5439,40 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 )?
             }
         }
-        Commands::Redact(value) => manager.redact(
-            &value.agent.name,
-            &value.literal,
-            value.include_archived,
-            value.dry_run,
-        )?,
+        Commands::Redact(value) => {
+            let literal = if let Some(literal) = value.literal {
+                eprintln!("agentctl: warning: --literal is visible in argv, process listings and shell history; prefer --literal-file or --literal-stdin");
+                literal
+            } else if let Some(path) = &value.literal_file {
+                let text = std::fs::read_to_string(path).map_err(|error| {
+                    Failure::Usage(format!(
+                        "cannot read literal file {}: {error}",
+                        path.display()
+                    ))
+                })?;
+                text.strip_suffix('\n').unwrap_or(&text).to_owned()
+            } else if value.literal_stdin {
+                use std::io::Read;
+                let mut text = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut text)
+                    .map_err(|error| {
+                        Failure::Usage(format!("cannot read literal from stdin: {error}"))
+                    })?;
+                text.strip_suffix('\n').unwrap_or(&text).to_owned()
+            } else {
+                return Err(Failure::Usage(
+                    "redact needs one of --literal, --literal-file, or --literal-stdin".to_owned(),
+                ));
+            };
+            manager.redact(
+                &value.agent.name,
+                &literal,
+                value.include_archived,
+                value.dry_run,
+                value.no_backup,
+            )?
+        }
         Commands::Doctor(value) => {
             let report = manager.doctor(value.repair_labels)?;
             write_json(&report).map_err(Failure::Output)?;

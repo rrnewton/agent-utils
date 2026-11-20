@@ -1,22 +1,32 @@
 use super::*;
 
+const SECRET: &str = "SECRET-123456";
+
 fn seed_history(fixture: &Fixture) -> PathBuf {
     let dir = fixture.root.join("registry/agents/worker");
     let processed = dir.join("queue/processed");
     fs::create_dir_all(&processed).unwrap();
     fs::write(
         processed.join("m1.json"),
-        r#"{"text":"the SECRET and SECRET again","count":42,"SECRET":"key name stays"}"#,
+        format!(
+            r#"{{"text":"the {SECRET} and {SECRET} again","count":42,"{SECRET}":"key stays"}}"#
+        ),
     )
     .unwrap();
     let events = dir.join("events");
     fs::create_dir_all(&events).unwrap();
     fs::write(
         events.join("e.jsonl"),
-        "{\"note\":\"a SECRET here\"}\nnot json SECRET\n",
+        format!("{{\"note\":\"a {SECRET} here\"}}\nnot json {SECRET}\n"),
     )
     .unwrap();
     dir
+}
+
+fn stop_worker(fixture: &Fixture) {
+    let mut record = fixture.manager().load("worker").unwrap();
+    record.lifecycle = "stopped".to_owned();
+    fixture.manager().save(&record).unwrap();
 }
 
 #[test]
@@ -24,18 +34,20 @@ fn redact_rewrites_only_string_values_with_backups_and_audit() {
     let fixture = Fixture::new();
     fixture.start(None);
     seed_history(&fixture);
+    stop_worker(&fixture);
     let dry = fixture
         .manager()
-        .redact("worker", "SECRET", false, true)
+        .redact("worker", SECRET, false, true, false)
         .unwrap();
     assert_eq!(dry["total_matches"], 3);
-    // Dry run wrote nothing.
+    assert_eq!(dry["left_behind"]["unparseable_lines"], 1);
     assert!(!fixture.root.join("registry/backups").exists());
     let result = fixture
         .manager()
-        .redact("worker", "SECRET", false, false)
+        .redact("worker", SECRET, false, false, false)
         .unwrap();
     assert_eq!(result["total_matches"], 3);
+    assert_eq!(result["clean"], false);
     let processed = fs::read_to_string(
         fixture
             .root
@@ -46,18 +58,18 @@ fn redact_rewrites_only_string_values_with_backups_and_audit() {
         processed.contains("[redacted] and [redacted] again"),
         "{processed}"
     );
-    assert!(processed.contains("\"count\":42"), "{processed}");
-    assert!(
-        processed.contains("\"SECRET\":\"key name stays\""),
-        "{processed}"
-    );
+    let document: Value = serde_json::from_str(&processed).unwrap();
+    assert_eq!(document["count"], 42);
+    assert_eq!(document[SECRET], "key stays");
+    // The key itself is reported left behind, not rewritten.
+    assert_eq!(result["left_behind"]["keys"], 1);
     let audit =
         fs::read_to_string(fixture.root.join("registry/backups/redact-audit.jsonl")).unwrap();
     assert!(
-        !audit.contains("SECRET"),
+        !audit.contains(SECRET),
         "audit must not hold the literal: {audit}"
     );
-    assert!(audit.contains("\"total_matches\":3"), "{audit}");
+    assert_eq!(audit.lines().count(), 2, "started then completed: {audit}");
     let backup_dir = fixture
         .root
         .join("registry")
@@ -66,35 +78,75 @@ fn redact_rewrites_only_string_values_with_backups_and_audit() {
 }
 
 #[test]
+fn redact_refuses_events_while_running_and_short_literals() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    seed_history(&fixture);
+    // Running agent: the events rewrite is refused (blocker 1).
+    assert!(fixture
+        .manager()
+        .redact("worker", SECRET, false, false, false)
+        .is_err());
+    assert!(fixture
+        .manager()
+        .redact("worker", "short", false, true, false)
+        .is_err());
+    assert!(fixture
+        .manager()
+        .redact("worker", "running", false, true, false)
+        .is_err());
+}
+
+#[test]
 fn redact_refuses_mid_delivery_and_skips_archives_by_default() {
     let fixture = Fixture::new();
     fixture.start(None);
     let dir = seed_history(&fixture);
-    // Archived copy is untouched without --include-archived.
+    stop_worker(&fixture);
     let archived = fixture
         .root
-        .join("registry/archive/worker-tok/queue/processed");
+        .join("registry/archive/worker-1795-1234/queue/processed");
     fs::create_dir_all(&archived).unwrap();
-    fs::write(archived.join("a.json"), r#"{"text":"SECRET archived"}"#).unwrap();
+    fs::write(
+        archived.join("a.json"),
+        format!(r#"{{"text":"{SECRET} archived"}}"#),
+    )
+    .unwrap();
     let result = fixture
         .manager()
-        .redact("worker", "SECRET", false, false)
+        .redact("worker", SECRET, false, false, false)
         .unwrap();
     assert_eq!(result["total_matches"], 3);
     assert!(fs::read_to_string(archived.join("a.json"))
         .unwrap()
-        .contains("SECRET"));
+        .contains(SECRET));
     let included = fixture
         .manager()
-        .redact("worker", "SECRET", true, false)
+        .redact("worker", SECRET, true, false, false)
         .unwrap();
     assert_eq!(included["total_matches"], 1);
-    // Mid-delivery (inflight entry) refuses.
     let inflight = dir.join("queue/inflight");
     fs::create_dir_all(&inflight).unwrap();
     fs::write(inflight.join("x.json"), "{}").unwrap();
     assert!(fixture
         .manager()
-        .redact("worker", "SECRET", true, false)
+        .redact("worker", SECRET, true, false, false)
         .is_err());
+}
+
+#[test]
+fn redact_supports_a_retired_agent() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    seed_history(&fixture);
+    stop_worker(&fixture);
+    // Retire by hand: move the agent directory into the archive.
+    let archive = fixture.root.join("registry/archive/worker-1795-1234");
+    fs::create_dir_all(archive.parent().unwrap()).unwrap();
+    fs::rename(fixture.root.join("registry/agents/worker"), &archive).unwrap();
+    let result = fixture
+        .manager()
+        .redact("worker", SECRET, false, false, false)
+        .unwrap();
+    assert_eq!(result["total_matches"], 3);
 }
