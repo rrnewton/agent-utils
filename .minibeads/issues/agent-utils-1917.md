@@ -1,13 +1,14 @@
 ---
 title: 'cross-test-tmp-cleanup-and-snapshot-prune: cross tests clean their temp trees and services snapshots can be pruned'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
 - agentctl
 - test-hygiene
 created_at: 2026-11-19T16:30:59-05:00
-updated_at: 2026-11-19T16:30:59-05:00
+updated_at: 2026-11-20T02:44:28-05:00
+closed_at: 2026-11-20T02:44:28-05:00
 ---
 
 # Description
@@ -60,3 +61,14 @@ shared signal-cleaned context manager, but without the keep opt-in;
 the shard runner's basetemp already has a keep-on-failure opt-in of
 its own. Neither covers failure retention or the registry helpers.
 No services prune exists yet.
+
+## Resolution
+
+Landed d2c7da98 on github/main (feature 53f7462f, fixes d2c7da98;
+gated df4a0856). Cross differentials and the shard/gate/validate/
+component registries now clean up on success, failure and signal,
+keeping a failing tree only under AGENT_UTILS_KEEP_TEST_TMP=1 with
+its path printed. `agentctl services prune` (dry-run default) keeps
+live, rollback-referenced, pin-protected and newest-3 snapshots.
+Unverified: screenshots-desks waived (scene 59 pre-existing on the
+gated base, fixed on main); no live-state prune was run.
