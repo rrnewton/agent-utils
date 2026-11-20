@@ -1,13 +1,13 @@
 ---
 title: 'wrkslots-transfer-owner-held-dead-owner: a held slot with a dead owner cannot change hands'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - wrkslots
 - lifecycle
 created_at: 2026-11-18T12:30:00+00:00
-updated_at: 2026-11-18T12:30:00+00:00
+updated_at: 2026-11-20T19:00:00+00:00
 ---
 
 # Description
@@ -27,3 +27,7 @@ Wanted: a `transfer-owner` that preserves the evidence and the hold (or an expli
 # Notes
 
 One of three related lifecycle dead-ends reported together; see #1868 wrkslots-finish-without-handoff-dead-end and #1869 wrkslots-adopt-reports-success-binds-nothing. Whether current main already changes this behaviour is checked before the fix and recorded in the resolution.
+
+## Resolution
+
+[watermelon-full-preview] Landed as 2be1c9e9. Current main still refused the exact reported case (dead owner on the same boot, successor in caller ancestry, checkout holding only ignored files), so the fix was needed. `transfer-owner` now carries ignored files with the slot unchanged instead of counting them as dirt: the clean-tree check runs with a scrubbed git environment (`core.excludesFile=/dev/null`, no caller `XDG_CONFIG_HOME/git/ignore`, `insteadOf` or `GIT_CONFIG_*` influence), honours only tracked `.gitignore` rules, compares paths exactly via `git --literal-pathspecs ls-files -z`, refuses on hidden `.gitignore` edits (`--no-filters` blob hashing, assume-unchanged/skip-worktree, fsmonitor disabled), and refuses on any non-zero git exit in either edition. Tracked modifications and untracked non-ignored files still refuse; a live owner still refuses. The ignored-set count/digest is reported in the transfer output only and never persisted; no new persisted field. Both editions are covered by end-to-end CLI tests including the exact ignored-symlink plus `ignored/` evidence case with files intact by inode. The gate's single red (`python.wrkslots.shard-11`, census test #1957) fails identically alone on unmodified main and was waived for this landing by the coordinator.
