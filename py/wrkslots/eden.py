@@ -509,6 +509,82 @@ def seed_backing_repo(
         )
 
 
+def restart_slot_daemon(runner: Runner, config_dir: str, mount: str) -> str:
+    """Restart one slot's Eden daemon when it is dead (#1977).
+
+    Returns ``already-healthy`` when ``eden info`` already answers for
+    ``mount``, or ``restarted`` when a start made it answer. Starting
+    uses ``eden --config-dir <dir> start --if-not-running``, the
+    per-config-dir start the host Eden CLI provides (``eden start
+    --help``); provisioning started this daemon implicitly through
+    ``eden clone`` under the same ``--config-dir``, and removal stops
+    it with ``eden stop`` under it. No checkout is created, so this
+    never consumes host-cap room beyond the checkout that already
+    exists and counts. An answer that cannot be parsed, names another
+    mount, or cannot be run at all is unqueryable and refuses rather
+    than starting blindly; a failed start, or a daemon that still
+    does not answer after one, refuses too.
+    """
+
+    def query() -> CheckoutInfo:
+        try:
+            rc, stdout, stderr = runner(
+                ["eden", "--config-dir", config_dir, "info", mount]
+            )
+        except OSError as exc:
+            raise EdenError(
+                f"cannot query Eden daemon for {mount}: {exc}"
+            ) from exc
+        if rc != 0:
+            raise EdenError(
+                f"Eden daemon for {mount} does not answer: "
+                f"{stderr.strip() or stdout.strip() or 'eden info failed'}"
+            )
+        try:
+            info = parse_info(stdout)
+        except EdenError as exc:
+            raise EdenError(
+                f"cannot query Eden daemon for {mount}: {exc}"
+            ) from exc
+        if info.mount != mount:
+            raise EdenError(
+                f"eden info for {mount} reports mount {info.mount!r}; "
+                "refusing to treat another checkout's daemon as this slot's"
+            )
+        return info
+
+    try:
+        query()
+    except EdenError as initial:
+        # A parse or identity failure is unqueryable, not dead: only a
+        # daemon that answers nothing (or cannot run) is started. The
+        # query helper marks the unqueryable cases with its prefix.
+        if str(initial).startswith(("cannot query", "eden info for")):
+            raise
+        try:
+            rc, stdout, stderr = runner(
+                ["eden", "--config-dir", config_dir, "start", "--if-not-running"]
+            )
+        except OSError as exc:
+            raise EdenError(
+                f"cannot start Eden daemon for {mount}: {exc}"
+            ) from exc
+        if rc != 0:
+            raise EdenError(
+                f"eden start failed for {mount}: "
+                f"{stderr.strip() or stdout.strip() or 'eden start failed'}; "
+                f"daemon before start: {initial}"
+            ) from initial
+        try:
+            query()
+        except EdenError as after:
+            raise EdenError(
+                f"Eden daemon for {mount} did not answer after start: {after}"
+            ) from after
+        return "restarted"
+    return "already-healthy"
+
+
 def provision_checkout(
     runner: Runner,
     config_dir: str,

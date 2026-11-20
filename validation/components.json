@@ -450,6 +450,7 @@
         "py/wrkslots/tests/test_doctor_stray_worktrees.py",
         "py/wrkslots/tests/test_e2e_stress.py",
         "py/wrkslots/tests/test_eden.py",
+        "py/wrkslots/tests/test_eden_restart.py",
         "py/wrkslots/tests/test_ensure_states_rust.py",
         "py/wrkslots/tests/test_event_memo.py",
         "py/wrkslots/tests/test_fence_salvage_recovery.py",
