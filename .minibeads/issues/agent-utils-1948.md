@@ -15,7 +15,7 @@ updated_at: 2026-11-20T00:00:00+00:00
 
 # Design
 
-- Strengthen the quote veto so a dialog block with transcript-like content above it never takes a key, even with no marker visible: candidates are requiring the count line (see #1937 hooks-dialog-require-count-line) plus a startup-banner shape above the title, or refusing when anything at all sits above the title except Muse's known banner lines.
+- Strengthen the quote veto so a dialog block with transcript-like content above it never takes a key, even with no marker visible: candidates are requiring the count line (see #1949 hooks-dialog-require-count-line) plus a startup-banner shape above the title, or refusing when anything at all sits above the title except Muse's known banner lines.
 
 # Acceptance Criteria
 

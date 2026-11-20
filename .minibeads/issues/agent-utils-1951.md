@@ -15,7 +15,7 @@ updated_at: 2026-11-20T00:00:00+00:00
 
 # Design
 
-- Narrow the veto to transcript evidence that cannot be a startup remnant (for example requiring the marker line to sit below the banner, or matching full prompt shapes), keeping the verbatim-quote scenarios (including #1936 hooks-quote-scrolled-marker) key-free.
+- Narrow the veto to transcript evidence that cannot be a startup remnant (for example requiring the marker line to sit below the banner, or matching full prompt shapes), keeping the verbatim-quote scenarios (including #1948 hooks-quote-scrolled-marker) key-free.
 - Pin both editions to identical acceptance on the shared scenario table, including the Unicode marker cases.
 
 # Acceptance Criteria

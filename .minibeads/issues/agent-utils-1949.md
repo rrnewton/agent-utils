@@ -11,7 +11,7 @@ updated_at: 2026-11-20T00:00:00+00:00
 
 # Description
 
-[watermelon-full-preview] From the third review of #1932 (agentctl-muse-hooks-trust-auto-decline, landed 62f03e1d): `_hooks_trust_block` / `hooks_trust_block` accept dialog forms with both body lines missing, or a bare title directly above the options, because the between-title gap check allows an empty gap and the count line is optional in the parse (it is only extracted when present). Real Muse always draws the count line ("N new or changed hooks need your trust."), so requiring it tightens the match at no liveness cost and also hardens the scrolled-off quote case (#1936 hooks-quote-scrolled-marker).
+[watermelon-full-preview] From the third review of #1932 (agentctl-muse-hooks-trust-auto-decline, landed 62f03e1d): `_hooks_trust_block` / `hooks_trust_block` accept dialog forms with both body lines missing, or a bare title directly above the options, because the between-title gap check allows an empty gap and the count line is optional in the parse (it is only extracted when present). Real Muse always draws the count line ("N new or changed hooks need your trust."), so requiring it tightens the match at no liveness cost and also hardens the scrolled-off quote case (#1948 hooks-quote-scrolled-marker).
 
 # Design
 
