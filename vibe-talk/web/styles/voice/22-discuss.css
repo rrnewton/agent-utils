@@ -30,6 +30,14 @@
 :root {
   --channel-pane-end: 0px;
   --channel-pane-bottom: 0px;
+  /* `#1960 vibe-talk-discuss-header-toggle-colours`: the Discuss bar
+   * header's highlight colour lives in this ONE variable, painted on
+   * `.discuss-head`. The default is the current panel colour, so there
+   * is no visual change until the owner picks a candidate value (the
+   * candidates and their contrast ratios are in
+   * `vibe-talk/tests/discuss_head_colours.md`); a theme preset or the
+   * owner's pick then changes this one line. */
+  --discuss-head-bg: var(--panel);
 }
 
 @media (min-width: 900px) and (pointer: fine) {
@@ -149,7 +157,7 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   container-type: inline-size;
   margin: 0 calc(-10px - env(safe-area-inset-right)) 0 calc(-10px - env(safe-area-inset-left));
   padding: 6px calc(10px + env(safe-area-inset-right)) 6px calc(10px + env(safe-area-inset-left));
-  background: var(--panel);
+  background: var(--discuss-head-bg, var(--panel));
   border-bottom: 1px solid var(--edge);
 }
 
@@ -464,22 +472,65 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   margin: 14px 0 8px;
 }
 
+/* `#1960`: the Current summary header packs its two lines densely on
+ * the left (title, then the Covers line, no gap rows) with the single
+ * Expand/Collapse toggle to their RIGHT, vertically centred. */
 .discuss-section-head {
   display: flex;
-  align-items: baseline;
-  gap: 8px;
-  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: nowrap;
+}
+
+.discuss-section-lines {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  flex: 1 1 auto;
+  min-width: 0;
+  line-height: 1.25;
 }
 
 .discuss-section-title {
   font-size: 1rem;
   font-weight: 700;
-  margin: 4px 0 6px;
+  margin: 4px 0 0;
 }
 
 .discuss-current-covers {
   color: var(--muted);
   font-size: 0.85rem;
+  line-height: 1.25;
+}
+
+/* `#1960`: the ONE toggle for every expand/collapse-all control in the
+ * pane (Current summary, Timeline, each earlier summary). Bigger than
+ * the old `#1924` small chips: a comfortable touch target, 44px tall
+ * on a phone, 36px on a desk. Its label is the whole state: "Expand"
+ * unless every fold under its root is open, then "Collapse". */
+.discuss-toggle {
+  flex: 0 0 auto;
+  margin-left: auto;
+  min-height: 44px;
+  min-width: 96px;
+  padding: 10px 18px;
+  font-size: 0.95rem;
+  color: var(--ink);
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+@media (min-width: 900px) and (pointer: fine) {
+  .discuss-toggle {
+    min-height: 36px;
+    padding: 6px 14px;
+  }
+}
+
+.discuss-toggle-bar {
+  display: flex;
+  justify-content: flex-end;
+  margin: 4px 0 8px;
 }
 
 .discuss-collapsible {
@@ -590,15 +641,11 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   border-bottom: 1px solid var(--edge);
 }
 
-/* `#1924` (a): size and padding come from `.discuss-chip` alone, so the
- * per-summary toggles match the chip bars exactly. */
+/* `#1960`: the earlier summary's toggle is the same `.discuss-toggle`
+ * as the other headers, standing at the right of its header line. */
 .discuss-old-toggle {
   flex: 0 0 auto;
   margin-left: auto;
-}
-
-.discuss-old-toggle + .discuss-old-toggle {
-  margin-left: 4px;
 }
 
 .discuss-old:not([open]) .discuss-old-toggle {

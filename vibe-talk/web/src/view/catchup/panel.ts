@@ -870,7 +870,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       for (const kid of Array.from(node.children ?? [])) {
         const el = kid as HTMLElement;
         const tag = String(el.tagName || "").toLowerCase();
-        if (el.className === "discuss-collapse-bar") continue;
+        if (el.className === "discuss-collapse-bar" || String(el.className ?? "").includes("discuss-toggle-bar")) continue;
         if (tag === "li") {
           found.push(el);
           walk(el);
@@ -1326,22 +1326,53 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     }
   }
 
-  /** `#1912`: one low-key chip pair, centred, in the Save draft style. */
-  function makeChipBar(kind: string, onAll: (open: boolean) => void): HTMLDivElement {
-    const bar = document.createElement("div");
-    bar.className = `discuss-collapse-bar discuss-chip-bar discuss-chip-bar--${kind}`;
-    const expand = document.createElement("button");
-    expand.type = "button";
-    expand.className = "chip discuss-chip";
-    expand.textContent = "Expand all";
-    expand.addEventListener("click", () => onAll(true));
-    const collapse = document.createElement("button");
-    collapse.type = "button";
-    collapse.className = "chip discuss-chip";
-    collapse.textContent = "Collapse all";
-    collapse.addEventListener("click", () => onAll(false));
-    bar.append(expand, collapse);
-    return bar;
+  /** `#1960`: every DETAILS under `root`, nested folds included. */
+  function detailsDeep(root: HTMLElement): HTMLElement[] {
+    const found: HTMLElement[] = [];
+    const walk = (el: HTMLElement): void => {
+      for (const kid of Array.from(el.children as unknown as ArrayLike<HTMLElement>)) {
+        const child = kid as HTMLElement;
+        if (child.tagName === "DETAILS") found.push(child);
+        walk(child);
+      }
+    };
+    walk(root);
+    return found;
+  }
+
+  /** `#1960`: true only when at least one fold stands and every fold is open. */
+  function allFoldsOpen(root: HTMLElement): boolean {
+    const all = detailsDeep(root);
+    return all.length > 0 && all.every((el) => (el as HTMLElement & { open?: boolean }).open === true);
+  }
+
+  interface DiscussToggle {
+    button: HTMLButtonElement;
+    refresh: () => void;
+  }
+
+  /**
+   * `#1960 vibe-talk-discuss-header-toggle-colours`: the ONE shared toggle
+   * for every expand/collapse-all control in the pane. It says "Expand"
+   * when everything is collapsed or anywhere in between (bias to expand
+   * all) and "Collapse" only when everything is expanded; tapping applies
+   * to all folds under its root. No "all" in the label.
+   */
+  function makeDiscussToggle(kind: string, root: () => HTMLElement, onAll: (open: boolean) => void): DiscussToggle {
+    const button = document.createElement("button") as HTMLButtonElement;
+    button.type = "button";
+    button.className = `chip discuss-toggle discuss-toggle--${kind}`;
+    const refresh = (): void => {
+      const allOpen = allFoldsOpen(root());
+      button.textContent = allOpen ? "Collapse" : "Expand";
+      button.setAttribute("data-state", allOpen ? "all-open" : "not-all-open");
+    };
+    button.addEventListener("click", () => {
+      onAll(!allFoldsOpen(root()));
+      refresh();
+    });
+    refresh();
+    return { button, refresh };
   }
 
   /** `#1912`: the current summary's headed covers line ("Covers N messages"). */
@@ -1405,16 +1436,36 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       // collapsed, with one Expand/Collapse-all bar at the top of the answer.
       const folds = foldSectionsByHeading(box as never, (tag) => document.createElement(tag) as never, foldOpen);
       if (folds > 0) {
-        for (const kid of Array.from(box.children)) {
-          if ((kid as HTMLElement).tagName === "DETAILS") {
-            kid.addEventListener("toggle", () => keepFoldsNow(box));
-          }
-        }
-        const bar = makeChipBar("current", (open) => {
+        const toggle = makeDiscussToggle("current", () => box as unknown as HTMLElement, (open) => {
           setAllSections(box as never, open);
           keepFoldsNow(box);
         });
-        box.prepend(bar);
+        for (const kid of Array.from(box.children)) {
+          if ((kid as HTMLElement).tagName === "DETAILS") {
+            kid.addEventListener("toggle", () => {
+              keepFoldsNow(box);
+              toggle.refresh();
+            });
+          }
+        }
+        toggle.refresh();
+        // `#1960`: the toggle stands to the RIGHT of the densely packed
+        // header lines (title + Covers) in the section head; a host
+        // without that head keeps it at the top of the answer.
+        const head = maybe("discuss-current-head");
+        if (head !== null) {
+          for (const kid of Array.from(head.children as unknown as ArrayLike<HTMLElement>)) {
+            if (String((kid as HTMLElement).className ?? "").includes("discuss-toggle")) {
+              head.removeChild(kid as never);
+            }
+          }
+          head.appendChild(toggle.button as never);
+        } else {
+          const bar = document.createElement("div");
+          bar.className = "discuss-toggle-bar discuss-toggle-bar--current";
+          bar.appendChild(toggle.button);
+          box.prepend(bar);
+        }
       }
     } else {
       setClassWord(box, "discuss-answer--plain", true);
@@ -1515,7 +1566,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     while (nodeUp !== null && nodeUp !== undefined && nodeUp !== (box as unknown)) {
       const elUp = nodeUp as HTMLElement;
       const tagUp = typeof elUp.tagName === "string" ? elUp.tagName.toLowerCase() : "";
-      if (tagUp === "summary" || elUp.className === "discuss-collapse-bar") return;
+      if (tagUp === "summary" || elUp.className === "discuss-collapse-bar" || String(elUp.className ?? "").includes("discuss-toggle")) return;
       nodeUp = (elUp as { parentNode?: unknown }).parentNode;
     }
     const blocks = discussBlocks(box);
@@ -1553,7 +1604,10 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     const box = deps.byId("discuss-timeline");
     box.replaceChildren();
     if (entries.length === 0) return;
-    const bar = makeChipBar("timeline", (open) => setDetailsDeep(box as unknown as HTMLElement, open));
+    const timelineToggle = makeDiscussToggle("timeline", () => box as unknown as HTMLElement, (open) => setDetailsDeep(box as unknown as HTMLElement, open));
+    const bar = document.createElement("div");
+    bar.className = "discuss-toggle-bar discuss-toggle-bar--timeline";
+    bar.appendChild(timelineToggle.button);
     box.appendChild(bar);
     let at = 0;
     while (at < entries.length) {
@@ -1604,33 +1658,40 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         summary.appendChild(label);
         const body = document.createElement("div");
         body.className = "discuss-old-body";
-        const small = (words: string, open: boolean): HTMLButtonElement => {
-          const button = document.createElement("button");
-          button.type = "button";
-          button.className = "chip discuss-chip discuss-old-toggle";
-          button.textContent = words;
-          button.addEventListener("click", (event) => {
-            event.preventDefault();
-            event.stopPropagation();
-            details.open = true;
-            setDetailsDeep(body as unknown as HTMLElement, open);
-            if (!open) details.open = true;
-          });
-          return button;
-        };
-        summary.appendChild(small("expand all", true));
-        summary.appendChild(small("collapse all", false));
-        details.appendChild(summary);
         if (entry.answer.text_html !== "") {
           insertSanitizedHtml(body, entry.answer.text_html);
           foldSectionsByHeading(body as never, (tag) => document.createElement(tag) as never);
         } else {
           body.textContent = entry.answer.text;
         }
+        // `#1960`: the same single toggle as the other headers. It lives
+        // in this summary, so its tap never folds this row: opening opens
+        // this row and every fold in its body; collapsing closes only
+        // the body's folds and keeps this row open to show them closed.
+        const oldToggle = makeDiscussToggle("old", () => body as unknown as HTMLElement, (open) => {
+          details.open = true;
+          setDetailsDeep(body as unknown as HTMLElement, open);
+          details.open = true;
+        });
+        oldToggle.button.className = `${oldToggle.button.className} discuss-old-toggle`;
+        oldToggle.button.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+        });
+        for (const fold of detailsDeep(body as unknown as HTMLElement)) {
+          fold.addEventListener("toggle", () => oldToggle.refresh());
+        }
+        oldToggle.refresh();
+        summary.appendChild(oldToggle.button);
+        details.appendChild(summary);
         details.appendChild(body);
         box.appendChild(details);
       }
     }
+    for (const fold of detailsDeep(box as unknown as HTMLElement)) {
+      fold.addEventListener("toggle", () => timelineToggle.refresh());
+    }
+    timelineToggle.refresh();
     keepCitationsInApp(box);
     void scope;
   }

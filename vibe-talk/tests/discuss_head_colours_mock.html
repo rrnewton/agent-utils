@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Discuss bar header colours — #1960 mock-ups</title>
+<style>
+  /* Mock-up only (#1960 Task B): the same theme tokens as web/style.css,
+     the same --discuss-head-bg variable as 22-discuss.css. Each phone
+     frame sets that one variable to a candidate value. */
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 16px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .theme { padding: 16px; }
+  .theme--dark { --bg:#14161a; --panel:#1d2026; --edge:#2c313a; --ink:#e7e9ee; --muted:#99a1b0; --accent:#5b9dd9; background:#0c0e11; color:#e7e9ee; }
+  .theme--light { --bg:#f6f7f9; --panel:#ffffff; --edge:#d9dde4; --ink:#1a1d22; --muted:#5d6674; --accent:#24618f; background:#e8eaee; color:#1a1d22; }
+  .frames { display:flex; flex-wrap:wrap; gap:20px; }
+  figure { margin:0; width:412px; }
+  figcaption { padding:8px 4px; font-size:14px; }
+  .phone { width:412px; height:915px; border:2px solid var(--edge); border-radius:24px; overflow:hidden; display:flex; flex-direction:column; background:var(--bg); color:var(--ink); }
+  .messages { flex:1 1 50%; padding:14px; overflow:hidden; }
+  .msg { background:var(--panel); border:1px solid var(--edge); border-radius:8px; padding:8px 10px; margin-bottom:10px; }
+  .sheet { flex:0 0 50%; display:flex; flex-direction:column; background:var(--panel); border-top:1px solid var(--edge); }
+  .discuss-head { background:var(--discuss-head-bg, var(--panel)); border-bottom:1px solid var(--edge); padding:10px 12px; font-weight:700; display:flex; align-items:center; gap:8px; }
+  .grip { width:42px; height:5px; border-radius:3px; background:var(--muted); margin:0 auto; }
+  .discuss-head-wrap { background:var(--discuss-head-bg, var(--panel)); padding-top:6px; }
+  .section-head { display:flex; align-items:center; gap:12px; padding:10px 12px 0; }
+  .lines { flex:1 1 auto; line-height:1.25; }
+  .lines h2 { font-size:16px; margin:0; }
+  .covers { color:var(--muted); font-size:13px; }
+  .toggle { flex:0 0 auto; margin-left:auto; min-height:44px; min-width:96px; padding:10px 18px; font-size:15px; border-radius:999px; border:1px solid var(--edge); background:var(--panel); color:var(--ink); }
+  .stacked { flex:0 0 auto; margin-left:auto; display:flex; flex-direction:column; gap:6px; }
+  .stacked .toggle { min-height:32px; }
+  .answer { padding:8px 12px; color:var(--ink); }
+  .c1 { --discuss-head-bg: color-mix(in srgb, var(--accent) 18%, var(--panel)); }
+  .c2 { --discuss-head-bg: color-mix(in srgb, var(--accent) 32%, var(--panel)); }
+  .c3 { --discuss-head-bg: color-mix(in srgb, var(--accent) 48%, var(--panel)); }
+  .c4 { --discuss-head-bg: color-mix(in srgb, var(--accent) 35%, var(--edge)); }
+</style>
+</head>
+<body>
+<section class="theme theme--dark" data-theme="dark">
+  <h1>Dark theme — Discuss bar at half height (mid-screen)</h1>
+  <div class="frames">
+    <figure><div class="phone c1"><div class="messages"><div class="msg">Ada: shipped the cache fix</div><div class="msg">Ben: reviewing now</div><div class="msg">Ada: tests green</div></div><div class="sheet"><div class="discuss-head-wrap"><div class="grip"></div><div class="discuss-head">Discuss: main channel</div></div><div class="section-head"><div class="lines"><h2>Current summary</h2><span class="covers">Covers 12 messages</span></div><button class="toggle" type="button">Expand</button></div><p class="answer">Progress and Review sections, folded.</p></div></div><figcaption>C1 accent wash 18 — color-mix(in srgb, var(--accent) 18%, var(--panel)) — #283746 — vs panel 1.33, ink 10.07</figcaption></figure>
+    <figure><div class="phone c2"><div class="messages"><div class="msg">Ada: shipped the cache fix</div><div class="msg">Ben: reviewing now</div><div class="msg">Ada: tests green</div></div><div class="sheet"><div class="discuss-head-wrap"><div class="grip"></div><div class="discuss-head">Discuss: main channel</div></div><div class="section-head"><div class="lines"><h2>Current summary</h2><span class="covers">Covers 12 messages</span></div><button class="toggle" type="button">Expand</button></div><p class="answer">Progress and Review sections, folded.</p></div></div><figcaption>C2 accent wash 32 — color-mix(in srgb, var(--accent) 32%, var(--panel)) — #31485f — vs panel 1.73, ink 7.78</figcaption></figure>
+    <figure><div class="phone c3"><div class="messages"><div class="msg">Ada: shipped the cache fix</div><div class="msg">Ben: reviewing now</div><div class="msg">Ada: tests green</div></div><div class="sheet"><div class="discuss-head-wrap"><div class="grip"></div><div class="discuss-head">Discuss: main channel</div></div><div class="section-head"><div class="lines"><h2>Current summary</h2><span class="covers">Covers 12 messages</span></div><div class="stacked"><button class="toggle" type="button">Expand</button><button class="toggle" type="button">Collapse</button></div></div><p class="answer">Stacked two-button variant (mock-up only) on this frame.</p></div></div><figcaption>C3 accent wash 48 — color-mix(in srgb, var(--accent) 48%, var(--panel)) — #3b5c7c — vs panel 2.34, ink 5.75</figcaption></figure>
+    <figure><div class="phone c4"><div class="messages"><div class="msg">Ada: shipped the cache fix</div><div class="msg">Ben: reviewing now</div><div class="msg">Ada: tests green</div></div><div class="sheet"><div class="discuss-head-wrap"><div class="grip"></div><div class="discuss-head">Discuss: main channel</div></div><div class="section-head"><div class="lines"><h2>Current summary</h2><span class="covers">Covers 12 messages</span></div><button class="toggle" type="button">Collapse</button></div><p class="answer">All sections open, so the toggle reads Collapse.</p></div></div><figcaption>C4 accent over edge 35 — color-mix(in srgb, var(--accent) 35%, var(--edge)) — #3c5772 — vs panel 2.17, ink 6.19</figcaption></figure>
+  </div>
+</section>
+<section class="theme theme--light" data-theme="light">
+  <h1>Light theme — Discuss bar at half height (mid-screen)</h1>
+  <div class="frames">
+    <figure><div class="phone c1"><div class="messages"><div class="msg">Ada: shipped the cache fix</div><div class="msg">Ben: reviewing now</div><div class="msg">Ada: tests green</div></div><div class="sheet"><div class="discuss-head-wrap"><div class="grip"></div><div class="discuss-head">Discuss: main channel</div></div><div class="section-head"><div class="lines"><h2>Current summary</h2><span class="covers">Covers 12 messages</span></div><button class="toggle" type="button">Expand</button></div><p class="answer">Progress and Review sections, folded.</p></div></div><figcaption>C1 accent wash 18 — #d8e3eb — vs panel 1.31, ink 12.91</figcaption></figure>
+    <figure><div class="phone c2"><div class="messages"><div class="msg">Ada: shipped the cache fix</div><div class="msg">Ben: reviewing now</div><div class="msg">Ada: tests green</div></div><div class="sheet"><div class="discuss-head-wrap"><div class="grip"></div><div class="discuss-head">Discuss: main channel</div></div><div class="section-head"><div class="lines"><h2>Current summary</h2><span class="covers">Covers 12 messages</span></div><button class="toggle" type="button">Expand</button></div><p class="answer">Progress and Review sections, folded.</p></div></div><figcaption>C2 accent wash 32 — #b9ccdb — vs panel 1.65, ink 10.27</figcaption></figure>
+    <figure><div class="phone c3"><div class="messages"><div class="msg">Ada: shipped the cache fix</div><div class="msg">Ben: reviewing now</div><div class="msg">Ada: tests green</div></div><div class="sheet"><div class="discuss-head-wrap"><div class="grip"></div><div class="discuss-head">Discuss: main channel</div></div><div class="section-head"><div class="lines"><h2>Current summary</h2><span class="covers">Covers 12 messages</span></div><div class="stacked"><button class="toggle" type="button">Expand</button><button class="toggle" type="button">Collapse</button></div></div><p class="answer">Stacked two-button variant (mock-up only) on this frame.</p></div></div><figcaption>C3 accent wash 48 — #96b3c9 — vs panel 2.19, ink 7.73</figcaption></figure>
+    <figure><div class="phone c4"><div class="messages"><div class="msg">Ada: shipped the cache fix</div><div class="msg">Ben: reviewing now</div><div class="msg">Ada: tests green</div></div><div class="sheet"><div class="discuss-head-wrap"><div class="grip"></div><div class="discuss-head">Discuss: main channel</div></div><div class="section-head"><div class="lines"><h2>Current summary</h2><span class="covers">Covers 12 messages</span></div><button class="toggle" type="button">Collapse</button></div><p class="answer">All sections open, so the toggle reads Collapse.</p></div></div><figcaption>C4 accent over edge 35 — #9ab2c6 — vs panel 2.21, ink 7.66</figcaption></figure>
+  </div>
+</section>
+</body>
+</html>

@@ -12,6 +12,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import { moduleForTests } from "../../../web/build.mjs";
 
@@ -46,6 +47,8 @@ function fakeElement(tagName = "div") {
     focus(options) { el.focusCalls.push(options); },
     appendChild(kid) { el.children.push(kid); kid.parentNode = el; return kid; },
     append(...kids) { for (const kid of kids) el.appendChild(kid); },
+    prepend(...kids) { el.children.unshift(...kids); for (const kid of kids) kid.parentNode = el; },
+    removeChild(kid) { el.children.splice(el.children.indexOf(kid), 1); return kid; },
     replaceChildren(...kids) { el.children = []; for (const kid of kids) el.appendChild(kid); },
     addEventListener(type, listener) { (el.listeners[type] ||= []).push(listener); },
     removeEventListener(type, listener) { el.listeners[type] = (el.listeners[type] || []).filter((one) => one !== listener); },
@@ -101,7 +104,7 @@ const IDS = [
   "discuss-answer", "discuss-footer", "discuss-covers", "discuss-links",
   "discuss-mark-read", "discuss-mark-unread", "discuss-unmarkable",
   "discuss-stamp", "discuss-retry", "discuss-terms", "discuss-terms-summary", "discuss-terms-list",
-  "discuss-stale", "discuss-stale-text", "discuss-update", "discuss-timeline", "discuss-current-covers",
+  "discuss-stale", "discuss-stale-text", "discuss-update", "discuss-timeline", "discuss-current-covers", "discuss-current-head",
   "discuss-followup", "discuss-send", "discuss-uncovered", "discuss-uncovered-go", "discuss-uncovered-text",
   "discuss-actions", "discuss-resize", "discuss-head", "discuss-title",
   "discuss-dock-toggle", "discuss-full-toggle", "screen-main",
@@ -1338,7 +1341,7 @@ test("catchup: timeline and saved labels date a previous day's summary (#1787)",
   } finally { fx.restore(); }
 });
 
-test("catchup: timeline pairs follow-ups, earlier summaries open headings-first, both chip pairs act (#1912)", async () => {
+test("catchup: timeline pairs follow-ups, earlier summaries open headings-first, the one toggle acts (#1912, #1960)", async () => {
   const HTML = "<h2>Old Alpha</h2><p>old a</p><h2>Old Beta</h2><p>old b</p>";
   const scope = { channelId: "chan-1", threadId: null, view: "flat", label: "Channel chan-1" };
   const savedDocument = globalThis.document;
@@ -1396,35 +1399,67 @@ test("catchup: timeline pairs follow-ups, earlier summaries open headings-first,
     await flush();
     assert.equal(els["discuss-current-covers"].textContent, "Covers 2 messages");
     const timeline = els["discuss-timeline"].children;
-    // Chip bar, then the earlier summary, then ONE collapsible Q/A pair.
+    // Toggle bar, then the earlier summary, then ONE collapsible Q/A pair.
     assert.equal(timeline.length, 3);
-    assert.ok(String(timeline[0].className).includes("discuss-chip-bar--timeline"), "timeline chip pair missing");
+    assert.ok(String(timeline[0].className).includes("discuss-toggle-bar--timeline"), "timeline toggle bar missing");
+    const timelineToggle = timeline[0].children[0];
+    assert.equal(timelineToggle.textContent, "Expand", "timeline toggle did not start at Expand");
+    assert.equal(els["discuss-timeline"].textContent.includes("Expand all"), false, "an Expand all label remains");
     const old = timeline[1];
     assert.match(old.children[0].children[0].textContent, /Earlier summary/);
     const oldBody = old.children[1];
     const oldFolds = () => oldBody.children.filter((kid) => kid.tagName === "DETAILS");
     assert.equal(oldFolds().length, 2, "earlier summary did not fold by heading");
     assert.deepEqual(oldFolds().map((fold) => fold.open), [false, false], "earlier summary did not open headings-first");
-    const smallExpand = old.children[0].children.find((kid) => kid.textContent === "expand all");
-    assert.ok(smallExpand, "small expand all missing on the earlier summary header");
-    click(smallExpand);
-    assert.deepEqual(oldFolds().map((fold) => fold.open), [true, true], "small expand all did not expand the earlier summary");
+    const oldToggle = old.children[0].children.find((kid) => String(kid.className).includes("discuss-toggle"));
+    assert.ok(oldToggle, "the shared toggle is missing on the earlier summary header");
+    assert.equal(oldToggle.textContent, "Expand", "earlier summary toggle did not start at Expand");
+    click(oldToggle);
+    assert.deepEqual(oldFolds().map((fold) => fold.open), [true, true], "the earlier summary toggle did not expand its folds");
+    assert.equal(oldToggle.textContent, "Collapse", "all-open did not read Collapse");
+    assert.equal(old.open, true, "the earlier summary toggle closed its own row");
+    click(oldToggle);
+    assert.deepEqual(oldFolds().map((fold) => fold.open), [false, false], "Collapse did not close the earlier summary folds");
+    assert.equal(old.open, true, "Collapse closed the earlier summary row itself");
+    assert.equal(oldToggle.textContent, "Expand", "closed folds did not read Expand again");
     const pair = timeline[2];
     assert.match(pair.children[0].textContent, /Follow-up question/);
     assert.equal(pair.children[1].children.length, 2, "question and answer do not collapse together");
     assert.equal(pair.children[1].children[0].textContent, "and the deploy?");
     assert.equal(pair.children[1].children[1].textContent, "It shipped.");
-    // The timeline chip pair opens and closes every timeline collapsible at once.
-    click(timeline[0].children[0]);
-    assert.equal(pair.open, true, "timeline Expand all did not open the pair");
-    assert.equal(old.open, true, "timeline Expand all did not open the earlier summary");
-    click(timeline[0].children[1]);
-    assert.equal(pair.open, false, "timeline Collapse all did not close the pair");
-    assert.equal(old.open, false, "timeline Collapse all did not close the earlier summary");
+    // The timeline toggle opens and closes every timeline collapsible at once.
+    click(timelineToggle);
+    assert.equal(pair.open, true, "timeline Expand did not open the pair");
+    assert.equal(old.open, true, "timeline Expand did not open the earlier summary");
+    assert.equal(timelineToggle.textContent, "Collapse", "timeline all-open did not read Collapse");
+    click(timelineToggle);
+    assert.equal(pair.open, false, "timeline Collapse did not close the pair");
+    assert.equal(old.open, false, "timeline Collapse did not close the earlier summary");
+    assert.equal(timelineToggle.textContent, "Expand", "timeline closed did not read Expand");
   } finally {
     if (savedDocument === undefined) delete globalThis.document;
     else globalThis.document = savedDocument;
   }
+});
+
+test("catchup header: dense lines, toggle to the right, one colour variable (#1960)", () => {
+  const read = (path) => readFileSync(new URL(path, import.meta.url), "utf8");
+  const html = read("../../../web/voice.html");
+  assert.ok(html.includes('id="discuss-current-head" class="discuss-section-head"'), "the current head lost its id");
+  assert.ok(html.includes('class="discuss-section-lines"'), "the two header lines are not packed in one column");
+  const linesAt = html.indexOf('class="discuss-section-lines"');
+  const titleAt = html.indexOf('id="discuss-current-heading"', linesAt);
+  const coversAt = html.indexOf('id="discuss-current-covers"', linesAt);
+  assert.ok(linesAt >= 0 && titleAt > linesAt && coversAt > titleAt, "title then Covers do not stand densely in the left column");
+  const css = read("../../../web/styles/voice/22-discuss.css");
+  assert.ok(css.includes("--discuss-head-bg: var(--panel);"), "the head colour does not default to the panel colour in one variable");
+  assert.ok(css.includes("background: var(--discuss-head-bg, var(--panel));"), ".discuss-head is not painted from the one variable");
+  assert.match(css, /\.discuss-toggle \{[^}]*min-height: 44px;/, "the toggle is not a 44px phone touch target");
+  assert.match(css, /\.discuss-section-head \{[^}]*align-items: center;/, "the toggle is not centred beside the header lines");
+  const panel = read("../../../web/src/view/catchup/panel.ts");
+  assert.equal(panel.includes("Expand all"), false, "an Expand all label remains in the panel");
+  assert.equal(panel.includes("Collapse all"), false, "a Collapse all label remains in the panel");
+  assert.equal(panel.includes("expand all"), false, "a lowercase expand all label remains in the panel");
 });
 
 test("catchup: a follow-up sends from the composer and joins the timeline", async () => {
@@ -2053,8 +2088,8 @@ test("catchup folds: open sections survive close/reopen and a reload; a new summ
         keepFolds: (state) => { stored.value = state; stored.keeps.push(state); },
       });
       const folds = () => els["discuss-answer"].children.filter((kid) => kid.tagName === "DETAILS");
-      const bar = () => els["discuss-answer"].children.find((kid) => String(kid.className).includes("discuss-collapse-bar"));
-      return { els, panel, folds, bar };
+      const toggle = () => els["discuss-current-head"].children.find((kid) => String(kid.className).includes("discuss-toggle"));
+      return { els, panel, folds, toggle };
     };
 
     const first = makePanel();
@@ -2063,16 +2098,21 @@ test("catchup folds: open sections survive close/reopen and a reload; a new summ
     await flush();
     await flush();
     assert.deepEqual(first.folds().map((fold) => fold.open), [false, false], "sections did not start collapsed");
-    assert.ok(first.bar(), "the Expand/Collapse all bar is missing");
+    assert.ok(first.toggle(), "the one header toggle is missing");
+    assert.equal(first.toggle().textContent, "Expand", "all-closed did not read Expand");
     const beta = first.folds()[1];
     beta.open = true;
     fire(beta, "toggle");
     assert.deepEqual(stored.value, { record: "chan-1||1000", open: ["Beta"] }, "the toggle was not kept for the record");
-    click(first.bar().children[0]);
-    assert.deepEqual(first.folds().map((fold) => fold.open), [true, true], "Expand all did not open every section");
-    assert.deepEqual(stored.value, { record: "chan-1||1000", open: ["Alpha", "Beta"] }, "Expand all was not kept");
-    click(first.bar().children[1]);
-    assert.deepEqual(stored.value, { record: "chan-1||1000", open: [] }, "Collapse all was not kept");
+    assert.equal(first.toggle().textContent, "Expand", "a mixed state did not bias to Expand");
+    click(first.toggle());
+    assert.deepEqual(first.folds().map((fold) => fold.open), [true, true], "Expand did not open every section");
+    assert.equal(first.toggle().textContent, "Collapse", "all-open did not read Collapse");
+    assert.deepEqual(stored.value, { record: "chan-1||1000", open: ["Alpha", "Beta"] }, "Expand was not kept");
+    click(first.toggle());
+    assert.deepEqual(first.folds().map((fold) => fold.open), [false, false], "Collapse did not close every section");
+    assert.equal(first.toggle().textContent, "Expand", "all-closed did not read Expand again");
+    assert.deepEqual(stored.value, { record: "chan-1||1000", open: [] }, "Collapse was not kept");
     const betaAgain = first.folds()[1];
     betaAgain.open = true;
     fire(betaAgain, "toggle");

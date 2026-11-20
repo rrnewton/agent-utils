@@ -4808,7 +4808,7 @@ def _act_discuss_summary(driver: Driver) -> None:
         timeout=30_000,
     )
     # Open the answer's sections, so the shot shows the summary itself, not its fold lines.
-    expand = driver.page.locator("#discuss-answer button", has_text="Expand all")
+    expand = driver.page.locator("#discuss-current-head .discuss-toggle", has_text="Expand")
     if expand.count() > 0:
         expand.first.click()
         driver.settle(200)
@@ -7630,11 +7630,15 @@ SCENES: tuple[Scene, ...] = (
                 "document.getElementById('discuss-answer').textContent.includes('Model stub summary')",
             ),
             (
-                # `#1924` (a): the summary chips stand at the one small chip size.
-                "the summary chips stand at the small shared chip size",
-                "(() => { const chip = document.querySelector('.discuss-chip-bar--current .discuss-chip'); "
-                "if (!chip) return false; const root = parseFloat(getComputedStyle(document.documentElement).fontSize); "
-                "return Math.abs(parseFloat(getComputedStyle(chip).fontSize) - root * 0.72) < 0.6; })()",
+                # `#1960`: the one toggle stands to the right of the densely
+                # packed header lines, bigger, with no "all" in its label.
+                "the current toggle stands right of the header lines, big, without all",
+                "(() => { const t = document.querySelector('#discuss-current-head .discuss-toggle'); "
+                "const lines = document.querySelector('.discuss-section-lines'); "
+                "if (!t || !lines) return false; const tr = t.getBoundingClientRect(); const lr = lines.getBoundingClientRect(); "
+                "return (t.textContent.trim() === 'Expand' || t.textContent.trim() === 'Collapse') "
+                "&& !document.getElementById('discuss-panel').textContent.includes('Expand all') "
+                "&& tr.left >= lr.right - 1 && tr.height >= 32; })()",
             ),
             (
                 # `#1924` (b): the section triangles read at heading size on a tall row.
@@ -7886,25 +7890,23 @@ SCENES: tuple[Scene, ...] = (
                 "[...document.querySelectorAll('.discuss-qa > summary')].some((s) => s.textContent.includes('Follow-up question'))",
             ),
             (
-                "the earlier summary is open headings-first with its small expand all",
+                "the earlier summary is open headings-first with its toggle reading Expand",
                 "document.querySelector('.discuss-old').open "
                 "&& [...document.querySelectorAll('.discuss-old-body details')].every((d) => !d.open) "
-                "&& [...document.querySelectorAll('.discuss-old-toggle')].some((b) => b.textContent === 'expand all')",
+                "&& [...document.querySelectorAll('.discuss-old-toggle')].some((b) => b.textContent.trim() === 'Expand')",
             ),
             (
-                "both centred chip pairs stand on the page",
-                "!!document.querySelector('.discuss-chip-bar--current') && !!document.querySelector('.discuss-chip-bar--timeline')",
+                "the one toggle stands for the current summary and the timeline",
+                "!!document.querySelector('#discuss-current-head .discuss-toggle') && !!document.querySelector('.discuss-toggle-bar--timeline .discuss-toggle')",
             ),
             (
-                # `#1924` (a): every chip pair shares the one small size.
-                "every chip pair shares the one small size",
+                # `#1960`: every header toggle shares the one bigger size.
+                "every header toggle shares the one toggle size",
                 "(() => { const fs = (el) => (el ? parseFloat(getComputedStyle(el).fontSize) : -1); "
-                "const cur = fs(document.querySelector('.discuss-chip-bar--current .discuss-chip')); "
-                "const tl = fs(document.querySelector('.discuss-chip-bar--timeline .discuss-chip')); "
+                "const cur = fs(document.querySelector('#discuss-current-head .discuss-toggle')); "
+                "const tl = fs(document.querySelector('.discuss-toggle-bar--timeline .discuss-toggle')); "
                 "const old = fs(document.querySelector('.discuss-old-toggle')); "
-                "const root = parseFloat(getComputedStyle(document.documentElement).fontSize); "
-                "return cur > 0 && Math.abs(cur - tl) < 0.6 && Math.abs(cur - old) < 0.6 "
-                "&& Math.abs(cur - root * 0.72) < 0.6; })()",
+                "return cur > 0 && Math.abs(cur - tl) < 0.6 && Math.abs(cur - old) < 0.6; })()",
             ),
             (
                 # `#1924` (b): the timeline triangles read at heading size on tall rows.
