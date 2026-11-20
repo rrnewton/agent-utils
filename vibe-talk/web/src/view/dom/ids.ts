@@ -224,6 +224,7 @@ export interface ElementById {
   "docs-since-go": HTMLButtonElement;
   "docs-since-hours": HTMLInputElement;
   "docs-since-title": HTMLParagraphElement;
+  "docs-downloaded-toggle": HTMLButtonElement;
   "docs-starred-toggle": HTMLButtonElement;
   "documents-list": HTMLDivElement;
   "documents-react-policy": HTMLSelectElement;

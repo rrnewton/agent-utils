@@ -77,10 +77,6 @@ export const PACK_VIEWS: Record<string, string[]> = {
   // keeps it hidden (the strip is priced to the edge); the menu's Discuss stands
   // there disabled with its reason instead — see `renderControlBar` below.
   "discuss-open": ["discord"],
-  // `#1909`: the Documents list's Starred toggle, in the pack so a narrow
-  // phone scrolls it rather than losing the switch off the edge. The
-  // reader hides it by CSS (`21-documents.css`), as it has no list to filter.
-  "docs-starred-toggle": ["docs"],
 };
 
 /** Make the control bar from the page's screens, menus and search. */
@@ -166,6 +162,15 @@ export function createControlBar(deps: ControlBarDependencies): ControlBar {
       deps.el("audio-source").hidden = !main || !["discord", "docs"].includes(deps.view()) || deps.readAloudAgent() === null;
     }
     deps.el("open-settings").hidden = deps.screenHasTitle(deps.screen());
+    // `#2001`: the Documents Downloaded/Starred pair stands left of the
+    // hamburger, out of the pack; it belongs on the Documents view alone.
+    // The reader hides it by CSS (`21-documents.css`), as it has no list.
+    try {
+      deps.el("docs-downloaded-toggle").hidden = !main || deps.view() !== "docs";
+      deps.el("docs-starred-toggle").hidden = !main || deps.view() !== "docs";
+    } catch {
+      // A host without the pair keeps the bar as it was.
+    }
     // The pack, by the same rule and as a LOOP rather than by name: `#60 canned-prompt-buttons` adds
     // members here, and a member added later is decided by the same line as the rest.
     //

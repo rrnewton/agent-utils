@@ -1224,15 +1224,46 @@ test("THE BAR FITS ON THE OWNER'S 375px PHONE, ON EVERY VIEW", async () => {
   const docs = barCostPx(page);
   assert.ok(docs.shown.includes("docs-fetch"), "this is not the Documents view's bar");
   assert.equal(docs.shown.at(-1), "view-switch", "the switch is not the Documents bar's last button");
-  assert.ok(docs.cost <= budget, report("the Documents view", docs));
-  // In the reader Fetch and the Starred toggle (`#1909`) leave the bar and
-  // Outline stands in their place (`#1544`: never together), so the reader's
-  // bar is the list's bar minus those two and their gap, plus Outline.
-  const withOutline = docs.cost - memberPx("docs-fetch") - memberPx("docs-starred-toggle")
-    - lengthPx(cssValue(cssBlock("#control-bar"), "gap")) + memberPx("doc-outline-open");
+  // `#2001` phone room: with the pair beside the hamburger the list's bar
+  // has no room for the audio toggle too, so on a phone it leaves the
+  // Documents list bar (the reader and Settings keep it). The priced cost
+  // below is the phone bar as drawn: every fixed member, without audio.
+  assert.match(
+    CSS_CODE,
+    /:root:has\(#pane-docs:not\(\[hidden\]\) #docs-list-view:not\(\[hidden\]\)\) #audio-source \{\s*display: none;/,
+    "the audio toggle does not leave the phone Documents list bar"
+  );
+  const docsPhoneCost = docs.cost - memberPx("audio-source")
+    - lengthPx(cssValue(cssBlock("#control-bar"), "gap"));
+  assert.ok(docsPhoneCost <= budget,
+    report("the Documents view (phone, without the audio toggle)", { cost: docsPhoneCost, shown: docs.shown.filter((id) => id !== "audio-source") }));
+  // `#2001`: the pair left of the hamburger, star immediately left of it,
+  // Fetch between the hamburger and the switch.
+  assert.deepStrictEqual(
+    ["docs-downloaded-toggle", "docs-starred-toggle", "action-menu-open", "docs-fetch", "view-switch"].map((id) => docs.shown.indexOf(id)),
+    [...["docs-downloaded-toggle", "docs-starred-toggle", "action-menu-open", "docs-fetch", "view-switch"].map((id) => docs.shown.indexOf(id))].sort((a, b) => a - b),
+    "the Documents bar does not read downloaded, star, hamburger, Fetch, switch"
+  );
+  assert.equal(docs.shown.indexOf("docs-starred-toggle"), docs.shown.indexOf("action-menu-open") - 1,
+    "the star is not immediately left of the hamburger");
+  assert.ok(
+    HTML_CODE.indexOf('id="docs-downloaded-toggle"') < HTML_CODE.indexOf('id="docs-starred-toggle"') &&
+      HTML_CODE.indexOf('id="docs-starred-toggle"') < HTML_CODE.indexOf('id="action-menu-open"'),
+    "the Downloaded/Starred pair is not left of the hamburger in the markup"
+  );
+  for (const width of [393, 412]) {
+    const atWidth = budget + (width - PHONE_PX);
+    assert.ok(docsPhoneCost <= atWidth, report(`the Documents view at ${width}px`, { cost: docsPhoneCost, shown: docs.shown }));
+  }
+  // In the reader Fetch and the Downloaded/Starred pair (`#1909`, `#2001`)
+  // leave the bar and Outline stands in Fetch's place (`#1544`: never
+  // together), so the reader's bar is the list's bar minus those three and
+  // their two gaps, plus Outline.
+  const withOutline = docs.cost - memberPx("docs-fetch") - memberPx("docs-starred-toggle") - memberPx("docs-downloaded-toggle")
+    - 2 * lengthPx(cssValue(cssBlock("#control-bar"), "gap")) + memberPx("doc-outline-open");
   assert.ok(
     withOutline <= budget,
-    `the Documents reader: ${[...docs.shown.filter((id) => id !== "docs-fetch" && id !== "docs-starred-toggle"), "doc-outline-open"].join(" + ")} need ${withOutline.toFixed(1)}px of ` +
+    `the Documents reader: ${[...docs.shown.filter((id) => id !== "docs-fetch" && id !== "docs-starred-toggle" && id !== "docs-downloaded-toggle"), "doc-outline-open"].join(" + ")} need ${withOutline.toFixed(1)}px of ` +
       `the ${budget.toFixed(1)}px a ${PHONE_PX}px phone leaves, so Outline pushes the switch off the edge`
   );
   // `#1812 vibe-talk-discuss-off-in-documents`: no Discuss on the Documents bar;

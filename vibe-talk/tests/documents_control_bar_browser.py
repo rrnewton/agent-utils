@@ -106,7 +106,7 @@ def check_desktop(page: Page) -> None:
           f"Fetch is not standing in the list view: {state}")
     check(outline["display"] == "none" or flag(outline, "hidden"),
           f"Outline shows in the list view beside Fetch: {state}")
-    check(abs(num(fetch, "right") - num(menu, "left")) < 80,
+    check(abs(num(fetch, "left") - num(menu, "right")) < 80,
           f"Fetch is not at the bar's right beside the hamburger: {state}")
 
     page.locator("#documents-list .doc-card", has_text="control-doc").click()

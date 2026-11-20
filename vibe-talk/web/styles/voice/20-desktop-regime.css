@@ -115,6 +115,8 @@
     --dock-switch: 7.5rem;
     /* `#880 voice-page-menu-placement`. The action menu's hamburger, left of the switch: a bar button's width. */
     --dock-menu: 2.75rem;
+    /* `#2001`: Fetch/Outline in Documents, between the hamburger and the switch at a fixed width so the corner can be priced. */
+    --dock-fetch: 4.25rem;
     /* The bar's floor: see `#control-bar-bottom`. */
     --bar-floor: 8rem;
     position: relative;
@@ -215,7 +217,7 @@
      (`#1078 bottom-bar-switcher`): without it the bar takes the whole row and Fetch and
      Outline slide under the switch in its corner, untappable. */
   :root:has(#pane-docs:not([hidden])) #control-bar-bottom:has(#view-switch:not([hidden])) {
-    margin-right: calc(var(--dock-switch) + var(--dock-menu) + 0.8rem);
+    margin-right: calc(var(--dock-switch) + var(--dock-fetch) + 3 * var(--dock-menu) + 1.6rem);
   }
 
   :root[data-reader="hidden"]:has(#pane-discord:not([hidden])) #dock:not(:has(#hang-up:not([hidden]))):not(:has(#read-aloud[data-active="true"])):not(:has(#read-aloud-stop:not([hidden]))) #control-bar[data-placement="bottom"] {
@@ -321,6 +323,36 @@
     position: absolute;
     right: calc(var(--dock-inset) + var(--dock-switch) + var(--dock-menu) + 0.8rem);
     bottom: 0.4rem;
+  }
+
+  /* `#2001`: in Documents the corner reads downloaded, star, hamburger,
+     Fetch/Outline, switch, from left to right. Fetch/Outline take a fixed
+     width between the hamburger and the switch; the pair stands left of
+     the hamburger at a bar button's width each. */
+  :root:has(#pane-docs:not([hidden])) #control-bar[data-placement="bottom"] #doc-outline-open,
+  :root:has(#pane-docs:not([hidden])) #control-bar[data-placement="bottom"] #docs-fetch {
+    right: calc(var(--dock-inset) + var(--dock-switch) + 0.4rem);
+    width: var(--dock-fetch);
+    box-sizing: border-box;
+  }
+  :root:has(#pane-docs:not([hidden])) #control-bar[data-placement="bottom"] #action-menu-open {
+    right: calc(var(--dock-inset) + var(--dock-switch) + var(--dock-fetch) + 0.8rem);
+  }
+  :root:has(#pane-docs:not([hidden])) #control-bar[data-placement="bottom"] #docs-starred-toggle {
+    position: absolute;
+    right: calc(var(--dock-inset) + var(--dock-switch) + var(--dock-fetch) + var(--dock-menu) + 1.2rem);
+    bottom: 0.4rem;
+    width: var(--dock-menu);
+    min-width: 0;
+    box-sizing: border-box;
+  }
+  :root:has(#pane-docs:not([hidden])) #control-bar[data-placement="bottom"] #docs-downloaded-toggle {
+    position: absolute;
+    right: calc(var(--dock-inset) + var(--dock-switch) + var(--dock-fetch) + 2 * var(--dock-menu) + 1.6rem);
+    bottom: 0.4rem;
+    width: var(--dock-menu);
+    min-width: 0;
+    box-sizing: border-box;
   }
 
 

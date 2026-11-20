@@ -4592,15 +4592,6 @@ writable = true</pre>
               <span class="mini-label">Discuss</span>
             </button>
 
-            <!-- Starred (`#1909 vibe-talk-documents-filter-bar-fixed`): the Documents
-                 list's starred-only filter as a star icon on the bottom bar.
-                 In the pack, so a narrow phone scrolls it with the pack's other
-                 members rather than pushing the switch off the edge; on the
-                 Documents list the pack is otherwise near empty, so it stands
-                 beside the audio toggle. Outline star off, filled gold star on;
-                 `aria-pressed` and the "Starred" label say the state. -->
-            <button id="docs-starred-toggle" class="bar-button" type="button" hidden
-                    aria-pressed="false" aria-label="Starred" title="Starred">☆</button>
           </div>
 
           <!--
@@ -4750,6 +4741,20 @@ writable = true</pre>
             call and channel views; in Documents, Outline and Fetch stand between it and the switch
             (`#1078 bottom-bar-switcher`), which stays the bar's last button there as everywhere.
           -->
+          <!-- Downloaded and Starred (`#2001 vibe-talk-documents-toolbar-star-downloaded`,
+               Starred on the bar since `#1909`): the Documents list's two filter
+               toggles as a pair immediately left of the hamburger, out of the
+               scrolling pack so a narrow phone never scrolls them out of reach.
+               Downloaded is left of the star so the star stands immediately
+               left of the hamburger, as the owner asked; Downloaded shows the
+               row download glyph and filters to fetched documents. Both keep
+               `aria-pressed` and a fixed label; outline star off, filled gold
+               star on. -->
+          <button id="docs-downloaded-toggle" class="bar-button" type="button" hidden
+                  aria-pressed="false" aria-label="Downloaded" title="Downloaded">↓</button>
+          <button id="docs-starred-toggle" class="bar-button" type="button" hidden
+                  aria-pressed="false" aria-label="Starred" title="Starred">☆</button>
+
           <button id="action-menu-open" class="bar-button" type="button" aria-expanded="false"
                   aria-controls="action-menu" aria-label="Actions"
                   title="Actions on this channel: expand or collapse every message, summaries, hide the reader">

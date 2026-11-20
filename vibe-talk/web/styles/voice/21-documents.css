@@ -832,9 +832,10 @@ body:has(#control-bar[data-placement="top"]) #doc-outline-pop {
 .doc-bucket[aria-pressed="true"]::before {
   content: "✓ ";
 }
-/* The bottom bar's Starred toggle (`#1909`): the shared star dress
-   (`.doc-star` above) in the bar's own sizing — outline star in muted
-   ink off, filled star in the pin gold on its ground on. */
+/* The bottom bar's Starred toggle (`#1909`, beside the hamburger since
+   `#2001`): the shared star dress (`.doc-star` above) in the bar's own
+   sizing — outline star in muted ink off, filled star in the pin gold on
+   its ground on. */
 #docs-starred-toggle {
   font-size: 1.15em;
   color: var(--muted, CanvasText);
@@ -844,10 +845,34 @@ body:has(#control-bar[data-placement="top"]) #doc-outline-pop {
   color: var(--pin-ink, #f0c75e);
   border-color: var(--pin-edge, #d4a63a);
 }
-/* In the pack the toggle's view is decided by `PACK_VIEWS` (Documents), but
-   the reader is a Documents view with no list to filter: while a document
-   is open the toggle stands down, as Fetch does. */
-:root:has(#pane-docs:not([hidden]) #docs-reader:not([hidden])) #docs-starred-toggle {
+/* The Downloaded toggle (`#2001`), left of the star: the row's download
+   glyph in muted ink off, accent-filled on, so its pressed state reads in
+   light and dark as a bucket chip's does. */
+#docs-downloaded-toggle {
+  font-size: 1.15em;
+  color: var(--muted, CanvasText);
+}
+#docs-downloaded-toggle[aria-pressed="true"] {
+  background: var(--accent, Highlight);
+  border-color: var(--accent, Highlight);
+  color: var(--on-accent, #fff);
+  font-weight: 700;
+}
+/* Phone room (`#2001`): the Documents list bar has no room for the audio
+   source toggle beside the pair, the hamburger, Fetch and the switch, so
+   on a phone it leaves the list's bar. It returns in the reader, where
+   reading happens, and Settings keeps the same choice. */
+@media not ((min-width: 900px) and (pointer: fine)) {
+  :root:has(#pane-docs:not([hidden]) #docs-list-view:not([hidden])) #audio-source {
+    display: none;
+  }
+}
+
+/* The pair's view is decided by the control bar (Documents), but the
+   reader is a Documents view with no list to filter: while a document
+   is open the pair stands down, as Fetch does. */
+:root:has(#pane-docs:not([hidden]) #docs-reader:not([hidden])) #docs-starred-toggle,
+:root:has(#pane-docs:not([hidden]) #docs-reader:not([hidden])) #docs-downloaded-toggle {
   display: none;
 }
 

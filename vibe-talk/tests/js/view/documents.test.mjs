@@ -3086,6 +3086,93 @@ test("documents list: the card star toggles, writes the synced value, and the St
   });
 });
 
+test("documents list: Downloaded filters to fetched rows, composes with buckets and Starred, and both toggles persist (#2001)", async () => {
+  const listMod = requireModule(LIST, "src/view/documents/list.ts");
+  const rows = [
+    { ...docRow("md-doc", 100), kind: "github_markdown", fetched: true },
+    { ...docRow("paste-doc", 200), kind: "paste", fetched: false, fetched_ms: null },
+    { ...docRow("md-unfetched", 300), kind: "github_markdown", fetched: false, fetched_ms: null },
+  ];
+  const filterStorage = memoryStorage();
+  const stateMod = requireModule(DOCSTATE, "src/view/documents/docstate.ts");
+  const docStates = stateMod.createDocStatesStore(memoryStorage());
+  const makeList = (seen) => {
+    const listEl = fakeElement("div");
+    const filterBar = fakeElement("div");
+    const scroller = fakeElement("div");
+    scroller.scrollTop = 0;
+    scroller.clientHeight = 100;
+    Object.defineProperty(scroller, "scrollHeight", { get: () => listEl.children.length * 300 });
+    const list = listMod.createDocumentsList({
+      nudge: (s, delta) => { s.scrollTop += delta; }, toPosition: (s, top) => { s.scrollTop = top; }, toFoot: (s) => { s.scrollTop = s.scrollHeight; },
+      api: async () => ({ documents: rows, total: rows.length }),
+      byId: (id) => ({
+        "documents-list": listEl, "scroll-area": scroller,
+        "pane-docs": fakeElement("div"), "docs-list-view": fakeElement("div"),
+        "docs-filter-bar": filterBar,
+      })[id],
+      onOpen: () => {},
+      onDownloadedOnlyChange: (on) => seen.push(on),
+      filterStorage,
+      docStates,
+    });
+    return { list, listEl, filterBar };
+  };
+  const savedDocument = globalThis.document;
+  globalThis.document = {
+    createElement: (tag) => fakeElement(tag),
+    createElementNS: (_ns, tag) => fakeElement(tag),
+    createTextNode: (text) => ({ nodeType: 3, textContent: String(text) }),
+    querySelector: () => null,
+  };
+  const fire = (el, type, event = {}) => {
+    for (const listener of [...(el.listeners[type] || [])]) listener(event);
+  };
+  try {
+    const seen = [];
+    const first = makeList(seen);
+    await first.list.refresh();
+    const keys = () => first.listEl.children
+      .filter((kid) => String(kid.className).includes("doc-card"))
+      .map((kid) => kid.getAttribute("data-key"));
+    assert.deepEqual(keys(), ["md-doc", "paste-doc", "md-unfetched"]);
+    first.list.setDownloadedOnly(true);
+    assert.equal(first.list.downloadedOnly(), true);
+    assert.deepEqual(keys(), ["md-doc"], "Downloaded did not show only the fetched document");
+    assert.deepEqual(seen.at(-1), true, "the bar toggle was not told of the downloaded state");
+    // Composes with the bucket: a fetched markdown row leaves under Pastes.
+    const chipNow = (bucket) => first.filterBar.children
+      .find((kid) => String(kid.className).includes("doc-buckets"))
+      .children.find((kid) => kid.getAttribute("data-bucket") === bucket);
+    fire(chipNow("pastes"), "click", {});
+    assert.deepEqual(keys(), [], "Downloaded+Pastes showed the unfetched paste");
+    fire(chipNow("all"), "click", {});
+    // Composes with Starred: starring the fetched row keeps it, the rest stay out.
+    first.list.setStarred("md-doc", true);
+    first.list.setStarredOnly(true);
+    assert.deepEqual(keys(), ["md-doc"], "Starred+Downloaded did not show only the starred fetched document");
+    assert.equal(filterStorage.held.get(listMod.DOC_FILTERS_KEY), '{"s":1,"d":1}',
+      "the toggles did not persist to device storage");
+    first.list.unmount();
+    // A fresh list over the same storage (a reload) restores both toggles.
+    const secondSeen = [];
+    const second = makeList(secondSeen);
+    assert.equal(second.list.starredOnly(), true, "Starred did not survive a reload");
+    assert.equal(second.list.downloadedOnly(), true, "Downloaded did not survive a reload");
+    await second.list.refresh();
+    const keys2 = () => second.listEl.children
+      .filter((kid) => String(kid.className).includes("doc-card"))
+      .map((kid) => kid.getAttribute("data-key"));
+    assert.deepEqual(keys2(), ["md-doc"], "the reloaded list did not apply both persisted filters");
+    second.list.setDownloadedOnly(false);
+    assert.equal(filterStorage.held.get(listMod.DOC_FILTERS_KEY), '{"s":1}',
+      "clearing Downloaded did not persist");
+    second.list.unmount();
+  } finally {
+    if (savedDocument === undefined) delete globalThis.document; else globalThis.document = savedDocument;
+  }
+});
+
 test("documents list: bucket chips stand in the fixed filter-bar host, exactly one pressed (#1909)", async () => {
   const listMod = requireModule(LIST, "src/view/documents/list.ts");
   const rows = [

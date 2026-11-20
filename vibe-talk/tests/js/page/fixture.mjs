@@ -587,7 +587,7 @@ const FIXTURE_TREE = {
   // `#241 voice-composer` took Type off the strip: the message box is in the transcript now.
   // `#1355 phone-bar-discuss-slot`: the audio toggle left for the reader row; Discuss is
   // the pack's last member on the channel view.
-  "bar-pack": ["discord-channel", "prompts-open", "read-new", "discuss-open", "docs-starred-toggle"],
+  "bar-pack": ["discord-channel", "prompts-open", "read-new", "discuss-open"],
   // The tray of canned prompts. A child of the BAR and not of the pack, and both halves of that
   // matter: of the bar because the bar is what moves between the two mounts, and not of the pack
   // because the pack scrolls sideways and a menu that can scroll out from under its own opener is
@@ -600,7 +600,7 @@ const FIXTURE_TREE = {
   // `#1078 bottom-bar-switcher`: Outline and Fetch stand between the hamburger and the switch in
   // Documents, and the switch is last in every view. The trays, menus and tab row hang off the bar
   // out of its flow and stay out of this list, as the fetch menu always has.
-  "control-bar": ["open-settings", "bar-pack", "prompts-tray", "action-menu-open", "doc-outline-open", "docs-fetch", "view-switch"],
+  "control-bar": ["open-settings", "bar-pack", "prompts-tray", "docs-downloaded-toggle", "docs-starred-toggle", "action-menu-open", "doc-outline-open", "docs-fetch", "view-switch"],
   // The reader/call row in the dock, in markup order (`#1781`: tests now cross Documents on
   // the switch's rotation, which moves the audio toggle out of this row and back — a move
   // only a real parent can prove). Its members' heights are not the model's business here.

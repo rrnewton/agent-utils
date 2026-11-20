@@ -2,7 +2,7 @@
 // documents linked in chat, and the full-screen reader for one of them. Its
 // public interface; the page mounts it once and shows it as the `docs` view.
 
-export { createDocumentsList, dedupeDocumentRows, documentIdentity, documentMatchesNameFilter } from "./list.ts";
+export { createDocumentsList, dedupeDocumentRows, documentIdentity, documentMatchesNameFilter, DOC_FILTERS_KEY } from "./list.ts";
 export type { DocumentsList, DocumentsListDependencies, DocumentsListPlace } from "./list.ts";
 export { DOC_STATES_KEY, parseDocStates, serializeDocStates, withDocFlag } from "./docstate.ts";
 export { createDocumentsReader, currentOutlineIndex, highlightSearchTerms, openDocumentNotice } from "./reader.ts";
@@ -297,6 +297,19 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
         // A host without the bar toggle keeps the filter as it was.
       }
     },
+    onDownloadedOnlyChange: (on) => {
+      try {
+        deps.byId("docs-downloaded-toggle").setAttribute("aria-pressed", String(on));
+      } catch {
+        // A host without the bar toggle keeps the filter as it was.
+      }
+    },
+    filterStorage: deps.storage
+      ? {
+          getItem: (key) => deps.storage?.().getItem(key) ?? null,
+          setItem: (key, value) => deps.storage?.().setItem(key, value),
+        }
+      : null,
   });
   const search = createDocumentsSearch({
     api: deps.api,
@@ -492,6 +505,7 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     try {
       deps.byId("docs-filter-bar").hidden = false;
       deps.byId("docs-starred-toggle").hidden = false;
+      deps.byId("docs-downloaded-toggle").hidden = false;
     } catch {
       // A host without the fixed bar keeps the list as it was.
     }
@@ -580,6 +594,7 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     try {
       deps.byId("docs-filter-bar").hidden = true;
       deps.byId("docs-starred-toggle").hidden = true;
+      deps.byId("docs-downloaded-toggle").hidden = true;
     } catch {
       // A host without the fixed bar keeps the list as it was.
     }
@@ -667,14 +682,26 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
         (error: unknown) => deps.onStatus?.(error instanceof Error ? error.message : String(error)),
       ).finally(() => setBusy(false));
     };
-    // The bottom bar's Starred toggle (`#1909`): the list owns the state;
-    // its render syncs this button's pressed dress through the callback.
+    // The bottom bar's Starred toggle (`#1909`, beside the hamburger since
+    // `#2001`): the list owns the state; its render syncs this button's
+    // pressed dress through the callback.
     try {
       const starredToggle = deps.byId("docs-starred-toggle");
       starredToggle.setAttribute("aria-pressed", String(list.starredOnly()));
       starredToggle.textContent = list.starredOnly() ? "★" : "☆";
       listening.listen(starredToggle, "click", () => {
         list.setStarredOnly(!list.starredOnly());
+      });
+    } catch {
+      // A host without the bar toggle keeps the filter as it was.
+    }
+    // The Downloaded toggle (`#2001`), left of the star: the row's download
+    // glyph, filtering to fetched documents only.
+    try {
+      const downloadedToggle = deps.byId("docs-downloaded-toggle");
+      downloadedToggle.setAttribute("aria-pressed", String(list.downloadedOnly()));
+      listening.listen(downloadedToggle, "click", () => {
+        list.setDownloadedOnly(!list.downloadedOnly());
       });
     } catch {
       // A host without the bar toggle keeps the filter as it was.
