@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-discuss-header-toggle-colours: One Expand/Collapse toggle in the Discuss summary header, larger, to the right; candidate highlight colours for the Discuss bar'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 labels:
@@ -8,7 +8,7 @@ labels:
 - discuss
 - ui
 created_at: 2026-11-20T08:37:00-05:00
-updated_at: 2026-11-20T08:37:00-05:00
+updated_at: 2026-11-20T09:36:20-05:00
 ---
 
 # Description
@@ -38,3 +38,7 @@ Today the summary-level chip pair (under "Current summary"), the timeline chip p
 # Notes
 
 [watermelon-full-preview] mu-discusshead, owner request 228, 2026-11-20. Number pre-assigned by coordb; filed before implementation. Related: #1912 vibe-talk-discuss-summary-timeline-layout (the redesign this follows up), #1924 vibe-talk-discuss-chips-triangles-terms (small chips and readable triangles this supersedes for the chip pairs), #1961 (later theme work this feeds), #1497 discuss-fold-state-persist, #1387 discuss-collapsible-sections.
+
+## Resolution
+
+Landed on github/main as `cdcc8523` (mu-discusshead, 2026-11-20) and deployed by coordb the same day. One shared Expand/Collapse toggle serves the Current summary (Terms included in its scope), the Timeline, and each earlier summary; the Current header packs its two lines densely with the toggle to their right. `.discuss-head` is painted from `--discuss-head-bg` (default `var(--panel)`); the four candidate values with contrast ratios are in `vibe-talk/tests/discuss_head_colours.md`, with light/dark contact sheets delivered to the owner for the pick — the chosen colour is a one-line follow-up. Focused page/type/page-build suites passed; browser evidence ran on a host with Chromium (real-server scenes 73-76, 84, 85 green at `42bb6779`), and local gate reds were the missing-browser-library environment only, landed under coordb's waiver.
