@@ -1,0 +1,11 @@
+# Installed by `agentctl install-units --tab-hygiene` (#1971 agentctl-tabs-scheduled-hygiene).
+# One tab-hygiene pass for this registry: canonical tab order and bare-shell
+# closes under the grace clocks recorded in the registry's tab-hygiene.json.
+# The watch daemon is not required; this oneshot is the whole duty.
+[Unit]
+Description=agentctl tab hygiene for one registry
+ConditionHost=@HOST@
+
+[Service]
+Type=oneshot
+ExecStart=@AGENTCTL@ --registry @REGISTRY@ --herdr-bin @HERDR@ tabs --apply

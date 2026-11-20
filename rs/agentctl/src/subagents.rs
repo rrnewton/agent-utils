@@ -12531,6 +12531,17 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         self.status_showing(agent_name, false)
     }
 
+    /// The record's own fields for a tab census (#1971
+    /// agentctl-tabs-scheduled-hygiene): pane, tab, viewer, lifecycle,
+    /// mode, cwd, profile and role, read from the record file alone.
+    /// Unlike [`Self::status`] this resolves nothing live — a census over
+    /// dozens of records must not pay two Herdr calls per record for
+    /// fields the record already carries.
+    pub fn census_record(&self, agent_name: &str) -> Result<Value> {
+        let record = self.load(agent_name)?;
+        self.record_row(&record)
+    }
+
     /// [`Self::status`], optionally with full launch argument values (#1937).
     pub fn status_showing(&self, agent_name: &str, show_argv: bool) -> Result<Value> {
         let record = self.load(agent_name)?;

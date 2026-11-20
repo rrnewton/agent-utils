@@ -1750,6 +1750,32 @@ target's viewer first, a lane's viewer as that lane — instead of last as an
 unmanaged tab. The name is a tab only: no pane id is read or changed, and a
 record with no viewer tab behaves as before.
 
+Tab hygiene also runs without a watch daemon (#1971
+agentctl-tabs-scheduled-hygiene). `agentctl tabs` lists every managed tab
+with its owner, foreground process, idle time and verdict; `--dry-run`
+names what a pass would do and takes no action, and `--apply` runs one
+pass now: canonical order (liaison first, then the designated
+coordinator and coordinator/coordinator-hands roles, then lanes), label
+sync, and bare-shell closes — a close only for an unclaimed pane the
+kernel proves is an idle shell with an empty composer, past
+`bare_shell_grace_seconds` in the clocks recorded in
+`REGISTRY/tab-hygiene.json` (schema `agentctl-tab-hygiene/v1`; a watch
+daemon keeps the same clocks in its own health file). A claimed pane is
+never closed. `restore` runs one such pass at its end. To schedule it
+for a registry, opt in per team:
+
+```
+agentctl --registry ~/project/.agentctl install-units --dest ~/.config/systemd/user --tab-hygiene
+systemctl --user daemon-reload
+systemctl --user enable --now agentctl-tab-hygiene.timer
+agentctl --registry ~/project/.agentctl tabs --dry-run   # preview first
+```
+
+The timer fires two minutes after boot and then every five minutes, and
+`install-units` writes only the pair and enables nothing by itself. A
+team that already runs the watch daemon gets the same pass from it and
+does not need the timer.
+
 A standing agent rests idle between requests by design, such as a standing
 reviewer, so it is never reported `idle-no-verdict` (#901
 watch-standing-agents). Mark one with `agentctl set NAME --standing`, which

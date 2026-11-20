@@ -921,6 +921,14 @@ struct InstallUnits {
     /// restore units. Example: agentctl install-units --dest ~/.config/systemd/user --teams-config ~/.config/agentctl/teams.json
     #[arg(long, value_name = "PATH", conflicts_with_all = ["bridge_unit", "bridge", "headless", "scheduled"])]
     teams_config: Option<PathBuf>,
+    /// Write only agentctl-tab-hygiene.service plus agentctl-tab-hygiene.timer, the opt-in
+    /// scheduled tab-hygiene pair for this registry (#1971): the timer runs
+    /// `agentctl tabs --apply` shortly after boot and then every five minutes, so canonical
+    /// tab order and bare-shell closes happen without a watch daemon. Writes nothing else
+    /// and enables nothing; the operator enables the timer after reviewing the files.
+    /// Example: agentctl --registry ~/project/.agentctl install-units --dest ~/.config/systemd/user --tab-hygiene
+    #[arg(long, conflicts_with_all = ["bridge_unit", "bridge", "headless", "scheduled", "teams_config"])]
+    tab_hygiene: bool,
 }
 
 #[derive(Args)]
@@ -1202,8 +1210,11 @@ struct RunHeadless {
 #[derive(Args)]
 struct TabsArgs {
     /// Name the actions a hygiene pass would take, and take none (the listing itself never changes anything)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "apply")]
     dry_run: bool,
+    /// Run one hygiene pass now — canonical tab order, bare-shell closes under the recorded grace clocks in REGISTRY/tab-hygiene.json — and print what it did, instead of only listing (the scheduled form: install-units --tab-hygiene runs this from a user timer)
+    #[arg(long)]
+    apply: bool,
 }
 
 #[derive(Args)]
@@ -4641,6 +4652,16 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             let client = HerdrClient::with_executable("direct", &args.herdr_bin)
                 .map_err(AgentError::from)?;
             let config = crate::restore::RestoreConfig::load(&args.registry)?;
+            if value.apply {
+                let applied = crate::restore::tabs_apply(
+                    &client,
+                    &args.registry,
+                    &config,
+                    &crate::restore::SystemHost,
+                )?;
+                write_json(&applied).map_err(Failure::Output)?;
+                return Ok(0);
+            }
             let mut listing = crate::restore::tabs_listing(&client, &args.registry, &config)?;
             listing["dry_run"] = json!(value.dry_run);
             if !value.dry_run {
@@ -4936,6 +4957,21 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                         force: value.force,
                     },
                     &absolute(&teams_config)?,
+                )?)
+                .map_err(Failure::Output)?;
+                return Ok(0);
+            }
+            if value.tab_hygiene {
+                write_json(&crate::units::install_tab_hygiene(
+                    &crate::units::InstallOptions {
+                        dest: value.dest,
+                        agentctl,
+                        herdr,
+                        registry: absolute(&args.registry)?,
+                        bridge_unit: None,
+                        dry_run: value.dry_run,
+                        force: value.force,
+                    },
                 )?)
                 .map_err(Failure::Output)?;
                 return Ok(0);

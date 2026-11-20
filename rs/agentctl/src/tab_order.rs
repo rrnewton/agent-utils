@@ -114,7 +114,17 @@ fn request(socket: &Path, method: &str, params: Value) -> Result<Value, String> 
         .write_all(&line)
         .map_err(|error| format!("{method}: {error}"))?;
     let mut reader = BufReader::new(stream);
+    // Bounded (#1971): a stream of unrelated replies must not keep this
+    // call alive forever; each read already times out on its own, so cap
+    // the number of replies one request will skip.
+    let mut skipped = 0_usize;
     loop {
+        if skipped > 128 {
+            return Err(format!(
+                "{method}: Herdr sent over 128 replies without answering this request"
+            ));
+        }
+        skipped += 1;
         let mut reply = String::new();
         let read = reader
             .read_line(&mut reply)
@@ -148,8 +158,8 @@ pub const ROLE_LIAISON: u8 = 0;
 pub const ROLE_LIAISON_MARKED: u8 = 1;
 /// The registry's designated coordinator.
 pub const ROLE_DESIGNATED: u8 = 2;
-/// Another coordinator (a coordinator profile, or a profile role of
-/// `coordinator` or `coordinator-hands`).
+/// Another coordinator (a coordinator profile, or a profile or record
+/// role of `coordinator` or `coordinator-hands`).
 pub const ROLE_COORDINATOR: u8 = 3;
 /// A managed lane's tab.
 pub const ROLE_LANE: u8 = 4;
@@ -168,8 +178,9 @@ pub const ROLE_UNMANAGED: u8 = 5;
 ///    `role` field, its launch profile's `role`, or a profile named
 ///    `liaison` / `*-liaison`.
 /// 3. [`ROLE_DESIGNATED`]: the designated coordinator (`designated`).
-/// 4. [`ROLE_COORDINATOR`]: a coordinator profile, or a profile role of
-///    `coordinator` / `coordinator-hands`.
+/// 4. [`ROLE_COORDINATOR`]: a coordinator profile, or a profile or
+///    record role of `coordinator` / `coordinator-hands` (the hands role
+///    counts here, #1971).
 /// 5. [`ROLE_LANE`]: any other registered agent.
 ///
 /// With no bridge target and no liaison mark the designated coordinator
@@ -197,6 +208,7 @@ pub fn role_for(
     }
     if is_coordinator_profile(profile)
         || matches!(profile_role, Some("coordinator" | "coordinator-hands"))
+        || matches!(record_role, Some("coordinator" | "coordinator-hands"))
     {
         return ROLE_COORDINATOR;
     }
@@ -501,6 +513,31 @@ mod tests {
                 Some("coordb")
             ),
             ROLE_COORDINATOR
+        );
+        // #1971: the hands role on the record alone (no coordinator
+        // profile, no profile role) also ranks as a coordinator, ahead
+        // of lanes; a plain worker record role does not.
+        assert_eq!(
+            role_of(
+                "hands",
+                Some("worker"),
+                None,
+                Some("coordinator-hands"),
+                bridge,
+                Some("coordb")
+            ),
+            ROLE_COORDINATOR
+        );
+        assert_eq!(
+            role_of(
+                "lane-b",
+                Some("muse-worker"),
+                None,
+                Some("worker"),
+                bridge,
+                Some("coordb")
+            ),
+            ROLE_LANE
         );
         assert_eq!(
             role_of(

@@ -22,6 +22,8 @@ const BRIDGE: &str = include_str!("systemd/agentctl-bridge.service");
 const SCHEDULED_SERVICE: &str = include_str!("systemd/agentctl-scheduled.service");
 const SCHEDULED_TIMER: &str = include_str!("systemd/agentctl-scheduled.timer");
 const AGENT_RESTORE_TEAMS: &str = include_str!("systemd/agent-restore-teams.service");
+const TAB_HYGIENE_SERVICE: &str = include_str!("systemd/agentctl-tab-hygiene.service");
+const TAB_HYGIENE_TIMER: &str = include_str!("systemd/agentctl-tab-hygiene.timer");
 
 type Result<T> = std::result::Result<T, AgentError>;
 
@@ -434,6 +436,58 @@ pub fn install_restore_teams(options: &InstallOptions, teams_config: &Path) -> R
     }))
 }
 
+/// The tab-hygiene timer/service pair (#1971), rendered on the host named
+/// `host`, as `(relative path, contents)` for the service, then the timer.
+/// The service runs `agentctl tabs --apply` for this registry; the timer
+/// fires it shortly after boot and then every five minutes.
+pub fn rendered_tab_hygiene(
+    options: &InstallOptions,
+    host: &str,
+) -> Result<Vec<(PathBuf, String)>> {
+    let host = scheduled_host(host)?;
+    let agentctl = unit_path("agentctl", &options.agentctl)?;
+    let herdr = unit_path("herdr", &options.herdr)?;
+    let registry = unit_path("registry", &options.registry)?;
+    let render = |template: &str| {
+        template
+            .replace("@AGENTCTL@", &agentctl)
+            .replace("@HERDR@", &herdr)
+            .replace("@REGISTRY@", &registry)
+            .replace("@HOST@", &host)
+    };
+    Ok(vec![
+        (
+            PathBuf::from("agentctl-tab-hygiene.service"),
+            render(TAB_HYGIENE_SERVICE),
+        ),
+        (
+            PathBuf::from("agentctl-tab-hygiene.timer"),
+            render(TAB_HYGIENE_TIMER),
+        ),
+    ])
+}
+
+/// Write only the tab-hygiene timer/service pair for this registry;
+/// refuse to replace a different existing file without `force`. Enables
+/// and starts nothing: the operator enables the timer deliberately, so
+/// scheduled closes start only on an opted-in team (#1971).
+pub fn install_tab_hygiene(options: &InstallOptions) -> Result<Value> {
+    let host = crate::subagents::local_hostname()
+        .ok_or_else(|| fail("cannot determine this host's name for the units' ConditionHost"))?;
+    let files = rendered_tab_hygiene(options, &host)?;
+    let (written, unchanged) = write_files(options, &files)?;
+    Ok(json!({
+        "dry_run": options.dry_run,
+        "written": written,
+        "unchanged": unchanged,
+        "next_steps": [
+            "review the files",
+            "systemctl --user daemon-reload",
+            "systemctl --user enable --now agentctl-tab-hygiene.timer",
+        ],
+    }))
+}
+
 /// Write only the unit of the headless agent `name`; refuse to replace a different existing
 /// file without `force`. Enables and starts nothing.
 pub fn install_headless(
@@ -542,6 +596,52 @@ mod tests {
             std::env::temp_dir().join(format!("agentctl-units-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         path
+    }
+
+    #[test]
+    fn tab_hygiene_pair_runs_tabs_apply_on_a_timer_and_is_written_alone() {
+        // #1971: the opt-in pair is the scheduled form of the hygiene
+        // pass — it names this registry and no other, fires shortly
+        // after boot and every five minutes, and is host-bound.
+        let dest = scratch("tab-hygiene");
+        let files = rendered_tab_hygiene(&options(&dest), "host-one.example").unwrap();
+        let names: Vec<String> = files
+            .iter()
+            .map(|(name, _)| name.display().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "agentctl-tab-hygiene.service".to_owned(),
+                "agentctl-tab-hygiene.timer".to_owned()
+            ]
+        );
+        let service = &files[0].1;
+        assert!(
+            service.contains(
+                "ExecStart=/opt/agentctl/bin/agentctl --registry /home/owner/project/.agentctl --herdr-bin /home/owner/bin/herdr tabs --apply\n"
+            ),
+            "{service}"
+        );
+        assert!(
+            service.contains("ConditionHost=host-one.example\n"),
+            "{service}"
+        );
+        let timer = &files[1].1;
+        assert!(timer.contains("OnBootSec=2min\n"), "{timer}");
+        assert!(timer.contains("OnUnitActiveSec=5min\n"), "{timer}");
+        assert!(
+            timer.contains("Unit=agentctl-tab-hygiene.service\n"),
+            "{timer}"
+        );
+        assert!(timer.contains("Persistent=true\n"), "{timer}");
+        assert!(!service.contains('@') && !timer.contains('@'));
+        assert!(rendered_tab_hygiene(&options(&dest), "bad host").is_err());
+        let report = install_tab_hygiene(&options(&dest)).unwrap();
+        assert_eq!(report["written"].as_array().unwrap().len(), 2);
+        assert!(dest.join("agentctl-tab-hygiene.timer").exists());
+        assert!(!dest.join("agent-watch.service").exists());
+        let _ = fs::remove_dir_all(&dest);
     }
 
     #[test]

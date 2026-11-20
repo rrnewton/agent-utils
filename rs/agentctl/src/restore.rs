@@ -3875,18 +3875,18 @@ pub fn restore<A: ManagedApi + ?Sized>(
         if let Ok(panes) = client.panes() {
             let claimed: std::collections::BTreeSet<String> = names
                 .iter()
-                .filter_map(|name| manager.status(name).ok())
+                .filter_map(|name| manager.census_record(name).ok())
                 .filter_map(|status| status["pane_id"].as_str().map(str::to_owned))
                 .collect();
             let cwd_of = |name: &str| {
                 manager
-                    .status(name)
+                    .census_record(name)
                     .ok()
                     .and_then(|s| s["cwd"].as_str().map(str::to_owned))
             };
             let pane_of = |name: &str| {
                 manager
-                    .status(name)
+                    .census_record(name)
                     .ok()
                     .and_then(|s| s["pane_id"].as_str().map(str::to_owned))
             };
@@ -3966,6 +3966,22 @@ pub fn restore<A: ManagedApi + ?Sized>(
         }));
     }
     report["units"] = json!(units);
+    // One tab-hygiene run at the end of restore (#1971): canonical order
+    // and bare-shell cultivation must not wait for a watch daemon that
+    // may not be running. It shares the standalone grace clocks with
+    // `agentctl tabs --apply`, so this pass starts the clocks a later
+    // timer pass continues; a failure is recorded, never a restore
+    // failure.
+    report["tab_hygiene"] = if options.dry_run {
+        json!({"action": "skipped", "reason": "dry run"})
+    } else if !config.duties.tab_hygiene {
+        json!({"action": "skipped", "reason": "tab_hygiene duty off"})
+    } else {
+        match tabs_apply(client, registry, config, host) {
+            Ok(applied) => applied,
+            Err(error) => json!({"applied": false, "detail": error.to_string()}),
+        }
+    };
     // #1130: a refused slot-owner transfer counts as a named refusal too,
     // the coordinator's included, even though the lane itself revived.
     let transfer_refused =
@@ -5111,6 +5127,75 @@ fn profile_roles(registry: &Path) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
+/// Soft budget for the expensive part of one pane census (#1971
+/// agentctl-tabs-scheduled-hygiene): the idle-shell proof and screen read
+/// of unclaimed panes. Each Herdr call is already bounded on its own
+/// (30 s control timeout, 5 s tab-socket timeout), but a census multiplies
+/// those bounds by the pane count — the 77-record `tabs --dry-run` that
+/// appeared to hang for over a minute was spending seconds per pane on
+/// stable-identity observation inside the idle-shell proof, for claimed
+/// panes whose verdict never uses it. Claimed panes (a record's pane, or
+/// a tab a record names as its viewer) therefore skip the proof and the
+/// screen read entirely, one `pane get` serves both cwd and foreground,
+/// and unclaimed panes past the budget are reported unprobed —
+/// `idle_shell: false`, composer holding text — so they are kept, never
+/// closed on missing evidence.
+const CENSUS_BUDGET: Duration = Duration::from_secs(60);
+
+/// Build the pane facts of one census; the second return is true when
+/// the census budget cut the expensive probes short.
+fn census_pane_facts<A: ManagedApi + ?Sized>(
+    client: &A,
+    panes: &[crate::client::Pane],
+    labels_by_tab: &BTreeMap<String, String>,
+    claimed_panes: &std::collections::BTreeSet<String>,
+    viewer_tabs: &std::collections::BTreeSet<String>,
+) -> (Vec<crate::tabs::PaneFacts>, bool) {
+    let started = Instant::now();
+    let mut truncated = false;
+    let facts = panes
+        .iter()
+        .map(|pane| {
+            let claimed =
+                claimed_panes.contains(&pane.pane_id) || viewer_tabs.contains(&pane.tab_id);
+            if !claimed && !truncated && started.elapsed() > CENSUS_BUDGET {
+                truncated = true;
+            }
+            let probe = !claimed && !truncated;
+            let info = client.pane_info(&pane.pane_id).ok();
+            crate::tabs::PaneFacts {
+                cwd: info
+                    .as_ref()
+                    .map(|info| info.cwd.clone())
+                    .unwrap_or_default(),
+                pane_id: pane.pane_id.clone(),
+                tab_id: pane.tab_id.clone(),
+                workspace_id: pane.workspace_id.clone(),
+                label: labels_by_tab.get(&pane.tab_id).cloned(),
+                idle_shell: probe && client.pane_is_idle_shell(&pane.pane_id).unwrap_or(false),
+                // Read like the watch pass does; an unreadable or
+                // unprobed screen still counts as holding text
+                // (fail-closed).
+                composer_text: if probe {
+                    match client.read_screen_with_runtime(
+                        &pane.pane_id,
+                        &crate::agent::SystemRuntime::default(),
+                    ) {
+                        Ok(screen) => crate::tabs::composer_holds_text(&screen),
+                        Err(_) => true,
+                    }
+                } else {
+                    !claimed
+                },
+                foreground: info
+                    .map(|info| info.agent.unwrap_or(info.status))
+                    .unwrap_or_else(|| "unknown".to_owned()),
+            }
+        })
+        .collect();
+    (facts, truncated)
+}
+
 /// The `agentctl tabs` listing (#1793): every tab of every managed
 /// workspace with its owner record, foreground process, idle time, and
 /// verdict. Read-only; with `dry_run` it also names the actions a hygiene
@@ -5134,36 +5219,10 @@ pub fn tabs_listing<A: ManagedApi + ?Sized>(
             labels_by_tab.extend(found);
         }
     }
-    let pane_facts: Vec<crate::tabs::PaneFacts> = panes
-        .iter()
-        .map(|pane| crate::tabs::PaneFacts {
-            cwd: client
-                .pane_info(&pane.pane_id)
-                .map(|info| info.cwd)
-                .unwrap_or_default(),
-            pane_id: pane.pane_id.clone(),
-            tab_id: pane.tab_id.clone(),
-            workspace_id: pane.workspace_id.clone(),
-            label: labels_by_tab.get(&pane.tab_id).cloned(),
-            idle_shell: client.pane_is_idle_shell(&pane.pane_id).unwrap_or(false),
-            // Read like the watch pass does; an unreadable screen still
-            // counts as holding text (fail-closed).
-            composer_text: match client
-                .read_screen_with_runtime(&pane.pane_id, &crate::agent::SystemRuntime::default())
-            {
-                Ok(screen) => crate::tabs::composer_holds_text(&screen),
-                Err(_) => true,
-            },
-            foreground: client
-                .pane_info(&pane.pane_id)
-                .map(|info| info.agent.unwrap_or(info.status))
-                .unwrap_or_else(|_| "unknown".to_owned()),
-        })
-        .collect();
     let agent_facts: Vec<crate::tabs::AgentFacts> = names
         .iter()
         .filter_map(|name| {
-            let status = manager.status(name).ok()?;
+            let status = manager.census_record(name).ok()?;
             Some(crate::tabs::AgentFacts {
                 cwd: status["cwd"].as_str().unwrap_or_default().to_owned(),
                 name: name.clone(),
@@ -5176,6 +5235,16 @@ pub fn tabs_listing<A: ManagedApi + ?Sized>(
             })
         })
         .collect();
+    let claimed_set: std::collections::BTreeSet<String> = agent_facts
+        .iter()
+        .filter_map(|agent| agent.pane_id.clone())
+        .collect();
+    let viewer_set: std::collections::BTreeSet<String> = agent_facts
+        .iter()
+        .filter_map(|agent| agent.viewer_tab_id.clone())
+        .collect();
+    let (pane_facts, census_truncated) =
+        census_pane_facts(client, &panes, &labels_by_tab, &claimed_set, &viewer_set);
     let order_tabs: Vec<(String, String)> = workspaces
         .iter()
         .filter_map(|workspace| {
@@ -5227,6 +5296,7 @@ pub fn tabs_listing<A: ManagedApi + ?Sized>(
     );
     Ok(json!({
         "grace_assumed_elapsed": true,
+        "census_truncated": census_truncated,
         "bare_shell_grace_seconds": config.bare_shell_grace_seconds,
         "tabs": rows.iter().map(|row| json!({
             "workspace_id": row.workspace_id, "tab_id": row.tab_id,
@@ -5235,6 +5305,73 @@ pub fn tabs_listing<A: ManagedApi + ?Sized>(
             "verdict": row.verdict,
         })).collect::<Vec<_>>(),
         "would_do": actions.iter().map(|action| format!("{action:?}")).collect::<Vec<_>>(),
+    }))
+}
+
+/// The standalone hygiene state (#1971): the grace clocks a one-shot
+/// `agentctl tabs --apply` (or the hygiene run at the end of `restore`)
+/// keeps between invocations, in one fixed registry file — schema
+/// `agentctl-tab-hygiene/v1`, `{bare_shell_since, orphan_tab_since,
+/// closed_bare_shells}`. It holds no agent records and no record fields;
+/// a watch daemon keeps the same clocks in its own health file and the
+/// two never read each other's. An unreadable state reads as empty,
+/// which only restarts the grace clocks: the fail-safe direction.
+pub const TAB_HYGIENE_STATE_FILE: &str = "tab-hygiene.json";
+
+/// Load the standalone hygiene state's grace clocks and closure log.
+fn load_tab_hygiene_state(
+    registry: &Path,
+) -> (BTreeMap<String, f64>, BTreeMap<String, f64>, Vec<Value>) {
+    let Some(state) = read_report(&registry.join(TAB_HYGIENE_STATE_FILE)) else {
+        return (BTreeMap::new(), BTreeMap::new(), Vec::new());
+    };
+    (
+        serde_json::from_value(state["bare_shell_since"].clone()).unwrap_or_default(),
+        serde_json::from_value(state["orphan_tab_since"].clone()).unwrap_or_default(),
+        state["closed_bare_shells"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default(),
+    )
+}
+
+/// Run one hygiene pass with the standalone persisted grace clocks and
+/// save them back (#1971): what `agentctl tabs --apply` and the run at
+/// the end of `restore` both do, so a scheduled timer pass and a boot
+/// restore share one grace history instead of each restarting it.
+///
+/// # Errors
+///
+/// The updated state cannot be written.
+pub fn tabs_apply<A: ManagedApi + ?Sized>(
+    client: &A,
+    registry: &Path,
+    config: &RestoreConfig,
+    host: &dyn Host,
+) -> Result<Value> {
+    let (mut bare_since, mut tab_since, mut closed) = load_tab_hygiene_state(registry);
+    let findings = hygiene_pass(
+        client,
+        registry,
+        config,
+        host,
+        &mut bare_since,
+        &mut tab_since,
+        &mut closed,
+    );
+    let state = json!({
+        "schema": "agentctl-tab-hygiene/v1",
+        "checked_at": host.now(),
+        "bare_shell_since": bare_since,
+        "orphan_tab_since": tab_since,
+        "closed_bare_shells": closed,
+    });
+    write_report(&registry.join(TAB_HYGIENE_STATE_FILE), &state)?;
+    Ok(json!({
+        "applied": true,
+        "findings": findings,
+        "closed_bare_shells": state["closed_bare_shells"],
+        "state": registry.join(TAB_HYGIENE_STATE_FILE),
     }))
 }
 
@@ -5288,7 +5425,7 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
     let mut claimed: BTreeMap<String, ClaimedTab> = BTreeMap::new();
     let mut viewer_tabs: BTreeMap<String, ViewerTab> = BTreeMap::new();
     for name in &names {
-        if let Ok(status) = manager.status(name) {
+        if let Ok(status) = manager.census_record(name) {
             if let Some(pane) = status["pane_id"].as_str() {
                 claimed.insert(
                     pane.to_owned(),
@@ -5359,7 +5496,7 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
     let agent_facts_early: Vec<crate::tabs::AgentFacts> = names
         .iter()
         .filter_map(|name| {
-            let status = manager.status(name).ok()?;
+            let status = manager.census_record(name).ok()?;
             Some(crate::tabs::AgentFacts {
                 name: name.clone(),
                 pane_id: status["pane_id"].as_str().map(str::to_owned),
@@ -5374,30 +5511,18 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
         .collect();
     let claimed_set: std::collections::BTreeSet<String> = claimed.keys().cloned().collect();
     let viewer_set: std::collections::BTreeSet<String> = viewer_tabs.keys().cloned().collect();
-    let pane_facts: Vec<crate::tabs::PaneFacts> = panes
-        .iter()
-        .map(|pane| crate::tabs::PaneFacts {
-            cwd: client
-                .pane_info(&pane.pane_id)
-                .map(|info| info.cwd)
-                .unwrap_or_default(),
-            pane_id: pane.pane_id.clone(),
-            tab_id: pane.tab_id.clone(),
-            workspace_id: pane.workspace_id.clone(),
-            label: labels_by_tab.get(&pane.tab_id).cloned(),
-            idle_shell: client.pane_is_idle_shell(&pane.pane_id).unwrap_or(false),
-            composer_text: match client
-                .read_screen_with_runtime(&pane.pane_id, &crate::agent::SystemRuntime::default())
-            {
-                Ok(screen) => crate::tabs::composer_holds_text(&screen),
-                Err(_) => true,
-            },
-            foreground: client
-                .pane_info(&pane.pane_id)
-                .map(|info| info.agent.unwrap_or(info.status))
-                .unwrap_or_else(|_| "unknown".to_owned()),
-        })
-        .collect();
+    let (pane_facts, census_truncated) =
+        census_pane_facts(client, &panes, &labels_by_tab, &claimed_set, &viewer_set);
+    let mut findings = findings;
+    if census_truncated {
+        findings.push(finding(
+            "hygiene",
+            "census",
+            false,
+            "pane census budget reached; unprobed panes were kept, not closed",
+            Value::Null,
+        ));
+    }
     let managed_workspaces =
         crate::tabs::managed_workspaces(&pane_facts, &claimed_set, &viewer_set, &agent_facts_early);
     // Canonical tab order, through the Herdr socket when reachable.
@@ -5446,7 +5571,7 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
     let agent_facts: Vec<crate::tabs::AgentFacts> = names
         .iter()
         .filter_map(|name| {
-            let status = manager.status(name).ok()?;
+            let status = manager.census_record(name).ok()?;
             let identity = ["harness_identity", "custom_process_identity"]
                 .iter()
                 .find_map(|key| {
@@ -5459,15 +5584,21 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
             // its foreground is not a bare shell, Herdr recognises an agent
             // in it, and the recorded process identity is alive in the
             // kernel (pid + start time + executable). A label never promotes.
-            let live_proven = status["pane_id"].as_str().is_some_and(|pane| {
-                panes.iter().any(|candidate| candidate.pane_id == pane)
-                    && !client.pane_is_idle_shell(pane).unwrap_or(true)
-                    && client
-                        .pane_info(pane)
-                        .is_ok_and(|info| info.agent.is_some())
-            }) && identity.as_ref().is_some_and(|identity| {
-                client.process_liveness(identity) == crate::client::ProcessLiveness::Alive
-            });
+            // Only a `launch_failed` record can be promoted, so the proof
+            // (an idle-shell probe per pane, #1971) is paid only for those;
+            // every other record reads `live_proven: false`, which the
+            // planner uses for nothing else.
+            let live_proven = status["lifecycle"].as_str() == Some("launch_failed")
+                && status["pane_id"].as_str().is_some_and(|pane| {
+                    panes.iter().any(|candidate| candidate.pane_id == pane)
+                        && !client.pane_is_idle_shell(pane).unwrap_or(true)
+                        && client
+                            .pane_info(pane)
+                            .is_ok_and(|info| info.agent.is_some())
+                })
+                && identity.as_ref().is_some_and(|identity| {
+                    client.process_liveness(identity) == crate::client::ProcessLiveness::Alive
+                });
             Some(crate::tabs::AgentFacts {
                 cwd: status["cwd"].as_str().unwrap_or_default().to_owned(),
                 name: name.clone(),
@@ -5820,6 +5951,235 @@ mod tests {
             workspace_id: "w1".into(),
         }];
         assert!(orphan_still_empty(&other, "w1:t9"));
+    }
+
+    /// Counting fake for the census tests (#1971): every Herdr-shaped
+    /// call the census makes is recorded, so a test can prove which
+    /// panes paid for the expensive idle-shell proof and screen read.
+    struct CensusFake {
+        panes: Vec<crate::client::Pane>,
+        pane_info_calls: std::sync::Mutex<Vec<String>>,
+        idle_calls: std::sync::Mutex<Vec<String>>,
+        read_calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl CensusFake {
+        fn new(panes: Vec<crate::client::Pane>) -> Self {
+            Self {
+                panes,
+                pane_info_calls: std::sync::Mutex::new(Vec::new()),
+                idle_calls: std::sync::Mutex::new(Vec::new()),
+                read_calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl crate::agent::AgentApi for CensusFake {
+        fn panes(&self) -> crate::error::Result<Vec<crate::client::Pane>> {
+            Ok(self.panes.clone())
+        }
+        fn pane_info(&self, pane_id: &str) -> crate::error::Result<crate::client::AgentPaneInfo> {
+            self.pane_info_calls
+                .lock()
+                .unwrap()
+                .push(pane_id.to_owned());
+            let pane = self
+                .panes
+                .iter()
+                .find(|pane| pane.pane_id == pane_id)
+                .unwrap();
+            Ok(crate::client::AgentPaneInfo {
+                pane_id: pane_id.to_owned(),
+                workspace_id: pane.workspace_id.clone(),
+                cwd: "/work/slot".to_owned(),
+                agent: Some("muse".to_owned()),
+                status: "idle".to_owned(),
+                session_agent: None,
+                session_value: None,
+                scroll: None,
+                terminal_id: None,
+                tab_id: Some(pane.tab_id.clone()),
+                reported_status: None,
+            })
+        }
+        fn workspace_label(&self, _workspace: &str) -> crate::error::Result<String> {
+            Ok("w".to_owned())
+        }
+        fn run(&self, _pane: &str, _text: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn wait_agent_status(
+            &self,
+            _pane: &str,
+            _status: &str,
+            _timeout_ms: u64,
+        ) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn read(
+            &self,
+            pane_id: &str,
+            _source: &str,
+            _lines: Option<usize>,
+        ) -> crate::error::Result<String> {
+            self.read_calls.lock().unwrap().push(pane_id.to_owned());
+            Ok("$ ".to_owned())
+        }
+    }
+
+    impl crate::subagents::ManagedApi for CensusFake {
+        fn workspace_id_for_label(&self, _label: &str) -> crate::error::Result<Option<String>> {
+            Ok(None)
+        }
+        fn create_workspace(
+            &self,
+            _label: &str,
+            _cwd: &str,
+            _environment: &[String],
+        ) -> crate::error::Result<(String, String, String)> {
+            Err(crate::error::AdapterError::unavailable("fake"))
+        }
+        fn create_tab(
+            &self,
+            _workspace: &str,
+            _label: &str,
+            _cwd: &str,
+            _environment: &[String],
+        ) -> crate::error::Result<String> {
+            Err(crate::error::AdapterError::unavailable("fake"))
+        }
+        fn create_tab_with_pane(
+            &self,
+            _workspace: &str,
+            _label: &str,
+            _cwd: &str,
+            _environment: &[String],
+        ) -> crate::error::Result<(String, String)> {
+            Err(crate::error::AdapterError::unavailable("fake"))
+        }
+        fn close_pane(&self, _pane: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn focus_pane(&self, _pane: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn rename_tab(&self, _tab: &str, _label: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn start_agent(
+            &self,
+            _name: &str,
+            _harness: &str,
+            _pane: &str,
+            _args: &[String],
+            _timeout: Duration,
+        ) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn agent_pane(&self, _name: &str) -> crate::error::Result<String> {
+            Err(crate::error::AdapterError::unavailable("fake"))
+        }
+        fn report_agent_session(
+            &self,
+            _name: &str,
+            _pane: &str,
+            _kind: &str,
+            _session: &str,
+        ) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn send_keys(&self, _pane: &str, _key: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn close_tab(&self, _tab: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn pane_is_idle_shell(&self, pane: &str) -> crate::error::Result<bool> {
+            self.idle_calls.lock().unwrap().push(pane.to_owned());
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn census_probes_only_unclaimed_panes_and_gets_each_pane_once() {
+        // #1971: a claimed pane's verdict never uses the idle-shell
+        // proof or its screen, so the census must not pay the
+        // stable-identity observation (seconds on a dead or exec-ing
+        // shell) for it; one `pane get` serves cwd and foreground.
+        let pane = |id: &str, tab: &str| crate::client::Pane {
+            pane_id: id.to_owned(),
+            tab_id: tab.to_owned(),
+            workspace_id: "w1".to_owned(),
+        };
+        let fake = CensusFake::new(vec![
+            pane("w1:p1", "w1:t1"), // claimed by a record's pane
+            pane("w1:p2", "w1:t2"), // in a record's viewer tab
+            pane("w1:p3", "w1:t3"), // unclaimed: probed
+        ]);
+        let claimed: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::from(["w1:p1".to_owned()]);
+        let viewers: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::from(["w1:t2".to_owned()]);
+        let (facts, truncated) = census_pane_facts(
+            &fake,
+            &fake.panes.clone(),
+            &BTreeMap::new(),
+            &claimed,
+            &viewers,
+        );
+        assert!(!truncated);
+        assert_eq!(
+            fake.pane_info_calls.lock().unwrap().len(),
+            3,
+            "one pane get per pane"
+        );
+        assert_eq!(
+            *fake.idle_calls.lock().unwrap(),
+            vec!["w1:p3".to_owned()],
+            "idle proof only for the unclaimed pane"
+        );
+        assert_eq!(
+            *fake.read_calls.lock().unwrap(),
+            vec!["w1:p3".to_owned()],
+            "screen read only for the unclaimed pane"
+        );
+        let unclaimed = facts.iter().find(|fact| fact.pane_id == "w1:p3").unwrap();
+        assert!(unclaimed.idle_shell && !unclaimed.composer_text);
+        for fact in facts.iter().filter(|fact| fact.pane_id != "w1:p3") {
+            assert!(!fact.idle_shell, "claimed panes are never closable here");
+            assert_eq!(fact.foreground, "muse");
+            assert_eq!(fact.cwd, "/work/slot");
+        }
+    }
+
+    #[test]
+    fn tabs_apply_persists_and_reloads_its_grace_state() {
+        // #1971: a one-shot pass writes tab-hygiene.json and the next
+        // pass reads the same clocks back, so a timer-driven pass
+        // continues a grace a restore pass started.
+        let directory = std::env::temp_dir().join(format!(
+            "agentctl-tab-hygiene-state-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let registry = directory.join("registry");
+        fs::create_dir_all(&registry).unwrap();
+        let fake = CensusFake::new(Vec::new());
+        let config = RestoreConfig::load(&registry).unwrap();
+        let applied = tabs_apply(&fake, &registry, &config, &SystemHost).unwrap();
+        assert_eq!(applied["applied"], true);
+        let state = read_report(&registry.join(TAB_HYGIENE_STATE_FILE)).unwrap();
+        assert_eq!(state["schema"], "agentctl-tab-hygiene/v1");
+        // A clock stamped by hand survives a reload round-trip.
+        let mut state = state;
+        state["bare_shell_since"] = json!({"w1:p9": 42.0});
+        write_report(&registry.join(TAB_HYGIENE_STATE_FILE), &state).unwrap();
+        let (bare, _tabs, _closed) = load_tab_hygiene_state(&registry);
+        assert_eq!(bare.get("w1:p9"), Some(&42.0));
+        fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
