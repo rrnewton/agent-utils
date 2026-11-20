@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-search-typing-changed-only: search typing writes only changed rows and settles in one coalesced pass'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -9,7 +9,8 @@ labels:
 - ui
 - performance
 created_at: 2026-11-20T14:10:00-05:00
-updated_at: 2026-11-20T14:10:00-05:00
+updated_at: 2026-11-20T15:05:00-05:00
+closed_at: 2026-11-20T15:05:00-05:00
 ---
 
 # Description
@@ -34,3 +35,7 @@ updated_at: 2026-11-20T14:10:00-05:00
 # Notes
 
 Owner-priority, fast-track. Standing lane mu-clientperf under coordb; one fix per issue, one commit per fix. Builds on #1913 vibe-talk-search-typing-lag and the #1976 Phase 1 measurements. Fix 2 (archive single-row dress) gets its own number after this lands.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as 260d5b0b (replayed tip 353412fc with the #1976 issue file), deployed 2026-11-20 2:54 PM ET. Changed-only search writes and one coalesced adaptive settled pass; browser gate counts class/fetch/storage writes per key. Before/after (816-row fixture, devbig030): refining-key class writes 816 -> 0-5, settled-pass class writes 5,713 -> 1; search latency p50 79 -> 78 ms at 1x, 1,744 -> 1,413 ms at 4x.
