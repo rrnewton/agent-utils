@@ -6531,8 +6531,10 @@ def _assert_not_held(config: Config, record: ActiveRecord) -> None:
 
 def _assert_absent_validate_rows_not_held(config: Config, records: Sequence[ActiveRecord]) -> None:
     slots = {record.slot for record in records}
-    events = _load_events(config, config.machine)
-    if not events:
+    # Streamed (#1931): only the named slots' hold state is derived, one
+    # verified event at a time; the empty-log snapshot branch is unchanged.
+    events: Iterable[Mapping[str, object]] = _iter_events(config, config.machine)
+    if not _event_file_names(_event_directory(config, config.machine)):
         for record in records:
             hold_snapshot = _load_hold_snapshot(config, record.slot, record.machine)
             if hold_snapshot is not None:
@@ -10477,14 +10479,61 @@ def _event_writer(config: Config, machine: str) -> _EventWriter:
     directory.mkdir(mode=0o755, parents=True, exist_ok=True)
     if created:
         _fsync_directory(directory.parent)
-    events = _load_events(config, machine)
+    # Position at the chain tip without retaining the history (#1931):
+    # reuse this scope's per-file memo exactly as `_verify_event_paths`
+    # does (an event already parsed in this command is never re-parsed,
+    # and only settled files are kept), otherwise parse one event at a
+    # time and drop it. Either way the whole chain is verified.
+    sequence = 0
+    previous_sha256 = "0" * 64
+    memo = _ACTIVE_EVENT_MEMO[-1].files if _ACTIVE_EVENT_MEMO else None
+    observed_ns = _event_memo_clock_ns()
+    names = _event_file_names(directory)
+    # Retaining parsed events is the memo's parse-once behaviour for
+    # chains up to its own whole-chain limit; past it, parse and drop
+    # so a writer on a huge history stays bounded (#1931).
+    retain = memo is not None and len(names) <= _CHAIN_MEMO_EVENTS_LIMIT
+    for name in names:
+        sequence += 1
+        path = directory / name
+        raw: dict[str, object] | None = None
+        if memo is not None:
+            identity = _event_file_identity(path)
+            cached = memo.get((str(path), machine))
+            if (
+                identity is not None
+                and cached is not None
+                and cached[:3] == (identity, sequence, previous_sha256)
+            ):
+                raw = cached[3]
+            elif identity is not None:
+                raw = _event_from_path(path, machine, sequence, previous_sha256)
+                if retain and (
+                    identity[4] + _EVENT_MEMO_STABLE_NS <= observed_ns
+                    and _event_file_identity(path) == identity
+                ):
+                    memo_scope = _ACTIVE_EVENT_MEMO[-1]
+                    if len(memo) >= _EVENT_MEMO_ENTRIES_LIMIT or (
+                        memo_scope.bytes_limit is not None
+                        and memo_scope.file_bytes + identity[2] > memo_scope.bytes_limit
+                    ):
+                        memo.clear()
+                        memo_scope.file_bytes = 0
+                    memo[(str(path), machine)] = (
+                        identity,
+                        sequence,
+                        previous_sha256,
+                        raw,
+                    )
+                    memo_scope.file_bytes += identity[2]
+        if raw is None:
+            raw = _event_from_path(path, machine, sequence, previous_sha256)
+        previous_sha256 = _as_str(raw["sha256"], "append-only event.sha256")
     return _EventWriter(
         directory=directory,
         machine=machine,
-        sequence=len(events),
-        previous_sha256=(
-            "0" * 64 if not events else _as_str(events[-1]["sha256"], "append-only event.sha256")
-        ),
+        sequence=sequence,
+        previous_sha256=previous_sha256,
     )
 
 
@@ -11294,6 +11343,31 @@ def _states_from_events(
     return _states_from_fold(machine, fold)
 
 
+def _states_from_events_streamed(
+    config: Config, machine: str, *, require_repository: bool = True
+) -> tuple[ActiveState, ArchiveState] | None:
+    """Streamed `_states_from_events`: fold one event at a time (#1931).
+
+    The chain is verified and folded record by record via `_iter_events`
+    and the shared `_fold_events_into`, retaining only the derived
+    registry state, so peak memory is bounded by the current registry
+    independently of history size. The derived state, checks and
+    refusals are identical to the materialised fold. Returns None when
+    the log is empty, as `_states_from_events` does.
+    """
+
+    if not _event_file_names(_event_directory(config, machine)):
+        return None
+    fold = _ReplayFold()
+    _fold_events_into(config, machine, _iter_events(config, machine), fold)
+    if fold.active_revision is None or fold.archive_revision is None:
+        raise StateError("append-only event log has no complete imported state")
+    if require_repository:
+        for record in fold.active_records.values():
+            _assert_record_paths(config, record, require_repository=True)
+    return _states_from_fold(machine, fold)
+
+
 _UNREPLAYABLE_PREFIX = "refusing to append an event the registry loader would reject: "
 
 
@@ -11402,10 +11476,17 @@ def _load_active(
     machine: str | None = None,
     *,
     require_repository: bool = True,
+    stream_events: bool = False,
 ) -> ActiveState:
     selected = machine or config.machine
-    states = _states_from_events(
-        config, selected, require_repository=require_repository
+    states = (
+        _states_from_events_streamed(
+            config, selected, require_repository=require_repository
+        )
+        if stream_events
+        else _states_from_events(
+            config, selected, require_repository=require_repository
+        )
     )
     return (
         _load_active_snapshot(
@@ -11421,10 +11502,17 @@ def _load_archive(
     machine: str | None = None,
     *,
     require_repository: bool = True,
+    stream_events: bool = False,
 ) -> ArchiveState:
     selected = machine or config.machine
-    states = _states_from_events(
-        config, selected, require_repository=require_repository
+    states = (
+        _states_from_events_streamed(
+            config, selected, require_repository=require_repository
+        )
+        if stream_events
+        else _states_from_events(
+            config, selected, require_repository=require_repository
+        )
     )
     return _load_archive_snapshot(config, selected) if states is None else states[1]
 
@@ -11587,7 +11675,7 @@ def _write_active_rows_removed(
     if missing:
         raise StateError(f"cannot batch-remove missing slot {missing[0]}")
     _ensure_event_log(config, state.machine)
-    previous = _load_active(config, state.machine)
+    previous = _load_active(config, state.machine, stream_events=True)
     if previous != state:
         raise StateError("active state changed before batch removal")
     revision = state.revision
@@ -11805,46 +11893,67 @@ def _remember_pending(
     )
 
 
+def _fold_pending_event(
+    config: Config,
+    machine: str,
+    event: Mapping[str, object],
+    pending: dict[Path, Mapping[str, object]],
+) -> None:
+    kind = _as_str(event["kind"], "append-only event.kind")
+    payload = _as_mapping(event["payload"], "append-only event.payload")
+    if kind == "operation-progress-recorded":
+        journal_value = _as_mapping(
+            payload.get("journal"), "append-only operation journal"
+        )
+        path = _operation_event_journal_path(
+            config, machine, payload, journal=journal_value
+        )
+        identity = (journal_value.get("kind"), journal_value.get("slot"))
+        for existing_path, existing in pending.items():
+            if existing_path != path and (
+                existing.get("kind"), existing.get("slot")
+            ) == identity:
+                raise StateError(
+                    "append-only history has the same pending operation under "
+                    "multiple journal paths"
+                )
+        pending[path] = journal_value
+    elif kind in {"operation-completed", "operation-quarantined"}:
+        path = _operation_event_journal_path(config, machine, payload)
+        current = pending.get(path)
+        if current is None:
+            return
+        if (
+            payload.get("slot") == current.get("slot")
+            and payload.get("operation") == current.get("kind")
+        ):
+            del pending[path]
+        else:
+            raise StateError(
+                "append-only completion does not match its pending operation"
+            )
+
+
 def _pending_operations_from_events(
     config: Config, machine: str
 ) -> Mapping[Path, Mapping[str, object]]:
     events = _load_events(config, machine)
     start, pending = _resume_pending(config, machine, events)
     for event in events[start:]:
-        kind = _as_str(event["kind"], "append-only event.kind")
-        payload = _as_mapping(event["payload"], "append-only event.payload")
-        if kind == "operation-progress-recorded":
-            journal_value = _as_mapping(
-                payload.get("journal"), "append-only operation journal"
-            )
-            path = _operation_event_journal_path(
-                config, machine, payload, journal=journal_value
-            )
-            identity = (journal_value.get("kind"), journal_value.get("slot"))
-            for existing_path, existing in pending.items():
-                if existing_path != path and (
-                    existing.get("kind"), existing.get("slot")
-                ) == identity:
-                    raise StateError(
-                        "append-only history has the same pending operation under "
-                        "multiple journal paths"
-                    )
-            pending[path] = journal_value
-        elif kind in {"operation-completed", "operation-quarantined"}:
-            path = _operation_event_journal_path(config, machine, payload)
-            current = pending.get(path)
-            if current is None:
-                continue
-            if (
-                payload.get("slot") == current.get("slot")
-                and payload.get("operation") == current.get("kind")
-            ):
-                del pending[path]
-            else:
-                raise StateError(
-                    "append-only completion does not match its pending operation"
-                )
+        _fold_pending_event(config, machine, event, pending)
     _remember_pending(config, machine, events, pending)
+    return pending
+
+
+def _pending_operations_from_events_streamed(
+    config: Config, machine: str
+) -> Mapping[Path, Mapping[str, object]]:
+    """Streamed `_pending_operations_from_events` (#1931): same fold and
+    refusals, one verified event at a time, without the pending memo."""
+
+    pending: dict[Path, Mapping[str, object]] = {}
+    for event in _iter_events(config, machine):
+        _fold_pending_event(config, machine, event, pending)
     return pending
 
 
@@ -12859,6 +12968,58 @@ def _load_all_archives(
     return archives
 
 
+def _load_all_active_streamed(
+    config: Config, *, require_repository: bool = True
+) -> list[ActiveState]:
+    """`_load_all_active` with the streamed event fold (#1931)."""
+
+    states = [
+        _load_active(
+            config, machine, require_repository=require_repository, stream_events=True
+        )
+        for machine in _state_machines(config)
+    ]
+    global_slots: dict[str, str] = {}
+    global_agents: dict[str, str] = {}
+    for state in states:
+        for record in state.slots:
+            previous_slot = global_slots.setdefault(record.slot, state.machine)
+            if previous_slot != state.machine:
+                raise StateError(
+                    f"slot {record.slot!r} is active in both {previous_slot} and {state.machine}"
+                )
+            if record.slot_type == "agent" and record.import_source is None:
+                previous_agent = global_agents.setdefault(record.agent, record.slot)
+                if previous_agent != record.slot:
+                    raise StateError(
+                        f"agent {record.agent!r} owns both {previous_agent} and {record.slot}"
+                    )
+    return states
+
+
+def _load_all_archives_streamed(
+    config: Config, *, require_repository: bool = True
+) -> list[ArchiveState]:
+    """`_load_all_archives` with the streamed event fold (#1931)."""
+
+    archives = [
+        _load_archive(
+            config, machine, require_repository=require_repository, stream_events=True
+        )
+        for machine in _state_machines(config)
+    ]
+    slots: dict[str, str] = {}
+    for archive in archives:
+        for record in archive.records:
+            slot = _as_str(record.get("slot"), "archive slot")
+            previous = slots.setdefault(slot, archive.machine)
+            if previous != archive.machine:
+                raise StateError(
+                    f"slot {slot!r} is archived in both {previous} and {archive.machine}"
+                )
+    return archives
+
+
 def _load_archives_tolerant(
     config: Config,
 ) -> tuple[list[ArchiveState], list[dict[str, object]]]:
@@ -12973,6 +13134,33 @@ def _validate_global_state(
         return _validate_global_state_once(config, require_repository=require_repository)
 
 
+def _validate_global_state_streamed(
+    config: Config, *, require_repository: bool = True
+) -> tuple[list[ActiveState], list[ArchiveState]]:
+    """`_validate_global_state` with the streamed fold (#1931): same
+    overlap rule, derived one event at a time per machine."""
+
+    try:
+        return _validate_global_state_once_streamed(
+            config, require_repository=require_repository
+        )
+    except _RegistryOverlap as overlap:
+        subject = config.control / "ACTIVE"
+        if _holds_lock(subject):
+            raise
+        first = overlap
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(
+                _locked(subject, exclusive=False, wait_seconds=_OVERLAP_REREAD_LOCK_WAIT_SECONDS)
+            )
+        except Refusal:
+            raise first from None
+        return _validate_global_state_once_streamed(
+            config, require_repository=require_repository
+        )
+
+
 def _prewarm_registry_read(read: Callable[[], object]) -> None:
     """Run a reader's registry validation once before it takes the shared lock (#1172).
 
@@ -13001,6 +13189,28 @@ def _validate_global_state_once(
 ) -> tuple[list[ActiveState], list[ArchiveState]]:
     states = _load_all_active(config, require_repository=require_repository)
     archives = _load_all_archives(config, require_repository=require_repository)
+    active_slots = {
+        record.slot: state.machine for state in states for record in state.slots
+    }
+    for archive in archives:
+        for record in archive.records:
+            slot = _as_str(record.get("slot"), "archive slot")
+            if slot in active_slots:
+                raise _RegistryOverlap(
+                    f"slot {slot!r} is active on {active_slots[slot]} and archived on {archive.machine}"
+                )
+    return states, archives
+
+
+def _validate_global_state_once_streamed(
+    config: Config, *, require_repository: bool = True
+) -> tuple[list[ActiveState], list[ArchiveState]]:
+    states = _load_all_active_streamed(
+        config, require_repository=require_repository
+    )
+    archives = _load_all_archives_streamed(
+        config, require_repository=require_repository
+    )
     active_slots = {
         record.slot: state.machine for state in states for record in state.slots
     }
@@ -42021,7 +42231,10 @@ def _journal_machine(config: Config, path: Path) -> str | None:
 
 
 def _outstanding_journals(
-    config: Config, machines: AbstractSet[str] | None = None
+    config: Config,
+    machines: AbstractSet[str] | None = None,
+    *,
+    stream_events: bool = False,
 ) -> list[Path]:
     """Outstanding mutation journals, optionally for named machines only.
 
@@ -42056,7 +42269,11 @@ def _outstanding_journals(
         machine = directory.name.removeprefix("EVENTS.")
         if machines is not None and machine not in machines:
             continue
-        paths.update(_pending_operations_from_events(config, machine))
+        paths.update(
+            _pending_operations_from_events_streamed(config, machine)
+            if stream_events
+            else _pending_operations_from_events(config, machine)
+        )
     return sorted(paths)
 
 
@@ -94217,9 +94434,18 @@ def _absent_validate_rows_state(
     *,
     allow_exact_overlap: bool,
     require_repository: bool = True,
+    stream_events: bool = False,
 ) -> tuple[list[ActiveState], list[ArchiveState]]:
-    states = _load_all_active(config, require_repository=require_repository)
-    archives = _load_all_archives(config, require_repository=require_repository)
+    if stream_events:
+        states = _load_all_active_streamed(
+            config, require_repository=require_repository
+        )
+        archives = _load_all_archives_streamed(
+            config, require_repository=require_repository
+        )
+    else:
+        states = _load_all_active(config, require_repository=require_repository)
+        archives = _load_all_archives(config, require_repository=require_repository)
     allowed = {(item.machine, item.slot): item for item in items}
     active = {record.slot: (state.machine, record) for state in states for record in state.slots}
     for archive in archives:
@@ -94253,7 +94479,9 @@ def _plan_absent_validate_rows(
             f"every input row must name selected machine {config.machine}; use --machine "
             "for another shard"
         )
-    states, archives = _absent_validate_rows_state(config, items, allow_exact_overlap=False)
+    states, archives = _absent_validate_rows_state(
+        config, items, allow_exact_overlap=False, stream_events=True
+    )
     active_by_identity = {
         (state.machine, record.slot): record for state in states for record in state.slots
     }
@@ -94447,6 +94675,7 @@ def _recover_absent_validate_rows(
         config,
         tuple(item for item, _record, _entry in items),
         allow_exact_overlap=True,
+        stream_events=True,
     )
     active_state = next(state for state in states if state.machine == config.machine)
     archive_state = next(state for state in archives if state.machine == config.machine)
@@ -94564,7 +94793,7 @@ def _recover_absent_validate_rows(
     # only in the fold, not in the snapshot files, so a snapshot
     # readback cannot prove it (#1701; the streamed fold of #1794
     # is the path to cheapen this load, not a snapshot shortcut).
-    states, archives = _validate_global_state(config)
+    states, archives = _validate_global_state_streamed(config)
     active_by_identity = {
         (state.machine, record.slot): record for state in states for record in state.slots
     }
@@ -94700,7 +94929,7 @@ def _cmd_recover_absent_validate_rows(args: argparse.Namespace) -> int:
         lock_started = time.monotonic()
         with _mutation_locks(config, args.wait_lock):
             _refuse_partial_state(config)
-            journals = _outstanding_journals(config)
+            journals = _outstanding_journals(config, stream_events=True)
             if journals:
                 if len(journals) != 1:
                     raise StateError("multiple interrupted mutations require inspection")
@@ -94717,7 +94946,7 @@ def _cmd_recover_absent_validate_rows(args: argparse.Namespace) -> int:
                     (item.machine, item.slot, item.generation) for item, _record, _entry in items
                 }
                 already_recovered_keys = _already_recovered_absent_validate_keys(
-                    _load_all_archives(config), requested
+                    _load_all_archives_streamed(config), requested
                 )
                 unaccounted = [
                     item
@@ -94777,7 +95006,7 @@ def _cmd_recover_absent_validate_rows(args: argparse.Namespace) -> int:
                     lock_seconds=time.monotonic() - lock_started,
                 )
                 return 0
-            states, archives = _validate_global_state(config)
+            states, archives = _validate_global_state_streamed(config)
             before = _global_rows(states, archives)
             already_recovered_keys = _already_recovered_absent_validate_keys(
                 archives, requested
@@ -94827,11 +95056,15 @@ def _cmd_recover_absent_validate_rows(args: argparse.Namespace) -> int:
                     # when every registry row is unchanged, so a
                     # refusal after any archive or ACTIVE write keeps
                     # its journal for replay.
-                    after_states, after_archives = _validate_global_state(config)
+                    after_states, after_archives = _validate_global_state_streamed(
+                        config
+                    )
                     if _global_rows(after_states, after_archives) == before:
                         _clear_journal(config, journal)
                     raise
-                after_states, after_archives = _validate_global_state(config)
+                after_states, after_archives = _validate_global_state_streamed(
+                    config
+                )
                 target_slots = {item.slot for item in requested}
                 if {
                     key: value
@@ -100108,8 +100341,20 @@ def _install_parent_death_signal() -> None:
 
 
 #: Commands whose client must not outlive the wrapper that launched it (#1681).
+#: Every member is journal-resumable: killing it mid-mutation leaves a
+#: journal a later `recover` (or a rerun of the same command) completes,
+#: which is what makes the parent-death signal safe to arm (#1931).
 _PARENT_DEATH_COMMANDS = frozenset(
-    {"remove", "remove-agent-batch", "remove-validate-batch", "retire-pending", "finisher"}
+    {
+        "remove",
+        "remove-agent-batch",
+        "remove-validate-batch",
+        "retire-pending",
+        "finisher",
+        "recover-absent-agent-row",
+        "recover-absent-agent-rows",
+        "recover-absent-validate-rows",
+    }
 )
 
 

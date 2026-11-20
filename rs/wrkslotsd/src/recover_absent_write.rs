@@ -22,7 +22,6 @@ use crate::canonical::canonical_sha256;
 use crate::config_validate::validate_name;
 use crate::ensure_states::{refuse_partial_state, require_fixture};
 use crate::finish_write::assert_record_paths;
-use crate::global_state::load_event_chain;
 use crate::hold_write::{acquire_mutation_locks, active_document, validate_global};
 use crate::status_state::read_process_identity;
 
@@ -48,39 +47,44 @@ fn is_digest(value: &str) -> bool {
 pub(crate) fn archives_document(cfg: &Cfg, selected: &str) -> Result<Value> {
     // When an event log exists, both state files are derived from
     // it (a snapshot may lag a crash); otherwise read the snapshot.
-    if let Ok(events) = load_event_chain(&cfg.control.join(format!("EVENTS.{selected}")), selected)
-    {
-        if !events.is_empty() {
-            let mut records: Vec<Value> = Vec::new();
-            let mut revision: i64 = 0;
-            for event in &events {
-                let payload = event.get("payload").cloned().unwrap_or(Value::Null);
-                match event.get("kind").and_then(Value::as_str) {
-                    Some("state-imported") => {
-                        if let Some(archive) = payload.get("archive") {
-                            records = archive
-                                .get("records")
-                                .and_then(Value::as_array)
-                                .cloned()
-                                .unwrap_or_default();
-                            revision = archive
-                                .get("revision")
-                                .and_then(Value::as_i64)
-                                .unwrap_or(revision);
-                        }
-                    }
-                    Some("archive-state-recorded") => {
-                        if let Some(record) = payload.get("record") {
-                            records.push(record.clone());
-                        }
-                        revision = payload
+    // Streamed (#1931): fold the chain one event at a time, retaining
+    // only the derived archive records (current state, not history).
+    let folded = crate::global_state::event_chain_fold(
+        &cfg.control.join(format!("EVENTS.{selected}")),
+        selected,
+        (false, Vec::<Value>::new(), 0_i64),
+        |state, event| {
+            state.0 = true;
+            let payload = event.get("payload").cloned().unwrap_or(Value::Null);
+            match event.get("kind").and_then(Value::as_str) {
+                Some("state-imported") => {
+                    if let Some(archive) = payload.get("archive") {
+                        state.1 = archive
+                            .get("records")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default();
+                        state.2 = archive
                             .get("revision")
                             .and_then(Value::as_i64)
-                            .unwrap_or(revision);
+                            .unwrap_or(state.2);
                     }
-                    _ => {}
                 }
+                Some("archive-state-recorded") => {
+                    if let Some(record) = payload.get("record") {
+                        state.1.push(record.clone());
+                    }
+                    state.2 = payload
+                        .get("revision")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(state.2);
+                }
+                _ => {}
             }
+        },
+    );
+    if let Ok((seen, records, revision)) = folded {
+        if seen {
             return Ok(json!({
                 "schema": 2,
                 "machine": selected,
@@ -110,11 +114,10 @@ fn recovery_matches(
     let Some(archive_id) = archived.get("archive_id").and_then(Value::as_str) else {
         return false;
     };
-    let Ok(events) = load_event_chain(&cfg.control.join(format!("EVENTS.{selected}")), selected)
-    else {
-        return false;
-    };
-    events.iter().any(|event| {
+    let Ok(matched) = crate::global_state::event_chain_matches(
+        &cfg.control.join(format!("EVENTS.{selected}")),
+        selected,
+        |event| {
         let payload = event.get("payload").cloned().unwrap_or(Value::Null);
         let record = payload.get("record").cloned().unwrap_or(Value::Null);
         let evidence = payload.get("evidence").cloned().unwrap_or(Value::Null);
@@ -135,7 +138,11 @@ fn recovery_matches(
             && evidence.get("archive_id").and_then(Value::as_str) == Some(archive_id)
             && evidence.get("source_record_sha256").and_then(Value::as_str) == Some(sha)
             && evidence.get("physical_storage").and_then(Value::as_str) == Some("externally-absent")
-    })
+        },
+    ) else {
+        return false;
+    };
+    matched
 }
 
 fn journal_path(cfg: &Cfg, selected: &str) -> PathBuf {

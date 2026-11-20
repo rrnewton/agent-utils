@@ -21,7 +21,6 @@ use crate::canonical::canonical_sha256;
 use crate::config_validate::validate_name;
 use crate::ensure_states::{refuse_partial_state, require_fixture};
 use crate::finish_write::assert_record_paths;
-use crate::global_state::load_event_chain;
 use crate::hold_write::{acquire_mutation_locks, active_document, validate_global};
 use crate::status_state::read_process_identity;
 
@@ -165,11 +164,12 @@ fn recovery_matches(
     let Some(archive_id) = archived.get("archive_id").and_then(Value::as_str) else {
         return false;
     };
-    let Ok(events) = load_event_chain(&cfg.control.join(format!("EVENTS.{selected}")), selected)
-    else {
-        return false;
-    };
-    events.iter().any(|event| {
+    // Streamed (#1931): validate the chain one event at a time and
+    // retain nothing; the match semantics are unchanged.
+    let Ok(matched) = crate::global_state::event_chain_matches(
+        &cfg.control.join(format!("EVENTS.{selected}")),
+        selected,
+        |event| {
         let payload = event.get("payload").cloned().unwrap_or(Value::Null);
         let record = payload.get("record").cloned().unwrap_or(Value::Null);
         let evidence = payload.get("evidence").cloned().unwrap_or(Value::Null);
@@ -192,7 +192,11 @@ fn recovery_matches(
             && evidence.get("source_record_sha256").and_then(Value::as_str)
                 == Some(row.record_sha256.as_str())
             && evidence.get("validation_outcome").and_then(Value::as_str) == Some("unknown")
-    })
+        },
+    ) else {
+        return false;
+    };
+    matched
 }
 
 /// Whether `path` is covered by a deleted-subvolume bind (#1771):

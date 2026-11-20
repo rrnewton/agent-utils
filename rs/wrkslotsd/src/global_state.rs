@@ -228,6 +228,36 @@ pub(crate) fn load_event_chain_filtered(
 /// How a machine's event log classifies under the log directory's entry
 /// rules: complete event files derive state, in-progress `.tmp.` files
 /// do not, and any other entry is invalid with the loader's message.
+/// Whether any archive-state-recorded event satisfies `predicate`,
+/// validating the whole chain and retaining only those events (#1931).
+pub(crate) fn event_chain_matches(
+    directory: &Path,
+    machine: &str,
+    predicate: impl FnMut(&Value) -> bool,
+) -> Result<bool> {
+    let events = load_event_chain_filtered(directory, machine, &["archive-state-recorded"])?;
+    Ok(events.iter().any(predicate))
+}
+
+/// Fold the chain's state-imported and archive-state-recorded events,
+/// retaining only those (current state, not history) (#1931).
+pub(crate) fn event_chain_fold<State>(
+    directory: &Path,
+    machine: &str,
+    mut state: State,
+    mut fold: impl FnMut(&mut State, &Value),
+) -> Result<State> {
+    let events = load_event_chain_filtered(
+        directory,
+        machine,
+        &["state-imported", "archive-state-recorded"],
+    )?;
+    for event in &events {
+        fold(&mut state, event);
+    }
+    Ok(state)
+}
+
 pub(crate) enum EventLogStatus {
     Snapshot,
     Derived,

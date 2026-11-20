@@ -33,6 +33,26 @@ def fixture_machine(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("WRKSLOTS_MACHINE", "testhost")
 
 
+def test_streamed_fold_matches_materialised_fold(tmp_path: Path) -> None:
+    """The streamed fold derives exactly the materialised state (#1931)."""
+
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(
+        project, slot="gone", agent="validate-a", branch=None,
+        slot_type="validate",
+    )
+    assert made.returncode == 0, made.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._states_from_events_streamed(config, "testhost") == (
+        wrkslots._states_from_events(config, "testhost")
+    )
+    # A second fold in the same memo scope resumes from the tip and
+    # still derives the identical state.
+    assert wrkslots._states_from_events_streamed(config, "testhost") == (
+        wrkslots._states_from_events(config, "testhost")
+    )
+
+
 def _absent_input(project: Path, slots: list[str]) -> Path:
     audit = wrkslots.main(
         ["--project-root", str(project), "audit", "--format", "json"]
