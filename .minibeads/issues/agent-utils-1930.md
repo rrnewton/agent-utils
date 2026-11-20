@@ -1,13 +1,14 @@
 ---
 title: 'wrkslots-detect-worktrees-outside-wrkslots: a read-only detector for worktrees created outside wrkslots'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - wrkslots
 - doctor
 created_at: 2026-11-19T19:40:00-05:00
-updated_at: 2026-11-19T19:40:00-05:00
+updated_at: 2026-11-20T06:30:00-05:00
+closed_at: 2026-11-20T06:30:00-05:00
 ---
 
 # Description
@@ -31,3 +32,7 @@ updated_at: 2026-11-19T19:40:00-05:00
 # Notes
 
 Separate commit from #1929 wrkslots-provenance-only-slot-offline-probe. No persisted state is written by the census.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main in 6e3873a2 (landed as dc2c5fdb): doctor --stray-worktrees read-only census (outside/nested unmanaged worktrees with branch, age, bounded size, unpushed), Rust doctor-text parity, deletes nothing. Focused suites and gate passed (gate reds only waived environment families).

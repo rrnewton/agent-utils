@@ -1,13 +1,14 @@
 ---
 title: 'wrkslots-provenance-only-slot-offline-probe: create must not refuse an offline slot at its remote probe'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - wrkslots
 - offline
 created_at: 2026-11-19T19:40:00-05:00
-updated_at: 2026-11-19T19:40:00-05:00
+updated_at: 2026-11-20T06:30:00-05:00
+closed_at: 2026-11-20T06:30:00-05:00
 ---
 
 # Description
@@ -31,3 +32,7 @@ updated_at: 2026-11-19T19:40:00-05:00
 # Notes
 
 Coordb approved the evidence-only recording (2026-11-19): gating at schema level 3 would make the flag useless to the writer_ceiling 2 consumer, and an ungated record field would make their old reader refuse remove/finish.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main in fbaa6ef6 (landed as dc2c5fdb): create --offline-reason TEXT skips the create-time remote probe; reason recorded only in slot-created event evidence. Old readers 096a8d74/74549a37 status/doctor/audit/finish/remove proven on a scratch offline slot. Focused suites and gate passed (gate reds only waived environment families).
