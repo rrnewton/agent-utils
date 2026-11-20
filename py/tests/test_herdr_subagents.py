@@ -2362,6 +2362,34 @@ def test_goal_confirms_only_its_exact_replacement_menu(tmp_path: Path, monkeypat
     assert fake.submitted == ["/goal finish this task"]
 
 
+def test_replace_goal_picker_is_an_answerable_question() -> None:
+    # #1939: the recorded picker classifies as a question prompts can
+    # name and answer can choose, never as an opaque menu.
+    from agentctl.harness_tui import State
+    from agentctl.harness_tui.codex import CodexTui, read_replace_goal_picker
+
+    screen = ("Replace goal?\nNew objective: finish this task\n"
+              "› 1. Replace current goal  Set the new objective and start it now\n"
+              "2. Cancel  Keep the current goal\n"
+              "Press enter to confirm or esc to go back")
+    picker = read_replace_goal_picker(screen)
+    assert picker is not None
+    shown, _cut, selected, _replace, _cancel = picker
+    assert (shown, selected) == ("finish this task", 1)
+    view = CodexTui().classify(screen)
+    assert view.state is State.QUESTION
+    assert view.question is not None
+    assert [option.number for option in view.question.options] == [1, 2]
+    assert view.question.selected == 1
+    # Near misses stay unanswerable: no footer, a renamed option, or no
+    # objective line is not the recorded picker.
+    for near in (screen.replace("Press enter to confirm or esc to go back", "esc to go back"),
+                 screen.replace("Replace current goal", "Replace the goal"),
+                 screen.replace("New objective: ", "Objective: ")):
+        assert read_replace_goal_picker(near) is None
+        assert CodexTui().classify(near).question is None
+
+
 def test_queued_goals_keep_confirmation_authority_across_restart(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from agentctl.errors import AgentPossiblySubmitted
     manager, fake = setup(tmp_path, monkeypatch)

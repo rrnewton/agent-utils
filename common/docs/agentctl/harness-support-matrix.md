@@ -362,7 +362,13 @@ answers a recognised form, per harness in
   (`rs/agentctl/src/harness_tui/claude.rs`).
 - **Codex**: supported — question forms including free text through the
   "None of the above" option, plus the rate-limit model-switch form
-  (`rs/agentctl/src/harness_tui/codex.rs`).
+  (`rs/agentctl/src/harness_tui/codex.rs`). The Replace-goal picker is
+  recognised by strict recorded text (#1939; `CodexReplacement` in
+  `rs/agentctl/src/goal_command.rs`), so `prompts` names it with both
+  options and `answer --option 1|2` can choose either; a near miss
+  stays an unanswerable menu. Nothing auto-answers it from here: only
+  a goal delivery flow may confirm its own offered goal (see Goal
+  commands).
 - **Muse**: none — Muse forms are classified so status can say
   blocked, but `answer_plan` always refuses: "Muse forms are not
   answered by agentctl; answer them in the pane"
@@ -752,7 +758,14 @@ sender header (#609 sender-header-mandatory;
   them echoes it as an ordinary user turn
   (`rs/agentctl/src/goal_command.rs`). Codex additionally exposes its
   native goals over the app-server protocol (`agentctl codex-goal`,
-  `rs/agentctl/src/codex_goal.rs`) — Codex only.
+  `rs/agentctl/src/codex_goal.rs`) — Codex only. When Codex asks
+  whether to replace the goal already set, the goal delivery flows
+  (a registered goal's delivery, or the raw `/goal` command they typed)
+  confirm `Replace current goal` themselves only when the offered
+  objective is exactly the one they sent — a cut or wrapped showing
+  must be its prefix — with Replace highlighted (#1939); an offered
+  goal that differs, or with Cancel highlighted, cancels the question
+  instead, and no other path auto-answers the picker.
 - **Unknown TUI**: none — no answer row is known, so no proof exists.
 - **Headless**: partial — goals ride as ordinary queued turns; there is
   no screen answer to prove them with.

@@ -1,5 +1,7 @@
 //! Codex default-keymap question forms.
-use super::{navigation, option_row, plain, AnswerPlan, HarnessTui, Question, State, View};
+use super::{
+    navigation, option_row, plain, AnswerPlan, HarnessTui, OptionItem, Question, State, View,
+};
 
 pub struct CodexTui;
 impl HarnessTui for CodexTui {
@@ -11,6 +13,30 @@ impl HarnessTui for CodexTui {
     }
     fn classify(&self, screen: &str) -> View {
         let clean = plain(screen);
+        // The Replace-goal picker (#1939): strict recorded text, read as
+        // an answerable question so `prompts` names it and `answer` can
+        // choose either option. Nothing auto-answers it here; only a
+        // goal delivery flow may confirm its own offered goal.
+        if let Some(picker) = crate::goal_command::CodexReplacement::read(&clean) {
+            return View::question(Question {
+                text: format!("Replace goal?\nNew objective: {}", picker.new),
+                options: vec![
+                    OptionItem {
+                        number: 1,
+                        text: picker.replace_label.clone(),
+                    },
+                    OptionItem {
+                        number: 2,
+                        text: picker.cancel_label.clone(),
+                    },
+                ],
+                selected: picker.selected.map(usize::from),
+                total: 1,
+                collapsed: false,
+                notes: false,
+                draft: String::new(),
+            });
+        }
         let rows: Vec<_> = clean.lines().collect();
         let tail = rows[rows.len().saturating_sub(16)..]
             .join("\n")
@@ -305,5 +331,52 @@ impl HarnessTui for CodexTui {
             text: Some(text.to_owned()),
             selected: Some(other),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Replace-goal picker as recorded (#1939).
+    const PICKER: &str = "Replace goal?\nNew objective: finish this task\n› 1. Replace current \
+                          goal  Set the new objective and start it now\n2. Cancel  Keep the \
+                          current goal\nPress enter to confirm or esc to go back\n";
+
+    #[test]
+    fn the_replace_goal_picker_is_an_answerable_question() {
+        let view = CodexTui.classify(PICKER);
+        assert_eq!(view.state, State::BlockingQuestion, "{view:?}");
+        let question = view.question.expect("question");
+        assert!(question.text.contains("finish this task"), "{question:?}");
+        assert_eq!(
+            question
+                .options
+                .iter()
+                .map(|option| option.number)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert_eq!(question.selected, Some(1));
+        // Either option can be answered from the highlighted row.
+        let replace = CodexTui.answer_plan(&question, Some(1), None).unwrap();
+        assert_eq!(replace.submit_key, "Enter");
+        assert!(replace.keys.is_empty(), "{replace:?}");
+        let cancel = CodexTui.answer_plan(&question, Some(2), None).unwrap();
+        assert_eq!(cancel.keys, ["Down"]);
+        assert_eq!(cancel.selected, Some(2));
+    }
+
+    #[test]
+    fn a_near_miss_picker_stays_an_unanswerable_menu() {
+        for screen in [
+            PICKER.replace("Press enter to confirm or esc to go back", "esc to go back"),
+            PICKER.replace("Replace current goal", "Replace the goal"),
+            PICKER.replace("New objective: ", "Objective: "),
+        ] {
+            let view = CodexTui.classify(&screen);
+            assert_ne!(view.state, State::BlockingQuestion, "{view:?}");
+            assert!(view.question.is_none(), "{view:?}");
+        }
     }
 }

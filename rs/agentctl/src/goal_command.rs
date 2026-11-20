@@ -273,11 +273,156 @@ impl MuseReplacement {
     }
 }
 
+/// Codex's question whether to replace the goal already set, as one screen shows it
+/// (#1939 agentctl-codex-replace-goal-picker).
+///
+/// ```text
+/// Replace goal?
+/// New objective: OBJECTIVE
+/// › 1. Replace current goal  Set the new objective and start it now
+/// 2. Cancel  Keep the current goal
+/// Press enter to confirm or esc to go back
+/// ```
+///
+/// Strict, like the hooks trust dialog: the exact title, objective line,
+/// both options and the confirm footer must all show, or this is not the
+/// picker. The objective wraps at the pane's right edge, so a showing cut
+/// there (or ended with `…`) is read as cut, as Muse's is.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodexReplacement {
+    /// The new objective as shown, wrapped rows joined, without a trailing `…`.
+    pub new: String,
+    /// Whether the new objective was cut.
+    pub new_cut: bool,
+    /// The selected option: 1 replaces the current goal, 2 cancels.
+    pub selected: Option<u8>,
+    /// Option 1's label and description, as displayed.
+    pub replace_label: String,
+    /// Option 2's label and description, as displayed.
+    pub cancel_label: String,
+}
+
+impl CodexReplacement {
+    /// Read Codex's replacement question from `screen`, if it shows one.
+    #[must_use]
+    pub fn read(screen: &str) -> Option<Self> {
+        let lines: Vec<&str> = screen.lines().map(str::trim_end).collect();
+        let width = lines
+            .iter()
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(0);
+        let start = lines.iter().position(|line| line.trim() == "Replace goal?")?;
+        let rest = &lines[start + 1..];
+        if !rest
+            .iter()
+            .any(|line| line.trim() == "Press enter to confirm or esc to go back")
+        {
+            return None;
+        }
+        // The objective line, plus any rows it wraps onto, up to option 1.
+        let objective_at = rest.iter().position(|line| {
+            line.trim_start()
+                .strip_prefix("New objective:")
+                .is_some_and(|text| text.starts_with(' '))
+        })?;
+        let mut objective_rows: Vec<&str> = Vec::new();
+        for line in &rest[objective_at..] {
+            let trimmed = line.trim();
+            let body = trimmed
+                .strip_prefix('›')
+                .map_or(trimmed, |rest| rest.trim_start());
+            if body.starts_with("1. ") || body.starts_with("2. ") {
+                break;
+            }
+            objective_rows.push(line);
+        }
+        let first = objective_rows
+            .first()?
+            .trim_start()
+            .strip_prefix("New objective:")?
+            .trim()
+            .to_owned();
+        let mut new = first;
+        for row in &objective_rows[1..] {
+            new.push(' ');
+            new.push_str(row.trim());
+        }
+        let last_row = objective_rows.last()?;
+        let new_cut = last_row.chars().count() >= width || new.ends_with('…');
+        if new.ends_with('…') {
+            new = new.trim_end_matches('…').trim_end().to_owned();
+        }
+        if new.is_empty() {
+            return None;
+        }
+        // Both options, in order, with their exact descriptions.
+        let option = |number: u8| -> Option<(String, bool)> {
+            rest.iter().find_map(|line| {
+                let trimmed = line.trim();
+                let (selected, body) = match trimmed.strip_prefix('›') {
+                    Some(rest) => (true, rest.trim_start()),
+                    None => (false, trimmed),
+                };
+                let text = body.strip_prefix(&format!("{number}. "))?;
+                Some((text.trim().to_owned(), selected))
+            })
+        };
+        let (replace_label, replace_selected) = option(1)?;
+        let (cancel_label, cancel_selected) = option(2)?;
+        if !replace_label.starts_with("Replace current goal")
+            || !replace_label.contains("Set the new objective and start it now")
+            || !cancel_label.starts_with("Cancel")
+            || !cancel_label.contains("Keep the current goal")
+            || (replace_selected && cancel_selected)
+        {
+            return None;
+        }
+        Some(Self {
+            new,
+            new_cut,
+            selected: if replace_selected {
+                Some(1)
+            } else if cancel_selected {
+                Some(2)
+            } else {
+                None
+            },
+            replace_label,
+            cancel_label,
+        })
+    }
+
+    /// What a `/goal OBJECTIVE` command should do with this question: confirm
+    /// only when the offered objective is the one sent and `Replace current
+    /// goal` is selected. Anything else is never auto-answered.
+    #[must_use]
+    pub fn choice(&self, objective: &str) -> ReplacementChoice {
+        if !shows(&self.new, self.new_cut, objective) {
+            return ReplacementChoice::Cancel(
+                "Codex asked about replacing the goal, but the new objective it showed is not \
+                 the one sent"
+                    .to_owned(),
+            );
+        }
+        if self.selected == Some(1) {
+            ReplacementChoice::Replace
+        } else {
+            ReplacementChoice::Cancel(
+                "Codex asked about replacing the goal with `Replace current goal` not selected"
+                    .to_owned(),
+            )
+        }
+    }
+}
+
 /// Whether `screen` shows a question about replacing a goal, Muse's or Codex's, that a command
 /// left open.
 #[must_use]
 pub fn replacement_question_open(screen: &str) -> bool {
-    MuseReplacement::read(screen).is_some() || compact(screen).contains("Replacegoal?")
+    MuseReplacement::read(screen).is_some()
+        || CodexReplacement::read(screen).is_some()
+        || compact(screen).contains("Replacegoal?")
 }
 
 #[cfg(test)]
@@ -472,5 +617,83 @@ mod tests {
             ReplacementChoice::Cancel(_)
         ));
         assert!(replacement_question_open(screen));
+    }
+
+    /// The Codex picker as recorded (#1939): option 1 highlighted.
+    fn codex_picker(objective: &str, selected: u8) -> String {
+        let mark = |number: u8| if number == selected { "› " } else { "" };
+        format!(
+            "Replace goal?\nNew objective: {objective}\n{}1. Replace current goal  Set the new \
+             objective and start it now\n{}2. Cancel  Keep the current goal\nPress enter to \
+             confirm or esc to go back\n",
+            mark(1),
+            mark(2)
+        )
+    }
+
+    #[test]
+    fn codex_asks_before_replacing_a_goal() {
+        let screen = codex_picker("finish this task", 1);
+        let question = CodexReplacement::read(&screen).expect("question");
+        assert_eq!(question.new, "finish this task");
+        assert_eq!(question.selected, Some(1));
+        assert_eq!(
+            question.choice("finish this task"),
+            ReplacementChoice::Replace
+        );
+        // An offered goal that is not the one sent is never confirmed.
+        assert!(matches!(
+            question.choice("a different task"),
+            ReplacementChoice::Cancel(_)
+        ));
+        // With Cancel highlighted, even the sent goal is not confirmed.
+        let cancel = CodexReplacement::read(&codex_picker("finish this task", 2))
+            .expect("question");
+        assert_eq!(cancel.selected, Some(2));
+        assert!(matches!(
+            cancel.choice("finish this task"),
+            ReplacementChoice::Cancel(_)
+        ));
+        assert!(replacement_question_open(&screen));
+    }
+
+    #[test]
+    fn codex_picker_match_is_strict() {
+        let screen = codex_picker("finish this task", 1);
+        // No confirm footer, a renamed option, or a missing objective
+        // line: none of these is the recorded picker.
+        assert!(CodexReplacement::read(
+            &screen.replace("Press enter to confirm or esc to go back", "esc to go back")
+        )
+        .is_none());
+        assert!(CodexReplacement::read(
+            &screen.replace("Replace current goal", "Replace the goal")
+        )
+        .is_none());
+        assert!(CodexReplacement::read(&screen.replace("New objective: ", "Objective: ")).is_none());
+        assert!(CodexReplacement::read("Replace goal?\n").is_none());
+    }
+
+    #[test]
+    fn codex_wrapped_objective_still_matches_the_goal_sent() {
+        // The objective wraps at the pane edge; the joined showing is
+        // the sent objective, and a showing cut mid-way is its prefix.
+        let objective = "ship the release and report back when the gate is green";
+        let screen = "Replace goal?\nNew objective: ship the release and report back when the \
+                      gate is green\n› 1. Replace current goal  Set the new objective and start \
+                      it now\n2. Cancel  Keep the current goal\nPress enter to confirm or esc to \
+                      go back\n";
+        let question = CodexReplacement::read(screen).expect("question");
+        assert_eq!(question.choice(objective), ReplacementChoice::Replace);
+        let cut = "Replace goal?\nNew objective: ship the release and report back…\n› 1. Replace \
+                   current goal  Set the new objective and start it now\n2. Cancel  Keep the \
+                   current goal\nPress enter to confirm or esc to go back\n";
+        let question = CodexReplacement::read(cut).expect("question");
+        assert!(question.new_cut);
+        assert_eq!(question.choice(objective), ReplacementChoice::Replace);
+        assert!(matches!(
+            question.choice("ship the release and report blue"),
+            ReplacementChoice::Cancel(_)
+        ));
     }
 }

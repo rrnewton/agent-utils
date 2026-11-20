@@ -89,6 +89,86 @@ fn a_codex_goal_command_is_proved_by_its_goal_active_row() {
     );
 }
 
+/// The Codex Replace-goal picker as recorded (#1939), offering `objective`.
+fn codex_picker(objective: &str) -> String {
+    format!(
+        "Replace goal?\nNew objective: {objective}\n› 1. Replace current goal  Set the new \
+         objective and start it now\n2. Cancel  Keep the current goal\nPress enter to confirm \
+         or esc to go back\n"
+    )
+}
+
+#[test]
+fn a_codex_goal_that_agentctl_sent_confirms_its_own_replacement_picker() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    *fixture.client.screen.lock().unwrap() =
+        Some("› Ask Codex to do anything\n  GPT · /work\n".to_owned());
+    *fixture.client.screen_after_run.lock().unwrap() =
+        Some(codex_picker("ship the release"));
+    *fixture.client.screen_after_enter.lock().unwrap() = Some(
+        "• Goal active Objective: ship the release\n› Ask Codex to do anything\n  GPT · /work   \
+         Pursuing goal (3s)\n"
+            .to_owned(),
+    );
+    let manager = fixture.manager();
+    let result = manager
+        .send_identified_with_runtime(
+            "worker",
+            "/goal ship the release",
+            quick(),
+            "goal",
+            &Clock::default(),
+        )
+        .unwrap();
+    assert_eq!(result.delivered, ["goal"]);
+    // One Enter submits the command; the flow itself confirms the picker
+    // it offered, because the offered goal is the one it sent.
+    let keys: Vec<String> = fixture
+        .client
+        .keys_sent
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, key)| key.clone())
+        .collect();
+    assert!(keys.contains(&"Enter".to_owned()), "{keys:?}");
+    assert!(!keys.contains(&"Escape".to_owned()), "{keys:?}");
+}
+
+#[test]
+fn a_codex_picker_offering_another_goal_is_cancelled_never_confirmed() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    *fixture.client.screen.lock().unwrap() =
+        Some("› Ask Codex to do anything\n  GPT · /work\n".to_owned());
+    *fixture.client.screen_after_run.lock().unwrap() =
+        Some(codex_picker("a different task"));
+    let manager = fixture.manager();
+    let error = manager
+        .send_identified_with_runtime(
+            "worker",
+            "/goal ship the release",
+            quick(),
+            "goal",
+            &Clock::default(),
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("not the one sent"),
+        "{error}"
+    );
+    let keys: Vec<String> = fixture
+        .client
+        .keys_sent
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, key)| key.clone())
+        .collect();
+    assert!(keys.contains(&"Escape".to_owned()), "{keys:?}");
+}
+
 #[test]
 fn a_goal_command_with_no_answer_is_possibly_submitted_and_never_typed_again() {
     let fixture = Fixture::new();

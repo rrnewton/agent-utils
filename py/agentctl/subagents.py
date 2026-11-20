@@ -1338,13 +1338,20 @@ class _ArtifactPublicationUncertainError(_ArchivePublicationUncertainError):
 
 
 def _goal_replacement_selected(screen: str, objective: str) -> bool:
-    normalized = " ".join(screen.split())
+    # Strict, like the hooks trust dialog (#1939): the whole recorded
+    # picker must show, the offered objective must be the one sent (a
+    # cut showing must be its prefix), and Replace must be highlighted.
+    # This is the only auto-answer authority, on goal delivery paths.
+    from agentctl.harness_tui.codex import read_replace_goal_picker
+
+    picker = read_replace_goal_picker(screen)
+    if picker is None:
+        return False
+    shown, cut, selected, _replace, _cancel = picker
+    shown_words = " ".join(shown.split())
     wanted = " ".join(objective.split())
-    return ("Replace goal?" in normalized
-            and any(f"New objective: {wanted} {marker} 1. Replace current goal Set the new objective and start it now" in normalized
-                    for marker in ("›", "❯"))
-            and "2. Cancel Keep the current goal" in normalized
-            and "Press enter to confirm or esc to go back" in normalized)
+    matches = wanted.startswith(shown_words) if cut and shown_words else shown_words == wanted
+    return matches and selected == 1
 
 
 #: Longest wait for a sent prompt to appear in the target pane's scrollback.

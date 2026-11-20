@@ -2785,10 +2785,12 @@ pub(crate) struct ManifestRecordFacts {
 }
 
 fn goal_replacement_selected(screen: &str, objective: &str) -> bool {
-    let screen = screen.split_whitespace().collect::<Vec<_>>().join(" ");
-    let objective = objective.split_whitespace().collect::<Vec<_>>().join(" ");
-    screen.contains("Replace goal?") && ["›", "❯"].iter().any(|marker| screen.contains(&format!("New objective: {objective} {marker} 1. Replace current goal Set the new objective and start it now")))
-        && screen.contains("2. Cancel Keep the current goal") && screen.contains("Press enter to confirm or esc to go back")
+    // Strict, like the hooks trust dialog (#1939): the whole recorded
+    // picker must show, the offered objective must be the one sent, and
+    // `Replace current goal` must be the highlighted option. This is the
+    // only auto-answer authority, and only on goal delivery paths.
+    crate::goal_command::CodexReplacement::read(screen)
+        .is_some_and(|question| question.choice(objective) == crate::goal_command::ReplacementChoice::Replace)
 }
 
 #[derive(Clone, Debug)]
@@ -5515,11 +5517,28 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                         }
                     }
                 }
-                if goal_replacement_selected(&screen, objective) {
-                    self.confirm_goal_replacement(pane_id, runtime)?;
-                    key_presses += 1;
-                    confirmed = true;
-                    continue;
+                // Codex's picker (#1939): confirm only the goal this
+                // flow sent, with Replace highlighted; anything else
+                // cancels the question, never leaves it open.
+                if let Some(question) = crate::goal_command::CodexReplacement::read(&screen) {
+                    match question.choice(objective) {
+                        ReplacementChoice::Replace => {
+                            self.confirm_goal_replacement(pane_id, runtime)?;
+                            key_presses += 1;
+                            confirmed = true;
+                            continue;
+                        }
+                        ReplacementChoice::Keep => {
+                            return Err(self.cancel_goal_question(
+                                pane_id,
+                                "Codex asked about replacing the goal it already has",
+                                runtime,
+                            ));
+                        }
+                        ReplacementChoice::Cancel(reason) => {
+                            return Err(self.cancel_goal_question(pane_id, &reason, runtime));
+                        }
+                    }
                 }
             }
             let now = runtime.monotonic();
@@ -17800,6 +17819,7 @@ pub(crate) mod tests {
                     unwrapped_empty: AtomicBool::new(false),
                     status: Mutex::new(None),
                     screen_after_run: Mutex::new(None),
+                    screen_after_enter: Mutex::new(None),
                     screens_after_run: Mutex::new(std::collections::VecDeque::new()),
                     labels: Mutex::new(BTreeMap::new()),
                     terminals: Mutex::new(BTreeMap::new()),
@@ -18286,6 +18306,9 @@ pub(crate) mod tests {
         /// The text `screen` becomes once the next text is written with `run`, when set, as a
         /// typed prompt and the turn it starts push the rows above them up.
         pub(crate) screen_after_run: Mutex<Option<String>>,
+        /// The text `screen` becomes once the next Enter key is sent, when set:
+        /// a picker that key answers redraws the pane (#1939).
+        pub(crate) screen_after_enter: Mutex<Option<String>>,
         /// Texts successive reads return after the next `run`, first to last, before
         /// `screen` applies: a screen sequence only the typing sets in motion, counted
         /// in reads so a test never waits on the clock or races its own staging.
@@ -19694,6 +19717,9 @@ pub(crate) mod tests {
                 }
             }
             if key == "Enter" {
+                if let Some(screen) = self.screen_after_enter.lock().unwrap().take() {
+                    *self.screen.lock().unwrap() = Some(screen);
+                }
                 if let Some(prompt) = self
                     .muse_editor
                     .lock()

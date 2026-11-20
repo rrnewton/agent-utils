@@ -6,6 +6,68 @@ import re
 from . import AnswerPlan, Option, Question, State, View, navigation, plain
 
 
+def read_replace_goal_picker(screen: str) -> tuple[str, bool, int | None, str, str] | None:
+    """Codex's Replace-goal picker (#1939), strict recorded text: the exact
+    title, objective line, both options and the confirm footer, or None.
+    Returns (objective as shown, whether it was cut, selected option,
+    option 1 text, option 2 text). The objective wraps at the pane edge,
+    so a showing cut there (or ended with an ellipsis) counts as cut."""
+    lines = [line.rstrip() for line in screen.splitlines()]
+    width = max((len(line) for line in lines), default=0)
+    try:
+        start = next(i for i, line in enumerate(lines) if line.strip() == "Replace goal?")
+    except StopIteration:
+        return None
+    rest = lines[start + 1:]
+    if not any(line.strip() == "Press enter to confirm or esc to go back" for line in rest):
+        return None
+    objective_at = next(
+        (i for i, line in enumerate(rest)
+         if line.lstrip().startswith("New objective: ")),
+        None,
+    )
+    if objective_at is None:
+        return None
+    rows: list[str] = []
+    for line in rest[objective_at:]:
+        body = line.strip().removeprefix("›").strip()
+        if body.startswith(("1. ", "2. ")):
+            break
+        rows.append(line)
+    if not rows:
+        return None
+    shown = rows[0].lstrip().removeprefix("New objective:").strip()
+    for row in rows[1:]:
+        shown += " " + row.strip()
+    cut = len(rows[-1]) >= width or shown.endswith("…")
+    if shown.endswith("…"):
+        shown = shown[:-1].rstrip()
+    if not shown:
+        return None
+
+    def option(number: int) -> tuple[str, bool] | None:
+        for line in rest:
+            trimmed = line.strip()
+            selected = trimmed.startswith("›")
+            body = trimmed.removeprefix("›").strip() if selected else trimmed
+            if body.startswith(f"{number}. "):
+                return body[len(f"{number}. "):].strip(), selected
+        return None
+
+    first, second = option(1), option(2)
+    if first is None or second is None:
+        return None
+    (replace_label, replace_selected), (cancel_label, cancel_selected) = first, second
+    if (not replace_label.startswith("Replace current goal")
+            or "Set the new objective and start it now" not in replace_label
+            or not cancel_label.startswith("Cancel")
+            or "Keep the current goal" not in cancel_label
+            or (replace_selected and cancel_selected)):
+        return None
+    selected = 1 if replace_selected else 2 if cancel_selected else None
+    return shown, cut, selected, replace_label, cancel_label
+
+
 class CodexTui:
     """Codex accepts ordinary follow-ups on Enter while a turn is working."""
 
@@ -19,6 +81,16 @@ class CodexTui:
         from agentctl.submission import codex_idle_composer, composer_view
 
         clean = plain(screen)
+        # The Replace-goal picker (#1939): an answerable question, so
+        # prompts names it and answer can choose either option. Nothing
+        # auto-answers it here; only a goal delivery flow may confirm
+        # its own offered goal.
+        picker = read_replace_goal_picker(clean)
+        if picker is not None:
+            shown, _cut, selected, replace_label, cancel_label = picker
+            return View(State.QUESTION, Question(
+                f"Replace goal?\nNew objective: {shown}",
+                (Option(1, replace_label), Option(2, cancel_label)), selected))
         rows = clean.splitlines()
         tail = "\n".join(rows[-16:]).lower()
         footer = next((row.strip().lower() for row in reversed(rows) if row.strip()), "")
