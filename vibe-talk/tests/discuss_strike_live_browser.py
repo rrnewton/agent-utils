@@ -164,11 +164,13 @@ def walk(page: Page, base: str, width: int, height: int, scheme: Literal["dark",
         timeout=20_000)
     check(page.locator("#discuss-answer .discuss-struck").count() == 0,
           "a bullet stood struck before anything was read")
-    if page.locator("#discuss-answer .discuss-collapse-bar button").count() > 0:
-        page.locator("#discuss-answer .discuss-collapse-bar button").first.click()
-        page.wait_for_function(
-            "() => [...document.querySelectorAll('#discuss-answer details')].every((d) => d.open)",
-            timeout=20_000)
+    # `#1960`: the single header toggle must stand; expand so citations show.
+    check(page.locator("#discuss-current-head .discuss-toggle").count() == 1,
+          "the Discuss header toggle is missing")
+    page.locator("#discuss-current-head .discuss-toggle").click()
+    page.wait_for_function(
+        "() => [...document.querySelectorAll('#discuss-answer details')].every((d) => d.open)",
+        timeout=20_000)
     page.evaluate("() => { window.__strikeLiveMark = 'no reload'; }")
 
     def on_screen(mid: str) -> str:

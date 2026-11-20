@@ -626,7 +626,8 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
     page.wait_for_function(
         "() => document.getElementById('discuss-answer').textContent.includes('Ada shipped')",
         timeout=20_000)
-    page.locator("#discuss-answer .discuss-collapse-bar button").first.click()
+    # `#1960`: one toggle now lives in the Current summary header; Expand.
+    page.locator("#discuss-current-head .discuss-toggle").click()
     page.wait_for_function(
         "() => [...document.querySelectorAll('#discuss-answer details')].every((d) => d.open)",
         timeout=20_000)
@@ -657,7 +658,8 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
     page.wait_for_function(
         "() => document.getElementById('discuss-answer').textContent.includes('Ada shipped')",
         timeout=20_000)
-    page.locator("#discuss-answer .discuss-collapse-bar button").nth(1).click()
+    # `#1960`: the same single toggle now reads Collapse; fold all shut.
+    page.locator("#discuss-current-head .discuss-toggle").click()
     page.wait_for_function(
         "() => [...document.querySelectorAll('#discuss-answer details')].every((d) => !d.open)",
         timeout=20_000)

@@ -350,7 +350,8 @@ def walk_phone(page: Page, base: str, width: int, height: int) -> None:
 
     page.click("#discuss-summarize")
     page.wait_for_selector("#discuss-answer a", state="attached", timeout=20_000)
-    page.locator("#discuss-answer .discuss-collapse-bar button").first.click()
+    # `#1960`: one toggle in the Current summary header; Expand.
+    page.locator("#discuss-current-head .discuss-toggle").click()
     page.wait_for_function(
         "() => [...document.querySelectorAll('#discuss-answer details')]"
         ".every((d) => d.open)",
@@ -492,7 +493,8 @@ def walk_desk(page: Page, base: str, width: int, height: int) -> None:
     check(grip_desk == "none", f"the grip shows on the desk overlay: {grip_desk}")
     page.click("#discuss-summarize")
     page.wait_for_selector("#discuss-answer a", state="attached", timeout=20_000)
-    page.locator("#discuss-answer .discuss-collapse-bar button").first.click()
+    # `#1960`: one toggle in the Current summary header; Expand.
+    page.locator("#discuss-current-head .discuss-toggle").click()
     page.wait_for_function(
         "() => [...document.querySelectorAll('#discuss-answer details')]"
         ".every((d) => d.open)",
