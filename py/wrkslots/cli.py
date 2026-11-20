@@ -74679,12 +74679,20 @@ def _recover_finish(
                 except Refusal as exc:
                     if identity_verified and census_path == fenced and not removed_names:
                         try:
+                            # Retain the journal (#1923): clearing it here
+                            # left the paired seal recovery without its
+                            # finish, and the refusal recorder then wrote
+                            # its stale phase=fenced copy back over a
+                            # checkout already restored to canonical, which
+                            # wedged every later recover. Phase=prepared
+                            # with the seal kept is what a retry expects.
                             _rollback_path_fence(
                                 config,
                                 record,
                                 journal,
                                 _GitVcs(),
                                 journal_path=path,
+                                retain_journal=True,
                             )
                         except Refusal as rollback:
                             raise Refusal(
