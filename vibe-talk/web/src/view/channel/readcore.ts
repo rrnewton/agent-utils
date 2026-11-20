@@ -703,6 +703,15 @@ export function createTimelineView(deps: TimelineViewDependencies): TimelineView
           if (!winGroups || !(deps.windowed && deps.windowed())) return;
           const cfgNow = deps.windowed();
           if (!cfgNow) return;
+          // `#1985` (via #1983's windowed walk): a row appended directly at
+          // the foot (a just-sent message) is not in this window's groups
+          // yet; a re-slice from the stale groups would remove it. The next
+          // full redraw windows it properly, so this re-slice stands down.
+          const grouped = new Set(winGroups.flatMap((group) => group.map((message) => String(message.id))));
+          for (const row of [...list.children]) {
+            if ((row as HTMLElement).dataset.windowSpacer) continue;
+            if (idsOf(row).some((id) => !grouped.has(id))) return;
+          }
           const bucketNow = String(area.clientWidth || list.clientWidth || 360);
           const heightsNow = winGroups.map((group) => groupHeightPx(group, bucketNow));
           const offsetsNow = offsetsFor(heightsNow);
