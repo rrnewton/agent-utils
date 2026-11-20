@@ -1,6 +1,7 @@
 ---
 title: 'wrkslots-full-status-hang-ignores-sigterm: full status hangs forever and ignores SIGTERM'
-status: open
+status: closed
+closed_at: 2026-11-20T11:20:00-05:00
 priority: 0
 issue_type: bug
 labels:
@@ -33,3 +34,7 @@ updated_at: 2026-11-20T00:00:00-05:00
 # Notes
 
 Reproduce in scratch only (a scratch project with many slots, then a full status while N concurrent heartbeat or transfer-owner loops mutate state; also inject a child that exits early or is killed mid-census). Never touch the consumer's project or real wrkslots state.
+
+# Resolution
+
+[watermelon-full-preview] Closed 2026-11-20, landed as `0d235c2f` on main. Root cause was not a wrkslots status hang: on the consumer's host `python3` is the fbpython launcher, which forks the real interpreter and waits with SIGTERM caught, so `timeout` signaled only the launcher and never the work (confirmed by launcher anatomy — main thread in wait4, second thread in futex_wait, SIGTERM caught — and by the signal topology; 320+ probe cycles did not reproduce the racy deadlock itself). Worker-side audit found every full-status wait bounded (lock 30s, scan deadline 180s, liveness 15s, census deadline with killpg and bounded reap) and no SIGTERM handler, so no genuine status hang exists to fix. Fix: the `common/bin` dispatcher's Python leg resolves the host's real interpreter (safely cached, fully validated) and execs it on the tracked script, so supervisors signal the process doing the work; docs direct callers to `bin/<tool>` under `timeout --kill-after=15` instead of `python3 -m wrkslots`. The init command symlink follow-up is #1965 wrkslots-init-command-wrapper. Gate reds were environment-only (Chromium `libnspr4.so` missing), waived by coordb; combined tree verified (98 passed) via the verified-tree path. No persisted fields changed.
