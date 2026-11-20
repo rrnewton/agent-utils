@@ -216,15 +216,6 @@ export interface DocumentLoadFailure {
   linkLabel: string;
 }
 
-/** The source address a canonical GitHub key names, so a failure can still link out. */
-function sourceUrlForKey(key: string): string | null {
-  const github = /^github:([^/]+)\/([^@]+)@([^:]+):(.+)$/.exec(key);
-  if (github) return `https://github.com/${github[1]}/${github[2]}/blob/${github[3]}/${github[4]}`;
-  const gist = /^gist:([A-Za-z0-9]+)$/.exec(key);
-  if (gist) return `https://gist.github.com/${gist[1]}`;
-  return null;
-}
-
 /**
  * Why one load failed, from the API error's own facts (`#1980
  * vibe-talk-docs-private-github-load`): the server's detail sentence is the
@@ -232,7 +223,7 @@ function sourceUrlForKey(key: string): string | null {
  * an unindexed key are each named. Pure, so the wording is testable without
  * a reader. The result always names a specific cause.
  */
-export function documentLoadFailure(error: unknown, url?: unknown, key?: string): DocumentLoadFailure {
+export function documentLoadFailure(error: unknown, url?: unknown): DocumentLoadFailure {
   const record = (typeof error === "object" && error !== null ? error : {}) as {
     message?: unknown; detail?: unknown; code?: unknown; status?: unknown; network?: unknown;
   };
@@ -260,7 +251,9 @@ export function documentLoadFailure(error: unknown, url?: unknown, key?: string)
   } else {
     reason = "vibe-talk could not fetch this document for an unknown reason.";
   }
-  const href = safeSourceHref(url) ?? safeSourceHref(key ? sourceUrlForKey(key) : null);
+  // The address is the server's own data (the document row), never one the
+  // page invents from the key: the page hardcodes no off-origin destination.
+  const href = safeSourceHref(url);
   let linkLabel = "Open source";
   if (href !== null) {
     try {
@@ -1185,6 +1178,9 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
       if (landed.document?.url !== undefined) knownUrl = landed.document.url;
       if (landed.document?.title !== undefined) knownTitle = landed.document.title;
     };
+    // Whether a fetch was spent, so a failed one may re-read the row it
+    // registered for the failure's own address (`#1980`).
+    let fetchAttempted = false;
     try {
       try {
         answer = asAnswer(await deps.api(path));
@@ -1194,17 +1190,29 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
         // the fetch route admits a canonical key, registering then fetching
         // it, so read again after it. Any other failure keeps today's shape.
         if (!isUnknownDocument(error)) throw error;
+        fetchAttempted = true;
         await deps.api("/api/v1/documents/fetch", { method: "POST", body: { key } });
         answer = asAnswer(await deps.api(path));
         noteAnswer(answer);
       }
       if (typeof answer.content !== "string") {
+        fetchAttempted = true;
         await deps.api("/api/v1/documents/fetch", { method: "POST", body: { key } });
         answer = asAnswer(await deps.api(path));
         noteAnswer(answer);
       }
     } catch (error) {
-      const failure = documentLoadFailure(error, knownUrl, key);
+      if (fetchAttempted && knownUrl === undefined) {
+        // The fetch registered the key before it failed: its row now names
+        // the document's own address, the failure's way out. Best effort —
+        // the original failure is the one reported either way.
+        try {
+          noteAnswer(asAnswer(await deps.api(path)));
+        } catch {
+          // No row landed; the failure shows its reason without a link.
+        }
+      }
+      const failure = documentLoadFailure(error, knownUrl);
       drawLoadFailure(failure, typeof knownTitle === "string" && knownTitle !== "" ? knownTitle : key);
       deps.onStatus?.(failure.reason);
       throw error;

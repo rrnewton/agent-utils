@@ -1758,14 +1758,14 @@ test("documents reader: documentLoadFailure names network, rate-limit and not-fo
   assert.equal(network.linkLabel, "Open on GitHub");
   const limited = documentLoadFailure(
     Object.assign(new Error("HTTP 502 document_fetch_failed: GitHub rate limit"), { detail: "GitHub rate limit: GitHub answered 429 for octo/widgets; try again later" }),
-    url, "github:octo/widgets@main:docs/x.md");
+    url);
   assert.match(limited.reason, /rate limit/i);
   const missing = documentLoadFailure(
     Object.assign(new Error("HTTP 502 x: y"), { detail: "not found at docs/x.md (moved or deleted)" }),
-    undefined, "github:octo/widgets@main:docs/x.md");
+    undefined);
   assert.match(missing.reason, /not found/i);
-  assert.equal(missing.href, url, "a key alone does not name the way out");
-  const unsafe = documentLoadFailure(new Error("boom"), "javascript:alert(1)", "paste:abc");
+  assert.equal(missing.href, null, "no server address, no invented way out");
+  const unsafe = documentLoadFailure(new Error("boom"), "javascript:alert(1)");
   assert.equal(unsafe.href, null, "an unsafe source became a link");
   for (const failure of [network, limited, missing, unsafe]) {
     assert.ok(!/^could not load the document\.?$/i.test(failure.reason),
