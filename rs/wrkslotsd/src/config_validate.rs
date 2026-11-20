@@ -2076,4 +2076,3 @@ mod tests {
         assert!(error.contains("unknown slot type 'agnet'"), "{error}");
     }
 }
-
