@@ -5,12 +5,12 @@ description: Manage isolated Git worktree slots with one-agent ownership, machin
 
 # Wrkslots
 
-Invoke wrkslots through the tracked `bin/wrkslots` wrapper (agent-utils `common/bin/wrkslots`,
-which dispatches to `py/bin/wrkslots`), never `python3 -m wrkslots`. On hosts where `python3` is
-the fbpython launcher, the launcher forks the real interpreter and waits with SIGTERM caught, so
-`timeout` or systemd signaling the started process never reaches the work and a finished or hung
-run can look immortal (#1964). The wrapper execs the host's real interpreter directly, so signals
-reach it. Wrap long reads the same way, with a kill-after backstop: `timeout --kill-after=15 300
+Invoke wrkslots through the tracked dispatcher entry — `agent-utils/bin/wrkslots` (the checkout's
+`common/bin/wrkslots`) — never `python3 -m wrkslots`. On hosts where `python3` is the fbpython
+launcher, the launcher forks the real interpreter and waits with SIGTERM caught, so `timeout` or
+systemd signaling the started process never reaches the work and a finished or hung run can look
+immortal (#1964). The dispatcher execs the host's real interpreter directly, so signals reach it.
+Wrap long reads the same way, with a kill-after backstop: `timeout --kill-after=15 300
 bin/wrkslots status`.
 
 Treat the configured control and slot directories as tool-owned. Use `worktrees/wrkslots`; never

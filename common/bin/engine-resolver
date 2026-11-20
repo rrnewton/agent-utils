@@ -336,6 +336,64 @@ if [[ -z "$WRKSLOTS_OPTIN" && -z "$WRKVIZ_OPTIN" && -z "$SUBAGENTS_OPTIN" && -n 
     fi
 fi
 
+# Resolve the real interpreter behind a `python3` command (#1964). The
+# probe runs the launcher only for one short-lived `-c` and is bounded
+# with `timeout -s KILL` (the launcher catches TERM, so KILL is the only
+# bound it honours). The answer is cached per host in a private state
+# file keyed by the launcher's realpath, its mtime, and sys.prefix; the
+# cache is used only inside $XDG_STATE_HOME or $HOME/.local/state, only
+# when that directory is owned by this user with mode 0700, and written
+# atomically under a unique temp name. Any doubt resolves fresh or
+# fails, and the caller falls back to the named interpreter.
+au_resolve_real_python() {
+    local cmd="$1"
+    local launcher launcher_real mtime probe real prefix
+    launcher="$(command -v -- "$cmd" 2>/dev/null)" || launcher=""
+    [[ -n "$launcher" ]] || return 1
+    launcher_real="$(readlink -f "$launcher" 2>/dev/null)" || launcher_real="$launcher"
+    mtime="$(stat -c %Y "$launcher_real" 2>/dev/null)" || mtime=""
+    local state_root=""
+    if [[ -n "${XDG_STATE_HOME:-}" ]]; then
+        state_root="$XDG_STATE_HOME/agent-utils"
+    elif [[ -n "${HOME:-}" ]]; then
+        state_root="$HOME/.local/state/agent-utils"
+    fi
+    local cache=""
+    if [[ -n "$state_root" && -n "$mtime" ]]; then
+        if [[ ! -d "$state_root" ]]; then
+            (umask 077; mkdir -p "$state_root" 2>/dev/null) || true
+        fi
+        if [[ -d "$state_root" && "$(stat -c %u "$state_root" 2>/dev/null)" == "$EUID" && "$(stat -c %a "$state_root" 2>/dev/null)" == "700" ]]; then
+            cache="$state_root/real-python.cache"
+        fi
+    fi
+    if [[ -n "$cache" && -f "$cache" ]]; then
+        local c_launcher="" c_mtime="" c_prefix="" c_real=""
+        { IFS= read -r c_launcher; IFS= read -r c_mtime; IFS= read -r c_prefix; IFS= read -r c_real; } < "$cache" || true
+        if [[ "$c_launcher" == "$launcher_real" && "$c_mtime" == "$mtime" && -n "$c_real" && -x "$c_real" ]]; then
+            printf '%s\n' "$c_real"
+            return 0
+        fi
+    fi
+    if command -v timeout >/dev/null 2>&1; then
+        probe="$(timeout -s KILL 10 "$cmd" -c 'import sys; print(sys.executable); print(sys.prefix)' 2>/dev/null)" || probe=""
+    else
+        probe="$("$cmd" -c 'import sys; print(sys.executable); print(sys.prefix)' 2>/dev/null)" || probe=""
+    fi
+    real="$(printf '%s\n' "$probe" | sed -n '1p')"
+    prefix="$(printf '%s\n' "$probe" | sed -n '2p')"
+    [[ -n "$real" && -x "$real" ]] || return 1
+    if [[ -n "$cache" ]]; then
+        local tmp="$cache.tmp.$$.$RANDOM"
+        if (umask 077; printf '%s\n%s\n%s\n%s\n' "$launcher_real" "$mtime" "$prefix" "$real" > "$tmp" 2>/dev/null && mv -f "$tmp" "$cache" 2>/dev/null); then
+            :
+        else
+            rm -f "$tmp" 2>/dev/null || true
+        fi
+    fi
+    printf '%s\n' "$real"
+}
+
 case "$ENGINE" in
     python|py)
         TARGET="$ROOT/py/bin/$TOOL"
@@ -344,13 +402,19 @@ case "$ENGINE" in
             exit 127
         fi
         echo "[$TOOL] engine=python (tracked entrypoint: py/bin/$TOOL)" >&2
-        # The tracked entrypoint is a shell wrapper that execs the host's
-        # real interpreter itself (#1964): running it through python3 here
-        # would put the fbpython launcher back in charge of the
-        # long-running process. CI_HUB_PYTHON still names the interpreter
-        # to resolve, passed through as AGENT_UTILS_PYTHON.
-        export AGENT_UTILS_PYTHON="${CI_HUB_PYTHON:-python3}"
-        exec "$TARGET" "$@"
+        # Run the entrypoint on the host's real interpreter, not through
+        # a `python3` launcher (#1964): where python3 is the fbpython
+        # launcher, the launcher forks the interpreter and waits with
+        # SIGTERM caught, so a supervisor's signal never reaches the
+        # work. The resolved interpreter runs the tracked script by path
+        # with -P (no cwd on sys.path, no PYTHONPATH export), keeping
+        # argv, stdin, exit code and signal behaviour identical to a
+        # direct launch. Fallback: the named interpreter, as before.
+        AU_PYTHON_CMD="${AGENT_UTILS_PYTHON:-${CI_HUB_PYTHON:-python3}}"
+        if AU_REAL_PYTHON="$(au_resolve_real_python "$AU_PYTHON_CMD")"; then
+            exec "$AU_REAL_PYTHON" -P "$TARGET" "$@"
+        fi
+        exec "$AU_PYTHON_CMD" "$TARGET" "$@"
         ;;
     rust|rs)
         # The tracked rs/bin link invokes the shared Cargo/provenance launcher. It verifies the

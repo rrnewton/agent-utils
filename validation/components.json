@@ -306,7 +306,6 @@
         "common/bin/",
         "common/gh_resolve/",
         "cross/differential.py",
-        "py/_real-python.sh",
         "py/dagrun/gh_resolve.py",
         "py/gitconfig_guard.py",
         "py/pr_landing_planner/gh_resolve.py",
@@ -358,6 +357,7 @@
         "py/tests/test_case_timings.py",
         "py/tests/test_editions.py",
         "py/tests/test_engine_resolver_default.py",
+        "py/tests/test_engine_resolver_real_python.py",
         "py/tests/test_engine_resolver_source_pin.py",
         "py/tests/test_engine_resolver_wrkslots_optin.py",
         "py/tests/test_engine_resolver_wrkviz_optin.py",
@@ -367,7 +367,6 @@
         "py/tests/test_gh_resolve_copies.py",
         "py/tests/test_gitconfig_guard.py",
         "py/tests/test_pid_namespace_init.py",
-        "py/tests/test_real_python_wrappers.py",
         "py/tests/test_rebase_delta_guard.py",
         "py/tests/test_rust_only.py"
       ]

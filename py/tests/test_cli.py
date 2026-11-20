@@ -2620,11 +2620,10 @@ def test_boxed_reexec_via_symlink_imports_package(
     inherited_runner_authority_env: Mapping[str, str],
 ) -> None:
     # Regression guard for the fleet-wide local-validate breakage: a DEFAULT boxed run invoked
-    # through the py/bin wrapper (NOT pip-installed) must re-exec a child that
+    # through the py/bin symlink (NOT `python -m`, NOT pip-installed) must re-exec a child that
     # can still import the package. The old code re-exec'd `python -m dagrun`, whose fresh child
     # had py/ off sys.path -> `No module named dagrun`, so every non-CI `run` (i.e. validate.sh)
-    # died. The fix re-execs __main__.py by absolute path, which does its own sys.path fixup; the
-    # py/bin shell wrapper (#1964) likewise puts py/ on PYTHONPATH for its `python -m` exec. Run
+    # died. The fix re-execs __main__.py by absolute path, which does its own sys.path fixup. Run
     # from a CWD *outside* py/ so an accidental cwd-relative import can't mask the bug. Boxing is
     # environment-dependent, so exit 3 (boxing genuinely unavailable) is a valid LOUD skip; the
     # one thing that must NEVER appear is the import failure.
@@ -2638,7 +2637,7 @@ def test_boxed_reexec_via_symlink_imports_package(
         )
 
     symlink = Path(__file__).resolve().parent.parent / "bin" / "dagrun"
-    assert symlink.exists(), f"expected the console wrapper at {symlink}"
+    assert symlink.exists(), f"expected the console symlink at {symlink}"
     dag = (
         '{"steps": [{"group": "cpu", "job": "burn", "desc": "burn",'
         ' "cmd": "while :; do :; done", "cpu_timeout": 1, "timeout": 30}]}'
@@ -2659,7 +2658,7 @@ def test_boxed_reexec_via_symlink_imports_package(
             )
         }
         proc = subprocess.run(
-            [str(symlink), "run", "--dag", str(path), "-q", "--no-profile"],
+            [sys.executable, str(symlink), "run", "--dag", str(path), "-q", "--no-profile"],
             capture_output=True,
             text=True,
             cwd=tmp,

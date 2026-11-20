@@ -34,7 +34,7 @@ def _build_sandbox(tmp_path: Path, *, mirror_state: str) -> Path:
     _chmod_x(root / "common" / "bin" / "engine-resolver")
     (root / "common" / "bin" / "tick-hub").symlink_to("engine-resolver")
     python_stub = root / "py" / "bin" / "tick-hub"
-    python_stub.write_text("#!/bin/sh\necho PY-tick-hub\n")
+    python_stub.write_text("print('PY-tick-hub')\n")
     _chmod_x(python_stub)
     rust_stub = root / "rs" / "bin" / "tick-hub"
     rust_stub.write_text("#!/bin/sh\necho RS-tick-hub\n")

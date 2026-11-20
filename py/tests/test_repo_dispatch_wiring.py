@@ -99,24 +99,17 @@ def test_package_manifests_and_source_dispatchers_have_the_same_command_inventor
 
 
 def test_tracked_python_launchers_are_directly_executable() -> None:
-    """Every ``py/bin`` wrapper is also a valid direct source-checkout command.
-
-    Since #1964 the wrappers are shell scripts that exec the host's real
-    interpreter (see py/bin/_real-python.sh), never a `python3` launcher
-    that would keep signals from the long-running process.
-    """
+    """Every ``py/bin`` link is also a valid direct source-checkout command."""
     py_bin = REPO_ROOT / "py" / "bin"
-    helper = REPO_ROOT / "py" / "_real-python.sh"
-    assert helper.is_file()
-    assert b"exec_real_python_module" in helper.read_bytes()
     for tool in RESOLVER_TOOLS:
-        wrapper = py_bin / tool
-        assert wrapper.is_file() and not wrapper.is_symlink(), tool
-        assert wrapper.stat().st_mode & stat.S_IXUSR, tool
-        assert wrapper.read_bytes().startswith(b"#!/bin/sh\n"), tool
+        link = py_bin / tool
+        assert link.is_symlink(), tool
+        target = link.resolve(strict=True)
+        assert target.stat().st_mode & stat.S_IXUSR, tool
+        assert target.read_bytes().startswith(b"#!/usr/bin/env python3\n"), tool
 
         completed = subprocess.run(
-            [str(wrapper), "--version"],
+            [str(link), "--version"],
             cwd=REPO_ROOT,
             capture_output=True,
             text=True,

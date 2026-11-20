@@ -39,7 +39,7 @@ def _build_sandbox(tmp_path: Path) -> Path:
     _chmod_x(common_bin / "engine-resolver")
     (common_bin / TOOL).symlink_to("engine-resolver")
     stub = python_bin / TOOL
-    stub.write_text(f"#!/bin/sh\necho PY-{TOOL}\n")
+    stub.write_text(f"print('PY-{TOOL}')\n")
     _chmod_x(stub)
     rust_stub = rust_bin / "wrkslotsd"
     rust_stub.write_text("#!/bin/sh\necho \"RS-wrkslotsd pycompat=${WRKSLOTS_PYCOMPAT:-}\"\n")

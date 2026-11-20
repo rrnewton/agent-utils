@@ -1,12 +1,1 @@
-#!/bin/sh
-# herdr-chat — run on the host's real interpreter, not the python3 launcher
-# (#1964 wrkslots-full-status-hang-ignores-sigterm; see _real-python.sh).
-# Called by name: agentctl.chat.main keeps the herdr-chat prog/state
-# contract that the module's __main__ fallback would not.
-case $0 in
-    */*) _au_self=$0 ;;
-    *) _au_self=$(command -v -- "$0" 2>/dev/null || printf '%s' "$0") ;;
-esac
-_au_dir=$(CDPATH= cd -- "$(dirname -- "$_au_self")" && pwd)
-. "$_au_dir/../_real-python.sh"
-exec_real_python_call agentctl.chat main "$@"
+../agentctl/chat.py

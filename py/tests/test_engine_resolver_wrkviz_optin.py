@@ -44,7 +44,7 @@ def _build_sandbox(tmp_path: Path) -> Path:
     validation.mkdir(parents=True)
     (validation / "editions.tsv").write_text("wrkviz\tpython\tabsent\t\n")
     stub = python_bin / TOOL
-    stub.write_text(f"#!/bin/sh\necho PY-{TOOL}\n")
+    stub.write_text(f"print('PY-{TOOL}')\n")
     _chmod_x(stub)
     rust_stub = rust_bin / "wrkvizd"
     rust_stub.write_text("#!/bin/sh\necho RS-wrkvizd\n")
