@@ -112,15 +112,20 @@ class FakeApi:
     def timeline(self, query: dict[str, list[str]]) -> Json:
         view = query.get("view", ["main"])[0]
         thread_id = query.get("thread_id", [None])[0]
+
+        def record(message: Json) -> dict[str, object]:
+            held = message.get("thread")
+            return held if isinstance(held, dict) else {}
+
         with self.lock:
             if view == "flat":
                 rows = list(self.messages)
             elif view == "thread":
-                rows = [m for m in self.messages if (m.get("thread") or {}).get("id") == thread_id]
+                rows = [m for m in self.messages if record(m).get("id") == thread_id]
             elif view == "threads":
                 rows = []
             else:
-                rows = [m for m in self.messages if (m.get("thread") or {}).get("is_root") is True]
+                rows = [m for m in self.messages if record(m).get("is_root") is True]
             return {
                 "channel": CHANNEL, "messages": rows, "threads": list(self.summaries), "thread": None,
                 "has_threads": True, "has_more": False, "next_before": None, "notice": None,
