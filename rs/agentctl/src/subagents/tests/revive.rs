@@ -3468,11 +3468,17 @@ fn fake_muse_journal(root: &Path, id: &str, cwd: &Path) {
 /// What a fake Muse writes when it starts: `<data>/muse/sessions/2026/11/06/<id>/` with the
 /// `.session.lock` its runtime holds (`pid=`, `host=`). Returns the lock.
 fn fake_muse_session(fixture: &Fixture, id: &str) -> PathBuf {
+    fake_muse_session_as(fixture, id, 4242)
+}
+
+/// A fake session whose lock names `pid`, as a real runtime's lock
+/// names its own process (#1934 D1).
+fn fake_muse_session_as(fixture: &Fixture, id: &str, pid: u64) -> PathBuf {
     let dir = fixture.root.join("data/muse/sessions/2026/11/06").join(id);
     fs::create_dir_all(&dir).unwrap();
     fs::write(dir.join("session.jsonl"), "").unwrap();
     let lock = dir.join(".session.lock");
-    fs::write(&lock, "pid=4242\nhost=localhost\n").unwrap();
+    fs::write(&lock, format!("pid={pid}\nhost=localhost\n")).unwrap();
     lock
 }
 
@@ -3554,16 +3560,17 @@ fn a_muse_lane_records_the_session_its_runtime_holds_and_revives_from_the_archiv
 
 #[test]
 fn a_second_lane_holding_the_same_session_is_recorded_as_unknown_naming_the_first() {
-    // #928: two lanes whose runtimes hold the same session file must
-    // not both record it; the second is left unknown, naming the live
-    // record that already binds it.
+    // #928, #1934 D1: a lock naming the first lane's runtime pid is
+    // the first lane's session, however many lanes' fd walks hold it;
+    // the second lane is never given it. (Before D1 the second lane
+    // captured it and the duplicate guard left it unknown instead.)
     let fixture = unreported();
     let id = "33333333-3333-3333-3333-333333333333";
     let lock = fake_muse_session(&fixture, id);
     let _held = pretend_held(vec![lock]);
     let first = start_worker(&fixture, "muse");
     assert!(first.get("native_session_warning").is_none(), "{first}");
-    let second = fixture
+    fixture
         .manager()
         .start(
             "other",
@@ -3575,21 +3582,13 @@ fn a_second_lane_holding_the_same_session_is_recorded_as_unknown_naming_the_firs
             },
         )
         .unwrap();
-    let warning = second["native_session_warning"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(warning.contains("\"worker\""), "{second}");
-    assert!(warning.contains("bind-session other"), "{warning}");
     let record = fixture.manager().load("other").unwrap();
-    assert!(record.native_session.is_none(), "duplicate was recorded");
-    let unknown = &record.extra["native_session_unknown"];
     assert!(
-        unknown["reason"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("\"worker\""),
-        "{unknown}"
+        record.native_session.is_none(),
+        "peer's session was recorded"
     );
+    let first = fixture.manager().load("worker").unwrap();
+    assert_eq!(first.native_session.as_ref().unwrap().value, id);
 }
 
 #[test]
@@ -3833,7 +3832,9 @@ fn adopting_a_muse_or_codex_lane_records_the_session_it_holds() {
     for harness in ["muse", "codex"] {
         let fixture = unreported();
         let held = match harness {
-            "muse" => fake_muse_session(&fixture, "33333333-3333-3333-3333-333333333333"),
+            // The adopted lane's lock names the pid adopt pins (the
+            // fake's first pane pid), as a real runtime's lock does.
+            "muse" => fake_muse_session_as(&fixture, "33333333-3333-3333-3333-333333333333", 300),
             _ => {
                 let dir = fixture.root.join("codex/sessions/2026/11/06");
                 fs::create_dir_all(&dir).unwrap();
@@ -4462,4 +4463,242 @@ fn revive_clears_a_candidate_at_the_hooks_dialog_and_publishes() {
     let answers = fixture.client.hooks_answers.lock().unwrap();
     assert_eq!(answers.len(), 1, "{answers:?}");
     assert_eq!(answers[0].1, "decline");
+}
+
+// --- #1934: the session directory held open, promote, backfill, candidate publish -------------
+
+#[test]
+fn a_muse_lane_holding_only_its_session_directory_records_it_at_start_and_revives() {
+    // The runtime holds its session directory (or only its journal) open,
+    // not always the lock: that held path still names the session, pinned
+    // to the launched process, so revive resumes it after a reboot
+    // instead of scanning the store by cwd.
+    for held_kind in ["directory", "journal"] {
+        let fixture = unreported();
+        let id = "01a1ab0f-0a3c-73c1-8056-ee5296bc1574";
+        let lock = fake_muse_session(&fixture, id);
+        let dir = lock.parent().unwrap().to_path_buf();
+        let held_path = if held_kind == "directory" {
+            dir.clone()
+        } else {
+            dir.join("session.jsonl")
+        };
+        let held = pretend_held(vec![held_path]);
+        let status = start_worker(&fixture, "muse");
+        assert!(status.get("native_session_warning").is_none(), "{status}");
+        let record = fixture.manager().load("worker").unwrap();
+        let native = record.native_session.clone().expect("captured at start");
+        assert_eq!((native.agent.as_str(), native.value.as_str()), ("muse", id));
+        assert_eq!(native.source, "observed");
+        drop(held);
+        let revived = stop_and_revive_archived(&fixture).unwrap();
+        assert_eq!(revived["revived"], true, "{revived}");
+        let new = fixture.manager().load("worker").unwrap();
+        assert_eq!(new.arguments, ["--approval-mode=never", "resume", id]);
+    }
+}
+
+#[test]
+fn a_peer_lanes_lock_is_never_recorded_however_long_it_is_held() {
+    // #1934 D1: a Muse process transiently holds other lanes'
+    // .session.lock files. A held lock naming another lane's pid
+    // attributes nothing; the lane's own journal still attributes its
+    // own session beside it.
+    let fixture = unreported();
+    let peer = fake_muse_session_as(&fixture, "99999999-9999-4999-8999-999999999999", 424_242);
+    let own_id = "01a1ab0f-0a3c-73c1-8056-ee5296bc1574";
+    let own_lock = fake_muse_session(&fixture, own_id);
+    let own_dir = own_lock.parent().unwrap().to_path_buf();
+    let held = pretend_held(vec![peer, own_dir.join("session.jsonl")]);
+    let status = start_worker(&fixture, "muse");
+    assert!(status.get("native_session_warning").is_none(), "{status}");
+    let record = fixture.manager().load("worker").unwrap();
+    assert_eq!(record.native_session.as_ref().unwrap().value, own_id);
+    drop(held);
+
+    // The peer lock alone records nothing at all.
+    let fixture = unreported();
+    let peer = fake_muse_session_as(&fixture, "99999999-9999-4999-8999-999999999999", 424_242);
+    let _held = pretend_held(vec![peer]);
+    start_worker(&fixture, "muse");
+    assert!(fixture
+        .manager()
+        .load("worker")
+        .unwrap()
+        .native_session
+        .is_none());
+}
+
+#[test]
+fn promote_records_the_muse_session_the_pinned_process_holds() {
+    let fixture = unreported();
+    let id = "22222222-2222-4222-8222-222222222222";
+    // The lock names the pid promote will pin (the fake's first pane pid).
+    let lock = fake_muse_session_as(&fixture, id, 300);
+    // Start with nothing held, then leave the record as a timed-out
+    // launch left it: running in its pane, recorded with no anchor and
+    // no session. Promote pins the live process and records its session.
+    let _none = pretend_held(Vec::new());
+    start_worker(&fixture, "muse");
+    let mut record = fixture.manager().load("worker").unwrap();
+    record.lifecycle = "launch_failed".to_owned();
+    record.error = Some("agent start: timed out waiting for agent startup".to_owned());
+    record.harness_identity = None;
+    record.anchor_rule = None;
+    record.terminal_id = None;
+    record.native_session = None;
+    fixture.manager().save(&record).unwrap();
+    let _held = pretend_held(vec![lock]);
+    let result = fixture
+        .manager()
+        .promote("worker", Some(&record.token))
+        .unwrap();
+    assert_eq!(result["promoted"], true, "{result}");
+    let promoted = fixture.manager().load("worker").unwrap();
+    assert_eq!(promoted.lifecycle, "running");
+    assert!(promoted.harness_anchor().is_some());
+    let native = promoted
+        .native_session
+        .clone()
+        .expect("recorded at promote");
+    assert_eq!((native.agent.as_str(), native.value.as_str()), ("muse", id));
+}
+
+#[test]
+fn doctor_repair_records_a_live_muse_session_and_never_guesses_among_several() {
+    let fixture = unreported();
+    let id = "33333333-3333-4333-8333-333333333333";
+    let lock = fake_muse_session(&fixture, id);
+    let _none = pretend_held(Vec::new());
+    start_worker(&fixture, "muse");
+    assert!(fixture
+        .manager()
+        .load("worker")
+        .unwrap()
+        .native_session
+        .is_none());
+    let _held = pretend_held(vec![lock]);
+    let report = fixture.manager().doctor_repairing(false, true).unwrap();
+    let row = report["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "worker")
+        .unwrap_or_else(|| panic!("no doctor row: {report}"));
+    assert_eq!(row["native_session_repaired"], json!(id), "{row}");
+    let record = fixture.manager().load("worker").unwrap();
+    assert_eq!(record.native_session.as_ref().unwrap().value, id);
+
+    // Several held sessions: repaired never guesses between them.
+    let fixture = unreported();
+    let first = fake_muse_session(&fixture, "44444444-4444-4444-8444-444444444444");
+    let second = fake_muse_session(&fixture, "55555555-5555-4555-8555-555555555555");
+    let _none = pretend_held(Vec::new());
+    start_worker(&fixture, "muse");
+    let _held = pretend_held(vec![first, second]);
+    let report = fixture.manager().doctor_repairing(false, true).unwrap();
+    let row = report["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "worker")
+        .unwrap_or_else(|| panic!("no doctor row: {report}"));
+    assert!(row.get("native_session_repaired").is_none(), "{row}");
+    assert!(fixture
+        .manager()
+        .load("worker")
+        .unwrap()
+        .native_session
+        .is_none());
+}
+
+/// An interrupted revive's candidate, unanchored as a kill mid-launch
+/// leaves it, with its Muse still live in the candidate's pane.
+fn unanchored_live_candidate() -> (Fixture, AgentRecord, AgentRecord) {
+    // A Muse lane that recorded its session at start, killed, then a
+    // revive interrupted after its candidate launched.
+    let fixture = unreported();
+    let id = "77777777-7777-4777-8777-777777777777";
+    let lock = fake_muse_session(&fixture, id);
+    {
+        let _held = pretend_held(vec![lock]);
+        start_worker(&fixture, "muse");
+    }
+    let old = fixture.manager().load("worker").unwrap();
+    assert_eq!(old.native_session.as_ref().unwrap().value, id);
+    kill_owned(&fixture, &old);
+    super::super::revive::fail_once("launched");
+    assert!(fixture
+        .manager()
+        .revive("worker", false, None, TIMEOUT)
+        .is_err());
+    let path = stage_path(&fixture, &old);
+    let (_, candidate, _) = super::super::revive::read_record_at(&path, "worker").unwrap();
+    let path = stage_path(&fixture, &old).join("agent.json");
+    let mut staged = agent::read_private_json(&path).unwrap();
+    staged["harness_identity"] = Value::Null;
+    staged["anchor_rule"] = Value::Null;
+    staged["terminal_id"] = Value::Null;
+    agent::atomic_json(&path, &staged).unwrap();
+    fixture.client.started.store(true, Ordering::Relaxed);
+    fixture.client.custom_alive.store(true, Ordering::Relaxed);
+    (fixture, old, candidate)
+}
+
+#[test]
+fn revive_publishes_a_live_unanchored_candidate_on_its_recorded_session() {
+    let (fixture, old, candidate) = unanchored_live_candidate();
+    let session = candidate.native_session.as_ref().unwrap().value.clone();
+    // The lock names the candidate's own runtime pid, as a real one does.
+    let pid = candidate
+        .custom_process_identity
+        .as_ref()
+        .map_or(4242, |identity| identity.pid);
+    let lock = fake_muse_session_as(&fixture, &session, pid);
+    let _held = pretend_held(vec![lock]);
+    let launches = fixture.client.environments.lock().unwrap().len();
+    let plan = fixture
+        .manager()
+        .revive("worker", true, None, TIMEOUT)
+        .unwrap();
+    assert_eq!(plan["action"], "recover", "{plan}");
+    let result = fixture
+        .manager()
+        .revive("worker", false, None, TIMEOUT)
+        .unwrap();
+    assert_eq!(result["revived"], true, "{result}");
+    let published = fixture.manager().load("worker").unwrap();
+    assert_eq!(published.token, candidate.token);
+    assert!(
+        published.harness_anchor().is_some() || published.custom_process_identity.is_some(),
+        "published candidate is pinned"
+    );
+    assert!(published.terminal_id.is_some());
+    assert_eq!(published.native_session.as_ref().unwrap().value, session);
+    assert!(!journal_path(&fixture, &old).exists());
+    // Published, not relaunched: no new launch environment was delivered.
+    assert_eq!(fixture.client.environments.lock().unwrap().len(), launches);
+}
+
+#[test]
+fn revive_refuses_a_live_candidate_on_a_different_session() {
+    let (fixture, old, _candidate) = unanchored_live_candidate();
+    let lock = fake_muse_session(&fixture, "66666666-6666-4666-8666-666666666666");
+    let _held = pretend_held(vec![lock]);
+    let plan = fixture
+        .manager()
+        .revive("worker", true, None, TIMEOUT)
+        .unwrap();
+    assert_eq!(plan["action"], "blocked", "{plan}");
+    let error = fixture
+        .manager()
+        .revive("worker", false, None, TIMEOUT)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not independently verified"), "{error}");
+    assert!(journal_path(&fixture, &old).exists());
+    // The old generation is still the active one; the candidate stays staged.
+    let active =
+        agent::read_private_json(&fixture.root.join("registry/agents/worker/agent.json")).unwrap();
+    assert_eq!(active["token"], json!(old.token), "{active}");
 }

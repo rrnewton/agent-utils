@@ -34,6 +34,17 @@ static MARKERS: ScreenMarkers = ScreenMarkers {
 };
 
 impl HarnessAdapter for Muse {
+    /// The runtime (`muse.real`, or the `muse` launcher that execs it) stays
+    /// the pane's foreground group leader while its helpers share the
+    /// terminal, as Codex's runtime does: without this the pane pin fails
+    /// whenever Muse spawns a helper, and no session can be captured
+    /// (#1934 agentctl-restore-muse-sessions-and-timeout).
+    fn native_group_leader(&self, executable: &Path) -> bool {
+        executable
+            .file_name()
+            .is_some_and(|name| name == "muse" || name == "muse.real")
+    }
+
     fn name(&self) -> &'static str {
         "muse"
     }
@@ -135,16 +146,15 @@ impl HarnessAdapter for Muse {
         journal_took_prompt(&transcript_path(hints)?, prompt, since)
     }
 
-    /// The sessions the runtime holds locked, sub-agents' excepted: each one's directory name.
+    /// The sessions the runtime holds open, sub-agents' excepted: each one's directory name.
+    /// The runtime holds its session directory itself open (and at times only
+    /// its journal), not always the `.session.lock`, so any held path inside
+    /// the dated session directory names the session (#1934).
     fn held_sessions(&self, held: &[PathBuf]) -> Vec<String> {
         let mut ids: Vec<String> = Vec::new();
-        for id in held
-            .iter()
-            .filter(|path| own_session_lock(path))
-            .filter_map(|lock| lock.parent()?.file_name()?.to_str())
-        {
-            if !ids.iter().any(|seen| seen == id) {
-                ids.push(id.to_owned());
+        for id in held.iter().filter_map(|path| held_session_id(path)) {
+            if !ids.iter().any(|seen| seen == &id) {
+                ids.push(id);
             }
         }
         ids
@@ -234,6 +244,23 @@ fn transcript_path(hints: &super::transcript::Hints<'_>) -> Option<PathBuf> {
         (entry.file_name().is_some_and(|name| name == session) && journal.is_file())
             .then_some(journal)
     })
+}
+
+/// The session a held path belongs to: the directory name four components
+/// under `muse/sessions/` (`<year>/<month>/<day>/<id>/...`, or the session
+/// directory itself held open). A sub-agent's session under `subagent/`
+/// is not the agent's own (#1934).
+pub(crate) fn held_session_id(path: &Path) -> Option<String> {
+    let text = path.to_string_lossy();
+    if !text.contains("/muse/sessions/") || text.contains("/subagent/") {
+        return None;
+    }
+    let parts: Vec<&str> = text.split('/').collect();
+    let at = parts.iter().position(|part| *part == "sessions")?;
+    parts
+        .get(at + 4)
+        .filter(|id| !id.is_empty())
+        .map(|id| (*id).to_owned())
 }
 
 /// Whether `path` is the lock of a Muse session of the agent's own: `.session.lock` under

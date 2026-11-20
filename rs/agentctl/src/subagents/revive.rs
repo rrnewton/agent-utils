@@ -113,10 +113,61 @@ fn record_runtime_pids(record: &AgentRecord) -> Vec<u64> {
     }
 }
 
-/// Sessions the Muse runtime at `pid` names for itself under `root` (#948): the
-/// runtime session json whose `process_generation_hint` is this pid, and any
-/// dated `.session.lock` whose content names this pid. Neither needs the fd
-/// walk that misses a runtime outside the pinned process's descendants.
+/// Whether `pid` is still the runtime process it was recorded as
+/// (#1934 D1): the pinned pid must match its full recorded identity
+/// (pid plus start time, so a reused pid never qualifies), and any
+/// other runtime pid must still be a Muse runtime executable. A lock
+/// or store report naming a bare pid is never trusted on the number
+/// alone, because most locks on a busy host name dead pids whose
+/// numbers a reboot can hand to another program.
+fn verified_runtime_pid(record: &AgentRecord, pid: u64) -> bool {
+    if !record_runtime_pids(record).contains(&pid) {
+        return false;
+    }
+    #[cfg(test)]
+    {
+        true
+    }
+    #[cfg(not(test))]
+    {
+        let Some(pinned) = record
+            .harness_anchor()
+            .or(record.custom_process_identity.as_ref())
+        else {
+            return false;
+        };
+        let Ok(observed) = crate::client::live_custom_process(pid) else {
+            return false;
+        };
+        if pid == pinned.pid {
+            return observed.identity == *pinned;
+        }
+        std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|path| {
+            path.file_name()
+                .is_some_and(|name| name == "muse" || name == "muse.real")
+        })
+    }
+}
+
+/// Sessions the Muse runtime names for itself under `root` (#948): the
+/// runtime session json whose `process_generation_hint` is one of the
+/// record's verified runtime pids, and any dated `.session.lock` whose
+/// content names one. Neither needs the fd walk that misses a runtime
+/// outside the pinned process's descendants.
+fn muse_sessions_for_runtime(root: &Path, record: &AgentRecord) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for pid in record_runtime_pids(record) {
+        if verified_runtime_pid(record, pid) {
+            for id in muse_sessions_for_pid(root, pid) {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+    }
+    ids
+}
+
 fn muse_sessions_for_pid(root: &Path, pid: u64) -> Vec<String> {
     let mut ids: Vec<String> = Vec::new();
     let hint = format!("pid={pid}");
@@ -172,6 +223,47 @@ fn muse_sessions_for_pid(root: &Path, pid: u64) -> Vec<String> {
 /// the session files their runtime holds (Claude Code's is assigned at launch). One held
 /// session is recorded as observed; several are never guessed between: the record keeps no
 /// id and says why under [`NATIVE_SESSION_UNKNOWN`]. Returns what to tell the operator then.
+/// The Muse sessions attributable to this lane from the files its
+/// runtime holds open (#1934 D1): a held path counts only inside the
+/// store's own sessions tree, and a held `.session.lock` counts only
+/// when the pid it names is one of this lane's runtime pids — a Muse
+/// process transiently holds other lanes' locks, so an unattributed
+/// lock is another lane's session, never this one's. A held journal or
+/// session directory is the runtime's own working session.
+fn muse_held_ids(record: &AgentRecord, held: &[PathBuf]) -> Vec<String> {
+    let pids = record_runtime_pids(record);
+    let root = muse_store_root();
+    let mut ids: Vec<String> = Vec::new();
+    for path in held {
+        let Some(id) = crate::harness::muse::held_session_id(path) else {
+            continue;
+        };
+        if let Some(root) = root.as_ref() {
+            if !path.starts_with(root.join("sessions")) {
+                continue;
+            }
+        }
+        if path.file_name().is_some_and(|name| name == ".session.lock") {
+            let Ok(text) = fs::read_to_string(path) else {
+                continue;
+            };
+            let names_own = text.lines().any(|line| {
+                line.trim()
+                    .strip_prefix("pid=")
+                    .and_then(|pid| pid.trim().parse::<u64>().ok())
+                    .is_some_and(|pid| pids.contains(&pid))
+            });
+            if !names_own {
+                continue;
+            }
+        }
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
 pub(super) fn capture_held_session(record: &mut AgentRecord) -> Option<String> {
     if record.native_session.is_some() || !matches!(record.harness.as_str(), "muse" | "codex") {
         return None;
@@ -185,19 +277,21 @@ pub(super) fn capture_held_session(record: &mut AgentRecord) -> Option<String> {
         if attempt > 0 {
             std::thread::sleep(Duration::from_millis(500));
         }
-        ids = adapter.held_sessions(&held_files(record));
-        // A Muse runtime outside the pinned process's descendants holds no
-        // lock the fd walk can see; the store names its session by pid (#948).
         if record.harness == "muse" {
-            if let Some(root) = muse_store_root() {
-                for pid in record_runtime_pids(record) {
-                    for id in muse_sessions_for_pid(&root, pid) {
-                        if !ids.contains(&id) {
-                            ids.push(id);
-                        }
-                    }
-                }
-            }
+            // Muse's own report for this lane's verified runtime pids
+            // is preferred (#1934 D1): it names the session itself, so
+            // a peer lock the fd walk happens to hold can never win.
+            // Only with no report do held files attribute a session.
+            let reported = muse_store_root()
+                .map(|root| muse_sessions_for_runtime(&root, record))
+                .unwrap_or_default();
+            ids = if reported.is_empty() {
+                muse_held_ids(record, &held_files(record))
+            } else {
+                reported
+            };
+        } else {
+            ids = adapter.held_sessions(&held_files(record));
         }
         ids.retain(|id| valid_metadata_text(id));
         if !ids.is_empty() {
@@ -2581,6 +2675,184 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         Ok(())
     }
 
+    /// Read-only proof that a retained candidate's harness lives in its
+    /// own pane on the recorded session (#1934): the automated form of
+    /// the retire-stale-registration pins (`--replacement-pane`,
+    /// `--replacement-session`) plus adopt. Every check the manual path
+    /// demands is demanded here; anything unproved is a refusal.
+    fn live_candidate_evidence(
+        &self,
+        candidate: &AgentRecord,
+        old: &AgentRecord,
+    ) -> Result<(String, Option<CustomProcessIdentity>)> {
+        let expected = candidate
+            .native_session
+            .as_ref()
+            .filter(|native| native.valid_for(candidate))
+            .map(|native| native.value.clone())
+            .or_else(|| recorded_conversation(old).ok().map(|native| native.value))
+            .ok_or_else(|| fail("retained candidate names no native session to match"))?;
+        let pane = candidate
+            .pane_id
+            .as_deref()
+            .ok_or_else(|| fail("retained candidate recorded no pane"))?;
+        if !self.client.panes()?.iter().any(|row| row.pane_id == pane) {
+            return Err(fail(format!("retained candidate's pane {pane} is gone")));
+        }
+        let info = self.client.pane_info(pane)?;
+        if candidate
+            .workspace_id
+            .as_deref()
+            .is_some_and(|workspace| workspace != info.workspace_id)
+            || candidate
+                .tab_id
+                .as_deref()
+                .zip(info.tab_id.as_deref())
+                .is_some_and(|(recorded, live)| recorded != live)
+            || !same_directory(&info.cwd, &candidate.cwd)
+        {
+            return Err(fail(
+                "retained candidate's pane changed workspace, tab, or cwd",
+            ));
+        }
+        if info.agent.as_deref() != Some(candidate.harness.as_str()) {
+            return Err(fail(format!(
+                "retained candidate's pane {pane} does not report its {} harness",
+                candidate.harness
+            )));
+        }
+        if info
+            .terminal_id
+            .as_deref()
+            .is_none_or(|terminal| !valid_metadata_text(terminal))
+        {
+            return Err(fail("retained candidate's pane reports no usable terminal"));
+        }
+        // The session the pane proves: Herdr's own report when it has
+        // one, else the session its pinned process holds, observed the
+        // same way start observes it. A different session refuses.
+        // The identity this proof pins is returned with it, so the pin
+        // step must find exactly that process, never a successor
+        // (#1934 D2).
+        let mut proved_identity: Option<CustomProcessIdentity> = None;
+        let observed = match (&info.session_agent, &info.session_value) {
+            (Some(agent), Some(value)) => {
+                if agent != &candidate.harness {
+                    return Err(fail(
+                        "retained candidate's pane reports a different session provider",
+                    ));
+                }
+                Some(value.clone())
+            }
+            (None, None) => {
+                // Attribute through the candidate's own pin when it
+                // has one (a custom pane's runtime), else the pane's
+                // pinnable harness process.
+                let mut probe = candidate.clone();
+                if candidate.anchors_with_harness_identity() {
+                    let identity = self
+                        .client
+                        .harness_identity(pane, &candidate.harness)?
+                        .ok_or_else(|| {
+                            fail("retained candidate's pane has no pinnable harness process")
+                        })?;
+                    proved_identity = Some(identity.clone());
+                    probe.harness_identity = Some(identity);
+                    probe.anchor_rule = Some(ANCHOR_RULE);
+                } else if candidate.custom_process_identity.is_none() {
+                    return Err(fail(
+                        "retained candidate pinned no runtime to attribute its session",
+                    ));
+                }
+                probe.terminal_id = info.terminal_id.clone();
+                // Observe afresh: the recorded value must not prove itself.
+                probe.native_session = None;
+                probe.extra.remove(NATIVE_SESSION_UNKNOWN);
+                let _ = capture_held_session(&mut probe);
+                if probe.extra.contains_key(NATIVE_SESSION_UNKNOWN) {
+                    return Err(fail(
+                        "retained candidate's runtime holds several sessions; agentctl does not guess",
+                    ));
+                }
+                probe
+                    .native_session
+                    .as_ref()
+                    .map(|native| native.value.clone())
+            }
+            _ => {
+                return Err(fail(
+                    "retained candidate's pane reports an incomplete session",
+                ))
+            }
+        };
+        match observed {
+            Some(value) if value == expected => Ok((
+                format!(
+                    "its {} process lives in pane {pane} on the recorded session {expected}",
+                    candidate.harness
+                ),
+                proved_identity,
+            )),
+            Some(value) => Err(fail(format!(
+                "retained candidate's pane {pane} runs session {value}, not the recorded {expected}"
+            ))),
+            None => Err(fail(
+                "retained candidate's live session cannot be proved from its pane",
+            )),
+        }
+    }
+
+    /// Whether `candidate` lacks a pin [`Self::verify_candidate`]
+    /// requires: no usable terminal, or no pinned harness process. Only
+    /// that failure is curable by pinning the live candidate (#1934); a
+    /// candidate that is pinned and still unverifiable (a changed proof,
+    /// a session claimed elsewhere) stays refused.
+    fn candidate_unpinned(candidate: &AgentRecord) -> bool {
+        candidate
+            .terminal_id
+            .as_deref()
+            .is_none_or(|terminal| !valid_metadata_text(terminal))
+            || (candidate.anchors_with_harness_identity() && candidate.harness_anchor().is_none())
+            || (!candidate.anchors_with_harness_identity()
+                && candidate.custom_process_identity.is_none())
+    }
+
+    /// Pin a retained candidate whose launch was interrupted before it
+    /// anchored, from the live runtime [`Self::live_candidate_evidence`]
+    /// proved (#1934). Mirrors adopt: pin the pane's harness process,
+    /// record its terminal, then let [`Self::verify_candidate`] re-prove
+    /// every claim before anything is published.
+    fn pin_live_candidate(&self, candidate: &mut AgentRecord, old: &AgentRecord) -> Result<String> {
+        let (evidence, proved_identity) = self.live_candidate_evidence(candidate, old)?;
+        let pane = candidate.pane_id.clone().expect("proved candidate pane");
+        let info = self.client.pane_info(&pane)?;
+        if candidate.anchors_with_harness_identity() {
+            let identity = self
+                .client
+                .harness_identity(&pane, &candidate.harness)?
+                .ok_or_else(|| fail("live candidate's harness process cannot be pinned"))?;
+            // The process pinned now must be the one the evidence
+            // proved, identical in full, not merely a live successor
+            // in the same pane (#1934 D2).
+            if proved_identity.is_some_and(|proved| proved != identity) {
+                return Err(fail(
+                    "live candidate's harness changed between proof and pin",
+                ));
+            }
+            if !self.client.verify_harness_identity(&pane, &identity)? {
+                return Err(fail("live candidate's harness changed while pinning"));
+            }
+            candidate.harness_identity = Some(identity);
+            candidate.anchor_rule = Some(ANCHOR_RULE);
+        } else if candidate.custom_process_identity.is_none() {
+            return Err(fail("live candidate pinned no custom runtime to verify"));
+        }
+        candidate.terminal_id = info.terminal_id.clone();
+        candidate.session_agent = info.session_agent.clone();
+        candidate.session_value = info.session_value.clone();
+        Ok(evidence)
+    }
+
     fn revive_plan_document(&self, record: &AgentRecord, action: &str, reason: &str) -> Value {
         json!({ "name":record.name, "token":record.token, "harness":record.harness,
             "profile":record.profile, "model":record.model, "cwd":record.cwd, "slot":record.slot,
@@ -2776,14 +3048,37 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 if journal.ready_record_sha256.is_some() && candidate.lifecycle != "running" {
                     return Err(fail("ready revive candidate lifecycle changed"));
                 }
-                self.verify_candidate(candidate, old, &journal.proof).map_err(|error| fail(format!(
-                    "retained revive candidate cannot be verified: {error}; inspect {} and its recorded terminal; no automatic relaunch; use `agentctl revive {} --dry-run` and `agentctl revive {}`; if the candidate never started, `agentctl revive {} --abandon-candidate` marks it failed and launches again (refused while a harness runs for it)",
-                    stage_path.join("agent.json").display(), journal.name, journal.name, journal.name
-                )))?;
+                if let Err(error) = self.verify_candidate(candidate, old, &journal.proof) {
+                    // An unpinned live candidate revive would pin and
+                    // publish (#1934) plans as recover, not blocked.
+                    if !Self::candidate_unpinned(candidate)
+                        || self.live_candidate_evidence(candidate, old).is_err()
+                    {
+                        return Err(fail(format!(
+                            "retained revive candidate cannot be verified: {error}; inspect {} and its recorded terminal; no automatic relaunch; use `agentctl revive {} --dry-run` and `agentctl revive {}`; if the candidate never started, `agentctl revive {} --abandon-candidate` marks it failed and launches again (refused while a harness runs for it)",
+                            stage_path.join("agent.json").display(), journal.name, journal.name, journal.name
+                        )));
+                    }
+                }
             }
-            let current = self.revive_proof(old)?;
-            if current != journal.proof && !(published && current.kind == "missing") {
-                return Err(fail("stale revive presentation changed"));
+            // A candidate relaunched in the old pane (#744 reuse) holds
+            // that pane live, so the old generation's death proof cannot
+            // be re-derived; completion re-checks it the same way. The
+            // plan therefore tolerates the proof error only for that
+            // candidate, never for a changed presentation.
+            let reused =
+                !published && candidate.pane_id.as_deref() == Some(journal.proof.pane_id.as_str());
+            match self.revive_proof(old) {
+                Ok(current) => {
+                    if current != journal.proof && !(published && current.kind == "missing") {
+                        return Err(fail("stale revive presentation changed"));
+                    }
+                }
+                Err(error) => {
+                    if !reused {
+                        return Err(error);
+                    }
+                }
             }
             Ok(())
         })();
@@ -4602,10 +4897,33 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 self.save(&candidate)?;
                 staged_bytes = artifact_bytes(&staged, "agent.json")?;
             }
-            self.verify_candidate(&candidate, old, &journal.proof).map_err(|_| fail(format!(
-                "interrupted revive candidate is not independently verified; refusing another launch; no automatic relaunch; journal and diagnostics retained at {}; use `agentctl revive {} --dry-run` and `agentctl revive {}`; if the candidate never started, `agentctl revive {} --abandon-candidate` marks it failed and launches again (refused while a harness runs for it)",
-                stage_path.join("agent.json").display(), journal.name, journal.name, journal.name
-            )))?;
+            // A candidate interrupted before it anchored, whose harness
+            // still lives in its pane on the recorded session, is pinned
+            // and published instead of blocking forever (#1934); every
+            // other unverifiable candidate keeps the refusal.
+            if let Err(error) = self.verify_candidate(&candidate, old, &journal.proof) {
+                // Pinning re-proves pane, harness and session before it
+                // changes anything, and verification runs again after
+                // it; only an unpinned candidate may attempt it.
+                if Self::candidate_unpinned(&candidate)
+                    && self.pin_live_candidate(&mut candidate, old).is_ok()
+                {
+                    candidate.storage_directory = Some(StorageDirectory {
+                        path: stage_path.clone(),
+                        device: staged.device,
+                        inode: staged.inode,
+                    });
+                    self.save(&candidate)?;
+                    staged_bytes = artifact_bytes(&staged, "agent.json")?;
+                    self.verify_candidate(&candidate, old, &journal.proof)
+                        .map_err(|_| error)?;
+                } else {
+                    return Err(fail(format!(
+                        "interrupted revive candidate is not independently verified; refusing another launch; no automatic relaunch; journal and diagnostics retained at {}; use `agentctl revive {} --dry-run` and `agentctl revive {}`; if the candidate never started, `agentctl revive {} --abandon-candidate` marks it failed and launches again (refused while a harness runs for it)",
+                        stage_path.join("agent.json").display(), journal.name, journal.name, journal.name
+                    )));
+                }
+            }
             if candidate.lifecycle != "running" {
                 if journal.ready_record_sha256.is_some() {
                     return Err(fail(

@@ -210,7 +210,7 @@ enum Commands {
         after_help = "Examples:\n  agentctl progress lane-a --file status.md --matching 'crashes recorded' --hours 6\n  agentctl progress lane-a --command 'ls results/*.json | wc -l' --hours 4\n  agentctl progress lane-a\n  agentctl progress lane-a --clear\n\nThe declaration is REGISTRY/.progress/NAME.json (schema agentctl-progress/v1). A relative --file is read from the agent's\nworking directory; --command runs there with sh -c, for at most 30 s, once per watch-agents pass, and its standard output is\nthe metric (a failing command is no evidence of change). A dispatcher declares the metric right after `agentctl start`.\nPrints {name, progress} (null when none is declared) or, with --clear, {name, cleared} as JSON; --clear exits 1 when there\nwas nothing to clear. The Rust edition only."
     )]
     Progress(Progress),
-    /// Compare every registry record with live Herdr state and report each mismatch. Read-only unless --repair-labels. Exit 0 when clean, 1 with findings
+    /// Compare every registry record with live Herdr state and report each mismatch. Read-only unless --repair-labels or --repair-native-sessions. Exit 0 when clean, 1 with findings
     #[command(after_help = "Example: agentctl doctor")]
     Doctor(Doctor),
     /// Rewrite a literal string to [redacted] across one agent's processed queue and events (and, with --include-archived, its archived records' processed queues). Event logs are rewritten only when the agent is stopped. Never touches the live inbox or in-flight entries; refuses while the agent is mid-delivery. Backs up each touched file (0600) under REGISTRY/backups and appends audit lines that never contain the string. Uncovered: queue/failed and queue/cancelled, agent.json, misroutes/readback, chat bridge state, harness transcripts
@@ -1551,6 +1551,9 @@ struct Doctor {
     /// Restore the tab label and Herdr agent name of owned agents whose every other anchor still matches
     #[arg(long)]
     repair_labels: bool,
+    /// Record the native session of live Muse and Codex lanes that lack one, observed from the process each record pins (never guessed among several)
+    #[arg(long)]
+    repair_native_sessions: bool,
 }
 
 #[derive(Args)]
@@ -5516,7 +5519,8 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             )?
         }
         Commands::Doctor(value) => {
-            let report = manager.doctor(value.repair_labels)?;
+            let report =
+                manager.doctor_repairing(value.repair_labels, value.repair_native_sessions)?;
             write_json(&report).map_err(Failure::Output)?;
             return Ok(if report["clean"] == true { 0 } else { 1 });
         }

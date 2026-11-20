@@ -4557,3 +4557,144 @@ fn watch_answers_a_managed_muse_hooks_dialog() {
     );
     assert_eq!(fixture.client.hooks_answers.lock().unwrap().len(), 1);
 }
+
+#[test]
+fn restore_restarted_midway_resumes_revived_lanes_and_finishes() {
+    // #1934: the first boot attempt was killed by its unit timeout after
+    // reviving lane-a; its partial report names that lane. The restarted
+    // run carries lane-a forward (still alive, never relaunched) and
+    // revives only lane-b, then completes the boot's report.
+    let fixture = Fixture::new();
+    let alive_named = |fixture: &Fixture, name: &str| {
+        fixture
+            .client
+            .fresh_presentations
+            .store(true, Ordering::Relaxed);
+        fixture
+            .manager()
+            .start(
+                name,
+                &fixture.root,
+                StartOptions {
+                    harness: "codex".to_owned(),
+                    resume: Some(format!("{name}-conversation")),
+                    harness_args: vec!["--yolo".to_owned()],
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        fixture.manager().load(name).unwrap()
+    };
+    let lane_a = alive_named(&fixture, "lane-a");
+    let lane_b = alive_named(&fixture, "lane-b");
+    fixture
+        .client
+        .dead_panes
+        .lock()
+        .unwrap()
+        .insert(lane_b.pane_id.clone().unwrap());
+    let host = ScriptedHost::new();
+    let config = config(&fixture, None);
+    let registry = fixture.root.join("registry");
+    // The killed attempt's partial report, in this boot's epoch.
+    let reports = fixture.root.join("reports");
+    fs::create_dir_all(&reports).unwrap();
+    fs::write(
+        reports.join(format!("{BOOT}.json")),
+        json!({
+            "schema": "agentctl-restore-report/v1",
+            "boot_id": BOOT,
+            "epoch": {"boot_id": BOOT, "user_manager": "invocation:manager-a"},
+            "started_at": 1_999_999_000.0,
+            "finished_at": 1_999_999_500.0,
+            "dry_run": false,
+            "complete": false,
+            "in_progress": true,
+            "coordinator": null,
+            "agents": [{"name": "lane-a", "action": "revived", "pane_id": lane_a.pane_id}],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let report = restore(&fixture.client, &registry, &host, &config, &options(None)).unwrap();
+    assert_eq!(report["complete"], true, "{report}");
+    assert_eq!(report["in_progress"], false, "{report}");
+    let resumed = agent_row(&report, "lane-a");
+    assert_eq!(resumed["action"], "revived", "{report}");
+    assert_eq!(resumed["resumed"], true, "{report}");
+    let finished = agent_row(&report, "lane-b");
+    assert_eq!(finished["action"], "revived", "{report}");
+    assert!(finished.get("resumed").is_none(), "{report}");
+    assert_eq!(report["resumed_lanes"], json!(["lane-a"]), "{report}");
+    // Carried forward, not relaunched: lane-a keeps its generation,
+    // lane-b is a new one.
+    assert_eq!(
+        fixture.manager().load("lane-a").unwrap().token,
+        lane_a.token
+    );
+    assert_ne!(
+        fixture.manager().load("lane-b").unwrap().token,
+        lane_b.token
+    );
+    let path = reports.join(format!("{BOOT}.json"));
+    let recorded = crate::restore::read_report(&path).unwrap();
+    assert_eq!(recorded["complete"], true, "{recorded}");
+    assert_eq!(recorded["resumed_lanes"], json!(["lane-a"]), "{recorded}");
+}
+
+#[test]
+fn restore_never_resumes_a_lane_whose_plan_only_skips_its_lifecycle() {
+    // #1934 D3: a partial row claiming a launch_failed lane was
+    // revived proves nothing — its revive plan skips on lifecycle, not
+    // on a live harness. The restarted restore promotes it through the
+    // normal recovery path instead of carrying the row forward.
+    let fixture = Fixture::new();
+    fixture
+        .client
+        .fresh_presentations
+        .store(true, Ordering::Relaxed);
+    fixture
+        .manager()
+        .start(
+            "lane-a",
+            &fixture.root,
+            StartOptions {
+                harness: "codex".to_owned(),
+                resume: Some("lane-a-conversation".to_owned()),
+                harness_args: vec!["--yolo".to_owned()],
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    let mut record = fixture.manager().load("lane-a").unwrap();
+    record.lifecycle = "launch_failed".to_owned();
+    record.error = Some("agent start: timed out waiting for agent startup".to_owned());
+    fixture.manager().save(&record).unwrap();
+    let host = ScriptedHost::new();
+    let config = config(&fixture, None);
+    let registry = fixture.root.join("registry");
+    let reports = fixture.root.join("reports");
+    fs::create_dir_all(&reports).unwrap();
+    fs::write(
+        reports.join(format!("{BOOT}.json")),
+        json!({
+            "schema": "agentctl-restore-report/v1",
+            "boot_id": BOOT,
+            "epoch": {"boot_id": BOOT, "user_manager": "invocation:manager-a"},
+            "started_at": 1_999_999_000.0,
+            "finished_at": 1_999_999_500.0,
+            "dry_run": false,
+            "complete": false,
+            "in_progress": true,
+            "coordinator": null,
+            "agents": [{"name": "lane-a", "action": "revived", "pane_id": record.pane_id}],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let report = restore(&fixture.client, &registry, &host, &config, &options(None)).unwrap();
+    let row = agent_row(&report, "lane-a");
+    assert_eq!(row["action"], "promoted", "{report}");
+    assert!(row.get("resumed").is_none(), "{report}");
+    assert_eq!(report["resumed_lanes"], json!([]), "{report}");
+}

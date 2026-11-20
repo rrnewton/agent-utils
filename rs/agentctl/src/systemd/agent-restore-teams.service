@@ -18,8 +18,12 @@ StartLimitBurst=5
 [Service]
 Type=oneshot
 ExecStart=@AGENTCTL@ restore-teams --config @TEAMS_CONFIG@ --boot
-# Each registry waits for Herdr, the user certificate, and every lane's
-# startup deadline in turn.
+# Per-attempt watchdog, not a whole-host budget (#1934): each registry's
+# restore writes a partial report as it goes and a restarted run resumes
+# where it left off, so this bound only has to cover healthy progress,
+# never every team at once. Removing it would let a hung attempt block
+# the boot forever with no retry; scaling it with the team or lane count
+# would bake a stale count into a static unit.
 TimeoutStartSec=1800
 Restart=on-failure
 RestartSec=60

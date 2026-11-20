@@ -1772,6 +1772,18 @@ fn write_report(path: &Path, report: &Value) -> Result<()> {
         .map_err(|error| fail(format!("cannot publish {}: {error}", path.display())))
 }
 
+/// Best-effort progress for a restore still running (#1934): the same
+/// report shape as the final one, never complete, with the lanes finished
+/// so far under `agents`. A unit timeout kills the run, not the evidence:
+/// the restarted run resumes from these rows instead of starting over.
+fn write_progress_report(path: &Path, report: &Value, at: f64) {
+    let mut partial = report.clone();
+    partial["complete"] = json!(false);
+    partial["in_progress"] = json!(true);
+    partial["finished_at"] = json!(at);
+    let _ = write_report(path, &partial);
+}
+
 /// Best-effort evidence for a restore that failed before its final report
 /// (#975: at boot the journal may be unreadable, so this file is the only
 /// record of why nothing came back). Never marks the boot complete, so the
@@ -3407,6 +3419,35 @@ pub fn restore<A: ManagedApi + ?Sized>(
     let epoch_changed = previous_epoch
         .as_ref()
         .is_some_and(|recorded| *recorded != epoch);
+    // Lanes a killed attempt already revived this boot (#1934): a partial
+    // report from this same epoch names them, and the restarted run
+    // carries those rows forward after re-proving each lane alive,
+    // instead of reviving it again. Only the revived class resumes;
+    // refused, excluded and skipped rows are decided afresh.
+    let prior_revived: std::collections::BTreeMap<String, Value> = if options.dry_run {
+        Default::default()
+    } else if let Some((_, prior)) = &previous {
+        if prior["complete"] != true && RestoreEpoch::from_report(prior).as_ref() == Some(&epoch) {
+            std::iter::once(&prior["coordinator"])
+                .chain(prior["agents"].as_array().into_iter().flatten())
+                .filter(|row| {
+                    matches!(
+                        row["action"].as_str(),
+                        Some("revived" | "promoted" | "revived-fresh")
+                    )
+                })
+                .filter_map(|row| {
+                    row["name"]
+                        .as_str()
+                        .map(|name| (name.to_owned(), row.clone()))
+                })
+                .collect()
+        } else {
+            Default::default()
+        }
+    } else {
+        Default::default()
+    };
     if !options.force && !options.dry_run {
         // The replay candidate is the shared completed pick, not merely
         // the first readable report: a partial report at the current
@@ -3506,6 +3547,15 @@ pub fn restore<A: ManagedApi + ?Sized>(
         "desired_state_source": if config.agents.is_some() { "pinned-list" } else { "registry-derived" },
         "report": path,
     });
+    // Progress is durable from the start (#1934): a killed attempt leaves
+    // the lanes it finished in the boot's report, and the restart resumes
+    // from them. Best-effort, and never written for a dry run.
+    let write_progress = |report: &Value| {
+        if !options.dry_run {
+            write_progress_report(&path, report, host.now());
+        }
+    };
+    write_progress(&report);
     let project = registry.parent().unwrap_or(registry);
     report["slot_images"] = if options.dry_run {
         json!({"action": "skipped", "reason": "dry run"})
@@ -3636,6 +3686,7 @@ pub fn restore<A: ManagedApi + ?Sized>(
                     .map(|other| register_elsewhere(client, other, &live, options.dry_run))
                     .collect::<Vec<_>>());
             }
+            write_progress(&report);
         }
         let mut agents = Vec::new();
         // Managers come back before the agents they manage, at every depth of the control
@@ -3655,11 +3706,15 @@ pub fn restore<A: ManagedApi + ?Sized>(
         {
             if config.exclude.contains(name) {
                 agents.push(json!({"name": name, "action": "excluded", "reason": "listed in restore.json exclude"}));
+                report["agents"] = json!(agents.clone());
+                write_progress(&report);
                 continue;
             }
             if let Some(desired) = config.agents.as_ref() {
                 if !desired.iter().any(|wanted| wanted == name) {
                     agents.push(json!({"name": name, "action": "excluded", "reason": "not listed in restore.json agents (desired state)"}));
+                    report["agents"] = json!(agents.clone());
+                    write_progress(&report);
                     continue;
                 }
             } else {
@@ -3675,6 +3730,8 @@ pub fn restore<A: ManagedApi + ?Sized>(
                             "action": "refused",
                             "reason": format!("cannot derive desired state for {name}: {evidence}"),
                         }));
+                        report["agents"] = json!(agents.clone());
+                        write_progress(&report);
                         continue;
                     }
                     Ok(lifecycle) if lifecycle != "running" && lifecycle != "launch_failed" => {
@@ -3685,6 +3742,8 @@ pub fn restore<A: ManagedApi + ?Sized>(
                                 "lifecycle is {lifecycle}, not running at shutdown; registry-derived restore leaves it down"
                             ),
                         }));
+                        report["agents"] = json!(agents.clone());
+                        write_progress(&report);
                         continue;
                     }
                     Ok(_) => {}
@@ -3705,7 +3764,31 @@ pub fn restore<A: ManagedApi + ?Sized>(
                     "reason": reason,
                     "slot_bind": {"action": "refused"},
                 }));
+                report["agents"] = json!(agents.clone());
+                write_progress(&report);
                 continue;
+            }
+            // Resume (#1934): a lane the killed attempt already revived
+            // this boot, still provably alive, is carried forward, not
+            // revived again. The dry-run plan is the proof, and only
+            // its alive skip proves life: a lifecycle skip ("record
+            // lifecycle is not running") proves nothing, so such a lane
+            // is recovered normally, never carried forward (#1934 D3).
+            if let Some(prior) = prior_revived.get(name.as_str()) {
+                let alive = manager
+                    .revive(name, true, None, options.startup_timeout)
+                    .is_ok_and(|plan| {
+                        plan["action"] == "skip"
+                            && plan["reason"] == "recorded harness process is alive"
+                    });
+                if alive {
+                    let mut row = prior.clone();
+                    row["resumed"] = json!(true);
+                    agents.push(row);
+                    report["agents"] = json!(agents.clone());
+                    write_progress(&report);
+                    continue;
+                }
             }
             eprintln!("agentctl restore: restoring {name}");
             let mut row = recover_agent(&manager, name, options);
@@ -3721,6 +3804,8 @@ pub fn restore<A: ManagedApi + ?Sized>(
                 &boxed,
             );
             agents.push(row);
+            report["agents"] = json!(agents.clone());
+            write_progress(&report);
             if launched && config.startup_delay_seconds > 0 {
                 host.sleep(Duration::from_secs(config.startup_delay_seconds));
             }
@@ -3914,6 +3999,18 @@ pub fn restore<A: ManagedApi + ?Sized>(
         .map(|row| row["warning"].clone())
         .collect();
     report["fresh_starts"] = json!(fresh_starts);
+    // Lanes carried forward from the killed attempt's partial report
+    // (#1934), named so the boot log shows the restart resumed.
+    report["resumed_lanes"] = json!(report["agents"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter(|row| row["resumed"] == true)
+                .filter_map(|row| row["name"].as_str().map(|name| json!(name)))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default());
+    report["in_progress"] = json!(false);
     report["complete"] =
         json!(herdr_ready && coordinator_ok && launched_survived && !options.dry_run);
     // A dry run never completes; this says whether the same run for real would.

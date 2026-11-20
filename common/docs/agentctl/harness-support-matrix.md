@@ -483,11 +483,19 @@ restore-native-sessions).
   the harness starts.
 - **Codex**: supported — discovered from the rollout files the process
   holds open (`held_sessions` in `rs/agentctl/src/harness/codex.rs`).
-- **Muse**: supported — discovered from the session lock the runtime
-  holds open (#916 muse-native-session-id; `held_sessions` in
-  `rs/agentctl/src/harness/muse.rs`). A fresh Muse start mints its own
-  id, which agentctl records at anchor; agentctl cannot name a Muse
-  conversation in advance.
+- **Muse**: supported — discovered from the session directory the
+  runtime holds open (the directory itself, its journal, or its lock;
+  #916 muse-native-session-id, #1934; `held_sessions` in
+  `rs/agentctl/src/harness/muse.rs`), observed from the launched pane's
+  own pinned Muse process at start, adopt, and promote, with the
+  runtime recognised as a native group leader so the pin survives its
+  helpers. A fresh Muse start mints its own id, which agentctl records
+  then; agentctl cannot name a Muse conversation in advance. Live
+  lanes whose records still lack one are backfilled by
+  `agentctl doctor --repair-native-sessions`, from the same pinned
+  observation in the existing `native_session` field (no new record
+  field, so older builds keep reading the record); several held
+  sessions are never guessed between.
 - **Unknown TUI**: none — no id is assigned, discovered, or recorded.
 - **Headless**: supported — the wrapper owns the session id and resumes
   it across restarts.
@@ -523,7 +531,16 @@ arguments and conversation (`split_conversation`, `fresh_arguments`,
   selector with no id (`--last`) is refused rather than guessed.
 - **Muse**: partial — a trailing `resume ID` replays, but a fresh start
   cannot resume a conversation agentctl names (#741): revive starts
-  the recorded arguments and Muse mints a new session.
+  the recorded arguments and Muse mints a new session. Since #1934
+  the recorded session is the one start observed, so revive resumes
+  it after a reboot instead of scanning the store by cwd. Restore
+  writes a partial report as it goes and a restarted run in the same
+  boot epoch resumes from it (`resumed_lanes` in the report; the
+  shipped units keep `TimeoutStartSec=1800` as a per-attempt watchdog,
+  not a whole-team budget), and a retained revive candidate whose
+  Muse still lives in its pane on the recorded session is pinned and
+  published by `agentctl revive` instead of blocking (the automated
+  retire-stale-registration plus adopt proofs; refused otherwise).
 - **Unknown TUI**: none — launch specs cannot replay an unrecognised
   harness (`split_conversation` returns `None`; replay errors).
 - **Headless**: supported — the wrapper resumes its recorded session;
@@ -852,6 +869,14 @@ differential lockstep for the interactive core, but it is not identical:
   not the Rust wrapper's persistent Claude process. The user guide's
   edition table says this plainly; the matrix's Headless column is the
   Rust meaning.
+- The #1934 restore work is Rust-only: Muse session capture from the
+  held session directory at start/promote, the
+  `doctor --repair-native-sessions` backfill, restore's partial-report
+  resume, and publishing a live retained revive candidate. The Python
+  edition has no restore command, discovers a Muse session by newest
+  journal naming the cwd at revive, and keeps the manual
+  retire-stale-registration plus adopt recovery for interrupted
+  revives.
 - Where the two editions disagree, this matrix records the Rust
   edition, and the disagreement itself is a cell to fix, not a detail
   to omit.

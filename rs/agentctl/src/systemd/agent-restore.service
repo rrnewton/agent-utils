@@ -14,7 +14,12 @@ StartLimitBurst=5
 [Service]
 Type=oneshot
 ExecStart=@AGENTCTL@ --registry @REGISTRY@ --herdr-bin @HERDR@ restore --boot
-# Reviving each agent can take its startup deadline plus the configured delay between agents.
+# Per-attempt watchdog, not a whole-team budget (#1934): restore writes a
+# partial report as it goes and a restarted run resumes where it left off,
+# so this bound only has to cover healthy progress, never every lane at
+# once. Removing it would let a hung attempt block the boot forever with
+# no retry; scaling it with the lane count would bake a stale count into
+# a static unit. 1800s of no completion, then the bounded restart resumes.
 TimeoutStartSec=1800
 Restart=on-failure
 RestartSec=60

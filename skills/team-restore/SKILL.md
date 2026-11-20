@@ -50,6 +50,11 @@ Read the report before running anything:
 - If `action` is `already-restored` / `replayed: true` but agents are visibly down, the guard thinks this
   boot was already restored. That's what happens after a user-manager restart, which keeps the boot id.
   Add `--force`. It only bypasses the replay; it never overrides a refusal.
+- A report with `complete: false` and `in_progress: true` is a killed attempt's partial report, not a
+  completed restore: it names the lanes that attempt already revived under `agents`. A rerun in the same
+  boot resumes from it — those lanes are carried forward (`resumed: true`, listed in `resumed_lanes`)
+  after being re-proved alive, and only the remaining lanes are revived. Never delete a partial report
+  to "start clean"; it is the resume state (and the only boot evidence if the journal is unreadable).
 - Read `refused` and each agent's `reason` now, not after the real run.
 
 ## 3. Run it
@@ -59,6 +64,11 @@ agentctl --registry R --herdr-bin H restore [--force]
 ```
 
 Run it under nohup or with a generous timeout (it can take minutes), and keep its JSON report.
+The boot unit's `TimeoutStartSec=1800` is a per-attempt watchdog, not a whole-team budget: restore
+writes its partial report as it goes, so a timed-out and restarted unit resumes where it left off
+instead of starting over. Do not raise or remove that timeout to fit a big team; if a single attempt
+makes no progress (the partial report stops growing), that is a hung lane to diagnose, not a budget
+to widen.
 
 On a host and build with the deterministic driver, prefer
 `agentctl --registry R team kick` for the whole recovery: it detects,
@@ -92,6 +102,18 @@ manual steps below remain the fallback and the meaning of its checks.
   sinks over. Then check the channel by hand for messages the gap swallowed.
 - **Revive refuses "death unverifiable" or "pane/cwd changed":** `agentctl stop NAME`, then
   `agentctl start NAME --profile P --resume SESSION`.
+- **Revive refuses "record has no native conversation ID" for Muse lanes:** the lane's session was
+  never recorded. While it is live, backfill it with
+  `agentctl --registry R doctor --repair-native-sessions` (the session is observed from the process
+  the record pins; several held sessions are never guessed between — bind one by hand with
+  `agentctl bind-session NAME <id>`). New starts and promotes record the session themselves.
+- **Revive blocked on a half-finished candidate whose Muse still lives:** just rerun
+  `agentctl revive NAME`. When the retained candidate's harness is alive in its pane on the recorded
+  session, revive pins and publishes it (the automated retire-stale-registration plus adopt proofs).
+  It refuses — journal retained — when the live session differs or cannot be proved; only then fall
+  back to the manual pins (`retire-stale-registration --expected-revive-sha256 … --replacement-pane …
+  --replacement-session …`, then `adopt`). `--abandon-candidate` stays refused while a harness runs
+  for the candidate.
 - **A lane came back at a lower effort level:** its profile's launch environment wasn't replayed. Restart
   it with stop + `start --profile P --resume SESSION` at a safe point (no gate running).
 - **`agentctl list` fails or the watcher reports an odd agent:** a non-agent directory under `agents/` (for

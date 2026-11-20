@@ -9671,6 +9671,17 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         promoted.terminal_id = info.terminal_id.clone();
         promoted.harness_identity = Some(identity.clone());
         promoted.anchor_rule = Some(ANCHOR_RULE);
+        // A harness that names its conversation only by the files it holds
+        // (Muse, Codex) gets it recorded here too, from the process just
+        // pinned, as at start and adopt (#1934).
+        if promoted.native_session.is_none() {
+            if let Some(warning) = revive::capture_held_session(&mut promoted) {
+                eprintln!("agentctl: warning: {warning}");
+            }
+            if let Some(warning) = self.guard_duplicate_capture(&mut promoted) {
+                eprintln!("agentctl: warning: {warning}");
+            }
+        }
         promoted.lifecycle = "running".to_owned();
         promoted.error = None;
         if self.client.pane_info(&pane)? != info
@@ -9683,6 +9694,15 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         self.save(&promoted)?;
         let mut result = self.status_record(&promoted)?;
         result["promoted"] = json!(true);
+        if let Some(reason) = promoted
+            .extra
+            .get(revive::NATIVE_SESSION_UNKNOWN)
+            .and_then(|note| note["reason"].as_str())
+        {
+            result["native_session_warning"] = Value::String(format!(
+                "native conversation unknown: {reason}; name it with `agentctl bind-session {agent_name} <id>`"
+            ));
+        }
         Ok(result)
     }
 
@@ -10111,6 +10131,18 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
 
     /// Compare every registry record with live Herdr state; read-only unless repairing labels.
     pub fn doctor(&self, repair_labels: bool) -> Result<Value> {
+        self.doctor_repairing(repair_labels, false)
+    }
+
+    /// [`Self::doctor`], optionally also recording the native session of
+    /// live Muse and Codex lanes that lack one, from the same pinned
+    /// observation start and adopt use (#1934). No new record field is
+    /// written: the session lands in the existing `native_session`.
+    pub fn doctor_repairing(
+        &self,
+        repair_labels: bool,
+        repair_native_sessions: bool,
+    ) -> Result<Value> {
         let mut rows = Vec::new();
         let mut registry_findings = Vec::new();
         let journals = match self.rename_journals() {
@@ -10264,6 +10296,21 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 && journals.is_empty()
             {
                 row["repaired"] = json!(self.repair_presentation(&record.name)?);
+            }
+            if repair_native_sessions
+                && !findings.is_empty()
+                && findings.iter().all(|finding| {
+                    matches!(
+                        *finding,
+                        "native-session-missing" | "native-session-ambiguous"
+                    )
+                })
+                && journals.is_empty()
+            {
+                if let Some(value) = self.repair_native_session(&record.name)? {
+                    row["native_session_repaired"] = json!(value);
+                    row["repaired"] = json!(true);
+                }
             }
             rows.push(row);
         }
@@ -10450,6 +10497,29 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             findings.push("unanchored");
         }
         Ok(findings)
+    }
+
+    /// Record the native session a live lane's pinned process holds, when
+    /// its record names none (#1934 backfill). Several held sessions are
+    /// never guessed between: the record then keeps the unknown note
+    /// capture wrote, and nothing is reported repaired.
+    fn repair_native_session(&self, agent_name: &str) -> Result<Option<String>> {
+        let _lock = self.lock(agent_name)?;
+        let _identity_lock = self.identity_lock()?;
+        let mut record = self.load(agent_name)?;
+        if record.native_session.is_some() || !matches!(record.harness.as_str(), "muse" | "codex") {
+            return Ok(None);
+        }
+        let _ = revive::capture_held_session(&mut record);
+        let _ = self.guard_duplicate_capture(&mut record);
+        let value = record
+            .native_session
+            .as_ref()
+            .map(|native| native.value.clone());
+        if value.is_some() || record.extra.contains_key(revive::NATIVE_SESSION_UNKNOWN) {
+            self.save(&record)?;
+        }
+        Ok(value)
     }
 
     /// Restore one owned agent's label and Herdr name when every other anchor holds.
