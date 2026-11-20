@@ -25625,6 +25625,166 @@ def _host_id() -> str:
     raise Refusal(f"cannot establish the stable machine identity{detail}")
 
 
+#: Machine-id alias evidence (#1933 wrkslots-machine-id-changed-host-alias).
+#:
+#: After a reprovision changes /etc/machine-id, every owner recorded under
+#: the old identity would stay indeterminate forever: the host check runs
+#: before the boot check, so the boot that ended is never consulted. A
+#: coordinator may instead record the old identity as a previous identity
+#: of this host. The record is host-local state, never registry state: it
+#: lives under the user's state directory (``WRKSLOTS_HOST_ALIAS_PATH``
+#: overrides the path), no registry reader ever opens it, and a reader
+#: that predates it keeps failing closed exactly as before. No ACTIVE
+#: field, journal key, or event kind is added.
+_HOST_ALIAS_SCHEMA = 1
+#: Longest previous-to-current chain the judge follows. A hand-edited
+#: cycle terminates at the cap (and at the visited set) instead of
+#: looping, and a longer chain simply does not count.
+_HOST_ALIAS_MAX_CHAIN = 8
+_HOST_ALIAS_ENTRY_KEYS = frozenset(
+    {
+        "previous_host_id",
+        "current_host_id",
+        "hostname",
+        "recorded_at",
+        "recorded_by",
+        "previous_boot_ids",
+        "current_boot_id",
+    }
+)
+_HOST_ALIAS_RECORDED_BY_KEYS = frozenset({"pid", "start_ticks", "boot_id", "host_id"})
+
+
+def _host_alias_path() -> Path:
+    override = os.environ.get("WRKSLOTS_HOST_ALIAS_PATH")
+    if override:
+        return Path(override).expanduser()
+    state_home = os.environ.get("XDG_STATE_HOME")
+    base = (
+        Path(state_home).expanduser()
+        if state_home
+        else Path.home() / ".local" / "state"
+    )
+    return base / "wrkslots" / "host-aliases.json"
+
+
+def _host_alias_id_valid(value: object) -> bool:
+    """Whether ``value`` can name a machine or boot identity in an alias."""
+
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and not any(
+            character.isspace() or ord(character) < 0x20 or ord(character) == 0x7F
+            for character in value
+        )
+    )
+
+
+def _valid_host_alias_entry(raw: object) -> dict[str, object] | None:
+    if not isinstance(raw, dict) or set(raw) != _HOST_ALIAS_ENTRY_KEYS:
+        return None
+    if not _host_alias_id_valid(raw["previous_host_id"]):
+        return None
+    if not _host_alias_id_valid(raw["current_host_id"]):
+        return None
+    if not _host_alias_id_valid(raw["current_boot_id"]):
+        return None
+    if not isinstance(raw["hostname"], str) or not raw["hostname"]:
+        return None
+    if not isinstance(raw["recorded_at"], str) or not raw["recorded_at"]:
+        return None
+    recorded_by = raw["recorded_by"]
+    if not isinstance(recorded_by, dict) or set(recorded_by) != _HOST_ALIAS_RECORDED_BY_KEYS:
+        return None
+    if type(recorded_by["pid"]) is not int or type(recorded_by["start_ticks"]) is not int:
+        return None
+    if not _host_alias_id_valid(recorded_by["boot_id"]):
+        return None
+    if not _host_alias_id_valid(recorded_by["host_id"]):
+        return None
+    boots = raw["previous_boot_ids"]
+    if not isinstance(boots, list) or not all(_host_alias_id_valid(boot) for boot in boots):
+        return None
+    return raw
+
+
+def _load_host_aliases(path: Path | None = None) -> tuple[dict[str, object], ...]:
+    """Validated alias entries of this host; any failure means no aliases.
+
+    Failing closed is the point: a missing, unreadable, symlinked, or
+    malformed alias file proves nothing, so the judge answers exactly
+    as it did before aliases existed.
+    """
+
+    try:
+        selected = _host_alias_path() if path is None else path
+        if selected.is_symlink():
+            return ()
+        raw: object = json.loads(selected.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RuntimeError):
+        return ()
+    if not isinstance(raw, dict) or set(raw) != {"schema", "aliases"}:
+        return ()
+    if raw["schema"] != _HOST_ALIAS_SCHEMA or not isinstance(raw["aliases"], list):
+        return ()
+    entries = []
+    for item in raw["aliases"]:
+        entry = _valid_host_alias_entry(item)
+        if entry is not None:
+            entries.append(entry)
+    return tuple(entries)
+
+
+def _host_alias_counts(
+    recorded_host_id: str,
+    *,
+    current_host_id: str,
+    hostname: str,
+    current_boot_id: str,
+    aliases: tuple[dict[str, object], ...],
+) -> bool:
+    """Whether ``recorded_host_id`` is a recorded previous identity of this host.
+
+    Follows previous-to-current links whose hostname is this host's and
+    whose recorded boots exclude the current boot, so an alias for the
+    boot that is still running never counts, at any hop. At most
+    ``_HOST_ALIAS_MAX_CHAIN`` hops; a cycle or a longer chain does not
+    count. An empty ``previous_boot_ids`` proves nothing by itself: the
+    caller still applies the ordinary boot check to the recorded owner.
+    """
+
+    if recorded_host_id == current_host_id:
+        return True
+    links: dict[str, list[str]] = {}
+    for entry in aliases:
+        if entry["hostname"] != hostname:
+            continue
+        boots = entry["previous_boot_ids"]
+        assert isinstance(boots, list)
+        if current_boot_id in boots:
+            continue
+        previous = entry["previous_host_id"]
+        current = entry["current_host_id"]
+        assert isinstance(previous, str) and isinstance(current, str)
+        links.setdefault(previous, []).append(current)
+    seen = {recorded_host_id}
+    frontier = [recorded_host_id]
+    for _hop in range(_HOST_ALIAS_MAX_CHAIN):
+        following: list[str] = []
+        for node in frontier:
+            for target in links.get(node, ()):
+                if target == current_host_id:
+                    return True
+                if target not in seen:
+                    seen.add(target)
+                    following.append(target)
+        if not following:
+            return False
+        frontier = following
+    return False
+
+
 # The machine's own PID 1 and PID 2, recognised by cgroup rather than by number.
 #
 # ⚠️ THE NUMBER ALONE IS THE WRONG TEST, and this was measured rather than
@@ -27685,15 +27845,40 @@ def _process_state_legacy(identity: ProcessIdentity | None) -> tuple[str, str]:
         host_id = _host_id()
     except Refusal as exc:
         return "indeterminate", str(exc)
+    boot_id: str | None = None
     if host_id != identity.host_id:
-        return (
-            "indeterminate",
-            "the recorded owner belongs to a different machine identity",
-        )
-    try:
-        boot_id = _boot_id(Path("/proc"))
-    except Refusal as exc:
-        return "indeterminate", str(exc)
+        # A recorded previous identity of this host counts as this host
+        # (#1933): the boot check below then proves an old-boot owner
+        # dead. Every other foreign identity stays indeterminate, with
+        # the same detail as before aliases existed.
+        try:
+            boot_id = _boot_id(Path("/proc"))
+        except Refusal:
+            boot_id = None
+        aliased = False
+        if boot_id is not None:
+            try:
+                hostname = _short_hostname()
+            except Refusal:
+                hostname = None
+            if hostname is not None:
+                aliased = _host_alias_counts(
+                    identity.host_id,
+                    current_host_id=host_id,
+                    hostname=hostname,
+                    current_boot_id=boot_id,
+                    aliases=_load_host_aliases(),
+                )
+        if not aliased:
+            return (
+                "indeterminate",
+                "the recorded owner belongs to a different machine identity",
+            )
+    if boot_id is None:
+        try:
+            boot_id = _boot_id(Path("/proc"))
+        except Refusal as exc:
+            return "indeterminate", str(exc)
     if boot_id != identity.boot_id:
         return "dead", "the recorded machine boot ended"
     try:
@@ -47362,6 +47547,120 @@ def _assert_clean_tree_for_rebind(config: Config, record: ActiveRecord) -> None:
                 f"files ({first}); a slot changes agent only with a clean "
                 "tree: finish or discard the changes first"
             )
+
+
+def _cmd_host_alias_missing(args: argparse.Namespace) -> int:
+    del args
+    raise Refusal(
+        "host-alias requires the 'add' action. remedy: run 'wrkslots host-alias add "
+        "--previous-host-id OLD --coordinator-authorized --coordinator-pid PID' after a "
+        "reprovision changed this host's machine identity"
+    )
+
+
+def _cmd_host_alias_add(args: argparse.Namespace) -> int:
+    """Record a previous machine identity of this host after a reprovision (#1933).
+
+    The alias is host-local evidence, written only to the alias file
+    (see ``_host_alias_path``); no registry state changes, so readers
+    that predate the alias keep judging pre-reprovision owners
+    indeterminate. Every check runs before the write: a live authorized
+    coordinator, the previous identity differs from the current one,
+    this host's short name is the shard, the current boot is none of
+    the boots recorded under the previous identity, and no coordinator
+    recorded under that identity is live now. Only then does the judge
+    treat the old identity as this host, where the ordinary boot check
+    proves its owners dead.
+    """
+
+    _require_coordinator_authorized(args, "host-alias recording")
+    coordinator = _capture_caller_process(args.coordinator_pid, "coordinator")
+    config = _load_config(args.project_root, args.machine)
+    hostname = _short_hostname()
+    if hostname != config.machine:
+        raise Refusal(
+            f"host-alias records this host only: the selected shard is "
+            f"{config.machine!r} but this host is {hostname!r}. remedy: rerun "
+            f"without --machine, or with '--machine {hostname}', on the host "
+            "whose machine identity changed"
+        )
+    previous = args.previous_host_id
+    if not _host_alias_id_valid(previous):
+        raise Refusal(
+            f"invalid previous host id {previous!r}; pass the exact previous "
+            "machine identity (the contents of /etc/machine-id before the "
+            "reprovision), without whitespace"
+        )
+    current_host = _host_id()
+    current_boot = _boot_id(Path("/proc"))
+    if previous == current_host:
+        raise Refusal(
+            "the previous host id is the current machine identity; an alias "
+            "records a previous identity of this host, not its present one"
+        )
+    state = _load_active(config)
+    previous_boots: set[str] = set()
+    for record in state.slots:
+        lease = record.coordinator_lease
+        if lease.host_id == previous:
+            previous_boots.add(lease.boot_id)
+            # Belt and braces: a coordinator generation recorded under
+            # the previous identity that is live right now (same boot,
+            # same PID generation; the host field alone differs) means
+            # that identity is a live contemporary, not a dead
+            # predecessor of this host.
+            try:
+                live = _read_process_identity(lease.pid)
+            except Refusal:
+                live = None
+            if live is not None and (
+                live.pid,
+                live.start_ticks,
+                live.boot_id,
+                live.cgroup_path,
+            ) == (lease.pid, lease.start_ticks, lease.boot_id, lease.cgroup_path):
+                raise Refusal(
+                    f"coordinator PID {lease.pid} recorded under the previous "
+                    f"host id {previous!r} is live now; that identity is not a "
+                    "previous identity of this host. state: REFUSED -- no "
+                    "alias was recorded"
+                )
+        if record.owner is not None and record.owner.host_id == previous:
+            previous_boots.add(record.owner.boot_id)
+    if current_boot in previous_boots:
+        raise Refusal(
+            f"the current boot {current_boot} is recorded under the previous "
+            f"host id {previous!r}; an alias whose boot is still running "
+            "proves nothing. state: REFUSED -- no alias was recorded"
+        )
+    path = _host_alias_path()
+    entries = _load_host_aliases(path)
+    if any(entry["previous_host_id"] == previous for entry in entries):
+        raise Refusal(
+            f"host id {previous!r} is already recorded as a previous identity "
+            f"of this host in {path}; the first evidence stands"
+        )
+    entry: dict[str, object] = {
+        "previous_host_id": previous,
+        "current_host_id": current_host,
+        "hostname": hostname,
+        "recorded_at": _utc_now(),
+        "recorded_by": {
+            "pid": coordinator.pid,
+            "start_ticks": coordinator.start_ticks,
+            "boot_id": coordinator.boot_id,
+            "host_id": coordinator.host_id,
+        },
+        "previous_boot_ids": sorted(previous_boots),
+        "current_boot_id": current_boot,
+    }
+    _atomic_write_json(path, {"schema": _HOST_ALIAS_SCHEMA, "aliases": [*entries, entry]})
+    print(
+        f"recorded host alias previous_host_id={previous} "
+        f"current_host_id={current_host} hostname={hostname} "
+        f"previous_boot_ids={len(previous_boots)} path={path}"
+    )
+    return 0
 
 
 def _cmd_transfer_owner(args: argparse.Namespace) -> int:
@@ -97681,6 +97980,61 @@ usage or audit gate unknown, 3 fail-closed refusal.
     recover_unbound.add_argument("--validation", action="append", required=True, metavar="TEXT", help="validation evidence (repeatable)")
     recover_unbound.add_argument("--limitation", action="append", metavar="TEXT", help="known limitation to retain (repeatable)")
     recover_unbound.set_defaults(handler=_cmd_recover_unbound_owner)
+
+    host_alias = subparsers.add_parser(
+        "host-alias",
+        help="record a previous machine identity of this host (coordinator only)",
+        description=(
+            "Record, in host-local state outside every registry, that this host previously "
+            "had another machine identity, so owners recorded before a reprovision changed "
+            "/etc/machine-id can be judged again: the recorded identity counts as this "
+            "host, and the ordinary boot check proves its old-boot owners dead. Without an "
+            "alias those owners stay indeterminate forever and no transfer, adoption, or "
+            "recovery can rebind their slots. The alias file is "
+            "$XDG_STATE_HOME/wrkslots/host-aliases.json (default "
+            "~/.local/state/wrkslots/host-aliases.json; WRKSLOTS_HOST_ALIAS_PATH overrides "
+            "the path). No registry state changes, so readers that predate the alias never "
+            "see it and keep failing closed."
+        ),
+        epilog=(
+            "examples:\n"
+            "  wrkslots host-alias add --previous-host-id 0123abcd --coordinator-authorized \\\n"
+            "    --coordinator-pid 1234"
+        ),
+        formatter_class=_HelpFormatter,
+    )
+    host_alias.set_defaults(handler=_cmd_host_alias_missing)
+    host_alias_actions = host_alias.add_subparsers(dest="host_alias_command", metavar="ACTION")
+    host_alias_add = host_alias_actions.add_parser(
+        "add",
+        help="record a previous machine identity of this host",
+        description=(
+            "Verify, then record, that OLD was this host's machine identity before a "
+            "reprovision. Refuses unless a live coordinator authorizes it, OLD differs "
+            "from the current machine identity, the short host name is the selected "
+            "machine shard, the current boot is none of the boots recorded under OLD in "
+            "this shard's active records, and no coordinator recorded under OLD is live "
+            "now. An OLD with no recorded boots is allowed: the entry then proves "
+            "nothing by itself, and each recorded owner still has to fail the ordinary "
+            "boot check. Recording the same OLD twice refuses; the first evidence stands."
+        ),
+        formatter_class=_HelpFormatter,
+    )
+    host_alias_add.add_argument(
+        "--previous-host-id", required=True, metavar="OLD",
+        help="previous machine identity of this host: the exact contents of "
+        "/etc/machine-id before the reprovision (required; must differ from the "
+        "current identity)",
+    )
+    host_alias_add.add_argument(
+        "--coordinator-pid", type=int, required=True, metavar="PID",
+        help="live coordinator PID recorded as who authorized the alias (required)",
+    )
+    host_alias_add.add_argument(
+        "--coordinator-authorized", action="store_true",
+        help="record that the coordinator authorized this alias (required)",
+    )
+    host_alias_add.set_defaults(handler=_cmd_host_alias_add)
 
     relocate = subparsers.add_parser(
         "relocate-repository",
