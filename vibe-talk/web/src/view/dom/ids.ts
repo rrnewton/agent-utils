@@ -199,6 +199,7 @@ export interface ElementById {
   "doc-star": HTMLButtonElement;
   "doc-title": HTMLHeadingElement;
   "dock": HTMLElement;
+  "docs-downloaded-toggle": HTMLButtonElement;
   "docs-fetch": HTMLButtonElement;
   "docs-fetch-clear": HTMLButtonElement;
   "docs-fetch-menu": HTMLDivElement;
@@ -224,7 +225,6 @@ export interface ElementById {
   "docs-since-go": HTMLButtonElement;
   "docs-since-hours": HTMLInputElement;
   "docs-since-title": HTMLParagraphElement;
-  "docs-downloaded-toggle": HTMLButtonElement;
   "docs-starred-toggle": HTMLButtonElement;
   "documents-list": HTMLDivElement;
   "documents-react-policy": HTMLSelectElement;
