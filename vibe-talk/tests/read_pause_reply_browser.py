@@ -543,6 +543,10 @@ def composer_pause_walk(desk: Desk, api: VoicesApi, voice: str, touch: bool) -> 
     held = expect_paused_focused(desk, voice, "react-while-playing", "quick-reply-text", began)
     desk.wait_for("() => window.recognitionStarts >= 1", "composer-pause: React started no dictation", STATE_S)
     desk.check(label(page) == "Resume", "composer-pause: dictation is listening over a read that is not paused")
+    # The dictated words themselves, settled in the box: the Draft chip below counts those, and
+    # closing before they land would keep no draft at all.
+    desk.wait_for("() => document.getElementById('quick-reply-text').value.endsWith('please check the replica')",
+                  "composer-pause: React's dictated words did not land in the box", STATE_S)
     check_held_still(desk, voice, "react-while-playing", held)
     desk.shot("composer-react-paused")
     page.keyboard.press("Escape")
