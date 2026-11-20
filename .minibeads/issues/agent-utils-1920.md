@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-main-thread-switch-and-scroll-lag: switching Main to thread and scrolling stay off the layout path'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -8,7 +8,8 @@ labels:
 - ui
 - performance
 created_at: 2026-11-19T17:24:25-05:00
-updated_at: 2026-11-19T17:24:25-05:00
+updated_at: 2026-11-19T19:17:11-05:00
+closed_at: 2026-11-19T19:17:11-05:00
 ---
 
 # Description
@@ -36,3 +37,7 @@ Goal: switching between Main and a thread (and back), and scrolling a long chann
 # Notes
 
 Owner-priority, fast-track: deployed on landing. Lane mu-threadlag/1920. Nested worktree .muse/worktrees/threadlag on branch mu-threadlag/1920. Related: #1913 vibe-talk-search-typing-lag (search typing; this issue is its recorded remainder), #220 view-switch-instant. New vibe-talk checks go in tests/dag.d/<next-free-NNN>-<job>.yaml; numbers are never reused (next free at filing: 168).
+
+## Resolution
+
+[watermelon-full-preview] Landed ee62c758 on github/main. Root cause, measured not guessed: `scrollAnchor` (scrollkeep) found the reader's row by scanning from the head, or up from the foot, measuring every row between there and the screen — 1027 distinct rows read in one capture on the 2000-row fixture, inside every Main -> thread switch (rememberChannelContext/captureScroll and the held-redraw holds). It now binary-searches the drawn rows (hidden and collapsed-run members left out first, as `readerPlace` does), so a switch measures only the screen's neighbourhood. Before -> after, synchronous layout reads (`getBoundingClientRect`) on a seeded 2000-row channel with a 121-row thread, phone: load 2297 -> 203, Main -> thread 1150 -> 166, thread -> Main 2092 -> 116, held Main -> thread 1090 -> 99, ten scroll steps 394 -> 338 (counts, not wall-clock; the host was at load average ~200 throughout). Gate: `thread_switch_fast_browser.py` + dag 168 bounds reads per switch (500) and per five-step scroll burst independently of row count at 412x915 and 1280x800, asserts the thread's rows are exact and the reader's place is kept (+/-1.5px) across Main -> thread -> Main; on the base tree it reads 1136 and fails. `content-visibility: auto` was tried and reverted: estimated off-screen heights moved the reader's anchor 80px in view_switch_browser, so off-screen rows keep real layout and the DOM (about 50k nodes, about 35 listeners per row) is unchanged — event delegation is not a cheap change in the row builders, and full virtualisation is not needed for the bound. First entry to a thread still builds its rows synchronously (wall time scales with thread size); that remains the follow-up if it still hurts. Gate on 0c157ba2: red only on search-unmatched-browser (an extra settled server hit shown), 3/3 solo green, exclusive rerun passed; autoscroll_follow_browser is red on a clean base too (pre-existing). Evidence: /tmp/mu-threadlag-shots (harness matrix, landed main ee62c758, BUILD.txt inside), /tmp/mu-threadlag-shots-before and /tmp/mu-threadlag-shots-after (gate-walk thread view and back-in-Main, byte-identical pairs — the fix is performance-only).
