@@ -39,8 +39,17 @@ accent-blue-on-accent-blue blank button) nor the unstarred colour.
 The reader steps at both sizes also cover `#1545
 hamburger-show-hidden-list-only`: with a document open, the hamburger
 offers neither Show hidden (a list-only item) nor the empty Reader box.
+
+With `--screenshots DIR` (`#1989 vibe-talk-documents-failure-screenshots`)
+the same real-server walk also photographs the two failure states it
+asserts — the private-repo failure in the reader and the broken row with
+its reason and link — at phone (393 and 412 wide) and desktop 1280, in
+light and dark, so the owner can be shown them. Neither state has a
+composer, so every shot is keyboard-closed at the profile's full height.
+Without the flag nothing is photographed and the walk is unchanged.
 """
 
+import argparse
 import json
 import socket
 import subprocess
@@ -358,7 +367,137 @@ def check_doc_search(page: Page, width: int, height: int) -> None:
           "the search result opened the wrong document")
 
 
+SCREENSHOT_PROFILES: tuple[tuple[str, int, int, bool], ...] = (
+    ("phone-393", 393, 852, True),
+    ("phone-412", 412, 915, True),
+    ("desktop-1280", 1280, 800, False),
+)
+
+
+def write_shots_build_file(out_dir: Path) -> None:
+    """Say what the shots show, in `scripts/run.sh --screenshots`' format.
+
+    Best effort: a tree with no git or no page-build manifest still gets
+    its photographs, with the unknown lines saying so.
+    """
+    def git(*args: str) -> str:
+        try:
+            done = subprocess.run(
+                ["git", "-C", str(ROOT), *args],
+                capture_output=True, text=True, timeout=10, check=False)
+            return done.stdout.strip() or "unknown"
+        except Exception:
+            return "unknown"
+
+    page_build = "unknown"
+    manifests = sorted(
+        (ROOT / "target/release/build").glob("vibe-talk-*/out/web/assets.json"),
+        key=lambda path: path.stat().st_mtime if path.exists() else 0,
+    )
+    if manifests:
+        try:
+            page_build = str(json.loads(manifests[-1].read_text())["page_build"])
+        except Exception:
+            page_build = "unknown"
+    (out_dir / "BUILD.txt").write_text(
+        f"commit {git('rev-parse', 'HEAD')}\n"
+        f"commit-date {git('log', '-1', '--format=%cI', 'HEAD')}\n"
+        f"page-build {page_build}\n"
+    )
+
+
+def capture_failure_screenshots(browser: object, base: str, out_dir: Path) -> None:
+    """Photograph the two asserted failure states (`#1989`), per theme and size.
+
+    A fresh device per (theme, profile): the broken row first, while the
+    list is up, then the guide's private link in the reader. Every wait is
+    on the same page conditions the walk asserts, and the link checks are
+    the walk's own, so a shot can never show a state the test did not prove.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for theme in ("light", "dark"):
+        for profile, width, height, mobile in SCREENSHOT_PROFILES:
+            ctx = browser.new_context(  # type: ignore[attr-defined]
+                viewport={"width": width, "height": height},
+                has_touch=mobile, is_mobile=mobile, color_scheme=theme)
+            page = ctx.new_page()
+            ctx.set_default_timeout(HANG_BACKSTOP_MS)
+            page.add_init_script(
+                f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")
+            page.goto(base + "/?v=docs", wait_until="load")
+            page.wait_for_selector("#documents-list .doc-card", timeout=HANG_BACKSTOP_MS)
+
+            broken = page.locator("#documents-list .doc-card", has_text="broken.md")
+            if mobile:
+                broken.tap()
+            else:
+                broken.click()
+            page.wait_for_function(
+                "() => [...document.querySelectorAll('#documents-list .doc-card')]"
+                ".some((c) => c.textContent.includes('Could not fetch it.'))",
+                timeout=HANG_BACKSTOP_MS)
+            broken_text = broken.text_content() or ""
+            check("GitHub answered 500" in broken_text,
+                  f"the photographed broken row does not name its cause: {broken_text!r}")
+            broken_link = broken.locator("a.doc-open-source")
+            check(broken_link.text_content() == "Open on GitHub"
+                  and broken_link.get_attribute("href")
+                  == "https://github.com/octo/widgets/blob/main/docs/broken.md",
+                  "the photographed broken row has no Open on GitHub link to its document")
+            broken.scroll_into_view_if_needed()
+            page.screenshot(path=str(out_dir / f"{theme}--{profile}--broken-row.png"))
+
+            guide_deadline = time.monotonic() + HANG_BACKSTOP_MS / 1000
+            while True:
+                guide = page.locator("#documents-list .doc-card", has_text="guide.md")
+                if mobile:
+                    guide.tap()
+                else:
+                    guide.click()
+                try:
+                    page.wait_for_function(
+                        "() => (document.getElementById('doc-body')?.textContent || '')"
+                        ".includes('Guide index')",
+                        timeout=30_000)
+                    break
+                except Exception:
+                    check(time.monotonic() < guide_deadline,
+                          "the photographed guide did not open in the reader")
+                    if page.locator("#doc-back").is_visible():
+                        if mobile:
+                            page.tap("#doc-back")
+                        else:
+                            page.click("#doc-back")
+                        page.wait_for_selector(
+                            "#documents-list .doc-card", timeout=HANG_BACKSTOP_MS)
+            private = page.locator("#doc-body a", has_text="the private document")
+            if mobile:
+                private.tap()
+            else:
+                private.click()
+            page.wait_for_function(
+                "() => (document.getElementById('doc-body')?.textContent || '')"
+                ".includes('vibe-talk has no access to octo/widgets')",
+                timeout=HANG_BACKSTOP_MS)
+            check("Could not load the document." not in (page.text_content("#doc-body") or ""),
+                  "the photographed private failure is the bare could-not-load sentence")
+            open_link = page.locator("#doc-body a.doc-load-error-link")
+            check(open_link.text_content() == "Open on GitHub"
+                  and open_link.get_attribute("href")
+                  == "https://github.com/octo/widgets/blob/main/docs/private.md",
+                  "the photographed private failure has no Open on GitHub link to its document")
+            page.screenshot(path=str(out_dir / f"{theme}--{profile}--private-reader.png"))
+            ctx.close()
+    write_shots_build_file(out_dir)
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--screenshots", metavar="DIR", type=Path, default=None,
+        help="also save PNGs of the private-repo reader failure and the broken "
+             "document row (phone 393/412 and desktop 1280, light and dark) into DIR")
+    args = parser.parse_args()
     port = free_port()
     base = f"http://127.0.0.1:{port}"
     raw = ThreadingHTTPServer(("127.0.0.1", 0), RawHandler)
@@ -1082,6 +1221,8 @@ def main() -> int:
                     " && !c.classList.contains('doc-hidden'))",
                     timeout=HANG_BACKSTOP_MS)
                 hctx.close()
+                if args.screenshots is not None:
+                    capture_failure_screenshots(browser, base, args.screenshots)
                 browser.close()
             print("documents browser check: real-server list, touch fetch, reader, outline pop-up, "
                   "source link, fetch error, and in-document links all seen")

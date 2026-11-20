@@ -1391,10 +1391,35 @@ def shrink_keyboard(driver: Driver, scene_name: str, focus: str | None = None) -
             "() => document.activeElement.scrollIntoView({block: 'nearest'})"
         )
         driver.page.wait_for_timeout(150)
+        # `#1989 vibe-talk-documents-failure-screenshots`: on laptop-1280 the
+        # resize this shrink makes re-lays the desktop page out, and that
+        # settle takes the focus off the field before the shutter — scene 77
+        # then failed at capture with "the composer holds the focus", while
+        # the check below read whatever element happened to hold it (the
+        # body passes as "inside") and never noticed. The scene's state is
+        # the field focused IN the shrunk viewport, so prove that there:
+        # focus it again after the resize has settled, and fail by name,
+        # saying what held the focus, if it will not stay.
+        focused = f"() => document.activeElement === document.querySelector({json.dumps(focus)})"
+        try:
+            driver.page.wait_for_function(focused, timeout=2_000)
+        except Exception:
+            driver.page.locator(focus).click()
+            try:
+                driver.page.wait_for_function(focused, timeout=10_000)
+            except Exception as error:
+                holder = driver.js(
+                    "document.activeElement ? (document.activeElement.id || document.activeElement.tagName) : 'none'"
+                )
+                raise Unreachable(
+                    scene_name,
+                    "the focused field holds the focus after the shrink",
+                    f"activeElement is {holder!r}, not {focus}",
+                ) from error
         rect = cast(
             dict[str, float],
             driver.js(
-                "(() => { const r = document.activeElement.getBoundingClientRect(); "
+                f"(() => {{ const r = document.querySelector({json.dumps(focus)}).getBoundingClientRect(); "
                 "return {top: r.top, bottom: r.bottom}; })()"
             ),
         )
@@ -9463,6 +9488,7 @@ SELF_TEST_CHECKS = (
     "a focused field outside the shrunk viewport fails the keyboard check",
     "the standard matrix states stay restricted to the phone and laptop matrix profiles",
     "capture settles transient UI before the shutter opens",
+    "the keyboard shrink re-proves its field's focus after the resize, naming what held it",
 )
 
 
@@ -9499,6 +9525,11 @@ def check_keyboard_controls() -> list[str]:
         problems.append("capture no longer settles transient UI before the shutter opens.")
     if "shrink_keyboard(driver" not in source:
         problems.append("no scene shrinks the keyboard through the shared helper.")
+    if "holds the focus after the shrink" not in source:
+        problems.append(
+            "the keyboard shrink no longer re-proves its field's focus after the resize — "
+            "scene 77 would again fail at capture with no name for what held the focus."
+        )
     return problems
 
 
