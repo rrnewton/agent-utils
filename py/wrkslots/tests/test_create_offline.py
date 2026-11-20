@@ -94,14 +94,15 @@ def test_offline_create_skips_probe_and_records_reason_in_evidence(
     assert "offline_reason" not in record
     assert record["checkouts"][0]["remote_url_sha256"]
 
-    created = [
-        event
-        for event in _events(root)
-        if event.get("kind") == "active-state-recorded"
-        and event["payload"].get("action") == "slot-created"
-    ]
+    created = []
+    for event in _events(root):
+        payload = event.get("payload")
+        assert isinstance(payload, dict)
+        if event.get("kind") == "active-state-recorded" and payload.get("action") == "slot-created":
+            created.append(payload)
     assert len(created) == 1
-    evidence = created[0]["payload"]["evidence"]
+    evidence = created[0]["evidence"]
+    assert isinstance(evidence, dict)
     assert evidence["offline_reason"] == "GHE unreachable; provenance only"
     # Journals are cleared on success and carry no offline field.
     control = root / "worktrees"
@@ -175,12 +176,13 @@ def test_rust_create_text_offline_skips_fetch(tmp_path: Path) -> None:
     active = json.loads((root / "worktrees" / "ACTIVE.node-a.json").read_text())
     (record,) = active["slots"]
     assert "offline_reason" not in record
-    created = [
-        event
-        for event in _events(root)
-        if event.get("kind") == "active-state-recorded"
-        and event["payload"].get("action") == "slot-created"
-    ]
-    assert created[0]["payload"]["evidence"]["offline_reason"] == (
-        "GHE unreachable; provenance only"
-    )
+    created = []
+    for event in _events(root):
+        payload = event.get("payload")
+        assert isinstance(payload, dict)
+        if event.get("kind") == "active-state-recorded" and payload.get("action") == "slot-created":
+            created.append(payload)
+    assert len(created) == 1
+    evidence = created[0]["evidence"]
+    assert isinstance(evidence, dict)
+    assert evidence["offline_reason"] == "GHE unreachable; provenance only"
