@@ -115,18 +115,26 @@ pub fn viewer_claim_of<'a>(pane: &PaneFacts, agents: &'a [AgentFacts]) -> Option
         .find(|agent| viewer_claim_verified(pane, agent))
 }
 
-/// Whether a viewer tab's pane plausibly runs its agent's view (#1971
-/// re-review, rename side of #1973): an idle shell, or a foreground the
-/// census reports as `agentctl`, a console or a tail. Anything else is
-/// somebody else's process in a possibly reused tab, and label sync
-/// must not rename its tab to the agent's name.
+/// Whether a viewer tab's pane plausibly runs `agent`'s view (#1971
+/// re-review, rename side of #1973): an idle shell, or a foreground
+/// command that is `agentctl` itself (argv0 basename `agentctl`) with
+/// a `tail` or `console` subcommand naming this agent. Anything else —
+/// a plain `tail -F log`, another agent's console, any program whose
+/// name merely contains those letters — is somebody else's process in
+/// a possibly reused tab, and label sync must not rename its tab.
 #[must_use]
-pub fn viewer_pane_is_view(pane: &PaneFacts) -> bool {
-    pane.idle_shell
-        || pane.foreground == "agentctl"
-        || pane.foreground.starts_with("agentctl ")
-        || pane.foreground.contains("console")
-        || pane.foreground.contains("tail")
+pub fn viewer_pane_is_view(pane: &PaneFacts, agent: &str) -> bool {
+    if pane.idle_shell {
+        return true;
+    }
+    let mut words = pane.foreground.split_whitespace();
+    let Some(argv0) = words.next() else {
+        return false;
+    };
+    let basename = argv0.rsplit('/').next().unwrap_or(argv0);
+    basename == "agentctl"
+        && matches!(words.next(), Some("tail" | "console"))
+        && words.next() == Some(agent)
 }
 
 /// One row of an `agentctl tabs` listing.
@@ -319,7 +327,7 @@ pub fn plan(
                 && agent.pane_id.as_deref() != Some(pane.pane_id.as_str());
             if pane.label.as_deref() != Some(agent.name.as_str())
                 && managed.contains(&pane.workspace_id)
-                && (!via_viewer || viewer_pane_is_view(pane))
+                && (!via_viewer || viewer_pane_is_view(pane, &agent.name))
             {
                 actions.push(TabAction::RenameTab {
                     tab_id: pane.tab_id.clone(),
@@ -667,7 +675,32 @@ mod tests {
                 .any(|a| matches!(a, TabAction::RenameTab { .. })),
             "{actions:?}"
         );
-        viewer.foreground = "agentctl".into();
+        // A plain log tail (the #1975 recovery tab) and another
+        // agent's console are not this agent's view either.
+        for foreground in ["tail -F /some/log", "agentctl console other-agent"] {
+            viewer.foreground = foreground.into();
+            let panes = vec![
+                pane("w1:p1", "w1:t1", "w1", "agent-a", false, false),
+                viewer.clone(),
+            ];
+            let (_, actions) = plan(
+                &panes,
+                &order,
+                &agents,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                10_000.0,
+                600.0,
+                None,
+            );
+            assert!(
+                !actions
+                    .iter()
+                    .any(|a| matches!(a, TabAction::RenameTab { .. })),
+                "{foreground}: {actions:?}"
+            );
+        }
+        viewer.foreground = "agentctl console coord".into();
         let panes = vec![
             pane("w1:p1", "w1:t1", "w1", "agent-a", false, false),
             viewer,
