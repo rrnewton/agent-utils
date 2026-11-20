@@ -71,6 +71,8 @@ export interface DoneActDependencies {
   refreshAfterLiveMutation(): void;
   renderCachedTimeline(): void;
   renderChannelRows(): void;
+  /** `#1990 vibe-talk-archive-single-row-dress`: dress only an archive's acted rows. Optional for doubles. */
+  dressDoneRows?(ids: readonly string[]): void;
   renderChannelSeam(summary: unknown): void;
   renderReadModeControl(): void;
   renderReplyLinks(): void;
@@ -133,8 +135,8 @@ export interface DoneAct {
   unflashIds(ids: Ids): void;
   unflashDone(row: Row | null): void;
   flashDone(row: Row | null): void;
-  refreshAfterInboxChange(): Promise<void>;
-  renderDoneChange(): void;
+  refreshAfterInboxChange(ids?: readonly string[]): Promise<void>;
+  renderDoneChange(ids?: readonly string[]): void;
   putBackRowsOff(listed: Element[], taken: Set<string>): void;
   queueInboxWrite<T>(task: () => Promise<T>): Promise<T>;
   inboxWriteOwner(): string;
@@ -542,7 +544,7 @@ export function createDoneAct(deps: DoneActDependencies): DoneAct {
    * it — and doing that instead of a re-read is why a swipe greys the row instantly rather than
    * after a round trip to Discord.
    */
-  async function refreshAfterInboxChange() {
+  async function refreshAfterInboxChange(ids?: readonly string[]) {
     // `#407 unpack-row-parity`. An act on a row unpacked under the cards is made in the right column,
     // which draws no thread of its own while it shows them: what changed is drawn in the cards, and its
     // left-over thread is neither drawn nor written over the store.
@@ -551,7 +553,7 @@ export function createDoneAct(deps: DoneActDependencies): DoneAct {
       return;
     }
     if (deps.providerFacts.threading()) {
-      renderDoneChange();
+      renderDoneChange(ids);
       deps.saveChannelScope();
       return;
     }
@@ -587,12 +589,20 @@ export function createDoneAct(deps: DoneActDependencies): DoneAct {
    * from the store (`renderCachedTimeline`), as every Done did before, put a whole-list redraw in the key's own
    * task: about 100 ms of every e and Shift+E over 300 rows. Without threads, nothing (`renderCachedTimeline`).
    */
-  function renderDoneChange() {
+  function renderDoneChange(ids?: readonly string[]) {
     if (!deps.providerFacts.threading() || deps.hidingRead() || deps.selection().view === "threads") {
       deps.renderCachedTimeline();
       return;
     }
-    deps.holdingMessage(() => deps.holdingReplyArrows(deps.renderChannelRows));
+    // `#1990 vibe-talk-archive-single-row-dress`: with the acted ids known, only their rows
+    // and neighbours are dressed, held exactly as the whole-list pass was held; without them
+    // (a caller that cannot name what changed) the full pass stands. A row the window has
+    // not mounted is dressed by neither pass and is not mounted here.
+    if (ids && ids.length > 0 && deps.dressDoneRows) {
+      deps.holdingMessage(() => deps.holdingReplyArrows(() => deps.dressDoneRows!(ids)));
+    } else {
+      deps.holdingMessage(() => deps.holdingReplyArrows(deps.renderChannelRows));
+    }
     deps.renderScrollTools();
   }
 
@@ -965,7 +975,7 @@ export function createDoneAct(deps: DoneActDependencies): DoneAct {
       // `#892 voice-page-optimistic-done`. Said now, as drawn now, before anything awaits: Done here does not
       // wait for the server, and a failure is said by the error line. It used to say "Saving" until answered.
       deps.setStatus(saidAtOnce);
-      await refreshAfterInboxChange();
+      await refreshAfterInboxChange(requested);
       renderTodoControls();
       kept = deps.inboxLedger().add("dismiss", channel, body.messages ? body.messages.map(String) : requested, inboxWriteOwner());
       const writing = queueInboxWrite(async () => {
@@ -1011,7 +1021,7 @@ export function createDoneAct(deps: DoneActDependencies): DoneAct {
         if (listed && deps.readModes().hiding() && !deps.providerFacts.threading() && String(deps.selectedChannelId()) === String(channel)) {
           putBackRowsOff(listed, back);
         }
-        deps.guardQuietly(refreshAfterInboxChange)();
+        deps.guardQuietly(() => refreshAfterInboxChange([...back]))();
       });
       // ...and in every view held, from the store the lines above took it back in; in the left column
       // when it was made in the right one and that has stopped showing its thread since; and in the right
@@ -1128,7 +1138,7 @@ export function createDoneAct(deps: DoneActDependencies): DoneAct {
       // `#892 voice-page-optimistic-done`. Said now, as drawn now, before anything awaits; a refusal is said by
       // the error line.
       deps.setStatus(saidBack);
-      await refreshAfterInboxChange();
+      await refreshAfterInboxChange(restored);
       renderTodoControls();
       kept = deps.inboxLedger().add("restore", channel, restored, inboxWriteOwner());
       // In batches the server accepts, as the dismissal that made them went: the undo of a long Done
@@ -1167,7 +1177,7 @@ export function createDoneAct(deps: DoneActDependencies): DoneAct {
       deps.inColumn(column, () => {
         for (const id of removed) if (back.has(id)) doneState().archived.add(id);
         mirrorArchived(mirrored.filter((id: string) => back.has(id)), true);
-        deps.guardQuietly(refreshAfterInboxChange)();
+        deps.guardQuietly(() => refreshAfterInboxChange([...back]))();
       });
       // ...and in every view held, from the store the lines above took it back in; in the left column
       // when it was made in the right one and that has stopped showing its thread since; and in the right
@@ -1208,7 +1218,7 @@ export function createDoneAct(deps: DoneActDependencies): DoneAct {
         else doneState().archived.delete(id);
       }
       const drawn = [...deps.el("discord-log").children].some((row: Row) => deps.idsOf(row).some((id: string) => ids.includes(id)));
-      if (drawn && changed.length) renderDoneChange();
+      if (drawn && changed.length) renderDoneChange(ids);
       else deps.syncUnreadReplies();
     });
     return changed;

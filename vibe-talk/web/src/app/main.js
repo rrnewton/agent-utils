@@ -2298,6 +2298,7 @@ const doneAct = createDoneAct({
   nextUndoAt: () => nextUndoAt(), pinsView: () => pinsView(), readSpeaksFor: (payload, id) => readSpeaksFor(payload, id),
   refreshAfterLiveMutation: () => refreshAfterLiveMutation(), renderCachedTimeline: () => renderCachedTimeline(),
   renderChannelRows: () => renderChannelRows(), renderChannelSeam: (summary) => renderChannelSeam(summary),
+  dressDoneRows: (ids) => dressDoneRows(ids),
   renderReadModeControl: () => renderReadModeControl(), renderReplyLinks: () => renderReplyLinks(),
   renderScrollTools: () => renderScrollTools(), renderSideColumn: () => renderSideColumn(),
   retryingWrite: (fn, opts) => retryingWrite(fn, /** @type {any} */ (opts)), rowMessages: (row) => rowMessages(/** @type {any} */ (row)),
@@ -5689,7 +5690,7 @@ const channelRows = createChannelRows({
   reopenPendingReply: () => reopenPendingReply(),
 });
 const {
-  renderChannelRows, renderChannelRowsNow,
+  renderChannelRows, renderChannelRowsNow, dressDoneRows,
   rowMenus, emptyMessage, hiddenEmpty, glom, regroupChannelRows, channelRowFrame,
   discordNode, closeRowMenuOutside, closeRowMenuOnEscape, markReadThroughHere,
   storedSlackOpen, upstreamServiceName, copyUpstreamLink, copyMessageText,

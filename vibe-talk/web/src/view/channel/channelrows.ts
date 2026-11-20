@@ -15,7 +15,7 @@ import { editedTitle, messageDate, messageTimeLabel, shortLocalTime } from "../.
 import { createRowMenus } from "./rowmenu.ts";
 import type { RowMenus } from "./rowmenu.ts";
 import { renderedText } from "./text.ts";
-import { patchRows } from "./rows.ts";
+import { patchRows, rowMessages } from "./rows.ts";
 import type { DressPass } from "./rowdress.ts";
 import type { ReplyTally } from "../../core/channels/index.ts";
 import { EDITED_MARK, timeNode } from "./time.ts";
@@ -169,6 +169,8 @@ export interface ChannelRows {
   renderChannelRows(): void;
   /** The render pass itself, where a caller is already holding the rows. */
   renderChannelRowsNow(): void;
+  /** `#1990 vibe-talk-archive-single-row-dress`: dress only the rows an archive changed. */
+  dressDoneRows(ids: readonly string[]): void;
 }
 
 /** No menu open, nothing drawn. */
@@ -1081,8 +1083,7 @@ export function createChannelRows(deps: ChannelRowsDependencies): ChannelRows {
     // `#298 thread-card-header`. The card at the top of the right column's thread counts its replies and
     // unread as the rows' chips do, so it follows the same arrivals, reads and Done, in either column;
     // and so does the card at the top of a thread across the window.
-    deps.paintSideThreadCard(tally);
-    if (!deps.side() && deps.selectionView() === "thread") deps.paintThreadCard(deps.leftEl("thread-card"), deps.openThreadChoice(), tally);
+    paintThreadCards(tally);
     // `#299 all-thread-strip`. The thread selected in All, on the rows as they now stand: a live reply of
     // it arrives at full strength, any other message dimmed.
     deps.paintAllThreadFocus();
@@ -1102,10 +1103,88 @@ export function createChannelRows(deps: ChannelRowsDependencies): ChannelRows {
     else if (deps.replyState().pending) deps.reopenPendingReply();
   }
 
+  /**
+   * `#1990 vibe-talk-archive-single-row-dress`: what one Done or put back changes on screen,
+   * dressed where it stands instead of by the whole-list pass. An archive changes no author,
+   * no ordering, no day and no pin membership, so the census, arrange, seams and pinned
+   * rebuild of `renderChannelRowsNow` have nothing to redo; what follows an archive is the
+   * acted rows' own dress, their thread roots' unread chips, the cards that tally threads,
+   * and the read runs the acted rows stand in. A row that is not mounted (windowed lists,
+   * archived from the keyboard while just off-screen) is not mounted or measured here: its
+   * dress comes from the store when the window next mounts it.
+   */
+  function dressDoneRows(ids: readonly string[]): void {
+    const acted = new Set(ids.map(String));
+    if (acted.size === 0) return;
+    const list = deps.byId("discord-log");
+    const rows = [...list.children];
+    const viewing = deps.selectedChannelId();
+    const answered = deps.answeredBy(rows, viewing);
+    const tally = deps.replyTally();
+    const mainList = new Set(rows);
+    const inAll = deps.drawingAll();
+    const wanted = new Set<Element>();
+    const threads = new Set<string>();
+    // From the store, not only from mounted rows: an acted reply in another view (marked
+    // Done by a sent reply, put back by Undo on Main) still names its thread, whose root
+    // on screen counts its unread replies.
+    for (const message of deps.heldMessages()) {
+      if (!acted.has(String((message as Message).id))) continue;
+      const thread = deps.threadOf(message);
+      if (thread) threads.add(String(thread));
+    }
+    for (const row of rows) {
+      const held = deps.idsOf(row as HTMLElement);
+      if (!held.some((id) => acted.has(id))) continue;
+      wanted.add(row);
+      // The rows immediately beside an acted row: read runs and arrows are drawn from
+      // neighbours, and a run that takes in or lets go of the acted row re-dresses them.
+      const at = rows.indexOf(row);
+      if (rows[at - 1]) wanted.add(rows[at - 1] as Element);
+      if (rows[at + 1]) wanted.add(rows[at + 1] as Element);
+      for (const message of rowMessages(row as HTMLElement)) {
+        const thread = deps.threadOf(message);
+        if (thread) threads.add(String(thread));
+      }
+    }
+    // Thread roots: their chips count unread replies from the same tally.
+    if (threads.size > 0) {
+      for (const row of rows) {
+        const held = rowMessages(row as HTMLElement);
+        if (held.some((message) => {
+          const thread = (message as { thread?: { is_root?: boolean } }).thread;
+          return Boolean(thread) && thread?.is_root === true && threads.has(String(deps.threadOf(message) || ""));
+        })) wanted.add(row);
+      }
+    }
+    // Copies of the acted messages: the pinned list's, and rows unpacked under cards.
+    for (const row of [...deps.byId("pinned-log").children]) {
+      if (deps.idsOf(row as HTMLElement).some((id) => acted.has(id))) wanted.add(row);
+    }
+    for (const row of [...deps.byId("thread-list").querySelectorAll("li")]) {
+      if (deps.idsOf(row as HTMLElement).some((id) => acted.has(id))) wanted.add(row);
+    }
+    for (const row of wanted) {
+      deps.dressChannelRow(row as HTMLElement, { tally, answered, viewing,
+        inMain: deps.selectionView() === "main" && mainList.has(row as Element), inAll: inAll && mainList.has(row as Element) });
+      measureLabelRow(row as HTMLElement);
+      deps.drawLinkedMark(row as HTMLElement);
+    }
+    deps.applyReadRuns();
+    paintThreadCards(tally);
+  }
+
+  /** The thread cards that tally threads, at the side and across the window (`#298`). */
+  function paintThreadCards(tally: ReplyTally): void {
+    deps.paintSideThreadCard(tally);
+    if (!deps.side() && deps.selectionView() === "thread") deps.paintThreadCard(deps.leftEl("thread-card"), deps.openThreadChoice(), tally);
+  }
+
   return {
     rowMenus, emptyMessage, mayLeadToReplies, hiddenEmpty, glom, regroupChannelRows,
     channelRowFrame, editedMark, reactionStrip, discordNode, closeRowMenuOutside,
     closeRowMenuOnEscape, markReadThroughHere, storedSlackOpen, upstreamServiceName,
     copyUpstreamLink, copyMessageText, writeClipboardText, channelSummary, renderChannelRows, renderChannelRowsNow,
+    dressDoneRows,
   };
 }
