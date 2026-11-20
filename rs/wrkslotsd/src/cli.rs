@@ -1839,6 +1839,7 @@ const PY_IDENTITY: &[&str] = &[
 const PY_ONLY: &[&str] = &[
     "box",
     "clean-caches",
+    "host-alias",
     "image",
     "import-existing",
     "init",

@@ -1288,6 +1288,32 @@ the slot of every running agent after it detects a restart, transfers the slot t
 revived harness, and then releases that hold. A slot whose agent cannot be revived stays held, so
 no cleanup path retires it before an operator looks.
 
+## After a reprovision changes the machine identity
+
+A reprovision can change `/etc/machine-id` while the project, its slots, and their recorded owners
+survive. Every owner recorded under the previous identity then reads as belonging to a different
+machine, so it stays indeterminate forever: `transfer-owner` cannot prove it dead, `adopt` does not
+rebind an existing slot, and heartbeats cannot run. Record the previous identity as an alias of
+this host, once, as the coordinator:
+
+```sh
+wrkslots host-alias add --previous-host-id OLD_MACHINE_ID --coordinator-authorized --coordinator-pid COORDINATOR_PID
+```
+
+Replace `OLD_MACHINE_ID` with the exact previous contents of `/etc/machine-id` (the `host_id` in the
+slots' recorded owner identities) and `COORDINATOR_PID` with the live coordinator's PID. The command
+refuses unless the coordinator is live, the old identity differs from the current one, this host's
+short name is the machine shard, the current boot is none of the boots recorded under the old
+identity, and no coordinator recorded under that identity is live now.
+
+The alias is host-local evidence in `$XDG_STATE_HOME/wrkslots/host-aliases.json` (by default
+`~/.local/state/wrkslots/host-aliases.json`; `WRKSLOTS_HOST_ALIAS_PATH` overrides the path). It is
+not registry state: no slot record, journal, or event changes, and a reader that predates aliases
+never opens the file, so it keeps failing closed on those owners exactly as before. With the alias
+recorded, the recorded identity counts as this host and the ordinary boot check proves an old-boot
+owner dead; `transfer-owner`, `adopt`, and `recover` then work as usual. An identity that was never
+aliased still reads as a different machine.
+
 ## Giving a slot back while the owner keeps running
 
 An agent that finishes with a slot often keeps running, for example to take its next task in a new

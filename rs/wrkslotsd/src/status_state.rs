@@ -113,6 +113,199 @@ fn host_id() -> std::result::Result<String, String> {
     ))
 }
 
+/// Machine-id alias evidence (#1933): previous identities of this host,
+/// recorded by a coordinator after a reprovision. Host-local state only;
+/// a missing, unreadable, symlinked, or malformed file proves nothing.
+const HOST_ALIAS_SCHEMA: i64 = 1;
+const HOST_ALIAS_MAX_CHAIN: usize = 8;
+
+struct HostAliasEntry {
+    previous_host_id: String,
+    current_host_id: String,
+    hostname: String,
+    previous_boot_ids: Vec<String>,
+}
+
+fn host_alias_id_valid(value: &str) -> bool {
+    !value.is_empty()
+        && !value
+            .chars()
+            .any(|c| c.is_whitespace() || (c as u32) < 0x20 || c as u32 == 0x7f)
+}
+
+fn expand_user_path(raw: &str) -> std::path::PathBuf {
+    if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return std::path::PathBuf::from(home).join(rest);
+        }
+    }
+    std::path::PathBuf::from(raw)
+}
+
+fn host_alias_path() -> Option<std::path::PathBuf> {
+    if let Ok(override_path) = std::env::var("WRKSLOTS_HOST_ALIAS_PATH") {
+        if !override_path.is_empty() {
+            return Some(expand_user_path(&override_path));
+        }
+    }
+    if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
+        if !state_home.is_empty() {
+            return Some(
+                expand_user_path(&state_home)
+                    .join("wrkslots")
+                    .join("host-aliases.json"),
+            );
+        }
+    }
+    let home = std::env::var_os("HOME")?;
+    Some(
+        std::path::PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("wrkslots")
+            .join("host-aliases.json"),
+    )
+}
+
+fn valid_host_alias_entry(raw: &Value) -> Option<HostAliasEntry> {
+    let entry = raw.as_object()?;
+    if entry.len() != 7
+        || ![
+            "previous_host_id",
+            "current_host_id",
+            "hostname",
+            "recorded_at",
+            "recorded_by",
+            "previous_boot_ids",
+            "current_boot_id",
+        ]
+        .iter()
+        .all(|key| entry.contains_key(*key))
+    {
+        return None;
+    }
+    let previous = entry.get("previous_host_id")?.as_str()?;
+    let current = entry.get("current_host_id")?.as_str()?;
+    let current_boot = entry.get("current_boot_id")?.as_str()?;
+    if !host_alias_id_valid(previous)
+        || !host_alias_id_valid(current)
+        || !host_alias_id_valid(current_boot)
+    {
+        return None;
+    }
+    let hostname = entry.get("hostname")?.as_str()?;
+    let recorded_at = entry.get("recorded_at")?.as_str()?;
+    if hostname.is_empty() || recorded_at.is_empty() {
+        return None;
+    }
+    let recorded_by = entry.get("recorded_by")?.as_object()?;
+    if recorded_by.len() != 4
+        || !["pid", "start_ticks", "boot_id", "host_id"]
+            .iter()
+            .all(|key| recorded_by.contains_key(*key))
+        || recorded_by.get("pid")?.as_i64().is_none()
+        || recorded_by.get("start_ticks")?.as_i64().is_none()
+        || !host_alias_id_valid(recorded_by.get("boot_id")?.as_str()?)
+        || !host_alias_id_valid(recorded_by.get("host_id")?.as_str()?)
+    {
+        return None;
+    }
+    let mut previous_boot_ids = Vec::new();
+    for boot in entry.get("previous_boot_ids")?.as_array()? {
+        let boot = boot.as_str()?;
+        if !host_alias_id_valid(boot) {
+            return None;
+        }
+        previous_boot_ids.push(boot.to_string());
+    }
+    Some(HostAliasEntry {
+        previous_host_id: previous.to_string(),
+        current_host_id: current.to_string(),
+        hostname: hostname.to_string(),
+        previous_boot_ids,
+    })
+}
+
+fn load_host_aliases() -> Vec<HostAliasEntry> {
+    let Some(path) = host_alias_path() else {
+        return Vec::new();
+    };
+    if std::fs::symlink_metadata(&path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Vec::new();
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(raw) = serde_json::from_str::<Value>(&text) else {
+        return Vec::new();
+    };
+    let Some(document) = raw.as_object() else {
+        return Vec::new();
+    };
+    if document.len() != 2
+        || document.get("schema").and_then(Value::as_i64) != Some(HOST_ALIAS_SCHEMA)
+    {
+        return Vec::new();
+    }
+    let Some(aliases) = document.get("aliases").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    aliases.iter().filter_map(valid_host_alias_entry).collect()
+}
+
+fn host_alias_counts(
+    recorded_host_id: &str,
+    current_host_id: &str,
+    hostname: &str,
+    current_boot_id: &str,
+    aliases: &[HostAliasEntry],
+) -> bool {
+    if recorded_host_id == current_host_id {
+        return true;
+    }
+    let mut links: std::collections::HashMap<&str, Vec<&str>> =
+        std::collections::HashMap::new();
+    for entry in aliases {
+        if entry.hostname != hostname
+            || entry
+                .previous_boot_ids
+                .iter()
+                .any(|boot| boot == current_boot_id)
+        {
+            continue;
+        }
+        links
+            .entry(entry.previous_host_id.as_str())
+            .or_default()
+            .push(entry.current_host_id.as_str());
+    }
+    let mut seen = std::collections::HashSet::from([recorded_host_id]);
+    let mut frontier = vec![recorded_host_id];
+    for _ in 0..HOST_ALIAS_MAX_CHAIN {
+        let mut following = Vec::new();
+        for node in frontier {
+            if let Some(targets) = links.get(node) {
+                for target in targets {
+                    if *target == current_host_id {
+                        return true;
+                    }
+                    if seen.insert(target) {
+                        following.push(*target);
+                    }
+                }
+            }
+        }
+        if following.is_empty() {
+            return false;
+        }
+        frontier = following;
+    }
+    false
+}
+
 pub(crate) fn boot_id() -> std::result::Result<String, String> {
     match std::fs::read_to_string("/proc/sys/kernel/random/boot_id") {
         Ok(text) => {
@@ -265,15 +458,36 @@ pub(crate) fn process_state(identity: Option<&Identity>) -> (String, String) {
         Ok(host) => host,
         Err(message) => return ("indeterminate".to_string(), message),
     };
+    let mut boot: Option<String> = None;
     if host != identity.host_id {
-        return (
-            "indeterminate".to_string(),
-            "the recorded owner belongs to a different machine identity".to_string(),
-        );
+        // A recorded previous identity of this host counts as this host
+        // (#1933); the unchanged boot check then proves an old-boot
+        // owner dead. Every other foreign identity stays indeterminate.
+        boot = boot_id().ok();
+        let aliased = boot.as_deref().is_some_and(|current_boot| {
+            crate::config_validate::short_hostname().is_ok_and(|hostname| {
+                host_alias_counts(
+                    &identity.host_id,
+                    &host,
+                    &hostname,
+                    current_boot,
+                    &load_host_aliases(),
+                )
+            })
+        });
+        if !aliased {
+            return (
+                "indeterminate".to_string(),
+                "the recorded owner belongs to a different machine identity".to_string(),
+            );
+        }
     }
-    let boot = match boot_id() {
-        Ok(boot) => boot,
-        Err(message) => return ("indeterminate".to_string(), message),
+    let boot = match boot {
+        Some(boot) => boot,
+        None => match boot_id() {
+            Ok(boot) => boot,
+            Err(message) => return ("indeterminate".to_string(), message),
+        },
     };
     if boot != identity.boot_id {
         return (
