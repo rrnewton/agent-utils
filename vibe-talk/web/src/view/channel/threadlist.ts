@@ -60,6 +60,8 @@ export interface ThreadListDependencies {
   refreshFailed(payload: unknown): boolean;
   saveChannelScope(): void;
   syncUnreadReplies(): void;
+  /** `#1985`: repaint the channel rows' thread chips in the pass summaries land in. Optional. */
+  renderChannelRows?(): void;
   renderSideFreshness(): void;
   sideCardReplies(choice: ThreadChoice, tally: unknown): string;
   sideCardUnread(choice: ThreadChoice, tally: unknown): string;
@@ -679,6 +681,10 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
       deps.saveChannelScope();
       renderThreadSelect();
       renderThreadHeading();
+      // `#1985`: the summaries this read brought are what the mounted rows'
+      // Thread chips paint from; repaint them in this same pass instead of
+      // leaving a bare Thread label until the next timeline poll.
+      if (deps.renderChannelRows) deps.renderChannelRows();
       deps.syncUnreadReplies();
     } catch (_error) {
       threadDirectoryReadAt.delete(channel);

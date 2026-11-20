@@ -1,0 +1,14 @@
+steps:
+  - group: check
+    job: windowed-all-browser
+    desc: windowed All view (chips slugged on first render, ';' anchor, END/Newest at the foot, no scroll bounce while settling) in current Chromium at 412x915 and 1280x800, windowed on and off
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/windowed_all_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 12
+      classification: latency-bound

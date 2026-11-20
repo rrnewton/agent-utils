@@ -642,6 +642,11 @@ export function foldPageIn(
     deps.ledger.orderCopiesRead(canon, taken, deps.numberOf());
   }
   if (payload.thread) upsertThreadSummary(canon, payload.thread);
+  // `#1985 vibe-talk-windowed-all-view-fixes`: a page's own thread summaries are
+  // data it already brought (as a delta's are, above): holding them at once is
+  // what lets a root's Thread chip paint its slug and count on first render,
+  // instead of waiting for a later threads read to bring the same summaries.
+  for (const summary of payload.threads || []) upsertThreadSummary(canon, summary);
   if (view !== "thread") canon.hasThreads = payload.has_threads === true;
   if (!failed || !covered) {
     coverViewOf(canon, key, view, view === "threads" ? payload.threads || [] : payload.messages || [], older, hasMore,

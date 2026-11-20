@@ -487,6 +487,15 @@ export function createTimelineView(deps: TimelineViewDependencies): TimelineView
   let winTo = -1;
   let winListening = false;
   let winConverging = false;
+  // `#1985`: a scroll write this window made itself (its anchor nudge or its
+  // foot lock) is not the reader scrolling: the scroll listener below must not
+  // answer its own write with another re-slice, which repriced the spacers and
+  // nudged again at frame rate (the >10Hz bounce between two positions).
+  let winSelfScroll = false;
+  // `#1985`: the last anchor nudge this window applied, by anchor and sign. A
+  // next nudge of the same anchor in the opposite direction is the two
+  // corrections chasing each other, not information: it is not applied.
+  let winLastNudge: { key: string; sign: number } | null = null;
 
   function groupHeightPx(group: Message[], bucket: string): number {
     const canon = channelStore.current();
@@ -522,6 +531,17 @@ export function createTimelineView(deps: TimelineViewDependencies): TimelineView
       ? { from: Math.min(winFrom, groups.length), to: Math.min(winTo, groups.length) }
       : sliceFor(offsets, area.scrollTop, area.clientHeight, cfg.prefetchPx, cfg.rowCap);
     // A standing selection pins its group into the window, as focus and speech do in step 5.
+    // `#1985` foot lock: a reader standing at the foot before this render is
+    // there on purpose (END, the Newest chip, a follow of the newest line).
+    // The window must end at the last group and be put back at the foot after
+    // mounting (below): a slice priced from estimated heights alone left the
+    // reader a spacer's error above the bottom, and the re-slice after it
+    // moved the foot again, so END and Newest visibly did nothing stable.
+    const atFoot = area.scrollHeight > 0 && area.clientHeight > 0 &&
+      area.scrollTop + area.clientHeight >= area.scrollHeight - 2;
+    if (atFoot && groups.length > 0) {
+      slice = { from: Math.max(0, Math.min(slice.from, groups.length - Math.min(cfg.rowCap, groups.length))), to: groups.length };
+    }
     const selectionNow = deps.selectionIn ? deps.selectionIn(list) : null;
     if (selectionNow) {
       const at = groups.findIndex((group) => group.some((message) => String(message.id) === selectionNow.id));
@@ -546,10 +566,18 @@ export function createTimelineView(deps: TimelineViewDependencies): TimelineView
       }
     }
     // The anchor: the first mounted row not yet scrolled off the top, and where it sits.
+    // `#1985`: a row another keeper is already holding (a filter/fold hold, a
+    // landed jump) is the anchor over the merely first row: two keepers
+    // holding two different rows is what fought the fold toggle's hold.
     const areaTop = area.getBoundingClientRect().top;
     let anchorKey: string | null = null;
     let anchorTop = 0;
-    for (const row of [...list.children]) {
+    const heldRow = (deps.heldFilterRow() as Element | null) || (deps.jumpAnchorRow ? deps.jumpAnchorRow() : null);
+    if (heldRow && list.contains(heldRow) && !(heldRow as HTMLElement).dataset.windowSpacer) {
+      anchorKey = idsOf(heldRow).join(" ");
+      anchorTop = heldRow.getBoundingClientRect().top;
+    }
+    if (!anchorKey) for (const row of [...list.children]) {
       if ((row as HTMLElement).dataset.windowSpacer) continue;
       const rect = row.getBoundingClientRect();
       if (rect.bottom > areaTop) {
@@ -636,17 +664,38 @@ export function createTimelineView(deps: TimelineViewDependencies): TimelineView
         return true;
       }
     }
-    if (anchorKey) {
+    if (atFoot && slice.to === groups.length) {
+      // The foot lock, landed: with the last group mounted the scroll height
+      // is real, so one measured write puts the reader on the bottom row.
+      winLastNudge = null;
+      if (Math.abs(area.scrollTop - (area.scrollHeight - (area.clientHeight || 0))) > 0.5) {
+        winSelfScroll = true;
+        deps.toPosition(area, area.scrollHeight);
+      }
+    } else if (anchorKey) {
       const held = [...list.children].find((row) => !(row as HTMLElement).dataset.windowSpacer && idsOf(row).join(" ") === anchorKey);
       if (held) {
         const delta = held.getBoundingClientRect().top - anchorTop;
-        if (Math.abs(delta) > 0.5) deps.nudge(area, delta);
+        if (Math.abs(delta) > 0.5) {
+          // `#1985` anti-oscillation: an equal-and-opposite re-nudge of the
+          // same anchor is the correction chasing its own re-slice; applying
+          // it is the visible bounce, so it is dropped and the guard resets.
+          if (winLastNudge && winLastNudge.key === anchorKey && Math.sign(delta) !== winLastNudge.sign) {
+            winLastNudge = null;
+          } else {
+            winLastNudge = { key: anchorKey, sign: Math.sign(delta) };
+            winSelfScroll = true;
+            deps.nudge(area, delta);
+          }
+        } else winLastNudge = null;
       }
     }
     if (!winListening && typeof area.addEventListener === "function") {
       winListening = true;
       let queued = false;
       area.addEventListener("scroll", () => {
+        // `#1985`: this window's own anchor/foot write is not a reader scroll.
+        if (winSelfScroll) { winSelfScroll = false; return; }
         if (queued || !winGroups) return;
         queued = true;
         const run = () => {
@@ -654,7 +703,8 @@ export function createTimelineView(deps: TimelineViewDependencies): TimelineView
           if (!winGroups || !(deps.windowed && deps.windowed())) return;
           const cfgNow = deps.windowed();
           if (!cfgNow) return;
-          const heightsNow = winGroups.map((group) => groupHeightPx(group, bucket));
+          const bucketNow = String(area.clientWidth || list.clientWidth || 360);
+          const heightsNow = winGroups.map((group) => groupHeightPx(group, bucketNow));
           const offsetsNow = offsetsFor(heightsNow);
           // Hysteresis: re-slice only when the visible band reaches the window's inner
           // margin — the prefetch exists so small moves (an anchor write, a re-read's

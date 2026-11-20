@@ -422,6 +422,22 @@ test("`#624 voice-page-modularity`: a page folded into a store, from the module 
   assert.deepStrictEqual(seen.map(([what]) => what), ["fold", "read", "gaps"], "a scope that did not change asked for columns");
 });
 
+test("`#1985 vibe-talk-windowed-all-view-fixes`: a flat page's own thread summaries are held at once, so its chips paint on first render", () => {
+  const { emptyCanon, foldPageIn, createCopyOrder, createRemovals } = CHANNELS;
+  const canon = emptyCanon("c");
+  const deps = {
+    ledger: createCopyOrder(), removals: createRemovals(), numberOf: () => 1,
+    foldOf: () => ({ takes: () => true, answers: () => true }),
+    scopeChanged: () => {}, staleAsOf: () => null, foldReadState: () => {}, noteReplyGaps: () => {},
+  };
+  const summary = { id: "t1", display_name: "my-thread-slug", reply_count: 7, reply_count_exact: true, updated_at: "2026-10-01T00:00:02Z" };
+  foldPageIn(canon, { messages: [{ id: "1", timestamp: "2026-10-01T00:00:01Z", thread: { id: "t1", is_root: true } }],
+    threads: [summary], has_more: false, has_threads: true }, false, "flat", null, "flat", null, deps);
+  assert.deepStrictEqual(canon.threads.map((held) => held.id), ["t1"], "a flat page's thread summaries were discarded");
+  assert.equal(canon.threads[0].display_name, "my-thread-slug");
+  assert.equal(canon.threads[0].reply_count, 7);
+});
+
 test("`#624 voice-page-modularity`: what a store holds of every thread's replies, and what their counts say, from the module alone", () => {
   const { emptyCanon, replyTallyOf, exactReplyCount, tallyRecord, unseenRepliesIn, emptyTally } = CHANNELS;
   const canon = emptyCanon("c");

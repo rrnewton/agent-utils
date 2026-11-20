@@ -227,3 +227,83 @@ test("`#624 voice-page-modularity`: the older walks mount and dispose without a 
   walks.dispose();
 });
 
+// `#1985 vibe-talk-windowed-all-view-fixes`: the windowed foot lock and the
+// anti-oscillation guard, on a simulated layout (row 100px, estimate 84px, so
+// estimated and real heights disagree as they do on the owner's list).
+class FakeEl {
+  constructor(tag = "li") {
+    this.tagName = tag.toUpperCase(); this.children = []; this.parentNode = null;
+    this.dataset = {}; this.style = {}; this.attrs = new Map(); this.ownerDocument = null;
+    this.__ids = []; this.__messages = []; this.__h = 100; this.hidden = false;
+  }
+  setAttribute(k, v) { this.attrs.set(k, String(v)); } getAttribute(k) { return this.attrs.has(k) ? this.attrs.get(k) : null; }
+  hasAttribute(k) { return this.attrs.has(k); } removeAttribute(k) { this.attrs.delete(k); }
+  contains(node) { return node === this || this.children.includes(node); }
+  append(...nodes) { for (const n of nodes) this.insertBefore(n, null); }
+  insertBefore(node, before) {
+    if (node.parentNode) node.parentNode.removeChild(node);
+    const at = before ? this.children.indexOf(before) : -1;
+    if (at < 0) this.children.push(node); else this.children.splice(at, 0, node);
+    node.parentNode = this; return node;
+  }
+  removeChild(node) { const at = this.children.indexOf(node); if (at >= 0) this.children.splice(at, 1); node.parentNode = null; return node; }
+  replaceChildren(...nodes) { for (const c of [...this.children]) this.removeChild(c); this.append(...nodes); }
+  get offsetHeight() { return this.dataset.windowSpacer ? parseFloat(this.style.height || "0") || 0 : this.__h; }
+  getBoundingClientRect() {
+    const list = this.__list; const area = this.__area;
+    if (!list || !area) return { top: 0, bottom: this.offsetHeight, height: this.offsetHeight };
+    let top = -area.scrollTop;
+    for (const child of list.children) { if (child === this) break; top += child.offsetHeight; }
+    return { top, bottom: top + this.offsetHeight, height: this.offsetHeight };
+  }
+}
+
+test("`#1985`: a windowed render at the foot ends at the last group and lands on the bottom row", () => {
+  const { createTimelineView } = READCORE;
+  const messages = Array.from({ length: 50 }, (_, i) => ({ id: String(i + 1), content: "x", timestamp: `2026-10-01T00:00:${String(i % 60).padStart(2, "0")}Z` }));
+  const area = new FakeEl("div"); area.clientHeight = 500; area.clientWidth = 400;
+  let scrollTopHeld = 0;
+  Object.defineProperty(area, "scrollHeight", { get() { return list.children.reduce((sum, c) => sum + c.offsetHeight, 0); } });
+  // As a browser does: a scroll write is clamped to the foot of what stands.
+  Object.defineProperty(area, "scrollTop", {
+    get() { return scrollTopHeld; },
+    set(value) { scrollTopHeld = Math.max(0, Math.min(Number(value) || 0, Math.max(0, area.scrollHeight - area.clientHeight))); },
+  });
+  area.getBoundingClientRect = () => ({ top: 0, bottom: 500, height: 500 });
+  area.addEventListener = () => {};
+  const list = new FakeEl("ul"); list.id = "discord-log";
+  const doc = { activeElement: null, createElement: (tag) => { const el = new FakeEl(tag); el.ownerDocument = doc; el.__list = list; el.__area = area; return el; } };
+  list.ownerDocument = doc;
+  const rows = { messages, threads: [] };
+  const { deps, canon } = fakeDeps({
+    el: (id) => (id === "scroll-area" ? area : id === "discord-log" ? list : new FakeEl("div")),
+    selection: () => ({ view: "flat", threadId: null, thread: null }),
+    timelineRows: () => rows,
+    windowed: () => ({ prefetchPx: 100, rowCap: 5 }),
+    heldFilterRow: () => null,
+    jumpAnchorRow: () => null,
+    discordNode: (group) => { const el = doc.createElement("li"); el.__ids = group.map((m) => String(m.id)); el.__messages = group; el.__list = list; el.__area = area; return el; },
+    idsOf: (row) => row.__ids || [],
+    rowMessages: (row) => row.__messages || [],
+    captureScroll: () => ({ pinned: true, anchor: null, top: 0 }),
+    scrollAnchor: () => null,
+    followsNewest: () => true,
+    heldRowAfter: () => null,
+    guardQuietly: (fn) => fn,
+  });
+  canon.messages = messages;
+  const view = createTimelineView(deps);
+  view.renderCachedTimeline();
+  const mounted = () => list.children.filter((c) => !c.dataset.windowSpacer);
+  assert.ok(mounted().length <= 5, `mounted ${mounted().length} rows over the cap`);
+  // Stand at the foot as END/Newest leave the reader, then render again: the
+  // window must end at the last group and the reader on the bottom row.
+  area.scrollTop = area.scrollHeight;
+  view.renderCachedTimeline();
+  const last = mounted()[mounted().length - 1];
+  assert.equal(last.__ids[0], "50", "the window at the foot does not end at the newest row");
+  assert.ok(Math.abs(area.scrollTop + area.clientHeight - area.scrollHeight) <= 1,
+    `at the foot the reader stands at ${area.scrollTop}+${area.clientHeight} of ${area.scrollHeight}, not on the bottom row`);
+  view.dispose();
+});
+

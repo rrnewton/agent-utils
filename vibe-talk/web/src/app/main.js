@@ -4692,6 +4692,7 @@ const threadList = createThreadList({
   refreshFailed,
   saveChannelScope,
   syncUnreadReplies: () => syncUnreadReplies(),
+  renderChannelRows: () => renderChannelRows(),
   renderSideFreshness,
   sideCardReplies,
   sideCardUnread,
