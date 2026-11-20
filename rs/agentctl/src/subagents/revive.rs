@@ -2088,7 +2088,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                     let active = self.read_record(&journal.name).ok()?;
                     (active.token != journal.old_token
                         && active.extra.get("revived_from") == Some(&json!(journal.old_token)))
-                    .then(|| active.pane_id)
+                    .then_some(active.pane_id)
                     .flatten()
                 });
                 let named = self.client.agent_pane(&record.name).ok();
