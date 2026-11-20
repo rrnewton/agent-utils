@@ -1,13 +1,13 @@
 ---
 title: 'wrkslots-remote-proof-without-egress: apply-time ls-remote blocks recovery under egress filtering'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - wrkslots
 - lifecycle
 created_at: 2026-11-18T12:30:00+00:00
-updated_at: 2026-11-18T12:30:00+00:00
+updated_at: 2026-11-20T15:00:00+00:00
 ---
 
 # Description
@@ -27,3 +27,7 @@ Design-first item; the coordinator approved direction is recorded in the resolut
 # Notes
 
 Queued after #1868 wrkslots-finish-without-handoff-dead-end, #1869 wrkslots-adopt-reports-success-binds-nothing and #1870 wrkslots-transfer-owner-held-dead-owner. Design proposed to the coordinator before any code.
+
+## Resolution
+
+[watermelon-full-preview] Landed as 6f77ee98. `capture-remote-proof` lists a network URL under the tool's clean environment (no `insteadOf` rewrite can redirect it) and writes a schema-2 proof carrying its own resolved URL, capture time, the raw listing and its digest; local and file URLs refuse, and the write is atomic and symlink-refusing. `recover-ownerless-agent-worktree --remote-proof FILE --apply` binds the proof's URL by digest to the authorization, re-checks freshness where the proof is used, and proves coverage plus a clean tree before any journal is written; while a proof is in force, listings answer from it and any fetch or push refuses, while containment is still proven against the worktree's own objects. The digest and capture time ride the journal's free-form `x` slot; no new persisted field (both pinned old readers accepted the stamped journals in the sibling #1869 skew proof). Tests cover the no-egress apply, stale/future/wrong-URL/non-containing refusals with no journal, a dirty-tree refusal, capture refusing local/file URLs, and capture ignoring an `insteadOf` rule in the global config.
