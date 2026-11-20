@@ -256,7 +256,7 @@ def test_real_holder_late_census_refusal_in_recover_unfences(
     assert not finish_path.exists()
 
 
-@pytest.mark.load_quarantine  # #1935 wrkslots-recover-churn-deterministic
+@pytest.mark.load_quarantine  # #1943 wrkslots-recover-churn-deterministic
 def test_real_churn_late_census_refusal_in_recover_unfences(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
