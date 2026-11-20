@@ -62,6 +62,7 @@ from dagrun.model import (
     preferred_inner_jobs,
     step_classification,
     undeclared_resource_demands,
+    oom_reached_step_cap,
     write_domain_violations,
     env_with_inner_jobs,
     step_width_is_resizable,
@@ -2187,6 +2188,9 @@ class Runner:
         applied_memory_max = self.cgroups.applied_memory_max(step.tag)
         pids_events = self.cgroups.pids_events(step.tag)
         peak = self.cgroups.peak_bytes(step.tag)
+        # An oom_kill with no max/oom event and a peak below the cap was chosen by an ancestor
+        # limit or the host's global OOM killer, not by this step's own memory.max.
+        oom_cap_reached = (not oomed) or oom_reached_step_cap(memory_events, peak, applied_memory_max)
         cpu_stats = self.cgroups.cpu_stats(step.tag)
         step_pressure_end = _psi_reading(self.cgroups.cpu_pressure(step.tag)) if boxed else None
         ambient_end: AmbientSnapshot | None = capture_ambient_snapshot(()) if boxed else None
@@ -2300,6 +2304,7 @@ class Runner:
                     returncode=returncode,
                     oomed=oomed,
                     oom_kills=oom_kills,
+                    oom_cap_reached=oom_cap_reached,
                     timed_out=timed_out,
                     timeout=wall_budget,
                     cpu_timed_out=cpu_timed_out,
@@ -2421,7 +2426,24 @@ class Runner:
                         f"{self.evidence.directory}/{sanitize_evidence_tag(step.tag)}.log"
                     )
             self._emit(f"[{step.tag}] ✗ FAIL   {step.desc} ({dur}s, {outcome.reason})")
-            if oomed:
+            if oomed and not oom_cap_reached:
+                events = memory_events or {}
+                ceiling = (
+                    _fmt_bytes(int(applied_memory_max))
+                    if applied_memory_max is not None and applied_memory_max.isdigit()
+                    else str(applied_memory_max)
+                )
+                self._emit(
+                    f"[{step.tag}] ▲ OUTER/HOST OOM: [{step.tag}] was killed by an outer/host "
+                    f"OOM, cap not reached (cap≈{_fmt_bytes(mem_max)}, peak≈{_fmt_bytes(peak)}, "
+                    f"tightest applied ceiling≈{ceiling}; "
+                    f"memory.events max={events.get('max', 0)} oom={events.get('oom', 0)} "
+                    f"oom_kill={events.get('oom_kill', 0)}). The step never reached its own "
+                    "memory.max, so raising this step's cap will not help: an ancestor cgroup "
+                    "(the job/container limit) or the host's global OOM killer chose the victim. "
+                    "Look at what else shared that ceiling or host."
+                )
+            elif oomed:
                 self._emit(
                     f"[{step.tag}] ▲ MEMORY CAP PROBLEM: [{step.tag}] was OOM-killed at its "
                     f"inner cgroup "

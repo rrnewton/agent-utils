@@ -363,6 +363,7 @@ class StepOutcome:
         cpu_timeout_platform: str = "",
         aborted: bool = False,
         pids_events: int = 0,
+        oom_cap_reached: bool = True,
     ) -> "StepOutcome":
         """Build a failed outcome, deriving :attr:`reason` from the shared precedence
         rule (OOM > CPU-timeout > timeout > pids-guard > detail-capture > signal > exit) so
@@ -386,6 +387,7 @@ class StepOutcome:
             cpu_timeout_multiplier=cpu_timeout_multiplier,
             cpu_timeout_platform=cpu_timeout_platform,
             cpu_timeout=cpu_timeout,
+            oom_cap_reached=oom_cap_reached,
         )
         return cls(
             tag=tag,

@@ -20,7 +20,7 @@ import pytest
 from dagrun.cgroup import Cgroups, NoopCgroups, _create_nested_run_root, _sanitize
 from dagrun.cli import main
 from dagrun.memory_feedback import Censoring, peak_observation_from_row
-from dagrun.model import DagConfig, ResourceHint, Step
+from dagrun.model import DagConfig, ResourceHint, Step, oom_reached_step_cap
 from dagrun.perflog import CsvMetricsSink, new_run_id
 from dagrun.protocols import CgroupManager
 from dagrun.scheduler import run_dag
@@ -341,6 +341,62 @@ def test_an_oom_kill_cannot_be_a_false_exit_zero_pass(tmp_path: Path) -> None:
         assert row["ok"] == ("true" if expected_ok else "false")
         assert row["returncode"] == "0"
         assert row["oom_kills"] == row["memory_events_oom_kill"] == str(kills)
+
+
+def test_an_oom_kill_below_the_cap_with_no_local_limit_event_names_an_outer_or_host_oom(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``oom_kill`` counts kills by ANY OOM killer; ``max``/``oom`` count only this cgroup's limit.
+
+    The motivating report: one oom_kill, peak 5.1 GiB under a 7.5 GiB cap, with nothing else
+    running under the job's ceiling. The step never reached its own memory.max, so the report
+    must not tell the reader to raise that cap (a consumer did, to no effect). The same kill AT
+    the cap, or with a local ``max`` event, keeps the inner-cap report.
+    """
+    gib = 1024**3
+    cap = int(7.5 * gib)
+    cases = {
+        # (peak, local events) -> expected cap verdict
+        "outer": (int(5.1 * gib), {"max": 0, "oom": 0, "oom_kill": 1}, False),
+        "at_cap": (cap - 8192, {"max": 0, "oom": 0, "oom_kill": 1}, True),
+        "local_max": (int(5.1 * gib), {"max": 4, "oom": 0, "oom_kill": 1}, True),
+        "local_oom": (int(5.1 * gib), {"max": 0, "oom": 1, "oom_kill": 1}, True),
+    }
+    for name, (peak, events, reached) in cases.items():
+        store = tmp_path / name
+        cfg = DagConfig(steps=(_step(name, "true"),))
+        cgroups = _PlantedCgroups({f"g.{name}": (peak, str(cap), events)})
+        result = run_dag(
+            cfg,
+            jobs=1,
+            cgroups=cgroups,
+            metrics=CsvMetricsSink(store, git_sha="deadbee"),
+            verbosity=0,
+        )
+        outcome = result.outcomes[0]
+        assert not outcome.ok and outcome.oomed and outcome.oom_kills == 1, (name, outcome)
+        out = capsys.readouterr().out
+        if reached:
+            assert outcome.reason == "OOM-KILLED (hit inner MemoryMax; 1 oom_kill event(s))", name
+            assert "MEMORY CAP PROBLEM" in out and "OUTER/HOST OOM" not in out, name
+        else:
+            assert outcome.reason == (
+                "OOM-KILLED by an outer/host OOM, step cap not reached (1 oom_kill event(s))"
+            )
+            assert "OUTER/HOST OOM" in out and "cap not reached" in out
+            assert "MEMORY CAP PROBLEM" not in out
+
+
+def test_oom_cap_verdict_is_conservative_when_anything_is_unknown() -> None:
+    """Missing evidence never claims an outer OOM: the historical inner-cap report stands."""
+    events = {"max": 0, "oom": 0, "oom_kill": 1}
+    assert oom_reached_step_cap(None, 10, "100") is True
+    assert oom_reached_step_cap(events, None, "100") is True
+    assert oom_reached_step_cap(events, 10, None) is True
+    assert oom_reached_step_cap(events, 10, "max") is True
+    assert oom_reached_step_cap(events, 10, "100") is False
+    assert oom_reached_step_cap(events, 95, "100") is True
+    assert oom_reached_step_cap({**events, "oom_group_kill": 1}, 10, "100") is True
 
 
 def test_a_boundary_oom_without_a_local_victim_is_still_a_failure(tmp_path: Path) -> None:

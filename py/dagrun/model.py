@@ -952,6 +952,39 @@ ABORTED_BY_PEER_FAILURE_REASON = (
 )
 
 
+#: A peak within this fraction of the cap counts as having reached it: ``memory.peak`` is
+#: page-granular and a kill at the cap leaves it a few pages short of ``memory.max``.
+OOM_CAP_REACHED_FRACTION = 0.95
+
+
+def oom_reached_step_cap(
+    memory_events: Mapping[str, int] | None,
+    peak_bytes: int | None,
+    applied_memory_max: str | None,
+) -> bool:
+    """Whether an observed OOM kill was charged at the step's own memory cap.
+
+    ``memory.events`` ``oom_kill`` counts kills by ANY OOM killer, including an ancestor
+    cgroup's limit and the host's global OOM killer, while ``max``, ``oom`` and
+    ``oom_group_kill`` count only events at this cgroup's own limit (an ancestor's limit
+    events are not visible in a child's file). So the kill came from outside the step only
+    when none of those three counters fired AND the step's ``memory.peak`` stayed clearly below
+    the cap it ran under. Anything unknown (no events, no peak, an unbounded or unreadable cap)
+    keeps the conservative answer ``True``, which keeps the inner-cap report.
+    """
+    if memory_events is None or peak_bytes is None or applied_memory_max is None:
+        return True
+    if any(memory_events.get(counter, 0) > 0 for counter in ("max", "oom", "oom_group_kill")):
+        return True
+    try:
+        cap = int(applied_memory_max)
+    except ValueError:
+        return True
+    if cap <= 0:
+        return True
+    return peak_bytes >= cap * OOM_CAP_REACHED_FRACTION
+
+
 def step_failure_reason(
     *,
     returncode: int | None,
@@ -967,6 +1000,7 @@ def step_failure_reason(
     cpu_timeout_canonical: int = 0,
     cpu_timeout_multiplier: float = DEFAULT_CPU_TIMEOUT_MULTIPLIER,
     cpu_timeout_platform: str = "",
+    oom_cap_reached: bool = True,
 ) -> str:
     """Describe a failed step without conflating an external signal with an OOM.
 
@@ -982,12 +1016,22 @@ def step_failure_reason(
     be reported as an OOM without a positive kernel ``memory.events`` OOM counter. Conversely, a
     delegated boundary can report ``oom`` while its descendant victim owns ``oom_kill``, so the
     zero-kill OOM wording remains explicit rather than degrading to an unexplained SIGKILL.
+
+    ``oom_cap_reached=False`` is :func:`oom_reached_step_cap`'s verdict that the kill did NOT
+    come from the step's own ``memory.max``: the step recorded no ``max``/``oom`` event and its
+    peak stayed below the cap, so an ancestor limit or the host's global OOM killer chose the
+    victim (``oom_kill`` counts kills by any OOM killer). Raising that step's cap cannot help.
     """
     if oomed:
         if oom_kills == 0:
             return (
                 "MEMORY CAP EXHAUSTED (kernel reported OOM at inner MemoryMax; "
                 "no local oom_kill counter)"
+            )
+        if not oom_cap_reached:
+            return (
+                f"OOM-KILLED by an outer/host OOM, step cap not reached "
+                f"({oom_kills} oom_kill event(s))"
             )
         return f"OOM-KILLED (hit inner MemoryMax; {oom_kills} oom_kill event(s))"
     if cpu_timed_out:
