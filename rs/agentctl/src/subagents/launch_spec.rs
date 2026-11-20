@@ -5,8 +5,10 @@
 //! (names only are stored), the slot policy, the workspace label, and the native conversation.
 //! `start` writes one before the harness exists; `adopt` and `anchor` read it from the pinned
 //! harness process's `/proc/PID/cmdline`. `revive` replays it with the conversation selector
-//! replaced by an explicit resume, so a profile edited after launch does not change what a
-//! revived agent runs.
+//! replaced by an explicit resume; for a record started from a launch profile it first
+//! rebuilds the argument vector from the profile's current definition (#1928), so a profile
+//! edited after launch takes effect at the next revive, restart or restore instead of
+//! replaying the stored arguments forever.
 //!
 //! The spec lives in the record under `launch_spec`. Both editions validate the same shape and
 //! preserve the key through every lifecycle operation. A key a newer agentctl added to the spec
@@ -268,6 +270,56 @@ pub(super) fn resumed_session(
         return Err(refusal());
     }
     Ok(id)
+}
+
+/// The names of the flags whose spelling or associated value differs between two
+/// argument vectors, apart from any conversation selectors: names only, never a
+/// value, in sorted order (#1928). A flag's value is the text after `=`, or the
+/// following token when it does not itself start with `-`.
+pub(super) fn changed_flag_names(
+    harness: &str,
+    recorded: &[String],
+    actual: &[String],
+) -> Vec<String> {
+    let flags = |argv: &[String]| -> BTreeMap<String, Vec<Option<String>>> {
+        let mut map: BTreeMap<String, Vec<Option<String>>> = BTreeMap::new();
+        let mut index = 0;
+        while index < argv.len() {
+            let token = &argv[index];
+            if token.starts_with('-') && token.len() > 1 {
+                let (name, inline) = match token.split_once('=') {
+                    Some((name, value)) => (name.to_owned(), Some(value.to_owned())),
+                    None => (token.clone(), None),
+                };
+                let value = inline.or_else(|| {
+                    argv.get(index + 1)
+                        .filter(|next| !next.starts_with('-'))
+                        .cloned()
+                });
+                if value.is_some() && !token.contains('=') {
+                    index += 1;
+                }
+                map.entry(name).or_default().push(value);
+            }
+            index += 1;
+        }
+        map
+    };
+    let (Ok((_, recorded_rest)), Ok((_, actual_rest))) =
+        (split(harness, recorded), split(harness, actual))
+    else {
+        return Vec::new();
+    };
+    let recorded_flags = flags(&recorded_rest);
+    let actual_flags = flags(&actual_rest);
+    recorded_flags
+        .keys()
+        .chain(actual_flags.keys())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|name| recorded_flags.get(*name) != actual_flags.get(*name))
+        .cloned()
+        .collect()
 }
 
 /// Whether two argument vectors are the same launch apart from any

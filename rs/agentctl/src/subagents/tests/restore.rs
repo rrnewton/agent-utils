@@ -271,6 +271,89 @@ fn restore_remounts_first_revives_then_starts_units_and_is_idempotent() {
 }
 
 #[test]
+fn restore_carries_settings_the_profile_gained_after_launch() {
+    // #1928: restore revives through the same profile rebuild as revive,
+    // so a lane launched before its profile gained `--settings` comes
+    // back carrying it, and the report names the flag, never its value.
+    let fixture = Fixture::new();
+    fixture
+        .client
+        .fresh_presentations
+        .store(true, Ordering::Relaxed);
+    let output = std::process::Command::new("/usr/bin/git")
+        .args(["init", "--quiet"])
+        .current_dir(&fixture.root)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    fs::write(fixture.root.join(".gitignore"), ".agentctl/\n").unwrap();
+    let directory = fixture.root.join(".agentctl");
+    agent::create_private_directory(&directory, "test profile config", false, false).unwrap();
+    let path = directory.join("profiles.json");
+    agent::atomic_json(
+        &path,
+        &json!({"schema":"agentctl-profiles/v1","profiles":{
+            "claude-recovery": {"harness":"claude","mode":"interactive","model":"opus",
+                "argv":["--dangerously-skip-permissions"], "env":{}}
+        }}),
+    )
+    .unwrap();
+    fixture
+        .manager()
+        .start(
+            "lane",
+            &fixture.root,
+            StartOptions {
+                harness: "claude".to_owned(),
+                profile: Some("claude-recovery".to_owned()),
+                model: Some("opus".to_owned()),
+                harness_args: vec!["--dangerously-skip-permissions".to_owned()],
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    let old = fixture.manager().load("lane").unwrap();
+    fixture
+        .client
+        .dead_panes
+        .lock()
+        .unwrap()
+        .insert(old.pane_id.clone().unwrap());
+    fixture.client.started.store(false, Ordering::Relaxed);
+    let mut profiles_doc = agent::read_private_json(&path).unwrap();
+    profiles_doc["profiles"]["claude-recovery"]["argv"] = json!([
+        "--dangerously-skip-permissions",
+        "--settings",
+        "/private/lane-settings.json"
+    ]);
+    agent::atomic_json(&path, &profiles_doc).unwrap();
+    let host = ScriptedHost::new();
+    let restore_config = config(&fixture, None);
+    let registry = fixture.root.join("registry");
+    let report = restore(
+        &fixture.client,
+        &registry,
+        &host,
+        &restore_config,
+        &options(None),
+    )
+    .unwrap();
+    let row = agent_row(&report, "lane");
+    assert_eq!(row["action"], "revived", "{report}");
+    assert_eq!(
+        row["profile_refresh"]["flags"],
+        json!(["--settings"]),
+        "{row}"
+    );
+    assert!(!row["profile_refresh"].to_string().contains("lane-settings"));
+    let new = fixture.manager().load("lane").unwrap();
+    assert!(new
+        .arguments
+        .windows(2)
+        .any(|pair| pair == ["--settings", "/private/lane-settings.json"]));
+}
+
+#[test]
 fn restore_default_report_lives_under_the_registry_in_its_own_subdirectory() {
     // #975 boot-restore-retry: with no report_dir configured, the per-boot
     // report defaults to a registry subdirectory, so the boot evidence

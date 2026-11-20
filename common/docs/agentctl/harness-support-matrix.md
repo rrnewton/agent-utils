@@ -75,6 +75,7 @@ Every cell names its code path. Paths are relative to this repository;
 | Session identity | supported | supported | supported | none | supported (Claude and Muse) |
 | Takeover / handback | n/a (is the target) | none | none | none | supported (Claude and Muse) |
 | Restore / revive (launch replay) | supported | supported | partial | none | supported (Claude and Muse) |
+| Profile refresh on revive (#1928) | supported | supported | supported | none | none |
 | Effort control | supported | supported | supported | none | supported (Claude and Muse) |
 | Model selection | supported | supported | supported | none | supported (Claude and Muse) |
 | Launch-env replay | supported | supported | supported | partial | supported |
@@ -511,6 +512,28 @@ arguments and conversation (`split_conversation`, `fresh_arguments`,
   harness (`split_conversation` returns `None`; replay errors).
 - **Headless**: supported — the wrapper resumes its recorded session;
   restore skips live wrappers and never repeats a published revive.
+
+### Profile refresh on revive (#1928)
+
+Declared settings apply at the next natural revive, restart or restore,
+never by forcing a restart: for a record started from a launch profile,
+revive rebuilds its argument vector from the profile's current
+definition (the same construction as `start --resume`), records the new
+launch spec, and reports the changed fields and flags by name only in
+`profile_refresh` (`refreshed_from_profile` and `changed_flag_names` in
+`rs/agentctl/src/subagents/revive.rs` and
+`rs/agentctl/src/subagents/launch_spec.rs`, mirrored in
+`py/agentctl/revive.py` and `py/agentctl/launch_spec.py`). Explicit model
+and effort overrides keep winning; a profile that now names another
+harness, mode or a cloud launch refuses by name instead of replaying the
+stored arguments. `status` keeps showing `profile_drift` for a running
+lane while a restart is pending.
+
+- **Claude Code, Codex, Muse**: supported — the interactive revive,
+  restart and (Rust edition) restore paths all rebuild.
+- **Unknown TUI**: none — no launch spec and no profile argv apply.
+- **Headless**: none — wrapper launches keep their recorded arguments;
+  the headless approval surface is a separate path (#671).
 
 ### Effort control
 

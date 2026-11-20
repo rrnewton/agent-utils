@@ -329,6 +329,104 @@ def _spec_environment(manager: ManagedAgents, record: AgentRecord, spec: dict[st
 
 
 @dataclass(frozen=True)
+class _ProfileRefresh:
+    """A launch rebuilt from the profile's current definition (#1928)."""
+
+    arguments: tuple[str, ...]
+    environment: tuple[str, ...]
+    environment_names: tuple[str, ...]
+    model: str | None
+    reasoning_effort: str | None
+    fields: list[str]
+    flags: list[str]
+
+
+def _profile_refresh(manager: ManagedAgents, record: AgentRecord) -> _ProfileRefresh | None:
+    """Rebuild ``record``'s launch from its profile as it stands now (#1928).
+
+    ``None`` for a record with no profile or no launch spec. A profile that
+    can no longer be applied — gone, or naming another harness, mode or a
+    cloud launch — refuses by name rather than silently replaying the
+    stored arguments.
+    """
+    spec = record.launch_spec
+    if record.profile is None or spec is None:
+        return None
+    root = configuration_root(record.cwd, manager.registry)
+    _path, profiles = load_profiles(root)
+    selected = profiles.get(record.profile)
+    if selected is None:
+        raise AgentDeliveryError("recorded launch profile is missing")
+    if (selected.harness != record.harness or selected.mode != record.mode
+            or selected.agentcloud is not None):
+        raise AgentDeliveryError(
+            "recorded launch profile policy changed (harness, mode, model, effort, or arguments)")
+    validate_structured_harness_argument_conflicts(
+        record.harness, list(selected.argv), label="refreshed profile",
+        structured_model=selected.model is not None,
+        structured_effort=selected.reasoning_effort is not None,
+        structured_resume=True,
+    )
+    declared_model = record.model_override or selected.model
+    structured = (*reasoning_arguments(record.harness, selected.reasoning_effort),
+                  *selected.argv)
+    launch_env = manager._project_launch_env()
+    if (record.harness == "codex" and launch_env is not None
+            and launch_env.codex_needs_non_login_shell()
+            and not any("allow_login_shell" in item for item in selected.argv)):
+        structured = (*structured, "-c", "allow_login_shell=false")
+    base = harness_arguments(record.harness, model=declared_model, extra=structured)
+    arguments = launch_spec.replay_arguments(
+        record.harness, base, _revive_conversation(record))
+    effective = copy.copy(record)
+    effective.reasoning_effort = selected.reasoning_effort
+    entries = _relaunch_environment(effective, selected)
+    names = tuple(sorted({entry.partition("=")[0] for entry in entries if "=" in entry}))
+    recorded = spec.get("argv")
+    old_argv = [value for value in recorded if isinstance(value, str)] \
+        if isinstance(recorded, list) else list(record.arguments)
+    fields: list[str] = []
+    if record.model_override is None and record.model != selected.model:
+        fields.append("model")
+    if record.reasoning_effort != selected.reasoning_effort:
+        fields.append("reasoning_effort")
+    if tuple(sorted(record.environment_names)) != names:
+        fields.append("environment_names")
+    if not launch_spec.same_launch_rest(record.harness, old_argv, list(base)):
+        fields.append("argv")
+    return _ProfileRefresh(
+        arguments=tuple(arguments), environment=tuple(entries),
+        environment_names=names, model=selected.model,
+        reasoning_effort=selected.reasoning_effort, fields=fields,
+        flags=launch_spec.changed_flag_names(record.harness, old_argv, list(base)),
+    )
+
+
+def _refresh_report(old: AgentRecord, candidate: AgentRecord) -> dict[str, object] | None:
+    """What a revive changed by rebuilding from the current profile (#1928):
+    changed fields and changed flags, names only, never a value."""
+    if old.profile is None:
+        return None
+    spec = old.launch_spec
+    recorded = None if spec is None else spec.get("argv")
+    old_argv = [value for value in recorded if isinstance(value, str)] \
+        if isinstance(recorded, list) else list(old.arguments)
+    fields: list[str] = []
+    if old.model != candidate.model:
+        fields.append("model")
+    if old.reasoning_effort != candidate.reasoning_effort:
+        fields.append("reasoning_effort")
+    if list(old.environment_names) != list(candidate.environment_names):
+        fields.append("environment_names")
+    if not launch_spec.same_launch_rest(old.harness, old_argv, list(candidate.arguments)):
+        fields.append("argv")
+    if not fields:
+        return None
+    return {"fields": fields,
+            "flags": launch_spec.changed_flag_names(old.harness, old_argv, list(candidate.arguments))}
+
+
+@dataclass(frozen=True)
 class _LaunchPolicy:
     arguments: tuple[str, ...]
     environment: tuple[str, ...]
@@ -338,6 +436,11 @@ class _LaunchPolicy:
     relay_executable: str | None = None
     # The discovered root replacing a self-referential slot_project (#1140).
     healed_slot_project: str | None = None
+    # The launch policy a profile rebuild gives the new generation (#1928);
+    # without a refresh these are the old generation's own values.
+    model: str | None = None
+    reasoning_effort: str | None = None
+    environment_names: tuple[str, ...] = ()
 
 
 def _policy(manager: ManagedAgents, record: AgentRecord) -> _LaunchPolicy:
@@ -358,9 +461,10 @@ def _policy(manager: ManagedAgents, record: AgentRecord) -> _LaunchPolicy:
     if not Path(record.cwd).is_dir() or str(Path(record.cwd).resolve()) != record.cwd:
         raise AgentDeliveryError("recorded working directory is missing or changed")
     environment: tuple[str, ...] = ()
+    refresh: _ProfileRefresh | None = None
     if spec is not None:
-        # Replay what ran. A profile edited after launch does not change the replay;
-        # it only supplies the environment values whose names the spec recorded.
+        # The spec supplies the environment values whose names it recorded;
+        # a profile rebuild (#1928) then replaces the launch policy itself.
         if (spec["cwd"] != record.cwd or spec["profile"] != record.profile
                 or (spec["slot"], spec["slot_project"], spec["slot_isolation"])
                 != (record.slot, record.slot_project, record.slot_isolation)
@@ -371,6 +475,12 @@ def _policy(manager: ManagedAgents, record: AgentRecord) -> _LaunchPolicy:
                 f"recorded program {spec['executable']!r} is not the {record.harness} harness, so it cannot be replayed"
             )
         environment = _spec_environment(manager, record, spec)
+        # Declared settings apply at the next natural restart or restore
+        # (#1928): rebuild the launch from the profile's current definition
+        # instead of replaying the stored arguments forever.
+        refresh = _profile_refresh(manager, record)
+        if refresh is not None:
+            environment = refresh.environment
     else:
         extra = _extras(record)
         if record.profile is not None:
@@ -390,6 +500,8 @@ def _policy(manager: ManagedAgents, record: AgentRecord) -> _LaunchPolicy:
     check_required_env(record.harness, effective_environment(environment),
                        registry_required=_req_registry, profile=_req_profile, profiles=_req_profiles)
     arguments = _expected_arguments(record)
+    if refresh is not None:
+        arguments = refresh.arguments
     # #1822: a relaunch from arguments with no bypass flag refuses, as a
     # start would; headless records are exempt (runner-mediated approvals).
     if record.mode == "interactive":
@@ -438,7 +550,10 @@ def _policy(manager: ManagedAgents, record: AgentRecord) -> _LaunchPolicy:
         # Without project policy, return to the workspace the agent was launched or adopted in.
         workspace = manager.client.workspace_id_for_label(recorded_label)
     return _LaunchPolicy(arguments, environment, slot_command, relay_command, workspace, relay_executable,
-        healed_slot_project)
+        healed_slot_project,
+        model=record.model if refresh is None else refresh.model,
+        reasoning_effort=record.reasoning_effort if refresh is None else refresh.reasoning_effort,
+        environment_names=tuple(record.environment_names) if refresh is None else refresh.environment_names)
 
 
 def _old_process(record: AgentRecord) -> CustomProcessIdentity:
@@ -647,6 +762,9 @@ def plan(manager: ManagedAgents, name: str, *, expected_token: str | None = None
         _read_record(manager, manager._directory(name), name, identity=identity, digest=_digest(content))
         result = _plan(record, "revive", None)
         result["workspace_id"] = policy.workspace_id
+        refresh = _profile_refresh(manager, record)
+        if refresh is not None and refresh.fields:
+            result["profile_refresh"] = {"fields": refresh.fields, "flags": refresh.flags}
         return result
     except (HerdrRunError, OSError, ValueError) as exc:
         return _plan(record, "blocked", str(exc))
@@ -666,6 +784,8 @@ def _new_candidate(old: AgentRecord, token: str, policy: _LaunchPolicy) -> Agent
     candidate = replace(old, token=token, created_at=time.time(), lifecycle="starting",
         slot_project=slot_project,
         adapter=_revived_adapter(old),
+        model=policy.model, reasoning_effort=policy.reasoning_effort,
+        environment_names=list(policy.environment_names),
         resume=conversation, arguments=list(policy.arguments), native_session=_native_session(old.harness, conversation, "asserted"),
         workspace_id=None, tab_id=None, pane_id=None, session_agent=None, session_value=None,
         terminal_id=None, harness_identity=None, anchor_rule=None, custom_process_identity=None, foreign_shell_identity=None,
@@ -677,7 +797,7 @@ def _new_candidate(old: AgentRecord, token: str, policy: _LaunchPolicy) -> Agent
     candidate.set_launch_spec(launch_spec.build(
         source="revive", captured_at=candidate.created_at, harness=old.harness,
         executable=policy.relay_executable, argv=policy.arguments, cwd=old.cwd, profile=old.profile,
-        environment_names=old.environment_names, slot=old.slot, slot_project=slot_project,
+        environment_names=candidate.environment_names, slot=old.slot, slot_project=slot_project,
         slot_isolation=old.slot_isolation,
         workspace_label=None if previous is None else cast("str | None", previous["workspace_label"]),
         native_session=(conversation, "asserted"),
@@ -697,18 +817,23 @@ def _slot_project_matches(candidate: AgentRecord, old: AgentRecord) -> bool:
     return candidate.slot_project == discovered_slot_project(old.cwd)
 
 
-def _same_policy(candidate: AgentRecord, old: AgentRecord) -> bool:
+def _same_policy(candidate: AgentRecord, old: AgentRecord,
+                 refresh: _ProfileRefresh | None = None) -> bool:
+    # A candidate launched by a refreshing revive carries the profile's
+    # current policy, not the old generation's (#1928).
     return not (candidate.name != old.name
             or candidate.token == old.token or candidate.harness != old.harness
             or candidate.cwd != old.cwd or candidate.adapter != _revived_adapter(old)
             or candidate.mode != old.mode or candidate.backend != old.backend
-            or candidate.model != old.model or candidate.profile != old.profile
-            or candidate.reasoning_effort != old.reasoning_effort or candidate.environment_names != old.environment_names
+            or candidate.model != (old.model if refresh is None else refresh.model)
+            or candidate.profile != old.profile
+            or candidate.reasoning_effort != (old.reasoning_effort if refresh is None else refresh.reasoning_effort)
+            or candidate.environment_names != (list(old.environment_names) if refresh is None else list(refresh.environment_names))
             or candidate.slot != old.slot or not _slot_project_matches(candidate, old)
             or candidate.slot_isolation != old.slot_isolation or candidate.paused != old.paused
             or candidate.resume != _revive_conversation(old)
             or _conversation(candidate) != _revive_conversation(old)
-            or candidate.arguments != list(_expected_arguments(old)))
+            or candidate.arguments != list(_expected_arguments(old) if refresh is None else refresh.arguments))
 
 
 class _SessionCensusClient:
@@ -756,7 +881,7 @@ def _candidate_manager(manager: ManagedAgents, old: AgentRecord, proof: dict[str
 
 
 def _ready(manager: ManagedAgents, candidate: AgentRecord, old: AgentRecord, proof: dict[str, object]) -> None:
-    if (candidate.lifecycle != "running" or not _same_policy(candidate, old)
+    if (candidate.lifecycle != "running" or not _same_policy(candidate, old, _profile_refresh(manager, old))
             or candidate.terminal_id is None or (candidate.harness_anchor is None if candidate.adapter == "herdr"
                                                else candidate.custom_process_identity is None)):
         raise AgentDeliveryError("revive candidate lacks the recorded policy or independent runtime anchors")
@@ -931,6 +1056,8 @@ def _complete_locked(manager: ManagedAgents, journal: dict[str, object]) -> dict
     result = manager._status_record(candidate)
     result.update({"revived": True, "previous_token": original.token, "archive": str(archive),
                    "pane_closed": pane_closed, "tab_closed": pane_closed or current_proof["kind"] == "missing"})
+    if (report := _refresh_report(original, candidate)) is not None:
+        result["profile_refresh"] = report
     # Bind the new harness as the slot's owner, as restart does (#1130
     # restore-slot-rebind): a refusal is reported owed, never raised, so the
     # revive still succeeds. Non-slot revives gain no key.
@@ -1186,7 +1313,7 @@ def _preserve_unlaunched_setup(
                         raise AgentDeliveryError("orphaned revive candidate has unexpected contents")
                 if "agent.json" in candidate_entries:
                     candidate, _bytes, _held = _read_record(manager, stage, old.name, identity=(staged.device, staged.inode))
-                    if (candidate.lifecycle != "starting" or not _same_policy(candidate, old)
+                    if (candidate.lifecycle != "starting" or not _same_policy(candidate, old, _profile_refresh(manager, old))
                             or candidate._unknown.get("revived_from") != old.token
                             or candidate.pane_reported_by_agentctl
                             or any(value is not None for value in (
@@ -1411,6 +1538,8 @@ def restart(manager: ManagedAgents, name: str, *, when_idle: bool = False,
     except Exception:
         notified = False
     new_identity = new.custom_process_identity or new.harness_identity
+    # A plain restart refreshes through its revive (#1928).
+    refresh_report = result.get("profile_refresh")
     return {
         "name": name, "action": "restarted", "pane_id": new.pane_id,
         "previous_pane_id": record.pane_id,
@@ -1418,6 +1547,10 @@ def restart(manager: ManagedAgents, name: str, *, when_idle: bool = False,
         "previous_harness_pid": old_pid, "session": session,
         "token": result.get("token"), "renamed": renamed,
         "slot_owner": slot, "notified": notified,
+        "profile_refresh": (
+            cast(dict[str, object], refresh_report).get("fields")
+            if isinstance(refresh_report, dict) else None
+        ),
     }
 
 

@@ -1159,6 +1159,10 @@ struct LaunchPlan {
     slot_command: Option<String>,
     relay_command: Option<String>,
     relay_executable: Option<String>,
+    /// The record rebuilt from its profile's current definition, when the
+    /// revive refreshed one (#1928): the candidate takes its model, effort
+    /// and environment names, and the new launch spec records its argv.
+    refreshed: Option<AgentRecord>,
     /// The discovered project root replacing a self-referential recorded
     /// `slot_project` (#1140); written into the candidate and its spec.
     healed_slot_project: Option<String>,
@@ -1649,6 +1653,30 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             return Err(fail("recorded starting directory changed"));
         }
         if let Some(spec) = record.launch_spec.as_ref() {
+            // Declared settings apply at the next natural restart or restore
+            // (#1928, owner rule 319): a record started from a profile is
+            // rebuilt from the profile's current definition, as
+            // `start --resume` already is, instead of replaying the stored
+            // arguments forever. A profile that can no longer be applied —
+            // gone, or naming another harness, mode or a cloud launch —
+            // refuses by name here rather than silently replaying stale
+            // arguments; nothing about a running lane is restarted.
+            if record.profile.is_some() {
+                let (refreshed, _changed) = self.refreshed_from_profile(record)?;
+                let refreshed_spec = refreshed
+                    .launch_spec
+                    .clone()
+                    .ok_or_else(|| fail("refreshed launch profile has no launch spec"))?;
+                let mut plan = self.spec_launch_plan(
+                    &refreshed,
+                    &refreshed_spec,
+                    cwd,
+                    startup_timeout,
+                    reuse_pane,
+                )?;
+                plan.refreshed = Some(refreshed);
+                return Ok(plan);
+            }
             return self.spec_launch_plan(record, spec, cwd, startup_timeout, reuse_pane);
         }
         // Muse with no recorded conversation starts fresh with a handoff brief (#741).
@@ -1772,9 +1800,10 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         self.finish_launch_plan(record, options, arguments, native, cwd)
     }
 
-    /// Replay what ran: the spec's arguments with one explicit resume, and the environment
-    /// values its names select from the private profile. A profile edited after launch does
-    /// not change the replay.
+    /// Launch what the spec says: its arguments with one explicit resume, and the environment
+    /// values its names select from the private profile. For a record started from a profile
+    /// the caller passes the refreshed record and spec (#1928), so the arguments are the
+    /// profile's current ones; without a profile the stored spec replays as recorded.
     fn spec_launch_plan(
         &self,
         record: &AgentRecord,
@@ -2034,6 +2063,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             slot_command,
             relay_command,
             relay_executable,
+            refreshed: None,
             healed_slot_project,
         })
     }
@@ -2303,7 +2333,15 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
 
     fn candidate_policy_matches(&self, record: &AgentRecord, old: &AgentRecord) -> Result<bool> {
         let native = revive_conversation(old)?;
-        let expected_arguments = expected_arguments(old)?;
+        // A candidate launched by a refreshing revive carries the profile's
+        // current policy, not the old generation's (#1928).
+        let refreshed = if old.profile.is_some() && old.launch_spec.is_some() {
+            Some(self.refreshed_from_profile(old)?.0)
+        } else {
+            None
+        };
+        let effective = refreshed.as_ref().unwrap_or(old);
+        let expected_arguments = expected_arguments(effective)?;
         Ok(record.name == old.name
             && record.token != old.token
             && record.harness == old.harness
@@ -2316,10 +2354,10 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             && record.adapter == revived_adapter(old)
             && record.cwd == old.cwd
             && record.profile == old.profile
-            && record.model == old.model
-            && record.reasoning_effort == old.reasoning_effort
+            && record.model == effective.model
+            && record.reasoning_effort == effective.reasoning_effort
             && record.arguments == expected_arguments
-            && record.environment_names == old.environment_names
+            && record.environment_names == effective.environment_names
             && record.slot == old.slot
             && self.slot_project_matches(record, old)
             && record.slot_isolation == old.slot_isolation
@@ -2380,6 +2418,52 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         json!({ "name":record.name, "token":record.token, "harness":record.harness,
             "profile":record.profile, "model":record.model, "cwd":record.cwd, "slot":record.slot,
             "native_session":conversation(record).ok(), "action":action, "reason":reason })
+    }
+
+    /// What a revive of `old` changed because it rebuilt the launch from the
+    /// profile's current definition (#1928): the fields that changed and the
+    /// flags that changed — names only, never a value or an argument. `None`
+    /// when the old generation names no profile or nothing changed.
+    fn profile_refresh_report(old: &AgentRecord, candidate: &AgentRecord) -> Option<Value> {
+        old.profile.as_ref()?;
+        let old_argv = spec_arguments(old).unwrap_or_else(|| old.arguments.clone());
+        let mut fields = Vec::new();
+        if old.model != candidate.model {
+            fields.push("model");
+        }
+        if old.reasoning_effort != candidate.reasoning_effort {
+            fields.push("reasoning_effort");
+        }
+        if old.environment_names != candidate.environment_names {
+            fields.push("environment_names");
+        }
+        if !launch_spec::same_launch_rest(&old.harness, &old_argv, &candidate.arguments) {
+            fields.push("argv");
+        }
+        if fields.is_empty() {
+            return None;
+        }
+        Some(json!({
+            "fields": fields,
+            "flags": launch_spec::changed_flag_names(&old.harness, &old_argv, &candidate.arguments),
+        }))
+    }
+
+    /// The refresh a dry-run revive plan would apply (#1928).
+    fn planned_profile_refresh(&self, record: &AgentRecord) -> Option<Value> {
+        if record.profile.is_none() || record.launch_spec.is_none() {
+            return None;
+        }
+        let (refreshed, changed) = self.refreshed_from_profile(record).ok()?;
+        if changed.is_empty() {
+            return None;
+        }
+        let old_argv = spec_arguments(record).unwrap_or_else(|| record.arguments.clone());
+        let new_argv = spec_arguments(&refreshed).unwrap_or_default();
+        Some(json!({
+            "fields": changed,
+            "flags": launch_spec::changed_flag_names(&record.harness, &old_argv, &new_argv),
+        }))
     }
 
     /// Slot ownership for a live-skip plan (#1130 restore-slot-rebind): read
@@ -3239,7 +3323,13 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             "slot_owner": slot,
             "notified": notified,
             "restart_journal": restart_journal,
-            "profile_refresh": profile_changes,
+            // A plain restart now refreshes through its revive (#1928), so
+            // report that refresh's changed fields when no explicit
+            // --refresh-profile ran.
+            "profile_refresh": match &profile_changes {
+                Some(changed) => json!(changed),
+                None => result["profile_refresh"]["fields"].clone(),
+            },
             "replayed_prompts": replayed,
             "queued_delivered": result["queued_delivered"],
             "queued_archived": result["queued_archived"],
@@ -3549,11 +3639,17 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 return Ok(plan);
             }
             return Ok(match self.preflight_revive(&record, startup_timeout) {
-                Ok(_) => self.revive_plan_document(
-                    &record,
-                    "revive",
-                    "recorded harness is dead and recovery policy is verified",
-                ),
+                Ok(_) => {
+                    let mut plan = self.revive_plan_document(
+                        &record,
+                        "revive",
+                        "recorded harness is dead and recovery policy is verified",
+                    );
+                    if let Some(report) = self.planned_profile_refresh(&record) {
+                        plan["profile_refresh"] = report;
+                    }
+                    plan
+                }
                 Err(error) => self.revive_plan_document(&record, "blocked", &error.to_string()),
             });
         }
@@ -3753,6 +3849,11 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             candidate.slot_project = Some(healed.clone());
         }
         candidate.arguments = plan.arguments;
+        if let Some(refreshed) = &plan.refreshed {
+            candidate.model = refreshed.model.clone();
+            candidate.reasoning_effort = refreshed.reasoning_effort.clone();
+            candidate.environment_names = refreshed.environment_names.clone();
+        }
         candidate
             .extra
             .insert("revived_from".to_owned(), json!(record.token));
@@ -4530,6 +4631,9 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         }
         let mut result = self.status_record(&candidate)?;
         result["revived"] = json!(true);
+        if let Some(report) = Self::profile_refresh_report(old, &candidate) {
+            result["profile_refresh"] = report;
+        }
         result["previous_token"] = json!(journal.old_token);
         result["archive"] = json!(archive_path);
         result["pane_closed"] = json!(!keep_pane);

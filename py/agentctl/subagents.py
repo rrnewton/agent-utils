@@ -4391,8 +4391,10 @@ class ManagedAgents:
 
         The changed-field computation of the Rust edition's refreshed-profile
         comparison (#1023), for status only; a record with no profile, or a
-        profile that cannot be read, reports no drift. The refresh and revive
-        paths stay with the Rust edition for now (#1412).
+        profile that cannot be read, reports no drift. The explicit
+        refresh command stays with the Rust edition for now (#1412); a
+        revive, restart or restore in either edition rebuilds the launch
+        from the current profile (#1928).
         """
         if record.profile is None:
             return None

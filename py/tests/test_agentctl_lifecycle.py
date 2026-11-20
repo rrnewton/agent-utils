@@ -7,6 +7,7 @@ import json
 import os
 import shlex
 import stat
+import subprocess
 import threading
 from collections.abc import Callable, Sequence
 from dataclasses import replace
@@ -1833,6 +1834,76 @@ def test_revive_resumes_exact_conversation_and_keeps_its_queue(
         assert arguments[-2:] == ("resume", new.resume)
 
 
+def _settings_profile(tmp_path: Path) -> Path:
+    subprocess.run(["/usr/bin/git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
+    directory = tmp_path / ".agentctl"
+    directory.mkdir(mode=0o700)
+    path = directory / "profiles.json"
+    path.write_text(json.dumps({"schema": "agentctl-profiles/v1", "profiles": {
+        "claude-recovery": {"harness": "claude", "mode": "interactive", "model": "opus",
+                            "argv": ["--dangerously-skip-permissions"], "env": {}},
+    }}), encoding="utf-8")
+    path.chmod(0o600)
+    return path
+
+
+def _gain_settings(path: Path) -> None:
+    config = json.loads(path.read_text(encoding="utf-8"))
+    config["profiles"]["claude-recovery"]["argv"] = [
+        "--dangerously-skip-permissions", "--settings", "/private/lane-settings.json"]
+    path.write_text(json.dumps(config), encoding="utf-8")
+    path.chmod(0o600)
+
+
+def test_revive_carries_settings_the_profile_gained_after_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #1928 incident shape, Python edition: a lane launched before its
+    # profile gained `--settings` is revived after the edit and carries
+    # it; the refresh report names flags only, never their values.
+    path = _settings_profile(tmp_path)
+    manager, _fake, old = prepare_revive(
+        tmp_path, monkeypatch, harness="claude", profile="claude-recovery",
+        model="opus", harness_args=("--dangerously-skip-permissions",))
+    _gain_settings(path)
+    drift = cast(dict[str, object], manager.status("worker")["profile_drift"])
+    assert drift["fields"] == ["argv"]
+    plan = manager.revive("worker", dry_run=True)
+    plan_refresh = cast(dict[str, object], plan["profile_refresh"])
+    assert plan["action"] == "revive" and plan_refresh["flags"] == ["--settings"], plan
+    assert "lane-settings" not in json.dumps(plan_refresh)
+    result = manager.revive("worker", expected_token=old.token)
+    result_refresh = cast(dict[str, object], result["profile_refresh"])
+    assert result_refresh["flags"] == ["--settings"], result
+    assert "lane-settings" not in json.dumps(result_refresh)
+    new = manager.get("worker")
+    assert any(pair == ("--settings", "/private/lane-settings.json")
+               for pair in zip(new.arguments, new.arguments[1:], strict=False))
+    assert new.launch_spec is not None
+    spec_argv = [str(value) for value in cast(list[object], new.launch_spec["argv"])]
+    assert any(pair == ("--settings", "/private/lane-settings.json")
+               for pair in zip(spec_argv, spec_argv[1:], strict=False))
+    assert "profile_drift" not in manager.status("worker")
+
+
+def test_restart_carries_settings_the_profile_gained_after_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #1928: a plain restart refreshes through its revive.
+    path = _settings_profile(tmp_path)
+    manager, _fake, _old = prepare_revive(
+        tmp_path, monkeypatch, harness="claude", profile="claude-recovery",
+        model="opus", harness_args=("--dangerously-skip-permissions",))
+    _gain_settings(path)
+    result = manager.restart("worker")
+    assert result["action"] == "restarted", result
+    assert result["profile_refresh"] == ["argv"], result
+    new = manager.get("worker")
+    assert any(pair == ("--settings", "/private/lane-settings.json")
+               for pair in zip(new.arguments, new.arguments[1:], strict=False))
+
+
 def test_revive_delivers_three_queued_prompts_in_order_and_archives_none(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2309,13 +2380,19 @@ def test_revive_reloads_matching_private_profile_and_preserves_literal_policy(
             manager.revive("worker")
         assert len(fake.launched) == 1 and fake.closed == []
         return
-    # A profile edited after launch does not change the replay of what ran.
+    # A profile edited after launch rebuilds the revive launch (#1928):
+    # the new generation carries the profile's current model and argv.
     result = manager.revive("worker")
-    assert result["revived"] is True and result["profile"] == "owner-policy" and result["model"] == "chosen"
+    expected_model = "different" if change == "model" else "chosen"
+    assert result["revived"] is True and result["profile"] == "owner-policy" and result["model"] == expected_model
     assert fake.environments == [("RECOVERY_MODE=value=with spaces",)] * 2
     record = manager.get("worker")
     assert record.environment_names == ["RECOVERY_MODE"]
-    assert record.arguments == ["--resume", old.native_session["value"] if old.native_session else "", "--model", "chosen", "--dangerously-skip-permissions"]
+    expected_arguments = ["--resume", old.native_session["value"] if old.native_session else "", "--model", expected_model, "--dangerously-skip-permissions"]
+    if change == "argv":
+        expected_arguments.append("--changed")
+        assert cast(dict[str, object], result["profile_refresh"])["fields"] == ["argv"]
+    assert record.arguments == expected_arguments
     assert all(b"value=with spaces" not in content for content in registry_bytes(manager.registry).values())
 
 

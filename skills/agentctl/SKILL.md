@@ -205,7 +205,11 @@ for one harness, update that matrix in the same commit.
 
 `agentctl restart NAME --when-idle` restarts a live agent in its own pane
 with its recorded session (same pane, tab, name, queue, and slot; slot
-ownership is transferred to the new process). Before restarting, have the
+ownership is transferred to the new process). Declared profile settings
+apply at that restart — and at a revive or restore — from the profile's
+current definition, not the arguments recorded at launch (#1928); a
+profile edit never restarts a running lane by itself, and `agentctl
+status` shows `profile_drift` while one is pending. Before restarting, have the
 agent finish or stop its background shells, monitors, internal subagents,
 and session crons and note what to re-arm: none of them survive, and the
 restarted agent gets a re-arm notice. `agentctl restart --team

@@ -2635,14 +2635,16 @@ fn revive_loads_profile_environment_privately_and_keeps_its_policy() {
 }
 
 #[test]
-fn revive_replays_a_spec_through_profile_drift_but_not_environment_name_drift() {
-    for field in ["model", "effort", "argv", "environment"] {
+fn revive_rebuilds_a_spec_from_the_current_profile() {
+    // #1928: declared settings apply at the next natural restart or
+    // restore, so a revive launches what the profile says now instead of
+    // replaying the stored arguments forever.
+    for field in ["model", "argv", "environment"] {
         let (fixture, _, path) = profile_fixture();
         let mut config = agent::read_private_json(&path).unwrap();
         let profile = &mut config["profiles"]["claude-recovery"];
         match field {
             "model" => profile["model"] = json!("different"),
-            "effort" => profile["reasoning_effort"] = json!("medium"),
             "argv" => {
                 profile["argv"] = json!([
                     "--allowedTools",
@@ -2653,19 +2655,118 @@ fn revive_replays_a_spec_through_profile_drift_but_not_environment_name_drift() 
             _ => profile["env"] = json!({"DIFFERENT_MODE":"profile-private-value"}),
         }
         agent::atomic_json(&path, &config).unwrap();
-        let plan = fixture
-            .manager()
-            .revive("worker", true, None, TIMEOUT)
-            .unwrap();
-        // The spec replays what ran; the profile only supplies the named environment values.
-        let expected = if field == "environment" {
-            "blocked"
-        } else {
-            "revive"
-        };
-        assert_eq!(plan["action"], expected, "{field}");
+        let manager = fixture.manager();
+        let plan = manager.revive("worker", true, None, TIMEOUT).unwrap();
+        assert_eq!(plan["action"], "revive", "{field}: {plan}");
+        assert!(
+            plan["profile_refresh"]["fields"]
+                .as_array()
+                .is_some_and(|fields| fields.iter().any(|value| value == field
+                    || (field == "environment" && value == "environment_names"))),
+            "{field}: {plan}"
+        );
         assert!(!plan.to_string().contains("profile-private-value"));
+        manager.revive("worker", false, None, TIMEOUT).unwrap();
+        let new = manager.load("worker").unwrap();
+        match field {
+            "model" => assert_eq!(new.model.as_deref(), Some("different")),
+            "argv" => assert!(new
+                .arguments
+                .windows(2)
+                .any(|pair| pair == ["--allowedTools", "Read,Write"])),
+            _ => {
+                assert_eq!(new.environment_names, ["DIFFERENT_MODE"]);
+                assert_eq!(
+                    fixture.client.environments.lock().unwrap()[1],
+                    ["DIFFERENT_MODE=profile-private-value"]
+                );
+            }
+        }
+        assert!(manager.status("worker").unwrap()["profile_drift"].is_null());
     }
+}
+
+#[test]
+fn revive_carries_settings_the_profile_gained_after_launch() {
+    // #1928 incident shape: a lane launched before its profile gained
+    // `--settings` is revived after the edit, and the new generation
+    // carries the flag; the refresh report names flags only, never values.
+    let (fixture, old, path) = profile_fixture();
+    let mut config = agent::read_private_json(&path).unwrap();
+    config["profiles"]["claude-recovery"]["argv"] = json!([
+        "--allowedTools",
+        "Read",
+        "--dangerously-skip-permissions",
+        "--settings",
+        "/private/lane-settings.json"
+    ]);
+    agent::atomic_json(&path, &config).unwrap();
+    let manager = fixture.manager();
+    // A running lane keeps showing drift, so an operator knows a restart
+    // is pending; nothing restarts it for them.
+    let drift = &manager.status("worker").unwrap()["profile_drift"];
+    assert_eq!(drift["fields"], json!(["argv"]), "{drift}");
+    let plan = manager.revive("worker", true, None, TIMEOUT).unwrap();
+    assert_eq!(plan["action"], "revive", "{plan}");
+    assert_eq!(
+        plan["profile_refresh"]["flags"],
+        json!(["--settings"]),
+        "{plan}"
+    );
+    assert!(!plan["profile_refresh"]
+        .to_string()
+        .contains("lane-settings"));
+    let result = manager.revive("worker", false, None, TIMEOUT).unwrap();
+    assert_eq!(
+        result["profile_refresh"]["flags"],
+        json!(["--settings"]),
+        "{result}"
+    );
+    assert!(!result["profile_refresh"]
+        .to_string()
+        .contains("lane-settings"));
+    let new = manager.load("worker").unwrap();
+    assert!(new
+        .arguments
+        .windows(2)
+        .any(|pair| pair == ["--settings", "/private/lane-settings.json"]));
+    let spec = new.launch_spec.as_ref().unwrap();
+    assert!(spec["argv"]
+        .as_array()
+        .unwrap()
+        .windows(2)
+        .any(|pair| pair == [json!("--settings"), json!("/private/lane-settings.json")]));
+    assert_eq!(
+        new.resume,
+        old.native_session
+            .as_ref()
+            .map(|native| native.value.clone())
+    );
+    assert!(manager.status("worker").unwrap()["profile_drift"].is_null());
+}
+
+#[test]
+fn restart_rebuilds_from_the_current_profile_without_the_refresh_flag() {
+    // #1928: a plain restart refreshes through its revive; the explicit
+    // --refresh-profile stays valid but is no longer the only path.
+    let (fixture, _old, path) = profile_fixture();
+    edit_profile(&path);
+    let result = fixture
+        .manager()
+        .restart("worker", false, Duration::from_secs(30), TIMEOUT)
+        .unwrap();
+    assert_eq!(result["action"], "restarted", "{result}");
+    assert_eq!(
+        result["profile_refresh"],
+        json!(["environment_names", "argv"]),
+        "{result}"
+    );
+    let new = fixture.manager().load("worker").unwrap();
+    assert!(new
+        .arguments
+        .windows(2)
+        .any(|pair| pair == ["--allowedTools", "Read,Write"]));
+    assert_eq!(new.environment_names, ["RECOVERY_MODE", "ULTRA_MODE"]);
 }
 
 #[test]
@@ -3992,10 +4093,7 @@ fn harness_wrapper_record_with_a_live_harness_identity_is_alive() {
         .revive("worker", true, None, TIMEOUT)
         .unwrap();
     assert_eq!(plan["action"], "skip", "{plan}");
-    assert!(
-        plan["reason"].as_str().unwrap().contains("alive"),
-        "{plan}"
-    );
+    assert!(plan["reason"].as_str().unwrap().contains("alive"), "{plan}");
 }
 
 #[test]
@@ -4011,9 +4109,7 @@ fn harness_wrapper_record_with_a_dead_or_reused_harness_identity_is_not_alive() 
         }
         match case {
             "stale-pid" => old.harness_identity.as_mut().unwrap().pid += 1000,
-            "reused-pid" => {
-                old.harness_identity.as_mut().unwrap().starttime_ticks += 1
-            }
+            "reused-pid" => old.harness_identity.as_mut().unwrap().starttime_ticks += 1,
             _ => {}
         }
         fixture.manager().save(&old).unwrap();
@@ -4056,9 +4152,7 @@ fn harness_wrapper_liveness_tracks_a_real_child_process() {
     // forked child still carries this test binary's image. The bound
     // only reports a hang; the wait is the /proc condition itself.
     let started = std::time::Instant::now();
-    while fs::read_link(format!("/proc/{pid}/exe"))
-        .is_ok_and(|path| path != executable)
-    {
+    while fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|path| path != executable) {
         assert!(
             started.elapsed() < Duration::from_secs(120),
             "pid {pid} never exec'd {}",
@@ -4070,17 +4164,13 @@ fn harness_wrapper_liveness_tracks_a_real_child_process() {
     as_harness_wrapper(&mut old);
     old.harness_identity = Some(identity.clone());
     fixture.manager().save(&old).unwrap();
-    let client =
-        HerdrClient::with_executable("direct", &fixture.root.join("herdr")).unwrap();
+    let client = HerdrClient::with_executable("direct", &fixture.root.join("herdr")).unwrap();
     let manager = ManagedAgents::new(&client, &fixture.root.join("registry"))
         .unwrap()
         .with_inherited_workspace(None);
     let plan = manager.revive("worker", true, None, TIMEOUT).unwrap();
     assert_eq!(plan["action"], "skip", "{plan}");
-    assert!(
-        plan["reason"].as_str().unwrap().contains("alive"),
-        "{plan}"
-    );
+    assert!(plan["reason"].as_str().unwrap().contains("alive"), "{plan}");
     // A reused pid (same pid, another generation) is never Alive.
     let mut reused = old.clone();
     reused.harness_identity.as_mut().unwrap().starttime_ticks += 1;

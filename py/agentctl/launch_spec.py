@@ -5,8 +5,10 @@ the program, the working directory, the private profile whose environment values
 launch used (names only are stored), the slot policy, the workspace label, and the
 native conversation. ``start`` writes one before the harness exists; ``adopt`` and
 ``anchor`` read it from the pinned harness process's ``/proc/PID/cmdline``. ``revive``
-replays it with the conversation selector replaced by an explicit resume, so a change
-to a profile after launch does not change what a revived agent runs.
+replays it with the conversation selector replaced by an explicit resume; for a record
+started from a launch profile it first rebuilds the argument vector from the profile's
+current definition (#1928), so a profile edited after launch takes effect at the next
+revive, restart or restore instead of replaying the stored arguments forever.
 
 The spec lives in the record under ``launch_spec``. Both editions validate the same
 shape and preserve the key through every lifecycle operation. A key a newer agentctl
@@ -245,6 +247,39 @@ def resumed_session(harness: str, recorded: Sequence[str], actual: Sequence[str]
     if not tail or not _text(value):
         raise AgentDeliveryError(refusal)
     return value
+
+
+def changed_flag_names(harness: str, recorded: Sequence[str], actual: Sequence[str]) -> list[str]:
+    """Names of flags whose spelling or associated value differs between two
+    argument vectors, apart from any conversation selectors: names only,
+    never a value, in sorted order (#1928).
+    """
+    def flags(argv: Sequence[str]) -> dict[str, list[str | None]]:
+        result: dict[str, list[str | None]] = {}
+        index = 0
+        while index < len(argv):
+            token = argv[index]
+            if token.startswith("-") and len(token) > 1:
+                if "=" in token:
+                    name, value = token.split("=", 1)
+                else:
+                    name, value = token, None
+                    if index + 1 < len(argv) and not argv[index + 1].startswith("-"):
+                        value = argv[index + 1]
+                        index += 1
+                result.setdefault(name, []).append(value)
+            index += 1
+        return result
+
+    try:
+        recorded_flags = flags(_split(harness, recorded)[1])
+        actual_flags = flags(_split(harness, actual)[1])
+    except Exception:
+        return []
+    return sorted(
+        name for name in {*recorded_flags, *actual_flags}
+        if recorded_flags.get(name) != actual_flags.get(name)
+    )
 
 
 def same_launch_rest(harness: str, recorded: Sequence[str], actual: Sequence[str]) -> bool:

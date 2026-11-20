@@ -1393,7 +1393,7 @@ struct Revive {
     /// Mark an interrupted revive's candidate failed even when agentctl cannot prove it dead, then launch again; refused while a harness process runs for the candidate. A candidate proved dead (its pane gone, or holding only an idle shell) is abandoned without this flag. The attempt is kept under REGISTRY/.revives/.abandoned/ with the evidence. Applies only to a named revive
     #[arg(long, requires = "name", conflicts_with_all = ["archived", "fresh"])]
     abandon_candidate: bool,
-    /// Relaunch from the launch profile's current definition (argv, environment, model, reasoning effort) instead of the recorded launch, keeping the conversation, queue and token; for a profile edited since the agent started. Refused when the profile now names another harness or mode. Applies only to a named revive
+    /// Relaunch from the launch profile's current definition (argv, environment, model, reasoning effort), keeping the conversation, queue and token; for a profile edited since the agent started. A plain revive already rebuilds this way (#1928); this flag additionally rewrites the recorded launch first and reports the changed fields. Refused when the profile now names another harness or mode. Applies only to a named revive
     #[arg(long, requires = "name", conflicts_with_all = ["dry_run", "archived", "abandon_candidate"])]
     refresh_profile: bool,
     /// Startup-readiness deadline in seconds, greater than 0 and at most 300 (default: 30)
@@ -1419,7 +1419,7 @@ struct Restart {
     /// Accept Claude's exit-dialog stop-tasks choice (only when the agent confirms the listed tasks are stale)
     #[arg(long)]
     stop_background_tasks: bool,
-    /// Relaunch from the launch profile's current definition (argv, environment, model, reasoning effort) instead of the recorded launch, keeping the conversation, queue and token. Checked before the harness exits; refused when the profile now names another harness or mode
+    /// Relaunch from the launch profile's current definition (argv, environment, model, reasoning effort), keeping the conversation, queue and token. A plain restart already rebuilds this way through its revive (#1928); this flag additionally rewrites the recorded launch before the harness exits. Checked before the harness exits; refused when the profile now names another harness or mode
     #[arg(long, conflicts_with = "team")]
     refresh_profile: bool,
     /// How long --when-idle may wait in seconds, greater than 0 and at most 3600 (default: 3600)

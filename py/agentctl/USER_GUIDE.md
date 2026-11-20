@@ -927,9 +927,15 @@ it as `launch_spec`.
   `resume ID` for Codex and Muse) and adds one explicit resume of the recorded
   conversation. A selector that cannot be reproduced, such as Codex
   `resume --last` or a bare Claude `--resume` picker, blocks revival.
-- A profile edited after launch does not change the replay. The profile only
-  supplies the values of the environment names the spec recorded; a missing
-  profile, or one whose names differ, blocks revival before launch.
+- A profile edited after launch rebuilds the replay (#1928): declared
+  settings apply at the next natural revive, restart or restore, the way
+  `start --resume` already launches, and the result's `profile_refresh`
+  names the changed fields and flags (names only, never values). Explicit
+  model and effort overrides keep winning. A missing profile, or one that
+  now names another harness, mode or a cloud launch, blocks revival
+  before launch instead of silently replaying the stored arguments. A
+  running lane is never restarted for an edit; `status` shows
+  `profile_drift` while one is pending.
 - A spec whose program is not the harness itself (for example `node cli.js`)
   blocks revival, because Herdr launches the harness by kind.
 - Without a project workspace setting, the replacement returns to the workspace

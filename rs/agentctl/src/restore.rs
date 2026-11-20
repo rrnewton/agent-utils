@@ -2124,6 +2124,7 @@ fn recover_agent<A: ManagedApi + ?Sized>(
                     "action": "revived",
                     "pane_id": result["pane_id"],
                     "workspace_id": result["workspace_id"],
+                    "profile_refresh": result["profile_refresh"],
                     "queued_delivered": result["queued_delivered"].as_array().map_or(0, Vec::len),
                     "queued_archived": result["queued_archived"].as_array().map_or(0, Vec::len),
                     "queued_uncertain": result["queued_uncertain"].as_array().map_or(0, Vec::len),
