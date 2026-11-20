@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-eden-finish-per-checkout-drafts: Eden finish must account only the drafts of its own checkout, not every draft in the shared backing store'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -156,3 +156,23 @@ sharedpath store), so finish also unions journal-visited drafts
 still in the store, excluding explicitly disowned nodes. (7)
 A hidden amended successor is named at its newest successor,
 not the stale predecessor.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as 6cbb6dfc
+(replay of gated 214042f9, tree 7ceb1889; full gate passed with
+no failed steps, and the combined tree passed py_compile, full
+strict mypy, and test_eden + test_finish_accounting +
+test_heartbeat_lock_scope with 106 passed). Four cold reviews:
+the last three were NOT SAFE and every defect they reproduced
+(migration orphans, rebuild drops, blanket declarations over
+unseen or recorded drafts, generation stranding, autopull on
+unknown nodes, journal rewrites and hidden drafts, the shown
+-list bypass, and fail-open journal queries) is fixed and
+covered by tests, including real-Sapling shared-store probes.
+No new record field or event kind: the only new persisted
+artifacts live inside the slot's .eden-state/wrkslots-drafts/
+(the ledger with its disowned list, its flock file, and the
+shown-list marker), which older readers never parse; from
+74549a37 status, doctor, audit and finish behave exactly as
+before, fail-safe.
