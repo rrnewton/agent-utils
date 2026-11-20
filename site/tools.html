@@ -66,8 +66,8 @@
 <div class="wrap">
 <p class="eyebrow">Tools</p>
 <h1>The tools</h1>
-<p class="lead">Each tool starts with the problem it solves, then what you get and what it needs. Each agent-utils tool documents itself: run it with <code>quickstart</code> or <code>--help</code>.</p>
-<p>Five tools exist twice, as independent Python and Rust <em>editions</em> that share their core commands and output. A harness runs the Rust edition unless you ask for Python. The badge on each tool says which it has.</p>
+<p class="lead">Use the tools together or on their own. Run a tool with <code>quickstart</code> or <code>--help</code> for instructions.</p>
+<p>Paired tools have Python and Rust editions with shared core commands. Badges below show the available editions.</p>
 <nav class="toc" aria-label="Tools on this page">
 <div>
 <p class="toc-label">Core</p>
@@ -133,15 +133,15 @@
 <p class="tool-lede">Start, message, read and stop coding agents by name, while each agent's terminal stays open to you.</p>
 <dl class="tool-facts">
 <dt>Problem</dt>
-<dd>You run several long-lived agents. Each follow-up must reach the right one exactly once, the team must survive crashes and reboots, and you still want to type into any agent directly.</dd>
+<dd>Long-running agents need reliable follow-ups, recovery after restarts and terminals you can still use yourself.</dd>
 <dt>What you get</dt>
-<dd>Named sessions in a local registry. A durable prompt queue that never resends a prompt it cannot confirm: exit 75 means safely pending, 76 means possibly submitted. Launch profiles you write, with model and effort per profile. Attach and take over at any time, and <code>restore</code> a whole team after a reboot.</dd>
+<dd>Named sessions, a durable prompt queue and launch profiles for your models and settings. Inspect uncertain deliveries before retrying. Attach to interactive agents, or <code>restore</code> a saved team after a reboot.</dd>
 <dt>Agent CLIs</dt>
 <dd>Claude Code and Codex, plus any other terminal agent through harness-neutral screen rules. Claude Code also runs headless, under the same names and commands. The <a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/agentctl/harness-support-matrix.md">support matrix</a> says what works for each.</dd>
 <dt>Needs</dt>
 <dd>Linux, a Rust toolchain (or Python 3.10 or newer), and Herdr; agent panes can also run in tmux. No hosted account and no always-running manager.</dd>
 <dt>Status</dt>
-<dd>Core and beta, at version 0.1. <code>agentctl wait</code> reports that an agent is ready for input, not that its work is done.</dd>
+<dd>Beta, version 0.1. <code>wait</code> reports readiness for input; check the agent's reply for task completion.</dd>
 <dt>Editions</dt>
 <dd>Python and Rust share the interactive core and one user guide. Rust, the default, adds the chat plugin host, the coordinator inbox and <code>restore</code>; Python keeps the Google Chat polling bridge.</dd>
 </dl>
@@ -153,7 +153,7 @@
 <li>Checks the recipient pane before and after typing, reads it back to confirm delivery, and quarantines a likely misroute.</li>
 <li>Launch profiles in a private <code>.agentctl/profiles.json</code>: agent CLI, model, effort, arguments and environment, passed without shell expansion.</li>
 <li><code>start --slot</code> runs an agent inside a wrkslots slot.</li>
-<li><code>restore</code> brings back every agent that was running at shutdown, then the chat bridge and other services.</li>
+<li><code>restore</code> restarts agents from saved launch settings, then starts configured bridges and services.</li>
 <li><code>doctor</code> compares the registry with Herdr; <code>capabilities</code> lists what this installation includes.</li>
 </ul>
 </div>
@@ -202,7 +202,7 @@
 <h4>Key capabilities</h4>
 <ul>
 <li><code>create</code> provisions and registers a slot on a fresh branch in one step.</li>
-<li>Removal needs an expired time-to-live, a dead owner, and agreement from process, mount, Git and path checks. Missing evidence means refusal.</li>
+<li>Removal checks that no process uses the slot. A finished owner can release it; abandoned slots need expiry and liveness checks.</li>
 <li>Unpushed commits go to a salvage remote or a verified local bundle before anything is deleted.</li>
 <li>Storage: a plain directory, one sparse ext4 image per slot (about 70 MiB when fresh), or one shared btrfs image for every slot.</li>
 <li><code>wrkslots run SLOT -- CMD</code>: per-slot systemd limits, a private <code>/tmp</code>, and only the slot and named paths writable.</li>
@@ -240,11 +240,11 @@
 <dt>Problem</dt>
 <dd>You want to hand the coordinator work, and hear back, while you are away from the terminal.</dd>
 <dt>What you get</dt>
-<dd>Messages from allowlisted senders only, stored before anything else happens. A reaction that means "received". Each reply posted to the right thread exactly once. A delivery whose outcome is unclear is recorded, never retyped.</dd>
+<dd>Requests saved before delivery, receipt reactions and replies to the original thread. Uncertain deliveries wait for inspection.</dd>
 <dt>Needs</dt>
-<dd>Herdr. For Slack: the Slack provider (built with <code>cargo</code>), a Slack command-line client on the host, a Slack app to post replies, the channel ID and your user ID. For Google Chat: a space ID, your user ID and an OAuth token.</dd>
+<dd>Herdr and a provider connection: the Slack plugin and command-line client, or Google Chat credentials. The setup guide covers channel and sender settings.</dd>
 <dt>Status</dt>
-<dd>Core; connect it at setup or later. Slack is event-driven. Google Chat is polled, hourly by default; <code>--interval</code> shortens that. Prompts arrive as pasted terminal input, and a reply cut off by Herdr's scrollback fails visibly instead of being guessed.</dd>
+<dd>Connect at setup or later. Slack is event-driven; Google Chat polls hourly by default, configurable with <code>--interval</code>.</dd>
 <dt>Editions</dt>
 <dd>Two bridges. Rust: an event-driven host for provider plugins, used for Slack. Python: the Google Chat polling bridge.</dd>
 </dl>
@@ -278,15 +278,15 @@
 <section aria-labelledby="external">
 <div class="group-head">
 <h2 id="external">External dependency</h2>
-<p>Not part of agent-utils, and not maintained here.</p>
+<p>Installed separately from agent-utils.</p>
 </div>
 
 <section class="tool tool-external" id="herdr" aria-labelledby="herdr-title">
 <div class="tool-head">
 <h3 id="herdr-title">Herdr</h3>
-<p class="badges"><span class="badge badge-external">external</span><span class="badge badge-edition">tested with 0.8</span></p>
+<p class="badges"><span class="badge badge-external">external</span><span class="badge badge-edition">terminal server</span></p>
 </div>
-<p class="tool-lede">A separately maintained, persistent terminal server. Every agent in a harness runs in one of its tabs.</p>
+<p class="tool-lede">A persistent terminal server for interactive agents, with tabs you can attach to and use yourself.</p>
 <dl class="tool-facts">
 <dt>Problem</dt>
 <dd>Agents need a terminal that outlives whatever started them, and you need to attach to any agent's real interface and take over.</dd>
@@ -295,7 +295,7 @@
 <dt>Needs</dt>
 <dd>Install it from upstream and start it once with <code>herdr</code>. Setup offers to install it.</dd>
 <dt>Status</dt>
-<dd>External, last tested with Herdr 0.8. agentctl can also drive agent panes in tmux.</dd>
+<dd>Installed separately. agentctl can also drive agent panes in tmux.</dd>
 </dl>
 <h4>Documentation</h4>
 <ul class="doc-links">
@@ -318,12 +318,12 @@
 <h3 id="herdr-run-title"><code>herdr-run</code></h3>
 <p class="badges"><span class="badge">optional</span><span class="badge badge-edition">Python + Rust</span></p>
 </div>
-<p class="tool-lede">Runs an allowlisted command in a visible Herdr pane, outside whatever confines the caller, and returns its real output and exit code.</p>
+<p class="tool-lede">Runs an allowlisted command outside the agent's sandbox in a visible Herdr pane, returning output and exit status.</p>
 <dl class="tool-facts">
 <dt>Problem</dt>
-<dd>A sandboxed agent needs a sanctioned, visible way to run a blocked command such as <code>git push</code>, <code>gh</code> or a dependency fetch.</dd>
+<dd>An agent's sandbox blocks <code>git push</code>, <code>gh</code> or a dependency fetch needed to finish the task.</dd>
 <dt>What you get</dt>
-<dd>A per-project allowlist, <code>.herdr-run.yaml</code>, that only a person widens. Exact output and exit status, distinct codes for refusals, and an audit log, in a pane anyone can watch.</dd>
+<dd>You choose the allowed commands in <code>.herdr-run.yaml</code>. Each run keeps its output, exit status and audit record.</dd>
 <dt>Needs</dt>
 <dd>Linux, a systemd user manager, and Herdr.</dd>
 <dt>Status</dt>
@@ -337,7 +337,7 @@
 <ul>
 <li>Checks the bare program name against policy, re-quotes every argument, and refuses known escapes.</li>
 <li>Captures results through files, not by scraping the screen.</li>
-<li>Never types over a person: one lock per pane, and conservative readiness checks.</li>
+<li>Locks the pane and checks it is ready before submitting a command.</li>
 <li>A cap on tabs; <code>net-doctor</code> checks that a pane can reach what the sandbox cannot.</li>
 </ul>
 </div>
@@ -366,7 +366,7 @@
 <p class="tool-lede">One timer evaluates many recurring duties, each on its own cadence, and prints stable lines such as <code>ACTION:</code> and <code>HEALTH:</code>.</p>
 <dl class="tool-facts">
 <dt>Problem</dt>
-<dd>A coordinator has many recurring duties: reports, freshness checks, conditions a shell command can test. Without tick-hub, each needs its own timer and its own format.</dd>
+<dd>Recurring reports and freshness checks clutter the schedule with separate timers.</dd>
 <dt>What you get</dt>
 <dd>Reminders with cadences, flags, shell gates and dependencies. File-freshness checks that report ok, stale or missing. A deterministic line protocol; state is written only with <code>--flush</code>.</dd>
 <dt>Needs</dt>
@@ -396,9 +396,9 @@
 <p class="tool-lede">Runs a dependency graph of build and test steps with bounded concurrency, cgroup containment and per-step profiling.</p>
 <dl class="tool-facts">
 <dt>Problem</dt>
-<dd>Run one step at a time, validation is slow. Run all at once, it overloads a shared machine, and one runaway step can take the host with it.</dd>
+<dd>Serial validation is slow; unrestricted parallel builds can exhaust a shared machine.</dd>
 <dt>What you get</dt>
-<dd>Steps in dependency order under limits on active steps, CPUs, memory and named resources such as a browser. Every step boxed in a cgroup. Profiles, speedup sweeps, and timeouts that capture evidence before they kill.</dd>
+<dd>Runs independent steps concurrently under CPU, memory and resource limits. Each step gets a cgroup, timing data and a timeout that captures diagnostics before stopping it.</dd>
 <dt>Needs</dt>
 <dd>A Rust toolchain or Python 3.10 or newer, cgroup v2 and a systemd user scope. Without containment, a run refuses unless you pass <code>--allow-cgroup-failure</code>.</dd>
 <dt>Status</dt>
@@ -470,7 +470,7 @@
 <dt>Problem</dt>
 <dd>Fuzz sweeps, flaky-test hunts and parameter scans can pile up processes and saturate a host.</dd>
 <dt>What you get</dt>
-<dd>Each seed becomes one boxed dagrun step. Concurrency is sized from measured idle cores after a short calibration. A cost estimate comes first and measured actuals after. A breach kills the worker's whole process tree and names what it breached.</dd>
+<dd>One dagrun step per seed, with concurrency based on measured idle CPU capacity. Reports estimated and actual cost. Workers that exceed a limit are stopped with their whole process tree.</dd>
 <dt>Needs</dt>
 <dd>Python 3.10 or newer, dagrun and cgroup v2.</dd>
 <dt>Status</dt>
@@ -494,12 +494,12 @@
 <h3 id="agent-teams-title"><code>agent-teams</code></h3>
 <p class="badges"><span class="badge">optional</span><span class="badge">build from source</span><span class="badge badge-edition">Rust</span></p>
 </div>
-<p class="tool-lede">Sends a message from one team's coordinator to another's, on the same host or another, exactly once.</p>
+<p class="tool-lede">Routes messages between team coordinators on one machine or several, with duplicate prevention.</p>
 <dl class="tool-facts">
 <dt>Problem</dt>
-<dd>Teams of agents run on several machines. Reaching another team's coordinator means knowing which host it is on and how to type into it, and a retry after an unclear outcome delivers the message twice.</dd>
+<dd>Coordinators on different machines need to exchange work without tracking each other's terminals or duplicating messages on retries.</dd>
 <dt>What you get</dt>
-<dd>One command to message another team. Each message carries one ID, and the receiving host claims it in a ledger before delivering, so a retry or a second route never delivers it twice. Routes run locally, over SSH, through a command, or through a shared chat channel. Nothing drives a remote terminal: the receiving host does its own typing.</dd>
+<dd>Address a team by name through local, SSH, command or chat routes. The receiving host records each message ID before delivery to prevent duplicates across retries and routes.</dd>
 <dt>Needs</dt>
 <dd>One Rust binary per host. Herdr and agentctl are optional; with agentctl, messages land in the coordinator's prompt queue.</dd>
 <dt>Status</dt>
@@ -526,9 +526,9 @@
 <p class="tool-lede">A local merge queue that orders, batches, validates and lands ready changes while keeping the base branch green.</p>
 <dl class="tool-facts">
 <dt>Problem</dt>
-<dd>Landing ready changes one at a time costs one rebase and one validation each. Landing them all at once breaks the branch when two conflict, or pass alone but fail together.</dd>
+<dd>Validating each change separately repeats work and misses failures that appear only when changes are combined.</dd>
 <dt>What you get</dt>
-<dd>Changes grouped by Git's exact conflict graph, ordered by priority and age, and split into batches. Each batch's combined tree is validated, several at once, and lands only when green. When a batch fails, only the failed tests rerun to find the culprit, which is ejected with a report while the rest lands. A change it cannot land gets a reason and the action that unblocks it.</dd>
+<dd>Groups changes by Git conflicts, priority and age. Validates combined batches in parallel and lands those that pass. Failed batches are split to isolate the failing changes; reports explain what remains blocked.</dd>
 <dt>Needs</dt>
 <dd>Git 2.40 or newer and a Rust toolchain. It runs against a local clone: no service, no webhook.</dd>
 <dt>Status</dt>
@@ -554,7 +554,7 @@
 <p class="tool-lede">Builds a zoomable local website from agent transcripts: a timeline of what a coordinator and its subagents did.</p>
 <dl class="tool-facts">
 <dt>Problem</dt>
-<dd>After days of multi-agent work, it is hard to see who did what and when, and what each phase achieved.</dd>
+<dd>After days of work, agent transcripts make it hard to see who did what and when.</dd>
 <dt>What you get</dt>
 <dd>One track per agent, with fork and join edges and active, waiting and idle time. Cached summaries from a phrase up to a quarter. A static site served on <code>127.0.0.1</code>, and a command-line query tool. It reads Claude Code and Codex transcripts, including nested subagents.</dd>
 <dt>Needs</dt>
@@ -582,12 +582,12 @@
 <h3 id="gh-paced-title"><code>gh-paced</code></h3>
 <p class="badges"><span class="badge">optional</span><span class="badge">build from source</span><span class="badge badge-edition">Rust</span></p>
 </div>
-<p class="tool-lede">A wrapper in front of the GitHub CLI that charges every <code>gh</code> call against budgets and waits, or refuses, before GitHub pushes back.</p>
+<p class="tool-lede">Paces <code>gh</code> calls against shared per-host budgets to reduce GitHub rate-limit errors.</p>
 <dl class="tool-facts">
 <dt>Problem</dt>
-<dd>Agents looping over <code>gh</code>, on several hosts that share one account, can trip GitHub's secondary rate limits, and an account that keeps calling risks suspension.</dd>
+<dd>Several agents sharing a GitHub account can exhaust its rate limits.</dd>
 <dt>What you get</dt>
-<dd>Each call classified as read, search, write or credential, and charged against per-host budgets sized to keep four hosts on one account well under GitHub's limits. One write in flight at a time, a 15-minute pause after any rate-limit response, and a guard against oversized write bodies.</dd>
+<dd>Separate budgets for reads, searches, writes and credentials. One write at a time, a 15-minute pause after a rate-limit response, and limits on write size.</dd>
 <dt>Needs</dt>
 <dd>Linux, the real <code>gh</code> binary, and a Rust toolchain.</dd>
 <dt>Status</dt>
@@ -615,7 +615,7 @@
 <p class="tool-lede">Reports plan usage, reset times and burn rates for Claude Code and Codex, plus local token use, without a model call.</p>
 <dl class="tool-facts">
 <dt>Problem</dt>
-<dd>Agents cannot see their own budgets. A person can type <code>/status</code>; an agent would need a throwaway session or a paid model call.</dd>
+<dd>Coordinators need to know when an agent's plan is nearing its limit.</dd>
 <dt>What you get</dt>
 <dd>Each plan window with percentage used and reset time. Burn over 15 minutes to 24 hours, and whether a window would fill before it resets. Local token use from transcripts. Text, JSON or one-line output, and optional 15-minute history.</dd>
 <dt>Needs</dt>
@@ -645,9 +645,9 @@
 <p class="tool-lede">A small, dependency-aware issue tracker, <code>mb</code>, that keeps each issue as a Markdown file in the repository's <code>.minibeads/</code> directory, committed with the work.</p>
 <dl class="tool-facts">
 <dt>Problem</dt>
-<dd>A coordinator hands out many small tasks a day. On GitHub they crowd out real bug reports and spend a shared rate limit; in chat, nobody can see what is in flight or what was never closed.</dd>
+<dd>Small agent tasks need an owner and a status without adding a GitHub issue for every step.</dd>
 <dt>What you get</dt>
-<dd>Issues with priorities, labels, comments and dependencies. <code>mb ready</code> lists unblocked work. An atomic claim marks a task in progress for one agent. JSON output for scripts, and a sync to GitHub Issues for the few tasks that belong there.</dd>
+<dd>Track priorities, dependencies and comments in Git. <code>mb ready</code> lists unblocked tasks; atomic claims assign each to one agent. Includes JSON output and GitHub Issues sync.</dd>
 <dt>Needs</dt>
 <dd>A Rust toolchain: <code>git submodule update --init ext/minibeads</code>, then <code>cargo install --path ext/minibeads --bin mb</code>, or <code>cargo install minibeads</code> from crates.io. No database and no service.</dd>
 <dt>Status</dt>
@@ -672,9 +672,9 @@
 <p class="tool-lede">A small Rust server and web app for reading and answering your agents' chat on a phone or desktop. <a href="vibe-talk.html">Its own page</a> shows it in five short clips.</p>
 <dl class="tool-facts">
 <dt>Problem</dt>
-<dd>Agents post long messages, many of them before you look. Ordinary chat clients are built for people, not for a stream of agent reports.</dd>
+<dd>Long agent reports bury the questions waiting for your answer.</dd>
 <dt>What you get</dt>
-<dd>One-line summaries of long messages, named threads, and Discuss, a side agent that catches you up on a channel. Done, read modes, pins and search for triage. A Documents view of everything linked in chat. Replies, read-aloud and voice conversation. Separate read and write tokens, and posts that cannot ping <code>@everyone</code>.</dd>
+<dd>One-line summaries of long messages, named threads, and Discuss, a side agent that catches you up on a channel. Done, read modes, pins and search for triage. A Documents view for linked files and reports. Replies, read-aloud and voice conversation. Separate read and write tokens, and posts that cannot ping <code>@everyone</code>.</dd>
 <dt>Needs</dt>
 <dd>A host to run it, natively or in a container; TLS in front if you expose it; a chat credential (Slack, Discord, or a Google Chat bridge); and optionally a model provider for summaries and a voice vendor.</dd>
 <dt>Status</dt>
@@ -704,9 +704,9 @@
 <p class="tool-lede">An advisory planner that turns a queue of pull requests into per-PR actions and conflict-safe groups.</p>
 <dl class="tool-facts">
 <dt>Problem</dt>
-<dd>Landing many pull requests means working out which conflict, what order they need, whose CI still applies to the exact head, and which can land together.</dd>
+<dd>A queue of pull requests needs an order that respects conflicts, dependencies and current test results.</dd>
 <dt>What you get</dt>
-<dd>Real merge-conflict detection, dependency ordering, CI classification, and evidence tied to each PR's exact head. Output for people, as JSON, or as line-oriented actions. An offline fixture mode, and a live mode that uses <code>gh</code> and <code>git</code>.</dd>
+<dd>Checks merge conflicts, dependencies and CI results for each PR's current commit. Outputs a plan as text, JSON or actions. Runs against offline fixtures or live GitHub data.</dd>
 <dt>Needs</dt>
 <dd>A Rust toolchain or Python 3.10 or newer; <code>gh</code> and <code>git</code> for live mode.</dd>
 <dt>Status</dt>
@@ -788,7 +788,7 @@
 <dt>Problem</dt>
 <dd>A chat bridge must not lose or double-process messages across disconnects, and providers should plug in as separate programs without credentials in the protocol.</dd>
 <dt>What you get</dt>
-<dd>Ordered events, replay cursors, explicit gap events and a durable acknowledgement boundary, carried over a versioned JSON process protocol. A fake provider for conformance tests.</dd>
+<dd>Ordered events, replay after disconnects and explicit reports of missing history over a versioned JSON protocol. Includes a fake provider for testing.</dd>
 <dt>Status</dt>
 <dd>Version 0.1. The Slack provider is the first plugin; it is built from source, not published. Plugins are trusted code running as your user.</dd>
 </dl>
@@ -804,16 +804,16 @@
 <section class="tool" id="wrkslotsd" aria-labelledby="wrkslotsd-title">
 <div class="tool-head">
 <h3 id="wrkslotsd-title"><code>wrkslotsd</code></h3>
-<p class="badges"><span class="badge">diagnostic</span><span class="badge">unpublished</span><span class="badge badge-edition">Rust</span></p>
+<p class="badges"><span class="badge">opt-in</span><span class="badge">unpublished</span><span class="badge badge-edition">Rust</span></p>
 </div>
-<p class="tool-lede">A Rust reader of the wrkslots event log and state files, growing into the wrkslots Rust edition.</p>
+<p class="tool-lede">The opt-in Rust implementation of wrkslots commands and event-log diagnostics.</p>
 <dl class="tool-facts">
 <dt>Status</dt>
-<dd>Unpublished. It reads and validates; Python wrkslots still makes every change to a slot.</dd>
+<dd>Unpublished. Supports commands including create, remove, hold and unhold; commands not yet ported refuse. Python remains the default.</dd>
 </dl>
 <h4>Documentation</h4>
 <ul class="doc-links">
-<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/wrkslots/RELATED_WORK.md#current-implementation-and-migration-boundary">Current implementation and migration boundary</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/bin/engine-resolver">Edition selection and opt-in behavior</a></li>
 <li>Source: <a href="https://github.com/rrnewton/agent-utils/tree/main/rs/wrkslotsd">Rust</a></li>
 </ul>
 <p class="back-to-top"><a href="#main">Back to top</a></p>
@@ -826,7 +826,7 @@
 <div class="wrap">
 <h2 id="install-title">Installing a tool on its own</h2>
 <div class="prose">
-<p>In a harness nothing needs installing: the commands in <code>agent-utils/bin</code> run from the checkout, and Cargo builds the Rust ones on first use. To use one tool on its own, install it from a checkout of this repository:</p>
+<p>Setup runs tools from <code>agent-utils/bin</code>, building Rust tools on first use. To install a tool separately from a repository checkout:</p>
 <pre tabindex="0" role="region" aria-label="Installing one tool from a checkout"><code>python3 -m pip install ./py/wrkslots      # a Python distribution
 cargo install --path rs/agentctl          # a Rust crate</code></pre>
 <p>No agent-utils package is published to a package index yet. The <a href="https://github.com/rrnewton/agent-utils/blob/main/py/README.md">Python distributions</a> and <a href="https://github.com/rrnewton/agent-utils/blob/main/rs/README.md">Rust crates</a> list them all.</p>

@@ -67,10 +67,10 @@
 <p class="eyebrow">Optional tool</p>
 <h1>vibe-talk</h1>
 <p class="badges"><span class="badge">optional</span><span class="badge badge-warn">early</span><span class="badge badge-edition">Rust service</span><span class="badge badge-edition">v0.1.0</span></p>
-<p class="lead">A Slack and Discord client built for vibe-coding: a small Rust server and web app for reading and answering your agents' chat on a phone or desktop. It shows only the agent channels you configure, so their traffic stays out of your everyday chat.</p>
+<p class="lead">Read and answer your agents' Slack or Discord messages from a phone or desktop. Summaries, named threads and triage controls help you catch up. Only the channels you configure appear.</p>
 <div class="callout" role="note" aria-labelledby="about-clips">
 <p class="callout-title" id="about-clips">About the clips</p>
-<p>Five short clips of the core flows: summaries, one report in full, new messages, a reply from the phone, and threads on a desktop. They were recorded against local mocks, before Discuss, Documents and the triage controls existed. Nothing moves until you press <strong>Play the clip</strong>.</p>
+<p>These five clips use local mock services and predate Discuss, Documents and the triage controls. Press <strong>Play the clip</strong> to start an animation.</p>
 </div>
 </div>
 </div>
@@ -80,21 +80,21 @@
 <div class="section-head">
 <p class="eyebrow">Purpose</p>
 <h2 id="purpose-title">What it does</h2>
-<p>Agents post long reports, many before you look, and some wait on your answer. Chat clients are built for people, not for a stream of agent reports.</p>
+<p>Skim the reports, find the questions and reply where your agents are already talking.</p>
 </div>
 <dl class="tool-facts">
 <dt>Summaries</dt>
-<dd>Long messages fold to a one-line summary, with the full text a tap away. Threads get short, stable names and their own summaries. Discuss, a side agent, catches you up on a channel or thread, with links back to the messages.</dd>
+<dd>Read a one-line summary or tap for the full message. Threads keep short names and updated summaries. Ask Discuss to explain a channel or thread, with links to the messages.</dd>
 <dt>Triage</dt>
 <dd>Mark messages Done; show, fold or hide what you have read; pin what you will need again. Search what is loaded, then the server's copy of the history.</dd>
 <dt>Threads</dt>
 <dd>Give each agent a channel and let its subagents work in threads. On a desktop, threads sit beside the channel, and drafts follow you between devices.</dd>
 <dt>Documents</dt>
-<dd>Documents linked in chat are collected in one view: fetched, searchable and readable in the app.</dd>
+<dd>Read and search supported document links in one view, including GitHub files and gists.</dd>
 <dt>Voice</dt>
 <dd>Read any message aloud with the phone's own voice or ElevenLabs, or talk it over with a voice agent.</dd>
 <dt>Unbundled</dt>
-<dd>Any agent that can post to chat works with it. vibe-talk reads and posts messages but never starts, stops or types into agents; with <a href="tools.html#agentctl-chat"><code>agentctl chat</code></a> on the same channel, you answer the coordinator from it.</dd>
+<dd>Use it with any agent that posts to chat. Add <a href="tools.html#agentctl-chat"><code>agentctl chat</code></a> on a Slack channel to exchange messages with your coordinator.</dd>
 </dl>
 </div>
 </section>
@@ -104,7 +104,7 @@
 <div class="section-head">
 <p class="eyebrow">Clips</p>
 <h2 id="clips-title">Five short clips</h2>
-<p>Each clip shows a still until you press <strong>Play the clip</strong>; <strong>Stop the clip</strong> brings the still back. Four are a phone screen. The last is a desktop browser, and scrolls sideways on a narrow screen.</p>
+<p>Press <strong>Stop the clip</strong> to return to the still. The first four show a phone; the last shows a desktop.</p>
 </div>
 
 <article class="clip" id="clip-summaries" aria-labelledby="clip-summaries-title">
@@ -120,7 +120,7 @@
 <figcaption>Long agent reports collapse to one-sentence summaries with one tap.</figcaption>
 </figure>
 <div class="clip-text">
-<p>A channel on a phone. Long agent messages fold to their first three lines; tapping <strong>Summaries</strong> shows a one-sentence summary of each instead. The full message stays one tap away.</p>
+<p>Tap <strong>Summaries</strong> to replace message previews with one-sentence summaries. Tap a summary to read the full report.</p>
 <p class="clip-meta">12.8 seconds, 1.4 MB · <a href="media/vibe-talk/channel-summaries.gif">Open the animation<span class="vh">: summaries of long messages</span></a></p>
 <p class="small">In vibe-talk's README: <a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/README.md#a-long-message-can-be-read-as-a-summary-of-itself">a long message can be read as a summary of itself</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/README.md#summaries">summaries</a></p>
 </div>
@@ -136,10 +136,10 @@
 </details>
 <img class="clip-poster" src="media/vibe-talk/long-report-poster.png" width="412" height="915" loading="lazy" decoding="async" alt="Still from the end of the clip: worker-2's CSV export report open in full on a phone, with bold headings, a bulleted list of changes, a table of test results and a numbered list of open questions.">
 </div>
-<figcaption>One tap opens the full report, drawn as the agent wrote it.</figcaption>
+<figcaption>One tap opens the full report with its formatting.</figcaption>
 </figure>
 <div class="clip-text">
-<p>A report starts as its summary and opens with a tap. The server renders its markup (headings, bullets, a results table and links), with the agent's <code>[worker-2]</code> tag and title in the row header.</p>
+<p>Headings, bullets, tables and links stay readable. The row header identifies the agent and report.</p>
 <p class="clip-meta">9.6 seconds, 0.8 MB · <a href="media/vibe-talk/long-report.gif">Open the animation<span class="vh">: one message in full</span></a></p>
 <p class="small">In vibe-talk's README: <a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/README.md#how-message-text-is-drawn">how message text is drawn</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/README.md#rich-headers">rich headers</a></p>
 </div>
@@ -158,7 +158,7 @@
 <figcaption>New agent messages arrive while the page is open.</figcaption>
 </figure>
 <div class="clip-text">
-<p>With the newest messages on screen, worker-1 reports a regression test and the coordinator answers. Both appear without a reload, and a <strong>new</strong> chip jumps to them.</p>
+<p>Messages arrive without a reload. Tap the <strong>new</strong> chip to jump to them.</p>
 <p class="clip-meta">12.4 seconds, 0.1 MB · <a href="media/vibe-talk/live-message.gif">Open the animation<span class="vh">: new messages while you watch</span></a></p>
 <p class="small">In vibe-talk's README: <a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/README.md#live-push">live push</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/README.md#change-hint-acceleration">change-hint acceleration</a></p>
 </div>
@@ -177,7 +177,7 @@
 <figcaption>Approve an agent's request from your phone and watch the answer come back.</figcaption>
 </figure>
 <div class="clip-text">
-<p>The owner taps <strong>Reply</strong> on worker-3's request to land a toolchain bump and sends "Yes, land it. Thanks!". The request is marked as dealt with, worker-3's answer arrives linked to the reply, and the coordinator wraps up the day.</p>
+<p>Tap <strong>Reply</strong> on a request and send your answer. The reply stays linked to the request, and the agent's response appears in the channel.</p>
 <p class="clip-meta">18.3 seconds, 0.3 MB · <a href="media/vibe-talk/reply-from-phone.gif">Open the animation<span class="vh">: answer from your phone</span></a></p>
 <p class="small">In vibe-talk's README: <a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/README.md#replying-from-the-page">replying from the page</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/README.md#two-ways-a-channel-row-can-already-have-been-dealt-with-and-only-one-of-them-hides-it">what "dealt with" means</a></p>
 </div>
@@ -196,7 +196,7 @@
 <figcaption>On a desktop, the main channel sits beside named threads.</figcaption>
 </figure>
 <div class="clip-text">
-<p>At desktop width, threads sit beside the channel as cards, each with a name, a summary, its age and its unread count. The owner opens <code>csv-export-review</code> and replies, and worker-2 answers in the same thread. A thread keeps its first name, so you can find it again; its summary updates as the thread grows.</p>
+<p>Open a named thread beside the channel and reply there. Its name stays fixed while its summary and unread count update.</p>
 <p class="clip-meta">19.1 seconds, 1.0 MB · <a href="media/vibe-talk/desktop-threads.gif">Open the animation<span class="vh">: threads on a desktop</span></a></p>
 <p class="small">In vibe-talk's README: <a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/README.md#thread-names">thread names</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/README.md#the-page-has-two-compositions-and-a-capability-query-picks-between-them">the desktop layout</a></p>
 </div>
@@ -237,8 +237,8 @@
 <div class="section-head">
 <p class="eyebrow">Try it</p>
 <h2 id="try-title">Running it yourself</h2>
-<p>It needs a host (a native build or a container), TLS in front if you expose it, since the microphone needs HTTPS, and a chat credential. A model provider and a voice vendor are optional. It holds only the chat credential and needs no access to your code, so run it apart from the agents.</p>
-<p>Start with the setup guide: install it, pick one connection route (same machine, LAN, SSH forward, Cloudflare Tunnel, Tailscale or a company web proxy), then pair your phone with a one-time link. <code>vibe-talk doctor</code> checks the setup before the first start.</p>
+<p>Run the Rust server natively or in a container with your chat credentials. Use HTTPS for remote access and the microphone. Add model and voice providers as needed.</p>
+<p>The setup guide covers local access, tunnels and phone pairing. Run <code>vibe-talk doctor</code> to check the configuration before starting.</p>
 </div>
 <div class="grid grid-2">
 <div>
@@ -257,7 +257,7 @@
 </div>
 <div>
 <h3>Related work</h3>
-<p>The <a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/RELATED_WORK.md">related-work comparison</a> looked at hosted products and open-source projects for reaching coding agents by phone and voice. A server is needed either way to hold the chat credential, so vibe-talk owns that piece instead of handing it to a vendor.</p>
+<p><a href="https://github.com/slopus/happy">Happy</a> gives you mobile and web control of coding-agent sessions. vibe-talk works through your existing chat channels: skim reports from several agents, discuss them and reply. You run its server and choose the summary and voice providers. See the <a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/RELATED_WORK.md">related-work comparison</a> for more options.</p>
 </div>
 </div>
 </div>

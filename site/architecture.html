@@ -66,7 +66,7 @@
 <div class="wrap">
 <p class="eyebrow">Architecture</p>
 <h1>How the suite fits together</h1>
-<p class="lead">One level below <a href="index.html#architecture">the overview figure</a>: what each layer does, how one task moves through it, and where state lives.</p>
+<p class="lead">From a request to a landed change: the tools, the task lifecycle and the files they keep. See the <a href="index.html#architecture">overview diagram</a>.</p>
 </div>
 </div>
 
@@ -74,7 +74,7 @@
 <div class="wrap">
 <div class="section-head">
 <h2 id="layers-title">Layers and responsibilities</h2>
-<p>Each layer has one job and a narrow interface to the next. The coordinator reaches subagents only through agentctl and wrkslots, and only the coordinator talks to you.</p>
+<p>The coordinator delegates through agentctl, gives each task a wrkslots worktree and reports the results to you.</p>
 </div>
 <div class="table-wrap" role="region" aria-labelledby="layers-caption" tabindex="0">
 <table class="table-stack" role="table">
@@ -97,49 +97,49 @@
 
 <div class="layer-block arch-owner">
 <h3 id="owner">The owner</h3>
-<p>You decide what gets done and you own the policy. The coordinator writes launch profiles exactly as you state them, never invents models or flags, and changes the skills or the harness <code>AGENTS.md</code> only when you ask. Only you widen the herdr-run allowlist.</p>
+<p>You choose the work, agent models and launch settings. The coordinator follows your project rules; changes to those rules or the command allowlist need your approval.</p>
 <p class="small"><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-coordinator/SKILL.md#skills-and-instructions-are-owner-controlled">Skills and instructions are owner-controlled</a></p>
 </div>
 
 <div class="layer-block arch-channel">
 <h3 id="channel">The owner channel</h3>
 <p>The simplest channel is the coordinator's Herdr tab: attach and type. Run <code>agentctl pause</code> first if a script also types into that terminal.</p>
-<p><code>agentctl chat</code> connects one Slack or Google Chat channel to the coordinator. It accepts messages only from allowlisted senders, stores each one, and reacts to mark it received. Herdr pastes the message into the coordinator's pane, and the coordinator's reply goes back to the thread exactly once.</p>
-<p>The Rust bridge is event-driven and takes providers as plugins; Slack is the first. The Python bridge polls Google Chat, hourly by default.</p>
-<p><a href="vibe-talk.html">vibe-talk</a> is a separate phone and desktop client for the same chat. It reads and posts messages but never controls agents, so with agentctl chat on the same Slack channel, you read and answer the coordinator from vibe-talk.</p>
+<p><code>agentctl chat</code> passes messages from allowed senders in a Slack or Google Chat channel to the coordinator. It stores requests before delivery and posts replies back to the thread.</p>
+<p>The Rust bridge handles Slack events through a provider plugin. The Python bridge polls Google Chat, hourly by default.</p>
+<p>Use <a href="vibe-talk.html">vibe-talk</a> to read and answer those messages from a phone or desktop on the same Slack channel.</p>
 <p class="small"><a href="https://github.com/rrnewton/agent-utils/blob/main/rs/agentctl/src/embedded_chat_userguide.md">Chat user guide</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/rs/chat-subscription-slack/README.md">The Slack provider</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agentctl-chat/SKILL.md">How an agent answers bridged chat</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/chat-subscription-plugin/README.md">Plugin protocol</a></p>
 </div>
 
 <div class="layer-block arch-coordinator">
 <h3 id="coordinator">The coordinator</h3>
-<p>The coordinator is an ordinary coding agent started in the harness root. It reads the harness <code>AGENTS.md</code> and the coordinator skill at the start of every session. The harness file wins where the two disagree, and inside the checkout the project's own rules win.</p>
-<p>Its priorities, in order: what you asked; a red main branch; work in flight; the backlog. Setup registers it as the agentctl session <code>coordinator</code>, so timers, scripts and other agents reach it with <code>agentctl send coordinator</code>. A coordinator on another machine leads another team, and <a href="tools.html#agent-teams">agent-teams</a> carries messages between the two.</p>
+<p>The coordinator is an ordinary coding agent started in the project folder. Its <code>AGENTS.md</code> and coordinator skill describe how to delegate, check and land work. Your project's rules take precedence.</p>
+<p>Its priorities are your requests, a failing main branch, work in progress, then the backlog. Reach it with <code>agentctl send coordinator</code>; use <a href="tools.html#agent-teams">agent-teams</a> to reach coordinators on other machines.</p>
 <p class="small"><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-coordinator/SKILL.md#priorities">Priorities</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-setup/templates/AGENTS.md">Harness AGENTS.md template</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-setup/SKILL.md#phase-7-hand-off-to-the-owner">How setup starts it</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/agent-teams/QUICKSTART.md">agent-teams quickstart</a></p>
 </div>
 
 <div class="layer-block arch-sessions">
 <h3 id="sessions">Sessions: agentctl on Herdr</h3>
-<p>Herdr is a persistent terminal server, installed separately. Every agent runs in its own Herdr tab, so you can attach and take over at any time. agentctl can also drive agent panes in tmux.</p>
-<p>agentctl keeps a registry of named sessions in the harness's private <code>.agentctl/</code> directory, with no hosted account and no manager process. Prompts go through a durable queue. Exit code 75 means a prompt is safely pending; <code>agentctl drain</code> retries it. Exit code 76 means it may already have been submitted, so it is set aside and never resent automatically. <code>agentctl start --slot</code> starts an agent inside a slot, and <code>agentctl restore</code> brings the team back after a reboot.</p>
+<p>Interactive agents run in Herdr tabs or tmux panes you can attach to. Headless workers use the same named agentctl commands.</p>
+<p>agentctl stores named sessions and pending prompts in the private <code>.agentctl/</code> directory. <code>agentctl drain</code> retries pending prompts; uncertain deliveries are set aside for inspection. Use <code>start --slot</code> to launch an agent in a worktree and <code>restore</code> to restart a saved team.</p>
 <p class="small"><a href="https://github.com/rrnewton/agent-utils/blob/main/py/agentctl/USER_GUIDE.md">agentctl user guide</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/py/agentctl/USER_GUIDE.md#observe-and-take-over">Observe and take over</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/py/agentctl/USER_GUIDE.md#boxing-an-agent-to-a-wrkslots-slot">Boxing an agent to a slot</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/py/agentctl/USER_GUIDE.md#restore-a-team-after-the-host-restarts-rust-edition">Restore after a restart</a></p>
 </div>
 
 <div class="layer-block arch-workspaces">
 <h3 id="workspaces">Workspaces: wrkslots</h3>
-<p>Each task gets a slot: a linked worktree of the primary checkout, on a fresh branch from the remote default branch. Where the host allows it, each slot lives in its own sparse ext4 image, so a runaway build fills its own image rather than the disk. Every slot gets systemd resource limits. An optional sandbox makes only the slot and named paths writable; it guards against accidents, not attacks.</p>
-<p>wrkslots records ownership in a hash-linked event history, and removes a slot in one of two ways. Reclaim needs an expired time-to-live, a dead agent (asked through <code>bin/agent-liveness</code>), and agreement from process, mount, Git and path checks. Release is quicker: the owner writes a handoff and gives the slot back, and the coordinator reads the handoff before removal. Either way, unpushed commits are saved to a salvage remote or a verified bundle first.</p>
+<p>Each task gets a worktree on a fresh branch. Choose directory storage, an ext4 image per slot or a shared btrfs image. Run agents with CPU and memory limits, plus optional restrictions on where they can write.</p>
+<p>wrkslots records who owns each slot and preserves unpushed commits before removal. Cleanup waits until no process uses the slot. An owner can release a finished slot with a handoff; abandoned slots need expiry and liveness checks.</p>
 <p class="small"><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/wrkslots/USER_GUIDE.md#normal-lifecycle">Normal lifecycle</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/wrkslots/USER_GUIDE.md#disk-image-slots">Disk-image slots</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/wrkslots/USER_GUIDE.md#limits-of-the-box">Limits of the box</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/py/wrkslots/examples/agentctl_liveness_probe.py">The liveness probe</a></p>
 </div>
 
 <div class="layer-block arch-recurring">
 <h3 id="recurring">Recurring work: tick-hub</h3>
-<p>tick-hub decides which reminders and freshness checks are due and prints lines such as <code>ACTION:</code> and <code>HEALTH:</code>; it schedules and delivers nothing itself. In a harness, a systemd timer runs it every 15 minutes and sends any output with an <code>ACTION:</code> line to the coordinator with <code>agentctl send</code>, the same queue your messages use.</p>
+<p>The setup template runs tick-hub every 15 minutes with a systemd timer. It checks which reminders are due and which files are stale. The timer script forwards any tick containing an <code>ACTION:</code> line to the coordinator through <code>agentctl send</code>.</p>
 <p class="small"><a href="https://github.com/rrnewton/agent-utils/tree/main/skills/agent-utils-setup/templates/tick-hub">Delivery templates</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/tick-hub/rendered/rust/README.md#output-contract">Output contract</a></p>
 </div>
 
 <div class="layer-block arch-landing">
 <h3 id="landing">Validation and landing</h3>
-<p>Your project's rules decide how work lands: pull requests or direct pushes, required reviews and checks. The coordinator validates before it pushes and checks the result on the remote afterwards. dagrun runs validation locally under resource limits. merge-queue batches ready changes and lands only green combined trees. herdr-run pushes when the agent's sandbox blocks the network, gh-paced paces GitHub calls, and pr-landing-planner proposes a landing order without acting on it.</p>
+<p>The coordinator runs your project's checks and follows its review and landing rules. Add dagrun for resource limits, merge-queue to test and land batches, or herdr-run for allowlisted network commands. gh-paced limits GitHub calls; pr-landing-planner suggests a landing order.</p>
 <p class="small"><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-coordinator/SKILL.md#landing">Landing rules</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-coordinator/SKILL.md#shared-machine-safety">Shared-machine safety</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/merge-queue/QUICKSTART.md">merge-queue quickstart</a></p>
 </div>
 </div>
@@ -149,12 +149,12 @@
 <div class="wrap">
 <div class="section-head">
 <h2 id="lifecycle-title">A delegated task, end to end</h2>
-<p>The path in the harness <code>AGENTS.md</code> template, with the sandbox off (the default). <code>$WS</code> is the harness's wrkslots command and <code>$AU</code> its agent-utils <code>bin/</code>.</p>
+<p>This example uses the default setup, with the sandbox off. <code>$WS</code> is the wrkslots command and <code>$AU</code> the agent-utils <code>bin/</code> directory.</p>
 </div>
 <ol class="steps prose">
 <li>
 <h3>You ask <span class="who">owner</span></h3>
-<p>In the coordinator's tab or in chat: "Please have a subagent add CONTRIBUTING.md and land it." The coordinator names the task with a short slug, such as <code>add-contributing</code>, and picks the repository, slot and branch.</p>
+<p>Ask in the coordinator's tab or in chat: "Have a subagent add CONTRIBUTING.md and land it." It picks a worktree and branch for the task.</p>
 </li>
 <li>
 <h3>A fresh slot <span class="who">coordinator · wrkslots</span></h3>
@@ -167,7 +167,7 @@ $WS create &lt;slot&gt; --slot-type agent --coordinator-authorized \
 </li>
 <li>
 <h3>A subagent with a brief <span class="who">coordinator · agentctl</span></h3>
-<p>It starts a subagent in the slot with one of your launch profiles and a brief: the goal, the slot and branch, how to validate and how to report.</p>
+<p>It starts a subagent with your launch profile and a brief covering the task, worktree, tests and expected result.</p>
 <pre tabindex="0" role="region" aria-label="Command that starts a subagent in the slot"><code>AGENTCTL_WRKSLOTS_BIN=$WS $AU/agentctl start &lt;name&gt; --cwd &lt;harness&gt; \
   --profile &lt;profile&gt; --slot &lt;slot&gt; --file &lt;brief&gt;</code></pre>
 <p>The subagent opens as a new tab in the project's Herdr workspace. Every task gets a fresh agent.</p>
@@ -182,7 +182,7 @@ $WS create &lt;slot&gt; --slot-type agent --coordinator-authorized \
 </li>
 <li>
 <h3>Check the work <span class="who">coordinator</span></h3>
-<p>It reads the diff, the test output and the pushed commit, then the handoff (<code>$WS read-handoff</code>), and checks which tests ran on which commit.</p>
+<p>It reviews the diff, test output and handoff against the pushed commit.</p>
 </li>
 <li>
 <h3>Stop and remove <span class="who">coordinator · wrkslots</span></h3>
@@ -229,8 +229,8 @@ $WS remove &lt;slot&gt; --coordinator-pid &lt;pid&gt; --expected-generation &lt;
 ├── .agentctl/                  <span class="c">session registry and launch profiles; private</span>
 └── .wrkslots.yml               <span class="c">slot policy, commented key by key</span></code></pre>
 <div class="prose">
-<p>The harness is its own small Git repository, local unless you add a remote, so its configuration is versioned. Its <code>.gitignore</code> excludes the checkout, <code>agent-utils/</code>, <code>worktrees/</code>, <code>.agentctl/</code> and chat configuration, and agentctl refuses to use launch profiles unless <code>.agentctl/</code> is ignored.</p>
-<p>Skills are linked, not copied, so updating agent-utils updates them. The <code>bin/</code> dispatchers run each paired tool's Rust edition, built by Cargo on first use; <code>DAGRUN_ENGINE=python</code> (or <code>AGENT_UTILS_ENGINE=python</code>) runs Python instead, and there is never a silent fallback. The Rust default needs <code>cargo</code> on <code>PATH</code> wherever the tools run, timer services included.</p>
+<p>The project folder has its own Git history for configuration and skill links. Checkouts, worktrees, session state and chat credentials stay outside that history. agentctl requires <code>.agentctl/</code> to be ignored.</p>
+<p>Updating agent-utils also updates the linked skills. Most tools with two editions default to Rust and build on first use, so <code>cargo</code> must be on <code>PATH</code>, including in timer services. Set <code>AGENT_UTILS_ENGINE=python</code> to use Python.</p>
 <p class="small"><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-setup/SKILL.md#what-setup-produces">What setup produces</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/QUICKSTART.md#6-the-result">A real result</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/common/bin/engine-resolver">The dispatcher</a></p>
 </div>
 </div>
@@ -240,7 +240,7 @@ $WS remove &lt;slot&gt; --coordinator-pid &lt;pid&gt; --expected-generation &lt;
 <div class="wrap">
 <div class="section-head">
 <h2 id="state-title">Where state lives</h2>
-<p>Everything the suite keeps is a file on your machine. There is no hosted service and no database server.</p>
+<p>The tools keep their state in local files. Agent and chat providers have their own storage.</p>
 </div>
 <div class="table-wrap" role="region" aria-labelledby="state-caption" tabindex="0">
 <table class="table-stack" role="table">
@@ -277,19 +277,19 @@ $WS remove &lt;slot&gt; --coordinator-pid &lt;pid&gt; --expected-generation &lt;
 <div class="grid grid-2">
 <article class="card">
 <h3>One voice</h3>
-<p>Only the coordinator talks to you. Subagents report to it, and it sums up: what changed, why, and the numbers behind it.</p>
+<p>The coordinator gathers subagent reports and tells you what changed, why and how it was tested.</p>
 </article>
 <article class="card">
 <h3>References you can follow</h3>
-<p>Work is cited as <code>#&lt;number&gt; &lt;slug&gt;</code>, and anything an agent publishes, such as a commit body, says which agent wrote it.</p>
+<p>Reports link to the work and its tests. Published comments and commit bodies identify the agent that wrote them.</p>
 </article>
 <article class="card">
 <h3>Eyes on every agent</h3>
-<p>Each agent is a real terminal in a Herdr tab. Attach, read along, or pause automation and type.</p>
+<p>Attach to an interactive agent in Herdr or tmux. Read along, or pause automation and type.</p>
 </article>
 <article class="card">
 <h3>Policy stays yours</h3>
-<p>Launch profiles, the herdr-run allowlist, the skills and <code>AGENTS.md</code> change only when you ask. "Turn on the sandbox for subagents" is a request to the coordinator.</p>
+<p>Ask the coordinator to change agent settings or project instructions. You control which commands herdr-run allows.</p>
 </article>
 </div>
 <p class="small"><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-coordinator/SKILL.md#reporting-to-the-owner">Reporting to the owner</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/QUICKSTART.md#9-later">Changing the setup later</a></p>
@@ -305,9 +305,9 @@ $WS remove &lt;slot&gt; --coordinator-pid &lt;pid&gt; --expected-generation &lt;
 <li><strong>Linux only.</strong> wrkslots, dagrun and the slot limits need systemd and cgroup v2. agent-usage also runs on macOS.</li>
 <li><strong>Not a security boundary.</strong> The slot sandbox and the herdr-run allowlist stop accidents by cooperative agents, not a hostile one.</li>
 <li><strong>Ready is not done.</strong> agentctl knows when an agent is waiting for input; only the agent's reply says the task is finished.</li>
-<li><strong>Herdr is a separate project</strong>, last tested at 0.8.</li>
+<li><strong>Herdr is installed separately.</strong> agentctl also supports tmux panes and headless workers.</li>
 <li><strong>Two chat providers.</strong> Slack, through the event-driven bridge and a Slack command-line client, and Google Chat, polled.</li>
-<li><strong>Pre-1.0.</strong> agentctl is beta, and every version is below 1.0.</li>
+<li><strong>Pre-1.0.</strong> agentctl is beta.</li>
 </ul>
 </div>
 </section>

@@ -88,13 +88,22 @@
 <p>Adopt agent-utils for this project, following skills/agent-utils-setup/SKILL.md from https://github.com/rrnewton/agent-utils.</p>
 </blockquote>
 <ol>
-<li>It checks your project and machine and shows what is missing.</li>
-<li>It asks about ten questions, each with a default.</li>
-<li>It lists every change and waits for your yes.</li>
-<li>It moves your checkout into a new project folder, the harness, checks every tool, and starts your coordinator.</li>
+<li>It checks your project and the tools installed on your machine.</li>
+<li>You choose the agents, worktree storage and chat connection.</li>
+<li>You approve the setup before it changes anything.</li>
+<li>It sets up the project folder, checks the tools and starts your coordinator.</li>
 </ol>
 </div>
 </figure>
+</div>
+</section>
+
+<section class="section" id="comparison" aria-labelledby="comparison-title">
+<div class="wrap prose">
+<h2 id="comparison-title">How it compares</h2>
+<p><a href="https://github.com/gastownhall/gastown">Gas Town</a> bundles a coordinator, worker roles, persistent work tracking and a merge queue. <a href="https://github.com/gastownhall/gascity">Gas City</a> runs tasks through formulas for implementation and review, with a dashboard to follow progress. Both offer an integrated workflow for a team of agents.</p>
+<p><a href="https://github.com/smtg-ai/claude-squad">Claude Squad</a> manages agents in tmux sessions and separate Git worktrees from a terminal dashboard. <a href="https://github.com/slopus/happy">Happy</a> provides mobile and web control of Claude Code and Codex through a synchronization server.</p>
+<p>agent-utils lets you assemble the workflow. Use agentctl for named sessions and messages, wrkslots for worktrees, and your choice of tracker and landing process. Add chat, phone access or a merge queue as needed. Your coordinator is an ordinary coding agent following your project's instructions.</p>
 </div>
 </section>
 
@@ -103,7 +112,7 @@
 <div class="section-head">
 <p class="eyebrow">Why</p>
 <h2 id="why-title">What it solves</h2>
-<p class="lead">One agent in one terminal is easy to watch. Many agents running for days, on several machines, while you are often away, are not.</p>
+<p class="lead">Running agents for days across several machines makes sessions, messages and unfinished work harder to track.</p>
 </div>
 <div class="grid">
 <article class="card problem">
@@ -114,17 +123,17 @@
 <article class="card problem">
 <h3>Prompts get lost or sent twice</h3>
 <p>A follow-up typed into the wrong terminal, or resent after an unclear failure, is hard to undo.</p>
-<p class="answer"><strong><a href="tools.html#agentctl">agentctl</a></strong> queues every prompt, confirms it reached the right agent, and never resends one it cannot confirm.</p>
+<p class="answer"><strong><a href="tools.html#agentctl">agentctl</a></strong> queues prompts, checks delivery to the right agent, and sets uncertain deliveries aside for inspection.</p>
 </article>
 <article class="card problem">
 <h3>Background agents are a black box</h3>
 <p>You cannot steer an agent you cannot see.</p>
-<p class="answer">Every agent runs in its own <strong><a href="tools.html#herdr">Herdr</a></strong> tab, so you can attach and type at any time. agentctl runs headless agents under the same names and commands.</p>
+<p class="answer">Attach to interactive agents in <strong><a href="tools.html#herdr">Herdr</a></strong> or tmux; manage headless workers with the same agentctl commands.</p>
 </article>
 <article class="card problem">
 <h3>A reboot takes the team down</h3>
 <p>After a restart, every agent, tab and chat bridge is gone.</p>
-<p class="answer"><strong><a href="tools.html#agentctl">agentctl restore</a></strong> brings back every agent that was running, then the chat bridge and the other services.</p>
+<p class="answer"><strong><a href="tools.html#agentctl">agentctl restore</a></strong> restarts agents from saved launch settings, then starts the configured bridges and services.</p>
 </article>
 <article class="card problem">
 <h3>Cleanup destroys work</h3>
@@ -144,7 +153,7 @@
 <article class="card problem">
 <h3>Teams on other machines cannot talk</h3>
 <p>A coordinator on one host has no reliable way to reach one on another.</p>
-<p class="answer"><strong><a href="tools.html#agent-teams">agent-teams</a></strong> delivers a message to another team's coordinator, on any host, exactly once.</p>
+<p class="answer"><strong><a href="tools.html#agent-teams">agent-teams</a></strong> routes messages between team coordinators and prevents duplicate delivery.</p>
 </article>
 <article class="card problem">
 <h3>A sandbox blocks the last step</h3>
@@ -175,7 +184,7 @@
 <div class="section-head">
 <p class="eyebrow">Architecture</p>
 <h2 id="arch-title">How it fits together</h2>
-<p class="lead">A project that adopts the suite gets a <em>harness</em>: a directory holding your checkout, a folder of agent slots, a copy of agent-utils, and an <code>AGENTS.md</code> that makes the agent started there the coordinator.</p>
+<p class="lead">One coordinator delegates work to agents in separate worktrees. A project folder holds your checkout, the tools and the instructions they share.</p>
 </div>
 
 <figure class="arch" aria-labelledby="arch-caption">
@@ -198,7 +207,7 @@
 </div>
 <p class="arch-edge">typed into the coordinator's pane</p>
 <div class="arch-layer arch-coordinator">
-<p class="arch-label">Coordinator<span>one agent, harness root</span></p>
+<p class="arch-label">Coordinator<span>one agent, project folder</span></p>
 <ul class="arch-row">
 <li class="arch-node is-wide"><b>Coordinator agent</b><span>reads <code>AGENTS.md</code> and the coordinator skill; plans, delegates, checks, lands, reports</span></li>
 <li class="arch-node is-optional"><b><code>tick-hub</code> timer<span class="vh"> (optional)</span></b><span>recurring duties, sent with <code>agentctl send</code></span></li>
@@ -245,10 +254,10 @@
 <ul class="arch-legend" aria-label="Legend">
 <li><span class="swatch is-core"></span>core: set up by default; chat can be connected later</li>
 <li><span class="swatch is-optional"></span>optional: offered by setup, or added later</li>
-<li><span class="swatch"></span>part of the harness, the project, or Herdr</li>
+<li><span class="swatch"></span>part of the project or Herdr</li>
 </ul>
 </div>
-<figcaption id="arch-caption">A harness, top to bottom. You talk to one coordinator, in its Herdr tab or over chat. It starts each subagent with <code>agentctl</code> in its own Herdr tab and <code>wrkslots</code> slot, then validates and lands the work under your project's rules.</figcaption>
+<figcaption id="arch-caption">Talk to the coordinator in its terminal or over chat. It starts subagents in separate worktrees, checks their work and lands it under your project's rules.</figcaption>
 </figure>
 <p><a href="architecture.html">The architecture page</a> covers each layer, one task from start to finish, and where state lives.</p>
 </div>
@@ -259,14 +268,14 @@
 <div class="section-head">
 <p class="eyebrow">Tools</p>
 <h2 id="tools-title">The tools</h2>
-<p class="lead">agentctl and wrkslots are always set up, and chat can be connected later. The rest are optional, and each tool also works on its own.</p>
+<p class="lead">Setup includes agentctl and wrkslots. Add chat and other tools as you need them, or use any tool on its own.</p>
 </div>
 
 <h3>Core</h3>
 <div class="grid">
 <article class="card card-core">
 <h4 class="card-title"><a href="tools.html#agentctl"><code>agentctl</code></a> <span class="badges"><span class="badge badge-core">core</span><span class="badge badge-warn">beta</span></span></h4>
-<p>Start, message, read and stop coding agents by name, from your shell, a script or the coordinator. Prompts are queued durably and never sent twice.</p>
+<p>Start, message, read and stop coding agents by name, from your shell, a script or the coordinator. Prompts are saved before delivery; uncertain sends wait for inspection.</p>
 <p class="card-links"><a href="https://github.com/rrnewton/agent-utils/blob/main/py/agentctl/USER_GUIDE.md">User guide<span class="vh"> for agentctl</span></a></p>
 </article>
 <article class="card card-core">
@@ -281,7 +290,7 @@
 </article>
 <article class="card card-external">
 <h4 class="card-title"><a href="tools.html#herdr">Herdr</a> <span class="badges"><span class="badge badge-external">external</span></span></h4>
-<p>A persistent terminal server, installed separately. Every agent runs in its own Herdr tab. Last tested with Herdr 0.8.</p>
+<p>A persistent terminal server for interactive agents, with tabs you can attach to and use yourself. Installed separately.</p>
 <p class="card-links"><a href="https://github.com/herdrdev/herdr">Upstream project<span class="vh">: Herdr</span></a></p>
 </article>
 </div>
@@ -305,7 +314,7 @@
 </article>
 <article class="card">
 <h4 class="card-title"><a href="tools.html#agent-teams"><code>agent-teams</code></a> <span class="badges"><span class="badge">optional</span><span class="badge">build from source</span></span></h4>
-<p>Sends a message to another team's coordinator, on the same host or another, exactly once.</p>
+<p>Routes messages between team coordinators on one machine or several, with duplicate prevention.</p>
 <p class="card-links"><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/agent-teams/QUICKSTART.md">Quickstart<span class="vh"> for agent-teams</span></a></p>
 </article>
 <article class="card">
@@ -320,7 +329,7 @@
 </article>
 <article class="card">
 <h4 class="card-title"><a href="tools.html#gh-paced"><code>gh-paced</code></a> <span class="badges"><span class="badge">optional</span><span class="badge">build from source</span></span></h4>
-<p>Paces <code>gh</code> calls so agents sharing one GitHub account stay inside GitHub's rate limits.</p>
+<p>Paces <code>gh</code> calls to reduce rate-limit errors when agents share a GitHub account.</p>
 <p class="card-links"><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/gh-paced/QUICKSTART.md">Quickstart<span class="vh"> for gh-paced</span></a></p>
 </article>
 <article class="card">
@@ -353,7 +362,7 @@
 <div class="section-head">
 <p class="eyebrow">Adopt it</p>
 <h2 id="adopt-title">Adopt it for a project</h2>
-<p class="lead">Open your coding agent in your project's checkout and give it one sentence. The setup skill does the rest, and asks before it changes anything.</p>
+<p class="lead">Start in your project's checkout. The setup skill checks the machine, walks you through the choices and asks you to approve the changes.</p>
 </div>
 <div class="grid-2 grid">
 <div>
@@ -365,25 +374,25 @@
 </li>
 <li>
 <h3>It detects</h3>
-<p>Your project's remote, branches, worktrees and submodules, the agent CLIs on your <code>PATH</code>, and what the machine offers: Git, Python, <code>cargo</code>, Herdr, systemd, cgroup v2, disk-image support and <code>gh</code>. You see this table before any question.</p>
+<p>It checks your Git layout, installed agent CLIs and the dependencies needed to run them in separate worktrees.</p>
 </li>
 <li>
 <h3>It asks</h3>
-<p>About ten questions, each with a default: folder names, launch profiles, the Herdr workspace, how many slots, slot storage, the sandbox, build caches, and whether to connect chat now. "Defaults" accepts them all. Launch profiles are written exactly as you state them.</p>
+<p>Choose agents and launch profiles, worktree storage and limits, build caches, and whether to connect chat. Each question has a default.</p>
 </li>
 <li>
 <h3>It shows the plan, then acts</h3>
-<p>It lists every move, file, command and install, and changes nothing until you approve. It never changes host configuration.</p>
+<p>Review the proposed folders, files and installs, then approve the setup.</p>
 </li>
 <li>
 <h3>It checks and hands over</h3>
-<p>It checks every tool, offers a throwaway round trip (a slot, a worker, a handoff, removal), then starts your coordinator.</p>
+<p>It checks the tools, offers a trial task, then starts your coordinator.</p>
 </li>
 </ol>
 </div>
 <div class="adopt-aside">
 <h3>What you end up with</h3>
-<pre class="tree" tabindex="0" role="region" aria-label="The harness directory setup produces"><code>~/work/foobar/             <span class="c">the harness; the coordinator runs here</span>
+<pre class="tree" tabindex="0" role="region" aria-label="The harness directory setup produces"><code>~/work/foobar/             <span class="c">project folder; the coordinator runs here</span>
   AGENTS.md                <span class="c">makes the agent here the coordinator</span>
   foobar/                  <span class="c">your checkout, moved in unchanged</span>
   agent-utils/             <span class="c">tools in bin/, skills in skills/</span>
@@ -393,7 +402,7 @@
   .claude/skills -&gt; ../.agents/skills
   .agentctl/profiles.json  <span class="c">launch profiles; private</span>
   .wrkslots.yml            <span class="c">slot policy, commented</span></code></pre>
-<p>The harness is a small local Git repository, and your checkout stays an independent repository inside it. Nothing is installed system-wide: the tools run from the agent-utils checkout, and Cargo builds the Rust ones on first use. Later changes, such as "connect this to Slack" or "add dagrun for our tests", are requests to the coordinator.</p>
+<p>The project folder has its own Git history; your checkout keeps its existing history inside it. Tools run from the agent-utils checkout, with Rust tools built on first use. Later, ask the coordinator to "connect this to Slack" or "add dagrun for our tests".</p>
 <p><a href="https://github.com/rrnewton/agent-utils/blob/main/QUICKSTART.md">The quickstart</a> walks through one recorded run. The <a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-setup/SKILL.md">setup skill</a> is the procedure itself.</p>
 </div>
 </div>
@@ -408,13 +417,8 @@
 </div>
 <div class="grid grid-2">
 <article class="card">
-<h3>Quickstart: self-documenting CLIs</h3>
-<p>Every tool carries its own <code>quickstart</code>, user guide and <code>--help</code>, so you and your agents read the same instructions as the installed version. The agent skills point to them instead of copying them.</p>
-<p class="card-links"><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/README.md">Tool documentation</a> <a href="https://github.com/rrnewton/agent-utils/blob/main/skills/README.md">Skills</a></p>
-</article>
-<article class="card">
 <h3>Two editions, one contract</h3>
-<p>Five tools are written twice, in Python and in Rust, and Rust is the default. Differential tests run both editions on the same inputs and compare output, exit codes and state.</p>
+<p>Tools with Python and Rust editions share core commands. Differential tests run both on the same inputs and compare output, exit codes and state.</p>
 <p class="card-links"><a href="https://github.com/rrnewton/agent-utils/blob/main/cross/README.md#what-is-compared">What is compared</a> <a href="https://github.com/rrnewton/agent-utils/blob/main/README.md#implementations">Editions</a></p>
 </article>
 <article class="card">
@@ -424,7 +428,7 @@
 </article>
 <article class="card">
 <h3>Fail closed</h3>
-<p>When a tool cannot tell whether an action is safe, it refuses and says why. wrkslots will not remove a slot it cannot prove idle, and cpuset-alloc will not fall back to a CPU mask a process can escape.</p>
+<p>wrkslots preserves worktrees that may still be in use. cpuset-alloc refuses to run unless it can enforce the CPU reservation.</p>
 <p class="card-links"><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/wrkslots/README.md">wrkslots</a> <a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/dagrun/rendered/python/USER_GUIDE.md#collision-free-cpu-reservations">CPU reservations</a></p>
 </article>
 </div>
