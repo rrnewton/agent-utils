@@ -824,6 +824,191 @@ async fn a_missing_or_ambiguous_document_says_not_found() {
     }
 }
 
+/// A stub GitHub that is a private repository (`#1980
+/// vibe-talk-docs-private-github-load`): every path answers 404 without
+/// the configured credential, as GitHub does for a repository it will not
+/// show an unauthenticated caller, and serves the file and its tree with it.
+fn fake_private_github() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let base = format!("http://{}", listener.local_addr().expect("addr"));
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            use std::io::{Read as _, Write as _};
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let path = request
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("")
+                .split('?')
+                .next()
+                .unwrap_or("")
+                .to_owned();
+            let authed = request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("authorization: Bearer test-token-1980"));
+            let (status, body) = if !authed {
+                (404, "not found".to_owned())
+            } else if path.contains("/git/trees/") {
+                (
+                    200,
+                    serde_json::json!({"tree": [{"path": "docs/private.md", "type": "blob"}]})
+                        .to_string(),
+                )
+            } else if path.ends_with("/docs/private.md") {
+                (200, "# Private report\n\nsecret body\n".to_owned())
+            } else if path.ends_with("/docs/limited.md") {
+                (429, "slow down".to_owned())
+            } else {
+                (404, "not found".to_owned())
+            };
+            let reason = match status {
+                200 => "OK",
+                429 => "Too Many Requests",
+                _ => "Not Found",
+            };
+            let extra = if status == 429 {
+                "retry-after: 30\r\n"
+            } else {
+                ""
+            };
+            let _ = stream.write_all(
+                format!("HTTP/1.1 {status} {reason}\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n{body}", body.len())
+                    .as_bytes(),
+            );
+        }
+    });
+    base
+}
+
+fn private_entry() -> Entry {
+    let index = Index::new(Vec::new());
+    index.apply_message(
+        "c",
+        "m-private",
+        Some(1_000),
+        "agent",
+        None,
+        "https://github.com/octo/widgets/blob/main/docs/private.md",
+    );
+    index
+        .get("github:octo/widgets@main:docs/private.md")
+        .expect("private entry")
+}
+
+#[tokio::test]
+async fn a_private_document_fetches_only_with_the_configured_credential() {
+    let base = fake_private_github();
+    // No credential: GitHub's 404 is no access, never "moved or deleted".
+    let anonymous =
+        GithubFetcher::new(TokenSource::None, Some(base.clone()), None).with_api_base(base.clone());
+    let error = anonymous
+        .fetch(&private_entry())
+        .await
+        .expect_err("an unauthenticated private fetch must fail");
+    let FetchError::Failed(detail) = error else {
+        panic!("wrong failure: {error}");
+    };
+    assert!(detail.contains("no access"), "{detail}");
+    assert!(detail.contains("no GitHub credential"), "{detail}");
+    assert!(!detail.contains("moved or deleted"), "{detail}");
+
+    // The credential vibe-talk is already allowed to use (`[documents]`
+    // token file/command, sent as a bearer by `send_get`) opens it.
+    let credentialed = GithubFetcher::new(
+        TokenSource::Static("test-token-1980".to_owned()),
+        Some(base.clone()),
+        None,
+    )
+    .with_api_base(base);
+    let fetched = credentialed
+        .fetch(&private_entry())
+        .await
+        .expect("credentialed private fetch");
+    assert!(fetched.content.contains("Private report"), "{fetched:?}");
+}
+
+#[tokio::test]
+async fn a_private_document_loads_through_the_real_router() {
+    // The owner's exact request through the router (fetch, then read), with
+    // only the GitHub upstream stubbed: a private file loads end to end.
+    let base = fake_private_github();
+    let (mut state, _discord, _elevenlabs) = testing::state_parts();
+    let index = Arc::new(Index::new(Vec::new()));
+    index.apply_message(
+        READ_CHANNEL,
+        "1000000000000000099",
+        Some(9_000),
+        "agent",
+        None,
+        "https://github.com/octo/widgets/blob/main/docs/private.md",
+    );
+    let fetcher = GithubFetcher::new(
+        TokenSource::Static("test-token-1980".to_owned()),
+        Some(base.clone()),
+        None,
+    )
+    .with_api_base(base);
+    state.documents = Arc::new(Service::new(index, Arc::new(fetcher), 100, 1 << 20));
+    let app = router(state);
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/v1/documents/fetch",
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({ "key": "github:octo/widgets@main:docs/private.md" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let uri = format!(
+        "/api/v1/documents/{}",
+        encoded("github:octo/widgets@main:docs/private.md")
+    );
+    let (status, body) = call(&app, "GET", &uri, Some(READ_TOKEN), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["content"]
+            .as_str()
+            .expect("content")
+            .contains("Private report"),
+        "{body}"
+    );
+    assert_eq!(
+        body["document"]["url"],
+        "https://github.com/octo/widgets/blob/main/docs/private.md"
+    );
+}
+
+#[tokio::test]
+async fn a_rate_limited_github_answer_is_named_as_a_rate_limit() {
+    let base = fake_private_github();
+    let index = Index::new(Vec::new());
+    index.apply_message(
+        "c",
+        "m-limited",
+        Some(1_000),
+        "agent",
+        None,
+        "https://github.com/octo/widgets/blob/main/docs/limited.md",
+    );
+    let entry = index
+        .get("github:octo/widgets@main:docs/limited.md")
+        .expect("limited entry");
+    let fetcher = GithubFetcher::new(
+        TokenSource::Static("test-token-1980".to_owned()),
+        Some(base.clone()),
+        None,
+    )
+    .with_api_base(base);
+    let error = fetcher.fetch(&entry).await.expect_err("rate limited");
+    let FetchError::Failed(detail) = error else {
+        panic!("wrong failure: {error}");
+    };
+    assert!(detail.contains("rate limit"), "{detail}");
+}
+
 #[tokio::test]
 async fn a_commit_ref_never_looks_in_the_tree() {
     let fake = fake_http_github(vec!["reports/old.md"]);

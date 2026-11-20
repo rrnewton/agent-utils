@@ -458,6 +458,17 @@
   padding: 0 4px 24px;
   overflow-wrap: break-word;
 }
+/* A failed load (`#1980 vibe-talk-docs-private-github-load`): the specific
+   reason and the way out to the source, in the body's own reading measure. */
+.doc-load-error {
+  padding: 16px 4px;
+}
+.doc-load-error-reason {
+  margin: 0 0 12px;
+}
+.doc-load-error-link {
+  text-decoration: underline;
+}
 @media (min-width: 900px) and (pointer: fine) {
   #doc-body {
     max-width: 90ch;

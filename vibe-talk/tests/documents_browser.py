@@ -93,7 +93,8 @@ OUTLINE_TEXTS = ["Demo deployment report", "1 Setup", "1.1 Setup details", "2 Fi
 GUIDE_BODY = (
     "# Guide index\n\nStart with [the next document](next.md), or jump to "
     "[its second part](next.md#part-two).\n\nElsewhere: "
-    "[an example](https://example.com/elsewhere).\n"
+    "[an example](https://example.com/elsewhere).\n\n"
+    "Private: [the private document](private.md).\n"
 )
 NEXT_BODY = (
     "# Next document\n\nOpened from the guide.\n\n" + _FILLER * 6
@@ -117,6 +118,9 @@ class RawHandler(BaseHTTPRequestHandler):
             self.reply(200, body.encode())
         elif path.endswith("/docs/broken.md"):
             self.reply(500, b"broken upstream")
+        elif path.endswith("/docs/private.md"):
+            # A private repository GitHub will not show this server (`#1980`).
+            self.reply(403, b"forbidden")
         else:
             self.reply(404, b"not found")
 
@@ -688,6 +692,27 @@ def main() -> int:
                     "() => (document.getElementById('doc-body')?.textContent || '')"
                     ".includes('Guide index')",
                     timeout=HANG_BACKSTOP_MS)
+                # The private document (`#1980`): the raw stub refuses it, and
+                # the reader says why, with the way out to GitHub, never a
+                # bare failure.
+                page.locator("#doc-body a", has_text="the private document").tap()
+                page.wait_for_function(
+                    "() => (document.getElementById('doc-body')?.textContent || '')"
+                    ".includes('vibe-talk has no access to octo/widgets')",
+                    timeout=HANG_BACKSTOP_MS)
+                check("Could not load the document." not in (page.text_content("#doc-body") or ""),
+                      "the private failure is the bare could-not-load sentence")
+                open_link = page.locator("#doc-body a.doc-load-error-link")
+                check(open_link.text_content() == "Open on GitHub",
+                      "the private failure has no Open on GitHub link")
+                check(open_link.get_attribute("href")
+                      == "https://github.com/octo/widgets/blob/main/docs/private.md",
+                      "the Open on GitHub link does not name the private document")
+                page.tap("#doc-back")
+                page.wait_for_function(
+                    "() => (document.getElementById('doc-body')?.textContent || '')"
+                    ".includes('Guide index')",
+                    timeout=HANG_BACKSTOP_MS)
                 page.tap("#doc-back")
                 page.wait_for_selector("#documents-list .doc-card", timeout=HANG_BACKSTOP_MS)
 
@@ -699,6 +724,15 @@ def main() -> int:
                     "() => [...document.querySelectorAll('#documents-list .doc-card')]"
                     ".some((c) => c.textContent.includes('Could not fetch it.'))",
                     timeout=HANG_BACKSTOP_MS)
+                broken_text = gh_card.text_content() or ""
+                check("GitHub answered 500" in broken_text,
+                      f"the broken row does not name its cause: {broken_text!r}")
+                broken_link = gh_card.locator("a.doc-open-source")
+                check(broken_link.text_content() == "Open on GitHub",
+                      "the broken row has no Open on GitHub link")
+                check(broken_link.get_attribute("href")
+                      == "https://github.com/octo/widgets/blob/main/docs/broken.md",
+                      "the broken row's link does not name its document")
                 ctx.close()
 
                 # The same outline flow at desktop size with a mouse: open, jump,

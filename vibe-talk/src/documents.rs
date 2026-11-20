@@ -1222,6 +1222,14 @@ impl TokenSource {
     fn is_command(&self) -> bool {
         matches!(self, TokenSource::Command { .. })
     }
+
+    /// Whether any credential is configured at all. GitHub answers 404 for a
+    /// private repository it will not show an unauthenticated caller, exactly
+    /// as for a missing file, so this fact changes what a 404 may be said to
+    /// mean (`#1980 vibe-talk-docs-private-github-load`).
+    fn has_credential(&self) -> bool {
+        !matches!(self, TokenSource::None)
+    }
 }
 
 /// What GitHub answered when asked for one thread's title. `#1058 pr-name-enrichment`.
@@ -1238,6 +1246,44 @@ pub enum IssueTitle {
     NotFound,
     /// GitHub asked for a pause (429, or a 403 carrying its rate-limit headers).
     RateLimited,
+}
+
+/// What a non-success GitHub answer means, in the words the reader is shown
+/// (`#1980 vibe-talk-docs-private-github-load`): a rate limit is a pause, a
+/// 401/403 is a refusal, and a 404 with no credential configured cannot be
+/// told apart from a private repository GitHub will not show vibe-talk, so
+/// it is never reported as a plain missing file. Any other status keeps
+/// GitHub's own number.
+fn github_status_failure(
+    subject: &str,
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    has_credential: bool,
+) -> FetchError {
+    let code = status.as_u16();
+    if code == 429 || (code == 403 && rate_limited(headers)) {
+        FetchError::Failed(format!(
+            "GitHub rate limit: GitHub answered {code} for {subject}; try again later"
+        ))
+    } else if code == 401 || code == 403 {
+        FetchError::Failed(format!(
+            "vibe-talk has no access to {subject}: GitHub answered {code}; \
+             the repository may be private or vibe-talk's GitHub credential was refused"
+        ))
+    } else if code == 404 && !has_credential {
+        FetchError::Failed(format!(
+            "vibe-talk has no access to {subject}: GitHub answered 404 and no GitHub \
+             credential is configured, so a private repository cannot be fetched (a \
+             missing repository or file answers the same way)"
+        ))
+    } else if code == 404 {
+        FetchError::Failed(format!(
+            "vibe-talk has no access to {subject}, or it does not exist: GitHub answered 404; \
+             a private repository vibe-talk's credential cannot read answers the same way"
+        ))
+    } else {
+        FetchError::Failed(format!("GitHub answered {code} for {subject}"))
+    }
 }
 
 /// Whether a 403's headers say it is a rate limit rather than a refusal: a `retry-after`, or
@@ -1322,16 +1368,18 @@ impl GithubFetcher {
         );
         let mut response = self.send_get(&url).await?;
         if !response.status().is_success() {
-            return Err(FetchError::Failed(format!(
-                "GitHub answered {}",
-                response.status()
-            )));
+            return Err(github_status_failure(
+                &format!("{owner}/{repo}"),
+                response.status(),
+                response.headers(),
+                self.token.has_credential(),
+            ));
         }
         let mut bytes: Vec<u8> = Vec::new();
         while let Some(chunk) = response
             .chunk()
             .await
-            .map_err(|e| FetchError::Failed(e.to_string()))?
+            .map_err(|e| FetchError::Failed(format!("could not reach GitHub: {e}")))?
         {
             if bytes.len() + chunk.len() > 8 * MAX_DOCUMENT_BYTES {
                 return Err(FetchError::Failed("repository tree too large".to_owned()));
@@ -1363,26 +1411,34 @@ impl GithubFetcher {
     }
 
     /// The one path in the tree with `entry`'s file name, when exactly one matches.
-    async fn moved_path(&self, entry: &Entry) -> Option<String> {
-        let (owner, repo, r#ref) = (
-            entry.locator.owner.as_deref()?,
-            entry.locator.repo.as_deref()?,
-            entry.locator.ref_name.as_deref()?,
-        );
+    /// A tree that GitHub will not show (a private repository, a refused
+    /// credential, a rate limit, a network failure) is an error, not an
+    /// absence: only a tree that answered may say the file is not in it
+    /// (`#1980 vibe-talk-docs-private-github-load`).
+    async fn moved_path(&self, entry: &Entry) -> Result<Option<String>, FetchError> {
+        let (Some(owner), Some(repo), Some(r#ref)) = (
+            entry.locator.owner.as_deref(),
+            entry.locator.repo.as_deref(),
+            entry.locator.ref_name.as_deref(),
+        ) else {
+            return Ok(None);
+        };
         if is_commit_ref(r#ref) {
-            return None;
+            return Ok(None);
         }
-        let paths = self.tree_paths(owner, repo, r#ref).await.ok()?;
+        let paths = self.tree_paths(owner, repo, r#ref).await?;
         let name = entry.file_name.as_str();
         let mut matches = paths
             .iter()
             .filter(|path| path.rsplit('/').next().is_some_and(|last| last == name))
             .cloned();
-        let first = matches.next()?;
+        let Some(first) = matches.next() else {
+            return Ok(None);
+        };
         if matches.next().is_some() {
-            return None;
+            return Ok(None);
         }
-        Some(first)
+        Ok(Some(first))
     }
 
     fn url(&self, entry: &Entry) -> Result<String, FetchError> {
@@ -1411,7 +1467,7 @@ impl GithubFetcher {
             let response = request
                 .send()
                 .await
-                .map_err(|e| FetchError::Failed(e.to_string()))?;
+                .map_err(|e| FetchError::Failed(format!("could not reach GitHub: {e}")))?;
             let refused = matches!(response.status().as_u16(), 401 | 403);
             if refused && attempt == 0 && self.token.is_command() {
                 self.token.invalidate();
@@ -1446,14 +1502,36 @@ impl GithubFetcher {
         Ok((String::from_utf8_lossy(&bytes).into_owned(), etag))
     }
 
+    /// The `owner/repo` a GitHub document names, for failure wording.
+    fn repo_subject(entry: &Entry) -> String {
+        match (
+            entry.locator.owner.as_deref(),
+            entry.locator.repo.as_deref(),
+        ) {
+            (Some(owner), Some(repo)) => format!("{owner}/{repo}"),
+            _ => entry.locator.path.clone(),
+        }
+    }
+
     async fn get(&self, entry: &Entry) -> Result<FetchedRaw, FetchError> {
         let url = self.url(entry)?;
         let response = self.send_get(&url).await?;
         if response.status().as_u16() == 404 {
+            // A commit names no tree to walk, so its 404 keeps GitHub's
+            // meaning (private or missing) instead of a moved guess.
+            if entry.locator.ref_name.as_deref().is_some_and(is_commit_ref) {
+                return Err(github_status_failure(
+                    &Self::repo_subject(entry),
+                    response.status(),
+                    response.headers(),
+                    self.token.has_credential(),
+                ));
+            }
             // A moved document on a branch: find its file name in the tree and
-            // fetch it from its new home; otherwise say where it was lost.
-            let moved = self.moved_path(entry).await;
-            let Some(new_path) = moved else {
+            // fetch it from its new home; otherwise say where it was lost. A
+            // tree GitHub will not show is the fetch's real failure, not an
+            // absence (`#1980 vibe-talk-docs-private-github-load`).
+            let Some(new_path) = self.moved_path(entry).await? else {
                 return Err(FetchError::Failed(format!(
                     "not found at {} (moved or deleted)",
                     entry.locator.path
@@ -1477,10 +1555,12 @@ impl GithubFetcher {
             });
         }
         if !response.status().is_success() {
-            return Err(FetchError::Failed(format!(
-                "GitHub answered {}",
-                response.status()
-            )));
+            return Err(github_status_failure(
+                &Self::repo_subject(entry),
+                response.status(),
+                response.headers(),
+                self.token.has_credential(),
+            ));
         }
         let (content, etag) = self.read_body(response).await?;
         Ok(FetchedRaw {
@@ -1539,10 +1619,12 @@ impl GithubFetcher {
         let url = format!("{}/gists/{}", self.api_base, entry.locator.path);
         let response = self.send_get(&url).await?;
         if !response.status().is_success() {
-            return Err(FetchError::Failed(format!(
-                "GitHub answered {}",
-                response.status()
-            )));
+            return Err(github_status_failure(
+                &format!("gist {}", entry.locator.path),
+                response.status(),
+                response.headers(),
+                self.token.has_credential(),
+            ));
         }
         let (body, _) = self.read_body(response).await?;
         let parsed: serde_json::Value =
@@ -1570,10 +1652,12 @@ impl GithubFetcher {
                         })?;
                     let raw = self.send_get(raw_url).await?;
                     if !raw.status().is_success() {
-                        return Err(FetchError::Failed(format!(
-                            "GitHub answered {}",
-                            raw.status()
-                        )));
+                        return Err(github_status_failure(
+                            &format!("gist {}", entry.locator.path),
+                            raw.status(),
+                            raw.headers(),
+                            self.token.has_credential(),
+                        ));
                     }
                     self.read_body(raw).await?.0
                 }
@@ -1599,10 +1683,12 @@ impl GithubFetcher {
         let url = self.url(entry)?;
         let response = self.send_get(&url).await?;
         if !response.status().is_success() {
-            return Err(FetchError::Failed(format!(
-                "GitHub answered {}",
-                response.status()
-            )));
+            return Err(github_status_failure(
+                &Self::repo_subject(entry),
+                response.status(),
+                response.headers(),
+                self.token.has_credential(),
+            ));
         }
         // Headers only: the body is dropped unread, so a freshness check
         // costs a round trip, not a download.

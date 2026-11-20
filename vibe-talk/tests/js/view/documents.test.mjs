@@ -1698,7 +1698,79 @@ test("documents reader: an unindexed key falls through to fetch, other failures 
     if (savedDocument === undefined) delete globalThis.document; else globalThis.document = savedDocument;
   }
   assert.deepEqual(refused, [`GET /api/v1/documents/${encodeURIComponent(key)}`]);
-  assert.deepEqual(statuses, ["Could not load the document."]);
+  assert.deepEqual(statuses, [
+    "vibe-talk has no access to this document: the request was refused (private repository or a credential GitHub refused).",
+  ]);
+  assert.ok(!statuses.join(" ").includes("Could not load the document."),
+    "a failed load still says only that it could not load");
+});
+
+test("documents reader: a failed private fetch shows its reason and an Open on GitHub link (#1980)", async () => {
+  const key = "github:octo/widgets@main:docs/private.md";
+  const detail = "vibe-talk has no access to octo/widgets: GitHub answered 404 and no GitHub credential is configured, so a private repository cannot be fetched (a missing repository or file answers the same way)";
+  const api = async (path, options = {}) => {
+    if ((options.method || "GET") === "POST") {
+      throw Object.assign(new Error(`HTTP 502 document_fetch_failed: ${detail}`),
+        { code: "document_fetch_failed", status: 502, detail });
+    }
+    return {
+      document: { title: "private.md", url: "https://github.com/octo/widgets/blob/main/docs/private.md" },
+      content: null, outline: [],
+    };
+  };
+  const mod = requireModule(READER, "src/view/documents/reader.ts");
+  const els = {};
+  for (const id of ["doc-title", "doc-outline", "doc-outline-pop", "doc-outline-open",
+    "doc-back", "doc-read", "doc-body", "scroll-area"]) els[id] = readerEl("div");
+  els["doc-body"].querySelectorAll = () => [];
+  const statuses = [];
+  const reader = mod.createDocumentsReader({
+    intoView: (element, block, inline) => { if (element && typeof element.scrollIntoView === "function") element.scrollIntoView(inline === undefined ? { block } : { block, inline }); },
+    api, byId: (id) => els[id], readDocument: () => {}, onBack: () => {},
+    onStatus: (text) => statuses.push(text),
+  });
+  const savedDocument = globalThis.document;
+  globalThis.document = { createElement: (tag) => readerEl(tag) };
+  try {
+    await assert.rejects(reader.open(key), /document_fetch_failed/);
+  } finally {
+    if (savedDocument === undefined) delete globalThis.document; else globalThis.document = savedDocument;
+  }
+  assert.deepEqual(statuses, [detail], "the status is not the server's specific reason");
+  const bodyText = els["doc-body"].textContent;
+  assert.ok(bodyText.includes("no access to octo/widgets"), `the body shows no reason: ${bodyText}`);
+  assert.ok(bodyText.includes("Open on GitHub"), `the body has no way out: ${bodyText}`);
+  const box = els["doc-body"].children[0];
+  const link = box.children.find((kid) => kid.tagName === "A");
+  assert.ok(link, "the failure body holds no link");
+  assert.equal(link.getAttribute("href"), "https://github.com/octo/widgets/blob/main/docs/private.md");
+  assert.equal(link.getAttribute("target"), "_blank");
+  assert.equal(reader.current(), null, "a failed load left a document current");
+});
+
+test("documents reader: documentLoadFailure names network, rate-limit and not-found causes (#1980)", () => {
+  const { documentLoadFailure } = requireModule(READER, "src/view/documents/reader.ts");
+  assert.equal(typeof documentLoadFailure, "function", "reader does not export documentLoadFailure");
+  const url = "https://github.com/octo/widgets/blob/main/docs/x.md";
+  const network = documentLoadFailure(Object.assign(new Error("down"), { network: true }), url);
+  assert.match(network.reason, /network/i);
+  assert.equal(network.href, url);
+  assert.equal(network.linkLabel, "Open on GitHub");
+  const limited = documentLoadFailure(
+    Object.assign(new Error("HTTP 502 document_fetch_failed: GitHub rate limit"), { detail: "GitHub rate limit: GitHub answered 429 for octo/widgets; try again later" }),
+    url, "github:octo/widgets@main:docs/x.md");
+  assert.match(limited.reason, /rate limit/i);
+  const missing = documentLoadFailure(
+    Object.assign(new Error("HTTP 502 x: y"), { detail: "not found at docs/x.md (moved or deleted)" }),
+    undefined, "github:octo/widgets@main:docs/x.md");
+  assert.match(missing.reason, /not found/i);
+  assert.equal(missing.href, url, "a key alone does not name the way out");
+  const unsafe = documentLoadFailure(new Error("boom"), "javascript:alert(1)", "paste:abc");
+  assert.equal(unsafe.href, null, "an unsafe source became a link");
+  for (const failure of [network, limited, missing, unsafe]) {
+    assert.ok(!/^could not load the document\.?$/i.test(failure.reason),
+      `a bare failure survived: ${failure.reason}`);
+  }
 });
 
 // ---- reader kind header (`#1327 doc-reader-kind-header`) ---------------------------------------

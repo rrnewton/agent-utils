@@ -503,7 +503,22 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
     meta.className = "doc-meta";
     const failed = errors.get(row.key);
     if (isBusy) meta.textContent = "Fetching…";
-    else if (failed) meta.textContent = failed;
+    else if (failed) {
+      meta.textContent = failed;
+      // The way out stays on a failed card (`#1980`): the source itself,
+      // GitHub by name where that is where it lives.
+      if (/^https?:\/\/[^/]+/i.test(row.url)) {
+        const out = document.createElement("a");
+        out.className = "doc-open-source";
+        out.href = row.url;
+        out.target = "_blank";
+        out.rel = "noopener noreferrer";
+        out.textContent = /github\.com/i.test(row.url) ? "Open on GitHub" : "Open source";
+        out.addEventListener("click", (event) => event.stopPropagation());
+        meta.appendChild(document.createTextNode(" · "));
+        meta.appendChild(out);
+      }
+    }
     else if (row.moved_to) meta.textContent = `moved to ${row.moved_to}`;
     else {
       const file = document.createElement("span");
@@ -958,7 +973,10 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
       const answer = await deps.api(FETCH_PATH, { method: "POST", body: { key: row.key } });
       return fetchedPatchOf(answer, row.key);
     } catch (error) {
-      const words = error instanceof Error ? error.message : String(error);
+      const detail = (error as { detail?: unknown })?.detail;
+      const words = typeof detail === "string" && detail.trim() !== ""
+        ? detail.trim()
+        : error instanceof Error ? error.message : String(error);
       errors.set(row.key, `Could not fetch it. ${words}`);
       deps.onStatus?.(`Could not fetch ${row.file_name}. ${words}`);
       return false;

@@ -206,6 +206,72 @@ function isUnknownDocument(error: unknown): boolean {
   return typeof record.message === "string" && record.message.includes("unknown_document");
 }
 
+/** One failed load, in the words and with the way out the reader shows (`#1980`). */
+export interface DocumentLoadFailure {
+  /** The specific reason, as a sentence. Never a bare "could not load". */
+  reason: string;
+  /** The document's own safe http(s) address, or null where none is known. */
+  href: string | null;
+  /** What the way-out link says: GitHub by name for a github.com address. */
+  linkLabel: string;
+}
+
+/** The source address a canonical GitHub key names, so a failure can still link out. */
+function sourceUrlForKey(key: string): string | null {
+  const github = /^github:([^/]+)\/([^@]+)@([^:]+):(.+)$/.exec(key);
+  if (github) return `https://github.com/${github[1]}/${github[2]}/blob/${github[3]}/${github[4]}`;
+  const gist = /^gist:([A-Za-z0-9]+)$/.exec(key);
+  if (gist) return `https://gist.github.com/${gist[1]}`;
+  return null;
+}
+
+/**
+ * Why one load failed, from the API error's own facts (`#1980
+ * vibe-talk-docs-private-github-load`): the server's detail sentence is the
+ * reason where it gave one; a network failure, a rate limit, a refusal and
+ * an unindexed key are each named. Pure, so the wording is testable without
+ * a reader. The result always names a specific cause.
+ */
+export function documentLoadFailure(error: unknown, url?: unknown, key?: string): DocumentLoadFailure {
+  const record = (typeof error === "object" && error !== null ? error : {}) as {
+    message?: unknown; detail?: unknown; code?: unknown; status?: unknown; network?: unknown;
+  };
+  const detail = typeof record.detail === "string" ? record.detail.trim() : "";
+  const message = typeof record.message === "string" ? record.message : String(error ?? "");
+  const code = typeof record.code === "string" ? record.code : "";
+  const status = typeof record.status === "number" ? record.status : null;
+  let reason: string;
+  if (record.network === true || /could not reach vibe-talk/i.test(message)) {
+    reason = "Could not reach vibe-talk (network) while loading this document. Check the connection and try again.";
+  } else if (detail !== "") {
+    reason = detail;
+  } else if (code === "unknown_document" || message.includes("unknown_document")) {
+    reason = "This document is not in vibe-talk's index yet, and it could not be fetched.";
+  } else if (status === 429 || /rate limit/i.test(message)) {
+    reason = "GitHub rate limit: GitHub asked vibe-talk to pause. Try again later.";
+  } else if (status === 401 || status === 403 || /\bHTTP (401|403)\b/.test(message) || code === "forbidden") {
+    reason = "vibe-talk has no access to this document: the request was refused (private repository or a credential GitHub refused).";
+  } else if (status === 404 || /\bHTTP 404\b/.test(message)) {
+    reason = "Not found: GitHub has no such document at this address, or the repository is private and vibe-talk has no access to it.";
+  } else if (/could not reach GitHub/i.test(message)) {
+    reason = message.replace(/^HTTP \d+ [^:]+:\s*/, "");
+  } else if (message !== "") {
+    reason = message;
+  } else {
+    reason = "vibe-talk could not fetch this document for an unknown reason.";
+  }
+  const href = safeSourceHref(url) ?? safeSourceHref(key ? sourceUrlForKey(key) : null);
+  let linkLabel = "Open source";
+  if (href !== null) {
+    try {
+      if (new URL(href).hostname === "github.com" || new URL(href).hostname === "gist.github.com") linkLabel = "Open on GitHub";
+    } catch {
+      // A non-parsing address keeps the generic label; safeSourceHref already vetted it.
+    }
+  }
+  return { reason, href, linkLabel };
+}
+
 /** Characters that may not appear in an address the title may link to (render.ts's discipline). */
 const UNSAFE_URL_CHARS = /[\s"<>\u0000-\u001f\u007f]/;
 
@@ -613,6 +679,39 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     anchor.setAttribute("rel", "noopener noreferrer");
     anchor.textContent = text;
     title.appendChild(anchor);
+  }
+
+  /**
+   * Draw a failed load in the body (`#1980`): the specific reason as text
+   * and, where the document's address is a safe one, the way out to it.
+   * Text and a page-built anchor only, never markup from the error.
+   */
+  function drawLoadFailure(failure: DocumentLoadFailure, titleText: string): void {
+    drawTitle(titleText, failure.href ?? undefined);
+    let body: HTMLElement;
+    try {
+      body = deps.byId("doc-body");
+    } catch {
+      return;
+    }
+    if (!body) return;
+    body.textContent = "";
+    const box = document.createElement("div");
+    box.className = "doc-load-error";
+    const words = document.createElement("p");
+    words.className = "doc-load-error-reason";
+    words.textContent = failure.reason;
+    box.appendChild(words);
+    if (failure.href !== null) {
+      const link = document.createElement("a");
+      link.className = "doc-load-error-link";
+      link.setAttribute("href", failure.href);
+      link.setAttribute("target", "_blank");
+      link.setAttribute("rel", "noopener noreferrer");
+      link.textContent = failure.linkLabel;
+      box.appendChild(link);
+    }
+    body.appendChild(box);
   }
 
   /**
@@ -1078,9 +1177,18 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     stopWatching();
     const path = `/api/v1/documents/${encodeURIComponent(key)}`;
     let answer: DocumentAnswer;
+    // The document's own address, from any answer that landed before a
+    // failure, so the failure can still link out to it (`#1980`).
+    let knownUrl: unknown;
+    let knownTitle: unknown;
+    const noteAnswer = (landed: DocumentAnswer): void => {
+      if (landed.document?.url !== undefined) knownUrl = landed.document.url;
+      if (landed.document?.title !== undefined) knownTitle = landed.document.title;
+    };
     try {
       try {
         answer = asAnswer(await deps.api(path));
+        noteAnswer(answer);
       } catch (error) {
         // Unindexed (followed from another document, never mentioned in chat):
         // the fetch route admits a canonical key, registering then fetching
@@ -1088,13 +1196,17 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
         if (!isUnknownDocument(error)) throw error;
         await deps.api("/api/v1/documents/fetch", { method: "POST", body: { key } });
         answer = asAnswer(await deps.api(path));
+        noteAnswer(answer);
       }
       if (typeof answer.content !== "string") {
         await deps.api("/api/v1/documents/fetch", { method: "POST", body: { key } });
         answer = asAnswer(await deps.api(path));
+        noteAnswer(answer);
       }
     } catch (error) {
-      deps.onStatus?.("Could not load the document.");
+      const failure = documentLoadFailure(error, knownUrl, key);
+      drawLoadFailure(failure, typeof knownTitle === "string" && knownTitle !== "" ? knownTitle : key);
+      deps.onStatus?.(failure.reason);
       throw error;
     }
     markdown = typeof answer.content === "string" ? answer.content : null;
