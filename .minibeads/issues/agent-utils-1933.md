@@ -1,12 +1,13 @@
 ---
 title: 'wrkslots-machine-id-changed-host-alias: bind pre-reprovision owners after the machine identity changes'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-11-19T23:48:16-05:00
-updated_at: 2026-11-19T23:48:16-05:00
+updated_at: 2026-11-20T03:09:46-05:00
+closed_at: 2026-11-20T03:09:46-05:00
 ---
 
 # Description
@@ -31,3 +32,7 @@ updated_at: 2026-11-19T23:48:16-05:00
 # Notes
 
 [watermelon-full-preview] mu-hostalias lane, 2026-11-19. Urgent: every slot owner on the host is unbindable until this lands. Alias file path and format are reported to the coordinator before implementation.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as 448403ae (tree c8f40f45, replay of e0499063 over c6082172). `wrkslots host-alias add --previous-host-id OLD --coordinator-authorized --coordinator-pid P` records previous machine identities in `$XDG_STATE_HOME/wrkslots/host-aliases.json` (host-local, 0600, outside every registry; no shared-state field, journal key, or event kind added). Both judges count an aliased identity as this host only across a boot change; a current-boot record under a previous identity stays indeterminate, so no live owner reads dead (cold-review probes 3d/3b2). Two cold reviews: first NOT SAFE (live owner read dead), fixed; second SAFE. Gate e0499063: every wrkslots step green; the 147 failed steps are waived environment failures (Chromium cannot start, libnspr4.so missing since the reprovision) and 4 no-results are learned-cap OOM kills. Overlap with the census redo was handled by verifying the exact replayed tree (56 named tests, Rust parity, clippy, strict mypy) and landing with --allow-overlap --verified-tree.
