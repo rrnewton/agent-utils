@@ -6,10 +6,10 @@ repository's own documents, which stay the authority.
 
 | File | What it is |
 |---|---|
-| `index.html` | Overview: why the suite exists, the architecture figure, the tools, adoption, engineering. |
+| `index.html` | Overview: the pitch, the problems it solves, the architecture figure, the tools, adoption, engineering. |
 | `architecture.html` | Layers, a delegated task end to end, the harness directory, where state lives. |
 | `tools.html` | One section per tool, anchored by tool name (`tools.html#wrkslots`). |
-| `vibe-talk.html` | vibe-talk: what it is for, five demo clips, what in them is real, providers and maturity. |
+| `vibe-talk.html` | vibe-talk: what it does, five demo clips, providers, and how to run it. |
 | `media/vibe-talk/` | The demo clips: one GIF and one still poster PNG per clip. |
 | `style.css` | The only stylesheet, with light and dark palettes. |
 | `favicon.svg` | The site icon. |
@@ -31,9 +31,10 @@ repository's own documents, which stay the authority.
 - Link pages to each other relatively. Link repository content as
   `https://github.com/rrnewton/agent-utils/blob/main/<path>` for files and `/tree/main/<dir>`
   for directories, and only to tracked paths that are not symlinks.
-- Introduce a tool by the user's problem, the useful outcome, then its dependencies, and state its
-  maturity the way its own documents do. This is a public page: never name a project that
-  consumes agent-utils, and keep host- or organization-specific details out.
+- Introduce a tool by the user's problem, the useful outcome, then its dependencies. Keep prose
+  short and concrete: one line of status that matches the tool's own documents, and caveats in the
+  limits list, not in every paragraph. This is a public page: never name a project that consumes
+  agent-utils, and keep host- or organization-specific details out.
 - Every image has `alt`. GIFs stay at or under 3 MB.
 - Nothing moves until the visitor asks. A demo clip shows its still poster (`<img
   class="clip-poster">`) after a `<details class="clip-play">` whose `<summary>` says "Play the
