@@ -69,6 +69,28 @@ def fixture_machine(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("WRKSLOTS_MACHINE", "testhost")
 
 
+@pytest.fixture(autouse=True)
+def fixture_no_item_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never gate these counted-evidence tests on a wall clock (#1947).
+
+    Each retire-pending candidate runs as a remove-agent-batch item under
+    the 60 s pre-deletion budget (`_AGENT_REMOVE_BATCH_ITEM_SECONDS`). That
+    budget is a production lock-holding guard, not the contract here: these
+    tests assert *where* work runs (counted calls with the flock held or
+    free), and on a hot host the lock-free validation alone legitimately
+    takes about a minute per slot, so the budget expired first and the
+    batch retained slots the tests expected removed (or deferred). Lift it
+    to the 3600 s hang backstop other remove tests use (`#1195`), so the
+    outcome is decided by the work finishing, not by a clock. The budget
+    machinery itself keeps its dedicated tests in `test_lifecycle.py`.
+    """
+
+    monkeypatch.setattr(cli, "_AGENT_REMOVE_BATCH_ITEM_SECONDS", 3600.0)
+    monkeypatch.setattr(
+        cli, "_agent_remove_batch_item_seconds", lambda *_args: 3600.0
+    )
+
+
 def _exclusive_lock_held(project: Path) -> bool:
     """Whether some open file description holds the configuration lock.
 
