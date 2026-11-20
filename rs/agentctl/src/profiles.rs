@@ -1390,10 +1390,7 @@ fn wrkslots_value(value: Option<&Value>) -> Result<Option<String>, AgentError> {
 }
 
 /// Validate one `muse_hooks_trust` value (#1932): fail closed.
-fn hooks_trust_setting(
-    value: Option<&Value>,
-    label: &str,
-) -> Result<Option<String>, AgentError> {
+fn hooks_trust_setting(value: Option<&Value>, label: &str) -> Result<Option<String>, AgentError> {
     match value {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(setting)) if setting == "decline" || setting == "trust" => {
@@ -1419,9 +1416,10 @@ pub(crate) fn hooks_trust_policy(
     let raw = registry_policy(&root.join(".agentctl"))?;
     if let Some(object) = raw {
         if let Some(name) = profile_name {
-            if let Some(Value::Object(profile)) = object.get("profiles").and_then(|profiles| {
-                profiles.as_object().and_then(|profiles| profiles.get(name))
-            }) {
+            if let Some(Value::Object(profile)) = object
+                .get("profiles")
+                .and_then(|profiles| profiles.as_object().and_then(|profiles| profiles.get(name)))
+            {
                 if let Some(setting) = hooks_trust_setting(
                     profile.get("muse_hooks_trust"),
                     &format!("profile '{name}'"),
@@ -2234,9 +2232,7 @@ mod tests {
             hooks_trust_policy(&root, &registry, None).unwrap().0,
             "trust"
         );
-        write(
-            r#"{"schema":"agentctl-profiles/v1","muse_hooks_trust":"sometimes","profiles":{}}"#,
-        );
+        write(r#"{"schema":"agentctl-profiles/v1","muse_hooks_trust":"sometimes","profiles":{}}"#);
         assert!(hooks_trust_policy(&root, &registry, None)
             .unwrap_err()
             .to_string()

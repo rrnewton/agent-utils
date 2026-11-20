@@ -2378,11 +2378,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
     /// record is otherwise ready; answer per the registry's policy.
     /// Only the exact dialog is answered, and an answer that fails is
     /// this verification's failure, never swallowed.
-    fn answer_candidate_hooks_trust(
-        &self,
-        candidate: &AgentRecord,
-        pane: &str,
-    ) -> Result<()> {
+    fn answer_candidate_hooks_trust(&self, candidate: &AgentRecord, pane: &str) -> Result<()> {
         if candidate.harness != "muse" || candidate.is_foreign() {
             return Ok(());
         }

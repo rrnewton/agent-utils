@@ -4538,13 +4538,7 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
                 match manager.answer_hooks_trust_if_dialog(&name) {
                     Ok(Some(detail)) => {
                         eprintln!("agentctl watch: hooks trust: {detail}");
-                        findings.push(finding(
-                            "hooks_trust",
-                            &name,
-                            true,
-                            detail,
-                            Value::Null,
-                        ));
+                        findings.push(finding("hooks_trust", &name, true, detail, Value::Null));
                     }
                     Ok(None) => {}
                     Err(error) => findings.push(finding(

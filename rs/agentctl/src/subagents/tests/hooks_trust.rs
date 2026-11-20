@@ -45,10 +45,7 @@ fn a_managed_muse_lane_at_the_dialog_is_answered_per_policy() {
         "{line}"
     );
     assert_eq!(fixture.client.hooks_answers.lock().unwrap().len(), 1);
-    assert_eq!(
-        fixture.client.hooks_answers.lock().unwrap()[0].1,
-        "decline"
-    );
+    assert_eq!(fixture.client.hooks_answers.lock().unwrap()[0].1, "decline");
     // The dialog is gone afterwards.
     let screen = fixture.client.screen.lock().unwrap().clone().unwrap();
     assert!(!crate::client::muse_hooks_trust_dialog(&screen), "{screen}");

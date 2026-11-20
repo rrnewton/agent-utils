@@ -25,13 +25,12 @@ use sha2::{Digest, Sha256};
 use crate::agent::{self, AgentApi, AgentError, DrainOptions, QueueResult, Target};
 use crate::client::{
     muse_editor_rows_empty, muse_startup_metadata, muse_trust_prompt, muse_verified_pane_status,
-    HooksTrustAnswer,
     muse_verified_process_editor_draft, muse_verified_process_editor_rows,
     muse_verified_process_idle_composer, muse_verified_process_paste_drawn,
     muse_verified_process_paste_in_composer, muse_verified_process_paste_is_exact_composer,
     muse_verified_process_prompt_queued_count, muse_verified_process_prompt_transcript_count,
-    AgentIdentity, AgentPaneInfo, CustomProcessIdentity, HerdrClient, MusePasteDrawn, Pane,
-    PaneShellProof, ProcessLiveness, ReexecutedCommand,
+    AgentIdentity, AgentPaneInfo, CustomProcessIdentity, HerdrClient, HooksTrustAnswer,
+    MusePasteDrawn, Pane, PaneShellProof, ProcessLiveness, ReexecutedCommand,
 };
 use crate::error::{AdapterError, AdapterErrorKind};
 use crate::submission::{GuardedInput, GuardedPrompt, Submission};
@@ -1777,7 +1776,15 @@ impl ManagedApi for HerdrClient {
         timeout: Duration,
         persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> crate::error::Result<()>,
     ) -> crate::error::Result<CustomProcessIdentity> {
-        HerdrClient::start_relay_agent(self, kind, pane, command_line, timeout, persist_identity, None)
+        HerdrClient::start_relay_agent(
+            self,
+            kind,
+            pane,
+            command_line,
+            timeout,
+            persist_identity,
+            None,
+        )
     }
     fn start_relay_agent_with_hooks(
         &self,
@@ -1788,7 +1795,15 @@ impl ManagedApi for HerdrClient {
         persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> crate::error::Result<()>,
         hooks: Option<HooksTrustAnswer<'_>>,
     ) -> crate::error::Result<CustomProcessIdentity> {
-        HerdrClient::start_relay_agent(self, kind, pane, command_line, timeout, persist_identity, hooks)
+        HerdrClient::start_relay_agent(
+            self,
+            kind,
+            pane,
+            command_line,
+            timeout,
+            persist_identity,
+            hooks,
+        )
     }
     fn answer_hooks_trust_dialog(
         &self,
@@ -1820,7 +1835,16 @@ impl ManagedApi for HerdrClient {
         timeout: Duration,
         persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> crate::error::Result<()>,
     ) -> crate::error::Result<()> {
-        HerdrClient::start_pane_agent(self, name, harness, pane, args, timeout, persist_identity, None)
+        HerdrClient::start_pane_agent(
+            self,
+            name,
+            harness,
+            pane,
+            args,
+            timeout,
+            persist_identity,
+            None,
+        )
     }
     #[allow(clippy::too_many_arguments)]
     fn start_pane_agent_with_hooks(
@@ -1833,7 +1857,16 @@ impl ManagedApi for HerdrClient {
         persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> crate::error::Result<()>,
         hooks: Option<HooksTrustAnswer<'_>>,
     ) -> crate::error::Result<()> {
-        HerdrClient::start_pane_agent(self, name, harness, pane, args, timeout, persist_identity, hooks)
+        HerdrClient::start_pane_agent(
+            self,
+            name,
+            harness,
+            pane,
+            args,
+            timeout,
+            persist_identity,
+            hooks,
+        )
     }
     #[allow(clippy::too_many_arguments)]
     fn start_pane_agent_in_box_with_hooks(
@@ -1846,7 +1879,16 @@ impl ManagedApi for HerdrClient {
         persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> crate::error::Result<()>,
         hooks: Option<HooksTrustAnswer<'_>>,
     ) -> crate::error::Result<()> {
-        HerdrClient::start_pane_agent_in_box(self, name, harness, pane, args, timeout, persist_identity, hooks)
+        HerdrClient::start_pane_agent_in_box(
+            self,
+            name,
+            harness,
+            pane,
+            args,
+            timeout,
+            persist_identity,
+            hooks,
+        )
     }
     fn start_pane_agent_in_box(
         &self,
@@ -13624,19 +13666,17 @@ its drain would also type, so it was not queued",
     /// before any keypress. Returns the log line naming the decision
     /// and which setting it came from.
     pub fn answer_hooks_trust(&self, agent_name: &str) -> Result<String> {
-        self.answer_hooks_trust_if_dialog(agent_name)?.ok_or_else(|| {
-            fail(format!(
+        self.answer_hooks_trust_if_dialog(agent_name)?
+            .ok_or_else(|| {
+                fail(format!(
                 "agent {agent_name} shows no exact plugin-hooks trust dialog; nothing was answered"
             ))
-        })
+            })
     }
 
     /// [`Self::answer_hooks_trust`], or `Ok(None)` when this agent is not
     /// a Muse lane parked at the exact dialog: the watch sweep's form.
-    pub fn answer_hooks_trust_if_dialog(
-        &self,
-        agent_name: &str,
-    ) -> Result<Option<String>> {
+    pub fn answer_hooks_trust_if_dialog(&self, agent_name: &str) -> Result<Option<String>> {
         // The watch sweep calls this for every registered name: only a
         // Muse lane can show the dialog, so the lifecycle lock is taken
         // only once the record proves this one is Muse.
@@ -13686,9 +13726,7 @@ its drain would also type, so it was not queued",
             || "hook count not shown".to_owned(),
             |n| format!("{n} hooks"),
         );
-        Ok(Some(format!(
-            "{agent_name}: {verb} ({shown}) per {source}"
-        )))
+        Ok(Some(format!("{agent_name}: {verb} ({shown}) per {source}")))
     }
 
     /// Force a redraw of `agent_name`'s TUI (recovery ladder step 2):
@@ -24786,6 +24824,8 @@ fi
     mod headless_takeover;
     /// Herdr readiness and adopted Muse process ownership compatibility.
     mod herdr_compatibility;
+    /// Muse plugin-hooks trust answers in managed panes (#1932).
+    mod hooks_trust;
     /// Recipient checks around input, anchors, rename transactions and doctor.
     mod identity;
     /// Launch specs written at start, read at adopt and anchor, and replayed by revive.
@@ -24818,8 +24858,6 @@ fi
     /// Resume recovery, immutable planning, exact publication and crash reconciliation.
     mod revive;
     mod session_follow;
-    /// Muse plugin-hooks trust answers in managed panes (#1932).
-    mod hooks_trust;
     /// Drafts Muse left unsent: agentctl's own submitted, anyone else's refused (#720).
     mod stale_draft;
     /// Trusted stop refusals and generation-bound recovery advice.

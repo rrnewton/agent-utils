@@ -2362,9 +2362,11 @@ impl HerdrClient {
         }
         let target = if decision == "decline" { 2 } else { 1 };
         let fresh = |client: &Self| -> Result<Option<HooksTrustBlock>> {
-            Ok(hooks_trust_block(
-                &client.read(pane_id, "visible", Some(200))?,
-            ))
+            Ok(hooks_trust_block(&client.read(
+                pane_id,
+                "visible",
+                Some(200),
+            )?))
         };
         let Some(block) = fresh(self)? else {
             return Ok((false, None));
@@ -2594,11 +2596,8 @@ impl HerdrClient {
                 if let Some(hooks) = hooks_trust.as_mut() {
                     if muse_hooks_trust_dialog(&screen) {
                         if !hooks_answered {
-                            let (answered, count) = self.answer_hooks_trust_dialog(
-                                pane_id,
-                                hooks.decision,
-                                deadline,
-                            )?;
+                            let (answered, count) =
+                                self.answer_hooks_trust_dialog(pane_id, hooks.decision, deadline)?;
                             if answered {
                                 hooks_answered = true;
                                 (hooks.answered)(hooks.decision, count);
@@ -3020,11 +3019,8 @@ impl HerdrClient {
                 if let Some(hooks) = hooks_trust.as_mut() {
                     if muse_hooks_trust_dialog(&plain) {
                         if !hooks_answered {
-                            let (answered, count) = self.answer_hooks_trust_dialog(
-                                pane_id,
-                                hooks.decision,
-                                deadline,
-                            )?;
+                            let (answered, count) =
+                                self.answer_hooks_trust_dialog(pane_id, hooks.decision, deadline)?;
                             if answered {
                                 hooks_answered = true;
                                 (hooks.answered)(hooks.decision, count);
@@ -4627,7 +4623,9 @@ mod tests {
         assert!(!muse_hooks_trust_dialog(
             &HOOKS_TRUST_DIALOG.replace("Continue without trusting", "Continue without trust")
         ));
-        assert!(!muse_hooks_trust_dialog("Do you want to proceed?\n❯ Yes\n  No\n"));
+        assert!(!muse_hooks_trust_dialog(
+            "Do you want to proceed?\n❯ Yes\n  No\n"
+        ));
         // The dialog quoted in a working lane's transcript, its own
         // composer below: not the dialog (#1932 review).
         let quoted = format!(
@@ -4711,11 +4709,7 @@ elif args[:2] == ["pane", "send-keys"]:
             fs::create_dir(&root).unwrap();
             let client = dialog_herdr(&root);
             let (answered, count) = client
-                .answer_hooks_trust_dialog(
-                    "p1",
-                    decision,
-                    Instant::now() + Duration::from_secs(30),
-                )
+                .answer_hooks_trust_dialog("p1", decision, Instant::now() + Duration::from_secs(30))
                 .unwrap();
             assert_eq!((answered, count), (true, Some(39)), "{decision}");
             assert_eq!(
@@ -4740,11 +4734,7 @@ elif args[:2] == ["pane", "send-keys"]:
         fs::write(root.join("confirmed"), "x").unwrap();
         let client = dialog_herdr(&root);
         let (answered, _) = client
-            .answer_hooks_trust_dialog(
-                "p1",
-                "decline",
-                Instant::now() + Duration::from_secs(30),
-            )
+            .answer_hooks_trust_dialog("p1", "decline", Instant::now() + Duration::from_secs(30))
             .unwrap();
         assert!(!answered);
         assert!(!root.join("keys").exists());
@@ -4767,14 +4757,13 @@ elif args[:2] == ["pane", "send-keys"]:
         fs::write(root.join("state"), "1").unwrap();
         let client = dialog_herdr(&root);
         let (answered, count) = client
-            .answer_hooks_trust_dialog(
-                "p1",
-                "decline",
-                Instant::now() + Duration::from_secs(30),
-            )
+            .answer_hooks_trust_dialog("p1", "decline", Instant::now() + Duration::from_secs(30))
             .unwrap();
         assert_eq!((answered, count), (true, Some(39)));
-        assert_eq!(fs::read_to_string(root.join("keys")).unwrap(), "Down\nEnter\n");
+        assert_eq!(
+            fs::read_to_string(root.join("keys")).unwrap(),
+            "Down\nEnter\n"
+        );
         assert_eq!(fs::read_to_string(root.join("confirmed")).unwrap(), "2");
         fs::remove_dir_all(root).unwrap();
         // The dialog vanishes after the first Down: no Enter follows.
@@ -4803,11 +4792,7 @@ elif args[:2] == ["pane", "send-keys"]:
         fs::set_permissions(root.join("herdr"), fs::Permissions::from_mode(0o700)).unwrap();
         let client = HerdrClient::with_executable("direct", &root.join("herdr")).unwrap();
         let (answered, _) = client
-            .answer_hooks_trust_dialog(
-                "p1",
-                "decline",
-                Instant::now() + Duration::from_secs(30),
-            )
+            .answer_hooks_trust_dialog("p1", "decline", Instant::now() + Duration::from_secs(30))
             .unwrap();
         assert!(!answered);
         assert_eq!(fs::read_to_string(root.join("keys")).unwrap(), "Down\n");

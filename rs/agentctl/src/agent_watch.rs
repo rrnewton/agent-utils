@@ -7190,7 +7190,11 @@ mod tests {
         muse.harness = Some("muse".to_owned());
         let mut codex = observation("other", "blocked", Some(HOOKS_DIALOG));
         codex.harness = Some("codex".to_owned());
-        let mut near = observation("near", "blocked", Some("Review plugin hooks\nContinue without trusting\n"));
+        let mut near = observation(
+            "near",
+            "blocked",
+            Some("Review plugin hooks\nContinue without trusting\n"),
+        );
         near.harness = Some("muse".to_owned());
         let mut probe = ScriptedProbe(vec![vec![muse, codex, near]]);
         let mut notifier = RecordingNotifier::default();
@@ -7199,9 +7203,9 @@ mod tests {
         assert_eq!(report["hooks_trust"].as_array().map(Vec::len), Some(1));
         assert_eq!(report["hooks_trust"][0]["acted"], true);
         assert!(
-            report["hooks_trust"][0]["outcome"]
-                .as_str()
-                .is_some_and(|line| line.contains("declined hook trust (39 hooks) per built-in default")),
+            report["hooks_trust"][0]["outcome"].as_str().is_some_and(
+                |line| line.contains("declined hook trust (39 hooks) per built-in default")
+            ),
             "{report}"
         );
         // Check-only reports the dialog and answers nothing.
