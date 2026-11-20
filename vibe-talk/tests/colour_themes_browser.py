@@ -16,6 +16,7 @@ Condition waits only — no fixed sleeps in any assertion.
 from __future__ import annotations
 
 import argparse
+import subprocess
 import tempfile
 import threading
 from http.server import ThreadingHTTPServer
@@ -23,6 +24,24 @@ from pathlib import Path
 
 import offline_cache_browser as fixture
 from offline_cache_browser import TOKEN, FakeApi, check, handler_for
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def write_build_stamp(folder: Path, page_build: str) -> Path:
+    """The shot folder's BUILD.txt, in run.sh's format: what build the shots show."""
+    def git(*argv: str) -> str:
+        return subprocess.run(["git", "-C", str(ROOT.parent), *argv],
+                              capture_output=True, text=True).stdout.strip() or "unknown"
+
+    stamp = folder / "BUILD.txt"
+    stamp.write_text(
+        f"commit {git('rev-parse', 'HEAD')}\n"
+        f"commit-date {git('log', '-1', '--format=%cI', 'HEAD')}\n"
+        f"page-build {page_build}\n",
+        encoding="utf-8",
+    )
+    return stamp
 
 STATE_MS = 30_000
 # preset -> (dark accent, light accent, dark discuss head, light discuss head)
@@ -130,22 +149,11 @@ def main() -> int:
                                 .every((a) => a.playState !== 'running'))""", timeout=STATE_MS)
                             stamp = args.screenshots / "BUILD.txt"
                             if not stamp.exists():
-                                import subprocess
-
-                                def git(*argv: str) -> str:
-                                    return subprocess.run(["git", "-C", str(ROOT.parent), *argv],
-                                                          capture_output=True, text=True).stdout.strip() or "unknown"
-
                                 build = page.evaluate("""() => {
                                   const m = document.body.innerText.match(/build\\s+(\\d+)/i);
                                   return m ? m[1] : 'unknown';
                                 }""")
-                                stamp.write_text(
-                                    f"commit {git('rev-parse', 'HEAD')}\n"
-                                    f"commit-date {git('log', '-1', '--format=%cI', 'HEAD')}\n"
-                                    f"page-build {build}\n",
-                                    encoding="utf-8",
-                                )
+                                write_build_stamp(args.screenshots, build)
                             page.screenshot(path=str(args.screenshots / f"colour-{scheme}-{preset}.png"))
                         print(f"{scheme}/{preset}: accent var {drawn['accent']}, head {drawn['head']}")
                     # A reload restores the last preset (amber) through the pre-paint script.
