@@ -4530,7 +4530,7 @@ fn a_peer_lanes_lock_is_never_recorded_however_long_it_is_held() {
 
     // A peer journal held open attributes nothing either: only the
     // session's own lock, naming this lane's pid, attributes any
-    // held form (dev-hermit kernel-lock evidence, 2026-11-20).
+    // held form (kernel-lock evidence, 2026-11-20).
     let fixture = unreported();
     let peer = fake_muse_session_as(&fixture, "99999999-9999-4999-8999-999999999999", 424_242);
     let peer_journal = peer.parent().unwrap().join("session.jsonl");

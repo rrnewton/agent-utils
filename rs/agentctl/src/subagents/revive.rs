@@ -247,7 +247,7 @@ fn muse_held_ids(record: &AgentRecord, held: &[PathBuf]) -> Vec<String> {
         // by the open fd: a Muse process keeps other lanes' lock
         // files (and can hold their journals) open, while the held
         // kernel lock and its pid= line name only its own lane
-        // (dev-hermit, 2026-11-20). The lock in the held path's own
+        // (kernel-lock evidence, 2026-11-20). The lock in the held path's own
         // session directory, or the nearest ancestor's, must name one
         // of this lane's runtime pids.
         let lock = if path.file_name().is_some_and(|name| name == ".session.lock") {
