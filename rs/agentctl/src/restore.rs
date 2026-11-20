@@ -4524,6 +4524,40 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
             ));
         }
     }
+    // Muse's plugin-hooks trust dialog (#1932): a managed Muse lane of
+    // this registry parked at the exact dialog is answered per the
+    // registry's policy; the manager re-reads the pane and re-verifies
+    // the dialog before any keypress, and other registries' and
+    // unmanaged panes are never touched.
+    if herdr_up {
+        if let Ok(manager) = ManagedAgents::new(client, registry) {
+            for name in agent_queue::registry::names(registry).unwrap_or_default() {
+                if options.check_only {
+                    continue;
+                }
+                match manager.answer_hooks_trust_if_dialog(&name) {
+                    Ok(Some(detail)) => {
+                        eprintln!("agentctl watch: hooks trust: {detail}");
+                        findings.push(finding(
+                            "hooks_trust",
+                            &name,
+                            true,
+                            detail,
+                            Value::Null,
+                        ));
+                    }
+                    Ok(None) => {}
+                    Err(error) => findings.push(finding(
+                        "hooks_trust",
+                        &name,
+                        false,
+                        error.to_string(),
+                        Value::Null,
+                    )),
+                }
+            }
+        }
+    }
     // Half-duty detection (#1145, config-level only in Phase 1: unit presence
     // is not probed beyond what the blocks above already query).
     if !(duties.unit_repair && duties.notify) {

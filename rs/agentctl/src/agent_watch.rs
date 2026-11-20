@@ -1478,6 +1478,14 @@ pub trait Notifier {
         let _ = agent;
         Err(fail("this notifier cannot press Enter"))
     }
+    /// Answer Muse's plugin-hooks trust dialog in `agent`'s pane per the
+    /// registry's policy (#1932): the manager re-reads the pane and
+    /// re-verifies the exact dialog before any keypress. The default
+    /// cannot act, only report.
+    fn answer_hooks_trust(&mut self, agent: &str) -> Result<String> {
+        let _ = agent;
+        Err(fail("this watcher cannot answer hooks dialogs"))
+    }
     /// Recovery ladder step 1: submit a stranded draft of ours (bare Enter).
     fn ladder_sweep(&mut self, agent: &str) -> Result<String> {
         self.flush_draft(agent)
@@ -3757,6 +3765,35 @@ fn watch_agents_once(
             });
         }
     }
+    // Muse's plugin-hooks trust dialog (#1932): a managed Muse lane of
+    // this registry parked at the exact dialog is answered per policy.
+    // Observations come only from this registry's records, so no other
+    // registry's or unmanaged pane is ever touched.
+    let mut hooks_trust = Vec::new();
+    if probe_error.is_null() {
+        for observation in &observations {
+            if observation.harness.as_deref() != Some("muse") {
+                continue;
+            }
+            let Some(screen) = observation.screen.as_deref() else {
+                continue;
+            };
+            if !crate::client::muse_hooks_trust_dialog(screen) {
+                continue;
+            }
+            if options.check_only {
+                hooks_trust.push(json!({"agent": observation.name, "acted": false, "reason": "hooks trust dialog"}));
+                continue;
+            }
+            match notifier.answer_hooks_trust(&observation.name) {
+                Ok(detail) => hooks_trust
+                    .push(json!({"agent": observation.name, "acted": true, "outcome": detail})),
+                Err(error) => hooks_trust.push(
+                    json!({"agent": observation.name, "acted": false, "outcome": error.to_string()}),
+                ),
+            }
+        }
+    }
     // Whom to tell is decided again each pass from the latest observation, so a notice still
     // waiting does not go to a manager that has since stopped, paused, lost the agent, or
     // stopped taking notices.
@@ -3969,6 +4006,7 @@ fn watch_agents_once(
         "team_notices": team_notices,
         "team_pump": team_pump,
         "auto_interrupts": auto_interrupts,
+        "hooks_trust": hooks_trust,
         "activity": observations
             .iter()
             .map(|row| {
@@ -5611,6 +5649,13 @@ pub fn watch_agents(
                 row["detail"].as_str().unwrap_or("")
             ));
         }
+        for row in report["hooks_trust"].as_array().into_iter().flatten() {
+            log(format_args!(
+                "{} hooks trust: {}",
+                row["agent"].as_str().unwrap_or("?"),
+                row["outcome"].as_str().unwrap_or("")
+            ));
+        }
         log_failed_sends(&report["notice"], &report["child_done"]);
         if let Some((state_path, report_path)) = paths.as_ref() {
             if let Err(error) = save_state(&mut state, state_path)
@@ -6891,6 +6936,10 @@ impl<A: ManagedApi + ?Sized> Notifier for ManagedNotifier<'_, A> {
         ManagedAgents::new(self.client, &self.registry)?.press_enter(agent)
     }
 
+    fn answer_hooks_trust(&mut self, agent: &str) -> Result<String> {
+        ManagedAgents::new(self.client, &self.registry)?.answer_hooks_trust(agent)
+    }
+
     fn ladder_redraw(&mut self, agent: &str) -> Result<String> {
         ManagedAgents::new(self.client, &self.registry)?.redraw_pane(agent)
     }
@@ -7126,6 +7175,52 @@ mod tests {
             headless: None,
             standing: false,
         }
+    }
+
+    const HOOKS_DIALOG: &str = "Review plugin hooks\n39 new or changed hooks need your trust\n\n❯ Review hooks\n  Trust all and continue\n  Continue without trusting\n\nUp/Down to choose, Enter to confirm. Esc continues without trusting.\n";
+
+    #[test]
+    fn a_managed_muse_lane_at_the_hooks_dialog_is_answered_and_logged() {
+        // #1932: the exact dialog in this registry's Muse lane is
+        // answered per policy; other harnesses and near-misses are not.
+        let base = options();
+        let mut state = WatchState::default();
+        let mut muse = observation("lane", "blocked", Some(HOOKS_DIALOG));
+        muse.harness = Some("muse".to_owned());
+        let mut codex = observation("other", "blocked", Some(HOOKS_DIALOG));
+        codex.harness = Some("codex".to_owned());
+        let mut near = observation("near", "blocked", Some("Review plugin hooks\nContinue without trusting\n"));
+        near.harness = Some("muse".to_owned());
+        let mut probe = ScriptedProbe(vec![vec![muse, codex, near]]);
+        let mut notifier = RecordingNotifier::default();
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 1_000.0, &base);
+        assert_eq!(notifier.hooks_answers, ["lane"]);
+        assert_eq!(report["hooks_trust"].as_array().map(Vec::len), Some(1));
+        assert_eq!(report["hooks_trust"][0]["acted"], true);
+        assert!(
+            report["hooks_trust"][0]["outcome"]
+                .as_str()
+                .is_some_and(|line| line.contains("declined hook trust (39 hooks) per built-in default")),
+            "{report}"
+        );
+        // Check-only reports the dialog and answers nothing.
+        let mut state = WatchState::default();
+        let mut muse = observation("lane", "blocked", Some(HOOKS_DIALOG));
+        muse.harness = Some("muse".to_owned());
+        let mut probe = ScriptedProbe(vec![vec![muse]]);
+        let mut notifier = RecordingNotifier::default();
+        let report = watch_agents_once(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            1_000.0,
+            &WatchAgentsOptions {
+                check_only: true,
+                ..options()
+            },
+        );
+        assert!(notifier.hooks_answers.is_empty());
+        assert_eq!(report["hooks_trust"][0]["acted"], false);
     }
 
     struct ScriptedProbe(Vec<Vec<Observation>>);
@@ -8361,6 +8456,8 @@ mod tests {
         flush_fails: bool,
         /// Agents the general backstop pressed Enter in (#1560).
         presses: Vec<String>,
+        /// Agents whose hooks dialog the watcher answered (#1932).
+        hooks_answers: Vec<String>,
         /// Whether every backstop press fails (#1560).
         press_fails: bool,
         /// Notices withdrawn so a newer one replaces them, as (recipient, message ID) (#840).
@@ -8433,6 +8530,13 @@ mod tests {
             } else {
                 Ok("pressed Enter".to_owned())
             }
+        }
+
+        fn answer_hooks_trust(&mut self, agent: &str) -> Result<String> {
+            self.hooks_answers.push(agent.to_owned());
+            Ok(format!(
+                "{agent}: declined hook trust (39 hooks) per built-in default"
+            ))
         }
 
         fn ladder_redraw(&mut self, agent: &str) -> Result<String> {

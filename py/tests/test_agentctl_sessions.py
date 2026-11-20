@@ -27,6 +27,7 @@ from agentctl.profiles import (
     check_required_env,
     configuration_root,
     effective_environment,
+    hooks_trust_policy,
     load_configuration, load_profiles, permission_bypass_flag, reasoning_arguments,
     require_permission_bypass, required_env_for_launch,
     validate_muse_headless_arguments,
@@ -114,9 +115,10 @@ def test_native_conversation_is_captured_only_from_the_launched_harness(
         original_start = fake.start_pane_agent
 
         def start(name: str, kind: str, pane_id: str, arguments: tuple[str, ...], *, timeout: float,
-                  on_observed: Callable[[CustomProcessIdentity], None] | None = None) -> CustomProcessIdentity:
+                  on_observed: Callable[[CustomProcessIdentity], None] | None = None,
+                  **hooks: object) -> CustomProcessIdentity:
             # The fake's custom launcher reports no conversation unless the test supplies one.
-            identity = original_start(name, kind, pane_id, arguments, timeout=timeout, on_observed=on_observed)
+            identity = original_start(name, kind, pane_id, arguments, timeout=timeout, on_observed=on_observed, **hooks)
             fake.infos[pane_id] = replace(fake.infos[pane_id], session_agent=kind, session_value="reported-conversation")
             return identity
 
@@ -349,6 +351,42 @@ def test_project_configuration_accepts_the_shared_term_backend_key(tmp_path: Pat
     path.chmod(0o600)
     with pytest.raises(AgentDeliveryError, match="term_backend must be"):
         load_configuration(tmp_path)
+
+
+def test_hooks_trust_policy_precedence_and_fail_closed(tmp_path: Path) -> None:
+    # Built-in default: decline, with no config at all (#1932).
+    assert hooks_trust_policy(tmp_path, tmp_path / "registry") == ("decline", "built-in default")
+    # Registry default (top level) beats the built-in; a profile beats both.
+    _write_profiles(tmp_path, {
+        "plain": {"harness": "muse", "mode": "interactive", "argv": ["--approval-mode=never"]},
+        "own": {"harness": "muse", "mode": "interactive", "argv": ["--approval-mode=never"],
+                "muse_hooks_trust": "decline"},
+    })
+    path = tmp_path / ".agentctl/profiles.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["muse_hooks_trust"] = "trust"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    path.chmod(0o600)
+    registry = tmp_path / "registry"
+    assert hooks_trust_policy(tmp_path, registry, "plain") == ("trust", "registry default in profiles.json")
+    assert hooks_trust_policy(tmp_path, registry, "own") == ("decline", "profile 'own' in profiles.json")
+    assert hooks_trust_policy(tmp_path, registry) == ("trust", "registry default in profiles.json")
+    # The parsed profile carries the setting too.
+    assert load_profiles(tmp_path)[1]["own"].muse_hooks_trust == "decline"
+    # An invalid value refuses at load, at either level (fail closed).
+    document["muse_hooks_trust"] = "sometimes"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    path.chmod(0o600)
+    with pytest.raises(AgentDeliveryError, match="muse_hooks_trust must be"):
+        hooks_trust_policy(tmp_path, registry)
+    with pytest.raises(AgentDeliveryError, match="muse_hooks_trust must be"):
+        load_configuration(tmp_path)
+    document["muse_hooks_trust"] = "trust"
+    document["profiles"]["own"]["muse_hooks_trust"] = "maybe"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    path.chmod(0o600)
+    with pytest.raises(AgentDeliveryError, match="muse_hooks_trust must be"):
+        hooks_trust_policy(tmp_path, registry, "own")
 
 
 def test_project_configuration_ignores_unknown_top_level_keys_with_one_warning(
@@ -1141,7 +1179,7 @@ def test_root_slot_starts_the_harness_behind_the_relay(tmp_path: Path, monkeypat
     launched: list[tuple[str, str, str]] = []
 
     def start_relay(kind: str, pane_id: str, line: str, *, timeout: float = 30.0,
-                    on_observed: object = None) -> CustomProcessIdentity:
+                    on_observed: object = None, **hooks: object) -> CustomProcessIdentity:
         launched.append((kind, pane_id, line))
         assert callable(on_observed)
         on_observed(identity)
@@ -1442,9 +1480,10 @@ def _profile_resume_native_report(
         def custom(
             name: str, kind: str, pane_id: str, arguments: tuple[str, ...], *,
             timeout: float, on_observed: Callable[[CustomProcessIdentity], None] | None = None,
+            **hooks: object,
         ) -> CustomProcessIdentity:
             identity = original_custom(name, kind, pane_id, arguments,
-                timeout=timeout, on_observed=on_observed)
+                timeout=timeout, on_observed=on_observed, **hooks)
             fake.infos[pane_id] = replace(fake.infos[pane_id],
                 session_agent=provider or kind, session_value=value)
             return identity

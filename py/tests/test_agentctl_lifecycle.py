@@ -1732,10 +1732,11 @@ def prepare_revive(
         def custom(
             name: str, kind: str, pane_id: str, arguments: tuple[str, ...], *, timeout: float,
             on_observed: Callable[[CustomProcessIdentity], None] | None = None,
+            **hooks: object,
         ) -> CustomProcessIdentity:
             fake.custom_identity = replace(fake.custom_identity, pid=200 + fake.serial,
                                            starttime_ticks=200 + fake.serial)
-            identity = original_custom(name, kind, pane_id, arguments, timeout=timeout, on_observed=on_observed)
+            identity = original_custom(name, kind, pane_id, arguments, timeout=timeout, on_observed=on_observed, **hooks)
             conversation = arguments[-1] if len(arguments) >= 2 and arguments[-2] == "resume" else "muse-native"
             fake.infos[pane_id] = replace(fake.infos[pane_id], session_agent="muse", session_value=conversation)
             return identity
@@ -2078,6 +2079,42 @@ def test_revive_preflight_refuses_conflicting_ownership_without_launch(
 
 
 @pytest.mark.parametrize("phase", ["launched", "archived", "published", "close-unknown", "close-lost-ack"])
+def test_revive_candidate_answers_the_hooks_dialog_and_is_published(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The candidate Muse shows the plugin-hooks trust dialog, then its
+    # composer (#1932): revive answers it inside the candidate flow and
+    # the revive completes on its own.
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch, harness="muse")
+    fake.hooks_dialog = True
+    result = manager.revive("worker", expected_token=old.token)
+    assert result["revived"] is True
+    assert fake.hooks_answers == [("decline", 39)]
+    assert manager.get("worker").lifecycle == "running"
+    assert "declined hook trust (39 hooks) per built-in default" in capsys.readouterr().err
+
+
+def test_revive_verification_clears_a_candidate_already_at_the_dialog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A candidate launched before the answer existed sits at the dialog
+    # with an otherwise-ready record: verification clears it first.
+    from agentctl import revive as recovery
+
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="muse",
+                  harness_args=("--approval-mode=never",))
+    record = manager.get("worker")
+    assert record.pane_id is not None
+    fake.dialog_panes.add(record.pane_id)
+    recovery._answer_candidate_hooks_trust(manager, record)
+    assert fake.hooks_answers == [("decline", 39)]
+    assert record.pane_id not in fake.dialog_panes
+    # A screen that is not the exact dialog is never answered.
+    recovery._answer_candidate_hooks_trust(manager, record)
+    assert fake.hooks_answers == [("decline", 39)]
+
+
 def test_revive_retry_reconciles_each_transaction_boundary_without_second_launch(
     phase: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

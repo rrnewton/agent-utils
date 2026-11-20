@@ -222,6 +222,8 @@ struct Document {
     launch_env: Option<Value>,
     #[serde(default)]
     required_env: Option<Value>,
+    #[serde(default)]
+    muse_hooks_trust: Option<Value>,
     profiles: UniqueMap<RawProfile>,
     #[serde(flatten)]
     unknown: UnknownKeys,
@@ -348,6 +350,8 @@ struct RawProfile {
     slot_isolation: Option<String>,
     #[serde(default)]
     required_env: Option<Value>,
+    #[serde(default)]
+    muse_hooks_trust: Option<Value>,
     /// The agent's role, one of [`ROLES`], and its protocol, one of [`PROTOCOLS`]: checked here,
     /// and read from the file by the chat bridge's latency stamps (#897).
     #[serde(default)]
@@ -1204,6 +1208,8 @@ fn validate(name: String, mut raw: RawProfile) -> Result<LaunchProfile, AgentErr
         )));
     }
     let required_env = required_names(raw.required_env.as_ref(), &format!("profile {name:?}"))?;
+    // Checked at load (#1932); launches resolve it via `hooks_trust_policy`.
+    hooks_trust_setting(raw.muse_hooks_trust.as_ref(), &format!("profile {name:?}"))?;
     // #1822: every interactive launch carries its harness's bypass flag.
     // Headless profiles are exempt at load: codex/agy headless argv is
     // empty by rule, and headless Claude is refused at start/run-headless
@@ -1359,6 +1365,7 @@ pub(crate) fn load_configuration(
     backend_value(document.term_backend.as_ref())?;
     launch_env_value(document.launch_env.as_ref())?;
     registry_required_env(document.required_env.as_ref())?;
+    hooks_trust_setting(document.muse_hooks_trust.as_ref(), "registry default")?;
     // Only a file that loads is warned about, so a refusal reads the same in both editions.
     if let Some(warning) = unknown_paths_warning(&path, unknown) {
         static WARNED: std::sync::Once = std::sync::Once::new();
@@ -1380,6 +1387,56 @@ fn wrkslots_value(value: Option<&Value>) -> Result<Option<String>, AgentError> {
             "profile config wrkslots must be an absolute path to the wrkslots command",
         )),
     }
+}
+
+/// Validate one `muse_hooks_trust` value (#1932): fail closed.
+fn hooks_trust_setting(
+    value: Option<&Value>,
+    label: &str,
+) -> Result<Option<String>, AgentError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(setting)) if setting == "decline" || setting == "trust" => {
+            Ok(Some(setting.clone()))
+        }
+        Some(other) => Err(fail(format!(
+            "{label} muse_hooks_trust must be \"decline\" or \"trust\", not {other}"
+        ))),
+    }
+}
+
+/// The Muse plugin-hooks trust answer for one launch (#1932): the
+/// per-profile `muse_hooks_trust` in profiles.json wins, then the file's
+/// top-level registry default, then the built-in "decline" (Continue
+/// without trusting). "trust" (Trust all and continue) comes back only
+/// when a setting explicitly says so; an invalid value refuses here.
+pub(crate) fn hooks_trust_policy(
+    cwd: &Path,
+    registry: &Path,
+    profile_name: Option<&str>,
+) -> Result<(String, String), AgentError> {
+    let root = configuration_root(cwd, registry, true)?;
+    let raw = registry_policy(&root.join(".agentctl"))?;
+    if let Some(object) = raw {
+        if let Some(name) = profile_name {
+            if let Some(Value::Object(profile)) = object.get("profiles").and_then(|profiles| {
+                profiles.as_object().and_then(|profiles| profiles.get(name))
+            }) {
+                if let Some(setting) = hooks_trust_setting(
+                    profile.get("muse_hooks_trust"),
+                    &format!("profile '{name}'"),
+                )? {
+                    return Ok((setting, format!("profile '{name}' in profiles.json")));
+                }
+            }
+        }
+        if let Some(setting) =
+            hooks_trust_setting(object.get("muse_hooks_trust"), "registry default")?
+        {
+            return Ok((setting, "registry default in profiles.json".to_owned()));
+        }
+    }
+    Ok(("decline".to_owned(), "built-in default".to_owned()))
 }
 
 pub(crate) fn load_profiles(
@@ -2124,6 +2181,78 @@ mod tests {
             );
         }
         fs::remove_dir_all(&registry).unwrap();
+    }
+
+    #[test]
+    fn hooks_trust_policy_precedence_and_fail_closed() {
+        // #1932: per-profile muse_hooks_trust wins, then the top-level
+        // registry default, then the built-in decline; invalid refuses.
+        let root = std::env::temp_dir().join(format!(
+            "agentctl-hooks-trust-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        let registry = root.join("registry");
+        assert_eq!(
+            hooks_trust_policy(&root, &registry, None).unwrap(),
+            ("decline".to_owned(), "built-in default".to_owned())
+        );
+        assert!(Command::new(SYSTEM_GIT)
+            .args(["init", "-q"])
+            .arg(&root)
+            .status()
+            .unwrap()
+            .success());
+        fs::write(root.join(".gitignore"), ".agentctl/\n").unwrap();
+        let directory = root.join(".agentctl");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("profiles.json");
+        let write = |text: &str| {
+            fs::write(&path, text).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        write(
+            r#"{"schema":"agentctl-profiles/v1","muse_hooks_trust":"trust","profiles":{"plain":{"harness":"muse","mode":"interactive","argv":["--approval-mode=never"]},"own":{"harness":"muse","mode":"interactive","argv":["--approval-mode=never"],"muse_hooks_trust":"decline"}}}"#,
+        );
+        assert_eq!(
+            hooks_trust_policy(&root, &registry, Some("plain")).unwrap(),
+            (
+                "trust".to_owned(),
+                "registry default in profiles.json".to_owned()
+            )
+        );
+        assert_eq!(
+            hooks_trust_policy(&root, &registry, Some("own")).unwrap(),
+            (
+                "decline".to_owned(),
+                "profile 'own' in profiles.json".to_owned()
+            )
+        );
+        assert_eq!(
+            hooks_trust_policy(&root, &registry, None).unwrap().0,
+            "trust"
+        );
+        write(
+            r#"{"schema":"agentctl-profiles/v1","muse_hooks_trust":"sometimes","profiles":{}}"#,
+        );
+        assert!(hooks_trust_policy(&root, &registry, None)
+            .unwrap_err()
+            .to_string()
+            .contains("muse_hooks_trust must be"));
+        assert!(load_configuration(&root, false)
+            .unwrap_err()
+            .to_string()
+            .contains("muse_hooks_trust must be"));
+        write(
+            r#"{"schema":"agentctl-profiles/v1","profiles":{"own":{"harness":"muse","mode":"interactive","argv":["--approval-mode=never"],"muse_hooks_trust":"maybe"}}}"#,
+        );
+        assert!(hooks_trust_policy(&root, &registry, Some("own"))
+            .unwrap_err()
+            .to_string()
+            .contains("muse_hooks_trust must be"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -28,6 +28,22 @@ import agentctl.legacy_cli as cli
 import agentctl.codex_goal as native_goal
 
 
+#: Muse's plugin-hooks trust dialog, as the installed Muse draws it (#1932).
+HOOKS_TRUST_DIALOG_TEXT = (
+    "Review plugin hooks\n"
+    "39 new or changed hooks need your trust\n"
+    "\n"
+    "Hooks run commands on your machine when their event matches.\n"
+    "Approval follows the declaration, including after script updates.\n"
+    "\n"
+    "❯ Review hooks\n"
+    "  Trust all and continue\n"
+    "  Continue without trusting\n"
+    "\n"
+    "Up/Down to choose, Enter to confirm. Esc continues without trusting.\n"
+)
+
+
 class FakeManagedClient:
     def __init__(self) -> None:
         self.workspace: str | None = None
@@ -50,6 +66,12 @@ class FakeManagedClient:
         self.custom_fails_after_observation = False
         self.custom_running = False
         self.custom_at_idle_shell = True
+        #: Muse plugin-hooks trust dialog simulation (#1932): when set, a
+        #: muse launch sits at the dialog until the launch answers it.
+        self.hooks_dialog = False
+        self.hooks_answers: list[tuple[str, int | None]] = []
+        #: Panes whose visible screen is the dialog right now (candidate flow).
+        self.dialog_panes: set[str] = set()
         self.custom_identity = CustomProcessIdentity(
             version=1, boot_id="00000000-0000-0000-0000-000000000000",
             pid=200, starttime_ticks=200, executable_device=1, executable_inode=2,
@@ -212,10 +234,18 @@ class FakeManagedClient:
     def start_pane_agent(
         self, name: str, kind: str, pane_id: str, arguments: tuple[str, ...], *, timeout: float,
         on_observed: Callable[[CustomProcessIdentity], None] | None = None,
+        hooks_trust: str | None = None,
+        on_hooks_trust: object = None,
+        on_hooks_trust_refused: object = None,
     ) -> CustomProcessIdentity:
         assert timeout > 0
         self.launched.append((name, kind, pane_id, arguments))
         self.custom_running = True
+        if self.hooks_dialog and hooks_trust is not None:
+            # The real client answers the dialog during launch (#1932).
+            self.hooks_answers.append((hooks_trust, 39))
+            if callable(on_hooks_trust):
+                on_hooks_trust(hooks_trust, 39)
         if on_observed is not None:
             on_observed(self.custom_identity)
         if self.custom_fails_after_observation:
@@ -314,7 +344,19 @@ class FakeManagedClient:
 
     def read(self, pane_id: str, *, source: str, lines: int) -> str:
         assert pane_id in self.infos and lines > 0
+        if pane_id in self.dialog_panes and source == "visible":
+            return HOOKS_TRUST_DIALOG_TEXT
         return "" if source == "recent-unwrapped" else "human and coordinator transcript\n"
+
+    def answer_hooks_trust_dialog(
+        self, pane_id: str, decision: str, *, deadline: float,
+    ) -> tuple[bool, int | None]:
+        assert pane_id in self.infos and decision in ("decline", "trust")
+        if pane_id not in self.dialog_panes:
+            return (False, None)
+        self.dialog_panes.discard(pane_id)
+        self.hooks_answers.append((decision, 39))
+        return (True, 39)
 
     def read_scrollback(self, pane_id: str) -> str:
         assert pane_id in self.infos
@@ -1485,6 +1527,53 @@ def test_muse_ultra_start_carries_the_gate_and_status_reports_only_real_drift(
         "fields": ["environment_names"],
         "fix": "agentctl restart worker --refresh-profile",
     }
+
+
+def test_muse_start_answers_the_hooks_dialog_and_delivers_the_brief(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Fake Muse shows the plugin-hooks trust dialog, then its composer
+    # (#1932): the start answers it (built-in decline), delivers the
+    # brief, and the record promotes to running.
+    manager, fake = setup(tmp_path, monkeypatch)
+    fake.hooks_dialog = True
+    status = manager.start(
+        "worker", cwd=str(tmp_path), harness="muse", brief="do the thing",
+    )
+    assert fake.hooks_answers == [("decline", 39)]
+    assert fake.submitted == ["do the thing"]
+    assert status["lifecycle"] == "running"
+    assert "declined hook trust (39 hooks) per built-in default" in capsys.readouterr().err
+
+
+def test_muse_start_trusts_hooks_only_under_an_explicit_trust_setting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    subprocess.run(["/usr/bin/git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
+    directory = tmp_path / ".agentctl"
+    directory.mkdir(mode=0o700)
+    config = directory / "profiles.json"
+    config.write_text(json.dumps({
+        "schema": "agentctl-profiles/v1",
+        "muse_hooks_trust": "decline",
+        "profiles": {"muse-x": {
+            "harness": "muse", "mode": "interactive",
+            "argv": ["--approval-mode=never"], "env": {},
+            "muse_hooks_trust": "trust",
+        }},
+    }), encoding="utf-8")
+    config.chmod(0o600)
+    fake.hooks_dialog = True
+    manager.start(
+        "worker", cwd=str(tmp_path), harness="muse", profile="muse-x",
+        brief="do the thing",
+    )
+    # The profile's explicit trust beats the registry's decline.
+    assert fake.hooks_answers == [("trust", 39)]
+    assert fake.submitted == ["do the thing"]
+    assert "trusted all hooks (39 hooks) per profile 'muse-x' in profiles.json" in capsys.readouterr().err
 
 
 def test_interactive_start_rejects_string_harness_arguments_before_allocation(

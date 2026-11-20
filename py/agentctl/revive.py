@@ -9,6 +9,7 @@ import os
 import re
 import stat
 import subprocess
+import sys
 import time
 import uuid
 from contextlib import nullcontext
@@ -17,9 +18,9 @@ from pathlib import Path
 from typing import cast
 
 from agentctl import agent, launch_spec, registry_layout, sender_header
-from agentctl.client import AgentPaneInfo, CustomProcessIdentity, HerdrClient, Pane, herdr_error_code
+from agentctl.client import AgentPaneInfo, CustomProcessIdentity, HerdrClient, Pane, herdr_error_code, muse_hooks_trust_dialog
 from agentctl.errors import AgentDeliveryError, HerdrRunError, HerdrUnavailable, RecoveryAction, _with_recovery
-from agentctl.profiles import LaunchProfile, check_required_env, configuration_root, effective_environment, load_profiles, reasoning_arguments, require_permission_bypass, required_env_for_launch, validate_structured_harness_argument_conflicts
+from agentctl.profiles import LaunchProfile, check_required_env, configuration_root, effective_environment, hooks_trust_policy, load_profiles, reasoning_arguments, require_permission_bypass, required_env_for_launch, validate_structured_harness_argument_conflicts
 from agentctl.subagents import (
     AgentRecord, ManagedAgents, _MAX_AGENT_RECORD_BYTES, _NAME, _SHA256,
     _PinnedAgentDirectory, _missing_target, _name, _native_session,
@@ -880,11 +881,43 @@ def _candidate_manager(manager: ManagedAgents, old: AgentRecord, proof: dict[str
     return candidate_manager
 
 
+def _answer_candidate_hooks_trust(manager: ManagedAgents, candidate: AgentRecord) -> None:
+    """Clear a Muse candidate's plugin-hooks trust dialog before verifying it (#1932).
+
+    A candidate launched before this answer existed (or by a launch
+    that never reached it) can sit at the dialog while its record is
+    otherwise ready; answer per the registry's policy, then let the
+    verification below judge the composer it lands on. Only the exact
+    dialog is answered; a near-miss is left for verification to name.
+    """
+    if candidate.harness != "muse" or not candidate.pane_id:
+        return
+    answer = getattr(manager.client, "answer_hooks_trust_dialog", None)
+    read = getattr(manager.client, "read", None)
+    if answer is None or read is None:
+        return
+    screen = read(candidate.pane_id, source="visible", lines=200)
+    if not muse_hooks_trust_dialog(screen):
+        return
+    decision, source = hooks_trust_policy(candidate.cwd, manager.registry, candidate.profile)
+    answered, count = answer(
+        candidate.pane_id, decision, deadline=time.monotonic() + 30.0,
+    )
+    if answered:
+        verb = "trusted all hooks" if decision == "trust" else "declined hook trust"
+        shown = f"{count} hooks" if count is not None else "hook count not shown"
+        print(
+            f"agentctl: {candidate.name}: {verb} ({shown}) per {source}",
+            file=sys.stderr,
+        )
+
+
 def _ready(manager: ManagedAgents, candidate: AgentRecord, old: AgentRecord, proof: dict[str, object]) -> None:
     if (candidate.lifecycle != "running" or not _same_policy(candidate, old, _profile_refresh(manager, old))
             or candidate.terminal_id is None or (candidate.harness_anchor is None if candidate.adapter == "herdr"
                                                else candidate.custom_process_identity is None)):
         raise AgentDeliveryError("revive candidate lacks the recorded policy or independent runtime anchors")
+    _answer_candidate_hooks_trust(manager, candidate)
     verifier = _candidate_manager(manager, old, proof)
     agent.resolve_target(verifier.client, manager._target(candidate))
     verifier._checked(candidate)

@@ -22,6 +22,8 @@ from agentctl.client import (
     HerdrClient,
     ProcessInfo,
     muse_auto_review_idle_composer,
+    muse_hooks_trust_count,
+    muse_hooks_trust_dialog,
     muse_hooks_trust_prompt,
     muse_idle_composer,
     muse_prompt_in_composer,
@@ -858,6 +860,149 @@ def test_custom_muse_launch_names_the_hooks_trust_dialog_and_never_answers_it() 
     # Nothing was typed and no agent was reported: the dialog is only named.
     assert not any(call[1:3] == ["pane", "report-agent"] for call in calls)
     assert not any(call[1:2] == ["pane"] and "send" in call[2] for call in calls)
+
+
+_HOOKS_OPTIONS = ("Review hooks", "Trust all and continue", "Continue without trusting")
+_MUSE_COMPOSER = (
+    "Muse Code 1.4.24\n\n"
+    "────────────────\n❯\n────────────────\n"
+    "kiki · xhigh · /work/project · YOLO\n"
+)
+
+
+def _hooks_dialog(selection: int) -> str:
+    lines = [
+        "Review plugin hooks",
+        "39 new or changed hooks need your trust",
+        "",
+        "Hooks run commands on your machine when their event matches.",
+        "Approval follows the declaration, including after script updates.",
+        "",
+    ]
+    lines += [
+        ("❯ " if index == selection else "  ") + option
+        for index, option in enumerate(_HOOKS_OPTIONS)
+    ]
+    lines += ["", "Up/Down to choose, Enter to confirm. Esc continues without trusting.", ""]
+    return "\n".join(lines)
+
+
+class _DialogRunner:
+    """A fake Muse: the hooks dialog until Enter confirms a selection."""
+
+    def __init__(self, screen: str) -> None:
+        self.screen = screen
+        self.selection = 0
+        self.confirmed: int | None = None
+        self.keys: list[str] = []
+        self.calls: list[list[str]] = []
+        self.executable = os.path.realpath("/bin/true")
+
+    def run(self, command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        argv = list(command)
+        self.calls.append(argv)
+        if argv[1:3] == ["pane", "process-info"]:
+            output = {"result": {"process_info": {
+                "pane_id": "p1", "shell_pid": 10, "foreground_process_group_id": 11,
+                "foreground_processes": [{
+                    "pid": 2_147_483_647, "name": "true",
+                    "cmdline": f"{self.executable} literal",
+                    "argv": [self.executable, "literal"], "executable": self.executable,
+                }],
+            }}}
+            return subprocess.CompletedProcess(argv, 0, json.dumps(output), "")
+        if argv[1:3] == ["pane", "read"]:
+            screen = self.screen
+            if screen == HOOKS_TRUST_DIALOG and self.confirmed is None:
+                screen = _hooks_dialog(self.selection)
+            elif self.confirmed is not None:
+                screen = _MUSE_COMPOSER
+            return subprocess.CompletedProcess(argv, 0, screen, "")
+        if argv[1:3] == ["pane", "send-keys"]:
+            key = argv[4]
+            self.keys.append(key)
+            if key == "Down":
+                self.selection = min(2, self.selection + 1)
+            elif key == "Enter" and self.screen == HOOKS_TRUST_DIALOG:
+                self.confirmed = self.selection
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[1:3] == ["pane", "get"]:
+            output = {"result": {"pane": {
+                "pane_id": "p1", "workspace_id": "w1", "cwd": "/work/project",
+                "agent": "muse", "agent_status": "idle", "agent_session": None,
+            }}}
+            return subprocess.CompletedProcess(argv, 0, json.dumps(output), "")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    def client(self) -> HerdrClient:
+        client = HerdrClient(herdr_bin="fixture-herdr", run=self.run)
+        client._harness_executable = lambda _kind: self.executable  # type: ignore[assignment]
+        return client
+
+
+def test_hooks_trust_dialog_recognition_is_strict() -> None:
+    assert muse_hooks_trust_dialog(HOOKS_TRUST_DIALOG)
+    assert muse_hooks_trust_count(HOOKS_TRUST_DIALOG) == 39
+    # Each required element, removed or reworded, defeats the match.
+    assert not muse_hooks_trust_dialog(HOOKS_TRUST_DIALOG.replace("Review plugin hooks", "Review hooks"))
+    assert not muse_hooks_trust_dialog(HOOKS_TRUST_DIALOG.replace("Trust all and continue\n", ""))
+    assert not muse_hooks_trust_dialog(HOOKS_TRUST_DIALOG.replace("Continue without trusting", "Continue without trust"))
+    assert not muse_hooks_trust_dialog("Do you want to proceed?\n❯ Yes\n  No\n")
+    assert muse_hooks_trust_count("Review plugin hooks\nContinue without trusting\n") is None
+
+
+def test_custom_muse_launch_declines_hook_trust_and_reaches_the_composer() -> None:
+    fake = _DialogRunner(HOOKS_TRUST_DIALOG)
+    seen: list[tuple[str, int | None]] = []
+    fake.client().start_pane_agent(
+        "worker", "muse", "p1", (), timeout=5,
+        hooks_trust="decline",
+        on_hooks_trust=lambda decision, count: seen.append((decision, count)),
+    )
+    # Option 3 selected explicitly (Down, Down) and confirmed; never Esc,
+    # never option 2.
+    assert fake.keys == ["Down", "Down", "Enter"]
+    assert fake.confirmed == 2
+    assert seen == [("decline", 39)]
+    assert any(call[1:3] == ["pane", "report-agent"] for call in fake.calls)
+
+
+def test_custom_muse_launch_trusts_only_when_policy_says_trust() -> None:
+    fake = _DialogRunner(HOOKS_TRUST_DIALOG)
+    seen: list[tuple[str, int | None]] = []
+    fake.client().start_pane_agent(
+        "worker", "muse", "p1", (), timeout=5,
+        hooks_trust="trust",
+        on_hooks_trust=lambda decision, count: seen.append((decision, count)),
+    )
+    assert fake.keys == ["Down", "Enter"]
+    assert fake.confirmed == 1
+    assert seen == [("trust", 39)]
+
+
+@pytest.mark.parametrize("screen", [
+    # Loose family match (title + option 3) but option 2 reworded away:
+    # refused and reported, never answered.
+    HOOKS_TRUST_DIALOG.replace("Trust all and continue", "Trust everything"),
+    # A different trust dialog and a permission prompt are not the dialog.
+    "Do you trust this workspace?\n❯ Yes\n  No\n",
+    "Do you want to proceed?\n❯ Yes\n  No\n",
+    # Options without the title.
+    "❯ Review hooks\n  Trust all and continue\n  Continue without trusting\n",
+])
+def test_custom_muse_launch_never_answers_a_near_miss(screen: str) -> None:
+    fake = _DialogRunner(screen)
+    refused: list[bool] = []
+    with pytest.raises(HerdrUnavailable):
+        fake.client().start_pane_agent(
+            "worker", "muse", "p1", (), timeout=0.3,
+            hooks_trust="decline",
+            on_hooks_trust_refused=lambda: refused.append(True),
+        )
+    assert fake.keys == []
+    assert fake.confirmed is None
+    if muse_hooks_trust_prompt(screen):
+        assert refused == [True]
 
 
 def test_custom_muse_launch_rejects_bare_prompt_without_idle_footer() -> None:

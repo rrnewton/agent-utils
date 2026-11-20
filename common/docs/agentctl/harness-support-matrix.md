@@ -386,10 +386,20 @@ managed send checks for it before typing into an idle pane.
   dialog ("Review plugin hooks") is recognised as its own startup state
   (#1893 agentctl-launch-failed-but-live): launch readiness waits while
   it shows and names it (`waiting: hooks trust`) instead of timing out
-  as a missing idle composer, status reports the same, and nothing ever
-  answers it (`muse_hooks_trust_prompt` in `rs/agentctl/src/client.rs`,
-  `py/agentctl/client.py`; `agentctl promote` repairs the
-  `launch_failed` record once a person clears it).
+  as a missing idle composer, and status reports the same
+  (`muse_hooks_trust_prompt` in `rs/agentctl/src/client.rs`,
+  `py/agentctl/client.py`). Since #1932 the exact dialog (title plus
+  all three option texts, `muse_hooks_trust_dialog`) is also answered
+  automatically: a launch (`start`, `revive`, `restart`, `restore`,
+  including a revive candidate already parked at it) and the watchers
+  (`watch-agents`, `watch`) select an option explicitly and confirm,
+  verify the dialog is gone, and log the decision with its source. The
+  answer is the `muse_hooks_trust` setting in `.agentctl/profiles.json`
+  — per-profile `profiles.<name>.muse_hooks_trust`, then the top-level
+  registry default, then the built-in `decline` ("Continue without
+  trusting", option 3); `trust` ("Trust all and continue", option 2)
+  is sent only when a setting explicitly says so, and an invalid value
+  refuses at load. Near-miss dialogs are never answered.
 - **Unknown TUI**: none.
 
 ### Headless mode itself

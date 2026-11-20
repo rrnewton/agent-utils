@@ -154,6 +154,8 @@ class LaunchProfile:
     agentcloud: dict[str, object] | None = None
     #: Variable names this profile additionally requires at launch (#1429 launch-required-env).
     required_env: tuple[str, ...] = ()
+    #: Muse plugin-hooks trust answer (#1932): "decline" or "trust".
+    muse_hooks_trust: str | None = None
 
     def public(self) -> dict[str, object]:
         """Return discovery metadata without argument or environment values."""
@@ -667,12 +669,13 @@ def _profile(name: str, raw: object) -> LaunchProfile:
             raise AgentDeliveryError(f"profile {name!r} environment values must be NUL-free strings")
         environment.append(f"{key}={value}")
     required = _required_names(raw.get("required_env"), f"profile {name!r}")
+    hooks_trust = _hooks_trust_setting(raw.get("muse_hooks_trust"), f"profile {name!r}")
     # #1822: every interactive launch carries its harness's bypass flag.
     # Headless profiles are exempt at load: codex/agy headless argv is
     # empty by rule, and this edition runs no headless Claude.
     if mode == "interactive":
         require_permission_bypass(f'profile "{name}"', harness, argv)
-    return LaunchProfile(name, harness, mode, model, effort, argv, tuple(environment), agentcloud, required)
+    return LaunchProfile(name, harness, mode, model, effort, argv, tuple(environment), agentcloud, required, hooks_trust)
 
 
 def _workspace(value: object) -> str | None:
@@ -820,12 +823,53 @@ def _launch_env(value: object) -> LaunchEnv | None:
     return LaunchEnv(env_file, tuple(directories))
 
 
+def _hooks_trust_setting(value: object, label: str) -> str | None:
+    """Validate one `muse_hooks_trust` value (#1932): fail closed."""
+    if value is None:
+        return None
+    if value not in ("decline", "trust"):
+        raise AgentDeliveryError(
+            f"{label} muse_hooks_trust must be \"decline\" or \"trust\", not {value!r}"
+        )
+    return cast(str, value)
+
+
+def hooks_trust_policy(
+    cwd: str | Path, registry: str | Path, profile_name: str | None = None,
+) -> tuple[str, str]:
+    """The Muse plugin-hooks trust answer for one launch (#1932).
+
+    Returns (decision, source): the per-profile `muse_hooks_trust` in
+    profiles.json wins, then the file's top-level registry default, then
+    the built-in "decline" (Continue without trusting). "trust" (Trust
+    all and continue) is returned only when a setting explicitly says
+    so; an invalid value refuses here, at load.
+    """
+    root = configuration_root(cwd, registry, absent_ok=True)
+    raw = _config_object_at(root)
+    if raw is not None:
+        profiles = raw.get("profiles")
+        if profile_name is not None and isinstance(profiles, dict):
+            profile = profiles.get(profile_name)
+            if isinstance(profile, dict) and profile.get("muse_hooks_trust") is not None:
+                return (
+                    cast(str, _hooks_trust_setting(profile["muse_hooks_trust"], f"profile {profile_name!r}")),
+                    f"profile {profile_name!r} in profiles.json",
+                )
+        if raw.get("muse_hooks_trust") is not None:
+            return (
+                cast(str, _hooks_trust_setting(raw["muse_hooks_trust"], "registry default")),
+                "registry default in profiles.json",
+            )
+    return ("decline", "built-in default")
+
+
 # Unknown top-level keys are warned about once and ignored rather than refused, so a key a newer
 # agentctl adds never breaks an older one reading the same file. Keys inside a profile stay strict.
-_KNOWN_TOP_LEVEL_KEYS = frozenset({"schema", "profiles", "workspace", "wrkslots", "term_backend", "launch_env", "required_env"})
+_KNOWN_TOP_LEVEL_KEYS = frozenset({"schema", "profiles", "workspace", "wrkslots", "term_backend", "launch_env", "required_env", "muse_hooks_trust"})
 _PROFILE_FIELDS = frozenset({
     "harness", "mode", "model", "reasoning_effort", "argv", "env", "agentcloud", "record_edges",
-    "role", "protocol", "required_env",
+    "role", "protocol", "required_env", "muse_hooks_trust",
 })
 _ROLES = ("coordinator", "liaison", "coordinator-hands", "worker")
 _PROTOCOLS = ("self-tooling", "hands-delegating")
@@ -903,6 +947,7 @@ def load_configuration(
     _wrkslots(raw.get("wrkslots"))
     _term_backend(raw.get("term_backend"))
     _launch_env(raw.get("launch_env"))
+    _hooks_trust_setting(raw.get("muse_hooks_trust"), "registry default")
     workspace = _workspace(raw.get("workspace"))
     # Only a file that loads is warned about, so a refusal reads the same in both editions.
     warning = unknown_keys_warning(path, _unknown_key_paths(raw))

@@ -414,7 +414,7 @@ def relay_worker(
     )
 
     def start_relay(kind: str, pane_id: str, line: str, *, timeout: float = 30.0,
-                    on_observed: object = None) -> CustomProcessIdentity:
+                    on_observed: object = None, **hooks: object) -> CustomProcessIdentity:
         assert callable(on_observed)
         on_observed(identity)
         return identity

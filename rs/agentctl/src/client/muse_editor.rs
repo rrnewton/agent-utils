@@ -733,7 +733,8 @@ pub(crate) fn muse_screen_has_composer(screen: &str) -> bool {
 pub(crate) fn muse_verified_pane_status(reported_status: &str, screen: &str) -> &'static str {
     // The plugin-hooks trust dialog is a pane waiting on a person, named as
     // itself whatever the terminal host reports (#1893
-    // agentctl-launch-failed-but-live). Nothing ever answers it.
+    // agentctl-launch-failed-but-live); launches and the watchers answer
+    // the exact dialog per policy (#1932), status only names it.
     if crate::client::muse_hooks_trust_prompt(screen) {
         return "waiting: hooks trust";
     }

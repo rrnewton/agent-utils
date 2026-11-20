@@ -61,6 +61,7 @@ from agentctl.profiles import (
     blocking_question_warning,
     check_required_env,
     effective_environment,
+    hooks_trust_policy,
     load_profiles,
     reasoning_arguments,
     required_env_for_launch,
@@ -3923,6 +3924,31 @@ class ManagedAgents:
     ) -> None:
         """Launch into the record's storage destination and capture independent anchors."""
         name, harness, arguments = record.name, record.harness, tuple(record.arguments)
+        # Muse's plugin-hooks trust dialog answer for this launch
+        # (#1932): resolved from profiles.json (profile, then registry
+        # default, then built-in decline); logged, never persisted.
+        hooks_trust: str | None = None
+        hooks_source = ""
+        if harness == "muse":
+            hooks_trust, hooks_source = hooks_trust_policy(
+                record.cwd, self.registry, record.profile,
+            )
+
+        def note_hooks_trust(decision: str, count: int | None) -> None:
+            verb = "trusted all hooks" if decision == "trust" else "declined hook trust"
+            shown = f"{count} hooks" if count is not None else "hook count not shown"
+            print(
+                f"agentctl: {name}: {verb} ({shown}) per {hooks_source}",
+                file=sys.stderr,
+            )
+
+        def note_hooks_trust_refused() -> None:
+            print(
+                f"agentctl: warning: {name}: a hooks dialog in pane {record.pane_id} "
+                "is not the exact plugin-hooks trust dialog; not answering it",
+                file=sys.stderr,
+            )
+
         launch_env = self._project_launch_env()
         if launch_env is not None and relay_command is not None:
             raise HerdrUnavailable(_LAUNCH_ENV_RELAY_REFUSAL)
@@ -3948,6 +3974,8 @@ class ManagedAgents:
             self.client.start_relay_agent(
                 harness, record.pane_id, relay_command,
                 timeout=startup_timeout, on_observed=persist_relay,
+                hooks_trust=hooks_trust, on_hooks_trust=note_hooks_trust,
+                on_hooks_trust_refused=note_hooks_trust_refused,
             )
             record.pane_reported_by_agentctl = True
             self._save(record)
@@ -3965,16 +3993,22 @@ class ManagedAgents:
                     start_in_box(
                         name, harness, record.pane_id, arguments,
                         timeout=startup_timeout, on_observed=persist_identity,
+                        hooks_trust=hooks_trust, on_hooks_trust=note_hooks_trust,
+                        on_hooks_trust_refused=note_hooks_trust_refused,
                     )
                 else:
                     self.client.start_pane_agent(
                         name, harness, record.pane_id, arguments,
                         timeout=startup_timeout, on_observed=persist_identity,
+                        hooks_trust=hooks_trust, on_hooks_trust=note_hooks_trust,
+                        on_hooks_trust_refused=note_hooks_trust_refused,
                     )
             else:
                 self.client.start_pane_agent(
                     name, harness, record.pane_id, arguments,
                     timeout=startup_timeout, on_observed=persist_identity,
+                    hooks_trust=hooks_trust, on_hooks_trust=note_hooks_trust,
+                    on_hooks_trust_refused=note_hooks_trust_refused,
                 )
             record.pane_reported_by_agentctl = True
             self._save(record)

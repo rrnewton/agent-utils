@@ -738,12 +738,68 @@ pub(crate) fn muse_trust_prompt(screen: &str) -> bool {
 /// continues without trusting) (#1893 agentctl-launch-failed-but-live).
 ///
 /// The dialog takes the pane before any composer exists, so a launch that only
-/// waits for an idle composer reads it as a launch that never came up. It is a
-/// pane waiting on a person: recognised here so launch and status can name it.
-/// Nothing in agentctl ever answers it.
+/// waits for an idle composer reads it as a launch that never came up. This
+/// loose match only names the state; answering takes the strict match in
+/// [`muse_hooks_trust_dialog`].
 pub(crate) fn muse_hooks_trust_prompt(screen: &str) -> bool {
     let lowered = screen.to_ascii_lowercase();
     lowered.contains("review plugin hooks") && lowered.contains("continue without trusting")
+}
+
+const HOOKS_TRUST_OPTIONS: [&str; 3] = [
+    "review hooks",
+    "trust all and continue",
+    "continue without trusting",
+];
+
+/// Whether `screen` is exactly Muse's plugin-hooks trust dialog (#1932):
+/// the "Review plugin hooks" title AND all three option texts must match.
+/// Anything else (a permission prompt, a different trust dialog, an
+/// approve-command prompt) is never answered; if option 3's text is
+/// missing or reworded this is false and the caller refuses to act.
+pub(crate) fn muse_hooks_trust_dialog(screen: &str) -> bool {
+    let lowered = screen.to_ascii_lowercase();
+    lowered.contains("review plugin hooks")
+        && HOOKS_TRUST_OPTIONS
+            .iter()
+            .all(|option| lowered.contains(option))
+}
+
+/// The hook count the dialog shows ("N new or changed hooks"), if any.
+pub(crate) fn muse_hooks_trust_count(screen: &str) -> Option<u32> {
+    let lowered = screen.to_ascii_lowercase();
+    let start = lowered.find(" new or changed hooks need your trust")?;
+    let digits: String = lowered[..start]
+        .chars()
+        .rev()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    digits.parse().ok()
+}
+
+/// The dialog option the `❯` cursor sits on, lowercased, if drawn.
+fn muse_selected_option(screen: &str) -> Option<String> {
+    screen.lines().find_map(|line| {
+        line.trim_start()
+            .strip_prefix('❯')
+            .map(|rest| rest.trim().to_ascii_lowercase())
+    })
+}
+
+/// A launch's plugin-hooks trust answer (#1932): the policy decision and
+/// the two outcomes the launch layer logs. "decline" selects option 3
+/// ("Continue without trusting"), "trust" option 2 ("Trust all and
+/// continue"); Esc is never the answer.
+pub struct HooksTrustAnswer<'a> {
+    /// The policy decision: "decline" or "trust".
+    pub decision: &'a str,
+    /// Called with the decision and shown hook count after confirming.
+    pub answered: &'a mut dyn FnMut(&str, Option<u32>),
+    /// Called once when a near-miss dialog is seen and not answered.
+    pub refused: &'a mut dyn FnMut(),
 }
 
 /// Muse's ruled editor, its status order and the proofs that input reached it.
@@ -2185,11 +2241,74 @@ impl HerdrClient {
         Ok(())
     }
 
+    /// Answer Muse's plugin-hooks trust dialog in this exact pane (#1932).
+    ///
+    /// `decision` is the caller's policy: "decline" selects option 3
+    /// ("Continue without trusting"), "trust" option 2 ("Trust all and
+    /// continue"). The option is selected explicitly (Down, then Enter;
+    /// Esc is never the answer). The screen is re-read and the strict
+    /// dialog re-verified right before every keypress, so a stale or
+    /// changed screen is never answered. `(false, ..)` means the pane no
+    /// longer shows the exact dialog and nothing was confirmed.
+    pub fn answer_hooks_trust_dialog(
+        &self,
+        pane_id: &str,
+        decision: &str,
+        deadline: Instant,
+    ) -> Result<(bool, Option<u32>)> {
+        if decision != "decline" && decision != "trust" {
+            return Err(AdapterError::unavailable(format!(
+                "unknown hooks-trust decision {decision:?}"
+            )));
+        }
+        let screen = self.read(pane_id, "visible", Some(200))?;
+        if !muse_hooks_trust_dialog(&screen) {
+            return Ok((false, None));
+        }
+        let count = muse_hooks_trust_count(&screen);
+        let steps: &[&str] = if decision == "trust" {
+            &["trust all and continue"]
+        } else {
+            &["trust all and continue", "continue without trusting"]
+        };
+        for expected in steps {
+            self.send_keys(pane_id, "Down")?;
+            // Wait until the cursor visibly sits on the next option (or
+            // the dialog went away) before sending anything else.
+            while Instant::now() < deadline {
+                let current =
+                    muse_selected_option(&self.read(pane_id, "visible", Some(200))?);
+                if current.as_deref().is_none_or(|text| text.contains(expected)) {
+                    break;
+                }
+                thread::sleep(
+                    Duration::from_millis(50)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+        }
+        // Re-read right before confirming: a screen that changed out of
+        // the exact dialog is refused, never answered from a stale read.
+        let screen = self.read(pane_id, "visible", Some(200))?;
+        if !muse_hooks_trust_dialog(&screen) {
+            return Ok((false, count));
+        }
+        let target = steps[steps.len() - 1];
+        if muse_selected_option(&screen)
+            .is_some_and(|selected| !selected.contains(target))
+        {
+            return Ok((false, count));
+        }
+        self.send_keys(pane_id, "Enter")?;
+        Ok((true, count))
+    }
+
     /// Launch an otherwise unsupported TUI through one exact pane.
     ///
     /// This path never supplies input to a workspace-trust prompt. It proves
     /// the foreground executable, publishes a pane-local agent report, and
     /// re-reads that exact pane rather than consulting a name registry.
+    #[allow(clippy::too_many_arguments)]
     pub fn start_pane_agent(
         &self,
         _name: &str,
@@ -2198,6 +2317,7 @@ impl HerdrClient {
         arguments: &[String],
         timeout: Duration,
         persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> Result<()>,
+        hooks_trust: Option<HooksTrustAnswer<'_>>,
     ) -> Result<()> {
         self.start_pane_agent_boxed(
             _name,
@@ -2207,11 +2327,13 @@ impl HerdrClient {
             timeout,
             persist_identity,
             false,
+            hooks_trust,
         )
     }
 
     /// [`Self::start_pane_agent`] inside a slot box: the adapter's boxed
     /// executable and arguments replace the launcher's (the box is the sandbox).
+    #[allow(clippy::too_many_arguments)]
     pub fn start_pane_agent_in_box(
         &self,
         name: &str,
@@ -2220,6 +2342,7 @@ impl HerdrClient {
         arguments: &[String],
         timeout: Duration,
         persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> Result<()>,
+        hooks_trust: Option<HooksTrustAnswer<'_>>,
     ) -> Result<()> {
         self.start_pane_agent_boxed(
             name,
@@ -2229,9 +2352,11 @@ impl HerdrClient {
             timeout,
             persist_identity,
             true,
+            hooks_trust,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn start_pane_agent_boxed(
         &self,
@@ -2242,6 +2367,7 @@ impl HerdrClient {
         timeout: Duration,
         persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> Result<()>,
         boxed: bool,
+        mut hooks_trust: Option<HooksTrustAnswer<'_>>,
     ) -> Result<()> {
         if timeout.is_zero() || timeout > Duration::from_secs(300) {
             return Err(AdapterError::unavailable(
@@ -2317,6 +2443,8 @@ impl HerdrClient {
         persist_identity(observed.clone())?;
         let mut ready = false;
         let mut hooks_waiting = false;
+        let mut hooks_answered = false;
+        let mut hooks_refused_noted = false;
         while Instant::now() < deadline {
             if !self.recorded_custom_harness_observed(pane_id, &observed, &|| false)? {
                 return Err(AdapterError::unavailable(format!(
@@ -2331,11 +2459,32 @@ impl HerdrClient {
                     "{kind} workspace trust prompt requires human attention; no input was submitted"
                 )));
             }
-            // The hooks-trust dialog is a known startup state, not a composer
-            // that never comes up: keep waiting while it shows (a person may
-            // clear it mid-launch), and name it if the bound expires with it
-            // still up (#1893 agentctl-launch-failed-but-live). Nothing ever
-            // answers it.
+            // The exact hooks-trust dialog in a pane this launch just
+            // started is answered per policy (#1932): select the policy's
+            // option, confirm, then keep waiting for the composer. A
+            // looser match only names the wait, as before (#1893), and a
+            // near-miss is reported once and never answered.
+            if kind == "muse" {
+                if let Some(hooks) = hooks_trust.as_mut() {
+                    if muse_hooks_trust_dialog(&screen) {
+                        if !hooks_answered {
+                            let (answered, count) = self.answer_hooks_trust_dialog(
+                                pane_id,
+                                hooks.decision,
+                                deadline,
+                            )?;
+                            if answered {
+                                hooks_answered = true;
+                                (hooks.answered)(hooks.decision, count);
+                                continue;
+                            }
+                        }
+                    } else if muse_hooks_trust_prompt(&screen) && !hooks_refused_noted {
+                        hooks_refused_noted = true;
+                        (hooks.refused)();
+                    }
+                }
+            }
             hooks_waiting = muse_hooks_trust_prompt(&screen);
             // The process generation is pinned and re-verified around every
             // read, so the headerless verified-process proof applies: a
@@ -2667,6 +2816,7 @@ impl HerdrClient {
         command_line: &str,
         timeout: Duration,
         persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> Result<()>,
+        mut hooks_trust: Option<HooksTrustAnswer<'_>>,
     ) -> Result<CustomProcessIdentity> {
         if timeout.is_zero() || timeout > Duration::from_secs(300) {
             return Err(AdapterError::unavailable(
@@ -2713,6 +2863,8 @@ impl HerdrClient {
         persist_identity(observed.clone())?;
         self.report_pane_agent(pane_id, kind, "unknown")?;
         let mut state = "unknown".to_owned();
+        let mut hooks_answered = false;
+        let mut hooks_refused_noted = false;
         loop {
             if Instant::now() >= deadline {
                 return Err(AdapterError::unavailable(format!(
@@ -2734,9 +2886,31 @@ impl HerdrClient {
             let (agent, observed_state) = self.explain_agent(pane_id)?;
             let screen = self.read_screen_with_cancellation(pane_id, &|| false)?;
             state = relay_screen_state(kind, &observed_state, &screen);
-            // The hooks-trust dialog names the wait in the bound's error
-            // below; nothing ever answers it (#1893).
-            if muse_hooks_trust_prompt(&crate::harness_tui::plain(&screen)) {
+            let plain = crate::harness_tui::plain(&screen);
+            // The exact hooks-trust dialog in a pane this launch just
+            // started is answered per policy (#1932); anything looser
+            // only names the wait, as before (#1893).
+            if kind == "muse" {
+                if let Some(hooks) = hooks_trust.as_mut() {
+                    if muse_hooks_trust_dialog(&plain) {
+                        if !hooks_answered {
+                            let (answered, count) = self.answer_hooks_trust_dialog(
+                                pane_id,
+                                hooks.decision,
+                                deadline,
+                            )?;
+                            if answered {
+                                hooks_answered = true;
+                                (hooks.answered)(hooks.decision, count);
+                            }
+                        }
+                    } else if muse_hooks_trust_prompt(&plain) && !hooks_refused_noted {
+                        hooks_refused_noted = true;
+                        (hooks.refused)();
+                    }
+                }
+            }
+            if muse_hooks_trust_prompt(&plain) {
                 state = "waiting: hooks trust".to_owned();
             }
             // Herdr's title rule can read idle before the harness has drawn anything; the
@@ -4270,6 +4444,122 @@ mod tests {
             "─".repeat(40),
             "─".repeat(40)
         )));
+    }
+
+    #[test]
+    fn hooks_trust_recognition_is_strict() {
+        // #1932: title AND all three options, or it is not answered.
+        assert!(muse_hooks_trust_dialog(HOOKS_TRUST_DIALOG));
+        assert_eq!(muse_hooks_trust_count(HOOKS_TRUST_DIALOG), Some(39));
+        assert_eq!(
+            muse_selected_option(HOOKS_TRUST_DIALOG).as_deref(),
+            Some("review hooks")
+        );
+        assert!(!muse_hooks_trust_dialog(
+            &HOOKS_TRUST_DIALOG.replace("Review plugin hooks", "Review hooks")
+        ));
+        assert!(!muse_hooks_trust_dialog(
+            &HOOKS_TRUST_DIALOG.replace("Trust all and continue\n", "")
+        ));
+        assert!(!muse_hooks_trust_dialog(
+            &HOOKS_TRUST_DIALOG.replace("Continue without trusting", "Continue without trust")
+        ));
+        assert!(!muse_hooks_trust_dialog("Do you want to proceed?\n❯ Yes\n  No\n"));
+        assert_eq!(
+            muse_hooks_trust_count("Review plugin hooks\nContinue without trusting\n"),
+            None
+        );
+    }
+
+    /// A fake Muse herdr: the hooks dialog until Enter confirms.
+    #[cfg(target_os = "linux")]
+    fn dialog_herdr(root: &std::path::Path) -> HerdrClient {
+        let script = r#"#!/usr/bin/python3
+import pathlib, sys
+here = pathlib.Path(__file__).parent
+state = here / "state"
+keys = here / "keys"
+sel = int(state.read_text()) if state.exists() else 0
+args = sys.argv[1:]
+if args[:2] == ["pane", "read"]:
+    if (here / "confirmed").exists():
+        print("Muse Code 1.4.24\n\n────────────────\n❯\n────────────────\nkiki · xhigh · /work/project · YOLO")
+    else:
+        options = ["Review hooks", "Trust all and continue", "Continue without trusting"]
+        lines = ["Review plugin hooks", "39 new or changed hooks need your trust", ""]
+        lines += [("❯ " if i == sel else "  ") + option for i, option in enumerate(options)]
+        lines += ["", "Up/Down to choose, Enter to confirm. Esc continues without trusting."]
+        print("\n".join(lines))
+elif args[:2] == ["pane", "send-keys"]:
+    key = args[3]
+    with keys.open("a") as handle:
+        handle.write(key + "\n")
+    if key == "Down":
+        state.write_text(str(min(2, sel + 1)))
+    elif key == "Enter":
+        (here / "confirmed").write_text(str(sel))
+"#;
+        fs::write(root.join("herdr"), script).unwrap();
+        fs::set_permissions(root.join("herdr"), fs::Permissions::from_mode(0o700)).unwrap();
+        HerdrClient::with_executable("direct", &root.join("herdr")).unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn answering_the_hooks_dialog_selects_the_policy_option() {
+        let _guard = EXECUTABLE_FIXTURE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (decision, expected_keys, confirmed) in [
+            ("decline", "Down\nDown\nEnter\n", "2"),
+            ("trust", "Down\nEnter\n", "1"),
+        ] {
+            let root = std::env::temp_dir().join(format!(
+                "agentctl-hooks-answer-{}-{}-{decision}",
+                std::process::id(),
+                SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&root).unwrap();
+            let client = dialog_herdr(&root);
+            let (answered, count) = client
+                .answer_hooks_trust_dialog(
+                    "p1",
+                    decision,
+                    Instant::now() + Duration::from_secs(30),
+                )
+                .unwrap();
+            assert_eq!((answered, count), (true, Some(39)), "{decision}");
+            assert_eq!(
+                fs::read_to_string(root.join("keys")).unwrap(),
+                expected_keys,
+                "{decision}: option selected explicitly, never Esc"
+            );
+            assert_eq!(
+                fs::read_to_string(root.join("confirmed")).unwrap(),
+                confirmed,
+                "{decision}"
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+        // A screen that is not the exact dialog is never answered.
+        let root = std::env::temp_dir().join(format!(
+            "agentctl-hooks-answer-{}-{}-miss",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("confirmed"), "x").unwrap();
+        let client = dialog_herdr(&root);
+        let (answered, _) = client
+            .answer_hooks_trust_dialog(
+                "p1",
+                "decline",
+                Instant::now() + Duration::from_secs(30),
+            )
+            .unwrap();
+        assert!(!answered);
+        assert!(!root.join("keys").exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

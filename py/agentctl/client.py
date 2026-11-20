@@ -185,11 +185,49 @@ def muse_hooks_trust_prompt(screen: str) -> bool:
 
     "Review plugin hooks" with "Continue without trusting" (Esc continues
     without trusting) takes the pane before any composer exists (#1893
-    agentctl-launch-failed-but-live). It is a pane waiting on a person;
-    nothing in agentctl ever answers it.
+    agentctl-launch-failed-but-live). This loose match only names the
+    state; answering takes the strict match in `muse_hooks_trust_dialog`.
     """
     lowered = screen.lower()
     return "review plugin hooks" in lowered and "continue without trusting" in lowered
+
+
+_HOOKS_TRUST_OPTIONS = (
+    "review hooks",
+    "trust all and continue",
+    "continue without trusting",
+)
+_HOOKS_TRUST_COUNT = re.compile(r"(\d+) new or changed hooks need your trust")
+
+
+def muse_hooks_trust_dialog(screen: str) -> bool:
+    """Whether `screen` is exactly Muse's plugin-hooks trust dialog.
+
+    Strict (#1932): the "Review plugin hooks" title AND all three option
+    texts must match. Anything else (a permission prompt, a different
+    trust dialog, an approve-command prompt) is never answered; if
+    option 3's text is missing or reworded this is False and the caller
+    refuses to act.
+    """
+    lowered = screen.lower()
+    return "review plugin hooks" in lowered and all(
+        option in lowered for option in _HOOKS_TRUST_OPTIONS
+    )
+
+
+def muse_hooks_trust_count(screen: str) -> int | None:
+    """The hook count the dialog shows ("N new or changed hooks"), if any."""
+    match = _HOOKS_TRUST_COUNT.search(screen.lower())
+    return int(match.group(1)) if match else None
+
+
+def _muse_selected_option(screen: str) -> str | None:
+    """The dialog option the `❯` cursor sits on, lowercased, if drawn."""
+    for line in screen.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("❯"):
+            return stripped[1:].strip().lower()
+    return None
 
 
 # Placeholder hints Muse draws dim inside an empty composer (Muse 1.4.23,
@@ -2265,9 +2303,60 @@ class HerdrClient:
             return "idle"
         return herdr_state
 
+    def answer_hooks_trust_dialog(
+        self, pane_id: str, decision: str, *, deadline: float,
+    ) -> tuple[bool, int | None]:
+        """Answer Muse's plugin-hooks trust dialog in this exact pane (#1932).
+
+        `decision` is the caller's policy: "decline" selects option 3
+        ("Continue without trusting"), "trust" option 2 ("Trust all and
+        continue"). The option is selected explicitly (Down, then Enter;
+        Esc is never the answer). The screen is re-read and the strict
+        dialog re-verified right before every keypress, so a stale or
+        changed screen is never answered. Returns (answered, hook count):
+        (False, ...) means the pane no longer shows the exact dialog and
+        nothing was confirmed.
+        """
+        if decision not in ("decline", "trust"):
+            raise ValueError(f"unknown hooks-trust decision {decision!r}")
+        screen = self.read(pane_id, source="visible", lines=200)
+        if not muse_hooks_trust_dialog(screen):
+            return (False, None)
+        count = muse_hooks_trust_count(screen)
+        steps = (
+            ("trust all and continue",)
+            if decision == "trust"
+            else ("trust all and continue", "continue without trusting")
+        )
+        for expected in steps:
+            self.send_keys(pane_id, "Down")
+            # Wait until the cursor visibly sits on the next option (or
+            # the dialog went away) before sending anything else.
+            while time.monotonic() < deadline:
+                current = _muse_selected_option(
+                    self.read(pane_id, source="visible", lines=200)
+                )
+                if current is None or expected in current:
+                    break
+                self._sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        # Re-read right before confirming: a screen that changed out of
+        # the exact dialog is refused, never answered from a stale read.
+        screen = self.read(pane_id, source="visible", lines=200)
+        if not muse_hooks_trust_dialog(screen):
+            return (False, count)
+        selected = _muse_selected_option(screen)
+        target = steps[-1]
+        if selected is not None and target not in selected:
+            return (False, count)
+        self.send_keys(pane_id, "Enter")
+        return (True, count)
+
     def start_relay_agent(
         self, kind: str, pane_id: str, command_line: str, *, timeout: float = 30.0,
         on_observed: Callable[[CustomProcessIdentity], None] | None = None,
+        hooks_trust: str | None = None,
+        on_hooks_trust: Callable[[str, int | None], None] | None = None,
+        on_hooks_trust_refused: Callable[[], None] | None = None,
     ) -> CustomProcessIdentity:
         """Run a slot-boxed harness behind a root relay in a fresh pane and prove it ready.
 
@@ -2305,6 +2394,8 @@ class HerdrClient:
         # Herdr evaluates screen rules only for a pane it knows as an agent.
         self.report_pane_agent(pane_id, kind, "unknown")
         state = "unknown"
+        hooks_answered = False
+        hooks_refused_noted = False
         while time.monotonic() < deadline:
             # The program may exec while it starts; any relay program still running counts.
             if self.relay_process(pane_id) is None:
@@ -2318,9 +2409,25 @@ class HerdrClient:
             agent_kind, state = self.explain_agent(pane_id)
             screen = self.read_screen(pane_id)
             state = self.relay_screen_state(kind, state, screen)
-            # The hooks-trust dialog names the wait in the bound's error
-            # below; nothing ever answers it (#1893).
-            if muse_hooks_trust_prompt(self.read(pane_id, source="visible", lines=200)):
+            plain = self.read(pane_id, source="visible", lines=200)
+            # The exact hooks-trust dialog in a pane this launch just
+            # started is answered per policy (#1932); anything looser
+            # only names the wait, as before (#1893).
+            if kind == "muse" and hooks_trust is not None:
+                if muse_hooks_trust_dialog(plain):
+                    if not hooks_answered:
+                        answered, count = self.answer_hooks_trust_dialog(
+                            pane_id, hooks_trust, deadline=deadline,
+                        )
+                        if answered:
+                            hooks_answered = True
+                            if on_hooks_trust is not None:
+                                on_hooks_trust(hooks_trust, count)
+                elif muse_hooks_trust_prompt(plain) and not hooks_refused_noted:
+                    hooks_refused_noted = True
+                    if on_hooks_trust_refused is not None:
+                        on_hooks_trust_refused()
+            if muse_hooks_trust_prompt(plain):
                 state = "waiting: hooks trust"
             # Herdr's title rule can read idle before the harness has drawn
             # anything; the verified composer on screen is the ready signal.
@@ -2360,11 +2467,16 @@ class HerdrClient:
         *, timeout: float = 30.0,
         on_observed: Callable[[CustomProcessIdentity], None] | None = None,
         boxed: bool = False,
+        hooks_trust: str | None = None,
+        on_hooks_trust: Callable[[str, int | None], None] | None = None,
+        on_hooks_trust_refused: Callable[[], None] | None = None,
     ) -> CustomProcessIdentity:
         """Launch and verify a custom TUI through one exact Herdr pane.
 
         Unknown harness kinds cannot use Herdr's native ``agent start`` path.
-        No trust-prompt input is synthesized by this adapter.
+        With `hooks_trust` set (Muse launches), the exact plugin-hooks
+        trust dialog is answered per that policy (#1932); no other
+        trust-prompt input is synthesized by this adapter.
         """
         del name
         if not 0 < timeout <= 300:
@@ -2423,6 +2535,8 @@ class HerdrClient:
             os.close(descriptor)
         ready = False
         hooks_waiting = False
+        hooks_answered = False
+        hooks_refused_noted = False
         while time.monotonic() < deadline:
             self.verify_custom_harness(pane_id, kind, observed)
             screen = self.read(pane_id, source="visible", lines=200)
@@ -2430,9 +2544,26 @@ class HerdrClient:
                 raise HerdrUnavailable(
                     f"{kind} workspace trust prompt requires human attention; no input was submitted"
                 )
-            # The hooks-trust dialog is a known startup state, not a composer
-            # that never comes up: keep waiting while it shows, and name it if
-            # the bound expires with it still up (#1893). Nothing answers it.
+            # The exact hooks-trust dialog in a pane this launch just
+            # started is answered per policy (#1932): select the policy's
+            # option, confirm, then keep waiting for the composer. A
+            # looser match only names the wait, as before (#1893), and a
+            # near-miss is reported once and never answered.
+            if kind == "muse" and hooks_trust is not None:
+                if muse_hooks_trust_dialog(screen):
+                    if not hooks_answered:
+                        answered, count = self.answer_hooks_trust_dialog(
+                            pane_id, hooks_trust, deadline=deadline,
+                        )
+                        if answered:
+                            hooks_answered = True
+                            if on_hooks_trust is not None:
+                                on_hooks_trust(hooks_trust, count)
+                            continue
+                elif muse_hooks_trust_prompt(screen) and not hooks_refused_noted:
+                    hooks_refused_noted = True
+                    if on_hooks_trust_refused is not None:
+                        on_hooks_trust_refused()
             hooks_waiting = muse_hooks_trust_prompt(screen)
             # An arrow alone is also used by choice dialogs. Muse's idle screen couples its
             # composer marker with exactly one status footer, whatever its mode says.
@@ -2460,11 +2591,16 @@ class HerdrClient:
         self, name: str, kind: str, pane_id: str, arguments: Sequence[str] = (),
         *, timeout: float = 30.0,
         on_observed: Callable[[CustomProcessIdentity], None] | None = None,
+        hooks_trust: str | None = None,
+        on_hooks_trust: Callable[[str, int | None], None] | None = None,
+        on_hooks_trust_refused: Callable[[], None] | None = None,
     ) -> CustomProcessIdentity:
         """[`start_pane_agent`] inside a slot box (the box is the sandbox)."""
         return self.start_pane_agent(
             name, kind, pane_id, arguments,
             timeout=timeout, on_observed=on_observed, boxed=True,
+            hooks_trust=hooks_trust, on_hooks_trust=on_hooks_trust,
+            on_hooks_trust_refused=on_hooks_trust_refused,
         )
 
     def agent_prompt(

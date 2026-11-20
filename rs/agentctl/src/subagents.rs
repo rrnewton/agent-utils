@@ -25,6 +25,7 @@ use sha2::{Digest, Sha256};
 use crate::agent::{self, AgentApi, AgentError, DrainOptions, QueueResult, Target};
 use crate::client::{
     muse_editor_rows_empty, muse_startup_metadata, muse_trust_prompt, muse_verified_pane_status,
+    HooksTrustAnswer,
     muse_verified_process_editor_draft, muse_verified_process_editor_rows,
     muse_verified_process_idle_composer, muse_verified_process_paste_drawn,
     muse_verified_process_paste_in_composer, muse_verified_process_paste_is_exact_composer,
@@ -1160,6 +1161,19 @@ pub trait ManagedApi: AgentApi {
             "slot relay launch is unavailable",
         ))
     }
+    /// [`Self::start_relay_agent`] answering the dialog per `hooks` (#1932).
+    fn start_relay_agent_with_hooks(
+        &self,
+        kind: &str,
+        pane: &str,
+        command_line: &str,
+        timeout: Duration,
+        persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> crate::error::Result<()>,
+        hooks: Option<HooksTrustAnswer<'_>>,
+    ) -> crate::error::Result<CustomProcessIdentity> {
+        let _ = hooks;
+        self.start_relay_agent(kind, pane, command_line, timeout, persist_identity)
+    }
     /// The program running behind a root slot relay in one pane, if any.
     fn relay_process(&self, _pane: &str) -> crate::error::Result<Option<CustomProcessIdentity>> {
         Err(crate::error::AdapterError::unavailable(
@@ -1245,6 +1259,46 @@ pub trait ManagedApi: AgentApi {
         persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> crate::error::Result<()>,
     ) -> crate::error::Result<()> {
         self.start_pane_agent(name, harness, pane, args, timeout, persist_identity)
+    }
+    /// [`Self::start_pane_agent`] answering Muse's plugin-hooks trust
+    /// dialog per `hooks` (#1932). The default keeps the plain launch.
+    #[allow(clippy::too_many_arguments)]
+    fn start_pane_agent_with_hooks(
+        &self,
+        name: &str,
+        harness: &str,
+        pane: &str,
+        args: &[String],
+        timeout: Duration,
+        persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> crate::error::Result<()>,
+        hooks: Option<HooksTrustAnswer<'_>>,
+    ) -> crate::error::Result<()> {
+        let _ = hooks;
+        self.start_pane_agent(name, harness, pane, args, timeout, persist_identity)
+    }
+    /// [`Self::start_pane_agent_in_box`] answering the dialog per `hooks`.
+    #[allow(clippy::too_many_arguments)]
+    fn start_pane_agent_in_box_with_hooks(
+        &self,
+        name: &str,
+        harness: &str,
+        pane: &str,
+        args: &[String],
+        timeout: Duration,
+        persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> crate::error::Result<()>,
+        hooks: Option<HooksTrustAnswer<'_>>,
+    ) -> crate::error::Result<()> {
+        let _ = hooks;
+        self.start_pane_agent_in_box(name, harness, pane, args, timeout, persist_identity)
+    }
+    /// Answer Muse's plugin-hooks trust dialog in `pane` per `decision`
+    /// (#1932). The default cannot act.
+    fn answer_hooks_trust_dialog(
+        &self,
+        _pane: &str,
+        _decision: &str,
+    ) -> crate::error::Result<(bool, Option<u32>)> {
+        Ok((false, None))
     }
     /// Run one literal executable in a fresh shell pane and pin it as the foreground process.
     fn start_pane_command(
@@ -1718,7 +1772,30 @@ impl ManagedApi for HerdrClient {
         timeout: Duration,
         persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> crate::error::Result<()>,
     ) -> crate::error::Result<CustomProcessIdentity> {
-        HerdrClient::start_relay_agent(self, kind, pane, command_line, timeout, persist_identity)
+        HerdrClient::start_relay_agent(self, kind, pane, command_line, timeout, persist_identity, None)
+    }
+    fn start_relay_agent_with_hooks(
+        &self,
+        kind: &str,
+        pane: &str,
+        command_line: &str,
+        timeout: Duration,
+        persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> crate::error::Result<()>,
+        hooks: Option<HooksTrustAnswer<'_>>,
+    ) -> crate::error::Result<CustomProcessIdentity> {
+        HerdrClient::start_relay_agent(self, kind, pane, command_line, timeout, persist_identity, hooks)
+    }
+    fn answer_hooks_trust_dialog(
+        &self,
+        pane: &str,
+        decision: &str,
+    ) -> crate::error::Result<(bool, Option<u32>)> {
+        HerdrClient::answer_hooks_trust_dialog(
+            self,
+            pane,
+            decision,
+            std::time::Instant::now() + Duration::from_secs(30),
+        )
     }
     fn relay_process(&self, pane: &str) -> crate::error::Result<Option<CustomProcessIdentity>> {
         HerdrClient::relay_process(self, pane)
@@ -1738,7 +1815,33 @@ impl ManagedApi for HerdrClient {
         timeout: Duration,
         persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> crate::error::Result<()>,
     ) -> crate::error::Result<()> {
-        HerdrClient::start_pane_agent(self, name, harness, pane, args, timeout, persist_identity)
+        HerdrClient::start_pane_agent(self, name, harness, pane, args, timeout, persist_identity, None)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn start_pane_agent_with_hooks(
+        &self,
+        name: &str,
+        harness: &str,
+        pane: &str,
+        args: &[String],
+        timeout: Duration,
+        persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> crate::error::Result<()>,
+        hooks: Option<HooksTrustAnswer<'_>>,
+    ) -> crate::error::Result<()> {
+        HerdrClient::start_pane_agent(self, name, harness, pane, args, timeout, persist_identity, hooks)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn start_pane_agent_in_box_with_hooks(
+        &self,
+        name: &str,
+        harness: &str,
+        pane: &str,
+        args: &[String],
+        timeout: Duration,
+        persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> crate::error::Result<()>,
+        hooks: Option<HooksTrustAnswer<'_>>,
+    ) -> crate::error::Result<()> {
+        HerdrClient::start_pane_agent_in_box(self, name, harness, pane, args, timeout, persist_identity, hooks)
     }
     fn start_pane_agent_in_box(
         &self,
@@ -1757,6 +1860,7 @@ impl ManagedApi for HerdrClient {
             args,
             timeout,
             persist_identity,
+            None,
         )
     }
     fn start_pane_command(
@@ -11574,9 +11678,57 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 options.startup_timeout,
             )?;
         }
+        // Muse's plugin-hooks trust dialog answer for this launch
+        // (#1932): resolved from profiles.json (profile, then registry
+        // default, then built-in decline); logged, never persisted.
+        let hooks_policy = if record.harness == "muse" {
+            Some(crate::profiles::hooks_trust_policy(
+                std::path::Path::new(&record.cwd),
+                &self.registry,
+                record.profile.as_deref(),
+            )?)
+        } else {
+            None
+        };
+        let hooks_name = record.name.clone();
+        let hooks_source = hooks_policy
+            .as_ref()
+            .map(|(_, source)| source.clone())
+            .unwrap_or_default();
+        let mut hooks_answered = {
+            let name = hooks_name.clone();
+            let source = hooks_source.clone();
+            move |decision: &str, count: Option<u32>| {
+                let verb = if decision == "trust" {
+                    "trusted all hooks"
+                } else {
+                    "declined hook trust"
+                };
+                let shown = count.map_or_else(
+                    || "hook count not shown".to_owned(),
+                    |n| format!("{n} hooks"),
+                );
+                eprintln!("agentctl: {name}: {verb} ({shown}) per {source}");
+            }
+        };
+        let mut hooks_refused = {
+            let name = hooks_name.clone();
+            let pane = pane_id.clone();
+            move || {
+                eprintln!(
+                    "agentctl: warning: {name}: a hooks dialog in pane {pane} \
+                     is not the exact plugin-hooks trust dialog; not answering it"
+                );
+            }
+        };
+        let hooks = hooks_policy.as_ref().map(|(decision, _)| HooksTrustAnswer {
+            decision: decision.as_str(),
+            answered: &mut hooks_answered,
+            refused: &mut hooks_refused,
+        });
         if let Some(line) = relay_command {
             let harness = record.harness.clone();
-            self.client.start_relay_agent(
+            self.client.start_relay_agent_with_hooks(
                 &harness,
                 &pane_id,
                 line,
@@ -11589,6 +11741,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                         ))
                     })
                 },
+                hooks,
             )?;
             record.pane_reported_by_agentctl = true;
             self.save(record)?;
@@ -11609,22 +11762,24 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 })
             };
             if in_box {
-                self.client.start_pane_agent_in_box(
+                self.client.start_pane_agent_in_box_with_hooks(
                     &agent_name,
                     &harness,
                     &pane_id,
                     &arguments,
                     options.startup_timeout,
                     &mut persist,
+                    hooks,
                 )?;
             } else {
-                self.client.start_pane_agent(
+                self.client.start_pane_agent_with_hooks(
                     &agent_name,
                     &harness,
                     &pane_id,
                     &arguments,
                     options.startup_timeout,
                     &mut persist,
+                    hooks,
                 )?;
             }
             record.pane_reported_by_agentctl = true;
@@ -13405,6 +13560,79 @@ its drain would also type, so it was not queued",
         Ok(format!("pressed Enter in {agent_name}'s pane {pane_id}"))
     }
 
+    /// Answer Muse's plugin-hooks trust dialog in one managed agent's
+    /// pane, per the registry's policy (#1932): the watcher calls this
+    /// only for a record this registry owns whose screen is the exact
+    /// dialog, and the pane is re-read and re-verified here right
+    /// before any keypress. Returns the log line naming the decision
+    /// and which setting it came from.
+    pub fn answer_hooks_trust(&self, agent_name: &str) -> Result<String> {
+        self.answer_hooks_trust_if_dialog(agent_name)?.ok_or_else(|| {
+            fail(format!(
+                "agent {agent_name} shows no exact plugin-hooks trust dialog; nothing was answered"
+            ))
+        })
+    }
+
+    /// [`Self::answer_hooks_trust`], or `Ok(None)` when this agent is not
+    /// a Muse lane parked at the exact dialog: the watch sweep's form.
+    pub fn answer_hooks_trust_if_dialog(
+        &self,
+        agent_name: &str,
+    ) -> Result<Option<String>> {
+        // The watch sweep calls this for every registered name: only a
+        // Muse lane can show the dialog, so the lifecycle lock is taken
+        // only once the record proves this one is Muse.
+        if self.load(agent_name)?.harness != "muse" {
+            return Ok(None);
+        }
+        let _lock = self.lock(agent_name)?;
+        let record = self.load(agent_name)?;
+        if record.harness != "muse" {
+            return Ok(None);
+        }
+        record.input_allowed()?;
+        self.checked(&record)?;
+        let pane_id = record
+            .pane_id
+            .clone()
+            .ok_or_else(|| fail(format!("agent {agent_name} has no pane")))?;
+        let screen = self.client.read(&pane_id, "visible", Some(200))?;
+        if !crate::client::muse_hooks_trust_dialog(&screen) {
+            return Ok(None);
+        }
+        let (decision, source) = crate::profiles::hooks_trust_policy(
+            std::path::Path::new(&record.cwd),
+            &self.registry,
+            record.profile.as_deref(),
+        )?;
+        let (answered, count) = self.client.answer_hooks_trust_dialog(&pane_id, &decision)?;
+        if !answered {
+            return Err(fail(format!(
+                "agent {agent_name}'s hooks dialog changed before it could be answered; nothing was confirmed"
+            )));
+        }
+        // Verify the dialog is gone before calling it answered.
+        let after = self.client.read(&pane_id, "visible", Some(200))?;
+        if crate::client::muse_hooks_trust_dialog(&after) {
+            return Err(fail(format!(
+                "agent {agent_name}'s hooks dialog is still up after the answer; inspect its pane"
+            )));
+        }
+        let verb = if decision == "trust" {
+            "trusted all hooks"
+        } else {
+            "declined hook trust"
+        };
+        let shown = count.map_or_else(
+            || "hook count not shown".to_owned(),
+            |n| format!("{n} hooks"),
+        );
+        Ok(Some(format!(
+            "{agent_name}: {verb} ({shown}) per {source}"
+        )))
+    }
+
     /// Force a redraw of `agent_name`'s TUI (recovery ladder step 2):
     /// SIGWINCH to the pinned harness process makes every harness here
     /// repaint; the screen is re-read and returned as evidence.
@@ -13518,23 +13746,71 @@ its drain would also type, so it was not queued",
             pinned = Some(identity);
             Ok(())
         };
+        // The relaunch answers Muse's plugin-hooks trust dialog per
+        // policy, as a start does (#1932).
+        let hooks_policy = if record.harness == "muse" {
+            Some(crate::profiles::hooks_trust_policy(
+                std::path::Path::new(&record.cwd),
+                &self.registry,
+                record.profile.as_deref(),
+            )?)
+        } else {
+            None
+        };
+        let hooks_source = hooks_policy
+            .as_ref()
+            .map(|(_, source)| source.clone())
+            .unwrap_or_default();
+        let mut hooks_answered = {
+            let name = agent_name.to_owned();
+            let source = hooks_source.clone();
+            move |decision: &str, count: Option<u32>| {
+                let verb = if decision == "trust" {
+                    "trusted all hooks"
+                } else {
+                    "declined hook trust"
+                };
+                let shown = count.map_or_else(
+                    || "hook count not shown".to_owned(),
+                    |n| format!("{n} hooks"),
+                );
+                eprintln!("agentctl: {name}: {verb} ({shown}) per {source}");
+            }
+        };
+        let mut hooks_refused = {
+            let name = agent_name.to_owned();
+            let pane = pane_id.clone();
+            move || {
+                eprintln!(
+                    "agentctl: warning: {name}: a hooks dialog in pane {pane} \
+                     is not the exact plugin-hooks trust dialog; not answering it"
+                );
+            }
+        };
+        let hooks = hooks_policy.as_ref().map(|(decision, _)| HooksTrustAnswer {
+            decision: decision.as_str(),
+            answered: &mut hooks_answered,
+            refused: &mut hooks_refused,
+        });
         if in_box {
-            self.client.start_pane_agent_in_box(
+            self.client.start_pane_agent_in_box_with_hooks(
                 agent_name,
                 &record.harness,
                 &pane_id,
                 &arguments,
                 Duration::from_secs(60),
                 &mut capture,
+                hooks,
             )?;
         } else {
-            self.client.start_pane_agent(
+            self.client.start_pane_agent_with_hooks(
                 agent_name,
                 &record.harness,
                 &pane_id,
                 &arguments,
                 Duration::from_secs(60),
                 &mut capture,
+                hooks,
             )?;
         }
         let _ = pinned;

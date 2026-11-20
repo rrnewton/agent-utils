@@ -2368,6 +2368,49 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             }))
     }
 
+    /// Clear a Muse candidate's plugin-hooks trust dialog before
+    /// verifying it (#1932): a candidate launched before this answer
+    /// existed can sit at the dialog while its record is otherwise
+    /// ready; answer per the registry's policy, then let verification
+    /// judge the composer it lands on. Only the exact dialog is
+    /// answered; a near-miss is left for verification to name.
+    fn answer_candidate_hooks_trust(&self, candidate: &AgentRecord) {
+        if candidate.harness != "muse" {
+            return;
+        }
+        let Some(pane) = candidate.pane_id.as_deref() else {
+            return;
+        };
+        let Ok(screen) = self.client.read(pane, "visible", Some(200)) else {
+            return;
+        };
+        if !crate::client::muse_hooks_trust_dialog(&screen) {
+            return;
+        }
+        let Ok((decision, source)) = crate::profiles::hooks_trust_policy(
+            std::path::Path::new(&candidate.cwd),
+            &self.registry,
+            candidate.profile.as_deref(),
+        ) else {
+            return;
+        };
+        if let Ok((true, count)) = self.client.answer_hooks_trust_dialog(pane, &decision) {
+            let verb = if decision == "trust" {
+                "trusted all hooks"
+            } else {
+                "declined hook trust"
+            };
+            let shown = count.map_or_else(
+                || "hook count not shown".to_owned(),
+                |n| format!("{n} hooks"),
+            );
+            eprintln!(
+                "agentctl: {}: {verb} ({shown}) per {source}",
+                candidate.name
+            );
+        }
+    }
+
     fn verify_candidate(
         &self,
         record: &AgentRecord,
@@ -2390,6 +2433,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 "resumed candidate has no independently pinned runtime",
             ));
         }
+        self.answer_candidate_hooks_trust(record);
         let exclusion = CensusExclusion::new(old, proof);
         self.resolve_recovery_target(self.client, &self.target(record)?, Some(&exclusion), None)?;
         let info = self.checked_with_recovery(record, Some(&exclusion))?;
