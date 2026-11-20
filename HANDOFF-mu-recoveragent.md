@@ -103,3 +103,58 @@ github/main --keep-going > /tmp/mu-recoveragent-gatelog 2>&1 (never pipe;
 touch nothing while it runs; check ledger head_sha). cargo fmt --all --
 --check clean. New test files classified in validation/components.json.
 Land only on coordb LAND NOW. End every turn DONE:/BLOCKED:.
+
+## Owner corrections 243–245 (via coordb, 11:51–11:52 AM ET, pre-reboot)
+
+- **244 ALWAYS START, IN PARALLEL.** The recovery shepherd starts
+  unconditionally at every boot from its own minimal unit (fewest possible
+  failure points on the path to starting it; no Herdr, no agentctl session
+  machinery — just the run-agent-prompt loop), in parallel with the
+  deterministic restore (no After/Requires/BindsTo), and monitors it.
+  Restore never waits on it. This supersedes plan §3.1's fast path ("no
+  recovery agent on a clean reboot") and settles my start-timing question:
+  always, from boot, parallel. v0 scope = watch plus stamp; fixing loop
+  iterations come with Phase 1/2.
+- **v0 installed by coordb for today's reboot test** (harness repo):
+  `hosts/devbig014/ops/shepherd-v0.sh` + `agent-utils-shepherd-v0.service`
+  (Type=oneshot, WantedBy=default.target, TimeoutStartSec=130min, Nice=10).
+  Read both in full pre-reboot. Script: polls
+  `agentctl-restore-agent-utils-014.service` (≤10 min for this-boot start,
+  then ≤100 min to finish, logging state), settles 120 s, gathers facts
+  (restore report `.agentctl/restore/reports/<boot_id>.json`, `agentctl
+  list`, bridge unit, failed units), asks ONE tool-less one-shot for a
+  `VERDICT: OK|PROBLEMS:` final line, writes stamp
+  `~/.local/state/agent-utils/shepherd/<boot_id>/stamp.txt`, queues it to
+  coordb + liaison; stamp carries raw facts even if every agent fails.
+  Real tool-less one-shot lines (fallback on rc≠0 or empty stdout, each
+  `timeout -s KILL 300`, stdin </dev/null):
+  `muse exec --preset empty --reasoning-effort low "$PROMPT"`;
+  `claude -p --permission-mode default --disallowedTools Bash Edit Write NotebookEdit WebFetch -- "$PROMPT"`;
+  `codex exec --sandbox read-only "$PROMPT"`.
+  My shipped version replaces v0 (coordb's words). Fixing iterations need
+  tool-enabled variants — exact flags from --help (workflow slice 5).
+  Caution: v0 also lists the dev-hermit registry read-only for facts; my
+  brief forbids touching that registry, so the shipped shepherd judges its
+  own team only unless coordb explicitly directs otherwise.
+- **245 RESTORING LANES IS BOTH JOBS, idempotently.** Deterministic restore
+  restarts lanes AND re-attaches their work slots (#1975 — no
+  `.minibeads/issues/agent-utils-1975.md` at 2a74b782; locate during
+  verification via GitHub/git log). Lanes may resume before their
+  coordinator is back — that is fine (supersedes plan §3.5 "lanes refuse
+  while lead dead-and-revivable" and §4.1 "lanes never revive rootless").
+  The coordinator's recovery notice tells it to SWEEP: anything already
+  back is fine; recover only what isn't. Exactly-one-restorer and
+  no-double-launch still hold mechanically (driver flock + revive locks +
+  idempotent actions), not by launch ordering.
+- **243 YES check approved (per team): lead running + bridge healthy +
+  handoff acked.** This is the deterministic verification behind any agent
+  YES verdict. Owner 234's "every prior team coordinator" reads as: the
+  leads of the teams that were up before the reboot, each judged per team;
+  confirm the host scope in the phase plan (hands-off rule for other teams
+  stands — their own shepherds/notices cover them).
+- Consequences for the phase plan: start-timing and Herdr-pane-visibility
+  questions are SETTLED by 244 (own minimal unit; visibility = journal +
+  shepherd log/stamp files, never a Herdr dependency). Remaining confirms
+  for coordb: host/team scope of the YES rollup; tool-enabled one-shot
+  flags; where the wrapper + loop live (agent-utils product code vs
+  harness ops) and how v0 is retired per host.
