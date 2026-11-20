@@ -243,19 +243,32 @@ fn muse_held_ids(record: &AgentRecord, held: &[PathBuf]) -> Vec<String> {
                 continue;
             }
         }
-        if path.file_name().is_some_and(|name| name == ".session.lock") {
-            let Ok(text) = fs::read_to_string(path) else {
-                continue;
-            };
-            let names_own = text.lines().any(|line| {
-                line.trim()
-                    .strip_prefix("pid=")
-                    .and_then(|pid| pid.trim().parse::<u64>().ok())
-                    .is_some_and(|pid| pids.contains(&pid))
-            });
-            if !names_own {
-                continue;
-            }
+        // Every held form attributes by the session's own lock, not
+        // by the open fd: a Muse process keeps other lanes' lock
+        // files (and can hold their journals) open, while the held
+        // kernel lock and its pid= line name only its own lane
+        // (dev-hermit, 2026-11-20). The lock in the held path's own
+        // session directory, or the nearest ancestor's, must name one
+        // of this lane's runtime pids.
+        let lock = if path.file_name().is_some_and(|name| name == ".session.lock") {
+            Some(path.clone())
+        } else {
+            path.ancestors()
+                .map(|ancestor| ancestor.join(".session.lock"))
+                .find(|candidate| candidate.is_file())
+        };
+        let Some(lock) = lock else { continue };
+        let Ok(text) = fs::read_to_string(&lock) else {
+            continue;
+        };
+        let names_own = text.lines().any(|line| {
+            line.trim()
+                .strip_prefix("pid=")
+                .and_then(|pid| pid.trim().parse::<u64>().ok())
+                .is_some_and(|pid| pids.contains(&pid))
+        });
+        if !names_own {
+            continue;
         }
         if !ids.contains(&id) {
             ids.push(id);

@@ -4527,6 +4527,20 @@ fn a_peer_lanes_lock_is_never_recorded_however_long_it_is_held() {
         .unwrap()
         .native_session
         .is_none());
+
+    // A peer journal held open attributes nothing either: only the
+    // session's own lock, naming this lane's pid, attributes any
+    // held form (dev-hermit kernel-lock evidence, 2026-11-20).
+    let fixture = unreported();
+    let peer = fake_muse_session_as(&fixture, "99999999-9999-4999-8999-999999999999", 424_242);
+    let peer_journal = peer.parent().unwrap().join("session.jsonl");
+    let own_id = "01a1ab0f-0a3c-73c1-8056-ee5296bc1574";
+    let own_lock = fake_muse_session(&fixture, own_id);
+    let own_journal = own_lock.parent().unwrap().join("session.jsonl");
+    let _held = pretend_held(vec![peer_journal, own_journal]);
+    start_worker(&fixture, "muse");
+    let record = fixture.manager().load("worker").unwrap();
+    assert_eq!(record.native_session.as_ref().unwrap().value, own_id);
 }
 
 #[test]
