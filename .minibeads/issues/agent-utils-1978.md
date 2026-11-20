@@ -1,13 +1,14 @@
 ---
 title: 'vibe-talk-cmd-d-dock-toggle: Cmd+D toggles dock/float for the focused quote-reply pop-up or Discuss pane'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - vibe-talk
 - keyboard
 created_at: 2026-11-20T13:36:00-05:00
-updated_at: 2026-11-20T13:36:00-05:00
+updated_at: 2026-11-20T14:21:00-05:00
+closed_at: 2026-11-20T14:21:00-05:00
 ---
 
 # Description
@@ -34,3 +35,7 @@ Owner update 252 (2026-11-20 1:23 PM ET) overrides the original brief's Shift fa
 # Notes
 
 Number reserved by the lead coordinator (coordb ledger) for this lane, confirmed 2026-11-20. Related: `#1315 floating-reply-dock`, `#1354 discuss-layout-modes`, `#889 voice-page-copy-link-key` (the Cmd+L / Cmd+Shift+L pattern the original brief cited; superseded for this binding by owner update 252), `#1386 discuss-mod8-toggle`.
+
+## Resolution
+
+[watermelon-full-preview] Landed 2026-11-20 as 43ef007f + ab21228b on main (replayed from affb2793 under coordb's waiver for this landing only; coordb deploys on landing). Plain Cmd+D (Mac) / plain Ctrl+D (off Mac, owner update 252: no Shift variant, never bare Ctrl+D on a Mac) toggles dock/float only with focus inside the quote-reply pop-up (or the in-stream reply it docked into) or the Discuss pane, composers included; preventDefault only where it acts. Evidence: page test `#1978` in tests/js/page/keyboard.mjs, the real-browser walk tests/cmd_d_browser.py (vibe-talk.check.cmd-d-browser) passing rc=0 on devbig030 at affb2793 (desk Ctrl+D, Mac-emulated Cmd+D, phone Ctrl+D; both surfaces both ways, negative outside), screenshot scenes 73-76 rc=0 with BUILD.txt checked and shots reviewed by coordb. Gate on affb2793: zero non-browser failures (vibe-talk.test.unit 3406 passed, repository.hygiene.issue-parse passed after the included agent-utils-1964 heading demotion); the 149 browser/shots/pwa reds were devbig014's missing libnspr4.so, waived for this landing. Dynamic check in a normal browser tab where the browser keeps Cmd+D as its bookmark: the page cannot take the chord there, so nothing happens — in the installed app (no address bar) the chord is the page's, as with Cmd+L (#889).
