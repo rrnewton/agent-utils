@@ -1188,6 +1188,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     // `#821 voice-page-read-aloud-react`. Nothing is held once the read is gone.
     heldSentence = null;
     heldAnchor = null;
+    composerHeldRead = false;
     const wasPending = pendingRead !== null;
     pendingRead = null;
     // `#487 read-aloud-recovery`. A read waiting to start again after it was cut off held the media
@@ -2126,6 +2127,12 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   let heldSentence: HeldSentence | null = null;
   /** `#821`. What the held words are drawn in (their range, or their block), to find them again at React's press. */
   let heldAnchor: { getBoundingClientRect(): DOMRect } | null = null;
+  /**
+   * `#1967 vibe-talk-reader-pause-on-any-composer`. Whether the current hold is a reply composer's
+   * (`pauseForComposer`), not the reader's own Pause: such a composer's Send carries the read on
+   * (`resumeComposerHeldRead`), where a hand-paused read stays held for its Resume tap (`#554`).
+   */
+  let composerHeldRead = false;
   /** `#1587 autoplay-follow-scroll`: whether the reader's own scroll has paused following, and the port watched for it. */
   const followPause = createFollowPause();
   let followPort: HTMLElement | null = null;
@@ -2566,7 +2573,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
    * sentence being heard, and replies to that at once.
    */
   function reactToHeldSentence() {
-    if (nowPlaying !== null && !readingPaused()) pauseReading();
+    if (nowPlaying !== null && !readingPaused()) pauseForComposer();
     const held = heldSentence;
     if (!readingPaused() || held === null) return;
     // Where the words stand now: the list may have moved since the pause.
@@ -3174,6 +3181,36 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   }
 
   /**
+   * `#1967 vibe-talk-reader-pause-on-any-composer`. THE choke point every reply-composer path goes
+   * through: a reply composer taking the focus (the read controls' one `focusin` listener), or
+   * dictation starting into one (the dictation's own guard), holds a playing read here, before any
+   * microphone can hear it, and remembers that the composer held it. A read already held — by the
+   * reader's own Pause, or by an earlier composer — is not claimed: its Send leaves it held (`#554`).
+   * Whether this call held the read.
+   */
+  function pauseForComposer(): boolean {
+    if (nowPlaying === null || readingPaused()) return false;
+    pauseReading();
+    if (!readingPaused()) return false;
+    composerHeldRead = true;
+    return true;
+  }
+
+  /**
+   * `#1967 vibe-talk-reader-pause-on-any-composer`. A reply sent from a composer that held the read:
+   * carry on from where it was held, never from its first block. A composer that held nothing (the
+   * reader had paused by hand, or nothing was reading) sends and leaves the read as it was. Whether
+   * this call carried the read on.
+   */
+  function resumeComposerHeldRead(): boolean {
+    if (!composerHeldRead) return false;
+    composerHeldRead = false;
+    if (!readingPaused()) return false;
+    resumeReading();
+    return true;
+  }
+
+  /**
    * Whether the read being held can no longer be carried on as it stands: a part failed while it
    * was held, its audio context is gone, or the speech ticket its unplayed parts were asked for
    * under has ended (`#368 speech-ticket-gone`, `#290 speech-ticket-refresh`). A pause may last
@@ -3301,6 +3338,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   function resumeReading() {
     const playing = nowPlaying;
     if (playing === null || !playing.paused) return;
+    composerHeldRead = false;
     // `#821 voice-page-read-aloud-react`. Carried on: nothing is held, and the light goes on with the read.
     heldSentence = null;
     heldAnchor = null;
@@ -4051,6 +4089,8 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   readInProgress,
   readFollowing,
   toggleReadingPaused,
+  pauseForComposer,
+  resumeComposerHeldRead,
   reactToHeldSentence,
   readingRowsShown,
   get heldSentence() { return heldSentence; },

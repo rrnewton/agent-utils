@@ -419,6 +419,29 @@ test("`#1503 react-dictation-keeps-listening`: listening restarts across session
   assert.equal(made.length, count, "listening restarted after the empty-session cap");
 });
 
+test("`#1967 vibe-talk-reader-pause-on-any-composer`: dictation holds a playing read before any session starts, first and restarted alike", () => {
+  const { createDictation } = VIEW_COMPOSER;
+  const box = { value: "", getAttribute: () => null, setAttribute: () => {}, removeAttribute: () => {} };
+  const order = [];
+  const made = [];
+  class Fake {
+    constructor() { made.push(this); }
+    start() { order.push("mic"); }
+    abort() {}
+  }
+  const dictation = createDictation({
+    recognition: () => Fake, lang: () => "en-GB", box: () => box,
+    say: () => {}, listening: () => {}, settled: () => {},
+    pauseReading: () => order.push("pause"),
+  });
+  assert.equal(dictation.start(), true);
+  assert.deepStrictEqual(order, ["pause", "mic"], "the microphone started before the read was held");
+  // A restarted session (the first ended while listening is wanted) is held first too.
+  made.at(-1).onend();
+  assert.deepStrictEqual(order, ["pause", "mic", "pause", "mic"], "a restarted microphone started before the read was held");
+  dictation.stop();
+});
+
 test("`#624 voice-page-modularity`: the quoted words' and the quick-reply box's listeners mount in the page's order, reach what each names, and come down again", () => {
   const { mountQuickReplyListeners } = VIEW_COMPOSER;
   const log = [];

@@ -52,6 +52,11 @@ export interface DictationDependencies {
   listening(on: boolean): void;
   /** Words the recognition settled on were written into the box: keep them as the draft. */
   settled(): void;
+  /**
+   * `#1967 vibe-talk-reader-pause-on-any-composer`. Hold a playing read before the microphone can
+   * hear it, reader's own speech included. Optional: a page with no read to hold omits it.
+   */
+  pauseReading?: () => void;
 }
 
 /** What the state line says while listening, where dictation cannot run, and when it has stopped. */
@@ -130,6 +135,9 @@ export function createDictation(deps: DictationDependencies): Dictation {
 
   // One recognition session, hearing into the box over `before` and `settledWords`. Whether it started.
   function launch(): boolean {
+    // `#1967 vibe-talk-reader-pause-on-any-composer`. Before ANY session starts — the first, and
+    // every `#1503` restart — a playing read is held, so the microphone can never hear the reader.
+    if (typeof deps.pauseReading === "function") deps.pauseReading();
     const Make = deps.recognition();
     if (Make === null) return false;
     let heard: Recognition;

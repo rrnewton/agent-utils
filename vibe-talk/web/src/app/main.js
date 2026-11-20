@@ -6334,6 +6334,8 @@ const replySession = createReplySession({
     start: () => dictation.start(),
     showKeyboard: () => dictation.showKeyboard(),
   },
+  // `#1967 vibe-talk-reader-pause-on-any-composer`. A docked Send from a composer-held read resumes it.
+  resumeAfterSend: () => readAloudOwner().resumeComposerHeldRead(),
   queueOutgoingMessage: (entry, column) => queueOutgoingMessage(/** @type {any} */ (entry), /** @type {any} */ (column)),
   replyMarksRead: (target, text) => replyMarksRead(/** @type {any} */ (target), text),
   quoteBlock: (quote) => quoteBlock(quote),
@@ -6390,6 +6392,8 @@ const {
 // Which kept drafts were left with "Start a new thread" ticked is the reply drafts' (`startsThread`).
 
 const dictation = createDictation({
+  // `#1967 vibe-talk-reader-pause-on-any-composer`. Dictation starting holds a playing read first.
+  pauseReading: () => readAloudOwner().pauseForComposer(),
   recognition: () => /** @type {any} */ (window).SpeechRecognition || /** @type {any} */ (window).webkitSpeechRecognition || null,
   lang: () => (typeof navigator === "object" && navigator && navigator.language) || "en-US",
   box: () => el("quick-reply-text"),
@@ -6426,6 +6430,8 @@ const quoteOwner = createQuoting({
     setHiddenIfChanged(leftEl("quick-reply-discard"), true);
     renderDraftChip();
   },
+  // `#1967 vibe-talk-reader-pause-on-any-composer`. A quick-reply Send from a composer-held read resumes it.
+  resumeAfterSend: () => readAloudOwner().resumeComposerHeldRead(),
 });
 
 
@@ -8909,6 +8915,9 @@ application.track(mountReadingJumps({
 application.track(mountReadControls({
   byId: (id) => el(id),
   win: () => (typeof window.addEventListener === "function" ? window : null),
+  // `#1967 vibe-talk-reader-pause-on-any-composer`. Focus into a reply composer holds a playing read.
+  doc: () => (typeof document.addEventListener === "function" ? document : null),
+  pauseForComposer: () => readAloudOwner().pauseForComposer(),
   stepReadSpeed: (direction) => readAloudOwner().stepReadSpeed(direction),
   commitReadSpeedBox: () => readAloudOwner().commitReadSpeedBox(),
   stepReading: (delta) => readAloudOwner().stepReading(delta),

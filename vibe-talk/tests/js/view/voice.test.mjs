@@ -185,6 +185,8 @@ test("`#624 voice-page-modularity`: the read-aloud controls reach the act each n
     forgetAutoplayHalt: () => log.push("halt forgotten"),
     readInProgress: () => inProgress,
     toggleReadingPaused: () => log.push("pause"),
+    doc: () => target("document"),
+    pauseForComposer: () => log.push("composer pause"),
     pendingRead: () => pending,
     readingMode: () => mode,
     setReadingMode: (on) => { mode = on; log.push(`mode ${on}`); },
@@ -196,7 +198,15 @@ test("`#624 voice-page-modularity`: the read-aloud controls reach the act each n
     "listen read-steer-grip pointermove", "listen read-steer-grip pointerup", "listen read-steer-grip pointercancel",
     "listen read-steer-grip lostpointercapture", "listen read-steer-grip keydown", "listen read-steer-grip dblclick",
     "listen read-autoplay click", "listen window resize", "listen read-aloud click", "listen read-aloud-stop click",
-    "listen read-aloud-stop click"], "a listener was added out of the page's order");
+    "listen read-aloud-stop click", "listen document focusin"], "a listener was added out of the page's order");
+  // `#1967 vibe-talk-reader-pause-on-any-composer`: focus in a reply composer holds the read; any other focus does not.
+  fire("document", "focusin", { target: { id: "reply-text" } });
+  fire("document", "focusin", { target: { id: "quick-reply-text" } });
+  fire("document", "focusin", { target: { id: "compose-text" } });
+  fire("document", "focusin", { target: { id: "read-aloud" } });
+  fire("document", "focusin", { target: null });
+  fire("document", "focusin", {});
+  assert.equal(log.filter((one) => one === "composer pause").length, 2, "a non-reply focus held the read, or a reply focus did not");
   log.length = 0;
   fire("read-speed-down", "click");
   fire("read-speed-up", "click");

@@ -52,6 +52,15 @@ its engine and lights no sentence, holds the block being read instead, and React
 Pass --web-root DIR to run against another copy of the page (the one before #554 fails at the device
 voice's resume), --screenshots DIR to keep PNGs, and --benchmark to also fail when a resume is not heard
 within --resume-within-s seconds (default 4).
+
+`#1967 vibe-talk-reader-pause-on-any-composer`. The owner, in the car: a quote reply dialogue, docked,
+"was still reading out loud and transcribing its own words into the quoted reply". So, for both voices
+on a phone (and the agent's on a desk), with the read PLAYING — where the walks above always paused
+by hand first — every enumerated path into a reply composer (the row's Reply, the selection chip, its
+strip twin, the dock icon, React, the Draft chip, a tap into the docked box, and a focus put in it)
+must hold the read with that composer focused, before any dictation can hear it; React's dictation
+starts over that held read; Cancel and close leave it held; and a Send from such a composer-held
+pause carries the read on from the sentence or block it was held in. Tap-to-pause times are printed.
 """
 
 from __future__ import annotations
@@ -66,7 +75,7 @@ from typing import TYPE_CHECKING
 
 import offline_cache_browser as fixture
 from inline_reply_browser import PHONE, press_reply, sign_in
-from offline_cache_browser import check
+from offline_cache_browser import Json, check
 import read_aloud_views_browser
 from read_aloud_views_browser import AUDIO_PROBE, STATE_S, VoicesApi, handler, paragraphs_of
 from two_column_browser import Desk
@@ -377,6 +386,273 @@ def walk(desk: Desk, api: VoicesApi, voice: str, args: argparse.Namespace) -> No
     error = page.evaluate("() => document.getElementById('error').textContent")
     desk.check(error == "", f"{voice}: an error was shown: {error!r}")
     desk.shot("4-resumed")
+
+
+# `#1967 vibe-talk-reader-pause-on-any-composer`. Every element that can put the cursor into a reply
+# composer, enumerated from the page: a row's Reply button (`.reply-button`, also its Quote reply
+# form), the selection chip (`#selection-chip`) and its strip twin (`#read-steer-quote`), React
+# (`#read-react`), the floating box's dock icon (`#quick-reply-dock`), the Draft chip
+# (`#draft-chip`), and the two composers themselves (`#reply-text`, `#quick-reply-text`) by tap or
+# by focus. New paths are caught because every one of them ends in a focus on one of the two
+# composers, which the page's one `focusin` choke point holds the read for.
+COMPOSER_OPENERS = ["selection-chip", "read-steer-quote", "read-react", "quick-reply-dock", "draft-chip",
+                    "reply-text", "quick-reply-text"]
+
+
+def start_reading(desk: Desk, voice: str, touch: bool) -> None:
+    """Sign in and get the long first message reading into its second sentence or block."""
+    page = desk.page
+    sign_in(desk)
+    if voice == "device":
+        page.click("#audio-source")
+        desk.wait_for("() => document.getElementById('audio-source').getAttribute('aria-checked') === 'false'",
+                      "composer-pause: the audio switch did not choose the device voice", STATE_S)
+    press(page, "#read-aloud", touch)
+    desk.wait_for("() => document.getElementById('read-aloud').getAttribute('data-active') === 'true'",
+                  "composer-pause: Read did not turn on", STATE_S)
+    row = f"#{LIST} > li[data-id='{MESSAGE}']"
+    page.evaluate("(selector) => document.querySelector(selector).scrollIntoView({block: 'center'})", row)
+    desk.settled()
+    body = page.locator(f"{row} .body").first.bounding_box()
+    assert body is not None
+    if touch:
+        page.touchscreen.tap(body["x"] + 12, body["y"] + min(10, body["height"] / 2))
+    else:
+        page.mouse.click(body["x"] + 12, body["y"] + min(10, body["height"] / 2))
+    if voice == "device":
+        wait_until(page, "() => window.deviceSpeech.filter((one) => one.started !== null).length >= 2",
+                   "composer-pause, device: the read never reached its second sentence")
+    else:
+        desk.wait_for(SECOND_BLOCK_JS, "composer-pause, agent: the read never reached its second block", STATE_S)
+    desk.check(label(page) == "Pause", f"composer-pause: Read says {label(page)!r} while the read plays")
+
+
+def held_snapshot(desk: Desk, voice: str) -> Json:
+    page = desk.page
+    if voice == "device":
+        return {"started": sum(1 for one in page.evaluate(SPOKEN_JS) if one["started"] is not None)}
+    return {"count": str(page.evaluate("() => document.getElementById('read-steer-count').textContent")),
+            "clock": page.evaluate("() => readAloudOwner().readAloudContext.currentTime")}
+
+
+def check_held_still(desk: Desk, voice: str, where: str, held: Json) -> None:
+    desk.settled()
+    now = held_snapshot(desk, voice)
+    desk.check(now == held, f"{where}: the read moved while its composer held it: {held} -> {now}")
+
+
+def expect_paused_focused(desk: Desk, voice: str, where: str, box_id: str, began: float) -> Json:
+    """The choke point's verdict: Read says Resume, the named composer has the focus, and the read
+    has not moved. How long the pause took is printed (timing decides nothing, #1250)."""
+    page = desk.page
+    desk.wait_for("() => document.getElementById('read-aloud-label').textContent === 'Resume'",
+                  f"{where}: the read was not paused by the composer path", STATE_S)
+    print(f"{voice}/{where}: tap-to-pause {(time.monotonic() - began) * 1000:.0f}ms (printed only)", flush=True)
+    desk.check(page.evaluate("() => document.activeElement && document.activeElement.id") == box_id,
+               f"{where}: the focus is not in #{box_id}")
+    return held_snapshot(desk, voice)
+
+
+def press_any(page: Page, selector: str, touch: bool) -> None:
+    """Press as `press` does, by the element itself where it is not drawn (a one-block read's strip)."""
+    if page.locator(selector).first.bounding_box() is None:
+        page.evaluate("(selector) => document.querySelector(selector).click()", selector)
+    else:
+        press(page, selector, touch)
+
+
+def resume_reading(desk: Desk, voice: str, touch: bool) -> None:
+    page = desk.page
+    marker = page.evaluate("() => performance.now()")
+    press(page, "#read-aloud", touch)
+    desk.wait_for("() => document.getElementById('read-aloud-label').textContent === 'Pause'",
+                  "composer-pause: Resume did not carry the read on", STATE_S)
+    if voice == "device":
+        wait_until(page, f"() => window.deviceSpeech.some((one) => one.started !== null && one.started > {marker})",
+                   "composer-pause, device: the resumed read was silent")
+    else:
+        desk.wait_for(SECOND_BLOCK_JS, "composer-pause, agent: the resumed read left its held blocks", STATE_S)
+
+
+def composer_pause_walk(desk: Desk, api: VoicesApi, voice: str, touch: bool) -> None:
+    """`#1967`: while reading, EVERY enumerated path into a reply composer pauses first; a Send from
+    a composer-held pause resumes from where it was held; Cancel and close leave it paused."""
+    page = desk.page
+    for opener in COMPOSER_OPENERS:
+        desk.check(page.evaluate(f"() => document.getElementById({opener!r}) !== null"),
+                   f"composer-pause: #{opener} is not in the page; the enumeration is stale")
+    start_reading(desk, voice, touch)
+
+    # 1. The row's Reply button, while playing: the docked composer, focused, the read held.
+    began = time.monotonic()
+    press_reply(desk, LIST, MESSAGE, touch=touch)
+    held = expect_paused_focused(desk, voice, "reply-while-playing", "reply-text", began)
+    check_held_still(desk, voice, "reply-while-playing", held)
+    desk.shot("composer-reply-paused")
+    # Cancel with nothing written closes at once and leaves the read paused (existing behaviour).
+    press(page, "#reply-cancel", touch)
+    desk.wait_for("() => document.getElementById('column-reply').hidden",
+                  "composer-pause: Cancel did not put the docked reply away", STATE_S)
+    desk.check(label(page) == "Resume", "composer-pause: Cancel resumed a read it should leave paused")
+    resume_reading(desk, voice, touch)
+
+    # 2. The selection chip, while playing: the floating composer, focused, the read held.
+    page.evaluate(SELECT_JS, [LIST, MESSAGE, 2, 22])
+    desk.wait_for("() => !document.getElementById('selection-chip').hidden",
+                  "composer-pause: no selection chip while the read plays", STATE_S)
+    began = time.monotonic()
+    press(page, "#selection-chip", touch)
+    held = expect_paused_focused(desk, voice, "chip-while-playing", "quick-reply-text", began)
+    check_held_still(desk, voice, "chip-while-playing", held)
+    desk.shot("composer-chip-paused")
+    # Its strip twin, from the same held words, while the read stays held by the chip's pause.
+    page.keyboard.press("Escape")
+    desk.wait_for("() => document.getElementById('quick-reply').hidden",
+                  "composer-pause: Esc did not close the floating reply", STATE_S)
+    desk.check(label(page) == "Resume", "composer-pause: closing the floating reply resumed the read")
+    page.evaluate(SELECT_JS, [LIST, MESSAGE, 30, 50])
+    desk.wait_for("() => !document.getElementById('read-steer-quote').hidden"
+                  " && document.getElementById('read-steer-quote').getClientRects().length > 0",
+                  "composer-pause: no Quote reply in the strip to press", STATE_S)
+    began = time.monotonic()
+    press(page, "#read-steer-quote", touch)
+    expect_paused_focused(desk, voice, "strip-quote-while-held", "quick-reply-text", began)
+    desk.shot("composer-strip-paused")
+    # 3. The dock icon: the floating draft docks into the stream composer, still held, focused there.
+    began = time.monotonic()
+    press(page, "#quick-reply-dock", touch)
+    expect_paused_focused(desk, voice, "dock-while-held", "reply-text", began)
+    desk.wait_for("() => document.getElementById('quick-reply').hidden",
+                  "composer-pause: docking left the floating reply up", STATE_S)
+    desk.shot("composer-docked-paused")
+    press(page, "#reply-cancel", touch)
+    desk.wait_for("() => document.getElementById('column-reply').hidden",
+                  "composer-pause: Cancel did not put the docked reply away after docking", STATE_S)
+    desk.check(label(page) == "Resume", "composer-pause: Cancel after docking resumed the read")
+    resume_reading(desk, voice, touch)
+
+    # 4. React, while playing: pauses first, dictation starts, and its words are the typist's own
+    # stand-in's — with the read held throughout, so none of the reader's speech can land in the box.
+    began = time.monotonic()
+    press_any(page, "#read-react", touch)
+    held = expect_paused_focused(desk, voice, "react-while-playing", "quick-reply-text", began)
+    desk.wait_for("() => window.recognitionStarts >= 1", "composer-pause: React started no dictation", STATE_S)
+    desk.check(label(page) == "Resume", "composer-pause: dictation is listening over a read that is not paused")
+    check_held_still(desk, voice, "react-while-playing", held)
+    desk.shot("composer-react-paused")
+    page.keyboard.press("Escape")
+    desk.wait_for("() => document.getElementById('quick-reply').hidden",
+                  "composer-pause: Esc left the React reply up", STATE_S)
+    desk.check(label(page) == "Resume", "composer-pause: closing the React reply resumed the read")
+    # 5. The Draft chip those words left behind, pressed while playing again.
+    desk.wait_for("() => !document.getElementById('draft-chip').hidden",
+                  "composer-pause: the Draft chip does not count the React draft", STATE_S)
+    resume_reading(desk, voice, touch)
+    began = time.monotonic()
+    press(page, "#draft-chip", touch)
+    expect_paused_focused(desk, voice, "draft-chip-while-playing", "quick-reply-text", began)
+    page.keyboard.press("Escape")
+    desk.wait_for("() => document.getElementById('quick-reply').hidden",
+                  "composer-pause: Esc left the Draft chip's reply up", STATE_S)
+    desk.check(label(page) == "Resume", "composer-pause: closing the Draft chip's reply resumed the read")
+    resume_reading(desk, voice, touch)
+
+    # 6. The composers themselves: with the docked reply open under a resumed read, a tap into its
+    # box, and then a programmatic (keyboard-shortcut) focus, each hold the read again.
+    press_reply(desk, LIST, MESSAGE, touch=touch)
+    desk.check(label(page) == "Resume", "composer-pause: Reply did not hold the read for the tap path")
+    press(page, "#read-aloud", touch)
+    desk.wait_for("() => document.getElementById('read-aloud-label').textContent === 'Pause'",
+                  "composer-pause: the read did not resume under its open reply", STATE_S)
+    began = time.monotonic()
+    press(page, "#reply-text", touch)
+    held = expect_paused_focused(desk, voice, "tap-into-docked-while-playing", "reply-text", began)
+    check_held_still(desk, voice, "tap-into-docked-while-playing", held)
+    press(page, "#read-aloud", touch)
+    desk.wait_for("() => document.getElementById('read-aloud-label').textContent === 'Pause'",
+                  "composer-pause: the read did not resume for the focus path", STATE_S)
+    began = time.monotonic()
+    page.evaluate("() => document.getElementById('reply-text').focus()")
+    expect_paused_focused(desk, voice, "focus-into-docked-while-playing", "reply-text", began)
+
+    # 7. Send from this composer-held pause: the read carries on from where it was held.
+    held = held_snapshot(desk, voice)
+    paused_in = ""
+    started_before = 0
+    if voice == "device":
+        spoken = [one for one in page.evaluate(SPOKEN_JS) if one["started"] is not None]
+        paused_in = spoken[-1]["text"] if spoken else ""
+        started_before = len(spoken)
+    sent = len(api.posted())
+    page.fill("#reply-text", "Yes, send resumes the read")
+    began = time.monotonic()
+    press(page, "#reply-send", touch)
+    desk.wait_for("() => document.getElementById('column-reply').hidden",
+                  "composer-pause: Send did not put the docked reply away", STATE_S)
+    deadline = time.monotonic() + STATE_S
+    while time.monotonic() < deadline and len(api.posted()) <= sent:
+        page.wait_for_timeout(POLL_MS)
+    posted = api.posted()[sent:]
+    desk.check(len(posted) == 1 and posted[0].get("reply_to") == MESSAGE,
+               f"composer-pause: what was posted was {posted}")
+    desk.wait_for("() => document.getElementById('read-aloud-label').textContent === 'Pause'",
+                  "composer-pause: Send from a composer-held pause did not resume the read", STATE_S)
+    print(f"{voice}/send-resume: send-to-resume {(time.monotonic() - began) * 1000:.0f}ms (printed only)", flush=True)
+    if voice == "device":
+        wait_until(page, "() => window.deviceSpeech.filter((one) => one.started !== null).length > "
+                   + str(started_before), "composer-pause, device: no utterance after Send", STATE_S)
+        after = [one for one in page.evaluate(SPOKEN_JS) if one["started"] is not None]
+        desk.check(after[started_before]["text"] == paused_in,
+                   f"composer-pause, device: after Send the voice said {after[started_before]['text']!r}, "
+                   f"not the sentence paused in, {paused_in!r}")
+    else:
+        clock = page.evaluate("() => readAloudOwner().readAloudContext.currentTime")
+        started = time.monotonic()
+        moved = 0.0
+        while moved <= 0.15 and time.monotonic() - started < STATE_S:
+            page.wait_for_timeout(POLL_MS)
+            moved = page.evaluate("() => readAloudOwner().readAloudContext.currentTime") - clock
+        desk.check(moved > 0.15, "composer-pause, agent: after Send the audio clock stood still")
+        count_now = str(page.evaluate("() => document.getElementById('read-steer-count').textContent"))
+        held_block = block_of(str(held["count"]))
+        now_block = block_of(count_now)
+        desk.check(held_block is None or now_block is None or now_block[0] >= held_block[0],
+                   f"composer-pause, agent: Send resumed at {count_now!r}, back from the held {held['count']!r}")
+    error = page.evaluate("() => document.getElementById('error').textContent")
+    desk.check(error == "", f"composer-pause: an error was shown: {error!r}")
+    desk.shot("composer-sent-resumed")
+    desk.notes.append("every enumerated composer path paused while playing; Send resumed from the held place")
+
+
+def run_composer_pause(browser: Browser, args: argparse.Namespace, voice: str, touch: bool) -> str:
+    previous_block_s = read_aloud_views_browser.BLOCK_SECONDS
+    if voice == "agent":
+        read_aloud_views_browser.BLOCK_SECONDS = STEADY_BLOCK_S
+    api = VoicesApi()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler(api))
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    width, height = PHONE if touch else (1280, 800)
+    try:
+        context, page, version = open_page(browser, width, height, touch)
+        errors: list[str] = []
+        page.on("pageerror", lambda error: errors.append(str(error)))
+        page.add_init_script(AUDIO_PROBE)
+        page.add_init_script(ANDROID_VOICE)
+        page.add_init_script(FAKE_RECOGNITION)
+        desk = PauseDesk(page, args.screenshots, f"composer-pause-{voice}-{width}", width, height)
+        page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
+        composer_pause_walk(desk, api, voice, touch)
+        check(not errors, f"composer-pause {voice} {width}x{height}: the page threw: {errors}")
+        context.close()
+        return f"{version}, composer-pause at {width}x{height}, the {voice} voice: " + "; ".join(desk.notes)
+    finally:
+        read_aloud_views_browser.BLOCK_SECONDS = previous_block_s
+        api.stopping.set()
+        server.shutdown()
+        server.server_close()
+        thread.join()
 
 
 # `#819`: the words of the message being read, from offset `start` of its longest run of text to `end`,
@@ -956,6 +1232,10 @@ def main() -> int:
                     report.append(run_react(browser, args, "agent", size, touch, True))
                 report.append(run_react(browser, args, "agent", (412, 915), True, False))
                 report.append(run_react(browser, args, "device", (412, 915), True, True))
+                # `#1967 vibe-talk-reader-pause-on-any-composer`: every path into a composer, while playing.
+                for voice in ("agent", "device"):
+                    report.append(run_composer_pause(browser, args, voice, True))
+                report.append(run_composer_pause(browser, args, "agent", False))
         finally:
             browser.close()
     for line in report:

@@ -78,6 +78,11 @@ export interface ReplySessionDependencies {
     closeQuickReply(): void;
   };
   dictation: { stop(): void; quietKeyboard(): void; start(): void; showKeyboard(): void };
+  /**
+   * `#1967 vibe-talk-reader-pause-on-any-composer`. This reply sent from a composer that held the
+   * read: carry the read on from where it was held. Optional: a page with no read omits it.
+   */
+  resumeAfterSend?: () => void;
   sideColumnUp(): boolean;
   queueOutgoingMessage(entry: Record<string, unknown>, column?: ReplyColumnLike | null): Promise<unknown>;
   replyMarksRead(target: ReplyMessageLike, text: string): string | null;
@@ -827,6 +832,9 @@ export function createReplySession(deps: ReplySessionDependencies): ReplySession
     replyState.quote = null;
     deps.el("reply-text").value = "";
     deps.el("reply-state").textContent = "";
+    // `#1967 vibe-talk-reader-pause-on-any-composer`. Sent from a composer that held the read:
+    // carry it on from where it was held. A hand-paused read (`#554`) is not this: it stays held.
+    if (typeof deps.resumeAfterSend === "function") deps.resumeAfterSend();
     // Do not call closeReply: its draft save would overwrite the fallback retained after a storage
     // failure. The captured request owns its text now; a newer reply draft must never be touched by
     // its eventual completion.

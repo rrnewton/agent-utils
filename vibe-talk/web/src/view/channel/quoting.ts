@@ -206,6 +206,11 @@ export interface QuotingDependencies {
   noteDraft(key: string, channel: string, written: boolean): void;
   /** `#821 voice-page-read-aloud-react`. The box has closed, however it did: whatever listens into it stops. */
   closed(): void;
+  /**
+   * `#1967 vibe-talk-reader-pause-on-any-composer`. This reply sent from a composer that held the
+   * read: carry the read on from where it was held. Optional: a page with no read omits it.
+   */
+  resumeAfterSend?: () => void;
   /** `#846 draft-chip-honest`. The box has opened on a message's words, its draft on screen. */
   opened?(): void;
 }
@@ -682,6 +687,9 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
     });
     deps.byId("quick-reply-text").value = "";
     closeQuickReply();
+    // `#1967 vibe-talk-reader-pause-on-any-composer`. Sent from a composer that held the read:
+    // carry it on from where it was held. A hand-paused read (`#554`) is not this: it stays held.
+    if (typeof deps.resumeAfterSend === "function") deps.resumeAfterSend();
     await completion;
   }
 

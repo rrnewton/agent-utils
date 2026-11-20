@@ -33,6 +33,13 @@ export interface ReadControlsDependencies {
   /** Whether a read plays or is held, its Pause and Resume, and the message still being fetched, if any. */
   readInProgress(): boolean;
   toggleReadingPaused(): unknown;
+  /**
+   * `#1967 vibe-talk-reader-pause-on-any-composer`. The document, for the focus arriving in a reply
+   * composer; null where it cannot be listened to.
+   */
+  doc(): EventTarget | null;
+  /** A reply composer took the focus while a read plays: hold the read before anything is heard into it. */
+  pauseForComposer(): unknown;
   pendingRead(): string | null;
   /** Whether reading mode is on, turning it on or off, and leaving it with the read (Stop). */
   readingMode(): boolean;
@@ -101,5 +108,18 @@ export function mountReadControls(deps: ReadControlsDependencies): ReadControls 
   listen(el("read-aloud-stop"), "click", () => deps.leaveReadingMode());
   // `#886 voice-page-autoplay`. Stop forgets a Hang up's halt, as nothing it stopped will end and go on.
   listen(el("read-aloud-stop"), "click", () => deps.forgetAutoplayHalt());
+  // `#1967 vibe-talk-reader-pause-on-any-composer`. THE one focus choke point: every way of putting
+  // the cursor into a reply composer — the row's Reply or Quote reply, the selection chip or its strip
+  // twin, React, the dock icon, the Draft chip, a keyboard shortcut, a tap into the box itself — ends
+  // in a `focusin` on one of the two reply composers, the docked `#reply-text` (moved between its
+  // column hosts) or the floating `#quick-reply-text`. A playing read is held there, before any
+  // microphone (the page's dictation, which guards itself too, or the keyboard's) can hear it.
+  const doc = deps.doc();
+  if (doc !== null) {
+    listen<FocusEvent>(doc, "focusin", (event) => {
+      const target = event && event.target as { readonly id?: unknown } | null;
+      if (target && (target.id === "reply-text" || target.id === "quick-reply-text")) deps.pauseForComposer();
+    });
+  }
   return { unmount };
 }
