@@ -66,8 +66,21 @@ def _arm_active_parent_death(expected_parent: int) -> bool:
 
 
 def _become_subreaper() -> None:
-    """Adopt orphaned adapter descendants instead of leaving them to PID 1."""
-    _prctl(_PR_SET_CHILD_SUBREAPER, 1)
+    """Adopt orphaned adapter descendants instead of leaving them to PID 1.
+
+    Adoption is load-bearing: without it the frozen-census cleanup cannot
+    prove the adapter's orphans are gone. A kernel or seccomp policy that
+    refuses PR_SET_CHILD_SUBREAPER (#1938) therefore fails by name, never
+    silently, since proceeding would fake that proof.
+    """
+    try:
+        _prctl(_PR_SET_CHILD_SUBREAPER, 1)
+    except OSError as exc:
+        raise OSError(
+            exc.errno,
+            f"PR_SET_CHILD_SUBREAPER refused ({exc.strerror}); "
+            "orphaned adapter descendants cannot be adopted or proven gone",
+        ) from exc
 
 
 def _kill_group(pgid: int) -> None:

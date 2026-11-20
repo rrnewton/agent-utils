@@ -295,6 +295,18 @@ def _wait_for_process_identities(
     )
 
 
+def test_subreaper_refusal_fails_by_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A kernel or seccomp refusal of PR_SET_CHILD_SUBREAPER names itself (#1938)."""
+    from agentctl import _command_supervisor
+
+    def refuse(_option: int, _argument: int) -> None:
+        raise OSError(1, "Operation not permitted")
+
+    monkeypatch.setattr(_command_supervisor, "_prctl", refuse)
+    with pytest.raises(OSError, match="PR_SET_CHILD_SUBREAPER refused"):
+        _command_supervisor._become_subreaper()
+
+
 def test_command_supervisor_reaps_nested_descendants_before_return(tmp_path: Path) -> None:
     """An outer subreaper exposes zombies which would otherwise be hidden by PID 1."""
     pids = tmp_path / "descendants"
