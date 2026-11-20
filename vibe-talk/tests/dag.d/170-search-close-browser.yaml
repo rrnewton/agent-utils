@@ -1,0 +1,19 @@
+steps:
+  # `#1968 vibe-talk-search-close-x` in the browser engine: the X at the right of the open
+  # search bar is named "Close search", at least 44px, overlaps nothing on the bar, and
+  # clicking it folds the bar, clears the query and restores the parked row and scroll,
+  # at 412x915 (keyboard open and closed) and 1280x800 in light and dark.
+  - group: check
+    job: search-close-browser
+    desc: the search bar X closes search and restores the parked view, in current Chromium at 412x915 and 1280x800 in both schemes, keyboard open and closed
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/search_close_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 600
+    cpu_timeout: 90
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 60
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824

@@ -207,6 +207,8 @@ export function createControlBar(deps: ControlBarDependencies): ControlBar {
     // for width — in the dock or in the header.
     deps.el("search-toggle").hidden = deps.screen() !== "main";
     deps.el("search-field").hidden = deps.el("search-toggle").hidden || !deps.searchOpen();
+    // `#1968 vibe-talk-search-close-x`. The X stands only while the bar is open.
+    deps.el("search-close").hidden = deps.el("search-field").hidden;
     deps.el("search-count").hidden = deps.el("search-field").hidden;
     // `#206 pin-message`, a Labels drop-down since `#1853`. Beside the glass while the bar is
     // open, and over the channel only: a pin is a channel message, and the call's transcript

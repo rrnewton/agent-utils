@@ -795,6 +795,21 @@
   height: 21px;
 }
 
+/* `#1968 vibe-talk-search-close-x`. The X at the right-hand end of the open bar: a full
+   44px square target (the bar's own `--toggle-hit`), ink-coloured so it reads as the way
+   out, pushed to the right edge so it stays there when a phone wraps the bar to two rows. */
+#search-close {
+  width: var(--toggle-hit);
+  height: var(--toggle-hit);
+  margin-left: auto;
+  color: var(--ink);
+}
+
+#search-close .icon {
+  width: 22px;
+  height: 22px;
+}
+
 /* The 48px target, drawn as nothing. A pseudo-element is part of its button for hit-testing, so a
    tap anywhere in this square presses the glass while the disc stays its own size. Its box is
    measured from the button's padding box, hence the border's 1px on every side.

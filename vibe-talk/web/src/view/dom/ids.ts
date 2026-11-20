@@ -591,6 +591,7 @@ export interface ElementById {
   "search-older-note": HTMLParagraphElement;
   "search-scope": HTMLParagraphElement;
   "search-screen-sep": HTMLDivElement;
+  "search-close": HTMLButtonElement;
   "search-toggle": HTMLButtonElement;
   "selection-chip": HTMLButtonElement;
   "selection-chip-dismiss": HTMLButtonElement;

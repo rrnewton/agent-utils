@@ -94,6 +94,12 @@ export function mountFilterChips(deps: FilterChipsDependencies): FilterChips {
   // `#129 message-search`. The glass is a toggle, and the second tap is the way out: a control that
   // only ever opens leaves the reader looking for a close button that is not on a phone keyboard.
   listen(el("search-toggle"), "click", () => deps.setSearchOpen(!deps.searchOpen()));
+  // `#1968 vibe-talk-search-close-x`. The X on the right of the open bar: the same close the
+  // magnifier's second tap and Escape make, through the same path, focus settled as Escape settles it.
+  listen(el("search-close"), "click", () => {
+    deps.setSearchOpen(false);
+    deps.settleFocus();
+  });
   // `#1853`: the Labels drop-down beside the glass owns Pinned now
   // (`createLabelsFilter`); this mount keeps the glass and the other toggles.
   // `#211 link-filter`. The same, for links.

@@ -2554,6 +2554,23 @@ def _act_message_search(driver: Driver) -> None:
     driver.settle(300)
 
 
+def _act_search_close(driver: Driver) -> None:
+    """`#1968 vibe-talk-search-close-x`: the open bar with its X at the right-hand end.
+
+    The bar stands over the channel with a query typed, so the shot shows the field, the
+    count, the filters, the magnifier and the X competing for the line exactly as the
+    owner meets them on a phone.
+    """
+    _act_open_channel(driver)
+    driver.click("search-toggle")
+    driver.page.wait_for_function("() => window.__visible('search-field')", timeout=5_000)
+    driver.page.fill("#search-field", '"mac runner"')
+    driver.page.wait_for_function(
+        "() => (window.__text('search-count') || '').length > 0", timeout=5_000
+    )
+    driver.settle(300)
+
+
 def _act_links_filter(driver: Driver) -> None:
     """`#211 link-filter`: the Links filter on over the channel, each row's links one per line.
 
@@ -7985,6 +8002,30 @@ SCENES: tuple[Scene, ...] = (
                 "const dark = document.documentElement.getAttribute('data-theme') === 'dark'; "
                 "return root.getPropertyValue('--accent').trim() === (dark ? '#4cc2b0' : '#0f766e') "
                 "&& root.getPropertyValue('--discuss-head-bg').trim() === (dark ? '#1d4a42' : '#d9f0ea'); })()",
+            ),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="87-search-close",
+        what="the search bar open with a query typed and the Close search X at its right-hand end",
+        act=_act_search_close,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            (
+                "the X is up, named, and at least 44px square",
+                "(() => { const x = document.getElementById('search-close'); "
+                "const r = x.getBoundingClientRect(); return window.__visible('search-close') "
+                "&& x.getAttribute('aria-label') === 'Close search' && r.width >= 44 && r.height >= 44; })()",
+            ),
+            (
+                "the X is the rightmost control on the bar and overlaps none of them",
+                "(() => { const bar = document.getElementById('search-float'); "
+                "const x = document.getElementById('search-close').getBoundingClientRect(); "
+                "return [...bar.children].filter((el) => el.id !== 'search-close' && window.__visible(el.id))."
+                "every((el) => { const r = el.getBoundingClientRect(); "
+                "return r.right <= x.left + 1 || r.bottom <= x.top || r.top >= x.bottom; }); })()",
             ),
             ("no error banner is up", "!window.__visible('error-wrap')"),
         ),

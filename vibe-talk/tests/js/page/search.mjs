@@ -227,6 +227,39 @@ test("CLOSING THE GLASS PUTS EVERY ROW BACK, BECAUSE A FILTER NOBODY CAN SEE IS 
   assert.equal(page.el("search-field").hidden, true, "Escape left the field open");
 });
 
+test("THE X ON THE RIGHT OF THE BAR CLOSES THE SEARCH AND PUTS EVERY ROW BACK", async () => {
+  // `#1968 vibe-talk-search-close-x`. The magnifier's second tap was the only way out and
+  // nothing said so; the X says it. It stands only while the bar is open, at its right-hand
+  // end, named for a screen reader, and a press is the magnifier's close: query cleared,
+  // every row back, the field folded away.
+  const page = newPage();
+  recorded(page, "conv", TALKED_ABOUT);
+  await signIn(page);
+  await page.settle();
+  const close = page.el("search-close");
+  assert.equal(close.hidden, true, "the X stands with the search closed");
+  // The fixture takes only `hidden` and `aria-pressed` from the markup, so the name and
+  // the button type are read from the served markup itself.
+  assert.match(HTML, /<button id="search-close"[^>]*type="button"[^>]*aria-label="Close search"/,
+    "the X has no accessible name in the markup");
+  assertMarkupContains("search-float", "search-close");
+  // The target is the bar's own 44px square, not the 36px disc drawn inside the toggles.
+  assert.match(cssBlock("#search-close"), /width:\s*var\(--toggle-hit\)/);
+  assert.match(cssBlock("#search-close"), /height:\s*var\(--toggle-hit\)/);
+  assert.match(cssBlock("#search-close"), /margin-left:\s*auto/, "the X is not held to the right of the bar");
+
+  await search(page, "stalled");
+  assert.equal(unfiltered(page, "transcript").length, 1);
+  assert.equal(close.hidden, false, "the X did not stand with the bar open");
+
+  await close.click();
+  assert.equal(unfiltered(page, "transcript").length, 4, "the X left the filter on");
+  assert.equal(page.el("search-field").value, "", "the X parked the query behind a shut control");
+  assert.equal(page.el("search-field").hidden, true, "the X left the field open");
+  assert.equal(close.hidden, true, "the X stayed up over a closed search");
+  assert.equal(page.el("search-toggle").getAttribute("aria-pressed"), "false");
+});
+
 test("NOTHING MATCHED IS SAID WHERE THE MESSAGES WERE, NOT ONLY IN THE CORNER", async () => {
   // The state this closes is a blank screen. Every row is still IN the list — hidden by a class,
   // which is the whole design — so neither pane's own empty state fires, and the only thing
