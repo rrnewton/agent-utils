@@ -87,7 +87,7 @@ export {
   upsertThread,
   versionOf,
 } from "./incremental.ts";
-export { DEFAULT_ROW_PX, correctionFor, forgetHeight, heightFor, measuredHeight, noteMeasured, rangeHeight, rowClassOf } from "./heights.ts";
+export { DEFAULT_ROW_PX, correctionFor, estimatedHeightFor, forgetHeight, heightFor, measuredHeight, noteMeasured, rangeHeight, rowClassOf } from "./heights.ts";
 export { createHydrationPacer } from "./hydration.ts";
 export type { HydrationPacer } from "./hydration.ts";
 export type { RowClass } from "./heights.ts";

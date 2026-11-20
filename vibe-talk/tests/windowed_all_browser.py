@@ -69,7 +69,10 @@ def build_messages() -> tuple[list[Json], list[Json]]:
                 "timestamp": (EPOCH + timedelta(minutes=seq)).isoformat().replace("+00:00", "Z"),
                 "spoken_time": "", "reply_to": None,
                 "content": f"Thread {thread} message {round_}: {LONG}",
-                "thread": {"id": root_id, "is_root": is_root, "root_message_id": root_id},
+                # The contract's MessageThread: every field, on every message.
+                "thread": {"id": root_id, "is_root": is_root, "root_message_id": root_id,
+                           "reply_count": REPLIES if is_root else None,
+                           "reply_count_exact": is_root},
             }
             if is_root:
                 row["id"] = root_id
@@ -89,6 +92,7 @@ def build_messages() -> tuple[list[Json], list[Json]]:
 
 @dataclass
 class FakeApi:
+    stopping: threading.Event = field(default_factory=threading.Event)
     lock: threading.Lock = field(default_factory=threading.Lock)
     messages: list[Json] = field(default_factory=list)
     summaries: list[Json] = field(default_factory=list)
@@ -153,8 +157,23 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
                 self.json(200, {"turns": [], "has_more": False, "next_before": None})
             elif path.endswith("/timeline") or path.endswith("/page"):
                 self.json(200, api.timeline(parse_qs(parts.query)))
+            elif path.endswith("/stream"):
+                self.stream()
             else:
                 self.json(404, {"error": "not_found", "detail": "not served by this check"})
+
+        def stream(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try:
+                while not api.stopping.wait(1):
+                    self.wfile.write(b": keep-alive\n\n")
+                    self.wfile.flush()
+            except OSError:
+                pass
+            self.close_connection = True
 
         def asset(self, request_path: str) -> None:
             relative = "voice.html" if request_path == "/" else request_path.lstrip("/")
@@ -210,12 +229,14 @@ SETTLE_JS = """() => new Promise((resolve) => {
     else requestAnimationFrame(step);
   };
   requestAnimationFrame(step);
-})()"""
+})"""
 ANCHOR_JS = """() => {
-  const a = document.getElementById('scroll-area');
-  const top = a.getBoundingClientRect().top;
+  // The reader's row, as the fold itself anchors: the first row standing in
+  // the visible band (not the sliver already scrolled off the top, whose own
+  // expansion must move it).
+  const band = document.getElementById('scroll-area').clientHeight || 0;
   const row = [...document.querySelectorAll('#discord-log > li[data-id]')]
-    .find((li) => li.getBoundingClientRect().bottom > top);
+    .find((li) => { const top = li.getBoundingClientRect().top; return top >= -1 && top < band; });
   return row ? { id: row.getAttribute('data-id'), top: row.getBoundingClientRect().top } : null;
 }"""
 ANCHOR_TOP_JS = """(id) => {
@@ -260,7 +281,13 @@ def all_walk(walk: Walk, windowed: bool) -> None:
         page.select_option("#thread-select", "flat")
     walk.wait_for("() => document.getElementById('discord-log').getAttribute('data-view') === 'flat'",
                   "All did not open")
-    walk.wait_for(f"() => {MOUNTED_JS} > 0", "All mounted no rows")
+    walk.wait_for("() => document.querySelectorAll('#discord-log > li:not([data-window-spacer])').length > 0",
+                  "All mounted no rows")
+    if windowed:
+        # The window stands a render after the first rows land: condition, not a count at an instant.
+        walk.wait_for("() => { const n = document.querySelectorAll('#discord-log > li:not([data-window-spacer])').length; "
+                      f"return n > 0 && n < {THREADS * (REPLIES + 1)}; }}",
+                      "windowed All never windowed its rows")
     mounted = int(page.evaluate(MOUNTED_JS))
     if windowed:
         walk.check(0 < mounted < THREADS * (REPLIES + 1),
@@ -273,13 +300,37 @@ def all_walk(walk: Walk, windowed: bool) -> None:
     walk.shot("1-all-chips")
     # Mid-history anchor, then (b) the ';' fold toggle.
     page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight * 0.4; }")
-    page.wait_for_timeout(300)
+    walk.wait_for("() => { const band = document.getElementById('scroll-area').clientHeight || 0; "
+                  "return [...document.querySelectorAll('#discord-log > li[data-id]')]"
+                  ".some((li) => { const t = li.getBoundingClientRect().top; return t >= -1 && t < band; }); }",
+                  "no anchor row mid-history")
     anchor = page.evaluate(ANCHOR_JS)
     walk.check(anchor is not None, "no anchor row mid-history")
+    # Select the anchor row, as a reader on it does: the fold holds the
+    # selected row, and that row is the place this check judges.
+    page.locator(f"#discord-log > li[data-id='{anchor['id']}']").click()
+    page.wait_for_timeout(300)
+    selected = page.evaluate(
+        "() => document.querySelector('#discord-log > li[data-selected=\"true\"]')?.getAttribute('data-id') ?? null")
+    walk.check(selected is not None, "clicking the anchor row did not select it")
+    anchor = {"id": str(selected), "top": page.evaluate(ANCHOR_TOP_JS, str(selected))}
+    walk.check(anchor["top"] is not None, "no selected anchor row")
     page.evaluate("() => document.getElementById('scroll-area').focus()")
     page.keyboard.press(";")
-    page.wait_for_timeout(300)
-    top = page.evaluate(ANCHOR_TOP_JS, anchor["id"])
+    # The anchor's settled place, not a mid-flight sample: same within a
+    # pixel across five checks in a row, however long the host takes.
+    top = None
+    stable = 0
+    for _ in range(200):
+        now = page.evaluate(ANCHOR_TOP_JS, anchor["id"])
+        if now is not None and top is not None and abs(now - top) <= 1:
+            stable += 1
+            if stable >= 5:
+                break
+        else:
+            stable = 0
+        top = now
+        page.wait_for_timeout(50)
     if windowed:
         walk.check(top is not None and abs(top - anchor["top"]) <= 8,
                    f"';' moved the anchor from {anchor['top']} to {top}")
@@ -358,6 +409,7 @@ def main() -> int:
                         context.close()
                         report.append(f"{walk.label}: " + "; ".join(walk.notes))
                 finally:
+                    api.stopping.set()
                     server.shutdown()
                     server.server_close()
                     thread_.join()

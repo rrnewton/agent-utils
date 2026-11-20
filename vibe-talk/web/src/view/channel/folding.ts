@@ -192,6 +192,14 @@ export function createFolding(deps: FoldingDependencies): Folding {
   /** Which messages the reader has OPENED, by message id: the id survives a rebuild of the row. */
   const expandedIds = new Set<string>();
 
+  /**
+   * The fold step last applied in this column (`#1985`): rows built after it
+   * start in its state. With a windowed list only the mounted rows could be
+   * stepped, and a row mounted later built folded as always, taking its
+   * height out of the list above the reader and throwing their place.
+   */
+  let foldBuildStep: string | null = null;
+
   function summaryThread(entry: FoldEntry): string | null {
     const thread = entry.li.getAttribute("data-unpack-thread") || deps.threadOf(deps.rowMessages(entry.li)[0]);
     return thread && thread !== deps.currentScope() ? thread : null;
@@ -253,7 +261,8 @@ export function createFolding(deps: FoldingDependencies): Folding {
       applySummaryState(entry);
     }
     li.foldEntry = entry;
-    setFolded(entry, !(entry.id !== null && expandedIds.has(entry.id)));
+    setFolded(entry, !((entry.id !== null && expandedIds.has(entry.id)) ||
+      (foldBuildStep === "expand" && entry.id !== null)));
     fold.addEventListener("click", deps.inThisColumn(() => {
       deps.readerActed();
       const pane = deps.side() ? deps.sidePane() : deps.channelPane();
@@ -729,6 +738,7 @@ export function createFolding(deps: FoldingDependencies): Folding {
 
   function setAllFolded(folded: boolean): void {
     deps.readerActed();
+    foldBuildStep = folded ? "collapse" : "expand";
     deps.preservingScroll(() => {
       for (const entry of visibleFolds()) setFolded(entry, folded);
     });
@@ -781,6 +791,7 @@ export function createFolding(deps: FoldingDependencies): Folding {
 
   function applyFoldStep(step: string, folds: FoldEntry[], field: HTMLElement | null = null): void {
     deps.readerActed();
+    foldBuildStep = step;
     if (field) {
       deps.entryState().landing = null;
       deps.entryState().threadOwed = null;

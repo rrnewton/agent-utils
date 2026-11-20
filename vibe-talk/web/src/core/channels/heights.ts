@@ -83,6 +83,20 @@ export function measuredHeight(canon: ChannelCanon, id: string, bucket: string):
   return held === undefined ? null : held;
 }
 
+/**
+ * The estimated height of `message` at `bucket` with no measured value
+ * consulted (`#1985`): the class median refined by body length, as
+ * `heightFor` prices a row nobody has measured.
+ */
+export function estimatedHeightFor(canon: ChannelCanon, message: Message, bucket: string, folded: boolean): number {
+  const state = stateOf(canon);
+  const cls = rowClassOf(message, folded);
+  const base = median(state.samples.get(`${cls}|${bucket}`) || []);
+  if (cls === "collapsed") return base;
+  const lines = Math.max(1, Math.ceil((message.content?.length || 0) / 40));
+  return lines <= 3 ? base : Math.round(base * (1 + (lines - 3) * 0.18));
+}
+
 /** Total estimated height of `messages[from..to)` at `bucket` (a spacer's height). */
 export function rangeHeight(
   canon: ChannelCanon,
