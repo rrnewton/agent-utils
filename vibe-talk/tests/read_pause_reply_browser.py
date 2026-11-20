@@ -525,7 +525,12 @@ def composer_pause_walk(desk: Desk, api: VoicesApi, voice: str, touch: bool) -> 
     desk.wait_for("() => document.getElementById('quick-reply').hidden",
                   "composer-pause: docking left the floating reply up", STATE_S)
     desk.shot("composer-docked-paused")
+    # The docked box holds the quote, so Cancel asks "Discard this draft?" first (as it does for any
+    # words); answering Yes is what puts it away.
     press(page, "#reply-cancel", touch)
+    desk.wait_for("() => !document.getElementById('reply-discard').hidden",
+                  "composer-pause: Cancel on the docked quote asked no discard question", STATE_S)
+    press(page, "#reply-discard-yes", touch)
     desk.wait_for("() => document.getElementById('column-reply').hidden",
                   "composer-pause: Cancel did not put the docked reply away after docking", STATE_S)
     desk.check(label(page) == "Resume", "composer-pause: Cancel after docking resumed the read")
