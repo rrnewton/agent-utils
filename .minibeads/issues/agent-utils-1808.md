@@ -41,3 +41,7 @@ Both editions (Python and Rust wrkslotsd) agree on the lock object, the wait dis
 # Notes
 
 Coordinates with #1807 (remove race fix, same lock code): implementation rebases on top of #1807 once it is on main. Measurement report sent to the lead coordinator before any code change (2026-11-18).
+
+## Status (2026-11-20)
+
+[watermelon-full-preview] Stages A-D landed: A-C plus #1857 at 74549a37, stage D (dual legacy-dir + config.lock, fixed order) at 77fa56e8. Stage E (heartbeats take no config lock, digest-checked coherence) is implemented and committed in the mu-configlock/stage-e branch (fd18320c) and advance-GO'd, but not yet landed; it remains the one open stage, so this issue stays open for it.

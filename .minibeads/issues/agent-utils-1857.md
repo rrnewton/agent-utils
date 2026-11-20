@@ -1,13 +1,14 @@
 ---
 title: 'wrkslots-prepared-remove-tolerates-foreign-events: prepared removes defer on any foreign event'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - wrkslots
 - lock-scope
 created_at: 2026-11-18T12:30:00+00:00
-updated_at: 2026-11-18T12:30:00+00:00
+updated_at: 2026-11-20T07:38:14+00:00
+closed_at: 2026-11-20T07:38:14+00:00
 ---
 
 # Description
@@ -31,3 +32,7 @@ Regression test from the measured scenario: foreign events (another slot's creat
 # Notes
 
 Found on top of #1807; the fix builds on #1808's tolerated-change work (stage 1). The consumer pins this fix as soon as it lands.
+
+## Resolution
+
+[watermelon-full-preview] Delivered with the #1808 A-C stack at 74549a37: the prepared-removal check tolerates other slots' heartbeat-only event growth (fold-onto-log verified) and the advance-past-another-slot's-event branch is reachable; regression tests from the consumer scenario pass in both editions. Consumer confirmed removes go through after pinning that build.

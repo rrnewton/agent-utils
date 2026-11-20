@@ -31,3 +31,7 @@ Acceptance fixture (from the consumer): a seal journal whose named processes are
 # Notes
 
 Blocks the consumer's validate runs and removal queue; owner-priority gate.
+
+## Status (2026-11-20)
+
+[watermelon-full-preview] The narrow closures landed at 9d37f563: the real-reader census guard test, the generic --slice mechanism, the absent-slot recovery closure (recorded owner proven dead plus two reference scans), and the validation teardown closure (owner dead, recorded slice subtree empty-or-unknown, one reference scan; the deleted-root exemption proves the held inode). The general census still refuses under sustained churn of new same-UID generations: the candidate-scoped and lineage-scoped redesigns were both proven unsafe by cold review (a vanished unscanned generation is indistinguishable from churn), so the general-census direction (scoped owner/cgroup proof) awaits the owner's decision, and this issue stays open for it.
