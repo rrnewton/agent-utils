@@ -1,13 +1,13 @@
 ---
 title: 'wrkslots-adopt-reports-success-binds-nothing: adopt exits 0 but binds no owner'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - wrkslots
 - lifecycle
 created_at: 2026-11-18T12:30:00+00:00
-updated_at: 2026-11-18T12:30:00+00:00
+updated_at: 2026-11-20T14:00:00+00:00
 ---
 
 # Description
@@ -30,3 +30,7 @@ updated_at: 2026-11-18T12:30:00+00:00
 One of three related lifecycle dead-ends reported together; see #1868 wrkslots-finish-without-handoff-dead-end and #1870 wrkslots-transfer-owner-held-dead-owner. Whether current main already changes this behaviour is checked before the fix and recorded in the resolution.
 
 Second case (2026-11-19, from the same reporter): `finish` refuses `no bound owner process` and `adopt` is blocked by a dead VALIDATE-BATCH-SEAL journal (`interrupted validation-batch seal recorded in ...; run wrkslots recover first`). Scope therefore includes seals: `adopt` recovers an orphaned (operator proven dead, no paired finish) seal under its lock, and proceeds beside a remaining seal when the adopted slot is disjoint from every sealed target (different slot, no directory containment, different (device, inode)); an overlapping adopt keeps the canonical seal refusal. The orphan proof was tightened after a cold review: only a recorded boot that ended, a PID absent from a verified whole-host process view, or the exact recorded generation as an unreaped zombie counts as dead; a cgroup-only move, a reused PID, a namespace-local recording, a missing operator, and an unverifiable host view all keep the seal binding. The pre-existing create-side forms of the cgroup and no-operator misjudgments are tracked as #1922 wrkslots-seal-orphan-misjudges-live-operator. The stuck paired-finish census behind the reporter's seal is #1883. This change is Python-only: the Rust edition has no seal-recovery writer yet (its adopt is fixture-only before cutover), so the Rust port is a follow-up the cutover must include. Case 1's silent exit 0 was traced to the reporter's `timeout 60 ... | head -20` pipeline (head's exit code, with adopt starved by full-registry validations under churn); every adopt path in the code refuses non-zero, so that half closes as not-a-bug in the resolution.
+
+## Resolution
+
+[watermelon-full-preview] Landed as c98f8428. Adopt now judges a validation-batch seal against its own slot under the mutation lock (overlap by slot, path containment, or recorded device+inode keeps the canonical refusal; recovery only after every precondition passes), and adopt, create and recover share a judge-namespace-relative orphan proof in both editions: only a recorded boot that ended, a PID absent or reused under the seal's own namespace stamp (an unstamped legacy seal under a verified whole-host view), or the exact recorded generation as an unreaped zombie proves a batch dead. The writer stamps its own pidns (never refusing for its namespace, but refusing when /proc is not its own), the override is gated to its own namespace or a verified host view, scans for live batches including inside the recorded namespace, and records each retirement after it succeeds in the existing recovery event. Case 1's silent exit 0 was the reporter's `timeout 60 ... | head -20` pipeline (head's exit code), not adopt: every adopt path refuses non-zero, so that half closes as not-a-bug. The Rust recovery writer remains a cutover follow-up, as noted; seventh-review residuals are #1958 wrkslots-seal-override-scan-residuals.
