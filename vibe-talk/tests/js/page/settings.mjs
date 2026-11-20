@@ -3067,5 +3067,5 @@ test("`#1961 vibe-talk-colour-themes`: no accent blue stands hard-coded outside 
       assert.ok(!bare.includes(hex), `${name} still hard-codes ${hex} outside its tokens`);
     }
   }
-  assert.match(cssRules(CSS_CODE, ".discuss-head").join("\n"), /background:\s*var\(--discuss-head-bg\)/, "the Discuss header does not paint the themed variable");
+  assert.match(cssRules(CSS_CODE, ".discuss-head").join("\n"), /background:\s*var\(--discuss-head-bg(?:,|\))/, "the Discuss header does not paint the themed variable");
 });
