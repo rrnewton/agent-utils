@@ -2269,14 +2269,17 @@ class _WorkspaceClient:
                     if isinstance(document, dict) and document.get("text") == command:
                         self.goal_objective = objective
                         break
-        # Never type a registered goal over a picker already open
+        # Never type any goal command over a picker already open
         # (#1939 D4): its Enter would answer the other goal's picker.
-        # Only a delivery that just claimed the registered goal (above)
-        # is refused; ordinary text that merely looks like a goal
-        # keeps its base behaviour. This edition never cancels a
-        # picker; it only ever confirms its own registered goal in
-        # wait_agent_status below.
-        if self.record.harness == "codex" and self.goal_objective is not None:
+        # Any delivery whose text parses as a goal command refuses,
+        # registered or not; ordinary non-goal text is refused by
+        # the verified-submission baseline instead. This edition
+        # never cancels a picker; it only ever confirms its own
+        # registered goal in wait_agent_status below.
+        stripped = command.lstrip()
+        is_goal = (stripped.startswith("/goal") and len(stripped) > 5
+                   and stripped[5] in (" ", "\t"))
+        if self.record.harness == "codex" and is_goal:
             from agentctl.harness_tui.codex import read_replace_goal_picker
 
             screen = self.client.read(pane_id, source="visible", lines=200)

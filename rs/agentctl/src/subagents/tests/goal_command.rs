@@ -282,6 +282,31 @@ fn the_registered_run_path_also_refuses_over_an_open_picker() {
 }
 
 #[test]
+fn an_ordinary_send_of_a_registered_objective_also_refuses_over_an_open_picker() {
+    // #1939 (coordb): even the ordinary-send shape whose text IS a
+    // registered objective — the one that bypasses the raw goal flow
+    // by design — refuses not-staged over an open picker, so no
+    // delivery can type plus Enter into it.
+    let fixture = Fixture::new();
+    fixture.start(None);
+    let mut record = fixture.manager().load("worker").unwrap();
+    record
+        .goal_messages
+        .insert("m-1".to_owned(), "ship the release".to_owned());
+    fixture.manager().save(&record).unwrap();
+    *fixture.client.screen.lock().unwrap() = Some(codex_picker("a different task"));
+    let manager = fixture.manager();
+    let error = manager
+        .send("worker", "/goal ship the release", quick())
+        .unwrap_err();
+    assert!(error.to_string().contains("already open"), "{error}");
+    assert!(fixture.client.runs.lock().unwrap().is_empty());
+    assert!(fixture.client.keys_sent.lock().unwrap().is_empty());
+    // Still pending for a later drain, never filed as submitted.
+    assert_eq!(manager.pending_prompts("worker").unwrap().len(), 1);
+}
+
+#[test]
 fn a_goal_command_with_no_answer_is_possibly_submitted_and_never_typed_again() {
     let fixture = Fixture::new();
     fixture.start(None);
