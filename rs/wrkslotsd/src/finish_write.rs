@@ -75,9 +75,18 @@ fn network_operation(args: &[&str]) -> bool {
 
 /// Run one Git command, waiting out credential pacing on network commands.
 fn git_run_paced(repo: &Path, args: &[&str], dev_null_dir: bool) -> Result<GitOutput> {
+    git_run_paced_ssh(repo, args, dev_null_dir, None)
+}
+
+fn git_run_paced_ssh(
+    repo: &Path,
+    args: &[&str],
+    dev_null_dir: bool,
+    ssh_command: Option<&str>,
+) -> Result<GitOutput> {
     let deadline = Instant::now() + Duration::from_secs(CREDENTIAL_PACING_WAIT_SECONDS);
     loop {
-        let output = git_run(repo, args, dev_null_dir)?;
+        let output = git_run_env(repo, args, dev_null_dir, ssh_command)?;
         if output.code == 0
             || !network_operation(args)
             || !credential_pacing_refused(&format!("{}\n{}", output.stderr, output.stdout))
@@ -97,6 +106,15 @@ fn git_run_paced(repo: &Path, args: &[&str], dev_null_dir: bool) -> Result<GitOu
 }
 
 fn git_run(repo: &Path, args: &[&str], dev_null_dir: bool) -> Result<GitOutput> {
+    git_run_env(repo, args, dev_null_dir, None)
+}
+
+fn git_run_env(
+    repo: &Path,
+    args: &[&str],
+    dev_null_dir: bool,
+    ssh_command: Option<&str>,
+) -> Result<GitOutput> {
     let mut command = Command::new("git");
     command
         .args([
@@ -119,6 +137,10 @@ fn git_run(repo: &Path, args: &[&str], dev_null_dir: bool) -> Result<GitOutput> 
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .env("GIT_NO_REPLACE_OBJECTS", "1");
+    // #1940: a declared per-remote SSH command, scoped to this command.
+    if let Some(ssh) = ssh_command {
+        command.env("GIT_SSH_COMMAND", ssh);
+    }
     if dev_null_dir {
         command.env("GIT_DIR", "/dev/null");
     }
@@ -130,6 +152,28 @@ fn git_run(repo: &Path, args: &[&str], dev_null_dir: bool) -> Result<GitOutput> 
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
+}
+
+pub(crate) fn git_with_ssh(
+    repo: &Path,
+    args: &[&str],
+    ssh_command: Option<&str>,
+) -> Result<String> {
+    let output = git_run_paced_ssh(repo, args, false, ssh_command)?;
+    if output.code != 0 {
+        let detail = output.stderr.trim();
+        return Err(format!(
+            "Git refused in {}: git {}{}",
+            repo.display(),
+            args.join(" "),
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            }
+        ));
+    }
+    Ok(output.stdout)
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<String> {
@@ -900,15 +944,17 @@ pub(crate) fn fetch_remote(
     remote: &str,
     landed_ref: &str,
     url: &str,
+    ssh_command: Option<&str>,
 ) -> Result<()> {
     let prefix = format!("refs/remotes/{remote}/");
     if !landed_ref.starts_with(&prefix) {
         return Err(format!("landed ref must be under {prefix}: {landed_ref}"));
     }
-    let listed = git_run_paced(
+    let listed = git_run_paced_ssh(
         checkout,
         &["ls-remote", "--refs", "--heads", "--", url],
         true,
+        ssh_command,
     )?;
     if listed.code != 0 {
         return Err(format!(
@@ -950,7 +996,7 @@ pub(crate) fn fetch_remote(
     let scratch_inventory = |checkout: &Path| ref_inventory(checkout, SCRATCH);
     if !advertised.is_empty() {
         let fetched = (|| -> Result<()> {
-            git(
+            git_with_ssh(
                 checkout,
                 &[
                     "fetch",
@@ -962,6 +1008,7 @@ pub(crate) fn fetch_remote(
                     url,
                     &format!("+refs/heads/*:{SCRATCH}*"),
                 ],
+                ssh_command,
             )?;
             let transferred = scratch_inventory(checkout)?;
             let transferred_expected: BTreeMap<String, String> = transferred
@@ -2085,7 +2132,13 @@ pub(crate) fn assert_checkout_safe_judged(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    fetch_remote(&path, &remote, &landed_ref, &url)?;
+    fetch_remote(
+        &path,
+        &remote,
+        &landed_ref,
+        &url,
+        cfg.ssh_command(&remote).as_deref(),
+    )?;
     let (after_sha, _after_url) = remote_authority(&path, &remote)?;
     if after_sha != authority_sha {
         return Err(format!(

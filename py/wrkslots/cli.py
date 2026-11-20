@@ -615,6 +615,7 @@ OPTIONAL_CONFIG_KEYS = frozenset(
         "product_repos",
         "share_submodules",
         "salvage_push_remotes",
+        "remote_ssh_commands",
         "ttl_rescue_ref_root",
         "reclaimable_ignored_paths",
         "validation_exclusion_roots",
@@ -773,6 +774,15 @@ CONFIG_KEY_DOCS: dict[str, str] = {
     "salvage_push_remotes": (
         "Remote URLs that removal may push salvage commits to. Absent or empty allows none: "
         "uncommitted work on any other remote is kept in a verified local bundle instead."
+    ),
+    "remote_ssh_commands": (
+        "Per-remote SSH settings (#1940): a map from remote name to structured fields "
+        "identity_file (absolute path to a key file), identity_agent (none or an agent "
+        "socket path) and proxy_command. wrkslots applies them only as GIT_SSH_COMMAND for "
+        "that remote's fetch, ls-remote and push; nothing is written to any Git config. "
+        "Paths only: no key contents or secrets belong here. List the key in ignorable_keys "
+        "so an older wrkslots ignores it (with a warning) instead of refusing the file; an "
+        "older wrkslots then reaches that remote exactly as it does today, or fails loudly."
     ),
     "ttl_rescue_ref_root": (
         "Ref namespace root for TTL rescue refs (#1368): dated rescue refs are "
@@ -1486,6 +1496,15 @@ class SlotIdentity:
 
 
 @dataclasses.dataclass(frozen=True)
+class RemoteSshCommand:
+    """Declared SSH settings for one remote (#1940): paths only, no secrets."""
+
+    identity_file: str | None = None
+    identity_agent: str | None = None
+    proxy_command: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
 class Config:
     """Validated project configuration and resolved local paths."""
 
@@ -1531,6 +1550,8 @@ class Config:
     share_submodules: bool = False
     #: Remote URLs salvage may push to; every other remote gets a local bundle.
     salvage_push_remotes: tuple[str, ...] = ()
+    #: Per-remote SSH settings (#1940), as (remote, settings) pairs.
+    remote_ssh_commands: tuple[tuple[str, RemoteSshCommand], ...] = ()
     #: Ref namespace root for TTL rescue refs (#1368); absent means refs/rescue.
     ttl_rescue_ref_root: str = "refs/rescue"
     #: Checkout-relative build-output subtrees that leave a frozen clone pristine.
@@ -2791,6 +2812,109 @@ def _validate_salvage_push_remote(value: str) -> str:
     if not value or value != value.strip() or "\x00" in value:
         raise Refusal("salvage push remotes must be non-empty remote URLs")
     return value
+
+
+#: Characters that may never appear in an SSH path field (#1940): any of
+#: them could break out of the shlex-quoted GIT_SSH_COMMAND token, and a
+#: newline could split the command outright. Proxy commands are shell
+#: programs by design, so they are refused only for characters that
+#: defeat quoting itself (newline, NUL); their tokens still reach GIT
+#: only as one shlex-quoted ProxyCommand value.
+_SSH_PATH_FORBIDDEN = frozenset(" \t\r\n\x00\"'`$\\;|&<>(){}[]!#~*?")
+
+
+def _ssh_path(value: object, label: str) -> str:
+    text = _as_str(value, label)
+    if not text.startswith("/") or any(char in _SSH_PATH_FORBIDDEN for char in text):
+        raise StateError(
+            f"{label} must be one absolute path with no spaces or shell "
+            "metacharacters"
+        )
+    return text
+
+
+def _parse_remote_ssh_commands(
+    value: object, label: str
+) -> tuple[tuple[str, RemoteSshCommand], ...]:
+    """Parse the `remote_ssh_commands` config map (#1940)."""
+
+    raw = _as_mapping(value, label)
+    result: list[tuple[str, RemoteSshCommand]] = []
+    for remote in sorted(raw):
+        _validate_remote(remote)
+        entry_label = f"{label}.{remote}"
+        entry = _as_mapping(raw[remote], entry_label)
+        _exact_keys(
+            entry,
+            set(),
+            {"identity_file", "identity_agent", "proxy_command"},
+            entry_label,
+        )
+        identity_file = (
+            None
+            if entry.get("identity_file") is None
+            else _ssh_path(entry["identity_file"], f"{entry_label}.identity_file")
+        )
+        identity_agent: str | None = None
+        if entry.get("identity_agent") is not None:
+            agent = _as_str(entry["identity_agent"], f"{entry_label}.identity_agent")
+            identity_agent = (
+                "none"
+                if agent == "none"
+                else _ssh_path(agent, f"{entry_label}.identity_agent")
+            )
+        proxy_command: str | None = None
+        if entry.get("proxy_command") is not None:
+            proxy = _as_str(entry["proxy_command"], f"{entry_label}.proxy_command")
+            if not proxy.strip() or any(char in proxy for char in "\r\n\x00"):
+                raise StateError(
+                    f"{entry_label}.proxy_command must be one non-empty command "
+                    "with no newline"
+                )
+            proxy_command = proxy
+        if identity_file is None and identity_agent is None and proxy_command is None:
+            raise StateError(f"{entry_label} must set at least one SSH field")
+        result.append(
+            (remote, RemoteSshCommand(identity_file, identity_agent, proxy_command))
+        )
+    return tuple(result)
+
+
+def _remote_ssh_doctor_rows(config: Config) -> list[dict[str, object]]:
+    """Doctor's view of declared SSH settings (#1940): paths, never contents."""
+
+    return [
+        {
+            "remote": name,
+            "identity_file": settings.identity_file,
+            "identity_agent": settings.identity_agent,
+            "proxy_command": (
+                "set" if settings.proxy_command is not None else None
+            ),
+        }
+        for name, settings in config.remote_ssh_commands
+    ]
+
+
+def _remote_ssh_command(config: Config, remote: str) -> str | None:
+    """The GIT_SSH_COMMAND for `remote`, or None when none is declared (#1940).
+
+    Every interpolated value reaches the command as exactly one
+    shlex-quoted token, so no field can inject into the shell Git runs.
+    """
+
+    for name, settings in config.remote_ssh_commands:
+        if name != remote:
+            continue
+        tokens = ["ssh"]
+        if settings.identity_file is not None:
+            tokens += ["-i", settings.identity_file]
+        if settings.identity_agent is not None:
+            tokens += ["-o", f"IdentityAgent={settings.identity_agent}"]
+        if settings.proxy_command is not None:
+            tokens += ["-o", f"ProxyCommand={settings.proxy_command}"]
+        return " ".join(shlex.quote(token) for token in tokens)
+    return None
 
 
 def _string_tuple(
@@ -5324,6 +5448,13 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
             _validate_salvage_push_remote,
         )
     )
+    remote_ssh_commands = (
+        ()
+        if "remote_ssh_commands" not in raw
+        else _parse_remote_ssh_commands(
+            raw["remote_ssh_commands"], "configuration.remote_ssh_commands"
+        )
+    )
     reclaimable_ignored_paths = (
         ()
         if "reclaimable_ignored_paths" not in raw
@@ -5421,6 +5552,7 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
         product_repos=product_repos,
         share_submodules=share_submodules,
         salvage_push_remotes=salvage_push_remotes,
+        remote_ssh_commands=remote_ssh_commands,
         ttl_rescue_ref_root=(
             _validate_rescue_ref_root(
                 _as_str(raw["ttl_rescue_ref_root"], "configuration.ttl_rescue_ref_root")
@@ -22947,6 +23079,8 @@ class _GitVcs:
         remote: str,
         landed_ref: str,
         authority: _RemoteAuthority,
+        *,
+        ssh_command: str | None = None,
     ) -> None:
         _validate_remote(remote)
         _validate_full_ref(landed_ref, "landed ref")
@@ -22962,11 +23096,19 @@ class _GitVcs:
             isolated,
             object_env,
         ):
+            # #1940: a declared per-remote SSH command reaches only
+            # this remote's network operations, as an environment
+            # override; no Git config is written.
+            network_env = (
+                object_env
+                if ssh_command is None
+                else {**object_env, "GIT_SSH_COMMAND": ssh_command}
+            )
             advertised = self._ls_remote_inventory(
                 isolated,
                 authority.url,
                 heads_only=True,
-                env_overrides=object_env,
+                env_overrides=network_env,
             )
             fetched: dict[str, str] = {}
             if advertised:
@@ -22986,7 +23128,7 @@ class _GitVcs:
                     input_text="".join(
                         f"+{ref}:{ref}\n" for ref in sorted(advertised)
                     ),
-                    env_overrides=object_env,
+                    env_overrides=network_env,
                 )
                 transferred = self._direct_ref_inventory(
                     isolated,
@@ -32093,7 +32235,8 @@ def _assert_checkout_safe(
         )
     if refresh_remote:
         vcs.fetch_remote(
-            path, checkout.remote, checkout.landed_ref, remote_authority
+            path, checkout.remote, checkout.landed_ref, remote_authority,
+            ssh_command=_remote_ssh_command(config, checkout.remote),
         )
         vcs.assert_remote_authority(path, checkout.remote, remote_authority)
     remote_refs = vcs.remote_refs_containing(path, checkout.remote, head)
@@ -44120,7 +44263,10 @@ def _create_plan(config: Config, args: argparse.Namespace, vcs: _GitVcs) -> tupl
         # read locally and recorded. Normal slots never skip it.
         offline = bool(getattr(args, "offline_reason", None))
         if not offline and (args.slot_type != "validate" or name not in starts):
-            vcs.fetch_remote(repository, remote, landed_ref, remote_authority)
+            vcs.fetch_remote(
+                repository, remote, landed_ref, remote_authority,
+                ssh_command=_remote_ssh_command(config, remote),
+            )
         vcs.assert_remote_authority(repository, remote, remote_authority)
         start = vcs.verify_ref(
             repository, starts.get(name, landed_ref), "start point"
@@ -60926,7 +61072,8 @@ def _cmd_unpushed_scan(args: argparse.Namespace) -> int:
                         f"checkout {checkout.name} remote {checkout.remote} URL changed"
                     )
                 vcs.fetch_remote(
-                    path, checkout.remote, checkout.landed_ref, remote_authority
+                    path, checkout.remote, checkout.landed_ref, remote_authority,
+                    ssh_command=_remote_ssh_command(config, checkout.remote),
                 )
                 vcs.assert_remote_authority(path, checkout.remote, remote_authority)
                 containing = vcs.remote_refs_containing(path, checkout.remote, head)
@@ -62385,6 +62532,11 @@ def _cmd_doctor_scan_timed(args: argparse.Namespace, config: Config) -> int:
                     **({"worktrees_image": wt_scope} if wt_scope is not None else {}),
                     **({"eden": eden_section} if eden_section is not None else {}),
                     **({"machine": machine_note} if machine_note is not None else {}),
+                    **(
+                        {"remote_ssh_commands": _remote_ssh_doctor_rows(config)}
+                        if config.remote_ssh_commands
+                        else {}
+                    ),
                     "machines": [state.machine for state in states],
                     "event_counts": {
                         state.machine: len(_load_events(config, state.machine))
@@ -62440,6 +62592,13 @@ def _cmd_doctor_scan_timed(args: argparse.Namespace, config: Config) -> int:
                 )
         if machine_note is not None:
             print(f"machine: {machine_note}")
+        for ssh_row in _remote_ssh_doctor_rows(config):
+            print(
+                f"remote-ssh: remote={ssh_row['remote']} "
+                f"identity_file={ssh_row['identity_file'] or '-'} "
+                f"identity_agent={ssh_row['identity_agent'] or '-'} "
+                f"proxy_command={ssh_row['proxy_command'] or '-'}"
+            )
         counts: dict[str, int] = {}
         for item in findings:
             kind = str(item["kind"])
@@ -78448,7 +78607,10 @@ def _frozen_release_plan(
         raise Refusal(
             "frozen validation checkout remote differs from its source checkout; preserve both"
         )
-    vcs.fetch_remote(repository, remote, _landed_ref_for_remote(config, remote), authority)
+    vcs.fetch_remote(
+        repository, remote, _landed_ref_for_remote(config, remote), authority,
+        ssh_command=_remote_ssh_command(config, remote),
+    )
     vcs.assert_remote_authority(repository, remote, authority)
     repositories = [(".", target, bool(vcs.remote_refs_containing(repository, remote, target)))]
     for relative in sorted(vcs.initialized_submodules(checkout)):
@@ -79109,7 +79271,10 @@ def _validation_checkout_facts(
     # path that deliberately retains the checkout needs exact local binding,
     # not a remote copy of a commit that the checkout continues to preserve.
     if require_remote_containment:
-        vcs.fetch_remote(remote_observer, remote, landed_ref, observer_authority)
+        vcs.fetch_remote(
+            remote_observer, remote, landed_ref, observer_authority,
+            ssh_command=_remote_ssh_command(config, remote),
+        )
         if vcs.remote_url_sha256(checkout, remote) != remote_digest:
             raise Refusal("validation checkout remote changed during recovery inspection")
         vcs.assert_remote_authority(remote_observer, remote, observer_authority)

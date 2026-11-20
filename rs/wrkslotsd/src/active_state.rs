@@ -48,6 +48,34 @@ pub(crate) struct Cfg {
     pub(crate) eden_mount_root: Option<PathBuf>,
     /// Extra validation exclusion guard parents, after the built-in root.
     pub(crate) validation_exclusion_roots: Vec<PathBuf>,
+    /// Declared per-remote SSH settings (#1940), from the config payload.
+    pub(crate) remote_ssh_commands: Vec<Value>,
+}
+
+impl Cfg {
+    /// The GIT_SSH_COMMAND for `remote`, or None when none is declared.
+    pub(crate) fn ssh_command(&self, remote: &str) -> Option<String> {
+        crate::config_validate::remote_ssh_command_for(&self.remote_ssh_commands, remote)
+    }
+
+    /// Doctor rows for declared SSH settings: paths, never contents.
+    pub(crate) fn ssh_doctor_rows(&self) -> Vec<Value> {
+        self.remote_ssh_commands
+            .iter()
+            .map(|entry| {
+                json!({
+                    "remote": entry.get("remote").cloned().unwrap_or(Value::Null),
+                    "identity_file": entry.get("identity_file").cloned().unwrap_or(Value::Null),
+                    "identity_agent": entry.get("identity_agent").cloned().unwrap_or(Value::Null),
+                    "proxy_command": if entry.get("proxy_command").is_some_and(|v| !v.is_null()) {
+                        json!("set")
+                    } else {
+                        Value::Null
+                    },
+                })
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone)]
@@ -1493,6 +1521,11 @@ pub(crate) fn load_cfg(
                     .collect()
             })
             .unwrap_or_default(),
+        remote_ssh_commands: config
+            .get("remote_ssh_commands")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
     };
     Ok((cfg, selected))
 }
@@ -1540,6 +1573,7 @@ mod eden_mount_tests {
             harness_repo: None,
             eden_mount_root: mount_root,
             validation_exclusion_roots: Vec::new(),
+            remote_ssh_commands: Vec::new(),
             root,
         }
     }

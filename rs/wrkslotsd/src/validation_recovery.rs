@@ -2226,7 +2226,13 @@ pub(crate) fn validation_checkout_facts(
         observer = observation;
     }
     if require_remote_containment {
-        crate::finish_write::fetch_remote(observer, &remote, &landed_ref, &observer_url)?;
+        crate::finish_write::fetch_remote(
+            observer,
+            &remote,
+            &landed_ref,
+            &observer_url,
+            cfg.ssh_command(&remote).as_deref(),
+        )?;
         let after = crate::finish_write::remote_authority(checkout, &remote)?.0;
         if after != remote_digest {
             return Err(
@@ -3366,7 +3372,13 @@ pub(crate) fn frozen_release_dry_run(
         );
     }
     let landed_ref = landed_ref_for_remote(cfg);
-    crate::finish_write::fetch_remote(&repository, &remote, &landed_ref, &repo_url)?;
+    crate::finish_write::fetch_remote(
+        &repository,
+        &remote,
+        &landed_ref,
+        &repo_url,
+        cfg.ssh_command(&remote).as_deref(),
+    )?;
     let on_remote = !remote_refs_containing(&repository, &remote, &head)?.is_empty();
     let mut repositories = vec![json!({
         "repository": ".",

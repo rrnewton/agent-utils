@@ -83,6 +83,15 @@ def _expected(
         "retire_freeze": config.retire_freeze,
         "root": str(config.root),
         "salvage_push_remotes": list(config.salvage_push_remotes),
+        "remote_ssh_commands": [
+            {
+                "remote": name,
+                "identity_file": settings.identity_file,
+                "identity_agent": settings.identity_agent,
+                "proxy_command": settings.proxy_command,
+            }
+            for name, settings in config.remote_ssh_commands
+        ],
         "ttl_rescue_ref_root": config.ttl_rescue_ref_root,
         "sandbox": sandbox_module.settings_to_obj(config.sandbox_settings),
         "slot_representation": config.slot_representation,

@@ -1612,7 +1612,13 @@ fn salvage_checkout(cfg: &Cfg, checkout: &Value, repository: &Path) -> Result<Va
         .unwrap_or_default()
         .to_string();
     let (authority_sha, url) = remote_authority(&path, &remote)?;
-    fetch_remote(&path, &remote, &landed_ref, &url)?;
+    fetch_remote(
+        &path,
+        &remote,
+        &landed_ref,
+        &url,
+        cfg.ssh_command(&remote).as_deref(),
+    )?;
     let (after_sha, _after_url) = remote_authority(&path, &remote)?;
     if after_sha != authority_sha {
         return Err(format!(
@@ -5832,6 +5838,7 @@ mod private_history_tests {
             harness_repo: None,
             eden_mount_root: None,
             validation_exclusion_roots: Vec::new(),
+            remote_ssh_commands: Vec::new(),
         };
         let history = submodule_private_history(&cfg, &repo, &repo, &kept, false)
             .unwrap()
@@ -5870,6 +5877,7 @@ mod private_history_tests {
             harness_repo: None,
             eden_mount_root: None,
             validation_exclusion_roots: Vec::new(),
+            remote_ssh_commands: Vec::new(),
         };
         (base, repo, kept, cfg)
     }

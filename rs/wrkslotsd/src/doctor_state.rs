@@ -861,6 +861,12 @@ fn doctor_cli_once(
         if let (Some(note), Some(object)) = (&machine_note, envelope.as_object_mut()) {
             object.insert("machine".to_string(), json!(note));
         }
+        let ssh_rows = cfg.ssh_doctor_rows();
+        if !ssh_rows.is_empty() {
+            if let Some(object) = envelope.as_object_mut() {
+                object.insert("remote_ssh_commands".to_string(), json!(ssh_rows));
+            }
+        }
         return Ok(format!(
             "{}\n",
             serde_json::to_string_pretty(&envelope)
@@ -887,6 +893,16 @@ fn doctor_cli_once(
     }
     if let Some(note) = &machine_note {
         out.push_str(&format!("machine: {note}\n"));
+    }
+    for row in cfg.ssh_doctor_rows() {
+        let text = |key: &str| row.get(key).and_then(Value::as_str).unwrap_or("-");
+        out.push_str(&format!(
+            "remote-ssh: remote={} identity_file={} identity_agent={} proxy_command={}\n",
+            text("remote"),
+            text("identity_file"),
+            text("identity_agent"),
+            text("proxy_command"),
+        ));
     }
     let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     for item in &findings {

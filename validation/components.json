@@ -499,6 +499,7 @@
         "py/wrkslots/tests/test_reanchor_liveness.py",
         "py/wrkslots/tests/test_reap_stray_rust.py",
         "py/wrkslots/tests/test_reap_stray_worktrees.py",
+        "py/wrkslots/tests/test_remote_ssh.py",
         "py/wrkslots/tests/test_reclaim_slot_state.py",
         "py/wrkslots/tests/test_reclaim_state_rust.py",
         "py/wrkslots/tests/test_record_holds_rust.py",

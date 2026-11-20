@@ -303,7 +303,13 @@ pub(crate) fn unpushed(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            fetch_remote(&path, &remote, &landed_ref, &url)?;
+            fetch_remote(
+                &path,
+                &remote,
+                &landed_ref,
+                &url,
+                cfg.ssh_command(&remote).as_deref(),
+            )?;
             let (after_sha, _after_url) = remote_authority(&path, &remote)?;
             if after_sha != authority_sha {
                 return Err(format!(

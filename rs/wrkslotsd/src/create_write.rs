@@ -62,6 +62,44 @@ fn git(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+fn git_ssh(repo: &Path, args: &[&str], ssh_command: Option<&str>) -> Result<String> {
+    // #1940: like `git`, with a declared per-remote SSH command scoped
+    // to this one network command.
+    let mut command = Command::new("git");
+    command
+        .args([
+            "--no-replace-objects",
+            "-c",
+            "core.useReplaceRefs=false",
+            "-C",
+        ])
+        .arg(repo)
+        .args(args)
+        .env_clear();
+    for (key, value) in std::env::vars() {
+        if !key.starts_with("GIT_") {
+            command.env(key, value);
+        }
+    }
+    command
+        .env("LC_ALL", "C")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_NO_REPLACE_OBJECTS", "1");
+    if let Some(ssh) = ssh_command {
+        command.env("GIT_SSH_COMMAND", ssh);
+    }
+    let output = command
+        .output()
+        .map_err(|error| format!("cannot run git: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!("git {} failed: {stderr}", args.join(" ")));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 fn git_ok(repo: &Path, args: &[&str]) -> bool {
     git(repo, args).is_ok()
 }
@@ -1259,7 +1297,7 @@ fn create_slot_inner(
         let url_sha = format!("{:x}", Sha256::digest(url.as_bytes()));
         // #1929: --offline-reason skips the create-time remote fetch.
         if offline_reason.is_none() && (slot_type != "validate" || !starts.contains_key(name)) {
-            git(
+            git_ssh(
                 &repository,
                 &[
                     "fetch",
@@ -1268,6 +1306,7 @@ fn create_slot_inner(
                     remote,
                     &format!("+refs/heads/*:refs/remotes/{remote}/*"),
                 ],
+                cfg.ssh_command(remote).as_deref(),
             )?;
         }
         let start_ref = starts
