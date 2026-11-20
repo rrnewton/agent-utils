@@ -1,6 +1,6 @@
 ---
 title: 'discuss-cache-84-85: screenshots run.sh Discuss cache trigger misses states 84 and 85'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -35,3 +35,7 @@ message cache (`#1855`).
 Filed and fixed by mu-flakes4. Browser verification is unavailable on
 this host (missing system library), so the step is judged by the shell
 trigger itself, not by a photographed run.
+
+## Resolution
+
+Landed on github/main as `07b2b854` (mu-flakes4, 2026-11-20).

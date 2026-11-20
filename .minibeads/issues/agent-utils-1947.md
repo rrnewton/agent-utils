@@ -1,6 +1,6 @@
 ---
 title: 'retire-lock-scope-flaky-budget: retire lock-scope tests gated by the 60 s item budget on a hot host'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -44,3 +44,7 @@ new HEAD once it runs.
 Diagnosed by mu-flakes4 (taking over from mu-flakes3) from the probe
 payload shape and a timed solo run; the throwaway probe file
 `test_zz_probe_retire.py` was deleted as part of this fix.
+
+## Resolution
+
+Landed on github/main as `07b2b854` (mu-flakes4, 2026-11-20). Browser steps unverified on this host (libnspr4 missing) for #1936.
