@@ -28,6 +28,7 @@ STATE_MS = 30_000
 # preset -> (dark accent, light accent, dark discuss head, light discuss head)
 PRESETS = {
     "blue": ("rgb(91, 157, 217)", "rgb(36, 97, 143)", "rgb(29, 32, 38)", "rgb(255, 255, 255)"),
+    "blue-hc": ("rgb(91, 157, 217)", "rgb(36, 97, 143)", "rgb(29, 32, 38)", "rgb(255, 255, 255)"),
     "teal": ("rgb(76, 194, 176)", "rgb(15, 118, 110)", "rgb(29, 74, 66)", "rgb(217, 240, 234)"),
     "plum": ("rgb(207, 159, 224)", "rgb(126, 58, 158)", "rgb(74, 45, 99)", "rgb(236, 217, 247)"),
     "amber": ("rgb(232, 179, 75)", "rgb(138, 90, 0)", "rgb(92, 66, 28)", "rgb(247, 234, 208)"),
@@ -92,8 +93,12 @@ def main() -> int:
                         timeout=STATE_MS,
                     )
                     at = 0 if scheme == "dark" else 1
-                    hexes = {"blue": ("#5b9dd9", "#24618f"), "teal": ("#4cc2b0", "#0f766e"),
-                             "plum": ("#cf9fe0", "#7e3a9e"), "amber": ("#e8b34b", "#8a5a00")}
+                    hexes = {"blue": ("#5b9dd9", "#24618f"), "blue-hc": ("#5b9dd9", "#24618f"),
+                             "teal": ("#4cc2b0", "#0f766e"), "plum": ("#cf9fe0", "#7e3a9e"),
+                             "amber": ("#e8b34b", "#8a5a00")}
+                    on_accents = {"blue": ("#ffffff", "#ffffff"), "blue-hc": ("#14161a", "#ffffff"),
+                                  "teal": ("#14161a", "#ffffff"), "plum": ("#14161a", "#ffffff"),
+                                  "amber": ("#14161a", "#ffffff")}
                     for preset, want in PRESETS.items():
                         page.select_option("#colour-theme", preset)
                         page.wait_for_function(
@@ -105,12 +110,14 @@ def main() -> int:
                           const head = document.querySelector('.discuss-head');
                           return {
                             accent: root.getPropertyValue('--accent').trim(),
+                            onAccent: root.getPropertyValue('--on-accent').trim(),
                             stored: localStorage.getItem('vibe-talk.voice.colour-theme'),
                             head: head ? getComputedStyle(head).backgroundColor : null,
                           };
                         }""")
                         check(drawn["stored"] == preset, f"{scheme}/{preset}: kept as {drawn['stored']}")
                         check(drawn["accent"] == hexes[preset][at], f"{scheme}/{preset}: accent {drawn['accent']}")
+                        check(drawn["onAccent"] == on_accents[preset][at], f"{scheme}/{preset}: on-accent {drawn['onAccent']}")
                         check(drawn["head"] in (None, want[2 + at]), f"{scheme}/{preset}: Discuss head {drawn['head']}")
                         if args.screenshots:
                             args.screenshots.mkdir(parents=True, exist_ok=True)
