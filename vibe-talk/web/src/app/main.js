@@ -2996,6 +2996,12 @@ const {
 let enteredSearchIdentity = "";
 let searchScreenRows = [];
 let searchScreenIdentity = null;
+// `#1968 vibe-talk-search-close-x`: where the reader was before a typed search's entry
+// landing moved them, and whether it did. Closing the bar puts them back there (below);
+// an entry that stayed on a visible hit never moved them, and closing then keeps the
+// found rows in place as `#243` asks.
+let searchEntryAnchor = null;
+let searchEntryMoved = false;
 // `#1913 vibe-talk-search-typing-lag`: the full filter change a keystroke schedules, run once
 // the typing pauses. Each keystroke replaces the pending one, so a burst of typing pays for
 // one full pass (place-keeping, seams, tallies, the server ask), never one per key.
@@ -3017,6 +3023,9 @@ function noteSearchScreen() {
   searchScreenIdentity = identity;
   // A redraw of the search already landed reads no row's layout again.
   if (identity === enteredSearchIdentity) return;
+  // `#1968`: a new entry may move the reader; remember where they are before it does.
+  searchEntryAnchor = filterAnchor();
+  searchEntryMoved = false;
   const list = visibleList();
   // `#1913`: only rows with a box can stand on screen; the hidden ones carry no layout, and
   // leaving them out lets `rowsOnScreen` measure only the screen's neighbourhood.
@@ -3039,7 +3048,32 @@ function landSearchEntry() {
   // Nothing matched: the emptied list's own placement takes the reader to
   // the sentence at its head that says why; there are no recent hits to show.
   if (hits.size === 0) return;
-  if (!searchScreenRows.some((row) => hits.has(row))) scrollToNewest();
+  if (!searchScreenRows.some((row) => hits.has(row))) {
+    // `#1968`: the entry is taking the reader to the newest hits; closing the bar
+    // owes them the place this took them from.
+    searchEntryMoved = true;
+    scrollToNewest();
+  }
+}
+
+/**
+ * `#1968 vibe-talk-search-close-x`: after the bar closes, put the reader back where
+ * they were reading before a typed search's entry landing moved them to the newest
+ * hits. Only then: an entry that stayed put, and a message the reader chose among
+ * the results, keep the close's own kept place (`#243`). The anchor's own reader-moved
+ * guard (`placeFilterAnchor`) makes this a no-op when the reader scrolled themselves
+ * after the entry landed.
+ */
+function restoreSearchEntryPlace() {
+  const anchor = searchEntryAnchor;
+  const moved = searchEntryMoved;
+  searchEntryAnchor = null;
+  searchEntryMoved = false;
+  if (!moved || !anchor) return;
+  const current = filterAnchor();
+  if (current && current.selected) return;
+  if (!(anchor.newest || anchorHolder(anchor))) return;
+  placeFilterAnchor(anchor);
 }
 
 // --- a filter changed: the reader's message stays where it is on the screen ----------------------
@@ -3089,6 +3123,7 @@ function landSearchEntry() {
 let labelsFilterRef = null;
 const searchOpenControl = createSearchOpenControl({
   keepingFilterPlace,
+  restoreEntryPlace: () => restoreSearchEntryPlace(),
   searchField,
   markSearchSoon,
   el,

@@ -3077,6 +3077,35 @@ test("`#1734 vibe-talk-search-view-scroll-default`: entering a search stays on a
   assert.ok(Math.abs(anchor.getBoundingClientRect().top - anchorTop) <= 2, "the row under the reader's eye moved");
 });
 
+test("`#1968 vibe-talk-search-close-x`: closing after a search entry moved the reader puts them back where they were reading", async () => {
+  // The entry landing is a loan, not a move: typing "needle" from a parked place with
+  // no hit on screen takes the reader to the newest hits, and closing the bar — here
+  // with the X — owes them the parked row at the parked offset, not the newest hits.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, Array.from({ length: 40 }, (_u, i) =>
+    message({ id: String(i + 1), content: `haystack note ${i}${i >= 25 ? " needle" : ""}` })));
+  const area = page.el("scroll-area");
+  area.scrollTop = Math.round((area.scrollHeight - area.clientHeight) / 3);
+  await page.settle();
+  const anchor = page.el("discord-log").children.find((li) => li.getBoundingClientRect().bottom > area.getBoundingClientRect().top);
+  const anchorTop = anchor.getBoundingClientRect().top;
+  const parked = area.scrollTop;
+
+  await search(page, "needle");
+  const foot = area.scrollHeight - area.clientHeight;
+  assert.ok(Math.abs(area.scrollTop - foot) <= 2, "the entry did not take the reader to the newest hits, so this proves nothing");
+
+  await page.el("search-close").click();
+  await page.settle();
+  assert.equal(unfiltered(page, "discord-log").length, 40, "closing left the filter on");
+  const head = page.el("discord-log").children.find((li) => li.getBoundingClientRect().bottom > area.getBoundingClientRect().top);
+  assert.equal(head, anchor, "closing left the reader on a different row than they parked on");
+  assert.ok(Math.abs(anchor.getBoundingClientRect().top - anchorTop) <= 2,
+    `the parked row moved from ${anchorTop} to ${anchor.getBoundingClientRect().top}`);
+  assert.ok(Math.abs(area.scrollTop - parked) <= 2, `closing moved the scroll from ${parked} to ${area.scrollTop}`);
+});
+
 test("`#1816 vibe-talk-search-history-up-arrow`: Up recalls the last search, Down gives the draft back, and Escape still closes", async () => {
   const page = newPage();
   recorded(page, "conv", TALKED_ABOUT);

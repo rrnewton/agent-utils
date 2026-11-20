@@ -19,6 +19,7 @@ test("closing the search bar clears its filters inside the kept place", () => {
   };
   const owner = createSearchOpenControl({
     keepingFilterPlace: (act) => { record.push("keep"); act(); },
+    restoreEntryPlace: () => record.push("entry-place"),
     searchField: {
       setOpen: (open) => record.push(`open=${open}`),
       setQuery: (query) => record.push(`query=${JSON.stringify(query)}`),
@@ -43,7 +44,7 @@ test("closing the search bar clears its filters inside the kept place", () => {
   owner.setSearchOpen(false);
   assert.equal(
     record.join(" "),
-    "keep open=false query=\"\" marked=\"\" mark links=false pinned=false whole=false author=everyone toggle aria-pressed=false hold main-data-searching bar pill tools",
+    "keep open=false query=\"\" marked=\"\" mark links=false pinned=false whole=false author=everyone toggle aria-pressed=false hold main-data-searching bar pill tools entry-place",
   );
   assert.equal(elements["search-field"].value, "");
 });
