@@ -1,6 +1,7 @@
 ---
 title: 'agentctl-watch-stale-background-shell-footer: watch must read the background-shell count from the live footer only'
-status: open
+status: closed
+closed_at: 2026-11-20T08:08:18-05:00
 priority: 2
 issue_type: bug
 labels:
@@ -33,3 +34,7 @@ Likely cause: the Muse screen parser reads a stale "1 background shell" footer (
 # Notes
 
 Reported by coordb 2026-11-20; the consumer lane is not named (repository boundary rule). Lane mu-agentctlfix, after #1937 agentctl-status-redact-argv and #1938 agentctl-pidfd-open-einval are gated. Suspected parser surface: the Claude footer counting in `rs/agentctl/src/harness/claude.rs` and the background-wait classification in `rs/agentctl/src/agent_watch.rs`.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as 1a385378. Both harnesses now read background-shell counts only from the live footer: Claude judges the last separator-bearing row in the bottom window, Muse counts only the panel block at the screen's bottom under its `main` header (tolerating pipe-glyph rows, blank rows, a wrapped footer, and up to three rows below the panel). The strict reads apply only with a process sample that has no tools and (for Claude) a shell count; a missing sample, a live tool, or a sub-agent count uses the wide read, and a tool whose CPU or I/O moved inside the stall window never classifies idle-no-verdict. With a quiet sample a shell count now reads idle-no-verdict at the same threshold instead of background-wait (approved design). Cold re-review at 708bcb48 across 17 screens x 4 process states found the tip never worse than base except that approved row. Closing and auto-interrupt do not depend on these reads and were untouched.
