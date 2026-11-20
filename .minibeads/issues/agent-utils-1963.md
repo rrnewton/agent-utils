@@ -1,5 +1,5 @@
 ---
-title: 'agentctl-redact: rewrite a literal string in one agent'\''s processed history and archives'
+title: 'agentctl-redact: rewrite a literal string across one agent processed history and archives'
 status: open
 priority: 2
 issue_type: feature
