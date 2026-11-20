@@ -16387,30 +16387,17 @@ its drain would also type, so it was not queued",
             }
             Ok(pane) if Some(pane.as_str()) == record.pane_id.as_deref() => BootOverride::Applies,
             Ok(pane) => {
-                let in_census = self
-                    .client
-                    .panes()
-                    .is_ok_and(|panes| panes.iter().any(|item| item.pane_id == pane));
-                // A revive candidate launched by this very revive reports
-                // the recorded session in its new pane; it is not foreign.
-                let candidate = in_census
-                    && self.client.pane_info(&pane).is_ok_and(|info| {
-                        let session = record
-                            .native_session
-                            .as_ref()
-                            .map(|native| native.value.as_str())
-                            .or(record.session_value.as_deref());
-                        session.is_some() && info.session_value.as_deref() == session
-                    });
-                if candidate {
-                    BootOverride::Applies
-                } else if in_census {
-                    BootOverride::Refuse(format!(
-                        "the recorded Herdr agent name points at live pane {pane}, not the recorded pane {:?}; refusing to retire or revive over it — remedy: stop that pane's agent first, or rename it, then retry",
-                        record.pane_id
-                    ))
-                } else {
-                    BootOverride::Applies
+                // Fail closed when the census itself cannot be read (F3 in
+                // the re-review): an unreadable pane list proves nothing.
+                match self.client.panes() {
+                    Err(_) => BootOverride::NotApplies,
+                    Ok(panes) if panes.iter().any(|item| item.pane_id == pane) => {
+                        BootOverride::Refuse(format!(
+                            "the recorded Herdr agent name points at live pane {pane}, not the recorded pane {:?}; refusing to retire or revive over it — remedy: stop that pane's agent first, or rename it, then retry",
+                            record.pane_id
+                        ))
+                    }
+                    Ok(_) => BootOverride::Applies,
                 }
             }
             Err(_) => BootOverride::NotApplies,
@@ -16426,13 +16413,46 @@ its drain would also type, so it was not queued",
             .as_ref()
             .map(|native| native.value.clone())
             .or_else(|| record.session_value.clone())?;
-        if session.len() < 8 {
-            return None;
-        }
+        // Short ids are matched exactly as recorded (the full string), per
+        // the re-review's "refuse, or match exactly" alternative.
         let needle = session.as_bytes();
-        let contains = |bytes: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
-        let self_uid = fs::metadata("/proc/self").ok()?.uid();
-        let entries = fs::read_dir("/proc").ok()?;
+        // Long ids match as a substring; short ids match exactly as recorded
+        // (a whole NUL-separated field, an `=value`, or a path component),
+        // so a generic short id cannot incriminate an unrelated process.
+        let contains = |bytes: &[u8]| {
+            if needle.len() >= 16 {
+                bytes.windows(needle.len()).any(|w| w == needle)
+            } else {
+                bytes.split(|byte| *byte == 0).any(|field| {
+                    field == needle
+                        || (field.len() > needle.len()
+                            && field.ends_with(needle)
+                            && field[field.len() - needle.len() - 1] == b'=')
+                        || field
+                            .rsplit(|byte| *byte == b'/')
+                            .next()
+                            .is_some_and(|name| {
+                                name == needle
+                                    || name
+                                        .strip_prefix(needle)
+                                        .is_some_and(|rest| rest.starts_with(b"."))
+                            })
+                })
+            }
+        };
+        let Ok(self_meta) = fs::metadata("/proc/self") else {
+            return Some(
+                "cannot scan /proc for a live holder of the recorded session; refusing (fail closed) — remedy: retry where /proc is readable"
+                    .to_owned(),
+            );
+        };
+        let self_uid = self_meta.uid();
+        let Ok(entries) = fs::read_dir("/proc") else {
+            return Some(
+                "cannot scan /proc for a live holder of the recorded session; refusing (fail closed) — remedy: retry where /proc is readable"
+                    .to_owned(),
+            );
+        };
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(pid) = name.to_str().and_then(|text| text.parse::<u32>().ok()) else {
@@ -17441,6 +17461,7 @@ pub(crate) mod tests {
                     named_pane: Mutex::new("owned".to_owned()),
                     moves: Mutex::new(Vec::new()),
                     panes_calls: AtomicU64::new(0),
+                    panes_fail_on_call: AtomicU64::new(0),
                     pane_info_calls: AtomicU64::new(0),
                     runs: Mutex::new(Vec::new()),
                     slot_commands: Mutex::new(Vec::new()),
@@ -17893,6 +17914,7 @@ pub(crate) mod tests {
         moves: Mutex<Vec<(String, String, String)>>,
         /// How many times `panes` was called.
         pub(crate) panes_calls: AtomicU64,
+        pub(crate) panes_fail_on_call: AtomicU64,
         /// How many times `pane_info` was called.
         pub(crate) pane_info_calls: AtomicU64,
         /// Every text written to a pane with `run`, such as a prompt, in order, and a line for
@@ -18232,7 +18254,13 @@ pub(crate) mod tests {
         }
 
         fn panes(&self) -> AdapterResult<Vec<Pane>> {
-            self.panes_calls.fetch_add(1, Ordering::Relaxed);
+            let call = self.panes_calls.fetch_add(1, Ordering::Relaxed) + 1;
+            let fail_from = self.panes_fail_on_call.load(Ordering::Relaxed);
+            if fail_from > 0 && call >= fail_from {
+                return Err(AdapterError::unavailable(
+                    "pane query failed on the numbered call",
+                ));
+            }
             if self.fail_panes.load(Ordering::Relaxed) {
                 return Err(AdapterError::unavailable(
                     "pane query failed after allocation",

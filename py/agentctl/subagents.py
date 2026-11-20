@@ -3052,18 +3052,6 @@ class ManagedAgents:
         except Exception:
             return ("not", None)
         if in_census:
-            # A revive candidate launched by this very revive reports the
-            # recorded session in its new pane; it is not foreign.
-            session = None
-            if record.native_session is not None:
-                session = record.native_session.get("value")
-            session = session or record.session_value
-            try:
-                info = self.client.pane_info(pane)
-                if session is not None and info.session_value == session:
-                    return ("applies", None)
-            except Exception:
-                pass
             return ("refuse", (
                 f"the recorded Herdr agent name points at live pane {pane}, not the recorded pane {record.pane_id!r}; "
                 "refusing to retire or revive over it — remedy: stop that pane's agent first, or rename it, then retry"
@@ -3077,14 +3065,16 @@ class ManagedAgents:
         if record.native_session is not None:
             session = record.native_session.get("value")
         session = session or record.session_value
-        if not isinstance(session, str) or len(session) < 8:
+        if not isinstance(session, str) or not session:
             return None
+        # Short ids are matched exactly as recorded (the full string).
         needle = session.encode()
         uid = os.getuid()
         try:
             pids = [name for name in os.listdir("/proc") if name.isdigit()]
         except OSError:
-            return None
+            return ("cannot scan /proc for a live holder of the recorded session; "
+                    "refusing (fail closed) — remedy: retry where /proc is readable")
         for pid_text in pids:
             pid = int(pid_text)
             if pid == os.getpid():
@@ -3101,6 +3091,17 @@ class ManagedAgents:
                         "of the recorded session; refusing (fail closed) — remedy: retry once that process "
                         "exits or is inspectable")
             cmdline = b""
+            def matches(data: bytes) -> bool:
+                if len(needle) >= 16:
+                    return needle in data
+                for field in data.split(b"\0"):
+                    if field == needle or field.endswith(b"=" + needle):
+                        return True
+                    name = field.rsplit(b"/", 1)[-1]
+                    if name == needle or name.startswith(needle + b"."):
+                        return True
+                return False
+
             for what in ("cmdline", "environ"):
                 try:
                     with open(f"{base}/{what}", "rb") as stream:
@@ -3124,7 +3125,7 @@ class ManagedAgents:
                     break
                 if what == "cmdline":
                     cmdline = data
-                if needle in data:
+                if matches(data):
                     return (f"live process {pid} holds the recorded native session (its {what} carries it); "
                             f"refusing to retire or revive over it — remedy: stop process {pid} first")
             try:
@@ -3144,7 +3145,7 @@ class ManagedAgents:
                     target = os.readlink(f"{base}/fd/{fd}")
                 except OSError:
                     continue
-                if session in target:
+                if matches(target.encode()):
                     return (f"live process {pid} holds the recorded native session (an open file names it); "
                             f"refusing to retire or revive over it — remedy: stop process {pid} first")
         return None

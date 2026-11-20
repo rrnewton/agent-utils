@@ -580,16 +580,55 @@ def _census(manager: ManagedAgents) -> tuple[Pane, ...]:
     return panes
 
 
+def _journal_candidate_pane(manager: ManagedAgents, record: AgentRecord) -> str | None:
+    """The staged candidate's pane while a revive journal for this name is open."""
+    for journal in journals(manager):
+        if journal["name"] != record.name:
+            continue
+        path = manager.registry / ".revives" / str(journal["old_token"]) / "new" / "agent.json"
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            break
+        pane = document.get("pane_id")
+        if isinstance(pane, str):
+            return pane
+    # The candidate may already be published as the active record.
+    try:
+        active = AgentRecord.load(manager._directory(record.name) / "agent.json", record.name)
+    except Exception:
+        return None
+    if active.token != record.token and active._unknown.get("revived_from") == record.token:
+        return active.pane_id
+    return None
+
+
 def _proof(manager: ManagedAgents, record: AgentRecord) -> dict[str, object]:
     # Previous-boot proof (#1944): boot change proves death; a missing pane
     # plus a stale Herdr agent object cannot block revive.
     override, message = manager._boot_override(record)
-    if override == "refuse" and any(journal["name"] == record.name for journal in journals(manager)):
-        override = "applies"  # this revive's own candidate holds the name (F1)
+    if override == "refuse":
+        candidate = _journal_candidate_pane(manager, record)
+        try:
+            named = manager.client.agent_pane(record.name)
+        except Exception:
+            named = None
+        session = record.native_session.get("value") if isinstance(record.native_session, dict) else record.session_value
+        reports_session = False
+        if named is not None and session is not None:
+            try:
+                reports_session = manager.client.pane_info(named).session_value == session
+            except Exception:
+                reports_session = False
+        if (candidate is not None and named == candidate) or (reports_session and any(journal["name"] == record.name for journal in journals(manager))):
+            override = "applies"  # this revive's own candidate holds the name (F1)
     if override == "refuse":
         raise AgentDeliveryError(message or "the recorded Herdr agent name points at a live pane")
     if override == "applies":
-        refusal = manager._live_session_holder_refusal(record)
+        # After launch the revive's own harness holds the session (item 1):
+        # while a journal is open, the preflight scan is the holder proof.
+        refusal = (None if any(journal["name"] == record.name for journal in journals(manager))
+                   else manager._live_session_holder_refusal(record))
         if refusal is not None:
             raise AgentDeliveryError(refusal)
         if not record.pane_id or not record.tab_id or not record.workspace_id:
@@ -649,8 +688,21 @@ def _name_available(manager: ManagedAgents, record: AgentRecord) -> None:
     # Previous-boot proof (#1944): ignore a stale-only Herdr agent object
     # (Herdr offers no agent-object deletion) when the recorded pane is gone.
     override, message = manager._boot_override(record)
-    if override == "refuse" and any(journal["name"] == record.name for journal in journals(manager)):
-        override = "applies"  # this revive's own candidate holds the name (F1)
+    if override == "refuse":
+        candidate = _journal_candidate_pane(manager, record)
+        try:
+            named = manager.client.agent_pane(record.name)
+        except Exception:
+            named = None
+        session = record.native_session.get("value") if isinstance(record.native_session, dict) else record.session_value
+        reports_session = False
+        if named is not None and session is not None:
+            try:
+                reports_session = manager.client.pane_info(named).session_value == session
+            except Exception:
+                reports_session = False
+        if (candidate is not None and named == candidate) or (reports_session and any(journal["name"] == record.name for journal in journals(manager))):
+            override = "applies"  # this revive's own candidate holds the name (F1)
     if override == "refuse":
         raise AgentDeliveryError(message or "the recorded Herdr agent name points at a live pane")
     if override == "applies":

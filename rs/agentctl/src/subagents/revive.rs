@@ -2074,9 +2074,39 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
     fn revive_boot_override(&self, record: &AgentRecord) -> BootOverride {
         match self.boot_override(record) {
             BootOverride::Refuse(message) => {
-                let journal_open = journals(&self.registry)
-                    .is_ok_and(|all| all.iter().any(|journal| journal.name == record.name));
-                if journal_open {
+                // Only this revive's own candidate pane is exempt, and only
+                // while its journal is open: compare the pane, not just the
+                // journal's existence (re-review item 2).
+                let candidate_pane = journals(&self.registry).ok().and_then(|all| {
+                    let journal = all.iter().find(|journal| journal.name == record.name)?;
+                    let stage = operation_directory(&self.registry, journal).join("new");
+                    if let Ok((_, candidate, _)) = read_record_at(&stage, &journal.name) {
+                        return candidate.pane_id;
+                    }
+                    // The candidate may already be published as the active
+                    // record (its revived_from names the old token).
+                    let active = self.read_record(&journal.name).ok()?;
+                    (active.token != journal.old_token
+                        && active.extra.get("revived_from") == Some(&json!(journal.old_token)))
+                    .then(|| active.pane_id)
+                    .flatten()
+                });
+                let named = self.client.agent_pane(&record.name).ok();
+                // Or the named pane is this revive's candidate reporting
+                // the recorded session while its journal is open.
+                let reports_session = named.as_deref().is_some_and(|pane| {
+                    let session = record
+                        .native_session
+                        .as_ref()
+                        .map(|native| native.value.as_str())
+                        .or(record.session_value.as_deref());
+                    session.is_some()
+                        && self
+                            .client
+                            .pane_info(pane)
+                            .is_ok_and(|info| info.session_value.as_deref() == session)
+                });
+                if (candidate_pane.is_some() && named == candidate_pane) || reports_session {
                     BootOverride::Applies
                 } else {
                     BootOverride::Refuse(message)
@@ -2086,11 +2116,24 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         }
     }
 
+    /// Session-holder refusal for revive: after launch the revive's own new
+    /// harness legitimately holds the session (re-review item 1), so while a
+    /// journal for this name is open the scan does not run — the preflight
+    /// scan, before any candidate existed, is the holder proof.
+    fn revive_holder_refusal(&self, record: &AgentRecord) -> Option<String> {
+        let journal_open = journals(&self.registry)
+            .is_ok_and(|all| all.iter().any(|journal| journal.name == record.name));
+        if journal_open {
+            return None;
+        }
+        Self::live_session_holder_refusal(record)
+    }
+
     fn revive_liveness(&self, record: &AgentRecord) -> ProcessLiveness {
         // Previous-boot proof (#1944): boot change + proven-missing pane +
         // a stale-only Herdr name proves death (see `boot_override`).
         if matches!(self.revive_boot_override(record), BootOverride::Applies)
-            && Self::live_session_holder_refusal(record).is_none()
+            && self.revive_holder_refusal(record).is_none()
         {
             return ProcessLiveness::Dead;
         }
@@ -2101,7 +2144,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
 
     fn revive_proof(&self, record: &AgentRecord) -> Result<Proof> {
         if matches!(self.revive_boot_override(record), BootOverride::Applies) {
-            if let Some(refusal) = Self::live_session_holder_refusal(record) {
+            if let Some(refusal) = self.revive_holder_refusal(record) {
                 return Err(fail(refusal));
             }
         }
@@ -2134,7 +2177,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             return Err(fail(message.clone()));
         }
         if matches!(boot_override, BootOverride::Applies) {
-            if let Some(refusal) = Self::live_session_holder_refusal(record) {
+            if let Some(refusal) = self.revive_holder_refusal(record) {
                 return Err(fail(refusal));
             }
             let panes = self.client.panes()?;
@@ -2760,7 +2803,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             return Err(fail(message));
         }
         if matches!(self.revive_boot_override(record), BootOverride::Applies) {
-            if let Some(refusal) = Self::live_session_holder_refusal(record) {
+            if let Some(refusal) = self.revive_holder_refusal(record) {
                 return Err(fail(refusal));
             }
         }

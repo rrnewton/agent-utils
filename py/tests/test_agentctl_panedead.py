@@ -165,6 +165,59 @@ def test_revive_live_session_holder_refuses(
         holder.wait()
 
 
+def test_retire_pane_reporting_recorded_session_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Item 2: a live pane reporting the recorded session is alive, not stale.
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch, harness="claude")
+    assert old.pane_id is not None and old.harness_anchor is not None
+    object.__setattr__(old.harness_anchor, "boot_id", OLD_BOOT)
+    manager._save(old)
+    fake.presentations = [item for item in fake.presentations if item.pane_id != old.pane_id]
+    from dataclasses import replace as _replace
+    from agentctl.client import Pane
+    fake.presentations.append(Pane("w9:other", old.tab_id or "w1:t9", "w1"))
+    session = old.native_session["value"] if old.native_session else "claude-session"
+    fake.infos["w9:other"] = _replace(
+        fake.infos[old.pane_id], pane_id="w9:other", agent="claude",
+        session_agent="claude", session_value=session,
+    )
+    monkeypatch.setattr(fake, "agent_pane", lambda _name: "w9:other")
+    with pytest.raises(AgentDeliveryError, match="w9:other"):
+        _retire(manager)
+    assert (manager._directory("worker") / "agent.json").exists()
+
+
+def test_revive_candidate_holding_session_after_launch_is_not_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Item 1: the fake launch itself starts a real --resume holder process.
+    import subprocess
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch, harness="claude")
+    assert old.pane_id is not None and old.harness_anchor is not None
+    object.__setattr__(old.harness_anchor, "boot_id", OLD_BOOT)
+    manager._save(old)
+    fake.presentations = [item for item in fake.presentations if item.pane_id != old.pane_id]
+    session = old.native_session["value"] if old.native_session else "claude-session"
+    holders: list[subprocess.Popen[bytes]] = []
+    original_start = fake.start_agent
+
+    def start_with_holder(*args: object, **kwargs: object) -> None:
+        original_start(*args, **kwargs)  # type: ignore[arg-type]
+        holders.append(subprocess.Popen(
+            ["python3", "-c", "import time; time.sleep(30)", "--resume", session],
+        ))
+
+    monkeypatch.setattr(fake, "start_agent", start_with_holder)
+    try:
+        result = manager.revive("worker", expected_token=old.token)
+        assert result["revived"] is True
+    finally:
+        for holder in holders:
+            holder.kill()
+            holder.wait()
+
+
 def test_revive_previous_boot_missing_pane_revives(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

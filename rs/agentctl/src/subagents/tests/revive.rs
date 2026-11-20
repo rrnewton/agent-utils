@@ -1232,6 +1232,43 @@ fn revive_live_session_holder_refuses() {
 }
 
 #[test]
+fn revive_candidate_holding_session_after_launch_is_not_refused() {
+    // Re-review item 1: after launch the revive's own harness holds the
+    // session; a holder process must not make the journalled revive refuse.
+    let (fixture, mut old) = recoverable("claude", false);
+    let pane = old.pane_id.clone().unwrap();
+    old.harness_identity.as_mut().unwrap().boot_id =
+        "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_owned();
+    fixture.manager().save(&old).unwrap();
+    fixture
+        .client
+        .panes
+        .lock()
+        .unwrap()
+        .retain(|item| item.pane_id != pane);
+    fixture.client.herdr_closed.lock().unwrap().insert(pane);
+    super::super::revive::fail_once("launched");
+    assert!(fixture
+        .manager()
+        .revive("worker", false, None, TIMEOUT)
+        .is_err());
+    // A real process now holds the recorded session, as the new harness does.
+    let token = old
+        .native_session
+        .as_ref()
+        .map(|native| native.value.clone())
+        .unwrap_or_else(|| "claude-session".to_owned());
+    let mut holder = std::process::Command::new("python3")
+        .args(["-c", "import time; time.sleep(30)", "--resume", &token])
+        .spawn()
+        .unwrap();
+    let result = fixture.manager().revive("worker", false, None, TIMEOUT);
+    let _ = holder.kill();
+    let _ = holder.wait();
+    assert_eq!(result.unwrap()["revived"], true);
+}
+
+#[test]
 fn revive_refuses_a_missing_old_pane_when_its_tab_has_been_reused() {
     let (fixture, old) = recoverable("claude", false);
     let pane = old.pane_id.as_ref().unwrap();

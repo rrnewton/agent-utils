@@ -1392,6 +1392,26 @@ fn dead_native_live_session_holder_refuses() {
 }
 
 #[test]
+fn dead_native_second_census_failure_is_unproven() {
+    // Re-review item 3: a failing second census must not fall through to Applies.
+    let fixture = Fixture::new();
+    fixture.start(None);
+    let record = previous_boot_missing_pane(&fixture);
+    fixture
+        .client
+        .panes_fail_on_call
+        .store(2, Ordering::Relaxed);
+    assert!(fixture
+        .manager()
+        .stop_with_options("worker", native_options(&fixture, &record))
+        .is_err());
+    assert!(fixture
+        .root
+        .join("registry/agents/worker/agent.json")
+        .exists());
+}
+
+#[test]
 fn dead_native_retirement_archives_a_custom_record_whose_pane_is_a_plain_shell() {
     // Herdr restored the Muse pane as /bin/bash after a reboot (#744).
     let fixture = Fixture::new();
