@@ -5615,7 +5615,7 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
             let mut current = order;
             for (index, tab) in desired.iter().enumerate() {
                 if current.get(index) != Some(tab)
-                    && crate::tab_order::move_tab(&socket, tab, index).is_ok()
+                    && crate::tab_order::move_tab(socket, tab, index).is_ok()
                 {
                     current.remove(
                         current
