@@ -417,8 +417,67 @@ fn read_transcript(lines: &[&[u8]], activity: &mut super::transcript::Activity) 
 /// `├ ◈ Sleep 20 between steps  running   19s`, and `ran 18s, exit 0` once it finished. A Muse
 /// that ended its turn waiting on one, as a goal turn often does between steps, has not stopped
 /// without a verdict (#678 muse-bridge-latency). `None` when no terminal runs.
+///
+/// Only the live panel counts (#1942): the panel block must sit at the
+/// bottom of the screen, under its `main · ` header — at most a few
+/// footer or notice rows below it, blank rows aside. A panel in
+/// scrollback — an earlier turn's terminals, still saying running after
+/// they finished — is history, not state.
 #[must_use]
 pub fn background_work(screen: &str) -> Option<String> {
+    let lines: Vec<&str> = screen.lines().collect();
+    let panel_row = |line: &str| {
+        let line = line.trim_start();
+        line.starts_with('├') || line.starts_with('└') || line.starts_with('│')
+    };
+    // Find the last panel row, tolerating a wrapped footer or a notice
+    // row below the panel (at most three non-blank rows under it).
+    let mut cursor = lines.len();
+    let mut below = 0;
+    while cursor > 0 {
+        let line = lines[cursor - 1].trim();
+        if line.is_empty() {
+            cursor -= 1;
+            continue;
+        }
+        if panel_row(line) {
+            break;
+        }
+        below += 1;
+        if below > 3 {
+            return None;
+        }
+        cursor -= 1;
+    }
+    let mut running = 0;
+    while cursor > 0 && panel_row(lines[cursor - 1]) {
+        if lines[cursor - 1]
+            .split("  ")
+            .map(str::trim)
+            .any(|field| field == "running")
+        {
+            running += 1;
+        }
+        cursor -= 1;
+    }
+    if running == 0 || cursor == 0 {
+        return None;
+    }
+    if !lines[cursor - 1].trim_start().starts_with("main · ") {
+        return None;
+    }
+    Some(format!(
+        "{running} background shell{}",
+        if running == 1 { "" } else { "s" }
+    ))
+}
+
+/// The pre-#1942 read: any panel below the editor's bottom rule, however
+/// far above the screen's bottom it sits. Kept for the conservative case
+/// (no process sample, or a live tool under the harness), where dropping
+/// a count the strict read misses would misread busy as idle.
+#[must_use]
+pub fn background_work_wide(screen: &str) -> Option<String> {
     let lines: Vec<&str> = screen.lines().collect();
     let bottom = lines.iter().rposition(|line| {
         let line = line.trim();
@@ -839,6 +898,25 @@ mod tests {
             None
         );
         assert_eq!(background_work(&screen("")), None);
+        // A stale panel in scrollback (#1942): an earlier turn's terminal
+        // still says running, but the live screen below it has no panel
+        // above its footer, so nothing is counted.
+        let stale = format!(
+            "◆ Older turn\nmain · ↓ to select\n└ ◆ Sleep  running   19s\n◆ Finished · Sleep · ✓ · ctrl+o\n{rule}\n❯\n{rule}\n{footer}\n"
+        );
+        assert_eq!(background_work(&stale), None);
+        // The reported shape (#1942): the stale panel sits under the
+        // editor's rule with no rule after it, and the current screen
+        // continues below it. The wide (base) read counts it; the live
+        // read does not.
+        let reported = format!(
+            "◆ Working\n{rule}\n❯\nmain · ↓ to select\n└ ◆ Sleep  running   19s\n◆ Finished the thing\n◆ Another line\n❯\n{footer}\n"
+        );
+        assert_eq!(
+            background_work_wide(&reported).as_deref(),
+            Some("1 background shell")
+        );
+        assert_eq!(background_work(&reported), None);
         // A transcript row that says running is not the panel.
         assert_eq!(
             background_work(&format!(

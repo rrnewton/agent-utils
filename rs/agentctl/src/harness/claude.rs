@@ -318,11 +318,43 @@ const BACKGROUND_WINDOW_LINES: usize = 12;
 /// turn, as in `✻ Sautéed for 5m 51s · done 12:44 AM · 2 shells still running`. The turn's
 /// row is history: it still says `still running` after the work ends. So when the input box
 /// (a `❯` row) is in view, only the footer rows under it are read, and the turn's row only
-/// when no input box is. An agent that went idle waiting on such work, such as a validation
+/// when no input box is. Only the live footer row counts (#1942): the last
+/// `·`-bearing row in the window is the footer Claude Code draws now; a count
+/// on a row above it is scrollback, and reading upward past a quiet live
+/// footer flags work that ended with the turn that drew it. An agent that
+/// went idle waiting on such work, such as a validation
 /// gate it runs in a background shell, has not stopped without a verdict; only one whose
 /// screen then stops changing for the stall threshold is reported, as stalled.
 #[must_use]
 pub fn background_work(screen: &str) -> Option<String> {
+    let lines: Vec<&str> = screen.lines().collect();
+    let mut start = lines.len().saturating_sub(BACKGROUND_WINDOW_LINES);
+    if let Some(input) = lines[start..]
+        .iter()
+        .rposition(|line| line.trim_start().starts_with('❯'))
+    {
+        start += input + 1;
+    }
+    let footer = lines[start..]
+        .iter()
+        .rev()
+        .find(|line| line.contains('·'))?;
+    footer.split('·').find_map(|segment| {
+        let segment = segment.trim().trim_start_matches('←').trim_start();
+        background_count(segment).then(|| segment.to_owned())
+    })
+}
+
+/// The pre-#1942 read: any count in the bottom window, searching upward.
+/// Kept for every case where dropping a count the narrow read misses (a
+/// footer wrapped on a narrow pane, a row drawn below it, a long draft
+/// containing `·`) would misread busy as idle: no process sample at all
+/// (a missing sample means maybe a tool), a live tool in the tree, or a
+/// sub-agent count (`1 agent` runs inside the harness and never shows as
+/// a tool). The narrow read, which can only turn Some into None, is used
+/// only with a sample that has no tools and a shell count.
+#[must_use]
+pub fn background_work_wide(screen: &str) -> Option<String> {
     let lines: Vec<&str> = screen.lines().collect();
     let mut start = lines.len().saturating_sub(BACKGROUND_WINDOW_LINES);
     if let Some(input) = lines[start..]

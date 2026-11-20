@@ -1841,8 +1841,32 @@ fn classify(
         && !observation.has_pending
     {
         let running = turn_running(screen);
-        let background =
-            background_work(screen).or_else(|| crate::harness::muse::background_work(screen));
+        // The narrow reads can only turn Some into None (#1942), so they
+        // are used only with a process sample that has no tools and (for
+        // Claude) a shell count: a missing sample means maybe a tool, a
+        // live tool means the wide read decides, and sub-agents run
+        // inside the harness where the tree never shows them. A
+        // progressing tool then never reads as idle (guard below).
+        let wide = crate::harness::claude::background_work_wide(screen);
+        let narrow_claude = match (&wide, observation.work.as_ref()) {
+            (Some(what), Some(sample))
+                if sample.tools().next().is_none() && what.contains("shell") =>
+            {
+                background_work(screen)
+            }
+            _ => wide.clone(),
+        };
+        let sample_quiet = observation
+            .work
+            .as_ref()
+            .is_some_and(|sample| sample.tools().next().is_none());
+        let background = narrow_claude.or_else(|| {
+            if sample_quiet {
+                crate::harness::muse::background_work(screen)
+            } else {
+                crate::harness::muse::background_work_wide(screen)
+            }
+        });
         let work = background
             .clone()
             .or_else(|| running.then(|| "esc to interrupt".to_owned()));
@@ -1894,6 +1918,21 @@ fn classify(
                     observation.status
                 ),
             ));
+        }
+        // Never idle while a tool under the harness is progressing (#1942):
+        // its CPU or I/O moved inside the stall window, so this pass is
+        // quiet rather than a verdict that the agent stopped.
+        if let Some(sample) = observation.work.as_ref() {
+            let stall = options.stall.as_secs_f64();
+            let progressing = sample.tools().any(|tool| {
+                memory
+                    .work
+                    .get(&tool.key)
+                    .is_some_and(|mark| now - mark.changed_at < stall)
+            });
+            if progressing {
+                return None;
+            }
         }
         return Some(Finding::new(
             EpisodeKind::IdleNoVerdict,
@@ -9886,6 +9925,195 @@ mod tests {
         let idle = pass(&mut probe, &mut notifier, &mut state, 3900.0, &options);
         assert_eq!(idle["episodes"][0]["kind"], "idle-no-verdict", "{idle}");
         assert_eq!(notifier.sent.len(), 2);
+    }
+
+    // Recorded pane text (#1942): a stale footer counting one shell sits in
+    // scrollback above the live footer, which counts nothing.
+    const STALE_FOOTER: &str = "● Waiting for the validation gate in the background.\n\n❯\u{a0}\n  ⏵⏵ auto mode on · 1 shell · ↓ to manage\n  ⏵⏵ auto mode on · ↓ to manage\n";
+
+    #[test]
+    fn a_stale_footer_in_scrollback_reads_idle_never_background_wait() {
+        assert_eq!(background_work(STALE_FOOTER), None);
+        let options = options();
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        let mut empty = observation("lane", "idle", Some(STALE_FOOTER));
+        empty.work = idle_harness();
+        let mut probe = ScriptedProbe(vec![vec![empty.clone()], vec![empty]]);
+        pass(&mut probe, &mut notifier, &mut state, 0.0, &options);
+        let report = pass(&mut probe, &mut notifier, &mut state, 1000.0, &options);
+        assert_ne!(report["episodes"][0]["kind"], "background-wait", "{report}");
+        assert!(
+            notifier
+                .sent
+                .iter()
+                .all(|entry| !entry.1.contains("background work")),
+            "{:?}",
+            notifier.sent
+        );
+    }
+
+    #[test]
+    fn a_live_process_tree_means_busy_never_safe_to_close() {
+        // The safety invariant (#1942): disagreement handling must only make
+        // the watcher more conservative. A tool under the harness keeps the
+        // agent in the background-wait family while the live footer counts
+        // its shells; it is never reclassified idle on the screen's word.
+        let options = options();
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        let mut stuck = FakeProc::default();
+        stuck
+            .spawn(100, 1, 'S', "claude")
+            .spawn(200, 100, 'S', "/bin/bash -c python3 scripts/validate.py")
+            .sleep_in(200, "pipe_read");
+        let mut busy = observation("lane", "idle", Some(BACKGROUND_FOOTER_ONLY));
+        busy.work = sample(&stuck, 100, None);
+        let mut probe = ScriptedProbe(vec![vec![busy.clone()], vec![busy]]);
+        pass(&mut probe, &mut notifier, &mut state, 0.0, &options);
+        let report = pass(&mut probe, &mut notifier, &mut state, 1_860.0, &options);
+        assert_eq!(report["episodes"][0]["kind"], "background-wait", "{report}");
+    }
+
+    #[test]
+    fn a_stale_footer_without_a_sample_reads_wide_and_stays_stalled() {
+        // No process sample means maybe a tool (#1942): the wide read
+        // decides, so the pane stalls at the stall threshold instead of
+        // reading idle at the idle threshold.
+        let options = options();
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        let bare = observation("lane", "idle", Some(STALE_FOOTER));
+        let mut probe = ScriptedProbe(vec![vec![bare.clone()], vec![bare.clone()], vec![bare]]);
+        pass(&mut probe, &mut notifier, &mut state, 0.0, &options);
+        let middle = pass(&mut probe, &mut notifier, &mut state, 1000.0, &options);
+        assert_ne!(middle["episodes"][0]["kind"], "idle-no-verdict", "{middle}");
+        let late = pass(&mut probe, &mut notifier, &mut state, 2900.0, &options);
+        assert_eq!(late["episodes"][0]["kind"], "stalled", "{late}");
+    }
+
+    #[test]
+    fn wrapped_and_buried_footers_read_wide_only_with_a_live_tool() {
+        // A footer wrapped on a narrow pane, and a count row with another
+        // separator row below it: the narrow read sees neither (#1942), the
+        // wide read sees both, and classify uses the wide read only while a
+        // tool runs under the harness.
+        let wrapped = "● Working.\n\n❯\n  ⏵⏵ auto mode on · 2 shells · ← 1\nagent · ↓ to manage\n";
+        let buried =
+            "● Working.\n\n❯\n  ⏵⏵ auto mode on · 2 shells · ↓ to manage\n  statusline · ready\n";
+        for screen in [wrapped, buried] {
+            assert_eq!(background_work(screen), None, "{screen}");
+            assert_eq!(
+                crate::harness::claude::background_work_wide(screen).as_deref(),
+                Some("2 shells"),
+                "{screen}"
+            );
+        }
+        let options = options();
+        for screen in [wrapped, buried] {
+            let mut stuck = FakeProc::default();
+            stuck
+                .spawn(100, 1, 'S', "claude")
+                .spawn(200, 100, 'S', "/bin/bash -c python3 scripts/validate.py")
+                .sleep_in(200, "pipe_read");
+            let mut busy = observation("lane", "idle", Some(screen));
+            busy.work = sample(&stuck, 100, None);
+            let mut notifier = RecordingNotifier::default();
+            let mut state = WatchState::default();
+            let mut probe = ScriptedProbe(vec![vec![busy.clone()], vec![busy]]);
+            pass(&mut probe, &mut notifier, &mut state, 0.0, &options);
+            let report = pass(&mut probe, &mut notifier, &mut state, 1_860.0, &options);
+            assert_eq!(report["episodes"][0]["kind"], "background-wait", "{report}");
+        }
+    }
+
+    #[test]
+    fn a_quiet_footer_with_a_progressing_tool_is_never_idle() {
+        // The tool burned more CPU between passes, so it is progressing:
+        // this pass stays quiet, never idle-no-verdict (#1942).
+        let options = options();
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        let early = Observation {
+            work: busy_harness(10),
+            ..observation("lane", "idle", Some(QUIET_FOOTER))
+        };
+        let later = Observation {
+            work: busy_harness(50),
+            ..observation("lane", "idle", Some(QUIET_FOOTER))
+        };
+        let mut probe = ScriptedProbe(vec![vec![early], vec![later]]);
+        pass(&mut probe, &mut notifier, &mut state, 0.0, &options);
+        let report = pass(&mut probe, &mut notifier, &mut state, 1_000.0, &options);
+        assert_eq!(report["episodes"], json!([]), "{report}");
+        assert!(notifier.sent.is_empty(), "{:?}", notifier.sent);
+    }
+
+    #[test]
+    fn a_stale_footer_with_a_live_tool_stays_background_wait() {
+        // The stale-footer shape itself, with a stuck tool under the
+        // harness: the wide read keeps the background-wait (#1942).
+        let options = options();
+        let mut stuck = FakeProc::default();
+        stuck
+            .spawn(100, 1, 'S', "claude")
+            .spawn(200, 100, 'S', "/bin/bash -c python3 scripts/validate.py")
+            .sleep_in(200, "pipe_read");
+        let mut busy = observation("lane", "idle", Some(STALE_FOOTER));
+        busy.work = sample(&stuck, 100, None);
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        let mut probe = ScriptedProbe(vec![vec![busy.clone()], vec![busy]]);
+        pass(&mut probe, &mut notifier, &mut state, 0.0, &options);
+        let report = pass(&mut probe, &mut notifier, &mut state, 1_860.0, &options);
+        assert_eq!(report["episodes"][0]["kind"], "background-wait", "{report}");
+    }
+
+    #[test]
+    fn a_pane_with_a_foreground_process_is_never_a_bare_shell_close() {
+        // The closing side of the invariant (#1942): tab hygiene closes only
+        // unclaimed panes with no foreground process, however idle they look.
+        use crate::tabs::{plan, PaneFacts, TabAction};
+        let panes = vec![PaneFacts {
+            pane_id: "w1:p1".to_owned(),
+            tab_id: "w1:t1".to_owned(),
+            workspace_id: "w1".to_owned(),
+            label: Some("lane".to_owned()),
+            idle_shell: false,
+            composer_text: false,
+            foreground: "muse".to_owned(),
+            cwd: "/work/slot".to_owned(),
+        }];
+        let mut bare = std::collections::BTreeMap::new();
+        bare.insert("w1:p1".to_owned(), 0.0);
+        let agents = vec![crate::tabs::AgentFacts {
+            name: "other".to_owned(),
+            pane_id: Some("w1:p0".to_owned()),
+            viewer_tab_id: None,
+            lifecycle: "running".to_owned(),
+            headless: false,
+            viewer_is_tail: false,
+            cwd: "/work/slot".to_owned(),
+            live_proven: true,
+        }];
+        let order = vec![("w1".to_owned(), "w1:t1".to_owned())];
+        let (_rows, actions) = plan(
+            &panes,
+            &order,
+            &agents,
+            &bare,
+            &std::collections::BTreeMap::new(),
+            10_000.0,
+            600.0,
+            None,
+        );
+        assert!(
+            !actions.iter().any(|action| matches!(
+                action,
+                TabAction::ClosePane { .. } | TabAction::CloseTab { .. }
+            )),
+            "{actions:?}"
+        );
     }
 
     fn generic(name: &str, screen: &str) -> Observation {
