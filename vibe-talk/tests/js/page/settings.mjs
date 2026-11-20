@@ -3047,6 +3047,9 @@ test("`#1961 vibe-talk-colour-themes`: a Colour theme choice is applied, kept, a
   // The pre-paint script carries the same preset, so a reload cannot flash blue first.
   assert.match(HTML, /vibe-talk\.voice\.colour-theme/, "the shell does not read the preset before paint");
   assert.match(HTML, /#4cc2b0/, "the shell does not carry the teal preset before paint");
+  // The shell's copy of the tables is the module's, token for token: the two cannot drift.
+  const shellPresets = JSON.parse(/var colourPresets = (\{.*?\});/.exec(HTML)[1]);
+  assert.deepStrictEqual(shellPresets, JSON.parse(JSON.stringify(SETTINGS.COLOUR_PRESETS)), "the pre-paint preset tables drifted from the module's");
 });
 
 test("`#1961 vibe-talk-colour-themes`: no accent blue stands hard-coded outside the token tables", () => {
