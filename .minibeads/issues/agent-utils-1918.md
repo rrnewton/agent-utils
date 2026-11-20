@@ -1,6 +1,6 @@
 ---
 title: 'agentctl-watch-orphan-tab-race: a tab created during the pane census is closed as an orphan'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -33,3 +33,7 @@ updated_at: 2026-11-19T16:38:00-05:00
 # Notes
 
 Containment already live: both registries' watch config sets close_bare_shells=false; those files are not changed by this fix. New persisted field `orphan_tab_since` in the watch health report mirrors `bare_shell_since`; reported to the coordinator before gating.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as 4a05b1e8. hygiene_pass snapshots the tab order before the pane census; tabs::plan closes an orphan only when first seen strictly before the pass and past the bare-shell grace (new persisted health field orphan_tab_since, reported to the coordinator, rollback-safe Value parsing); the orphan close re-lists the tab's panes and skips when any pane exists. Focused tests (census-race tab kept, first-seen kept, re-list veto, genuine orphan past grace closed) pass; full gate passed on the rebased tree.
