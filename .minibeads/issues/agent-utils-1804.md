@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-eden-multiple-backing-repos: accept multiple in-image Eden backing repos'
-status: open
+status: closed
 priority: 2
 issue_type: task
 labels:
@@ -22,3 +22,7 @@ updated_at: 2026-11-17T15:30:00-05:00
 - Coordinator approves the design; then list/map config, named create selection, and lazy seeding land with tests.
 
 # Notes
+
+## Resolution
+
+Landed 7d78801cfe43095275e7ba8298845c9f381e0b26 on github/main (mu-edenfix). `eden_backing_repo` accepts a name, list, or map in both editions with strict validation; `create --eden` selects by configured name; `seed-eden-backing --name` lazily clones the remote upstream into the in-image cache. Full gate pass and combined-tree verification green. No new persisted field.
