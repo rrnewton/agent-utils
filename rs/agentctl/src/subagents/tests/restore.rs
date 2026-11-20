@@ -2322,6 +2322,7 @@ fn restore_restarts_eden_daemons_for_its_own_slots_only() {
         1,
         "{report}"
     );
+    assert_eq!(report["eden_refused"], 0, "{report}");
     let commands = host.commands();
     let eden_calls: Vec<&String> = commands
         .iter()
@@ -2357,8 +2358,10 @@ fn restore_restarts_eden_daemons_for_its_own_slots_only() {
 #[test]
 fn restore_completes_when_the_eden_restart_verb_fails_or_is_absent() {
     // #1977: a failing verb, and no wrkslots at all, both degrade to a
-    // refused eden_daemons row; the lane still comes back.
+    // refused eden_daemons row; the lane still comes back. The refusal
+    // is counted in `eden_refused` and never changes the exit class.
     let fixture = Fixture::new();
+    dead_agent(&fixture);
     promotable_slotted(&fixture, "slotted", "slotted-slot");
     let host = ScriptedHost::new();
     let root = fixture.root.display().to_string();
@@ -2393,8 +2396,15 @@ fn restore_completes_when_the_eden_restart_verb_fails_or_is_absent() {
             .contains("eden exploded"),
         "{report}"
     );
+    // Eden refusals are summarised separately and never refuse a lane:
+    // the run still completes with the clean-lane exit class.
+    assert_eq!(report["eden_refused"], 1, "{report}");
+    assert_eq!(report["refused"], 0, "{report}");
+    assert_eq!(report["complete"], true, "{report}");
+    assert_eq!(restore_exit_code(&report, false), 0, "{report}");
 
     let fixture = Fixture::new();
+    dead_agent(&fixture);
     promotable_slotted(&fixture, "slotted", "slotted-slot");
     let host = ScriptedHost::new();
     let registry = fixture.root.join("registry");
@@ -2426,6 +2436,263 @@ fn restore_completes_when_the_eden_restart_verb_fails_or_is_absent() {
             .any(|command| command.contains("restart-slot-daemons")),
         "{:?}",
         host.commands()
+    );
+    assert_eq!(report["eden_refused"], 1, "{report}");
+}
+
+#[test]
+fn restore_passes_a_skipped_git_slot_through_without_an_eden_refusal() {
+    // #1977 fix 1: the verb classifies a git-only slot as `skipped`;
+    // restore passes the row through and synthesises no refusal for it.
+    let fixture = Fixture::new();
+    dead_agent(&fixture);
+    promotable_slotted(&fixture, "slotted", "git-slot");
+    let host = ScriptedHost::new();
+    let root = fixture.root.display().to_string();
+    host.answer(
+        "image status",
+        0,
+        &format!("work/git-slot at {root} (ready)\n"),
+        "",
+    );
+    host.answer("findmnt", 0, &format!("{root} /dev/loop0\n"), "");
+    host.answer(
+        "restart-slot-daemons",
+        0,
+        &json!({"eden_daemons": [{
+            "slot": "git-slot", "checkout": null, "mount": null, "config_dir": null,
+            "status": "skipped",
+            "reason": "slot has no Eden checkout; no Eden daemon to restart",
+        }], "refused": 0})
+        .to_string(),
+        "",
+    );
+    script_slot_transfer(&host, "git-slot", "slotted");
+    let registry = fixture.root.join("registry");
+    let report = restore(
+        &fixture.client,
+        &registry,
+        &host,
+        &config(&fixture, None),
+        &options(Some("/opt/wrkslots")),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_row(&report, "slotted")["action"],
+        "promoted",
+        "{report}"
+    );
+    assert_eq!(report["eden_daemons"][0]["slot"], "git-slot", "{report}");
+    assert_eq!(report["eden_daemons"][0]["status"], "skipped", "{report}");
+    assert_eq!(
+        report["eden_daemons"].as_array().unwrap().len(),
+        1,
+        "{report}"
+    );
+    assert_eq!(report["eden_refused"], 0, "{report}");
+    assert_eq!(report["refused"], 0, "{report}");
+}
+
+#[test]
+fn restore_never_passes_a_foreign_slot_project_to_wrkslots() {
+    // #1977 fix 2: this verb starts processes, so a slot bound to a
+    // different project is refused locally and never invoked.
+    let fixture = Fixture::new();
+    dead_agent(&fixture);
+    promotable_slotted(&fixture, "foreign", "foreign-slot");
+    let mut record = fixture.manager().load("foreign").unwrap();
+    record.slot_project = Some(fixture.root.join("other-project").display().to_string());
+    fixture.manager().save(&record).unwrap();
+    let host = ScriptedHost::new();
+    let root = fixture.root.display().to_string();
+    host.answer(
+        "image status",
+        0,
+        &format!("work/foreign-slot at {root} (ready)\n"),
+        "",
+    );
+    host.answer("findmnt", 0, &format!("{root} /dev/loop0\n"), "");
+    script_slot_transfer(&host, "foreign-slot", "foreign");
+    let registry = fixture.root.join("registry");
+    let report = restore(
+        &fixture.client,
+        &registry,
+        &host,
+        &config(&fixture, None),
+        &options(Some("/opt/wrkslots")),
+    )
+    .unwrap();
+    let rows = report["eden_daemons"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{report}");
+    assert_eq!(rows[0]["slot"], "foreign-slot", "{report}");
+    assert_eq!(rows[0]["status"], "refused", "{report}");
+    assert!(
+        rows[0]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("is not the restore project"),
+        "{report}"
+    );
+    assert_eq!(report["eden_refused"], 1, "{report}");
+    assert!(
+        !host
+            .commands()
+            .iter()
+            .any(|command| command.contains("restart-slot-daemons")),
+        "a foreign slot must never reach the verb: {:?}",
+        host.commands()
+    );
+}
+
+#[test]
+fn restore_keeps_every_verb_row_for_a_slot_and_isolates_a_timed_out_slot() {
+    // #1977 fixes 4 + rows: the verb runs once per slot, every row it
+    // returns for the slot is kept, and one slot that never answers
+    // cannot lose the other slot's restart.
+    let fixture = Fixture::new();
+    dead_agent(&fixture);
+    promotable_slotted(&fixture, "alpha", "slot-a");
+    promotable_slotted(&fixture, "beta", "slot-b");
+    let host = ScriptedHost::new();
+    let root = fixture.root.display().to_string();
+    host.answer(
+        "image status",
+        0,
+        &format!("work/slot-a at {root} (ready)\nwork/slot-b at {root} (ready)\n"),
+        "",
+    );
+    host.answer("findmnt", 0, &format!("{root} /dev/loop0\n"), "");
+    // Slot A never finishes (the host-level timeout shape); slot B
+    // reports two checkout rows for the same slot.
+    host.answers.borrow_mut().push((
+        "restart-slot-daemons --slot slot-a".to_owned(),
+        CommandOutcome {
+            status: None,
+            stdout: String::new(),
+            stderr: "wrkslots did not finish within 120s".to_owned(),
+        },
+    ));
+    host.answer(
+        "restart-slot-daemons --slot slot-b",
+        0,
+        &json!({"eden_daemons": [
+            {"slot": "slot-b", "checkout": "main", "mount": "/mounts/b1",
+             "config_dir": "/slots/slot-b/.eden-state", "status": "restarted"},
+            {"slot": "slot-b", "checkout": "second", "mount": "/mounts/b2",
+             "config_dir": "/slots/slot-b/.eden-state", "status": "already-healthy"},
+        ], "refused": 0})
+        .to_string(),
+        "",
+    );
+    script_slot_transfer(&host, "slot-a", "alpha");
+    script_slot_transfer(&host, "slot-b", "beta");
+    let registry = fixture.root.join("registry");
+    let report = restore(
+        &fixture.client,
+        &registry,
+        &host,
+        &config(&fixture, None),
+        &options(Some("/opt/wrkslots")),
+    )
+    .unwrap();
+    let rows = report["eden_daemons"].as_array().unwrap();
+    let slot_a: Vec<&Value> = rows.iter().filter(|row| row["slot"] == "slot-a").collect();
+    let slot_b: Vec<&Value> = rows.iter().filter(|row| row["slot"] == "slot-b").collect();
+    assert_eq!(slot_a.len(), 1, "{report}");
+    assert_eq!(slot_a[0]["status"], "refused", "{report}");
+    assert_eq!(
+        slot_b.len(),
+        2,
+        "every verb row for the slot is kept: {report}"
+    );
+    assert_eq!(slot_b[0]["status"], "restarted", "{report}");
+    assert_eq!(slot_b[1]["status"], "already-healthy", "{report}");
+    assert_eq!(report["eden_refused"], 1, "{report}");
+    let eden_calls: Vec<String> = host
+        .commands()
+        .into_iter()
+        .filter(|command| command.contains("restart-slot-daemons"))
+        .collect();
+    assert_eq!(eden_calls.len(), 2, "one verb run per slot: {eden_calls:?}");
+}
+
+#[test]
+fn restore_without_a_restart_does_not_restart_eden_daemons() {
+    // #1977: the Eden step follows the restart-detected condition, so
+    // a daemon stopped on purpose in this boot stays stopped on an
+    // ordinary run; the lane itself still promotes.
+    let fixture = Fixture::new();
+    promotable_slotted(&fixture, "slotted", "slotted-slot");
+    let host = ScriptedHost::new();
+    let root = fixture.root.display().to_string();
+    host.answer(
+        "image status",
+        0,
+        &format!("work/slotted-slot at {root} (ready)\n"),
+        "",
+    );
+    host.answer("findmnt", 0, &format!("{root} /dev/loop0\n"), "");
+    script_slot_transfer(&host, "slotted-slot", "slotted");
+    let registry = fixture.root.join("registry");
+    let report = restore(
+        &fixture.client,
+        &registry,
+        &host,
+        &config(&fixture, None),
+        &options(Some("/opt/wrkslots")),
+    )
+    .unwrap();
+    assert_eq!(report["restart_detected"], false, "{report}");
+    assert_eq!(
+        agent_row(&report, "slotted")["action"],
+        "promoted",
+        "{report}"
+    );
+    assert_eq!(report["eden_daemons"], json!([]), "{report}");
+    assert_eq!(report["eden_refused"], 0, "{report}");
+    assert!(
+        !host
+            .commands()
+            .iter()
+            .any(|command| command.contains("restart-slot-daemons")),
+        "{:?}",
+        host.commands()
+    );
+}
+
+#[test]
+fn restore_names_eden_refusals_in_the_coordinator_notice() {
+    // #1977 fix 6: a refused daemon is named in the coordinator's
+    // notice while the restore still completes cleanly.
+    let fixture = Fixture::new();
+    dead_named(&fixture, "lead");
+    promotable_slotted(&fixture, "slotted", "slotted-slot");
+    let host = ScriptedHost::new();
+    let root = fixture.root.display().to_string();
+    host.answer(
+        "image status",
+        0,
+        &format!("work/slotted-slot at {root} (ready)\n"),
+        "",
+    );
+    host.answer("findmnt", 0, &format!("{root} /dev/loop0\n"), "");
+    host.answer("restart-slot-daemons", 3, "", "eden exploded\n");
+    script_slot_transfer(&host, "slotted-slot", "slotted");
+    let registry = fixture.root.join("registry");
+    let report = restore(
+        &fixture.client,
+        &registry,
+        &host,
+        &config(&fixture, Some("lead")),
+        &options(Some("/opt/wrkslots")),
+    )
+    .unwrap();
+    assert_eq!(report["eden_refused"], 1, "{report}");
+    assert_eq!(restore_exit_code(&report, false), 0, "{report}");
+    let runs = fixture.client.runs.lock().unwrap().join("\n");
+    assert!(
+        runs.contains("Eden daemon restarts refused: 1 (slotted-slot)"),
+        "{runs}"
     );
 }
 
