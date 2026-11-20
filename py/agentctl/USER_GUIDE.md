@@ -1768,9 +1768,16 @@ for a registry, opt in per team:
 ```
 agentctl --registry ~/project/.agentctl install-units --dest ~/.config/systemd/user --tab-hygiene
 systemctl --user daemon-reload
-systemctl --user enable --now 'agentctl-tab-hygiene-*.timer'   # the pair is named per registry; install-units prints its exact name
 agentctl --registry ~/project/.agentctl tabs --dry-run   # preview first
 ```
+
+The pair is named per registry, and the `install-units` output's
+`next_steps` line names this registry's exact timer — enable that
+name, in the form `agentctl-tab-hygiene-<12 hex digits>.timer`, for
+example `systemctl --user enable --now agentctl-tab-hygiene-0123456789ab.timer`
+with the digits `install-units` printed for your registry (a glob in
+an enable command expands only against units systemd has already
+loaded, so do not enable by glob).
 
 The timer fires two minutes after boot and then every five minutes, and
 `install-units` writes only the pair and enables nothing by itself. A

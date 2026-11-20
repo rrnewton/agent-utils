@@ -82,6 +82,53 @@ pub fn claim_of<'a>(pane: &PaneFacts, agents: &'a [AgentFacts]) -> Option<&'a Ag
     agents.iter().find(|agent| claim_verified(pane, agent))
 }
 
+/// Whether any record names `pane` as its own, verified or not (#1971
+/// re-review): an unverified claim confers no ownership, rename or
+/// managed-set membership, but it still blocks every close — a claimed
+/// pane is never closed, however stale the claim looks.
+#[must_use]
+pub fn claimed_by_id(pane: &PaneFacts, agents: &[AgentFacts]) -> bool {
+    agents
+        .iter()
+        .any(|agent| agent.pane_id.as_deref() == Some(pane.pane_id.as_str()))
+}
+
+/// Whether a record's viewer claim on `pane`'s tab is verified (#1971
+/// re-review): the record names this tab as its viewer, and its recorded
+/// workspace is the pane's workspace, its recorded terminal is the
+/// pane's terminal, or the pane's cwd is the record's cwd or inside it
+/// (where a viewer is created). Anything else may be a reused tab id
+/// and manages nothing.
+#[must_use]
+pub fn viewer_claim_verified(pane: &PaneFacts, agent: &AgentFacts) -> bool {
+    agent.viewer_tab_id.as_deref() == Some(pane.tab_id.as_str())
+        && (agent.workspace_id.as_deref() == Some(pane.workspace_id.as_str())
+            || (agent.terminal_id.is_some() && agent.terminal_id == pane.terminal_id)
+            || cwd_related(&pane.cwd, &agent.cwd))
+}
+
+/// The verified viewer claim on `pane`'s tab, when one record holds it.
+#[must_use]
+pub fn viewer_claim_of<'a>(pane: &PaneFacts, agents: &'a [AgentFacts]) -> Option<&'a AgentFacts> {
+    agents
+        .iter()
+        .find(|agent| viewer_claim_verified(pane, agent))
+}
+
+/// Whether a viewer tab's pane plausibly runs its agent's view (#1971
+/// re-review, rename side of #1973): an idle shell, or a foreground the
+/// census reports as `agentctl`, a console or a tail. Anything else is
+/// somebody else's process in a possibly reused tab, and label sync
+/// must not rename its tab to the agent's name.
+#[must_use]
+pub fn viewer_pane_is_view(pane: &PaneFacts) -> bool {
+    pane.idle_shell
+        || pane.foreground == "agentctl"
+        || pane.foreground.starts_with("agentctl ")
+        || pane.foreground.contains("console")
+        || pane.foreground.contains("tail")
+}
+
 /// One row of an `agentctl tabs` listing.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TabRow {
@@ -182,19 +229,15 @@ pub fn duplicate_of<'a>(pane: &PaneFacts, agents: &'a [AgentFacts]) -> Option<&'
 }
 
 /// Workspaces this registry manages: holding a verified claimed pane
-/// ([`claim_of`]), a named viewer tab, or a corroborated duplicate pane
-/// (name + cwd, never label alone).
+/// ([`claim_of`]), a verified viewer tab ([`viewer_claim_of`]), or a
+/// corroborated duplicate pane (name + cwd, never label alone).
 #[must_use]
-pub fn managed_workspaces(
-    panes: &[PaneFacts],
-    viewer_tabs: &BTreeSet<String>,
-    agents: &[AgentFacts],
-) -> BTreeSet<String> {
+pub fn managed_workspaces(panes: &[PaneFacts], agents: &[AgentFacts]) -> BTreeSet<String> {
     panes
         .iter()
         .filter(|pane| {
             claim_of(pane, agents).is_some()
-                || viewer_tabs.contains(&pane.tab_id)
+                || viewer_claim_of(pane, agents).is_some()
                 || duplicate_of(pane, agents).is_some()
         })
         .map(|pane| pane.workspace_id.clone())
@@ -222,11 +265,7 @@ pub fn plan(
     grace_seconds: f64,
     viewer_workspace: Option<&str>,
 ) -> (Vec<TabRow>, Vec<TabAction>) {
-    let viewer_tabs: BTreeSet<String> = agents
-        .iter()
-        .filter_map(|a| a.viewer_tab_id.clone())
-        .collect();
-    let managed = managed_workspaces(panes, &viewer_tabs, agents);
+    let managed = managed_workspaces(panes, agents);
     let by_viewer: BTreeMap<&str, &AgentFacts> = agents
         .iter()
         .filter_map(|a| Some((a.viewer_tab_id.as_deref()?, a)))
@@ -236,11 +275,17 @@ pub fn plan(
     let mut rows = Vec::new();
     let mut actions = Vec::new();
     for pane in panes {
-        let owner = claim_of(pane, agents).or_else(|| by_viewer.get(pane.tab_id.as_str()).copied());
+        // Ownership counts only verified claims (#1971 re-review): an
+        // unverified pane or viewer claim confers no owner here.
+        let owner = claim_of(pane, agents).or_else(|| viewer_claim_of(pane, agents));
         let idle = bare_since.get(&pane.pane_id).map(|since| now - since);
         let mut verdict = "keep".to_owned();
         if !managed.contains(&pane.workspace_id) {
             verdict = "keep (unmanaged workspace)".to_owned();
+        } else if owner.is_none() && claimed_by_id(pane, agents) {
+            // #1971 re-review (1): an unverified claim blocks every
+            // close, even inside a managed workspace.
+            verdict = "keep (unverified claim)".to_owned();
         } else if owner.is_none() {
             // Unclaimed: a duplicate only with name+cwd corroboration.
             let duplicate = duplicate_of(pane, agents).is_some();
@@ -264,9 +309,17 @@ pub fn plan(
             }
         }
         // Label sync: a claimed or viewer tab carries its agent's name.
+        // A viewer tab is renamed only when its pane plausibly runs
+        // that agent's view (#1973 rename side, #1971 re-review (3)):
+        // an idle shell, or an `agentctl` tail/console foreground. A
+        // pane running anything else may be a reused tab id, and
+        // renaming it would make it look ours.
         if let Some(agent) = owner {
+            let via_viewer = agent.viewer_tab_id.as_deref() == Some(pane.tab_id.as_str())
+                && agent.pane_id.as_deref() != Some(pane.pane_id.as_str());
             if pane.label.as_deref() != Some(agent.name.as_str())
                 && managed.contains(&pane.workspace_id)
+                && (!via_viewer || viewer_pane_is_view(pane))
             {
                 actions.push(TabAction::RenameTab {
                     tab_id: pane.tab_id.clone(),
@@ -544,6 +597,98 @@ mod tests {
         let mut verified_pane = panes[0].clone();
         verified_pane.terminal_id = Some("term-1".into());
         assert!(claim_verified(&verified_pane, &stale));
+    }
+
+    #[test]
+    fn an_unverified_claim_in_a_managed_workspace_still_blocks_the_close() {
+        // #1971 re-review (1): w1 is managed by agent-a's verified pane;
+        // the second pane is named by a stale record from w9. Unverified
+        // means no ownership and no rename — but never a close.
+        let panes = vec![
+            pane("w1:p1", "w1:t1", "w1", "agent-a", false, false),
+            pane("w1:p2", "w1:t2", "w1", "scratch", true, false),
+        ];
+        let mut stale = agent("stale", Some("w1:p2"));
+        stale.workspace_id = Some("w9".into());
+        let agents = vec![agent("agent-a", Some("w1:p1")), stale];
+        let order: Vec<(String, String)> = panes
+            .iter()
+            .map(|p| (p.workspace_id.clone(), p.tab_id.clone()))
+            .collect();
+        let (rows, actions) = plan(
+            &panes,
+            &order,
+            &agents,
+            &since("w1:p2", 0.0),
+            &BTreeMap::new(),
+            10_000.0,
+            600.0,
+            None,
+        );
+        assert!(actions.is_empty(), "{actions:?}");
+        let row = rows.iter().find(|r| r.tab_id == "w1:t2").unwrap();
+        assert_eq!(row.owner, None);
+        assert_eq!(row.verdict, "keep (unverified claim)");
+    }
+
+    #[test]
+    fn a_viewer_tab_is_renamed_only_when_its_pane_runs_the_view() {
+        // #1971 re-review (3) / #1973 rename side: the viewer tab's
+        // label has drifted, but its pane foreground is another
+        // process (a reused tab id) — no rename. An `agentctl`
+        // foreground is the view, and renames as before.
+        let mut viewer = pane("w1:p9", "w1:t9", "w1", "drifted", false, false);
+        viewer.foreground = "muse".into();
+        let mut headless = agent("coord", None);
+        headless.headless = true;
+        headless.viewer_tab_id = Some("w1:t9".into());
+        let panes = vec![
+            pane("w1:p1", "w1:t1", "w1", "agent-a", false, false),
+            viewer.clone(),
+        ];
+        let agents = vec![agent("agent-a", Some("w1:p1")), headless.clone()];
+        let order: Vec<(String, String)> = panes
+            .iter()
+            .map(|p| (p.workspace_id.clone(), p.tab_id.clone()))
+            .collect();
+        let (_, actions) = plan(
+            &panes,
+            &order,
+            &agents,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            10_000.0,
+            600.0,
+            None,
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, TabAction::RenameTab { .. })),
+            "{actions:?}"
+        );
+        viewer.foreground = "agentctl".into();
+        let panes = vec![
+            pane("w1:p1", "w1:t1", "w1", "agent-a", false, false),
+            viewer,
+        ];
+        let (_, actions) = plan(
+            &panes,
+            &order,
+            &agents,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            10_000.0,
+            600.0,
+            None,
+        );
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                TabAction::RenameTab { tab_id, to } if tab_id == "w1:t9" && to == "coord"
+            )),
+            "{actions:?}"
+        );
     }
 
     #[test]

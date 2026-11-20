@@ -439,11 +439,13 @@ pub fn install_restore_teams(options: &InstallOptions, teams_config: &Path) -> R
 /// The unit base name for one registry's tab-hygiene pair (#1971 cold
 /// review): named per registry, so two registries on one host never
 /// collide on one pair. The suffix is the first twelve hex digits of
-/// the registry path's SHA-256 — stable for a registry, distinct
-/// between registries whatever their directories are called.
+/// the SHA-256 of the registry's canonicalised path, so the same
+/// registry reached through a symlink gets the same pair, and distinct
+/// registries get distinct pairs.
 fn tab_hygiene_unit_base(registry: &Path) -> String {
     use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(registry.display().to_string().as_bytes());
+    let canonical = fs::canonicalize(registry).unwrap_or_else(|_| registry.to_path_buf());
+    let digest = Sha256::digest(canonical.display().to_string().as_bytes());
     let suffix: String = digest
         .iter()
         .take(6)

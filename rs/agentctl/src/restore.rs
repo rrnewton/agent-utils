@@ -5154,7 +5154,6 @@ fn census_pane_facts<A: ManagedApi + ?Sized>(
     panes: &[crate::client::Pane],
     labels_by_tab: &BTreeMap<String, String>,
     agents: &[crate::tabs::AgentFacts],
-    viewer_tabs: &std::collections::BTreeSet<String>,
 ) -> (Vec<crate::tabs::PaneFacts>, bool) {
     let started = Instant::now();
     let mut facts: Vec<crate::tabs::PaneFacts> = Vec::with_capacity(panes.len());
@@ -5180,10 +5179,10 @@ fn census_pane_facts<A: ManagedApi + ?Sized>(
                 .unwrap_or_else(|| "unknown".to_owned()),
             terminal_id: info.and_then(|info| info.terminal_id),
         };
-        let claimed = agents
-            .iter()
-            .any(|agent| crate::tabs::claim_verified(&fact, agent))
-            || viewer_tabs.contains(&fact.tab_id);
+        let claimed = agents.iter().any(|agent| {
+            crate::tabs::claim_verified(&fact, agent)
+                || crate::tabs::viewer_claim_verified(&fact, agent)
+        });
         fact.composer_text = !claimed;
         if !claimed {
             probe_order.push(facts.len());
@@ -5257,12 +5256,8 @@ pub fn tabs_listing<A: ManagedApi + ?Sized>(
             })
         })
         .collect();
-    let viewer_set: std::collections::BTreeSet<String> = agent_facts
-        .iter()
-        .filter_map(|agent| agent.viewer_tab_id.clone())
-        .collect();
     let (pane_facts, census_truncated) =
-        census_pane_facts(client, &panes, &labels_by_tab, &agent_facts, &viewer_set);
+        census_pane_facts(client, &panes, &labels_by_tab, &agent_facts);
     let order_tabs: Vec<(String, String)> = workspaces
         .iter()
         .filter_map(|workspace| {
@@ -5578,14 +5573,8 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
             })
         })
         .collect();
-    let viewer_set: std::collections::BTreeSet<String> = viewer_tabs.keys().cloned().collect();
-    let (pane_facts, census_truncated) = census_pane_facts(
-        client,
-        &panes,
-        &labels_by_tab,
-        &agent_facts_early,
-        &viewer_set,
-    );
+    let (pane_facts, census_truncated) =
+        census_pane_facts(client, &panes, &labels_by_tab, &agent_facts_early);
     // Ordering claims count only verified claims (#1971 cold review):
     // a stale record naming another team's pane must not rename or
     // reorder that team's tabs.
@@ -5604,8 +5593,7 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
             Value::Null,
         ));
     }
-    let managed_workspaces =
-        crate::tabs::managed_workspaces(&pane_facts, &viewer_set, &agent_facts_early);
+    let managed_workspaces = crate::tabs::managed_workspaces(&pane_facts, &agent_facts_early);
     // Canonical tab order, through the guarded Herdr socket when the
     // caller's Herdr binary is the one serving it (#1971 nit).
     if let Some(socket) = socket {
@@ -6225,15 +6213,8 @@ mod tests {
             workspace_id: Some("w1".to_owned()),
             terminal_id: None,
         }];
-        let viewers: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::from(["w1:t2".to_owned()]);
-        let (facts, truncated) = census_pane_facts(
-            &fake,
-            &fake.panes.clone(),
-            &BTreeMap::new(),
-            &agents,
-            &viewers,
-        );
+        let (facts, truncated) =
+            census_pane_facts(&fake, &fake.panes.clone(), &BTreeMap::new(), &agents);
         assert!(!truncated);
         assert_eq!(
             fake.pane_info_calls.lock().unwrap().len(),
