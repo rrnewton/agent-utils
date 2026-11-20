@@ -7705,6 +7705,128 @@ class ManagedAgents:
                     })
         return found
 
+    def redact(self, name: str, literal: str, *, include_archived: bool = False,
+               dry_run: bool = False) -> dict[str, object]:
+        """Rewrite `literal` in one agent's processed history (#1963).
+
+        Never touches the live inbox or in-flight entries; refuses while an
+        inflight entry exists. Backups (0600) and an audit line that never
+        holds the literal go under the registry's `backups/` directory.
+        """
+        if not literal:
+            raise AgentDeliveryError("redact literal must not be empty")
+        replacement = "[redacted]"
+
+        def count_in(value: object) -> int:
+            if isinstance(value, str):
+                return value.count(literal)
+            if isinstance(value, list):
+                return sum(count_in(item) for item in value)
+            if isinstance(value, dict):
+                return sum(count_in(item) for item in value.values())
+            return 0
+
+        def apply(value: object) -> tuple[object, int]:
+            total = count_in(value)
+            if total:
+                # Strings are immutable: rebuild with replacements.
+                def rebuild(item: object) -> object:
+                    if isinstance(item, str):
+                        return item.replace(literal, replacement)
+                    if isinstance(item, list):
+                        return [rebuild(child) for child in item]
+                    if isinstance(item, dict):
+                        return {key: rebuild(child) for key, child in item.items()}
+                    return item
+                return rebuild(value), total
+            return value, 0
+
+        with self._lock(name):
+            self._load(name)
+            agent_dir = self._directory(name)
+            inflight = agent_dir / "queue" / "inflight"
+            if inflight.is_dir() and any(path.suffix == ".json" for path in inflight.iterdir()):
+                raise AgentDeliveryError(
+                    f"agent {name!r} is mid-delivery (an inflight entry exists); refusing to redact — remedy: wait for the delivery to finish, then retry"
+                )
+            targets: list[Path] = []
+            for base, extension in ((agent_dir / "queue" / "processed", ".json"),
+                                    (agent_dir / "events", ".jsonl")):
+                if base.is_dir():
+                    targets.extend(sorted(path for path in base.iterdir() if path.suffix == extension and path.is_file()))
+            if include_archived:
+                archive = self.registry / "archive"
+                if archive.is_dir():
+                    for directory in sorted(path for path in archive.iterdir()
+                                            if path.is_dir() and path.name.startswith(f"{name}-")):
+                        for base, extension in ((directory / "queue" / "processed", ".json"),
+                                                (directory / "events", ".jsonl")):
+                            if base.is_dir():
+                                targets.extend(sorted(path for path in base.iterdir() if path.suffix == extension and path.is_file()))
+            planned: list[tuple[Path, int, str]] = []
+            for path in targets:
+                text = path.read_text(encoding="utf-8")
+                if path.suffix == ".jsonl":
+                    total = 0
+                    lines: list[str] = []
+                    for line in text.splitlines():
+                        try:
+                            value = json.loads(line)
+                        except ValueError:
+                            lines.append(line)
+                            continue
+                        new_value, count = apply(value)
+                        total += count
+                        lines.append(json.dumps(new_value, ensure_ascii=False, separators=(",", ":")) if count else line)
+                    if total:
+                        planned.append((path, total, "\n".join(lines) + "\n"))
+                else:
+                    try:
+                        value = json.loads(text)
+                    except ValueError as exc:
+                        raise AgentDeliveryError(f"cannot redact {path}: it is not valid JSON") from exc
+                    new_value, total = apply(value)
+                    if total:
+                        planned.append((path, total, json.dumps(new_value, ensure_ascii=False, separators=(",", ":"))))
+            total_matches = sum(count for _path, count, _content in planned)
+            file_rows = [{"file": str(path.relative_to(self.registry)), "matches": count}
+                         for path, count, _content in planned]
+            if dry_run:
+                return {"name": name, "dry_run": True, "files": file_rows,
+                        "total_matches": total_matches}
+            backup_value: object = None
+            if planned:
+                now = int(time.time())
+                backups_root = self.registry / "backups"
+                backup_dir = backups_root / f"redact-{name}-{now}"
+                suffix = 0
+                while backup_dir.exists():
+                    suffix += 1
+                    backup_dir = backups_root / f"redact-{name}-{now}-{suffix}"
+                backup_dir.mkdir(parents=True, exist_ok=False)
+                os.chmod(backups_root, 0o700)
+                os.chmod(backup_dir, 0o700)
+                written: list[str] = []
+                for index, (path, _count, content) in enumerate(planned):
+                    backup = backup_dir / f"{index:04}.bak"
+                    backup.write_bytes(path.read_bytes())
+                    os.chmod(backup, 0o600)
+                    path.write_text(content, encoding="utf-8")
+                    written.append(str(path.relative_to(self.registry)))
+                audit = {
+                    "schema": "agentctl-redact-audit/v1", "agent": name,
+                    "who": os.environ.get("USER", "unknown"), "at": now,
+                    "files": written, "total_matches": total_matches,
+                    "backup": str(backup_dir.relative_to(self.registry)),
+                }
+                audit_path = backups_root / "redact-audit.jsonl"
+                with open(audit_path, "a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(audit, ensure_ascii=False) + "\n")
+                os.chmod(audit_path, 0o600)
+                backup_value = str(backup_dir.relative_to(self.registry))
+            return {"name": name, "dry_run": False, "files": file_rows,
+                    "total_matches": total_matches, "backup": backup_value}
+
     def doctor(self, *, repair_labels: bool = False) -> dict[str, object]:
         """Compare every registry record with live Herdr state; read-only unless repairing labels."""
         rows: list[dict[str, object]] = []

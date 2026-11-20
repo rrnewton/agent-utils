@@ -269,6 +269,14 @@ def parser() -> argparse.ArgumentParser:
     pending_choice.add_argument("--cancel-pending", action="store_true",
         help="with --new-conversation: cancel the prompts queued for the old conversation, untyped (the "
         "Rust edition only; this edition refuses it while prompts wait)")
+    redact = command("redact", "Rewrite a literal string to [redacted] across one agent's processed queue and events "
+        "(and, with --include-archived, its archived records' processed queues). Never touches the live inbox or "
+        "in-flight entries; refuses while the agent is mid-delivery.",
+        "agentctl redact reviewer --literal SECRET --dry-run", named=True)
+    redact.add_argument("--literal", required=True, help="literal string to rewrite to [redacted] inside JSON string values")
+    redact.add_argument("--include-archived", action="store_true",
+        help="also rewrite the agent's archived records' processed queues and events")
+    redact.add_argument("--dry-run", action="store_true", help="list the files and match counts without writing anything")
     doctor = command("doctor", "Compare every registry record with live Herdr state and report each mismatch. "
         "Read-only unless --repair-labels. Exit 0 when clean, 1 with findings.",
         "agentctl doctor")
@@ -810,6 +818,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result = sessions.anchor_new_conversation(name, args.session_id, pending)
             else:
                 result = sessions.anchor(name, replace=args.replace, session=args.session_id)
+        elif args.command == "redact":
+            result = sessions.redact(name, args.literal, include_archived=args.include_archived, dry_run=args.dry_run)
         elif args.command == "doctor":
             report = sessions.doctor(repair_labels=args.repair_labels)
             print(json.dumps(report, indent=2, sort_keys=True))

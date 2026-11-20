@@ -41,6 +41,7 @@ mod control;
 mod headless;
 mod launch_spec;
 mod nested;
+mod redact;
 mod retire_registration;
 mod revive;
 mod session_follow;
@@ -25099,6 +25100,7 @@ fi
     mod progress;
     /// Recorded conversation and launch policy, with no status-time mutation.
     mod recovery_metadata;
+    mod redact;
     /// Required launch environment, registry-wide and per profile (#1429).
     mod required_env;
     /// `agentctl restore` and `agentctl watch` against the fake Herdr and a scripted host.

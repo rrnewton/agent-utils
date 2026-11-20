@@ -213,6 +213,11 @@ enum Commands {
     /// Compare every registry record with live Herdr state and report each mismatch. Read-only unless --repair-labels. Exit 0 when clean, 1 with findings
     #[command(after_help = "Example: agentctl doctor")]
     Doctor(Doctor),
+    /// Rewrite a literal string to [redacted] across one agent's processed queue and events (and, with --include-archived, its archived records' processed queues). Never touches the live inbox or in-flight entries; refuses while the agent is mid-delivery. Backs up each touched file (0600) under REGISTRY/backups and appends an audit line that never contains the string
+    #[command(
+        after_help = "Examples:\n  agentctl redact reviewer --literal SECRET --dry-run\n  agentctl redact reviewer --literal SECRET --include-archived"
+    )]
+    Redact(RedactArgs),
     /// Move a registry's agents from the old layout (REGISTRY/NAME/, REGISTRY/.NAME.lock) to layout 2 (REGISTRY/agents/NAME/, REGISTRY/locks/NAME.lock), so the registry's fixed files are not buried among per-agent entries. Reports what it would do unless --apply
     #[command(
         name = "migrate-layout",
@@ -1500,6 +1505,21 @@ struct Anchor {
     /// With --new-conversation: cancel the prompts queued for the old conversation, untyped (each lands in the queue's cancelled/)
     #[arg(long, requires = "new_conversation")]
     cancel_pending: bool,
+}
+
+#[derive(Args)]
+struct RedactArgs {
+    #[command(flatten)]
+    agent: Named,
+    /// Literal string to rewrite to [redacted] inside JSON string values
+    #[arg(long, value_name = "STRING")]
+    literal: String,
+    /// Also rewrite the agent's archived records' processed queues and events
+    #[arg(long)]
+    include_archived: bool,
+    /// List the files and match counts without writing anything
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Args)]
@@ -5410,6 +5430,12 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 )?
             }
         }
+        Commands::Redact(value) => manager.redact(
+            &value.agent.name,
+            &value.literal,
+            value.include_archived,
+            value.dry_run,
+        )?,
         Commands::Doctor(value) => {
             let report = manager.doctor(value.repair_labels)?;
             write_json(&report).map_err(Failure::Output)?;
