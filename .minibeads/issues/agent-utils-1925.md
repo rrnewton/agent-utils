@@ -101,3 +101,34 @@ store_drafts=2, not_attributed=1 and writes only the own node.
 Rust: no Sapling draft classification exists in rs/wrkslotsd
 (finish accounting for Eden is Python-only there), and the sidecar
 needs no Rust record change; test_cli_compat_rust passes.
+
+[watermelon-full-preview] Cold review of 184b52a5 was NOT SAFE
+for migrating existing slots; fixes landed in cbeb9c32 and await
+a second review. D1: a first `capture-drafts` (owner or
+coordinator only) now lists the store's drafts outside the
+current stack dated from the slot's creation and writes nothing
+until the operator passes `--include NODE` per own draft or
+`--none-of-these-are-mine`; `--rebuild` repairs a corrupt ledger
+through the same listing. D3 (reader-skew report): captures are
+serialised by a new per-ledger flock file,
+`.eden-state/wrkslots-drafts/<checkout>.json.lock`, beside the
+ledger; only the flock on its descriptor counts, and a failed
+capture re-reads under the lock so it cannot overwrite a newer
+list. D2/D5: hidden own drafts stay unaccounted and finish names
+them with the `sl unhide` hint; a public node without a
+Differential Revision counts landed; an unknown ledger node
+refuses naming `--rebuild` (the queries use `present()`, so no
+pull is triggered). D4: unaccounted nodes by another author
+(when an identity is configured) are labelled "ancestor not
+authored by this checkout", and `--discard-unaccounted` now
+refuses for any Eden checkout instead of running the Git bundle
+branch on a Sapling mount. Generation is stamped at create (1)
+and checked; the generation-mismatch and last_error comments
+are corrected, as are the USER_GUIDE window claims. Tests: full
+CLI end-to-end (create, heartbeat, finish refusal naming only
+the own draft, migration listing/include, finish pass), the D1
+two-stack case, concurrent-capture union, hidden (unit and real
+sl), unknown, public-without-revision, foreign labelling,
+stranger refusal, corrupt-ledger rebuild; test_eden.py 77
+passed, the 74549a37 test files pass on the new code (69), and
+mypy --strict is clean on both touched modules.
