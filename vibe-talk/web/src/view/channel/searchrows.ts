@@ -50,6 +50,9 @@ type SearchRow = HTMLElement & {
   /** `#1913`: the row's findable text, folded once when the row is drawn (`searchFold`), so the
    * typing-fast pass matches with substring checks and never re-folds or re-reads a message. */
   foldedSearch?: string;
+  /** `#1984 vibe-talk-search-typing-changed-only`: the `search-hidden` word as this owner last
+   * left it, so a pass writes the class only on rows whose visibility actually changed. */
+  searchHidden?: boolean;
   runDays?: string;
   seamLine?: unknown;
 };
@@ -220,6 +223,17 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
 
   function markSearchNow(): void {
     searchField.markNow();
+  }
+
+  /** `#1984`: put `search-hidden` on `row` only where its visibility changed. The per-row bit is
+   * reconciled with the class the row actually wears, so a row another writer (the side cards)
+   * changed is never left stale: a matching class costs no DOM write, a differing one is written
+   * once and the bit follows it. */
+  function setSearchHidden(row: SearchRow, hidden: boolean): void {
+    const wears = classWords(row).includes("search-hidden");
+    if (row.searchHidden === hidden && wears === hidden) return;
+    if (wears !== hidden) setClassWord(row as never, "search-hidden", hidden);
+    row.searchHidden = hidden;
   }
 
   const parsedQueries = deps.language.parsedQueries;
@@ -450,7 +464,7 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
           const folded = (row as SearchRow).foldedSearch ?? text;
           hit = terms.every((term) => folded.includes(term));
         }
-        setClassWord(row as never, "search-hidden", !hit);
+        setSearchHidden(row as SearchRow, !hit);
       }
     }
     // `#1913`: retire the previous query's bucket chips at once (O(1)); the server ask and
@@ -525,7 +539,7 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
         const revealed = !hit && text !== null && (id === "thread-list"
           ? openedCards !== null && openedCards.threads.has(String(row.getAttribute("data-context-id")))
           : inOpenedGap(row, opened));
-        setClassWord(row as never, "search-hidden", !(hit || revealed));
+        setSearchHidden(row as SearchRow, !(hit || revealed));
         markSearchHits(row as SearchRow, hit && text !== null ? marking : []);
         // `#1786`: rows the server search placed are not loaded messages, so
         // neither the denominator nor the match count speaks for them.

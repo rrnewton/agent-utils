@@ -181,6 +181,66 @@ def walk_through(walk: Walk, total: int) -> None:
                ".map((row) => row.getAttribute('data-id')).join(',') === '201,204,209,214'",
                "the settled rows are not the lantern four")
     walk.shot("settled-lantern")
+    # `#1984 vibe-talk-search-typing-changed-only`: after settling, refining keys whose hit set
+    # barely moves write the hidden class only on changed rows (event counts, never wall time):
+    # no fetch, no storage write and no settled (full) pass lands between keys typed at a steady
+    # pace, and after the pause the marks are the settled query's.
+    walk.check(page.evaluate("() => document.querySelectorAll('#discord-log .search-hit').length > 0"),
+               "the settled lantern hits carry no marks")
+    # Fully settled includes the server's answer (the bucket chips), so no ask for the old
+    # query is still in flight to be counted against a refining key below.
+    walk.until("() => { const row = document.getElementById('search-bucket-row');"
+               " return row && !row.hidden && !document.getElementById('search-bucket-main').hidden; }",
+               "the bucket chips never appeared for lantern")
+    page.evaluate("""() => {
+        window.__keyCounts = { cls: 0, fetch: 0, lsSet: 0 };
+        const log = document.getElementById('discord-log');
+        new MutationObserver((ms) => { for (const m of ms) if (m.attributeName === 'class') window.__keyCounts.cls += 1; })
+            .observe(log, { subtree: true, attributes: true, attributeFilter: ['class'] });
+        const of = window.fetch; window.fetch = (...a) => { const u = String(a[0] && a[0].url || a[0]); if (u.includes('/search')) { window.__keyCounts.fetch += 1; (window.__keyCounts.urls = window.__keyCounts.urls || []).push(u.slice(-60)); } return of(...a); };
+        const proto = Object.getPrototypeOf(localStorage); const os = proto.setItem;
+        proto.setItem = function (k, v) { window.__keyCounts.lsSet += 1; return os.call(this, k, v); };
+    }""")
+    # Keys dispatched in-page at a steady 30 ms pace, each sampled after two frames, so the
+    # pace the page sees is the pace asserted — no harness round-trip between keys.
+    deltas = page.evaluate("""async () => {
+        const field = document.getElementById('search-field');
+        const out = [];
+        for (const value of ['lanter', 'lantern', 'lanter', 'lantern']) {
+            window.__keyCounts.cls = 0; window.__keyCounts.fetch = 0; window.__keyCounts.lsSet = 0; window.__keyCounts.urls = [];
+            field.value = value; field.dispatchEvent(new Event('input', { bubbles: true }));
+            await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+            out.push({ ...window.__keyCounts, count: document.getElementById('search-count').textContent });
+            await new Promise((r) => setTimeout(r, 30));
+        }
+        return out;
+    }""")
+    for delta in deltas:
+        walk.check(delta["cls"] <= max(8, total // 20),
+                   f"a refining keystroke wrote {delta['cls']} row classes over {total} rows (changed-only bound {max(8, total // 20)})")
+        walk.check(delta["fetch"] == 0 and delta["lsSet"] == 0,
+                   f"a keystroke reached the server search or storage: {delta}")
+        walk.check(delta["count"].startswith("4 of"),
+                   f"a settled pass landed between keys typed at a steady pace: {delta}")
+    walk.until("() => document.querySelectorAll('#discord-log .search-hit').length > 0",
+               "the settled marks did not return after refining and retyping")
+    # Backspacing the query away: every hit stands again and no mark outlives its words.
+    page.evaluate("""() => { const f = document.getElementById('search-field'); f.value = ''; f.dispatchEvent(new Event('input', { bubbles: true })); }""")
+    walk.until("() => document.getElementById('search-count').textContent === ''",
+               "the cleared search left its settled count standing")
+    walk.check(page.evaluate("() => document.querySelectorAll('#discord-log .search-hit').length === 0"),
+               "marks outlived the cleared query")
+    walk.check(page.evaluate(f"() => document.querySelectorAll('#discord-log > li[data-id]:not(.search-hidden)').length >= {total - 20}"),
+               "clearing the search did not stand the rows back up")
+    # Typing it again: the same four stand, marked, once the typing pauses.
+    for value in ("l", "la", "lan", "lant", "lante", "lanter", "lantern"):
+        page.evaluate("""(value) => { const f = document.getElementById('search-field'); f.value = value; f.dispatchEvent(new Event('input', { bubbles: true })); }""", value)
+        page.wait_for_timeout(30)
+    walk.until(f"() => document.getElementById('search-count').textContent === '4 of {total} loaded'",
+               "the retyped lantern search did not settle to the same count")
+    walk.until("() => document.querySelectorAll('#discord-log .search-hit').length > 0",
+               "the retyped hits were not re-marked after the pause")
+    walk.shot("retyped-lantern")
     # The pinned bucket chips for this query, from the server's debounced answer.
     walk.until("() => { const row = document.getElementById('search-bucket-row');"
                " return row && !row.hidden && !document.getElementById('search-bucket-main').hidden; }",

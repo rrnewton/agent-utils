@@ -3007,10 +3007,28 @@ let searchEntryMoved = false;
 // one full pass (place-keeping, seams, tallies, the server ask), never one per key.
 let fullSearchTimer = null;
 const FULL_SEARCH_PAUSE_MS = 150;
+const SEARCH_SETTLE_MAX_MS = 1000;
+let lastSearchKeyAt = 0;
+let searchSettleMs = FULL_SEARCH_PAUSE_MS;
 function deferFullSearch(fn) {
   const clock = clockOnUse();
+  // `#1984 vibe-talk-search-typing-changed-only`: wait for a real pause, not a fixed 150 ms a
+  // throttled phone's keystrokes always exceed. The delay grows with the gap the last keys
+  // actually took (twice it, floored at the old pause, capped), so while keys are still
+  // arriving at their measured pace the settled pass stays pending; it lands once they stop.
+  const now = Date.now();
+  if (lastSearchKeyAt > 0) {
+    const gap = now - lastSearchKeyAt;
+    searchSettleMs = Math.min(SEARCH_SETTLE_MAX_MS, Math.max(FULL_SEARCH_PAUSE_MS, gap * 2));
+  }
+  lastSearchKeyAt = now;
   if (fullSearchTimer !== null) clock.clearTimeout(fullSearchTimer);
-  fullSearchTimer = clock.setTimeout(() => { fullSearchTimer = null; fn(); }, FULL_SEARCH_PAUSE_MS);
+  fullSearchTimer = clock.setTimeout(() => {
+    fullSearchTimer = null;
+    lastSearchKeyAt = 0;
+    searchSettleMs = FULL_SEARCH_PAUSE_MS;
+    fn();
+  }, searchSettleMs);
 }
 function noteSearchScreen() {
   const text = el("search-field").value;

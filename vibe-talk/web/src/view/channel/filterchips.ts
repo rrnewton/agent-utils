@@ -170,11 +170,17 @@ export function mountFilterChips(deps: FilterChipsDependencies): FilterChips {
     }
     if (bigList && deps.applySearchFast && deps.deferFullSearch) {
       deps.applySearchFast();
-      deps.deferFullSearch(fullChange);
+      // `#1984 vibe-talk-search-typing-changed-only`: mark and full are one settled pass — the
+      // typed words become the marked words inside it, so no separate mark timer lands between
+      // keys, and the marks it draws are the settled query's, exactly as the two passes drew them.
+      deps.deferFullSearch(() => {
+        deps.setMarked(deps.query());
+        fullChange();
+      });
     } else {
       fullChange();
+      deps.markSearchSoon();
     }
-    deps.markSearchSoon();
   }
   listen(el("search-field"), "input", () => {
     // `#1816 vibe-talk-search-history-up-arrow`. Typing ends any history walk: what stands in

@@ -5665,6 +5665,11 @@ const TUNING_BANDS = {
     "long list (#1913 vibe-talk-search-typing-lag): shorter and the place-keeping, seams and " +
     "server ask land between keystrokes typed at speed, longer and the settled count, seams and " +
     "marks visibly trail the rows the fast pass has already chosen"],
+  SEARCH_SETTLE_MAX_MS: [500, 2000,
+    "the cap on the adaptive settled-search pause (#1984 vibe-talk-search-typing-changed-only): " +
+    "the pause grows to twice the measured gap between keys so a throttled phone pays no full " +
+    "pass between keys; under the cap that growth gives up too soon, over it the settled count, " +
+    "seams and marks visibly trail a reader who has genuinely stopped typing"],
   CLEAR_ARMED_MS: [1000, 20000,
     "the second tap that really clears: under a second the confirmation cannot be reached, over " +
     "twenty and a stray later tap still destroys the view"],

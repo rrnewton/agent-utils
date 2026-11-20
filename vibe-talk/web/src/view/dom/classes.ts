@@ -10,6 +10,9 @@
  * neither.
  */
 function setClassWord(element: Element, word: string, on: boolean): void {
+  // `#1984 vibe-talk-search-typing-changed-only`: an unchanged word is no write at all — assigning
+  // `className` regardless paid a DOM mutation and a style recalculation per row per keystroke.
+  if (element.classList && element.classList.contains(word) === on) return;
   const words = element.className.split(/\s+/).filter((one) => one && one !== word);
   if (on) {
     words.push(word);

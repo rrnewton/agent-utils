@@ -1245,11 +1245,13 @@ test("`#624 voice-page-modularity`: the search's and the filter chips' listeners
   // `#1913`: the fast/deferred typing split stands only over a long list; give the double one.
   el("discord-log").children = { length: 500 };
   el("search-field").value = "foo";
-  assert.deepStrictEqual(run(() => fire("search-field", "input")), ["history reset", "note screen", "query foo", "typed? \"<foo>\"", "fast", "defer", "keep place (", "lift (", "chips", ")", ")", "land", "mark soon"]);
+  // `#1984`: over a long list the settled pass is coalesced — the typed words become the marked
+  // words inside the deferred change, and no separate mark timer follows the keystroke.
+  assert.deepStrictEqual(run(() => fire("search-field", "input")), ["history reset", "note screen", "query foo", "typed? \"<foo>\"", "fast", "defer", "marked \"<foo>\"", "keep place (", "lift (", "chips", ")", ")", "land"]);
   state.typed = false;
   state.side = true;
   el("search-field").value = " ";
-  assert.deepStrictEqual(run(() => fire("search-field", "input")), ["history reset", "note screen", "query  ", "typed? \"< >\"", "marked \"< >\"", "fast", "defer", "keep place (", "lift (", "chips", "side cards", ")", ")", "land", "mark soon"],
+  assert.deepStrictEqual(run(() => fire("search-field", "input")), ["history reset", "note screen", "query  ", "typed? \"< >\"", "marked \"< >\"", "fast", "defer", "marked \"< >\"", "keep place (", "lift (", "chips", "side cards", ")", ")", "land"],
     "a cleared search kept its marks, or the right column's cards were not filtered again");
   assert.deepStrictEqual([run(() => fire("search-field", "keydown", { key: "Enter" })), run(() => { state.older = true; fire("search-field", "keydown", { key: "Enter" }); }),
     run(() => fire("search-field", "keydown", { key: "Escape" })), run(() => fire("search-field", "keydown", { key: "Escape", isComposing: true })),
@@ -1264,7 +1266,7 @@ test("`#624 voice-page-modularity`: the search's and the filter chips' listeners
   assert.deepStrictEqual(run(() => fire("search-field", "keydown", { key: "ArrowDown" })), ["newer?"]);
   state.recall = "held";
   assert.deepStrictEqual(run(() => fire("search-field", "keydown", { key: "ArrowUp" })),
-    ["older? \" \"", "note screen", "query held", "typed? \"<held>\"", "fast", "defer", "keep place (", "lift (", "chips", ")", ")", "land", "mark soon", "swallow ArrowUp"]);
+    ["older? \" \"", "note screen", "query held", "typed? \"<held>\"", "fast", "defer", "marked \"<held>\"", "keep place (", "lift (", "chips", ")", ")", "land", "swallow ArrowUp"]);
   assert.equal(el("search-field").value, "held");
   assert.deepStrictEqual(run(() => fire("search-field", "keydown", { key: "ArrowDown", isComposing: true })), [],
     "a history key was answered while an input method composed");
