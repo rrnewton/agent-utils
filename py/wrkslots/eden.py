@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,6 +36,25 @@ Runner = Callable[[Sequence[str]], tuple[int, str, str]]
 
 class EdenError(RuntimeError):
     """An Eden operation could not be completed safely."""
+
+
+class UnqueryableEdenError(EdenError):
+    """The daemon's answer cannot be trusted, so it must not be started blindly.
+
+    Raised when ``eden info`` cannot be run, times out, returns output
+    that does not parse, or answers for a different mount: in every such
+    case the daemon's state is unknown rather than down.
+    """
+
+
+class EdenDaemonDownError(EdenError):
+    """``eden info`` ran but the daemon does not answer, so it may be started."""
+
+
+#: Per-call budgets for the restart verb (#1977): a hung FUSE query must
+#: refuse its own slot, never stall the remaining slots.
+INFO_TIMEOUT_SECONDS = 15.0
+START_TIMEOUT_SECONDS = 60.0
 
 
 @dataclass(frozen=True)
@@ -509,45 +529,117 @@ def seed_backing_repo(
         )
 
 
-def restart_slot_daemon(runner: Runner, config_dir: str, mount: str) -> str:
+def _run_with_timeout(
+    runner: Runner, argv: Sequence[str], timeout: float
+) -> tuple[int, str, str]:
+    """Run one Eden call under ``timeout`` seconds.
+
+    The real CLI runner accepts a ``timeout`` keyword; simple fake
+    runners that take only ``argv`` are called without it. A timeout
+    raised by either form propagates as ``subprocess.TimeoutExpired``
+    for the caller to turn into that slot's refusal.
+    """
+
+    try:
+        return runner(argv, timeout=timeout)  # type: ignore[call-arg]
+    except TypeError:
+        return runner(argv)
+
+
+def eden_state_containment_problem(
+    config_dir: str, slot_dir: str, slot_root: str | None
+) -> str | None:
+    """Why starting a daemon from ``config_dir`` would leave its slot, or None.
+
+    ``<slot>/.eden-state`` is inspected with ``lstat`` and its realpath
+    must stay inside our slot directory, so a state dir symlinked into
+    another tree refuses instead of starting a daemon against it. For
+    absolute mounts the caller also passes the project's slot root and
+    the derived slot directory's realpath must stay inside it, so a
+    symlinked slot cannot redirect the restart outside the project. A
+    missing state dir is not a problem here; the caller skips it.
+    """
+
+    try:
+        os.lstat(config_dir)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return f"cannot inspect .eden-state at {config_dir}: {exc}"
+    resolved_state = os.path.realpath(config_dir)
+    resolved_slot = os.path.realpath(slot_dir)
+    if not is_inside(resolved_state, resolved_slot):
+        return (
+            f".eden-state at {config_dir} resolves to {resolved_state}, "
+            f"outside its slot directory {slot_dir}; refusing to start a "
+            "daemon against another tree"
+        )
+    if slot_root is not None:
+        resolved_root = os.path.realpath(slot_root)
+        if not is_inside(resolved_slot, resolved_root):
+            return (
+                f"slot directory {slot_dir} resolves to {resolved_slot}, "
+                f"outside the project slot root {slot_root}; refusing to "
+                "start a daemon outside this project's slots"
+            )
+    return None
+
+
+def restart_slot_daemon(
+    runner: Runner, config_dir: str, mount: str, *, dry_run: bool = False
+) -> str:
     """Restart one slot's Eden daemon when it is dead (#1977).
 
     Returns ``already-healthy`` when ``eden info`` already answers for
-    ``mount``, or ``restarted`` when a start made it answer. Starting
-    uses ``eden --config-dir <dir> start --if-not-running``, the
+    ``mount``, ``restarted`` when a start made it answer, or, with
+    ``dry_run``, ``would-restart`` for a dead daemon (no start is run).
+    Starting uses ``eden --config-dir <dir> start --if-not-running``, the
     per-config-dir start the host Eden CLI provides (``eden start
     --help``); provisioning started this daemon implicitly through
     ``eden clone`` under the same ``--config-dir``, and removal stops
     it with ``eden stop`` under it. No checkout is created, so this
     never consumes host-cap room beyond the checkout that already
     exists and counts. An answer that cannot be parsed, names another
-    mount, or cannot be run at all is unqueryable and refuses rather
-    than starting blindly; a failed start, or a daemon that still
-    does not answer after one, refuses too.
+    mount, cannot be run, or times out is unqueryable
+    (:class:`UnqueryableEdenError`) and refuses rather than starting
+    blindly; only a daemon proven down (:class:`EdenDaemonDownError`)
+    is started. Every call is bounded (``info`` by
+    ``INFO_TIMEOUT_SECONDS``, ``start`` by ``START_TIMEOUT_SECONDS``)
+    and a timeout refuses this slot alone. After a failed start the
+    daemon is queried once more before refusing, because another
+    starter may have won the race in the meantime; a daemon that still
+    does not answer after a start refuses too.
     """
 
     def query() -> CheckoutInfo:
         try:
-            rc, stdout, stderr = runner(
-                ["eden", "--config-dir", config_dir, "info", mount]
+            rc, stdout, stderr = _run_with_timeout(
+                runner,
+                ["eden", "--config-dir", config_dir, "info", mount],
+                INFO_TIMEOUT_SECONDS,
             )
         except OSError as exc:
-            raise EdenError(
+            raise UnqueryableEdenError(
                 f"cannot query Eden daemon for {mount}: {exc}"
             ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise UnqueryableEdenError(
+                f"cannot query Eden daemon for {mount}: eden info timed "
+                f"out after {INFO_TIMEOUT_SECONDS:g}s"
+            ) from exc
         if rc != 0:
-            raise EdenError(
+            raise EdenDaemonDownError(
                 f"Eden daemon for {mount} does not answer: "
                 f"{stderr.strip() or stdout.strip() or 'eden info failed'}"
             )
         try:
             info = parse_info(stdout)
         except EdenError as exc:
-            raise EdenError(
+            raise UnqueryableEdenError(
                 f"cannot query Eden daemon for {mount}: {exc}"
             ) from exc
         if info.mount != mount:
-            raise EdenError(
+            raise UnqueryableEdenError(
                 f"eden info for {mount} reports mount {info.mount!r}; "
                 "refusing to treat another checkout's daemon as this slot's"
             )
@@ -555,31 +647,51 @@ def restart_slot_daemon(runner: Runner, config_dir: str, mount: str) -> str:
 
     try:
         query()
-    except EdenError as initial:
-        # A parse or identity failure is unqueryable, not dead: only a
-        # daemon that answers nothing (or cannot run) is started. The
-        # query helper marks the unqueryable cases with its prefix.
-        if str(initial).startswith(("cannot query", "eden info for")):
-            raise
+    except UnqueryableEdenError:
+        # Unknown is not dead: never start blindly on an answer that
+        # could not be trusted.
+        raise
+    except EdenDaemonDownError as initial:
+        if dry_run:
+            return "would-restart"
+        start_error: EdenError | None = None
         try:
-            rc, stdout, stderr = runner(
-                ["eden", "--config-dir", config_dir, "start", "--if-not-running"]
+            rc, stdout, stderr = _run_with_timeout(
+                runner,
+                ["eden", "--config-dir", config_dir, "start", "--if-not-running"],
+                START_TIMEOUT_SECONDS,
             )
         except OSError as exc:
-            raise EdenError(
+            start_error = EdenError(
                 f"cannot start Eden daemon for {mount}: {exc}"
-            ) from exc
-        if rc != 0:
-            raise EdenError(
+            )
+        except subprocess.TimeoutExpired:
+            start_error = EdenError(
+                f"eden start timed out for {mount} after "
+                f"{START_TIMEOUT_SECONDS:g}s; daemon before start: {initial}"
+            )
+        else:
+            if rc == 0:
+                try:
+                    query()
+                except EdenError as after:
+                    raise EdenError(
+                        f"Eden daemon for {mount} did not answer after "
+                        f"start: {after}"
+                    ) from after
+                return "restarted"
+            start_error = EdenError(
                 f"eden start failed for {mount}: "
                 f"{stderr.strip() or stdout.strip() or 'eden start failed'}; "
                 f"daemon before start: {initial}"
-            ) from initial
+            )
+        # The start failed, but another starter may have won meanwhile:
+        # query once more before refusing this slot.
         try:
             query()
         except EdenError as after:
             raise EdenError(
-                f"Eden daemon for {mount} did not answer after start: {after}"
+                f"{start_error}; re-query after the failed start: {after}"
             ) from after
         return "restarted"
     return "already-healthy"

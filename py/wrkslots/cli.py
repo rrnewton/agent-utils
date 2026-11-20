@@ -46244,9 +46244,11 @@ def _require_worktrees_image_mounted(config: Config, action: str) -> None:
     )
 
 
-def _eden_runner(argv: Sequence[str]) -> tuple[int, str, str]:
+def _eden_runner(
+    argv: Sequence[str], timeout: float | None = None
+) -> tuple[int, str, str]:
     done = subprocess.run(
-        list(argv), capture_output=True, text=True, check=False
+        list(argv), capture_output=True, text=True, check=False, timeout=timeout
     )
     return done.returncode, done.stdout, done.stderr
 
@@ -46265,10 +46267,19 @@ def _cmd_eden_restart_slot_daemons(args: argparse.Namespace) -> int:
     Eden checkouts with an existing ``<slot>/.eden-state`` are queried,
     and no other project's slots are ever enumerated. Healthy daemons
     are skipped, dead ones are started and re-verified, and an
-    unqueryable daemon or a failed start refuses that slot alone while
-    the rest proceed. No checkout is created, so the host cap that
-    creation checks is not re-decided here: an existing checkout
-    already counts, and restarting its daemon adds nothing to it.
+    unqueryable daemon, a timed-out call, or a failed start refuses
+    that slot alone while the rest proceed. A named slot with no Eden
+    checkout reports ``skipped`` (never queried, never a refusal), and
+    a named slot that is no longer in the active records reports a
+    ``refused`` row while the rest still run; only a malformed slot
+    name refuses the whole verb. With ``--dry-run`` a dead daemon
+    reports ``would-restart`` and nothing is started. No checkout is
+    created, so the host cap that creation checks is not re-decided
+    here: an existing checkout already counts, and restarting its
+    daemon adds nothing to it. This verb takes no project lock against
+    a concurrent slot remove, so a remove racing a restart can
+    resurrect a daemon for a slot being deleted (recorded limitation,
+    #1977).
     """
 
     config = _load_config(args.project_root, args.machine)
@@ -46277,26 +46288,55 @@ def _cmd_eden_restart_slot_daemons(args: argparse.Namespace) -> int:
         _validate_name(name, "slot")
         if name not in requested:
             requested.append(name)
+    requested_set = set(requested)
+    dry_run = bool(getattr(args, "dry_run", False))
     state = _load_active(config)
     known = {record.slot for record in state.slots}
-    unknown = [name for name in requested if name not in known]
-    if unknown:
-        raise Refusal(
-            f"unknown slot(s) for this project: {', '.join(unknown)}; "
-            "eden restart-slot-daemons only restarts slots in this "
-            "project's active records"
-        )
+    rows: list[dict[str, object]] = []
+    refused = 0
+    for name in requested:
+        if name not in known:
+            rows.append(
+                {
+                    "slot": name,
+                    "checkout": None,
+                    "mount": None,
+                    "config_dir": None,
+                    "status": "refused",
+                    "reason": (
+                        f"slot {name} is not in this project's active "
+                        "records; it may have been removed, so nothing "
+                        "was started for it"
+                    ),
+                }
+            )
+            refused += 1
     selected = [
         record
         for record in sorted(state.slots, key=lambda record: record.slot)
-        if not requested or record.slot in requested
+        if not requested or record.slot in requested_set
     ]
-    rows: list[dict[str, object]] = []
-    refused = 0
     for record in selected:
-        for checkout in record.checkouts:
-            if checkout.vcs != "eden":
-                continue
+        eden_checkouts = [
+            checkout for checkout in record.checkouts if checkout.vcs == "eden"
+        ]
+        if not eden_checkouts:
+            if record.slot in requested_set:
+                rows.append(
+                    {
+                        "slot": record.slot,
+                        "checkout": None,
+                        "mount": None,
+                        "config_dir": None,
+                        "status": "skipped",
+                        "reason": (
+                            "slot has no Eden checkout; no Eden daemon "
+                            "to restart"
+                        ),
+                    }
+                )
+            continue
+        for checkout in eden_checkouts:
             try:
                 mount = _stored_path(config, checkout.path, "checkout path")
                 slot_path = _eden_slot_path(config, mount, checkout)
@@ -46314,11 +46354,36 @@ def _cmd_eden_restart_slot_daemons(args: argparse.Namespace) -> int:
                 refused += 1
                 continue
             config_dir = slot_path / ".eden-state"
+            slot_root: str | None = None
+            if mount.is_absolute():
+                roots = _slot_roots(config)
+                root_type = (
+                    mount.parent.name
+                    if mount.parent.name in SLOT_TYPES
+                    else record.slot_type
+                )
+                slot_root = str(roots.get(root_type, config.worktrees))
+            problem = eden.eden_state_containment_problem(
+                str(config_dir), str(slot_path), slot_root
+            )
+            if problem is not None:
+                rows.append(
+                    {
+                        "slot": record.slot,
+                        "checkout": checkout.name,
+                        "mount": str(mount),
+                        "config_dir": str(config_dir),
+                        "status": "refused",
+                        "reason": problem,
+                    }
+                )
+                refused += 1
+                continue
             if not config_dir.is_dir():
                 continue
             try:
                 status = eden.restart_slot_daemon(
-                    _eden_runner, str(config_dir), str(mount)
+                    _eden_runner, str(config_dir), str(mount), dry_run=dry_run
                 )
             except eden.EdenError as exc:
                 rows.append(
@@ -46342,12 +46407,14 @@ def _cmd_eden_restart_slot_daemons(args: argparse.Namespace) -> int:
                     "status": status,
                 }
             )
+    rows.sort(key=lambda row: str(row["slot"]))
     if getattr(args, "format", "human") == "json":
         print(
             json.dumps(
                 {
                     "schema": SCHEMA,
                     "project_root": str(config.root),
+                    "dry_run": dry_run,
                     "eden_daemons": rows,
                     "refused": refused,
                 },
@@ -101102,29 +101169,42 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "active Eden slot of this project on this machine that still has its "
             ".eden-state, skip daemons that already answer, start dead ones with "
             "'eden --config-dir <slot>/.eden-state start --if-not-running', and "
-            "re-query info to verify each start. A daemon that cannot be queried "
-            "(unparsable or another mount's answer, or no runnable eden) or whose "
-            "start fails refuses that slot alone with its reason while the rest "
-            "proceed; the exit is then 3, otherwise 0. Idempotent: a healthy daemon "
-            "records already-healthy and is never started. Only this project's "
-            "active records are read; another project's slots are never enumerated. "
-            "No checkout is created, so the host Eden cap that creation checks is "
-            "not re-decided: an existing checkout already counts toward it."
+            "re-query info to verify each start. Each info call is bounded to "
+            "about 15 seconds and each start to about 60 seconds; a timed-out "
+            "call refuses that slot alone. A daemon that cannot be queried "
+            "(unparsable or another mount's answer, no runnable eden, or a "
+            "timed-out query) or whose start fails refuses that slot alone with "
+            "its reason while the rest proceed; the exit is then 3, otherwise "
+            "0. A named slot with no Eden checkout reports skipped and is never "
+            "queried; a named slot no longer in the active records reports a "
+            "refused row while the rest still run (only a malformed name "
+            "refuses the whole verb). A .eden-state whose realpath leaves its "
+            "slot directory refuses that slot and starts nothing. Idempotent: "
+            "a healthy daemon records already-healthy and is never started. "
+            "Only this project's active records are read; another project's "
+            "slots are never enumerated. No checkout is created, so the host "
+            "Eden cap that creation checks is not re-decided: an existing "
+            "checkout already counts toward it."
         ),
         epilog=(
             "examples:\n"
             "  wrkslots eden restart-slot-daemons\n"
-            "  wrkslots eden restart-slot-daemons --slot slot01 --format json"
+            "  wrkslots eden restart-slot-daemons --slot slot01 --format json\n"
+            "  wrkslots eden restart-slot-daemons --dry-run --format json"
         ),
         formatter_class=_HelpFormatter,
     )
     eden_restart.add_argument(
         "--slot", action="append", metavar="NAME", default=[],
-        help="limit to this active slot name (repeatable; an unknown name refuses)",
+        help="limit to this slot name (repeatable; a slot with no Eden checkout reports skipped, a slot no longer in the active records reports a refused row, and a malformed name refuses the whole verb)",
+    )
+    eden_restart.add_argument(
+        "--dry-run", action="store_true",
+        help="report what would start without starting anything: a dead daemon reports would-restart, a healthy one already-healthy, and no 'eden start' is run (default: off)",
     )
     eden_restart.add_argument(
         "--format", choices=("human", "json"), default="human",
-        help="output format: json prints {eden_daemons: [...], refused: N} (default: human)",
+        help="output format: json prints {dry_run: bool, eden_daemons: [...], refused: N} (default: human)",
     )
     eden_restart.set_defaults(handler=_cmd_eden_restart_slot_daemons)
     eden_group.set_defaults(handler=_cmd_eden_help, eden_parser=eden_group)

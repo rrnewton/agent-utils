@@ -34,3 +34,5 @@ Lane mu-restoreboot, filed with #1975 restore-boot-recovery and landing separate
 # Notes
 
 Related: #1975 restore-boot-recovery (same lane; this issue lands separately), #1804 wrkslots-eden-multiple-backing-repos (closed; per-slot daemon layout), #1730 (Eden mounts outside the project). Persisted fields: none — only the Eden daemon's own state under `<slot>/.eden-state` is touched; restore report JSON gains additive rows.
+
+Recorded limitation: the verb takes no project lock against a concurrent slot remove, so a remove racing a restart can resurrect a daemon for a slot being deleted. Closing that race needs the remove path and the restart verb to share a lock; it is noted here rather than fixed in this change.

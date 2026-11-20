@@ -18,7 +18,7 @@ REV = "a" * 40
 DIGEST = "b" * 64
 
 _FAKE_EDEN = """#!/usr/bin/env python3
-import json, os, sys
+import json, os, sys, time
 from pathlib import Path
 log = Path(os.environ["FAKE_EDEN_LOG"])
 log.parent.mkdir(parents=True, exist_ok=True)
@@ -33,6 +33,10 @@ verb = argv[argv.index("--config-dir") + 2]
 mode = scenario.get(config_dir, "healthy")
 if verb == "info":
     mount = argv[argv.index("info") + 1]
+    if mode == "hang":
+        time.sleep(30)
+        print("daemon is not running", file=sys.stderr)
+        raise SystemExit(1)
     if mode == "garbage":
         print("not json")
         raise SystemExit(0)
@@ -47,6 +51,11 @@ if verb == "info":
     print("daemon is not running", file=sys.stderr)
     raise SystemExit(1)
 if verb == "start":
+    if mode == "rival":
+        started.add(config_dir)
+        started_path.write_text(json.dumps(sorted(started)))
+        print("start boom (another starter won)", file=sys.stderr)
+        raise SystemExit(1)
     if mode == "start-fails":
         print("start boom", file=sys.stderr)
         raise SystemExit(1)
@@ -77,11 +86,11 @@ def _project(tmp_path: Path, name: str = "project") -> Path:
     return root
 
 
-def _record(root: Path, slot: str) -> wrkslots_cli.ActiveRecord:
-    config = wrkslots_cli._load_config(str(root), "node-a")
-    slot_path = wrkslots_cli._slot_directory(config, slot, "agent")
-    (slot_path / ".eden-state").mkdir(parents=True)
-    (slot_path / "checkout").mkdir(parents=True)
+def _record_for(
+    root: Path,
+    slot: str,
+    checkouts: tuple[wrkslots_cli.Checkout, ...],
+) -> wrkslots_cli.ActiveRecord:
     return wrkslots_cli.ActiveRecord(
         slot=slot,
         agent=f"agent-{slot}",
@@ -97,7 +106,19 @@ def _record(root: Path, slot: str) -> wrkslots_cli.ActiveRecord:
         coordinator_lease=wrkslots_cli._read_process_identity(os.getpid()),
         coordinator_recovery_note=None,
         handoff=None,
-        checkouts=(
+        checkouts=checkouts,
+    )
+
+
+def _record(root: Path, slot: str) -> wrkslots_cli.ActiveRecord:
+    config = wrkslots_cli._load_config(str(root), "node-a")
+    slot_path = wrkslots_cli._slot_directory(config, slot, "agent")
+    (slot_path / ".eden-state").mkdir(parents=True)
+    (slot_path / "checkout").mkdir(parents=True)
+    return _record_for(
+        root,
+        slot,
+        (
             wrkslots_cli.Checkout(
                 name="main",
                 path=(slot_path / "checkout").relative_to(config.root).as_posix(),
@@ -110,6 +131,32 @@ def _record(root: Path, slot: str) -> wrkslots_cli.ActiveRecord:
                 head=REV,
                 containing_remote_refs=(),
                 vcs="eden",
+            ),
+        ),
+    )
+
+
+def _git_record(root: Path, slot: str) -> wrkslots_cli.ActiveRecord:
+    config = wrkslots_cli._load_config(str(root), "node-a")
+    slot_path = wrkslots_cli._slot_directory(config, slot, "agent")
+    slot_path.mkdir(parents=True, exist_ok=True)
+    (root.parent / "repo").mkdir(exist_ok=True)
+    return _record_for(
+        root,
+        slot,
+        (
+            wrkslots_cli.Checkout(
+                name="main",
+                path=slot_path.relative_to(config.root).as_posix(),
+                repository="../repo",
+                branch="main",
+                start_point=REV,
+                remote="origin",
+                remote_url_sha256=DIGEST,
+                landed_ref="refs/remotes/origin/main",
+                head=REV,
+                containing_remote_refs=(),
+                vcs="git",
             ),
         ),
     )
@@ -170,6 +217,14 @@ def _starts(log: Path, config_dir: str) -> int:
     )
 
 
+def _infos(log: Path, config_dir: str) -> int:
+    return sum(
+        1
+        for argv in _calls(log)
+        if argv[argv.index("--config-dir") + 1] == config_dir and "info" in argv
+    )
+
+
 def _run(root: Path, *extra: str) -> int:
     return wrkslots_cli.main(
         [
@@ -227,10 +282,24 @@ def test_slot_limiting_and_unknown_slot_refusal(
         argv[argv.index("--config-dir") + 1] != second for argv in _calls(log)
     ), "an unlisted slot is never queried"
 
+    # A stale --slot (no longer in the active records) is a refused
+    # row, not a whole-verb refusal: the other named slot still runs.
     log.write_text("")
-    assert _run(root, "--slot", "no-such-slot") == 3
-    assert "unknown slot" in capsys.readouterr().err
-    assert _calls(log) == [], "an unknown slot refuses before any daemon query"
+    assert _run(root, "--slot", "eden-b", "--slot", "ghost-slot") == 3
+    report = json.loads(capsys.readouterr().out)
+    rows = {row["slot"]: row["status"] for row in report["eden_daemons"]}
+    assert rows == {"eden-b": "restarted", "ghost-slot": "refused"}
+    assert report["refused"] == 1
+    ghost = next(row for row in report["eden_daemons"] if row["slot"] == "ghost-slot")
+    assert "not in this project's active records" in ghost["reason"]
+
+    # A malformed name still refuses the whole verb before any query.
+    log.write_text("")
+    assert _run(root, "--slot", "bad name") == 3
+    captured = capsys.readouterr()
+    assert "invalid slot" in captured.err
+    assert captured.out == ""
+    assert _calls(log) == [], "a malformed slot refuses before any daemon query"
 
 
 def test_unqueryable_and_start_failure_refuse_one_slot_and_others_proceed(
@@ -279,3 +348,142 @@ def test_second_project_state_is_never_queried(
         argv[argv.index("--config-dir") + 1] != other for argv in _calls(log)
     ), "another project's .eden-state is never queried or started"
     assert _starts(log, other) == 0
+
+
+def test_dry_run_reports_would_restart_and_starts_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _project(tmp_path)
+    _write_row(root, _record(root, "eden-a"))
+    _write_row(root, _record(root, "eden-b"))
+    dead, healthy = _config_dir(root, "eden-a"), _config_dir(root, "eden-b")
+    log = _install_fake_eden(tmp_path, monkeypatch, {dead: "dead", healthy: "healthy"})
+
+    assert _run(root, "--dry-run") == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["dry_run"] is True
+    rows = {row["slot"]: row["status"] for row in report["eden_daemons"]}
+    assert rows == {"eden-a": "would-restart", "eden-b": "already-healthy"}
+    assert report["refused"] == 0
+    assert all("start" not in argv for argv in _calls(log)), (
+        "a dry run must not invoke eden start at all"
+    )
+
+    # The dry run started nothing, so a real run still has work to do.
+    assert _run(root) == 0
+    report = json.loads(capsys.readouterr().out)
+    rows = {row["slot"]: row["status"] for row in report["eden_daemons"]}
+    assert rows == {"eden-a": "restarted", "eden-b": "already-healthy"}
+    assert _starts(log, dead) == 1
+
+
+def test_named_git_slot_is_skipped_without_an_eden_query(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _project(tmp_path)
+    _write_row(root, _git_record(root, "git-a"))
+    _write_row(root, _record(root, "eden-a"))
+    eden_dir = _config_dir(root, "eden-a")
+    log = _install_fake_eden(tmp_path, monkeypatch, {eden_dir: "dead"})
+
+    assert _run(root, "--slot", "git-a", "--slot", "eden-a") == 0
+    report = json.loads(capsys.readouterr().out)
+    rows = {row["slot"]: row for row in report["eden_daemons"]}
+    assert rows["git-a"]["status"] == "skipped"
+    assert rows["eden-a"]["status"] == "restarted"
+    assert report["refused"] == 0, "a skipped git slot is not a refusal"
+    queried = {argv[argv.index("--config-dir") + 1] for argv in _calls(log)}
+    assert queried == {eden_dir}, "the git slot is classified, never queried"
+
+
+def test_symlinked_eden_state_refuses_and_starts_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _project(tmp_path)
+    _write_row(root, _record(root, "eden-a"))
+    _write_row(root, _record(root, "eden-b"))
+    linked, healthy = _config_dir(root, "eden-a"), _config_dir(root, "eden-b")
+    outside = tmp_path / "another-tree-state"
+    outside.mkdir()
+    Path(linked).rmdir()
+    Path(linked).symlink_to(outside, target_is_directory=True)
+    log = _install_fake_eden(tmp_path, monkeypatch, {linked: "dead", healthy: "dead"})
+
+    assert _run(root) == 3
+    report = json.loads(capsys.readouterr().out)
+    rows = {row["slot"]: row for row in report["eden_daemons"]}
+    assert rows["eden-a"]["status"] == "refused"
+    assert "another tree" in rows["eden-a"]["reason"]
+    assert rows["eden-b"]["status"] == "restarted"
+    assert all(
+        argv[argv.index("--config-dir") + 1] != linked for argv in _calls(log)
+    ), "a state dir escaping its slot is never queried or started"
+    assert _starts(log, linked) == 0
+
+
+def test_absolute_mount_slot_escaping_the_slot_root_refuses(tmp_path: Path) -> None:
+    # The registry loader already refuses a symlinked slot directory on
+    # load, so the verb's second containment clause is exercised
+    # directly: a slot directory resolving outside the project slot
+    # root is a problem even when its .eden-state stays inside it.
+    slot_root = tmp_path / "slots"
+    slot_root.mkdir()
+    outside_slot = tmp_path / "outside-slot"
+    (outside_slot / ".eden-state").mkdir(parents=True)
+    slot_path = slot_root / "eden-abs"
+    slot_path.symlink_to(outside_slot, target_is_directory=True)
+
+    problem = eden.eden_state_containment_problem(
+        str(slot_path / ".eden-state"), str(slot_path), str(slot_root)
+    )
+    assert problem is not None
+    assert "slot root" in problem
+
+    inside_slot = slot_root / "eden-in"
+    (inside_slot / ".eden-state").mkdir(parents=True)
+    assert (
+        eden.eden_state_containment_problem(
+            str(inside_slot / ".eden-state"), str(inside_slot), str(slot_root)
+        )
+        is None
+    )
+
+
+def test_hung_daemon_times_out_and_the_other_slot_still_restarts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _project(tmp_path)
+    _write_row(root, _record(root, "eden-hang"))
+    _write_row(root, _record(root, "eden-b"))
+    hung, dead = _config_dir(root, "eden-hang"), _config_dir(root, "eden-b")
+    log = _install_fake_eden(tmp_path, monkeypatch, {hung: "hang", dead: "dead"})
+    monkeypatch.setattr(eden, "INFO_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr(eden, "START_TIMEOUT_SECONDS", 0.5)
+
+    assert _run(root) == 3
+    report = json.loads(capsys.readouterr().out)
+    rows = {row["slot"]: row for row in report["eden_daemons"]}
+    assert rows["eden-hang"]["status"] == "refused"
+    assert "timed out" in rows["eden-hang"]["reason"]
+    assert rows["eden-b"]["status"] == "restarted"
+    assert _starts(log, hung) == 0, "a timed-out query is never started blindly"
+    assert _starts(log, dead) == 1
+
+
+def test_failed_start_requeries_before_refusing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _project(tmp_path)
+    _write_row(root, _record(root, "eden-race"))
+    raced = _config_dir(root, "eden-race")
+    log = _install_fake_eden(tmp_path, monkeypatch, {raced: "rival"})
+
+    # Our start reports failure, but another starter brought the daemon
+    # up meanwhile: the re-query proves it, so the slot is not refused.
+    assert _run(root) == 0
+    report = json.loads(capsys.readouterr().out)
+    rows = {row["slot"]: row["status"] for row in report["eden_daemons"]}
+    assert rows == {"eden-race": "restarted"}
+    assert report["refused"] == 0
+    assert _starts(log, raced) == 1
+    assert _infos(log, raced) >= 2, "a failed start is re-queried once"
