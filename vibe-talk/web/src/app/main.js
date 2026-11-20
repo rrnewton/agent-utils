@@ -3667,6 +3667,40 @@ const keyboard = createKeyboardComposition({
     discussView.toggle();
     return true;
   },
+  // `#1978 vibe-talk-cmd-d-dock-toggle`: plain Cmd+D on a Mac, plain Ctrl+D elsewhere
+  // (owner update 252: no Shift variant; never bare Ctrl+D on a Mac) toggles dock/float
+  // only where the focus stands inside one of the two floating surfaces — the
+  // quote-reply box (or the reply it docked into) or the Discuss pane, its follow-up
+  // box included. Everywhere else it answers false, so the dispatch leaves the chord
+  // (and its default) to the browser.
+  dockFromKeyboard: (event, target) => {
+    const held = /** @type {any} */ (event);
+    if (!held || held.shiftKey || held.altKey) return false;
+    const mac = modKeyName() === "Cmd";
+    if (mac ? !(held.metaKey && !held.ctrlKey) : !(held.ctrlKey && !held.metaKey)) return false;
+    // Inside a surface: under its root, or on one of its own named parts (every part of
+    // each surface carries its prefix; Discuss's two openers, outside the pane, do not count).
+    const inside = (/** @type {string} */ id, /** @type {string} */ prefix, /** @type {string[]} */ outside = []) => {
+      const targetId = String(/** @type {any} */ (target)?.id || "");
+      if (targetId && !outside.includes(targetId) && (targetId === id || targetId.startsWith(prefix))) return true;
+      try {
+        const root = leftEl(id);
+        return Boolean(root) && (target === root || nodeWithin(root, target));
+      } catch {
+        return false;
+      }
+    };
+    if (quoteOwner.quickReplyOpen() && inside("quick-reply", "quick-reply")) {
+      dockQuickReply();
+      return true;
+    }
+    if (discussView.isOpen() && inside("discuss-panel", "discuss-", ["discuss-open", "discuss-menu-open"])) {
+      discussView.setMode(discussView.mode() === "docked" ? "overlay" : "docked");
+      return true;
+    }
+    if (replyState.docked && inside("reply-compose", "reply-")) return floatDockedReply();
+    return false;
+  },
 });
 const {
   channelPane, sidePane, KEY_PANES, paneColumn, lastPane, keySelection,
@@ -6419,7 +6453,7 @@ const replySession = createReplySession({
 const {
   replyState, replyRoute, replyBoundForThread, rememberDraft, draftMarker, renderDraftMarkers,
   noteDraft, inSight, renderDraftChip, openSentenceReply, pressDraftChip, cancelQuickReply,
-  answerQuickReplyDiscard, quickReplyToStream, openReply, renderReplyDestination, closeReply,
+  answerQuickReplyDiscard, quickReplyToStream, floatDockedReply, openReply, renderReplyDestination, closeReply,
   cancelReply, answerReplyDiscard, sendReply, replyPane, replyKeysHere, placeInlineReply, placeRowsInPlaceAgain,
   fitInlineRoom, reopenPendingReply, noteReplyFocusLeaving, putDockedReplyAway, replyingTo,
   markReplying, followReplyStore, anchorUnder, replySight,

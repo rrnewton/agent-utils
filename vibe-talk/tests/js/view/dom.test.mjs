@@ -2156,7 +2156,7 @@ test("`#624 voice-page-modularity`: the keymap lists every key in a group, hands
   for (const [name] of calls.splice(0)) reached.add(name);
   const expected = ["bookmarkFromKeyboard", "bookmarkJumpFromKeyboard", "collapsedLinesFromKeyboard", "columnFromKeyboard",
     "columnsFromKeyboard", "composeFromKeyboard", "copyChordFromKeyboard", "copyFromKeyboard", "copyLinkFromKeyboard",
-    "deepLinkFromKeyboard", "detailsFromKeyboard", "discussFromKeyboard", "doneFromKeyboard", "filterFromKeyboard", "foldOneFromKeyboard", "foldStepFromKeyboard", "jumpList",
+    "deepLinkFromKeyboard", "detailsFromKeyboard", "discussFromKeyboard", "dockFromKeyboard", "doneFromKeyboard", "filterFromKeyboard", "foldOneFromKeyboard", "foldStepFromKeyboard", "jumpList",
     "keyContext", "keysFromKeyboard", "listEdge", "mainRowsFromKeyboard", "menuFromKeyboard", "newestFromComposer",
     "nextUnreadFromKeyboard", "onEscape", "openFromKeyboard", "orderFromKeyboard", "outlineFromKeyboard", "packFromKeyboard", "pickChannel",
     "placeFromKeyboard", "pressRowButton", "readCollapseFromKeyboard", "readFromKeyboard", "readModeFromKeyboard",

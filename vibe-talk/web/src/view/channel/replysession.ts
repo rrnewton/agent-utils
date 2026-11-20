@@ -74,6 +74,8 @@ export interface ReplySessionDependencies {
     quickReplyOpenKey(): string | null;
     openQuickDraft(key: string, row: HTMLElement): void;
     openSentenceReply(row: HTMLElement, id: string, text: string, box: { top: number; bottom: number; left: number; right: number } | null): void;
+    /** `#1978 vibe-talk-cmd-d-dock-toggle`. Float this docked reply out as the floating quote-reply box. */
+    openFloatedReply(row: HTMLElement, message: ReplyMessageLike, quote: string, written: string, toMain?: boolean): void;
     quickReplyOpen(): boolean;
     closeQuickReply(): void;
   };
@@ -145,6 +147,8 @@ export interface ReplySession {
   cancelQuickReply(): void;
   answerQuickReplyDiscard(discard: boolean): void;
   quickReplyToStream(row: HTMLElement, message: ReplyMessageLike, text: string, opts?: { toMain?: boolean; focus?: boolean }): void;
+  /** `#1978 vibe-talk-cmd-d-dock-toggle`. Float the docked quoted reply back out; false where it quotes nothing. */
+  floatDockedReply(): boolean;
   openReply(messages: ReplyMessageLike[], from?: HTMLElement | null, quote?: string, focus?: boolean): void;
   renderReplyDestination(): void;
   closeReply(how?: { restore?: boolean; refocus?: boolean }): void;
@@ -617,6 +621,44 @@ export function createReplySession(deps: ReplySessionDependencies): ReplySession
     });
   }
 
+
+  /**
+   * `#1978 vibe-talk-cmd-d-dock-toggle`. The floating half of the dock toggle, from the stream
+   * box: a docked reply that opens with a quote floats back out as the quote-reply box, its
+   * words past the quote and its Post to main choice carried, the stream draft given up to
+   * the floating box's own draft so the words live in one place. A plain reply (no quote at
+   * its head) has no floating form and stays docked: false, and nothing moves.
+   */
+  function floatDockedReply(): boolean {
+    if (!replyState.docked || !replyState.target) return false;
+    const target = replyState.target;
+    const id = String(target.id);
+    const channel = String(replyState.channelId || deps.selectedChannelId() || "");
+    const lines = String(deps.el("reply-text").value || "").replace(/\r\n?/g, "\n").split("\n");
+    let at = 0;
+    const quoted: string[] = [];
+    while (at < lines.length && /^\s*>/.test(lines[at] as string)) {
+      quoted.push((lines[at] as string).replace(/^\s*> ?/, ""));
+      at += 1;
+    }
+    const quote = quoted.join(" ").replace(/\s+/g, " ").trim();
+    if (quote === "") return false;
+    while (at < lines.length && (lines[at] as string).trim() === "") at += 1;
+    const written = lines.slice(at).join("\n");
+    const before = deps.paneRowFor(deps.channelPane, id) || deps.paneRowFor(deps.sidePane, id) ||
+      (replyState.list ? deps.rowIn(replyState.list, id) : null);
+    if (!before) return false;
+    const toMain = !deps.el("reply-to-main-row").hidden && deps.el("reply-to-main").checked;
+    closeReply({ restore: false, refocus: false });
+    // The stream draft closeReply just kept is the floating box's draft now.
+    deps.replyDrafts.delete(id);
+    if (deps.outbox.storageOkay()) deps.replyDrafts.save();
+    noteDraft("reply", id, channel, false);
+    renderDraftMarkers();
+    const row = deps.paneRowFor(deps.channelPane, id) || deps.paneRowFor(deps.sidePane, id) || before;
+    deps.quoteOwner().openFloatedReply(row as HTMLElement, target, quote, written, toMain);
+    return deps.quoteOwner().quickReplyOpen();
+  }
 
   /**
    * Open Reply on one specific row: its box in the stream of the column Reply was pressed in, under the
@@ -1306,7 +1348,7 @@ export function createReplySession(deps: ReplySessionDependencies): ReplySession
   return {
     replyState, replyRoute, replyBoundForThread, rememberDraft, draftMarker, renderDraftMarkers,
     noteDraft, inSight, renderDraftChip, openSentenceReply, pressDraftChip, cancelQuickReply, placeRowsInPlaceAgain,
-    answerQuickReplyDiscard, quickReplyToStream, openReply, renderReplyDestination, closeReply,
+    answerQuickReplyDiscard, quickReplyToStream, floatDockedReply, openReply, renderReplyDestination, closeReply,
     cancelReply, answerReplyDiscard, sendReply, replyPane, replyKeysHere, placeInlineReply,
     fitInlineRoom, reopenPendingReply, noteReplyFocusLeaving, putDockedReplyAway, replyingTo,
     markReplying, followReplyStore, anchorUnder, replySight: deps.replySight,

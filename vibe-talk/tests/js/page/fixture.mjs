@@ -2188,6 +2188,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         // Absent unless a test says the backend has thread-plus-broadcast, as the server omits it when false.
         // `#1165 reply-count-broadcast-only`.
         broadcast_supported: page.broadcastSupported,
+        // Absent unless a test says Discuss can run, as the server omits it when no summarizer is configured.
+        discuss_available: page.discussAvailable,
         // `#528 thread-card-markdown-and-cap`. Absent unless a test says the server names threads.
         thread_names_supported: page.threadNamesSupported,
         upstream_read_mark_supported: page.upstreamReadMarkSupported,
@@ -2340,6 +2342,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
      */
     repliesInThread: undefined,
     broadcastSupported: undefined,
+    /** Whether client-config says Discuss can run; `undefined` sends nothing, as a server with no summarizer does. */
+    discussAvailable: undefined,
     /** The scope the server reports for the saved token; `undefined` plays a malformed answer. */
     tokenScope: "write",
     /** Every explicit provider read-boundary request. Separate from local Done/archive calls. */
@@ -3462,6 +3466,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     },
     atob,
     btoa,
+    // A browser's query-string builder, which Discuss's preview and record reads use (`#1978`).
+    URLSearchParams,
     // Read-aloud needs three things a browser has and this fixture did not: a way to turn a blob
     // into a URL, a player, and a way for the TEST to say the audio finished. Playback is the one
     // event that matters here — the page archives a message on `ended` — so the player records

@@ -7,7 +7,7 @@
 
 import { isLink, isTextField } from "../dom/index.ts";
 import type { AfterDone } from "./donekeys.ts";
-import { modHeld, typedKey } from "./chords.ts";
+import { appleKeyboard, modHeld, typedKey } from "./chords.ts";
 import type { KeyChord } from "./chords.ts";
 import type { DispatchedKey } from "./keydispatch.ts";
 import type { ViewChoice } from "./viewkeys.ts";
@@ -130,6 +130,8 @@ export interface KeymapActs<Target> {
   outlineFromKeyboard(): unknown;
   /** `#1386 discuss-mod8-toggle`. Toggle the Discuss panel over the current view. */
   discussFromKeyboard(): unknown;
+  /** `#1978 vibe-talk-cmd-d-dock-toggle`. Toggle dock/float for the focused floating surface; whether it did. */
+  dockFromKeyboard(event: DispatchedKey, target: Target): unknown;
   composeFromKeyboard(): unknown;
   writeFromKeyboard(): unknown;
   newestFromComposer(target: Target): unknown;
@@ -150,7 +152,7 @@ export function createKeymap<Target>(acts: KeymapActs<Target>): KeymapBinding<Ta
     copyChordFromKeyboard, copyFromKeyboard, nextUnreadFromKeyboard, stepUnreadFromKeyboard, afterDone, doneFromKeyboard, readCollapseFromKeyboard, foldOneFromKeyboard,
     foldStepFromKeyboard, collapsedLinesFromKeyboard, packFromKeyboard, unpackFromKeyboard, bookmarkFromKeyboard,
     bookmarkJumpFromKeyboard, viewFromKeyboard, voiceFromKeyboard, readModeFromKeyboard, filterFromKeyboard,
-    undoFromKeyboard, orderFromKeyboard, mainRowsFromKeyboard, columnsFromKeyboard, outlineFromKeyboard, discussFromKeyboard, composeFromKeyboard,
+    undoFromKeyboard, orderFromKeyboard, mainRowsFromKeyboard, columnsFromKeyboard, outlineFromKeyboard, discussFromKeyboard, dockFromKeyboard, composeFromKeyboard,
     writeFromKeyboard, newestFromComposer,
   } = acts;
   return [
@@ -345,6 +347,28 @@ export function createKeymap<Target>(acts: KeymapActs<Target>): KeymapBinding<Ta
         `and reopens where you left it — its layout and its transcript`,
       controls: ["discuss-open"],
       run: () => discussFromKeyboard(),
+    },
+    {
+      // `#1978 vibe-talk-cmd-d-dock-toggle`. Dock/float for the surface holding the focus: the
+      // floating quote-reply box docks into the stream (and a docked quoted reply floats back
+      // out), and a floating Discuss pane docks (and a docked one floats back). Plain Cmd+D
+      // on a Mac, plain Ctrl+D elsewhere (owner update 252: no Shift variant); never bare
+      // Ctrl+D on a Mac, where it stays forward-delete in a text field. It is not
+      // `everywhere`: outside those two surfaces the chord is left to the browser (its
+      // bookmark), which the act's false answer leaves alone, and its default is refused
+      // only where the act did something.
+      group: KEYS_VIEW, chords: [{ key: "d", mod: true }],
+      does: () => appleKeyboard(modKeyName())
+        ? "Dock or float the surface you are in: in the floating quote-reply box, Cmd+D docks " +
+          "it under its message and Cmd+D again in that reply floats it back out; in Discuss, " +
+          "Cmd+D docks the floating pane and again floats a docked one. Anywhere else Cmd+D " +
+          "does nothing new"
+        : "Dock or float the surface you are in: in the floating quote-reply box, Ctrl+D " +
+          "docks it under its message and Ctrl+D again in that reply floats it back out; in " +
+          "Discuss, it docks the floating pane and again floats a docked one. Anywhere else " +
+          "Ctrl+D does nothing new",
+      controls: ["quick-reply-dock", "discuss-dock-toggle"],
+      run: (event, target) => dockFromKeyboard(event, target),
     },
     {
       group: KEYS_MOVING, chords: [{ key: "[" }, { key: "]" }],

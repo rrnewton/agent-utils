@@ -269,6 +269,8 @@ export interface KeyboardCompositionDependencies<
   toggleDocumentOutline?(): unknown;
   /** Toggle the Discuss panel over the current view (`#1386`); whether it did. */
   toggleDiscuss?(): unknown;
+  /** Toggle dock/float for the focused floating surface (`#1978`); whether it did. */
+  dockFromKeyboard?(event: unknown, target: HTMLElement): unknown;
   /** `#1321 after-done-setting`. What e does after marking Done, as kept in Settings. */
   afterDone(): AfterDone;
   // Dispatch, timing and hints.
@@ -851,6 +853,7 @@ export function createKeyboardComposition<
     columnsFromKeyboard: () => deps.columnsFromKeyboard(),
     outlineFromKeyboard: () => deps.toggleDocumentOutline?.() ?? false,
     discussFromKeyboard: () => deps.toggleDiscuss?.() ?? false,
+    dockFromKeyboard: (event, target) => deps.dockFromKeyboard?.(event, target) ?? false,
     composeFromKeyboard: () => composeFromKeyboard(),
     writeFromKeyboard: () => writeFromKeyboard(),
     newestFromComposer: (target) => newestFromComposer(target),

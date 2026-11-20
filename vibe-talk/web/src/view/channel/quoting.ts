@@ -265,6 +265,12 @@ export interface Quoting {
    * found as any quick reply's.
    */
   openSentenceReply(row: QuotedRow, id: string, quote: string, box: Box | null): void;
+  /**
+   * `#1978 vibe-talk-cmd-d-dock-toggle`. Float a docked quoted reply back out: the floating
+   * box on `message` quoting `quote`, holding `written` (the docked box's words past its
+   * quote), its Post to main choice carried where it was ticked there.
+   */
+  openFloatedReply(row: QuotedRow, message: Message, quote: string, written: string, toMain?: boolean): void;
 }
 
 /** Nothing held, no box open. */
@@ -705,6 +711,25 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
     openQuickReplyFor(row, message, quote.trim(), box || { top, bottom: top + QUICK_REPLY_GAP_PX * 3, left: rect.left, right: rect.right });
   }
 
+  /**
+   * `#1978 vibe-talk-cmd-d-dock-toggle`. The docked half of the dock toggle: a reply that was
+   * docked from this box (or opened in the stream quoting words) floats back out over its
+   * row, with what was written in the stream box and its Post to main choice carried.
+   */
+  function openFloatedReply(row: QuotedRow, message: Message, quote: string, written: string, toMain = false): void {
+    const rect = row.getBoundingClientRect();
+    const top = Number(rect.top) || 0;
+    openQuickReplyFor(row, message, quote, { top, bottom: top + QUICK_REPLY_GAP_PX * 3, left: rect.left, right: rect.right });
+    if (!quickReply) return;
+    const text = deps.byId("quick-reply-text");
+    text.value = written;
+    keepQuickDraft(quickReply.key, quickReply.channel, written);
+    if (toMain && !deps.byId("quick-reply-to-main-row").hidden) deps.byId("quick-reply-to-main").checked = true;
+    text.focus({ preventScroll: true });
+    const end = text.value.length;
+    if (typeof text.setSelectionRange === "function") text.setSelectionRange(end, end);
+  }
+
   function openQuickDraft(key: string, row: QuotedRow): void {
     const { id, quote } = keyParts(key);
     const message = rowMessages(row).find((one) => String(one.id) === id) || rowMessages(row)[0];
@@ -730,7 +755,7 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
     quoteSelectionNow,
     quickReplyHolds, quickReplyListMoved, quickReplyOpen: () => quickReply !== null,
     quickReplyOpenKey: () => (quickReply ? quickReply.key : null), placeQuickReply,
-    closeQuickReply, putDownQuickReply, dockQuickReply, sendQuickReply, noteQuickReplyInput, openQuickDraft, openSentenceReply,
+    closeQuickReply, putDownQuickReply, dockQuickReply, sendQuickReply, noteQuickReplyInput, openQuickDraft, openSentenceReply, openFloatedReply,
     quickDraftLive: (key) => Boolean((quickReplyDrafts.get(key) || "").trim()),
     quickDraftMessage: (key) => keyParts(key).id,
   };

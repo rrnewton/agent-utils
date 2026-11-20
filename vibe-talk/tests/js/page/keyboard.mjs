@@ -19,7 +19,7 @@ import { CHANNEL, CSS_CODE, DISCORD_POLL_MS, DONE_FLASH_FADE_MS, DONE_FLASH_HOLD
   reopenedChannel, replyArrowOf, replyBoxAt, replyButton, replyInStream, rowHoldingId,
   rowMoreButton, rowMoreMenu, rowStates, rowWithId, runThread, scaleOf, scopedData, selectedId,
   serveScoped, servedBookmarkPage, serverFloor, showDiscord, shownIds, sideIds, sideRow, signIn,
-  sseMessage, startTalking, statusText, summaryText, tallChannel, tapArrow, tapBookmarkClear, test,
+  sseMessage, startTalking, statusText, summaryText, tallChannel, tapArrow, tapBookmarkClear, test, wordsIn,
   threadBadge, threadData, threadHistory, threadPage, throughHere, turnSummariesOn, turnTodoOn,
   twoColumnServer, twoColumns, typedFrames, unpackPage, unpackRows, unpackedRow } from "./fixture.mjs";
 
@@ -5172,4 +5172,77 @@ test("`#491 threads-view-sent-receipt`: a reply sent from among the cards, once 
   assert.equal(drawn().length, 1, "the premise: the reply is not drawn among the cards");
   assert.deepEqual(receipts().map((li) => li.getAttribute("data-send-state")), [],
     "the reply is drawn among the cards and again as a receipt at the foot");
+});
+
+test("`#1978 vibe-talk-cmd-d-dock-toggle`: plain Cmd+D (Mac) / Ctrl+D (off Mac) toggles dock/float in the quote reply and Discuss, and nothing elsewhere", async () => {
+  const QUOTE = "Point 03 is one thing the agent says here.";
+  const LONG = "1000000000000000030";
+  const sentences = Array.from({ length: 20 }, (_, at) => `Point ${String(at + 1).padStart(2, "0")} is one thing the agent says here.`);
+  // [platform, the plain chord, the other platform's chord]
+  for (const [platform, chord, other] of [
+    ["MacIntel", { metaKey: true }, { ctrlKey: true }],
+    ["Linux x86_64", { ctrlKey: true }, { metaKey: true }],
+  ]) {
+    const where = platform === "MacIntel" ? "on a Mac" : "off a Mac";
+    const page = newPage(new Map(), SCRIPT, (p) => p.setPlatform(platform));
+    page.discussAvailable = true;
+    await signIn(page);
+    const messages = Array.from({ length: 29 }, (_, at) => message({ id: String(1000000000000000001n + BigInt(at)), content: `note ${at + 1}` }));
+    messages.push(message({ id: LONG, content: sentences.join(" ") }));
+    await showDiscord(page, messages);
+    // Negative: outside either surface the chord is not taken and nothing opens or docks.
+    let event = await press(page, page.el("scroll-area"), "d", chord);
+    assert.equal(event.defaulted, true, `${where}: the dock chord outside the surfaces was swallowed`);
+    assert.equal(page.el("quick-reply").hidden, true, `${where}: the dock chord outside opened a quick reply`);
+    assert.equal(page.el("discuss-panel").hidden, true, `${where}: the dock chord outside opened Discuss`);
+    // The list of keys names the plain chord in this keyboard's words, and no Shift variant.
+    const listed = page.el("keyboard-keys").descendants().filter((node) => node.tagName === "kbd").map((node) => node.textContent);
+    const plain = platform === "MacIntel" ? "Cmd+D" : "Ctrl+D";
+    assert.ok(listed.includes(plain), `${where}: the list of keys does not name ${plain}: ${listed.join(" | ")}`);
+    assert.ok(!listed.some((words) => words.includes("Shift+D")), `${where}: the list of keys names a Shift+D variant`);
+    // Quote reply: floating -> docked -> floating, focus in the composer throughout.
+    await page.selectText(wordsIn(rowWithId(page, LONG)), null, QUOTE);
+    await page.el("selection-chip").click();
+    await page.settle();
+    assert.equal(page.el("quick-reply").hidden, false, `${where}: the chip opened no quick reply`);
+    assert.equal(page.document.activeElement, page.el("quick-reply-text"), `${where}: the quick reply did not take the focus`);
+    await page.el("quick-reply-text").setValue("dock me");
+    // The other platform's chord and the Shift variant do nothing here.
+    for (const wrong of [other, { ...chord, shiftKey: true }]) {
+      event = await press(page, page.el("quick-reply-text"), "d", wrong);
+      assert.equal(event.defaulted, true, `${where}: a non-plain dock chord was taken in the quick reply`);
+      assert.equal(page.el("quick-reply").hidden, false, `${where}: a non-plain dock chord docked the quick reply`);
+    }
+    event = await press(page, page.el("quick-reply-text"), "d", chord);
+    assert.equal(event.defaulted, false, `${where}: the dock chord in the quick reply was left to the browser`);
+    assert.equal(page.el("quick-reply").hidden, true, `${where}: the dock chord did not close the floating box`);
+    assert.equal(replyInStream(page), true, `${where}: the dock chord did not dock the reply in the stream`);
+    assert.equal(page.document.activeElement, page.el("reply-text"), `${where}: docking did not keep the focus in the composer`);
+    assert.ok(page.el("reply-text").value.includes(QUOTE), `${where}: the docked reply lost its quote`);
+    assert.ok(page.el("reply-text").value.includes("dock me"), `${where}: the docked reply lost what was written`);
+    event = await press(page, page.el("reply-text"), "d", chord);
+    assert.equal(event.defaulted, false, `${where}: the dock chord in the docked reply was left to the browser`);
+    assert.equal(page.el("quick-reply").hidden, false, `${where}: the dock chord did not float the docked reply back out`);
+    assert.equal(replyInStream(page), false, `${where}: floating left the reply docked as well`);
+    assert.equal(page.el("quick-reply-quote").textContent, QUOTE, `${where}: the floated box lost its quote`);
+    assert.equal(page.el("quick-reply-text").value, "dock me", `${where}: the floated box lost what was written`);
+    assert.equal(page.document.activeElement, page.el("quick-reply-text"), `${where}: floating did not keep the focus in the composer`);
+    await page.el("quick-reply-cancel").click();
+    await page.settle();
+    // Discuss: floating (overlay) -> docked -> floating, focus in its follow-up composer.
+    await page.el("discuss-open").click();
+    await page.settle();
+    assert.equal(page.el("discuss-panel").hidden, false, `${where}: Discuss did not open`);
+    assert.equal(page.el("discuss-panel").getAttribute("data-mode"), "overlay", `${where}: Discuss did not open floating`);
+    await focusOn(page, page.el("discuss-followup"));
+    event = await press(page, page.el("discuss-followup"), "d", other);
+    assert.equal(event.defaulted, true, `${where}: the other platform's chord was taken in Discuss`);
+    assert.equal(page.el("discuss-panel").getAttribute("data-mode"), "overlay", `${where}: the other chord docked Discuss`);
+    event = await press(page, page.el("discuss-followup"), "d", chord);
+    assert.equal(event.defaulted, false, `${where}: the dock chord in Discuss was left to the browser`);
+    assert.equal(page.el("discuss-panel").getAttribute("data-mode"), "docked", `${where}: the dock chord did not dock Discuss`);
+    event = await press(page, page.el("discuss-followup"), "d", chord);
+    assert.equal(event.defaulted, false, `${where}: the dock chord in docked Discuss was left to the browser`);
+    assert.equal(page.el("discuss-panel").getAttribute("data-mode"), "overlay", `${where}: the dock chord did not float Discuss back out`);
+  }
 });
