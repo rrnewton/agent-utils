@@ -41,7 +41,7 @@ def _build_sandbox(tmp_path: Path) -> Path:
     for tool in (PAIRED, PYTHON_ONLY):
         (common_bin / tool).symlink_to("engine-resolver")
         stub = python_bin / tool
-        stub.write_text(f"print('PY-{tool}')\n")
+        stub.write_text(f"#!/bin/sh\necho PY-{tool}\n")
         _chmod_x(stub)
     rust_stub = rust_bin / PAIRED
     rust_stub.write_text(f"#!/bin/sh\necho RS-{PAIRED}\n")

@@ -1,5 +1,24 @@
 # wrkslots user guide
 
+## How to invoke wrkslots
+
+Invoke wrkslots through the tracked wrapper — agent-utils `bin/wrkslots` (`common/bin/wrkslots`,
+which dispatches to `py/bin/wrkslots`) or an installed `wrkslots` console command — never
+`python3 -m wrkslots`. On hosts where `python3` is the fbpython launcher, the launcher forks the
+real interpreter as its child and waits for it with SIGTERM caught: a supervisor that signals the
+process it started (`timeout`, systemd) signals only the launcher, never the interpreter doing
+the work, so a run whose worker has finished or died can linger indefinitely and shrug off
+SIGTERM (#1964 wrkslots-full-status-hang-ignores-sigterm). The wrapper resolves the host's real
+interpreter once and execs it directly, so the long-running process is the interpreter itself
+and signals reach it. The same applies to the other agent-utils Python tools: use their
+`bin/<tool>` wrappers, not `python3 -m`.
+
+Wrap long reads with a kill-after backstop so even a genuinely stuck read cannot outlive its
+supervisor: `timeout --kill-after=15 300 bin/wrkslots status`. Read-only scans are already
+bounded (`--scan-timeout`, default 180s; lock waits bounded by `--wait-lock`, default 30s), so a
+status that outlives a few minutes is wedged outside wrkslots' own waits — check whether its
+process is a launcher (`/proc/<pid>/exe` naming `fbpython`) whose worker is already defunct.
+
 ## What a slot contains
 
 A slot is an append-only history plus a directory of linked Git worktrees. An `agent` slot holds

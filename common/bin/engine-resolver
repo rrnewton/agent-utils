@@ -344,7 +344,13 @@ case "$ENGINE" in
             exit 127
         fi
         echo "[$TOOL] engine=python (tracked entrypoint: py/bin/$TOOL)" >&2
-        exec "${CI_HUB_PYTHON:-python3}" "$TARGET" "$@"
+        # The tracked entrypoint is a shell wrapper that execs the host's
+        # real interpreter itself (#1964): running it through python3 here
+        # would put the fbpython launcher back in charge of the
+        # long-running process. CI_HUB_PYTHON still names the interpreter
+        # to resolve, passed through as AGENT_UTILS_PYTHON.
+        export AGENT_UTILS_PYTHON="${CI_HUB_PYTHON:-python3}"
+        exec "$TARGET" "$@"
         ;;
     rust|rs)
         # The tracked rs/bin link invokes the shared Cargo/provenance launcher. It verifies the

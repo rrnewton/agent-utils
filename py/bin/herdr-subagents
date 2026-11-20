@@ -1,1 +1,10 @@
-../agentctl/foreign_cli.py
+#!/bin/sh
+# herdr-subagents — run on the host's real interpreter, not the python3 launcher
+# (#1964 wrkslots-full-status-hang-ignores-sigterm; see _real-python.sh).
+case $0 in
+    */*) _au_self=$0 ;;
+    *) _au_self=$(command -v -- "$0" 2>/dev/null || printf '%s' "$0") ;;
+esac
+_au_dir=$(CDPATH= cd -- "$(dirname -- "$_au_self")" && pwd)
+. "$_au_dir/../_real-python.sh"
+exec_real_python_module agentctl.foreign_cli "$@"
