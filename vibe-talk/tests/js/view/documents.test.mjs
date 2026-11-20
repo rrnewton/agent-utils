@@ -2365,6 +2365,50 @@ test("documents list: card meta is one line with a text mentions link; chips sit
   }
 });
 
+test("documents list: an unmentioned card's meta has no stray separators (#1994)", async () => {
+  // A document no message ever mentioned (admitted by an in-reader link):
+  // no mentioned-ago, no file-leading separator, no doubled dots.
+  const rows = [
+    { ...docRow("linked", Date.now()), kind: "github_markdown", file_name: "linked.md",
+      mention_count: 0, fetched: true, fetched_ms: Date.now(), last_mentioned_ms: null, mentions: [] },
+  ];
+  const mod = requireModule(LIST, "src/view/documents/list.ts");
+  const listEl = fakeElement("div");
+  const scroller = fakeElement("div");
+  scroller.scrollTop = 0; scroller.clientHeight = 100;
+  Object.defineProperty(scroller, "scrollHeight", { get: () => listEl.children.length * 300 });
+  const byId = (id) => ({ "documents-list": listEl, "scroll-area": scroller,
+    "pane-docs": fakeElement("div"), "docs-list-view": fakeElement("div") })[id];
+  const savedDocument = globalThis.document;
+  globalThis.document = { createElement: (tag) => fakeElement(tag),
+    createElementNS: (_ns, tag) => fakeElement(tag),
+    createTextNode: (text) => ({ nodeType: 3, textContent: String(text) }), querySelector: () => null };
+  try {
+    const list = mod.createDocumentsList({ api: async () => ({ documents: rows, total: 1 }),
+      nudge: (scroller, delta) => { scroller.scrollTop += delta; },
+      toPosition: (scroller, top) => { scroller.scrollTop = top; },
+      toFoot: (scroller) => { scroller.scrollTop = scroller.scrollHeight; },
+      byId, onOpen: () => {}, onMentions: () => {} });
+    await list.refresh();
+    const card = listEl.children.find((kid) => String(kid.className).includes("doc-card"));
+    assert.ok(card, "no card drawn");
+    const texts = card.children.find((kid) => String(kid.className).includes("doc-texts"));
+    const meta = texts.children.find((kid) => String(kid.className).includes("doc-meta"));
+    assert.ok(meta, "card has no single .doc-meta line");
+    const text = meta.textContent;
+    assert.ok(!text.startsWith("·") && !text.startsWith(" "), `meta starts with a stray separator: ${JSON.stringify(text)}`);
+    assert.ok(!text.includes("··") && !text.includes("·  ·") && !text.includes("  "),
+      `meta carries a doubled separator or gap: ${JSON.stringify(text)}`);
+    assert.ok(text.startsWith("linked.md"), `meta does not start with the file name: ${JSON.stringify(text)}`);
+    assert.ok(text.includes("fetched just now"), `meta misses the fetched time: ${JSON.stringify(text)}`);
+    assert.ok(text.includes("0 mentions"), `meta misses the mention count: ${JSON.stringify(text)}`);
+    assert.ok(!text.includes("mentioned"), `meta invents a mentioned time: ${JSON.stringify(text)}`);
+    list.unmount();
+  } finally {
+    if (savedDocument === undefined) delete globalThis.document; else globalThis.document = savedDocument;
+  }
+});
+
 test("documents search: hits render with the searched count; a result opens at its query (#1266)", async () => {
   const { createDocumentsSearch } = requireModule(SEARCH, "src/view/documents/search.ts");
   const toggle = fakeElement("button");

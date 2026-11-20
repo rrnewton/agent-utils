@@ -521,20 +521,31 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
     }
     else if (row.moved_to) meta.textContent = `moved to ${row.moved_to}`;
     else {
-      const file = document.createElement("span");
-      file.className = "doc-meta-file";
-      file.textContent = row.file_name;
-      file.title = row.file_name;
-      meta.appendChild(file);
-      meta.appendChild(document.createTextNode(` · ${mentionedAgo(row.last_mentioned_ms, Date.now())}`));
+      // Only the parts that have text, joined by the separator (`#1994
+      // documents-list-meta-separators`): an empty part — a document no
+      // message mentioned, so no mentioned-ago — used to leave its
+      // separator behind ("·· fetched just now · 0 mentions").
+      const parts: Node[] = [];
+      if (row.file_name) {
+        const file = document.createElement("span");
+        file.className = "doc-meta-file";
+        file.textContent = row.file_name;
+        file.title = row.file_name;
+        parts.push(file);
+      }
+      const mentioned = mentionedAgo(row.last_mentioned_ms, Date.now());
+      if (mentioned) parts.push(document.createTextNode(mentioned));
       if (row.kind === "github_issue" && row.issue_status) {
-        meta.appendChild(document.createTextNode(` · ${row.issue_status}`));
+        parts.push(document.createTextNode(row.issue_status));
       }
       if (row.fetched && row.fetched_ms !== null) {
-        const fetched = document.createElement("span");
-        fetched.textContent = ` · ${fetchedAgo(row.fetched_ms, Date.now())}`;
-        fetched.title = new Date(row.fetched_ms).toLocaleString();
-        meta.appendChild(fetched);
+        const fetchedText = fetchedAgo(row.fetched_ms, Date.now());
+        if (fetchedText) {
+          const fetched = document.createElement("span");
+          fetched.textContent = fetchedText;
+          fetched.title = new Date(row.fetched_ms).toLocaleString();
+          parts.push(fetched);
+        }
       }
       const mentions = document.createElement("button");
       mentions.setAttribute("type", "button");
@@ -544,17 +555,21 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
         event.stopPropagation();
         deps.onMentions?.(row);
       });
-      meta.appendChild(document.createTextNode(" · "));
-      meta.appendChild(mentions);
-      const kindLink = document.createElement("a");
-      kindLink.className = "doc-kind";
-      kindLink.href = row.url;
-      kindLink.target = "_blank";
-      kindLink.rel = "noopener noreferrer";
-      kindLink.textContent = row.kind;
-      kindLink.addEventListener("click", (event) => event.stopPropagation());
-      meta.appendChild(document.createTextNode(" · "));
-      meta.appendChild(kindLink);
+      parts.push(mentions);
+      if (row.kind) {
+        const kindLink = document.createElement("a");
+        kindLink.className = "doc-kind";
+        kindLink.href = row.url;
+        kindLink.target = "_blank";
+        kindLink.rel = "noopener noreferrer";
+        kindLink.textContent = row.kind;
+        kindLink.addEventListener("click", (event) => event.stopPropagation());
+        parts.push(kindLink);
+      }
+      for (const [index, part] of parts.entries()) {
+        if (index > 0) meta.appendChild(document.createTextNode(" · "));
+        meta.appendChild(part);
+      }
     }
     texts.append(title, meta);
     card.appendChild(texts);
