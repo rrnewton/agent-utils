@@ -1,6 +1,6 @@
 ---
 title: 'agentctl-revive-missing-pane-dead-proof: revive a previous-boot lane whose pane is gone, refuse a same-boot missing pane with the remedy named'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
