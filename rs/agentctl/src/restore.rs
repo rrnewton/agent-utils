@@ -1833,6 +1833,110 @@ fn remount_slot_images(host: &dyn Host, wrkslots: Option<&Path>, project: &Path)
     })
 }
 
+/// Restart the per-slot Eden daemons of this registry's own slotted agents
+/// (#1977): `wrkslots eden restart-slot-daemons`, limited with `--slot` to
+/// exactly the slots bound in this registry, grouped by each agent's slot
+/// project. The wrkslots binary is the one already resolved for
+/// `image status` (`RestoreOptions::wrkslots`). Every failure — no binary
+/// configured, a failed or unparsable verb run, a slot the verb did not
+/// report — degrades to a per-slot `refused` row here and never fails
+/// restore; the verb's own per-slot rows pass through with their slot's
+/// agents named.
+fn restart_eden_daemons(
+    host: &dyn Host,
+    wrkslots: Option<&Path>,
+    boxed: &[SlotAgent],
+) -> Vec<Value> {
+    if boxed.is_empty() {
+        return Vec::new();
+    }
+    let mut by_project: BTreeMap<PathBuf, Vec<&SlotAgent>> = BTreeMap::new();
+    for agent in boxed {
+        by_project
+            .entry(agent.project.clone())
+            .or_default()
+            .push(agent);
+    }
+    let mut rows: Vec<Value> = Vec::new();
+    for (project, agents) in &by_project {
+        let mut slots: Vec<&str> = agents.iter().map(|agent| agent.slot.as_str()).collect();
+        slots.sort_unstable();
+        slots.dedup();
+        let slot_agents: Vec<Value> = slots
+            .iter()
+            .map(|slot| {
+                json!({
+                    "slot": slot,
+                    "agents": agents
+                        .iter()
+                        .filter(|agent| agent.slot == *slot)
+                        .map(|agent| agent.name.clone())
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        let Some(wrkslots) = wrkslots else {
+            for entry in &slot_agents {
+                rows.push(json!({
+                    "slot": entry["slot"],
+                    "agents": entry["agents"],
+                    "project": project,
+                    "status": "refused",
+                    "reason": "no wrkslots configured or on PATH; the slot's Eden daemon was not restarted",
+                }));
+            }
+            continue;
+        };
+        eprintln!(
+            "agentctl restore: restarting Eden daemons for slot(s) {}",
+            slots.join(", ")
+        );
+        let mut arguments: Vec<&str> = vec!["eden", "restart-slot-daemons"];
+        for slot in &slots {
+            arguments.push("--slot");
+            arguments.push(slot);
+        }
+        arguments.extend(["--format", "json"]);
+        let argv = wrkslots_argv(wrkslots, project, &arguments);
+        let outcome = host.run(&argv, Some(project), Duration::from_secs(120));
+        let reported: Vec<Value> = serde_json::from_str::<Value>(&outcome.stdout)
+            .ok()
+            .and_then(|document| document["eden_daemons"].as_array().cloned())
+            .unwrap_or_default();
+        for entry in &slot_agents {
+            let slot = entry["slot"].as_str().unwrap_or_default();
+            match reported.iter().find(|row| row["slot"] == slot) {
+                Some(row) => {
+                    let mut row = row.clone();
+                    row["agents"] = entry["agents"].clone();
+                    row["project"] = json!(project);
+                    rows.push(row);
+                }
+                None => rows.push(json!({
+                    "slot": slot,
+                    "agents": entry["agents"],
+                    "project": project,
+                    "status": "refused",
+                    "reason": format!(
+                        "wrkslots eden restart-slot-daemons did not report slot {slot}: {}",
+                        match outcome.status {
+                            Some(status) => format!(
+                                "exit {status}: {}",
+                                first_error_lines(&outcome.stderr)
+                            ),
+                            None => format!(
+                                "it did not finish: {}",
+                                first_error_lines(&outcome.stderr)
+                            ),
+                        }
+                    ),
+                })),
+            }
+        }
+    }
+    rows
+}
+
 /// Each image-backed slot `wrkslots image status` listed, with its mounted location
 /// and phase, for the pre-revive bind check (#1130 D3).
 fn image_slot_entries(stdout: &str) -> Vec<Value> {
@@ -3272,6 +3376,18 @@ pub fn restore<A: ManagedApi + ?Sized>(
     // After a restart, every running agent boxed to a slot is dead: hold its slot so no
     // cleanup can retire it before the agent is revived and owns it again.
     let boxed = slot_agents(registry, &names, config);
+    // #1977: restart this registry's own slots' Eden daemons after the
+    // image remount and before the holds, limited to those slots. A
+    // refused daemon is a report row, never a failed restore.
+    report["eden_daemons"] = if options.dry_run {
+        json!([])
+    } else {
+        json!(restart_eden_daemons(
+            host,
+            options.wrkslots.as_deref(),
+            &boxed
+        ))
+    };
     report["slot_holds"] = match options.wrkslots.as_deref() {
         Some(wrkslots) if report["restart_detected"] == true && !options.dry_run => json!(boxed
             .iter()

@@ -2270,6 +2270,166 @@ fn restore_promotes_and_transfers_a_slot_lane_whose_bind_is_present() {
 }
 
 #[test]
+fn restore_restarts_eden_daemons_for_its_own_slots_only() {
+    // #1977: after the image remount and before any slot hold/transfer,
+    // restore runs the wrkslots Eden verb limited to the slots bound in
+    // this registry, and records the verb's per-slot rows.
+    let fixture = Fixture::new();
+    dead_named(&fixture, "lead");
+    promotable_slotted(&fixture, "slotted", "slotted-slot");
+    let host = ScriptedHost::new();
+    let root = fixture.root.display().to_string();
+    host.answer(
+        "image status",
+        0,
+        &format!("work/slotted-slot at {root} (ready)\n"),
+        "",
+    );
+    host.answer("findmnt", 0, &format!("{root} /dev/loop0\n"), "");
+    host.answer(
+        "restart-slot-daemons",
+        0,
+        &json!({"eden_daemons": [{
+            "slot": "slotted-slot", "checkout": "main",
+            "mount": "/mounts/slotted-slot", "config_dir": "/slots/slotted-slot/.eden-state",
+            "status": "restarted",
+        }], "refused": 0})
+        .to_string(),
+        "",
+    );
+    script_slot_transfer(&host, "slotted-slot", "slotted");
+    let registry = fixture.root.join("registry");
+    let report = restore(
+        &fixture.client,
+        &registry,
+        &host,
+        &config(&fixture, Some("lead")),
+        &options(Some("/opt/wrkslots")),
+    )
+    .unwrap();
+    assert_eq!(
+        report["eden_daemons"][0]["slot"], "slotted-slot",
+        "{report}"
+    );
+    assert_eq!(report["eden_daemons"][0]["status"], "restarted", "{report}");
+    assert_eq!(
+        report["eden_daemons"][0]["agents"],
+        json!(["slotted"]),
+        "{report}"
+    );
+    assert_eq!(
+        report["eden_daemons"].as_array().unwrap().len(),
+        1,
+        "{report}"
+    );
+    let commands = host.commands();
+    let eden_calls: Vec<&String> = commands
+        .iter()
+        .filter(|command| command.contains("restart-slot-daemons"))
+        .collect();
+    assert_eq!(
+        eden_calls,
+        [&format!(
+            "/opt/wrkslots --project-root {root} eden restart-slot-daemons --slot slotted-slot --format json"
+        )],
+        "{commands:?}"
+    );
+    let image = commands
+        .iter()
+        .position(|c| c.contains("image status"))
+        .unwrap();
+    let eden = commands
+        .iter()
+        .position(|c| c.contains("restart-slot-daemons"))
+        .unwrap();
+    let transfer = commands
+        .iter()
+        .position(|c| c.contains("transfer-owner"))
+        .unwrap();
+    assert!(image < eden && eden < transfer, "{commands:?}");
+    assert_eq!(
+        agent_row(&report, "slotted")["action"],
+        "promoted",
+        "{report}"
+    );
+}
+
+#[test]
+fn restore_completes_when_the_eden_restart_verb_fails_or_is_absent() {
+    // #1977: a failing verb, and no wrkslots at all, both degrade to a
+    // refused eden_daemons row; the lane still comes back.
+    let fixture = Fixture::new();
+    promotable_slotted(&fixture, "slotted", "slotted-slot");
+    let host = ScriptedHost::new();
+    let root = fixture.root.display().to_string();
+    host.answer(
+        "image status",
+        0,
+        &format!("work/slotted-slot at {root} (ready)\n"),
+        "",
+    );
+    host.answer("findmnt", 0, &format!("{root} /dev/loop0\n"), "");
+    host.answer("restart-slot-daemons", 3, "", "eden exploded\n");
+    script_slot_transfer(&host, "slotted-slot", "slotted");
+    let registry = fixture.root.join("registry");
+    let report = restore(
+        &fixture.client,
+        &registry,
+        &host,
+        &config(&fixture, None),
+        &options(Some("/opt/wrkslots")),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_row(&report, "slotted")["action"],
+        "promoted",
+        "{report}"
+    );
+    assert_eq!(report["eden_daemons"][0]["status"], "refused", "{report}");
+    assert!(
+        report["eden_daemons"][0]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("eden exploded"),
+        "{report}"
+    );
+
+    let fixture = Fixture::new();
+    promotable_slotted(&fixture, "slotted", "slotted-slot");
+    let host = ScriptedHost::new();
+    let registry = fixture.root.join("registry");
+    let report = restore(
+        &fixture.client,
+        &registry,
+        &host,
+        &config(&fixture, None),
+        &options(None),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_row(&report, "slotted")["action"],
+        "promoted",
+        "{report}"
+    );
+    assert_eq!(report["eden_daemons"][0]["status"], "refused", "{report}");
+    assert!(
+        report["eden_daemons"][0]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no wrkslots configured"),
+        "{report}"
+    );
+    assert!(
+        !host
+            .commands()
+            .iter()
+            .any(|command| command.contains("restart-slot-daemons")),
+        "{:?}",
+        host.commands()
+    );
+}
+
+#[test]
 fn restore_transfers_a_slotted_coordinators_slot() {
     // #1130: the coordinator's own slot moves to its revived harness too.
     let fixture = Fixture::new();
@@ -2673,8 +2833,13 @@ fn after_a_restart_restore_holds_the_slot_of_each_running_boxed_agent() {
     assert_eq!(report["slot_holds"][0]["slot"], "lane-slot", "{report}");
     assert_eq!(report["slot_holds"][0]["action"], "failed");
     let root = fixture.root.display().to_string();
+    // #1977: the Eden daemon restart for this slot runs before its hold.
     assert_eq!(
         host.commands()[1],
+        format!("/opt/wrkslots --project-root {root} eden restart-slot-daemons --slot lane-slot --format json")
+    );
+    assert_eq!(
+        host.commands()[2],
         format!("/opt/wrkslots --project-root {root} hold lane-slot --reason reboot: agent lane waits for agentctl restore")
     );
 }
