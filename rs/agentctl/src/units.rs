@@ -436,6 +436,22 @@ pub fn install_restore_teams(options: &InstallOptions, teams_config: &Path) -> R
     }))
 }
 
+/// The unit base name for one registry's tab-hygiene pair (#1971 cold
+/// review): named per registry, so two registries on one host never
+/// collide on one pair. The suffix is the first twelve hex digits of
+/// the registry path's SHA-256 — stable for a registry, distinct
+/// between registries whatever their directories are called.
+fn tab_hygiene_unit_base(registry: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(registry.display().to_string().as_bytes());
+    let suffix: String = digest
+        .iter()
+        .take(6)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("agentctl-tab-hygiene-{suffix}")
+}
+
 /// The tab-hygiene timer/service pair (#1971), rendered on the host named
 /// `host`, as `(relative path, contents)` for the service, then the timer.
 /// The service runs `agentctl tabs --apply` for this registry; the timer
@@ -448,20 +464,22 @@ pub fn rendered_tab_hygiene(
     let agentctl = unit_path("agentctl", &options.agentctl)?;
     let herdr = unit_path("herdr", &options.herdr)?;
     let registry = unit_path("registry", &options.registry)?;
+    let base = tab_hygiene_unit_base(&options.registry);
     let render = |template: &str| {
         template
             .replace("@AGENTCTL@", &agentctl)
             .replace("@HERDR@", &herdr)
             .replace("@REGISTRY@", &registry)
             .replace("@HOST@", &host)
+            .replace("@UNIT@", &base)
     };
     Ok(vec![
         (
-            PathBuf::from("agentctl-tab-hygiene.service"),
+            PathBuf::from(format!("{base}.service")),
             render(TAB_HYGIENE_SERVICE),
         ),
         (
-            PathBuf::from("agentctl-tab-hygiene.timer"),
+            PathBuf::from(format!("{base}.timer")),
             render(TAB_HYGIENE_TIMER),
         ),
     ])
@@ -475,6 +493,7 @@ pub fn install_tab_hygiene(options: &InstallOptions) -> Result<Value> {
     let host = crate::subagents::local_hostname()
         .ok_or_else(|| fail("cannot determine this host's name for the units' ConditionHost"))?;
     let files = rendered_tab_hygiene(options, &host)?;
+    let timer = files[1].0.display().to_string();
     let (written, unchanged) = write_files(options, &files)?;
     Ok(json!({
         "dry_run": options.dry_run,
@@ -483,7 +502,7 @@ pub fn install_tab_hygiene(options: &InstallOptions) -> Result<Value> {
         "next_steps": [
             "review the files",
             "systemctl --user daemon-reload",
-            "systemctl --user enable --now agentctl-tab-hygiene.timer",
+            format!("systemctl --user enable --now {timer}"),
         ],
     }))
 }
@@ -609,13 +628,21 @@ mod tests {
             .iter()
             .map(|(name, _)| name.display().to_string())
             .collect();
-        assert_eq!(
-            names,
-            vec![
-                "agentctl-tab-hygiene.service".to_owned(),
-                "agentctl-tab-hygiene.timer".to_owned()
-            ]
+        // Per-registry names (#1971 cold review): the pair for this
+        // registry, and a different pair for another registry.
+        assert_eq!(names.len(), 2);
+        assert!(
+            names[0].starts_with("agentctl-tab-hygiene-") && names[0].ends_with(".service"),
+            "{names:?}"
         );
+        assert!(
+            names[1].starts_with("agentctl-tab-hygiene-") && names[1].ends_with(".timer"),
+            "{names:?}"
+        );
+        let mut other = options(&dest);
+        other.registry = PathBuf::from("/home/owner/other/.agentctl");
+        let other_files = rendered_tab_hygiene(&other, "host-one.example").unwrap();
+        assert_ne!(other_files[0].0, files[0].0);
         let service = &files[0].1;
         assert!(
             service.contains(
@@ -627,19 +654,17 @@ mod tests {
             service.contains("ConditionHost=host-one.example\n"),
             "{service}"
         );
+        assert!(service.contains("TimeoutStartSec=5min\n"), "{service}");
         let timer = &files[1].1;
         assert!(timer.contains("OnBootSec=2min\n"), "{timer}");
         assert!(timer.contains("OnUnitActiveSec=5min\n"), "{timer}");
-        assert!(
-            timer.contains("Unit=agentctl-tab-hygiene.service\n"),
-            "{timer}"
-        );
-        assert!(timer.contains("Persistent=true\n"), "{timer}");
+        assert!(timer.contains(&format!("Unit={}\n", names[0])), "{timer}");
+        assert!(!timer.contains("Persistent"), "{timer}");
         assert!(!service.contains('@') && !timer.contains('@'));
         assert!(rendered_tab_hygiene(&options(&dest), "bad host").is_err());
         let report = install_tab_hygiene(&options(&dest)).unwrap();
         assert_eq!(report["written"].as_array().unwrap().len(), 2);
-        assert!(dest.join("agentctl-tab-hygiene.timer").exists());
+        assert!(dest.join(&names[1]).exists());
         assert!(!dest.join("agent-watch.service").exists());
         let _ = fs::remove_dir_all(&dest);
     }

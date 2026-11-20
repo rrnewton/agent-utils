@@ -8,4 +8,5 @@ ConditionHost=@HOST@
 
 [Service]
 Type=oneshot
+TimeoutStartSec=5min
 ExecStart=@AGENTCTL@ --registry @REGISTRY@ --herdr-bin @HERDR@ tabs --apply

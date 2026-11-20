@@ -1761,13 +1761,14 @@ kernel proves is an idle shell with an empty composer, past
 `bare_shell_grace_seconds` in the clocks recorded in
 `REGISTRY/tab-hygiene.json` (schema `agentctl-tab-hygiene/v1`; a watch
 daemon keeps the same clocks in its own health file). A claimed pane is
-never closed. `restore` runs one such pass at its end. To schedule it
+never closed. `restore` runs one such pass at its end, on by default
+(turn it off with `tab_hygiene: false` under `duties`). To schedule it
 for a registry, opt in per team:
 
 ```
 agentctl --registry ~/project/.agentctl install-units --dest ~/.config/systemd/user --tab-hygiene
 systemctl --user daemon-reload
-systemctl --user enable --now agentctl-tab-hygiene.timer
+systemctl --user enable --now 'agentctl-tab-hygiene-*.timer'   # the pair is named per registry; install-units prints its exact name
 agentctl --registry ~/project/.agentctl tabs --dry-run   # preview first
 ```
 

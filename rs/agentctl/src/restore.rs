@@ -3977,7 +3977,10 @@ pub fn restore<A: ManagedApi + ?Sized>(
     } else if !config.duties.tab_hygiene {
         json!({"action": "skipped", "reason": "tab_hygiene duty off"})
     } else {
-        match tabs_apply(client, registry, config, host) {
+        // Guarded socket (#1971 nit): only the Herdr serving this
+        // restore's binary may have its tabs moved.
+        let socket = crate::tab_order::socket_for(&options.herdr_bin);
+        match tabs_apply(client, registry, config, host, socket.as_deref()) {
             Ok(applied) => applied,
             Err(error) => json!({"applied": false, "detail": error.to_string()}),
         }
@@ -5143,56 +5146,72 @@ fn profile_roles(registry: &Path) -> BTreeMap<String, String> {
 const CENSUS_BUDGET: Duration = Duration::from_secs(60);
 
 /// Build the pane facts of one census; the second return is true when
-/// the census budget cut the expensive probes short.
+/// the census budget cut the expensive probes short. A pane counts as
+/// claimed only on a verified claim ([`crate::tabs::claim_verified`],
+/// workspace or terminal) or when its tab is a record's viewer tab.
 fn census_pane_facts<A: ManagedApi + ?Sized>(
     client: &A,
     panes: &[crate::client::Pane],
     labels_by_tab: &BTreeMap<String, String>,
-    claimed_panes: &std::collections::BTreeSet<String>,
+    agents: &[crate::tabs::AgentFacts],
     viewer_tabs: &std::collections::BTreeSet<String>,
 ) -> (Vec<crate::tabs::PaneFacts>, bool) {
     let started = Instant::now();
+    let mut facts: Vec<crate::tabs::PaneFacts> = Vec::with_capacity(panes.len());
+    let mut probe_order: Vec<usize> = Vec::new();
+    for pane in panes {
+        let info = client.pane_info(&pane.pane_id).ok();
+        let mut fact = crate::tabs::PaneFacts {
+            cwd: info
+                .as_ref()
+                .map(|info| info.cwd.clone())
+                .unwrap_or_default(),
+            pane_id: pane.pane_id.clone(),
+            tab_id: pane.tab_id.clone(),
+            workspace_id: pane.workspace_id.clone(),
+            label: labels_by_tab.get(&pane.tab_id).cloned(),
+            idle_shell: false,
+            // An unreadable or unprobed screen counts as holding text
+            // (fail-closed); a claimed pane's composer is never read.
+            composer_text: false,
+            foreground: info
+                .as_ref()
+                .map(|info| info.agent.clone().unwrap_or_else(|| info.status.clone()))
+                .unwrap_or_else(|| "unknown".to_owned()),
+            terminal_id: info.and_then(|info| info.terminal_id),
+        };
+        let claimed = agents
+            .iter()
+            .any(|agent| crate::tabs::claim_verified(&fact, agent))
+            || viewer_tabs.contains(&fact.tab_id);
+        fact.composer_text = !claimed;
+        if !claimed {
+            probe_order.push(facts.len());
+        }
+        facts.push(fact);
+    }
+    // Rotate the probe start (#1971 nit): when the budget cuts a census
+    // short, the unprobed tail is a different tail each pass instead of
+    // the same panes starving forever.
+    if !probe_order.is_empty() {
+        let rotation = (unix_now() as usize) % probe_order.len();
+        probe_order.rotate_left(rotation);
+    }
     let mut truncated = false;
-    let facts = panes
-        .iter()
-        .map(|pane| {
-            let claimed =
-                claimed_panes.contains(&pane.pane_id) || viewer_tabs.contains(&pane.tab_id);
-            if !claimed && !truncated && started.elapsed() > CENSUS_BUDGET {
-                truncated = true;
-            }
-            let probe = !claimed && !truncated;
-            let info = client.pane_info(&pane.pane_id).ok();
-            crate::tabs::PaneFacts {
-                cwd: info
-                    .as_ref()
-                    .map(|info| info.cwd.clone())
-                    .unwrap_or_default(),
-                pane_id: pane.pane_id.clone(),
-                tab_id: pane.tab_id.clone(),
-                workspace_id: pane.workspace_id.clone(),
-                label: labels_by_tab.get(&pane.tab_id).cloned(),
-                idle_shell: probe && client.pane_is_idle_shell(&pane.pane_id).unwrap_or(false),
-                // Read like the watch pass does; an unreadable or
-                // unprobed screen still counts as holding text
-                // (fail-closed).
-                composer_text: if probe {
-                    match client.read_screen_with_runtime(
-                        &pane.pane_id,
-                        &crate::agent::SystemRuntime::default(),
-                    ) {
-                        Ok(screen) => crate::tabs::composer_holds_text(&screen),
-                        Err(_) => true,
-                    }
-                } else {
-                    !claimed
-                },
-                foreground: info
-                    .map(|info| info.agent.unwrap_or(info.status))
-                    .unwrap_or_else(|| "unknown".to_owned()),
-            }
-        })
-        .collect();
+    for index in probe_order {
+        if started.elapsed() > CENSUS_BUDGET {
+            truncated = true;
+            break;
+        }
+        let pane_id = facts[index].pane_id.clone();
+        facts[index].idle_shell = client.pane_is_idle_shell(&pane_id).unwrap_or(false);
+        facts[index].composer_text = match client
+            .read_screen_with_runtime(&pane_id, &crate::agent::SystemRuntime::default())
+        {
+            Ok(screen) => crate::tabs::composer_holds_text(&screen),
+            Err(_) => true,
+        };
+    }
     (facts, truncated)
 }
 
@@ -5205,6 +5224,7 @@ pub fn tabs_listing<A: ManagedApi + ?Sized>(
     client: &A,
     registry: &Path,
     config: &RestoreConfig,
+    socket: Option<&Path>,
 ) -> Result<Value> {
     let manager = crate::subagents::ManagedAgents::new(client, registry)
         .map_err(|error| fail(error.to_string()))?;
@@ -5232,25 +5252,22 @@ pub fn tabs_listing<A: ManagedApi + ?Sized>(
                 headless: status["mode"].as_str() == Some("headless"),
                 viewer_is_tail: status["viewer_kind"].as_str() == Some("tail"),
                 live_proven: false,
+                workspace_id: status["workspace_id"].as_str().map(str::to_owned),
+                terminal_id: status["terminal_id"].as_str().map(str::to_owned),
             })
         })
-        .collect();
-    let claimed_set: std::collections::BTreeSet<String> = agent_facts
-        .iter()
-        .filter_map(|agent| agent.pane_id.clone())
         .collect();
     let viewer_set: std::collections::BTreeSet<String> = agent_facts
         .iter()
         .filter_map(|agent| agent.viewer_tab_id.clone())
         .collect();
     let (pane_facts, census_truncated) =
-        census_pane_facts(client, &panes, &labels_by_tab, &claimed_set, &viewer_set);
+        census_pane_facts(client, &panes, &labels_by_tab, &agent_facts, &viewer_set);
     let order_tabs: Vec<(String, String)> = workspaces
         .iter()
         .filter_map(|workspace| {
-            crate::tab_order::socket_path()
-                .filter(|path| path.exists())
-                .and_then(|socket| crate::tab_order::list_tabs(&socket, workspace).ok())
+            socket
+                .and_then(|socket| crate::tab_order::list_tabs(socket, workspace).ok())
                 .map(|tabs| {
                     tabs.into_iter()
                         .map(|tab| (workspace.to_string(), tab))
@@ -5266,13 +5283,9 @@ pub fn tabs_listing<A: ManagedApi + ?Sized>(
     // empty clock and a hard-coded composer made `--dry-run` unable to name
     // any close at all.
     let grace = config.bare_shell_grace_seconds as f64;
-    let claimed: std::collections::BTreeSet<&str> = agent_facts
-        .iter()
-        .filter_map(|agent| agent.pane_id.as_deref())
-        .collect();
     let assumed_since: BTreeMap<String, f64> = pane_facts
         .iter()
-        .filter(|pane| pane.idle_shell && !claimed.contains(pane.pane_id.as_str()))
+        .filter(|pane| pane.idle_shell && crate::tabs::claim_of(pane, &agent_facts).is_none())
         .map(|pane| (pane.pane_id.clone(), 0.0))
         .collect();
     // Same assumption for orphan tabs (#1918): previewed as long-seen.
@@ -5335,21 +5348,69 @@ fn load_tab_hygiene_state(
     )
 }
 
+/// Longest a standalone grace clock may age before it is dropped
+/// (#1971 cold review): about two timer passes. Herdr restores tabs
+/// after a reboot as plain shells under the same pane ids, so a clock
+/// from before the boot — or simply long stale — must never make the
+/// first pass after it close those shells at once.
+const TAB_HYGIENE_CLOCK_MAX_AGE: f64 = 600.0;
+
 /// Run one hygiene pass with the standalone persisted grace clocks and
 /// save them back (#1971): what `agentctl tabs --apply` and the run at
 /// the end of `restore` both do, so a scheduled timer pass and a boot
-/// restore share one grace history instead of each restarting it.
+/// restore share one grace history instead of each restarting it. The
+/// whole pass runs under a registry flock
+/// (`.tab-hygiene.lock`), so a restore-end pass, a timer pass and any
+/// other standalone pass cannot interleave and overwrite each other's
+/// state; a pass that cannot take the lock is skipped, never queued.
+/// Grace clocks recorded under another boot id, or older than
+/// [`TAB_HYGIENE_CLOCK_MAX_AGE`], are dropped before the pass. Viewer
+/// creation is suppressed in these standalone passes until #1973
+/// mu-headlesstab settles viewer ownership; ordering and closes are
+/// unaffected.
 ///
 /// # Errors
 ///
-/// The updated state cannot be written.
+/// The lock or the updated state cannot be written.
 pub fn tabs_apply<A: ManagedApi + ?Sized>(
     client: &A,
     registry: &Path,
     config: &RestoreConfig,
     host: &dyn Host,
+    socket: Option<&Path>,
 ) -> Result<Value> {
+    let lock_path = registry.join(".tab-hygiene.lock");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&lock_path)
+        .map_err(|error| fail(format!("cannot open the tab-hygiene lock: {error}")))?;
+    if lock.try_lock_exclusive().is_err() {
+        return Ok(json!({
+            "applied": false,
+            "skipped": "another tab-hygiene pass holds the lock",
+            "state": registry.join(TAB_HYGIENE_STATE_FILE),
+        }));
+    }
     let (mut bare_since, mut tab_since, mut closed) = load_tab_hygiene_state(registry);
+    // Drop stale clocks (#1971 cold review): another boot, or a
+    // checked_at more than about two passes ago.
+    let previous = read_report(&registry.join(TAB_HYGIENE_STATE_FILE));
+    let boot_id = host.boot_id().ok();
+    let clocks_fresh = previous.as_ref().is_some_and(|state| {
+        state["boot_id"].as_str() == boot_id.as_deref()
+            && state["checked_at"]
+                .as_f64()
+                .is_some_and(|at| host.now() - at <= TAB_HYGIENE_CLOCK_MAX_AGE && at <= host.now())
+    });
+    let clocks_reset = !clocks_fresh && (!bare_since.is_empty() || !tab_since.is_empty());
+    if !clocks_fresh {
+        bare_since.clear();
+        tab_since.clear();
+    }
     let findings = hygiene_pass(
         client,
         registry,
@@ -5358,10 +5419,13 @@ pub fn tabs_apply<A: ManagedApi + ?Sized>(
         &mut bare_since,
         &mut tab_since,
         &mut closed,
+        socket,
+        true,
     );
     let state = json!({
         "schema": "agentctl-tab-hygiene/v1",
         "checked_at": host.now(),
+        "boot_id": boot_id,
         "bare_shell_since": bare_since,
         "orphan_tab_since": tab_since,
         "closed_bare_shells": closed,
@@ -5369,6 +5433,7 @@ pub fn tabs_apply<A: ManagedApi + ?Sized>(
     write_report(&registry.join(TAB_HYGIENE_STATE_FILE), &state)?;
     Ok(json!({
         "applied": true,
+        "clocks_reset": clocks_reset,
         "findings": findings,
         "closed_bare_shells": state["closed_bare_shells"],
         "state": registry.join(TAB_HYGIENE_STATE_FILE),
@@ -5393,6 +5458,7 @@ fn orphan_still_empty(panes_now: &[crate::client::Pane], tab_id: &str) -> bool {
     !panes_now.iter().any(|pane| pane.tab_id == tab_id)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn hygiene_pass<A: ManagedApi + ?Sized>(
     client: &A,
     registry: &Path,
@@ -5401,6 +5467,8 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
     bare_since: &mut BTreeMap<String, f64>,
     tab_since: &mut BTreeMap<String, f64>,
     closed: &mut Vec<Value>,
+    socket: Option<&Path>,
+    suppress_viewers: bool,
 ) -> Vec<Value> {
     let findings = Vec::new();
     let manager = match crate::subagents::ManagedAgents::new(client, registry) {
@@ -5466,9 +5534,8 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
         workspaces
             .iter()
             .filter_map(|workspace| {
-                crate::tab_order::socket_path()
-                    .filter(|path| path.exists())
-                    .and_then(|socket| crate::tab_order::list_tabs(&socket, workspace).ok())
+                socket
+                    .and_then(|socket| crate::tab_order::list_tabs(socket, workspace).ok())
                     .map(|tabs| {
                         tabs.into_iter()
                             .map(|tab| (workspace.to_string(), tab))
@@ -5506,13 +5573,27 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
                 viewer_is_tail: status["viewer_kind"].as_str() == Some("tail"),
                 cwd: status["cwd"].as_str().unwrap_or_default().to_owned(),
                 live_proven: false,
+                workspace_id: status["workspace_id"].as_str().map(str::to_owned),
+                terminal_id: status["terminal_id"].as_str().map(str::to_owned),
             })
         })
         .collect();
-    let claimed_set: std::collections::BTreeSet<String> = claimed.keys().cloned().collect();
     let viewer_set: std::collections::BTreeSet<String> = viewer_tabs.keys().cloned().collect();
-    let (pane_facts, census_truncated) =
-        census_pane_facts(client, &panes, &labels_by_tab, &claimed_set, &viewer_set);
+    let (pane_facts, census_truncated) = census_pane_facts(
+        client,
+        &panes,
+        &labels_by_tab,
+        &agent_facts_early,
+        &viewer_set,
+    );
+    // Ordering claims count only verified claims (#1971 cold review):
+    // a stale record naming another team's pane must not rename or
+    // reorder that team's tabs.
+    claimed.retain(|pane_id, _| {
+        pane_facts.iter().any(|fact| {
+            &fact.pane_id == pane_id && crate::tabs::claim_of(fact, &agent_facts_early).is_some()
+        })
+    });
     let mut findings = findings;
     if census_truncated {
         findings.push(finding(
@@ -5524,11 +5605,12 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
         ));
     }
     let managed_workspaces =
-        crate::tabs::managed_workspaces(&pane_facts, &claimed_set, &viewer_set, &agent_facts_early);
-    // Canonical tab order, through the Herdr socket when reachable.
-    if let Some(socket) = crate::tab_order::socket_path().filter(|path| path.exists()) {
+        crate::tabs::managed_workspaces(&pane_facts, &viewer_set, &agent_facts_early);
+    // Canonical tab order, through the guarded Herdr socket when the
+    // caller's Herdr binary is the one serving it (#1971 nit).
+    if let Some(socket) = socket {
         for workspace in &managed_workspaces {
-            let Ok(order) = crate::tab_order::list_tabs(&socket, workspace) else {
+            let Ok(order) = crate::tab_order::list_tabs(socket, workspace) else {
                 continue;
             };
             let labels = client.tab_labels(workspace).unwrap_or_default();
@@ -5608,6 +5690,8 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
                 headless: status["mode"].as_str() == Some("headless"),
                 viewer_is_tail: status["viewer_kind"].as_str() == Some("tail"),
                 live_proven,
+                workspace_id: status["workspace_id"].as_str().map(str::to_owned),
+                terminal_id: status["terminal_id"].as_str().map(str::to_owned),
             })
         })
         .collect();
@@ -5689,6 +5773,9 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
                 // census vetoes the close. A failed re-list also vetoes
                 // (fail-closed). Stale-viewer closes keep their own path:
                 // their tab holds a live pane by design.
+                if suppress_viewers && why.starts_with("stale tail viewer") {
+                    continue;
+                }
                 if !config.close_bare_shells {
                     continue;
                 }
@@ -5715,11 +5802,18 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
                 agent,
                 workspace_id,
             } => {
-                let _ = manager.ensure_headless_viewer_with_close(
-                    &agent,
-                    &workspace_id,
-                    config.close_bare_shells,
-                );
+                // Suppressed in standalone passes (#1971 cold review)
+                // until #1973 mu-headlesstab settles viewer ownership;
+                // that fix has landed as ensure_headless_viewer_with_close,
+                // so the watch path uses it and standalone passes keep
+                // suppressing creation until coordb lifts the hold.
+                if !suppress_viewers {
+                    let _ = manager.ensure_headless_viewer_with_close(
+                        &agent,
+                        &workspace_id,
+                        config.close_bare_shells,
+                    );
+                }
             }
         }
     }
@@ -5733,6 +5827,7 @@ pub fn watch<A: ManagedApi + ?Sized>(
     host: &dyn Host,
     config: &RestoreConfig,
     options: &WatchOptions,
+    socket: Option<&Path>,
 ) -> Result<Value> {
     // Heartbeat from daemon start (#1914), before any state is read, so a block
     // in startup or in the first pass still shows an advancing heartbeat.
@@ -5803,6 +5898,8 @@ pub fn watch<A: ManagedApi + ?Sized>(
                 &mut bare_since,
                 &mut tab_since,
                 &mut closed_bare_shells,
+                socket,
+                false,
             ));
         }
         ensure_skipped(&mut findings, &config.duties);
@@ -6116,15 +6213,25 @@ mod tests {
             pane("w1:p2", "w1:t2"), // in a record's viewer tab
             pane("w1:p3", "w1:t3"), // unclaimed: probed
         ]);
-        let claimed: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::from(["w1:p1".to_owned()]);
+        let agents = vec![crate::tabs::AgentFacts {
+            name: "agent-a".to_owned(),
+            pane_id: Some("w1:p1".to_owned()),
+            viewer_tab_id: Some("w1:t2".to_owned()),
+            lifecycle: "running".to_owned(),
+            headless: false,
+            viewer_is_tail: false,
+            cwd: "/work/slot".to_owned(),
+            live_proven: false,
+            workspace_id: Some("w1".to_owned()),
+            terminal_id: None,
+        }];
         let viewers: std::collections::BTreeSet<String> =
             std::collections::BTreeSet::from(["w1:t2".to_owned()]);
         let (facts, truncated) = census_pane_facts(
             &fake,
             &fake.panes.clone(),
             &BTreeMap::new(),
-            &claimed,
+            &agents,
             &viewers,
         );
         assert!(!truncated);
@@ -6169,7 +6276,7 @@ mod tests {
         fs::create_dir_all(&registry).unwrap();
         let fake = CensusFake::new(Vec::new());
         let config = RestoreConfig::load(&registry).unwrap();
-        let applied = tabs_apply(&fake, &registry, &config, &SystemHost).unwrap();
+        let applied = tabs_apply(&fake, &registry, &config, &SystemHost, None).unwrap();
         assert_eq!(applied["applied"], true);
         let state = read_report(&registry.join(TAB_HYGIENE_STATE_FILE)).unwrap();
         assert_eq!(state["schema"], "agentctl-tab-hygiene/v1");
@@ -6179,6 +6286,28 @@ mod tests {
         write_report(&registry.join(TAB_HYGIENE_STATE_FILE), &state).unwrap();
         let (bare, _tabs, _closed) = load_tab_hygiene_state(&registry);
         assert_eq!(bare.get("w1:p9"), Some(&42.0));
+        // A clock from another boot is dropped before the next pass
+        // (#1971 cold review): Herdr restores the same pane ids after a
+        // reboot, so a pre-boot clock must not close them at once.
+        state["boot_id"] = json!("some-earlier-boot");
+        write_report(&registry.join(TAB_HYGIENE_STATE_FILE), &state).unwrap();
+        let applied = tabs_apply(&fake, &registry, &config, &SystemHost, None).unwrap();
+        assert_eq!(applied["clocks_reset"], true);
+        let state = read_report(&registry.join(TAB_HYGIENE_STATE_FILE)).unwrap();
+        assert_eq!(state["bare_shell_since"], json!({}));
+        assert!(state["boot_id"].is_string());
+        // A pass that cannot take the flock is skipped, never queued.
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(registry.join(".tab-hygiene.lock"))
+            .unwrap();
+        lock.lock_exclusive().unwrap();
+        let applied = tabs_apply(&fake, &registry, &config, &SystemHost, None).unwrap();
+        assert_eq!(applied["applied"], false);
+        drop(lock);
         fs::remove_dir_all(&directory).unwrap();
     }
 

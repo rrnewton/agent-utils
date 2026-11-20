@@ -1734,7 +1734,7 @@ fn watch_tells_a_live_coordinator_once_an_hour_about_what_it_could_not_repair() 
         queue_stale: Duration::from_secs(600),
     };
     let first =
-        crate::restore::watch(&fixture.client, &registry, &host, &config, &options).unwrap();
+        crate::restore::watch(&fixture.client, &registry, &host, &config, &options, None).unwrap();
     assert_eq!(first["ok"], false);
     assert_eq!(first["notice"]["sent"], true, "{first}");
     let sent = fixture.client.runs.lock().unwrap().clone();
@@ -1753,7 +1753,7 @@ fn watch_tells_a_live_coordinator_once_an_hour_about_what_it_could_not_repair() 
     assert!(progress["pass_started_at"].as_f64().unwrap_or(0.0) > 0.0);
     host.sleep(Duration::from_secs(600));
     let second =
-        crate::restore::watch(&fixture.client, &registry, &host, &config, &options).unwrap();
+        crate::restore::watch(&fixture.client, &registry, &host, &config, &options, None).unwrap();
     assert_eq!(second["notice"]["sent"], false);
     assert_eq!(
         fixture.client.runs.lock().unwrap().len(),
@@ -3547,6 +3547,7 @@ fn watch_never_repairs_or_alerts_on_a_unit_it_could_not_check() {
             state_dir: Some(fixture.root.join("watch")),
             queue_stale: Duration::from_secs(600),
         },
+        None,
     )
     .unwrap();
     let unit = health["findings"]
@@ -4345,6 +4346,7 @@ fn watch_notify_off_and_tab_hygiene_off_report_skipped_in_health() {
             state_dir: Some(fixture.root.join("watch")),
             queue_stale: Duration::from_secs(600),
         },
+        None,
     )
     .unwrap();
     assert_eq!(health["duties"]["notify"], false, "{health}");

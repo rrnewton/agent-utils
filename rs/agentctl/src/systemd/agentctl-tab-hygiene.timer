@@ -1,7 +1,6 @@
 # Installed by `agentctl install-units --tab-hygiene` (#1971 agentctl-tabs-scheduled-hygiene).
-# Runs agentctl-tab-hygiene.service shortly after boot and then every five
-# minutes. Persistent=true fires a run missed while the host was off, so a
-# reboot does not silently skip a period.
+# Runs the tab-hygiene service shortly after boot and then every five
+# minutes while the host stays up.
 [Unit]
 Description=agentctl tab hygiene timer
 ConditionHost=@HOST@
@@ -9,8 +8,7 @@ ConditionHost=@HOST@
 [Timer]
 OnBootSec=2min
 OnUnitActiveSec=5min
-Unit=agentctl-tab-hygiene.service
-Persistent=true
+Unit=@UNIT@.service
 
 [Install]
 WantedBy=timers.target

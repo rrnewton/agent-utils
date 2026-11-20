@@ -4635,6 +4635,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     state_dir: value.state_dir,
                     queue_stale: Duration::from_secs(u64::from(value.queue_stale_minutes) * 60),
                 },
+                crate::tab_order::socket_for(&args.herdr_bin).as_deref(),
             );
             stopped.store(true, std::sync::atomic::Ordering::SeqCst);
             crate::agent::log_stop_time("watch");
@@ -4652,17 +4653,31 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             let client = HerdrClient::with_executable("direct", &args.herdr_bin)
                 .map_err(AgentError::from)?;
             let config = crate::restore::RestoreConfig::load(&args.registry)?;
+            // Guarded socket (#1971 nit): only the Herdr serving the
+            // --herdr-bin binary may have its tabs listed or moved; a
+            // stand-in binary gets no socket at all.
+            let socket = crate::tab_order::socket_for(&args.herdr_bin);
             if value.apply {
+                if !config.duties.tab_hygiene {
+                    write_json(&json!({
+                        "applied": false,
+                        "skipped": "tab_hygiene duty off",
+                    }))
+                    .map_err(Failure::Output)?;
+                    return Ok(0);
+                }
                 let applied = crate::restore::tabs_apply(
                     &client,
                     &args.registry,
                     &config,
                     &crate::restore::SystemHost,
+                    socket.as_deref(),
                 )?;
                 write_json(&applied).map_err(Failure::Output)?;
                 return Ok(0);
             }
-            let mut listing = crate::restore::tabs_listing(&client, &args.registry, &config)?;
+            let mut listing =
+                crate::restore::tabs_listing(&client, &args.registry, &config, socket.as_deref())?;
             listing["dry_run"] = json!(value.dry_run);
             if !value.dry_run {
                 listing["would_do"] = json!([]);

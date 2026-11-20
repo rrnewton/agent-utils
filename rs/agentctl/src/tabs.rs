@@ -30,6 +30,8 @@ pub struct PaneFacts {
     pub foreground: String,
     /// The pane's working directory, when known.
     pub cwd: String,
+    /// Herdr terminal the pane holds, when reported (#1971 verified claims).
+    pub terminal_id: Option<String>,
 }
 
 /// Observed facts about one registered agent.
@@ -53,6 +55,31 @@ pub struct AgentFacts {
     pub cwd: String,
     /// The pinned process is proven live as the pane's foreground process.
     pub live_proven: bool,
+    /// Its recorded workspace, when it has one (#1971 verified claims).
+    pub workspace_id: Option<String>,
+    /// Its recorded Herdr terminal, when pinned (#1971 verified claims).
+    pub terminal_id: Option<String>,
+}
+
+/// Whether a record's claim on `pane` is verified as this registry's own
+/// (#1971 cold review): the record's pane id matches, and either its
+/// recorded workspace is the pane's workspace or its recorded terminal
+/// is the pane's terminal. An unverified claim — a stale record naming
+/// a pane another registry drives on the same Herdr server — makes
+/// neither the pane claimed nor its workspace managed, so hygiene never
+/// renames, reorders or closes on another team's behalf. (A live agent
+/// behind such a pane is still never closed: it is no idle shell.)
+#[must_use]
+pub fn claim_verified(pane: &PaneFacts, agent: &AgentFacts) -> bool {
+    agent.pane_id.as_deref() == Some(pane.pane_id.as_str())
+        && (agent.workspace_id.as_deref() == Some(pane.workspace_id.as_str())
+            || (agent.terminal_id.is_some() && agent.terminal_id == pane.terminal_id))
+}
+
+/// The verified claim on `pane`, when one record holds it.
+#[must_use]
+pub fn claim_of<'a>(pane: &PaneFacts, agents: &'a [AgentFacts]) -> Option<&'a AgentFacts> {
+    agents.iter().find(|agent| claim_verified(pane, agent))
 }
 
 /// One row of an `agentctl tabs` listing.
@@ -154,19 +181,19 @@ pub fn duplicate_of<'a>(pane: &PaneFacts, agents: &'a [AgentFacts]) -> Option<&'
         .find(|agent| agent.name == label && cwd_related(&pane.cwd, &agent.cwd))
 }
 
-/// Workspaces this registry manages: holding a claimed pane, a named viewer
-/// tab, or a corroborated duplicate pane (name + cwd, never label alone).
+/// Workspaces this registry manages: holding a verified claimed pane
+/// ([`claim_of`]), a named viewer tab, or a corroborated duplicate pane
+/// (name + cwd, never label alone).
 #[must_use]
 pub fn managed_workspaces(
     panes: &[PaneFacts],
-    claimed_panes: &BTreeSet<String>,
     viewer_tabs: &BTreeSet<String>,
     agents: &[AgentFacts],
 ) -> BTreeSet<String> {
     panes
         .iter()
         .filter(|pane| {
-            claimed_panes.contains(&pane.pane_id)
+            claim_of(pane, agents).is_some()
                 || viewer_tabs.contains(&pane.tab_id)
                 || duplicate_of(pane, agents).is_some()
         })
@@ -195,16 +222,11 @@ pub fn plan(
     grace_seconds: f64,
     viewer_workspace: Option<&str>,
 ) -> (Vec<TabRow>, Vec<TabAction>) {
-    let claimed_panes: BTreeSet<String> = agents.iter().filter_map(|a| a.pane_id.clone()).collect();
     let viewer_tabs: BTreeSet<String> = agents
         .iter()
         .filter_map(|a| a.viewer_tab_id.clone())
         .collect();
-    let managed = managed_workspaces(panes, &claimed_panes, &viewer_tabs, agents);
-    let by_pane: BTreeMap<&str, &AgentFacts> = agents
-        .iter()
-        .filter_map(|a| Some((a.pane_id.as_deref()?, a)))
-        .collect();
+    let managed = managed_workspaces(panes, &viewer_tabs, agents);
     let by_viewer: BTreeMap<&str, &AgentFacts> = agents
         .iter()
         .filter_map(|a| Some((a.viewer_tab_id.as_deref()?, a)))
@@ -214,9 +236,7 @@ pub fn plan(
     let mut rows = Vec::new();
     let mut actions = Vec::new();
     for pane in panes {
-        let owner = by_pane
-            .get(pane.pane_id.as_str())
-            .or_else(|| by_viewer.get(pane.tab_id.as_str()));
+        let owner = claim_of(pane, agents).or_else(|| by_viewer.get(pane.tab_id.as_str()).copied());
         let idle = bare_since.get(&pane.pane_id).map(|since| now - since);
         let mut verdict = "keep".to_owned();
         if !managed.contains(&pane.workspace_id) {
@@ -364,6 +384,7 @@ mod tests {
             composer_text: composer,
             foreground: if idle { "bash".into() } else { "muse".into() },
             cwd: "/work/slot".into(),
+            terminal_id: None,
         }
     }
     fn agent(name: &str, pane: Option<&str>) -> AgentFacts {
@@ -376,6 +397,8 @@ mod tests {
             viewer_is_tail: false,
             cwd: "/work/slot".into(),
             live_proven: pane.is_some(),
+            workspace_id: Some("w1".into()),
+            terminal_id: None,
         }
     }
     fn since(pane: &str, at: f64) -> BTreeMap<String, f64> {
@@ -492,6 +515,35 @@ mod tests {
             .iter()
             .find(|r| r.tab_id == "w9:t1")
             .is_some_and(|r| r.verdict.contains("unmanaged")));
+    }
+
+    #[test]
+    fn a_stale_claim_from_another_workspace_never_manages_or_owns_the_pane() {
+        // #1971 cold review: a record in w9 naming a live pane in w1 (a
+        // stale record on a shared Herdr server) neither owns that pane
+        // nor pulls w1 into this registry's managed set; a terminal
+        // match would verify the same claim.
+        let panes = vec![pane("w1:p1", "w1:t1", "w1", "scratch", true, false)];
+        let mut stale = agent("agent-a", Some("w1:p1"));
+        stale.workspace_id = Some("w9".into());
+        let order = vec![("w1".to_owned(), "w1:t1".to_owned())];
+        let (rows, actions) = plan(
+            &panes,
+            &order,
+            &[stale.clone()],
+            &since("w1:p1", 0.0),
+            &BTreeMap::new(),
+            10_000.0,
+            600.0,
+            None,
+        );
+        assert!(actions.is_empty(), "{actions:?}");
+        assert_eq!(rows[0].owner, None);
+        assert!(rows[0].verdict.contains("unmanaged"), "{}", rows[0].verdict);
+        stale.terminal_id = Some("term-1".into());
+        let mut verified_pane = panes[0].clone();
+        verified_pane.terminal_id = Some("term-1".into());
+        assert!(claim_verified(&verified_pane, &stale));
     }
 
     #[test]

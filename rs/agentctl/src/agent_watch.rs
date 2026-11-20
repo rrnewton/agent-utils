@@ -10170,6 +10170,7 @@ mod tests {
             composer_text: false,
             foreground: "muse".to_owned(),
             cwd: "/work/slot".to_owned(),
+            terminal_id: None,
         }];
         let mut bare = std::collections::BTreeMap::new();
         bare.insert("w1:p1".to_owned(), 0.0);
@@ -10182,6 +10183,8 @@ mod tests {
             viewer_is_tail: false,
             cwd: "/work/slot".to_owned(),
             live_proven: true,
+            workspace_id: Some("w1".to_owned()),
+            terminal_id: None,
         }];
         let order = vec![("w1".to_owned(), "w1:t1".to_owned())];
         let (_rows, actions) = plan(
