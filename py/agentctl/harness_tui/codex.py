@@ -50,19 +50,11 @@ def read_replace_goal_picker(screen: str) -> tuple[str, bool, int | None, str, s
     shown = rows[0].lstrip().removeprefix("New objective:").strip()
     for row in rows[1:]:
         shown += " " + row.strip()
-    # Cut only on a trailing ellipsis, or when the last objective row
-    # reaches the pane edge as the raw read proves it: reads padded
-    # to the pane width (trailing spaces) make the edge measurable.
-    # With no padding in the read, only an ellipsis proves a cut, so
-    # a complete objective that is the longest line never counts
-    # as cut (#1939 review).
-    objective_rows = set(range(start + 1 + objective_at,
-                               start + 1 + objective_at + len(rows)))
-    width = max((len(line) for i, line in enumerate(raw) if i not in objective_rows),
-                default=0)
-    padded = any(len(line) != len(line.rstrip()) for line in raw)
-    last_raw = raw[start + 1 + objective_at + len(rows) - 1] if rows else ""
-    cut = shown.endswith("…") or (padded and width > 0 and len(last_raw) >= width)
+    # Only an ellipsis proves a cut (#1939 third review): pane-edge
+    # inference from line widths misfires both ways (unpadded reads
+    # make a complete longest-line objective look cut; ANSI reads
+    # padded to full width make every objective look cut).
+    cut = shown.endswith("…")
     if shown.endswith("…"):
         shown = shown[:-1].rstrip()
     if not shown:

@@ -2260,6 +2260,7 @@ class _WorkspaceClient:
         return self.client.workspace_label(workspace_id)
 
     def prompt_agent(self, pane_id: str, command: str) -> SubmissionReceipt | None:
+        self.goal_objective = None
         # Never type a goal command over a picker already open
         # (#1939 D4): its Enter would answer the other goal's picker.
         # This edition never cancels a picker; it only ever confirms
@@ -2276,7 +2277,6 @@ class _WorkspaceClient:
                     "a Codex Replace-goal picker is already open; nothing was typed; "
                     "answer it with `agentctl answer` or in the pane, then resend the goal"
                 )
-        self.goal_objective = None
         if self.queue is not None:
             for identifier, objective in self.record.goal_messages.items():
                 path = Path(self.queue) / "inflight" / f"{identifier}.json"

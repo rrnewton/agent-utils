@@ -234,6 +234,41 @@ fn a_registered_goal_never_types_over_an_open_picker() {
 }
 
 #[test]
+fn the_registered_run_path_also_refuses_over_an_open_picker() {
+    // #1939 (a): the non-runtime registered path (`run`, as opposed
+    // to `run_with_runtime` above) refuses the same way, not staged.
+    let fixture = Fixture::new();
+    fixture.start(None);
+    *fixture.client.screen.lock().unwrap() = Some(codex_picker("a different task"));
+    let manager = fixture.manager();
+    let record = manager.load("worker").unwrap();
+    let pane = record.pane_id.clone().unwrap();
+    let client = WorkspaceClient {
+        client: &fixture.client,
+        record: &record,
+        goal_objective: Mutex::new(None),
+        custom_submission: Mutex::new(None),
+        queue: None,
+        registry: None,
+        check_prompt: false,
+        expected_workspace: None,
+        readback: None,
+    };
+    let error = <WorkspaceClient<'_, Fake> as AgentApi>::run(
+        &client,
+        &pane,
+        "/goal ship the release",
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("already open"),
+        "{error}"
+    );
+    assert!(fixture.client.runs.lock().unwrap().is_empty());
+    assert!(fixture.client.keys_sent.lock().unwrap().is_empty());
+}
+
+#[test]
 fn a_goal_command_with_no_answer_is_possibly_submitted_and_never_typed_again() {
     let fixture = Fixture::new();
     fixture.start(None);

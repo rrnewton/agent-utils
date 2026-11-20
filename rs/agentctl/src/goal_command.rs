@@ -358,31 +358,12 @@ impl CodexReplacement {
             new.push_str(row.trim());
         }
         objective_rows.last()?;
-        // Cut only on a trailing ellipsis, or when the last objective
-        // row reaches the pane edge as the raw read proves it: Herdr
-        // reads that pad rows to the pane width (trailing spaces)
-        // make the edge measurable, and only then does reaching the
-        // widest padded non-objective row count. With no padding in
-        // the read, only an ellipsis proves a cut — a complete
-        // objective that happens to be the longest line on screen is
-        // never misread as cut (#1939 review).
-        let objective_range =
-            (start + 1 + objective_at)..(start + 1 + objective_at + objective_rows.len());
-        let raw_width = screen
-            .lines()
-            .enumerate()
-            .filter(|(index, _)| !objective_range.contains(index))
-            .map(|(_, line)| line.chars().count())
-            .max()
-            .unwrap_or(0);
-        let padded = screen
-            .lines()
-            .any(|line| line.chars().count() != line.trim_end().chars().count());
-        let raw_last = screen
-            .lines()
-            .nth(start + 1 + objective_at + objective_rows.len() - 1)
-            .map_or(0, |line| line.chars().count());
-        let new_cut = new.ends_with('…') || (padded && raw_width > 0 && raw_last >= raw_width);
+        // Only an ellipsis proves a cut (#1939 third review): pane-edge
+        // inference from line widths misfires both ways — unpadded
+        // reads make a complete longest-line objective look cut, and
+        // ANSI reads padded to full width make every objective look
+        // cut. Neither may confirm a different, longer goal.
+        let new_cut = new.ends_with('…');
         if new.ends_with('…') {
             new = new.trim_end_matches('…').trim_end().to_owned();
         }
@@ -792,6 +773,38 @@ mod tests {
             codex_picker(objective, 1)
         );
         assert!(CodexReplacement::read(&quoted).is_none());
+    }
+
+    #[test]
+    fn a_padded_read_never_makes_an_objective_cut() {
+        // #1939 third review: rows padded to 80 columns (the ANSI
+        // read) must not make every objective read as cut, and one
+        // stray padded blank row must not either.
+        let pad = |screen: &str| -> String {
+            screen
+                .lines()
+                .map(|line| format!("{line:<80}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let padded = pad(&codex_picker("refactor the parser module", 1));
+        let question = CodexReplacement::read(&padded).expect("picker");
+        assert!(!question.new_cut, "{question:?}");
+        assert!(matches!(
+            question.choice("refactor the parser module and delete everything"),
+            ReplacementChoice::Cancel(_)
+        ));
+        assert_eq!(
+            question.choice("refactor the parser module"),
+            ReplacementChoice::Replace
+        );
+        let stray = format!(" \n{}", codex_picker("refactor the parser module", 1));
+        let question = CodexReplacement::read(&stray).expect("picker");
+        assert!(!question.new_cut, "{question:?}");
+        assert!(matches!(
+            question.choice("refactor the parser module and delete everything"),
+            ReplacementChoice::Cancel(_)
+        ));
     }
 
     #[test]

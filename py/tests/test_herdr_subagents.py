@@ -2407,6 +2407,19 @@ def test_replace_goal_picker_is_an_answerable_question() -> None:
     # A composer draft below the footer is a quote, never live.
     quoted_draft = full + "\n› fix a · b\n  GPT-6 · /work   Pursuing goal (3s)"
     assert read_replace_goal_picker(quoted_draft) is None
+    # #1939 third review: a padded read never makes an objective cut.
+    padded = "\n".join(line.ljust(80) for line in screen.replace(
+        "finish this task", "refactor the parser module").splitlines())
+    padded_picker = read_replace_goal_picker(padded)
+    assert padded_picker is not None and padded_picker[1] is False
+    assert _goal_replacement_selected(padded, "refactor the parser module")
+    assert not _goal_replacement_selected(
+        padded, "refactor the parser module and delete everything")
+    stray = " \n" + screen.replace("finish this task", "refactor the parser module")
+    stray_picker = read_replace_goal_picker(stray)
+    assert stray_picker is not None and stray_picker[1] is False
+    assert not _goal_replacement_selected(
+        stray, "refactor the parser module and delete everything")
     # #1939 D3: a short cut showing never matches a different goal.
     short = screen.replace("finish this task", "f…")
     assert not _goal_replacement_selected(short, "force-push main")

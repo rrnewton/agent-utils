@@ -3374,7 +3374,7 @@ class HerdrClient:
         source: str = "recent-unwrapped",
         lines: int | None = None,
     ) -> str:
-        """Read the pane's rendered text. ANSI is stripped (no ``--raw``), trailing spaces included.
+        """Read the pane's rendered text. ANSI is stripped (no ``--raw``); Herdr 0.9.5 text reads strip trailing spaces, so row widths here are content widths, never the pane width.
 
         Note this returns PLAIN TEXT, not JSON: ``herdr pane read`` writes the terminal contents to
         stdout directly, which is why it does not go through :meth:`_call`.
