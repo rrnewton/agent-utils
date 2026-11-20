@@ -748,7 +748,9 @@ fn tmux_unknown_harness_pins_actual_foreground_program() {
     );
     // The recorded launch names the actual program: a script TUI's
     // kernel image is its interpreter, so the script path is in argv.
-    let launch_argv = adopted["launch_spec"]["argv"]
+    // Status redacts values by default (#1937); ask for the full vector.
+    let shown = fixture.agentctl_json(&["status", "unknown-agent", "--show-argv"]);
+    let launch_argv = shown["launch_spec"]["argv"]
         .as_array()
         .map(|items| {
             items

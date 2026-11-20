@@ -1483,10 +1483,6 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
 
     /// The status row of a headless agent: the record, the wrapper's answer, the queue, and
     /// the last event.
-    pub(super) fn headless_status_record(&self, record: &AgentRecord) -> Result<Value> {
-        self.headless_status_record_showing(record, false)
-    }
-
     pub(super) fn headless_status_record_showing(
         &self,
         record: &AgentRecord,

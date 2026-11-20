@@ -12278,14 +12278,6 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         Ok(result)
     }
 
-    fn status_record_listed(
-        &self,
-        record: &AgentRecord,
-        fleet: &mut cloud::FleetCache,
-    ) -> Result<Value> {
-        self.status_record_listed_showing(record, fleet, false)
-    }
-
     fn status_record_listed_showing(
         &self,
         record: &AgentRecord,

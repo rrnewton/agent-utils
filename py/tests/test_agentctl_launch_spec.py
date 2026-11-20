@@ -119,8 +119,9 @@ def test_adopt_reads_the_pinned_command_line_and_its_conversation(
     # Human-facing output redacts values (#1937); the record keeps the vector.
     assert spec["argv"] == ["<set>", "<set>", "--no-alt-screen",
                             "--dangerously-bypass-approvals-and-sandbox"]
-    assert sessions.get("lead").launch_spec is not None
-    assert sessions.get("lead").launch_spec["argv"] == [
+    recorded = sessions.get("lead").launch_spec
+    assert recorded is not None
+    assert recorded["argv"] == [
         "resume", "argv-conversation", "--no-alt-screen",
         "--dangerously-bypass-approvals-and-sandbox"]
     assert spec["workspace_label"] == "subagents" and spec["environment_names"] == []

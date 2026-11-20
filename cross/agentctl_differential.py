@@ -45,17 +45,31 @@ _SHELL_IDENTITY_FIELDS = {
 }
 
 
+def _redacted(arguments: list[str]) -> list[str]:
+    """The human-facing form of one argument vector (#1937): flag names only."""
+    shown: list[str] = []
+    for token in arguments:
+        if token.startswith("-") and token != "-":
+            name, separator, _value = token.partition("=")
+            shown.append(f"{name}=<set>" if separator else name)
+        else:
+            shown.append("<set>")
+    return shown
+
+
 def _generated_conversations(value: object) -> set[str]:
     """Only UUIDs selected by the recorded Claude launch, never process boot IDs."""
     if isinstance(value, list):
         return set().union(*(_generated_conversations(item) for item in value))
     if isinstance(value, dict):
-        native, arguments = value.get("native_session"), value.get("arguments")
+        # Status redacts argv values (#1937), so the launch vector no longer
+        # corroborates the native session; the asserted native session itself
+        # is the recorded conversation.
+        native = value.get("native_session")
         if (isinstance(native, dict) and native.get("agent") == "claude"
-                and isinstance(arguments, list) and len(arguments) >= 2
-                and arguments[0] == "--session-id" and arguments[1] == native.get("value")
-                and isinstance(arguments[1], str)):
-            return {arguments[1]}
+                and native.get("source") == "asserted"
+                and isinstance(native.get("value"), str)):
+            return {native["value"]}
     return set()
 
 
@@ -520,6 +534,26 @@ def _launch_specs(harness: Harness, report: Report) -> None:
                        and isinstance(spec.get("native_session"), dict)
                        and spec["native_session"].get("source") == "asserted",
                        f"start did not record its exact launch: {status!r}")
+    secret_case = harness.case("primary-launch-spec-secret")
+    secret = "[REDACTED]"
+    secret_outcomes = _pair(harness, report, secret_case, "primary/launch-spec/secret/start", (
+        "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1", "--harness", "claude",
+        "--harness-arg=--api-key", f"--harness-arg={secret}", f"--harness-arg=--effort={secret}", *_COMMON,
+    ))
+    _pair(harness, report, secret_case, "primary/launch-spec/secret/status", ("status", "worker", *_COMMON))
+    _pair(harness, report, secret_case, "primary/launch-spec/secret/list", ("list", *_COMMON))
+    for edition, outcome in zip(("python", "rust"), secret_outcomes, strict=True):
+        shown = json.loads(outcome.stdout) if outcome.returncode == 0 else {}
+        spec = shown.get("launch_spec") if isinstance(shown, dict) else None
+        report.require(f"primary/launch-spec/secret/{edition}",
+                       outcome.returncode == 0 and secret not in outcome.stdout
+                       and isinstance(spec, dict)
+                       and spec.get("argv") == ["--session-id", "<set>", "--api-key", "<set>", "--effort=<set>"],
+                       f"a secret-looking launch value reached status output: {outcome.stdout!r}")
+        state = _state(secret_case.python_root if edition == "python" else secret_case.rust_root)
+        report.require(f"primary/launch-spec/secret/record/{edition}",
+                       secret in json.dumps(state.get("launch_arguments")),
+                       "the recorded launch lost its exact vector")
     _pair(harness, report, case, "primary/launch-spec/promote-running", ("promote", "worker", *_COMMON), 75)
     for root in (case.python_root, case.rust_root):
         path = root / "registry/agents/worker/agent.json"
@@ -1027,7 +1061,7 @@ def _profile_resume(harness: Harness, report: Report) -> None:
                            and value.get("model") == "selected-model"
                            and value.get("reasoning_effort") == "high"
                            and value.get("cwd") == "<ROOT>" and value.get("mode") == "interactive"
-                           and value.get("arguments") == expected_arguments[kind]
+                           and value.get("arguments") == _redacted(expected_arguments[kind])
                            and value.get("native_session") == native and value.get("resume") == conversation
                            and value.get("session_agent") == kind and value.get("session_value") == conversation
                            and value.get("environment_names") == ["PROFILE_SELECTOR"],
