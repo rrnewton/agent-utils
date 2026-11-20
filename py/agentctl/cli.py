@@ -536,7 +536,7 @@ def _goal_command(args: argparse.Namespace) -> list[str] | None:
 
 #: Commands only the Rust edition implements; this edition refuses them with exit status 2.
 _RUST_ONLY = ("restore", "restore-teams", "install-units", "watch", "watch-agents", "tabs", "hold", "coordinator", "manage", "set",
-              "purpose", "tree", "progress", "services", "set-model")
+              "purpose", "tree", "progress", "services", "set-model", "team")
 
 #: Commands that change agents' state, so idle layout-1 agents move to layout 2 first (not before a
 #: dry run). Everything else, reads and the chat services included, leaves the layout alone.

@@ -607,6 +607,11 @@ enum TeamCommand {
         after_help = "Examples:\n  agentctl --registry ~/project/.agentctl team verify\n  agentctl --registry ~/project/.agentctl team verify --check-only\n\nChecks, each reported by name with subject, evidence, and fix: desired-live (the restore desired set: coordinator plus the pinned agents list when restore.json has one, else every record running at shutdown; exclude always wins), units-bridges (systemctl --user is-active per restore.json unit, plus chat health per REGISTRY/bridges state directory, target agent included; a unit held by a turnover pin — REGISTRY/turnover.pin, REGISTRY/turnover-pins/<unit>.pin, or the services global.pin — reports held with its reason, never unhealthy), queued-not-archived (status queued_archived_undelivered plus this boot's restore-report queued counts; anything archived undelivered fails), watcher-dead-agents (watch health.json fresh, this boot, and ok), pane-at-prompt (an allowlisted dialog is dismissed and re-read, anything else blocking fails; --check-only reports instead; agentcloud and headless agents are skipped by record backend, viewer pane or not), coordinator-ack (this boot's restore notice processed in the coordinator's queue). A check that cannot apply is skipped and says why; missing evidence fails. An active driver alarm is reported under alarm."
     )]
     Verify(TeamVerify),
+    /// Print this registry's recovery facts as schema agentctl-team-manifest/v1: the desired set with an allowlist projection per agent (never record tokens or launch arguments), record_gaps naming every record missing profile, bypass flag, declared effort or recorded session (report-only — recovery never rewrites records), a queued census, unit booleans, lost work, fact-gathering errors, and a bounded projection of the team verify report. Never dismisses dialogs or rewrites records/driver state; status probing may tighten queue subdirectory permissions and profile reading may run git. Exit 0 when the manifest was built (its ok field mirrors team verify), 1 when it could not be built
+    #[command(
+        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl team manifest\n  agentctl --registry ~/project/.agentctl team manifest --state-dir ~/.local/state/agentctl\n\nThe manifest is the facts contract the recovery shepherd and team act share (#1559 restore-recovery-agent-plan): desired_state_source (pinned-list when restore.json has an agents list, else registry-derived), agents[] (harness, profile, declared/effective model and effort, lifecycle, liveness, pane, slot, native_session_present, queued pending/inflight/archived_undelivered), record_gaps[] per deficient record, units[] active/held booleans, lost[] for in-session work no restore can bring back, errors[] with one line per failed fact, and verify (a bounded projection of agentctl-team-verify/v1: closed fields and evidence classes, fix lines bounded free text, alarm present/absent only; checks run with check-only semantics)."
+    )]
+    Manifest(TeamManifest),
     /// Run this registry's deterministic restore driver until its next exit point: DETECT, restore when something is missing, VERIFY with the same checks as team verify, then HANDOFF or ESCALATE with armed deadlines. One driver per team under its state flock; a second invocation only reports state. Prints the persisted agentctl-team-driver/v1 record; exit 0 verified healthy or escalation delivered, 75 recovery pending, 1 refused. Refuses outside the host PID namespace
     #[command(
         after_help = "Examples:\n  agentctl --registry ~/project/.agentctl team restore-driver\n  agentctl --registry ~/project/.agentctl team restore-driver --handoff-timeout-seconds 900\n\nState lives at <state root>/team-drivers/<key>/state.json (key: first 16 hex of the canonical registry path hash) beside driver.lock and alarm.json. The driver persists before every effect, so a crash repeats at most one idempotent effect. It exits only healthy, with a delivered escalation, or with a wake armed for its deadline (waiting in-process when no timer can be armed). Escalation routes come from --escalation-config or ~/.config/agent-utils/escalation.toml: ordered plain commands read the incident on stdin, with {host}, {team} and {incident} substituted in argv; the first exit 0 delivers."
@@ -628,6 +633,16 @@ struct TeamVerify {
     #[arg(long, value_name = "DIR")]
     state_dir: Option<PathBuf>,
     /// Seconds an unprocessed outage notice may wait before coordinator-ack calls it overdue in its evidence, from 0 to 86400 (default: 1800); only a processed notice passes either way
+    #[arg(long, default_value_t = 1800, value_parser = clap::value_parser!(u64).range(0..=86400), value_name = "SECONDS")]
+    ack_timeout_seconds: u64,
+}
+
+#[derive(Args)]
+struct TeamManifest {
+    /// Agentctl state root holding watch/health.json and team-drivers/ (default: $XDG_STATE_HOME/agentctl, else ~/.local/state/agentctl)
+    #[arg(long, value_name = "DIR")]
+    state_dir: Option<PathBuf>,
+    /// Seconds an unprocessed outage notice may wait before the embedded verify calls it overdue in its evidence, from 0 to 86400 (default: 1800); only a processed notice passes either way
     #[arg(long, default_value_t = 1800, value_parser = clap::value_parser!(u64).range(0..=86400), value_name = "SECONDS")]
     ack_timeout_seconds: u64,
 }
@@ -3983,7 +3998,10 @@ fn writes_registry(command: &Commands) -> bool {
         Commands::RetireStaleRegistration(value) => !value.dry_run,
         Commands::Coordinator(value) => !matches!(value.command, CoordinatorCommand::Show),
         Commands::Alias(value) => matches!(value.command, AliasCommand::Rm(_)),
-        Commands::Team(value) => !matches!(value.command, TeamCommand::Verify(_)),
+        Commands::Team(value) => !matches!(
+            value.command,
+            TeamCommand::Verify(_) | TeamCommand::Manifest(_)
+        ),
         Commands::Start(_)
         | Commands::Console(_)
         | Commands::Adopt(_)
@@ -4388,6 +4406,30 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 let ok = crate::team_verify::verify_ok(&report);
                 write_json(&report).map_err(Failure::Output)?;
                 return Ok(if ok { 0 } else { 1 });
+            }
+            TeamCommand::Manifest(check) => {
+                let herdr_bin = resolve_herdr_bin(&args.registry, &args.herdr_bin);
+                let client =
+                    HerdrClient::with_executable("direct", &herdr_bin).map_err(AgentError::from)?;
+                let mut config = crate::restore::RestoreConfig::load(&args.registry)?;
+                let designation_problem = designation_problem(&client, &args.registry, &mut config);
+                let mut report = crate::team_manifest::manifest_team(
+                    &client,
+                    &args.registry,
+                    &crate::restore::SystemHost,
+                    &config,
+                    &crate::team_verify::VerifyOptions {
+                        state_dir: check.state_dir.clone(),
+                        ack_timeout_seconds: check.ack_timeout_seconds,
+                        dismiss_allowlisted: false,
+                    },
+                )?;
+                if designation_problem.is_some() {
+                    report["designation_problem"] =
+                        json!("coordinator designation unreadable or disagrees with restore.json");
+                }
+                write_json(&report).map_err(Failure::Output)?;
+                return Ok(0);
             }
             TeamCommand::RestoreDriver(driver) => {
                 let (client, inputs, options, designation_problem) =
@@ -8146,6 +8188,44 @@ mod tests {
             "desired-live",
             "pane-at-prompt",
             "coordinator-ack",
+        ] {
+            assert!(help.contains(option), "{option} missing from help");
+        }
+    }
+
+    #[test]
+    fn team_manifest_flags_parse_with_documented_defaults() {
+        let parsed = Cli::try_parse_from([
+            "agentctl",
+            "--registry",
+            "/home/owner/project/.agentctl",
+            "team",
+            "manifest",
+        ])
+        .unwrap();
+        let Some(Commands::Team(value)) = parsed.command else {
+            panic!("team command");
+        };
+        let TeamCommand::Manifest(check) = value.command else {
+            panic!("manifest command");
+        };
+        assert_eq!(check.state_dir, None);
+        assert_eq!(check.ack_timeout_seconds, 1800);
+        assert!(!writes_registry(&Commands::Team(Team {
+            command: TeamCommand::Manifest(TeamManifest {
+                state_dir: None,
+                ack_timeout_seconds: 1800,
+            }),
+        })));
+        let help = Cli::try_parse_from(["agentctl", "team", "manifest", "--help"])
+            .err()
+            .unwrap()
+            .to_string();
+        for option in [
+            "--state-dir",
+            "--ack-timeout-seconds",
+            "agentctl-team-manifest/v1",
+            "record_gaps",
         ] {
             assert!(help.contains(option), "{option} missing from help");
         }

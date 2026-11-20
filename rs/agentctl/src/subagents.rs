@@ -2711,6 +2711,40 @@ impl AgentRecord {
     }
 }
 
+/// How a record's named launch profile relates to the profile revive can
+/// read now, for the recovery manifest's report-only gaps (`#1559`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ManifestProfileState {
+    /// The record names no launch profile.
+    Absent,
+    /// The named profile can be applied and has not drifted.
+    Current,
+    /// The named profile can be read but differs in these fields.
+    Drifted(Vec<&'static str>),
+    /// The named profile is no longer defined.
+    Missing,
+    /// The named profile now names another harness, mode, or cloud launch.
+    Incompatible,
+    /// The named profile could not be judged (unreadable profile or cwd).
+    Unreadable,
+    /// Cloud and headless records do not take the interactive revive path.
+    NotApplicable,
+}
+
+/// The recovery-completeness facts `team manifest` may judge from one raw
+/// record. This deliberately carries only names, booleans, and the static
+/// bypass-flag text: no argv, token, or native-session value crosses into
+/// the manifest module.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ManifestRecordFacts {
+    pub profile: Option<String>,
+    pub profile_state: ManifestProfileState,
+    pub declared_effort: Option<String>,
+    pub native_session_present: bool,
+    pub missing_bypass_flag: Option<&'static str>,
+    pub adopted_without_launch_spec: bool,
+}
+
 fn goal_replacement_selected(screen: &str, objective: &str) -> bool {
     let screen = screen.split_whitespace().collect::<Vec<_>>().join(" ");
     let objective = objective.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -25085,6 +25119,8 @@ fi
     mod launch_spec;
     /// Priority and visibility of waits for an agent's lifecycle lock.
     mod lock_rank;
+    /// Recovery-manifest record facts judged from raw records (#1559).
+    mod manifest;
     /// The harness-recorded model captured once at session capture (#1340).
     mod model;
     /// Follow-ups typed into a running Muse turn: steered, proved, withdrawn or held.

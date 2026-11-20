@@ -18,6 +18,7 @@ use crate::agent::{AgentError, QueueMessageState};
 use crate::harness_tui::State as TuiState;
 use crate::restore::{
     derived_lifecycle, registered_names, team_driver_dir, CommandOutcome, Host, RestoreConfig,
+    RestoreEpoch,
 };
 use crate::subagents::{ManagedAgents, ManagedApi};
 
@@ -95,6 +96,18 @@ pub(crate) struct DesiredSet {
     pub(crate) names: Vec<String>,
     pub(crate) excluded: Vec<String>,
     pub(crate) undecidable: Vec<Value>,
+}
+
+/// One coherent probe pass shared by verify and the manifest, so both
+/// describe the same instant and no agent or unit is probed twice.
+pub(crate) struct TeamProbeSnapshot {
+    pub epoch: RestoreEpoch,
+    pub now: f64,
+    pub desired: DesiredSet,
+    pub statuses: Vec<(String, std::result::Result<Value, String>)>,
+    pub pins: std::result::Result<Pins, String>,
+    pub unit_outcomes: Vec<(String, CommandOutcome)>,
+    pub boot_report: Option<Value>,
 }
 
 pub(crate) fn desired_set(registry: &Path, config: &RestoreConfig) -> Result<DesiredSet> {
@@ -776,6 +789,32 @@ pub fn verify_team<A: ManagedApi + ?Sized>(
     config: &RestoreConfig,
     options: &VerifyOptions,
 ) -> Result<Value> {
+    let snapshot = collect_team_probe_snapshot(client, registry, host, config, options)?;
+    verify_team_from_snapshot(client, registry, config, options, &snapshot)
+}
+
+/// [`verify_team`], also returning the probe snapshot it judged from, for a
+/// caller such as the manifest that must describe the same pass.
+pub(crate) fn verify_team_with_snapshot<A: ManagedApi + ?Sized>(
+    client: &A,
+    registry: &Path,
+    host: &dyn Host,
+    config: &RestoreConfig,
+    options: &VerifyOptions,
+) -> Result<(Value, TeamProbeSnapshot)> {
+    let snapshot = collect_team_probe_snapshot(client, registry, host, config, options)?;
+    let report = verify_team_from_snapshot(client, registry, config, options, &snapshot)?;
+    Ok((report, snapshot))
+}
+
+/// The one status/unit probe pass shared by verify and the manifest.
+pub(crate) fn collect_team_probe_snapshot<A: ManagedApi + ?Sized>(
+    client: &A,
+    registry: &Path,
+    host: &dyn Host,
+    config: &RestoreConfig,
+    options: &VerifyOptions,
+) -> Result<TeamProbeSnapshot> {
     let epoch = host.epoch()?;
     let boot_id = epoch.boot_id.clone();
     let now = host.now();
@@ -796,34 +835,67 @@ pub fn verify_team<A: ManagedApi + ?Sized>(
             )
         })
         .collect();
+    let pins = read_pins(registry, &config.units, options.state_dir.as_deref());
+    let unit_outcomes: Vec<(String, CommandOutcome)> = config
+        .units
+        .iter()
+        .map(|unit| {
+            let outcome = host.run(
+                &[
+                    "systemctl".to_owned(),
+                    "--user".to_owned(),
+                    "is-active".to_owned(),
+                    unit.clone(),
+                ],
+                None,
+                Duration::from_secs(30),
+            );
+            (unit.clone(), outcome)
+        })
+        .collect();
+    Ok(TeamProbeSnapshot {
+        epoch,
+        now,
+        desired,
+        statuses,
+        pins,
+        unit_outcomes,
+        boot_report,
+    })
+}
+
+pub(crate) fn verify_team_from_snapshot<A: ManagedApi + ?Sized>(
+    client: &A,
+    registry: &Path,
+    config: &RestoreConfig,
+    options: &VerifyOptions,
+    snapshot: &TeamProbeSnapshot,
+) -> Result<Value> {
+    let epoch = &snapshot.epoch;
+    let boot_id = epoch.boot_id.clone();
+    let now = snapshot.now;
+    let boot_report = &snapshot.boot_report;
+    let manager = ManagedAgents::new(client, registry)?;
+    let desired = &snapshot.desired;
+    let statuses = &snapshot.statuses;
     let mut checks: Vec<Value> = Vec::new();
     checks.extend(desired.undecidable.iter().cloned());
-    checks.extend(desired_live_rows(&desired.names, &statuses));
-    let pins = match read_pins(registry, &config.units, options.state_dir.as_deref()) {
-        Ok(pins) => pins,
+    checks.extend(desired_live_rows(&desired.names, statuses));
+    let pins = match &snapshot.pins {
+        Ok(pins) => pins.clone(),
         Err(error) => {
             checks.push(row(
                 "units-bridges",
                 "fail",
                 None,
-                error,
+                error.clone(),
                 Some("write the pin's reason or remove the pin".to_owned()),
             ));
             Pins::default()
         }
     };
-    for unit in &config.units {
-        let outcome = host.run(
-            &[
-                "systemctl".to_owned(),
-                "--user".to_owned(),
-                "is-active".to_owned(),
-                unit.clone(),
-            ],
-            None,
-            Duration::from_secs(30),
-        );
-        checks.push(unit_row(unit, &outcome, pins.reason_for(unit)));
+    for (unit, outcome) in &snapshot.unit_outcomes {
+        checks.push(unit_row(unit, outcome, pins.reason_for(unit)));
     }
     if let Some(reason) = pins.global.as_deref() {
         checks.push(row(
@@ -844,7 +916,7 @@ pub fn verify_team<A: ManagedApi + ?Sized>(
         ));
     }
     checks.extend(bridge_rows(client, registry, &pins));
-    checks.extend(queued_rows(&desired.names, &statuses, boot_report.as_ref()));
+    checks.extend(queued_rows(&desired.names, statuses, boot_report.as_ref()));
     let health_path = watch_health_path(options.state_dir.as_deref());
     let health = health_path.as_deref().and_then(crate::restore::read_report);
     checks.push(watcher_row(
@@ -963,8 +1035,8 @@ pub fn verify_team<A: ManagedApi + ?Sized>(
         "boot_id": boot_id,
         "checked_at": now,
         "ok": ok,
-        "desired": desired.names,
-        "excluded": desired.excluded,
+        "desired": &desired.names,
+        "excluded": &desired.excluded,
         "alarm": read_alarm(registry, options.state_dir.as_deref()),
         "checks": checks,
     }))
@@ -1280,6 +1352,76 @@ mod tests {
         assert_eq!(argv[5..], request.argv[..]);
         // A past deadline still wakes promptly.
         assert!(crate::restore::wake_argv(&request, 5000.0).contains(&"--on-active=1s".to_owned()));
+    }
+
+    struct CountingHost {
+        runs: std::cell::Cell<usize>,
+    }
+
+    impl Host for CountingHost {
+        fn boot_id(&self) -> Result<String> {
+            Ok("boot-a".to_owned())
+        }
+
+        fn boot_time(&self) -> Option<u64> {
+            Some(0)
+        }
+
+        fn now(&self) -> f64 {
+            1000.0
+        }
+
+        fn sleep(&self, _duration: Duration) {}
+
+        fn run(&self, argv: &[String], _cwd: Option<&Path>, _timeout: Duration) -> CommandOutcome {
+            if argv.iter().any(|value| value == "is-active") {
+                self.runs.set(self.runs.get() + 1);
+            }
+            CommandOutcome {
+                status: Some(0),
+                stdout: "active\n".to_owned(),
+                stderr: String::new(),
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_verify_reuses_one_unit_probe_pass() {
+        let registry = temp_registry("snapshot-units");
+        let found = config(
+            &registry,
+            r#"{"schema": "agentctl-restore/v1", "units": ["a.service", "b.service"]}"#,
+        );
+        let options = VerifyOptions {
+            state_dir: Some(registry.join("state")),
+            ack_timeout_seconds: 1800,
+            dismiss_allowlisted: false,
+        };
+        let client =
+            crate::client::HerdrClient::with_executable("direct", &PathBuf::from("/bin/false"))
+                .unwrap();
+        let host = CountingHost {
+            runs: std::cell::Cell::new(0),
+        };
+        let snapshot =
+            collect_team_probe_snapshot(&client, &registry, &host, &found, &options).unwrap();
+        assert_eq!(host.runs.get(), 2);
+        assert_eq!(snapshot.unit_outcomes.len(), 2);
+        let report =
+            verify_team_from_snapshot(&client, &registry, &found, &options, &snapshot).unwrap();
+        assert_eq!(host.runs.get(), 2, "verify probed units a second time");
+        let unit_rows: Vec<&Value> = report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| {
+                row["name"] == "units-bridges"
+                    && matches!(row["subject"].as_str(), Some("a.service" | "b.service"))
+            })
+            .collect();
+        assert_eq!(unit_rows.len(), 2, "{report}");
+        assert!(unit_rows.iter().all(|row| row["status"] == "pass"));
+        let _ = fs::remove_dir_all(&registry);
     }
 
     #[test]

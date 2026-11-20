@@ -5204,6 +5204,184 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         })
     }
 
+    /// The recovery-completeness facts for one registered agent, judged
+    /// from its raw record (`#1559`): the profile current at this moment,
+    /// the argv a revive would replay, and the recorded native session.
+    /// This never returns an argv, token, or session value, and writes
+    /// nothing; profile reading may run git, exactly as `profile_drift`
+    /// already does for status.
+    pub(crate) fn manifest_record_facts(&self, agent_name: &str) -> Result<ManifestRecordFacts> {
+        let record = self.load(agent_name)?;
+        Ok(self.manifest_facts(&record))
+    }
+
+    fn manifest_facts(&self, record: &AgentRecord) -> ManifestRecordFacts {
+        let native_session_present = if record.is_cloud() {
+            record
+                .session_value
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+                || record.effective_native_session().is_some()
+        } else if record.is_headless() {
+            record
+                .extra
+                .get("headless")
+                .and_then(|spec| spec["session"].as_str())
+                .is_some_and(|value| !value.is_empty())
+                || record.effective_native_session().is_some()
+        } else {
+            record.effective_native_session().is_some()
+        };
+        let adopted_without_launch_spec = record.is_foreign() && record.launch_spec.is_none();
+        let (profile_state, missing_bypass_flag) = if record.is_cloud() {
+            (
+                if record.profile.is_some() {
+                    ManifestProfileState::NotApplicable
+                } else {
+                    ManifestProfileState::Absent
+                },
+                None,
+            )
+        } else if record.is_headless() {
+            let missing = if record.harness == "claude" {
+                crate::profiles::permission_bypass_flag(
+                    &record.harness,
+                    &super::headless::declared_arguments(record),
+                )
+            } else {
+                None
+            };
+            (
+                if record.profile.is_some() {
+                    ManifestProfileState::NotApplicable
+                } else {
+                    ManifestProfileState::Absent
+                },
+                missing,
+            )
+        } else if adopted_without_launch_spec {
+            // There is no captured argv to judge; the missing spec is the
+            // gap, not a guessed bypass verdict on empty arguments. A named
+            // profile is still a named profile: absence is only for a
+            // record that names none.
+            (
+                if record.profile.is_some() {
+                    ManifestProfileState::NotApplicable
+                } else {
+                    ManifestProfileState::Absent
+                },
+                None,
+            )
+        } else if record.profile.is_none() {
+            let source = spec_arguments(record).unwrap_or_else(|| record.arguments.clone());
+            let argv = with_declared_overrides(record, source.clone()).unwrap_or(source);
+            (
+                ManifestProfileState::Absent,
+                crate::profiles::permission_bypass_flag(&record.harness, &argv),
+            )
+        } else {
+            self.manifest_profile_assessment(record)
+        };
+        ManifestRecordFacts {
+            profile: record.profile.clone(),
+            profile_state,
+            declared_effort: record.reasoning_effort.clone(),
+            native_session_present,
+            missing_bypass_flag,
+            adopted_without_launch_spec,
+        }
+    }
+
+    /// Judge a profiled interactive record by the argv revive would launch
+    /// now: the refreshed profile for a spec record, the exact-match no-spec
+    /// profile otherwise. Only the missing bypass flag's static name and
+    /// changed field names leave this function.
+    fn manifest_profile_assessment(
+        &self,
+        record: &AgentRecord,
+    ) -> (ManifestProfileState, Option<&'static str>) {
+        let (refreshed, mut changed) = match self.refreshed_from_profile(record) {
+            Ok(found) => found,
+            Err(error) => {
+                let text = error.to_string();
+                if text.contains("has no permission-bypass flag") {
+                    // Profile loading validates the whole file, so this
+                    // refusal may name some other profile entirely. It
+                    // proves only that this record's profile cannot be
+                    // judged here, never that its own replay lacks a bypass.
+                    return (ManifestProfileState::Unreadable, None);
+                }
+                if text.contains("is no longer defined") {
+                    return (ManifestProfileState::Missing, None);
+                }
+                if text.contains("now names another harness or mode") {
+                    return (ManifestProfileState::Incompatible, None);
+                }
+                return (ManifestProfileState::Unreadable, None);
+            }
+        };
+        if record.launch_spec.is_none() {
+            // The legacy branch refuses on any profile mismatch, where the
+            // refresh comparison is override-aware; name the exact fields
+            // the legacy check compares.
+            let profile = match self.manifest_current_profile(record) {
+                Ok(profile) => profile,
+                Err(state) => return (state, None),
+            };
+            if profile.harness != record.harness
+                || profile.mode != record.mode
+                || profile.cloud.is_some()
+            {
+                return (ManifestProfileState::Incompatible, None);
+            }
+            if profile.model != record.model && !changed.contains(&"model") {
+                changed.push("model");
+            }
+            if profile.reasoning_effort != record.reasoning_effort
+                && !changed.contains(&"reasoning_effort")
+            {
+                changed.push("reasoning_effort");
+            }
+            let entries = Self::relaunch_environment(record, &profile);
+            if !Self::environment_reconstructs(record, &entries, &record.environment_names)
+                && !changed.contains(&"environment_names")
+            {
+                changed.push("environment_names");
+            }
+        }
+        let state = if changed.is_empty() {
+            ManifestProfileState::Current
+        } else {
+            ManifestProfileState::Drifted(changed)
+        };
+        // A drifted legacy profile refuses revive before any launch, so its
+        // argv is never replayed; a drifted spec profile is refreshed and
+        // its current argv is exactly what launches.
+        let judge = record.launch_spec.is_some() || matches!(state, ManifestProfileState::Current);
+        let missing = judge.then(|| {
+            let source = spec_arguments(&refreshed).unwrap_or_else(|| refreshed.arguments.clone());
+            let argv = with_declared_overrides(&refreshed, source.clone()).unwrap_or(source);
+            crate::profiles::permission_bypass_flag(&record.harness, &argv)
+        });
+        (state, missing.flatten())
+    }
+
+    fn manifest_current_profile(
+        &self,
+        record: &AgentRecord,
+    ) -> std::result::Result<crate::profiles::LaunchProfile, ManifestProfileState> {
+        let name = record
+            .profile
+            .as_deref()
+            .ok_or(ManifestProfileState::Absent)?;
+        let cwd = fs::canonicalize(&record.cwd).map_err(|_| ManifestProfileState::Unreadable)?;
+        let root = crate::profiles::configuration_root(&cwd, &self.registry, false)
+            .map_err(|_| ManifestProfileState::Unreadable)?;
+        let (_, mut profiles) = crate::profiles::load_profiles(&root, false)
+            .map_err(|_| ManifestProfileState::Unreadable)?;
+        profiles.remove(name).ok_or(ManifestProfileState::Missing)
+    }
+
     pub(super) fn retire_revive_preflight(
         &self,
         record: &AgentRecord,

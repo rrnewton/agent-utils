@@ -381,7 +381,7 @@ def test_promote_refuses_unless_the_launched_harness_is_provably_there(
 @pytest.mark.parametrize(
     "command",
     ["restore", "restore-teams", "install-units", "watch", "watch-agents", "hold", "coordinator", "manage", "set", "tree",
-     "progress", "services"])
+     "progress", "services", "team"])
 def test_rust_only_restore_commands_are_refused_by_this_edition(
     command: str, capsys: pytest.CaptureFixture[str],
 ) -> None:

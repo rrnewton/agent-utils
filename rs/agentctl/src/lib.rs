@@ -63,6 +63,7 @@ pub(crate) mod tab_order;
 pub mod tabs;
 pub mod team_driver;
 pub mod team_escalate;
+pub mod team_manifest;
 pub mod team_model;
 pub mod team_verify;
 pub mod term;

@@ -1393,6 +1393,36 @@ the coordinator's queue). A check that cannot apply is `skipped` and says
 why; missing evidence fails. Apart from that one dialog dismiss it writes
 nothing. The team driver runs the same checks as its VERIFY state.
 
+`agentctl team manifest` prints the recovery facts as schema
+`agentctl-team-manifest/v1` for humans, the later `team act`, and the
+recovery shepherd (#1559 restore-recovery-agent-plan):
+
+```sh
+agentctl --registry ~/project/.agentctl team manifest
+```
+
+For each desired agent it projects only allowlisted status facts (harness,
+profile, declared/effective model and effort, liveness, pane, slot, whether
+a native session is recorded, queued pending/inflight/archived-undelivered
+counts) — record tokens and launch arguments never appear. `record_gaps`
+names every record missing a profile, a permission-bypass flag, a declared
+effort, or a recorded session; the report is the fix list, because recovery
+reports such records and never rewrites them. It also carries unit
+active/held booleans, `lost` in-session work no restore can bring back, one
+`errors` line per failed fact, and a bounded projection of the verify
+report embedded (closed fields and evidence classes, alarm
+present/absent only; its `fix` lines remain bounded free text; run with
+check-only semantics: manifest never dismisses even the allowlisted
+dialog). Exit 0 means the manifest was built — its `ok` field mirrors team
+verify — and 1 means the registry could not be read at all. Manifest
+rewrites no record, driver state, or pane; it is not literally
+write-free, because status probing may tighten an existing queue
+subdirectory to private `0700` permissions and current-profile reading
+may run git, exactly as `status` already does. Status rows and units
+come from the one verify snapshot; the raw-record facts behind
+`record_gaps` are read immediately after it, so on a live registry they
+can describe the instant just after the `agents[]` rows they sit beside.
+
 `agentctl team kick` starts or reports that driver, and
 `agentctl team restore-driver` runs it in the foreground:
 
