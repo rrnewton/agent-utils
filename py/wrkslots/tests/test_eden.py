@@ -2349,9 +2349,9 @@ def test_classify_drafts_names_hidden_own_node() -> None:
         return (0, "", "")
 
     entry = eden.classify_drafts(runner, "/m", "main", node, own_nodes=(node,))
-    assert entry["hidden"] == [(node, "hidden work")]  # type: ignore[attr-defined]
+    assert entry["hidden"] == [(node, "hidden work")]
     assert [n for n, _s in entry["unaccounted"]] == [node]  # type: ignore[attr-defined]
-    refusal = wrkslots_cli._accounting_refusal("s1", [entry])  # type: ignore[arg-type]
+    refusal = wrkslots_cli._accounting_refusal("s1", [entry])
     assert f"sl unhide {node}" in refusal
 
 
@@ -2410,7 +2410,7 @@ def test_classify_drafts_labels_foreign_ancestor() -> None:
     )
     assert [n for n, _s in entry["unaccounted"]] == [node]  # type: ignore[attr-defined]
     assert [n for n, _s in entry["foreign"]] == [node]  # type: ignore[attr-defined]
-    refusal = wrkslots_cli._accounting_refusal("s1", [entry])  # type: ignore[arg-type]
+    refusal = wrkslots_cli._accounting_refusal("s1", [entry])
     assert "ancestor not authored by this checkout" in refusal
 
 
@@ -3077,12 +3077,12 @@ def test_real_sl_shared_store_scopes_drafts(tmp_path: Path) -> None:
     entry = eden.classify_drafts(
         runner, wc1, "main", hidden_node, own_nodes=(hidden_node,)
     )
-    assert entry["hidden"] == [(hidden_node, "wc1 hidden draft")]  # type: ignore[attr-defined]
+    assert entry["hidden"] == [(hidden_node, "wc1 hidden draft")]
 
     # A hidden own draft is named as hidden, never silently dropped.
     run("-R", wc1, "hide", amended)
     entry = eden.classify_drafts(
         runner, wc1, "main", amended, own_nodes=(amended,)
     )
-    assert entry["hidden"] == [(amended, "wc1 draft amended")]  # type: ignore[attr-defined]
+    assert entry["hidden"] == [(amended, "wc1 draft amended")]
     assert [node for node, _s in entry["unaccounted"]] == [amended]  # type: ignore[attr-defined]
