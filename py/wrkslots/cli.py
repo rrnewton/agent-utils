@@ -12169,6 +12169,42 @@ def _latest_handoff_read(
     return latest
 
 
+def _superseded_checkpoint_note(
+    config: Config,
+    record: ActiveRecord,
+    events: Sequence[Mapping[str, object]],
+) -> str:
+    """Name the superseded checkpoint a sidecar-less generation replaced."""
+    found: tuple[str, int] | None = None
+    for event in events:
+        if event.get("kind") != "active-state-recorded":
+            continue
+        payload = _as_mapping(event["payload"], "active-state-recorded event payload")
+        if (
+            payload.get("action") != "handoff-checkpoint-superseded"
+            or payload.get("slot") != record.slot
+        ):
+            continue
+        evidence_value = payload.get("evidence")
+        if not isinstance(evidence_value, Mapping):
+            continue
+        sha_value = evidence_value.get("superseded_sidecar_sha256")
+        previous_value = evidence_value.get("previous_generation")
+        if not isinstance(sha_value, str) or not isinstance(previous_value, int):
+            continue
+        if previous_value != record.generation - 1:
+            continue
+        found = (sha_value, previous_value)
+    if found is None:
+        return ""
+    sha, previous = found
+    path = _handoff_sidecar_path(config, record.slot, previous, record.machine)
+    return (
+        f"; superseded checkpoint sidecar sha256={sha} at {path} "
+        f"(generation {previous}) remains on disk for manual recovery"
+    )
+
+
 def _handoff_read_matches_artifact(
     read: _HandoffRead, artifact: _HandoffArtifact
 ) -> bool:
@@ -51323,16 +51359,18 @@ def _cmd_read_handoff(args: argparse.Namespace) -> int:
                 "--adopt-legacy-change compatibility flag"
             )
         if pre_artifact_refusal is not None:
+            note = _superseded_checkpoint_note(config, record, pre_events)
             raise Refusal(
-                f"{pre_artifact_refusal}. state: REFUSED -- no read was recorded; "
+                f"{pre_artifact_refusal}{note}. state: REFUSED -- no read was recorded; "
                 "preserve both the slot and any handoff sidecar"
             ) from pre_artifact_refusal
         artifact = pre_artifact
         if storage_absent:
             _refuse_absent_slot_without_sidecar(config, states, record, artifact)
         if artifact is None:
+            note = _superseded_checkpoint_note(config, record, pre_events)
             raise Refusal(
-                f"slot {record.slot} has no handoff sidecar or legacy HANDOFF.md. "
+                f"slot {record.slot} has no handoff sidecar or legacy HANDOFF.md{note}. "
                 "state: REFUSED -- no read was recorded. remedy: continue the reclaim "
                 "checks; absence of a handoff is not evidence that the owner is dead"
             )
@@ -51495,6 +51533,14 @@ def _cmd_write_handoff(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
     _validate_name(args.agent, "agent")
+    supersede_own = bool(getattr(args, "supersede_own_checkpoint", False))
+    supersede_reason = getattr(args, "reason", None)
+    if supersede_own and (
+        supersede_reason is None or not str(supersede_reason).strip()
+    ):
+        raise Refusal(
+            "write-handoff --supersede-own-checkpoint requires a non-empty --reason"
+        )
     owner = _capture_caller_process(args.owner_pid, "owner")
     requested_source = Path(args.from_file).absolute()
     contents, _source_identity = _read_regular_file_identity(
@@ -51525,8 +51571,9 @@ def _cmd_write_handoff(args: argparse.Namespace) -> int:
         # owner-consented removal consume. Without this, a slot finished
         # before write-handoff could never be released or removed while
         # its owner lives. An existing sidecar is still refused below
-        # unless it is byte-identical, so published handoffs stay
-        # immutable; the finish record itself is not modified here.
+        # unless it is byte-identical or the owner supersedes its own
+        # checkpoint below, so published handoffs stay immutable once
+        # read or released; the finish record itself is not modified here.
         # An undeclared nested linked worktree of another repository
         # does not stop a handoff (#1400): it is warned about loudly and
         # recorded in the sidecar; remove and retire still refuse it.
@@ -51583,9 +51630,115 @@ def _cmd_write_handoff(args: argparse.Namespace) -> int:
                 "provenance and is permanently manual-only; preserve it for inspection"
             )
         _ensure_event_log(config, record.machine, require_repository=False)
-        publication = _handoff_write_publication(
-            record, _load_events(config, record.machine)
-        )
+        events = _load_events(config, record.machine)
+        publication = _handoff_write_publication(record, events)
+        identical_completed = False
+        if supersede_own and existing is not None:
+            # A flagged re-write byte-identical to the completed sidecar
+            # (same provenance as an unflagged identical re-write)
+            # completes in place: no generation bump and no new events.
+            # This precedes the read/release gates because an unflagged
+            # identical re-write also completes after a read; different
+            # bytes keep every supersede gate below unchanged.
+            if (
+                existing.contents == artifact.contents
+                and existing.sha256 == artifact.sha256
+                and existing.source == artifact.source
+                and existing.source_path == artifact.source_path
+                and existing.source_identity == artifact.source_identity
+                and publication is not None
+                and _json_equal(
+                    publication[1], _handoff_artifact_to_obj(existing)
+                )
+                and publication[2]
+            ):
+                identical_completed = True
+                artifact = existing
+            # Owner-authenticated supersede of one's own checkpoint
+            # (#1975 phase 6, option (a)): the caller is already proven
+            # the current recorded owner above. Only a completed
+            # schema-2 write-handoff sidecar that has been neither read
+            # for retirement nor released may give way; once read or
+            # released it stays absolutely immutable.
+            elif existing.source != "write-handoff":
+                raise Refusal(
+                    f"slot {record.slot} already has an immutable handoff sidecar with "
+                    "different contents or source provenance; preserve both versions for "
+                    "manual review"
+                )
+            elif publication is None or not _json_equal(
+                publication[1], _handoff_artifact_to_obj(existing)
+            ):
+                raise Refusal(
+                    f"slot {record.slot} existing handoff sidecar has no matching "
+                    "owner-authenticated publication intent; preserve it for manual review"
+                )
+            elif not publication[2]:
+                raise Refusal(
+                    f"slot {record.slot} handoff publication is incomplete; preserve the "
+                    "sidecar and have its exact owner retry write-handoff"
+                )
+            elif (
+                (latest_read := _latest_handoff_read(record, events)) is not None
+                and latest_read.retirement_enqueued
+            ):
+                raise Refusal(
+                    f"slot {record.slot} handoff sidecar is immutable once read or "
+                    "released; it has already been read for retirement, so its owner "
+                    "cannot supersede it. remedy: have the coordinator supersede the "
+                    "read with 'wrkslots supersede-handoff' if the lane keeps using "
+                    "the slot"
+                )
+            elif _owner_release_in_effect(config, record, events) is not None:
+                raise Refusal(
+                    f"slot {record.slot} handoff sidecar is immutable once read or "
+                    "released; this generation has already been released by its "
+                    "owner, so it cannot be superseded. remedy: preserve the "
+                    "released handoff for coordinator retirement"
+                )
+            else:
+                before = _global_rows(states, _archives)
+                bumped = dataclasses.replace(
+                    record, generation=record.generation + 1
+                )
+                _write_active_state(
+                    config,
+                    _replace_record(
+                        _load_active(config, require_repository=False), bumped
+                    ),
+                    action="handoff-checkpoint-superseded",
+                    slot=bumped.slot,
+                    evidence={
+                        "writer": _identity_to_obj(owner),
+                        "previous_generation": record.generation,
+                        "superseded_sidecar_sha256": existing.sha256,
+                        "superseded_intent_sequence": publication[0],
+                        "reason": str(supersede_reason),
+                    },
+                    require_repository=False,
+                )
+                _interrupt_for_test("after-handoff-checkpoint-superseded")
+                after_states, after_archives = _validate_global_state(
+                    config, require_repository=False
+                )
+                _assert_only_slot_changed(
+                    before, _global_rows(after_states, after_archives), record.slot
+                )
+                states = list(after_states)
+                _archives = list(after_archives)
+                record = bumped
+                sidecar_path = _handoff_sidecar_path(
+                    config, record.slot, record.generation, record.machine
+                )
+                artifact = dataclasses.replace(
+                    artifact,
+                    path=sidecar_path,
+                    generation=record.generation,
+                    recorded_at=_utc_now(),
+                )
+                existing = _load_handoff_sidecar(config, record)
+                events = _load_events(config, record.machine)
+                publication = _handoff_write_publication(record, events)
         intent_sequence: int
         intended: Mapping[str, object]
         if existing is None:
@@ -51671,23 +51824,24 @@ def _cmd_write_handoff(args: argparse.Namespace) -> int:
         ):
             raise StateError("cannot record a handoff write without source provenance")
         _ensure_event_log(config, record.machine, require_repository=False)
-        _write_event_file(
-            config,
-            record.machine,
-            "handoff-written",
-            {
-                "slot": record.slot,
-                "generation": record.generation,
-                "sha256": artifact.sha256,
-                "path": sidecar_path.name,
-                "source": artifact.source,
-                "source_path": str(artifact.source_path),
-                "source_identity": _regular_file_identity_to_obj(
-                    artifact.source_identity
-                ),
-                "writer": _identity_to_obj(owner),
-            },
-        )
+        if not identical_completed:
+            _write_event_file(
+                config,
+                record.machine,
+                "handoff-written",
+                {
+                    "slot": record.slot,
+                    "generation": record.generation,
+                    "sha256": artifact.sha256,
+                    "path": sidecar_path.name,
+                    "source": artifact.source,
+                    "source_path": str(artifact.source_path),
+                    "source_identity": _regular_file_identity_to_obj(
+                        artifact.source_identity
+                    ),
+                    "writer": _identity_to_obj(owner),
+                },
+            )
     _capture_eden_drafts_after_touchpoint(config, record, "write-handoff")
     print(
         f"wrote handoff slot={record.slot} generation={record.generation} "
@@ -100884,8 +101038,14 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "Copy one bounded UTF-8 handoff into generation-bound control storage outside "
             "the checkout. Requires the exact live owner. A slot finished without a "
             "handoff can publish its handoff once, afterwards; the finish record is "
-            "never modified, and any second or different sidecar refuses. This "
-            "does not read, enqueue, finish, or remove the slot."
+            "never modified. The sidecar is immutable once a handoff-read with "
+            "retirement_enqueued has been recorded for its generation or an "
+            "owner-release is in effect for it: before either, its owner may "
+            "supersede its own completed checkpoint with "
+            "--supersede-own-checkpoint --reason TEXT, which advances the generation "
+            "and leaves the superseded sidecar on disk as audit evidence; any other "
+            "second or different sidecar refuses. This does not read, enqueue, "
+            "finish, or remove the slot."
         ),
         help="write a generation-bound handoff outside the checkout",
         formatter_class=_HelpFormatter,
@@ -100908,6 +101068,20 @@ usage or audit gate unknown, 3 fail-closed refusal.
         metavar="PATH",
         help="regular UTF-8 input outside every Git working tree, at most 1 MiB; "
         "it is copied, never moved",
+    )
+    write_handoff.add_argument(
+        "--supersede-own-checkpoint",
+        action="store_true",
+        help="supersede this generation's own completed write-handoff checkpoint "
+        "with no retirement-enqueued handoff-read for this generation and no "
+        "owner-release in effect, and publish at the next generation in the same "
+        "invocation; requires --reason; the superseded sidecar stays on disk",
+    )
+    write_handoff.add_argument(
+        "--reason",
+        metavar="TEXT",
+        help="why the owner supersedes its own checkpoint; recorded in the event "
+        "log (required with --supersede-own-checkpoint)",
     )
     write_handoff.set_defaults(handler=_cmd_write_handoff)
 

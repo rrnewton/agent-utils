@@ -25046,6 +25046,294 @@ def test_write_handoff_is_external_and_immutable_after_finish(tmp_path: Path) ->
     assert "immutable handoff sidecar" in refused.stderr
 
 
+def _handoff_write_args(
+    source: Path,
+    generation: str,
+    *,
+    supersede_reason: str | None = None,
+) -> tuple[str, ...]:
+    argv: tuple[str, ...] = (
+        "write-handoff",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        generation,
+        "--from-file",
+        str(source),
+    )
+    if supersede_reason is not None:
+        argv += ("--supersede-own-checkpoint", "--reason", supersede_reason)
+    return argv
+
+
+def _slot_generation(project: Path) -> int:
+    row = active_slots(project)[0]
+    assert isinstance(row, dict)
+    return int(cast(int, row["generation"]))
+
+
+def _superseded_payloads(project: Path) -> list[dict[str, object]]:
+    config = wrkslots._load_config(str(project), "testhost")
+    found: list[dict[str, object]] = []
+    for event in wrkslots._load_events(config):
+        payload = event["payload"]
+        if (
+            event["kind"] == "active-state-recorded"
+            and isinstance(payload, dict)
+            and payload.get("action") == "handoff-checkpoint-superseded"
+        ):
+            found.append(payload)
+    return found
+
+
+def test_supersede_own_checkpoint_after_reboot_transfer(tmp_path: Path) -> None:
+    """#1975 phase 6 incident replay: checkpoint, reboot, transfer, final."""
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    checkpoint = tmp_path / "checkpoint.md"
+    checkpoint.write_text("checkpoint before reboot\n", encoding="utf-8")
+    written = raw_command(project, *_handoff_write_args(checkpoint, "1"))
+    assert written.returncode == 0, written.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    checkpoint_sidecar = wrkslots._handoff_sidecar_path(config, "slot01", 1)
+    checkpoint_bytes = checkpoint_sidecar.read_bytes()
+    # Simulated reboot: the recorded owner is gone, then a plain
+    # transfer rebinds the same agent at the same generation.
+    mark_owner_dead(project)
+    moved = command(
+        project,
+        "transfer-owner",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+    assert moved.returncode == 0, moved.stderr
+    assert _slot_generation(project) == 1
+    final = tmp_path / "final.md"
+    final.write_text("final after reboot\n", encoding="utf-8")
+    published = raw_command(
+        project, *_handoff_write_args(final, "1", supersede_reason="final after reboot")
+    )
+    assert published.returncode == 0, published.stderr
+    assert _slot_generation(project) == 2
+    assert checkpoint_sidecar.read_bytes() == checkpoint_bytes
+    final_sidecar = wrkslots._handoff_sidecar_path(config, "slot01", 2)
+    assert json.loads(final_sidecar.read_text(encoding="utf-8"))["contents_utf8"] == (
+        "final after reboot\n"
+    )
+    superseded = _superseded_payloads(project)
+    assert len(superseded) == 1
+    evidence = superseded[0]["evidence"]
+    assert isinstance(evidence, dict)
+    assert evidence["previous_generation"] == 1
+    assert evidence["reason"] == "final after reboot"
+    read = raw_command(
+        project, "read-handoff", "slot01", "--coordinator-pid", str(os.getpid())
+    )
+    assert read.returncode == 0, read.stderr
+    assert "final after reboot" in read.stdout
+    assert "checkpoint before reboot" not in read.stdout
+
+
+def test_supersede_own_checkpoint_refuses_outstanding_publication(
+    tmp_path: Path,
+) -> None:
+    """An outstanding intent must first complete or recover, as today."""
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    source = tmp_path / "checkpoint.md"
+    source.write_text("checkpoint bytes\n", encoding="utf-8")
+    crashed = raw_command(
+        project,
+        *_handoff_write_args(source, "1"),
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-handoff-sidecar-write"},
+    )
+    assert crashed.returncode == 86
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._handoff_sidecar_path(config, "slot01", 1).is_file()
+    other = tmp_path / "other.md"
+    other.write_text("different bytes\n", encoding="utf-8")
+    refused = raw_command(
+        project, *_handoff_write_args(other, "1", supersede_reason="supersede early")
+    )
+    assert refused.returncode == 3
+    assert "handoff publication is incomplete" in refused.stderr
+    assert _slot_generation(project) == 1
+    assert _superseded_payloads(project) == []
+    # The exact owner completes the outstanding publication as today.
+    completed = raw_command(project, *_handoff_write_args(source, "1"))
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize(
+    "interrupt,flagged_retry",
+    [
+        # No gen-2 sidecar yet: the flagged retry publishes it directly.
+        ("after-handoff-checkpoint-superseded", True),
+        ("after-handoff-write-intent", True),
+        # A complete publication temp survives: recover publishes it,
+        # then the exact owner's unflagged retry completes, as today.
+        ("before-handoff-sidecar-publish", False),
+        # The gen-2 sidecar is published but incomplete: only the
+        # exact owner's unflagged retry may complete it, as today.
+        ("after-handoff-sidecar-write", False),
+    ],
+)
+def test_supersede_own_checkpoint_crash_windows_converge(
+    tmp_path: Path, interrupt: str, flagged_retry: bool
+) -> None:
+    """A crash anywhere in the flagged write retries to one gen+1 sidecar."""
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    checkpoint = tmp_path / "checkpoint.md"
+    checkpoint.write_text("checkpoint bytes\n", encoding="utf-8")
+    assert raw_command(project, *_handoff_write_args(checkpoint, "1")).returncode == 0
+    config = wrkslots._load_config(str(project), "testhost")
+    checkpoint_bytes = wrkslots._handoff_sidecar_path(
+        config, "slot01", 1
+    ).read_bytes()
+    final = tmp_path / "final.md"
+    final.write_text("final bytes\n", encoding="utf-8")
+    crashed = raw_command(
+        project,
+        *_handoff_write_args(final, "1", supersede_reason="final after reboot"),
+        env={"WRKSLOTS_TEST_INTERRUPT": interrupt},
+    )
+    assert crashed.returncode == 86
+    if interrupt == "before-handoff-sidecar-publish":
+        recovered = raw_command(
+            project,
+            "recover",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--discard-partial",
+        )
+        assert recovered.returncode == 0, recovered.stderr
+    if flagged_retry:
+        retried = raw_command(
+            project,
+            *_handoff_write_args(final, "2", supersede_reason="final after reboot"),
+        )
+    else:
+        retried = raw_command(project, *_handoff_write_args(final, "2"))
+    assert retried.returncode == 0, retried.stderr
+    assert _slot_generation(project) == 2
+    assert wrkslots._handoff_sidecar_path(config, "slot01", 1).read_bytes() == (
+        checkpoint_bytes
+    )
+    final_doc = json.loads(
+        wrkslots._handoff_sidecar_path(config, "slot01", 2).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert final_doc["contents_utf8"] == "final bytes\n"
+    assert len(_superseded_payloads(project)) == 1
+    publications = [
+        event
+        for event in wrkslots._load_events(config)
+        if event["kind"] == "handoff-write-completed"
+        and event["payload"]["generation"] == 2  # type: ignore[index]
+    ]
+    assert len(publications) == 1
+
+
+def test_read_checkpoint_blocks_owner_supersede_but_not_coordinator(
+    tmp_path: Path,
+) -> None:
+    """Once read, only the coordinator's supersede-handoff can advance."""
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    checkpoint = tmp_path / "checkpoint.md"
+    checkpoint.write_text("checkpoint bytes\n", encoding="utf-8")
+    assert raw_command(project, *_handoff_write_args(checkpoint, "1")).returncode == 0
+    read = raw_command(
+        project, "read-handoff", "slot01", "--coordinator-pid", str(os.getpid())
+    )
+    assert read.returncode == 0, read.stderr
+    final = tmp_path / "final.md"
+    final.write_text("final bytes\n", encoding="utf-8")
+    refused = raw_command(
+        project, *_handoff_write_args(final, "1", supersede_reason="too late")
+    )
+    assert refused.returncode == 3
+    assert "immutable once read or released" in refused.stderr
+    assert _slot_generation(project) == 1
+    slot_dir = checkout(project).parent
+    successor = subprocess.Popen(["sleep", "3600"], cwd=slot_dir)
+    try:
+        code = wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "supersede-handoff",
+                "slot01",
+                "--agent",
+                "codex-1",
+                "--owner-pid",
+                str(successor.pid),
+                "--expected-generation",
+                "1",
+                "--coordinator-pid",
+                str(os.getpid()),
+                "--coordinator-authorized",
+                "--reason",
+                "live lane keeps using the slot",
+            ]
+        )
+    finally:
+        successor.terminate()
+        successor.wait(timeout=10)
+    assert code == 0
+    assert _slot_generation(project) == 2
+
+
+def test_supersede_own_checkpoint_preserves_finish_record(tmp_path: Path) -> None:
+    """Finish, checkpoint, reboot/transfer, flagged final; finish untouched."""
+    project, repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    commit_task(repository, checkout(project), "codex/task")
+    assert finish(project).returncode == 0
+    row_before = active_slots(project)[0]
+    assert isinstance(row_before, dict)
+    finish_before = json.dumps(row_before["handoff"], sort_keys=True)
+    checkpoint = tmp_path / "checkpoint.md"
+    checkpoint.write_text("checkpoint bytes\n", encoding="utf-8")
+    assert raw_command(project, *_handoff_write_args(checkpoint, "1")).returncode == 0
+    mark_owner_dead(project)
+    moved = command(
+        project,
+        "transfer-owner",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+    assert moved.returncode == 0, moved.stderr
+    final = tmp_path / "final.md"
+    final.write_text("final bytes\n", encoding="utf-8")
+    published = raw_command(
+        project, *_handoff_write_args(final, "1", supersede_reason="final after reboot")
+    )
+    assert published.returncode == 0, published.stderr
+    assert _slot_generation(project) == 2
+    row_after = active_slots(project)[0]
+    assert isinstance(row_after, dict)
+    assert json.dumps(row_after["handoff"], sort_keys=True) == finish_before
+    # A second finish at the old generation still refuses.
+    again = finish(project)
+    assert again.returncode != 0
+
+
 def test_write_handoff_refuses_tracked_checkout_source_without_queueing(
     tmp_path: Path,
 ) -> None:

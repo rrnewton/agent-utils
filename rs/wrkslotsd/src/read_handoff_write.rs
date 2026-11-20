@@ -119,7 +119,8 @@ pub(crate) fn read_handoff(
         EventLogStatus::Invalid(message) => return Err(message),
         EventLogStatus::Snapshot => Vec::new(),
     };
-    validate_publication(&events, slot, generation, &reader_or_owner(&record))?;
+    validate_publication(&events, &selected, slot, generation)?;
+    let superseded_note = superseded_checkpoint_note(&events, &cfg, &selected, slot, generation);
     let published = crate::handoff_write::publication(&events, slot, generation);
     let slot_dir = slot_directory(&cfg, slot, slot_type)?;
     let sidecar = match load_sidecar(&cfg, &selected, slot, generation) {
@@ -159,7 +160,7 @@ pub(crate) fn read_handoff(
             "outstanding"
         };
         return Err(format!(
-            "slot {slot} has a {state} owner-authenticated handoff write intent but no canonical sidecar; preserve the slot. state: REFUSED -- no read was recorded; preserve both the slot and any handoff sidecar"
+            "slot {slot} has a {state} owner-authenticated handoff write intent but no canonical sidecar{superseded_note}; preserve the slot. state: REFUSED -- no read was recorded; preserve both the slot and any handoff sidecar"
         ));
     }
     let legacy_path = slot_dir.join("HANDOFF.md");
@@ -214,7 +215,7 @@ pub(crate) fn read_handoff(
                 ));
             }
             return Err(format!(
-                "slot {slot} has no handoff sidecar or legacy HANDOFF.md. state: REFUSED -- no read was recorded. remedy: continue the reclaim checks; absence of a handoff is not evidence that the owner is dead"
+                "slot {slot} has no handoff sidecar or legacy HANDOFF.md{superseded_note}. state: REFUSED -- no read was recorded. remedy: continue the reclaim checks; absence of a handoff is not evidence that the owner is dead"
             ));
         }
     };
@@ -327,6 +328,51 @@ pub(crate) fn read_handoff(
     }))
 }
 
+fn superseded_checkpoint_note(
+    events: &[Value],
+    cfg: &crate::active_state::Cfg,
+    selected: &str,
+    slot: &str,
+    generation: i64,
+) -> String {
+    let mut found: Option<(String, i64)> = None;
+    for event in events {
+        if event.get("kind").and_then(Value::as_str) != Some("active-state-recorded") {
+            continue;
+        }
+        let payload = event.get("payload").cloned().unwrap_or(Value::Null);
+        if payload.get("action").and_then(Value::as_str) != Some("handoff-checkpoint-superseded")
+            || payload.get("slot").and_then(Value::as_str) != Some(slot)
+        {
+            continue;
+        }
+        let Some(evidence) = payload.get("evidence") else {
+            continue;
+        };
+        let Some(sha) = evidence
+            .get("superseded_sidecar_sha256")
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let Some(previous) = evidence.get("previous_generation").and_then(Value::as_i64) else {
+            continue;
+        };
+        if previous != generation - 1 {
+            continue;
+        }
+        found = Some((sha.to_string(), previous));
+    }
+    let Some((sha, previous)) = found else {
+        return String::new();
+    };
+    let path = sidecar_path(&cfg.control, selected, slot, previous);
+    format!(
+        "; superseded checkpoint sidecar sha256={sha} at {} (generation {previous}) remains on disk for manual recovery",
+        path.display()
+    )
+}
+
 fn load_sidecar(
     cfg: &crate::active_state::Cfg,
     selected: &str,
@@ -392,32 +438,4 @@ fn load_sidecar(
         ));
     }
     Ok(Some(value))
-}
-
-fn reader_or_owner(record: &Value) -> crate::status_state::Identity {
-    let owner = record.get("owner").cloned().unwrap_or(Value::Null);
-    crate::status_state::Identity {
-        pid: owner.get("pid").and_then(Value::as_i64).unwrap_or(0),
-        start_ticks: owner
-            .get("start_ticks")
-            .and_then(Value::as_i64)
-            .unwrap_or(0),
-        boot_id: owner
-            .get("boot_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        host_id: owner
-            .get("host_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        cgroup_path: owner
-            .get("cgroup_path")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        namespace_pid: crate::status_state::optional_namespace_pid(&owner),
-        pidns_inode: crate::status_state::optional_pidns_inode(&owner),
-    }
 }

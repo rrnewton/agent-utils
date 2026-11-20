@@ -16,7 +16,8 @@ use sha2::{Digest, Sha256};
 use crate::active_state::{load_cfg, slot_directory};
 use crate::config_validate::validate_name;
 use crate::ensure_states::{
-    append_event, ensure_event_log, refuse_partial_state, require_fixture, utc_now,
+    append_event, atomic_write_json, ensure_event_log, refuse_partial_state, require_fixture,
+    utc_now,
 };
 use crate::global_state::{event_log_status, load_event_chain, EventLogStatus};
 use crate::handoff_state::{
@@ -232,18 +233,93 @@ fn validate_intent(payload: &Value, slot: &str, generation: i64) -> Result<()> {
     Ok(())
 }
 
-/// Validate the latest publication intent the way the existing
-/// publication fold does: artifact identity, writer binding to the
-/// supplied owner, known-intent completions, and completion digests.
-pub(crate) fn validate_publication(
-    events: &[Value],
+fn handoff_owner_step(
+    owner: Option<Value>,
+    event: &Value,
+    machine: &str,
     slot: &str,
     generation: i64,
-    supplied: &Identity,
+) -> Option<Value> {
+    let payload = event.get("payload").cloned().unwrap_or(Value::Null);
+    match event.get("kind").and_then(Value::as_str) {
+        Some("state-imported") => payload
+            .pointer("/active/slots")
+            .and_then(Value::as_array)
+            .and_then(|slots| {
+                slots.iter().find(|item| {
+                    item.get("machine").and_then(Value::as_str) == Some(machine)
+                        && item.get("slot").and_then(Value::as_str) == Some(slot)
+                        && item.get("generation").and_then(Value::as_i64) == Some(generation)
+                })
+            })
+            .and_then(|record| record.get("owner").cloned()),
+        Some("active-state-recorded") => {
+            if payload.get("slot").and_then(Value::as_str) != Some(slot) {
+                return owner;
+            }
+            let record = payload.get("record").filter(|value| !value.is_null())?;
+            if record.get("machine").and_then(Value::as_str) == Some(machine)
+                && record.get("slot").and_then(Value::as_str) == Some(slot)
+                && record.get("generation").and_then(Value::as_i64) == Some(generation)
+            {
+                record.get("owner").cloned()
+            } else {
+                None
+            }
+        }
+        _ => owner,
+    }
+}
+
+fn writer_matches_owner(owner: &Option<Value>, writer: Option<&Value>) -> bool {
+    let (Some(owner), Some(writer)) = (owner, writer) else {
+        return false;
+    };
+    let Some(owner_identity) = crate::status_state::identity_from_value(owner) else {
+        return false;
+    };
+    crate::status_state::identity_matches_value(&owner_identity, writer)
+}
+
+pub(crate) fn owner_before_intent(
+    events: &[Value],
+    machine: &str,
+    slot: &str,
+    generation: i64,
+    intent_sequence: i64,
+) -> Option<Value> {
+    let mut owner: Option<Value> = None;
+    for event in events {
+        let sequence = event.get("sequence").and_then(Value::as_i64).unwrap_or(0);
+        if sequence >= intent_sequence {
+            break;
+        }
+        owner = handoff_owner_step(owner, event, machine, slot, generation);
+    }
+    owner
+}
+
+/// Validate the latest publication intent the way the existing
+/// publication fold does: artifact identity, writer binding to the
+/// owner recorded at intent time, known-intent completions, and
+/// completion digests.
+pub(crate) fn validate_publication(
+    events: &[Value],
+    machine: &str,
+    slot: &str,
+    generation: i64,
 ) -> Result<()> {
     let mut intent_sequences: Vec<i64> = Vec::new();
+    let mut owner_at_intent: Option<Value> = None;
     for event in events {
         let payload = event.get("payload").cloned().unwrap_or(Value::Null);
+        match event.get("kind").and_then(Value::as_str) {
+            Some("state-imported") | Some("active-state-recorded") => {
+                owner_at_intent =
+                    handoff_owner_step(owner_at_intent.clone(), event, machine, slot, generation);
+            }
+            _ => {}
+        }
         if payload.get("slot").and_then(Value::as_str) != Some(slot)
             || payload.get("generation").and_then(Value::as_i64) != Some(generation)
         {
@@ -252,9 +328,7 @@ pub(crate) fn validate_publication(
         match event.get("kind").and_then(Value::as_str) {
             Some("handoff-write-intended") => {
                 validate_intent(&payload, slot, generation)?;
-                if !payload.get("writer").is_some_and(|writer| {
-                    crate::status_state::identity_matches_value(supplied, writer)
-                }) {
+                if !writer_matches_owner(&owner_at_intent, payload.get("writer")) {
                     return Err(
                         "handoff write intent writer does not match the recorded slot owner"
                             .to_string(),
@@ -500,12 +574,19 @@ pub(crate) fn write_handoff(
     owner_pid: i64,
     expected_generation: i64,
     from_file: &Path,
+    supersede_own_checkpoint: bool,
+    reason: Option<&str>,
 ) -> Result<Value> {
     require_fixture()?;
     let (cfg, selected) = load_cfg(root, machine_override)?;
     validate_name(&selected, "machine")?;
     validate_name(slot, "slot")?;
     validate_name(agent, "agent")?;
+    if supersede_own_checkpoint && reason.map(|text| text.trim().is_empty()).unwrap_or(true) {
+        return Err(
+            "write-handoff --supersede-own-checkpoint requires a non-empty --reason".to_string(),
+        );
+    }
     let supplied = read_process_identity(owner_pid)?;
     assert_caller(&supplied)?;
     let requested = if from_file.is_absolute() {
@@ -552,7 +633,7 @@ pub(crate) fn write_handoff(
     if record.get("slot_type").and_then(Value::as_str) != Some("agent") {
         return Err("validation slots cannot carry agent handoffs".to_string());
     }
-    let generation = record
+    let mut generation = record
         .get("generation")
         .and_then(Value::as_i64)
         .unwrap_or(0);
@@ -627,9 +708,9 @@ pub(crate) fn write_handoff(
         .get("slot_type")
         .and_then(Value::as_str)
         .unwrap_or("agent");
-    let path = sidecar_path(&cfg.control, &selected, slot, generation);
+    let mut path = sidecar_path(&cfg.control, &selected, slot, generation);
     let mut existing_schema1 = false;
-    let existing: Option<Value> = if path.exists() || path.is_symlink() {
+    let mut existing: Option<Value> = if path.exists() || path.is_symlink() {
         let (bytes, _) = read_regular_file_identity(&path, "handoff sidecar", LIMIT)?;
         let text = String::from_utf8(bytes)
             .map_err(|_| format!("handoff sidecar {} is invalid: not UTF-8", path.display()))?;
@@ -729,12 +810,12 @@ pub(crate) fn write_handoff(
     }
     ensure_event_log(root, &cfg, &selected)?;
     let directory = cfg.control.join(format!("EVENTS.{selected}"));
-    let events = if let EventLogStatus::Derived = event_log_status(&directory) {
+    let mut events = if let EventLogStatus::Derived = event_log_status(&directory) {
         load_event_chain(&directory, &selected)?
     } else {
         Vec::new()
     };
-    let published = publication(&events, slot, generation);
+    let mut published = publication(&events, slot, generation);
     if let Some((sequence, intended, completed)) = &published {
         let intent_event = events
             .iter()
@@ -742,9 +823,9 @@ pub(crate) fn write_handoff(
         if let Some(event) = intent_event {
             let payload = event.get("payload").cloned().unwrap_or(Value::Null);
             validate_intent(&payload, slot, generation)?;
-            if !payload.get("writer").is_some_and(|writer| {
-                crate::status_state::identity_matches_value(&supplied, writer)
-            }) {
+            let owner_at_intent =
+                owner_before_intent(&events, &selected, slot, generation, *sequence);
+            if !writer_matches_owner(&owner_at_intent, payload.get("writer")) {
                 return Err(
                     "handoff write intent writer does not match the recorded slot owner"
                         .to_string(),
@@ -773,6 +854,130 @@ pub(crate) fn write_handoff(
             if !digest_ok {
                 return Err("handoff write completion digest does not match its intent".to_string());
             }
+        }
+    }
+    if supersede_own_checkpoint {
+        if let Some(current) = existing.clone() {
+            // A flagged re-write byte-identical to the completed sidecar
+            // (same provenance as an unflagged identical re-write)
+            // completes in place: no generation bump and no new events.
+            // This precedes the read/release gates because an unflagged
+            // identical re-write also completes after a read; different
+            // bytes keep every supersede gate below unchanged.
+            let identical_digest = format!("{:x}", Sha256::digest(&contents));
+            let source_text = source.to_string_lossy().into_owned();
+            let is_identical = current
+                .get("contents_utf8")
+                .and_then(Value::as_str)
+                .map(|text| text.as_bytes())
+                == Some(contents.as_slice())
+                && current.get("sha256").and_then(Value::as_str) == Some(identical_digest.as_str())
+                && current.get("source").and_then(Value::as_str) == Some("write-handoff")
+                && current.get("source_path").and_then(Value::as_str) == Some(source_text.as_str())
+                && current.get("source_identity") == Some(&identity_to_obj(&source_identity));
+            let is_completed_identical = is_identical
+                && matches!(&published, Some((_, intended, true)) if *intended == current);
+            if is_completed_identical {
+                return Ok(json!({
+                    "machine": selected,
+                    "slot": slot,
+                    "generation": generation,
+                    "sha256": identical_digest,
+                    "path": path.to_string_lossy(),
+                }));
+            }
+            // Owner-authenticated supersede of one's own checkpoint
+            // (#1975 phase 6, option (a)): only a completed schema-2
+            // write-handoff sidecar that has been neither read for
+            // retirement nor released may give way.
+            if current.get("source").and_then(Value::as_str) != Some("write-handoff") {
+                return Err(format!(
+                    "slot {slot} already has an immutable handoff sidecar with different contents or source provenance; preserve both versions for manual review"
+                ));
+            }
+            let (intent_sequence, _intended, completed) = match &published {
+                Some((sequence, intended, done)) if *intended == current => {
+                    (*sequence, intended.clone(), *done)
+                }
+                _ => {
+                    return Err(format!(
+                        "slot {slot} existing handoff sidecar has no matching owner-authenticated publication intent; preserve it for manual review"
+                    ));
+                }
+            };
+            if !completed {
+                return Err(format!(
+                    "slot {slot} handoff publication is incomplete; preserve the sidecar and have its exact owner retry write-handoff"
+                ));
+            }
+            let superseded_sha = current
+                .get("sha256")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let latest_read =
+                crate::retirement_queue::latest_handoff_read(&events, slot, generation)?;
+            if latest_read.map(|read| read.enqueued).unwrap_or(false) {
+                return Err(format!(
+                    "slot {slot} handoff sidecar is immutable once read or released; it has already been read for retirement, so its owner cannot supersede it. remedy: have the coordinator supersede the read with 'wrkslots supersede-handoff' if the lane keeps using the slot"
+                ));
+            }
+            if crate::heartbeat_write::release_in_effect(&cfg, &record, &events)?.is_some() {
+                return Err(format!(
+                    "slot {slot} handoff sidecar is immutable once read or released; this generation has already been released by its owner, so it cannot be superseded. remedy: preserve the released handoff for coordinator retirement"
+                ));
+            }
+            let reason_text = reason.unwrap_or_default().to_string();
+            let previous_revision = active.get("revision").and_then(Value::as_i64).unwrap_or(0);
+            let previous_digest =
+                crate::canonical::canonical_sha256(&record).map_err(|error| error.to_string())?;
+            let mut bumped = record.clone();
+            if let Some(object) = bumped.as_object_mut() {
+                object.insert("generation".to_string(), json!(generation + 1));
+            }
+            append_event(
+                &cfg,
+                &selected,
+                "active-state-recorded",
+                json!({
+                    "action": "handoff-checkpoint-superseded",
+                    "slot": slot,
+                    "previous_revision": previous_revision,
+                    "revision": previous_revision + 1,
+                    "previous_record_sha256": previous_digest,
+                    "record": bumped,
+                    "evidence": {
+                        "writer": identity_value(&supplied),
+                        "previous_generation": generation,
+                        "superseded_sidecar_sha256": superseded_sha,
+                        "superseded_intent_sequence": intent_sequence,
+                        "reason": reason_text,
+                    },
+                }),
+            )?;
+            let mut slots: Vec<Value> = active
+                .get("slots")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for item in slots.iter_mut() {
+                if item.get("slot").and_then(Value::as_str) == Some(slot) {
+                    *item = bumped.clone();
+                }
+            }
+            let mut document = active.clone();
+            if let Some(object) = document.as_object_mut() {
+                object.insert("revision".to_string(), json!(previous_revision + 1));
+                object.insert("slots".to_string(), json!(slots));
+            }
+            let active_path = cfg.control.join(format!("ACTIVE.{selected}.json"));
+            atomic_write_json(&active_path, &document)?;
+            validate_global(root, &cfg)?;
+            generation += 1;
+            path = sidecar_path(&cfg.control, &selected, slot, generation);
+            existing = None;
+            events = load_event_chain(&directory, &selected)?;
+            published = publication(&events, slot, generation);
         }
     }
     let digest = format!("{:x}", Sha256::digest(&contents));

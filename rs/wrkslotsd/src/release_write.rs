@@ -194,7 +194,7 @@ pub(crate) fn release_slot(
             return Err(format!("cannot release slot {slot}: {error}. {TAIL}"));
         }
     };
-    validate_publication(&events, slot, generation, &supplied)?;
+    validate_publication(&events, &selected, slot, generation)?;
     let published = publication(&events, slot, generation);
     let slot_dir = slot_directory(&cfg, slot, slot_type)?;
     let legacy_path = slot_dir.join("HANDOFF.md");

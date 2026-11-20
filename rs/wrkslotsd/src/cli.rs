@@ -663,7 +663,7 @@ pub(crate) enum Readers {
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
-    /// Publish one generation-bound handoff sidecar; a slot finished without a handoff can publish its handoff once, afterwards, and the finish record never changes (writer; fixture registries only until cutover)
+    /// Publish one generation-bound handoff sidecar; a slot finished without a handoff can publish its handoff once, afterwards, and the finish record never changes. The sidecar is immutable once a handoff-read with retirement_enqueued has been recorded for its generation or an owner-release is in effect for it: before either, its owner may supersede its own completed checkpoint with --supersede-own-checkpoint --reason TEXT, which advances the generation and leaves the superseded sidecar on disk (writer; fixture registries only until cutover)
     WriteHandoff {
         /// Active agent slot name
         slot: String,
@@ -679,6 +679,12 @@ pub(crate) enum Readers {
         /// External handoff file (outside every Git working tree)
         #[arg(long, value_name = "FILE")]
         from_file: PathBuf,
+        /// Supersede this generation's own completed write-handoff checkpoint with no retirement-enqueued handoff-read for this generation and no owner-release in effect, and publish at the next generation in the same invocation; requires --reason; the superseded sidecar stays on disk
+        #[arg(long)]
+        supersede_own_checkpoint: bool,
+        /// Why the owner supersedes its own checkpoint; recorded in the event log (required with --supersede-own-checkpoint)
+        #[arg(long, value_name = "TEXT")]
+        reason: Option<String>,
         /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
         #[arg(long, value_name = "DIR")]
         root: Option<PathBuf>,
@@ -3021,6 +3027,8 @@ pub fn run() -> u8 {
                 owner_pid,
                 expected_generation,
                 from_file,
+                supersede_own_checkpoint,
+                reason,
                 root,
                 machine,
             } => {
@@ -3032,6 +3040,8 @@ pub fn run() -> u8 {
                     owner_pid,
                     expected_generation,
                     &from_file,
+                    supersede_own_checkpoint,
+                    reason.as_deref(),
                 ) {
                     Ok(value) => {
                         println!(

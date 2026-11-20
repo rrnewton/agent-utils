@@ -1188,9 +1188,30 @@ does not make a clean checkout dirty. The sidecar records the source classificat
 and exact file identity alongside its bytes. Before exposing a publication temporary file,
 `write-handoff` records an owner-authenticated intent containing that complete deterministic
 envelope; only exact canonical verification records completion. Reads accept the sidecar only when
-both events match it. The sidecar is immutable once published; `finish` still refuses every tracked,
+both events match it. The sidecar is immutable once a `handoff-read` with `retirement_enqueued` has been recorded for its generation or an owner-release is in effect for it; `finish` still refuses every tracked,
 untracked, or ignored checkout change. In particular, it does not exempt a pre-sidecar `HANDOFF.md`
 inside a flat-layout checkout.
+
+Before a `handoff-read` with `retirement_enqueued` has been recorded for its generation and
+while no owner-release is in effect for it, the exact owner may replace its checkpoint with
+`write-handoff SLOT --agent AGENT --owner-pid PID --expected-generation N --from-file
+/path/to/HANDOFF.md --supersede-own-checkpoint --reason TEXT` (`--reason` is required). The command
+proves the caller still owns the slot, refuses unless the occupying sidecar is its own completed
+schema-2 `write-handoff` publication with no outstanding intent, no `handoff-read` with
+`retirement_enqueued` for this generation, and no owner-release in effect, then advances the
+generation by one, records one
+`handoff-checkpoint-superseded` event, and publishes the new bytes at the new generation in the
+same invocation. A flagged re-write whose bytes and source provenance are byte-identical to the
+completed checkpoint instead completes in place: it returns the same success output as an
+unflagged byte-identical re-write, with no generation advance and no new events. The superseded
+checkpoint sidecar stays on disk as audit evidence; only the new
+generation is readable for retirement. Once a `handoff-read` with `retirement_enqueued` has been
+recorded for a generation or an owner-release is in effect for it, the sidecar stays absolutely
+immutable, and the coordinator remedy for a slot whose read was retirement-enqueued remains
+`supersede-handoff`. If a flagged write crashes after recording the superseded event but before
+publishing the new generation, a `read-handoff` at the new, sidecar-less generation refuses and
+names the superseded checkpoint's `superseded_sidecar_sha256` and its sidecar path, which remains
+on disk for manual recovery; the exact owner's retry at the new generation publishes as usual.
 
 A linked worktree of another repository nested inside the slot directory does not stop
 `write-handoff`: it warns loudly, naming the repository and path, and records both in the
@@ -1208,8 +1229,9 @@ The command does not hold the state lock while it writes up to 1 MiB to the call
 exact generation and file identity, writes and flushes the bytes, then reacquires the lock and
 revalidates both before recording the read. A failed flush or concurrent change records no new read.
 When the checkout file genuinely changed after an earlier read, ordinary read refuses and keeps
-both copies. Published sidecars are immutable: the deprecated adoption option also refuses, so no
-command silently replaces either artifact. An operator must preserve and reconcile the disagreement
+both copies. Published sidecars are immutable once a `handoff-read` with `retirement_enqueued` has been recorded for their generation or an owner-release is in effect for it: the deprecated adoption option also refuses, so no
+command silently replaces either artifact once such a read has been recorded or a release is in effect. Before any such read and while no release is in effect, only the exact
+owner's `--supersede-own-checkpoint` write above may advance past its own checkpoint. An operator must preserve and reconcile the disagreement
 outside this destructive workflow before a fresh slot can provide new retirement evidence.
 
 Inspect the queue with `wrkslots retirement-queue --format json`. A coordinator may attempt a
