@@ -2002,8 +2002,11 @@ fn parse_remote_ssh_commands(raw: &Map<String, Value>) -> Result<Vec<Value>> {
             None | Some(Value::Null) => None,
             Some(value) => {
                 let proxy = as_str(value, &format!("{label}.proxy_command"))?;
-                if proxy.trim().is_empty() || proxy.chars().any(|c| matches!(c, '\r' | '\n' | '\0'))
-                {
+                // Python's str.strip also strips \x1c-\x1f; match it.
+                let blank = proxy
+                    .chars()
+                    .all(|c| c.is_whitespace() || matches!(c, '\u{1c}'..='\u{1f}'));
+                if blank || proxy.chars().any(|c| matches!(c, '\r' | '\n' | '\0')) {
                     return Err(format!(
                         "{label}.proxy_command must be one non-empty command with no newline"
                     ));

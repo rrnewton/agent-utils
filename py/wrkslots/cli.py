@@ -778,8 +778,10 @@ CONFIG_KEY_DOCS: dict[str, str] = {
     "remote_ssh_commands": (
         "Per-remote SSH settings (#1940): a map from remote name to structured fields "
         "identity_file (absolute path to a key file), identity_agent (none or an agent "
-        "socket path) and proxy_command. wrkslots applies them only as GIT_SSH_COMMAND for "
-        "that remote's fetch, ls-remote and push; nothing is written to any Git config. "
+        "socket path) and proxy_command. Settings match by remote NAME: an entry for "
+        "origin applies to every repository's origin, whatever host its URL points to. "
+        "wrkslots applies them only as GIT_SSH_COMMAND for that remote's fetch "
+        "(including its ls-remote); nothing is written to any Git config. "
         "Paths only: no key contents or secrets belong here. List the key in ignorable_keys "
         "so an older wrkslots ignores it (with a warning) instead of refusing the file; an "
         "older wrkslots then reaches that remote exactly as it does today, or fails loudly."

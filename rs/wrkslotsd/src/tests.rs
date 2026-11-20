@@ -7206,3 +7206,72 @@ fn config_lock_dual_locks_the_legacy_root_and_the_config_file() {
         "config.lock must be free after the drop"
     );
 }
+
+#[test]
+fn fetch_remote_really_uses_the_declared_ssh_command() {
+    // #1940 end to end: fetch_remote over ssh:// with a shim as the
+    // whole GIT_SSH_COMMAND; /bin/false refuses, the shim answers.
+    let scratch = Scratch::new();
+    let upstream = scratch.0.join("upstream");
+    fs::create_dir(&upstream).expect("upstream dir");
+    let git = |repo: &Path, args: &[&str]| -> String {
+        let output = Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "commit.gpgsign=false",
+                "-C",
+            ])
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    };
+    git(&upstream, &["init", "-q", "-b", "main"]);
+    fs::write(upstream.join("file.txt"), "one\n").expect("write file");
+    git(&upstream, &["add", "file.txt"]);
+    git(&upstream, &["commit", "-q", "-m", "one"]);
+    let head = git(&upstream, &["rev-parse", "main"]);
+    let url = format!("ssh://git@localhost{}", upstream.display());
+    let shim = scratch.0.join("fake-ssh");
+    fs::write(
+        &shim,
+        "#!/bin/sh\nwhile [ $# -gt 1 ]; do shift; done\nexec sh -c \"$1\"\n",
+    )
+    .expect("write shim");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).expect("chmod shim");
+    }
+    let landed = "refs/remotes/origin/main";
+    assert!(crate::finish_write::fetch_remote(
+        &upstream,
+        "origin",
+        landed,
+        &url,
+        Some("/bin/false"),
+    )
+    .is_err());
+    crate::finish_write::fetch_remote(
+        &upstream,
+        "origin",
+        landed,
+        &url,
+        Some(shim.to_string_lossy().as_ref()),
+    )
+    .expect("fetch through shim");
+    assert_eq!(
+        git(&upstream, &["rev-parse", "refs/remotes/origin/main"]),
+        head
+    );
+}

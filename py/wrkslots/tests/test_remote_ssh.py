@@ -59,6 +59,7 @@ def test_command_round_trips_through_shlex() -> None:
         ("identity_agent", "/tmp/agent;id"),
         ("proxy_command", "ssh jump\nrm -rf /"),
         ("proxy_command", "  "),
+        ("proxy_command", "\x1c\x1f"),
     ],
 )
 def test_injection_values_refuse(field: str, value: str) -> None:
@@ -140,6 +141,76 @@ def test_rust_validate_config_and_doctor_match(tmp_path: Path) -> None:
     assert rows[0]["identity_file"] == "/keys/ghe-key"
     assert rows[0]["proxy_command"] == "set"
     assert "jump.example" not in doctor.stdout
+
+
+def test_evil_proxy_command_reaches_fake_ssh_as_one_argument(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # End to end: an injection-shaped proxy_command goes through the
+    # real builder into a git fetch over ssh://, with a fake ssh on
+    # PATH logging its argv. It must arrive as exactly one argument
+    # and create no probe file.
+    root = _fixture(tmp_path / "case")
+    upstream = tmp_path / "case" / "upstream-repo"
+    url = f"ssh://git@localhost{upstream}"
+    _git(upstream, "remote", "set-url", "origin", url)
+    probe = tmp_path / "probe-created"
+    evil = (
+        f"jump'$(touch {probe}) `touch {probe}` ; touch {probe} "
+        f"| touch {probe} & touch {probe} > {probe}"
+    )
+    parsed = wrkslots_cli._parse_remote_ssh_commands(
+        {
+            "origin": {
+                "identity_file": "/keys/ghe-key",
+                "identity_agent": "none",
+                "proxy_command": evil,
+            }
+        },
+        "configuration.remote_ssh_commands",
+    )
+    config = object.__new__(wrkslots_cli.Config)
+    object.__setattr__(config, "remote_ssh_commands", parsed)
+    command = wrkslots_cli._remote_ssh_command(config, "origin")
+    log = tmp_path / "ssh-argv.log"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_ssh = fake_bin / "ssh"
+    fake_ssh.write_text(
+        "#!/bin/sh\n"
+        f"for arg in \"$@\"; do printf 'ARG %s\\n' \"$arg\" >> {log}; done\n"
+        "while [ $# -gt 1 ]; do shift; done\n"
+        'exec sh -c "$1"\n'
+    )
+    fake_ssh.chmod(fake_ssh.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("PATH", f"{fake_bin}:{os.environ['PATH']}")
+    vcs = wrkslots_cli._GitVcs()
+    authority = vcs.remote_authority(upstream, "origin")
+    vcs.fetch_remote(
+        upstream, "origin", "refs/remotes/origin/main", authority,
+        ssh_command=command,
+    )
+    argv = [
+        line.removeprefix("ARG ")
+        for line in log.read_text().splitlines()
+        if line.startswith("ARG ")
+    ]
+    # Git may add its own -o options after ours; the declared tokens
+    # must lead, with the evil proxy as exactly one argument.
+    assert argv[:5] == [
+        "-i",
+        "/keys/ghe-key",
+        "-o",
+        "IdentityAgent=none",
+        "-o",
+    ]
+    assert argv[5] == f"ProxyCommand={evil}"
+    assert "git@localhost" in argv
+    assert argv[-1].startswith("git-upload-pack ")
+    assert not probe.exists()
+    assert _git(upstream, "rev-parse", "refs/remotes/origin/main") == _git(
+        upstream, "rev-parse", "main"
+    )
 
 
 def test_fetch_remote_honours_the_ssh_command(tmp_path: Path) -> None:
