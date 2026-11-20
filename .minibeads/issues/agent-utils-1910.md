@@ -27,3 +27,5 @@ A failed create must never leave the shared submodule common config modified: se
 # Notes
 
 Queued after #1876 wrkslots-remote-proof-without-egress. Whether current main already changes this behaviour is checked before the fix and recorded in the resolution.
+
+Note: a crash mid-restore can leave a stale `config.lock`/`config.worktree.lock` or a `.config.wrkslots-restore` temp file in the module common dir; both are named in the rollback output and are safe to remove by hand. The original incident came from a create on a submodule, which #1941 already handles in `_apply_slot_git_identity`; the third `worktree add` path (the direct share-submodules command) is out of scope for this create-rollback change.

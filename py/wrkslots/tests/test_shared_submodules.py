@@ -563,3 +563,89 @@ def test_plain_repo_identity_keeps_working(tmp_path: Path) -> None:
     shared = _common_config(repository).read_text(encoding="utf-8")
     assert "worktreeConfig = true" in shared
     assert "core.worktree" not in shared
+
+
+def test_failed_create_restores_shared_module_config_byte_identical(
+    tmp_path: Path,
+) -> None:
+    # #1910: a create that fails after the shared-submodule config step
+    # (here a failing post-provision hook) must leave the shared module
+    # repository's common config byte-identical.
+    project, repository, _remote = make_project(tmp_path)
+    add_recursive_submodules(tmp_path, project, repository)
+    update_configuration(
+        project,
+        post_provision_hooks=["test -e .hook-done || { touch .hook-done; exit 1; }"],
+        share_submodules=True,
+    )
+    module = _primary_module(repository)
+    config_before = (module / "config").read_bytes()
+    worktree_before = (
+        (module / "config.worktree").read_bytes()
+        if (module / "config.worktree").exists()
+        else None
+    )
+
+    made = create(project)
+
+    assert made.returncode != 0
+    assert (module / "config").read_bytes() == config_before
+    after_worktree = (
+        (module / "config.worktree").read_bytes()
+        if (module / "config.worktree").exists()
+        else None
+    )
+    assert after_worktree == worktree_before
+
+    # Recovery re-prepares and publishes a working shared submodule:
+    # git status there is clean, never a phantom view of the primary.
+    recovered = command(project, "recover", "--coordinator-pid", str(os.getpid()))
+    assert recovered.returncode == 0, recovered.stderr
+    slot_component = checkout(project) / "component"
+    status = git(slot_component, "status", "--porcelain")
+    assert status.stdout.strip() == ""
+    assert (module / "config").read_bytes() != config_before  # prepared again
+
+
+def test_hook_skip_marker_is_reported_as_skipped(tmp_path: Path) -> None:
+    # #1910: a hook exiting 0 with a wrkslots-hook-skip stderr line is
+    # reported as skipped with its reason, not as plain success.
+    project, repository, _remote = make_project(tmp_path)
+    update_configuration(
+        project,
+        post_provision_hooks=[
+            "echo 'wrkslots-hook-skip: no generator in this repo' >&2"
+        ],
+    )
+
+    made = create(project)
+
+    assert made.returncode == 0, made.stderr
+    assert "skipped (no generator in this repo)" in made.stderr
+    assert len(active_slots(project)) == 1
+
+
+def test_recover_reruns_first_hook_after_rollback_removed_worktree(
+    tmp_path: Path,
+) -> None:
+    # #1910: rollback removes the added submodule worktree, so recovery
+    # must rerun hook 1 instead of resuming at hook 2.
+    project, repository, _remote = make_project(tmp_path)
+    add_recursive_submodules(tmp_path, project, repository)
+    update_configuration(
+        project,
+        post_provision_hooks=[
+            'echo run >> "$WRKSLOTS_PROJECT_ROOT/hook1-runs"',
+            "test -e .hook2-done || { touch .hook2-done; exit 1; }",
+        ],
+        share_submodules=True,
+    )
+
+    made = create(project)
+    assert made.returncode != 0
+
+    recovered = command(project, "recover", "--coordinator-pid", str(os.getpid()))
+    assert recovered.returncode == 0, recovered.stderr
+    runs = (project / "hook1-runs").read_text(encoding="utf-8").splitlines()
+    assert len(runs) == 2, runs
+    assert len(active_slots(project)) == 1

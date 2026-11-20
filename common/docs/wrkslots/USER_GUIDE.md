@@ -625,6 +625,12 @@ environment variables:
 A hook that fails leaves the slot for inspection with its create journal; fix the cause and run
 `wrkslots recover`, which resumes from the failed hook.
 
+A hook that has nothing to do in a checkout (for example a generator hook in a repository with
+no generator) can mark itself skipped: exit 0 and print a stderr line beginning
+`wrkslots-hook-skip: ` followed by the reason. `create` then reports the step as
+`skipped (<reason>)`, distinct from success and failure. Hooks that never print the marker are
+reported exactly as before.
+
 An entry can also be a mapping, so that it runs only in slots of the listed types (#1122):
 
 ```yaml
@@ -653,7 +659,11 @@ the superproject's recorded gitlink. A hook's `git submodule update --init` then
 populated and does nothing. The key is opt-in (list it in `ignorable_keys` so an older
 wrkslots ignores it with a warning): sharing prepares the primary submodule repositories
 and the recovery paths for shared layouts are still being extended, so the private
-clone stays the default until they are complete. The per-slot cost is the small worktree administration under
+clone stays the default until they are complete. Preparing a module repository (enabling
+`extensions.worktreeConfig` and moving `core.worktree`) is rolled back byte-identically if the
+create then fails before the slot is registered, so a failed `create` never leaves a shared
+submodule's common config modified; `wrkslots recover` re-prepares it when the create resumes.
+The per-slot cost is the small worktree administration under
 `.git/modules/<name>/worktrees/`; objects and refs live once, in the primary repository, and
 `git gc` there computes reachability over every worktree, so no slot can be pruned out from
 under another. Submodules with no initialized primary module repository keep the stock

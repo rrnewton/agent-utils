@@ -45152,6 +45152,23 @@ def _instead_of_diagnosis(
     return diagnosis
 
 
+#: A post-provision hook that exits 0 and prints a stderr line beginning
+#: with this prefix marks itself skipped (#1910); the rest of the line is
+#: the reason, reported as ``skipped (<reason>)`` instead of plain success.
+HOOK_SKIP_PREFIX = "wrkslots-hook-skip:"
+
+
+def _hook_skip_reason(stderr: str) -> str | None:
+    """The skip reason a successful hook declared, or None (#1910)."""
+
+    for line in stderr.splitlines():
+        if line.startswith(HOOK_SKIP_PREFIX):
+            reason = line[len(HOOK_SKIP_PREFIX) :].strip()
+            reason = "".join(ch for ch in reason if ch.isprintable())
+            return reason[:200] or "no reason given"
+    return None
+
+
 def _run_post_provision_hooks(
     config: Config,
     created: Sequence[Checkout],
@@ -45272,6 +45289,13 @@ def _run_post_provision_hooks(
                 f"failed with rc {completed.returncode}; slot was left for inspection "
                 f"with journal {journal_path}. Fix the cause and run 'wrkslots recover'"
                 + (f"; {diagnosis}" if diagnosis else "")
+            )
+        skip_reason = _hook_skip_reason(completed.stderr)
+        if skip_reason is not None:
+            print(
+                f"post-provision hook {step + 1}/{total} checkout={checkout.name}: "
+                f"skipped ({skip_reason})",
+                file=sys.stderr,
             )
         journal["hook_progress"] = step + 1
         journal["hook_failure"] = None
@@ -45856,6 +45880,133 @@ def _shared_module_prep_state(
     return "unprepared", "extensions.worktreeConfig is not enabled yet", common
 
 
+def _common_config_snapshot(common: Path) -> tuple[bytes | None, bytes | None]:
+    """Bytes of a module common dir's ``config`` and ``config.worktree`` (#1910).
+
+    ``None`` marks an absent file, so a restore recreates the exact prior
+    state, including absence.
+    """
+
+    def read(name: str) -> bytes | None:
+        try:
+            return (common / name).read_bytes()
+        except FileNotFoundError:
+            return None
+
+    return read("config"), read("config.worktree")
+
+
+def _restore_common_config(
+    common: Path,
+    snapshot: tuple[bytes | None, bytes | None],
+    *,
+    expected: tuple[bytes | None, bytes | None] | None = None,
+) -> bool:
+    """Restore a snapshot atomically, under Git's config lock (#1910).
+
+    With ``expected``, this is a compare-and-swap: nothing is written
+    unless both files still hold exactly those bytes, so config writes by
+    other slots, the primary checkout, or the failed attempt's own hooks
+    are never erased. A symlinked config file or a held ``config.lock``
+    also leaves everything untouched. Returns True when restored.
+    """
+
+    names = ("config", "config.worktree")
+
+    def skipped(reason: str) -> bool:
+        print(f"shared-submodule: rollback restore skipped for {common}: {reason}", file=sys.stderr)
+        return False
+
+    if any((common / name).is_symlink() for name in names):
+        return skipped("a config file is a symlink")
+    for name, data in zip(names, snapshot):
+        target = common / name
+        lock = common / f"{name}.lock"
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            return skipped(f"{name}.lock is held")
+        try:
+            if expected is not None:
+                current = None
+                try:
+                    current = target.read_bytes()
+                except FileNotFoundError:
+                    current = None
+                want = expected[names.index(name)]
+                if current != want:
+                    return skipped(f"{name} changed since preparation")
+            if data is None:
+                target.unlink(missing_ok=True)
+            else:
+                tmp = common / f".{name}.wrkslots-restore"
+                tmp.write_bytes(data)
+                with contextlib.suppress(FileNotFoundError):
+                    os.chmod(tmp, stat.S_IMODE(target.stat().st_mode))
+                os.replace(tmp, target)
+        finally:
+            os.close(fd)
+            lock.unlink(missing_ok=True)
+    return True
+
+
+@dataclasses.dataclass
+class _SharedConfigRollback:
+    """One module common dir a create attempt prepared (#1910)."""
+
+    common: Path
+    before: tuple[bytes | None, bytes | None]
+    after: tuple[bytes | None, bytes | None]
+    source_submodule: Path | None = None
+    added_worktree: Path | None = None
+
+
+@contextlib.contextmanager
+def _rollback_shared_configs_on_failure(
+    snapshots: list[_SharedConfigRollback],
+    vcs: _GitVcs | None = None,
+    *,
+    reset_progress: Callable[[], None] | None = None,
+) -> Iterator[dict[str, bool]]:
+    """Roll back shared-module config changes if the attempt fails (#1910).
+
+    Yields a flag the caller sets before publishing the slot; a failure
+    before that first removes any linked worktree the attempt added (so
+    the restored config never leaves a slot submodule resolving to the
+    primary's working tree), then restores each prepared common config
+    byte-identically, compare-and-swap. A crash between snapshot and
+    restore leaves the fully prepared state, which is coherent; recovery
+    re-runs preparation idempotently.
+    """
+
+    published: dict[str, bool] = {"done": False}
+    try:
+        yield published
+    except BaseException:
+        if not published["done"]:
+            for entry in reversed(snapshots):
+                if entry.added_worktree is not None and vcs is not None:
+                    removed = vcs._run(
+                        entry.source_submodule or entry.added_worktree,
+                        ["worktree", "remove", "--force", str(entry.added_worktree)],
+                        check=False,
+                    )
+                    if removed.returncode != 0:
+                        print(
+                            "shared-submodule: rollback left "
+                            f"{entry.common} prepared: could not remove "
+                            f"the failed attempt's worktree {entry.added_worktree}",
+                            file=sys.stderr,
+                        )
+                        continue
+                    if reset_progress is not None:
+                        # The removed worktree held earlier hooks' output;
+                        # recovery must rerun every hook, not resume.
+                        reset_progress()
+                _restore_common_config(entry.common, entry.before, expected=entry.after)
+        raise
+
+
 def _prepare_shared_submodule_repo(vcs: _GitVcs, source_submodule: Path) -> bool:
     """Prepare the primary submodule repository at ``source_submodule`` for sharing.
 
@@ -45903,17 +46054,24 @@ def _prepare_shared_submodule_repo(vcs: _GitVcs, source_submodule: Path) -> bool
     # The shared-submodule caller moves the value instead of refusing:
     # sharing is the explicit request, and the move is verified and
     # logged here, and reversible by moving the value back (#1435).
-    _ensure_worktree_config_enabled(
-        vcs, source_submodule, common,
-        main_worktree=source,
-        move_core_worktree=True,
-        make_refusal=prepare_refusal,
-    )
-    if vcs.head(source_submodule) != head_before:
-        raise Refusal(
-            f"preparing {common} for sharing changed the HEAD of {source_submodule}; "
-            "preserve the repository and inspect it before rerunning"
+    # A failure here restores the common config byte-identically, so a
+    # failed preparation never leaves the extension behind (#1910).
+    snapshot = _common_config_snapshot(common)
+    try:
+        _ensure_worktree_config_enabled(
+            vcs, source_submodule, common,
+            main_worktree=source,
+            move_core_worktree=True,
+            make_refusal=prepare_refusal,
         )
+        if vcs.head(source_submodule) != head_before:
+            raise Refusal(
+                f"preparing {common} for sharing changed the HEAD of {source_submodule}; "
+                "preserve the repository and inspect it before rerunning"
+            )
+    except BaseException:
+        _restore_common_config(common, snapshot)
+        raise
     print(
         f"shared-submodule: prepared primary repository {common} for sharing "
         f"(extensions.worktreeConfig=true; core.worktree moved to "
@@ -45925,7 +46083,12 @@ def _prepare_shared_submodule_repo(vcs: _GitVcs, source_submodule: Path) -> bool
 
 
 def _share_checkout_submodules(
-    vcs: _GitVcs, source_repository: Path, slot_checkout: Path, *, _depth: int = 0
+    vcs: _GitVcs,
+    source_repository: Path,
+    slot_checkout: Path,
+    *,
+    _depth: int = 0,
+    snapshots: list[_SharedConfigRollback] | None = None,
 ) -> list[str]:
     """Make ``slot_checkout``'s unpopulated submodules shared linked worktrees.
 
@@ -45958,7 +46121,7 @@ def _share_checkout_submodules(
             )
             if shared:
                 outcomes.extend(
-                    _share_checkout_submodules(vcs, source_sub, slot_sub, _depth=_depth + 1)
+                    _share_checkout_submodules(vcs, source_sub, slot_sub, _depth=_depth + 1, snapshots=snapshots)
                 )
             continue
         tree = vcs._run(slot_checkout, ["ls-tree", "-z", "HEAD", "--", raw], check=False)
@@ -45974,10 +46137,28 @@ def _share_checkout_submodules(
                 "stock per-slot clone"
             )
             continue
-        _prepare_shared_submodule_repo(vcs, source_sub)
+        entry: _SharedConfigRollback | None = None
+        if snapshots is not None:
+            entry = _SharedConfigRollback(
+                common=common,
+                before=_common_config_snapshot(common),
+                after=_common_config_snapshot(common),
+                source_submodule=source_sub,
+            )
+            snapshots.append(entry)
+        changed = _prepare_shared_submodule_repo(vcs, source_sub)
+        if entry is not None:
+            if not changed:
+                assert snapshots is not None
+                snapshots.remove(entry)
+                entry = None
+            else:
+                entry.after = _common_config_snapshot(common)
         if slot_sub.is_dir() and not any(slot_sub.iterdir()):
             slot_sub.rmdir()
         vcs._run(source_sub, ["worktree", "add", "--detach", str(slot_sub), gitlink])
+        if entry is not None:
+            entry.added_worktree = slot_sub
         print(
             f"shared-submodule: {slot_checkout}/{raw} is a linked worktree of "
             f"{common} at {gitlink} (objects shared, no per-slot clone)",
@@ -45985,13 +46166,17 @@ def _share_checkout_submodules(
         )
         outcomes.append(f"{raw}: shared")
         outcomes.extend(
-            _share_checkout_submodules(vcs, source_sub, slot_sub, _depth=_depth + 1)
+            _share_checkout_submodules(vcs, source_sub, slot_sub, _depth=_depth + 1, snapshots=snapshots)
         )
     return outcomes
 
 
 def _share_created_submodules(
-    config: Config, created: Sequence[Checkout], vcs: _GitVcs
+    config: Config,
+    created: Sequence[Checkout],
+    vcs: _GitVcs,
+    *,
+    snapshots: list[_SharedConfigRollback] | None = None,
 ) -> None:
     """Share submodules for every checkout ``create`` just added (#1206)."""
 
@@ -46000,7 +46185,9 @@ def _share_created_submodules(
     for checkout in created:
         _relative, repository = _stored_repository_path(config, checkout.repository)
         path = _stored_path(config, checkout.path, "shared-submodule checkout path")
-        for outcome in _share_checkout_submodules(vcs, repository, path):
+        for outcome in _share_checkout_submodules(
+            vcs, repository, path, snapshots=snapshots
+        ):
             print(
                 f"shared-submodule: checkout={checkout.name} submodule {outcome}",
                 file=sys.stderr,
@@ -48301,48 +48488,20 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 # exact lock (WORKTREES_IMAGE_LOCK_REASON).
                 vcs.lock_worktree(repository, destination)
             _interrupt_for_test("after-create-worktree")
-        # #1206: share submodules before hooks run, so a hook's
-        # `git submodule update --init` finds them populated and shared.
-        _share_created_submodules(config, created, vcs)
-        hook_journal = _create_journal_payload(
-            config,
-            args,
-            owner,
-            task_scope,
-            coordinator_lease,
-            plan,
-            created,
-            created_at=created_at,
-            heartbeat_at=heartbeat_at,
-            hook_progress=0,
-            operation_id=operation_id,
-        )
-        hook_progress = _run_post_provision_hooks(
-            config, created, journal_path, hook_journal, event_writer=event_writer
-        )
-        _apply_slot_git_identity(config, created, journal_path)
-        # Record what provisioning made, so finish can tell build output
-        # from dirty work (#1369).
-        created = [
-            dataclasses.replace(
-                item,
-                provisioned=_snapshot_provisioned(
-                    item, _stored_path(config, item.path, "checkout path"), vcs
-                ),
-            )
-            for item in created
-        ]
-        for checkout in created:
-            _assert_checkout_identity_unchanged(config, checkout, vcs)
-        _assert_create_processes(
-            owner,
-            coordinator_lease,
-            stage="during create; recovery journal is preserved",
-        )
-        heartbeat_at = _utc_now()
-        _write_journal(
-            config,
-            _create_journal_payload(
+        _config_snapshots: list[_SharedConfigRollback] = []
+        _hook_journals: list[dict[str, object]] = []
+
+        def _reset_hook_progress() -> None:
+            for _j in _hook_journals:
+                _j["hook_progress"] = 0
+                _j["hook_failure"] = None
+                _write_journal(config, _j, event_writer=event_writer, journal_path=journal_path)
+
+        with _rollback_shared_configs_on_failure(_config_snapshots, vcs, reset_progress=_reset_hook_progress) as _published:
+            # #1206: share submodules before hooks run, so a hook's
+            # `git submodule update --init` finds them populated and shared.
+            _share_created_submodules(config, created, vcs, snapshots=_config_snapshots)
+            hook_journal = _create_journal_payload(
                 config,
                 args,
                 owner,
@@ -48352,54 +48511,94 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 created,
                 created_at=created_at,
                 heartbeat_at=heartbeat_at,
-                hook_progress=hook_progress,
+                hook_progress=0,
                 operation_id=operation_id,
-            ),
-            event_writer=event_writer,
-            journal_path=journal_path,
-        )
-        if task_scope is not None:
-            _verify_task_scope_before_publication(task_scope, _CREATE_SCOPE_REMEDY)
-        record = ActiveRecord(
-            slot=args.slot,
-            agent=args.agent,
-            task=args.task,
-            purpose=args.purpose,
-            slot_type=args.slot_type,
-            machine=config.machine,
-            generation=1,
-            created_at=created_at,
-            heartbeat_at=heartbeat_at,
-            heartbeat_ttl_seconds=config.heartbeat_ttl_seconds,
-            owner=owner,
-            coordinator_lease=coordinator_lease,
-            coordinator_recovery_note=None,
-            handoff=None,
-            checkouts=tuple(created),
-            task_scope=task_scope,
-            harness_checkout_reason=getattr(args, "harness_checkout_reason", None),
-        )
-        _verify_created_checkouts(config, record, vcs)
-        state = _append_record(state, record)
-        # #1929: the offline reason lives only in this event's
-        # evidence, which old readers treat as opaque for
-        # slot-created; no record or journal field carries it.
-        created_evidence: dict[str, object] = {
-            "slot_type": record.slot_type,
-            "coordinator_authorized": True,
-            "coordinator": _identity_to_obj(coordinator_lease),
-        }
-        if getattr(args, "offline_reason", None):
-            created_evidence["offline_reason"] = args.offline_reason
-        _write_active_state(
-            config,
-            state,
-            action="slot-created",
-            slot=record.slot,
-            evidence=created_evidence,
-            event_writer=event_writer,
-            previous=None if local is None else local.active,
-        )
+            )
+            _hook_journals.append(hook_journal)
+            hook_progress = _run_post_provision_hooks(
+                config, created, journal_path, hook_journal, event_writer=event_writer
+            )
+            _apply_slot_git_identity(config, created, journal_path)
+            # Record what provisioning made, so finish can tell build output
+            # from dirty work (#1369).
+            created = [
+                dataclasses.replace(
+                    item,
+                    provisioned=_snapshot_provisioned(
+                        item, _stored_path(config, item.path, "checkout path"), vcs
+                    ),
+                )
+                for item in created
+            ]
+            for checkout in created:
+                _assert_checkout_identity_unchanged(config, checkout, vcs)
+            _assert_create_processes(
+                owner,
+                coordinator_lease,
+                stage="during create; recovery journal is preserved",
+            )
+            heartbeat_at = _utc_now()
+            _write_journal(
+                config,
+                _create_journal_payload(
+                    config,
+                    args,
+                    owner,
+                    task_scope,
+                    coordinator_lease,
+                    plan,
+                    created,
+                    created_at=created_at,
+                    heartbeat_at=heartbeat_at,
+                    hook_progress=hook_progress,
+                    operation_id=operation_id,
+                ),
+                event_writer=event_writer,
+                journal_path=journal_path,
+            )
+            if task_scope is not None:
+                _verify_task_scope_before_publication(task_scope, _CREATE_SCOPE_REMEDY)
+            record = ActiveRecord(
+                slot=args.slot,
+                agent=args.agent,
+                task=args.task,
+                purpose=args.purpose,
+                slot_type=args.slot_type,
+                machine=config.machine,
+                generation=1,
+                created_at=created_at,
+                heartbeat_at=heartbeat_at,
+                heartbeat_ttl_seconds=config.heartbeat_ttl_seconds,
+                owner=owner,
+                coordinator_lease=coordinator_lease,
+                coordinator_recovery_note=None,
+                handoff=None,
+                checkouts=tuple(created),
+                task_scope=task_scope,
+                harness_checkout_reason=getattr(args, "harness_checkout_reason", None),
+            )
+            _verify_created_checkouts(config, record, vcs)
+            state = _append_record(state, record)
+            # #1929: the offline reason lives only in this event's
+            # evidence, which old readers treat as opaque for
+            # slot-created; no record or journal field carries it.
+            created_evidence: dict[str, object] = {
+                "slot_type": record.slot_type,
+                "coordinator_authorized": True,
+                "coordinator": _identity_to_obj(coordinator_lease),
+            }
+            if getattr(args, "offline_reason", None):
+                created_evidence["offline_reason"] = args.offline_reason
+            _published["done"] = True
+            _write_active_state(
+                config,
+                state,
+                action="slot-created",
+                slot=record.slot,
+                evidence=created_evidence,
+                event_writer=event_writer,
+                previous=None if local is None else local.active,
+            )
         _interrupt_for_test("after-active-write")
         _clear_journal(
             config,
@@ -77904,70 +78103,79 @@ def _recover_create(
     updated_journal["hook_failure"] = None
     updated_journal["failure_policy"] = "leave-for-inspection"
     _write_journal(config, updated_journal, journal_path=path)
-    _share_created_submodules(config, created, vcs)
-    hook_progress = _run_post_provision_hooks(
-        config,
-        created,
-        path,
-        updated_journal,
-        start=hook_progress,
-    )
-    if hook_progress != total_hook_steps:
-        raise StateError("create recovery did not complete its post-provision hooks")
-    _apply_slot_git_identity(config, created, path)
-    created = [
-        dataclasses.replace(
-            item,
-            provisioned=_snapshot_provisioned(
-                item, _stored_path(config, item.path, "checkout path"), vcs
-            ),
+    _config_snapshots: list[_SharedConfigRollback] = []
+
+    def _reset_hook_progress() -> None:
+        updated_journal["hook_progress"] = 0
+        updated_journal["hook_failure"] = None
+        _write_journal(config, updated_journal, journal_path=path)
+
+    with _rollback_shared_configs_on_failure(_config_snapshots, vcs, reset_progress=_reset_hook_progress) as _published:
+        _share_created_submodules(config, created, vcs, snapshots=_config_snapshots)
+        hook_progress = _run_post_provision_hooks(
+            config,
+            created,
+            path,
+            updated_journal,
+            start=hook_progress,
         )
-        for item in created
-    ]
-    for checkout in created:
-        _assert_checkout_identity_unchanged(config, checkout, vcs)
-    record = ActiveRecord(
-        slot=slot,
-        agent=agent,
-        task=task,
-        purpose=purpose,
-        slot_type=slot_type,
-        machine=config.machine,
-        generation=1,
-        created_at=created_at,
-        heartbeat_at=heartbeat_at,
-        heartbeat_ttl_seconds=heartbeat_ttl_seconds,
-        owner=owner,
-        coordinator_lease=coordinator_lease,
-        coordinator_recovery_note=None,
-        handoff=None,
-        checkouts=tuple(created),
-        task_scope=task_scope,
-    )
-    if record.task_scope is not None:
-        _verify_task_scope_before_publication(record.task_scope, _CREATE_SCOPE_REMEDY)
-    if _record_in_worktrees_image(
-        config, record, slot_path, _worktrees_image_bind_slots(config)
-    ):
-        # A create interrupted between `git worktree add` and taking the
-        # image lock finishes here; take it before publishing the row.
-        for checkout in created:
-            _relative, repository = _stored_repository_path(config, checkout.repository)
-            vcs.lock_worktree(
-                repository, _stored_path(config, checkout.path, "checkout path")
+        if hook_progress != total_hook_steps:
+            raise StateError("create recovery did not complete its post-provision hooks")
+        _apply_slot_git_identity(config, created, path)
+        created = [
+            dataclasses.replace(
+                item,
+                provisioned=_snapshot_provisioned(
+                    item, _stored_path(config, item.path, "checkout path"), vcs
+                ),
             )
-    _verify_created_checkouts(config, record, vcs)
-    _write_active_state(
-        config,
-        _append_record(state, record),
-        action="slot-created-by-recovery",
-        slot=record.slot,
-        evidence={
-            "slot_type": record.slot_type,
-            "original_coordinator": _identity_to_obj(coordinator_lease),
-            "recovery_actor": _identity_to_obj(recovery_actor),
-        },
-    )
+            for item in created
+        ]
+        for checkout in created:
+            _assert_checkout_identity_unchanged(config, checkout, vcs)
+        record = ActiveRecord(
+            slot=slot,
+            agent=agent,
+            task=task,
+            purpose=purpose,
+            slot_type=slot_type,
+            machine=config.machine,
+            generation=1,
+            created_at=created_at,
+            heartbeat_at=heartbeat_at,
+            heartbeat_ttl_seconds=heartbeat_ttl_seconds,
+            owner=owner,
+            coordinator_lease=coordinator_lease,
+            coordinator_recovery_note=None,
+            handoff=None,
+            checkouts=tuple(created),
+            task_scope=task_scope,
+        )
+        if record.task_scope is not None:
+            _verify_task_scope_before_publication(record.task_scope, _CREATE_SCOPE_REMEDY)
+        if _record_in_worktrees_image(
+            config, record, slot_path, _worktrees_image_bind_slots(config)
+        ):
+            # A create interrupted between `git worktree add` and taking the
+            # image lock finishes here; take it before publishing the row.
+            for checkout in created:
+                _relative, repository = _stored_repository_path(config, checkout.repository)
+                vcs.lock_worktree(
+                    repository, _stored_path(config, checkout.path, "checkout path")
+                )
+        _verify_created_checkouts(config, record, vcs)
+        _published["done"] = True
+        _write_active_state(
+            config,
+            _append_record(state, record),
+            action="slot-created-by-recovery",
+            slot=record.slot,
+            evidence={
+                "slot_type": record.slot_type,
+                "original_coordinator": _identity_to_obj(coordinator_lease),
+                "recovery_actor": _identity_to_obj(recovery_actor),
+            },
+        )
     _clear_journal(config, updated_journal, journal_path=path)
     print(f"recovered create: registered slot={slot} checkouts={len(created)}")
 
