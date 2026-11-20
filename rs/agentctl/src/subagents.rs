@@ -5472,6 +5472,10 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
             self.guarded(runtime)?.native_prompt(pane_id, text)?;
         }
         let objective = (!crate::goal_command::is_subcommand(argument)).then_some(argument);
+        // A Codex picker already open before this command was typed is
+        // not this delivery's to confirm or cancel (#1939 review): only
+        // a picker this command triggered may be answered by this flow.
+        let codex_picker_triggered = crate::goal_command::CodexReplacement::read(&before).is_none();
         let mut key_presses = 1;
         let mut confirmed = false;
         let receipt = |evidence: String, key_presses: u32| {
@@ -5519,8 +5523,11 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                 }
                 // Codex's picker (#1939): confirm only the goal this
                 // flow sent, with Replace highlighted; anything else
-                // cancels the question, never leaves it open.
-                if let Some(question) = crate::goal_command::CodexReplacement::read(&screen) {
+                // cancels the question, never leaves it open. A picker
+                // already open before typing is not this flow's to
+                // answer at all, so it is skipped here and at timeout.
+                if codex_picker_triggered {
+                    if let Some(question) = crate::goal_command::CodexReplacement::read(&screen) {
                     match question.choice(objective) {
                         ReplacementChoice::Replace => {
                             self.confirm_goal_replacement(pane_id, runtime)?;
@@ -5539,6 +5546,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                             return Err(self.cancel_goal_question(pane_id, &reason, runtime));
                         }
                     }
+                    }
                 }
             }
             let now = runtime.monotonic();
@@ -5548,6 +5556,18 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                     self.record.harness,
                     GOAL_ANSWER_TIMEOUT.as_secs()
                 );
+                // A Codex picker this command did not trigger is left
+                // open (#1939 review): cancelling it would answer a
+                // question this delivery never asked.
+                if !codex_picker_triggered
+                    && crate::goal_command::CodexReplacement::read(&screen).is_some()
+                {
+                    return Err(AdapterError::unavailable(format!(
+                        "{reason}; a Replace-goal picker this command did not trigger is left \
+                         open; answer it with `agentctl answer` or in the pane; it may have \
+                         taken it"
+                    )));
+                }
                 if crate::goal_command::replacement_question_open(&screen) {
                     return Err(self.cancel_goal_question(pane_id, &reason, runtime));
                 }

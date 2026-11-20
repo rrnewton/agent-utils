@@ -170,6 +170,40 @@ fn a_codex_picker_offering_another_goal_is_cancelled_never_confirmed() {
 }
 
 #[test]
+fn a_picker_already_open_is_never_cancelled_by_a_goal_command() {
+    // #1939 review: a picker this command did not trigger (it was
+    // already open before typing) is left open, never cancelled.
+    let fixture = Fixture::new();
+    fixture.start(None);
+    *fixture.client.screen.lock().unwrap() = Some(codex_picker("a different task"));
+    *fixture.client.screen_after_run.lock().unwrap() =
+        Some(codex_picker("a different task"));
+    let manager = fixture.manager();
+    let error = manager
+        .send_identified_with_runtime(
+            "worker",
+            "/goal ship the release",
+            quick(),
+            "goal",
+            &Clock::default(),
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("did not trigger"),
+        "{error}"
+    );
+    let keys: Vec<String> = fixture
+        .client
+        .keys_sent
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, key)| key.clone())
+        .collect();
+    assert!(!keys.contains(&"Escape".to_owned()), "{keys:?}");
+}
+
+#[test]
 fn a_goal_command_with_no_answer_is_possibly_submitted_and_never_typed_again() {
     let fixture = Fixture::new();
     fixture.start(None);
