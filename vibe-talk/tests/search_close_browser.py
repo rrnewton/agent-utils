@@ -115,6 +115,18 @@ def arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def number(state: Json, key: str) -> float:
+    value = state.get(key)
+    return float(value) if isinstance(value, (int, float)) else 0.0
+
+
+def box_of(state: Json, key: str) -> dict[str, float]:
+    value = state.get(key)
+    if not isinstance(value, dict):
+        return {}
+    return {str(k): float(v) if isinstance(v, (int, float)) else 0.0 for k, v in value.items()}
+
+
 def walk(page: Page, label: str, shots: Path | None, keyboard: bool) -> None:
     def state() -> Json:
         found = page.evaluate(STATE_JS)
@@ -137,7 +149,7 @@ def walk(page: Page, label: str, shots: Path | None, keyboard: bool) -> None:
     page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
     page.wait_for_function("() => document.querySelectorAll('#discord-log > li[data-id]').length === 40",
                            timeout=10_000)
-    check(state()["closeHidden"], f"{label}: the X stands with the search closed")
+    check(state().get("closeHidden") is True, f"{label}: the X stands with the search closed")
 
     # Park mid-list, then search from there: the place the X must put back.
     page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop = Math.round((a.scrollHeight - a.clientHeight) / 2); }")
@@ -146,14 +158,14 @@ def walk(page: Page, label: str, shots: Path | None, keyboard: bool) -> None:
     page.click("#search-toggle")
     page.wait_for_selector("#search-close", state="visible", timeout=10_000)
     open_state = state()
-    box = open_state["closeBox"] if isinstance(open_state.get("closeBox"), dict) else {}
-    check(open_state["closeLabel"] == "Close search", f"{label}: the X is named {open_state['closeLabel']!r}")
-    check(float(box.get("width", 0)) >= 44 and float(box.get("height", 0)) >= 44,
+    box = box_of(open_state, "closeBox")
+    check(open_state.get("closeLabel") == "Close search", f"{label}: the X is named {open_state.get('closeLabel')!r}")
+    check(box.get("width", 0.0) >= 44 and box.get("height", 0.0) >= 44,
           f"{label}: the X target is {box.get('width')}x{box.get('height')}, under 44px")
-    bar = open_state["barBox"] if isinstance(open_state.get("barBox"), dict) else {}
-    check(abs(float(box.get("right", 0)) - float(bar.get("right", 0))) <= 6,
+    bar = box_of(open_state, "barBox")
+    check(abs(box.get("right", 0.0) - bar.get("right", 0.0)) <= 6,
           f"{label}: the X is not at the right of the bar ({box.get('right')} vs bar {bar.get('right')})")
-    check(not open_state["overlap"], f"{label}: the X overlaps another control on the bar")
+    check(open_state.get("overlap") is not True, f"{label}: the X overlaps another control on the bar")
     shot("search-open")
 
     page.fill("#search-field", "needle")
@@ -166,12 +178,12 @@ def walk(page: Page, label: str, shots: Path | None, keyboard: bool) -> None:
     page.wait_for_function("() => document.getElementById('search-field').hidden && document.getElementById('search-close').hidden",
                            timeout=10_000)
     after = state()
-    check(after["query"] == "", f"{label}: the X left the query {after['query']!r} in the field")
-    check(not after["searching"], f"{label}: the X left the bar's room at the head of the list")
-    check(after["firstVisible"] == parked["firstVisible"],
-          f"{label}: the row at the head changed {parked['firstVisible']} -> {after['firstVisible']}")
-    check(abs(float(after["top"]) - float(parked["top"])) <= 2,
-          f"{label}: closing with the X moved the scroll from {parked['top']} to {after['top']}")
+    check(after.get("query") == "", f"{label}: the X left the query {after.get('query')!r} in the field")
+    check(after.get("searching") is not True, f"{label}: the X left the bar's room at the head of the list")
+    check(after.get("firstVisible") == parked.get("firstVisible"),
+          f"{label}: the row at the head changed {parked.get('firstVisible')} -> {after.get('firstVisible')}")
+    check(abs(number(after, "top") - number(parked, "top")) <= 2,
+          f"{label}: closing with the X moved the scroll from {number(parked, 'top')} to {number(after, 'top')}")
     shot("search-closed-by-x")
     if keyboard:
         page.evaluate("() => window.__iosClose()")

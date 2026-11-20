@@ -581,6 +581,7 @@ export interface ElementById {
   "search-bucket-thread": HTMLButtonElement;
   "search-bucket-threads": HTMLButtonElement;
   "search-bucket-transcripts": HTMLButtonElement;
+  "search-close": HTMLButtonElement;
   "search-count": HTMLSpanElement;
   "search-empty": HTMLParagraphElement;
   "search-entire-threads": HTMLButtonElement;
@@ -591,7 +592,6 @@ export interface ElementById {
   "search-older-note": HTMLParagraphElement;
   "search-scope": HTMLParagraphElement;
   "search-screen-sep": HTMLDivElement;
-  "search-close": HTMLButtonElement;
   "search-toggle": HTMLButtonElement;
   "selection-chip": HTMLButtonElement;
   "selection-chip-dismiss": HTMLButtonElement;
