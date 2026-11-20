@@ -941,7 +941,7 @@ def classify_drafts(
 ) -> dict[str, object]:
     """Classify one Eden checkout's Sapling drafts (#1702, #1925).
 
-    With ``own_nodes`` None this is the legacy store-wide reading:
+    With ``own_nodes`` None this is the unscoped store-wide reading:
     the checkout's non-public commits (`draft()`), which on a shared
     backing store includes every other checkout's drafts. With
     ``own_nodes`` given (the per-checkout ledger), only those nodes
