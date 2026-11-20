@@ -35,6 +35,7 @@ import tempfile
 import time
 import urllib.request
 from pathlib import Path
+from typing import TypedDict
 
 from playwright.sync_api import Page, Route, sync_playwright
 
@@ -101,6 +102,16 @@ def call(base: str, method: str, path: str, token: str,
         parsed: object = json.loads(res.read() or b"null")
     assert isinstance(parsed, dict)
     return parsed
+
+
+class LandedGeo(TypedDict):
+    top: float
+    bottom: float
+    vh: float
+    panelTop: float | None
+    collapsed: str | None
+    closedDetails: int
+    text: str
 
 
 def citation(target: str, label: str) -> str:
@@ -193,8 +204,8 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
     page.wait_for_selector("#discuss-timeline a", state="attached", timeout=20_000)
     page.evaluate("() => { for (const d of document.querySelectorAll('#discuss-answer details, #discuss-timeline details')) d.open = true; }")
 
-    def landed_geo(target: str) -> dict:
-        return page.evaluate(f"""() => {{
+    def landed_geo(target: str) -> LandedGeo | None:
+        geo: LandedGeo | None = page.evaluate(f"""() => {{
           const row = document.querySelector('#discord-log > li[data-id="{target}"]');
           if (!row) return null;
           const r = row.getBoundingClientRect();
@@ -206,6 +217,7 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
                    closedDetails: [...row.querySelectorAll('details')].filter(d => !d.open).length,
                    text: row.textContent}};
         }}""")
+        return geo
 
     def click_and_land(selector: str, target: str) -> None:
         page.click(selector)
@@ -245,6 +257,7 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
     page.wait_for_function(f"() => window.deviceSpeech.length > {said_before}", timeout=20_000)
     geo = landed_geo(targets["answer"])
     check(geo is not None, f"{label}: the read target row vanished")
+    assert geo is not None
     check(geo["top"] >= 0 and geo["top"] < geo["vh"], f"{label}: message top is not on screen: {geo}")
     check(geo["panelTop"] is None or geo["bottom"] <= geo["panelTop"] + 2 or geo["top"] < geo["panelTop"],
           f"{label}: message stands under the Discuss sheet: {geo}")
@@ -254,7 +267,7 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
     check(any("seed message" in text for text in said[said_before:]),
           f"{label}: the device voice did not speak the linked message: {said[said_before:]}")
     timing = [line for line in console_lines if "[readjump]" in line]
-    check(timing and re.search(r"click-to-reading-start \d+ms", timing[-1]),
+    check(bool(timing) and re.search(r"click-to-reading-start \d+ms", timing[-1]) is not None,
           f"{label}: no click-to-reading-start timing was logged: {console_lines}")
     print(f"discuss readjump ({label}): one click landed expanded and reading, {timing[-1]}")
     if shots is not None:
