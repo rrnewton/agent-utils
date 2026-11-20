@@ -304,6 +304,44 @@ def replay_arguments(harness: str, argv: Sequence[str], conversation: str) -> tu
     return (*rest, "resume", conversation)
 
 
+def redacted_argv(argv: Sequence[str], *, keep_program: bool = False) -> list[str]:
+    """Flag names with every value elided, for human-facing output (#1937).
+
+    A launch vector is exactly where a token can ride; status and its kin
+    show which flags ran, never what they carried. ``keep_program`` keeps
+    argv[0] (a nested record's program, not a secret) and redacts the rest.
+    """
+    shown: list[str] = []
+    for index, token in enumerate(argv):
+        if keep_program and index == 0:
+            shown.append(token)
+        elif token.startswith("-") and token != "-":
+            name, separator, _value = token.partition("=")
+            shown.append(f"{name}=<set>" if separator else name)
+        else:
+            shown.append("<set>")
+    return shown
+
+
+def redact_document(document: dict[str, object]) -> dict[str, object]:
+    """Copy a status-shaped row with any launch argv redacted (#1937)."""
+    result = dict(document)
+    spec = result.get(FIELD)
+    if isinstance(spec, dict) and isinstance(spec.get("argv"), list):
+        copied = dict(spec)
+        copied["argv"] = redacted_argv(cast(list[str], spec["argv"]))
+        result[FIELD] = copied
+    launch = result.get("launch")
+    if isinstance(launch, dict) and isinstance(launch.get("argv"), list):
+        copied_launch = dict(launch)
+        copied_launch["argv"] = redacted_argv(cast(list[str], launch["argv"]), keep_program=True)
+        result["launch"] = copied_launch
+    arguments = result.get("arguments")
+    if isinstance(arguments, list):
+        result["arguments"] = redacted_argv(cast(list[str], arguments))
+    return result
+
+
 def program_matches(harness: str, executable: str | None) -> bool:
     """Is the recorded program the harness itself, so Herdr's kind launch reproduces it?"""
     if executable is None:

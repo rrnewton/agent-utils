@@ -4484,10 +4484,10 @@ class ManagedAgents:
         except Exception:
             return None
 
-    def status(self, name: str) -> dict[str, object]:
+    def status(self, name: str, *, show_argv: bool = False) -> dict[str, object]:
         """Report live state or a visible probe error, preserving every durable record."""
         record = self._load(name)
-        result = self._status_record(record)
+        result = self._status_record(record, show_argv=show_argv)
         # Name a terminal another registry also records (#1683): two registries
         # driving one pane is easy to miss from either side.
         shared_terminals = self._shared_terminal_findings([record])
@@ -4782,10 +4782,14 @@ class ManagedAgents:
                 count += 1
         return count
 
-    def _status_record(self, record: AgentRecord) -> dict[str, object]:
+    def _status_record(self, record: AgentRecord, *, show_argv: bool = False) -> dict[str, object]:
         """Probe one pinned record without resolving its name a second time."""
         name = record.name
         result: dict[str, object] = record.to_document()
+        if not show_argv:
+            # Human-facing rows never carry launch values (#1937); the
+            # persisted record and revive replay keep the exact vector.
+            result = launch_spec.redact_document(result)
         result["children_count"] = self._children_count(name)
         result["launch_env_keys"] = self._launch_env_keys(record)
         result["queue"] = self._queue(name)
@@ -4859,7 +4863,7 @@ class ManagedAgents:
                     "--new-conversation (add --deliver-pending or --cancel-pending if prompts wait)"),
         }
 
-    def list(self) -> list[dict[str, object]]:
+    def list(self, *, show_argv: bool = False) -> list[dict[str, object]]:
         """List each row independently; one malformed row cannot hide the fleet."""
         if not self.registry.exists():
             return []
@@ -4872,7 +4876,7 @@ class ManagedAgents:
             if not registry_layout.record_directories(self.registry, other_name):
                 continue
             try:
-                row = self.status(other_name)
+                row = self.status(other_name, show_argv=show_argv)
                 # The missing-session flag belongs to a single status,
                 # not to fleet rows (the Rust list omits it too) (#948).
                 row.pop("native_session_missing", None)

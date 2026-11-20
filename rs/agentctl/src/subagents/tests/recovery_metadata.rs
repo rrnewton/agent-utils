@@ -111,8 +111,20 @@ fn profile_resume_preserves_loaded_policy_and_literal_conversation_for_each_loca
             ],
             _ => unreachable!(),
         };
-        assert_eq!(status["arguments"], json!(expected));
+        // The start result is human-facing: values are elided (#1937); the
+        // record below keeps the exact vector this test exists to prove.
+        assert_eq!(
+            status["arguments"],
+            json!(crate::subagents::launch_spec::redacted_argv(
+                &expected.iter().map(|item| item.to_string()).collect::<Vec<_>>(),
+                false
+            ))
+        );
         let record = fixture.manager().load("worker").unwrap();
+        assert_eq!(
+            record.arguments,
+            expected.iter().map(|item| item.to_string()).collect::<Vec<_>>()
+        );
         assert_eq!(
             fixture.client.launches.lock().unwrap()["owned"].1,
             record.arguments
@@ -392,7 +404,10 @@ fn resume_preserves_the_requested_conversation_without_assigning_a_new_one() {
         assert_eq!(status["native_session"]["source"], "asserted");
         let arguments = status["arguments"].as_array().unwrap();
         assert!(!arguments.iter().any(|argument| argument == "--session-id"));
-        assert!(arguments
+        // Status values are elided (#1937); the record proves the resume kept.
+        let record = fixture.manager().load("worker").unwrap();
+        assert!(record
+            .arguments
             .iter()
             .any(|argument| argument == "requested-conversation"));
     }

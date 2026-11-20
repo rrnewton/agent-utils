@@ -366,6 +366,56 @@ pub(super) fn fresh_arguments(
     })
 }
 
+/// Flag names with every value elided, for human-facing output (#1937).
+pub(super) fn redacted_argv(argv: &[String], keep_program: bool) -> Vec<String> {
+    argv.iter()
+        .enumerate()
+        .map(|(index, token)| {
+            if keep_program && index == 0 {
+                token.clone()
+            } else if token.starts_with('-') && token != "-" {
+                match token.split_once('=') {
+                    Some((name, _value)) => format!("{name}=<set>"),
+                    None => token.clone(),
+                }
+            } else {
+                "<set>".to_owned()
+            }
+        })
+        .collect()
+}
+
+/// Copy a status-shaped row with any launch argv redacted (#1937).
+pub(super) fn redact_document(document: &Value) -> Value {
+    let mut result = document.clone();
+    if let Some(spec) = result.get_mut("launch_spec") {
+        if let Some(argv) = spec.get("argv").and_then(Value::as_array) {
+            let argv: Vec<String> = argv
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_owned))
+                .collect();
+            spec["argv"] = json!(redacted_argv(&argv, false));
+        }
+    }
+    if let Some(launch) = result.get_mut("launch") {
+        if let Some(argv) = launch.get("argv").and_then(Value::as_array) {
+            let argv: Vec<String> = argv
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_owned))
+                .collect();
+            launch["argv"] = json!(redacted_argv(&argv, true));
+        }
+    }
+    if let Some(arguments) = result.get("arguments").and_then(Value::as_array) {
+        let arguments: Vec<String> = arguments
+            .iter()
+            .filter_map(|item| item.as_str().map(str::to_owned))
+            .collect();
+        result["arguments"] = json!(redacted_argv(&arguments, false));
+    }
+    result
+}
+
 /// Is the recorded program the harness itself, so Herdr's kind launch reproduces it?
 pub(super) fn program_matches(harness: &str, executable: Option<&str>) -> bool {
     executable.is_none_or(|executable| {

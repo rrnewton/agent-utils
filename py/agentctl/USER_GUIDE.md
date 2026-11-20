@@ -914,7 +914,10 @@ working directory, the profile name, the environment variable names (never
 values), the slot, project and isolation, the workspace label, and the native
 conversation with where it came from (`asserted` by agentctl, `observed` from
 Herdr, `argv` from the harness's own command line, or `caller`). `status` shows
-it as `launch_spec`.
+it as `launch_spec` with argument values elided (`--model <set>`): a launch
+vector is exactly where a token can ride, so human-facing output shows flag
+names only. `agentctl status NAME --show-argv` (likewise `list --show-argv`)
+shows the full vector; the record and the revive replay always keep it exact.
 
 - `start` writes the spec before Herdr starts the harness, so even a launch that
   never reports back can be replayed.

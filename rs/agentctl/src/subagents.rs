@@ -12247,8 +12247,13 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
 
     /// Report live state or an explicit probe error without reaping durable records.
     pub fn status(&self, agent_name: &str) -> Result<Value> {
+        self.status_showing(agent_name, false)
+    }
+
+    /// [`Self::status`], optionally with full launch argument values (#1937).
+    pub fn status_showing(&self, agent_name: &str, show_argv: bool) -> Result<Value> {
         let record = self.load(agent_name)?;
-        let mut result = self.status_record(&record)?;
+        let mut result = self.status_record_showing(&record, show_argv)?;
         // Direct children in this registry (#1904), beside the managed_by
         // edge record_row already carries, for a per-lieutenant scan.
         result["children_count"] = json!(self.children_count(agent_name));
@@ -12278,10 +12283,24 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         record: &AgentRecord,
         fleet: &mut cloud::FleetCache,
     ) -> Result<Value> {
+        self.status_record_listed_showing(record, fleet, false)
+    }
+
+    fn status_record_listed_showing(
+        &self,
+        record: &AgentRecord,
+        fleet: &mut cloud::FleetCache,
+        show_argv: bool,
+    ) -> Result<Value> {
         if record.is_cloud() {
-            self.cloud_status_record(record, fleet)
+            let result = self.cloud_status_record(record, fleet)?;
+            Ok(if show_argv {
+                result
+            } else {
+                launch_spec::redact_document(&result)
+            })
         } else {
-            self.status_record(record)
+            self.status_record_showing(record, show_argv)
         }
     }
 
@@ -12626,17 +12645,30 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     }
 
     fn status_record(&self, record: &AgentRecord) -> Result<Value> {
+        self.status_record_showing(record, false)
+    }
+
+    fn status_record_showing(&self, record: &AgentRecord, show_argv: bool) -> Result<Value> {
         // Every status-shaped row carries children_count (#1904), so the
         // editions agree on start/adopt/status/list outputs alike.
-        let mut result = self.status_record_viewing(record, true)?;
+        let mut result = self.status_record_viewing_showing(record, true, show_argv)?;
         result["children_count"] = json!(self.children_count(&record.name));
         Ok(result)
     }
 
     /// A `list` row's fields that need no live check: the record, its edges, queue and goal.
     fn record_row(&self, record: &AgentRecord) -> Result<Value> {
+        self.record_row_showing(record, false)
+    }
+
+    fn record_row_showing(&self, record: &AgentRecord, show_argv: bool) -> Result<Value> {
         let agent_name = &record.name;
         let mut result = record.document()?;
+        if !show_argv {
+            // Human-facing rows never carry launch values (#1937); the
+            // persisted record and revive replay keep the exact vector.
+            result = launch_spec::redact_document(&result);
+        }
         // A nested row stores a captured model only; the status row names it
         // either way, as the flat row and the Python edition do (#1340).
         if result.get("resolved_model").is_none() {
@@ -12688,14 +12720,28 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     /// [`Self::status_record`], with the running-turn view (a screen read of its own) only when
     /// `turn` is set.
     fn status_record_viewing(&self, record: &AgentRecord, turn: bool) -> Result<Value> {
+        self.status_record_viewing_showing(record, turn, false)
+    }
+
+    fn status_record_viewing_showing(
+        &self,
+        record: &AgentRecord,
+        turn: bool,
+        show_argv: bool,
+    ) -> Result<Value> {
         if record.is_cloud() {
-            return self.cloud_status_record(record, &mut cloud::FleetCache::new());
+            let result = self.cloud_status_record(record, &mut cloud::FleetCache::new())?;
+            return Ok(if show_argv {
+                result
+            } else {
+                launch_spec::redact_document(&result)
+            });
         }
         if record.is_headless() {
-            return self.headless_status_record(record);
+            return self.headless_status_record_showing(record, show_argv);
         }
         let agent_name = &record.name;
-        let mut result = self.record_row(record)?;
+        let mut result = self.record_row_showing(record, show_argv)?;
         result["launch_env_keys"] = json!(self.launch_env_keys(record));
         result["queued_archived_undelivered"] = json!(self.queued_archived_undelivered(record));
         match self.pending_move_destination(record) {
@@ -12917,6 +12963,11 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
 
     /// List every registered agent, preserving records when Herdr is unavailable.
     pub fn list(&self) -> Result<Vec<Value>> {
+        self.list_showing(false)
+    }
+
+    /// [`Self::list`], optionally with full launch argument values (#1937).
+    pub fn list_showing(&self, show_argv: bool) -> Result<Vec<Value>> {
         // One non-attaching agentcloud listing serves every cloud agent in this pass.
         let mut fleet = cloud::FleetCache::new();
         // Each row stands alone: a record this build cannot read is reported as its own error row
@@ -12927,7 +12978,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             .map(|name| {
                 let mut row = self
                     .load(name)
-                    .and_then(|record| self.status_record_listed(&record, &mut fleet))
+                    .and_then(|record| {
+                        self.status_record_listed_showing(&record, &mut fleet, show_argv)
+                    })
                     .unwrap_or_else(|error| Self::record_error_row(name, &error));
                 // Direct children in this registry (#1904), beside the
                 // managed_by edge each row already carries.
@@ -20020,9 +20073,14 @@ fi
                 },
             )
             .unwrap();
+        // Status arguments are redacted (#1937); the record proves the launch.
         assert_eq!(
             unstructured_status["arguments"],
-            json!(["--no-alt-screen", "--reasoning-effort=high"])
+            json!(["--no-alt-screen", "--reasoning-effort=<set>"])
+        );
+        assert_eq!(
+            unstructured.manager().load("worker").unwrap().arguments,
+            vec!["--no-alt-screen".to_owned(), "--reasoning-effort=high".to_owned()]
         );
         assert_eq!(unstructured_status["workspace_id"], "workspace");
 
@@ -20044,10 +20102,20 @@ fi
             json!([
                 "--no-alt-screen",
                 "--model",
-                "structured",
+                "<set>",
                 "-c",
-                "sandbox_mode=read-only"
+                "<set>"
             ])
+        );
+        assert_eq!(
+            codex.manager().load("worker").unwrap().arguments,
+            vec![
+                "--no-alt-screen".to_owned(),
+                "--model".to_owned(),
+                "structured".to_owned(),
+                "-c".to_owned(),
+                "sandbox_mode=read-only".to_owned()
+            ]
         );
         assert_eq!(codex_status["workspace_id"], "workspace");
     }

@@ -13,7 +13,7 @@ from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
 
-from agentctl import agent
+from agentctl import agent, launch_spec
 from agentctl.client import HerdrClient, _bounded_control_command
 from agentctl.errors import AgentDeliveryError, HerdrRunError
 from agentctl.jsonx import as_mapping
@@ -215,10 +215,10 @@ class Sessions(ManagedAgents):
         if save:
             self._save(record)
 
-    def status(self, name: str) -> dict[str, object]:
+    def status(self, name: str, *, show_argv: bool = False) -> dict[str, object]:
         """Distinguish saved lifecycle, runtime liveness, and supported operations."""
         record = self._load(name)
-        result = self._status_record(record)
+        result = self._status_record(record, show_argv=show_argv)
         # As in the base status: flag a live lane with no native session (#948).
         if (record.lifecycle == "running"
                 and record.harness in ("muse", "codex")
@@ -229,11 +229,13 @@ class Sessions(ManagedAgents):
             result["profile_drift"] = drift
         return result
 
-    def _status_record(self, record: AgentRecord) -> dict[str, object]:
+    def _status_record(self, record: AgentRecord, *, show_argv: bool = False) -> dict[str, object]:
         if record.adapter in ("herdr", "herdr-pane", "herdr-foreign", "herdr-relay"):
-            result = super()._status_record(record)
+            result = super()._status_record(record, show_argv=show_argv)
         else:
             result = record.to_document()
+            if not show_argv:
+                result = launch_spec.redact_document(result)
             try:
                 response = self._worker(record, "status")
                 result["runtime"] = response.get("result")

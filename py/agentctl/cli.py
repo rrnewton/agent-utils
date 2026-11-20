@@ -274,9 +274,13 @@ def parser() -> argparse.ArgumentParser:
         "agentctl doctor")
     doctor.add_argument("--repair-labels", action="store_true",
         help="restore the tab label and Herdr agent name of owned agents whose every other anchor still matches")
-    command("list", "List every registered session, including unavailable and failed launches.", "agentctl list")
+    list_command = command("list", "List every registered session, including unavailable and failed launches.", "agentctl list")
+    list_command.add_argument("--show-argv", action="store_true",
+        help="show full launch argument values in each row's launch spec (default: flag names only, values elided)")
     command("capabilities", "Show the adapters and services available in this installation.", "agentctl capabilities")
-    command("status", "Inspect saved identity, runtime state, and supported operations.", "agentctl status reviewer", named=True)
+    status_command = command("status", "Inspect saved identity, runtime state, and supported operations.", "agentctl status reviewer", named=True)
+    status_command.add_argument("--show-argv", action="store_true",
+        help="show full launch argument values in the launch spec (default: flag names only, values elided)")
     send = command("send", "Submit follow-up work; uncertain delivery is retained for inspection.",
         "agentctl send reviewer 'Please check the cancellation path too'", named=True)
     _message(send)
@@ -723,11 +727,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "move":
             result = sessions.move_to_project_workspace(name)
         elif args.command == "list":
-            result = sessions.list()
+            result = sessions.list(show_argv=args.show_argv)
             print(json.dumps(result, indent=2, sort_keys=True))
             return 1 if any(row.get("record_error") is True for row in result) else 0
         elif args.command == "status":
-            result = sessions.status(name)
+            result = sessions.status(name, show_argv=args.show_argv)
         elif args.command == "send":
             # Every path delivers the prompt opened with its sender header (#609
             # sender-header-mandatory); nothing suppresses it.

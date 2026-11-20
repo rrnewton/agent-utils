@@ -38,15 +38,15 @@ fn codex_max_and_ultra_start_with_their_config_argument() {
             .unwrap();
         assert_eq!(status["reasoning_effort"], level);
         let expected = format!("model_reasoning_effort={level}");
+        // Status arguments are redacted (#1937); the record proves the launch.
+        let record = fixture.manager().load("worker").unwrap();
         assert!(
-            status["arguments"]
-                .as_array()
-                .unwrap()
+            record
+                .arguments
                 .windows(2)
-                .any(|pair| pair[0] == "--config" && pair[1] == expected),
+                .any(|pair| pair[0].as_str() == "--config" && pair[1].as_str() == expected),
             "{status}"
         );
-        let record = fixture.manager().load("worker").unwrap();
         assert_eq!(record.reasoning_effort.as_deref(), Some(level));
         assert!(record.launch_spec.as_ref().is_some_and(|spec| {
             spec["argv"]

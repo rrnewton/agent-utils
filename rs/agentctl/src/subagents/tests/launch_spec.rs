@@ -81,13 +81,46 @@ fn start_records_the_exact_launch_before_herdr_reports_back() {
 }
 
 #[test]
+fn status_never_prints_a_token_like_launch_value() {
+    // #1937: a token in argv reaches status only as a flag name, never a value.
+    let fixture = Fixture::new();
+    let token = "sk-test-token-1937";
+    fixture
+        .manager()
+        .start(
+            "worker",
+            &fixture.root,
+            StartOptions {
+                harness: "claude".to_owned(),
+                model: Some("chosen".to_owned()),
+                harness_args: strings(&["--api-key", token, "--effort=high", token]),
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    let shown = fixture.manager().status("worker").unwrap().to_string();
+    let listed = json!(fixture.manager().list().unwrap()).to_string();
+    assert!(!shown.contains(token), "{shown}");
+    assert!(!listed.contains(token), "{listed}");
+    let full = fixture
+        .manager()
+        .status_showing("worker", true)
+        .unwrap()
+        .to_string();
+    assert!(full.contains(token), "{full}");
+    let record = fixture.manager().load("worker").unwrap();
+    assert!(record.launch_spec.unwrap().to_string().contains(token));
+}
+
+#[test]
 fn adopt_reads_the_pinned_command_line_and_its_conversation() {
     let argv = [CODEX, "resume", "argv-conversation", "--no-alt-screen"];
     let (_fixture, result) = adopted(Some(&argv), false);
     let spec = &result["launch_spec"];
     assert_eq!(spec["source"], "adopt");
     assert_eq!(spec["executable"], CODEX);
-    assert_eq!(spec["argv"], json!(argv[1..]));
+    // Human-facing output redacts values (#1937); the record keeps the vector.
+    assert_eq!(spec["argv"], json!(["<set>", "<set>", "--no-alt-screen"]));
     assert_eq!(spec["workspace_label"], "subagents");
     assert_eq!(
         spec["native_session"],

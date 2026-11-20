@@ -86,6 +86,26 @@ def test_start_records_the_exact_launch_before_herdr_reports_back(
     assert (spec["cwd"], spec["profile"], spec["workspace_label"]) == (str(tmp_path), None, None)
 
 
+def test_status_never_prints_a_token_like_launch_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1937: a token in argv reaches status only as a flag name, never a value."""
+    manager, _fake = setup(tmp_path, monkeypatch)
+    token = "sk-test-token-1937"
+    manager.start("worker", cwd=str(tmp_path), harness="claude", model="chosen",
+                  harness_args=("--api-key", token, f"--effort={token}", token))
+    shown = json.dumps(manager.status("worker"))
+    listed = json.dumps(manager.list())
+    assert token not in shown and token not in listed
+    spec = cast(dict[str, object], manager.status("worker")["launch_spec"])
+    assert spec["argv"] == ["--session-id", "<set>", "--model", "<set>",
+                            "--api-key", "<set>", "--effort=<set>", "<set>"]
+    full = cast(dict[str, object], manager.status("worker", show_argv=True)["launch_spec"])
+    assert token in json.dumps(full)
+    # The persisted record still holds the exact vector for revive replay.
+    assert token in json.dumps(manager.get("worker").launch_spec)
+
+
 @pytest.mark.parametrize("reported", [None, "herdr-conversation"])
 def test_adopt_reads_the_pinned_command_line_and_its_conversation(
     reported: str | None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -96,8 +116,13 @@ def test_adopt_reads_the_pinned_command_line_and_its_conversation(
     result = adopt(sessions, pane, tmp_path)
     spec = cast(dict[str, object], result["launch_spec"])
     assert spec["source"] == "adopt" and spec["executable"] == CODEX
-    assert spec["argv"] == ["resume", "argv-conversation", "--no-alt-screen",
+    # Human-facing output redacts values (#1937); the record keeps the vector.
+    assert spec["argv"] == ["<set>", "<set>", "--no-alt-screen",
                             "--dangerously-bypass-approvals-and-sandbox"]
+    assert sessions.get("lead").launch_spec is not None
+    assert sessions.get("lead").launch_spec["argv"] == [
+        "resume", "argv-conversation", "--no-alt-screen",
+        "--dangerously-bypass-approvals-and-sandbox"]
     assert spec["workspace_label"] == "subagents" and spec["environment_names"] == []
     assert spec["native_session"] == (
         {"agent": "codex", "value": "argv-conversation", "source": "argv"} if reported is None

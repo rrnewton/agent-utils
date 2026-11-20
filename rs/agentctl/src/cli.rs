@@ -250,12 +250,12 @@ enum Commands {
     Shutdown(Shutdown),
     /// List registered agents with live status or an explicit probe error
     #[command(after_help = "Example: agentctl list --registry .agentctl")]
-    List,
+    List(ListArgs),
     /// Show durable metadata, queue state, and the live runtime probe
     #[command(
         after_help = "Example: agentctl status reviewer\n\nWhile a blank-working episode is open for the agent (see `agentctl health --blank-working`), the report\ncarries blank_working {since, minutes, alerted}: when the blank stretch was first seen (Unix seconds), how\nmany minutes the health passes have seen it span, and whether the coordinator was told. The field is absent\nwhen no episode is open; this command records no episode of its own."
     )]
-    Status(Named),
+    Status(StatusArgs),
     /// Persist and deliver a prompt when the agent is ready
     #[command(
         after_help = "Examples:\n  agentctl send reviewer 'Review the diff'\n  agentctl send reviewer --file task.txt --message-id review-1\n  agentctl send --to-manager 'The gate is green'\n  agentctl send --to-children --file brief.md\n\nRelationship addressing (#1904): --to-manager and --to-children name no recipient; the caller is\nproved by process ancestry as `agentctl manage` proves its caller, and an unproved caller is\nrefused. --to-manager delivers to the caller's recorded managed_by; with no manager it delivers to\nthe designated coordinator and the header says so (`to-manager: none recorded; designated\ncoordinator`); with neither it refuses. --to-children delivers one durable copy to each live agent\nwhose managed_by is the caller and prints who got it; an explicit --message-id is suffixed per child.\nA send to an ancestor that is not the direct manager, or a descendant that is not a direct child,\nis marked in the header `skip-level: SENDER -> TARGET via CHAIN`; direct, peer and unrelated sends\nstay plain. The mark is computed at send time; no record field is added.\n\nFor an agentcloud agent the prompt is journaled by `agentcloudctl send --end-of-turn` (a leading\n/goal is sent without --end-of-turn), up to 102400 bytes. When --from-session (default:\n$AGENTCLOUD_SESSION_ID) names a different agentcloud session, agentcloudctl refuses that send,\nso the prompt goes as an attributed `agentcloudctl send-message` from that session instead; it\narrives as an ordinary input and a /goal is not interpreted. An explicit\nhuman send (--from-session '') from inside a different agentcloud session is refused, never\ndisguised. --message-id becomes the idempotency\nkey, so repeating it journals nothing new; without it agentctl generates and prints one. The\ndelivery timeouts and --max-attempts do not apply.\n\nEvery prompt opens with a sender header line naming who sent it and how, for example\n`[from cl-foo via agentctl · reply: agentctl send cl-foo]`. The sender is the registered agent\nwhose harness runs this command, else $AGENTCTL_AGENT, else the nearest claude, codex or muse\nancestor (`claude:PID@HOST`), else `human@HOST` at a terminal or `unknown@HOST`. No option\nsuppresses it; a one-line harness slash command such as `/compact` is sent as written."
@@ -433,6 +433,22 @@ struct Requests {
 struct Named {
     /// Registered agent name (1-32 lowercase letters, digits, and hyphens)
     name: String,
+}
+
+#[derive(Args)]
+struct StatusArgs {
+    /// Registered agent name (1-32 lowercase letters, digits, and hyphens)
+    name: String,
+    /// Show full launch argument values in the launch spec (default: flag names only, values elided)
+    #[arg(long)]
+    show_argv: bool,
+}
+
+#[derive(Args)]
+struct ListArgs {
+    /// Show full launch argument values in each row's launch spec (default: flag names only, values elided)
+    #[arg(long)]
+    show_argv: bool,
 }
 
 #[derive(Args)]
@@ -5606,8 +5622,8 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             let caller = std::env::var("AGENTCTL_AGENT").unwrap_or_default();
             manager.shutdown_team(&caller, Duration::from_secs_f64(value.wait))?
         }
-        Commands::List => json!(manager.list()?),
-        Commands::Status(value) => manager.status(&value.name)?,
+        Commands::List(value) => json!(manager.list_showing(value.show_argv)?),
+        Commands::Status(value) => manager.status_showing(&value.name, value.show_argv)?,
         Commands::Prompts(value) => manager.prompts(&value.name, None)?,
         Commands::Answer(value) => manager.prompts(
             &value.agent.name,
@@ -9532,8 +9548,11 @@ mod tests {
 #[test]
 fn ordinary_session_control_does_not_discover_plugins() {
     assert!(plugin_discovery_required(&Commands::Capabilities));
-    assert!(!plugin_discovery_required(&Commands::List));
-    assert!(!plugin_discovery_required(&Commands::Status(Named {
+    assert!(!plugin_discovery_required(&Commands::List(ListArgs {
+        show_argv: false,
+    })));
+    assert!(!plugin_discovery_required(&Commands::Status(StatusArgs {
         name: "worker".to_owned(),
+        show_argv: false,
     })));
 }
