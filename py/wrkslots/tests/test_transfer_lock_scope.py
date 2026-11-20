@@ -19,6 +19,7 @@ import contextlib
 import dataclasses
 import fcntl
 import os
+import sys
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import ParamSpec, TypeVar
@@ -240,3 +241,110 @@ def test_transfer_owner_refuses_when_the_tip_changes_to_a_stale_generation(
     row = _row(project, "slot01")
     assert row["generation"] == 2
     assert isinstance(row["owner"], dict) and row["owner"]["boot_id"] == "finished-boot"
+
+
+def _hold_toggle(project: Path, writes: list[int]) -> Callable[[], None]:
+    def write() -> None:
+        if len(writes) % 2 == 0:
+            completed = command(project, "hold", "slot02", "--reason", "concurrent writer")
+        else:
+            completed = command(project, "unhold", "slot02")
+        assert completed.returncode == 0, completed.stderr
+        writes.append(completed.returncode)
+
+    return write
+
+
+def test_transfer_owner_falls_back_to_locked_body_when_every_round_is_overtaken(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Busy rounds must not refuse in a reboot storm: wait and transfer under the lock."""
+    project = _project_with_slots(tmp_path)
+    monkeypatch.setattr(cli, "REGISTRY_VALIDATION_ATTEMPTS", 3)
+    ledger = _LockLedger(monkeypatch, project)
+    writes: list[int] = []
+    ledger.during_validation = _hold_toggle(project, writes)
+    events_before = _event_count(project)
+
+    rc = cli.main(_transfer_argv(project))
+
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    assert "registry is busy" not in captured.err
+    assert "transferred slot=slot01" in captured.out
+    assert len(writes) == 3
+    # Three overtaken lock-free rounds plus the locked fallback's own event.
+    assert _event_count(project) - events_before == 4
+    row = _row(project, "slot01")
+    assert isinstance(row["owner"], dict) and row["owner"]["pid"] == os.getpid()
+    # The fallback validated under the lock, as the pre-#1975 body did.
+    assert ledger.count("validate", held=True) >= 1
+
+
+def test_transfer_owner_with_an_outstanding_journal_takes_the_locked_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An outstanding journal defers to the locked body; its bytes are untouched."""
+    project = _project_with_slots(tmp_path)
+    interrupted = create(
+        project,
+        slot="slot09",
+        agent="codex-9",
+        branch="codex/task9",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"},
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    journals = list(control_directory(project).glob("CREATE.*.journal"))
+    assert len(journals) == 1
+    journal_bytes = journals[0].read_bytes()
+    events_before = _event_count(project)
+    ledger = _LockLedger(monkeypatch, project)
+
+    rc = cli.main(_transfer_argv(project))
+
+    captured = capsys.readouterr()
+    assert rc == 3, captured.err
+    assert "registry is busy" not in captured.err
+    assert journals[0].read_bytes() == journal_bytes
+    assert _event_count(project) == events_before
+    row = _row(project, "slot01")
+    assert isinstance(row["owner"], dict) and row["owner"]["boot_id"] == "finished-boot"
+    # The locked body was entered under the mutation locks (it refuses on
+    # the journal before any fleet validation runs there).
+    assert ledger.exclusive_rounds >= 1
+
+
+def test_transfer_owner_keeps_a_dead_mount_note_from_an_overtaken_round(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A dead-mount note emitted in round 1 still prints once when round 2 succeeds."""
+    project = _project_with_slots(tmp_path)
+    ledger = _LockLedger(monkeypatch, project)
+    writes: list[int] = []
+    toggle = _hold_toggle(project, writes)
+
+    def churn_once() -> None:
+        if not writes:
+            toggle()
+
+    ledger.during_validation = churn_once
+    point = project / "dead-entry"
+
+    def report_dead(config: object, states: object, record: object) -> None:
+        if point in cli._DEAD_MOUNT_REPORTED.get():
+            return
+        cli._DEAD_MOUNT_REPORTED.set((*cli._DEAD_MOUNT_REPORTED.get(), point))
+        print(
+            f"WARNING: dead FUSE entry at {point}, owning slot slot02",
+            file=sys.stderr,
+        )
+
+    monkeypatch.setattr(cli, "_report_dead_for_record", report_dead)
+
+    rc = cli.main(_transfer_argv(project))
+
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    assert writes == [0]
+    assert captured.err.count("dead FUSE entry at") == 1
+    assert "transferred slot=slot01" in captured.out

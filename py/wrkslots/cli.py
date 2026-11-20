@@ -49341,6 +49341,16 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
     # original fully-locked body, whose journal recovery needs the lock.
     captured_notes: list[tuple[str, str]] = []
 
+    def remember_notes(stdout_text: str, stderr_text: str) -> None:
+        # Notes accumulate across prevalidation rounds: a dead-mount note
+        # emitted in an overtaken round is deduped by _DEAD_MOUNT_REPORTED
+        # in later rounds, so replacing per round would drop it. Identical
+        # pairs are kept once, so every distinct note reaches the caller
+        # exactly once.
+        pair = (stdout_text, stderr_text)
+        if pair != ("", "") and pair not in captured_notes:
+            captured_notes.append(pair)
+
     def judge(
         record: ActiveRecord, events: Sequence[Mapping[str, object]]
     ) -> tuple[bool, str, object, str, bool, tuple[tuple[str, bytes], ...]]:
@@ -49506,9 +49516,7 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
             ):
                 return validate()
         finally:
-            captured_notes[:] = [
-                (stdout_buffer.getvalue(), stderr_buffer.getvalue())
-            ]
+            remember_notes(stdout_buffer.getvalue(), stderr_buffer.getvalue())
 
     def locked_body() -> tuple[
         str,
@@ -49578,7 +49586,7 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
             ):
                 return locked_body()
         finally:
-            captured_notes[:] = [(stdout_buffer.getvalue(), stderr_buffer.getvalue())]
+            remember_notes(stdout_buffer.getvalue(), stderr_buffer.getvalue())
 
     def commit(
         reference: _RegistryIdentity | None, prepared: _TransferPrevalidated | None
@@ -49631,18 +49639,31 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
         return (outcome, transferred, basis, previous_state, prepared.nested, ignored)
 
     try:
-        (
-            outcome,
-            final_record,
-            final_basis,
-            final_previous,
-            final_nested,
-            final_ignored,
-        ) = (
-            _run_prevalidated_mutation(
+        try:
+            (
+                outcome,
+                final_record,
+                final_basis,
+                final_previous,
+                final_nested,
+                final_ignored,
+            ) = _run_prevalidated_mutation(
                 config, args.wait_lock, "transfer-owner", prepare, commit
             )
-        )
+        except _RegistryBusy:
+            # Every lock-free round was overtaken (e.g. dozens of lanes
+            # transferring at once after a reboot): fall back to the old
+            # behaviour — wait for the lock and validate there — instead
+            # of refusing a transfer as busy, as heartbeat does.
+            with _mutation_locks(config, args.wait_lock):
+                (
+                    outcome,
+                    final_record,
+                    final_basis,
+                    final_previous,
+                    final_nested,
+                    final_ignored,
+                ) = locked_body_captured()
     finally:
         for stdout_text, stderr_text in captured_notes:
             if stdout_text:

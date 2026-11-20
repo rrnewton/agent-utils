@@ -1757,7 +1757,10 @@ def usage(image: SlotImage) -> dict[str, object]:
                 # A dead FUSE mount (its server gone, e.g. across a
                 # reboot) fails here with ENOTCONN/EIO instead of
                 # answering: degrade this entry, never the report.
-                entry["error"] = str(exc)
+                # First error wins: an earlier stat failure for this
+                # entry is not overwritten by the statvfs failure.
+                if "error" not in entry:
+                    entry["error"] = str(exc)
             else:
                 entry["used_bytes"] = (vfs.f_blocks - vfs.f_bfree) * vfs.f_frsize
                 entry["free_bytes"] = vfs.f_bavail * vfs.f_frsize

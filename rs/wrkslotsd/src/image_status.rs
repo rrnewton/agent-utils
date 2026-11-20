@@ -70,7 +70,11 @@ fn file_entry(
                     entry.insert("used_inodes".to_string(), json!(vfs.used_inodes));
                 }
                 Some(Err(message)) => {
-                    entry.insert("error".to_string(), json!(message));
+                    // First error wins, as in Python: an earlier stat
+                    // failure for this entry is not overwritten.
+                    if !entry.contains_key("error") {
+                        entry.insert("error".to_string(), json!(message));
+                    }
                 }
                 None => {}
             }
@@ -139,14 +143,19 @@ pub(crate) fn render_status_human(new_slot_representation: &str, reports: &[Valu
             let Some(entry) = report.get(label) else {
                 continue;
             };
+            let error_suffix = match entry.get("error") {
+                Some(value) => format!(" error={}", display(Some(value))),
+                None => String::new(),
+            };
             out.push_str(&format!(
-                "  {label:5} mounted={} backend={} host={} used={} ceiling={} inodes={}\n",
+                "  {label:5} mounted={} backend={} host={} used={} ceiling={} inodes={}{}\n",
                 display(entry.get("mounted")),
                 display(entry.get("backend")),
                 gib(entry.get("host_allocated_bytes")),
                 gib(entry.get("used_bytes")),
                 gib(entry.get("ceiling_bytes")),
                 display(entry.get("used_inodes")),
+                error_suffix,
             ));
         }
     }
@@ -251,6 +260,28 @@ mod tests {
             "[Errno 107] Transport endpoint is not connected"
         );
         assert!(dead["slot"].get("used_bytes").is_none());
+        let dead_human = render_status_human("image", std::slice::from_ref(&dead));
+        assert!(
+            dead_human.contains("mounted=True")
+                && dead_human.contains("error=[Errno 107] Transport endpoint is not connected"),
+            "{dead_human}"
+        );
+
+        // First error wins: a missing image file's stat error is not
+        // overwritten by the same entry's statvfs error.
+        std::fs::remove_file(record.image_file()).expect("remove slot image");
+        let missing = usage_report(
+            &record,
+            &|_: &Path, _: &Path| Some("fuse".to_string()),
+            &|_: &Path| {
+                Some(Err(
+                    "[Errno 107] Transport endpoint is not connected".to_string()
+                ))
+            },
+        );
+        let first_error = missing["slot"]["error"].as_str().expect("first error");
+        assert!(first_error.contains("[Errno 2]"), "{first_error}");
+        assert!(!first_error.contains("107"), "{first_error}");
 
         std::fs::remove_dir_all(&root).expect("cleanup");
         let _ = PathBuf::new();

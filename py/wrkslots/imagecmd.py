@@ -1788,6 +1788,7 @@ def _cmd_image_status(args: argparse.Namespace) -> int:
                 f"  {label:5s} mounted={entry.get('mounted')} backend={entry.get('backend', '-')} "
                 f"host={_gib(entry.get('host_allocated_bytes'))} used={_gib(entry.get('used_bytes'))} "
                 f"ceiling={_gib(entry.get('ceiling_bytes'))} inodes={entry.get('used_inodes', '-')}"
+                + (f" error={entry.get('error')}" if entry.get("error") else "")
             )
     return 0
 

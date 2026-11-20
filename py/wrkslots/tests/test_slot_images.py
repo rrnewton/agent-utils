@@ -1545,3 +1545,36 @@ def test_image_status_with_a_dead_mount_exits_zero_and_reports_the_rest(
     assert [entry["name"] for entry in document["images"]] == ["dead1", "ok1"]
     assert "Errno 107" in str(document["images"][0]["slot"]["error"])
     assert document["images"][1]["slot"]["used_bytes"] == (1000 - 400) * 1024
+
+    # The human rendering shows the per-entry error instead of hiding it
+    # behind mounted=True used=-.
+    assert imagecmd._cmd_image_status(
+        argparse.Namespace(project_root=str(root), machine="node-a", format="human")
+    ) == 0
+    human = capsys.readouterr().out
+    dead_line = next(line for line in human.splitlines() if "mounted=True" in line)
+    assert "error=" in dead_line and "Errno 107" in dead_line
+
+
+def test_usage_keeps_the_first_error_when_stat_and_statvfs_both_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """First error wins: a stat failure is not overwritten by statvfs."""
+    image = _status_image(tmp_path / "gone", "gone1")
+    image.slot_image.unlink()
+    monkeypatch.setattr(slotimage, "mount_table", lambda mountinfo=None: [])
+    monkeypatch.setattr(
+        slotimage, "mounted_backend",
+        lambda image_file, mount_point, table=None: "fuse",
+    )
+
+    def statvfs(path: str | os.PathLike[str]) -> os.statvfs_result:
+        raise OSError(errno.ENOTCONN, os.strerror(errno.ENOTCONN), os.fspath(path))
+
+    monkeypatch.setattr(os, "statvfs", statvfs)
+
+    report = slotimage.usage(image)
+    slot_entry = report["slot"]
+    assert isinstance(slot_entry, dict)
+    assert "Errno 2" in str(slot_entry["error"])
+    assert "107" not in str(slot_entry["error"])
