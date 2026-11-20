@@ -73,7 +73,24 @@ def main() -> int:
                     page.wait_for_selector("#open-settings", state="visible", timeout=STATE_MS)
                     page.click("#open-settings")
                     page.wait_for_selector("#colour-theme", state="attached", timeout=STATE_MS)
-                    page.evaluate("() => document.getElementById('fold-appearance').click()")
+                    # A fresh profile has Messages and Appearance folded (hidden
+                    # until found), so the picker is attached but not visible:
+                    # open every fold around it, exactly as scene 86's walk does.
+                    page.evaluate("""(id) => {
+                      const node = document.getElementById(id); const bodies = [];
+                      for (let n = node; n; n = n.parentElement) {
+                        if (n.classList && n.classList.contains('fold-body')) bodies.unshift(n);
+                      }
+                      for (const body of bodies) {
+                        const toggle = document.querySelector(`[aria-controls="${body.id}"]`);
+                        if (toggle && toggle.getAttribute('aria-expanded') !== 'true') toggle.click();
+                      }
+                      return bodies.length;
+                    }""", "colour-theme")
+                    page.wait_for_function(
+                        "() => document.getElementById('colour-theme').checkVisibility()",
+                        timeout=STATE_MS,
+                    )
                     at = 0 if scheme == "dark" else 1
                     hexes = {"blue": ("#5b9dd9", "#24618f"), "teal": ("#4cc2b0", "#0f766e"),
                              "plum": ("#cf9fe0", "#7e3a9e"), "amber": ("#e8b34b", "#8a5a00")}
