@@ -7067,7 +7067,7 @@ fn flat_cfg(scratch: &Scratch) -> crate::active_state::Cfg {
         harness_repo: None,
         eden_mount_root: None,
         validation_exclusion_roots: Vec::new(),
-            remote_ssh_commands: Vec::new(),
+        remote_ssh_commands: Vec::new(),
     }
 }
 

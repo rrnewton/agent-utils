@@ -1896,6 +1896,13 @@ mod tests {
             json!({"origin": {"proxy_command": "ssh jump\nrm -rf /"}}),
         );
         assert!(parse_remote_ssh_commands(&raw).is_err());
+        // Python str.strip parity: \x1c-\x1f alone is blank.
+        let mut raw = Map::new();
+        raw.insert(
+            "remote_ssh_commands".to_string(),
+            json!({"origin": {"proxy_command": "\u{1c}\u{1f}"}}),
+        );
+        assert!(parse_remote_ssh_commands(&raw).is_err());
     }
 
     #[test]
