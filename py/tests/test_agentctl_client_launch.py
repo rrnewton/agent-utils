@@ -851,6 +851,26 @@ HOOKS_TRUST_DIALOG = (
 )
 
 
+# The dialog as Muse 1.4.25 actually draws it, captured from a live
+# pane: `⟩` cursor, numbered rows, eleven blank lines, count with a
+# period, and Muse's startup banner above the title (#1932 review).
+HOOKS_TRUST_DIALOG_REAL = (
+    "Muse Code at Meta (https://fb.workplace.com/groups/27315719428107177)\n"
+    "Using AI Gateway (Meta Model API upstream)\n"
+    "muse: gate plugins: on (MUSE_EXPERIMENTAL_PLUGINS)\n"
+    "muse: gate reminder_subagent_hooks_off: on (MUSE_EXPERIMENTAL_REMINDER_SUBAGENT_HOOKS_OFF)\n"
+    "Review plugin hooks\n"
+    "23 new or changed hooks need your trust.\n"
+    "Hooks run commands on your machine when their event matches.\n"
+    "Approval follows the declaration, including after script updates.\n"
+    + "\n" * 11
+    + "⟩ 1. Review hooks\n"
+    "  2. Trust all and continue\n"
+    "  3. Continue without trusting\n"
+    "Up/Down to choose, Enter to confirm. Esc continues without trusting.\n"
+)
+
+
 def test_custom_muse_launch_names_the_hooks_trust_dialog_and_never_answers_it() -> None:
     assert muse_hooks_trust_prompt(HOOKS_TRUST_DIALOG)
     assert not muse_hooks_trust_prompt("Do you trust this workspace?\n")
@@ -873,17 +893,18 @@ _MUSE_COMPOSER = (
 def _hooks_dialog(selection: int) -> str:
     lines = [
         "Review plugin hooks",
-        "39 new or changed hooks need your trust",
-        "",
+        "39 new or changed hooks need your trust.",
         "Hooks run commands on your machine when their event matches.",
         "Approval follows the declaration, including after script updates.",
         "",
+        "",
+        "",
     ]
     lines += [
-        ("❯ " if index == selection else "  ") + option
+        ("⟩ " if index == selection else "  ") + f"{index + 1}. {option}"
         for index, option in enumerate(_HOOKS_OPTIONS)
     ]
-    lines += ["", "Up/Down to choose, Enter to confirm. Esc continues without trusting.", ""]
+    lines += ["Up/Down to choose, Enter to confirm. Esc continues without trusting.", ""]
     return "\n".join(lines)
 
 
@@ -1065,6 +1086,33 @@ def test_custom_muse_launch_stops_when_the_dialog_vanishes_mid_answer() -> None:
     assert fake.keys == ["Down"]
     assert seen == []
     assert any(call[1:3] == ["pane", "report-agent"] for call in fake.calls)
+
+
+def test_the_real_muse_dialog_is_recognised_and_answered() -> None:
+    assert muse_hooks_trust_dialog(HOOKS_TRUST_DIALOG_REAL)
+    assert muse_hooks_trust_count(HOOKS_TRUST_DIALOG_REAL) == 23
+    fake = _DialogRunner(HOOKS_TRUST_DIALOG)
+    seen: list[tuple[str, int | None]] = []
+    fake.client().start_pane_agent(
+        "worker", "muse", "p1", (), timeout=5,
+        hooks_trust="decline",
+        on_hooks_trust=lambda decision, count: seen.append((decision, count)),
+    )
+    assert fake.keys == ["Down", "Down", "Enter"]
+    assert seen == [("decline", 39)]
+
+
+def test_a_verbatim_quote_at_the_bottom_is_never_answered() -> None:
+    # A2: the whole dialog quoted at the bottom of a working lane, no
+    # composer visible; the quoting turn above it vetoes the match.
+    dialog = HOOKS_TRUST_DIALOG_REAL.split("Review plugin hooks", 1)[1]
+    quoted = "❯ cat the fixture please\n◆ here it is\nReview plugin hooks" + dialog
+    fake = _DialogRunner(quoted)
+    with pytest.raises(HerdrUnavailable):
+        fake.client().start_pane_agent(
+            "worker", "muse", "p1", (), timeout=0.3, hooks_trust="decline",
+        )
+    assert fake.keys == []
 
 
 def test_custom_muse_launch_rejects_bare_prompt_without_idle_footer() -> None:

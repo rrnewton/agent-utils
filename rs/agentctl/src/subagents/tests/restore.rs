@@ -3881,12 +3881,13 @@ fn watch_answers_a_managed_muse_hooks_dialog() {
         .unwrap();
     *fixture.client.screen.lock().unwrap() = Some(
         "Review plugin hooks\n\
-         39 new or changed hooks need your trust\n\
-         \n\
-         ❯ Review hooks\n\
-         \x20 Trust all and continue\n\
-         \x20 Continue without trusting\n\
-         \n\
+         39 new or changed hooks need your trust.\n\
+         Hooks run commands on your machine when their event matches.\n\
+         Approval follows the declaration, including after script updates.\n\
+         \n\n\n\
+         ⟩ 1. Review hooks\n\
+         \x20 2. Trust all and continue\n\
+         \x20 3. Continue without trusting\n\
          Up/Down to choose, Enter to confirm. Esc continues without trusting.\n"
             .to_owned(),
     );

@@ -751,7 +751,23 @@ const HOOKS_TRUST_OPTIONS: [&str; 3] = [
     "trust all and continue",
     "continue without trusting",
 ];
-const HOOKS_TRUST_MARKERS: [char; 2] = ['❯', '›'];
+const HOOKS_TRUST_MARKERS: [char; 3] = ['❯', '›', '⟩'];
+const HOOKS_TRUST_BODY: [&str; 2] = [
+    "hooks run commands on your machine when their event matches.",
+    "approval follows the declaration, including after script updates.",
+];
+/// Turn and prompt markers a transcript draws; one above the title
+/// means the dialog text is quoted in a conversation, not drawn by Muse.
+const HOOKS_TRUST_TURN_MARKERS: [char; 5] = ['❯', '›', '⟩', '◆', '◇'];
+
+/// Whether `line` is the dialog's hook-count line.
+fn hooks_trust_count_line(line: &str) -> bool {
+    let line = line.strip_suffix('.').unwrap_or(line);
+    let Some(numbers) = line.strip_suffix(" new or changed hooks need your trust") else {
+        return false;
+    };
+    !numbers.is_empty() && numbers.bytes().all(|byte| byte.is_ascii_digit())
+}
 
 /// Muse's plugin-hooks trust dialog parsed at the screen's bottom:
 /// the chosen hook count and the selected option index.
@@ -793,25 +809,52 @@ fn hooks_trust_block(screen: &str) -> Option<HooksTrustBlock> {
     let mut selected = None;
     for (offset, expected) in HOOKS_TRUST_OPTIONS.iter().enumerate() {
         let mut line = lines[first_option + offset].trim_start();
-        if let Some(rest) = line
-            .strip_prefix(HOOKS_TRUST_MARKERS[0])
-            .or_else(|| line.strip_prefix(HOOKS_TRUST_MARKERS[1]))
-        {
-            if selected.is_some() {
-                return None;
+        for marker in HOOKS_TRUST_MARKERS {
+            if let Some(rest) = line.strip_prefix(marker) {
+                if selected.is_some() {
+                    return None;
+                }
+                selected = Some(offset);
+                line = rest.trim_start();
+                break;
             }
-            selected = Some(offset);
-            line = rest.trim_start();
         }
-        if !line.trim().eq_ignore_ascii_case(expected) {
+        let text = line.trim().to_ascii_lowercase();
+        let numbered = format!("{}. ", offset + 1);
+        let text = text.strip_prefix(&numbered).unwrap_or(&text);
+        if text != *expected {
             return None;
         }
     }
     let selected = selected?;
-    let title = (0..first_option)
-        .rev()
-        .take(14)
-        .find(|&index| lines[index].trim().eq_ignore_ascii_case("review plugin hooks"))?;
+    // Search for the title up to the top of the screen (the gap grows
+    // with pane height): only blank lines and the dialog's own body
+    // lines may sit between the title and the options.
+    let mut title = None;
+    for index in (0..first_option).rev() {
+        let text = lines[index].trim().to_ascii_lowercase();
+        if text == "review plugin hooks" {
+            title = Some(index);
+            break;
+        }
+        if !text.is_empty()
+            && !HOOKS_TRUST_BODY.contains(&text.as_str())
+            && !hooks_trust_count_line(&text)
+        {
+            return None;
+        }
+    }
+    let title = title?;
+    // A turn marker above the title means the text is a quote inside a
+    // conversation (a scrolled working lane), not Muse's own dialog.
+    if lines[..title].iter().any(|line| {
+        line.trim_start()
+            .chars()
+            .next()
+            .is_some_and(|glyph| HOOKS_TRUST_TURN_MARKERS.contains(&glyph))
+    }) {
+        return None;
+    }
     let block = lines[title..footer].join("\n").to_ascii_lowercase();
     Some(HooksTrustBlock {
         count: muse_hooks_trust_count(&block),
@@ -4529,6 +4572,43 @@ mod tests {
         )));
     }
 
+    // The dialog as Muse 1.4.25 actually draws it, captured from a live
+    // pane: `⟩` cursor, numbered rows, eleven blank lines, count with a
+    // period, and Muse's startup banner above the title (#1932 review).
+    const HOOKS_TRUST_DIALOG_REAL: &str = "Muse Code at Meta (https://fb.workplace.com/groups/27315719428107177)\n\
+        Using AI Gateway (Meta Model API upstream)\n\
+        muse: gate plugins: on (MUSE_EXPERIMENTAL_PLUGINS)\n\
+        muse: gate reminder_subagent_hooks_off: on (MUSE_EXPERIMENTAL_REMINDER_SUBAGENT_HOOKS_OFF)\n\
+        Review plugin hooks\n\
+        23 new or changed hooks need your trust.\n\
+        Hooks run commands on your machine when their event matches.\n\
+        Approval follows the declaration, including after script updates.\n\
+        \n\n\n\n\n\n\n\n\n\n\n\
+        ⟩ 1. Review hooks\n\
+        \x20 2. Trust all and continue\n\
+        \x20 3. Continue without trusting\n\
+        Up/Down to choose, Enter to confirm. Esc continues without trusting.\n";
+
+    #[test]
+    fn the_real_muse_dialog_is_recognised() {
+        assert!(muse_hooks_trust_dialog(HOOKS_TRUST_DIALOG_REAL));
+        assert_eq!(muse_hooks_trust_count(HOOKS_TRUST_DIALOG_REAL), Some(23));
+        assert_eq!(
+            hooks_trust_block(HOOKS_TRUST_DIALOG_REAL).map(|block| block.selected),
+            Some(0)
+        );
+        // A2: the whole dialog quoted at the bottom of a working lane,
+        // no composer visible; the quoting turn above it vetoes it.
+        let quoted = format!(
+            "❯ cat the fixture please\n◆ here it is\nReview plugin hooks{}",
+            HOOKS_TRUST_DIALOG_REAL
+                .split_once("Review plugin hooks\n")
+                .unwrap()
+                .1
+        );
+        assert!(!muse_hooks_trust_dialog(&quoted), "{quoted}");
+    }
+
     #[test]
     fn hooks_trust_recognition_is_strict() {
         // #1932: title AND all three options, or it is not answered.
@@ -4595,9 +4675,9 @@ if args[:2] == ["pane", "read"]:
         print("Muse Code 1.4.24\n\n────────────────\n❯\n────────────────\nkiki · xhigh · /work/project · YOLO")
     else:
         options = ["Review hooks", "Trust all and continue", "Continue without trusting"]
-        lines = ["Review plugin hooks", "39 new or changed hooks need your trust", ""]
-        lines += [("❯ " if i == sel else "  ") + option for i, option in enumerate(options)]
-        lines += ["", "Up/Down to choose, Enter to confirm. Esc continues without trusting."]
+        lines = ["Review plugin hooks", "39 new or changed hooks need your trust.", "Hooks run commands on your machine when their event matches.", "Approval follows the declaration, including after script updates.", "", ""]
+        lines += [("⟩ " if i == sel else "  ") + f"{i + 1}. {option}" for i, option in enumerate(options)]
+        lines += ["Up/Down to choose, Enter to confirm. Esc continues without trusting."]
         print("\n".join(lines))
 elif args[:2] == ["pane", "send-keys"]:
     key = args[3]

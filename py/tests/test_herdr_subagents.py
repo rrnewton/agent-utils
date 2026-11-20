@@ -31,15 +31,13 @@ import agentctl.codex_goal as native_goal
 #: Muse's plugin-hooks trust dialog, as the installed Muse draws it (#1932).
 HOOKS_TRUST_DIALOG_TEXT = (
     "Review plugin hooks\n"
-    "39 new or changed hooks need your trust\n"
-    "\n"
+    "39 new or changed hooks need your trust.\n"
     "Hooks run commands on your machine when their event matches.\n"
     "Approval follows the declaration, including after script updates.\n"
-    "\n"
-    "❯ Review hooks\n"
-    "  Trust all and continue\n"
-    "  Continue without trusting\n"
-    "\n"
+    "\n\n\n"
+    "⟩ 1. Review hooks\n"
+    "  2. Trust all and continue\n"
+    "  3. Continue without trusting\n"
     "Up/Down to choose, Enter to confirm. Esc continues without trusting.\n"
 )
 

@@ -198,7 +198,15 @@ _HOOKS_TRUST_OPTIONS = (
     "continue without trusting",
 )
 _HOOKS_TRUST_COUNT = re.compile(r"(\d+) new or changed hooks need your trust")
-_HOOKS_TRUST_MARKERS = ("❯", "›")
+_HOOKS_TRUST_COUNT_LINE = re.compile(r"\d+ new or changed hooks need your trust\.?")
+_HOOKS_TRUST_MARKERS = ("❯", "›", "⟩")
+_HOOKS_TRUST_BODY = (
+    "hooks run commands on your machine when their event matches.",
+    "approval follows the declaration, including after script updates.",
+)
+# Turn and prompt markers a transcript draws; one above the title means
+# the dialog text is quoted in a conversation, not drawn by Muse.
+_HOOKS_TRUST_TURN_MARKERS = ("❯", "›", "⟩", "◆", "◇")
 
 
 def _hooks_trust_block(screen: str) -> tuple[int | None, int] | None:
@@ -236,16 +244,33 @@ def _hooks_trust_block(screen: str) -> tuple[int | None, int] | None:
                 return None
             selected = offset
             line = line[1:].lstrip()
-        if line.strip().lower() != expected:
+        text = line.strip().lower()
+        numbered = f"{offset + 1}. "
+        if text.startswith(numbered):
+            text = text[len(numbered):]
+        if text != expected:
             return None
     if selected is None:
         return None
+    # Search for the title up to the top of the screen (the gap grows
+    # with pane height): only blank lines and the dialog's own body
+    # lines may sit between the title and the options.
     title = None
-    for index in range(first_option - 1, max(-1, first_option - 14), -1):
-        if lines[index].strip().lower() == "review plugin hooks":
+    for index in range(first_option - 1, -1, -1):
+        text = lines[index].strip().lower()
+        if text == "review plugin hooks":
             title = index
             break
+        if text and text not in _HOOKS_TRUST_BODY and not _HOOKS_TRUST_COUNT_LINE.fullmatch(text):
+            return None
     if title is None:
+        return None
+    # A turn marker above the title means the text is a quote inside a
+    # conversation (a scrolled working lane), not Muse's own dialog.
+    if any(
+        lines[index].lstrip()[:1] in _HOOKS_TRUST_TURN_MARKERS
+        for index in range(title)
+    ):
         return None
     match = _HOOKS_TRUST_COUNT.search("\n".join(lines[title:footer]).lower())
     return (int(match.group(1)) if match else None, selected)
