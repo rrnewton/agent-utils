@@ -4151,6 +4151,58 @@ class ManagedAgents:
                 status["slot_owner"] = slot_owner
             return status
 
+    def _pretrust_muse_hooks(
+        self, record: AgentRecord, environment: Sequence[str],
+        hooks_source: str, launch_env: LaunchEnv | None,
+    ) -> None:
+        """Pre-trust plugin hooks for one Muse launch (#1972).
+
+        Runs with the launch's real environment (tab entries, then the
+        registry launch_env's BASH_ENV/PATH prefix, exactly the prefix
+        `prepare_launch_shell` types) and in the record's cwd, so the
+        approval lands in the settings store the agent will read.
+        Logged per hook (plugin, stable id, definition hash, setting
+        source), never persisted in the record. Any failure is a warning
+        only: the launch proceeds, and a hooks dialog, if one appears,
+        is answered per #1932's policy.
+        """
+        name = record.name
+        pretrust = getattr(self.client, "pretrust_muse_hooks", None)
+        if pretrust is None:
+            return
+        entries = list(environment)
+        if launch_env is not None:
+            if launch_env.env_file is not None:
+                entries.append(f"BASH_ENV={launch_env.env_file}")
+            if launch_env.path_prepend:
+                entries.append(
+                    "PATH=" + ":".join(launch_env.path_prepend)
+                    + ":" + os.environ.get("PATH", ""),
+                )
+        try:
+            report = pretrust(tuple(entries), cwd=record.cwd)
+        except Exception as exc:  # noqa: BLE001 - a warning, never a block
+            print(
+                f"agentctl: warning: {name}: hook pre-trust failed: {exc}; "
+                f"continuing the launch, and any hooks dialog will be "
+                f"answered per {hooks_source}",
+                file=sys.stderr,
+            )
+            return
+        for entry in report.approved:
+            print(
+                f"agentctl: {name}: pre-trusted {entry.stable_id} "
+                f"({entry.definition_hash}) per {hooks_source}",
+                file=sys.stderr,
+            )
+        for failure in report.failures:
+            print(
+                f"agentctl: warning: {name}: hook pre-trust failed: {failure}; "
+                f"continuing the launch, and any hooks dialog will be "
+                f"answered per {hooks_source}",
+                file=sys.stderr,
+            )
+
     def _launch_interactive(
         self, record: AgentRecord, workspace_id: str | None,
         environment: Sequence[str], project_workspace: str | None,
@@ -4167,6 +4219,7 @@ class ManagedAgents:
             hooks_trust, hooks_source = hooks_trust_policy(
                 record.cwd, self.registry, record.profile,
             )
+
 
         def note_hooks_trust(decision: str, count: int | None) -> None:
             verb = "trusted all hooks" if decision == "trust" else "declined hook trust"
@@ -4186,6 +4239,12 @@ class ManagedAgents:
         launch_env = self._project_launch_env()
         if launch_env is not None and relay_command is not None:
             raise HerdrUnavailable(_LAUNCH_ENV_RELAY_REFUSAL)
+        if harness == "muse" and hooks_trust == "trust":
+            # Pre-trust our plugin hooks through Muse's supported
+            # approve verb so the dialog never appears (#1972). Only
+            # under an explicit trust policy; failure never blocks the
+            # launch, and #1932's dialog answer remains the fallback.
+            self._pretrust_muse_hooks(record, environment, hooks_source, launch_env)
         self._create_presentation(
             record, workspace_id, environment, project_workspace
         )

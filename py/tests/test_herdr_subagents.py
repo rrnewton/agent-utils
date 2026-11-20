@@ -14,7 +14,8 @@ import pytest
 
 from agentctl import agent as delivery
 from agentctl.client import (
-    AgentIdentity, AgentPaneInfo, CustomProcessIdentity, HerdrClient, Pane, PaneShellProof,
+    AgentIdentity, AgentPaneInfo, CustomProcessIdentity, HerdrClient,
+    MuseHookPretrust, MusePretrustReport, Pane, PaneShellProof,
 )
 from agentctl.errors import (
     AgentDeliveryError, AgentPending, HerdrUnavailable, InputExpectationFailed,
@@ -68,6 +69,12 @@ class FakeManagedClient:
         #: muse launch sits at the dialog until the launch answers it.
         self.hooks_dialog = False
         self.hooks_answers: list[tuple[str, int | None]] = []
+        #: Hook pre-trust simulation (#1972): a successful pre-trust means
+        #: the launch never sits at the dialog at all.
+        self.pretrust_calls: list[tuple[str, ...]] = []
+        self.pretrust_cwds: list[str | None] = []
+        self.pretrust_fail = False
+        self.pretrusted = False
         #: Panes whose visible screen is the dialog right now (candidate flow).
         self.dialog_panes: set[str] = set()
         #: Text staged in each pane's composer by a verified submission.
@@ -231,6 +238,18 @@ class FakeManagedClient:
                         else f"session-{self.serial}")
         self.infos[pane_id] = replace(self.infos[pane_id], agent=kind, status="idle", session_agent=kind, session_value=conversation)
 
+    def pretrust_muse_hooks(
+        self, environment: tuple[str, ...] = (), *, cwd: str | None = None,
+    ) -> MusePretrustReport:
+        self.pretrust_calls.append(tuple(environment))
+        self.pretrust_cwds.append(cwd)
+        if self.pretrust_fail:
+            return MusePretrustReport((), ("muse plugins list: exploded",))
+        self.pretrusted = True
+        return MusePretrustReport(
+            (MuseHookPretrust("ours", "plugin:ours:hook:new", "sha256:new"),), (),
+        )
+
     def start_pane_agent(
         self, name: str, kind: str, pane_id: str, arguments: tuple[str, ...], *, timeout: float,
         on_observed: Callable[[CustomProcessIdentity], None] | None = None,
@@ -241,7 +260,7 @@ class FakeManagedClient:
         assert timeout > 0
         self.launched.append((name, kind, pane_id, arguments))
         self.custom_running = True
-        if self.hooks_dialog and hooks_trust is not None:
+        if self.hooks_dialog and not self.pretrusted and hooks_trust is not None:
             # The real client answers the dialog during launch (#1932).
             self.hooks_answers.append((hooks_trust, 39))
             if callable(on_hooks_trust):
@@ -1566,6 +1585,8 @@ def test_muse_start_answers_the_hooks_dialog_and_delivers_the_brief(
         "worker", cwd=str(tmp_path), harness="muse", brief="do the thing",
     )
     assert fake.hooks_answers == [("decline", 39)]
+    # Decline never pre-trusts (#1972): no approve call is even attempted.
+    assert fake.pretrust_calls == []
     assert fake.submitted == ["do the thing"]
     assert status["lifecycle"] == "running"
     assert "declined hook trust (39 hooks) per built-in default" in capsys.readouterr().err
@@ -1595,10 +1616,46 @@ def test_muse_start_trusts_hooks_only_under_an_explicit_trust_setting(
         "worker", cwd=str(tmp_path), harness="muse", profile="muse-x",
         brief="do the thing",
     )
-    # The profile's explicit trust beats the registry's decline.
+    # The profile's explicit trust beats the registry's decline, and the
+    # hooks are pre-trusted before the pane spawns (#1972), so the dialog
+    # never appears and is never answered.
+    assert len(fake.pretrust_calls) == 1
+    assert fake.pretrust_cwds == [str(tmp_path)]
+    assert fake.hooks_answers == []
+    assert fake.submitted == ["do the thing"]
+    assert "pre-trusted plugin:ours:hook:new (sha256:new) per profile 'muse-x' in profiles.json" in capsys.readouterr().err
+
+
+def test_muse_start_falls_back_to_the_dialog_when_pretrust_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Pre-trust failure never blocks a launch (#1972): the start still
+    # hits the dialog, and #1932's answer clears it per policy.
+    manager, fake = setup(tmp_path, monkeypatch)
+    subprocess.run(["/usr/bin/git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
+    directory = tmp_path / ".agentctl"
+    directory.mkdir(mode=0o700)
+    config = directory / "profiles.json"
+    config.write_text(json.dumps({
+        "schema": "agentctl-profiles/v1",
+        "profiles": {"muse-x": {
+            "harness": "muse", "mode": "interactive",
+            "argv": ["--approval-mode=never"], "env": {},
+            "muse_hooks_trust": "trust",
+        }},
+    }), encoding="utf-8")
+    config.chmod(0o600)
+    fake.hooks_dialog = True
+    fake.pretrust_fail = True
+    manager.start(
+        "worker", cwd=str(tmp_path), harness="muse", profile="muse-x",
+        brief="do the thing",
+    )
+    assert len(fake.pretrust_calls) == 1
     assert fake.hooks_answers == [("trust", 39)]
     assert fake.submitted == ["do the thing"]
-    assert "trusted all hooks (39 hooks) per profile 'muse-x' in profiles.json" in capsys.readouterr().err
+    assert "hook pre-trust failed" in capsys.readouterr().err
 
 
 def test_interactive_start_rejects_string_harness_arguments_before_allocation(

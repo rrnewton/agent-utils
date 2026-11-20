@@ -1179,6 +1179,21 @@ impl crate::subagents::ManagedApi for TmuxBackend {
         "tmux"
     }
 
+    fn pretrust_muse_hooks(
+        &self,
+        _environment: &[String],
+        _cwd: &Path,
+    ) -> crate::client::MusePretrustReport {
+        // #1972: the tmux backend has no muse-CLI pre-trust; say so
+        // once per launch instead of silently doing nothing. The
+        // #1932 dialog answer still applies at launch.
+        eprintln!(
+            "agentctl: warning: hook pre-trust is not supported on the tmux \
+             backend; any plugin-hooks dialog will be answered per policy"
+        );
+        crate::client::MusePretrustReport::default()
+    }
+
     fn prepare_launch_shell(
         &self,
         pane: &str,

@@ -79,6 +79,85 @@ fn a_near_miss_and_another_harness_are_never_answered() {
     assert!(codex.client.hooks_answers.lock().unwrap().is_empty());
 }
 
+fn write_trust_config(fixture: &Fixture) {
+    let output = std::process::Command::new("/usr/bin/git")
+        .args(["init", "--quiet"])
+        .current_dir(&fixture.root)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    fs::write(fixture.root.join(".gitignore"), ".agentctl/\n").unwrap();
+    let directory = fixture.root.join(".agentctl");
+    crate::agent::create_private_directory(&directory, "test profile config", false, false)
+        .unwrap();
+    crate::agent::atomic_json(
+        &directory.join("profiles.json"),
+        &serde_json::json!({
+            "schema": "agentctl-profiles/v1",
+            "muse_hooks_trust": "trust",
+            "profiles": {},
+        }),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_trust_launch_pretrusts_hooks_and_a_decline_launch_never_does() {
+    // #1972: under an explicit trust policy the launch pre-trusts hooks
+    // through Muse's approve verb before the pane spawns.
+    let fixture = Fixture::new();
+    write_trust_config(&fixture);
+    let _manager = start_muse(&fixture);
+    assert_eq!(fixture.client.pretrust_calls.lock().unwrap().len(), 1);
+
+    // The built-in decline default never attempts a pre-trust.
+    let decline = Fixture::new();
+    let _manager = start_muse(&decline);
+    assert!(decline.client.pretrust_calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_failed_pretrust_never_blocks_the_launch() {
+    let fixture = Fixture::new();
+    write_trust_config(&fixture);
+    fixture
+        .client
+        .pretrust_fail
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let _manager = start_muse(&fixture);
+    assert_eq!(fixture.client.pretrust_calls.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn pretrust_candidates_are_only_untrusted_hooks() {
+    let document = serde_json::json!({"runtime_capabilities": [
+        {"status": "review_needed", "candidate": {
+            "kind": "hook", "plugin_id": "ours",
+            "stable_id": "plugin:ours:hook:new", "definition_hash": "sha256:new"}},
+        {"status": "modified", "candidate": {
+            "kind": "hook", "plugin_id": "ours",
+            "stable_id": "plugin:ours:hook:changed", "definition_hash": "sha256:changed"}},
+        {"status": "trusted_enabled", "candidate": {
+            "kind": "hook", "plugin_id": "ours",
+            "stable_id": "plugin:ours:hook:fine", "definition_hash": "sha256:fine"}},
+        {"status": "trusted_disabled", "candidate": {
+            "kind": "hook", "plugin_id": "ours",
+            "stable_id": "plugin:ours:hook:rejected", "definition_hash": "sha256:rejected"}},
+        {"status": "review_needed", "candidate": {
+            "kind": "invocation_preapproval", "plugin_id": "ours",
+            "stable_id": "plugin:ours:invocation_preapproval:skill:x",
+            "definition_hash": "sha256:skill"}},
+    ]});
+    let candidates = crate::client::muse_pretrust_candidates(&document, "ours");
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|candidate| candidate.stable_id.as_str())
+            .collect::<Vec<_>>(),
+        ["plugin:ours:hook:new", "plugin:ours:hook:changed"]
+    );
+}
+
 #[test]
 fn an_adopted_foreign_muse_at_the_dialog_is_never_answered() {
     let fixture = Fixture::new();

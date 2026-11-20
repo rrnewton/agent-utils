@@ -989,6 +989,159 @@ class _DialogRunner:
         return client
 
 
+class _FakeMuseRunner:
+    """A `muse plugins` CLI fake (#1972): mixed trust statuses per plugin."""
+
+    def __init__(
+        self, *, approve_hash: str = "sha256:new", approve_enabled: bool = True,
+        inspect_document: dict[str, object] | None = None,
+    ) -> None:
+        self.calls: list[list[str]] = []
+        self.approve_hash = approve_hash
+        self.approve_enabled = approve_enabled
+        self.inspect_document = inspect_document
+
+    def __call__(self, command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        self.calls.append(list(command))
+        args = list(command[1:])
+        if args == ["plugins", "list", "--json"]:
+            document: object = {"plugins": [
+                {"plugin": {"id": "ours"}, "record": {"enabled": True}},
+                {"plugin": {"id": "off"}, "record": {"enabled": False}},
+            ]}
+        elif args == ["plugins", "inspect", "ours", "--json"]:
+            if self.inspect_document is not None:
+                document = self.inspect_document
+            else:
+                document = {"runtime_capabilities": [
+                    {"status": "review_needed", "candidate": {
+                        "kind": "hook", "plugin_id": "ours",
+                        "stable_id": "plugin:ours:hook:new",
+                        "definition_hash": "sha256:new"}},
+                    {"status": "modified", "candidate": {
+                        "kind": "hook", "plugin_id": "ours",
+                        "stable_id": "plugin:ours:hook:changed",
+                        "definition_hash": "sha256:changed"}},
+                    {"status": "trusted_enabled", "candidate": {
+                        "kind": "hook", "plugin_id": "ours",
+                        "stable_id": "plugin:ours:hook:fine",
+                        "definition_hash": "sha256:fine"}},
+                    {"status": "trusted_disabled", "candidate": {
+                        "kind": "hook", "plugin_id": "ours",
+                        "stable_id": "plugin:ours:hook:rejected",
+                        "definition_hash": "sha256:rejected"}},
+                    {"status": "review_needed", "candidate": {
+                        "kind": "skill", "plugin_id": "ours",
+                        "stable_id": "plugin:ours:skill:thing",
+                        "definition_hash": "sha256:skill"}},
+                ]}
+        elif args[:2] == ["plugins", "approve"]:
+            document = {"decision": "approve", "runtime_capabilities": [{
+                "stable_id": args[2], "enabled": self.approve_enabled,
+                "trusted_definition_hash": self.approve_hash,
+            }]}
+        else:  # pragma: no cover - the fake only serves the calls above
+            raise AssertionError(f"unexpected muse call: {command}")
+        return subprocess.CompletedProcess(command, 0, json.dumps(document), "")
+
+
+def _pretrust_client(runner: _FakeMuseRunner, tmp_path: Path) -> HerdrClient:
+    fake_muse = tmp_path / "fake-muse"
+    fake_muse.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_muse.chmod(0o755)
+    return HerdrClient(
+        herdr_bin="fixture-herdr", run=runner,
+        environ={"AGENTCTL_MUSE_BIN": str(fake_muse)},
+    )
+
+
+def test_pretrust_approves_only_untrusted_hooks_by_stable_id(tmp_path: Path) -> None:
+    runner = _FakeMuseRunner(approve_hash="sha256:new")
+    client = _pretrust_client(runner, tmp_path)
+    report = client.pretrust_muse_hooks(())
+    # Both review_needed hooks are candidates; only the first verifies,
+    # because the fake confirms a hash that matches just that one.
+    assert [(entry.plugin_id, entry.stable_id) for entry in report.approved] == [
+        ("ours", "plugin:ours:hook:new"),
+    ]
+    assert len(report.failures) == 1 and "plugin:ours:hook:changed" in report.failures[0]
+    approvals = [call for call in runner.calls if call[1:3] == ["plugins", "approve"]]
+    # Per-hook stable ids only: never a blanket plugin approval, never a
+    # skill, never an already-trusted or rejected-at-current-hash hook,
+    # and the disabled plugin is never inspected.
+    assert [call[3] for call in approvals] == [
+        "plugin:ours:hook:new", "plugin:ours:hook:changed",
+    ]
+    assert not any(call[1:3] == ["plugins", "inspect"] and call[3] == "off"
+                   for call in runner.calls)
+
+
+def test_pretrust_never_approves_an_unvalidated_candidate(tmp_path: Path) -> None:
+    # Candidates that do not demonstrably belong to the inspected plugin
+    # — another plugin's id, a bare plugin id (the blanket form), or a
+    # flag-like id — must be impossible to approve.
+    runner = _FakeMuseRunner(inspect_document={"runtime_capabilities": [
+        {"status": "review_needed", "candidate": {
+            "kind": "hook", "plugin_id": "other",
+            "stable_id": "plugin:other:hook:x", "definition_hash": "sha256:x"}},
+        {"status": "review_needed", "candidate": {
+            "kind": "hook", "plugin_id": "ours",
+            "stable_id": "ours", "definition_hash": "sha256:bare"}},
+        {"status": "review_needed", "candidate": {
+            "kind": "hook", "plugin_id": "ours",
+            "stable_id": "-rf", "definition_hash": "sha256:flag"}},
+        {"status": "review_needed", "candidate": {
+            "kind": "hook", "plugin_id": "ours",
+            "stable_id": "plugin:ours:skill:thing", "definition_hash": "sha256:sk"}},
+    ]})
+    client = _pretrust_client(runner, tmp_path)
+    report = client.pretrust_muse_hooks(())
+    assert report.approved == ()
+    assert not any(call[1:3] == ["plugins", "approve"] for call in runner.calls)
+
+
+def test_pretrust_requires_enabled_and_logs_both_hashes(tmp_path: Path) -> None:
+    # enabled is not True: fail closed, and the failure names the hash
+    # Muse now trusts as well as the one inspected.
+    runner = _FakeMuseRunner(approve_hash="sha256:other", approve_enabled=False)
+    client = _pretrust_client(runner, tmp_path)
+    report = client.pretrust_muse_hooks(())
+    assert report.approved == ()
+    assert any(
+        "sha256:other" in failure and "sha256:new" in failure
+        for failure in report.failures
+    )
+
+
+def test_pretrust_stops_after_the_first_timeout(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    def hanging(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(command))
+        if list(command[1:]) == ["plugins", "list", "--json"]:
+            return subprocess.CompletedProcess(command, 0, json.dumps({"plugins": [
+                {"plugin": {"id": "ours"}, "record": {"enabled": True}},
+            ]}), "")
+        raise subprocess.TimeoutExpired(command, 20)
+
+    client = _pretrust_client(hanging, tmp_path)  # type: ignore[arg-type]
+    report = client.pretrust_muse_hooks(())
+    assert report.approved == ()
+    assert len(report.failures) == 1 and "timed out" in report.failures[0]
+    # List plus the one timed-out inspect; no approve was attempted.
+    assert len(calls) == 2
+
+
+def test_pretrust_reports_failure_and_never_raises(tmp_path: Path) -> None:
+    def broken(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 1, "", "muse exploded")
+
+    client = _pretrust_client(broken, tmp_path)  # type: ignore[arg-type]
+    report = client.pretrust_muse_hooks(())
+    assert report.approved == ()
+    assert len(report.failures) == 1 and "plugins list" in report.failures[0]
+
+
 def test_hooks_trust_dialog_recognition_is_strict() -> None:
     assert muse_hooks_trust_dialog(HOOKS_TRUST_DIALOG)
     assert muse_hooks_trust_count(HOOKS_TRUST_DIALOG) == 39

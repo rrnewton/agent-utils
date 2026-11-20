@@ -1479,6 +1479,266 @@ fn listed_answer(
     })
 }
 
+/// One plugin hook pre-trusted through Muse's own approve verb (#1972).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MuseHookPretrust {
+    /// The plugin that declares the hook.
+    pub plugin_id: String,
+    /// Muse's stable capability id for the hook.
+    pub stable_id: String,
+    /// The definition hash Muse confirmed trust of.
+    pub definition_hash: String,
+}
+
+/// The outcome of one hook pre-trust pass (#1972): never an error.
+#[derive(Debug, Default)]
+pub struct MusePretrustReport {
+    /// Hooks Muse confirmed trusted at the inspected hash.
+    pub approved: Vec<MuseHookPretrust>,
+    /// Every step that did not verify, as a warning for the caller.
+    pub failures: Vec<String>,
+}
+
+/// Hooks one `muse plugins inspect` document says need trust (#1972).
+///
+/// Only `review_needed` (never trusted) and `modified` (trusted hash no
+/// longer matches) hooks count; a hook rejected at its current hash and
+/// anything that is not a hook (skills, invocation preapprovals) is left
+/// exactly as it is. A candidate counts only when it demonstrably
+/// belongs to the plugin that was inspected: its `plugin_id` must name
+/// that plugin and its stable id must be that plugin's hook id
+/// (`plugin:<plugin>:hook:...`), never a bare plugin id — the blanket
+/// approval form, which would also trust skill preapprovals — and
+/// never an id that could be read as a command-line flag.
+pub(crate) fn muse_pretrust_candidates(
+    document: &Value,
+    inspected_plugin: &str,
+) -> Vec<MuseHookPretrust> {
+    let Some(capabilities) = document
+        .get("runtime_capabilities")
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let mut candidates = Vec::new();
+    for entry in capabilities {
+        if !matches!(
+            entry.get("status").and_then(Value::as_str),
+            Some("review_needed" | "modified")
+        ) {
+            continue;
+        }
+        let Some(candidate) = entry.get("candidate") else {
+            continue;
+        };
+        if candidate.get("kind").and_then(Value::as_str) != Some("hook") {
+            continue;
+        }
+        let (Some(plugin_id), Some(stable_id), Some(definition_hash)) = (
+            candidate.get("plugin_id").and_then(Value::as_str),
+            candidate.get("stable_id").and_then(Value::as_str),
+            candidate.get("definition_hash").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        if plugin_id.is_empty() || stable_id.is_empty() || definition_hash.is_empty() {
+            continue;
+        }
+        if plugin_id != inspected_plugin
+            || !stable_id.starts_with(&format!("plugin:{inspected_plugin}:hook:"))
+            || stable_id.starts_with('-')
+        {
+            continue;
+        }
+        candidates.push(MuseHookPretrust {
+            plugin_id: inspected_plugin.to_owned(),
+            stable_id: stable_id.to_owned(),
+            definition_hash: definition_hash.to_owned(),
+        });
+    }
+    candidates
+}
+
+/// The whole pre-trust pass against one muse binary (#1972).
+///
+/// Split from `HerdrClient::pretrust_muse_hooks` so tests can run the
+/// real pass against a fake binary. The pass shares one 20-second
+/// deadline and stops after the first timeout, so a hung muse cannot
+/// stall a launch or a restore. Calls run in the launch's cwd with
+/// the launch's environment and closed stdin; HOME is the account
+/// home unless the launch environment names one, matching the
+/// other edition's handling.
+pub(crate) fn pretrust_muse_hooks_at(
+    executable: &Path,
+    environment: &[String],
+    cwd: &Path,
+) -> MusePretrustReport {
+    /// One muse call's failure: (message, timed out).
+    type CallFailure = (String, bool);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let run_muse = |args: &[String]| -> std::result::Result<Value, CallFailure> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(("pre-trust timed out after 20s; stopping".to_owned(), true));
+        }
+        let mut command = Command::new(executable);
+        command
+            .args(args)
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::null());
+        let mut home_overlaid = false;
+        for entry in environment {
+            if let Some((key, value)) = entry.split_once('=') {
+                if !key.is_empty() {
+                    home_overlaid |= key == "HOME";
+                    command.env(key, value);
+                }
+            }
+        }
+        if !home_overlaid {
+            if let Ok(home) = account_home() {
+                command.env("HOME", home);
+            }
+        }
+        let output =
+            bounded_output_with_cancellation(command, remaining, &|| false).map_err(|error| {
+                let timed_out = error.kind() == io::ErrorKind::TimedOut;
+                (
+                    if timed_out {
+                        "pre-trust timed out after 20s; stopping".to_owned()
+                    } else {
+                        format!("cannot invoke muse: {error}")
+                    },
+                    timed_out,
+                )
+            })?;
+        if output.status.code().unwrap_or(1) != 0 {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            let detail = if stderr.is_empty() { stdout } else { stderr };
+            return Err((
+                if detail.is_empty() {
+                    format!("exit {}", output.status.code().unwrap_or(1))
+                } else {
+                    detail
+                },
+                false,
+            ));
+        }
+        let document: Value = serde_json::from_slice(&output.stdout)
+            .map_err(|_| ("muse returned non-JSON output".to_owned(), false))?;
+        if let Some(message) = document
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str)
+        {
+            return Err((message.to_owned(), false));
+        }
+        Ok(document)
+    };
+    let listed = match run_muse(&strings(&["plugins", "list", "--json"])) {
+        Ok(listed) => listed,
+        Err((failure, _)) => {
+            return MusePretrustReport {
+                approved: Vec::new(),
+                failures: vec![format!("muse plugins list: {failure}")],
+            };
+        }
+    };
+    let mut plugin_ids: Vec<String> = Vec::new();
+    if let Some(plugins) = listed.get("plugins").and_then(Value::as_array) {
+        for entry in plugins {
+            // Fail closed: only a record that says enabled exactly is
+            // inspected, and never under a flag-like id.
+            if entry
+                .get("record")
+                .and_then(|record| record.get("enabled"))
+                .and_then(Value::as_bool)
+                != Some(true)
+            {
+                continue;
+            }
+            let plugin_id = entry
+                .get("plugin")
+                .and_then(|plugin| plugin.get("id"))
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    entry
+                        .get("record")
+                        .and_then(|record| record.get("id"))
+                        .and_then(Value::as_str)
+                });
+            if let Some(plugin_id) = plugin_id.filter(|id| !id.is_empty() && !id.starts_with('-')) {
+                plugin_ids.push(plugin_id.to_owned());
+            }
+        }
+    }
+    let mut report = MusePretrustReport::default();
+    for plugin_id in plugin_ids {
+        let inspected = match run_muse(&strings(&["plugins", "inspect", &plugin_id, "--json"])) {
+            Ok(inspected) => inspected,
+            Err((failure, timed_out)) => {
+                report
+                    .failures
+                    .push(format!("muse plugins inspect {plugin_id}: {failure}"));
+                if timed_out {
+                    return report;
+                }
+                continue;
+            }
+        };
+        for candidate in muse_pretrust_candidates(&inspected, &plugin_id) {
+            let answer = match run_muse(&strings(&[
+                "plugins",
+                "approve",
+                &candidate.stable_id,
+                "--json",
+            ])) {
+                Ok(answer) => answer,
+                Err((failure, timed_out)) => {
+                    report.failures.push(format!(
+                        "muse plugins approve {}: {failure}",
+                        candidate.stable_id
+                    ));
+                    if timed_out {
+                        return report;
+                    }
+                    continue;
+                }
+            };
+            let confirmed = answer
+                .get("runtime_capabilities")
+                .and_then(Value::as_array)
+                .and_then(|items| {
+                    items.iter().find(|item| {
+                        item.get("stable_id").and_then(Value::as_str)
+                            == Some(candidate.stable_id.as_str())
+                    })
+                });
+            let verified = answer.get("decision").and_then(Value::as_str) == Some("approve")
+                && confirmed.is_some_and(|item| {
+                    item.get("enabled").and_then(Value::as_bool) == Some(true)
+                        && item.get("trusted_definition_hash").and_then(Value::as_str)
+                            == Some(candidate.definition_hash.as_str())
+                });
+            if verified {
+                report.approved.push(candidate);
+            } else {
+                let now_trusted = confirmed
+                    .and_then(|item| item.get("trusted_definition_hash"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("nothing");
+                report.failures.push(format!(
+                    "muse plugins approve {}: Muse now trusts {now_trusted}, \
+                     not the inspected {}",
+                    candidate.stable_id, candidate.definition_hash
+                ));
+            }
+        }
+    }
+    report
+}
+
 impl HerdrClient {
     /// Select a configured Herdr executable. Only the direct adapter is supported.
     pub fn with_executable(adapter: &str, executable: &Path) -> Result<Self> {
@@ -1527,6 +1787,32 @@ impl HerdrClient {
             .ok()
             .is_some_and(|result| result["pane"]["scroll"]["offset_from_bottom"] == 0)
     }
+    /// Pre-trust Muse plugin hooks through `muse plugins approve` (#1972).
+    ///
+    /// Muse persists hook trust in its own settings store, keyed by
+    /// stable capability id with the trusted definition hash; the
+    /// supported writer is the `muse plugins` CLI, so agentctl never
+    /// edits Muse's files. Each enabled plugin is inspected, and each
+    /// hook Muse reports as `review_needed` or `modified` is approved
+    /// by its exact stable id — never a blanket plugin approval, which
+    /// would also trust skill invocation preapprovals — and counted
+    /// only when Muse's answer confirms the inspected hash. Changed
+    /// hooks therefore still prompt (and #1932's dialog answer remains
+    /// the fallback). This never fails: every problem is reported and
+    /// the caller launches anyway.
+    pub fn pretrust_muse_hooks(&self, environment: &[String], cwd: &Path) -> MusePretrustReport {
+        let executable = match resolve_harness_executable("muse") {
+            Ok(executable) => executable,
+            Err(error) => {
+                return MusePretrustReport {
+                    approved: Vec::new(),
+                    failures: vec![error.to_string()],
+                };
+            }
+        };
+        pretrust_muse_hooks_at(&executable, environment, cwd)
+    }
+
     fn invoke_with_timeout(&self, args: &[String], timeout: Duration) -> Result<CommandOutput> {
         self.invoke_with_timeout_and_cancellation(args, timeout, &|| false)
     }
@@ -4603,6 +4889,60 @@ mod tests {
                 .1
         );
         assert!(!muse_hooks_trust_dialog(&quoted), "{quoted}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pretrust_against_a_fake_muse_binary() {
+        // #1972: the real pass against a fake `muse` executable:
+        // list/inspect/approve, approving only the hooks Muse reports
+        // as new or changed, and verifying each confirmed hash (the
+        // changed hook's approval confirms a different hash, so it is
+        // a logged failure naming both hashes, never an approval).
+        let directory = std::env::temp_dir().join(format!(
+            "agentctl-pretrust-test-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let binary = directory.join("fake-muse");
+        let staging = directory.join("fake-muse.tmp");
+        fs::write(
+            &staging,
+            "#!/bin/sh\n\
+             if [ \"$1 $2\" = \"plugins list\" ]; then\n\
+             \x20 echo '{\"plugins\":[{\"plugin\":{\"id\":\"ours\"},\"record\":{\"enabled\":true}}]}'\n\
+             elif [ \"$1 $2\" = \"plugins inspect\" ]; then\n\
+             \x20 echo '{\"runtime_capabilities\":[\
+             {\"status\":\"review_needed\",\"candidate\":{\"kind\":\"hook\",\"plugin_id\":\"ours\",\"stable_id\":\"plugin:ours:hook:new\",\"definition_hash\":\"sha256:new\"}},\
+             {\"status\":\"modified\",\"candidate\":{\"kind\":\"hook\",\"plugin_id\":\"ours\",\"stable_id\":\"plugin:ours:hook:changed\",\"definition_hash\":\"sha256:changed\"}},\
+             {\"status\":\"trusted_enabled\",\"candidate\":{\"kind\":\"hook\",\"plugin_id\":\"ours\",\"stable_id\":\"plugin:ours:hook:fine\",\"definition_hash\":\"sha256:fine\"}}]}'\n\
+             elif [ \"$1 $2\" = \"plugins approve\" ]; then\n\
+             \x20 case \"$3\" in\n\
+             \x20 *hook:new) echo '{\"decision\":\"approve\",\"runtime_capabilities\":[{\"stable_id\":\"plugin:ours:hook:new\",\"enabled\":true,\"trusted_definition_hash\":\"sha256:new\"}]}' ;;\n\
+             \x20 *) echo '{\"decision\":\"approve\",\"runtime_capabilities\":[{\"stable_id\":\"plugin:ours:hook:changed\",\"enabled\":true,\"trusted_definition_hash\":\"sha256:other\"}]}' ;;\n\
+             \x20 esac\n\
+             fi\n",
+        )
+        .unwrap();
+        // Rename into place before executing: running a script that is
+        // still open for writing can fail with "Text file busy".
+        fs::set_permissions(
+            &staging,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        fs::rename(&staging, &binary).unwrap();
+        let report = pretrust_muse_hooks_at(&binary, &[], &directory);
+        assert_eq!(report.approved.len(), 1, "{report:?}");
+        assert_eq!(report.approved[0].stable_id, "plugin:ours:hook:new");
+        assert_eq!(report.failures.len(), 1, "{report:?}");
+        assert!(
+            report.failures[0].contains("sha256:other")
+                && report.failures[0].contains("sha256:changed"),
+            "{report:?}"
+        );
+        fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]

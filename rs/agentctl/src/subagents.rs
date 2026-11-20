@@ -1160,6 +1160,16 @@ pub trait ManagedApi: AgentApi {
     fn harness_executable(&self, kind: &str) -> crate::error::Result<PathBuf> {
         crate::client::resolve_harness_executable(kind)
     }
+    /// Pre-trust Muse plugin hooks before a launch (#1972). Clients
+    /// that cannot run the muse CLI report nothing, and the launch
+    /// falls back to answering the hooks dialog per #1932.
+    fn pretrust_muse_hooks(
+        &self,
+        _environment: &[String],
+        _cwd: &Path,
+    ) -> crate::client::MusePretrustReport {
+        crate::client::MusePretrustReport::default()
+    }
     /// Run a slot-boxed harness behind a root relay and pin the relayed program.
     fn start_relay_agent(
         &self,
@@ -1634,6 +1644,13 @@ pub trait ManagedApi: AgentApi {
 }
 
 impl ManagedApi for HerdrClient {
+    fn pretrust_muse_hooks(
+        &self,
+        environment: &[String],
+        cwd: &Path,
+    ) -> crate::client::MusePretrustReport {
+        HerdrClient::pretrust_muse_hooks(self, environment, cwd)
+    }
     fn process_liveness(&self, expected: &CustomProcessIdentity) -> ProcessLiveness {
         HerdrClient::process_liveness(self, expected)
     }
@@ -11827,6 +11844,50 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         Ok(destination)
     }
 
+    /// Pre-trust plugin hooks for one Muse launch (#1972), shared by
+    /// every launch path. Runs with the launch's real environment (tab
+    /// entries, then the registry launch_env's BASH_ENV/PATH prefix,
+    /// exactly the prefix `prepare_launch_shell` types) and in the
+    /// record's cwd, so the approval lands in the settings store the
+    /// agent will read. Logged per hook, never persisted; failures are
+    /// warnings only.
+    fn run_hook_pretrust(
+        &self,
+        name: &str,
+        source: &str,
+        environment: &[String],
+        launch_env: Option<&crate::profiles::LaunchEnv>,
+        cwd: &Path,
+    ) {
+        let mut entries = environment.to_vec();
+        if let Some(launch_env) = launch_env {
+            if let Some(file) = &launch_env.env_file {
+                entries.push(format!("BASH_ENV={file}"));
+            }
+            if !launch_env.path_prepend.is_empty() {
+                entries.push(format!(
+                    "PATH={}:{}",
+                    launch_env.path_prepend.join(":"),
+                    std::env::var("PATH").unwrap_or_default()
+                ));
+            }
+        }
+        let report = self.client.pretrust_muse_hooks(&entries, cwd);
+        for entry in &report.approved {
+            eprintln!(
+                "agentctl: {name}: pre-trusted {} ({}) per {source}",
+                entry.stable_id, entry.definition_hash
+            );
+        }
+        for failure in &report.failures {
+            eprintln!(
+                "agentctl: warning: {name}: hook pre-trust failed: {failure}; \
+                 continuing the launch, and any hooks dialog will be \
+                 answered per {source}"
+            );
+        }
+    }
+
     fn launch(
         &self,
         record: &mut AgentRecord,
@@ -11873,6 +11934,21 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         } else {
             None
         };
+        if let Some((decision, source)) = &hooks_policy {
+            if decision.as_str() == "trust" {
+                // Pre-trust our plugin hooks through Muse's supported
+                // approve verb so the dialog never appears (#1972). Only
+                // under an explicit trust policy; failure never blocks
+                // the launch, and #1932's dialog answer is the fallback.
+                self.run_hook_pretrust(
+                    &record.name,
+                    source,
+                    &options.environment,
+                    launch_env.as_ref(),
+                    Path::new(&record.cwd),
+                );
+            }
+        }
         let hooks_name = record.name.clone();
         let hooks_source = hooks_policy
             .as_ref()
@@ -13986,6 +14062,38 @@ its drain would also type, so it was not queued",
             .as_ref()
             .map(|(_, source)| source.clone())
             .unwrap_or_default();
+        if let Some((decision, source)) = &hooks_policy {
+            if decision.as_str() == "trust" {
+                // Same-pane relaunch pre-trust (#1972), as at start.
+                // The pane reuses its shell, so Muse comes back with
+                // the tab's environment: the profile's relaunch
+                // environment, as revive reconstructs it (best effort;
+                // pre-trust never blocks the restart).
+                let entries = record
+                    .profile
+                    .as_deref()
+                    .and_then(|profile_name| {
+                        let root = crate::profiles::configuration_root(
+                            Path::new(&record.cwd),
+                            &self.registry,
+                            false,
+                        )
+                        .ok()?;
+                        let (_, profiles) = crate::profiles::load_profiles(&root, false).ok()?;
+                        profiles
+                            .get(profile_name)
+                            .map(|profile| Self::relaunch_environment(&record, profile))
+                    })
+                    .unwrap_or_default();
+                self.run_hook_pretrust(
+                    agent_name,
+                    source,
+                    &entries,
+                    launch_env.as_ref(),
+                    Path::new(&record.cwd),
+                );
+            }
+        }
         let mut hooks_answered = {
             let name = agent_name.to_owned();
             let source = hooks_source.clone();
@@ -17652,6 +17760,8 @@ pub(crate) mod tests {
                     redirect_once: Mutex::new(BTreeMap::new()),
                     keys_sent: Mutex::new(Vec::new()),
                     hooks_answers: Mutex::new(Vec::new()),
+                    pretrust_calls: Mutex::new(Vec::new()),
+                    pretrust_fail: AtomicBool::new(false),
                     replace_harness_after_esc: AtomicBool::new(false),
                     replace_harness_on_wait: AtomicBool::new(false),
                     drop_note: AtomicBool::new(false),
@@ -18147,6 +18257,10 @@ pub(crate) mod tests {
         pub(crate) keys_sent: Mutex<Vec<(String, String)>>,
         /// Hooks-trust answers the fake client confirmed, as (pane, decision) (#1932).
         pub(crate) hooks_answers: Mutex<Vec<(String, String)>>,
+        /// Hook pre-trust calls, as environment entries (#1972).
+        pub(crate) pretrust_calls: Mutex<Vec<Vec<String>>>,
+        /// Whether the next pre-trust reports failure instead of approving.
+        pub(crate) pretrust_fail: AtomicBool,
         /// Replace the pane's harness right after the next Esc reaches it.
         pub(crate) replace_harness_after_esc: AtomicBool,
         /// Replace the pane's harness as the next status wait reports its state.
@@ -18708,6 +18822,30 @@ pub(crate) mod tests {
         }
     }
     impl ManagedApi for Fake {
+        fn pretrust_muse_hooks(
+            &self,
+            environment: &[String],
+            _cwd: &Path,
+        ) -> crate::client::MusePretrustReport {
+            self.pretrust_calls
+                .lock()
+                .unwrap()
+                .push(environment.to_vec());
+            if self.pretrust_fail.load(Ordering::Relaxed) {
+                return crate::client::MusePretrustReport {
+                    approved: Vec::new(),
+                    failures: vec!["muse plugins list: exploded".to_owned()],
+                };
+            }
+            crate::client::MusePretrustReport {
+                approved: vec![crate::client::MuseHookPretrust {
+                    plugin_id: "ours".to_owned(),
+                    stable_id: "plugin:ours:hook:new".to_owned(),
+                    definition_hash: "sha256:new".to_owned(),
+                }],
+                failures: Vec::new(),
+            }
+        }
         fn prompt_guarded(
             &self,
             pane: &str,

@@ -399,7 +399,19 @@ managed send checks for it before typing into an idle pane.
   registry default, then the built-in `decline` ("Continue without
   trusting", option 3); `trust` ("Trust all and continue", option 2)
   is sent only when a setting explicitly says so, and an invalid value
-  refuses at load. Near-miss dialogs are never answered.
+  refuses at load. Near-miss dialogs are never answered. Since #1972
+  a launch under `trust` first pre-trusts the hooks: before the harness
+  starts, agentctl runs the launch's own `muse plugins list` /
+  `inspect` and approves each hook Muse reports as new or changed
+  by its exact stable capability id through `muse plugins approve`
+  (Muse's supported writer for its persisted, hash-pinned trust
+  store; agentctl never edits Muse's files, and never uses the
+  blanket plugin approval, which would also trust skill invocation
+  preapprovals). Each approval is counted only when Muse confirms
+  the inspected definition hash, every approval and failure is
+  logged, a failure never blocks the launch, and a hook changed
+  after approval prompts again and is answered by the dialog path
+  above.
 - **Unknown TUI**: none.
 
 ### Headless mode itself

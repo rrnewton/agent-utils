@@ -19,7 +19,7 @@ import subprocess
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Literal, Protocol, cast
 
 from agentctl.errors import HerdrUnavailable, InputExpectationFailed
 from agentctl.jsonx import as_mapping, as_sequence, get_int, get_str, opt_str
@@ -292,6 +292,71 @@ def muse_hooks_trust_count(screen: str) -> int | None:
     """The hook count the dialog shows ("N new or changed hooks"), if any."""
     match = _HOOKS_TRUST_COUNT.search(screen.lower())
     return int(match.group(1)) if match else None
+
+
+@dataclass(frozen=True)
+class MuseHookPretrust:
+    """One plugin hook pre-trusted through Muse's own approve verb (#1972)."""
+
+    plugin_id: str
+    stable_id: str
+    definition_hash: str
+
+
+@dataclass(frozen=True)
+class MusePretrustReport:
+    """The outcome of one hook pre-trust pass (#1972): never an error."""
+
+    approved: tuple[MuseHookPretrust, ...] = ()
+    failures: tuple[str, ...] = ()
+
+
+def _muse_pretrust_candidates(
+    document: object, inspected_plugin: str,
+) -> tuple[MuseHookPretrust, ...]:
+    """Hooks one `muse plugins inspect` document says need trust (#1972).
+
+    Only `review_needed` (never trusted) and `modified` (trusted hash no
+    longer matches) hooks count; a hook rejected at its current hash and
+    anything that is not a hook (skills, invocation preapprovals) is left
+    exactly as it is. A candidate counts only when it demonstrably
+    belongs to the plugin that was inspected: its `plugin_id` must name
+    that plugin and its stable id must be that plugin's hook id
+    (`plugin:<plugin>:hook:...`), never a bare plugin id — the blanket
+    approval form, which would also trust skill preapprovals — and
+    never an id that could be read as a command-line flag.
+    """
+    if not isinstance(document, dict):
+        return ()
+    capabilities = document.get("runtime_capabilities")
+    if not isinstance(capabilities, list):
+        return ()
+    prefix = f"plugin:{inspected_plugin}:hook:"
+    candidates: list[MuseHookPretrust] = []
+    for entry in capabilities:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("status") not in ("review_needed", "modified"):
+            continue
+        candidate = entry.get("candidate")
+        if not isinstance(candidate, dict) or candidate.get("kind") != "hook":
+            continue
+        plugin_id = candidate.get("plugin_id")
+        stable_id = candidate.get("stable_id")
+        definition_hash = candidate.get("definition_hash")
+        if not all(
+            isinstance(value, str) and value
+            for value in (plugin_id, stable_id, definition_hash)
+        ):
+            continue
+        if plugin_id != inspected_plugin:
+            continue
+        if not cast(str, stable_id).startswith(prefix) or cast(str, stable_id).startswith("-"):
+            continue
+        candidates.append(MuseHookPretrust(
+            inspected_plugin, cast(str, stable_id), cast(str, definition_hash),
+        ))
+    return tuple(candidates)
 
 
 # Placeholder hints Muse draws dim inside an empty composer (Muse 1.4.23,
@@ -1017,6 +1082,8 @@ def _bounded_control_command(
     *,
     environ: Mapping[str, str] | None = None,
     timeout: float = CONTROL_TIMEOUT_SECONDS,
+    cwd: str | None = None,
+    stdin: int | None = None,
 ) -> "subprocess.CompletedProcess[str]":
     """Capture one control command and kill its whole process group on timeout.
 
@@ -1031,6 +1098,8 @@ def _bounded_control_command(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=None if environ is None else dict(environ),
+        cwd=cwd,
+        stdin=stdin,
         start_new_session=True,
     )
     assert process.stdout is not None and process.stderr is not None
@@ -1658,6 +1727,161 @@ class HerdrClient:
                 f"custom harness executable {kind!r} was not found in fixed install locations"
             )
         return _validated_executable(candidate, kind)
+
+    def pretrust_muse_hooks(
+        self, environment: Sequence[str] = (), *, cwd: str | None = None,
+        timeout: float = 20.0,
+    ) -> MusePretrustReport:
+        """Pre-trust Muse plugin hooks through `muse plugins approve` (#1972).
+
+        Muse persists hook trust in its own settings store, keyed by
+        stable capability id with the trusted definition hash; the
+        supported writer is the `muse plugins` CLI, so agentctl never
+        edits Muse's files. Each enabled plugin is inspected, and each
+        hook Muse reports as `review_needed` or `modified` is approved
+        by its exact stable id — never a blanket plugin approval, which
+        would also trust skill invocation preapprovals — and counted
+        only when Muse's answer confirms the inspected hash. Changed
+        hooks therefore still prompt (and #1932's dialog answer remains
+        the fallback). This never raises: every failure is reported and
+        the caller launches anyway.
+        """
+        try:
+            executable = self._harness_executable("muse")
+        except HerdrUnavailable as exc:
+            return MusePretrustReport(failures=(str(exc),))
+        environ = dict(self._environ)
+        overlaid: set[str] = set()
+        for entry in environment:
+            key, separator, value = entry.partition("=")
+            if separator and key:
+                environ[key] = value
+                overlaid.add(key)
+        if self._production_runner:
+            if "HOME" not in overlaid:
+                try:
+                    environ["HOME"] = self._account_home()
+                except HerdrUnavailable as exc:
+                    return MusePretrustReport(failures=(str(exc),))
+
+        deadline = time.monotonic() + timeout
+
+        def run_muse(
+            args: Sequence[str],
+        ) -> tuple[dict[str, object] | None, str | None, bool]:
+            """One muse call: (document, failure, timed out).
+
+            The whole pass shares one deadline (`timeout` seconds), so a
+            hung muse cannot stall a launch or a restore; the first
+            timeout stops the pass.
+            """
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None, f"pre-trust timed out after {timeout:g}s; stopping", True
+            command = [executable, *args]
+            try:
+                if self._production_runner:
+                    completed = _bounded_control_command(
+                        command, environ=environ, timeout=remaining,
+                        cwd=cwd, stdin=subprocess.DEVNULL,
+                    )
+                else:
+                    completed = self._run(command)
+            except subprocess.TimeoutExpired:
+                return None, f"pre-trust timed out after {timeout:g}s; stopping", True
+            except Exception as exc:  # noqa: BLE001 - reported, never raised
+                return None, f"cannot invoke muse: {exc}", False
+            if completed.returncode != 0:
+                detail = (completed.stderr or completed.stdout or "").strip()
+                return None, detail or f"exit {completed.returncode}", False
+            try:
+                document: object = json.loads(completed.stdout)
+            except json.JSONDecodeError:
+                return None, "muse returned non-JSON output", False
+            if not isinstance(document, dict):
+                return None, "muse returned a non-object document", False
+            error = document.get("error")
+            if isinstance(error, dict):
+                message = error.get("message")
+                return None, message if isinstance(message, str) else "muse error", False
+            return cast(dict[str, object], document), None, False
+
+        listed, failure, _timed_out = run_muse(("plugins", "list", "--json"))
+        if failure is not None or listed is None:
+            return MusePretrustReport(
+                failures=(f"muse plugins list: {failure}",),
+            )
+        plugin_ids: list[str] = []
+        plugins = listed.get("plugins")
+        if isinstance(plugins, list):
+            for entry in plugins:
+                if not isinstance(entry, dict):
+                    continue
+                record = entry.get("record")
+                # Fail closed: only a record that says enabled exactly
+                # is inspected, and never under a flag-like id.
+                if not isinstance(record, dict) or record.get("enabled") is not True:
+                    continue
+                plugin = entry.get("plugin")
+                plugin_id = plugin.get("id") if isinstance(plugin, dict) else None
+                if not isinstance(plugin_id, str) or not plugin_id:
+                    plugin_id = record.get("id")
+                if (
+                    isinstance(plugin_id, str) and plugin_id
+                    and not plugin_id.startswith("-")
+                ):
+                    plugin_ids.append(plugin_id)
+        approved: list[MuseHookPretrust] = []
+        failures: list[str] = []
+        for plugin_id in plugin_ids:
+            inspected, failure, timed_out = run_muse(
+                ("plugins", "inspect", plugin_id, "--json"),
+            )
+            if failure is not None or inspected is None:
+                failures.append(f"muse plugins inspect {plugin_id}: {failure}")
+                if timed_out:
+                    break
+                continue
+            for candidate in _muse_pretrust_candidates(inspected, plugin_id):
+                answer, failure, timed_out = run_muse(
+                    ("plugins", "approve", candidate.stable_id, "--json"),
+                )
+                if failure is not None or answer is None:
+                    failures.append(
+                        f"muse plugins approve {candidate.stable_id}: {failure}",
+                    )
+                    if timed_out:
+                        return MusePretrustReport(tuple(approved), tuple(failures))
+                    continue
+                raw_capabilities = answer.get("runtime_capabilities")
+                items = raw_capabilities if isinstance(raw_capabilities, list) else []
+                confirmed = next(
+                    (
+                        item for item in items
+                        if isinstance(item, dict)
+                        and item.get("stable_id") == candidate.stable_id
+                    ),
+                    None,
+                )
+                verified = (
+                    answer.get("decision") == "approve"
+                    and confirmed is not None
+                    and confirmed.get("enabled") is True
+                    and confirmed.get("trusted_definition_hash") == candidate.definition_hash
+                )
+                if verified:
+                    approved.append(candidate)
+                else:
+                    now_trusted = (
+                        confirmed.get("trusted_definition_hash")
+                        if confirmed is not None else None
+                    )
+                    failures.append(
+                        f"muse plugins approve {candidate.stable_id}: Muse now "
+                        f"trusts {now_trusted if isinstance(now_trusted, str) else 'nothing'}"
+                        f", not the inspected {candidate.definition_hash}",
+                    )
+        return MusePretrustReport(tuple(approved), tuple(failures))
 
     def report_pane_agent(self, pane_id: str, kind: str, state: str) -> None:
         """Label one exact custom-harness pane without registering an agent name."""
