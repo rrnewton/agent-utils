@@ -103,7 +103,7 @@ if [[ "$TOOL" == "wrkslots" ]]; then
     # The interpreter this launcher runs the Python edition with, as
     # an absolute path: wrkslotsd's privileged image helper runs
     # through exactly this interpreter (never a PATH lookup).
-    if RESOLVED_PYTHON="$(command -v "${CI_HUB_PYTHON:-python3}" 2>/dev/null)"; then
+    if RESOLVED_PYTHON="$(command -v "${AGENT_UTILS_PYTHON:-${CI_HUB_PYTHON:-python3}}" 2>/dev/null)"; then
         export WRKSLOTS_PYTHON_BIN="$(readlink -f "$RESOLVED_PYTHON")"
     fi
 fi
@@ -367,12 +367,29 @@ au_resolve_real_python() {
             cache="$state_root/real-python.cache"
         fi
     fi
-    if [[ -n "$cache" && -f "$cache" ]]; then
+    if [[ -n "$cache" && -f "$cache" && ! -L "$cache" ]]; then
         local c_launcher="" c_mtime="" c_prefix="" c_real=""
         { IFS= read -r c_launcher; IFS= read -r c_mtime; IFS= read -r c_prefix; IFS= read -r c_real; } < "$cache" || true
+        # A cached entry is trusted only when every recorded field checks
+        # out: same launcher and mtime, an executable whose basename is a
+        # python3*, and a sys.prefix the cached interpreter itself still
+        # reports. Anything else (a planted entry, a replaced venv) falls
+        # through to a fresh probe.
         if [[ "$c_launcher" == "$launcher_real" && "$c_mtime" == "$mtime" && -n "$c_real" && -x "$c_real" ]]; then
-            printf '%s\n' "$c_real"
-            return 0
+            case "$(basename "$c_real")" in
+                python3*)
+                    local c_prefix_now=""
+                    if command -v timeout >/dev/null 2>&1; then
+                        c_prefix_now="$(timeout -s KILL 10 "$c_real" -c 'import sys; print(sys.prefix)' 2>/dev/null)" || c_prefix_now=""
+                    else
+                        c_prefix_now="$("$c_real" -c 'import sys; print(sys.prefix)' 2>/dev/null)" || c_prefix_now=""
+                    fi
+                    if [[ -n "$c_prefix" && "$c_prefix_now" == "$c_prefix" ]]; then
+                        printf '%s\n' "$c_real"
+                        return 0
+                    fi
+                    ;;
+            esac
         fi
     fi
     if command -v timeout >/dev/null 2>&1; then
@@ -407,12 +424,14 @@ case "$ENGINE" in
         # launcher, the launcher forks the interpreter and waits with
         # SIGTERM caught, so a supervisor's signal never reaches the
         # work. The resolved interpreter runs the tracked script by path
-        # with -P (no cwd on sys.path, no PYTHONPATH export), keeping
-        # argv, stdin, exit code and signal behaviour identical to a
-        # direct launch. Fallback: the named interpreter, as before.
+        # (a script path never puts the caller's cwd on sys.path, and no
+        # PYTHONPATH is exported), keeping argv, stdin, exit code and
+        # signal behaviour identical to a direct launch — and identical
+        # on Python 3.10, which has no -P flag. Fallback: the named
+        # interpreter, as before.
         AU_PYTHON_CMD="${AGENT_UTILS_PYTHON:-${CI_HUB_PYTHON:-python3}}"
         if AU_REAL_PYTHON="$(au_resolve_real_python "$AU_PYTHON_CMD")"; then
-            exec "$AU_REAL_PYTHON" -P "$TARGET" "$@"
+            exec "$AU_REAL_PYTHON" "$TARGET" "$@"
         fi
         exec "$AU_PYTHON_CMD" "$TARGET" "$@"
         ;;

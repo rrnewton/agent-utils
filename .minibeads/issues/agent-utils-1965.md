@@ -12,18 +12,18 @@ updated_at: 2026-11-20T00:00:00-05:00
 
 # Description
 
-[watermelon-full-preview] Follow-up to #1964 wrkslots-full-status-hang-ignores-sigterm. `wrkslots init` creates the project-local command symlink (control/wrkslots) pointing at the package `__main__.py`. Executed directly, that file's `#!/usr/bin/env python3` shebang goes through the host's fbpython launcher again — the exact launcher whose SIGTERM-catching wait stranded a full status in #1964. Fresh projects should get a command that execs the real interpreter directly, as the tracked `bin/wrkslots` wrapper now does.
+[watermelon-full-preview] Follow-up to #1964 wrkslots-full-status-hang-ignores-sigterm. `wrkslots init` creates the project-local command symlink (control/wrkslots) pointing at the package `__main__.py`. Executed directly, that file's `#!/usr/bin/env python3` shebang goes through the host's fbpython launcher again — the exact launcher whose SIGTERM-catching wait stranded a full status in #1964. Fresh projects should get a command that runs on the real interpreter directly, as invocations through the tracked dispatcher (`common/bin/wrkslots`, whose Python leg execs the resolved interpreter on the entry script) now do.
 
 # Design
 
-- Fresh init links point at the tracked real-interpreter wrapper (py/bin/wrkslots from the source checkout), falling back to `__main__.py` where no wrapper sibling exists (an installed package).
-- Accept the old `__main__.py` target as a known-migratable previous target under `--repair`, alongside the existing single-file previous target: a repair rewrites the link to the wrapper instead of refusing.
+- Fresh init links point at the tracked Python entry script (py/bin/wrkslots from the source checkout), falling back to `__main__.py` where no such entry exists (an installed package).
+- Accept the old `__main__.py` target as a known-migratable previous target under `--repair`, alongside the existing single-file previous target: a repair rewrites the link to the entry script instead of refusing.
 - A non-repair re-init whose link points at the old target keeps refusing by name, so no silent retargeting happens outside the repair path.
 
 # Acceptance Criteria
 
-- A fresh `init` in a scratch project leaves control/wrkslots pointing at the wrapper, and invoking it runs on the real interpreter (no launcher parent).
-- `init --repair` on a project whose link still points at `__main__.py` migrates the link to the wrapper and reports the repair.
+- A fresh `init` in a scratch project leaves control/wrkslots pointing at the entry script, and invoking it through the dispatcher runs on the real interpreter (no launcher parent).
+- `init --repair` on a project whose link still points at `__main__.py` migrates the link to the entry script and reports the repair.
 - A plain re-init on such a project refuses and names the repair remedy.
 - Lifecycle tests cover fresh init, re-init refusal, and repair migration.
 

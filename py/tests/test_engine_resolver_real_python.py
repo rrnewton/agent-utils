@@ -5,8 +5,9 @@ with SIGTERM caught, a supervisor's signal never reaches the work. The
 ``common/bin`` dispatcher therefore resolves the real interpreter once
 (cached safely) and execs it on the tracked script by path. These tests
 pin: the bin/ process IS the resolved interpreter (same pid, direct
-parent), SIGTERM to it works, a shadowing module in the caller's cwd
-cannot hijack imports, no PYTHONPATH leaks into children, the classic
+parent), SIGTERM to it works, sys.path matches `python3 py/bin/<tool>`
+exactly, planted or symlinked cache entries are ignored, no PYTHONPATH
+leaks into children, the classic
 ``python3 py/bin/<tool>`` call still works, and the fallback executes
 when resolution fails. Waits are liveness bounds after an event (the
 ready file), not performance budgets.
@@ -170,16 +171,71 @@ def test_resolution_cache_is_written_and_reused(tmp_path: Path) -> None:
     assert cache.read_bytes() == before
 
 
-def test_cwd_shadowing_modules_cannot_hijack_the_real_entry(tmp_path: Path) -> None:
-    (tmp_path / "json.py").write_text("raise RuntimeError('shadowed json')\n", encoding="utf-8")
-    (tmp_path / "wrkslots.py").write_text("raise RuntimeError('shadowed wrkslots')\n", encoding="utf-8")
-    env = _env(AU_ROOT, {"XDG_STATE_HOME": str(tmp_path / "state")})
+def _launcher_record() -> tuple[str, str, str]:
+    launcher = Path(os.path.realpath(shutil.which("python3") or "python3"))
+    mtime = str(int(launcher.stat().st_mtime))
+    prefix = subprocess.run(
+        ["python3", "-c", "import sys; print(sys.prefix)"],
+        capture_output=True, text=True, check=True, timeout=30,
+    ).stdout.strip()
+    return str(launcher), mtime, prefix
+
+
+def test_syspath_parity_with_python3_pybin(tmp_path: Path) -> None:
+    stub = "import json, sys\nprint(json.dumps(sys.path))\n"
+    root = _build_sandbox(tmp_path, stub)
+    env = _env(root, {"XDG_STATE_HOME": str(tmp_path / "state")})
+    via_dispatcher = subprocess.run(
+        [str(root / "common" / "bin" / TOOL)],
+        cwd=root, capture_output=True, text=True, env=env, check=False, timeout=30,
+    )
+    assert via_dispatcher.returncode == 0, via_dispatcher.stderr
+    direct_env = _env(root)
+    via_python3 = subprocess.run(
+        ["python3", str(root / "py" / "bin" / TOOL)],
+        cwd=root, capture_output=True, text=True, env=direct_env, check=False, timeout=30,
+    )
+    assert via_python3.returncode == 0, via_python3.stderr
+    assert via_dispatcher.stdout == via_python3.stdout
+
+
+def test_symlinked_cache_is_ignored(tmp_path: Path) -> None:
+    root = _build_sandbox(tmp_path, "print('PY-fresh')\n")
+    state = tmp_path / "state"
+    cache_dir = state / "agent-utils"
+    cache_dir.mkdir(parents=True)
+    cache_dir.chmod(0o700)
+    launcher, mtime, prefix = _launcher_record()
+    planted = tmp_path / "planted.cache"
+    planted.write_text(f"{launcher}\n{mtime}\n{prefix}\n/bin/echo\n", encoding="utf-8")
+    (cache_dir / "real-python.cache").symlink_to(planted)
+    env = _env(root, {"XDG_STATE_HOME": str(state)})
     result = subprocess.run(
-        [str(AU_ROOT / "common" / "bin" / "wrkslots"), "--version"],
-        cwd=tmp_path, capture_output=True, text=True, env=env, check=False, timeout=30,
+        [str(root / "common" / "bin" / TOOL)],
+        cwd=root, capture_output=True, text=True, env=env, check=False, timeout=30,
     )
     assert result.returncode == 0, result.stderr
-    assert "wrkslots" in result.stdout
+    assert result.stdout == "PY-fresh\n"
+    assert planted.read_text(encoding="utf-8").endswith("/bin/echo\n")
+
+
+def test_planted_nonpython_cache_entry_is_ignored(tmp_path: Path) -> None:
+    root = _build_sandbox(tmp_path, "print('PY-fresh')\n")
+    state = tmp_path / "state"
+    cache_dir = state / "agent-utils"
+    cache_dir.mkdir(parents=True)
+    cache_dir.chmod(0o700)
+    launcher, mtime, prefix = _launcher_record()
+    cache = cache_dir / "real-python.cache"
+    cache.write_text(f"{launcher}\n{mtime}\n{prefix}\n/bin/echo\n", encoding="utf-8")
+    env = _env(root, {"XDG_STATE_HOME": str(state)})
+    result = subprocess.run(
+        [str(root / "common" / "bin" / TOOL)],
+        cwd=root, capture_output=True, text=True, env=env, check=False, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "PY-fresh\n"
+    assert Path(cache.read_text(encoding="utf-8").splitlines()[3]).resolve() == _resolved_real_interpreter()
 
 
 def test_python3_pybin_invocation_still_works() -> None:
