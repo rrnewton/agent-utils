@@ -174,21 +174,38 @@ fn mount_entries() -> Vec<MountEntry> {
 
 /// Backend and statvfs facts for one image file and mount point,
 /// from the live mount table, as the handlers inject them.
-fn mount_fact(image_file: &Path, mount_point: &Path) -> (Option<String>, Option<VfsFacts>) {
+fn mount_fact(
+    image_file: &Path,
+    mount_point: &Path,
+) -> (
+    Option<String>,
+    Option<std::result::Result<VfsFacts, String>>,
+) {
     let (state, _detail) = crate::storage_state::mount_state(image_file, mount_point);
     let backend = crate::image_mounts::mounted_backend(&state).map(str::to_string);
     let vfs = if backend.is_some() {
-        vfs_facts(mount_point)
+        Some(vfs_facts(mount_point))
     } else {
         None
     };
     (backend, vfs)
 }
 
-fn vfs_facts(mount_point: &Path) -> Option<VfsFacts> {
-    let stat = rustix::fs::statvfs(mount_point).ok()?;
+fn vfs_facts(mount_point: &Path) -> std::result::Result<VfsFacts, String> {
+    // Python renders a statvfs OSError as
+    // `[Errno N] <strerror>: '<path>'`; match it byte for byte so a
+    // dead FUSE mount degrades identically in both editions.
+    let stat = rustix::fs::statvfs(mount_point).map_err(|errno| {
+        let error = std::io::Error::from(errno);
+        let number = error.raw_os_error().unwrap_or_default();
+        let message = error.to_string();
+        let stripped = message
+            .strip_suffix(&format!(" (os error {number})"))
+            .unwrap_or(&message);
+        format!("[Errno {number}] {stripped}: '{}'", mount_point.display())
+    })?;
     let frsize = stat.f_frsize;
-    Some(VfsFacts {
+    Ok(VfsFacts {
         used_bytes: (stat.f_blocks.saturating_sub(stat.f_bfree)).saturating_mul(frsize),
         free_bytes: stat.f_bavail.saturating_mul(frsize),
         used_inodes: stat.f_files.saturating_sub(stat.f_ffree),

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import errno
 import json
 import os
 import re
@@ -1454,3 +1455,93 @@ def test_run_refuses_a_slot_box_from_inside_a_coordinator_box(
     monkeypatch.setattr(sandbox, "prepare_state", lambda *args: pytest.fail("must refuse before preparing state"))
     with pytest.raises(sandbox.SandboxError, match="from inside a coordinator box"):
         sandbox.run(_view(tmp_path), sandbox.SandboxSettings(isolation="userns"), ["true"])
+
+
+def _status_image(tmp_path: Path, slot: str) -> slotimage.SlotImage:
+    directory = tmp_path / "control" / "slot-images" / "agent" / slot
+    (directory / "state").mkdir(parents=True)
+    location = tmp_path / slot
+    location.mkdir()
+    image = slotimage.SlotImage(
+        directory=directory, slot=slot, slot_type="agent", location=location,
+        ceiling_bytes=cli.GIB, state_ceiling_bytes=cli.GIB, backend="fuse",
+        created_at="2026-10-30T00:00:00Z", phase="ready",
+    )
+    with open(image.slot_image, "wb") as handle:
+        handle.truncate(cli.GIB)
+    with open(image.state_image, "wb") as handle:
+        handle.truncate(cli.GIB)
+    return image
+
+
+@pytest.mark.parametrize("error_number", [errno.ENOTCONN, errno.EIO])
+def test_usage_dead_mount_degrades_only_its_own_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_number: int
+) -> None:
+    """A dead FUSE mount's statvfs failure is an entry error, not a crash (#1975)."""
+    dead = _status_image(tmp_path / "dead", "dead1")
+    healthy = _status_image(tmp_path / "healthy", "ok1")
+    fixed = os.statvfs_result((4096, 1024, 1000, 400, 300, 700, 200, 200, 0, 255))
+    monkeypatch.setattr(slotimage, "mount_table", lambda mountinfo=None: [])
+    monkeypatch.setattr(
+        slotimage, "mounted_backend",
+        lambda image_file, mount_point, table=None: "fuse",
+    )
+
+    def statvfs(path: str | os.PathLike[str]) -> os.statvfs_result:
+        if os.fspath(path) == str(dead.location):
+            raise OSError(error_number, os.strerror(error_number), str(dead.location))
+        return fixed
+
+    monkeypatch.setattr(os, "statvfs", statvfs)
+
+    dead_report = slotimage.usage(dead)
+    healthy_report = slotimage.usage(healthy)
+
+    dead_slot = dead_report["slot"]
+    assert isinstance(dead_slot, dict)
+    assert dead_slot["mounted"] is True and dead_slot["backend"] == "fuse"
+    assert f"Errno {error_number}" in str(dead_slot["error"])
+    assert "used_bytes" not in dead_slot and "free_bytes" not in dead_slot
+    healthy_slot = healthy_report["slot"]
+    assert isinstance(healthy_slot, dict)
+    assert healthy_slot["used_bytes"] == (1000 - 400) * 1024
+    assert "error" not in healthy_slot
+
+
+def test_image_status_with_a_dead_mount_exits_zero_and_reports_the_rest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "project"
+    (root / "worktrees").mkdir(parents=True)
+    (root / "live.py").write_text("# probe\n")
+    (root / ".wrkslots.yml").write_text(
+        "schema: 2\nmachine: node-a\nworktrees_dir: worktrees\n"
+        "default_remote: origin\ndefault_landed_ref: refs/remotes/origin/main\n"
+        "heartbeat_ttl_seconds: 60\nliveness_command: live.py\n"
+    )
+    dead = _status_image(tmp_path / "dead", "dead1")
+    healthy = _status_image(tmp_path / "healthy", "ok1")
+    fixed = os.statvfs_result((4096, 1024, 1000, 400, 300, 700, 200, 200, 0, 255))
+    monkeypatch.setattr(slotimage, "all_images", lambda control: [dead, healthy])
+    monkeypatch.setattr(slotimage, "mount_table", lambda mountinfo=None: [])
+    monkeypatch.setattr(
+        slotimage, "mounted_backend",
+        lambda image_file, mount_point, table=None: "fuse",
+    )
+
+    def statvfs(path: str | os.PathLike[str]) -> os.statvfs_result:
+        if os.fspath(path) == str(dead.location):
+            raise OSError(errno.ENOTCONN, os.strerror(errno.ENOTCONN), str(dead.location))
+        return fixed
+
+    monkeypatch.setattr(os, "statvfs", statvfs)
+
+    assert imagecmd._cmd_image_status(
+        argparse.Namespace(project_root=str(root), machine="node-a", format="json")
+    ) == 0
+
+    document = json.loads(capsys.readouterr().out)
+    assert [entry["name"] for entry in document["images"]] == ["dead1", "ok1"]
+    assert "Errno 107" in str(document["images"][0]["slot"]["error"])
+    assert document["images"][1]["slot"]["used_bytes"] == (1000 - 400) * 1024

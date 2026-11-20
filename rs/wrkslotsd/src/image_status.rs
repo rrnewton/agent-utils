@@ -27,7 +27,7 @@ fn file_entry(
     image_file: &Path,
     mount_point: &Path,
     backend_for: &impl Fn(&Path, &Path) -> Option<String>,
-    vfs_for: &impl Fn(&Path) -> Option<VfsFacts>,
+    vfs_for: &impl Fn(&Path) -> Option<Result<VfsFacts, String>>,
 ) -> Value {
     use std::os::unix::fs::MetadataExt as _;
     let mut entry = Map::new();
@@ -61,10 +61,18 @@ fn file_entry(
         Some(backend) => {
             entry.insert("mounted".to_string(), json!(true));
             entry.insert("backend".to_string(), json!(backend));
-            if let Some(vfs) = vfs_for(mount_point) {
-                entry.insert("used_bytes".to_string(), json!(vfs.used_bytes));
-                entry.insert("free_bytes".to_string(), json!(vfs.free_bytes));
-                entry.insert("used_inodes".to_string(), json!(vfs.used_inodes));
+            // A dead FUSE mount fails statvfs (ENOTCONN/EIO): degrade
+            // this entry with its error, never the whole report.
+            match vfs_for(mount_point) {
+                Some(Ok(vfs)) => {
+                    entry.insert("used_bytes".to_string(), json!(vfs.used_bytes));
+                    entry.insert("free_bytes".to_string(), json!(vfs.free_bytes));
+                    entry.insert("used_inodes".to_string(), json!(vfs.used_inodes));
+                }
+                Some(Err(message)) => {
+                    entry.insert("error".to_string(), json!(message));
+                }
+                None => {}
             }
         }
         None => {
@@ -78,7 +86,7 @@ fn file_entry(
 pub(crate) fn usage_report(
     record: &ImageRecord,
     backend_for: &impl Fn(&Path, &Path) -> Option<String>,
-    vfs_for: &impl Fn(&Path) -> Option<VfsFacts>,
+    vfs_for: &impl Fn(&Path) -> Option<Result<VfsFacts, String>>,
 ) -> Value {
     json!({
         "name": record.slot,
@@ -196,7 +204,7 @@ mod tests {
             .expect("size state");
 
         let no_backend = |_: &Path, _: &Path| -> Option<String> { None };
-        let no_vfs = |_: &Path| -> Option<VfsFacts> { None };
+        let no_vfs = |_: &Path| -> Option<Result<VfsFacts, String>> { None };
         let report = usage_report(&record, &no_backend, &no_vfs);
         assert_eq!(report["name"], "slot-a");
         assert_eq!(report["slot"]["mounted"], false);
@@ -217,15 +225,32 @@ mod tests {
             &record,
             &|_: &Path, _: &Path| Some("kernel".to_string()),
             &|_: &Path| {
-                Some(VfsFacts {
+                Some(Ok(VfsFacts {
                     used_bytes: 1_073_741_824,
                     free_bytes: 2_147_483_648,
                     used_inodes: 42,
-                })
+                }))
             },
         );
         assert_eq!(mounted["slot"]["backend"], "kernel");
         assert_eq!(mounted["slot"]["used_inodes"], 42);
+
+        // A dead mount's statvfs failure degrades only its own entry.
+        let dead = usage_report(
+            &record,
+            &|_: &Path, _: &Path| Some("fuse".to_string()),
+            &|_: &Path| {
+                Some(Err(
+                    "[Errno 107] Transport endpoint is not connected".to_string()
+                ))
+            },
+        );
+        assert_eq!(dead["slot"]["mounted"], true);
+        assert_eq!(
+            dead["slot"]["error"],
+            "[Errno 107] Transport endpoint is not connected"
+        );
+        assert!(dead["slot"].get("used_bytes").is_none());
 
         std::fs::remove_dir_all(&root).expect("cleanup");
         let _ = PathBuf::new();

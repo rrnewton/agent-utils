@@ -38,7 +38,8 @@ pub(crate) struct HandlerOutcome {
 
 /// Resolves, per image file and mount point, the mounted backend
 /// (`kernel`/`fuse`) and the statvfs facts when mounted.
-pub(crate) type MountFactsFn<'a> = dyn Fn(&Path, &Path) -> (Option<String>, Option<VfsFacts>) + 'a;
+pub(crate) type MountFactsFn<'a> =
+    dyn Fn(&Path, &Path) -> (Option<String>, Option<Result<VfsFacts, String>>) + 'a;
 
 fn refusal(message: &str, command: &str) -> HandlerOutcome {
     HandlerOutcome {
@@ -1192,15 +1193,17 @@ sys.stdout.write(f"{rc}\n{out.getvalue()}---STDERR---\n{err.getvalue()}")
         ] {
             set_case(case);
             let (exit, stdout, stderr) = run_python(case, fmt);
-            let facts = |image_file: &Path, _: &Path| -> (Option<String>, Option<VfsFacts>) {
+            let facts = |image_file: &Path,
+                         _: &Path|
+             -> (Option<String>, Option<Result<VfsFacts, String>>) {
                 if case == "mounted" && image_file == record.image_file() {
                     (
                         Some("kernel".to_string()),
-                        Some(VfsFacts {
+                        Some(Ok(VfsFacts {
                             used_bytes: (1_000_003 - 400_009) * 1024,
                             free_bytes: 300_007 * 1024,
                             used_inodes: 70_001 - 20_011,
-                        }),
+                        })),
                     )
                 } else {
                     (None, None)

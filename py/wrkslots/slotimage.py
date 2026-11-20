@@ -1751,10 +1751,17 @@ def usage(image: SlotImage) -> dict[str, object]:
         if backend is not None:
             entry["mounted"] = True
             entry["backend"] = backend
-            vfs = os.statvfs(mount_point)
-            entry["used_bytes"] = (vfs.f_blocks - vfs.f_bfree) * vfs.f_frsize
-            entry["free_bytes"] = vfs.f_bavail * vfs.f_frsize
-            entry["used_inodes"] = vfs.f_files - vfs.f_ffree
+            try:
+                vfs = os.statvfs(mount_point)
+            except OSError as exc:
+                # A dead FUSE mount (its server gone, e.g. across a
+                # reboot) fails here with ENOTCONN/EIO instead of
+                # answering: degrade this entry, never the report.
+                entry["error"] = str(exc)
+            else:
+                entry["used_bytes"] = (vfs.f_blocks - vfs.f_bfree) * vfs.f_frsize
+                entry["free_bytes"] = vfs.f_bavail * vfs.f_frsize
+                entry["used_inodes"] = vfs.f_files - vfs.f_ffree
         else:
             entry["mounted"] = False
         report[label] = entry

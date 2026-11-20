@@ -49333,18 +49333,26 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
         _validate_name(to_agent, "agent")
         _validate_agent_name(to_agent)
     successor = _read_process_identity(args.owner_pid)
-    with _mutation_locks(config, args.wait_lock):
-        _refuse_partial_state(config)
-        _assert_no_journal(config)
-        states, archives = _validate_global_state(config)
-        findings = _assert_command_registry_storage(
-            config, states, args, tolerate_target_git_registrations=True
-        )
-        nested = findings.target_git_registrations
-        before = _global_rows(states, archives)
-        state = _load_active(config)
-        record = _find_record(state, args.slot)
-        _report_dead_for_record(config, states, record)
+    # Lock-free prevalidation (#1975, following #1276/#1808-A): the fleet
+    # validation, the registry-storage scan and the event load run in
+    # prepare() holding no lock; under the locks only the registry
+    # identity is compared and the one record plus successor facts are
+    # re-checked before the write. An outstanding journal defers to the
+    # original fully-locked body, whose journal recovery needs the lock.
+    captured_notes: list[tuple[str, str]] = []
+
+    def judge(
+        record: ActiveRecord, events: Sequence[Mapping[str, object]]
+    ) -> tuple[bool, str, object, str, bool, tuple[tuple[str, bytes], ...]]:
+        """Single-record transfer refusals; shared by both paths.
+
+        Returns (rename, previous_state, released, basis, already_owned,
+        ignored_transferred). Only this record, its release history in
+        ``events`` and live process facts are judged here, never the
+        fleet. The ignored set is the one the locked re-judgement
+        observed; the lock-free judgement's set is discarded.
+        """
+
         _expected_generation(record, args.expected_generation)
         rename = to_agent is not None and to_agent != record.agent
         if record.agent != args.agent and (to_agent is not None or not reopen):
@@ -49352,15 +49360,9 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
                 f"ownership mismatch for slot {args.slot}: expected {record.agent}, got {args.agent}"
             )
         if not reopen and not rename and record.owner == successor:
-            print(
-                f"already owned slot={record.slot} agent={record.agent} "
-                f"generation={record.generation} owner_pid={successor.pid}"
-            )
-            return 0
+            return (rename, "", None, "", True, ())
         previous_state, detail = _process_state(record.owner)
-        released, void_reason = _owner_release_state(
-            config, record, _load_events(config, record.machine)
-        )
+        released, void_reason = _owner_release_state(config, record, events)
         released_in_effect = released is not None and void_reason is None
         if reopen:
             if not released_in_effect:
@@ -49404,6 +49406,15 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
         ignored_transferred: tuple[tuple[str, bytes], ...] = ()
         if rename:
             ignored_transferred = _assert_clean_tree_for_rebind(config, record)
+        return (rename, previous_state, released, basis, False, ignored_transferred)
+
+    def build(
+        record: ActiveRecord,
+        previous_state: str,
+        basis: str,
+        released: object,
+        rename: bool,
+    ) -> tuple[ActiveRecord, dict[str, object], str]:
         if reopen:
             assert coordinator is not None and released is not None
             transferred = dataclasses.replace(
@@ -49423,7 +49434,7 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
                 "coordinator": _identity_to_obj(coordinator),
                 "coordinator_authorized": True,
                 "reason": reason.strip(),
-                "release_sequence": released.sequence,
+                "release_sequence": released.sequence,  # type: ignore[attr-defined]
             }
             action = "owner-reopened"
         elif rename:
@@ -49453,6 +49464,86 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
                 "basis": basis,
             }
             action = "owner-transferred"
+        return transferred, evidence, action
+
+    def validate() -> _TransferPrevalidated:
+        states, archives = _validate_global_state(config)
+        findings = _assert_command_registry_storage(
+            config, states, args, tolerate_target_git_registrations=True
+        )
+        nested = findings.target_git_registrations
+        state = next(
+            (item for item in states if item.machine == config.machine), None
+        )
+        if state is None:
+            raise Refusal(
+                f"missing active state for machine {config.machine!r}; "
+                "no slot registry exists for it on this project"
+            )
+        record = _find_record(state, args.slot)
+        _report_dead_for_record(config, states, record)
+        events = _load_events(config, record.machine)
+        judge(record, events)
+        return _TransferPrevalidated(
+            states=tuple(states),
+            archives=tuple(archives),
+            nested=tuple(nested),
+            events=tuple(events),
+        )
+
+    def prepare() -> _TransferPrevalidated | None:
+        # The partial-state refusal is read-only, so it runs first here
+        # too, keeping its old precedence; it is re-checked under the
+        # locks before the write.
+        _refuse_partial_state(config)
+        if _outstanding_journals(config):
+            return None
+        stdout_buffer = io.StringIO()
+        stderr_buffer = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(
+                stderr_buffer
+            ):
+                return validate()
+        finally:
+            captured_notes[:] = [
+                (stdout_buffer.getvalue(), stderr_buffer.getvalue())
+            ]
+
+    def locked_body() -> tuple[
+        str,
+        ActiveRecord,
+        str | None,
+        str | None,
+        tuple[str, ...],
+        tuple[tuple[str, bytes], ...],
+    ]:
+        """The pre-#1975 transfer, run with the mutation locks held.
+
+        Used when a journal is outstanding: its classification and any
+        dead-actor repair belong under the lock.
+        """
+
+        _refuse_partial_state(config)
+        _assert_no_journal(config)
+        states, archives = _validate_global_state(config)
+        findings = _assert_command_registry_storage(
+            config, states, args, tolerate_target_git_registrations=True
+        )
+        nested = findings.target_git_registrations
+        before = _global_rows(states, archives)
+        state = _load_active(config)
+        record = _find_record(state, args.slot)
+        _report_dead_for_record(config, states, record)
+        events = _load_events(config, record.machine)
+        rename, previous_state, released, basis, already, ignored = judge(
+            record, events
+        )
+        if already:
+            return ("already", record, None, None, tuple(nested), ignored)
+        transferred, evidence, action = build(
+            record, previous_state, basis, released, rename
+        )
         if nested:
             evidence["unregistered_nested_worktrees"] = list(nested)
         _write_active_state(
@@ -49468,36 +49559,132 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
             _global_rows(after_states, after_archives),
             args.slot,
         )
-    if nested:
-        for detail in nested:
+        outcome = "reopened" if action == "owner-reopened" else "transferred"
+        return (outcome, transferred, basis, previous_state, tuple(nested), ignored)
+
+    def locked_body_captured() -> tuple[
+        str,
+        ActiveRecord,
+        str | None,
+        str | None,
+        tuple[str, ...],
+        tuple[tuple[str, bytes], ...],
+    ]:
+        stdout_buffer = io.StringIO()
+        stderr_buffer = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(
+                stderr_buffer
+            ):
+                return locked_body()
+        finally:
+            captured_notes[:] = [(stdout_buffer.getvalue(), stderr_buffer.getvalue())]
+
+    def commit(
+        reference: _RegistryIdentity | None, prepared: _TransferPrevalidated | None
+    ) -> tuple[
+        str,
+        ActiveRecord,
+        str | None,
+        str | None,
+        tuple[str, ...],
+        tuple[tuple[str, bytes], ...],
+    ]:
+        # Under the locks only: no fleet validation, storage scan or log
+        # load runs here; the registry identity still equals the one
+        # prepare validated, so its facts still hold.
+        _refuse_partial_state(config)
+        if prepared is None:
+            return locked_body_captured()
+        states, archives = list(prepared.states), list(prepared.archives)
+        before = _global_rows(states, archives)
+        local = (
+            None
+            if reference is None
+            else _verified_local_log(config, reference, states, archives)
+        )
+        state = _load_active(config) if local is None else local.active
+        record = _find_record(state, args.slot)
+        rename, previous_state, released, basis, already, ignored = judge(
+            record, prepared.events
+        )
+        if already:
+            return ("already", record, None, None, prepared.nested, ignored)
+        transferred, evidence, action = build(
+            record, previous_state, basis, released, rename
+        )
+        if prepared.nested:
+            evidence["unregistered_nested_worktrees"] = list(prepared.nested)
+        _write_active_state(
+            config,
+            _replace_record(state, transferred),
+            action=action,
+            slot=transferred.slot,
+            evidence=evidence,
+            event_writer=None if local is None else local.writer(config),
+            previous=None if local is None else local.active,
+        )
+        _assert_registry_change_limited_to_slot(
+            config, reference, before, args.slot, local
+        )
+        outcome = "reopened" if action == "owner-reopened" else "transferred"
+        return (outcome, transferred, basis, previous_state, prepared.nested, ignored)
+
+    try:
+        (
+            outcome,
+            final_record,
+            final_basis,
+            final_previous,
+            final_nested,
+            final_ignored,
+        ) = (
+            _run_prevalidated_mutation(
+                config, args.wait_lock, "transfer-owner", prepare, commit
+            )
+        )
+    finally:
+        for stdout_text, stderr_text in captured_notes:
+            if stdout_text:
+                print(stdout_text, end="", file=sys.stdout)
+            if stderr_text:
+                print(stderr_text, end="", file=sys.stderr)
+    if outcome == "already":
+        print(
+            f"already owned slot={final_record.slot} agent={final_record.agent} "
+            f"generation={final_record.generation} owner_pid={successor.pid}"
+        )
+        return 0
+    if final_nested:
+        for detail in final_nested:
             print(
                 f"WARNING: unregistered nested worktree retained during transfer-owner: "
                 f"{detail}. state: RETAINED -- ownership did not touch it and removal "
                 "still refuses it",
                 file=sys.stderr,
             )
-    if reopen:
+    if outcome == "reopened":
         print(
-            f"reopened slot={transferred.slot} agent={transferred.agent} "
-            f"generation={transferred.generation} owner_pid={successor.pid} basis={basis} "
-            f"previous={previous_state}"
+            f"reopened slot={final_record.slot} agent={final_record.agent} "
+            f"generation={final_record.generation} owner_pid={successor.pid} basis={final_basis} "
+            f"previous={final_previous}"
         )
     else:
         print(
-            f"transferred slot={transferred.slot} agent={transferred.agent} "
-            f"generation={transferred.generation} owner_pid={successor.pid} basis={basis} "
-            f"previous={previous_state}"
+            f"transferred slot={final_record.slot} agent={final_record.agent} "
+            f"generation={final_record.generation} owner_pid={successor.pid} basis={final_basis} "
+            f"previous={final_previous}"
         )
-    if ignored_transferred:
+    if final_ignored:
         # The ignored set that transferred with the slot (#1870), recorded
         # in the command output only -- not a new persisted field.
         listing = b"\n".join(
             checkout.encode("utf-8") + b"\0" + path
-            for checkout, path in ignored_transferred
+            for checkout, path in final_ignored
         )
         digest = hashlib.sha256(listing).hexdigest()
         print(
-            f"ignored_transferred count={len(ignored_transferred)} sha256={digest} "
+            f"ignored_transferred count={len(final_ignored)} sha256={digest} "
             "(informational only, never persisted); "
             "gitignored files transfer with the slot, unchanged"
         )
@@ -49923,6 +50110,23 @@ def _cmd_relocate_repository(args: argparse.Namespace) -> int:
         if _global_rows(after_states, after_archives) != expected:
             raise StateError("repository relocation changed an unrelated registry row")
     return 0
+
+
+@dataclasses.dataclass(frozen=True)
+class _TransferPrevalidated:
+    """What a transfer-owner lock-free validation established (#1975).
+
+    ``nested`` are the tolerated unregistered-nested-worktree details
+    the validated state earned; they print once, after the write.
+    ``events`` are this machine's verified event chain, from which the
+    release judgement under the lock is re-derived without loading
+    the log again.
+    """
+
+    states: tuple[ActiveState, ...]
+    archives: tuple[ArchiveState, ...]
+    nested: tuple[str, ...]
+    events: tuple[dict[str, object], ...]
 
 
 @dataclasses.dataclass(frozen=True)

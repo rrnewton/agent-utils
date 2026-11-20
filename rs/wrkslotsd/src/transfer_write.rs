@@ -397,6 +397,152 @@ fn assert_checkouts_clean_for_rebind(
     Ok(ignored)
 }
 
+fn find_slot_record(active: &Value, slot: &str, selected: &str) -> Result<Value> {
+    active
+        .get("slots")
+        .and_then(Value::as_array)
+        .and_then(|slots| {
+            slots
+                .iter()
+                .find(|item| item.get("slot").and_then(Value::as_str) == Some(slot))
+        })
+        .cloned()
+        .ok_or_else(|| format!("slot '{slot}' is not active on machine {selected}"))
+}
+
+struct TransferJudgement {
+    generation: i64,
+    record_agent: String,
+    rename: bool,
+    target_agent: String,
+    existing: Option<Identity>,
+    previous_state: String,
+    basis: String,
+    release_event: Option<Value>,
+    ignored_transferred: Vec<(String, Vec<u8>)>,
+}
+
+enum TransferDecision {
+    Already { generation: i64 },
+    Proceed(TransferJudgement),
+}
+
+/// Single-record transfer refusals, judged identically before the
+/// locks (lock-free) and again under them (#1975). Only this record,
+/// its release history and live process facts are judged here.
+#[allow(clippy::too_many_arguments)]
+fn judge_transfer(
+    root: Option<&Path>,
+    machine_override: Option<&str>,
+    cfg: &crate::active_state::Cfg,
+    selected: &str,
+    record: &Value,
+    successor: &Identity,
+    agent: &str,
+    to_agent: Option<&str>,
+    reopen: bool,
+    expected_generation: i64,
+) -> Result<TransferDecision> {
+    let slot = record
+        .get("slot")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let generation = record
+        .get("generation")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    if generation != expected_generation {
+        return Err(format!(
+            "stale generation for slot {slot}: expected {expected_generation}, current {generation}"
+        ));
+    }
+    let record_agent = record
+        .get("agent")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let rename = to_agent.is_some_and(|target| target != record_agent.as_str());
+    let target_agent = to_agent.unwrap_or(agent).to_string();
+    if record_agent != agent && (to_agent.is_some() || !reopen) {
+        return Err(format!(
+            "ownership mismatch for slot {slot}: expected {record_agent}, got {agent}"
+        ));
+    }
+    let existing = record_identity(record);
+    if !reopen && !rename {
+        if let Some(owner) = &existing {
+            if *owner == *successor {
+                return Ok(TransferDecision::Already { generation });
+            }
+        }
+    }
+    let (previous_state, detail) = process_state(existing.as_ref());
+    let events = load_event_chain(&cfg.control.join(format!("EVENTS.{selected}")), selected)?;
+    let release_event = release_in_effect(cfg, record, &events)?;
+    if reopen {
+        if release_event.is_none() {
+            return Err(format!(
+                "slot {slot} generation {generation} is not a released generation in effect; use plain 'wrkslots transfer-owner' without --reopen for a dead-owner transfer"
+            ));
+        }
+    } else {
+        if rename && (existing.is_none() || previous_state != "dead") {
+            return Err(format!(
+                "slot {slot} owner is {previous_state}: {detail}; transfer-owner only replaces an owner that is provably dead"
+            ));
+        }
+        if existing.is_some() && previous_state != "dead" {
+            return Err(format!(
+                "slot {slot} owner is {previous_state}: {detail}; transfer-owner only replaces an owner that is provably dead"
+            ));
+        }
+        if release_event.is_some() {
+            return Err(format!(
+                "slot {slot} generation {generation} was released by its owner; a released generation is waiting for removal and is not transferred. remedy: a coordinator may rebind it with 'wrkslots transfer-owner {slot} --agent <agent> --owner-pid <pid> --expected-generation {generation} --reopen --coordinator-authorized --coordinator-pid <pid> --reason <why>'"
+            ));
+        }
+    }
+    let slot_type = record
+        .get("slot_type")
+        .and_then(Value::as_str)
+        .unwrap_or("agent")
+        .to_string();
+    let basis = match assert_caller(successor, "owner") {
+        Ok(()) => "caller-ancestry".to_string(),
+        Err(_) => {
+            if cgroup_in_slot_box(&successor.cgroup_path, &slot_type, &slot) {
+                "slot-box".to_string()
+            } else {
+                return Err(format!(
+                    "owner PID {} is neither in the invoking process ancestry nor inside slot {slot}'s own box (control group {})",
+                    successor.pid, successor.cgroup_path
+                ));
+            }
+        }
+    };
+    let confirmed = read_process_identity(successor.pid)?;
+    if confirmed != *successor {
+        return Err("owner process generation changed during transfer-owner".to_string());
+    }
+    let ignored_transferred = if rename {
+        assert_checkouts_clean_for_rebind(root, machine_override, cfg, record)?
+    } else {
+        Vec::new()
+    };
+    Ok(TransferDecision::Proceed(TransferJudgement {
+        generation,
+        record_agent,
+        rename,
+        target_agent,
+        existing,
+        previous_state: previous_state.to_string(),
+        basis,
+        release_event,
+        ignored_transferred,
+    }))
+}
+
 /// Transfer the named slot to a live successor owner.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn transfer_owner(
@@ -443,6 +589,43 @@ pub(crate) fn transfer_owner(
         validate_agent_name(target)?;
     }
     let successor = read_process_identity(owner_pid)?;
+    // Lock-free prepare (#1975, following the Python edition and this
+    // edition's heartbeat): fleet validation, the storage scan, dead
+    // findings and the single-record judgement run holding no lock.
+    // This edition has no registry-identity compare yet, so the commit
+    // under the locks re-judges only the touched record (generation,
+    // agent, owner, release, successor) and never trusts the prepare.
+    refuse_partial_state(&cfg.control)?;
+    validate_global(root, &cfg)?;
+    let nested = refuse_target_storage_except_nested(root, slot)?;
+    crate::hold_write::report_dead_findings(root, slot)?;
+    let prepared_active = active_document(root, &cfg, &selected)?;
+    let prepared_record = find_slot_record(&prepared_active, slot, &selected)?;
+    match judge_transfer(
+        root,
+        machine_override,
+        &cfg,
+        &selected,
+        &prepared_record,
+        &successor,
+        agent,
+        to_agent,
+        reopen,
+        expected_generation,
+    )? {
+        TransferDecision::Already { generation } => {
+            return Ok(json!({
+                "machine": selected,
+                "slot": slot,
+                "agent": agent,
+                "generation": generation,
+                "owner_pid": successor.pid,
+                "already_transferred": true,
+            }));
+        }
+        TransferDecision::Proceed(_) => {}
+    }
+    // Commit: only the touched record is re-judged before the write.
     let _locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
     refuse_partial_state(&cfg.control)?;
     let journals = parse_journals(root)?;
@@ -454,109 +637,43 @@ pub(crate) fn transfer_owner(
             ));
         }
     }
-    validate_global(root, &cfg)?;
-    let nested = refuse_target_storage_except_nested(root, slot)?;
-    crate::hold_write::report_dead_findings(root, slot)?;
     let active = active_document(root, &cfg, &selected)?;
-    let record = active
-        .get("slots")
-        .and_then(Value::as_array)
-        .and_then(|slots| {
-            slots
-                .iter()
-                .find(|item| item.get("slot").and_then(Value::as_str) == Some(slot))
-        })
-        .cloned()
-        .ok_or_else(|| format!("slot '{slot}' is not active on machine {selected}"))?;
-    let generation = record
-        .get("generation")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    if generation != expected_generation {
-        return Err(format!(
-            "stale generation for slot {slot}: expected {expected_generation}, current {generation}"
-        ));
-    }
-    let record_agent = record
-        .get("agent")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let rename = to_agent.is_some_and(|target| target != record_agent.as_str());
-    let target_agent = to_agent.unwrap_or(agent);
-    if record_agent != agent && (to_agent.is_some() || !reopen) {
-        return Err(format!(
-            "ownership mismatch for slot {slot}: expected {record_agent}, got {agent}"
-        ));
-    }
-    let existing = record_identity(&record);
-    if !reopen && !rename {
-        if let Some(owner) = &existing {
-            if *owner == successor {
-                return Ok(json!({
-                    "machine": selected,
-                    "slot": slot,
-                    "agent": agent,
-                    "generation": generation,
-                    "owner_pid": successor.pid,
-                    "already_transferred": true,
-                }));
-            }
+    let record = find_slot_record(&active, slot, &selected)?;
+    let judged = match judge_transfer(
+        root,
+        machine_override,
+        &cfg,
+        &selected,
+        &record,
+        &successor,
+        agent,
+        to_agent,
+        reopen,
+        expected_generation,
+    )? {
+        TransferDecision::Already { generation } => {
+            return Ok(json!({
+                "machine": selected,
+                "slot": slot,
+                "agent": agent,
+                "generation": generation,
+                "owner_pid": successor.pid,
+                "already_transferred": true,
+            }));
         }
-    }
-    let (previous_state, detail) = process_state(existing.as_ref());
-    let events = load_event_chain(&cfg.control.join(format!("EVENTS.{selected}")), &selected)?;
-    let release_event = release_in_effect(&cfg, &record, &events)?;
-    if reopen {
-        if release_event.is_none() {
-            return Err(format!(
-                "slot {slot} generation {generation} is not a released generation in effect; use plain 'wrkslots transfer-owner' without --reopen for a dead-owner transfer"
-            ));
-        }
-    } else {
-        if rename && (existing.is_none() || previous_state != "dead") {
-            return Err(format!(
-                "slot {slot} owner is {previous_state}: {detail}; transfer-owner only replaces an owner that is provably dead"
-            ));
-        }
-        if existing.is_some() && previous_state != "dead" {
-            return Err(format!(
-                "slot {slot} owner is {previous_state}: {detail}; transfer-owner only replaces an owner that is provably dead"
-            ));
-        }
-        if release_event.is_some() {
-            return Err(format!(
-                "slot {slot} generation {generation} was released by its owner; a released generation is waiting for removal and is not transferred. remedy: a coordinator may rebind it with 'wrkslots transfer-owner {slot} --agent <agent> --owner-pid <pid> --expected-generation {generation} --reopen --coordinator-authorized --coordinator-pid <pid> --reason <why>'"
-            ));
-        }
-    }
-    let slot_type = record
-        .get("slot_type")
-        .and_then(Value::as_str)
-        .unwrap_or("agent")
-        .to_string();
-    let basis = match assert_caller(&successor, "owner") {
-        Ok(()) => "caller-ancestry",
-        Err(_) => {
-            if cgroup_in_slot_box(&successor.cgroup_path, &slot_type, slot) {
-                "slot-box"
-            } else {
-                return Err(format!(
-                    "owner PID {} is neither in the invoking process ancestry nor inside slot {slot}'s own box (control group {})",
-                    successor.pid, successor.cgroup_path
-                ));
-            }
-        }
+        TransferDecision::Proceed(judged) => judged,
     };
-    let confirmed = read_process_identity(successor.pid)?;
-    if confirmed != successor {
-        return Err("owner process generation changed during transfer-owner".to_string());
-    }
-    let ignored_transferred = if rename {
-        assert_checkouts_clean_for_rebind(root, machine_override, &cfg, &record)?
-    } else {
-        Vec::new()
-    };
+    let TransferJudgement {
+        generation,
+        record_agent,
+        rename,
+        target_agent,
+        existing,
+        previous_state,
+        basis,
+        release_event,
+        ignored_transferred,
+    } = judged;
     ensure_event_log(root, &cfg, &selected)?;
     let previous_revision = active.get("revision").and_then(Value::as_i64).unwrap_or(0);
     let new_generation = if reopen || rename {
@@ -647,7 +764,6 @@ pub(crate) fn transfer_owner(
     }
     let active_path = cfg.control.join(format!("ACTIVE.{selected}.json"));
     atomic_write_json(&active_path, &document)?;
-    validate_global(root, &cfg)?;
     let mut result = json!({
         "machine": selected,
         "slot": slot,
