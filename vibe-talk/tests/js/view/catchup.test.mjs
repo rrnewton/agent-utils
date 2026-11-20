@@ -104,7 +104,7 @@ const IDS = [
   "discuss-answer", "discuss-footer", "discuss-covers", "discuss-links",
   "discuss-mark-read", "discuss-mark-unread", "discuss-unmarkable",
   "discuss-stamp", "discuss-retry", "discuss-terms", "discuss-terms-summary", "discuss-terms-list",
-  "discuss-stale", "discuss-stale-text", "discuss-update", "discuss-timeline", "discuss-current-covers", "discuss-current-head",
+  "discuss-stale", "discuss-stale-text", "discuss-update", "discuss-timeline", "discuss-current-covers", "discuss-current-head", "discuss-current-section",
   "discuss-followup", "discuss-send", "discuss-uncovered", "discuss-uncovered-go", "discuss-uncovered-text",
   "discuss-actions", "discuss-resize", "discuss-head", "discuss-title",
   "discuss-dock-toggle", "discuss-full-toggle", "screen-main",
@@ -1460,6 +1460,81 @@ test("catchup header: dense lines, toggle to the right, one colour variable (#19
   assert.equal(panel.includes("Expand all"), false, "an Expand all label remains in the panel");
   assert.equal(panel.includes("Collapse all"), false, "a Collapse all label remains in the panel");
   assert.equal(panel.includes("expand all"), false, "a lowercase expand all label remains in the panel");
+});
+
+test("catchup header: Terms counts toward Collapse, and the toggle opens it too (#1960)", async () => {
+  const HTML = "<h2>Alpha</h2><p>a</p><h2>Beta</h2><p>b</p>";
+  const scope = { channelId: "chan-1", threadId: null, view: "flat", label: "Channel chan-1" };
+  const savedDocument = globalThis.document;
+  globalThis.document = {
+    createTextNode: (text) => ({ nodeType: 3, textContent: String(text), children: [] }),
+    createElement: (tag) => {
+      if (tag !== "template") return foldEl(tag);
+      const template = { _html: "", content: null };
+      Object.defineProperty(template, "innerHTML", {
+        set(value) {
+          template._html = String(value);
+          const nodes = [];
+          for (const match of template._html.matchAll(/<(h[1-6]|p)>([^<]*)<\/\1>/g)) nodes.push(foldEl(match[1], match[2]));
+          template.content = { childNodes: nodes };
+        },
+        get() { return template._html; },
+      });
+      return template;
+    },
+  };
+  try {
+    const els = {};
+    for (const id of IDS) els[id] = foldEl(id.endsWith("open") || id.endsWith("close") || id.includes("mark") ? "button" : "div");
+    els["discuss-panel"].hidden = true;
+    const panel = createDiscussPanel({
+      byId: (id) => {
+        const found = els[id];
+        if (!found) throw new Error(`no element ${id}`);
+        return found;
+      },
+      catchupPost: () => Promise.resolve(answer()),
+      catchupPreview: () => Promise.resolve(preview()),
+      catchupRecord: () => Promise.resolve({
+        exists: true,
+        current_summary: {
+          window: { count: 12, unread_count: 2 }, covered_ids: ["m1", "m2"], markable_ids: ["m1", "m2"],
+          cited_ids: [], footer_links: [], text: "saved point", text_html: HTML,
+          unknown_terms: ["cache-key rewrite", "flaky quorum"], stamp: null, created_ms: T2,
+        },
+        timeline: [],
+        staleness: null,
+      }),
+      catchupFollowup: () => Promise.resolve({}),
+      serviceName: () => "discord",
+      onJump: () => {},
+      dismissMessages: async () => {},
+      restoreMessages: async () => {},
+    });
+    panel.mount();
+    panel.openWith(scope);
+    await flush();
+    await flush();
+    const folds = () => els["discuss-answer"].children.filter((kid) => kid.tagName === "DETAILS");
+    const toggle = () => els["discuss-current-head"].children.find((kid) => String(kid.className).includes("discuss-toggle"));
+    const terms = els["discuss-terms"];
+    assert.equal(terms.hidden, false, "Terms did not show");
+    assert.deepEqual(folds().map((fold) => fold.open), [false, false]);
+    assert.equal(toggle().textContent, "Expand", "folded folds and Terms did not read Expand");
+    for (const fold of folds()) { fold.open = true; fire(fold, "toggle"); }
+    assert.equal(toggle().textContent, "Expand", "Collapse read while Terms was still folded");
+    click(toggle());
+    assert.equal(terms.open, true, "Expand did not open Terms");
+    assert.deepEqual(folds().map((fold) => fold.open), [true, true]);
+    assert.equal(toggle().textContent, "Collapse", "everything open did not read Collapse");
+    click(toggle());
+    assert.equal(terms.open, false, "Collapse did not close Terms");
+    assert.deepEqual(folds().map((fold) => fold.open), [false, false]);
+    assert.equal(toggle().textContent, "Expand", "everything closed did not read Expand");
+  } finally {
+    if (savedDocument === undefined) delete globalThis.document;
+    else globalThis.document = savedDocument;
+  }
 });
 
 test("catchup: a follow-up sends from the composer and joins the timeline", async () => {

@@ -829,6 +829,8 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
   // answer stands before its saved record lands: all collapsed, nothing kept.
   let foldRecord: string | null = null;
   let foldOpen: ReadonlySet<string> = new Set();
+  /** `#1960`: the standing Current-summary toggle's refresh, so a Terms fold change restates its label. */
+  let currentToggleRefresh: (() => void) | null = null;
   let lastFoldRecord: string | null = null;
   // `#1501 discuss-read-aloud-parity`. The read standing: its key, its drawn
   // blocks' texts, and the block lit now. Generation 0 until the saved
@@ -1340,9 +1342,9 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     return found;
   }
 
-  /** `#1960`: true only when at least one fold stands and every fold is open. */
+  /** `#1960`: true only when at least one visible fold stands and every visible fold is open. */
   function allFoldsOpen(root: HTMLElement): boolean {
-    const all = detailsDeep(root);
+    const all = detailsDeep(root).filter((el) => !(el as HTMLElement & { hidden?: boolean }).hidden);
     return all.length > 0 && all.every((el) => (el as HTMLElement & { open?: boolean }).open === true);
   }
 
@@ -1358,17 +1360,18 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
    * all) and "Collapse" only when everything is expanded; tapping applies
    * to all folds under its root. No "all" in the label.
    */
-  function makeDiscussToggle(kind: string, root: () => HTMLElement, onAll: (open: boolean) => void): DiscussToggle {
+  function makeDiscussToggle(kind: string, root: () => HTMLElement, onAll: (open: boolean) => void, extraOpen?: () => boolean): DiscussToggle {
     const button = document.createElement("button") as HTMLButtonElement;
     button.type = "button";
     button.className = `chip discuss-toggle discuss-toggle--${kind}`;
+    const isAllOpen = (): boolean => allFoldsOpen(root()) && (extraOpen === undefined || extraOpen());
     const refresh = (): void => {
-      const allOpen = allFoldsOpen(root());
+      const allOpen = isAllOpen();
       button.textContent = allOpen ? "Collapse" : "Expand";
       button.setAttribute("data-state", allOpen ? "all-open" : "not-all-open");
     };
     button.addEventListener("click", () => {
-      onAll(!allFoldsOpen(root()));
+      onAll(!isAllOpen());
       refresh();
     });
     refresh();
@@ -1436,10 +1439,20 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       // collapsed, with one Expand/Collapse-all bar at the top of the answer.
       const folds = foldSectionsByHeading(box as never, (tag) => document.createElement(tag) as never, foldOpen);
       if (folds > 0) {
+        // `#1960`: Terms stands under the same Current summary header, so
+        // it counts: "Collapse" only when the answer's folds AND Terms
+        // are all open, and the toggle opens/closes Terms with them. A
+        // host without the section or Terms falls back to the answer.
         const toggle = makeDiscussToggle("current", () => box as unknown as HTMLElement, (open) => {
           setAllSections(box as never, open);
+          const terms = maybe("discuss-terms") as (HTMLElement & { open?: boolean }) | null;
+          if (terms !== null && !terms.hidden) terms.open = open;
           keepFoldsNow(box);
+        }, () => {
+          const terms = maybe("discuss-terms") as (HTMLElement & { hidden?: boolean; open?: boolean }) | null;
+          return terms === null || terms.hidden === true || terms.open === true;
         });
+        currentToggleRefresh = toggle.refresh;
         for (const kid of Array.from(box.children)) {
           if ((kid as HTMLElement).tagName === "DETAILS") {
             kid.addEventListener("toggle", () => {
@@ -1497,6 +1510,9 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     const box = deps.byId("discuss-terms");
     box.removeAttribute("data-stale");
     box.hidden = answer.unknown_terms.length === 0;
+    // `#1960`: Terms counts toward the Current toggle, so its standing
+    // (shown or hidden) restates the toggle's label.
+    if (currentToggleRefresh !== null) currentToggleRefresh();
     if (answer.unknown_terms.length === 0) return;
     deps.byId("discuss-terms-summary").textContent =
       `Terms I didn't understand (${answer.unknown_terms.length})`;
@@ -2192,6 +2208,14 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         if (toolbarRead) {
           listening.listen(toolbarRead, "click", () => {
             readSummary();
+          });
+        }
+        // `#1960`: Terms counts toward the Current toggle, so folding it
+        // by hand restates the toggle's label.
+        const termsBox = maybe("discuss-terms");
+        if (termsBox !== null) {
+          listening.listen(termsBox, "toggle", () => {
+            if (currentToggleRefresh !== null) currentToggleRefresh();
           });
         }
         // The main composer's keys (`discuss-followup-composer`): the same Enter.

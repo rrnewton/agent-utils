@@ -130,6 +130,7 @@ export interface ElementById {
   "discuss-current-covers": HTMLSpanElement;
   "discuss-current-head": HTMLDivElement;
   "discuss-current-heading": HTMLHeadingElement;
+  "discuss-current-section": HTMLElement;
   "discuss-dock-toggle": HTMLButtonElement;
   "discuss-draft-discard": HTMLButtonElement;
   "discuss-draft-keep": HTMLButtonElement;
