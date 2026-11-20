@@ -61,6 +61,8 @@ strip twin, the dock icon, React, the Draft chip, a tap into the docked box, and
 must hold the read with that composer focused, before any dictation can hear it; React's dictation
 starts over that held read; Cancel and close leave it held; and a Send from such a composer-held
 pause carries the read on from the sentence or block it was held in. Tap-to-pause times are printed.
+(The Draft chip is the one path a phone cannot even offer mid-play: the playing strip hides the
+scroll-tools chips by design, so it is pressed from the held read and must open its composer held.)
 """
 
 from __future__ import annotations
@@ -447,6 +449,8 @@ def expect_paused_focused(desk: Desk, voice: str, where: str, box_id: str, began
     page = desk.page
     desk.wait_for("() => document.getElementById('read-aloud-label').textContent === 'Resume'",
                   f"{where}: the read was not paused by the composer path", STATE_S)
+    desk.wait_for(f"() => document.activeElement && document.activeElement.id === {box_id!r}",
+                  f"{where}: the focus never landed in #{box_id}", STATE_S)
     print(f"{voice}/{where}: tap-to-pause {(time.monotonic() - began) * 1000:.0f}ms (printed only)", flush=True)
     desk.check(page.evaluate("() => document.activeElement && document.activeElement.id") == box_id,
                f"{where}: the focus is not in #{box_id}")
@@ -553,13 +557,17 @@ def composer_pause_walk(desk: Desk, api: VoicesApi, voice: str, touch: bool) -> 
     desk.wait_for("() => document.getElementById('quick-reply').hidden",
                   "composer-pause: Esc left the React reply up", STATE_S)
     desk.check(label(page) == "Resume", "composer-pause: closing the React reply resumed the read")
-    # 5. The Draft chip those words left behind, pressed while playing again.
+    # 5. The Draft chip those words left behind. While a phone's read PLAYS, the strip layout hides
+    # the scroll-tools chips by design (15-dock: only the jump-back-to-reading chip stays), so the
+    # chip cannot be tapped mid-play at all; its earliest press is from a held read, and it must
+    # open its composer with the read still held.
     desk.wait_for("() => !document.getElementById('draft-chip').hidden",
                   "composer-pause: the Draft chip does not count the React draft", STATE_S)
-    resume_reading(desk, voice, touch)
+    desk.check(page.evaluate("() => document.getElementById('draft-chip').getClientRects().length") > 0,
+               "composer-pause: the Draft chip is counted but not drawn over a held read")
     began = time.monotonic()
     press(page, "#draft-chip", touch)
-    expect_paused_focused(desk, voice, "draft-chip-while-playing", "quick-reply-text", began)
+    expect_paused_focused(desk, voice, "draft-chip-from-held", "quick-reply-text", began)
     page.keyboard.press("Escape")
     desk.wait_for("() => document.getElementById('quick-reply').hidden",
                   "composer-pause: Esc left the Draft chip's reply up", STATE_S)
@@ -574,6 +582,7 @@ def composer_pause_walk(desk: Desk, api: VoicesApi, voice: str, touch: bool) -> 
     desk.wait_for("() => document.getElementById('read-aloud-label').textContent === 'Pause'",
                   "composer-pause: the read did not resume under its open reply", STATE_S)
     began = time.monotonic()
+    page.locator("#reply-text").scroll_into_view_if_needed()
     press(page, "#reply-text", touch)
     held = expect_paused_focused(desk, voice, "tap-into-docked-while-playing", "reply-text", began)
     check_held_still(desk, voice, "tap-into-docked-while-playing", held)
@@ -595,6 +604,7 @@ def composer_pause_walk(desk: Desk, api: VoicesApi, voice: str, touch: bool) -> 
     sent = len(api.posted())
     page.fill("#reply-text", "Yes, send resumes the read")
     began = time.monotonic()
+    page.locator("#reply-send").scroll_into_view_if_needed()
     press(page, "#reply-send", touch)
     desk.wait_for("() => document.getElementById('column-reply').hidden",
                   "composer-pause: Send did not put the docked reply away", STATE_S)
