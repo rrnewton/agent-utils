@@ -1,13 +1,14 @@
 ---
 title: 'wrkslots-per-remote-ssh-command: a declared per-remote SSH command for reaching GHE'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - wrkslots
 - ssh
 created_at: 2026-11-20T06:00:00-05:00
-updated_at: 2026-11-20T06:00:00-05:00
+updated_at: 2026-11-20T14:00:00-05:00
+closed_at: 2026-11-20T14:00:00-05:00
 ---
 
 # Description
@@ -31,3 +32,7 @@ updated_at: 2026-11-20T06:00:00-05:00
 # Notes
 
 Follow-on to #1929 wrkslots-provenance-only-slot-offline-probe and #1930 wrkslots-detect-worktrees-outside-wrkslots. Their issue closes are folded into this issue's landing commit.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main in bab11f41 (tree e45b68d0, verified on the combined tree: cargo fmt --all -- --check clean, cargo check, 76 focused tests). remote_ssh_commands config key in both editions, GIT_SSH_COMMAND scoped to fetch only, shlex-quoted with metachar/newline refusal, doctor shows paths and proxy presence only. Cold security review SAFE; gate reds only waived environment families. Filed follow-on #1955 wrkslots-remote-ssh-match-by-url.
