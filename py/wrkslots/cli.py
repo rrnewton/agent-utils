@@ -14247,7 +14247,10 @@ def _validate_journal_shape(
             _nested_git_evidence_from_obj(
                 raw["nested_git_evidence"], "finish journal.nested_git_evidence"
             )
-            if record.slot_type != "agent":
+            # The producer journals this evidence for agent slots and
+            # for validate-complete removals alike (#1790), so an
+            # interrupted validate finish must reload it on recovery.
+            if record.slot_type != "agent" and raw.get("validate_complete") is not True:
                 raise StateError(
                     "finish journal records nested Git evidence for a non-agent slot"
                 )
@@ -63643,6 +63646,131 @@ def _finish_journal_owner(raw: Mapping[str, object]) -> ProcessIdentity | None:
     return owner
 
 
+def _finish_deletion_lock_path(journal_path: Path) -> Path:
+    """The flock file proving an out-of-lock fenced deletion is running (#1735).
+
+    It lives beside its finish journal as ``DELETION-LOCK.<journal
+    name>`` and carries no payload: only the flock held on an open
+    descriptor counts, so a remover that dies releases it. The name
+    matches no journal listing (readers glob a ``.journal`` suffix),
+    no registry-identity prefix, and it is a file, not a directory in
+    the slots scan -- a ``deletion-locks/`` subdirectory there made
+    readers that predate it report an unclaimed slot directory. The
+    file is unlinked under the registry lock, still holding its
+    flock, when the deletion it guarded completes or rolls back, so
+    only a crashed removal leaves one behind, beside its journal.
+    """
+
+    return journal_path.with_name(f"DELETION-LOCK.{journal_path.name}.lock")
+
+
+# Deletion flocks this process holds, by lock-file path: [fd, count].
+# Re-entering a hold in the same process reuses the descriptor; the
+# flock itself is what other processes contend on.
+_deletion_holds: dict[str, list[int]] = {}
+_deletion_holds_guard = threading.Lock()
+
+
+class _FinishDeletionHold:
+    """One hold on a finish journal's deletion flock (#1735).
+
+    Taken inside the registry lock scope before that lock is released
+    and held through the unlocked deletion and the completion or
+    rollback under the lock, so no window exists where a remover is
+    live but unflocked. ``nonblocking`` is for recover: it must refuse
+    busy rather than queue behind a remover.
+    """
+
+    def __init__(self, journal_path: Path, *, nonblocking: bool = False) -> None:
+        self._lock_path = _finish_deletion_lock_path(journal_path)
+        self._nonblocking = nonblocking
+        self._entered = False
+
+    def __enter__(self) -> "_FinishDeletionHold":
+        key = str(self._lock_path)
+        with _deletion_holds_guard:
+            held = _deletion_holds.get(key)
+            if held is not None:
+                held[1] += 1
+                self._entered = True
+                return self
+            self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+            try:
+                fcntl.flock(
+                    fd,
+                    fcntl.LOCK_EX | (fcntl.LOCK_NB if self._nonblocking else 0),
+                )
+            except BaseException:
+                os.close(fd)
+                raise
+            _deletion_holds[key] = [fd, 1]
+            self._entered = True
+            return self
+
+    def __exit__(self, *exc: object) -> None:
+        if not self._entered:
+            return
+        self._entered = False
+        key = str(self._lock_path)
+        with _deletion_holds_guard:
+            held = _deletion_holds.get(key)
+            if held is None:
+                return
+            held[1] -= 1
+            if held[1] > 0:
+                return
+            del _deletion_holds[key]
+            os.close(held[0])
+
+
+def _finish_deletion_hold(
+    journal_path: Path, *, nonblocking: bool = False
+) -> _FinishDeletionHold:
+    return _FinishDeletionHold(journal_path, nonblocking=nonblocking)
+
+
+def _finish_deletion_held_here(journal_path: Path) -> bool:
+    """Whether this process already holds that deletion flock (#1735)."""
+
+    with _deletion_holds_guard:
+        return str(_finish_deletion_lock_path(journal_path)) in _deletion_holds
+
+
+def _discard_finish_deletion_lock(journal_path: Path) -> None:
+    """Unlink a deletion-lock file whose deletion is over (#1735).
+
+    Called under the registry lock while the flock is still held, so
+    no new remover can take the name between the unlink and the
+    release; a later hold recreates the file.
+    """
+
+    try:
+        _finish_deletion_lock_path(journal_path).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _finish_deletion_in_progress(journal_path: Path) -> bool:
+    """Whether another process holds the deletion flock (#1735)."""
+
+    if _finish_deletion_held_here(journal_path):
+        return False
+    try:
+        fd = os.open(_finish_deletion_lock_path(journal_path), os.O_RDWR)
+    except FileNotFoundError:
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
 _CONTAINING_REFS_INLINE_LIMIT = 64
 _CONTAINING_REFS_SIDECAR_DIR = "containing-refs"
 
@@ -67772,10 +67900,21 @@ def _begin_finish(
             ):
                 _clear_journal(config, journal, journal_path=journal_path)
             raise
+        # Take the deletion flock here, still inside the caller's
+        # registry lock scope, so no window exists between the lock's
+        # release and the flock. It stays held through the unlocked
+        # deletion and the completion or rollback under the lock, and
+        # is released there (#1735 second review).
+        deletion_hold = _finish_deletion_hold(journal_path)
+        deletion_hold.__enter__()
         if defer_deletion:
             _interrupt_for_test("after-finish-fence")
-            return _PreparedDeferredFinish(final_record, journal, journal_path)
-        return _PreparedPrivateFinish(final_record, journal, journal_path)
+            return _PreparedDeferredFinish(
+                final_record, journal, journal_path, deletion_hold=deletion_hold
+            )
+        return _PreparedPrivateFinish(
+            final_record, journal, journal_path, deletion_hold=deletion_hold
+        )
     try:
         journal = _finish_remove_paths(
             config,
@@ -67846,9 +67985,14 @@ def _rollback_prepared_private_finish(
             f"{refusal}; deferred path-fence rollback failed: {rollback}; "
             "run 'wrkslots recover'"
         ) from rollback
+    finally:
+        # The removal is over either way: drop the deletion flock and
+        # its file (the caller holds the registry lock) (#1735).
+        _discard_finish_deletion_lock(prepared.journal_path)
+        _release_prepared_deletion_hold(prepared)
 
 
-def _complete_prepared_private_finish(
+def _revalidate_prepared_private_finish(
     config: Config,
     prepared: _PreparedPrivateFinish,
     finish: _FinishContext,
@@ -67857,12 +68001,17 @@ def _complete_prepared_private_finish(
     runner: ProcessIdentity,
     handoff_writer: ProcessIdentity | None,
     proof_fd: int | None,
-) -> None:
-    """Revalidate and complete the short destructive phase under mutation locks."""
+) -> tuple[ActiveRecord, _FinishContext]:
+    """Revalidate one fenced private finish under the mutation locks (#1735).
+
+    Every check the locked completion used to run before deleting, and
+    nothing slow: the fenced deletion itself now runs with the locks
+    released (see ``_complete_prepared_private_finish``), exactly as an
+    ordinary removal's deferred deletion does (#894).
+    """
 
     raw = _load_prepared_private_finish(config, prepared)
-    states, archives = _validate_global_state_for_finish_recovery(config, raw)
-    before = _global_rows(states, archives)
+    states, _archives = _validate_global_state_for_finish_recovery(config, raw)
     state = next(item for item in states if item.machine == config.machine)
     current = _find_record(state, prepared.record.slot)
     if _record_to_obj(current) != _record_to_obj(prepared.record):
@@ -67920,14 +68069,67 @@ def _complete_prepared_private_finish(
     resumed_finish = dataclasses.replace(
         finish, allow_live_validate_owner=live_validate_owner
     )
-    journal = _finish_remove_paths(
-        config,
-        current,
-        dict(raw),
-        _GitVcs(),
-        resumed_finish,
-        journal_path=prepared.journal_path,
-    )
+    return current, resumed_finish
+
+
+def _delete_prepared_private_finish(
+    config: Config,
+    prepared: _PreparedPrivateFinish,
+    current: ActiveRecord,
+    finish: _FinishContext,
+) -> Mapping[str, object]:
+    """Delete one fenced private tree with no registry lock held (#1735).
+
+    Mirrors ``_delete_prepared_deferred_finish``: the journal on disk
+    must still be the one this removal wrote under the lock; a refusal
+    or kill here leaves it for the next remove or recovery pass.
+    """
+
+    raw = _load_prepared_private_finish(config, prepared)
+    with _finish_deletion_hold(prepared.journal_path):
+        return _finish_remove_paths(
+            config,
+            current,
+            dict(raw),
+            _GitVcs(),
+            finish,
+            journal_path=prepared.journal_path,
+        )
+
+
+def _complete_prepared_private_finish(
+    config: Config,
+    prepared: _PreparedPrivateFinish,
+    deleted_journal: Mapping[str, object],
+    *,
+    coordinator: ProcessIdentity,
+    runner: ProcessIdentity,
+    handoff_writer: ProcessIdentity | None,
+    proof_fd: int | None,
+) -> None:
+    """Record one out-of-lock private deletion under the mutation locks.
+
+    Only this slot's record is compared with the fenced record, as in
+    ``_complete_deferred_finish``: other slots may legitimately have
+    changed while the deletion ran unlocked. The process and hold
+    re-checks the deferred completion keeps run here too (#1735
+    review).
+    """
+
+    path, journal = _load_journal(config, selected_path=prepared.journal_path)
+    if path != prepared.journal_path or not _json_equal(journal, deleted_journal):
+        raise Refusal(
+            f"private finish journal changed during its out-of-lock deletion: {path}"
+        )
+    states, _archives = _validate_global_state_for_finish_recovery(config, journal)
+    state = next(item for item in states if item.machine == config.machine)
+    current = _find_record(state, prepared.record.slot)
+    if _record_to_obj(current) != _record_to_obj(prepared.record):
+        raise Refusal(
+            f"slot {prepared.record.slot} changed during its out-of-lock deletion"
+        )
+    _assert_remove_processes(coordinator, runner, handoff_writer, proof_fd)
+    _assert_not_held(config, current)
     _finish_state_update(
         config,
         state,
@@ -67935,14 +68137,10 @@ def _complete_prepared_private_finish(
         journal,
         journal_path=prepared.journal_path,
     )
-    after_states, after_archives = _validate_global_state(
-        config, require_repository=False
-    )
-    _assert_only_slot_changed(
-        before,
-        _global_rows(after_states, after_archives),
-        current.slot,
-    )
+    # Completion is recorded under the registry lock: drop the
+    # deletion flock and its file while both are still held (#1735).
+    _discard_finish_deletion_lock(prepared.journal_path)
+    _release_prepared_deletion_hold(prepared)
 
 
 def _delete_prepared_deferred_finish(
@@ -67965,14 +68163,15 @@ def _delete_prepared_deferred_finish(
         raise Refusal(
             f"deferred finish journal changed before its out-of-lock deletion: {path}"
         )
-    return _finish_remove_paths(
-        config,
-        prepared.record,
-        dict(journal),
-        _GitVcs(),
-        finish,
-        journal_path=prepared.journal_path,
-    )
+    with _finish_deletion_hold(prepared.journal_path):
+        return _finish_remove_paths(
+            config,
+            prepared.record,
+            dict(journal),
+            _GitVcs(),
+            finish,
+            journal_path=prepared.journal_path,
+        )
 
 
 def _complete_deferred_finish(
@@ -68014,6 +68213,10 @@ def _complete_deferred_finish(
         journal,
         journal_path=prepared.journal_path,
     )
+    # Completion is recorded under the registry lock: drop the
+    # deletion flock and its file while both are still held (#1735).
+    _discard_finish_deletion_lock(prepared.journal_path)
+    _release_prepared_deletion_hold(prepared)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -70600,12 +70803,12 @@ def _cmd_remove_in_scope(
             )
             # An ordinary removal fences and journals under the lock, deletes
             # the fenced tree with the lock released, and re-takes the lock only
-            # to record completion (#894).  The private-cleanup and scoped
-            # validation finishes keep their own out-of-lock shapes.
+            # to record completion (#894).  Scoped validation finishes now
+            # take the same deferred shape (#1735); private cleanup defers
+            # through its own prepared finish, and grouped batch members
+            # keep their group scan.
             defer_deletion = (
-                private_cleanup is None
-                and not scoped_validation_finish
-                and validation_removal_proof is None
+                private_cleanup is None and validation_removal_proof is None
             )
             prepared_finish = _begin_finish(
                 config,
@@ -70713,15 +70916,18 @@ def _cmd_remove_in_scope(
                     config, prepared_private_finish, exc
                 )
             raise
-        completion_scope = (
+        # Revalidate under the lock, delete the fenced tree with the
+        # lock released (#1735), then re-take it only to record the
+        # completion -- the deferred shape ordinary removals use (#894).
+        revalidate_scope = (
             _mutation_locks(config, args.wait_lock)
             if wait_deadline is None
             else _mutation_locks(config, args.wait_lock, deadline=wait_deadline)
         )
-        with completion_scope:
-            _refuse_partial_state(config, allow_validate_batch_seals=True)
-            try:
-                _complete_prepared_private_finish(
+        try:
+            with revalidate_scope:
+                _refuse_partial_state(config, allow_validate_batch_seals=True)
+                current_record, resumed_finish = _revalidate_prepared_private_finish(
                     config,
                     prepared_private_finish,
                     finish_context,
@@ -70730,12 +70936,56 @@ def _cmd_remove_in_scope(
                     handoff_writer=handoff_writer,
                     proof_fd=proof_fd,
                 )
-            except Refusal as exc:
+        except Refusal as exc:
+            rollback_scope = (
+                _mutation_locks(config, args.wait_lock)
+                if wait_deadline is None
+                else _mutation_locks(config, args.wait_lock, deadline=wait_deadline)
+            )
+            with rollback_scope:
                 if prepared_private_finish.journal_path.exists():
                     _rollback_prepared_private_finish(
                         config, prepared_private_finish, exc
                     )
-                raise
+                _release_prepared_deletion_hold(prepared_private_finish)
+            raise
+        try:
+            deleted_journal = _delete_prepared_private_finish(
+                config, prepared_private_finish, current_record, resumed_finish
+            )
+        except Refusal as exc:
+            # A deletion refusal rolls the fence back as the locked
+            # completion used to (#1735 review): leaving the journal
+            # would poison the rest of a multi-slot batch, whose later
+            # items would meet this process's own live journal.
+            rollback_scope = (
+                _mutation_locks(config, args.wait_lock)
+                if wait_deadline is None
+                else _mutation_locks(config, args.wait_lock, deadline=wait_deadline)
+            )
+            with rollback_scope:
+                if prepared_private_finish.journal_path.exists():
+                    _rollback_prepared_private_finish(
+                        config, prepared_private_finish, exc
+                    )
+                _release_prepared_deletion_hold(prepared_private_finish)
+            raise
+        completion_scope = (
+            _mutation_locks(config, args.wait_lock)
+            if wait_deadline is None
+            else _mutation_locks(config, args.wait_lock, deadline=wait_deadline)
+        )
+        with completion_scope:
+            _refuse_partial_state(config, allow_validate_batch_seals=True)
+            _complete_prepared_private_finish(
+                config,
+                prepared_private_finish,
+                deleted_journal,
+                coordinator=coordinator,
+                runner=runner,
+                handoff_writer=handoff_writer,
+                proof_fd=proof_fd,
+            )
     if (
         prepared_deferred_finish is not None
         and agent_batch is not None
@@ -70794,9 +71044,15 @@ def _finish_removal_tail(
         # refusal or kill here leaves the journal for the next remove or
         # recovery pass.
         with _agent_batch_item_deadline(agent_batch):
-            deleted_journal = _delete_prepared_deferred_finish(
-                config, prepared_deferred_finish, finish_context
-            )
+            try:
+                deleted_journal = _delete_prepared_deferred_finish(
+                    config, prepared_deferred_finish, finish_context
+                )
+            except BaseException:
+                # The journal stays for the next recovery pass, but
+                # this removal is over: drop its deletion flock.
+                _release_prepared_deletion_hold(prepared_deferred_finish)
+                raise
             completion_scope = (
                 _mutation_locks(
                     config, args.wait_lock, release_config_after_check=True
@@ -71356,10 +71612,24 @@ def _remove_validate_batch_grouped(
                         f"grouped census: {_recheck_fenced_path}"
                     )
                 try:
+                    _grouped_current, _grouped_finish = (
+                        _revalidate_prepared_private_finish(
+                            config,
+                            prepared,
+                            finish,
+                            coordinator=coordinator,
+                            runner=runner,
+                            handoff_writer=handoff_writer,
+                            proof_fd=proof_fd,
+                        )
+                    )
+                    _grouped_journal = _delete_prepared_private_finish(
+                        config, prepared, _grouped_current, _grouped_finish
+                    )
                     _complete_prepared_private_finish(
                         config,
                         prepared,
-                        finish,
+                        _grouped_journal,
                         coordinator=coordinator,
                         runner=runner,
                         handoff_writer=handoff_writer,
@@ -71368,6 +71638,7 @@ def _remove_validate_batch_grouped(
                 except Refusal as exc:
                     if prepared.journal_path.exists():
                         _rollback_prepared_private_finish(config, prepared, exc)
+                    _release_prepared_deletion_hold(prepared)
                     raise
         except (Refusal, StateError) as exc:
             retained.append(
@@ -76756,6 +77027,66 @@ def _recover_finish(
     live_use_recheck: _LiveUseRecheckBudget | None = None,
     discard_stale_image_copy: bool = False,
 ) -> None:
+    """Resume one finish journal under its deletion flock (#1735).
+
+    Recover takes the flock non-blocking and holds it for the whole
+    resume, so a remover (or another recover) cannot finish the same
+    slot beside it; if a remover holds it, recover is busy. A journal
+    this process itself is removing needs no second hold.
+    """
+
+    recorded = _finish_journal_owner(raw)
+    if recorded is not None and recorded != _read_process_identity(os.getpid()):
+        hold = _finish_deletion_hold(path, nonblocking=True)
+        try:
+            hold.__enter__()
+        except BlockingIOError:
+            raise _JournalBusy(
+                kind="finish",
+                pid=recorded.pid,
+                journal=path.name,
+                since=_journal_since(raw, path),
+            ) from None
+        try:
+            _recover_finish_resume(
+                config,
+                path,
+                raw,
+                state,
+                coordinator,
+                processes=processes,
+                live_use_recheck=live_use_recheck,
+                discard_stale_image_copy=discard_stale_image_copy,
+            )
+            # The resume finished the removal under the caller's
+            # registry lock: drop the flock's file while held (#1735).
+            _discard_finish_deletion_lock(path)
+        finally:
+            hold.__exit__()
+        return
+    _recover_finish_resume(
+        config,
+        path,
+        raw,
+        state,
+        coordinator,
+        processes=processes,
+        live_use_recheck=live_use_recheck,
+        discard_stale_image_copy=discard_stale_image_copy,
+    )
+
+
+def _recover_finish_resume(
+    config: Config,
+    path: Path,
+    raw: Mapping[str, object],
+    state: ActiveState,
+    coordinator: ProcessIdentity,
+    *,
+    processes: _RecoveryProcesses | None = None,
+    live_use_recheck: _LiveUseRecheckBudget | None = None,
+    discard_stale_image_copy: bool = False,
+) -> None:
     _journal_forward_compatible(raw, "finish journal")
     _exact_keys(
         raw, _FINISH_JOURNAL_REQUIRED, _FINISH_JOURNAL_OPTIONAL, "finish journal"
@@ -76821,6 +77152,34 @@ def _recover_finish(
     private_identity = _finish_private_census_identity(raw)
     if private_identity is not None and original_mode is None:
         raise StateError("private finish journal has no original directory mode")
+    # Never resume a finish whose recorded remover is still alive
+    # (#1735 review): recovering concurrently would delete the same
+    # fenced tree twice. This guard runs before any side effect below
+    # (unsealing a grouped fence, discarding a stale image copy), so a
+    # refused recover changes nothing. This process itself, by full
+    # identity, is the continuation and never blocks itself. The one
+    # exception is the authorizing coordinator's own generation: a
+    # batch runs inside its coordinator, which lives on after the
+    # batch stops, so coordinator liveness alone proves nothing --
+    # but the deletion flock is held for the whole unlocked deletion,
+    # so its absence proves that remove has stopped, and only then
+    # may the coordinator resume its own journal.
+    recorded_remover = _finish_journal_owner(raw)
+    if (
+        recorded_remover is not None
+        and recorded_remover != _read_process_identity(os.getpid())
+    ):
+        remover_state, _remover_detail = _process_state(recorded_remover)
+        if remover_state == "live" and (
+            recorded_remover != coordinator
+            or _finish_deletion_in_progress(path)
+        ):
+            raise _JournalBusy(
+                kind="finish",
+                pid=recorded_remover.pid,
+                journal=path.name,
+                since=_journal_since(raw, path),
+            )
     if _grouped_finish_member(raw, record, "finish journal"):
         if path != _finish_journal_path(config, record.slot):
             raise StateError("a grouped member's finish journal must be its scoped journal")
@@ -94919,6 +95278,9 @@ class _PreparedPrivateFinish:
     record: ActiveRecord
     journal: Mapping[str, object]
     journal_path: Path
+    deletion_hold: _FinishDeletionHold | None = dataclasses.field(
+        default=None, compare=False, repr=False
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -94936,6 +95298,18 @@ class _PreparedDeferredFinish:
     record: ActiveRecord
     journal: Mapping[str, object]
     journal_path: Path
+    deletion_hold: _FinishDeletionHold | None = dataclasses.field(
+        default=None, compare=False, repr=False
+    )
+
+
+def _release_prepared_deletion_hold(
+    prepared: "_PreparedPrivateFinish | _PreparedDeferredFinish",
+) -> None:
+    """Release a prepared finish's deletion flock, if it holds one (#1735)."""
+
+    if prepared.deletion_hold is not None:
+        prepared.deletion_hold.__exit__()
 
 
 # Most /proc listings one all-process census takes before it refuses

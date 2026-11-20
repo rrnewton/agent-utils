@@ -519,6 +519,7 @@
         "py/wrkslots/tests/test_release_frozen_rust.py",
         "py/wrkslots/tests/test_release_write_rust.py",
         "py/wrkslots/tests/test_remote_ssh.py",
+        "py/wrkslots/tests/test_remove_fenced_lock_scope.py",
         "py/wrkslots/tests/test_remove_lock_scope_rust.py",
         "py/wrkslots/tests/test_remove_private_history_rust.py",
         "py/wrkslots/tests/test_remove_proof_batching.py",
