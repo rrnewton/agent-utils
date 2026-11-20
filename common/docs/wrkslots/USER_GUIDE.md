@@ -3023,7 +3023,11 @@ draft outside the current stack, of every date, with its
 author and date, and writes nothing until the operator judges
 each one: `--include NODE` for this slot's (repeatable),
 `--disown NODE` for each that is not, or
-`--none-of-these-are-mine` to declare the whole listed run —
+`--none-of-these-are-mine` to declare the unrecorded drafts
+of a list an earlier capture already showed in full (the
+shown list is remembered in a `<checkout>.listing.json`
+marker beside the ledger, and a recorded draft always needs
+its own `--disown`) —
 each declaration is recorded in the ledger per node, with
 who declared it and when, and a hidden recorded draft can
 never be disowned or rebuilt away silently.
