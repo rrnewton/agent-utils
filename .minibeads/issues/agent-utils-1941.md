@@ -1,12 +1,13 @@
 ---
 title: 'wrkslots-validate-fresh-submodule-worktreeconfig: never set extensions.worktreeConfig on a shared submodule git dir'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-11-20T03:25:16-05:00
-updated_at: 2026-11-20T03:25:16-05:00
+updated_at: 2026-11-20T06:34:12-05:00
+closed_at: 2026-11-20T06:34:12-05:00
 ---
 
 # Description
@@ -29,3 +30,7 @@ updated_at: 2026-11-20T03:25:16-05:00
 # Notes
 
 [watermelon-full-preview] mu-wtconfig lane, 2026-11-20. Priority high: a consumer's validations are blocked.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as f3d6de8c (tree 6e7ae799, replay of 5dd3bb8b over 29b747e7). Root cause: the #1435 guard read `core.worktree` at the moment of the flip; on a submodule's module git dir (`.git/modules/<name>`) Git (re)writes `core.worktree` whenever it connects or updates the submodule (verified against git-submodule: `git submodule update --init` writes it back even after the value was moved out), so a config clean at flip time broke every linked worktree afterwards. Fix: identity (Python and Rust) detects a common dir under `.git/modules/` via `_is_submodule_common_dir` / `is_submodule_common_dir`, never enables `extensions.worktreeConfig` there, and skips that checkout's identity with a logged warning while the create proceeds; the pre-create refusal no longer fires for such repositories. The explicit shared-submodule preparation remains the only path that enables the extension on a module git dir (it moves `core.worktree` first, verified). Doctor's existing `worktree-config-core-worktree-in-common` finding is now covered on a real submodule git dir. No persisted field, journal key, event kind, or `.wrkslots.yml` schema entry was added or changed. Tests: `test_shared_submodules.py` 18/18 (3 new, all failing on github/main), Rust identity parity 3/3, `test_lifecycle.py -k identity` 143 passed; full gate on 5dd3bb8b passed, and the combined tree was re-verified (strict mypy, 19 focused tests, 143 lifecycle identity tests, `cargo test -p wrkslotsd` 208+1) before the overlap landing.
