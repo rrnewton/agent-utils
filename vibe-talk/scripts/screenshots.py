@@ -1348,8 +1348,14 @@ def focused_inside_problem(top: float, bottom: float, viewport_height: float) ->
     Pure, so `--self-test` can prove it goes red: a keyboard only opens because an input
     has focus, so an "open" shot whose focused field sits below the shrunk viewport is
     a shot of a keyboard that would have covered the very box it opened for.
+
+    A field fitted to the keyboard's top reports its foot a fraction of a pixel past
+    the (integer) viewport height — rects are fractional, the fit is to the pixel —
+    so a pixel of tolerance separates that rounding from coverage: a covered field
+    is a keyboard's height past, never one pixel (`#1989`, seen on android-412 as
+    579.4 against 579).
     """
-    if top < 0 or bottom > viewport_height:
+    if top < -1 or bottom > viewport_height + 1:
         return (
             f"the focused field ({top:.0f}..{bottom:.0f}) is outside the shrunk "
             f"viewport (0..{viewport_height:.0f}) — the keyboard would cover it"
@@ -7783,7 +7789,7 @@ SCENES: tuple[Scene, ...] = (
                 "the focused composer is inside the shrunk viewport",
                 "(() => { const r = document.getElementById('channel-compose-text').getBoundingClientRect(); "
                 "const h = window.visualViewport ? window.visualViewport.height : window.innerHeight; "
-                "return r.top >= 0 && r.bottom <= h; })()",
+                "return r.top >= -1 && r.bottom <= h + 1; })()",
             ),
             ("the switcher cards are not over the page", "!window.__visible('view-cards')"),
         ),
@@ -9489,6 +9495,7 @@ SELF_TEST_CHECKS = (
     "the standard matrix states stay restricted to the phone and laptop matrix profiles",
     "capture settles transient UI before the shutter opens",
     "the keyboard shrink re-proves its field's focus after the resize, naming what held it",
+    "a focused field a fraction past the shrunk foot passes, and two pixels past fails",
 )
 
 
@@ -9512,6 +9519,16 @@ def check_keyboard_controls() -> list[str]:
         )
     if focused_inside_problem(100, 300, 579) is not None:
         problems.append("a focused field inside the shrunk viewport fails the keyboard check.")
+    if focused_inside_problem(493, 579.4, 579) is not None:
+        problems.append(
+            "a focused field a fraction of a pixel past the shrunk viewport's foot fails "
+            "the keyboard check — the fitted-to-the-keyboard shot would be rejected on rounding."
+        )
+    if focused_inside_problem(493, 581, 579) is None:
+        problems.append(
+            "a focused field two pixels past the shrunk viewport's foot passes the keyboard "
+            "check — the one-pixel tolerance has become a coverage allowance."
+        )
     for name in ("73-discuss-preview", "74-discuss-summary",
                  "75-discuss-keyboard-closed", "76-discuss-keyboard-open",
                  "77-composer-keyboard-open"):
