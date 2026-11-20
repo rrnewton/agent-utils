@@ -756,6 +756,71 @@ def successor_nodes(
     return _run_nodes(runner, mount, "successors(" + " + ".join(nodes) + ")")
 
 
+def present_successor_nodes(runner: Runner, mount: str, node: str) -> tuple[str, ...]:
+    """Successors of one node, or empty when it is hidden or unknown.
+
+    ``present()`` keeps an unknown node from erroring (or pulling)
+    the query, so the caller can tell hidden, unknown and rewritten
+    nodes apart instead of silently dropping any of them (#1925
+    review D2/D5).
+    """
+
+    return _run_nodes(runner, mount, f"successors(present({node}))")
+
+
+def hidden_node_subject(runner: Runner, mount: str, node: str) -> str | None:
+    """The subject of a known-but-hidden node, or None when unknown."""
+
+    rc, stdout, _stderr = runner(
+        ["sl", "-R", mount, "log", "--hidden", "-r", node,
+         "-T", "{node}\n{desc|firstline}"]
+    )
+    if rc != 0:
+        return None
+    lines = stdout.splitlines()
+    if not lines or lines[0].strip() != node:
+        return None
+    return lines[1] if len(lines) > 1 else ""
+
+
+def node_is_public(runner: Runner, mount: str, node: str) -> bool:
+    """Whether ``node`` is in the store's public phase."""
+
+    return bool(_run_nodes(runner, mount, f"public() & present({node})"))
+
+
+def draft_candidate_info(
+    runner: Runner, mount: str
+) -> tuple[tuple[str, str, int, str], ...]:
+    """Store drafts outside this mount's stack: (node, author, unix date, subject).
+
+    These are the candidates a first capture must judge (#1925
+    review D1): every draft in the shared store that is not an
+    ancestor of this working copy's parent.
+    """
+
+    rc, stdout, stderr = runner(
+        ["sl", "-R", mount, "log", "-r", "draft() - ::.", "-T",
+         "{node}|{author}|{date|hgdate}|{desc|firstline}\n"]
+    )
+    if rc != 0:
+        raise EdenError(
+            f"Sapling accounting failed (sl -R {mount} log -r 'draft() - ::.'): "
+            f"{stderr.strip() or stdout.strip()}"
+        )
+    found: list[tuple[str, str, int, str]] = []
+    for line in stdout.splitlines():
+        parts = line.split("|", 3)
+        if len(parts) != 4 or not _NODE_RE.fullmatch(parts[0]):
+            continue
+        try:
+            when = int(parts[2].split()[0])
+        except (ValueError, IndexError):
+            when = 0
+        found.append((parts[0], parts[1], when, parts[3]))
+    return tuple(found)
+
+
 _DIFFREV_RE = re.compile(r"Differential Revision:\s*(?:\S*/)?D(\d+)")
 
 
@@ -767,6 +832,7 @@ def _diffrev(message: str) -> str | None:
 def classify_drafts(
     runner: Runner, mount: str, checkout_name: str, head: str,
     own_nodes: Sequence[str] | None = None,
+    own_author: str | None = None,
 ) -> dict[str, object]:
     """Classify one Eden checkout's Sapling drafts (#1702, #1925).
 
@@ -776,9 +842,15 @@ def classify_drafts(
     ``own_nodes`` given (the per-checkout ledger), only those nodes
     and their current successors are classified.  A draft is landed
     when its Differential Revision already appears in public
-    history, open when it carries a bookmark (published for review),
-    and unaccounted otherwise.  The caller's --validation text plays
-    no part: only the `sl` evidence decides.
+    history, or when the node itself is public (landed without a
+    revision), open when it carries a bookmark (published for
+    review), and unaccounted otherwise. A ledger node whose
+    successors are gone is reported as hidden (and stays
+    unaccounted) when the store still knows it hidden, and refuses
+    as unknown otherwise. With ``own_author`` given, unaccounted
+    nodes by another author are also listed as foreign ancestors.
+    The caller's --validation text plays no part: only the `sl`
+    evidence decides.
     """
 
     def run(argv: list[str]) -> str:
@@ -790,6 +862,7 @@ def classify_drafts(
             )
         return stdout
 
+    hidden: list[tuple[str, str]] = []
     if own_nodes is None:
         nodes = [
             line.strip()
@@ -799,7 +872,24 @@ def classify_drafts(
             if line.strip()
         ]
     else:
-        nodes = list(successor_nodes(runner, mount, own_nodes))
+        nodes = []
+        for ledger_node in own_nodes:
+            successors = present_successor_nodes(runner, mount, ledger_node)
+            if successors:
+                for node in successors:
+                    if node not in nodes:
+                        nodes.append(node)
+                continue
+            subject = hidden_node_subject(runner, mount, ledger_node)
+            if subject is None:
+                raise EdenError(
+                    f"Sapling ledger node {ledger_node} is not known to the "
+                    f"store at {mount}; it may have been pruned. Repair the "
+                    "ledger with 'wrkslots capture-drafts <slot> --rebuild' "
+                    "(which lists the store's candidates for explicit "
+                    "inclusion) before finishing"
+                )
+            hidden.append((ledger_node, subject))
     public_text = run(
         ["sl", "-R", mount, "log", "-r", "public()", "-l", "1000",
          "-T", "{desc}\n"]
@@ -816,21 +906,32 @@ def classify_drafts(
     }
     landed: list[tuple[str, str]] = []
     opened: list[tuple[str, str]] = []
-    unaccounted: list[tuple[str, str]] = []
+    unaccounted: list[tuple[str, str]] = list(hidden)
+    foreign: list[tuple[str, str]] = []
     for node in nodes:
         message = run(["sl", "-R", mount, "log", "-r", node, "-T", "{desc}"])
         subject = message.splitlines()[0] if message.splitlines() else ""
         rev = _diffrev(message)
         if rev is not None and rev in landed_revs:
             landed.append((node, subject))
+        elif own_nodes is not None and node_is_public(runner, mount, node):
+            landed.append((node, subject))
         elif node in open_nodes:
             opened.append((node, subject))
         else:
             unaccounted.append((node, subject))
+            if own_author is not None:
+                author = run(
+                    ["sl", "-R", mount, "log", "-r", node, "-T", "{author}"]
+                ).strip()
+                if author and author != own_author:
+                    foreign.append((node, subject))
     return {
         "checkout": checkout_name,
         "head": head,
         "landed": landed,
         "open": opened,
         "unaccounted": unaccounted,
+        "hidden": hidden,
+        "foreign": foreign,
     }

@@ -2135,6 +2135,8 @@ def test_classify_drafts_scoped_to_own_nodes() -> None:
                 return (0, f"{own_node}\n", "")
             if revset == "draft()":
                 return (0, f"{own_node}\n{other_node}\n", "")
+            if revset.startswith("public() &"):
+                return (0, "", "")
             if revset == "public()":
                 return (0, "", "")
             if revset == "bookmark()":
@@ -2162,6 +2164,8 @@ def test_classify_drafts_scoped_follows_amend_successor() -> None:
             if revset.startswith("successors("):
                 assert old_node in revset
                 return (0, f"{new_node}\n", "")
+            if revset.startswith("public() &"):
+                return (0, "", "")
             if revset == "public()":
                 return (0, "", "")
             if revset == "bookmark()":
@@ -2228,6 +2232,8 @@ def _scoped_runner(own_node: str, other_node: str) -> eden.Runner:
                 return (0, f"{own_node}\n", "")
             if revset == "draft()":
                 return (0, f"{own_node}\n{other_node}\n", "")
+            if revset.startswith("public() &"):
+                return (0, "", "")
             if revset == "public()":
                 return (0, "", "")
             if revset == "bookmark()":
@@ -2327,6 +2333,291 @@ def test_capture_ledger_create_update_and_no_seed(tmp_path: Path) -> None:
     assert ledger.last_error is not None and "daemon down" in ledger.last_error
 
 
+def test_classify_drafts_names_hidden_own_node() -> None:
+    """A hidden own draft stays unaccounted and is named as hidden."""
+    node = "a" * 40
+
+    def runner(argv: Sequence[str]) -> tuple[int, str, str]:
+        args = list(argv)
+        if "--hidden" in args:
+            return (0, f"{node}\nhidden work\n", "")
+        revset = args[args.index("-r") + 1] if "-r" in args else ""
+        if revset.startswith("successors(present("):
+            return (0, "", "")
+        if revset == "public()" or revset == "bookmark()":
+            return (0, "", "")
+        return (0, "", "")
+
+    entry = eden.classify_drafts(runner, "/m", "main", node, own_nodes=(node,))
+    assert entry["hidden"] == [(node, "hidden work")]  # type: ignore[attr-defined]
+    assert [n for n, _s in entry["unaccounted"]] == [node]  # type: ignore[attr-defined]
+    refusal = wrkslots_cli._accounting_refusal("s1", [entry])  # type: ignore[arg-type]
+    assert f"sl unhide {node}" in refusal
+
+
+def test_classify_drafts_unknown_node_refuses_with_rebuild() -> None:
+    """A ledger node the store does not know refuses, naming repair."""
+    node = "a" * 40
+
+    def runner(argv: Sequence[str]) -> tuple[int, str, str]:
+        args = list(argv)
+        if "--hidden" in args:
+            return (1, "", "unknown")
+        return (0, "", "")
+
+    with pytest.raises(eden.EdenError, match="not known to the store"):
+        eden.classify_drafts(runner, "/m", "main", node, own_nodes=(node,))
+
+
+def test_classify_drafts_public_without_revision_is_landed() -> None:
+    """A public ledger node counts landed even without a D-revision."""
+    node = "a" * 40
+
+    def runner(argv: Sequence[str]) -> tuple[int, str, str]:
+        args = list(argv)
+        revset = args[args.index("-r") + 1] if "-r" in args else ""
+        if revset.startswith("successors(present("):
+            return (0, f"{node}\n", "")
+        if revset.startswith("public() &"):
+            return (0, f"{node}\n", "")
+        if revset == "public()" or revset == "bookmark()":
+            return (0, "", "")
+        return (0, "landed silently\n", "")
+
+    entry = eden.classify_drafts(runner, "/m", "main", node, own_nodes=(node,))
+    assert [n for n, _s in entry["landed"]] == [node]  # type: ignore[attr-defined]
+    assert entry["unaccounted"] == []
+
+
+def test_classify_drafts_labels_foreign_ancestor() -> None:
+    """An unaccounted node by another author is labelled foreign."""
+    node = "a" * 40
+
+    def runner(argv: Sequence[str]) -> tuple[int, str, str]:
+        args = list(argv)
+        revset = args[args.index("-r") + 1] if "-r" in args else ""
+        if revset.startswith("successors(present("):
+            return (0, f"{node}\n", "")
+        if revset.startswith("public() &"):
+            return (0, "", "")
+        if revset == "public()" or revset == "bookmark()":
+            return (0, "", "")
+        if "{author}" in args:
+            return (0, "Other Lane <other@example.invalid>", "")
+        return (0, "foreign base\n", "")
+
+    entry = eden.classify_drafts(
+        runner, "/m", "main", node, own_nodes=(node,),
+        own_author="Own Lane <own@example.invalid>",
+    )
+    assert [n for n, _s in entry["unaccounted"]] == [node]  # type: ignore[attr-defined]
+    assert [n for n, _s in entry["foreign"]] == [node]  # type: ignore[attr-defined]
+    refusal = wrkslots_cli._accounting_refusal("s1", [entry])  # type: ignore[arg-type]
+    assert "ancestor not authored by this checkout" in refusal
+
+
+def test_capture_ledger_concurrent_captures_union(tmp_path: Path) -> None:
+    """Overlapping captures under the ledger flock lose no node."""
+    import threading
+
+    config = _scoped_config(tmp_path)
+    checkout = wrkslots_cli._checkout_from_obj(_eden_obj(), "row.checkouts[0]")
+    wrkslots_cli._capture_eden_draft_ledger(
+        config, checkout, slot="slot", generation=1,
+        runner=lambda argv: (0, "", ""), create=True,
+    )
+    nodes = [f"{index:040x}" for index in range(8)]
+    errors: list[BaseException] = []
+
+    def capture(node: str) -> None:
+        try:
+            wrkslots_cli._capture_eden_draft_ledger(
+                config, checkout, slot="slot", generation=1,
+                runner=lambda argv: (0, f"{node}\n", ""), create=False,
+            )
+        except BaseException as exc:  # noqa: BLE001 - collected and asserted
+            errors.append(exc)
+
+    threads = [threading.Thread(target=capture, args=(node,)) for node in nodes]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    ledger = wrkslots_cli._load_eden_draft_ledger(
+        wrkslots_cli._eden_draft_ledger_path(config, checkout),
+        slot="slot", checkout=checkout, generation=1,
+    )
+    assert ledger is not None and ledger.nodes == tuple(sorted(nodes))
+
+
+class _EdenDraftStub:
+    """Eden daemon stub plus a scripted Sapling store for CLI tests."""
+
+    def __init__(self) -> None:
+        self.daemon = _StubEdenDaemon([])
+        self.stack: list[str] = []
+        self.candidates: list[tuple[str, str, int, str]] = []
+        self.public_nodes: set[str] = set()
+        self.subjects: dict[str, str] = {}
+        self.authors: dict[str, str] = {}
+
+    def __call__(self, argv: Sequence[str]) -> tuple[int, str, str]:
+        args = list(argv)
+        if args[0] == "eden":
+            return self.daemon(argv)
+        if "root" in args:
+            return self.daemon(argv)
+        if "status" in args:
+            return (0, "", "")
+        revset = args[args.index("-r") + 1] if "-r" in args else ""
+        template = args[args.index("-T") + 1] if "-T" in args else ""
+        if revset == "draft() & ::.":
+            return (0, "".join(f"{node}\n" for node in self.stack), "")
+        if revset == "draft() - ::.":
+            return (0, "".join(
+                f"{node}|{author}|{when} +0000|{subject}\n"
+                for node, author, when, subject in self.candidates
+            ), "")
+        if "--hidden" in args:
+            return (1, "", "hidden")
+        if revset.startswith("successors(present("):
+            node = revset[len("successors(present("):-2]
+            return (0, f"{node}\n" if node in self.subjects else "", "")
+        if revset.startswith("public() &"):
+            node = revset.rsplit("(", 1)[-1][:-1]
+            return (0, f"{node}\n" if node in self.public_nodes else "", "")
+        if revset in ("public()", "bookmark()"):
+            return (0, "", "")
+        if template == "{author}":
+            return (0, self.authors.get(revset, ""), "")
+        if template == "{desc}":
+            return (0, self.subjects.get(revset, ""), "")
+        return (0, "", "")
+
+
+def _cli_args(root: Path, *argv: str) -> argparse.Namespace:
+    parser = wrkslots_cli._build_parser()
+    return parser.parse_args(
+        ["--project-root", str(root), "--machine", "node-a", *argv]
+    )
+
+
+def test_eden_cli_create_heartbeat_finish_and_migration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end: create, heartbeat, capture, finish (#1925 D1)."""
+    root = _eden_project(tmp_path)
+    config = wrkslots_cli._load_config(str(root), "node-a")
+    stub = _EdenDraftStub()
+    monkeypatch.setattr(wrkslots_cli, "_eden_runner", stub)
+    own, abandoned, foreign = "c" * 40, "d" * 40, "e" * 40
+    stub.subjects = {own: "own work", abandoned: "abandoned own stack",
+                     foreign: "other lane work"}
+    stub.authors = {own: "Lane <lane@example.invalid>",
+                    abandoned: "Lane <lane@example.invalid>",
+                    foreign: "Other <other@example.invalid>"}
+
+    assert wrkslots_cli._cmd_create(_eden_create_args(root)) == 0
+    record = wrkslots_cli._load_active(config).slots[0]
+    ledger_path = wrkslots_cli._eden_draft_ledger_path(config, record.checkouts[0])
+    ledger = wrkslots_cli._load_eden_draft_ledger(
+        ledger_path, slot="eden-a", checkout=record.checkouts[0], generation=1
+    )
+    assert ledger is not None and ledger.generation == 1 and ledger.nodes == ()
+
+    # The lane works; heartbeat captures its stack.
+    stub.stack = [own]
+    heartbeat = _cli_args(
+        root, "heartbeat", "eden-a", "--agent", "agent-eden",
+        "--owner-pid", str(os.getpid()), "--expected-generation", "1",
+    )
+    assert heartbeat.handler(heartbeat) == 0
+    ledger = wrkslots_cli._load_eden_draft_ledger(
+        ledger_path, slot="eden-a", checkout=record.checkouts[0], generation=1
+    )
+    assert ledger is not None and ledger.nodes == (own,)
+
+    def finish() -> argparse.Namespace:
+        return _cli_args(
+            root, "finish", "eden-a", "--agent", "agent-eden",
+            "--owner-pid", str(os.getpid()), "--expected-generation", "1",
+            "--validation", "e2e test",
+        )
+
+    args = finish()
+    with pytest.raises(wrkslots_cli.Refusal) as refused:
+        args.handler(args)
+    assert own in str(refused.value) and foreign not in str(refused.value)
+
+    # Migration: a pre-change slot has no ledger and two stacks off
+    # its current one. First capture lists and refuses; the operator
+    # includes the abandoned own stack and only that enters.
+    ledger_path.unlink()
+    stub.candidates = [
+        (abandoned, stub.authors[abandoned], 4_000_000_000, "abandoned own stack"),
+        (foreign, stub.authors[foreign], 4_000_000_000, "other lane work"),
+    ]
+    capture = _cli_args(
+        root, "capture-drafts", "eden-a", "--agent", "agent-eden",
+        "--owner-pid", str(os.getpid()), "--expected-generation", "1",
+    )
+    with pytest.raises(wrkslots_cli.Refusal) as listed:
+        capture.handler(capture)
+    assert abandoned in str(listed.value) and foreign in str(listed.value)
+    assert not ledger_path.exists()
+    capture = _cli_args(
+        root, "capture-drafts", "eden-a", "--agent", "agent-eden",
+        "--owner-pid", str(os.getpid()), "--expected-generation", "1",
+        "--include", abandoned,
+    )
+    assert capture.handler(capture) == 0
+    ledger = wrkslots_cli._load_eden_draft_ledger(
+        ledger_path, slot="eden-a", checkout=record.checkouts[0], generation=1
+    )
+    assert ledger is not None
+    assert set(ledger.nodes) == {own, abandoned} and foreign not in ledger.nodes
+
+    # Once the own drafts are public, finish passes end to end.
+    stub.public_nodes = {own, abandoned}
+    args = finish()
+    assert args.handler(args) == 0
+
+
+def test_capture_drafts_needs_owner_and_rebuild_repairs_corrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """capture-drafts refuses strangers; --rebuild repairs corruption."""
+    root = _eden_project(tmp_path)
+    config = wrkslots_cli._load_config(str(root), "node-a")
+    stub = _EdenDraftStub()
+    monkeypatch.setattr(wrkslots_cli, "_eden_runner", stub)
+    assert wrkslots_cli._cmd_create(_eden_create_args(root)) == 0
+    record = wrkslots_cli._load_active(config).slots[0]
+    ledger_path = wrkslots_cli._eden_draft_ledger_path(config, record.checkouts[0])
+
+    anonymous = _cli_args(root, "capture-drafts", "eden-a")
+    with pytest.raises(wrkslots_cli.Refusal, match="needs its owner"):
+        anonymous.handler(anonymous)
+
+    ledger_path.write_text("{corrupt", encoding="utf-8")
+    with pytest.raises(wrkslots_cli.Refusal, match="malformed JSON"):
+        wrkslots_cli._eden_scoped_draft_nodes(
+            config, record.checkouts[0], slot="eden-a", generation=1,
+            runner=stub,
+        )
+    rebuild = _cli_args(
+        root, "capture-drafts", "eden-a", "--agent", "agent-eden",
+        "--owner-pid", str(os.getpid()), "--expected-generation", "1",
+        "--rebuild",
+    )
+    assert rebuild.handler(rebuild) == 0
+    ledger = wrkslots_cli._load_eden_draft_ledger(
+        ledger_path, slot="eden-a", checkout=record.checkouts[0], generation=1
+    )
+    assert ledger is not None and ledger.nodes == ()
+
+
 def test_real_sl_shared_store_scopes_drafts(tmp_path: Path) -> None:
     """Real Sapling: two working copies, one backing store (#1925).
 
@@ -2398,3 +2689,11 @@ def test_real_sl_shared_store_scopes_drafts(tmp_path: Path) -> None:
     )
     assert [node for node, _s in entry["unaccounted"]] == [amended]  # type: ignore[attr-defined]
     assert nodes["wc2"] not in str(entry)
+
+    # A hidden own draft is named as hidden, never silently dropped.
+    run("-R", wc1, "hide", amended)
+    entry = eden.classify_drafts(
+        runner, wc1, "main", amended, own_nodes=(amended,)
+    )
+    assert entry["hidden"] == [(amended, "wc1 draft amended")]  # type: ignore[attr-defined]
+    assert [node for node, _s in entry["unaccounted"]] == [amended]  # type: ignore[attr-defined]

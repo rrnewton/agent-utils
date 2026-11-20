@@ -31300,6 +31300,28 @@ def _accounting_refusal(slot: str, entries: Sequence[Mapping[str, object]]) -> s
     ]
     for sha, subject in unaccounted:
         lines.append(f"unaccounted {sha} {subject}")
+    hidden: list[tuple[str, str]] = []
+    foreign: list[tuple[str, str]] = []
+    for entry in entries:
+        for pair in _as_commit_pairs(entry.get("hidden")):
+            if pair not in hidden:
+                hidden.append(pair)
+        for pair in _as_commit_pairs(entry.get("foreign")):
+            if pair not in foreign:
+                foreign.append(pair)
+    for sha, subject in hidden:
+        lines.append(
+            f"hidden own draft {sha} {subject}; this checkout's draft is "
+            f"hidden in Sapling, not landed: recover it with "
+            f"'sl unhide {sha}' in the checkout before finishing"
+        )
+    for sha, subject in foreign:
+        lines.append(
+            f"ancestor not authored by this checkout {sha} {subject}; "
+            "it entered this checkout's stack from another checkout: "
+            "rebase off it or let its own slot land it; "
+            "--discard-unaccounted will not discard it"
+        )
     lines.append(
         "publish or land every commit, or rerun finish with "
         "--discard-unaccounted to record and discard them"
@@ -31442,56 +31464,89 @@ def _capture_eden_draft_ledger(
     generation: int | None,
     runner: eden.Runner,
     create: bool,
+    include_nodes: Sequence[str] = (),
+    rebuild: bool = False,
+    restamp: bool = False,
 ) -> eden.DraftLedger | None:
     """Union this mount's current draft stack into its ledger.
 
-    Returns None without writing anything when no ledger exists and
-    ``create`` is false: touchpoints never seed a pre-#1925 checkout
-    silently. A failed capture is recorded as the ledger's
-    ``last_error`` (when a ledger exists or is being created) and
-    re-raised.
+    The whole read-union-write runs under the ledger's own flock
+    (``<checkout>.json.lock`` beside the ledger, #1925 review D3),
+    so overlapping heartbeat, write-handoff and finish captures
+    cannot drop each other's nodes, and a failed capture never
+    overwrites a newer list with an older one. Returns None without
+    writing anything when no ledger exists and ``create`` is false:
+    touchpoints never seed a pre-#1925 checkout silently. A failed
+    capture is recorded as the ledger's ``last_error`` (when a
+    ledger exists or is being created) and re-raised. ``rebuild``
+    discards the recorded nodes (and tolerates a corrupt ledger);
+    only capture-drafts passes it, after its candidate listing.
+    A generation mismatch refuses unless ``restamp`` is set, which
+    only the explicit capture-drafts verb passes.
     """
 
     path = _eden_draft_ledger_path(config, checkout)
-    # Generation is not checked here: a capture restamps the ledger
-    # with the caller's generation, which is how a ledger left by a
-    # previous generation of the same slot is adopted explicitly.
-    existing = _load_eden_draft_ledger(
-        path, slot=slot, checkout=checkout, generation=None
-    )
-    if existing is None and not create:
+    if not create and not rebuild and not path.exists() and not path.is_symlink():
         return None
-    mount = str(_stored_path(config, checkout.path, "checkout path"))
-    try:
-        current = eden.draft_stack_nodes(runner, mount)
-    except eden.EdenError as exc:
-        failed = eden.DraftLedger(
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _locked(path, exclusive=True, wait_seconds=None):
+        try:
+            existing = _load_eden_draft_ledger(
+                path, slot=slot, checkout=checkout, generation=None
+            )
+        except (StateError, Refusal, OSError):
+            if not rebuild:
+                raise
+            existing = None
+        if existing is None and not create and not rebuild:
+            return None
+        if (
+            existing is not None
+            and not restamp
+            and generation is not None
+            and existing.generation is not None
+            and existing.generation != generation
+        ):
+            raise StateError(
+                f"Eden draft ledger {path} belongs to generation "
+                f"{existing.generation}, not {generation}; run "
+                f"'wrkslots capture-drafts {slot}' to recapture for "
+                "this generation"
+            )
+        base_nodes = (
+            () if rebuild or existing is None else existing.nodes
+        )
+        mount = str(_stored_path(config, checkout.path, "checkout path"))
+        try:
+            current = eden.draft_stack_nodes(runner, mount)
+        except eden.EdenError as exc:
+            failed = eden.DraftLedger(
+                slot=slot,
+                checkout=checkout.name,
+                generation=generation if generation is not None else (
+                    existing.generation if existing is not None else None
+                ),
+                nodes=base_nodes,
+                captured_at=existing.captured_at if existing is not None else None,
+                last_error=str(exc),
+            )
+            try:
+                _write_eden_draft_ledger(path, failed)
+            except (OSError, Refusal, StateError):
+                pass
+            raise
+        ledger = eden.DraftLedger(
             slot=slot,
             checkout=checkout.name,
             generation=generation if generation is not None else (
                 existing.generation if existing is not None else None
             ),
-            nodes=existing.nodes if existing is not None else (),
-            captured_at=existing.captured_at if existing is not None else None,
-            last_error=str(exc),
+            nodes=tuple(sorted(set(base_nodes) | set(current) | set(include_nodes))),
+            captured_at=_utc_now(),
+            last_error=None,
         )
-        try:
-            _write_eden_draft_ledger(path, failed)
-        except (OSError, Refusal, StateError):
-            pass
-        raise
-    ledger = eden.DraftLedger(
-        slot=slot,
-        checkout=checkout.name,
-        generation=generation if generation is not None else (
-            existing.generation if existing is not None else None
-        ),
-        nodes=tuple(sorted(set(existing.nodes if existing is not None else ()) | set(current))),
-        captured_at=_utc_now(),
-        last_error=None,
-    )
-    _write_eden_draft_ledger(path, ledger)
-    return ledger
+        _write_eden_draft_ledger(path, ledger)
+        return ledger
 
 
 def _eden_scoped_draft_nodes(
@@ -31505,6 +31560,8 @@ def _eden_scoped_draft_nodes(
     """This checkout's own draft nodes for finish accounting (#1925).
 
     Captures the current stack into the existing ledger first. A
+    recorded ``last_error`` does not by itself refuse here: this
+    recapture is the retry, and only its own failure refuses. A
     checkout with no ledger predates #1925 (or was never captured):
     refuse naming the explicit first-capture command rather than
     attributing the shared store's drafts to it, or silently
@@ -31607,6 +31664,10 @@ def _assert_checkout_safe(
                     acct_entry = eden.classify_drafts(
                         _eden_runner, str(mount), safe.name, safe.head,
                         own_nodes=own_nodes,
+                        own_author=(
+                            None if config.identity is None else
+                            f"{config.identity.name} <{config.identity.email}>"
+                        ),
                     )
             except eden.EdenError as exc:
                 raise Refusal(str(exc)) from exc
@@ -46491,7 +46552,7 @@ def _provision_eden_slot(
         _write_eden_draft_ledger(
             ledger_path,
             eden.DraftLedger(
-                slot=args.slot, checkout=name, generation=None,
+                slot=args.slot, checkout=name, generation=1,
                 nodes=tuple(sorted(set(created_nodes))),
                 captured_at=_utc_now(), last_error=None,
             ),
@@ -46501,7 +46562,7 @@ def _provision_eden_slot(
             _write_eden_draft_ledger(
                 ledger_path,
                 eden.DraftLedger(
-                    slot=args.slot, checkout=name, generation=None,
+                    slot=args.slot, checkout=name, generation=1,
                     nodes=(), captured_at=None, last_error=str(exc),
                 ),
             )
@@ -49762,12 +49823,37 @@ def _cmd_release(args: argparse.Namespace) -> int:
 
 
 def _cmd_capture_drafts(args: argparse.Namespace) -> int:
-    """Explicit first (or repeat) per-checkout draft capture (#1925)."""
+    """Explicit first (or repeat) per-checkout draft capture (#1925).
+
+    Only the slot's owner or an authorised coordinator may run it.
+    A first capture (no ledger, or ``--rebuild``) lists the shared
+    store's drafts outside the current stack that date from the
+    slot's creation, and refuses until the operator includes theirs
+    by node or acknowledges that none of them are theirs: before the
+    listing is judged it writes no ledger, so an abandoned own stack
+    can never be silently orphaned by the migration itself.
+    """
 
     _reset_dead_mount_findings()
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
-    results: list[tuple[str, eden.DraftLedger, int]] = []
+    owner_fields = (args.agent, args.owner_pid, args.expected_generation)
+    if any(field is not None for field in owner_fields) and any(
+        field is None for field in owner_fields
+    ):
+        raise Refusal(
+            "capture-drafts owner authorisation needs --agent, --owner-pid "
+            "and --expected-generation together, or coordinator authorisation"
+        )
+    owner = (
+        _capture_caller_process(args.owner_pid, "owner")
+        if args.owner_pid is not None else None
+    )
+    coordinator = (
+        _capture_caller_process(args.coordinator_pid, "coordinator")
+        if getattr(args, "coordinator_pid", None) is not None else None
+    )
+    results: list[tuple[str, eden.DraftLedger, tuple[str, ...]]] = []
     with _mutation_locks(config, args.wait_lock):
         _refuse_partial_state(config)
         _assert_no_journal(config, target_slot=args.slot)
@@ -49775,33 +49861,97 @@ def _cmd_capture_drafts(args: argparse.Namespace) -> int:
         _assert_command_registry_storage(config, states, args)
         record = _find_record(_load_active(config), args.slot)
         _report_dead_for_record(config, states, record)
+        if owner is not None:
+            _assert_owner_auth(
+                record, str(args.agent), owner, int(args.expected_generation)
+            )
+        elif getattr(args, "coordinator_authorized", False):
+            if coordinator is None:
+                raise Refusal(
+                    "capture-drafts coordinator authorisation needs "
+                    "--coordinator-pid naming the live coordinator process"
+                )
+        else:
+            raise Refusal(
+                f"capture-drafts for slot {record.slot} needs its owner "
+                "(--agent, --owner-pid and --expected-generation) or a "
+                "coordinator (--coordinator-authorized --coordinator-pid). "
+                "state: REFUSED -- no ledger was written"
+            )
         eden_checkouts = [item for item in record.checkouts if item.vcs == "eden"]
         if not eden_checkouts:
             raise Refusal(
                 f"slot {record.slot} has no Eden checkout; capture-drafts "
                 "only records Sapling drafts of an Eden slot"
             )
+        try:
+            created_epoch = dt.datetime.fromisoformat(
+                record.created_at.replace("Z", "+00:00")
+            ).timestamp()
+        except ValueError:
+            created_epoch = 0.0
+        includes = tuple(args.include or ())
+        for node in includes:
+            if not re.fullmatch(r"[0-9a-f]{40}", node):
+                raise Refusal(f"--include names no Sapling commit: {node!r}")
         for checkout in eden_checkouts:
+            mount = str(_stored_path(config, checkout.path, "checkout path"))
+            ledger_path = _eden_draft_ledger_path(config, checkout)
+            first = args.rebuild or not ledger_path.exists()
+            chosen: tuple[str, ...] = ()
+            if first or includes:
+                try:
+                    candidates = eden.draft_candidate_info(_eden_runner, mount)
+                except eden.EdenError as exc:
+                    raise Refusal(
+                        f"draft capture for checkout {checkout.name} failed: {exc}"
+                    ) from exc
+                recent = [item for item in candidates if item[2] >= created_epoch]
+                older = len(candidates) - len(recent)
+                by_node = {item[0]: item for item in candidates}
+                for node in includes:
+                    if node not in by_node:
+                        raise Refusal(
+                            f"--include node {node} is not a draft outside "
+                            f"checkout {checkout.name}'s current stack in its "
+                            "shared store; include only a listed candidate"
+                        )
+                if recent and not includes and not args.none_of_these_are_mine:
+                    lines = [
+                        f"first draft capture for slot {record.slot} checkout "
+                        f"{checkout.name}: the shared store holds "
+                        f"{len(recent)} draft(s) outside the current stack "
+                        f"dated from the slot's creation ({older} older "
+                        "draft(s) are not listed and cannot be this slot's):"
+                    ]
+                    for node, author, _when, subject in recent:
+                        lines.append(f"candidate {node} author={author} {subject}")
+                    lines.append(
+                        "state: REFUSED -- no ledger was written. Judge the "
+                        "list: rerun with '--include NODE' for each draft "
+                        "that is this slot's (repeatable), or with "
+                        "'--none-of-these-are-mine' when none of them is"
+                    )
+                    raise Refusal("\n".join(lines))
+                chosen = includes
             try:
                 captured = _capture_eden_draft_ledger(
                     config, checkout, slot=record.slot,
                     generation=record.generation, runner=_eden_runner,
-                    create=True,
+                    create=True, include_nodes=chosen,
+                    rebuild=bool(args.rebuild), restamp=True,
                 )
-                if captured is None:  # create=True always writes one
-                    raise StateError("draft capture wrote no ledger")
-                mount = str(_stored_path(config, checkout.path, "checkout path"))
-                store_total = len(eden.all_draft_nodes(_eden_runner, mount))
             except eden.EdenError as exc:
                 raise Refusal(
                     f"draft capture for checkout {checkout.name} failed: {exc}"
                 ) from exc
-            results.append((checkout.name, captured, store_total))
-    for name, captured, store_total in results:
+            if captured is None:  # create=True always writes one
+                raise StateError("draft capture wrote no ledger")
+            results.append((checkout.name, captured, chosen))
+    for name, captured, chosen in results:
         print(
             f"captured-drafts slot={args.slot} checkout={name} "
-            f"nodes={len(captured.nodes)} store_drafts={store_total} "
-            f"not_attributed={max(store_total - len(captured.nodes), 0)}"
+            f"nodes={len(captured.nodes)} included={len(chosen)}"
         )
         for node in captured.nodes:
             print(f"captured {node}")
@@ -66736,6 +66886,30 @@ def _cmd_finish(args: argparse.Namespace) -> int:
                     message += "\n" + _unpushed_refusal(final, path, final.head, vcs)
             raise Refusal(message)
         if unaccounted and discard:
+            # Eden drafts have no Git bundle to preserve them with:
+            # never run the Git discard branch on a Sapling mount,
+            # and never record another checkout's ancestor (or any
+            # Eden draft) as this slot's discard (#1925 review D4).
+            eden_bad = [
+                final.name
+                for final in final_checkouts
+                if final.vcs == "eden"
+                and any(
+                    sha in {node for node, _s in unaccounted}
+                    for item in accounting_sink
+                    if item["checkout"] == final.name
+                    for sha, _subject in _as_commit_pairs(item["unaccounted"])
+                )
+            ]
+            if eden_bad:
+                raise Refusal(
+                    f"Eden checkout(s) {', '.join(eden_bad)} have unaccounted "
+                    "Sapling drafts; --discard-unaccounted applies to Git "
+                    "checkouts only and cannot discard them. state: REFUSED "
+                    "-- no handoff was recorded. remedy: land or publish "
+                    "the named drafts, then rerun finish without "
+                    "--discard-unaccounted"
+                )
             # Preserve the discarded history before recording the discard,
             # in the same local salvage archive removal uses (#1364).
             discarded = tuple(sha for sha, _subject in unaccounted)
@@ -99555,6 +99729,35 @@ usage or audit gate unknown, 3 fail-closed refusal.
         formatter_class=_HelpFormatter,
     )
     capture_drafts.add_argument("slot", help="active slot name")
+    capture_drafts.add_argument(
+        "--include", action="append", metavar="NODE",
+        help="a listed candidate draft that is this slot's (repeatable); first capture only",
+    )
+    capture_drafts.add_argument(
+        "--none-of-these-are-mine", action="store_true",
+        help="acknowledge that no listed candidate draft is this slot's; first capture only",
+    )
+    capture_drafts.add_argument(
+        "--rebuild", action="store_true",
+        help="discard the recorded ledger (repairing a corrupt one) and capture again "
+        "through the first-capture candidate listing",
+    )
+    capture_drafts.add_argument("--agent", metavar="AGENT", help="recorded agent name (owner authorisation)")
+    capture_drafts.add_argument(
+        "--owner-pid", type=int, metavar="PID", help="recorded live owner PID (owner authorisation)"
+    )
+    capture_drafts.add_argument(
+        "--expected-generation", type=int, metavar="N",
+        help="current slot generation (owner authorisation)",
+    )
+    capture_drafts.add_argument(
+        "--coordinator-authorized", action="store_true",
+        help="confirm coordinator authorisation (with --coordinator-pid)",
+    )
+    capture_drafts.add_argument(
+        "--coordinator-pid", type=int, metavar="PID",
+        help="live coordinator process PID (coordinator authorisation)",
+    )
     capture_drafts.set_defaults(handler=_cmd_capture_drafts)
 
     release = subparsers.add_parser(

@@ -2999,18 +2999,42 @@ drafts; wrkslots therefore records each checkout's draft stack
 (the draft ancestors of its working-copy parent) in a ledger
 under the slot's `.eden-state/wrkslots-drafts/` at create,
 heartbeat, write-handoff and finish, and accounts only those
-nodes and their rewrites. A slot created before this accounting
-has no ledger: finish refuses it, naming
-`wrkslots capture-drafts <slot>`, which the operator runs once
-with the checkout on its own draft tip as the explicit first
-capture. Drafts another checkout left in the shared store are
-never this slot's unaccounted work and can never be discarded
-as this slot's. One window remains: a wholly new stack built
-off a public revision and abandoned between captures, with the
-working copy never returning to it, is not in the ledger. Those
-commits stay in the shared backing store (finish missing them
-loses accounting, not the commits themselves), and a later
-`capture-drafts` from that stack's tip still records them.
+nodes and their rewrites (each capture is serialised by a
+`<checkout>.json.lock` file beside the ledger). A draft that
+became public counts landed even without a Differential
+Revision; a ledger draft that is now hidden stays unaccounted
+and finish names it with the `sl unhide` recovery. A node the
+store no longer knows refuses with the repair:
+`wrkslots capture-drafts <slot> --rebuild`.
+
+For a slot created after this accounting, one window remains:
+a wholly new stack built off a public revision and abandoned
+between captures, with the working copy never returning to it,
+is not in the ledger. Those commits stay in the shared backing
+store (finish missing them loses accounting, not the commits
+themselves), and a later `capture-drafts` from that stack's
+tip still records them.
+
+A slot created before this accounting has no ledger, and for
+it the window is wider: everything off the working copy's
+current stack at the first capture. Finish therefore refuses
+it, naming `wrkslots capture-drafts <slot>` (owner or
+coordinator only). That first capture lists the shared store's
+drafts outside the current stack that date from the slot's
+creation and writes nothing until the operator includes theirs
+with `--include NODE` (repeatable) or acknowledges
+`--none-of-these-are-mine`; drafts older than the slot are
+counted, not listed, and cannot be the slot's.
+
+Drafts of another checkout are not this slot's unaccounted
+work merely for sharing the store, and `--discard-unaccounted`
+never discards an Eden draft (it applies to Git checkouts
+only). One exception is labelled at finish: if this checkout
+stacked, rebased or moved onto another checkout's draft, that
+draft is in this ledger as an ancestor; finish labels it
+"ancestor not authored by this checkout", still refuses on
+it, and `--discard-unaccounted` will not discard it — rebase
+off it, or let its own slot land it.
 
 Retirement is `wrkslots remove <slot> --coordinator-pid <pid>
 --expected-generation N` (there is no `retire` verb;
