@@ -685,6 +685,10 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
   const outer = createListening();
   let wiredOuter = false;
   let loadingOlder = false;
+  // Whether the last render put a captured place back (`#1999`): a refresh
+  // whose redraw already restored the reader's relative place must not be
+  // overwritten by the absolute offset the refresh captured before its reads.
+  let anchoredOnRender = false;
   let totalNow = 0;
 
   /** The shared scroller, where the page has one; null in a host without it. */
@@ -887,10 +891,10 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
    * and nothing ever lands the list at its top. One measured nudge through
    * the scroll owner, only where the redraw actually moved the card.
    */
-  function restoreAnchor(capture: { key: string; tops: Map<string, number>; order: string[] } | null): void {
-    if (!capture) return;
+  function restoreAnchor(capture: { key: string; tops: Map<string, number>; order: string[] } | null): boolean {
+    if (!capture) return false;
     const scroller = scrollerOrNull();
-    if (!scroller || !listOnScreen()) return;
+    if (!scroller || !listOnScreen()) return false;
     const now = new Map<string, number>();
     for (const card of cardElements()) {
       const rect = usableRect(card.element);
@@ -906,15 +910,48 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
         if (now.has(capture.order[i]!)) key = capture.order[i]!;
       }
     }
-    if (key === null) return;
+    if (key === null) return false;
     const before = capture.tops.get(key);
     const after = now.get(key);
-    if (before === undefined || after === undefined) return;
+    if (before === undefined || after === undefined) return false;
     const delta = after - before;
     if (delta !== 0) deps.nudge(scroller, delta);
+    return true;
+  }
+
+  /**
+   * One named card's place (`#1999 vibe-talk-documents-download-jump`): its
+   * top in viewport coordinates, or null where it is not drawn measurably.
+   * A download tap holds its own card, not just whichever card stands at
+   * the band's top: the fetch-state redraws that follow must not move the
+   * card under the reader's finger, however the rows above it reflow.
+   */
+  function captureCardPlace(key: string): { key: string; top: number } | null {
+    for (const card of cardElements()) {
+      if (card.key !== key) continue;
+      const rect = usableRect(card.element);
+      return rect ? { key, top: rect.top } : null;
+    }
+    return null;
+  }
+
+  /** Put a captured card back at its top, by one measured nudge where it moved. */
+  function restoreCardPlace(place: { key: string; top: number } | null): void {
+    if (!place) return;
+    const scroller = scrollerOrNull();
+    if (!scroller || !listOnScreen()) return;
+    for (const card of cardElements()) {
+      if (card.key !== place.key) continue;
+      const rect = usableRect(card.element);
+      if (!rect) return;
+      const delta = rect.top - place.top;
+      if (delta !== 0) deps.nudge(scroller, delta);
+      return;
+    }
   }
 
   function render(rows: readonly DocumentRow[], keepAnchor = true): void {
+    anchoredOnRender = false;
     const anchor = keepAnchor ? captureAnchor() : null;
     rowsNow = dedupeDocumentRows(rows).sort(byOldest);
     listening.unmount();
@@ -965,7 +1002,7 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
     // captured above back before anything else reads the scroller. A caller
     // landing somewhere named (a refresh's follow or recorded place) writes
     // after this and wins, as it always has.
-    restoreAnchor(anchor);
+    anchoredOnRender = restoreAnchor(anchor);
     // Arrow keys walk the cards; Enter opens (above).
     listening.listen(list, "keydown", (event: KeyboardEvent) => {
       if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
@@ -1017,13 +1054,31 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
 
   async function fetchOnly(row: DocumentRow): Promise<void> {
     if (busy.has(row.key) || row.fetched) return;
+    // Hold the tapped card across every state change this tap causes
+    // (`#1999`): the busy redraw, the error redraw, and the success
+    // refresh (whose re-read can re-title cards and grow them) each get
+    // the card put back at the top the tap found it at.
+    const place = captureCardPlace(row.key);
+    const hadError = errors.has(row.key);
     busy.add(row.key);
     errors.delete(row.key);
     render(rowsNow);
+    restoreCardPlace(place);
     const ok = await fetchRow(row);
     busy.delete(row.key);
-    if (ok) await refresh();
-    else render(rowsNow);
+    if (ok) {
+      try {
+        await refresh();
+      } finally {
+        restoreCardPlace(place);
+      }
+      // A retry that lands replaces the failure it retried (`#1999`): the
+      // status line must not go on saying the fetched document failed.
+      if (hadError) deps.onStatus?.(`Fetched ${row.file_name}.`);
+    } else {
+      render(rowsNow);
+      restoreCardPlace(place);
+    }
   }
 
   async function open(row: DocumentRow): Promise<void> {
@@ -1032,13 +1087,16 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
       deps.onOpen(row.key);
       return;
     }
+    const place = captureCardPlace(row.key);
     busy.add(row.key);
     errors.delete(row.key);
     render(rowsNow);
+    restoreCardPlace(place);
     const ok = await fetchRow(row);
     busy.delete(row.key);
     if (!ok) {
       render(rowsNow);
+      restoreCardPlace(place);
       return;
     }
     deps.onOpen(row.key);
@@ -1091,7 +1149,12 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
     }
     render(fresh);
     if (scroller && listOnScreen()) {
-      if (follow) deps.toFoot(scroller); else deps.toPosition(scroller, top);
+      if (follow) deps.toFoot(scroller);
+      // A named place (Back) always wins. Otherwise the redraw's own
+      // relative anchor (`#1908`) already holds the reader where the
+      // reflow left them; the absolute offset captured before the reads
+      // would undo it wherever a card above changed height (`#1999`).
+      else if (place || !anchoredOnRender) deps.toPosition(scroller, top);
     }
   }
 

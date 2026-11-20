@@ -614,7 +614,9 @@ test("documents list: a refresh keeps the paged-in window, so Back restores the 
 // A list whose cards report a real layout: each card is 100px tall in document
 // order, the scroller shows a 100px band, and a card's rect is its place in
 // the document less the scroll offset — so anchor arithmetic is observable.
-async function withMeasuredList(answer, run) {
+// With `growOnFetch`, a fetched card stands 160px tall where an unfetched
+// one stands 100px: a fetched title wrapping onto extra lines, in geometry.
+async function withMeasuredList(answer, run, { growOnFetch = false } = {}) {
   const mod = requireModule(LIST, "src/view/documents/list.ts");
   assert.equal(typeof mod.createDocumentsList, "function", "list does not export createDocumentsList");
   const listEl = fakeElement("div");
@@ -622,22 +624,26 @@ async function withMeasuredList(answer, run) {
   scroller.scrollTop = 0;
   scroller.clientHeight = 100;
   scroller.getBoundingClientRect = () => ({ top: 0, bottom: 100, left: 0, right: 100, width: 100, height: 100 });
-  const cardIndex = (el) => {
+  const heightOf = (el) => (growOnFetch && !String(el.className).includes("doc-unfetched") ? 160 : 100);
+  const cardsOf = (el) => {
     const parent = el.parentNode;
-    if (!parent) return 0;
-    return parent.children.filter((kid) => String(kid.className).includes("doc-card")).indexOf(el);
+    return parent ? parent.children.filter((kid) => String(kid.className).includes("doc-card")) : [];
   };
   const measured = (tag) => {
     const el = fakeElement(tag);
     el.getBoundingClientRect = () => {
-      const index = Math.max(0, cardIndex(el));
-      const top = index * 100 - scroller.scrollTop;
-      return { top, bottom: top + 100, left: 0, right: 100, width: 100, height: 100 };
+      const cards = cardsOf(el);
+      const index = Math.max(0, cards.indexOf(el));
+      const top = cards.slice(0, index).reduce((sum, kid) => sum + heightOf(kid), 0) - scroller.scrollTop;
+      const height = String(el.className).includes("doc-card") ? heightOf(el) : 100;
+      return { top, bottom: top + height, left: 0, right: 100, width: 100, height };
     };
     return el;
   };
   Object.defineProperty(scroller, "scrollHeight", {
-    get: () => listEl.children.filter((kid) => String(kid.className).includes("doc-card")).length * 100 + 100,
+    get: () => listEl.children
+      .filter((kid) => String(kid.className).includes("doc-card"))
+      .reduce((sum, kid) => sum + heightOf(kid), 100),
   });
   const paneDocs = fakeElement("div");
   const listView = fakeElement("div");
@@ -645,6 +651,7 @@ async function withMeasuredList(answer, run) {
     "documents-list": listEl, "scroll-area": scroller, "pane-docs": paneDocs, "docs-list-view": listView,
   })[id];
   const paths = [];
+  const statuses = [];
   const list = mod.createDocumentsList({
     nudge: (scrollerEl, delta) => { scrollerEl.scrollTop += delta; },
     toPosition: (scrollerEl, top) => { scrollerEl.scrollTop = top; },
@@ -652,7 +659,7 @@ async function withMeasuredList(answer, run) {
     api: async (path, options) => { paths.push(path); return answer(path, options); },
     byId,
     onOpen: () => {},
-    onStatus: () => {},
+    onStatus: (text) => statuses.push(text),
   });
   const savedDocument = globalThis.document;
   globalThis.document = {
@@ -667,7 +674,7 @@ async function withMeasuredList(answer, run) {
     return card ? card.getBoundingClientRect().top : null;
   };
   try {
-    await run({ list, listEl, scroller, paths, cards, topOf });
+    await run({ list, listEl, scroller, paths, cards, topOf, statuses });
   } finally {
     if (savedDocument === undefined) delete globalThis.document; else globalThis.document = savedDocument;
     list.unmount();
@@ -690,6 +697,86 @@ test("documents list: clearing a filter keeps the reader's place, never the top 
     list.setNameFilter("");
     assert.ok(Math.abs(topOf("f") - 0) <= 2, `clearing the filter moved the anchor card (top: ${topOf("f")})`);
     assert.equal(scroller.scrollTop, 500, "clearing the filter left the reader at the top of the list");
+  });
+});
+
+// A download tap holds its own card (`#1999 vibe-talk-documents-download-jump`): the
+// tapped card's fetch grows the cards (fetched titles wrap taller), another
+// card's fetch lands in the same re-read, and the refresh that follows used
+// to restore the absolute offset captured before its reads — undoing the
+// redraw's relative anchor and moving the card under the reader's finger.
+test("documents list: a download tap holds its card across the success refresh (#1999)", async () => {
+  const fetched = new Set();
+  const rows = ["a", "b", "c", "d", "e", "f"].map((key, i) => ({
+    ...docRow(key, (i + 1) * 100), fetched: false, fetched_ms: null,
+  }));
+  const answer = (path, options) => {
+    if (options?.method === "POST") {
+      const key = options.body.key;
+      fetched.add(key);
+      fetched.add("b");
+      return { fetched: [{ key, title: `${key} fetched title`, version: null, fetched_ms: 999 }] };
+    }
+    return {
+      documents: rows.map((row) => (fetched.has(row.key) ? { ...row, fetched: true, fetched_ms: 999 } : row)),
+      total: rows.length,
+    };
+  };
+  await withMeasuredList(answer, async ({ list, scroller, cards, topOf }) => {
+    await list.refresh();
+    const downloadOf = (key) => cards()
+      .find((kid) => kid.getAttribute("data-key") === key)
+      ?.children.find((kid) => String(kid.className).includes("doc-download"));
+    // Mid-list: card c at the band's top, tapped there.
+    scroller.scrollTop = 200;
+    assert.equal(topOf("c"), 0, "card c is not at the band's top before the tap");
+    await flush(dispatchClick(downloadOf("c")));
+    assert.equal(topOf("c"), 0, `the success refresh moved the tapped card (top: ${topOf("c")})`);
+    // Parked at the bottom: the newest card stands at the foot; its own
+    // fetch grows it and the follow-to-foot landing must not move it either.
+    scroller.scrollTop = scroller.scrollHeight - scroller.clientHeight;
+    const footBefore = topOf("f");
+    await flush(dispatchClick(downloadOf("f")));
+    assert.equal(topOf("f"), footBefore,
+      `the bottom success moved the tapped card (top: ${topOf("f")}, was ${footBefore})`);
+  }, { growOnFetch: true });
+});
+
+// A retry that lands replaces its failure (`#1999`): the first tap's
+// "Could not fetch" status must not survive the successful second tap.
+test("documents list: a successful retry replaces the fetch failure status (#1999)", async () => {
+  const fetched = new Set();
+  let attempts = 0;
+  const rows = ["a", "b", "c"].map((key, i) => ({
+    ...docRow(key, (i + 1) * 100), fetched: false, fetched_ms: null,
+  }));
+  const answer = (path, options) => {
+    if (options?.method === "POST") {
+      attempts += 1;
+      if (attempts === 1) throw new Error("GitHub answered 500");
+      fetched.add(options.body.key);
+      return { fetched: [{ key: options.body.key, title: "c fetched title", version: null, fetched_ms: 999 }] };
+    }
+    return {
+      documents: rows.map((row) => (fetched.has(row.key) ? { ...row, fetched: true, fetched_ms: 999 } : row)),
+      total: rows.length,
+    };
+  };
+  await withMeasuredList(answer, async ({ list, cards, statuses }) => {
+    await list.refresh();
+    const downloadOf = (key) => cards()
+      .find((kid) => kid.getAttribute("data-key") === key)
+      ?.children.find((kid) => String(kid.className).includes("doc-download"));
+    await flush(dispatchClick(downloadOf("c")));
+    assert.ok(statuses.some((text) => text.includes("Could not fetch c.md")),
+      `the failed tap said nothing (statuses: ${statuses.join(" | ")})`);
+    const failures = statuses.length;
+    await flush(dispatchClick(downloadOf("c")));
+    const after = statuses.slice(failures);
+    assert.ok(after.includes("Fetched c.md."),
+      `the successful retry did not replace the failure (statuses: ${statuses.join(" | ")})`);
+    assert.ok(!after.some((text) => text.includes("Could not fetch")),
+      `the failure status survived its retry (statuses: ${statuses.join(" | ")})`);
   });
 });
 
