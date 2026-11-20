@@ -2620,7 +2620,11 @@ test("THE SCROLLER IS SIZED BY ITS CELL ALONE, so a change beside it does not la
   // #labels-panel's own scroller, and the panel floats from #search-float
   // outside #scroll-area, so it hangs off the list no more than Discuss's do.
   const withoutLabelsFilter = withoutBars.replace(/#labels-filter-input\s*\{[^}]*position:\s*sticky[^}]*\}/, " ");
-  assert.doesNotMatch(withoutLabelsFilter, /position:\s*(fixed|sticky)/, "something now escapes the scroller's containment");
+  // The follow-up composer's exception (`#1924`): on a phone it sticks just
+  // above the ask bar inside #discuss-panel's own scroller (the panel stands
+  // outside #scroll-area), so it escapes nothing here either.
+  const withoutComposer = withoutLabelsFilter.replace(/\.discuss-compose\s*\{[^}]*position:\s*sticky[^}]*\}/, " ");
+  assert.doesNotMatch(withoutComposer, /position:\s*(fixed|sticky)/, "something now escapes the scroller's containment");
 });
 
 test("A HIDDEN PAGE POLLS NOTHING: the poll waits for it to come back, and one that came due meanwhile runs then", async () => {
