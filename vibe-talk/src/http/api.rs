@@ -876,11 +876,21 @@ fn health_body(state: &AppState) -> serde_json::Value {
             })
         })
         .collect();
+    // `#1998 vibe-talk-github-helper-health-fallback`: the GitHub login
+    // helper's standing from its startup/heartbeat check: ok, missing or
+    // failing with the `#1997` cause, and the fallback in use. It holds no
+    // token — a check drops the token it obtains and keeps only this.
+    let helper = state.documents.github_helper_report();
     serde_json::json!({
         "status": phase.status(),
         "service": "vibe-talk",
         "version": env!("CARGO_PKG_VERSION"),
         "startup_probe": phase.describe(),
+        "github_helper": {
+            "status": helper.status.as_str(),
+            "detail": helper.detail,
+            "fallback": helper.fallback_text(),
+        },
         "summarizer": {
             "overall": health.overall,
             "headline": health.headline,

@@ -527,6 +527,15 @@ enabled = true
 # downloaded still shows as downloaded after a restart.
 # github_token_file = "/run/secrets/github-documents-token"
 # github_token_command = ["gh", "auth", "token"]  # alternative to the file; never both
+# The helper is checked at startup and on a heartbeat; /healthz reports it as
+# github_helper (ok / missing / failing, with the cause, and the fallback in
+# use). When the configured helper path does not exist, these fallbacks are
+# tried in order (default: the user-local install under the home directory's
+# .local/opt/gh/usr/bin/gh, then gh on PATH); a candidate that is not a real
+# helper, or one listed in the denylist, is skipped. An empty list turns
+# fallbacks off. Placeholders only — name your own installs.
+# github_token_helper_fallbacks = ["/placeholder/home/.local/opt/gh/usr/bin/gh", "gh"]
+# github_token_helper_denylist = ["/placeholder/bin/gh-wrapper"]
 # github_raw_base = "https://raw.githubusercontent.com"
 # HTTPS proxy for the documents fetcher only, on hosts with no direct egress.
 # https_proxy = "http://fwdproxy:8080"

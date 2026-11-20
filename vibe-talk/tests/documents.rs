@@ -982,6 +982,106 @@ async fn a_private_document_loads_through_the_real_router() {
 }
 
 #[tokio::test]
+async fn a_missing_token_helper_is_named_at_the_vibe_talk_layer_through_the_router() {
+    // `#1997 vibe-talk-github-login-error-text`: the configured helper does
+    // not exist; the fetch route's answer must carry the layer-named cause
+    // unchanged, so the reader and the document row can show it verbatim.
+    let base = fake_private_github();
+    let (mut state, _discord, _elevenlabs) = testing::state_parts();
+    let index = Arc::new(Index::new(Vec::new()));
+    index.apply_message(
+        READ_CHANNEL,
+        "1000000000000000101",
+        Some(9_100),
+        "agent",
+        None,
+        "https://github.com/octo/widgets/blob/main/docs/private.md",
+    );
+    let fetcher = GithubFetcher::new(
+        TokenSource::command_with_fallbacks(
+            vec![
+                "/definitely-missing-github-helper/gh".to_owned(),
+                "auth".to_owned(),
+                "token".to_owned(),
+            ],
+            vibe_talk::documents::HelperFallbacks::disabled(),
+        ),
+        Some(base.clone()),
+        None,
+    )
+    .with_api_base(base);
+    state.documents = Arc::new(Service::new(index, Arc::new(fetcher), 100, 1 << 20));
+    let app = router(state);
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/v1/documents/fetch",
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({ "key": "github:octo/widgets@main:docs/private.md" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(
+        body["detail"],
+        "vibe-talk could not get your GitHub login: the helper /definitely-missing-github-helper/gh is missing",
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn healthz_reports_the_github_helper_standing_and_its_fallback() {
+    // `#1998 vibe-talk-github-helper-health-fallback`: after a startup-style
+    // check with a fake fallback script in a temp dir, /healthz names the
+    // standing and surfaces "using fallback <path>" — never the token.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir =
+            std::env::temp_dir().join(format!("documents-healthz-helper-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let good = dir.join("gh-good");
+        std::fs::write(&good, "#!/bin/sh\necho fake-token-1998\n").expect("fake helper");
+        std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake helper");
+        let (mut state, _discord, _elevenlabs) = testing::state_parts();
+        let index = Arc::new(Index::new(Vec::new()));
+        let fetcher = GithubFetcher::new(
+            TokenSource::command_with_fallbacks(
+                vec![
+                    dir.join("gh-gone").to_string_lossy().into_owned(),
+                    "auth".to_owned(),
+                    "token".to_owned(),
+                ],
+                vibe_talk::documents::HelperFallbacks {
+                    candidates: vec![good.clone()],
+                    denylist: Vec::new(),
+                },
+            ),
+            None,
+            None,
+        );
+        state.documents = Arc::new(Service::new(index, Arc::new(fetcher), 100, 1 << 20));
+        let report = state.documents.check_github_helper().await;
+        assert_eq!(report.status.as_str(), "ok", "{report:?}");
+        let app = router(state);
+        let (status, body) = call(&app, "GET", "/healthz", None, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["github_helper"]["status"], "ok", "{body}");
+        assert_eq!(
+            body["github_helper"]["fallback"],
+            format!("using fallback {}", good.display()),
+            "{body}"
+        );
+        assert!(
+            !body.to_string().contains("fake-token-1998"),
+            "healthz kept a token: {body}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[tokio::test]
 async fn a_rate_limited_github_answer_is_named_as_a_rate_limit() {
     let base = fake_private_github();
     let index = Index::new(Vec::new());

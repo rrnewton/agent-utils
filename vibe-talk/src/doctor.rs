@@ -33,7 +33,9 @@ pub struct Finding {
     pub fix: String,
 }
 
-/// Check a loaded configuration. Pure: no I/O, so the same findings serve the CLI and tests.
+/// Check a loaded configuration. No network call and it never runs the
+/// GitHub helper (so no token is obtained); it only stats the configured
+/// helper path, so the same findings serve the CLI and tests.
 #[must_use]
 pub fn check(config: &Config) -> Vec<Finding> {
     let mut findings = Vec::new();
@@ -122,6 +124,31 @@ pub fn check(config: &Config) -> Vec<Finding> {
             detail: format!("the server binds {}", config.bind),
             fix: "none needed".to_owned(),
         });
+    }
+
+    // The GitHub login helper (`#1998 vibe-talk-github-helper-health-fallback`):
+    // the ops-side half of the startup/heartbeat check. This stats the path
+    // only — running the helper here would obtain a token doctor must not hold.
+    if let Some(program) = config.documents.github_token_command.first() {
+        if crate::documents::helper_program_exists(program) {
+            findings.push(Finding {
+                level: Level::Ok,
+                check: "github-helper",
+                detail: format!(
+                    "the GitHub helper {program} is present; vibe-talk checks its login at startup and on a heartbeat"
+                ),
+                fix: "none needed".to_owned(),
+            });
+        } else {
+            findings.push(Finding {
+                level: Level::Warn,
+                check: "github-helper",
+                detail: format!(
+                    "vibe-talk could not get your GitHub login: the helper {program} is missing"
+                ),
+                fix: "install the helper or repoint [documents] github_token_command at one; at startup vibe-talk tries its fallback helpers (github_token_helper_fallbacks) and /healthz reports which is in use".to_owned(),
+            });
+        }
     }
 
     if !config.channels.iter().any(|channel| channel.writable) {
@@ -304,6 +331,31 @@ writable = true
                 .any(|f| f.check == "voice" && f.level == Level::Warn),
             "findings: {}",
             render(&findings)
+        );
+    }
+
+    #[test]
+    fn a_missing_github_helper_is_named_at_the_vibe_talk_layer() {
+        let text = format!(
+            "{BASE}\n[documents]\ngithub_token_command = [\"/definitely-missing-github-helper/gh\", \"auth\", \"token\"]\n"
+        );
+        let findings = check(&config(&text));
+        let finding = findings
+            .iter()
+            .find(|f| f.check == "github-helper")
+            .expect("a github-helper finding");
+        assert_eq!(finding.level, Level::Warn);
+        assert!(
+            finding
+                .detail
+                .contains("vibe-talk could not get your GitHub login: the helper /definitely-missing-github-helper/gh is missing"),
+            "detail: {}",
+            finding.detail
+        );
+        assert!(
+            finding.fix.contains("github_token_helper_fallbacks"),
+            "fix: {}",
+            finding.fix
         );
     }
 

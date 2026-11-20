@@ -1,0 +1,20 @@
+steps:
+  # `#1997 vibe-talk-github-login-error-text` + `#1998
+  # vibe-talk-github-helper-health-fallback`: a missing GitHub helper is
+  # named at the vibe-talk layer on the document row and in the reader,
+  # with /healthz reporting it missing, against the real server (fake
+  # chat upstream) in current Chromium at 412x915 and 1280x800, light/dark.
+  - group: check
+    job: github-helper-browser
+    desc: a missing GitHub helper named on the document row and in the reader, with healthz standing, in current Chromium at 412x915 and 1280x800 in light and dark
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/github_helper_browser.py
+    jobs_flag: ""
+    deps: [build.release, setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 60
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824

@@ -1860,6 +1860,25 @@ test("documents reader: documentLoadFailure names network, rate-limit and not-fo
   }
 });
 
+test("documents reader: helper failures name vibe-talk and the real cause (#1997)", () => {
+  const { documentLoadFailure } = requireModule(READER, "src/view/documents/reader.ts");
+  const url = "https://github.com/octo/widgets/blob/main/docs/x.md";
+  const cases = [
+    "vibe-talk could not get your GitHub login: the helper /placeholder/bin/gh is missing",
+    "vibe-talk could not get your GitHub login: the helper exited 1: not logged in",
+    "vibe-talk could not get your GitHub login: the helper printed no token",
+  ];
+  for (const detail of cases) {
+    const failure = documentLoadFailure(
+      Object.assign(new Error(`HTTP 502 document_fetch_failed: ${detail}`),
+        { code: "document_fetch_failed", status: 502, detail }),
+      url);
+    assert.equal(failure.reason, detail, "the reader did not show the helper cause verbatim");
+    assert.equal(failure.href, url);
+    assert.equal(failure.linkLabel, "Open on GitHub");
+  }
+});
+
 // ---- reader kind header (`#1327 doc-reader-kind-header`) ---------------------------------------
 //
 // The header bar names what the open document IS: `github_issue` is a

@@ -229,6 +229,13 @@ pub struct DocumentsConfig {
     pub github_token_file: Option<PathBuf>,
     /// Command printing the GitHub token on stdout (an alternative to the file).
     pub github_token_command: Vec<String>,
+    /// Fallback helper programs tried in order when the configured helper
+    /// path does not exist (`#1998 vibe-talk-github-helper-health-fallback`).
+    /// `None` uses the known installs; `Some` of an empty list turns
+    /// fallbacks off.
+    pub github_token_helper_fallbacks: Option<Vec<PathBuf>>,
+    /// Fallback helper paths never used, however they answer (`#1998`).
+    pub github_token_helper_denylist: Vec<String>,
     /// Raw-content base for GitHub fetches (a fake in tests).
     pub github_raw_base: Option<String>,
     /// HTTPS proxy for the documents fetcher only (e.g. `http://fwdproxy:8080` on a
@@ -252,6 +259,8 @@ impl Default for DocumentsConfig {
         Self {
             github_token_file: None,
             github_token_command: Vec::new(),
+            github_token_helper_fallbacks: None,
+            github_token_helper_denylist: Vec::new(),
             github_raw_base: None,
             https_proxy: None,
             paste_url_prefixes: Vec::new(),
@@ -1955,6 +1964,9 @@ struct FileDocuments {
     github_token_file: Option<String>,
     #[serde(default)]
     github_token_command: Vec<String>,
+    github_token_helper_fallbacks: Option<Vec<String>>,
+    #[serde(default)]
+    github_token_helper_denylist: Vec<String>,
     github_raw_base: Option<String>,
     https_proxy: Option<String>,
     #[serde(default)]
@@ -2752,9 +2764,33 @@ fn documents_config(file: FileDocuments) -> Result<DocumentsConfig, ConfigError>
             "set github_token_file OR github_token_command, not both".to_owned(),
         ));
     }
+    let helper_fallbacks = match file.github_token_helper_fallbacks {
+        None => None,
+        Some(list) => {
+            let mut fallbacks = Vec::new();
+            for entry in list {
+                let entry = entry.trim().to_owned();
+                if entry.is_empty() {
+                    return Err(invalid(
+                        "github_token_helper_fallbacks",
+                        "an entry is empty; name a helper program or drop the entry".to_owned(),
+                    ));
+                }
+                fallbacks.push(PathBuf::from(entry));
+            }
+            Some(fallbacks)
+        }
+    };
     Ok(DocumentsConfig {
         github_token_file: path("github_token_file", file.github_token_file)?,
         github_token_command: file.github_token_command,
+        github_token_helper_fallbacks: helper_fallbacks,
+        github_token_helper_denylist: file
+            .github_token_helper_denylist
+            .iter()
+            .map(|entry| entry.trim().to_owned())
+            .filter(|entry| !entry.is_empty())
+            .collect(),
         github_raw_base: file
             .github_raw_base
             .map(|v| v.trim().to_owned())
@@ -5225,6 +5261,38 @@ provider = "slack"
         assert!(
             error.to_string().contains("github_token_command"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn documents_helper_fallbacks_load_and_can_be_turned_off() {
+        let text = format!(
+            "{FULL}\n[documents]\ngithub_token_command = [\"/placeholder/bin/gh\", \"auth\", \"token\"]\ngithub_token_helper_fallbacks = [\"/placeholder/home/.local/opt/gh/usr/bin/gh\", \"gh\"]\ngithub_token_helper_denylist = [\"/placeholder/bin/gh-wrapper\"]\n"
+        );
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid");
+        assert_eq!(
+            cfg.documents.github_token_helper_fallbacks,
+            Some(vec![
+                PathBuf::from("/placeholder/home/.local/opt/gh/usr/bin/gh"),
+                PathBuf::from("gh"),
+            ])
+        );
+        assert_eq!(
+            cfg.documents.github_token_helper_denylist,
+            ["/placeholder/bin/gh-wrapper"]
+        );
+        let off = format!(
+            "{FULL}\n[documents]\ngithub_token_command = [\"/placeholder/bin/gh\", \"auth\", \"token\"]\ngithub_token_helper_fallbacks = []\n"
+        );
+        let cfg = Config::from_toml_and_env(&off, &env(&[])).expect("valid");
+        assert_eq!(
+            cfg.documents.github_token_helper_fallbacks,
+            Some(Vec::new())
+        );
+        assert!(
+            crate::documents::HelperFallbacks::from_config(&cfg.documents)
+                .candidates
+                .is_empty()
         );
     }
 

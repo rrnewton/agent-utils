@@ -1137,6 +1137,341 @@ pub trait Fetcher: Send + Sync {
     /// The version the source now holds for `entry`, without content when the
     /// source can say cheaply; `None` when it cannot say without fetching.
     async fn current_version(&self, entry: &Entry) -> Result<Option<String>, FetchError>;
+    /// The GitHub helper's standing as last checked, without running it
+    /// (`#1998`); only the GitHub fetcher has a helper to report on.
+    fn github_helper_report(&self) -> HelperReport {
+        HelperReport::not_configured()
+    }
+    /// Check the GitHub helper now (`#1998`); only the GitHub fetcher runs one.
+    async fn check_github_helper(&self) -> HelperReport {
+        self.github_helper_report()
+    }
+}
+
+/// How the GitHub login helper stands (`#1998 vibe-talk-github-helper-health-fallback`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HelperStatus {
+    /// No helper is configured (no command, or a token file instead).
+    NotConfigured,
+    /// The helper (or its fallback) returned a token.
+    Ok,
+    /// The configured helper does not exist and no fallback worked.
+    Missing,
+    /// The helper exists but did not return a token.
+    Failing,
+}
+
+impl HelperStatus {
+    /// The word `/healthz` reports for this standing.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HelperStatus::NotConfigured => "not_configured",
+            HelperStatus::Ok => "ok",
+            HelperStatus::Missing => "missing",
+            HelperStatus::Failing => "failing",
+        }
+    }
+}
+
+/// The standing of the GitHub login helper, as `/healthz` and the ops check
+/// report it. It holds no token: a check runs the helper, drops the token it
+/// printed at once, and keeps only this outcome (`#1998`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HelperReport {
+    /// How the helper stands.
+    pub status: HelperStatus,
+    /// The cause, in the `#1997` layer-named wording; never a token.
+    pub detail: String,
+    /// The fallback helper in use, as a path only, when one is.
+    pub fallback: Option<String>,
+}
+
+impl HelperReport {
+    /// The standing when no helper command is configured.
+    #[must_use]
+    pub fn not_configured() -> Self {
+        Self {
+            status: HelperStatus::NotConfigured,
+            detail: "no GitHub helper is configured".to_owned(),
+            fallback: None,
+        }
+    }
+
+    /// The `using fallback <path>` line `/healthz` surfaces, when a fallback is in use.
+    #[must_use]
+    pub fn fallback_text(&self) -> Option<String> {
+        self.fallback
+            .as_ref()
+            .map(|path| format!("using fallback {path}"))
+    }
+}
+
+/// The fallback helpers tried, in order, when the configured helper path
+/// does not exist (`#1998`): an empty candidate list turns fallbacks off.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HelperFallbacks {
+    /// Candidate helper programs, in the order they are tried.
+    pub candidates: Vec<std::path::PathBuf>,
+    /// Candidate paths that are never used, however they answer.
+    pub denylist: Vec<String>,
+}
+
+impl HelperFallbacks {
+    /// Fallbacks off: no candidate is ever tried.
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self {
+            candidates: Vec::new(),
+            denylist: Vec::new(),
+        }
+    }
+
+    /// The fallbacks `[documents]` configuration names: its explicit list
+    /// (an empty list turns fallbacks off), else the known installs.
+    #[must_use]
+    pub fn from_config(config: &crate::config::DocumentsConfig) -> Self {
+        Self {
+            candidates: match &config.github_token_helper_fallbacks {
+                Some(list) => list.clone(),
+                None => default_helper_candidates(),
+            },
+            denylist: config.github_token_helper_denylist.clone(),
+        }
+    }
+}
+
+/// The known helper installs, in order: the user-local install under the
+/// home directory's `.local/opt/gh/usr/bin/gh`, then `gh` on `PATH` (`#1998`).
+#[must_use]
+pub fn default_helper_candidates() -> Vec<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
+        candidates.push(std::path::PathBuf::from(home).join(".local/opt/gh/usr/bin/gh"));
+    }
+    match find_on_path("gh") {
+        Some(on_path) => {
+            if !candidates.contains(&on_path) {
+                candidates.push(on_path);
+            }
+        }
+        None => candidates.push(std::path::PathBuf::from("gh")),
+    }
+    candidates
+}
+
+/// The first executable file named `name` on `PATH`, when one is there.
+fn find_on_path(name: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).find_map(|dir| {
+        let candidate = dir.join(name);
+        is_executable_file(&candidate).then_some(candidate)
+    })
+}
+
+/// Whether `program` can be found: a path is itself, a bare name is on `PATH`.
+#[must_use]
+pub fn helper_program_exists(program: &str) -> bool {
+    if program.contains('/') || program.contains('\\') {
+        std::path::Path::new(program).is_file()
+    } else {
+        find_on_path(program).is_some()
+    }
+}
+
+fn is_executable_file(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path)
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
+/// The `--user` a helper argv asks for, as `--user NAME` or `--user=NAME`.
+fn configured_user(argv: &[String]) -> Option<String> {
+    let mut args = argv.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--user" {
+            return args.next().cloned();
+        }
+        if let Some(user) = arg.strip_prefix("--user=") {
+            return Some(user.to_owned());
+        }
+    }
+    None
+}
+
+/// Whether a script candidate forces a GitHub account other than
+/// `configured`: it names a `--user` of its own that is not the configured
+/// one (or any `--user` at all when none is configured). Only scripts are
+/// read; a real helper binary is never scanned (`#1998`).
+fn script_forces_other_user(bytes: &[u8], configured: Option<&str>) -> bool {
+    if !bytes.starts_with(b"#!") {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&bytes[..bytes.len().min(8192)]);
+    let mut rest: &str = &text;
+    while let Some(at) = rest.find("--user") {
+        let after = &rest[at + "--user".len()..];
+        let value = if let Some(stripped) = after.strip_prefix('=') {
+            stripped
+        } else {
+            after.trim_start_matches([' ', '\t'])
+        };
+        let value = value
+            .trim_start_matches(['"', '\''])
+            .split(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+            .next()
+            .unwrap_or("");
+        if !value.is_empty() && configured != Some(value) {
+            return true;
+        }
+        rest = after;
+    }
+    false
+}
+
+/// Whether a fallback candidate may be tried at all: a real, executable
+/// file, not denylisted, and not a wrapper forcing another account (`#1998`).
+fn candidate_is_eligible(
+    path: &std::path::Path,
+    configured: Option<&str>,
+    denylist: &[String],
+) -> bool {
+    if denylist
+        .iter()
+        .any(|denied| denied == &path.to_string_lossy())
+    {
+        return false;
+    }
+    if !is_executable_file(path) {
+        return false;
+    }
+    match std::fs::read(path) {
+        Ok(bytes) => !script_forces_other_user(&bytes, configured),
+        Err(_) => false,
+    }
+}
+
+fn failure_detail(error: &FetchError) -> String {
+    match error {
+        FetchError::Failed(detail) => detail.clone(),
+        FetchError::Unsupported(kind) => format!("no fetcher for {kind} documents yet"),
+    }
+}
+
+fn report_for_failure(argv: &[String], detail: String) -> HelperReport {
+    let missing = argv
+        .first()
+        .is_some_and(|program| !helper_program_exists(program));
+    HelperReport {
+        status: if missing {
+            HelperStatus::Missing
+        } else {
+            HelperStatus::Failing
+        },
+        detail,
+        fallback: None,
+    }
+}
+
+/// Probe one helper argv and drop the token it prints: only the outcome is
+/// kept, and the token is never logged, stored, or returned (`#1998`).
+async fn probe_helper(argv: &[String]) -> Result<(), FetchError> {
+    run_token_command(argv).await.map(|_token| ())
+}
+
+/// Resolve the helper argv to use: the configured one when it answers, else
+/// the first eligible fallback that returns a token for the configured
+/// `--user` when the configured path does not exist (`#1998`).
+async fn resolve_helper(
+    argv: &[String],
+    fallbacks: &HelperFallbacks,
+) -> (Vec<String>, HelperReport) {
+    let Some(program) = argv.first() else {
+        return (argv.to_vec(), HelperReport::not_configured());
+    };
+    match probe_helper(argv).await {
+        Ok(()) => (
+            argv.to_vec(),
+            HelperReport {
+                status: HelperStatus::Ok,
+                detail: "the configured GitHub helper is working".to_owned(),
+                fallback: None,
+            },
+        ),
+        Err(error) => {
+            let detail = failure_detail(&error);
+            if helper_program_exists(program) {
+                return (
+                    argv.to_vec(),
+                    HelperReport {
+                        status: HelperStatus::Failing,
+                        detail,
+                        fallback: None,
+                    },
+                );
+            }
+            let user = configured_user(argv);
+            for candidate in &fallbacks.candidates {
+                let candidate_argv: Vec<String> =
+                    std::iter::once(candidate.to_string_lossy().into_owned())
+                        .chain(argv[1..].iter().cloned())
+                        .collect();
+                if candidate_argv[0] == *program {
+                    continue;
+                }
+                if !candidate_is_eligible(candidate, user.as_deref(), &fallbacks.denylist) {
+                    continue;
+                }
+                if probe_helper(&candidate_argv).await.is_ok() {
+                    let fallback = candidate_argv[0].clone();
+                    return (
+                        candidate_argv,
+                        HelperReport {
+                            status: HelperStatus::Ok,
+                            detail: format!(
+                                "the configured helper {program} is missing; using fallback {fallback}"
+                            ),
+                            fallback: Some(fallback),
+                        },
+                    );
+                }
+            }
+            (
+                argv.to_vec(),
+                HelperReport {
+                    status: HelperStatus::Missing,
+                    detail,
+                    fallback: None,
+                },
+            )
+        }
+    }
+}
+
+fn store_resolution(
+    health: &std::sync::Mutex<HelperReport>,
+    resolved: &std::sync::Mutex<Option<Vec<String>>>,
+    switch_logged: &std::sync::Mutex<bool>,
+    effective: Vec<String>,
+    report: HelperReport,
+) {
+    if let Some(fallback) = &report.fallback {
+        let mut logged = switch_logged.lock().unwrap_or_else(|p| p.into_inner());
+        if !*logged {
+            // Path only, once: never the token the fallback returned.
+            tracing::info!(fallback = %fallback, "vibe-talk github helper: using fallback helper");
+            *logged = true;
+        }
+    }
+    *resolved.lock().unwrap_or_else(|p| p.into_inner()) = Some(effective);
+    *health.lock().unwrap_or_else(|p| p.into_inner()) = report;
 }
 
 /// Where the GitHub fetcher's bearer token comes from.
@@ -1151,21 +1486,101 @@ pub enum TokenSource {
         argv: Vec<String>,
         /// The cached token and when it was fetched.
         cache: std::sync::Mutex<Option<(String, std::time::Instant)>>,
+        /// Fallback helpers tried when the configured path does not exist.
+        fallbacks: std::sync::Arc<HelperFallbacks>,
+        /// The helper's standing, from the last check or fetch.
+        health: std::sync::Arc<std::sync::Mutex<HelperReport>>,
+        /// The argv that last resolved (the configured one or a fallback).
+        resolved: std::sync::Mutex<Option<Vec<String>>>,
+        /// Whether the fallback switch was already logged (once, path only).
+        switch_logged: std::sync::Mutex<bool>,
     },
 }
+
+impl TokenSource {
+    /// A token command with the default fallback helpers.
+    #[must_use]
+    pub fn command(argv: Vec<String>) -> Self {
+        Self::command_with_fallbacks(
+            argv,
+            HelperFallbacks {
+                candidates: default_helper_candidates(),
+                denylist: Vec::new(),
+            },
+        )
+    }
+
+    /// A token command with named fallback helpers (possibly none).
+    #[must_use]
+    pub fn command_with_fallbacks(argv: Vec<String>, fallbacks: HelperFallbacks) -> Self {
+        TokenSource::Command {
+            argv,
+            cache: std::sync::Mutex::new(None),
+            fallbacks: std::sync::Arc::new(fallbacks),
+            health: std::sync::Arc::new(std::sync::Mutex::new(HelperReport::not_configured())),
+            resolved: std::sync::Mutex::new(None),
+            switch_logged: std::sync::Mutex::new(false),
+        }
+    }
+
+    /// The helper's standing as last checked, without running it.
+    #[must_use]
+    pub fn github_helper_report(&self) -> HelperReport {
+        match self {
+            TokenSource::None => HelperReport::not_configured(),
+            TokenSource::Static(_) => HelperReport {
+                status: HelperStatus::NotConfigured,
+                detail: "a GitHub token file is in use; no helper is configured".to_owned(),
+                fallback: None,
+            },
+            TokenSource::Command { health, .. } => {
+                health.lock().unwrap_or_else(|p| p.into_inner()).clone()
+            }
+        }
+    }
+
+    /// Check the helper now (startup and heartbeat, `#1998`): probe it (and
+    /// any fallback), drop every token obtained, keep only the report.
+    pub async fn check_github_helper(&self) -> HelperReport {
+        match self {
+            TokenSource::None | TokenSource::Static(_) => self.github_helper_report(),
+            TokenSource::Command {
+                argv,
+                fallbacks,
+                health,
+                resolved,
+                switch_logged,
+                ..
+            } => {
+                let (effective, report) = resolve_helper(argv, fallbacks).await;
+                store_resolution(health, resolved, switch_logged, effective, report.clone());
+                report
+            }
+        }
+    }
+}
+
+/// How often the helper heartbeat runs (`#1998`).
+pub const GITHUB_HELPER_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// How long a command token is reused before the command runs again.
 const TOKEN_COMMAND_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 /// How long a token command may run.
 const TOKEN_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// The layer every helper failure is named at (`#1997 vibe-talk-github-login-error-text`):
+/// the reader and the document row show this sentence verbatim, so it must
+/// name vibe-talk and the real cause, and never carry the token or more
+/// than the first stderr line.
+const HELPER_ERROR_PREFIX: &str = "vibe-talk could not get your GitHub login:";
+
 /// Run a token command and return its trimmed stdout. The token is never logged;
 /// a failure names only the first line of its stderr.
 async fn run_token_command(argv: &[String]) -> Result<String, FetchError> {
     let Some((program, args)) = argv.split_first() else {
-        return Err(FetchError::Failed(
-            "token command failed: no command configured".to_owned(),
-        ));
+        return Err(FetchError::Failed(format!(
+            "{HELPER_ERROR_PREFIX} no helper is configured"
+        )));
     };
     let output = tokio::time::timeout(
         TOKEN_COMMAND_TIMEOUT,
@@ -1175,18 +1590,41 @@ async fn run_token_command(argv: &[String]) -> Result<String, FetchError> {
             .output(),
     )
     .await
-    .map_err(|_| FetchError::Failed("token command failed: timed out".to_owned()))?
-    .map_err(|e| FetchError::Failed(format!("token command failed: {e}")))?;
+    .map_err(|_| FetchError::Failed(format!("{HELPER_ERROR_PREFIX} the helper timed out")))?
+    .map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            FetchError::Failed(format!(
+                "{HELPER_ERROR_PREFIX} the helper {program} is missing"
+            ))
+        } else {
+            FetchError::Failed(format!(
+                "{HELPER_ERROR_PREFIX} the helper {program} could not be run: {e}"
+            ))
+        }
+    })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let first = stderr.lines().next().unwrap_or("").trim();
-        return Err(FetchError::Failed(format!("token command failed: {first}")));
+        return Err(FetchError::Failed(match output.status.code() {
+            Some(code) if first.is_empty() => {
+                format!("{HELPER_ERROR_PREFIX} the helper exited {code}")
+            }
+            Some(code) => {
+                format!("{HELPER_ERROR_PREFIX} the helper exited {code}: {first}")
+            }
+            None if first.is_empty() => {
+                format!("{HELPER_ERROR_PREFIX} the helper exited without an exit code")
+            }
+            None => {
+                format!("{HELPER_ERROR_PREFIX} the helper exited without an exit code: {first}")
+            }
+        }));
     }
     let token = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     if token.is_empty() {
-        return Err(FetchError::Failed(
-            "token command failed: it printed no token".to_owned(),
-        ));
+        return Err(FetchError::Failed(format!(
+            "{HELPER_ERROR_PREFIX} the helper printed no token"
+        )));
     }
     Ok(token)
 }
@@ -1197,13 +1635,46 @@ impl TokenSource {
         match self {
             TokenSource::None => Ok(None),
             TokenSource::Static(token) => Ok(Some(token.clone())),
-            TokenSource::Command { argv, cache } => {
+            TokenSource::Command {
+                argv,
+                cache,
+                fallbacks,
+                health,
+                resolved,
+                switch_logged,
+            } => {
                 if let Some((token, at)) = cache.lock().unwrap_or_else(|p| p.into_inner()).clone() {
                     if at.elapsed() < TOKEN_COMMAND_TTL {
                         return Ok(Some(token));
                     }
                 }
-                let token = run_token_command(argv).await?;
+                let resolved_so_far =
+                    { resolved.lock().unwrap_or_else(|p| p.into_inner()).clone() };
+                let effective = match resolved_so_far {
+                    Some(effective) => effective,
+                    None => {
+                        let (effective, report) = resolve_helper(argv, fallbacks).await;
+                        store_resolution(
+                            health,
+                            resolved,
+                            switch_logged,
+                            effective.clone(),
+                            report,
+                        );
+                        effective
+                    }
+                };
+                let token = match run_token_command(&effective).await {
+                    Ok(token) => token,
+                    Err(error) => {
+                        // A helper that stopped answering is re-resolved on
+                        // the next ask (and by the heartbeat, `#1998`).
+                        *resolved.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                        *health.lock().unwrap_or_else(|p| p.into_inner()) =
+                            report_for_failure(&effective, failure_detail(&error));
+                        return Err(error);
+                    }
+                };
                 *cache.lock().unwrap_or_else(|p| p.into_inner()) =
                     Some((token.clone(), std::time::Instant::now()));
                 Ok(Some(token))
@@ -1721,6 +2192,14 @@ impl Fetcher for GithubFetcher {
             kind => Err(FetchError::Unsupported(kind.as_str())),
         }
     }
+
+    fn github_helper_report(&self) -> HelperReport {
+        self.token.github_helper_report()
+    }
+
+    async fn check_github_helper(&self) -> HelperReport {
+        self.token.check_github_helper().await
+    }
 }
 
 /// The paste fetcher: a configured command, run without a shell, after `--`.
@@ -1840,6 +2319,24 @@ impl Fetcher for CompositeFetcher {
             }
         }
         Err(unsupported)
+    }
+
+    fn github_helper_report(&self) -> HelperReport {
+        self.fetchers
+            .iter()
+            .map(|fetcher| fetcher.github_helper_report())
+            .find(|report| report.status != HelperStatus::NotConfigured)
+            .unwrap_or_else(HelperReport::not_configured)
+    }
+
+    async fn check_github_helper(&self) -> HelperReport {
+        for fetcher in &self.fetchers {
+            let report = fetcher.check_github_helper().await;
+            if report.status != HelperStatus::NotConfigured {
+                return report;
+            }
+        }
+        HelperReport::not_configured()
     }
 }
 
@@ -2006,10 +2503,10 @@ fn write_persisted_cache(path: &std::path::Path, docs: Vec<Fetched>) {
 #[must_use]
 pub fn token_source_from_config(config: &crate::config::DocumentsConfig) -> TokenSource {
     if !config.github_token_command.is_empty() {
-        TokenSource::Command {
-            argv: config.github_token_command.clone(),
-            cache: std::sync::Mutex::new(None),
-        }
+        TokenSource::command_with_fallbacks(
+            config.github_token_command.clone(),
+            HelperFallbacks::from_config(config),
+        )
     } else {
         match config
             .github_token_file
@@ -2253,6 +2750,19 @@ impl Service {
                 self.index.touch(&old_key);
             }
         }
+    }
+
+    /// The GitHub helper's standing as last checked, without running it (`#1998`).
+    #[must_use]
+    pub fn github_helper_report(&self) -> HelperReport {
+        self.fetcher.github_helper_report()
+    }
+
+    /// Check the GitHub helper now: startup and the heartbeat call this
+    /// (`#1998`). The token the helper prints is dropped inside the check;
+    /// only the report is kept.
+    pub async fn check_github_helper(&self) -> HelperReport {
+        self.fetcher.check_github_helper().await
     }
 
     /// How many fetched copies the cache holds.
@@ -2946,10 +3456,10 @@ mod tests {
 
     #[test]
     fn token_command_token_is_trimmed_and_cached() {
-        let source = TokenSource::Command {
-            argv: vec!["/bin/echo".to_owned(), "tok-123".to_owned()],
-            cache: std::sync::Mutex::new(None),
-        };
+        let source = TokenSource::command_with_fallbacks(
+            vec!["/bin/echo".to_owned(), "tok-123".to_owned()],
+            HelperFallbacks::disabled(),
+        );
         let first = block_on(source.token()).expect("token");
         let second = block_on(source.token()).expect("cached token");
         assert_eq!(first.as_deref(), Some("tok-123"));
@@ -2973,7 +3483,215 @@ mod tests {
         let FetchError::Failed(detail) = error else {
             panic!("wrong failure: {error}");
         };
-        assert_eq!(detail, "token command failed: first-problem");
+        assert_eq!(
+            detail,
+            "vibe-talk could not get your GitHub login: the helper exited 3: first-problem"
+        );
+        assert!(!detail.contains("second"), "full stderr leaked: {detail}");
+    }
+
+    #[test]
+    fn token_command_missing_helper_names_the_helper_at_the_vibe_talk_layer() {
+        let argv = vec![
+            "/definitely-missing-github-helper/gh".to_owned(),
+            "auth".to_owned(),
+            "token".to_owned(),
+        ];
+        let error = block_on(run_token_command(&argv)).expect_err("must fail");
+        let FetchError::Failed(detail) = error else {
+            panic!("wrong failure: {error}");
+        };
+        assert_eq!(
+            detail,
+            "vibe-talk could not get your GitHub login: the helper /definitely-missing-github-helper/gh is missing"
+        );
+    }
+
+    /// Write a fake helper script (`#1998`): fixtures only, in a temp dir.
+    #[cfg(unix)]
+    fn fake_helper(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write fake helper");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake helper");
+        path
+    }
+
+    #[cfg(unix)]
+    fn helper_temp_dir(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("documents-helper-{name}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("create helper temp dir");
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_check_reports_ok_missing_and_failing_without_keeping_a_token() {
+        let dir = helper_temp_dir("check");
+        let ok = fake_helper(&dir, "gh-ok", "echo fake-token-1998");
+        let failing = fake_helper(&dir, "gh-failing", "echo not-logged-in >&2; exit 1");
+        let empty = fake_helper(&dir, "gh-empty", "exit 0");
+        let missing = dir.join("gh-gone");
+        let cases: Vec<(Vec<String>, HelperStatus, &str)> = vec![
+            (
+                vec![
+                    ok.to_string_lossy().into_owned(),
+                    "auth".into(),
+                    "token".into(),
+                ],
+                HelperStatus::Ok,
+                "working",
+            ),
+            (
+                vec![
+                    missing.to_string_lossy().into_owned(),
+                    "auth".into(),
+                    "token".into(),
+                ],
+                HelperStatus::Missing,
+                "is missing",
+            ),
+            (
+                vec![
+                    failing.to_string_lossy().into_owned(),
+                    "auth".into(),
+                    "token".into(),
+                ],
+                HelperStatus::Failing,
+                "the helper exited 1: not-logged-in",
+            ),
+            (
+                vec![
+                    empty.to_string_lossy().into_owned(),
+                    "auth".into(),
+                    "token".into(),
+                ],
+                HelperStatus::Failing,
+                "the helper printed no token",
+            ),
+        ];
+        for (argv, status, detail_part) in cases {
+            let source = TokenSource::command_with_fallbacks(argv, HelperFallbacks::disabled());
+            let report = block_on(source.check_github_helper());
+            assert_eq!(report.status, status, "{report:?}");
+            assert!(
+                report.detail.contains(detail_part),
+                "detail: {}",
+                report.detail
+            );
+            assert_eq!(source.github_helper_report(), report);
+            assert!(
+                !format!("{report:?}").contains("fake-token-1998"),
+                "a check kept a token: {report:?}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_fallback_uses_the_first_working_candidate_and_surfaces_it() {
+        let dir = helper_temp_dir("fallback");
+        let failing = fake_helper(&dir, "gh-failing", "echo nope >&2; exit 1");
+        let good = fake_helper(&dir, "gh-good", "echo fake-token-1998");
+        let configured = vec![
+            dir.join("gh-gone").to_string_lossy().into_owned(),
+            "auth".to_owned(),
+            "token".to_owned(),
+            "--user".to_owned(),
+            "placeholder-user".to_owned(),
+        ];
+        let source = TokenSource::command_with_fallbacks(
+            configured,
+            HelperFallbacks {
+                candidates: vec![failing, good.clone()],
+                denylist: Vec::new(),
+            },
+        );
+        let report = block_on(source.check_github_helper());
+        assert_eq!(report.status, HelperStatus::Ok, "{report:?}");
+        assert_eq!(
+            report.fallback.as_deref(),
+            Some(good.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            report.fallback_text(),
+            Some(format!("using fallback {}", good.display()))
+        );
+        assert!(!report.detail.contains("fake-token-1998"), "{report:?}");
+        // The fallback is the helper fetches actually use.
+        let token = block_on(source.token()).expect("fallback token");
+        assert_eq!(token.as_deref(), Some("fake-token-1998"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_fallback_skips_denylisted_and_other_user_wrappers() {
+        let dir = helper_temp_dir("skip");
+        let wrapper = fake_helper(
+            &dir,
+            "gh-wrapper",
+            "exec /bin/echo fake-token-1998 --user other-user",
+        );
+        let denied = fake_helper(&dir, "gh-denied", "echo fake-token-1998");
+        let good = fake_helper(&dir, "gh-good", "echo fake-token-1998");
+        let configured = vec![
+            dir.join("gh-gone").to_string_lossy().into_owned(),
+            "auth".to_owned(),
+            "token".to_owned(),
+            "--user".to_owned(),
+            "placeholder-user".to_owned(),
+        ];
+        let source = TokenSource::command_with_fallbacks(
+            configured,
+            HelperFallbacks {
+                candidates: vec![wrapper, denied.clone(), good.clone()],
+                denylist: vec![denied.to_string_lossy().into_owned()],
+            },
+        );
+        let report = block_on(source.check_github_helper());
+        assert_eq!(report.status, HelperStatus::Ok, "{report:?}");
+        assert_eq!(
+            report.fallback.as_deref(),
+            Some(good.to_string_lossy().as_ref()),
+            "a wrapper for another account or a denylisted helper was used: {report:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_fallback_off_keeps_a_missing_helper_missing() {
+        let dir = helper_temp_dir("off");
+        let configured = vec![
+            dir.join("gh-gone").to_string_lossy().into_owned(),
+            "auth".to_owned(),
+            "token".to_owned(),
+        ];
+        let source = TokenSource::command_with_fallbacks(configured, HelperFallbacks::disabled());
+        let report = block_on(source.check_github_helper());
+        assert_eq!(report.status, HelperStatus::Missing, "{report:?}");
+        assert_eq!(report.fallback, None);
+        assert!(report.detail.contains("is missing"), "{}", report.detail);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn token_command_printing_no_token_is_named_at_the_vibe_talk_layer() {
+        // `/bin/true` exits 0 and prints nothing.
+        let argv = vec!["/bin/true".to_owned()];
+        let error = block_on(run_token_command(&argv)).expect_err("must fail");
+        let FetchError::Failed(detail) = error else {
+            panic!("wrong failure: {error}");
+        };
+        assert_eq!(
+            detail,
+            "vibe-talk could not get your GitHub login: the helper printed no token"
+        );
     }
 
     const SLICING_DOC: &str = "\

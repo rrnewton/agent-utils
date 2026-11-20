@@ -1131,6 +1131,41 @@ async fn main() -> anyhow::Result<()> {
         });
     }
     tokio::spawn(vibe_talk::service_health::run(state.clone()));
+    // `#1998 vibe-talk-github-helper-health-fallback`: check the documents
+    // GitHub login helper at startup, then on a heartbeat. A check drops
+    // the token it obtains; only the standing is kept, for `/healthz`, and
+    // logged here by status and cause (never a token).
+    {
+        let documents = Arc::clone(&state.documents);
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(vibe_talk::documents::GITHUB_HELPER_HEARTBEAT);
+            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                every.tick().await;
+                let report = documents.check_github_helper().await;
+                match report.status {
+                    vibe_talk::documents::HelperStatus::Ok => {
+                        tracing::info!(
+                            status = report.status.as_str(),
+                            detail = %report.detail,
+                            "github helper check passed"
+                        );
+                    }
+                    vibe_talk::documents::HelperStatus::Missing
+                    | vibe_talk::documents::HelperStatus::Failing => {
+                        tracing::warn!(
+                            status = report.status.as_str(),
+                            detail = %report.detail,
+                            "github helper check FAILED"
+                        );
+                    }
+                    vibe_talk::documents::HelperStatus::NotConfigured => {
+                        tracing::debug!("github helper check not configured");
+                    }
+                }
+            }
+        });
+    }
     // `#1848`: close the refusal watch's window when it runs out and raise
     // each all-refused route as an ERROR line, beside its standing in the
     // health answer, for the coordinator's tick to pick up.
