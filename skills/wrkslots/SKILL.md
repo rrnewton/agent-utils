@@ -204,6 +204,39 @@ lowest threshold. Follow the refusal's `audit` and `clean-caches` commands first
 floor stop builds, preserve or publish work, and reclaim space immediately. The override never
 bypasses the emergency floor.
 
+## Replace a checkpoint handoff with the final one (interim coordinator recipe)
+
+`write-handoff` publishes an immutable, generation-bound sidecar; there is no checkpoint/final
+distinction, so a lane that wrote a checkpoint handoff (for example before a reboot) cannot write
+its final one at the same generation — a different-bytes write refuses with "already has an
+immutable handoff sidecar with different contents or source provenance". Until #1975
+restore-boot-recovery adds the owner-authenticated `write-handoff --supersede-own-checkpoint`,
+the coordinator clears it with the existing verbs, in this order:
+
+```sh
+# 1. Read the checkpoint (this enqueues the slot for handoff retirement — see the window below).
+worktrees/wrkslots read-handoff slot01 --coordinator-pid "$COORDINATOR_PID" \
+  --expected-generation N
+# 2. Supersede that read: rebind the row to the lane now using the slot and advance the
+#    generation, which voids the retirement entry and orphans the checkpoint sidecar in place.
+#    A process in the lane's tree must be using the slot (cwd, descriptor, mapping or mount).
+worktrees/wrkslots supersede-handoff slot01 --agent "$AGENT" --owner-pid "$OWNER_PID" \
+  --expected-generation N --coordinator-pid "$COORDINATOR_PID" --coordinator-authorized \
+  --reason "checkpoint written pre-reboot; lane continues and will write its final handoff"
+# 3. The lane writes its final handoff at generation N+1 with the ordinary owner path.
+worktrees/wrkslots write-handoff slot01 --agent "$AGENT" --owner-pid "$OWNER_PID" \
+  --expected-generation $((N+1)) --from-file "$HANDOFF_FILE"
+```
+
+Window: between steps 1 and 2 the slot sits in the retirement queue — a concurrent removal pass
+could judge it by the checkpoint. Run steps 1 and 2 back-to-back in one coordinator turn, hold
+the slot if anything interleaves, and confirm nothing started removal. The checkpoint file is
+left on disk as audit evidence, never edited or deleted. After a reboot the lane first takes
+the row by the ordinary path (`transfer-owner` keeps the agent and generation, which is exactly
+why the sidecar name collides); steps 1–3 then run against the current generation. A schema-1
+sidecar or a legacy `HANDOFF.md` that disagrees with the final text still refuses at step 3 —
+reconcile by hand; this recipe waives neither.
+
 ## Finish and remove source
 
 While the owner is alive, `finish` proves clean Git state outside configured cache paths, trusted
