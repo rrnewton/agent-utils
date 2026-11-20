@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -495,27 +496,27 @@ def test_runner_without_a_timeout_is_refused_before_anything_runs() -> None:
     # uncapped: the signature is checked up front and the call refused.
     calls: list[list[str]] = []
 
-    def argv_only(argv: object) -> tuple[int, str, str]:
-        calls.append(list(argv))  # type: ignore[arg-type]
+    def argv_only(argv: Sequence[str]) -> tuple[int, str, str]:
+        calls.append(list(argv))
         return (1, "", "daemon is not running")
 
     with pytest.raises(eden.EdenError, match="does not accept a timeout"):
-        eden.restart_slot_daemon(argv_only, "/state", "/mount")  # type: ignore[arg-type]
+        eden.restart_slot_daemon(argv_only, "/state", "/mount")
     assert calls == [], "an uncappable runner is never invoked at all"
 
     with pytest.raises(eden.EdenError, match="does not accept a timeout"):
-        eden._run_with_timeout(argv_only, ["eden", "info", "/mount"], 15.0)  # type: ignore[arg-type]
+        eden._run_with_timeout(argv_only, ["eden", "info", "/mount"], 15.0)
     assert calls == []
 
 
 def test_runner_timeout_shapes_receive_the_cap() -> None:
     seen: list[float | None] = []
 
-    def with_timeout(argv: object, timeout: float | None = None) -> tuple[int, str, str]:
+    def with_timeout(argv: Sequence[str], timeout: float | None = None) -> tuple[int, str, str]:
         seen.append(timeout)
         return (0, "ok", "")
 
-    def with_kwargs(argv: object, **kwargs: float) -> tuple[int, str, str]:
+    def with_kwargs(argv: Sequence[str], **kwargs: float) -> tuple[int, str, str]:
         seen.append(kwargs["timeout"])
         return (0, "ok", "")
 
@@ -528,10 +529,10 @@ def test_restart_uses_the_capped_runner_for_info_and_start() -> None:
     timeouts: list[float | None] = []
     starts = 0
 
-    def runner(argv: object, timeout: float | None = None) -> tuple[int, str, str]:
+    def runner(argv: Sequence[str], timeout: float | None = None) -> tuple[int, str, str]:
         nonlocal starts
         timeouts.append(timeout)
-        args = list(argv)  # type: ignore[arg-type]
+        args = list(argv)
         if "start" in args:
             starts += 1
             return (0, "", "")
