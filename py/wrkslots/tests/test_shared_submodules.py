@@ -25,6 +25,7 @@ from wrkslots.tests.test_lifecycle import (  # noqa: E402
     create,
     finish,
     git,
+    initialize,
     make_project,
     mark_owner_dead,
     remove,
@@ -405,6 +406,146 @@ def test_doctor_silent_on_prepared_shared_submodule(tmp_path: Path) -> None:
 
     assert made.returncode == 0, made.stderr
     assert _WORKTREE_CONFIG_KIND not in _doctor_kinds(project)
+
+
+# --- Submodule repository as the slotted repository (#1941) ---
+#
+# The slotted repository can itself be a submodule: its common dir is
+# the superproject's .git/modules/<name>. Git's submodule machinery
+# (re)writes core.worktree into that shared config on connect/update,
+# so identity must never enable extensions.worktreeConfig there, even
+# when no core.worktree is present at the moment identity runs.
+
+
+def _submodule_repo_project(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A wrkslots project whose registered repository is a submodule.
+
+    Returns (project, repository, module_config): the project is the
+    superproject checkout, the repository its submodule at ``repo``,
+    and module_config the submodule's shared config under
+    ``.git/modules/repo``.
+    """
+
+    child_remote = tmp_path / "child.git"
+    child_source = tmp_path / "child-source"
+    super_remote = tmp_path / "super.git"
+    project = tmp_path / "super-clone"
+    for remote in (child_remote, super_remote):
+        subprocess.run(
+            ["git", "init", "--bare", "--initial-branch=main", str(remote)],
+            check=True, capture_output=True, text=True,
+        )
+    subprocess.run(
+        ["git", "clone", str(child_remote), str(child_source)],
+        check=True, capture_output=True, text=True,
+    )
+    git(child_source, "config", "user.name", "Wrkslots Test")
+    git(child_source, "config", "user.email", "wrkslots@example.invalid")
+    (child_source / "child.txt").write_text("child\n", encoding="utf-8")
+    git(child_source, "add", "child.txt")
+    git(child_source, "commit", "-m", "child base")
+    git(child_source, "push", "-u", "origin", "main")
+    subprocess.run(
+        ["git", "clone", str(super_remote), str(project)],
+        check=True, capture_output=True, text=True,
+    )
+    git(project, "config", "user.name", "Wrkslots Test")
+    git(project, "config", "user.email", "wrkslots@example.invalid")
+    (project / "super.txt").write_text("super\n", encoding="utf-8")
+    git(project, "add", "super.txt")
+    git(project, "commit", "-m", "super base")
+    git(
+        project, "-c", "protocol.file.allow=always",
+        "submodule", "add", str(child_remote), "repo",
+    )
+    git(project, "commit", "-am", "add child as repo")
+    git(project, "push", "-u", "origin", "main")
+    repository = project / "repo"
+    module_config = project / ".git" / "modules" / "repo" / "config"
+    initialize(project)
+    return project, repository, module_config
+
+
+def test_identity_never_enables_worktreeconfig_on_submodule_repo(
+    tmp_path: Path,
+) -> None:
+    project, repository, module_config = _submodule_repo_project(tmp_path)
+    peer = tmp_path / "peer"
+    git(repository, "worktree", "add", "-b", "codex/peer", str(peer), "HEAD")
+    # The defect's flip moment: core.worktree not yet written into the
+    # module config (a fresh materialization connects the submodule
+    # only after create). On the old code identity flips the extension
+    # here and every linked worktree breaks once Git writes the value.
+    git(repository, "config", "--unset", "core.worktree")
+    before_primary = _toplevel_and_status(repository)
+    before_peer = _toplevel_and_status(peer)
+    update_configuration(project, identity=dict(_SLOT_IDENTITY))
+
+    made = create(project)
+
+    assert made.returncode == 0, made.stderr
+    assert "identity skipped" in made.stderr
+    shared = module_config.read_text(encoding="utf-8")
+    assert "worktreeConfig" not in shared
+    slot = checkout(project)
+    assert (slot / "child.txt").read_text(encoding="utf-8") == "child\n"
+    assert _toplevel_and_status(slot) == (str(slot.resolve()), "")
+    assert _toplevel_and_status(repository) == before_primary
+    assert _toplevel_and_status(peer) == before_peer
+    status = git(project, "submodule", "status")
+    assert "cannot be used without a working tree" not in status.stdout
+    # Git (re)writes core.worktree into the module config when it
+    # reconnects the submodule; with the extension off that is the
+    # stock, harmless state and no worktree changes.
+    git(
+        project, "-c", "protocol.file.allow=always",
+        "submodule", "update", "--init", "--force", "repo",
+    )
+    shared = module_config.read_text(encoding="utf-8")
+    assert "worktreeConfig" not in shared
+    assert _toplevel_and_status(slot) == (str(slot.resolve()), "")
+    assert _toplevel_and_status(peer) == before_peer
+    assert git(project, "submodule", "status").returncode == 0
+
+
+def test_identity_on_submodule_repo_with_core_worktree_skips_not_refuses(
+    tmp_path: Path,
+) -> None:
+    project, repository, module_config = _submodule_repo_project(tmp_path)
+    assert git(repository, "config", "--get", "core.worktree").stdout.strip()
+    before_primary = _toplevel_and_status(repository)
+    update_configuration(project, identity=dict(_SLOT_IDENTITY))
+
+    made = create(project)
+
+    assert made.returncode == 0, made.stderr
+    assert "identity skipped" in made.stderr
+    assert "worktreeConfig" not in module_config.read_text(encoding="utf-8")
+    slot = checkout(project)
+    assert _toplevel_and_status(slot) == (str(slot.resolve()), "")
+    assert _toplevel_and_status(repository) == before_primary
+
+
+def test_doctor_reports_broken_shared_submodule_gitdir(tmp_path: Path) -> None:
+    project, repository, module_config = _submodule_repo_project(tmp_path)
+    update_configuration(project, identity=dict(_SLOT_IDENTITY))
+    assert create(project).returncode == 0
+    # Break it by hand: extension on while core.worktree is still in
+    # the shared submodule config.
+    git(repository, "config", "extensions.worktreeConfig", "true")
+    before = module_config.read_bytes()
+
+    result = command(project, "doctor", "--format", "json")
+
+    assert result.returncode == 0, result.stderr
+    findings = [
+        f for f in json.loads(result.stdout)["findings"]
+        if f["kind"] == _WORKTREE_CONFIG_KIND
+    ]
+    assert len(findings) == 1
+    assert "core.worktree" in str(findings[0]["detail"])
+    assert "config.worktree" in str(findings[0]["detail"])
+    assert module_config.read_bytes() == before, "doctor repaired"
 
 
 def test_plain_repo_identity_keeps_working(tmp_path: Path) -> None:

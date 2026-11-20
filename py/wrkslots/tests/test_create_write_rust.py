@@ -593,6 +593,66 @@ def test_create_identity_refusal_matches_python(tmp_path: Path) -> None:
         assert not list((root / "worktrees").glob("CREATE.*.journal"))
 
 
+def _submodule_repo_identity_fixture(base: Path) -> Path:
+    """A fixture whose repository is itself a submodule (#1941).
+
+    The superproject is `base` itself, its submodule sits at
+    `upstream-repo` (module git dir under `.git/modules/`), and the
+    wrkslots root is `base/project` with an identity configured.
+    """
+
+    root = base / "project"
+    (root / "worktrees").mkdir(parents=True)
+    (root / "live.py").write_text("# probe\n")
+    (root / ".wrkslots.yml").write_text(
+        "schema: 2\n"
+        "machine: node-a\n"
+        "worktrees_dir: worktrees\n"
+        "default_remote: origin\n"
+        "default_landed_ref: refs/remotes/origin/main\n"
+        "heartbeat_ttl_seconds: 60\n"
+        "liveness_command: live.py\n"
+        "identity: {name: Slot Bot, email: slot-bot@example.invalid}\n"
+    )
+    child = base / "child-source"
+    _repo(child)
+    _git(base, "init", "-q", "-b", "main")
+    (base / "super.txt").write_text("super\n")
+    _git(base, "add", "super.txt")
+    _git(base, "commit", "-q", "-m", "super base")
+    _git(
+        base, "-c", "protocol.file.allow=always",
+        "submodule", "add", "-q", str(child), "upstream-repo",
+    )
+    _git(base, "commit", "-q", "-m", "add upstream submodule")
+    return root
+
+
+def test_create_identity_skips_submodule_repo_matches_python(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rust_root = _submodule_repo_identity_fixture(tmp_path / "rust")
+    oracle_root = _submodule_repo_identity_fixture(tmp_path / "oracle")
+    capsys.readouterr()
+    assert _python_create(oracle_root) == 0
+    oracle_lines = _identity_lines(capsys.readouterr().err)
+    result = _rust_create(rust_root)
+    assert result.returncode == 0, result.stderr
+    assert _identity_lines(result.stderr) == oracle_lines == [
+        "identity: WARNING checkout=repo: not set: repository is a shared "
+        "submodule git dir; extensions.worktreeConfig is never enabled "
+        "there, identity skipped"
+    ]
+    assert _active_doc(rust_root) == _active_doc(oracle_root)
+    for root in (rust_root, oracle_root):
+        module_config = (
+            root.parent / ".git" / "modules" / "upstream-repo" / "config"
+        )
+        assert "worktreeConfig" not in module_config.read_text()
+        checkout = root / "worktrees" / "slot-b" / "repo"
+        assert (checkout / "file.txt").read_text() == "one\n"
+
+
 def test_create_hooks_see_the_slot_type_in_both_editions(tmp_path: Path) -> None:
     """#1122: every post-provision hook sees WRKSLOTS_SLOT_TYPE."""
 

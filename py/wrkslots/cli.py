@@ -43818,6 +43818,24 @@ def _inspect_worktree_config(
     )
 
 
+def _is_submodule_common_dir(common: Path) -> bool:
+    """Whether ``common`` is a submodule's module git dir (#1941).
+
+    That is a git dir below a superproject's ``.git/modules/``. Git's own
+    submodule machinery (re)writes ``core.worktree`` into such a config
+    whenever it connects or updates the submodule, so a state read that
+    finds no ``core.worktree`` there proves nothing about later reads:
+    enabling ``extensions.worktreeConfig`` on it is never safe, however
+    clean it looks at the moment of the flip.
+    """
+
+    parts = common.parts
+    return any(
+        first == ".git" and second == "modules"
+        for first, second in zip(parts, parts[1:])
+    )
+
+
 def _resolve_config_worktree(common: Path, value: str) -> Path:
     resolved = Path(value)
     if not resolved.is_absolute():
@@ -43844,6 +43862,13 @@ def _ensure_worktree_config_enabled(
     """
 
     state = _inspect_worktree_config(vcs, probe, common)
+    if not move_core_worktree and _is_submodule_common_dir(common):
+        # Identity never flips a submodule's module git dir (#1941): Git
+        # (re)writes core.worktree there on submodule connect/update, so
+        # even a currently clean config breaks afterwards. The explicit
+        # shared-submodule preparation (move_core_worktree) is the only
+        # caller allowed to enable the extension there.
+        raise Refusal(make_refusal(state))
     if state.shared_core_worktree is not None:
         if not move_core_worktree or main_worktree is None:
             raise Refusal(make_refusal(state))
@@ -43957,6 +43982,12 @@ def _assert_git_identity_supported(
         return
     for repository in dict.fromkeys(repositories):
         common = vcs.common_directory(repository)
+        if _is_submodule_common_dir(common):
+            # Identity is skipped (and logged) for a submodule's module
+            # git dir instead of refused (#1941): the create itself is
+            # sound, only the per-worktree identity write is unsafe
+            # there. See _apply_slot_git_identity.
+            continue
         state = _inspect_worktree_config(vcs, repository, common)
         if state.core_bare_true or state.shared_core_worktree is not None:
             raise Refusal(_identity_worktree_refusal(common / "config", state))
@@ -43985,6 +44016,14 @@ def _apply_slot_git_identity(
     directory is not private to this slot, is reported and skipped; a
     failure to set the checkout's own identity leaves the slot for
     inspection like a failed post-provision hook.
+
+    A checkout whose repository is itself a submodule (its common dir
+    lives under a superproject's ``.git/modules/``) is skipped with a
+    logged warning instead (#1941): Git's submodule machinery (re)writes
+    ``core.worktree`` into that shared config on connect and update, so
+    enabling the extension there breaks every linked worktree of the
+    submodule repository, including this fresh checkout, however clean
+    the config looks at flip time.
     """
 
     identity = config.identity
@@ -44000,18 +44039,26 @@ def _apply_slot_git_identity(
     settings = (("user.name", identity.name), ("user.email", identity.email))
     for checkout in created:
         path = _stored_path(config, checkout.path, "identity checkout path")
+        skipped_submodule_repo = False
         try:
             common = vcs.common_directory(path)
-            _ensure_worktree_config_enabled(
-                vcs, path, common,
-                main_worktree=None,
-                move_core_worktree=False,
-                make_refusal=lambda state: _identity_worktree_refusal(
-                    common / "config", state
-                ),
-            )
-            for key, value in settings:
-                vcs._run(path, ["config", "--worktree", key, value])
+            if _is_submodule_common_dir(common):
+                # Never enable extensions.worktreeConfig on a submodule's
+                # module git dir (#1941); skip this checkout's identity
+                # and log it instead. Its submodules are still visited
+                # below: private ones take a plain `git config` as usual.
+                skipped_submodule_repo = True
+            else:
+                _ensure_worktree_config_enabled(
+                    vcs, path, common,
+                    main_worktree=None,
+                    move_core_worktree=False,
+                    make_refusal=lambda state: _identity_worktree_refusal(
+                        common / "config", state
+                    ),
+                )
+                for key, value in settings:
+                    vcs._run(path, ["config", "--worktree", key, value])
             private = vcs._run(path, ["rev-parse", "--absolute-git-dir"])
         except Refusal as exc:
             raise Refusal(
@@ -44019,11 +44066,20 @@ def _apply_slot_git_identity(
                 f"slot was left for inspection with journal {journal_path}. Fix the "
                 "cause and run 'wrkslots recover'"
             ) from exc
-        print(
-            f"identity: checkout={checkout.name} worktree config: "
-            f"{identity.name} <{identity.email}>",
-            file=sys.stderr,
-        )
+        if skipped_submodule_repo:
+            print(
+                f"identity: WARNING checkout={checkout.name}: not set: "
+                "repository is a shared submodule git dir; "
+                "extensions.worktreeConfig is never enabled there, "
+                "identity skipped",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"identity: checkout={checkout.name} worktree config: "
+                f"{identity.name} <{identity.email}>",
+                file=sys.stderr,
+            )
         private_roots = (Path(private.stdout.strip()).resolve(), path.resolve())
         for relative, outcome in _set_submodule_git_identity(
             vcs, path, private_roots, settings

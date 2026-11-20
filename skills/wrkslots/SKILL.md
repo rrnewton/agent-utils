@@ -89,7 +89,11 @@ Enabling `extensions.worktreeConfig` is safe only while the repository's common 
 holds no `core.worktree`; check `git config --file <git-common-dir>/config --get core.worktree`
 first. wrkslots refuses to enable the switch while such a value remains, the shared-submodule
 preparation moves the value into the main worktree's `config.worktree`, and `wrkslots doctor`
-reports the enabled-but-unmoved state as `worktree-config-core-worktree-in-common`.
+reports the enabled-but-unmoved state as `worktree-config-core-worktree-in-common`. A
+repository that is itself a submodule (common directory under a superproject's
+`.git/modules/`) never gets the switch from identity at all, even when no `core.worktree`
+is present yet: Git (re)writes that value there on submodule connect/update, so the
+checkout's identity is skipped and logged instead of refused.
 
 Provisioning always starts with an empty per-checkout build cache; it never copies a donor cache.
 The first dependency build may therefore take many minutes instead of roughly one or two minutes,

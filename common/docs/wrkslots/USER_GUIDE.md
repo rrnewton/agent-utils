@@ -539,7 +539,14 @@ registered:
   submodule's module repository (`core.worktree=../../../<submodule>`), enabling the extension
   without moving the value makes every linked worktree resolve its top level through that one
   shared value. wrkslots refuses in that case (see below) rather than enabling the switch.
-  `user.name` and `user.email` are never written to the shared configuration;
+  One case is stricter still: a repository that is itself a submodule, whose common directory
+  lives under a superproject's `.git/modules/`, never gets the switch from identity at all.
+  Git's submodule machinery (re)writes `core.worktree` into that shared configuration whenever
+  it connects or updates the submodule, so a configuration clean at create time breaks every
+  linked worktree afterwards. For such a checkout the identity is skipped and logged
+  (`identity: WARNING checkout=...: not set: repository is a shared submodule git dir; ...`),
+  and the slot is still created. `user.name` and `user.email` are never written to the shared
+  configuration;
 - each populated submodule below the checkout, recursively, gets plain `git config user.name` and
   `user.email`. Such a submodule's Git directory lives under the slot's own Git directory, so that
   configuration is private to the slot.
@@ -564,7 +571,9 @@ through the shared `core.worktree` value, so `git status` and `git diff` there c
 changes. So when any repository in the plan has either setting in its shared configuration,
 `create` refuses before writing anything, and the refusal names the remedy: move the setting
 into the primary worktree's `config.worktree` (git-worktree(1), "CONFIGURATION FILE"), or remove
-`identity`. The shared-submodule preparation performs that move itself, for submodule module
+`identity`. A repository that is itself a submodule (common directory under `.git/modules/`)
+is the one exception: it is not refused, because Git will write `core.worktree` there itself;
+its identity is skipped and logged instead, as above. The shared-submodule preparation performs that move itself, for submodule module
 repositories, and logs it. `wrkslots doctor` reports the broken state itself — the extension on
 while `core.worktree` is still in a common configuration — as a
 `worktree-config-core-worktree-in-common` finding with the same remedy; doctor is read-only and

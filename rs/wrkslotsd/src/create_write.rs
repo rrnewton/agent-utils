@@ -110,15 +110,34 @@ fn configured_author(config: &Value) -> Option<(String, String)> {
     ))
 }
 
-fn shared_config(repo: &Path) -> Result<String> {
+fn common_dir(repo: &Path) -> Result<PathBuf> {
     let common = git(
         repo,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )?;
-    Ok(PathBuf::from(common)
+    Ok(PathBuf::from(common.trim().to_string()))
+}
+
+fn shared_config(repo: &Path) -> Result<String> {
+    Ok(common_dir(repo)?
         .join("config")
         .to_string_lossy()
         .into_owned())
+}
+
+/// Whether `common` is a submodule's module git dir: a git dir below a
+/// superproject's `.git/modules/`. Git's submodule machinery (re)writes
+/// `core.worktree` into such a config on connect/update, so enabling
+/// `extensions.worktreeConfig` there is never safe (#1941). Mirrors
+/// `_is_submodule_common_dir`.
+fn is_submodule_common_dir(common: &Path) -> bool {
+    let parts: Vec<String> = common
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    parts
+        .windows(2)
+        .any(|pair| pair[0] == ".git" && pair[1] == "modules")
 }
 
 /// One repository's worktree-config state (#1435): whether the
@@ -171,6 +190,11 @@ fn assert_author_supported(repositories: &[PathBuf]) -> Result<()> {
             continue;
         }
         seen.push(repository);
+        // Identity is skipped (and logged) for a submodule's module git
+        // dir instead of refused (#1941); see apply_author.
+        if is_submodule_common_dir(&common_dir(repository)?) {
+            continue;
+        }
         let (shared, _extension, has_core_worktree, bare_true) = worktree_config_state(repository)?;
         if bare_true || has_core_worktree {
             return Err(author_refusal(&shared, has_core_worktree, bare_true));
@@ -184,6 +208,11 @@ fn assert_author_supported(repositories: &[PathBuf]) -> Result<()> {
 /// `_ensure_worktree_config_enabled` with moving disabled.
 fn ensure_worktree_config(repo: &Path) -> Result<()> {
     let (shared, extension, has_core_worktree, bare_true) = worktree_config_state(repo)?;
+    // Identity never flips a submodule's module git dir (#1941): Git
+    // (re)writes core.worktree there on submodule connect/update.
+    if is_submodule_common_dir(&common_dir(repo)?) {
+        return Err(author_refusal(&shared, has_core_worktree, bare_true));
+    }
     if has_core_worktree || bare_true {
         return Err(author_refusal(&shared, has_core_worktree, bare_true));
     }
@@ -225,10 +254,15 @@ fn apply_author(
                 .and_then(Value::as_str)
                 .unwrap_or_default(),
         );
+        // Never enable extensions.worktreeConfig on a submodule's module
+        // git dir (#1941); skip this checkout's identity and log it.
+        let skipped_submodule_repo = is_submodule_common_dir(&common_dir(&path)?);
         let private = (|| -> Result<String> {
-            ensure_worktree_config(&path)?;
-            for (key, value) in settings {
-                git(&path, &["config", "--worktree", key, value])?;
+            if !skipped_submodule_repo {
+                ensure_worktree_config(&path)?;
+                for (key, value) in settings {
+                    git(&path, &["config", "--worktree", key, value])?;
+                }
             }
             git(&path, &["rev-parse", "--absolute-git-dir"])
         })()
@@ -238,7 +272,13 @@ fn apply_author(
                 journal_path.display()
             )
         })?;
-        eprintln!("identity: checkout={checkout_name} worktree config: {name} <{email}>");
+        if skipped_submodule_repo {
+            eprintln!(
+                "identity: WARNING checkout={checkout_name}: not set: repository is a shared submodule git dir; extensions.worktreeConfig is never enabled there, identity skipped"
+            );
+        } else {
+            eprintln!("identity: checkout={checkout_name} worktree config: {name} <{email}>");
+        }
         let canonical = |value: &Path| value.canonicalize().unwrap_or_else(|_| value.to_path_buf());
         let roots = [canonical(Path::new(&private)), canonical(&path)];
         let mut outcomes = Vec::new();
