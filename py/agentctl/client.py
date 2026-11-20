@@ -616,6 +616,13 @@ def _muse_status_mode(line: str) -> str | None:
     unknown model, effort or mode must not make an idle editor read as busy. The mode returned is
     the fourth field, or ``standard`` when Muse shows only three.
 
+    A pane too narrow for three fields squeezes the footer instead (Muse 1.4.25 at 42
+    columns): Muse keeps the model, truncated with `…`, and one tail field — the approval
+    mode at 42 columns, the effort at 30 — and drops the rest, so a two-field line whose
+    first field ends in `…` is the same footer with its mode read from the surviving tail
+    field. Two fields without the truncation mark, or a single field, still refuse: a
+    squeezed Muse footer always shows the cut (#1995 agentctl-muse-working-delivery).
+
     Rows of Muse's terminals panel (its ``main · ↓ to select`` header and its ``├``/``└`` tree
     rows, which list background shells and sub-agents) are never footers (#678
     muse-bridge-latency).
@@ -634,9 +641,14 @@ def _muse_status_mode(line: str) -> str | None:
         return None
     footer, _notice = _muse_split_notice(stripped)
     fields = [field.strip() for field in footer.split("·")]
-    if len(fields) < 3 or not all(fields):
+    if not all(fields):
         return None
-    return fields[3] if len(fields) > 3 else "standard"
+    if len(fields) >= 3:
+        return fields[3] if len(fields) > 3 else "standard"
+    # Muse's squeezed narrow footer: truncated model plus one surviving tail field.
+    if len(fields) == 2 and fields[0].endswith("…"):
+        return fields[1]
+    return None
 
 
 def _muse_footer_modes(lines: list[str]) -> tuple[str, ...]:

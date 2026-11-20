@@ -519,6 +519,13 @@ const PANEL_HEADER_HINT: &str = "↓ to select";
 /// course, and an unknown model, effort or mode must not make an idle editor read as busy. The
 /// mode returned is the fourth field, or `standard` when Muse shows only three.
 ///
+/// A pane too narrow for three fields squeezes the footer instead (Muse 1.4.25 at 42
+/// columns): Muse keeps the model, truncated with `…`, and one tail field — the approval
+/// mode at 42 columns, the effort at 30 — and drops the rest, so a two-field line whose
+/// first field ends in `…` is the same footer with its mode read from the surviving tail
+/// field. Two fields without the truncation mark, or a single field, still refuse: a
+/// squeezed Muse footer always shows the cut (#1995 agentctl-muse-working-delivery).
+///
 /// Rows of Muse's terminals panel, which sits between the bottom rule and the footer while a
 /// background shell or a sub-agent exists, are never footers: its `main · ↓ to select` header and
 /// its tree rows (`└ ◇ counter ·3  shared · Run the shell command ...`), whose `·` fields would
@@ -545,10 +552,17 @@ fn muse_status_mode(line: &str) -> Option<String> {
     }
     let (footer, _) = split_notice(line);
     let fields = footer.split('·').map(strip).collect::<Vec<_>>();
-    if fields.len() < 3 || fields.iter().any(|field| field.is_empty()) {
+    if fields.iter().any(|field| field.is_empty()) {
         return None;
     }
-    Some(fields.get(3).copied().unwrap_or("standard").to_owned())
+    if fields.len() >= 3 {
+        return Some(fields.get(3).copied().unwrap_or("standard").to_owned());
+    }
+    // Muse's squeezed narrow footer: truncated model plus one surviving tail field.
+    if fields.len() == 2 && fields[0].ends_with('…') {
+        return Some(fields[1].to_owned());
+    }
+    None
 }
 
 /// Return all structurally valid footer modes; callers require one authority.
@@ -1224,6 +1238,74 @@ mod tests {
         assert!(!muse_auto_review_idle_composer(&ambiguous));
         let choice = screen.replace("❯\n", "❯ Yes, continue\n  No, exit\n");
         assert!(!muse_idle_composer(&choice));
+    }
+
+    #[test]
+    fn squeezed_narrow_footer_is_a_muse_composer() {
+        // Captured live from Muse 1.4.25 at the 42-column pane width the
+        // lanes use (#1995 agentctl-muse-working-delivery): Muse squeezes
+        // its footer to the truncated model and one tail field, dropping
+        // effort and dir. Until this was read as a footer, every frame at
+        // this width held no recognisable composer at all.
+        let rule = "─".repeat(42);
+        let footer = "  watermelon-full-prev… · Launch overrides";
+        let idle = format!(
+            "  Muse Code 1.4.25\n\n  Skills: 83 loaded · 1 warning · 3\n  \
+             details hidden (ctrl+o to expand)\n\n{rule}\n❯\n{rule}\n{footer}\n"
+        );
+        assert_eq!(
+            muse_status_mode(footer).as_deref(),
+            Some("Launch overrides")
+        );
+        assert!(muse_idle_composer(&idle));
+        assert!(muse_verified_process_idle_composer(&idle));
+        assert_eq!(muse_verified_pane_status("working", &idle), "idle");
+        // At 30 columns the surviving tail field is the effort instead.
+        assert_eq!(
+            muse_status_mode("  watermelon-full-pre… · xhigh").as_deref(),
+            Some("xhigh")
+        );
+        // A working turn above the same squeezed footer is working, and a
+        // long paste staged in its editor is the whole composer.
+        let brief = "word ".repeat(80);
+        let brief = brief.trim();
+        let working = idle.replace(
+            "  Skills:",
+            "◈ Run sleep — running (8s · esc to interrupt)\n  Skills:",
+        );
+        assert!(!muse_verified_process_idle_composer(&working));
+        assert_eq!(muse_verified_pane_status("done", &working), "working");
+        let staged = working.replace(
+            "❯\n",
+            &format!("❯ [Pasted Content {} chars]\n", muse_paste_length(brief)),
+        );
+        assert!(muse_verified_process_paste_is_exact_composer(
+            &staged, brief
+        ));
+        assert_eq!(
+            muse_verified_process_paste_drawn(&staged, brief),
+            MusePasteDrawn::Whole
+        );
+        // A lane whose only activity is a backgrounded shell (its panel
+        // below the editor, no progress row) is idle for delivery.
+        let backgrounded = format!(
+            "◆ prior answer\n{rule}\n❯\n{rule}\nmain · ↓ to select\n\
+             └ ◇ shell · Run the shell command: sleep 300 · 2m\n{footer}\n"
+        );
+        assert!(muse_verified_process_idle_composer(&backgrounded));
+        assert_eq!(muse_verified_pane_status("done", &backgrounded), "idle");
+        // Unlike frames still refuse: no truncation mark, or one field only.
+        assert_eq!(muse_status_mode("  model · xhigh"), None);
+        assert_eq!(muse_status_mode("  watermelon-full-p…"), None);
+        // At 20 columns Muse shows the truncated model alone: still no
+        // footer, so the next narrowing keeps refusing until it is pinned.
+        let narrowest = idle
+            .replace(&rule, &"─".repeat(20))
+            .replace(footer, "  watermelon-full-p…");
+        assert!(!muse_verified_process_idle_composer(&narrowest));
+        assert!(!muse_verified_process_idle_composer(
+            &idle.replace("watermelon-full-prev…", "watermelon-full-preview")
+        ));
     }
 
     #[test]

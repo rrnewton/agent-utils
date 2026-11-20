@@ -532,6 +532,29 @@ def test_muse_launch_overrides_footer_is_an_idle_composer() -> None:
     assert not client_module.muse_idle_composer(choice)
 
 
+def test_squeezed_narrow_footer_is_a_muse_composer() -> None:
+    # Captured live from Muse 1.4.25 at the 42-column pane width the lanes
+    # use (#1995 agentctl-muse-working-delivery): Muse squeezes its footer
+    # to the truncated model and one tail field, dropping effort and dir.
+    rule = "─" * 42
+    footer = "  watermelon-full-prev… · Launch overrides"
+    idle = (
+        "  Muse Code 1.4.25\n\n  Skills: 83 loaded · 1 warning · 3\n"
+        f"  details hidden (ctrl+o to expand)\n\n{rule}\n❯\n{rule}\n{footer}\n"
+    )
+    assert client_module._muse_status_mode(footer) == "Launch overrides"
+    assert client_module.muse_idle_composer(idle)
+    assert muse_verified_process_idle_composer(idle)
+    # At 30 columns the surviving tail field is the effort instead.
+    assert client_module._muse_status_mode("  watermelon-full-pre… · xhigh") == "xhigh"
+    # Unlike frames still refuse: no truncation mark, or one field only.
+    assert client_module._muse_status_mode("  model · xhigh") is None
+    assert client_module._muse_status_mode("  watermelon-full-p…") is None
+    assert not muse_verified_process_idle_composer(
+        idle.replace("watermelon-full-prev…", "watermelon-full-preview")
+    )
+
+
 _MUSE_FRAMES = Path(__file__).resolve().parents[2] / "rs/agentctl/testdata/muse-frames.json"
 
 
