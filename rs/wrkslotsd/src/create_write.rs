@@ -372,6 +372,22 @@ fn identity_value(identity: &Identity) -> Value {
     crate::status_state::identity_to_value(identity)
 }
 
+/// Slot-created evidence (#1929): the offline reason lives only
+/// here, which old readers treat as opaque for slot-created.
+fn evidence_value(slot_type: &str, coordinator: &Identity, offline_reason: Option<&str>) -> Value {
+    let mut evidence = json!({
+        "slot_type": slot_type,
+        "coordinator_authorized": true,
+        "coordinator": identity_value(coordinator),
+    });
+    if let Some(reason) = offline_reason {
+        if let Some(object) = evidence.as_object_mut() {
+            object.insert("offline_reason".to_string(), Value::String(reason.to_string()));
+        }
+    }
+    evidence
+}
+
 fn parent_pid(pid: i64) -> Option<i64> {
     let raw = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
     let text = String::from_utf8_lossy(&raw);
@@ -752,6 +768,7 @@ pub(crate) fn create_slot(
     task_scope_invocation_id: Option<&str>,
     include_harness_checkout: bool,
     harness_checkout_reason: Option<&str>,
+    offline_reason: Option<&str>,
 ) -> Result<Value> {
     create_slot_inner(
         root,
@@ -775,6 +792,7 @@ pub(crate) fn create_slot(
         task_scope_invocation_id,
         include_harness_checkout,
         harness_checkout_reason,
+        offline_reason,
         false,
     )
 }
@@ -805,6 +823,7 @@ pub(crate) fn create_slot_text(
     task_scope_invocation_id: Option<&str>,
     include_harness_checkout: bool,
     harness_checkout_reason: Option<&str>,
+    offline_reason: Option<&str>,
 ) -> Result<Value> {
     create_slot_inner(
         root,
@@ -828,6 +847,7 @@ pub(crate) fn create_slot_text(
         task_scope_invocation_id,
         include_harness_checkout,
         harness_checkout_reason,
+        offline_reason,
         true,
     )
 }
@@ -855,6 +875,7 @@ fn create_slot_inner(
     task_scope_invocation_id: Option<&str>,
     include_harness_checkout: bool,
     harness_checkout_reason: Option<&str>,
+    offline_reason: Option<&str>,
     collect_text: bool,
 ) -> Result<Value> {
     require_fixture()?;
@@ -904,6 +925,11 @@ fn create_slot_inner(
     crate::adopt_write::validate_agent_name(agent)?;
     if task.is_empty() || purpose.is_empty() {
         return Err("task and purpose must be non-empty".to_string());
+    }
+    if let Some(reason) = offline_reason {
+        if reason.trim().is_empty() {
+            return Err("--offline-reason must be non-empty when supplied".to_string());
+        }
     }
     let owner = owner_pid.map(read_process_identity).transpose()?;
     let coordinator = read_process_identity(coordinator_pid)?;
@@ -1188,7 +1214,8 @@ fn create_slot_inner(
             }
         }
         let url_sha = format!("{:x}", Sha256::digest(url.as_bytes()));
-        if slot_type != "validate" || !starts.contains_key(name) {
+        // #1929: --offline-reason skips the create-time remote fetch.
+        if offline_reason.is_none() && (slot_type != "validate" || !starts.contains_key(name)) {
             git(
                 &repository,
                 &[
@@ -1633,11 +1660,7 @@ fn create_slot_inner(
             "revision": previous_revision + 1,
             "previous_record_sha256": Value::Null,
             "record": record,
-            "evidence": {
-                "slot_type": slot_type,
-                "coordinator_authorized": true,
-                "coordinator": identity_value(&coordinator),
-            },
+            "evidence": evidence_value(slot_type, &coordinator, offline_reason),
         }),
     )?;
     let mut document = state.clone();

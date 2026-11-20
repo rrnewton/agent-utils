@@ -43228,7 +43228,13 @@ def _create_plan(config: Config, args: argparse.Namespace, vcs: _GitVcs) -> tupl
                 f"remote {remote!r} URL differs from trusted provisioning input"
             )
         remote_url_sha256 = remote_authority.sha256
-        if args.slot_type != "validate" or name not in starts:
+        # #1929: a slot declared offline/provenance-only with
+        # --offline-reason skips the create-time remote probe
+        # (ls-remote + fetch in fetch_remote). The start ref is still
+        # verified locally below, and the remote authority is still
+        # read locally and recorded. Normal slots never skip it.
+        offline = bool(getattr(args, "offline_reason", None))
+        if not offline and (args.slot_type != "validate" or name not in starts):
             vcs.fetch_remote(repository, remote, landed_ref, remote_authority)
         vcs.assert_remote_authority(repository, remote, remote_authority)
         start = vcs.verify_ref(
@@ -45996,6 +46002,15 @@ def _cmd_create(args: argparse.Namespace) -> int:
     _validate_agent_name(args.agent)
     if not args.task or not args.purpose:
         raise Refusal("task and purpose must be non-empty")
+    offline_reason = getattr(args, "offline_reason", None)
+    if offline_reason is not None:
+        if not str(offline_reason).strip():
+            raise Refusal("--offline-reason must be non-empty when supplied")
+        if getattr(args, "eden", None):
+            raise Refusal(
+                "create --offline-reason cannot combine with --eden; Eden "
+                "provisioning contacts its backing host by design"
+            )
     _refuse_eden_image_combination(config, args)
     image_settings = _create_image_settings(config, args)
     owner = (
@@ -46576,16 +46591,22 @@ def _cmd_create(args: argparse.Namespace) -> int:
         )
         _verify_created_checkouts(config, record, vcs)
         state = _append_record(state, record)
+        # #1929: the offline reason lives only in this event's
+        # evidence, which old readers treat as opaque for
+        # slot-created; no record or journal field carries it.
+        created_evidence: dict[str, object] = {
+            "slot_type": record.slot_type,
+            "coordinator_authorized": True,
+            "coordinator": _identity_to_obj(coordinator_lease),
+        }
+        if getattr(args, "offline_reason", None):
+            created_evidence["offline_reason"] = args.offline_reason
         _write_active_state(
             config,
             state,
             action="slot-created",
             slot=record.slot,
-            evidence={
-                "slot_type": record.slot_type,
-                "coordinator_authorized": True,
-                "coordinator": _identity_to_obj(coordinator_lease),
-            },
+            evidence=created_evidence,
             event_writer=event_writer,
             previous=None if local is None else local.active,
         )
@@ -97785,6 +97806,19 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--override-disk-floor",
         action="store_true",
         help="allow create below the provisioning floor, but never below the emergency floor",
+    )
+    create.add_argument(
+        "--offline-reason",
+        metavar="TEXT",
+        default=None,
+        help=(
+            "declare this slot offline/provenance-only: skip the create-time remote "
+            "probe (ls-remote + fetch) so an unreachable remote does not refuse it. "
+            "TEXT (non-empty) is the reason, recorded only in the slot-created "
+            "event's evidence; the start ref must already resolve locally and the "
+            "remote's configured URL is still recorded. Without this flag create "
+            "always probes the remote. Cannot combine with --eden"
+        ),
     )
     create.add_argument(
         "--include-harness-checkout-i-know-this-is-heavy",

@@ -1393,6 +1393,9 @@ pub(crate) enum Lifecycle {
         /// Why a harness checkout is needed; recorded on the slot
         #[arg(long, value_name = "TEXT")]
         harness_checkout_reason: Option<String>,
+        /// Declare this slot offline/provenance-only: skip the create-time remote fetch; TEXT is recorded in the slot-created event evidence
+        #[arg(long = "offline-reason", value_name = "TEXT")]
+        offline_reason: Option<String>,
         /// Storage representation: config, worktree, or image
         #[arg(long, value_name = "KIND", default_value = "config")]
         representation: String,
@@ -1458,6 +1461,9 @@ pub(crate) enum Lifecycle {
         /// Why a harness checkout is needed; recorded on the slot
         #[arg(long, value_name = "TEXT")]
         harness_checkout_reason: Option<String>,
+        /// Declare this slot offline/provenance-only: skip the create-time remote fetch; TEXT is recorded in the slot-created event evidence
+        #[arg(long = "offline-reason", value_name = "TEXT")]
+        offline_reason: Option<String>,
         /// Storage representation: config, worktree, or image
         #[arg(long, value_name = "KIND", default_value = "config")]
         representation: String,
@@ -4048,6 +4054,7 @@ pub fn run() -> u8 {
                 task_scope_invocation_id,
                 include_harness_checkout,
                 harness_checkout_reason,
+                offline_reason,
                 representation,
                 root,
                 machine,
@@ -4074,6 +4081,7 @@ pub fn run() -> u8 {
                     task_scope_invocation_id.as_deref(),
                     include_harness_checkout,
                     harness_checkout_reason.as_deref(),
+                    offline_reason.as_deref(),
                 ) {
                     Ok(value) => {
                         println!(
@@ -4107,6 +4115,7 @@ pub fn run() -> u8 {
                 task_scope_invocation_id,
                 include_harness_checkout,
                 harness_checkout_reason,
+                offline_reason,
                 representation,
                 format,
                 root,
@@ -4133,6 +4142,7 @@ pub fn run() -> u8 {
                 task_scope_invocation_id.as_deref(),
                 include_harness_checkout,
                 harness_checkout_reason.as_deref(),
+                offline_reason.as_deref(),
                 format == "json",
             ) {
                 Ok(text) => {
