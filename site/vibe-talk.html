@@ -67,7 +67,7 @@
 <p class="eyebrow">Optional tool</p>
 <h1>vibe-talk</h1>
 <p class="badges"><span class="badge">optional</span><span class="badge badge-warn">early</span><span class="badge badge-edition">Rust service</span><span class="badge badge-edition">v0.0.1</span></p>
-<p class="lead">A small Rust web server and phone web app for reading, discussing and replying to your coding agents' chat messages when you are away from the terminal: one-sentence summaries of long messages, named threads, replies from the phone, read-aloud and voice conversation.</p>
+<p class="lead">A small Rust web server and phone web app for reading and replying to your coding agents' chat messages when you are away from the terminal. Chat clients are not designed for verbose teams of agents; vibe-talk subscribes only to your agent channels and keeps them out of your human chat.</p>
 <div class="callout" role="note" aria-labelledby="about-clips">
 <p class="callout-title" id="about-clips">About the clips on this page</p>
 <p>Five short clips of vibe-talk in use: summaries, one report in full, new messages as they arrive, a reply from the phone, and threads on a desktop. Nothing on this page moves until you press <strong>Play the clip</strong>.</p>
@@ -91,6 +91,24 @@
 <dt>Where it fits</dt>
 <dd>It is an optional phone front end for a chat service, beside the harness's <a href="architecture.html#channel">owner channel</a> rather than part of it. It reads and posts in the chat; it does not start, stop or type into agents. It reaches a harness's coordinator when <a href="tools.html#agentctl-chat"><code>agentctl chat</code></a> bridges the same chat space: Google Chat through a compatible bridge, or Discord and Slack directly.</dd>
 </dl>
+</div>
+</section>
+
+<section class="section" id="overview" aria-labelledby="overview-title">
+<div class="wrap">
+<div class="section-head">
+<p class="eyebrow">Overview</p>
+<h2 id="overview-title">What it does</h2>
+</div>
+<h3>Summaries</h3>
+<p>Threads get a name and a one-line summary. Long messages collapse to a short summary, with the full text one tap away. A group of unread messages can be summarized together. Discuss, a side agent, answers what you missed in a channel or thread, with links back to the messages. The voice agent summarizes too. Stated plainly: the voice view and Discuss are not unified today.</p>
+<h3>Unbundled</h3>
+<p>Any agent that can reach chat works with vibe-talk; no integrated agent platform is required, and vibe-talk does not start, stop, or control agents. Documents linked in chat are collected in one view: fetched, searchable, and readable in the app, with read-aloud.</p>
+<h3>Triage</h3>
+<p>Mark messages Done, show, fold, or hide what you have read, and reply from the phone. Search what is loaded, then search further back on the server. Pin messages to keep them at hand.</p>
+<h3>Flexible threads</h3>
+<p>An agent maps to a channel; its sub-agents work in threads in that channel. Each thread keeps its own name, summary, and draft, on the phone or beside the channel on a desktop.</p>
+<p class="small">The clips below show the earlier core flows. Clips for Discuss, Documents, and triage are planned; this text describes the current app.</p>
 </div>
 </section>
 
