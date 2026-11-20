@@ -140,13 +140,24 @@ def main() -> int:
                         check(drawn["head"] in (None, want[2 + at]), f"{scheme}/{preset}: Discuss head {drawn['head']}")
                         if args.screenshots:
                             args.screenshots.mkdir(parents=True, exist_ok=True)
-                            # The fold chevrons turn on a 0.12s transition; blue is shot
-                            # first, right after the folds open, and was caught
-                            # half-rotated. Wait for those turns to finish — a
-                            # condition on the chevrons' own transitions, not a sleep.
-                            page.wait_for_function("""() => [...document.querySelectorAll('.fold-toggle')]
-                              .every((el) => [...el.getAnimations(), ...el.getAnimations({ pseudoElement: '::before' })]
-                                .every((a) => a.playState !== 'running'))""", timeout=STATE_MS)
+                            # The fold chevrons turn on a 0.12s transition to
+                            # rotate(45deg); blue is shot first, right after the
+                            # folds open, and was caught half-rotated. An
+                            # animation-list wait caught nothing (pseudo-element
+                            # transitions are not listed before the turn starts),
+                            # so wait on the computed end state itself: every open
+                            # fold's chevron at the open matrix. If a chevron
+                            # never arrives there, this times out — a page bug,
+                            # reported as a test failure, not waited around.
+                            page.wait_for_function("""() => {
+                              const open = [...document.querySelectorAll('.fold-toggle[aria-expanded="true"]')];
+                              if (!open.length) return false;
+                              const cos = Math.cos(Math.PI / 4);
+                              return open.every((el) => {
+                                const parts = (getComputedStyle(el, '::before').transform.match(/[\\d.-]+/g) || []).map(Number);
+                                return parts.length === 6 && Math.abs(parts[0] - cos) < 1e-3 && Math.abs(parts[1] - cos) < 1e-3;
+                              });
+                            }""", timeout=STATE_MS)
                             stamp = args.screenshots / "BUILD.txt"
                             if not stamp.exists():
                                 build = page.evaluate("""() => {
