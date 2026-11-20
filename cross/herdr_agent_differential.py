@@ -314,6 +314,9 @@ def verified_composer():
     return not state.get("custom_harness") and state.get("harness", "codex") in ("claude", "codex")
 
 def after_write(text):
+    # A typed goal command opens its replacement picker.
+    if state.get("goal_menu") and text.startswith("/goal "):
+        state["picker_open"] = True
     # Injected transport behavior once a prompt has reached the agent.
     if state.get("run_mode") == "gate":
         save()
@@ -811,12 +814,11 @@ elif args[:2] == ["pane", "read"]:
     if source == "visible" and state.get("terminal_on_visible_read"):
         state["terminal_id"] = state["terminal_on_visible_read"]
     if source == "visible" and state.get("screen"):
-        # A goal picker stands only once its goal is typed (#1939:
-        # typing over an already-open picker is refused, so the menu
-        # this fixture models appears after the command, like Codex).
-        if state.get("goal_menu") and not any(
-            text.startswith("/goal ") for text in state.get("submitted", [])
-        ):
+        # A goal picker stands only while it is open: after its goal
+        # is typed and before a key answers it (#1939: typing over an
+        # already-open picker is refused, so the menu this fixture
+        # models opens and closes like Codex's own).
+        if state.get("goal_menu") and not state.get("picker_open"):
             sys.stdout.write("› Ask Codex to do anything\n  GPT · /work\n")
         else:
             sys.stdout.write(state["screen"])
@@ -864,6 +866,8 @@ elif args[:2] == ["pane", "send-keys"]:
             state.setdefault("submitted", []).append(state["custom_draft"])
     else:
         state["confirmed_goal"] = args[3] == "Enter"
+        if state.get("goal_menu") and args[3] in ("Enter", "Escape"):
+            state["picker_open"] = False
 else:
     print("unsupported fake Herdr call: " + repr(args), file=sys.stderr)
     save()
