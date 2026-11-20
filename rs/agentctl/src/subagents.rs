@@ -13588,15 +13588,16 @@ its drain would also type, so it was not queued",
         }
         let _lock = self.lock(agent_name)?;
         let record = self.load(agent_name)?;
-        if record.harness != "muse" {
+        // Adopted foreign panes are someone else's agent in this
+        // registry's bookkeeping, never a lane to type into (#1932).
+        if record.harness != "muse" || record.is_foreign() {
             return Ok(None);
         }
         record.input_allowed()?;
-        self.checked(&record)?;
-        let pane_id = record
-            .pane_id
-            .clone()
-            .ok_or_else(|| fail(format!("agent {agent_name} has no pane")))?;
+        let checked = self.checked(&record)?;
+        // The pane the identity check just proved is the record's own,
+        // not merely the pane the record names.
+        let pane_id = checked.pane_id.clone();
         let screen = self.client.read(&pane_id, "visible", Some(200))?;
         if !crate::client::muse_hooks_trust_dialog(&screen) {
             return Ok(None);
@@ -17205,6 +17206,7 @@ pub(crate) mod tests {
                     scrollback: Mutex::new(BTreeMap::new()),
                     redirect_once: Mutex::new(BTreeMap::new()),
                     keys_sent: Mutex::new(Vec::new()),
+                    hooks_answers: Mutex::new(Vec::new()),
                     replace_harness_after_esc: AtomicBool::new(false),
                     replace_harness_on_wait: AtomicBool::new(false),
                     drop_note: AtomicBool::new(false),
@@ -17697,6 +17699,8 @@ pub(crate) mod tests {
         pub(crate) redirect_once: Mutex<BTreeMap<String, String>>,
         /// Every key sent outside the guarded input path, with its pane.
         pub(crate) keys_sent: Mutex<Vec<(String, String)>>,
+        /// Hooks-trust answers the fake client confirmed, as (pane, decision) (#1932).
+        pub(crate) hooks_answers: Mutex<Vec<(String, String)>>,
         /// Replace the pane's harness right after the next Esc reaches it.
         pub(crate) replace_harness_after_esc: AtomicBool,
         /// Replace the pane's harness as the next status wait reports its state.
@@ -18807,6 +18811,30 @@ pub(crate) mod tests {
                 return Err(AdapterError::unavailable("injected readiness failure"));
             }
             Ok(())
+        }
+        fn answer_hooks_trust_dialog(
+            &self,
+            pane: &str,
+            decision: &str,
+        ) -> AdapterResult<(bool, Option<u32>)> {
+            // The fake dialog clears to a composer on a confirmed answer.
+            let mut screen = self.screen.lock().unwrap();
+            if screen
+                .as_deref()
+                .is_some_and(crate::client::muse_hooks_trust_dialog)
+            {
+                self.hooks_answers
+                    .lock()
+                    .unwrap()
+                    .push((pane.to_owned(), decision.to_owned()));
+                *screen = Some(
+                    "Muse Code 1.4.24\n────────────────\n❯\n────────────────\n\
+                     kiki · xhigh · /work · YOLO\n"
+                        .to_owned(),
+                );
+                return Ok((true, Some(39)));
+            }
+            Ok((false, None))
         }
         fn start_pane_agent(
             &self,
@@ -24721,6 +24749,8 @@ fi
     /// Resume recovery, immutable planning, exact publication and crash reconciliation.
     mod revive;
     mod session_follow;
+    /// Muse plugin-hooks trust answers in managed panes (#1932).
+    mod hooks_trust;
     /// Drafts Muse left unsent: agentctl's own submitted, anyone else's refused (#720).
     mod stale_draft;
     /// Trusted stop refusals and generation-bound recovery advice.

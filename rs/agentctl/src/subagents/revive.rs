@@ -2368,47 +2368,54 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             }))
     }
 
-    /// Clear a Muse candidate's plugin-hooks trust dialog before
-    /// verifying it (#1932): a candidate launched before this answer
-    /// existed can sit at the dialog while its record is otherwise
-    /// ready; answer per the registry's policy, then let verification
-    /// judge the composer it lands on. Only the exact dialog is
-    /// answered; a near-miss is left for verification to name.
-    fn answer_candidate_hooks_trust(&self, candidate: &AgentRecord) {
-        if candidate.harness != "muse" {
-            return;
+    /// Clear a Muse candidate's plugin-hooks trust dialog (#1932).
+    ///
+    /// Called only with the pane `verify_candidate` has already proven
+    /// to be the candidate's own (target resolved, runtime checked, no
+    /// other record claiming it), so keys never land in a pane that
+    /// merely sits where the candidate's used to. A candidate launched
+    /// before this answer existed can sit at the dialog while its
+    /// record is otherwise ready; answer per the registry's policy.
+    /// Only the exact dialog is answered, and an answer that fails is
+    /// this verification's failure, never swallowed.
+    fn answer_candidate_hooks_trust(
+        &self,
+        candidate: &AgentRecord,
+        pane: &str,
+    ) -> Result<()> {
+        if candidate.harness != "muse" || candidate.is_foreign() {
+            return Ok(());
         }
-        let Some(pane) = candidate.pane_id.as_deref() else {
-            return;
-        };
-        let Ok(screen) = self.client.read(pane, "visible", Some(200)) else {
-            return;
-        };
+        let screen = self.client.read(pane, "visible", Some(200))?;
         if !crate::client::muse_hooks_trust_dialog(&screen) {
-            return;
+            return Ok(());
         }
-        let Ok((decision, source)) = crate::profiles::hooks_trust_policy(
+        let (decision, source) = crate::profiles::hooks_trust_policy(
             std::path::Path::new(&candidate.cwd),
             &self.registry,
             candidate.profile.as_deref(),
-        ) else {
-            return;
-        };
-        if let Ok((true, count)) = self.client.answer_hooks_trust_dialog(pane, &decision) {
-            let verb = if decision == "trust" {
-                "trusted all hooks"
-            } else {
-                "declined hook trust"
-            };
-            let shown = count.map_or_else(
-                || "hook count not shown".to_owned(),
-                |n| format!("{n} hooks"),
-            );
-            eprintln!(
-                "agentctl: {}: {verb} ({shown}) per {source}",
+        )?;
+        let (answered, count) = self.client.answer_hooks_trust_dialog(pane, &decision)?;
+        if !answered {
+            return Err(fail(format!(
+                "revive candidate {}'s hooks dialog changed before it could be answered; nothing was confirmed",
                 candidate.name
-            );
+            )));
         }
+        let verb = if decision == "trust" {
+            "trusted all hooks"
+        } else {
+            "declined hook trust"
+        };
+        let shown = count.map_or_else(
+            || "hook count not shown".to_owned(),
+            |n| format!("{n} hooks"),
+        );
+        eprintln!(
+            "agentctl: {}: {verb} ({shown}) per {source}",
+            candidate.name
+        );
+        Ok(())
     }
 
     fn verify_candidate(
@@ -2433,7 +2440,6 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 "resumed candidate has no independently pinned runtime",
             ));
         }
-        self.answer_candidate_hooks_trust(record);
         let exclusion = CensusExclusion::new(old, proof);
         self.resolve_recovery_target(self.client, &self.target(record)?, Some(&exclusion), None)?;
         let info = self.checked_with_recovery(record, Some(&exclusion))?;
@@ -2455,6 +2461,9 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 "resumed candidate's runtime is claimed by another record",
             ));
         }
+        // The pane is proven the candidate's own above; only now may
+        // keys be sent to it (#1932).
+        self.answer_candidate_hooks_trust(record, &info.pane_id)?;
         Ok(())
     }
 

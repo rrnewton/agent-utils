@@ -4218,3 +4218,29 @@ fn restart_with_resume_refuses_a_recorded_launch_environment_before_ending_anyth
         "a refused same-pane restart must not end the harness"
     );
 }
+
+#[test]
+fn revive_clears_a_candidate_at_the_hooks_dialog_and_publishes() {
+    // #1932: the candidate Muse shows the plugin-hooks trust dialog;
+    // verification answers it per policy and the revive completes.
+    let (fixture, _old) = recoverable("muse", true);
+    *fixture.client.screen.lock().unwrap() = Some(
+        "Review plugin hooks\n\
+         39 new or changed hooks need your trust\n\
+         \n\
+         ❯ Review hooks\n\
+         \x20 Trust all and continue\n\
+         \x20 Continue without trusting\n\
+         \n\
+         Up/Down to choose, Enter to confirm. Esc continues without trusting.\n"
+            .to_owned(),
+    );
+    let result = fixture
+        .manager()
+        .revive("worker", false, None, TIMEOUT)
+        .unwrap();
+    assert_eq!(result["revived"], true, "{result}");
+    let answers = fixture.client.hooks_answers.lock().unwrap();
+    assert_eq!(answers.len(), 1, "{answers:?}");
+    assert_eq!(answers[0].1, "decline");
+}

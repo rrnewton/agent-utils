@@ -751,18 +751,83 @@ const HOOKS_TRUST_OPTIONS: [&str; 3] = [
     "trust all and continue",
     "continue without trusting",
 ];
+const HOOKS_TRUST_MARKERS: [char; 2] = ['❯', '›'];
 
-/// Whether `screen` is exactly Muse's plugin-hooks trust dialog (#1932):
-/// the "Review plugin hooks" title AND all three option texts must match.
+/// Muse's plugin-hooks trust dialog parsed at the screen's bottom:
+/// the chosen hook count and the selected option index.
+struct HooksTrustBlock {
+    count: Option<u32>,
+    selected: usize,
+}
+
+/// Parse the dialog anchored at the screen bottom (#1932): the
+/// choose/confirm footer must be the last nonblank line, the three
+/// option rows contiguous directly above it with exactly one cursor
+/// (`❯` or `›`) on one of them, and the "Review plugin hooks" title
+/// within the block above. A composer frame anywhere vetoes the
+/// match, so a working lane whose transcript quotes the dialog (which
+/// always has its composer below) never matches.
+fn hooks_trust_block(screen: &str) -> Option<HooksTrustBlock> {
+    if muse_verified_process_composer(screen) || muse_screen_has_composer(screen) {
+        return None;
+    }
+    let lines: Vec<&str> = screen.lines().collect();
+    let mut footer = lines.len();
+    while footer > 0 && lines[footer - 1].trim().is_empty() {
+        footer -= 1;
+    }
+    if footer == 0
+        || !lines[footer - 1]
+            .to_ascii_lowercase()
+            .contains("up/down to choose")
+    {
+        return None;
+    }
+    let footer = footer - 1;
+    let mut options_end = footer.checked_sub(1)?;
+    if lines[options_end].trim().is_empty() {
+        // One blank line may sit between the options and the footer.
+        options_end = options_end.checked_sub(1)?;
+    }
+    let first_option = options_end.checked_sub(2)?;
+    let mut selected = None;
+    for (offset, expected) in HOOKS_TRUST_OPTIONS.iter().enumerate() {
+        let mut line = lines[first_option + offset].trim_start();
+        if let Some(rest) = line
+            .strip_prefix(HOOKS_TRUST_MARKERS[0])
+            .or_else(|| line.strip_prefix(HOOKS_TRUST_MARKERS[1]))
+        {
+            if selected.is_some() {
+                return None;
+            }
+            selected = Some(offset);
+            line = rest.trim_start();
+        }
+        if !line.trim().eq_ignore_ascii_case(expected) {
+            return None;
+        }
+    }
+    let selected = selected?;
+    let title = (0..first_option)
+        .rev()
+        .take(14)
+        .find(|&index| lines[index].trim().eq_ignore_ascii_case("review plugin hooks"))?;
+    let block = lines[title..footer].join("\n").to_ascii_lowercase();
+    Some(HooksTrustBlock {
+        count: muse_hooks_trust_count(&block),
+        selected,
+    })
+}
+
+/// Whether `screen` is exactly Muse's plugin-hooks trust dialog.
+///
+/// Strict and bottom-anchored (#1932): see [`hooks_trust_block`].
 /// Anything else (a permission prompt, a different trust dialog, an
-/// approve-command prompt) is never answered; if option 3's text is
-/// missing or reworded this is false and the caller refuses to act.
+/// approve-command prompt, the dialog quoted in a transcript) is never
+/// answered; if option 3's text is missing or reworded this is false
+/// and the caller refuses to act.
 pub(crate) fn muse_hooks_trust_dialog(screen: &str) -> bool {
-    let lowered = screen.to_ascii_lowercase();
-    lowered.contains("review plugin hooks")
-        && HOOKS_TRUST_OPTIONS
-            .iter()
-            .all(|option| lowered.contains(option))
+    hooks_trust_block(screen).is_some()
 }
 
 /// The hook count the dialog shows ("N new or changed hooks"), if any.
@@ -778,15 +843,6 @@ pub(crate) fn muse_hooks_trust_count(screen: &str) -> Option<u32> {
         .rev()
         .collect();
     digits.parse().ok()
-}
-
-/// The dialog option the `❯` cursor sits on, lowercased, if drawn.
-fn muse_selected_option(screen: &str) -> Option<String> {
-    screen.lines().find_map(|line| {
-        line.trim_start()
-            .strip_prefix('❯')
-            .map(|rest| rest.trim().to_ascii_lowercase())
-    })
 }
 
 /// A launch's plugin-hooks trust answer (#1932): the policy decision and
@@ -2261,42 +2317,69 @@ impl HerdrClient {
                 "unknown hooks-trust decision {decision:?}"
             )));
         }
-        let screen = self.read(pane_id, "visible", Some(200))?;
-        if !muse_hooks_trust_dialog(&screen) {
-            return Ok((false, None));
-        }
-        let count = muse_hooks_trust_count(&screen);
-        let steps: &[&str] = if decision == "trust" {
-            &["trust all and continue"]
-        } else {
-            &["trust all and continue", "continue without trusting"]
+        let target = if decision == "decline" { 2 } else { 1 };
+        let fresh = |client: &Self| -> Result<Option<HooksTrustBlock>> {
+            Ok(hooks_trust_block(
+                &client.read(pane_id, "visible", Some(200))?,
+            ))
         };
-        for expected in steps {
+        let Some(block) = fresh(self)? else {
+            return Ok((false, None));
+        };
+        let mut count = block.count;
+        let mut selected = block.selected;
+        if selected > target {
+            // The cursor sits past the policy's option; never guess a
+            // wrap-around, and never confirm the wrong option.
+            return Ok((false, count));
+        }
+        while selected < target {
+            // Re-read and re-verify right before this key: a dialog
+            // that changed or went away stops with no further keys.
+            let Some(block) = fresh(self)? else {
+                return Ok((false, count));
+            };
+            count = block.count;
+            if block.selected != selected {
+                selected = block.selected;
+                if selected > target {
+                    return Ok((false, count));
+                }
+                continue;
+            }
             self.send_keys(pane_id, "Down")?;
-            // Wait until the cursor visibly sits on the next option (or
-            // the dialog went away) before sending anything else.
+            // Wait until the cursor visibly advances one option; a
+            // dialog that leaves, jumps, or does not move before the
+            // deadline ends the answer with no Enter.
+            let mut moved = false;
             while Instant::now() < deadline {
-                let current =
-                    muse_selected_option(&self.read(pane_id, "visible", Some(200))?);
-                if current.as_deref().is_none_or(|text| text.contains(expected)) {
+                let Some(block) = fresh(self)? else {
+                    return Ok((false, count));
+                };
+                if block.selected == selected + 1 {
+                    count = block.count;
+                    selected = block.selected;
+                    moved = true;
                     break;
+                }
+                if block.selected != selected {
+                    return Ok((false, count));
                 }
                 thread::sleep(
                     Duration::from_millis(50)
                         .min(deadline.saturating_duration_since(Instant::now())),
                 );
             }
+            if !moved {
+                return Ok((false, count));
+            }
         }
-        // Re-read right before confirming: a screen that changed out of
-        // the exact dialog is refused, never answered from a stale read.
-        let screen = self.read(pane_id, "visible", Some(200))?;
-        if !muse_hooks_trust_dialog(&screen) {
+        // Re-read right before confirming: the cursor must sit exactly
+        // on the policy's option in the dialog's own rows.
+        let Some(block) = fresh(self)? else {
             return Ok((false, count));
-        }
-        let target = steps[steps.len() - 1];
-        if muse_selected_option(&screen)
-            .is_some_and(|selected| !selected.contains(target))
-        {
+        };
+        if block.selected != target {
             return Ok((false, count));
         }
         self.send_keys(pane_id, "Enter")?;
@@ -4452,8 +4535,8 @@ mod tests {
         assert!(muse_hooks_trust_dialog(HOOKS_TRUST_DIALOG));
         assert_eq!(muse_hooks_trust_count(HOOKS_TRUST_DIALOG), Some(39));
         assert_eq!(
-            muse_selected_option(HOOKS_TRUST_DIALOG).as_deref(),
-            Some("review hooks")
+            hooks_trust_block(HOOKS_TRUST_DIALOG).map(|block| block.selected),
+            Some(0)
         );
         assert!(!muse_hooks_trust_dialog(
             &HOOKS_TRUST_DIALOG.replace("Review plugin hooks", "Review hooks")
@@ -4465,6 +4548,32 @@ mod tests {
             &HOOKS_TRUST_DIALOG.replace("Continue without trusting", "Continue without trust")
         ));
         assert!(!muse_hooks_trust_dialog("Do you want to proceed?\n❯ Yes\n  No\n"));
+        // The dialog quoted in a working lane's transcript, its own
+        // composer below: not the dialog (#1932 review).
+        let quoted = format!(
+            "❯ Muse shows Review plugin hooks: decline it\n◆ Working on it\n{HOOKS_TRUST_DIALOG}Muse Code 1.4.24\n────────────────\n❯\n────────────────\nkiki · xhigh · /work/project · YOLO\n"
+        );
+        assert!(!muse_hooks_trust_dialog(&quoted));
+        // No cursor glyph on any option row: not answerable.
+        assert!(!muse_hooks_trust_dialog(
+            &HOOKS_TRUST_DIALOG.replace("❯ Review hooks", "  Review hooks")
+        ));
+        // The alternate cursor glyph counts, and a cursor already on
+        // the second option is read from the dialog's own rows.
+        assert_eq!(
+            hooks_trust_block(&HOOKS_TRUST_DIALOG.replace("❯ Review hooks", "› Review hooks"))
+                .map(|block| block.selected),
+            Some(0)
+        );
+        assert_eq!(
+            hooks_trust_block(
+                &HOOKS_TRUST_DIALOG
+                    .replace("❯ Review hooks", "  Review hooks")
+                    .replace("  Trust all", "❯ Trust all")
+            )
+            .map(|block| block.selected),
+            Some(1)
+        );
         assert_eq!(
             muse_hooks_trust_count("Review plugin hooks\nContinue without trusting\n"),
             None
@@ -4559,6 +4668,69 @@ elif args[:2] == ["pane", "send-keys"]:
             .unwrap();
         assert!(!answered);
         assert!(!root.join("keys").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn answering_declines_from_the_second_option_and_stops_when_the_dialog_vanishes() {
+        let _guard = EXECUTABLE_FIXTURE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Cursor already on option 2: one Down reaches option 3.
+        let root = std::env::temp_dir().join(format!(
+            "agentctl-hooks-answer-{}-{}-second",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("state"), "1").unwrap();
+        let client = dialog_herdr(&root);
+        let (answered, count) = client
+            .answer_hooks_trust_dialog(
+                "p1",
+                "decline",
+                Instant::now() + Duration::from_secs(30),
+            )
+            .unwrap();
+        assert_eq!((answered, count), (true, Some(39)));
+        assert_eq!(fs::read_to_string(root.join("keys")).unwrap(), "Down\nEnter\n");
+        assert_eq!(fs::read_to_string(root.join("confirmed")).unwrap(), "2");
+        fs::remove_dir_all(root).unwrap();
+        // The dialog vanishes after the first Down: no Enter follows.
+        let root = std::env::temp_dir().join(format!(
+            "agentctl-hooks-answer-{}-{}-vanish",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        let script = r#"#!/usr/bin/python3
+import pathlib, sys
+here = pathlib.Path(__file__).parent
+args = sys.argv[1:]
+if args[:2] == ["pane", "read"]:
+    if (here / "gone").exists():
+        print("Muse Code 1.4.24\n\n────────────────\n❯\n────────────────\nkiki · xhigh · /work/project · YOLO")
+    else:
+        print("Review plugin hooks\n39 new or changed hooks need your trust\n\n❯ Review hooks\n  Trust all and continue\n  Continue without trusting\n\nUp/Down to choose, Enter to confirm. Esc continues without trusting.")
+elif args[:2] == ["pane", "send-keys"]:
+    with (here / "keys").open("a") as handle:
+        handle.write(args[3] + "\n")
+    if args[3] == "Down":
+        (here / "gone").write_text("1")
+"#;
+        fs::write(root.join("herdr"), script).unwrap();
+        fs::set_permissions(root.join("herdr"), fs::Permissions::from_mode(0o700)).unwrap();
+        let client = HerdrClient::with_executable("direct", &root.join("herdr")).unwrap();
+        let (answered, _) = client
+            .answer_hooks_trust_dialog(
+                "p1",
+                "decline",
+                Instant::now() + Duration::from_secs(30),
+            )
+            .unwrap();
+        assert!(!answered);
+        assert_eq!(fs::read_to_string(root.join("keys")).unwrap(), "Down\n");
         fs::remove_dir_all(root).unwrap();
     }
 

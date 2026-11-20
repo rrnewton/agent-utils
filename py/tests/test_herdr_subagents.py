@@ -72,6 +72,8 @@ class FakeManagedClient:
         self.hooks_answers: list[tuple[str, int | None]] = []
         #: Panes whose visible screen is the dialog right now (candidate flow).
         self.dialog_panes: set[str] = set()
+        #: Text staged in each pane's composer by a verified submission.
+        self.staged: dict[str, str] = {}
         self.custom_identity = CustomProcessIdentity(
             version=1, boot_id="00000000-0000-0000-0000-000000000000",
             pid=200, starttime_ticks=200, executable_device=1, executable_inode=2,
@@ -346,6 +348,10 @@ class FakeManagedClient:
         assert pane_id in self.infos and lines > 0
         if pane_id in self.dialog_panes and source == "visible":
             return HOOKS_TRUST_DIALOG_TEXT
+        if source == "visible" and self.infos[pane_id].agent == "muse":
+            # A launched Muse rests at its composer, which brief
+            # delivery waits to see (#1932).
+            return self.read_screen(pane_id)
         return "" if source == "recent-unwrapped" else "human and coordinator transcript\n"
 
     def answer_hooks_trust_dialog(
@@ -384,11 +390,32 @@ class FakeManagedClient:
         assert self.agent_pane(name) == pane_id
         self.infos[pane_id] = replace(self.infos[pane_id], session_agent=kind, session_value=session_id)
 
+    def read_screen(self, pane_id: str) -> str:
+        assert pane_id in self.infos
+        turns = "".join(f"❯ {entry}\n" for entry in self.transcripts.get(pane_id, []))
+        staged = self.staged.get(pane_id, "")
+        return (
+            "Muse Code 1.4.24\n" + turns
+            + "────────────────\n" + (f"❯ {staged}" if staged else "❯")
+            + "\n────────────────\nkiki · xhigh · /work/project · YOLO\n"
+        )
+
+    def send_text(self, pane_id: str, text: str, *, expect_terminal: str | None = None) -> None:
+        self._effect(pane_id, expect_terminal)
+        assert pane_id in self.infos
+        if text.startswith("\x1b[200~") and text.endswith("\x1b[201~"):
+            text = text[len("\x1b[200~"):-len("\x1b[201~")]
+        self.staged[pane_id] = text
+
     def send_keys(self, pane_id: str, keys: str, *, expect_terminal: str | None = None) -> None:
         if keys != "esc":
             self._effect(pane_id, expect_terminal)
         assert pane_id in self.infos and keys in ("Enter", "esc")
         self.keys_sent.append((pane_id, keys))
+        if keys == "Enter" and self.staged.get(pane_id):
+            # The harness takes the staged prompt as a user turn.
+            self.transcripts.setdefault(pane_id, []).append(self.staged.pop(pane_id))
+            self.submitted.append(self.transcripts[pane_id][-1])
 
 
 def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[ManagedAgents, FakeManagedClient]:

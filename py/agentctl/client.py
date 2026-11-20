@@ -198,36 +198,75 @@ _HOOKS_TRUST_OPTIONS = (
     "continue without trusting",
 )
 _HOOKS_TRUST_COUNT = re.compile(r"(\d+) new or changed hooks need your trust")
+_HOOKS_TRUST_MARKERS = ("❯", "›")
+
+
+def _hooks_trust_block(screen: str) -> tuple[int | None, int] | None:
+    """Parse Muse's plugin-hooks trust dialog anchored at the screen bottom.
+
+    Returns (hook count, selected option index), or None (#1932). The
+    choose/confirm footer must be the last nonblank line, the three
+    option rows contiguous directly above it with exactly one cursor
+    (`❯` or `›`) on one of them, and the "Review plugin hooks" title
+    within the block above. A composer frame anywhere on screen vetoes
+    the match, so a working lane whose transcript quotes the dialog
+    (which always has its composer below) never matches.
+    """
+    if muse_verified_process_composer(screen) or muse_screen_has_composer(screen):
+        return None
+    lines = screen.splitlines()
+    footer = len(lines) - 1
+    while footer >= 0 and not lines[footer].strip():
+        footer -= 1
+    if footer < 0 or "up/down to choose" not in lines[footer].lower():
+        return None
+    options_end = footer - 1
+    if options_end >= 0 and not lines[options_end].strip():
+        # One blank line may sit between the options and the footer.
+        options_end -= 1
+    first_option = options_end - 2
+    if first_option < 0:
+        return None
+    selected: int | None = None
+    for offset, expected in enumerate(_HOOKS_TRUST_OPTIONS):
+        line = lines[first_option + offset].lstrip()
+        marked = line[:1] in _HOOKS_TRUST_MARKERS
+        if marked:
+            if selected is not None:
+                return None
+            selected = offset
+            line = line[1:].lstrip()
+        if line.strip().lower() != expected:
+            return None
+    if selected is None:
+        return None
+    title = None
+    for index in range(first_option - 1, max(-1, first_option - 14), -1):
+        if lines[index].strip().lower() == "review plugin hooks":
+            title = index
+            break
+    if title is None:
+        return None
+    match = _HOOKS_TRUST_COUNT.search("\n".join(lines[title:footer]).lower())
+    return (int(match.group(1)) if match else None, selected)
 
 
 def muse_hooks_trust_dialog(screen: str) -> bool:
     """Whether `screen` is exactly Muse's plugin-hooks trust dialog.
 
-    Strict (#1932): the "Review plugin hooks" title AND all three option
-    texts must match. Anything else (a permission prompt, a different
-    trust dialog, an approve-command prompt) is never answered; if
-    option 3's text is missing or reworded this is False and the caller
-    refuses to act.
+    Strict and bottom-anchored (#1932): see `_hooks_trust_block`.
+    Anything else (a permission prompt, a different trust dialog, an
+    approve-command prompt, the dialog quoted in a transcript) is never
+    answered; if option 3's text is missing or reworded this is False
+    and the caller refuses to act.
     """
-    lowered = screen.lower()
-    return "review plugin hooks" in lowered and all(
-        option in lowered for option in _HOOKS_TRUST_OPTIONS
-    )
+    return _hooks_trust_block(screen) is not None
 
 
 def muse_hooks_trust_count(screen: str) -> int | None:
     """The hook count the dialog shows ("N new or changed hooks"), if any."""
     match = _HOOKS_TRUST_COUNT.search(screen.lower())
     return int(match.group(1)) if match else None
-
-
-def _muse_selected_option(screen: str) -> str | None:
-    """The dialog option the `❯` cursor sits on, lowercased, if drawn."""
-    for line in screen.splitlines():
-        stripped = line.lstrip()
-        if stripped.startswith("❯"):
-            return stripped[1:].strip().lower()
-    return None
 
 
 # Placeholder hints Muse draws dim inside an empty composer (Muse 1.4.23,
@@ -2319,34 +2358,53 @@ class HerdrClient:
         """
         if decision not in ("decline", "trust"):
             raise ValueError(f"unknown hooks-trust decision {decision!r}")
-        screen = self.read(pane_id, source="visible", lines=200)
-        if not muse_hooks_trust_dialog(screen):
+        target = 2 if decision == "decline" else 1
+
+        def fresh() -> tuple[int | None, int] | None:
+            return _hooks_trust_block(self.read(pane_id, source="visible", lines=200))
+
+        parsed = fresh()
+        if parsed is None:
             return (False, None)
-        count = muse_hooks_trust_count(screen)
-        steps = (
-            ("trust all and continue",)
-            if decision == "trust"
-            else ("trust all and continue", "continue without trusting")
-        )
-        for expected in steps:
-            self.send_keys(pane_id, "Down")
-            # Wait until the cursor visibly sits on the next option (or
-            # the dialog went away) before sending anything else.
-            while time.monotonic() < deadline:
-                current = _muse_selected_option(
-                    self.read(pane_id, source="visible", lines=200)
-                )
-                if current is None or expected in current:
-                    break
-                self._sleep(min(0.05, max(0.0, deadline - time.monotonic())))
-        # Re-read right before confirming: a screen that changed out of
-        # the exact dialog is refused, never answered from a stale read.
-        screen = self.read(pane_id, source="visible", lines=200)
-        if not muse_hooks_trust_dialog(screen):
+        count, selected = parsed
+        if selected > target:
+            # The cursor sits past the policy's option; never guess a
+            # wrap-around, and never confirm the wrong option.
             return (False, count)
-        selected = _muse_selected_option(screen)
-        target = steps[-1]
-        if selected is not None and target not in selected:
+        while selected < target:
+            # Re-read and re-verify right before this key: a dialog that
+            # changed or went away stops the answer with no further keys.
+            parsed = fresh()
+            if parsed is None:
+                return (False, count)
+            count, now_selected = parsed
+            if now_selected != selected:
+                selected = now_selected
+                if selected > target:
+                    return (False, count)
+                continue
+            self.send_keys(pane_id, "Down")
+            # Wait until the cursor visibly advances one option; a
+            # dialog that leaves, jumps, or does not move before the
+            # deadline ends the answer with no Enter.
+            moved = False
+            while time.monotonic() < deadline:
+                parsed = fresh()
+                if parsed is None:
+                    return (False, count)
+                if parsed[1] == selected + 1:
+                    count, selected = parsed
+                    moved = True
+                    break
+                if parsed[1] != selected:
+                    return (False, count)
+                self._sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+            if not moved:
+                return (False, count)
+        # Re-read right before confirming: the cursor must sit exactly
+        # on the policy's option in the dialog's own rows.
+        parsed = fresh()
+        if parsed is None or parsed[1] != target:
             return (False, count)
         self.send_keys(pane_id, "Enter")
         return (True, count)

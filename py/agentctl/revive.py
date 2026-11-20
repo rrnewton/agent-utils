@@ -881,27 +881,30 @@ def _candidate_manager(manager: ManagedAgents, old: AgentRecord, proof: dict[str
     return candidate_manager
 
 
-def _answer_candidate_hooks_trust(manager: ManagedAgents, candidate: AgentRecord) -> None:
-    """Clear a Muse candidate's plugin-hooks trust dialog before verifying it (#1932).
+def _answer_candidate_hooks_trust(
+    manager: ManagedAgents, candidate: AgentRecord, pane_id: str,
+) -> None:
+    """Clear a Muse candidate's plugin-hooks trust dialog (#1932).
 
-    A candidate launched before this answer existed (or by a launch
-    that never reached it) can sit at the dialog while its record is
-    otherwise ready; answer per the registry's policy, then let the
-    verification below judge the composer it lands on. Only the exact
-    dialog is answered; a near-miss is left for verification to name.
+    Called only after the candidate's target and pane have been
+    verified as the candidate's own, so keys never land in a pane that
+    merely sits where the candidate's used to. A candidate launched
+    before this answer existed can sit at the dialog while its record
+    is otherwise ready; answer per the registry's policy and let the
+    caller re-verify. Only the exact dialog is answered.
     """
-    if candidate.harness != "muse" or not candidate.pane_id:
+    if candidate.harness != "muse" or candidate.adapter == "herdr-foreign":
         return
     answer = getattr(manager.client, "answer_hooks_trust_dialog", None)
     read = getattr(manager.client, "read", None)
     if answer is None or read is None:
         return
-    screen = read(candidate.pane_id, source="visible", lines=200)
+    screen = read(pane_id, source="visible", lines=200)
     if not muse_hooks_trust_dialog(screen):
         return
     decision, source = hooks_trust_policy(candidate.cwd, manager.registry, candidate.profile)
     answered, count = answer(
-        candidate.pane_id, decision, deadline=time.monotonic() + 30.0,
+        pane_id, decision, deadline=time.monotonic() + 30.0,
     )
     if answered:
         verb = "trusted all hooks" if decision == "trust" else "declined hook trust"
@@ -917,10 +920,12 @@ def _ready(manager: ManagedAgents, candidate: AgentRecord, old: AgentRecord, pro
             or candidate.terminal_id is None or (candidate.harness_anchor is None if candidate.adapter == "herdr"
                                                else candidate.custom_process_identity is None)):
         raise AgentDeliveryError("revive candidate lacks the recorded policy or independent runtime anchors")
-    _answer_candidate_hooks_trust(manager, candidate)
     verifier = _candidate_manager(manager, old, proof)
-    agent.resolve_target(verifier.client, manager._target(candidate))
+    info = agent.resolve_target(verifier.client, manager._target(candidate))
     verifier._checked(candidate)
+    # The pane is proven the candidate's own above; only now may keys
+    # be sent to it (#1932).
+    _answer_candidate_hooks_trust(manager, candidate, info.pane_id)
 
 
 def _prepared_stopped(manager: ManagedAgents, journal: dict[str, object], old: AgentRecord) -> bytes:

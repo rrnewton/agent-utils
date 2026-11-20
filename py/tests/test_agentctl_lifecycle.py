@@ -2078,7 +2078,6 @@ def test_revive_preflight_refuses_conflicting_ownership_without_launch(
     assert len(fake.launched) == 1 and fake.closed == [] and registry_bytes(manager.registry) == before
 
 
-@pytest.mark.parametrize("phase", ["launched", "archived", "published", "close-unknown", "close-lost-ack"])
 def test_revive_candidate_answers_the_hooks_dialog_and_is_published(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -2107,14 +2106,15 @@ def test_revive_verification_clears_a_candidate_already_at_the_dialog(
     record = manager.get("worker")
     assert record.pane_id is not None
     fake.dialog_panes.add(record.pane_id)
-    recovery._answer_candidate_hooks_trust(manager, record)
+    recovery._answer_candidate_hooks_trust(manager, record, record.pane_id)
     assert fake.hooks_answers == [("decline", 39)]
     assert record.pane_id not in fake.dialog_panes
     # A screen that is not the exact dialog is never answered.
-    recovery._answer_candidate_hooks_trust(manager, record)
+    recovery._answer_candidate_hooks_trust(manager, record, record.pane_id)
     assert fake.hooks_answers == [("decline", 39)]
 
 
+@pytest.mark.parametrize("phase", ["launched", "archived", "published", "close-unknown", "close-lost-ack"])
 def test_revive_retry_reconciles_each_transaction_boundary_without_second_launch(
     phase: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

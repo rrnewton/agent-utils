@@ -890,9 +890,11 @@ def _hooks_dialog(selection: int) -> str:
 class _DialogRunner:
     """A fake Muse: the hooks dialog until Enter confirms a selection."""
 
-    def __init__(self, screen: str) -> None:
+    def __init__(self, screen: str, *, selection: int = 0, vanish: bool = False) -> None:
         self.screen = screen
-        self.selection = 0
+        self.selection = selection
+        self.vanish = vanish
+        self.vanished = False
         self.confirmed: int | None = None
         self.keys: list[str] = []
         self.calls: list[list[str]] = []
@@ -913,16 +915,19 @@ class _DialogRunner:
             return subprocess.CompletedProcess(argv, 0, json.dumps(output), "")
         if argv[1:3] == ["pane", "read"]:
             screen = self.screen
-            if screen == HOOKS_TRUST_DIALOG and self.confirmed is None:
-                screen = _hooks_dialog(self.selection)
-            elif self.confirmed is not None:
+            if self.vanished or self.confirmed is not None:
                 screen = _MUSE_COMPOSER
+            elif screen == HOOKS_TRUST_DIALOG:
+                screen = _hooks_dialog(self.selection)
             return subprocess.CompletedProcess(argv, 0, screen, "")
         if argv[1:3] == ["pane", "send-keys"]:
             key = argv[4]
             self.keys.append(key)
             if key == "Down":
                 self.selection = min(2, self.selection + 1)
+                if self.vanish:
+                    # A person cleared the dialog mid-answer.
+                    self.vanished = True
             elif key == "Enter" and self.screen == HOOKS_TRUST_DIALOG:
                 self.confirmed = self.selection
             return subprocess.CompletedProcess(argv, 0, "", "")
@@ -1003,6 +1008,63 @@ def test_custom_muse_launch_never_answers_a_near_miss(screen: str) -> None:
     assert fake.confirmed is None
     if muse_hooks_trust_prompt(screen):
         assert refused == [True]
+
+
+def test_custom_muse_launch_never_answers_a_quoted_dialog() -> None:
+    # The dialog quoted in a working lane's transcript, its own composer
+    # below: not the dialog, and no key is ever sent (#1932 review).
+    quoted = (
+        "❯ Muse shows Review plugin hooks: Review hooks / Trust all and "
+        "continue / Continue without trusting. Make agentctl decline.\n"
+        "◆ Working on it\n"
+    ) + HOOKS_TRUST_DIALOG + _MUSE_COMPOSER
+    fake = _DialogRunner(quoted)
+    try:
+        fake.client().start_pane_agent(
+            "worker", "muse", "p1", (), timeout=0.3, hooks_trust="decline",
+        )
+    except HerdrUnavailable:
+        pass
+    assert fake.keys == []
+    assert fake.confirmed is None
+
+
+def test_custom_muse_launch_never_confirms_without_a_cursor() -> None:
+    glyphless = HOOKS_TRUST_DIALOG.replace("❯ Review hooks", "  Review hooks")
+    fake = _DialogRunner(glyphless)
+    with pytest.raises(HerdrUnavailable):
+        fake.client().start_pane_agent(
+            "worker", "muse", "p1", (), timeout=0.3, hooks_trust="decline",
+        )
+    assert fake.keys == []
+
+
+def test_custom_muse_launch_declines_from_the_second_option() -> None:
+    fake = _DialogRunner(HOOKS_TRUST_DIALOG, selection=1)
+    seen: list[tuple[str, int | None]] = []
+    fake.client().start_pane_agent(
+        "worker", "muse", "p1", (), timeout=5,
+        hooks_trust="decline",
+        on_hooks_trust=lambda decision, count: seen.append((decision, count)),
+    )
+    assert fake.keys == ["Down", "Enter"]
+    assert fake.confirmed == 2
+    assert seen == [("decline", 39)]
+
+
+def test_custom_muse_launch_stops_when_the_dialog_vanishes_mid_answer() -> None:
+    fake = _DialogRunner(HOOKS_TRUST_DIALOG, vanish=True)
+    seen: list[tuple[str, int | None]] = []
+    fake.client().start_pane_agent(
+        "worker", "muse", "p1", (), timeout=5,
+        hooks_trust="decline",
+        on_hooks_trust=lambda decision, count: seen.append((decision, count)),
+    )
+    # One Down went in before the dialog left; no Enter followed it into
+    # the composer, and the launch still reaches the composer.
+    assert fake.keys == ["Down"]
+    assert seen == []
+    assert any(call[1:3] == ["pane", "report-agent"] for call in fake.calls)
 
 
 def test_custom_muse_launch_rejects_bare_prompt_without_idle_footer() -> None:

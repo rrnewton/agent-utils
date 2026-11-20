@@ -3860,3 +3860,65 @@ fn watch_finds_a_headless_coordinator_alive_and_may_notify_it() {
     assert_eq!(coordinator["ok"], true, "{findings:?}");
     assert_eq!(coordinator["detail"], "harness alive", "{findings:?}");
 }
+
+#[test]
+fn watch_answers_a_managed_muse_hooks_dialog() {
+    // #1932: one watch pass answers the exact dialog in this registry's
+    // managed Muse lane and reports it as a hooks_trust finding.
+    let fixture = Fixture::new();
+    fixture
+        .manager()
+        .start(
+            "lane",
+            &fixture.root,
+            StartOptions {
+                workspace_id: Some("workspace".to_owned()),
+                harness: "muse".to_owned(),
+                harness_args: vec!["--approval-mode=never".to_owned()],
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    *fixture.client.screen.lock().unwrap() = Some(
+        "Review plugin hooks\n\
+         39 new or changed hooks need your trust\n\
+         \n\
+         ❯ Review hooks\n\
+         \x20 Trust all and continue\n\
+         \x20 Continue without trusting\n\
+         \n\
+         Up/Down to choose, Enter to confirm. Esc continues without trusting.\n"
+            .to_owned(),
+    );
+    let host = ScriptedHost::new();
+    let config = config(&fixture, None);
+    let registry = fixture.root.join("registry");
+    let findings = watch_once(
+        &fixture.client,
+        &registry,
+        &host,
+        &config,
+        &WatchOptions {
+            interval: Duration::from_secs(60),
+            once: true,
+            check_only: false,
+            wrkslots: None,
+            state_dir: None,
+            queue_stale: Duration::from_secs(600),
+        },
+        &mut Default::default(),
+        &mut Default::default(),
+    );
+    let row = findings
+        .iter()
+        .find(|row| row["check"] == "hooks_trust")
+        .unwrap_or_else(|| panic!("no hooks_trust finding in {findings:?}"));
+    assert_eq!(row["ok"], true, "{row}");
+    assert!(
+        row["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("declined hook trust (39 hooks)")),
+        "{row}"
+    );
+    assert_eq!(fixture.client.hooks_answers.lock().unwrap().len(), 1);
+}
