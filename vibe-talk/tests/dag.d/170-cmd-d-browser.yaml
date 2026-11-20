@@ -1,0 +1,18 @@
+steps:
+  # `#1978 vibe-talk-cmd-d-dock-toggle` against the real server binary: plain
+  # Cmd+D (Mac-emulated) / Ctrl+D toggles dock/float in the quote-reply box and
+  # the Discuss pane, focus in the composer, with the negative case outside.
+  - group: check
+    job: cmd-d-browser
+    desc: the Cmd+D dock/float toggle (quote reply and Discuss, docked and floating both ways, focus in the composer, nothing outside), against the real server (fake chat upstream, contract-shaped catchup at the network edge) in current Chromium at 412x915 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/cmd_d_browser.py
+    jobs_flag: ""
+    deps: [build.release, setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 60
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
