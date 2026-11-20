@@ -150,3 +150,28 @@ fn redact_supports_a_retired_agent() {
         .unwrap();
     assert_eq!(result["total_matches"], 3);
 }
+
+#[test]
+fn redact_preserves_file_modes() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    fixture.start(None);
+    let dir = seed_history(&fixture);
+    stop_worker(&fixture);
+    let events = dir.join("events/e.jsonl");
+    let processed = dir.join("queue/processed/m1.json");
+    fs::set_permissions(&events, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(&processed, fs::Permissions::from_mode(0o640)).unwrap();
+    fixture
+        .manager()
+        .redact("worker", SECRET, false, false, false)
+        .unwrap();
+    assert_eq!(
+        fs::metadata(&events).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(&processed).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+}

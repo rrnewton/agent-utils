@@ -7876,8 +7876,11 @@ class ManagedAgents:
                     os.fsync(stream.fileno())
 
             def atomic_write(path: Path, content: str) -> None:
+                # Preserve the original file's mode across the rename.
                 temporary = path.parent / f".redact-{os.getpid()}-{path.name}.tmp"
-                with open(temporary, "w", encoding="utf-8") as stream:
+                descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                                     stat.S_IMODE(path.stat().st_mode))
+                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
                     stream.write(content)
                     stream.flush()
                     os.fsync(stream.fileno())

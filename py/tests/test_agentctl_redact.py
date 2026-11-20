@@ -103,3 +103,19 @@ def test_redact_supports_a_retired_agent(
     archive.parent.mkdir(parents=True, exist_ok=True)
     (manager.registry / "agents" / "worker").rename(archive)
     assert manager.redact("worker", SECRET)["total_matches"] == 3
+
+
+def test_redact_preserves_file_modes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path))
+    directory = _seed(manager)
+    _stop(manager)
+    events = directory / "events" / "e.jsonl"
+    processed = directory / "queue" / "processed" / "m1.json"
+    events.chmod(0o600)
+    processed.chmod(0o640)
+    manager.redact("worker", SECRET)
+    assert stat.S_IMODE(events.stat().st_mode) == 0o600
+    assert stat.S_IMODE(processed.stat().st_mode) == 0o640

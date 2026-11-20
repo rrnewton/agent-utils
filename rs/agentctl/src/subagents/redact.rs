@@ -127,9 +127,15 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         std::process::id(),
         path.as_os_str().len()
     ));
+    // Preserve the original file's mode across the rename (review fix):
+    // a 0600 event log must not come back 0644 from the umask.
+    let mode = fs::metadata(path).map(|meta| meta.permissions()).ok();
     let write = (|| -> std::io::Result<()> {
         use std::io::Write;
         let mut file = fs::File::create(&temporary)?;
+        if let Some(mode) = &mode {
+            file.set_permissions(mode.clone())?;
+        }
         file.write_all(bytes)?;
         file.sync_all()?;
         fs::rename(&temporary, path)?;
@@ -398,6 +404,9 @@ impl<C: ManagedApi + ?Sized> ManagedAgents<'_, C> {
                 file.write_all(&original)
                     .map_err(|error| fail(error.to_string()))?;
             }
+            // The queue writer's temp is always 0600; restore the file's
+            // own mode afterwards so a rewrite never changes permissions.
+            let original_mode = fs::metadata(&item.path).map(|meta| meta.permissions()).ok();
             match (&item.json, &item.lines) {
                 (Some(value), _) => agent::atomic_json(&item.path, value)?,
                 (_, Some(lines)) => {
@@ -408,6 +417,9 @@ impl<C: ManagedApi + ?Sized> ManagedAgents<'_, C> {
                     atomic_write(&item.path, content.as_bytes())?;
                 }
                 _ => unreachable!(),
+            }
+            if let Some(mode) = original_mode {
+                fs::set_permissions(&item.path, mode).map_err(|error| fail(error.to_string()))?;
             }
         }
         append_audit(
