@@ -744,6 +744,16 @@ export interface ClientConfigResponse {
    */
   idempotent_posts_supported?: boolean;
   /**
+   * The deployment's internal link hosts (`[speakable] internal_link_hosts`,
+   * `#2007 vibe-talk-speech-short-links`), so a device voice on the page
+   * shortens the same links the server's speech pass does: a link on one is
+   * spoken as the kind and id its path names, or as an internal link. Sent
+   * only when configured — absent, and from an older server, no host is
+   * internal to the page and every address takes the generic host rule. No
+   * host is named in code; the list is the deployment's own configuration.
+   */
+  internal_link_hosts?: string[];
+  /**
    * How changes reach the SSE hub.
    */
   live_delivery: LiveDelivery;

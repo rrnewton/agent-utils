@@ -279,6 +279,13 @@ fn client_config(
         broadcast_supported: full,
         idempotent_posts_supported: full,
         speech_prep_enabled: full,
+        // `#2007 vibe-talk-speech-short-links`. A fake internal host in the full
+        // sample, absent in the other, as from an unconfigured deployment.
+        internal_link_hosts: if full {
+            vec!["intranet.example".into()]
+        } else {
+            Vec::new()
+        },
         providers: vec![
             ProviderDescription {
                 key: "discord".into(),

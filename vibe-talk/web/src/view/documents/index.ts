@@ -12,7 +12,7 @@ export type { DocumentsReader, DocumentsReaderDependencies, OpenDocument } from 
 export { renderDocumentMarkdown, documentHeadingId } from "./render.ts";
 export { listAnchorDelta, listAnchorOf, readerAnchorDelta, readerAnchorOf } from "./viewstate.ts";
 export type { ListAnchor, ReaderAnchor } from "./viewstate.ts";
-export { documentReadBlocks } from "./blocks.ts";
+export { documentReadBlocks, setInternalLinkHostProvider, setInternalLinkHosts } from "./blocks.ts";
 export type { DocumentReadBlock } from "./blocks.ts";
 export { createViewSelector, nextView, otherViews, VIEW_CARDS_SETTLE_MS, VIEW_LABELS, VIEW_ORDER } from "./selector.ts";
 export type { DocViewName, ViewSelector, ViewSelectorDependencies } from "./selector.ts";
@@ -24,6 +24,7 @@ import type { DocStateStorage } from "./docstate.ts";
 import { createDocumentsList, FOLLOW_SLACK_PX } from "./list.ts";
 import type { DocumentsListPlace } from "./list.ts";
 import { createDocumentsReader, openDocumentNotice } from "./reader.ts";
+import { setInternalLinkHostProvider } from "./blocks.ts";
 import { centrePopupOver } from "../dom/index.ts";
 import { createDocumentsSearch } from "./search.ts";
 import type { OpenDocument } from "./reader.ts";
@@ -47,6 +48,12 @@ export interface DocumentsViewDependencies {
   }, from?: { part: number; block: number | null }): unknown;
   /** Stop the reading of document `key`, where that document's is the one playing; no other. */
   stopSpeaking?(key: string): unknown;
+  /**
+   * The deployment's internal link hosts as client-config names them
+   * (`#2007 vibe-talk-speech-short-links`), read on use for the speech rule a
+   * device voice applies to a document read. Absent, no host is internal.
+   */
+  internalLinkHosts?(): readonly string[];
   onStatus?(text: string): unknown;
   /** The open levels changed (a document opened or closed): sync the history. */
   onLevelChange?(): unknown;
@@ -113,6 +120,9 @@ export interface DocumentsView {
 
 /** Mount the Documents view over `#pane-docs`. Construction does nothing. */
 export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsView {
+  // The reader's speech rule reads the configured internal hosts on use
+  // (`#2007`), so a client-config answer landing after construction still counts.
+  if (deps.internalLinkHosts) setInternalLinkHostProvider(deps.internalLinkHosts);
   const listening = createListening();
   let readingNow = false;
   let wired = false;

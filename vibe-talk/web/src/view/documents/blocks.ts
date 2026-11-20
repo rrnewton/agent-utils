@@ -20,11 +20,125 @@ export interface DocumentReadBlock {
   level?: number;
 }
 
-/** Inline dressing off one line of prose: links and images say their words. */
+/**
+ * The deployment's internal link hosts (`#2007 vibe-talk-speech-short-links`), as
+ * client-config names them (`[speakable] internal_link_hosts` on the server):
+ * none by default, and no internal host is named in code, so an unconfigured
+ * deployment has none internal. Speech only — drawn links keep their addresses.
+ */
+let internalHosts: readonly string[] = [];
+let internalHostProvider: (() => readonly string[]) | null = null;
+
+/** Settle configured hosts for matching: any case, a `www.` prefix taken off. */
+function settledHosts(hosts: readonly string[]): string[] {
+  const settled: string[] = [];
+  for (const entry of hosts) {
+    const host = entry.trim().toLowerCase().replace(/^www\./, "").replace(/\.$/, "");
+    if (host !== "" && !settled.includes(host)) settled.push(host);
+  }
+  return settled;
+}
+
+/** Name the internal link hosts directly (a test, or a host with no provider). */
+export function setInternalLinkHosts(hosts: readonly string[]): void {
+  internalHosts = settledHosts(hosts);
+  internalHostProvider = null;
+}
+
+/** Read the internal link hosts from `provider` on use, as client-config lands. */
+export function setInternalLinkHostProvider(provider: () => readonly string[]): void {
+  internalHostProvider = provider;
+}
+
+/** The internal link hosts in force now. */
+function internalLinkHosts(): readonly string[] {
+  return internalHostProvider !== null ? settledHosts(internalHostProvider()) : internalHosts;
+}
+
+/** One kind of internal page an address path can name, and the id prefix it carries. */
+const INTERNAL_KINDS: readonly { words: readonly string[]; kind: string; prefix: string }[] = [
+  { words: ["paste", "pastes"], kind: "paste", prefix: "P" },
+  { words: ["diff", "diffs"], kind: "diff", prefix: "D" },
+  { words: ["task", "tasks"], kind: "task", prefix: "T" },
+];
+
+/** An id token as an internal path writes one (`P123`), as `{kind, digits}` or null. */
+function internalId(segment: string): { kind: string; digits: string } | null {
+  const row = INTERNAL_KINDS.find((kind) => kind.prefix === segment.charAt(0));
+  if (row === undefined) return null;
+  const digits = segment.slice(1);
+  return digits !== "" && /^\d+$/.test(digits) ? { kind: row.kind, digits } : null;
+}
+
+/** One internal kind and id, whole where a listener can hold it, else by its ending. */
+function internalSaid(kind: string, token: string, digits: string): string {
+  return digits.length <= 6 ? `${kind} ${token}` : `${kind} ending in ${digits.slice(-3)}`;
+}
+
+/** What a voice says for an internal address's path, or null where no kind is obvious. */
+function internalSpoken(path: string): string | null {
+  const segments = path.split(/[?#]/, 1)[0]!.split("/").filter((part) => part !== "");
+  const first = segments[0];
+  if (first === undefined) return null;
+  const lone = internalId(first);
+  if (lone !== null) return internalSaid(lone.kind, first, lone.digits);
+  const row = INTERNAL_KINDS.find((kind) => kind.words.includes(first.toLowerCase()));
+  if (row === undefined) return null;
+  const id = segments[1];
+  if (id === undefined) return null;
+  const named = internalId(id);
+  if (named !== null) return internalSaid(named.kind, id, named.digits);
+  if (/^\d+$/.test(id)) return internalSaid(row.kind, `${row.prefix}${id}`, id);
+  if (id.length <= 16 && /^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(id)) return `${row.kind} ${id}`;
+  return row.kind;
+}
+
+/**
+ * How one web address is said (`#2007 vibe-talk-speech-short-links`, mirroring the
+ * server's speech rule in src/speakable.rs): an internal link as its kind and id or
+ * as an internal link, a bare host as itself, and any other address by its host
+ * alone. Never the scheme, and never the path.
+ */
+function spokenUrl(address: string): string {
+  const rest = address.replace(/^https?:\/\//i, "");
+  const cut = rest.search(/[/?#]/);
+  const authority = cut === -1 ? rest : rest.slice(0, cut);
+  const path = cut === -1 ? "" : rest.slice(cut);
+  const host = (authority.split("@").pop() ?? "").split(":")[0]!.toLowerCase().replace(/^www\./, "");
+  if (!/^[a-z0-9-]+(\.[a-z0-9-]+)*$/.test(host)) return "a link";
+  if (internalLinkHosts().includes(host)) return internalSpoken(path) ?? "an internal link";
+  if (path === "" || path === "/") return host;
+  return `a link on ${host}`;
+}
+
+/** Whether a link's label says nothing but an address, so the address is what is said. */
+function labelIsAddress(label: string, target: string): boolean {
+  const text = label.trim();
+  return text === "" || text === target || /^(https?:\/\/|www\.)/i.test(text)
+    || internalLinkHosts().some((host) => text.toLowerCase().startsWith(`${host}/`));
+}
+
+/** A bare address's spoken form, with any prose punctuation after it kept as prose. */
+function spokenBare(address: string): string {
+  let end = address.length;
+  while (end > 0 && ".,;:!?".includes(address.charAt(end - 1))) end -= 1;
+  if (address.charAt(end - 1) === ")" && !address.slice(0, end).includes("(")) end -= 1;
+  return spokenUrl(address.slice(0, end)) + address.slice(end);
+}
+
+/** The bare addresses recognised in prose, rebuilt as the configured hosts land. */
+function bareAddressPattern(): RegExp {
+  const hosts = internalLinkHosts().map((host) => `${host.replace(/\./g, "\\.")}/`).join("|");
+  return new RegExp(`(?:https?://|www\\.|github\\.com/${hosts !== "" ? `|${hosts}` : ""})[^\\s<>"']+`, "gi");
+}
+
+/** Inline dressing off one line of prose: links say their words, addresses what they are. */
 function speakable(text: string): string {
   return text
     .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
-    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/\[([^\]]*)\]\(([^)]*)\)/g, (_match, label: string, target: string) =>
+      labelIsAddress(label, target) ? spokenUrl(target.trim()) : label)
+    .replace(bareAddressPattern(), (address) => spokenBare(address))
     .replace(/`([^`]*)`/g, "$1")
     .replace(/\*\*([^*]*)\*\*/g, "$1")
     .replace(/\*([^*]*)\*/g, "$1")

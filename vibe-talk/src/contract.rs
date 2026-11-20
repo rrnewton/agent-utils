@@ -208,6 +208,15 @@ pub struct ClientConfigResponse {
     /// the data would tell the operator the feature was off every time the channel was plain prose.
     /// They are flipping this switch to compare two runs; guessing is exactly what they cannot do.
     pub speech_prep_enabled: bool,
+    /// The deployment's internal link hosts (`[speakable] internal_link_hosts`,
+    /// `#2007 vibe-talk-speech-short-links`), so a device voice on the page
+    /// shortens the same links the server's speech pass does: a link on one is
+    /// spoken as the kind and id its path names, or as an internal link. Sent
+    /// only when configured — absent, and from an older server, no host is
+    /// internal to the page and every address takes the generic host rule. No
+    /// host is named in code; the list is the deployment's own configuration.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub internal_link_hosts: Vec<String>,
     /// Each configured chat provider and what it can do, in configuration order.
     ///
     /// Every channel names its provider by key ([`ChannelInfo::provider`]). The deployment-wide

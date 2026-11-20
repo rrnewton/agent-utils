@@ -399,6 +399,11 @@ backend = "elevenlabs"
 # It does NOT control the time-zone conversion: a message carries a local `spoken_time` either way.
 # Environment: VIBE_TALK_SPEAKABLE (true/false — an unreadable value refuses to start)
 enabled = true
+# Your deployment's internal link hosts: a link on one is spoken as the kind and id its path
+# names ("paste P123", "diff D123", "task T123"), or as an internal link, never in full. Host
+# names only, matched in any case with or without a "www." prefix. Keep the real names in this
+# deployment file only — never in the repository. Absent: no host is internal.
+# internal_link_hosts = ["intranet.example", "links.example"]
 
 # [owner] tells the voice agent which messages are YOURS, so it never reads you your own words back.
 # Every message line a model reads attributes yours to "the user (<name>)" instead of your display

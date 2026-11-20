@@ -1249,6 +1249,7 @@ const documentsView = createDocumentsView({
   storage: () => deviceStorageOnUse(),
   closeActionMenu: () => setActionMenuOpen(false),
   readDocument: (doc, from) => readAloudOwner().readDocument(doc, from),
+  internalLinkHosts: () => serverFacts.internalLinkHosts(),
   // Page-side kind-and-id awareness (`#1039` stage 3): the reader names only its
   // own document's key; whether that document's is the read playing (or pending)
   // is read off the owner's surface here, so no other read is ever stopped.

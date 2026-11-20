@@ -54,6 +54,7 @@ export interface ClientConfigLike {
   idempotent_posts_supported?: boolean;
   replies_in_thread?: boolean;
   speech_prep_enabled?: unknown;
+  internal_link_hosts?: unknown;
   noise_rules?: unknown;
   voice_settings?: unknown;
   voice_prompt?: unknown;
@@ -81,7 +82,7 @@ export interface ClientConfigDependencies {
   };
   serverFacts: {
     setThreadNames(on: boolean): void; setDiscussAvailable(on: boolean): void;
-    setTokenScope(scope: unknown): void;
+    setTokenScope(scope: unknown): void; setInternalLinkHosts(said: unknown): void;
     tokenScope(): unknown; markConfigApplied(): void;
   };
   whoIsWho: {
@@ -163,6 +164,9 @@ export function createClientConfig(deps: ClientConfigDependencies): ClientConfig
     deps.serverFacts.setThreadNames(config.thread_names_supported === true);
     // `catchup-side-agent`: whether Discuss has a direct LLM summarizer to ask.
     deps.serverFacts.setDiscussAvailable(config.discuss_available === true);
+    // `#2007 vibe-talk-speech-short-links`: the deployment's internal link hosts,
+    // for the speech rules a device voice applies on this page.
+    deps.serverFacts.setInternalLinkHosts(config.internal_link_hosts);
     deps.learnProviders(config.providers);
     deps.whoIsWho.setDeploymentCodingAgents(config);
     // The selected backend owns its display name. An older server leaves it unspecified, so the

@@ -1075,6 +1075,7 @@ pub async fn client_config(
         broadcast_supported: state.chat.supports_broadcast(),
         idempotent_posts_supported: state.chat.supports_idempotent_posts(),
         speech_prep_enabled: state.config.speakable.enabled,
+        internal_link_hosts: state.config.speakable.internal_link_hosts.clone(),
         replay_enabled: crate::replay::offered(
             &state.config.replay,
             &state.config.conversation,
@@ -7710,15 +7711,22 @@ pub async fn prepare_speech(
         let Some(message) = found.messages.get(id) else {
             continue;
         };
-        let said = crate::speakable::for_speech(
+        let said = crate::speakable::for_speech_configured(
             &crate::speakable::with_mention_names(&message.content, &message.mentions),
             now,
             &state.config.timezone,
+            &state.config.speakable.internal_link_hosts,
         );
         if said.trim().is_empty() {
             continue;
         }
-        let blocks = spoken_blocks(message, markup, now, &state.config.timezone);
+        let blocks = spoken_blocks(
+            message,
+            markup,
+            now,
+            &state.config.timezone,
+            &state.config.speakable.internal_link_hosts,
+        );
         resolved.push((message.id.0.clone(), said, blocks));
     }
     // Message preparation is lookup, fetch and normalization. The provider warm-up is a separate
@@ -7805,8 +7813,16 @@ fn spoken_blocks(
     markup: crate::render::Markup,
     now: i64,
     zone: &crate::clock::Zone,
+    hosts: &[String],
 ) -> Vec<SpokenBlock> {
-    spoken_blocks_for(&message.content, markup, &message.mentions, now, zone)
+    spoken_blocks_for(
+        &message.content,
+        markup,
+        &message.mentions,
+        now,
+        zone,
+        hosts,
+    )
 }
 
 /// [`spoken_blocks`] for text that is not a channel message: a cached document's
@@ -7817,6 +7833,7 @@ fn spoken_blocks_for(
     mentions: &[crate::model::MentionName],
     now: i64,
     zone: &crate::clock::Zone,
+    hosts: &[String],
 ) -> Vec<SpokenBlock> {
     use crate::render::BlockKind;
     let blocks = crate::render::source_blocks(content, markup, mentions);
@@ -7855,7 +7872,7 @@ fn spoken_blocks_for(
     for (element, (kind, pieces)) in cut.into_iter().enumerate() {
         let count = pieces.len();
         for (piece, source) in pieces.into_iter().enumerate() {
-            let said = crate::speakable::for_speech_with(
+            let said = crate::speakable::for_speech_with_configured(
                 &crate::speakable::with_mention_names(
                     crate::render::piece_source(&source),
                     mentions,
@@ -7863,6 +7880,7 @@ fn spoken_blocks_for(
                 now,
                 zone,
                 &mut names,
+                hosts,
             );
             spoken.push(SpokenBlock {
                 kind,
@@ -9635,7 +9653,12 @@ pub async fn prepare_document_speech(
         }
     };
     let now = jiff::Timestamp::now().as_millisecond();
-    let said = crate::speakable::for_speech(&content, now, &state.config.timezone);
+    let said = crate::speakable::for_speech_configured(
+        &content,
+        now,
+        &state.config.timezone,
+        &state.config.speakable.internal_link_hosts,
+    );
     if said.trim().is_empty() {
         return Ok(Json(PrepareSpeechResponse {
             prepared: Vec::new(),
@@ -9648,6 +9671,7 @@ pub async fn prepare_document_speech(
         &[],
         now,
         &state.config.timezone,
+        &state.config.speakable.internal_link_hosts,
     );
     let preparation_ms = millis(preparation_began.elapsed());
     let described = blocks

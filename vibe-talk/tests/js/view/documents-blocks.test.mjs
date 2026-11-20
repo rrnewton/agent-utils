@@ -103,6 +103,42 @@ test("documents blocks: markdown dressing is not spoken", () => {
   assert.deepEqual(blocks.map((b) => b.text), ["Read the guide with care and code now."]);
 });
 
+test("documents blocks: addresses are spoken as what they are, never in full (#2007 vibe-talk-speech-short-links)", () => {
+  // Fake configured hosts and obviously fake ids only: no internal host is
+  // named in code, so the test configures the hosts it exercises.
+  assert.equal(typeof BLOCKS.setInternalLinkHosts, "function", "blocks does not export setInternalLinkHosts");
+  const company = "intranet.example";
+  const short = "links.example";
+  const texts = (markdown) => blocksOf(markdown).map((b) => b.text);
+  // With no hosts configured, an address on one of them takes the generic rule.
+  BLOCKS.setInternalLinkHosts([]);
+  assert.deepEqual(texts(`See https://${company}/paste/P123 for the details.\n`),
+    ["See a link on intranet.example for the details."]);
+  BLOCKS.setInternalLinkHosts([company, short]);
+  assert.deepEqual(texts(`See https://${company}/paste/P123 for the details.\n`),
+    ["See paste P123 for the details."]);
+  assert.deepEqual(texts(`See https://www.${company}/diff/D123 and https://${short}/T123.\n`),
+    ["See diff D123 and task T123."]);
+  assert.deepEqual(texts(`Tracked at https://${company}/tasks/7654321 today.\n`),
+    ["Tracked at task ending in 321 today."]);
+  assert.deepEqual(texts(`See https://${company}/some/deep/path?q=1 now.\n`),
+    ["See an internal link now."]);
+  // Written with no scheme, as a configured host is recognised the same way.
+  assert.deepEqual(texts(`See ${company}/paste/P123 now.\n`), ["See paste P123 now."]);
+  // A link whose label is its own address says the address's kind; a writer's label wins.
+  assert.deepEqual(texts(`[https://${company}/paste/P123](https://${company}/paste/P123)\n`),
+    ["paste P123"]);
+  assert.deepEqual(texts(`Read [the writeup](https://${company}/paste/P123) now.\n`),
+    ["Read the writeup now."]);
+  BLOCKS.setInternalLinkHosts([]);
+  // Any other address by its host alone, a bare host as itself, GitHub by its host
+  // here (its page-by-page spoken names are the server speech rule's, pinned there).
+  assert.deepEqual(texts("See https://example.org/some/long/path and https://example.org today.\n"),
+    ["See a link on example.org and example.org today."]);
+  assert.deepEqual(texts("See https://github.com/octo/widgets/pull/41 today.\n"),
+    ["See a link on github.com today."]);
+});
+
 test("documents blocks: a rule draws nothing spoken", () => {
   const blocks = blocksOf("Above.\n\n---\n\nBelow.\n");
   assert.deepEqual(blocks.map((b) => b.text), ["Above.", "Below."]);

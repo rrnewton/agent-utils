@@ -573,18 +573,67 @@ fn owner_config(file: FileOwner) -> Result<OwnerConfig, ConfigError> {
 /// off, because that conversion is not a judgement: handing an assistant a UTC instant and letting
 /// it do the arithmetic produced a real wrong answer, and there is no reading of "turn the
 /// rewriting off" under which the operator was asking for that back.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SpeakableConfig {
     /// Rewrite bodies for speech. Defaults to `true` when the section or the key is absent.
     #[serde(default = "yes")]
     pub enabled: bool,
+    /// The deployment's internal link hosts (`[speakable] internal_link_hosts`,
+    /// `#2007 vibe-talk-speech-short-links`): a link on one is spoken as the kind
+    /// and id its path names ("paste P123", "diff D123", "task T123"), or as an
+    /// internal link, never in full. Empty by default — no internal host is named
+    /// in code, so an unconfigured deployment says every such address by the
+    /// generic host rule. Entries are host names only, matched in any case with
+    /// or without a `www.` prefix; they are also sent to the page in
+    /// client-config so a device voice shortens the same links. Checked when
+    /// the configuration loads (see `speakable_checked`).
+    #[serde(default)]
+    pub internal_link_hosts: Vec<String>,
 }
 
 impl Default for SpeakableConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            internal_link_hosts: Vec::new(),
+        }
     }
+}
+
+/// `[speakable]` as the file says it, once every internal link host is a host name
+/// a voice could say: lowercase ASCII labels of letters, digits and hyphens joined
+/// by dots, with any `www.` prefix or trailing dot taken off, duplicates out.
+/// `#2007 vibe-talk-speech-short-links`.
+fn speakable_checked(speakable: SpeakableConfig) -> Result<SpeakableConfig, ConfigError> {
+    let mut hosts: Vec<String> = Vec::new();
+    for raw in &speakable.internal_link_hosts {
+        let host = raw.trim().to_ascii_lowercase();
+        let host = host.strip_prefix("www.").unwrap_or(&host);
+        let host = host.strip_suffix('.').unwrap_or(host);
+        let valid = !host.is_empty()
+            && host.len() <= 253
+            && host.split('.').all(|label| {
+                !label.is_empty()
+                    && !label.starts_with('-')
+                    && label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            });
+        if !valid {
+            return Err(ConfigError::Invalid {
+                field: "speakable.internal_link_hosts".to_owned(),
+                detail: format!("{raw:?} is not a host name (labels of letters, digits and hyphens joined by dots)"),
+            });
+        }
+        if !hosts.iter().any(|held| held == host) {
+            hosts.push(host.to_owned());
+        }
+    }
+    Ok(SpeakableConfig {
+        internal_link_hosts: hosts,
+        ..speakable
+    })
 }
 
 /// `[render]`: how message bodies are drawn on the page. `markdown-tables-render`.
@@ -2570,12 +2619,13 @@ impl Config {
         };
         let channels = resolve_channel_providers(channels, &providers)?;
         validate_channels(&channels)?;
-        let speakable = SpeakableConfig {
+        let speakable = speakable_checked(SpeakableConfig {
             enabled: match get(ENV_SPEAKABLE) {
                 None => file.speakable.enabled,
                 Some(raw) => switch(raw, "speakable.enabled")?,
             },
-        };
+            internal_link_hosts: file.speakable.internal_link_hosts.clone(),
+        })?;
 
         let storage = storage_config(get(ENV_STORAGE_PATH), file.storage)?;
         // `#709 vt-live-tail-rust`. A tail with no named resume file keeps its position beside
@@ -6463,6 +6513,34 @@ provider = "slack"
         let text = format!("{FULL}\n[speakable]\n");
         let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
         assert!(cfg.speakable.enabled);
+    }
+
+    #[test]
+    fn internal_link_hosts_are_the_deployments_and_empty_by_default() {
+        // `#2007 vibe-talk-speech-short-links`: no internal host is named in code.
+        let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
+        assert!(cfg.speakable.internal_link_hosts.is_empty());
+        // Fake hosts only in tests; case, a `www.` prefix and duplicates settle.
+        let text = format!(
+            "{FULL}\n[speakable]\ninternal_link_hosts = [\"Intranet.Example\", \"www.links.example.\", \"intranet.example\"]\n"
+        );
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
+        assert_eq!(
+            cfg.speakable.internal_link_hosts,
+            ["intranet.example", "links.example"]
+        );
+        for bad in [
+            "https://intranet.example/x",
+            "intra net.example",
+            "-bad.example",
+            "",
+        ] {
+            let text = format!("{FULL}\n[speakable]\ninternal_link_hosts = [\"{bad}\"]\n");
+            assert!(
+                Config::from_toml_and_env(&text, &env(&[])).is_err(),
+                "{bad:?} was accepted"
+            );
+        }
     }
 
     #[test]

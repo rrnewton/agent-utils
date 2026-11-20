@@ -17,8 +17,10 @@
 //! 1. **Markdown comes off.** Discord's flavour: fences, inline code, bold, italic, underline,
 //!    strikethrough, spoilers, headers, quotes, links, mentions and custom emoji. A link reads as
 //!    its words, and an address with none is said as what it is (`#187 speakable-ids-urls`): a
-//!    page with a short label as that page, "widgets pull request 41"; anything else by its host,
-//!    "a link on example.com". Never "https", and never "colon slash slash".
+//!    page with a short label as that page, "widgets pull request 41"; an internal company link
+//!    by the kind and id its path names, or as an internal link (`#2007
+//!    vibe-talk-speech-short-links`); anything else by its host, "a link on example.com".
+//!    Never "https", and never "colon slash slash".
 //! 2. **Times become relative.** A listener wants "three hours ago", not "2026-08-24T04:31:00Z".
 //! 3. **Opaque strings become useful short names.** A hash is not information when spoken; it is
 //!    forty seconds of alphabet, so it becomes "hash code A". A long numeric identifier becomes
@@ -151,6 +153,21 @@ impl SharedNames {
         }
     }
 
+    /// [`for_speech_configured`], naming into the shared table.
+    #[must_use]
+    pub fn for_speech_configured(
+        &self,
+        content: &str,
+        now_ms: i64,
+        zone: &Zone,
+        hosts: &[String],
+    ) -> String {
+        match self.0.lock() {
+            Ok(mut names) => for_speech_with_configured(content, now_ms, zone, &mut names, hosts),
+            Err(_) => for_speech_configured(content, now_ms, zone, hosts),
+        }
+    }
+
     /// How many distinct opaque strings have been named, or zero if the lock is poisoned.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -191,14 +208,36 @@ pub fn for_speech(content: &str, now_ms: i64, zone: &Zone) -> String {
     for_speech_with(content, now_ms, zone, &mut Names::new())
 }
 
+/// [`for_speech`] for a deployment that configures internal link hosts
+/// (the speakable config's `internal_link_hosts`, `#2007 vibe-talk-speech-short-links`):
+/// an address on one of those hosts is said as the kind and id its path names, or
+/// as an internal link. No host is named in code; an unconfigured deployment has
+/// none, and every address takes the generic rules.
+#[must_use]
+pub fn for_speech_configured(content: &str, now_ms: i64, zone: &Zone, hosts: &[String]) -> String {
+    for_speech_with_configured(content, now_ms, zone, &mut Names::new(), hosts)
+}
+
 /// [`for_speech`], but naming into a table the caller keeps.
 #[must_use]
 pub fn for_speech_with(content: &str, now_ms: i64, zone: &Zone, names: &mut Names) -> String {
+    for_speech_with_configured(content, now_ms, zone, names, &[])
+}
+
+/// [`for_speech_configured`], but naming into a table the caller keeps.
+#[must_use]
+pub fn for_speech_with_configured(
+    content: &str,
+    now_ms: i64,
+    zone: &Zone,
+    names: &mut Names,
+    hosts: &[String],
+) -> String {
     let text = drop_timestamp_citations(content);
     // `#1898`: a link nested in a Markdown label is unwrapped to its words first, so no
     // raw `<url|label>` or second link's brackets are spoken.
     let text = crate::slack::mrkdwn::unwrap_links_in_labels(&text, &[]);
-    let text = strip_markdown(&text);
+    let text = strip_markdown(&text, hosts);
     let text = speak_times(&text, now_ms, zone);
     let text = name_opaque_strings(&text, names);
     collapse_whitespace(&text)
@@ -304,7 +343,7 @@ fn scan_plain_citation(chars: &[char], start: usize) -> Option<usize> {
 // --- markdown -----------------------------------------------------------------------------------
 
 /// Take Discord's markdown off, keeping the words inside it.
-fn strip_markdown(content: &str) -> String {
+fn strip_markdown(content: &str, hosts: &[String]) -> String {
     let without_fences = drop_fenced_blocks(content);
     let without_tables = describe_tables(&without_fences);
     let mut out = String::with_capacity(without_tables.len());
@@ -312,7 +351,7 @@ fn strip_markdown(content: &str) -> String {
         if index > 0 {
             out.push('\n');
         }
-        out.push_str(&strip_line(line));
+        out.push_str(&strip_line(line, hosts));
     }
     out
 }
@@ -564,7 +603,7 @@ fn say_code(block: &str) -> String {
     }
 }
 
-fn strip_line(line: &str) -> String {
+fn strip_line(line: &str, hosts: &[String]) -> String {
     let trimmed = line.trim_start();
     // Headers and quotes carry no sound. `- ` and `* ` bullets are left as words would be: the
     // pause between list items is what a reader hears anyway.
@@ -573,7 +612,7 @@ fn strip_line(line: &str) -> String {
         .trim_start()
         .trim_start_matches('#')
         .trim_start();
-    let words = strip_inline(body);
+    let words = strip_inline(body, hosts);
     if is_atx_heading(trimmed.trim_start_matches('>').trim_start()) {
         return end_heading_sentence(words);
     }
@@ -655,7 +694,7 @@ impl NextOf {
 
 /// Remove inline markers, resolve links to their text, say addresses as what they are, and name
 /// the things that have no sound.
-fn strip_inline(text: &str) -> String {
+fn strip_inline(text: &str, hosts: &[String]) -> String {
     let mut out = String::with_capacity(text.len());
     let chars: Vec<char> = text.chars().collect();
     let mut closes = NextOf::new(']');
@@ -664,7 +703,7 @@ fn strip_inline(text: &str) -> String {
     while i < chars.len() {
         // `[label](url)` reads as its label. A listener cannot use a URL and cannot write it down.
         if chars[i] == '[' {
-            if let Some((label, consumed)) = link_at(&chars, i, &mut closes, &mut parens) {
+            if let Some((label, consumed)) = link_at(&chars, i, &mut closes, &mut parens, hosts) {
                 out.push_str(&label);
                 i += consumed;
                 continue;
@@ -672,7 +711,7 @@ fn strip_inline(text: &str) -> String {
         }
         if chars[i] == '<' {
             // `<https://…>`, and a chat service's `<https://…|label>`, however long the address.
-            if let Some((said, consumed)) = angle_address_at(&chars, i) {
+            if let Some((said, consumed)) = angle_address_at(&chars, i, hosts) {
                 out.push_str(&said);
                 i += consumed;
                 continue;
@@ -689,9 +728,9 @@ fn strip_inline(text: &str) -> String {
         }
         // A bare web address is said as what it is. Before the emphasis markers, which would
         // otherwise take the underscores out of the middle of it.
-        if let Some(end) = address_at(&chars, i) {
+        if let Some(end) = address_at(&chars, i, hosts) {
             let address: String = chars[i..end].iter().collect();
-            out.push_str(&say_address(&address));
+            out.push_str(&say_address(&address, hosts));
             i = end;
             continue;
         }
@@ -728,6 +767,7 @@ fn link_at(
     start: usize,
     closes: &mut NextOf,
     parens: &mut NextOf,
+    hosts: &[String],
 ) -> Option<(String, usize)> {
     let close = closes.from(chars, start + 1)?;
     if chars.get(close + 1) != Some(&'(') {
@@ -741,19 +781,19 @@ fn link_at(
     let said = if label.trim().is_empty() {
         // Nothing to say but where it goes: `[](https://…)`, or Discord's `[](<https://…>)`.
         let chars: Vec<char> = target.chars().collect();
-        if address_prefix_at(&chars, 0).is_some() {
-            say_address(target)
+        if address_prefix_at(&chars, 0, hosts).is_some() {
+            say_address(target, hosts)
         } else {
             "a link".to_owned()
         }
     } else if bare_reference_said(&label, target) {
         // A label that is only the thread's number (`[#5275](…)`) is said as the page it goes
         // to, name and all, exactly as the bare address is.
-        say_address(target)
+        say_address(target, hosts)
     } else {
         // The label wins over the address, and is prose like any other: emphasis comes off it,
         // and an address written as the label is said as what it is.
-        strip_inline(&label)
+        strip_inline(&label, hosts)
     };
     Some((said, end + 1 - start))
 }
@@ -763,7 +803,7 @@ fn link_at(
 ///
 /// Its `>` is looked for only as far as the next `<` or the end of the line, so a line of
 /// `<https://` with no `>` is read once, not once per bracket.
-fn angle_address_at(chars: &[char], start: usize) -> Option<(String, usize)> {
+fn angle_address_at(chars: &[char], start: usize, hosts: &[String]) -> Option<(String, usize)> {
     let inside = start + 1;
     scheme_at(chars, inside)?;
     let close = inside
@@ -782,9 +822,9 @@ fn angle_address_at(chars: &[char], start: usize) -> Option<(String, usize)> {
         return None;
     }
     let said = if label.is_empty() || bare_reference_said(label, address) {
-        say_address(address)
+        say_address(address, hosts)
     } else {
-        strip_inline(label)
+        strip_inline(label, hosts)
     };
     Some((said, close + 1 - start))
 }
@@ -845,7 +885,7 @@ fn angle_form_at(rest: &str) -> Option<(String, usize)> {
 /// ending in 567"; an address that is nothing but a host is said as the host, "example.com"; and
 /// any other is said by its host alone, "a link on example.com". `www.` is dropped from a host,
 /// as is a port, and the name and password an address may carry before its host are never said.
-fn say_address(address: &str) -> String {
+fn say_address(address: &str, hosts: &[String]) -> String {
     let with_scheme;
     let address = if crate::link_labels::strip_scheme(address).is_some() {
         address
@@ -873,10 +913,110 @@ fn say_address(address: &str) -> String {
     if !plausible_host(host) {
         return "a link".to_owned();
     }
+    // Internal company links (`#2007 vibe-talk-speech-short-links`): the hosts are the
+    // deployment's, from its config (the speakable config's `internal_link_hosts`, empty
+    // by default — no internal host is named in code), and their links are said as the
+    // kind and id their path names, never by their path. Speech only — no displayed
+    // label changes.
+    if is_internal_host(hosts, host) {
+        return internal_spoken(path).unwrap_or_else(|| "an internal link".to_owned());
+    }
     if path.is_empty() || path == "/" {
         return host.to_owned();
     }
     lone_tracker_id(path).unwrap_or_else(|| format!("a link on {host}"))
+}
+
+/// Whether `host`, as `say_address` has it (lowercase, `www.` stripped), is one of the
+/// configured internal hosts, compared in any case.
+fn is_internal_host(hosts: &[String], host: &str) -> bool {
+    hosts.iter().any(|named| named.eq_ignore_ascii_case(host))
+}
+
+/// One kind of internal page an address path can name, and the id prefix it carries.
+struct InternalKind {
+    /// The path words that name this kind, lowercase.
+    words: &'static [&'static str],
+    /// How a voice names the kind.
+    kind: &'static str,
+    /// The letter its ids begin with.
+    prefix: char,
+}
+
+/// The internal page kinds a path can make obvious, table-driven so another kind or
+/// host pattern is a row here (`#2007 vibe-talk-speech-short-links`).
+const INTERNAL_KINDS: [InternalKind; 3] = [
+    InternalKind {
+        words: &["paste", "pastes"],
+        kind: "paste",
+        prefix: 'P',
+    },
+    InternalKind {
+        words: &["diff", "diffs"],
+        kind: "diff",
+        prefix: 'D',
+    },
+    InternalKind {
+        words: &["task", "tasks"],
+        kind: "task",
+        prefix: 'T',
+    },
+];
+
+/// An id token as an internal path writes one — a kind's letter and its digits, `P123` —
+/// as `(kind, digits)`, or `None` where the segment is not one.
+fn internal_id(segment: &str) -> Option<(&'static str, &str)> {
+    let (letter, digits) = segment.split_at(1.min(segment.len()));
+    let row = INTERNAL_KINDS
+        .iter()
+        .find(|row| letter.starts_with(row.prefix))?;
+    (!digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+        .then_some((row.kind, digits))
+}
+
+/// How a voice says one internal kind and id: whole where a listener can hold it,
+/// by its last three digits where it is a long numeric id, as tracker ids already are.
+fn internal_said(kind: &str, token: &str, digits: &str) -> String {
+    if digits.len() <= 6 {
+        format!("{kind} {token}")
+    } else {
+        format!("{kind} ending in {}", ending(digits))
+    }
+}
+
+/// What a voice says for an internal address's path, or `None` where the path names
+/// no obvious kind: a lone id segment (`/P123`), or a kind word with its id after it
+/// (`/paste/P123`, `/tasks/123`). Anything else is "an internal link" to the caller.
+fn internal_spoken(path: &str) -> Option<String> {
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    let segments: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    let first = segments.first().copied()?;
+    if let Some((kind, digits)) = internal_id(first) {
+        return Some(internal_said(kind, first, digits));
+    }
+    let row = INTERNAL_KINDS.iter().find(|row| {
+        row.words
+            .iter()
+            .any(|word| first.eq_ignore_ascii_case(word))
+    })?;
+    let id = segments.get(1).copied()?;
+    if let Some((kind, digits)) = internal_id(id) {
+        return Some(internal_said(kind, id, digits));
+    }
+    if !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()) {
+        let token = format!("{}{id}", row.prefix);
+        return Some(internal_said(row.kind, &token, id));
+    }
+    // A short opaque id a paste-style page carries, said whole; a longer one names
+    // only its kind, as a path a listener cannot use is not read out.
+    if id.len() <= 16
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Some(format!("{} {id}", row.kind));
+    }
+    Some(row.kind.to_owned())
 }
 
 /// A host name as a voice may say it: ASCII labels of letters, digits and hyphens, joined by dots,
@@ -917,15 +1057,22 @@ fn scheme_at(chars: &[char], at: usize) -> Option<usize> {
 }
 
 /// The length of what begins a web address at `at`: a scheme, or `www.` or `github.com/` written
-/// without one. Any other name followed by a path is too often a file to be read as an address.
-fn address_prefix_at(chars: &[char], at: usize) -> Option<usize> {
+/// without one, or a configured internal host (`#2007`) written without one. Any other
+/// name followed by a path is too often a file to be read as an address.
+fn address_prefix_at(chars: &[char], at: usize, hosts: &[String]) -> Option<usize> {
     if let Some(length) = scheme_at(chars, at) {
         return Some(length);
     }
-    ["www.", "github.com/"]
+    if let Some(prefix) = ["www.", "github.com/"]
         .into_iter()
         .find(|prefix| holds_at(chars, at, prefix))
-        .map(str::len)
+    {
+        return Some(prefix.len());
+    }
+    hosts
+        .iter()
+        .find(|host| holds_at(chars, at, host) && chars.get(at + host.len()) == Some(&'/'))
+        .map(|host| host.len())
 }
 
 /// Where a bare web address that begins at `start` ends, or `None` when none begins there.
@@ -934,8 +1081,15 @@ fn address_prefix_at(chars: &[char], at: usize) -> Option<usize> {
 /// written. It runs to whitespace or to a character no address holds unescaped, and then gives
 /// back what prose put after it rather than the address itself: a sentence's full stop, closing
 /// emphasis, and a bracket it did not open — `(see https://example.com/a_(b))` keeps its own pair.
-fn address_at(chars: &[char], start: usize) -> Option<usize> {
-    if !matches!(chars[start], 'h' | 'H' | 'w' | 'W' | 'g' | 'G') {
+fn address_at(chars: &[char], start: usize, hosts: &[String]) -> Option<usize> {
+    let first = chars[start];
+    let may_start = matches!(first, 'h' | 'H' | 'w' | 'W' | 'g' | 'G')
+        || hosts.iter().any(|host| {
+            host.chars()
+                .next()
+                .is_some_and(|c| c.eq_ignore_ascii_case(&first))
+        });
+    if !may_start {
         return None;
     }
     let follows_word = start
@@ -945,7 +1099,7 @@ fn address_at(chars: &[char], start: usize) -> Option<usize> {
     if follows_word {
         return None;
     }
-    let prefix = address_prefix_at(chars, start)?;
+    let prefix = address_prefix_at(chars, start, hosts)?;
     let mut end = start;
     let (mut parens, mut brackets) = (0_isize, 0_isize);
     while end < chars.len() && !ends_address(chars[end]) {
@@ -1398,7 +1552,7 @@ mod tests {
         // the square of its length before a word was spoken.
         let line = "a_<".repeat(70_000);
         let started = std::time::Instant::now();
-        let stripped = strip_inline(&line);
+        let stripped = strip_inline(&line, &[]);
         assert!(stripped.starts_with("a<a<"), "{}", &stripped[..12]);
         assert!(
             started.elapsed() < std::time::Duration::from_secs(2),
@@ -1652,6 +1806,77 @@ mod tests {
                 "{spoken}"
             );
         }
+    }
+
+    #[test]
+    fn an_internal_address_is_said_as_its_kind_and_id_or_as_an_internal_link() {
+        // `#2007 vibe-talk-speech-short-links`: fake configured hosts and obviously
+        // fake ids only — no internal host is named in code, so the test configures
+        // the hosts it exercises, as a deployment's config would.
+        let hosts: Vec<String> = vec!["intranet.example".into(), "links.example".into()];
+        let say = |text: &str| for_speech_configured(text, NOW, &eastern(), &hosts);
+        let company = "intranet.example";
+        let short = "links.example";
+        let lookalike = format!("a link on {company}.example.org");
+        for (address, said) in [
+            (format!("https://{company}/paste/P123"), "paste P123"),
+            (format!("https://www.{company}/diff/D123"), "diff D123"),
+            (format!("https://{short}/task/T123"), "task T123"),
+            (format!("https://{company}/P123"), "paste P123"),
+            (format!("https://{company}/tasks/123"), "task T123"),
+            (
+                format!("https://{company}/diff/D1234567"),
+                "diff ending in 567",
+            ),
+            (
+                format!("https://{company}/tasks/7654321?view=1"),
+                "task ending in 321",
+            ),
+            (
+                format!("https://{company}/some/deep/path?q=1"),
+                "an internal link",
+            ),
+            (format!("https://{company}/"), "an internal link"),
+            // A host that merely begins with a configured name is another host.
+            (
+                format!("https://{company}.example.org/paste/P123"),
+                lookalike.as_str(),
+            ),
+        ] {
+            let spoken = say(&address);
+            assert_eq!(spoken, said, "{address}");
+            assert!(
+                !spoken.contains("http") && !spoken.contains("//"),
+                "{spoken}"
+            );
+        }
+        // Written with no scheme, as the GitHub host already is recognised.
+        assert_eq!(
+            say(&format!("see {company}/paste/P123 now")),
+            "see paste P123 now"
+        );
+        assert_eq!(say(&format!("see {short}/T123 now")), "see task T123 now");
+        // A link whose label is its own internal address, and one with a writer's label.
+        assert_eq!(
+            say(&format!(
+                "[https://{company}/paste/P123](https://{company}/paste/P123)"
+            )),
+            "paste P123"
+        );
+        assert_eq!(
+            say(&format!("read [the writeup](https://{company}/paste/P123)")),
+            "read the writeup"
+        );
+        // With no hosts configured, the same address takes the generic host rule.
+        assert_eq!(
+            super::for_speech(&format!("https://{company}/paste/P123"), NOW, &eastern()),
+            format!("a link on {company}")
+        );
+        // Any other uncovered address is still said by its host alone.
+        assert_eq!(
+            say("https://example.org/some/long/path"),
+            "a link on example.org"
+        );
     }
 
     #[test]

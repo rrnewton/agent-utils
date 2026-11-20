@@ -470,6 +470,9 @@
         }
       ],
       "idempotent_posts_supported": true,
+      "internal_link_hosts": [
+        "intranet.example"
+      ],
       "live_delivery": "push",
       "live_poll_seconds": 5,
       "message_cache": {

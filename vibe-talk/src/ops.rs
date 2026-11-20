@@ -413,9 +413,12 @@ pub(crate) fn prepared_body(
         return String::new();
     }
     let named = crate::speakable::with_mention_names(content, mentions);
-    let said = state
-        .spoken_names
-        .for_speech(&named, now_ms, &state.config.timezone);
+    let said = state.spoken_names.for_speech_configured(
+        &named,
+        now_ms,
+        &state.config.timezone,
+        &state.config.speakable.internal_link_hosts,
+    );
     if said == content {
         String::new()
     } else {

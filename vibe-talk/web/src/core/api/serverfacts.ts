@@ -22,6 +22,14 @@ export interface ServerFacts {
   configApplied(): boolean;
   /** `/client-config` has answered. */
   markConfigApplied(): void;
+  /**
+   * The deployment's internal link hosts (`internal_link_hosts`, `#2007
+   * vibe-talk-speech-short-links`), or none before client-config has said, or
+   * where the deployment configured none: no host is internal then.
+   */
+  internalLinkHosts(): readonly string[];
+  /** Take the internal link hosts client-config said: host names only, settled for matching. */
+  setInternalLinkHosts(said: unknown): void;
   /** The page build the server last said it serves (`page_build`), or "" before a read has said. */
   pageBuild(): string;
   /** A read said the server serves `build`: whether that is news, a build said and not the one held. */
@@ -35,6 +43,7 @@ export function createServerFacts(): ServerFacts {
   let discussSupported = false;
   let clientConfigApplied = false;
   let serverPageBuild = "";
+  let linkHosts: readonly string[] = [];
 
   return {
     tokenScope: () => tokenScope,
@@ -52,6 +61,20 @@ export function createServerFacts(): ServerFacts {
     configApplied: () => clientConfigApplied,
     markConfigApplied() {
       clientConfigApplied = true;
+    },
+    internalLinkHosts: () => linkHosts,
+    setInternalLinkHosts(said) {
+      if (!Array.isArray(said)) {
+        linkHosts = [];
+        return;
+      }
+      const settled: string[] = [];
+      for (const entry of said) {
+        if (typeof entry !== "string") continue;
+        const host = entry.trim().toLowerCase().replace(/^www\./, "").replace(/\.$/, "");
+        if (host !== "" && !settled.includes(host)) settled.push(host);
+      }
+      linkHosts = settled;
     },
     pageBuild: () => serverPageBuild,
     notePageBuild(build) {

@@ -39,3 +39,12 @@ test("`#624 voice-page-modularity`: what the server says of itself is kept, a sc
   assert.equal(facts.notePageBuild("abc"), false, "the build held is no news");
   assert.equal(facts.pageBuild(), "abc");
 });
+
+test("`#2007 vibe-talk-speech-short-links`: the internal link hosts client-config names are kept settled, and none before it says", () => {
+  const facts = SERVER_API.createServerFacts();
+  assert.deepStrictEqual(facts.internalLinkHosts(), [], "no host is internal before client-config");
+  facts.setInternalLinkHosts(["Intranet.Example", "www.links.example.", "intranet.example", 42, ""]);
+  assert.deepStrictEqual(facts.internalLinkHosts(), ["intranet.example", "links.example"]);
+  facts.setInternalLinkHosts(undefined);
+  assert.deepStrictEqual(facts.internalLinkHosts(), [], "an older server's silence is no hosts");
+});
