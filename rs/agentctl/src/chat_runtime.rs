@@ -22360,7 +22360,9 @@ pub(crate) mod tests {
         }
         drop(state);
         let reopened = BridgeState::open(&root).expect("reopen after restart");
-        let claimed = reopened.take_pending_sent_refs().expect("claim after restart");
+        let claimed = reopened
+            .take_pending_sent_refs()
+            .expect("claim after restart");
         assert_eq!(claimed.len(), 2);
         assert_eq!(claimed[0].msg, "1763510460.000300");
         assert_eq!(claimed[1].msg, "1111111111.000999", "the stale ref, whole");

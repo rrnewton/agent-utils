@@ -3866,13 +3866,21 @@ async fn a_transcript_older_step_answers_at_once_while_its_provider_read_is_held
     // the provider brought. If the route waited on the provider, this
     // test would hang on the held reply instead of reaching its asserts.
     let (state, fake, _clock, _dir) = slack_transcript_deployment("transcript-older-race").await;
-    ok(&state, &path(SLACK_CH, "/timeline?view=main&limit=50"), WRITE_TOKEN).await;
+    ok(
+        &state,
+        &path(SLACK_CH, "/timeline?view=main&limit=50"),
+        WRITE_TOKEN,
+    )
+    .await;
     settled(&state).await;
     let root_a = slack_fake::ts(600, 0);
     let day = |query: &str| format!("/api/v1/transcripts/{SLACK_CH}/{root_a}?{query}");
     let newest = ok(&state, &day("limit=2"), WRITE_TOKEN).await;
     settled(&state).await;
-    let cursor = newest["next_before"].as_str().expect("a way back").to_owned();
+    let cursor = newest["next_before"]
+        .as_str()
+        .expect("a way back")
+        .to_owned();
     let hold = slack_fake::Hold::new(&root_a);
     fake.with(|fake_state| fake_state.hold_replies = Some(hold.clone()));
     let stepped = ok(

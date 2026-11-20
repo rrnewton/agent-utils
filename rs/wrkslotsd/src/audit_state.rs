@@ -6215,13 +6215,8 @@ fn audit_record(
     let (heartbeat_age, heartbeat_expired) = heartbeat_diagnosis(record)?;
     let mut agent_running = !(liveness.state == "dead" && owner_state == "dead");
     let hold = audit_hold.clone();
-    let (release, void_reason) = release_state_with_latest(
-        cfg,
-        record,
-        events,
-        release_latest,
-        precomputed_publication,
-    )?;
+    let (release, void_reason) =
+        release_state_with_latest(cfg, record, events, release_latest, precomputed_publication)?;
     let release_honoured = release.is_some()
         && void_reason.is_none()
         && matches!(owner_state.as_str(), "live" | "dead")
@@ -6318,13 +6313,9 @@ fn audit_record(
         if let Err(error) = crate::finish_write::assert_slot_contents(cfg, record) {
             reasons.push(error);
         } else {
-            if let Some(reason) = handoff_read_reason(
-                cfg,
-                record,
-                events,
-                &slot_path,
-                precomputed_read.clone(),
-            ) {
+            if let Some(reason) =
+                handoff_read_reason(cfg, record, events, &slot_path, precomputed_read.clone())
+            {
                 reasons.push(reason);
             }
             let checkouts = record
@@ -7328,10 +7319,8 @@ pub(crate) fn parse_audit(
     }
     // Handoff publications and reads likewise: one pass per machine
     // for every generation, not one log rescan per row (#1794).
-    let mut audit_publications: BTreeMap<
-        (String, String, i64),
-        (i64, Value, bool),
-    > = BTreeMap::new();
+    let mut audit_publications: BTreeMap<(String, String, i64), (i64, Value, bool)> =
+        BTreeMap::new();
     let mut audit_reads: BTreeMap<(String, String, i64), Value> = BTreeMap::new();
     for (machine, machine_events) in &events_by_machine {
         for ((slot, generation), publication) in handoff_publications(machine_events) {

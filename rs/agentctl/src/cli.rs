@@ -6189,9 +6189,9 @@ fn parse_health_timeouts(
 ) -> Result<std::collections::BTreeMap<String, Duration>, Failure> {
     let mut timeouts = std::collections::BTreeMap::new();
     for entry in entries {
-        let (unit, seconds) = entry
-            .split_once('=')
-            .ok_or_else(|| Failure::Usage(format!("--health-timeout-for {entry:?}: use UNIT=SECONDS")))?;
+        let (unit, seconds) = entry.split_once('=').ok_or_else(|| {
+            Failure::Usage(format!("--health-timeout-for {entry:?}: use UNIT=SECONDS"))
+        })?;
         let seconds: u64 = seconds
             .parse()
             .ok()

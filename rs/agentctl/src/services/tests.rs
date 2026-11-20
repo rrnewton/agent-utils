@@ -1021,10 +1021,7 @@ fn a_slow_first_watch_pass_gets_a_scaled_health_window() {
     // configured interval (600 + 90), so a healthy slow pass refreshes.
     let world = world();
     add_repair_watch_with_interval(&world, 600);
-    world
-        .fake
-        .watch_pass_delay
-        .set(Duration::from_secs(300));
+    world.fake.watch_pass_delay.set(Duration::from_secs(300));
     // The old daemon has long since completed a pass, so the preflight passes.
     world.fake.sleep(Duration::from_secs(3600));
     let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
@@ -1046,10 +1043,7 @@ fn an_explicit_per_unit_health_timeout_wins_over_the_scaled_window() {
     // the scaled window would have waited longer.
     let world = world();
     add_repair_watch_with_interval(&world, 600);
-    world
-        .fake
-        .watch_pass_delay
-        .set(Duration::from_secs(300));
+    world.fake.watch_pass_delay.set(Duration::from_secs(300));
     // No progress proof either: only a completed pass could prove health.
     world.fake.watch_progress.set(false);
     // The old daemon has long since completed a pass, so the preflight passes.
@@ -1081,7 +1075,11 @@ fn turnover_continues_past_a_completed_rollback() {
     // (as in turnover_refreshes_bridges_last_and_notifies_in_order).
     let release = world._temporary.0.join("release");
     fs::create_dir_all(&release).unwrap();
-    for name in ["agentctl", "agentctl-slack-outbound", "agentctl-slack-plugin"] {
+    for name in [
+        "agentctl",
+        "agentctl-slack-outbound",
+        "agentctl-slack-plugin",
+    ] {
         fs::write(release.join(name), format!("#!/bin/sh\necho {name}\n")).unwrap();
     }
     let destination = world.root.join("snapshots").join(&new[..12]);

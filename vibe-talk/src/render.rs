@@ -7226,10 +7226,7 @@ mod short_ref_tests {
         // `#1915` (coordb acceptance): in the SECOND channel, both
         // `:thread:N` and `:email:N` link from that channel's bridge
         // file; `:email:` of a thread-only number never links to it.
-        let html = drawn_in(
-            "see :thread:060 and :email:1847 and :email:60",
-            "C9999ZZZZ",
-        );
+        let html = drawn_in("see :thread:060 and :email:1847 and :email:60", "C9999ZZZZ");
         assert!(
             html.contains("href=\"?c=C9999ZZZZ&v=thread&t=1700000200.000400\""),
             "{html}"

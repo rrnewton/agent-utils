@@ -1690,19 +1690,10 @@ pub async fn timeline(
                 let stepped_request = request.clone();
                 let below = below.clone();
                 race_older(
-                    crate::held_replies::scope(
-                        held,
-                        async move {
-                            step_back_from_served(
-                                &state,
-                                caller,
-                                &channel_id,
-                                &stepped_request,
-                                &below,
-                            )
+                    crate::held_replies::scope(held, async move {
+                        step_back_from_served(&state, caller, &channel_id, &stepped_request, &below)
                             .await
-                        },
-                    ),
+                    }),
                     request,
                 )
                 .await?
@@ -1902,12 +1893,9 @@ where
     // read's back - so the request's counting and its one error line
     // still say what the read did.
     let hurried = crate::read_reason::hurried();
-    let mut task = tokio::spawn(reason.scope(crate::read_reason::hurry(
-        hurried,
-        async move {
-            crate::cache_first::noting(crate::upstream_profile::noting_failures(read)).await
-        },
-    )));
+    let mut task = tokio::spawn(reason.scope(crate::read_reason::hurry(hurried, async move {
+        crate::cache_first::noting(crate::upstream_profile::noting_failures(read)).await
+    })));
     match tokio::time::timeout(OLDER_WAIT, &mut task).await {
         Ok(joined) => {
             let ((result, failed), noted) = joined.map_err(|_| {
@@ -1923,13 +1911,15 @@ where
             }
             Ok(OlderStep::Upstream(result?))
         }
-        Err(_) => Ok(OlderStep::Fallback(Box::new(crate::threads::TimelinePage {
-            has_more: true,
-            next_before: request.before.clone(),
-            refresh_failed: Some(CACHE_FIRST.to_owned()),
-            as_of: Some(crate::clock::iso_from_ms(crate::store::now_ms())),
-            ..crate::threads::TimelinePage::default()
-        }))),
+        Err(_) => Ok(OlderStep::Fallback(Box::new(
+            crate::threads::TimelinePage {
+                has_more: true,
+                next_before: request.before.clone(),
+                refresh_failed: Some(CACHE_FIRST.to_owned()),
+                as_of: Some(crate::clock::iso_from_ms(crate::store::now_ms())),
+                ..crate::threads::TimelinePage::default()
+            },
+        ))),
     }
 }
 
@@ -8816,7 +8806,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_slow_step_back_answers_with_the_copy_fallback_and_a_fast_one_with_the_provider_page() {
+    async fn a_slow_step_back_answers_with_the_copy_fallback_and_a_fast_one_with_the_provider_page()
+    {
         // `#1886` addendum-1: past OLDER_WAIT the answer is the copy's
         // fallback (empty, more above, the same cursor, marked), and the
         // provider read is left running; inside the wait it is the

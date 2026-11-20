@@ -502,7 +502,10 @@ fn strip_deleted(path: PathBuf) -> PathBuf {
 /// pass budget (or, for `watch`, its interval), a soak and a margin, since
 /// its first pass may take that long (#1900).
 fn health_timeout(service: &Service, options: &RefreshOptions) -> Duration {
-    for name in [service.unit.as_str(), service.unit.trim_end_matches(".service")] {
+    for name in [
+        service.unit.as_str(),
+        service.unit.trim_end_matches(".service"),
+    ] {
         if let Some(timeout) = options.health_timeouts.get(name) {
             return *timeout;
         }
