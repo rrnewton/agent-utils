@@ -25655,8 +25655,12 @@ _HOST_ALIAS_ENTRY_KEYS = frozenset(
 _HOST_ALIAS_RECORDED_BY_KEYS = frozenset({"pid", "start_ticks", "boot_id", "host_id"})
 
 
-def _host_alias_path() -> Path:
+def _host_alias_path(*, judge: bool = False) -> Path:
     override = os.environ.get("WRKSLOTS_HOST_ALIAS_PATH")
+    if judge and os.environ.get("WRKSLOTS_HOST_ALIAS_TEST") != "1":
+        # The judge does not let a caller's environment move the alias
+        # file: outside tests it reads only the host's own state path.
+        override = None
     if override:
         return Path(override).expanduser()
     state_home = os.environ.get("XDG_STATE_HOME")
@@ -25709,6 +25713,32 @@ def _valid_host_alias_entry(raw: object) -> dict[str, object] | None:
     return raw
 
 
+def _host_alias_location_trusted(path: Path) -> bool:
+    """Whether the judge may trust an alias file at ``path``.
+
+    The file and its parent directory must be owned by the effective
+    user and not group- or world-writable, and no component of the
+    parent path may be a symlink. Anything else proves nothing.
+    """
+
+    try:
+        absolute = path.absolute()
+        for ancestor in absolute.parents:
+            if ancestor.is_symlink():
+                return False
+        for candidate in (absolute, absolute.parent):
+            info = candidate.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                return False
+            if info.st_uid != os.geteuid():
+                return False
+            if stat.S_IMODE(info.st_mode) & 0o022:
+                return False
+        return stat.S_ISREG(absolute.lstat().st_mode)
+    except OSError:
+        return False
+
+
 def _load_host_aliases(path: Path | None = None) -> tuple[dict[str, object], ...]:
     """Validated alias entries of this host; any failure means no aliases.
 
@@ -25718,7 +25748,9 @@ def _load_host_aliases(path: Path | None = None) -> tuple[dict[str, object], ...
     """
 
     try:
-        selected = _host_alias_path() if path is None else path
+        selected = _host_alias_path(judge=True) if path is None else path
+        if path is None and not _host_alias_location_trusted(selected):
+            return ()
         if selected.is_symlink():
             return ()
         raw: object = json.loads(selected.read_text(encoding="utf-8"))
@@ -27846,6 +27878,7 @@ def _process_state_legacy(identity: ProcessIdentity | None) -> tuple[str, str]:
     except Refusal as exc:
         return "indeterminate", str(exc)
     boot_id: str | None = None
+    host_via_alias = False
     if host_id != identity.host_id:
         # A recorded previous identity of this host counts as this host
         # (#1933): the boot check below then proves an old-boot owner
@@ -27874,6 +27907,7 @@ def _process_state_legacy(identity: ProcessIdentity | None) -> tuple[str, str]:
                 "indeterminate",
                 "the recorded owner belongs to a different machine identity",
             )
+        host_via_alias = True
     if boot_id is None:
         try:
             boot_id = _boot_id(Path("/proc"))
@@ -27881,6 +27915,15 @@ def _process_state_legacy(identity: ProcessIdentity | None) -> tuple[str, str]:
             return "indeterminate", str(exc)
     if boot_id != identity.boot_id:
         return "dead", "the recorded machine boot ended"
+    if host_via_alias:
+        # A previous identity proves death only through a boot change.
+        # In the current boot the generation compare cannot help: a live
+        # reading carries the current machine identity, never the
+        # recorded previous one, so it would read as a reused PID.
+        return (
+            "indeterminate",
+            "the recorded owner belongs to a previous machine identity in the current boot",
+        )
     try:
         current = _read_process_identity(identity.pid)
     except Refusal as exc:
@@ -47549,6 +47592,30 @@ def _assert_clean_tree_for_rebind(config: Config, record: ActiveRecord) -> None:
             )
 
 
+@contextlib.contextmanager
+def _host_alias_write_lock(path: Path) -> Iterator[None]:
+    """Serialize alias read-modify-write cycles on this host."""
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(
+            path.parent / f"{path.name}.lock",
+            os.O_CREAT | os.O_RDWR | os.O_CLOEXEC,
+            0o600,
+        )
+    except OSError as exc:
+        raise Refusal(f"cannot prepare host-alias lock beside {path}: {exc}") from exc
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    except OSError as exc:
+        raise Refusal(f"cannot lock host-alias file {path}: {exc}") from exc
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
 def _cmd_host_alias_missing(args: argparse.Namespace) -> int:
     del args
     raise Refusal(
@@ -47634,12 +47701,6 @@ def _cmd_host_alias_add(args: argparse.Namespace) -> int:
             "proves nothing. state: REFUSED -- no alias was recorded"
         )
     path = _host_alias_path()
-    entries = _load_host_aliases(path)
-    if any(entry["previous_host_id"] == previous for entry in entries):
-        raise Refusal(
-            f"host id {previous!r} is already recorded as a previous identity "
-            f"of this host in {path}; the first evidence stands"
-        )
     entry: dict[str, object] = {
         "previous_host_id": previous,
         "current_host_id": current_host,
@@ -47654,7 +47715,20 @@ def _cmd_host_alias_add(args: argparse.Namespace) -> int:
         "previous_boot_ids": sorted(previous_boots),
         "current_boot_id": current_boot,
     }
-    _atomic_write_json(path, {"schema": _HOST_ALIAS_SCHEMA, "aliases": [*entries, entry]})
+    with _host_alias_write_lock(path):
+        entries = _load_host_aliases(path)
+        if any(item["previous_host_id"] == previous for item in entries):
+            raise Refusal(
+                f"host id {previous!r} is already recorded as a previous identity "
+                f"of this host in {path}; the first evidence stands"
+            )
+        _atomic_write_json(
+            path, {"schema": _HOST_ALIAS_SCHEMA, "aliases": [*entries, entry]}
+        )
+        try:
+            os.chmod(path, 0o600)
+        except OSError as exc:
+            raise Refusal(f"cannot restrict host-alias file {path}: {exc}") from exc
     print(
         f"recorded host alias previous_host_id={previous} "
         f"current_host_id={current_host} hostname={hostname} "
@@ -97992,9 +98066,8 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "alias those owners stay indeterminate forever and no transfer, adoption, or "
             "recovery can rebind their slots. The alias file is "
             "$XDG_STATE_HOME/wrkslots/host-aliases.json (default "
-            "~/.local/state/wrkslots/host-aliases.json; WRKSLOTS_HOST_ALIAS_PATH overrides "
-            "the path). No registry state changes, so readers that predate the alias never "
-            "see it and keep failing closed."
+            "~/.local/state/wrkslots/host-aliases.json). No registry state changes, so "
+            "readers without host-alias support never see it and keep failing closed."
         ),
         epilog=(
             "examples:\n"

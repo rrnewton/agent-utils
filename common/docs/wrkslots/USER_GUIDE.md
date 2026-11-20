@@ -1307,12 +1307,13 @@ short name is the machine shard, the current boot is none of the boots recorded 
 identity, and no coordinator recorded under that identity is live now.
 
 The alias is host-local evidence in `$XDG_STATE_HOME/wrkslots/host-aliases.json` (by default
-`~/.local/state/wrkslots/host-aliases.json`; `WRKSLOTS_HOST_ALIAS_PATH` overrides the path). It is
-not registry state: no slot record, journal, or event changes, and a reader that predates aliases
-never opens the file, so it keeps failing closed on those owners exactly as before. With the alias
-recorded, the recorded identity counts as this host and the ordinary boot check proves an old-boot
-owner dead; `transfer-owner`, `adopt`, and `recover` then work as usual. An identity that was never
-aliased still reads as a different machine.
+`~/.local/state/wrkslots/host-aliases.json`). It is not registry state: no slot record, journal, or
+event changes, and a reader without host-alias support never opens the file, so it keeps failing
+closed on those owners exactly as before. With the alias recorded, the recorded identity counts as
+this host only across a boot change: the ordinary boot check proves an old-boot owner dead, while
+an owner recorded in the current boot under the previous identity stays indeterminate.
+`transfer-owner`, `adopt`, and `recover` then work as usual for the old-boot owners. An identity
+that was never aliased still reads as a different machine.
 
 ## Giving a slot back while the owner keeps running
 

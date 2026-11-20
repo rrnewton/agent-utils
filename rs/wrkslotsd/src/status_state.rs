@@ -143,9 +143,13 @@ fn expand_user_path(raw: &str) -> std::path::PathBuf {
 }
 
 fn host_alias_path() -> Option<std::path::PathBuf> {
-    if let Ok(override_path) = std::env::var("WRKSLOTS_HOST_ALIAS_PATH") {
-        if !override_path.is_empty() {
-            return Some(expand_user_path(&override_path));
+    // The judge does not let a caller's environment move the alias file:
+    // the override is honoured only under the test marker.
+    if std::env::var("WRKSLOTS_HOST_ALIAS_TEST").is_ok_and(|value| value == "1") {
+        if let Ok(override_path) = std::env::var("WRKSLOTS_HOST_ALIAS_PATH") {
+            if !override_path.is_empty() {
+                return Some(expand_user_path(&override_path));
+            }
         }
     }
     if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
@@ -226,14 +230,40 @@ fn valid_host_alias_entry(raw: &Value) -> Option<HostAliasEntry> {
     })
 }
 
+fn host_alias_location_trusted(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    for ancestor in path.ancestors().skip(1) {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) if !metadata.file_type().is_symlink() => {}
+            _ => return false,
+        }
+    }
+    let uid = rustix::process::geteuid().as_raw();
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    for candidate in [path, parent] {
+        let Ok(metadata) = std::fs::symlink_metadata(candidate) else {
+            return false;
+        };
+        if metadata.file_type().is_symlink()
+            || metadata.uid() != uid
+            || metadata.mode() & 0o022 != 0
+        {
+            return false;
+        }
+    }
+    std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
+}
+
 fn load_host_aliases() -> Vec<HostAliasEntry> {
     let Some(path) = host_alias_path() else {
         return Vec::new();
     };
-    if std::fs::symlink_metadata(&path)
-        .map(|metadata| metadata.file_type().is_symlink())
-        .unwrap_or(false)
-    {
+    if !host_alias_location_trusted(&path) {
         return Vec::new();
     }
     let Ok(text) = std::fs::read_to_string(path) else {
@@ -458,6 +488,7 @@ pub(crate) fn process_state(identity: Option<&Identity>) -> (String, String) {
         Err(message) => return ("indeterminate".to_string(), message),
     };
     let mut boot: Option<String> = None;
+    let mut host_via_alias = false;
     if host != identity.host_id {
         // A recorded previous identity of this host counts as this host
         // (#1933); the unchanged boot check then proves an old-boot
@@ -480,6 +511,7 @@ pub(crate) fn process_state(identity: Option<&Identity>) -> (String, String) {
                 "the recorded owner belongs to a different machine identity".to_string(),
             );
         }
+        host_via_alias = true;
     }
     let boot = match boot {
         Some(boot) => boot,
@@ -492,6 +524,16 @@ pub(crate) fn process_state(identity: Option<&Identity>) -> (String, String) {
         return (
             "dead".to_string(),
             "the recorded machine boot ended".to_string(),
+        );
+    }
+    if host_via_alias {
+        // A previous identity proves death only through a boot change;
+        // in the current boot a live reading carries the current
+        // machine identity, so the generation compare cannot help.
+        return (
+            "indeterminate".to_string(),
+            "the recorded owner belongs to a previous machine identity in the current boot"
+                .to_string(),
         );
     }
     match read_process_identity(identity.pid) {

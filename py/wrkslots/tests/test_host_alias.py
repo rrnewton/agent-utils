@@ -6,6 +6,7 @@ import argparse
 import dataclasses
 import json
 import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -61,6 +62,7 @@ def _write_aliases(path: Path, entries: list[dict[str, object]]) -> None:
 
 def _host_at_b(monkeypatch: pytest.MonkeyPatch, alias_path: Path) -> None:
     monkeypatch.setenv("WRKSLOTS_HOST_ALIAS_PATH", str(alias_path))
+    monkeypatch.setenv("WRKSLOTS_HOST_ALIAS_TEST", "1")
     monkeypatch.setattr(cli, "_host_id", lambda: MACHINE_B)
     monkeypatch.setattr(cli, "_boot_id", lambda proc_root: BOOT_B)
     monkeypatch.setattr(cli, "_short_hostname", lambda: HOSTNAME)
@@ -92,6 +94,52 @@ def test_same_boot_alias_never_counts(
         alias_path,
         [_entry(MACHINE_A, MACHINE_B, previous_boots=[BOOT_B], current_boot=BOOT_B)],
     )
+
+    assert cli._process_state(_identity(MACHINE_A, BOOT_A))[0] == "indeterminate"
+
+
+def test_current_boot_aliased_owner_is_never_dead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    alias_path = tmp_path / "host-aliases.json"
+    _host_at_b(monkeypatch, alias_path)
+    _write_aliases(alias_path, [_entry(MACHINE_A, MACHINE_B, previous_boots=[BOOT_A])])
+    live = cli._read_process_identity(os.getpid())
+    recorded_live = dataclasses.replace(live, host_id=MACHINE_A, boot_id=BOOT_B)
+    recorded_gone = _identity(MACHINE_A, BOOT_B)
+
+    # Probe 3d: a live owner's true generation, recorded under the old
+    # identity in the current boot, must not read as a reused PID.
+    assert cli._process_state(recorded_live) == (
+        "indeterminate",
+        "the recorded owner belongs to a previous machine identity in the current boot",
+    )
+    # Probe 3b2: the same record with a gone PID is not proven dead either.
+    assert cli._process_state(recorded_gone) == (
+        "indeterminate",
+        "the recorded owner belongs to a previous machine identity in the current boot",
+    )
+
+
+def test_group_writable_alias_file_is_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    alias_path = tmp_path / "host-aliases.json"
+    _host_at_b(monkeypatch, alias_path)
+    _write_aliases(alias_path, [_entry(MACHINE_A, MACHINE_B, previous_boots=[BOOT_A])])
+    os.chmod(alias_path, 0o664)
+
+    assert cli._process_state(_identity(MACHINE_A, BOOT_A))[0] == "indeterminate"
+
+
+def test_judge_ignores_alias_override_without_test_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    alias_path = tmp_path / "host-aliases.json"
+    _host_at_b(monkeypatch, alias_path)
+    monkeypatch.delenv("WRKSLOTS_HOST_ALIAS_TEST")
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
+    _write_aliases(alias_path, [_entry(MACHINE_A, MACHINE_B, previous_boots=[BOOT_A])])
 
     assert cli._process_state(_identity(MACHINE_A, BOOT_A))[0] == "indeterminate"
 
@@ -206,6 +254,7 @@ def test_host_alias_add_unblocks_old_owner_only(
     assert cli._cmd_host_alias_add(_verb_args(MACHINE_A)) == 0
     assert "recorded host alias" in capsys.readouterr().out
     payload = json.loads(alias_path.read_text(encoding="utf-8"))
+    assert stat.S_IMODE(alias_path.stat().st_mode) == 0o600
     assert payload["aliases"][0]["previous_boot_ids"] == [BOOT_A]
     assert cli._process_state(old_owner) == ("dead", "the recorded machine boot ended")
     assert cli._process_state(_identity(MACHINE_C, BOOT_A))[0] == "indeterminate"

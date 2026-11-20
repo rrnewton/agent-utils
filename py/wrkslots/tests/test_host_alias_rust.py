@@ -48,9 +48,21 @@ def test_rust_status_uses_host_alias_like_python(
         "host_id": "machine-a",
     }
     foreign_owner = {**old_owner, "host_id": "machine-c"}
+    current_boot = wrkslots_cli._boot_id(Path("/proc"))
+    live_current_old_host = {
+        **live,
+        "boot_id": current_boot,
+        "host_id": "machine-a",
+    }
+    gone_current_old_host = {
+        **old_owner,
+        "boot_id": current_boot,
+    }
     records = [
         _record("slot-old", "agent-a", old_owner),
         _record("slot-foreign", "agent-b", foreign_owner),
+        _record("slot-live-current", "agent-c", live_current_old_host),
+        _record("slot-gone-current", "agent-d", gone_current_old_host),
     ]
     control = root / "worktrees"
     (control / "ACTIVE.node-a.json").write_text(
@@ -77,6 +89,7 @@ def test_rust_status_uses_host_alias_like_python(
         encoding="utf-8",
     )
     monkeypatch.setenv("WRKSLOTS_HOST_ALIAS_PATH", str(alias_path))
+    monkeypatch.setenv("WRKSLOTS_HOST_ALIAS_TEST", "1")
 
     old_identity = wrkslots_cli.ProcessIdentity(
         pid=4194300,
@@ -92,6 +105,7 @@ def test_rust_status_uses_host_alias_like_python(
 
     env = dict(os.environ)
     env["WRKSLOTS_HOST_ALIAS_PATH"] = str(alias_path)
+    env["WRKSLOTS_HOST_ALIAS_TEST"] = "1"
     result = subprocess.run(
         [str(rust_wrkslotsd()), "parse-status", "--root", str(root)],
         cwd=AU_ROOT,
@@ -110,3 +124,8 @@ def test_rust_status_uses_host_alias_like_python(
     assert by_slot["slot-foreign"]["owner_detail"] == (
         "the recorded owner belongs to a different machine identity"
     )
+    for slot in ("slot-live-current", "slot-gone-current"):
+        assert by_slot[slot]["owner_state"] == "indeterminate"
+        assert by_slot[slot]["owner_detail"] == (
+            "the recorded owner belongs to a previous machine identity in the current boot"
+        )
