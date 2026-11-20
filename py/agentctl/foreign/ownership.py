@@ -239,7 +239,13 @@ def pidfds_supported() -> bool:
 
 
 def _open_pidfd(pid: int) -> Optional[int]:
-    """Open a pidfd; ``None`` when the number names no process."""
+    """Open a pidfd; ``None`` when the number names no process.
+
+    ``EINVAL`` is deliberately not translated here: the kernel answers it
+    when the number names a non-leader thread, which is what a dead leader's
+    number looks like once the kernel hands it to another process's thread
+    (#1938). Callers decide what that proves; see :func:`pin`.
+    """
     for _attempt in range(4):
         try:
             return os.pidfd_open(pid)
@@ -413,7 +419,23 @@ def pin(
         ):
             return Pin(GONE, f"pid {pid} no longer names the recorded process")
         return Pin(UNPROVEN, "this host does not provide pidfds, so the process cannot be pinned")
-    descriptor = _open_pidfd(pid)
+    try:
+        descriptor = _open_pidfd(pid)
+    except OSError as exc:
+        if exc.errno != errno.EINVAL:
+            raise
+        # The number names no thread-group leader: a non-leader thread bears
+        # it now, or nothing does. EINVAL alone is not a death certificate;
+        # procfs must positively show the recorded generation is gone, and a
+        # live exact match stays unproven, never dead (#1938).
+        current = read_stat(pid)
+        if current is None or (
+            identity.started_at is not None and str(current.starttime) != identity.started_at
+        ) or (current is not None and current.state in _DEAD_STATES):
+            if current_boot_id() == boot:
+                return Pin(GONE, f"pid {pid} has exited")
+            return Pin(UNPROVEN, "the boot identity changed while it was read")
+        return Pin(UNPROVEN, f"pid {pid} cannot be pinned: pidfd_open refused the number")
     if descriptor is None:
         if current_boot_id() == boot:
             return Pin(GONE, f"pid {pid} has exited")
@@ -694,7 +716,12 @@ def _kill_cgroup(path: Path, deadline: float) -> tuple[int, list[str]]:
                 stat = _quiet_stat(pid)
                 if stat is None or not pidfds_supported():
                     continue
-                descriptor = _open_pidfd(pid)
+                try:
+                    descriptor = _open_pidfd(pid)
+                except OSError:
+                    # EINVAL: the number names a thread, not this member;
+                    # leave it to the census, never signal by number (#1938).
+                    continue
                 if descriptor is None:
                     continue
                 with PinnedProcess(pid, descriptor, stat.starttime) as process:

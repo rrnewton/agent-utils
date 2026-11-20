@@ -815,11 +815,40 @@ pub fn pin_at(
             "this host does not provide pidfds, so the process cannot be pinned".to_owned(),
         ));
     }
-    let descriptor = open_pidfd(pid).map_err(|error| {
-        ForeignOwnershipError::runner_identity_unknown(format!(
-            "cannot open a pidfd for pid {pid}: {error}"
-        ))
-    })?;
+    let descriptor = match open_pidfd(pid) {
+        Ok(descriptor) => descriptor,
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
+            // The number names no thread-group leader: a non-leader thread
+            // bears it now, or nothing does (#1938). EINVAL alone is not a
+            // death certificate; procfs must positively show the recorded
+            // generation is gone, and a live exact match stays unproven.
+            let current = read_stat_at(proc_root, pid)?;
+            let gone_proven = match (&current, &identity.started_at) {
+                (None, _) => true,
+                (Some(current), Some(started_at)) => {
+                    current.starttime.to_string() != *started_at
+                        || DEAD_STATES.contains(&current.state.as_str())
+                }
+                (Some(current), None) => DEAD_STATES.contains(&current.state.as_str()),
+            };
+            if gone_proven {
+                if current_boot_id_at(proc_root)? == boot {
+                    return Ok(gone(format!("pid {pid} has exited")));
+                }
+                return Ok(unproven(
+                    "the boot identity changed while it was read".to_owned(),
+                ));
+            }
+            return Ok(unproven(format!(
+                "pid {pid} cannot be pinned: pidfd_open refused the number"
+            )));
+        }
+        Err(error) => {
+            return Err(ForeignOwnershipError::runner_identity_unknown(format!(
+                "cannot open a pidfd for pid {pid}: {error}"
+            )));
+        }
+    };
     let Some(descriptor) = descriptor else {
         if current_boot_id_at(proc_root)? == boot {
             return Ok(gone(format!("pid {pid} has exited")));
@@ -3408,6 +3437,45 @@ mod tests {
             child.try_wait().unwrap().is_none(),
             "child must be untouched"
         );
+        reap(&mut child);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pin_a_thread_id_is_never_the_recorded_leader() {
+        // A live non-leader thread id EINVALs pidfd_open (#1938); pinning it
+        // must prove nothing and leave the leader untouched.
+        if !pidfds_supported() {
+            return;
+        }
+        let mut child = std::process::Command::new("python3")
+            .args([
+                "-c",
+                "import threading, time\nthreading.Thread(target=lambda: (print(threading.get_native_id(), flush=True), time.sleep(30)), daemon=True).start()\ntime.sleep(30)\n",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn threaded child");
+        let mut line = String::new();
+        {
+            use std::io::BufRead;
+            let stdout = child.stdout.take().expect("child stdout");
+            std::io::BufReader::new(stdout)
+                .read_line(&mut line)
+                .expect("read thread id");
+        }
+        let tid: i64 = line.trim().parse().expect("thread id");
+        let pid = i64::from(child.id());
+        assert_ne!(tid, pid);
+        let leader = identity_of(pid);
+        let result = pin(
+            &ProcessIdentity::new(tid, leader.started_at.clone(), leader.boot_id.clone()),
+            None,
+        )
+        .unwrap();
+        assert_ne!(result.verdict, PinVerdict::Alive);
+        assert!(result.process.is_none());
+        assert!(child.try_wait().unwrap().is_none(), "child must be untouched");
         reap(&mut child);
     }
 

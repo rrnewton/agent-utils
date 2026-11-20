@@ -306,6 +306,47 @@ def test_pin_requires_the_recorded_boot_and_start_tick(child: subprocess.Popen[b
     assert _running(child.pid)
 
 
+def test_pin_einval_on_a_live_process_is_unproven_never_dead(
+    child: subprocess.Popen[bytes], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """pidfd_open EINVAL (the number names a thread, #1938) must fail closed."""
+    exact = _identity(child.pid)
+    real_open = os.pidfd_open
+
+    def refuse(pid: int) -> int:
+        if pid == child.pid:
+            raise OSError(22, "Invalid argument")
+        return real_open(pid)
+
+    monkeypatch.setattr(os, "pidfd_open", refuse)
+    result = ownership.pin(exact)
+    assert result.verdict == ownership.UNPROVEN and result.process is None
+    assert _running(child.pid, int(exact.started_at or "0"))
+
+
+def test_pin_a_thread_id_is_never_the_recorded_leader(descendants: _Descendants) -> None:
+    """A live non-leader thread id EINVALs pidfd_open; pinning it proves nothing."""
+    script = (
+        "import threading, time\n"
+        "threading.Thread(target=lambda: (print(threading.get_native_id(), flush=True),"
+        " time.sleep(30)), daemon=True).start()\n"
+        "time.sleep(30)\n"
+    )
+    proc = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE, text=True)
+    descendants.add(proc.pid)
+    try:
+        assert proc.stdout is not None
+        tid = int(proc.stdout.readline())
+        assert tid != proc.pid
+        leader = _identity(proc.pid)
+        result = ownership.pin(ownership.ProcessIdentity(tid, leader.started_at, leader.boot_id))
+        assert result.verdict in (ownership.UNPROVEN, ownership.GONE) and result.process is None
+        assert _running(proc.pid)
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
 def test_stop_process_never_signals_a_reused_pid_or_an_earlier_boot(child: subprocess.Popen[bytes]) -> None:
     """Adversarial: the recorded number now names an unrelated live process."""
     exact = _identity(child.pid)
