@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-reader-one-click-jump: one click on a message link while the reader is on lands expanded and starts reading it'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
@@ -9,7 +9,7 @@ labels:
 - discuss
 - ui
 created_at: 2026-11-20T08:42:46-05:00
-updated_at: 2026-11-20T08:42:46-05:00
+updated_at: 2026-11-20T09:15:26-05:00
 ---
 
 # Description
@@ -33,3 +33,7 @@ updated_at: 2026-11-20T08:42:46-05:00
 # Notes
 
 Owner-priority, deployed on landing. Browsers cannot run on this host right now (missing system libraries since the 2026-11-19 reprovision), so the browser test and screenshot walk are prepared ready to run and the lane reports blocked only on that; all other tests run locally. Test instances only; never the live instance.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as ff5d2bb3 (feature 64c77a82, replayed over 30d7ee00 under the coordinator's gate waiver). One click on a message link while the reader is active now captures that fact at the tap in the shared jump, and after the seek walk lands the message — expanded by the existing landing, its top re-asserted on screen while the Discuss sheet settles — the shared read-aloud owner starts reading that message from its start, restarting rather than toggling off where it is already that message; click-to-reading-start timing is logged. Reader off is unchanged. Page unit tests cover the decision and the jump; the browser test through the real router passed on a Chromium host at the gated tree (51 ms phone, 39 ms desk click-to-reading-start), and the Discuss screenshot matrix (light/dark, phone/desktop, keyboard open/closed) passed there too. The full local gate on the gated tree had only browser-family environment reds, waived by the coordinator with that evidence.
