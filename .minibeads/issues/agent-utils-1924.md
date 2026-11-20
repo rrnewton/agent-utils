@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-discuss-chips-triangles-terms: Make summary chips small, disclosure triangles readable, and show Terms in Discuss'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 labels:
@@ -8,7 +8,8 @@ labels:
 - discuss
 - ui
 created_at: 2026-11-19T17:53:26-05:00
-updated_at: 2026-11-19T17:53:26-05:00
+updated_at: 2026-11-19T19:31:26-05:00
+closed_at: 2026-11-19T19:31:26-05:00
 ---
 
 # Description
@@ -37,3 +38,7 @@ Today the summary-level chip pair and the timeline/per-summary chip pairs render
 # Notes
 
 [watermelon-full-preview] mu-discusschips, owner thread 223 follow-up, 2026-11-19. Number pre-assigned by coordb; filed before implementation. Related: #1912 vibe-talk-discuss-summary-timeline-layout (the redesign this follows up), #1911 vibe-talk-discuss-message-link-opens-new-window (parallel link handling), #1525 fold-marker-on-heading-line, #1497 discuss-fold-state-persist.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as a735de3d (replay of 71f76d7d over 02feb885). (a) The bar-level `font: inherit` reset that out-specified the small chip size is gone; every Expand/Collapse pair shares 0.72rem. (b) Disclosure triangles stand at 1.2rem centred on the heading line in a 2rem box, on 44px summary rows (Terms 32px). (c) The model stub answer carries a Terms section; scene 85-discuss-terms photographs Terms open, and scene 74 asserts it. (d) The phone composer sticks above the Summarize row (`#discuss-panel .discuss-compose`, the containment test's one new narrow exception), fully inside the sheet keyboard open and closed. Gates: first gate failed page-1 (the new sticky vs the containment allowlist; fixed narrowly) and discuss-browser (load-only, focused pass); second gate 199 passed with only scene 59-all-thread-selected failing (known main failure, waived by coordb) and fmt NO_RESULT (learned-cap OOM, rule 346). Evidence: before (744ac563) /tmp/mu-discusschips-shots-before and -before-kb; after from landed main (a735de3d) /tmp/mu-discusschips-shots-after, scenes 74/75/76/84/85, both themes and profiles, BUILD.txt in each folder, every image viewed.
