@@ -1269,6 +1269,53 @@ fn revive_candidate_holding_session_after_launch_is_not_refused() {
 }
 
 #[test]
+fn revive_session_reporting_pane_in_other_tab_refuses_without_journal() {
+    // Final re-review: with no journal open, a live pane in another tab
+    // reporting the recorded session is a live harness, not a candidate.
+    let (fixture, mut old) = recoverable("claude", false);
+    let pane = old.pane_id.clone().unwrap();
+    old.harness_identity.as_mut().unwrap().boot_id =
+        "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_owned();
+    fixture.manager().save(&old).unwrap();
+    fixture
+        .client
+        .panes
+        .lock()
+        .unwrap()
+        .retain(|item| item.pane_id != pane);
+    fixture.client.herdr_closed.lock().unwrap().insert(pane);
+    let mut human = Fake::pane("human");
+    human.tab_id = "othertab".to_owned();
+    fixture.client.panes.lock().unwrap().push(human);
+    *fixture.client.named_pane.lock().unwrap() = "human".to_owned();
+    fixture
+        .client
+        .herdr_names
+        .lock()
+        .unwrap()
+        .insert("worker".to_owned(), "human".to_owned());
+    fixture
+        .client
+        .stale_reported_panes
+        .lock()
+        .unwrap()
+        .insert("human".to_owned());
+    let session = old
+        .native_session
+        .as_ref()
+        .map(|native| native.value.clone())
+        .unwrap_or_else(|| "claude-session".to_owned());
+    *fixture.client.session_override.lock().unwrap() =
+        Some((Some("claude".to_owned()), Some(session)));
+    let error = fixture
+        .manager()
+        .revive("worker", false, None, TIMEOUT)
+        .unwrap_err();
+    assert!(error.to_string().contains("human"), "{error}");
+    assert!(!journal_path(&fixture, &old).exists());
+}
+
+#[test]
 fn revive_refuses_a_missing_old_pane_when_its_tab_has_been_reused() {
     let (fixture, old) = recoverable("claude", false);
     let pane = old.pane_id.as_ref().unwrap();

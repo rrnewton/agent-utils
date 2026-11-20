@@ -2093,19 +2093,24 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 });
                 let named = self.client.agent_pane(&record.name).ok();
                 // Or the named pane is this revive's candidate reporting
-                // the recorded session while its journal is open.
-                let reports_session = named.as_deref().is_some_and(|pane| {
-                    let session = record
-                        .native_session
-                        .as_ref()
-                        .map(|native| native.value.as_str())
-                        .or(record.session_value.as_deref());
-                    session.is_some()
-                        && self
-                            .client
-                            .pane_info(pane)
-                            .is_ok_and(|info| info.session_value.as_deref() == session)
-                });
+                // the recorded session — only while its journal is open,
+                // exactly like the Python edition (a fresh revive with no
+                // journal must refuse a session-reporting live pane).
+                let journal_open = journals(&self.registry)
+                    .is_ok_and(|all| all.iter().any(|journal| journal.name == record.name));
+                let reports_session = journal_open
+                    && named.as_deref().is_some_and(|pane| {
+                        let session = record
+                            .native_session
+                            .as_ref()
+                            .map(|native| native.value.as_str())
+                            .or(record.session_value.as_deref());
+                        session.is_some()
+                            && self
+                                .client
+                                .pane_info(pane)
+                                .is_ok_and(|info| info.session_value.as_deref() == session)
+                    });
                 if (candidate_pane.is_some() && named == candidate_pane) || reports_session {
                     BootOverride::Applies
                 } else {

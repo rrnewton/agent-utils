@@ -3041,8 +3041,9 @@ class ManagedAgents:
             return ("not", None)
         try:
             pane = self.client.agent_pane(record.name)
-        except HerdrUnavailable as exc:
-            if herdr_error_code(str(exc)) == "agent_not_found":
+        except Exception as exc:
+            # Any other Herdr failure is unproven, never an override.
+            if isinstance(exc, HerdrUnavailable) and herdr_error_code(str(exc)) == "agent_not_found":
                 return ("applies", None)
             return ("not", None)
         if pane == record.pane_id:

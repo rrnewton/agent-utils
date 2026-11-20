@@ -1397,6 +1397,9 @@ fn dead_native_second_census_failure_is_unproven() {
     let fixture = Fixture::new();
     fixture.start(None);
     let record = previous_boot_missing_pane(&fixture);
+    // The name points at a census-absent pane, so the second census call in
+    // boot_override is the one that must fail closed.
+    *fixture.client.named_pane.lock().unwrap() = "ghost".to_owned();
     fixture
         .client
         .panes_fail_on_call
