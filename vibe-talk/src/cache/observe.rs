@@ -1109,6 +1109,17 @@ mod tests {
             updated_at: crate::clock::iso_from_ms(T + 600_000),
             display_name: None,
             summary: None,
+            unread_count: None,
+            unread_exact: false,
+            last_reply_at: None,
+            last_reply_author: None,
+            last_reply_author_id: None,
+            last_reply_excerpt: None,
+            participants: Vec::new(),
+            participants_more: 0,
+            pinned: None,
+            root_done: None,
+            replies_done: None,
         };
         let page = TimelinePage {
             threads: vec![summary("m100", 3), summary("m200", 1)],

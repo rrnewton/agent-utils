@@ -1,0 +1,18 @@
+steps:
+  # `#1986 vibe-talk-one-page-complete-rows`: a thread row complete on the FIRST
+  # page (slug, 120 replies, the server's 7 unread, last reply + participants
+  # on its card) with no thread read and no step back in the fake API's log.
+  - group: check
+    job: one-page-complete-browser
+    desc: one page complete thread rows (slug + count + server unread on first render, no reach-back in the request log) in current Chromium at 412x915 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/one_page_complete_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 60
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824

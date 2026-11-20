@@ -616,6 +616,32 @@ declare namespace VibeTalk {
   }
 
   /**
+   * What this server knows of one channel's threads as a whole, carried on a timeline answer so
+   * a channel row needs no counting of its own (`#1986 vibe-talk-one-page-complete-rows`). Absent
+   * from an older server, and when this server's cache cannot say.
+   */
+  interface ChannelSummary {
+    /**
+     * Latest thread activity this server's cache holds for the channel, RFC 3339.
+     */
+    latest_activity_at?: string | null;
+    /**
+     * Threads this server's cache holds for the channel, in total (not this page's count).
+     */
+    thread_count: number;
+    /**
+     * Whether every carried thread's unread count is exact, so the sum is.
+     */
+    unread_exact: boolean;
+    /**
+     * Unread replies summed over the thread summaries THIS answer carries, counted as
+     * [`crate::threads::ThreadSummary::unread_count`] is. A page-scoped sum, not a
+     * channel-wide total: threads below the page are not in it.
+     */
+    unread_reply_count: number;
+  }
+
+  /**
    * How a thread came to be classed. Sticky: once classed, an edit or a
    * metadata-less re-read never unclasses; only `Owner` changes a class.
    */
@@ -2765,6 +2791,24 @@ declare namespace VibeTalk {
   }
 
   /**
+   * One author in a thread's `participants`, with how many of its replies this server holds.
+   */
+  interface ThreadParticipant {
+    /**
+     * The author's display name, as the provider reported them. UNTRUSTED.
+     */
+    author: string;
+    /**
+     * The author's id, travelling with the name as it does on every message.
+     */
+    author_id: UserId;
+    /**
+     * Replies by this author that this server holds for the thread.
+     */
+    reply_count: number;
+  }
+
+  /**
    * What one thread pin or unpin did: `PUT`/`DELETE /api/v1/channels/{id}/thread-pins/{thread_id}`.
    */
   interface ThreadPinChangeResponse {
@@ -2861,6 +2905,45 @@ declare namespace VibeTalk {
      */
     id: string;
     /**
+     * When the latest reply this server holds was written, RFC 3339. `updated_at` remains the
+     * provider's activity time; this is the cached copy's, and the two agree whenever the cache
+     * holds the newest reply. Absent under the same conditions as `unread_count`.
+     */
+    last_reply_at?: string | null;
+    /**
+     * Who wrote that latest reply, as the provider reported them.
+     */
+    last_reply_author?: string | null;
+    /**
+     * That author's id, travelling with the name as it does on every message.
+     */
+    last_reply_author_id?: UserId | null;
+    /**
+     * The latest reply's first line, cut as a title is cut. UNTRUSTED, as all content is.
+     */
+    last_reply_excerpt?: string | null;
+    /**
+     * Who has replied in this thread, most replies first, at most
+     * [`crate::ops::MAX_THREAD_PARTICIPANTS`] of them. Empty when this server holds no cached
+     * replies for the thread, which is also what an older server sends.
+     */
+    participants?: ThreadParticipant[];
+    /**
+     * How many further distinct authors replied beyond `participants`.
+     */
+    participants_more?: number;
+    /**
+     * Whether this thread is effectively pinned for the reader — a bang-bound thread's
+     * default, overridden by an explicit pin or unpin — resolved by this server from its pin
+     * records, so the row needs no second read. Absent when the store cannot say.
+     */
+    pinned?: boolean | null;
+    /**
+     * How many of this thread's cached replies the reader has marked Done. Absent when this
+     * server holds no cached replies for the thread.
+     */
+    replies_done?: number | null;
+    /**
      * Number of replies when known.
      */
     reply_count: number | null;
@@ -2873,6 +2956,10 @@ declare namespace VibeTalk {
      */
     root: Message | null;
     /**
+     * Whether the reader has marked this thread's ROOT Done. Absent when unknown.
+     */
+    root_done?: boolean | null;
+    /**
      * One sentence on what the thread is about now, re-summarised as it grows. Absent until
      * summarised. See [`thread_summary_due`] for when it is refreshed.
      */
@@ -2881,6 +2968,21 @@ declare namespace VibeTalk {
      * Provider-supplied title, or a neutral fallback.
      */
     title: string;
+    /**
+     * Replies in this thread the reader has not marked Done, counted by THIS server at serve
+     * time from its cached copies and the reader's Done marks (`#1986
+     * vibe-talk-one-page-complete-rows`): a page carries the count so a thread row is complete
+     * on first render, without the page counting the replies it happens to hold. Absent when
+     * this server holds no cached replies for the thread and cannot count: an older server, a
+     * thread it has never read, a deployment with no cache. Absent is UNKNOWN, never zero.
+     */
+    unread_count?: number | null;
+    /**
+     * Whether `unread_count` covers every reply (`reply_count_exact` and the cache holds them
+     * all) rather than only the replies this server holds: false is a floor, and a page may
+     * show it with a `+`. Meaningless without `unread_count`.
+     */
+    unread_exact?: boolean;
     /**
      * Latest message activity, as an RFC 3339 timestamp.
      */
@@ -2936,6 +3038,11 @@ declare namespace VibeTalk {
      * Configured parent channel, including its local alias and write policy.
      */
     channel: ChannelInfo;
+    /**
+     * What this server knows of the channel's threads as a whole. Absent when its cache
+     * cannot say, and from an older server.
+     */
+    channel_summary?: ChannelSummary | null;
     /**
      * Present exactly on an answer to `after`: the page then carries only what is new or changed
      * since that cursor, and rows absent from it are UNCHANGED, never deleted.
@@ -3041,6 +3148,14 @@ declare namespace VibeTalk {
      * false), and its main view carries the conversation's replies as well as its root.
      */
     thread: ThreadSummary | null;
+    /**
+     * The revision this channel's THREAD pins are at (`#1986
+     * vibe-talk-one-page-complete-rows`): `pins_revision` for thread rows, so a page learns
+     * another device changed a thread pin from a read it already makes, and each
+     * [`crate::threads::ThreadSummary::pinned`] is read against it. Absent when the store
+     * cannot say, and from an older server.
+     */
+    thread_pins_revision?: number | null;
     /**
      * Summaries for the threads view, ordered by last activity oldest first.
      */

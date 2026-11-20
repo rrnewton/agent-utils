@@ -398,15 +398,21 @@ export function createReplyCounts(deps: ReplyCountsDependencies): ReplyCounts {
    */
   function rootReplyState(message: Message, tally: ReplyTally) {
     const id = deps.selection().view === "main" ? rootThreadOf(message, tally) : null;
-    if (id === null) return { id: null, unread: 0, unseen: 0 };
+    if (id === null) return { id: null, unread: 0, unseen: 0, server: null as { count: number; exact: boolean } | null };
     const entry = tally.threads.get(id);
-    return { id, unread: entry ? entry.unread : 0, unseen: unseenReplies(id, message, tally) };
+    // `#1986 vibe-talk-one-page-complete-rows`: a server-counted unread on the thread's summary
+    // stands over any count of the replies this page happens to hold; absent (older server, or
+    // a thread it cannot count) the held count below is the answer, as before.
+    const counted = tally.summaries.get(id);
+    const server = counted && typeof counted.unread_count === "number"
+      ? { count: counted.unread_count, exact: counted.unread_exact !== false } : null;
+    return { id, unread: entry ? entry.unread : 0, unseen: unseenReplies(id, message, tally), server };
   }
 
   /** Whether `message` is a root on Main whose thread holds an unread reply, or may (`rootReplyState`). */
   function holdsUnreadReplies(message: Message, tally: ReplyTally) {
-    const { unread, unseen } = rootReplyState(message, tally);
-    return unread > 0 || unseen > 0;
+    const { unread, unseen, server } = rootReplyState(message, tally);
+    return (server ? server.count : unread) > 0 || unseen > 0;
   }
 
   /**
@@ -494,7 +500,12 @@ export function createReplyCounts(deps: ReplyCountsDependencies): ReplyCounts {
     // shows why. `#222 unread-replies`.
     const state = inMain ? rootReplyState(message, tally) : null;
     const id = state && state.id !== null && (own === null || state.id === own) ? state.id : null;
-    const [unread, unseen] = id !== null && state ? [state.unread, state.unseen] : [0, 0];
+    // `#1986`: the server's count, when the summary carries one, replaces the held count and
+    // the not-yet-loaded estimate together; its exactness replaces the floor rule below.
+    const server = id !== null && state ? state.server : null;
+    const [unread, unseen] = server
+      ? [server.count, 0]
+      : id !== null && state ? [state.unread, state.unseen] : [0, 0];
     let chip = childByClass(row, "thread-unread");
     let preview = childByClass(row, "thread-unread-preview");
     if (id === null || (unread === 0 && unseen === 0)) {
@@ -517,7 +528,7 @@ export function createReplyCounts(deps: ReplyCountsDependencies): ReplyCounts {
     // held, the replies reported but not yet brought, "1 new": not known to be unread, but nothing has
     // said they are read either. In words for a screen reader: "3+" is a glyph, read "three plus".
     const entry = tally.threads.get(id);
-    const floor = repliesPartlyHeld(id, message, entry ? entry.held : 0, tally);
+    const floor = server ? !server.exact : repliesPartlyHeld(id, message, entry ? entry.held : 0, tally);
     const replyWord = (count: number) => (count === 1 ? "reply" : "replies");
     const [words, label] = unread > 0
       ? [`${unread}${floor ? "+" : ""} unread`, `${floor ? "at least " : ""}${unread} unread ${replyWord(unread)}`]

@@ -20,7 +20,13 @@ export interface SideChoice {
   id: string;
   root?: Message | null;
   count?: unknown;
-  summary?: { reply_count_exact?: boolean } | null;
+  summary?: {
+    reply_count_exact?: boolean;
+    // `#1986 vibe-talk-one-page-complete-rows`: server-counted facts, absent from older servers.
+    unread_count?: number | null;
+    unread_exact?: boolean;
+    root_done?: boolean | null;
+  } | null;
   at?: number;
   started?: number;
 }
@@ -188,11 +194,22 @@ export function createSideCards(deps: SideCardsDependencies): SideCards {
    * the root or any reply, makes the whole thread unread, packed under its card or unpacked.
    */
   function threadIsRead(choice: SideChoice, unread: string): boolean {
+    // `#1986`: the server's word on the root's Done state, when the summary carries it (a
+    // threads page's roots are not among its messages, so the page's own marks may not say).
+    if (typeof choice.summary?.root_done === "boolean") {
+      return unread === "" && choice.summary.root_done;
+    }
     return unread === "" && !(choice.root && deps.stillToDo(choice.root, deps.channelCanon().dismissed));
   }
 
   /** What a card says of its thread's unread replies, as a root on Main says it ("3 unread", "1 new"), or "". */
   function sideCardUnread(choice: SideChoice, tally: SideTally): string {
+    // `#1986 vibe-talk-one-page-complete-rows`: the server's count on the summary, when it
+    // carries one, stands over the held count; absent, the held count below as before.
+    if (choice.summary && typeof choice.summary.unread_count === "number") {
+      const counted = choice.summary.unread_count;
+      return counted > 0 ? `${counted}${choice.summary.unread_exact === false ? "+" : ""} unread` : "";
+    }
     const entry = tally.threads.get(choice.id);
     const unread = entry ? entry.unread : 0;
     const unseen = deps.unseenReplies(choice.id, choice.root, tally, choice.summary);

@@ -230,6 +230,11 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
   let pinRecords = new Map<string, boolean>();
   let pinChannel = "";
   let pinLoadInFlight = "";
+  // `#1986 vibe-talk-one-page-complete-rows`: the thread-pin revision and channel summary the
+  // last timeline answer carried, so a change another device made re-reads the pin records
+  // here, on a read that already happened, as message pins do by their revision.
+  let threadPinsRevisionSeen: number | null = null;
+  let channelSummarySeen: { unread_reply_count?: unknown } | null = null;
 
   /** The agent thread `choice` is bang-bound to, from its root's `!@NAME`. */
   function bangAgent(choice: ThreadChoice | null): string | null {
@@ -245,6 +250,9 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
   function threadIsPinned(choice: ThreadChoice): boolean {
     const explicit = pinRecords.get(choice.id);
     if (explicit !== undefined) return explicit;
+    // `#1986 vibe-talk-one-page-complete-rows`: the server's resolved pin on the summary,
+    // when it carries one, before the local bang derivation it replaces.
+    if (typeof choice.summary?.pinned === "boolean") return choice.summary.pinned;
     return bangAgent(choice) !== null;
   }
 
@@ -381,7 +389,10 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
     if (deps.threading()) {
       options.push(["flat", "All"]);
       if (deps.threadListOffered()) {
-        options.push(["threads", "Thread list"]);
+        // `#1986`: the server's unread sum over the threads it counted, on the label itself.
+        const unread = channelSummarySeen && typeof channelSummarySeen.unread_reply_count === "number"
+          ? channelSummarySeen.unread_reply_count : 0;
+        options.push(["threads", unread > 0 ? `Thread list (${unread} unread)` : "Thread list"]);
         if (deps.layoutFit()) options.push(["columns", "Two columns"]);
       }
       // `#1608 agent-transcripts-timeline`: Transcripts, with the views,
@@ -645,6 +656,19 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
         payload = await deps.fetchTimeline(base);
       }
       if (String(deps.selectedChannelId()) !== channel) return;
+      // `#1986`: envelope facts on the same answer: a moved thread-pin revision re-reads the
+      // pin records; the channel summary feeds the picker's Thread list label below.
+      const revision = (payload as { thread_pins_revision?: unknown }).thread_pins_revision;
+      if (typeof revision === "number" && revision !== threadPinsRevisionSeen) {
+        const first = threadPinsRevisionSeen === null;
+        threadPinsRevisionSeen = revision;
+        if (!first && pinChannel === channel) {
+          pinChannel = "";
+          ensureThreadPins();
+        }
+      }
+      const said = (payload as { channel_summary?: unknown }).channel_summary;
+      channelSummarySeen = said && typeof said === "object" ? said as { unread_reply_count?: unknown } : channelSummarySeen;
       if (sent && (payload as { delta?: boolean }).delta) {
         if (!deps.foldTimelineDelta(payload, sent as string, "threads", null)) return;
       } else {

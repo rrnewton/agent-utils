@@ -883,6 +883,40 @@
       ],
       "type": "object"
     },
+    "ChannelSummary": {
+      "description": "What this server knows of one channel's threads as a whole, carried on a timeline answer so\na channel row needs no counting of its own (`#1986 vibe-talk-one-page-complete-rows`). Absent\nfrom an older server, and when this server's cache cannot say.",
+      "properties": {
+        "latest_activity_at": {
+          "description": "Latest thread activity this server's cache holds for the channel, RFC 3339.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "thread_count": {
+          "description": "Threads this server's cache holds for the channel, in total (not this page's count).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "unread_exact": {
+          "description": "Whether every carried thread's unread count is exact, so the sum is.",
+          "type": "boolean"
+        },
+        "unread_reply_count": {
+          "description": "Unread replies summed over the thread summaries THIS answer carries, counted as\n[`crate::threads::ThreadSummary::unread_count`] is. A page-scoped sum, not a\nchannel-wide total: threads below the page are not in it.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "thread_count",
+        "unread_reply_count",
+        "unread_exact"
+      ],
+      "type": "object"
+    },
     "ClassSource": {
       "description": "How a thread came to be classed. Sticky: once classed, an edit or a\nmetadata-less re-read never unclasses; only `Owner` changes a class.",
       "oneOf": [
@@ -3504,6 +3538,31 @@
       ],
       "type": "object"
     },
+    "ThreadParticipant": {
+      "description": "One author in a thread's `participants`, with how many of its replies this server holds.",
+      "properties": {
+        "author": {
+          "description": "The author's display name, as the provider reported them. UNTRUSTED.",
+          "type": "string"
+        },
+        "author_id": {
+          "$ref": "#/$defs/UserId",
+          "description": "The author's id, travelling with the name as it does on every message."
+        },
+        "reply_count": {
+          "description": "Replies by this author that this server holds for the thread.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "author",
+        "author_id",
+        "reply_count"
+      ],
+      "type": "object"
+    },
     "ThreadPinChangeResponse": {
       "description": "What one thread pin or unpin did: `PUT`/`DELETE /api/v1/channels/{id}/thread-pins/{thread_id}`.",
       "properties": {
@@ -3618,6 +3677,67 @@
           "description": "Opaque identifier used for reading or posting to this thread.",
           "type": "string"
         },
+        "last_reply_at": {
+          "description": "When the latest reply this server holds was written, RFC 3339. `updated_at` remains the\nprovider's activity time; this is the cached copy's, and the two agree whenever the cache\nholds the newest reply. Absent under the same conditions as `unread_count`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_reply_author": {
+          "description": "Who wrote that latest reply, as the provider reported them.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_reply_author_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UserId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "That author's id, travelling with the name as it does on every message."
+        },
+        "last_reply_excerpt": {
+          "description": "The latest reply's first line, cut as a title is cut. UNTRUSTED, as all content is.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "participants": {
+          "description": "Who has replied in this thread, most replies first, at most\n[`crate::ops::MAX_THREAD_PARTICIPANTS`] of them. Empty when this server holds no cached\nreplies for the thread, which is also what an older server sends.",
+          "items": {
+            "$ref": "#/$defs/ThreadParticipant"
+          },
+          "type": "array"
+        },
+        "participants_more": {
+          "description": "How many further distinct authors replied beyond `participants`.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pinned": {
+          "description": "Whether this thread is effectively pinned for the reader — a bang-bound thread's\ndefault, overridden by an explicit pin or unpin — resolved by this server from its pin\nrecords, so the row needs no second read. Absent when the store cannot say.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "replies_done": {
+          "description": "How many of this thread's cached replies the reader has marked Done. Absent when this\nserver holds no cached replies for the thread.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "reply_count": {
           "description": "Number of replies when known.",
           "format": "uint64",
@@ -3642,6 +3762,13 @@
           ],
           "description": "The original message, when available and readable."
         },
+        "root_done": {
+          "description": "Whether the reader has marked this thread's ROOT Done. Absent when unknown.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "summary": {
           "description": "One sentence on what the thread is about now, re-summarised as it grows. Absent until\nsummarised. See [`thread_summary_due`] for when it is refreshed.",
           "type": [
@@ -3652,6 +3779,19 @@
         "title": {
           "description": "Provider-supplied title, or a neutral fallback.",
           "type": "string"
+        },
+        "unread_count": {
+          "description": "Replies in this thread the reader has not marked Done, counted by THIS server at serve\ntime from its cached copies and the reader's Done marks (`#1986\nvibe-talk-one-page-complete-rows`): a page carries the count so a thread row is complete\non first render, without the page counting the replies it happens to hold. Absent when\nthis server holds no cached replies for the thread and cannot count: an older server, a\nthread it has never read, a deployment with no cache. Absent is UNKNOWN, never zero.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "unread_exact": {
+          "description": "Whether `unread_count` covers every reply (`reply_count_exact` and the cache holds them\nall) rather than only the replies this server holds: false is a floor, and a page may\nshow it with a `+`. Meaningless without `unread_count`.",
+          "type": "boolean"
         },
         "updated_at": {
           "description": "Latest message activity, as an RFC 3339 timestamp.",
@@ -3728,6 +3868,17 @@
         "channel": {
           "$ref": "#/$defs/ChannelInfo",
           "description": "Configured parent channel, including its local alias and write policy."
+        },
+        "channel_summary": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChannelSummary"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What this server knows of the channel's threads as a whole. Absent when its cache\ncannot say, and from an older server."
         },
         "delta": {
           "anyOf": [
@@ -3855,6 +4006,14 @@
             }
           ],
           "description": "The selected thread, for the thread view. Outside it, the one thread a channel registered as\na single conversation is scoped to: that channel has no child threads (`has_threads` is\nfalse), and its main view carries the conversation's replies as well as its root."
+        },
+        "thread_pins_revision": {
+          "description": "The revision this channel's THREAD pins are at (`#1986\nvibe-talk-one-page-complete-rows`): `pins_revision` for thread rows, so a page learns\nanother device changed a thread pin from a read it already makes, and each\n[`crate::threads::ThreadSummary::pinned`] is read against it. Absent when the store\ncannot say, and from an older server.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "threads": {
           "description": "Summaries for the threads view, ordered by last activity oldest first.",

@@ -2742,6 +2742,8 @@ pub async fn transcript_thread(
     let returned = page.messages.len();
     Ok(no_store(Json(TimelineResponse {
         pins_revision: None,
+        thread_pins_revision: None,
+        channel_summary: None,
         bookmark: None,
         returned,
         channel,
@@ -2836,6 +2838,9 @@ pub async fn timeline(
         && request.before.is_none()
         && page.has_threads
         && page.thread.is_none();
+    // `#1986 vibe-talk-one-page-complete-rows`: the thread facts this server can count, on the
+    // page itself, so a thread row is complete on first render.
+    let thread_facts = ops::attach_thread_facts(&state, &channel.id, &mut page).await;
     let (dismissed, reply_dismissals) =
         ops::timeline_read_state(&state, caller, &channel.id, &page.messages, replies).await?;
     // `#206 pin-message`. One indexed lookup on every read, delta included: this is how a refresh
@@ -2846,6 +2851,8 @@ pub async fn timeline(
     let bookmark = ops::bookmark_state(&state, &channel.id).await;
     Ok(no_store(Json(TimelineResponse {
         pins_revision,
+        thread_pins_revision: thread_facts.thread_pins_revision,
+        channel_summary: thread_facts.channel_summary,
         bookmark,
         returned: page.messages.len() + page.threads.len(),
         channel,

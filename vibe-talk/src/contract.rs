@@ -898,6 +898,24 @@ pub struct TranscriptsResponse {
     pub untrusted_content_notice: &'static str,
 }
 
+/// What this server knows of one channel's threads as a whole, carried on a timeline answer so
+/// a channel row needs no counting of its own (`#1986 vibe-talk-one-page-complete-rows`). Absent
+/// from an older server, and when this server's cache cannot say.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct ChannelSummary {
+    /// Threads this server's cache holds for the channel, in total (not this page's count).
+    pub thread_count: u64,
+    /// Unread replies summed over the thread summaries THIS answer carries, counted as
+    /// [`crate::threads::ThreadSummary::unread_count`] is. A page-scoped sum, not a
+    /// channel-wide total: threads below the page are not in it.
+    pub unread_reply_count: u64,
+    /// Whether every carried thread's unread count is exact, so the sum is.
+    pub unread_exact: bool,
+    /// Latest thread activity this server's cache holds for the channel, RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_activity_at: Option<String>,
+}
+
 /// A provider-neutral timeline plus this application's channel and read-state metadata.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct TimelineResponse {
@@ -931,6 +949,17 @@ pub struct TimelineResponse {
     /// storage configured, or a failing one — and from an older server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pins_revision: Option<i64>,
+    /// The revision this channel's THREAD pins are at (`#1986
+    /// vibe-talk-one-page-complete-rows`): `pins_revision` for thread rows, so a page learns
+    /// another device changed a thread pin from a read it already makes, and each
+    /// [`crate::threads::ThreadSummary::pinned`] is read against it. Absent when the store
+    /// cannot say, and from an older server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_pins_revision: Option<i64>,
+    /// What this server knows of the channel's threads as a whole. Absent when its cache
+    /// cannot say, and from an older server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_summary: Option<ChannelSummary>,
     /// This channel's bookmark and its revision. `#240 reading-bookmark`.
     ///
     /// On every read, newest page and delta alike, as `pins_revision` is, and for its reason: a

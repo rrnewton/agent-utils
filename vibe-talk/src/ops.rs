@@ -8250,6 +8250,183 @@ pub async fn attach_page_hues(
     }
 }
 
+/// At most this many authors a thread summary names (`#1986 vibe-talk-one-page-complete-rows`);
+/// the rest are a count in `participants_more`.
+pub const MAX_THREAD_PARTICIPANTS: usize = 8;
+
+/// What [`attach_thread_facts`] learned beside the page itself, for the response envelope.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ThreadPageFacts {
+    /// The channel's thread-pin revision, when the store could say.
+    pub thread_pins_revision: Option<i64>,
+    /// The channel summary, when the cache could say.
+    pub channel_summary: Option<crate::contract::ChannelSummary>,
+}
+
+/// Fill every thread summary on `page` with the facts this server can count at serve time
+/// (`#1986 vibe-talk-one-page-complete-rows`): unread and Done counts, the latest held reply,
+/// its participants, its effective pin and its root's Done state, plus the channel summary.
+///
+/// ONE indexed cache read for the page's thread ids (`message_by_thread`), one Done list and
+/// one thread-pin list from the store, and the channel's noise filter — O(page), never
+/// O(channel), and no provider read. Everything it cannot say stays absent: no cache, a thread
+/// it holds no replies for, a store that fails. Absent is UNKNOWN, never zero, and a failure
+/// here never fails the page. Slice 1 counts from held copies; maintained counters are slice 2.
+pub async fn attach_thread_facts(
+    state: &AppState,
+    channel: &ChannelId,
+    page: &mut crate::threads::TimelinePage,
+) -> ThreadPageFacts {
+    let mut ids: Vec<String> = page
+        .threads
+        .iter()
+        .map(|summary| summary.id.clone())
+        .collect();
+    if let Some(single) = &page.thread {
+        if !ids.contains(&single.id) {
+            ids.push(single.id.clone());
+        }
+    }
+    let facts = if ids.is_empty() {
+        None
+    } else {
+        state.message_cache.thread_facts(channel, &ids).await
+    };
+    let by_id: std::collections::HashMap<String, crate::cache::ThreadFact> = facts
+        .unwrap_or_default()
+        .into_iter()
+        .map(|fact| (fact.thread_id.clone(), fact))
+        .collect();
+    let dismissed: Option<std::collections::HashSet<String>> = state
+        .store
+        .dismissals(channel)
+        .await
+        .ok()
+        .map(|marks| marks.iter().map(|id| id.as_str().to_owned()).collect());
+    let pins = state.store.thread_pins(channel).await.ok();
+    let noise = crate::noise::filter_for(state, channel).await;
+    for summary in page.threads.iter_mut().chain(page.thread.iter_mut()) {
+        if let Some(marks) = &dismissed {
+            summary.root_done = summary
+                .root
+                .as_ref()
+                .map(|root| marks.contains(root.id.as_str()));
+        }
+        if let Some(records) = &pins {
+            let explicit = records
+                .records
+                .iter()
+                .find(|record| record.thread_id == summary.id)
+                .map(|record| record.pinned);
+            let bang = summary
+                .root
+                .as_ref()
+                .is_some_and(|root| crate::threads::bang_agent_of(&root.content).is_some());
+            summary.pinned = Some(explicit.unwrap_or(bang));
+        }
+        match by_id.get(&summary.id) {
+            Some(fact) if !fact.replies.is_empty() => {
+                apply_thread_fact(summary, fact, dismissed.as_ref(), &noise);
+            }
+            _ if summary.reply_count == Some(0) => {
+                summary.unread_count = Some(0);
+                summary.unread_exact = summary.reply_count_exact;
+                summary.replies_done = Some(0);
+            }
+            _ => {}
+        }
+    }
+    let totals = state.message_cache.thread_totals(channel).await;
+    ThreadPageFacts {
+        thread_pins_revision: pins.map(|records| records.revision),
+        channel_summary: totals.map(|(thread_count, latest_ms)| {
+            let carried: Vec<&crate::threads::ThreadSummary> =
+                page.threads.iter().chain(page.thread.iter()).collect();
+            crate::contract::ChannelSummary {
+                thread_count,
+                unread_reply_count: carried
+                    .iter()
+                    .filter_map(|summary| summary.unread_count)
+                    .sum(),
+                unread_exact: !carried.is_empty()
+                    && carried
+                        .iter()
+                        .all(|summary| summary.unread_count.is_some() && summary.unread_exact),
+                latest_activity_at: latest_ms.map(crate::clock::iso_from_ms),
+            }
+        }),
+    }
+}
+
+/// Count one held thread into its summary: see [`attach_thread_facts`]. `dismissed` is the
+/// reader's Done ids for the channel, or `None` when the store could not say (Done counts then
+/// stay absent while the rest is still counted).
+fn apply_thread_fact(
+    summary: &mut crate::threads::ThreadSummary,
+    fact: &crate::cache::ThreadFact,
+    dismissed: Option<&std::collections::HashSet<String>>,
+    noise: &crate::noise::NoiseFilter,
+) {
+    let held = u64::try_from(fact.replies.len()).unwrap_or(u64::MAX);
+    if let Some(marks) = dismissed {
+        summary.replies_done = Some(
+            fact.replies
+                .iter()
+                .filter(|reply| marks.contains(reply.id.as_str()))
+                .count() as u64,
+        );
+        summary.unread_count = Some(
+            fact.replies
+                .iter()
+                .filter(|reply| {
+                    !marks.contains(reply.id.as_str())
+                        && !reply.content.trim().is_empty()
+                        && !noise.is_noise_parts(&reply.id, &reply.content)
+                })
+                .count() as u64,
+        );
+        summary.unread_exact =
+            summary.reply_count_exact && summary.reply_count.is_some_and(|count| held >= count);
+    }
+    if let Some(last) = fact.replies.last() {
+        summary.last_reply_at = Some(crate::clock::iso_from_ms(last.created_ms));
+        summary.last_reply_author = Some(last.author.clone());
+        summary.last_reply_author_id = Some(last.author_id.clone());
+        summary.last_reply_excerpt = last
+            .content
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(crate::threads::title_from_line);
+    }
+    let mut counts: Vec<(String, String, u64)> = Vec::new();
+    for reply in &fact.replies {
+        let key = (reply.author_id.as_str().to_owned(), reply.author.clone());
+        match counts
+            .iter_mut()
+            .find(|(id, author, _)| (id.clone(), author.clone()) == key)
+        {
+            Some((_, _, count)) => *count += 1,
+            None => counts.push((key.0, key.1, 1)),
+        }
+    }
+    counts.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
+    let distinct = counts.len();
+    summary.participants = counts
+        .into_iter()
+        .take(MAX_THREAD_PARTICIPANTS)
+        .map(
+            |(author_id, author, reply_count)| crate::threads::ThreadParticipant {
+                author,
+                author_id: crate::model::UserId(author_id),
+                reply_count,
+            },
+        )
+        .collect();
+    summary.participants_more =
+        u32::try_from(distinct.saturating_sub(MAX_THREAD_PARTICIPANTS)).unwrap_or(u32::MAX);
+}
+
 /// Colour a batch of messages for the page: the history walk, the message list and lookup, one
 /// ingested or live message. See [`attach_page_hues`].
 pub async fn attach_message_hues(
@@ -8802,7 +8979,88 @@ mod tests {
             display_name: None,
             summary: None,
             hue: None,
+            unread_count: None,
+            unread_exact: false,
+            last_reply_at: None,
+            last_reply_author: None,
+            last_reply_author_id: None,
+            last_reply_excerpt: None,
+            participants: Vec::new(),
+            participants_more: 0,
+            pinned: None,
+            root_done: None,
+            replies_done: None,
         }
+    }
+
+    #[test]
+    fn thread_facts_count_a_thread_longer_than_a_page() {
+        // `#1986 vibe-talk-one-page-complete-rows`: 120 held replies (more than a 50 page, more
+        // than the 99 ceiling) count in full: 10 Done, 1 noise, 1 empty, so 108 unread; exact
+        // because the provider count is exact and every reply is held. 10 authors cap at 8.
+        let mut summary = summary("t", "2026-10-01T00:00:00Z", 120);
+        let replies: Vec<crate::cache::ThreadFactReply> = (1..=120_i64)
+            .map(|i| crate::cache::ThreadFactReply {
+                id: crate::model::MessageId(format!("r{i}")),
+                author: format!("author-{}", i % 10),
+                author_id: crate::model::UserId(format!("U-{}", i % 10)),
+                created_ms: 1_790_812_800_000 + i * 1000,
+                content: if i == 120 {
+                    "latest words here".to_owned()
+                } else if i == 119 {
+                    String::new()
+                } else {
+                    format!("reply {i}")
+                },
+            })
+            .collect();
+        let fact = crate::cache::ThreadFact {
+            thread_id: "t".to_owned(),
+            replies,
+        };
+        let dismissed: std::collections::HashSet<String> =
+            (1..=10).map(|i| format!("r{i}")).collect();
+        let noise = crate::noise::NoiseFilter::new(&["reply 50"], &[]);
+        apply_thread_fact(&mut summary, &fact, Some(&dismissed), &noise);
+        assert_eq!(summary.replies_done, Some(10));
+        assert_eq!(
+            summary.unread_count,
+            Some(108),
+            "120 - 10 Done - 1 noise - 1 empty"
+        );
+        assert!(summary.unread_exact);
+        assert_eq!(
+            summary.last_reply_excerpt.as_deref(),
+            Some("latest words here")
+        );
+        assert_eq!(summary.last_reply_author.as_deref(), Some("author-0"));
+        assert_eq!(summary.participants.len(), MAX_THREAD_PARTICIPANTS);
+        assert_eq!(summary.participants_more, 2);
+        assert_eq!(summary.participants[0].reply_count, 12);
+    }
+
+    #[test]
+    fn thread_facts_are_a_floor_when_not_every_reply_is_held() {
+        // Held 2 of an exact 5: the count is real but not whole, so it is not exact.
+        let mut summary = summary("t", "2026-10-01T00:00:00Z", 5);
+        let fact = crate::cache::ThreadFact {
+            thread_id: "t".to_owned(),
+            replies: vec![crate::cache::ThreadFactReply {
+                id: crate::model::MessageId("r1".to_owned()),
+                author: "ada".to_owned(),
+                author_id: crate::model::UserId("U-ada".to_owned()),
+                created_ms: 1_790_812_800_000,
+                content: "hi".to_owned(),
+            }],
+        };
+        apply_thread_fact(
+            &mut summary,
+            &fact,
+            Some(&std::collections::HashSet::new()),
+            &crate::noise::NoiseFilter::nothing(),
+        );
+        assert_eq!(summary.unread_count, Some(1));
+        assert!(!summary.unread_exact);
     }
 
     #[tokio::test]

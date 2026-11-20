@@ -431,6 +431,31 @@ pub struct ThreadRecord {
     pub last_activity_ms: i64,
 }
 
+/// The replies this file holds for one thread, oldest first: what a serve-time thread summary
+/// is counted from (`#1986 vibe-talk-one-page-complete-rows`, [`MessageCache::thread_facts`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ThreadFact {
+    /// The thread the replies belong to.
+    pub thread_id: String,
+    /// Every reply held for it, oldest first. Roots are not replies and are never here.
+    pub replies: Vec<ThreadFactReply>,
+}
+
+/// One held reply in a [`ThreadFact`]: the least a serve-time summary counts from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadFactReply {
+    /// The reply's id.
+    pub id: MessageId,
+    /// Who wrote it, as the provider reported them.
+    pub author: String,
+    /// That author's id.
+    pub author_id: crate::model::UserId,
+    /// When it was written, in Unix milliseconds (provider time).
+    pub created_ms: i64,
+    /// Its raw body. UNTRUSTED.
+    pub content: String,
+}
+
 /// A channel's thread list as the file holds it ([`MessageCache::thread_list`]). `#614
 /// timeline-read-failures`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -2685,6 +2710,32 @@ impl MessageCache {
                 !self.scope_blocked(chan, &Scope::Thread(record.thread_id.clone()).key())
             });
             list
+        })
+    }
+
+    /// The replies this file holds for each of `thread_ids`, in ONE indexed read
+    /// (`message_by_thread`): what a serve-time thread summary is counted from (`#1986
+    /// vibe-talk-one-page-complete-rows`). A thread whose scope is blocked contributes no
+    /// fact, as a blocked thread is left out of the list itself. Threads the file holds no
+    /// replies for are absent, never present-and-empty.
+    #[must_use]
+    pub fn thread_facts(&self, chan: &ChanKey, thread_ids: &[String]) -> Read<Vec<ThreadFact>> {
+        let ids: Vec<String> = thread_ids
+            .iter()
+            .filter(|id| !self.scope_blocked(chan, &Scope::Thread((*id).clone()).key()))
+            .cloned()
+            .collect();
+        self.read_scope(chan, &Scope::Main.key(), |connection| {
+            reader::thread_facts(connection, chan, &ids)
+        })
+    }
+
+    /// How many threads this file holds for `chan`, and the latest activity among them: see
+    /// [`reader::thread_totals`]. Blocked while Main is, as the thread list is.
+    #[must_use]
+    pub fn thread_totals(&self, chan: &ChanKey) -> Read<(u64, Option<i64>)> {
+        self.read_scope(chan, &Scope::Main.key(), |connection| {
+            reader::thread_totals(connection, chan)
         })
     }
 

@@ -982,6 +982,40 @@ fn listing_a_threads_replies_again_rewrites_neither_its_rows_nor_its_record() {
 }
 
 #[test]
+fn thread_facts_holds_every_reply_of_a_thread_longer_than_a_page() {
+    // `#1986 vibe-talk-one-page-complete-rows`: the serve-time count must not be bounded by a
+    // page (50, or the server's 99): a thread holding 120 replies answers with all 120.
+    let fx = Fixture::new("cache-thread-facts");
+    let replies: Vec<Message> = (1..=120_i64)
+        .map(|i| {
+            let mut row = reply(
+                &format!("r{i}"),
+                "m1",
+                &format!("reply number {i}"),
+                T0 + STEP + i,
+            );
+            row.author = format!("author-{}", i % 3);
+            row.author_id = crate::model::UserId(format!("U-{}", i % 3));
+            row
+        })
+        .collect();
+    fx.list_scope(Scope::Thread("m1".to_owned()), replies, T0 + 10, None);
+    let facts = fx
+        .cache
+        .thread_facts(&fx.chan, &ids(&["m1", "unknown"]))
+        .served()
+        .expect("served");
+    assert_eq!(facts.len(), 1, "only the held thread, absent never empty");
+    assert_eq!(facts[0].thread_id, "m1");
+    assert_eq!(facts[0].replies.len(), 120);
+    assert_eq!(facts[0].replies[0].id.as_str(), "r1", "oldest first");
+    assert_eq!(facts[0].replies[119].id.as_str(), "r120");
+    let (count, latest) = fx.cache.thread_totals(&fx.chan).served().expect("served");
+    assert_eq!(count, 1);
+    assert_eq!(latest, Some(T0 + STEP + 120));
+}
+
+#[test]
 fn absence_from_a_listing_of_another_scope_only_drops_that_membership() {
     let fx = Fixture::new("cache-membership");
     // A reply also sent to the channel: home is its thread, and it is listed in main too.

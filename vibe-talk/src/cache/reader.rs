@@ -12,8 +12,8 @@ use super::coverage::{Head, Interval, Source};
 use super::rows::{self, CachedMessage, ChanKey, Scope};
 use super::schema::{apply_per_open, sqlite_code};
 use super::shadow::{Query, View};
-use super::{Account, CacheError, Counts, ThreadRecord};
-use crate::model::MessageId;
+use super::{Account, CacheError, Counts, ThreadFact, ThreadFactReply, ThreadRecord};
+use crate::model::{MessageId, UserId};
 
 /// Two read-only connections. A read takes whichever is free.
 pub(crate) struct Readers {
@@ -683,6 +683,58 @@ pub(crate) fn thread(
         .optional()
 }
 
+/// Every reply the file holds for each of `thread_ids`, oldest first, in ONE indexed read
+/// (`message_by_thread` is `(chan, thread_id, created_ms)`): what a serve-time thread summary
+/// is counted from (`#1986 vibe-talk-one-page-complete-rows`). Ids are bound, never spliced
+/// into the SQL beyond the placeholder count, which is the page's own thread count. Threads
+/// with no held replies are absent from the answer.
+pub(crate) fn thread_facts(
+    connection: &Connection,
+    chan: &ChanKey,
+    thread_ids: &[String],
+) -> rusqlite::Result<Vec<ThreadFact>> {
+    if thread_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(chan_id) = chan_id(connection, chan)? else {
+        return Ok(Vec::new());
+    };
+    let marks = vec!["?"; thread_ids.len()].join(",");
+    let sql = format!(
+        "SELECT thread_id, message_id, author, author_id, created_ms, content FROM message
+         WHERE chan = ? AND thread_id IN ({marks}) AND is_root = 0
+         ORDER BY thread_id, created_ms, numeric_id"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(thread_ids.len() + 1);
+    values.push(chan_id.into());
+    values.extend(thread_ids.iter().map(|id| id.clone().into()));
+    let rows = statement.query_map(rusqlite::params_from_iter(values), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            ThreadFactReply {
+                id: MessageId(row.get::<_, String>(1)?),
+                author: row.get(2)?,
+                author_id: UserId(row.get::<_, String>(3)?),
+                created_ms: row.get(4)?,
+                content: row.get(5)?,
+            },
+        ))
+    })?;
+    let mut facts: Vec<ThreadFact> = Vec::new();
+    for row in rows {
+        let (thread_id, reply) = row?;
+        match facts.last_mut() {
+            Some(fact) if fact.thread_id == thread_id => fact.replies.push(reply),
+            _ => facts.push(ThreadFact {
+                thread_id,
+                replies: vec![reply],
+            }),
+        }
+    }
+    Ok(facts)
+}
+
 /// The `limit` threads of `chan` with the latest activity, newest first, each with its root as the
 /// file holds it: a thread whose root the file does not hold, or that says it has no replies, is
 /// not listed. Also when the latest read of Main's newest end began. In ONE read transaction. `#614
@@ -731,6 +783,29 @@ pub(crate) fn thread_list(
         threads,
         main_checked_ms,
     })
+}
+
+/// How many threads the file holds for `chan`, and the latest activity among them, in ONE
+/// aggregate read: the channel-wide half of a serve-time channel summary (`#1986
+/// vibe-talk-one-page-complete-rows`). `(0, None)` for a channel the file does not hold.
+pub(crate) fn thread_totals(
+    connection: &Connection,
+    chan: &ChanKey,
+) -> rusqlite::Result<(u64, Option<i64>)> {
+    let Some(chan_id) = chan_id(connection, chan)? else {
+        return Ok((0, None));
+    };
+    connection.query_row(
+        "SELECT COUNT(*), MAX(last_activity_ms) FROM thread WHERE chan = ?1",
+        params![chan_id],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)
+                    .map(|n| u64::try_from(n).unwrap_or(0))?,
+                row.get::<_, Option<i64>>(1)?,
+            ))
+        },
+    )
 }
 
 /// Every provider the file holds an account record for, with how many channels and messages it

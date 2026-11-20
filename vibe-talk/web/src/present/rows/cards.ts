@@ -114,11 +114,22 @@ function threadChoice(id: unknown, summary: ThreadSummary | null = null, root: M
  * Last ACTIVITY rather than when it started, because that is the order every list of threads is in:
  * a start age put "38w" above "2h" in a list sorted newest-activity-first, which reads as unsorted.
  */
-function threadFacts(choice: Pick<ThreadChoice, "at" | "started" | "count">): string {
+function threadFacts(choice: Pick<ThreadChoice, "at" | "started" | "count" | "summary">): string {
   const age = briefAge(Number.isFinite(choice.at) ? choice.at : choice.started);
   // A count of 0 is never printed: "Thread 0" read as a thread numbered zero, not an empty one.
-  return [age, typeof choice.count === "number" && choice.count > 0 ? String(choice.count) : ""]
-    .filter((part) => part !== "").join(" · ");
+  const parts = [age, typeof choice.count === "number" && choice.count > 0 ? String(choice.count) : ""];
+  // `#1986 vibe-talk-one-page-complete-rows`: who last replied and who is in the thread, when
+  // the server counted them onto the summary; absent from an older server, nothing is added.
+  const summary = choice.summary;
+  if (summary && typeof summary.last_reply_author === "string" && summary.last_reply_author !== "") {
+    parts.push(`last by ${summary.last_reply_author}`);
+  }
+  if (summary && Array.isArray(summary.participants) && summary.participants.length > 0) {
+    const names = summary.participants.slice(0, 3).map((who) => who.author);
+    const rest = summary.participants.length - names.length + (summary.participants_more || 0);
+    parts.push(rest > 0 ? `${names.join(", ")} +${rest}` : names.join(", "));
+  }
+  return parts.filter((part) => part !== "").join(" · ");
 }
 
 export { CARD_INDENTED_CHARS, CARD_LINE_CHARS, cardProxyLines, firstLineOf, foldedCardText, proxyLinesOf, threadChoice, threadFacts, titleLineOf, wrapCardLine };

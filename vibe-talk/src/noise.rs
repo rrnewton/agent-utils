@@ -307,7 +307,15 @@ impl NoiseFilter {
     /// Whether this message, as it reads NOW, is noise.
     #[must_use]
     pub fn is_noise(&self, message: &Message) -> bool {
-        !self.exempt.contains(message.id.as_str()) && self.matcher.matches(&message.content)
+        self.is_noise_parts(&message.id, &message.content)
+    }
+
+    /// Whether a message with this `id` and `content` is noise: [`NoiseFilter::is_noise`] for a
+    /// caller counting held copies it has not built whole messages from (`#1986
+    /// vibe-talk-one-page-complete-rows`).
+    #[must_use]
+    pub fn is_noise_parts(&self, id: &MessageId, content: &str) -> bool {
+        !self.exempt.contains(id.as_str()) && self.matcher.matches(content)
     }
 
     /// Set [`Message::noise`] on every message, in both directions.

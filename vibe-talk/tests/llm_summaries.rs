@@ -318,6 +318,17 @@ impl Threads {
                 .unwrap_or_else(|| format!("2026-10-11T08:0{n}:00Z")),
             display_name: None,
             summary: None,
+            unread_count: None,
+            unread_exact: false,
+            last_reply_at: None,
+            last_reply_author: None,
+            last_reply_author_id: None,
+            last_reply_excerpt: None,
+            participants: Vec::new(),
+            participants_more: 0,
+            pinned: None,
+            root_done: None,
+            replies_done: None,
         }
     }
 

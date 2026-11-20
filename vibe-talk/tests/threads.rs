@@ -163,6 +163,17 @@ impl ChatClient for ThreadBackend {
             updated_at: "2026-09-20T01:00:00Z".to_owned(),
             display_name: None,
             summary: None,
+            unread_count: None,
+            unread_exact: false,
+            last_reply_at: None,
+            last_reply_author: None,
+            last_reply_author_id: None,
+            last_reply_excerpt: None,
+            participants: Vec::new(),
+            participants_more: 0,
+            pinned: None,
+            root_done: None,
+            replies_done: None,
         };
         Ok(TimelinePage {
             messages: if request.view == TimelineView::Threads {
@@ -1134,6 +1145,17 @@ async fn a_channel_scoped_to_one_conversation_has_no_replies_outside_main_to_spe
         updated_at: "2026-10-04T07:00:00Z".to_owned(),
         display_name: None,
         summary: None,
+        unread_count: None,
+        unread_exact: false,
+        last_reply_at: None,
+        last_reply_author: None,
+        last_reply_author_id: None,
+        last_reply_excerpt: None,
+        participants: Vec::new(),
+        participants_more: 0,
+        pinned: None,
+        root_done: None,
+        replies_done: None,
     });
     mark(&app, "dismiss", &["2", "5"]).await;
     let (status, main) = call(

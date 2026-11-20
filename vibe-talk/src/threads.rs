@@ -194,6 +194,69 @@ pub struct ThreadSummary {
     /// conditions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hue: Option<u16>,
+    /// Replies in this thread the reader has not marked Done, counted by THIS server at serve
+    /// time from its cached copies and the reader's Done marks (`#1986
+    /// vibe-talk-one-page-complete-rows`): a page carries the count so a thread row is complete
+    /// on first render, without the page counting the replies it happens to hold. Absent when
+    /// this server holds no cached replies for the thread and cannot count: an older server, a
+    /// thread it has never read, a deployment with no cache. Absent is UNKNOWN, never zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread_count: Option<u64>,
+    /// Whether `unread_count` covers every reply (`reply_count_exact` and the cache holds them
+    /// all) rather than only the replies this server holds: false is a floor, and a page may
+    /// show it with a `+`. Meaningless without `unread_count`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unread_exact: bool,
+    /// When the latest reply this server holds was written, RFC 3339. `updated_at` remains the
+    /// provider's activity time; this is the cached copy's, and the two agree whenever the cache
+    /// holds the newest reply. Absent under the same conditions as `unread_count`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reply_at: Option<String>,
+    /// Who wrote that latest reply, as the provider reported them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reply_author: Option<String>,
+    /// That author's id, travelling with the name as it does on every message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reply_author_id: Option<crate::model::UserId>,
+    /// The latest reply's first line, cut as a title is cut. UNTRUSTED, as all content is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reply_excerpt: Option<String>,
+    /// Who has replied in this thread, most replies first, at most
+    /// [`crate::ops::MAX_THREAD_PARTICIPANTS`] of them. Empty when this server holds no cached
+    /// replies for the thread, which is also what an older server sends.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub participants: Vec<ThreadParticipant>,
+    /// How many further distinct authors replied beyond `participants`.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub participants_more: u32,
+    /// Whether this thread is effectively pinned for the reader — a bang-bound thread's
+    /// default, overridden by an explicit pin or unpin — resolved by this server from its pin
+    /// records, so the row needs no second read. Absent when the store cannot say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned: Option<bool>,
+    /// Whether the reader has marked this thread's ROOT Done. Absent when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_done: Option<bool>,
+    /// How many of this thread's cached replies the reader has marked Done. Absent when this
+    /// server holds no cached replies for the thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replies_done: Option<u64>,
+}
+
+/// One author in a thread's `participants`, with how many of its replies this server holds.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ThreadParticipant {
+    /// The author's display name, as the provider reported them. UNTRUSTED.
+    pub author: String,
+    /// The author's id, travelling with the name as it does on every message.
+    pub author_id: crate::model::UserId,
+    /// Replies by this author that this server holds for the thread.
+    pub reply_count: u64,
+}
+
+/// Zero for `participants_more`'s skip: a serde helper kept beside the structs, not a rule.
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }
 
 /// The agent a thread is bang-bound to, from its root's text. `#1550 thread-list-pins`.

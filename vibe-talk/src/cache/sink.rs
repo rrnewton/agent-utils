@@ -2638,6 +2638,17 @@ impl Sink {
                     display_name: None,
                     summary: None,
                     hue: None,
+                    unread_count: None,
+                    unread_exact: false,
+                    last_reply_at: None,
+                    last_reply_author: None,
+                    last_reply_author_id: None,
+                    last_reply_excerpt: None,
+                    participants: Vec::new(),
+                    participants_more: 0,
+                    pinned: None,
+                    root_done: None,
+                    replies_done: None,
                 }
             })
             .collect();
@@ -2654,6 +2665,54 @@ impl Sink {
             notice: None,
             reaches_start: false,
         })
+    }
+
+    /// The replies this file holds for each of `thread_ids` in `channel`, in one indexed read:
+    /// what a serve-time thread summary is counted from (`#1986
+    /// vibe-talk-one-page-complete-rows`; [`crate::cache::MessageCache::thread_facts`]). `None`
+    /// when the channel has no verified route or no cache is open — the facts are then unknown,
+    /// never zero, and the summaries keep their absent fields.
+    pub async fn thread_facts(
+        &self,
+        channel: &ChannelId,
+        thread_ids: &[String],
+    ) -> Option<Vec<super::ThreadFact>> {
+        if thread_ids.is_empty() {
+            return Some(Vec::new());
+        }
+        let (cache, chan) = self.facts_cache(channel)?;
+        let ids = thread_ids.to_vec();
+        tokio::task::spawn_blocking(move || cache.thread_facts(&chan, &ids).served())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// How many threads this file holds for `channel`, and the latest activity among them
+    /// (`#1986 vibe-talk-one-page-complete-rows`): `None` on the same terms as
+    /// [`Sink::thread_facts`].
+    pub async fn thread_totals(&self, channel: &ChannelId) -> Option<(u64, Option<i64>)> {
+        let (cache, chan) = self.facts_cache(channel)?;
+        tokio::task::spawn_blocking(move || cache.thread_totals(&chan).served())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// The cache and its key for `channel`, while the channel has a verified route and a cache
+    /// is open: the serve-time fact reads' one door (`#1986
+    /// vibe-talk-one-page-complete-rows`).
+    fn facts_cache(&self, channel: &ChannelId) -> Option<(Arc<super::MessageCache>, ChanKey)> {
+        let key = {
+            let routes = self.state.routes();
+            let route = routes
+                .fills
+                .get(channel)
+                .filter(|route| self.verification(&route.key) == Verification::Verified)?;
+            route.key.clone()
+        };
+        let cache = self.cache()?;
+        Some((cache, ChanKey::new(key, channel.as_str())))
     }
 
     /// A step back of `limit` from a page answered from the cache, whose oldest message was
