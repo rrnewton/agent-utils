@@ -31650,11 +31650,19 @@ def _eden_scoped_draft_nodes(
     # query that fails refuses: finish must never pass because a
     # query dropped a draft.
     mount = str(_stored_path(config, checkout.path, "checkout path"))
+    journal_remedy = (
+        f"checkout {checkout.name} Sapling journal accounting failed; "
+        "finish cannot rule out a draft this checkout abandoned since "
+        "its last capture, so it refuses rather than pass it. remedy: "
+        f"make 'sl -R {mount} journal' and 'sl -R {mount} log' succeed "
+        "in this checkout, then rerun finish (a capture cannot "
+        "substitute for a journal that cannot be read)"
+    )
     try:
         visited = eden.journal_visited_nodes(runner, mount)
         store_drafts = set(eden.all_draft_nodes(runner, mount))
     except eden.EdenError as exc:
-        raise Refusal(str(exc)) from exc
+        raise Refusal(f"{journal_remedy}: {exc}") from exc
     disowned = {node for node, _by, _at in captured.disowned}
     # Expand every visited node: a draft rewritten while not
     # checked out (metaedit, rebase) is hidden at its recorded
@@ -31680,7 +31688,7 @@ def _eden_scoped_draft_nodes(
                 if node not in extra_list:
                     extra_list.append(node)
     except eden.EdenError as exc:
-        raise Refusal(str(exc)) from exc
+        raise Refusal(f"{journal_remedy}: {exc}") from exc
     extra = tuple(extra_list)
     if extra:
         try:

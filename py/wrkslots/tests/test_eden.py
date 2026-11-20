@@ -2882,6 +2882,35 @@ def test_scoped_journal_expansion_failure_refuses(tmp_path: Path) -> None:
         )
 
 
+def test_scoped_journal_failure_names_how_to_proceed(tmp_path: Path) -> None:
+    """An unreadable Sapling journal refuses with the way forward."""
+    config = _scoped_config(tmp_path)
+    checkout = wrkslots_cli._checkout_from_obj(_eden_obj(), "row.checkouts[0]")
+    ledger_path = wrkslots_cli._eden_draft_ledger_path(config, checkout)
+    wrkslots_cli._write_eden_draft_ledger(
+        ledger_path,
+        eden.DraftLedger(slot="slot", checkout="main", generation=1,
+                         nodes=(), captured_at=None, last_error=None),
+    )
+
+    def runner(argv: Sequence[str]) -> tuple[int, str, str]:
+        args = list(argv)
+        if "journal" in args:
+            return (1, "", "journal unavailable")
+        revset = args[args.index("-r") + 1] if "-r" in args else ""
+        if revset == "draft() & ::.":
+            return (0, "", "")
+        return (0, "", "")
+
+    with pytest.raises(
+        wrkslots_cli.Refusal,
+        match=r"make 'sl -R .* journal'.*then rerun finish",
+    ):
+        wrkslots_cli._eden_scoped_draft_nodes(
+            config, checkout, slot="slot", generation=1, runner=runner
+        )
+
+
 def test_real_sl_shared_store_scopes_drafts(tmp_path: Path) -> None:
     """Real Sapling: two working copies, one backing store (#1925).
 
