@@ -3000,31 +3000,33 @@ drafts; wrkslots therefore records each checkout's draft stack
 under the slot's `.eden-state/wrkslots-drafts/` at create,
 heartbeat, write-handoff and finish, and accounts only those
 nodes and their rewrites (each capture is serialised by a
-`<checkout>.json.lock` file beside the ledger). A draft that
+`<checkout>.json.lock` file beside the ledger). At finish the
+ledger is also unioned with the drafts this working copy has
+sat on according to its own Sapling journal and since left,
+so a stack abandoned between captures is still accounted
+while it remains a draft in the store. A draft that
 became public counts landed even without a Differential
 Revision; a ledger draft that is now hidden stays unaccounted
-and finish names it with the `sl unhide` recovery. A node the
-store no longer knows refuses with the repair:
-`wrkslots capture-drafts <slot> --rebuild`.
-
-For a slot created after this accounting, one window remains:
-a wholly new stack built off a public revision and abandoned
-between captures, with the working copy never returning to it,
-is not in the ledger. Those commits stay in the shared backing
-store (finish missing them loses accounting, not the commits
-themselves), and a later `capture-drafts` from that stack's
-tip still records them.
+and finish names its newest hidden successor with the
+`sl unhide` recovery. A node the store no longer knows
+refuses with the repair `wrkslots capture-drafts <slot>
+--rebuild`, which carries every recorded node (it never
+drops one silently; a corrupt ledger is the only thing it
+discards) and re-runs the candidate judgement below.
 
 A slot created before this accounting has no ledger, and for
 it the window is wider: everything off the working copy's
 current stack at the first capture. Finish therefore refuses
 it, naming `wrkslots capture-drafts <slot>` (owner or
-coordinator only). That first capture lists the shared store's
-drafts outside the current stack that date from the slot's
-creation and writes nothing until the operator includes theirs
-with `--include NODE` (repeatable) or acknowledges
-`--none-of-these-are-mine`; drafts older than the slot are
-counted, not listed, and cannot be the slot's.
+coordinator only). That first capture lists every shared-store
+draft outside the current stack, of every date, with its
+author and date, and writes nothing until the operator judges
+each one: `--include NODE` for this slot's (repeatable),
+`--disown NODE` for each that is not, or
+`--none-of-these-are-mine` to declare the whole listed run —
+each declaration is recorded in the ledger per node, with
+who declared it and when, and a hidden recorded draft can
+never be disowned or rebuilt away silently.
 
 Drafts of another checkout are not this slot's unaccounted
 work merely for sharing the store, and `--discard-unaccounted`

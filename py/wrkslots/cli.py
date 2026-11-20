@@ -31434,11 +31434,11 @@ def _load_eden_draft_ledger(
         raise StateError(str(exc)) from exc
     if ledger.slot != slot or ledger.checkout != checkout.name:
         raise StateError(f"{label} names another slot or checkout")
-    if generation is not None and ledger.generation not in (None, generation):
-        raise StateError(
-            f"{label} belongs to generation {ledger.generation}, not {generation}; "
-            f"run 'wrkslots capture-drafts {slot}' to recapture for this generation"
-        )
+    # The generation is recorded for information only and never
+    # checked: the ledger is per slot and per checkout, and a
+    # transfer-owner or supersede generation bump must not strand
+    # every automatic capture (#1925 review, fix round 2).
+    del generation
     return ledger
 
 
@@ -31465,8 +31465,9 @@ def _capture_eden_draft_ledger(
     runner: eden.Runner,
     create: bool,
     include_nodes: Sequence[str] = (),
+    disown_nodes: Sequence[str] = (),
+    actor: str = "",
     rebuild: bool = False,
-    restamp: bool = False,
 ) -> eden.DraftLedger | None:
     """Union this mount's current draft stack into its ledger.
 
@@ -31479,10 +31480,11 @@ def _capture_eden_draft_ledger(
     touchpoints never seed a pre-#1925 checkout silently. A failed
     capture is recorded as the ledger's ``last_error`` (when a
     ledger exists or is being created) and re-raised. ``rebuild``
-    discards the recorded nodes (and tolerates a corrupt ledger);
-    only capture-drafts passes it, after its candidate listing.
-    A generation mismatch refuses unless ``restamp`` is set, which
-    only the explicit capture-drafts verb passes.
+    tolerates a corrupt ledger but still carries every recorded
+    node; a node leaves the ledger only through ``disown_nodes``,
+    which the caller (capture-drafts) has judged per node, and
+    each such node is recorded in the ledger's disowned list with
+    ``actor`` and the time.
     """
 
     path = _eden_draft_ledger_path(config, checkout)
@@ -31500,22 +31502,8 @@ def _capture_eden_draft_ledger(
             existing = None
         if existing is None and not create and not rebuild:
             return None
-        if (
-            existing is not None
-            and not restamp
-            and generation is not None
-            and existing.generation is not None
-            and existing.generation != generation
-        ):
-            raise StateError(
-                f"Eden draft ledger {path} belongs to generation "
-                f"{existing.generation}, not {generation}; run "
-                f"'wrkslots capture-drafts {slot}' to recapture for "
-                "this generation"
-            )
-        base_nodes = (
-            () if rebuild or existing is None else existing.nodes
-        )
+        base_nodes = existing.nodes if existing is not None else ()
+        base_disowned = existing.disowned if existing is not None else ()
         mount = str(_stored_path(config, checkout.path, "checkout path"))
         try:
             current = eden.draft_stack_nodes(runner, mount)
@@ -31529,21 +31517,35 @@ def _capture_eden_draft_ledger(
                 nodes=base_nodes,
                 captured_at=existing.captured_at if existing is not None else None,
                 last_error=str(exc),
+                disowned=base_disowned,
             )
             try:
                 _write_eden_draft_ledger(path, failed)
             except (OSError, Refusal, StateError):
                 pass
             raise
+        nodes = tuple(sorted(
+            (set(base_nodes) | set(current) | set(include_nodes))
+            - set(disown_nodes)
+        ))
+        now = _utc_now()
+        disowned_by_node = {
+            entry[0]: entry for entry in base_disowned if entry[0] not in nodes
+        }
+        for node in disown_nodes:
+            if node not in nodes:
+                disowned_by_node.setdefault(node, (node, actor, now))
+        disowned = tuple(disowned_by_node[node] for node in sorted(disowned_by_node))
         ledger = eden.DraftLedger(
             slot=slot,
             checkout=checkout.name,
             generation=generation if generation is not None else (
                 existing.generation if existing is not None else None
             ),
-            nodes=tuple(sorted(set(base_nodes) | set(current) | set(include_nodes))),
-            captured_at=_utc_now(),
+            nodes=nodes,
+            captured_at=now,
             last_error=None,
+            disowned=disowned,
         )
         _write_eden_draft_ledger(path, ledger)
         return ledger
@@ -31590,6 +31592,32 @@ def _eden_scoped_draft_nodes(
         raise Refusal(str(exc)) from exc
     if captured is None:  # the ledger was just proven to exist
         raise StateError(f"Eden draft ledger disappeared: {path}")
+    # The per-working-copy journal closes most of the window
+    # between captures: drafts this checkout sat on and later left
+    # are still its own, provided they are still drafts in the
+    # store and were never explicitly disowned. A journal that
+    # cannot be read never refuses finish by itself; the ledger
+    # remains the primary record.
+    mount = str(_stored_path(config, checkout.path, "checkout path"))
+    try:
+        visited = eden.journal_visited_nodes(runner, mount)
+        store_drafts = set(eden.all_draft_nodes(runner, mount))
+    except eden.EdenError:
+        visited, store_drafts = (), set()
+    disowned = {node for node, _by, _at in captured.disowned}
+    extra = tuple(
+        node for node in visited
+        if node in store_drafts and node not in captured.nodes
+        and node not in disowned
+    )
+    if extra:
+        try:
+            captured = _capture_eden_draft_ledger(
+                config, checkout, slot=slot, generation=generation,
+                runner=runner, create=False, include_nodes=extra,
+            ) or captured
+        except eden.EdenError as exc:
+            raise Refusal(str(exc)) from exc
     return captured.nodes
 
 
@@ -49884,30 +49912,34 @@ def _cmd_capture_drafts(args: argparse.Namespace) -> int:
                 f"slot {record.slot} has no Eden checkout; capture-drafts "
                 "only records Sapling drafts of an Eden slot"
             )
-        try:
-            created_epoch = dt.datetime.fromisoformat(
-                record.created_at.replace("Z", "+00:00")
-            ).timestamp()
-        except ValueError:
-            created_epoch = 0.0
+        actor = str(args.agent) if owner is not None else "coordinator"
         includes = tuple(args.include or ())
-        for node in includes:
+        disowns = tuple(getattr(args, "disown", None) or ())
+        for node in includes + disowns:
             if not re.fullmatch(r"[0-9a-f]{40}", node):
-                raise Refusal(f"--include names no Sapling commit: {node!r}")
+                raise Refusal(f"the named node is no Sapling commit: {node!r}")
         for checkout in eden_checkouts:
             mount = str(_stored_path(config, checkout.path, "checkout path"))
             ledger_path = _eden_draft_ledger_path(config, checkout)
-            first = args.rebuild or not ledger_path.exists()
+            judgement = bool(args.rebuild) or not ledger_path.exists()
             chosen: tuple[str, ...] = ()
-            if first or includes:
+            disowned_now: tuple[str, ...] = ()
+            if judgement or includes or disowns:
                 try:
                     candidates = eden.draft_candidate_info(_eden_runner, mount)
+                    existing = _load_eden_draft_ledger(
+                        ledger_path, slot=record.slot, checkout=checkout,
+                        generation=None,
+                    )
                 except eden.EdenError as exc:
                     raise Refusal(
                         f"draft capture for checkout {checkout.name} failed: {exc}"
                     ) from exc
-                recent = [item for item in candidates if item[2] >= created_epoch]
-                older = len(candidates) - len(recent)
+                except (StateError, Refusal, OSError):
+                    if not args.rebuild:
+                        raise
+                    existing = None
+                recorded = set(existing.nodes) if existing is not None else set()
                 by_node = {item[0]: item for item in candidates}
                 for node in includes:
                     if node not in by_node:
@@ -49916,30 +49948,73 @@ def _cmd_capture_drafts(args: argparse.Namespace) -> int:
                             f"checkout {checkout.name}'s current stack in its "
                             "shared store; include only a listed candidate"
                         )
-                if recent and not includes and not args.none_of_these_are_mine:
-                    lines = [
-                        f"first draft capture for slot {record.slot} checkout "
-                        f"{checkout.name}: the shared store holds "
-                        f"{len(recent)} draft(s) outside the current stack "
-                        f"dated from the slot's creation ({older} older "
-                        "draft(s) are not listed and cannot be this slot's):"
-                    ]
-                    for node, author, _when, subject in recent:
-                        lines.append(f"candidate {node} author={author} {subject}")
-                    lines.append(
-                        "state: REFUSED -- no ledger was written. Judge the "
-                        "list: rerun with '--include NODE' for each draft "
-                        "that is this slot's (repeatable), or with "
-                        "'--none-of-these-are-mine' when none of them is"
-                    )
-                    raise Refusal("\n".join(lines))
-                chosen = includes
+                for node in disowns:
+                    if node not in by_node and node not in recorded:
+                        raise Refusal(
+                            f"--disown node {node} is neither a listed "
+                            f"candidate nor a recorded draft of checkout "
+                            f"{checkout.name}; disown only a judged node"
+                        )
+                    if node in recorded and not eden.present_successor_nodes(
+                        _eden_runner, mount, node
+                    ) and eden.hidden_node_subject(_eden_runner, mount, node) is not None:
+                        raise Refusal(
+                            f"recorded draft {node} of checkout "
+                            f"{checkout.name} is hidden; a hidden draft is "
+                            "never dropped silently: recover it with "
+                            f"'sl unhide {node}' in the checkout first"
+                        )
+                if judgement:
+                    decided = set(includes) | set(disowns)
+                    if args.none_of_these_are_mine:
+                        decided |= set(by_node)
+                    undecided = [node for node in by_node if node not in decided]
+                    if undecided:
+                        lines = [
+                            f"draft capture for slot {record.slot} checkout "
+                            f"{checkout.name}: the shared store holds "
+                            f"{len(candidates)} draft(s) outside the current "
+                            "stack, of every date:"
+                        ]
+                        for node, author, when, subject in candidates:
+                            day = (
+                                dt.datetime.fromtimestamp(
+                                    when, dt.timezone.utc
+                                ).date().isoformat()
+                                if when else "unknown-date"
+                            )
+                            mark = (
+                                "recorded" if node in recorded else "candidate"
+                            )
+                            lines.append(
+                                f"{mark} {node} date={day} "
+                                f"author={author} {subject}"
+                            )
+                        lines.append(
+                            "state: REFUSED -- no ledger was written. Judge "
+                            "every listed draft: '--include NODE' for this "
+                            "slot's (repeatable), '--disown NODE' for each "
+                            "one that is not (recorded in the ledger), or "
+                            "'--none-of-these-are-mine' to declare every "
+                            "draft listed in this run not this slot's "
+                            "(also recorded per node)"
+                        )
+                        raise Refusal("\n".join(lines))
+                    chosen = includes
+                    disowned_now = tuple(sorted(
+                        set(disowns)
+                        | (set(by_node) if args.none_of_these_are_mine else set())
+                    ))
+                else:
+                    chosen = includes
+                    disowned_now = disowns
             try:
                 captured = _capture_eden_draft_ledger(
                     config, checkout, slot=record.slot,
                     generation=record.generation, runner=_eden_runner,
                     create=True, include_nodes=chosen,
-                    rebuild=bool(args.rebuild), restamp=True,
+                    disown_nodes=disowned_now, actor=actor,
+                    rebuild=bool(args.rebuild),
                 )
             except eden.EdenError as exc:
                 raise Refusal(
@@ -49951,10 +50026,13 @@ def _cmd_capture_drafts(args: argparse.Namespace) -> int:
     for name, captured, chosen in results:
         print(
             f"captured-drafts slot={args.slot} checkout={name} "
-            f"nodes={len(captured.nodes)} included={len(chosen)}"
+            f"nodes={len(captured.nodes)} included={len(chosen)} "
+            f"disowned={len(captured.disowned)}"
         )
         for node in captured.nodes:
             print(f"captured {node}")
+        for node, by, at in captured.disowned:
+            print(f"disowned {node} by={by} at={at}")
     return 0
 
 
@@ -99734,8 +99812,14 @@ usage or audit gate unknown, 3 fail-closed refusal.
         help="a listed candidate draft that is this slot's (repeatable); first capture only",
     )
     capture_drafts.add_argument(
+        "--disown", action="append", metavar="NODE",
+        help="declare a listed candidate or recorded draft not this slot's (repeatable); "
+        "recorded per node in the ledger with who declared it and when",
+    )
+    capture_drafts.add_argument(
         "--none-of-these-are-mine", action="store_true",
-        help="acknowledge that no listed candidate draft is this slot's; first capture only",
+        help="declare every draft listed in this run not this slot's; recorded per node "
+        "in the ledger, exactly like --disown on each of them",
     )
     capture_drafts.add_argument(
         "--rebuild", action="store_true",

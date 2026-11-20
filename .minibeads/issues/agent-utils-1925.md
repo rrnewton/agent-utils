@@ -132,3 +132,27 @@ sl), unknown, public-without-revision, foreign labelling,
 stranger refusal, corrupt-ledger rebuild; test_eden.py 77
 passed, the 74549a37 test files pass on the new code (69), and
 mypy --strict is clean on both touched modules.
+
+[watermelon-full-preview] The second cold review was again NOT
+SAFE; its three silent own-draft losses are fixed in this round.
+(1) `--rebuild` now carries every recorded node; a node leaves
+only through a per-node `--disown NODE`, recorded in the ledger
+as (node, declared-by, declared-at), and a hidden recorded node
+can never be disowned or rebuilt away. `--none-of-these-are-mine`
+now means exactly the drafts listed in that run, recorded per
+node the same way. (2) Candidates of every date are listed with
+author and date (the date-since-creation filter and the "cannot
+be this slot's" claim are gone). (3) The ledger generation is
+recorded but never checked, so transfer-owner and
+supersede-handoff generation bumps cannot strand captures; a
+real transfer-owner CLI test (dead sleeper owner transferred to
+the successor, then heartbeat captures) covers it. (4)
+`hidden_node_subject` queries `present(NODE)`, so an unknown
+node triggers no autopull. (5) Declarations are ledger records
+(see (1)); candidate lists show dates. (6) The journal question
+is settled per working copy (per-mount Sapling repo dir; the
+shared file names only bookmarks; reproduced per-WC on a real
+sharedpath store), so finish also unions journal-visited drafts
+still in the store, excluding explicitly disowned nodes. (7)
+A hidden amended successor is named at its newest successor,
+not the stale predecessor.

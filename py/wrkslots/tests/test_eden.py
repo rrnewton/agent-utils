@@ -2459,6 +2459,7 @@ class _EdenDraftStub:
         self.stack: list[str] = []
         self.candidates: list[tuple[str, str, int, str]] = []
         self.public_nodes: set[str] = set()
+        self.hidden_nodes: set[str] = set()
         self.subjects: dict[str, str] = {}
         self.authors: dict[str, str] = {}
 
@@ -2480,9 +2481,18 @@ class _EdenDraftStub:
                 for node, author, when, subject in self.candidates
             ), "")
         if "--hidden" in args:
-            return (1, "", "hidden")
+            import re as _re
+            found = _re.findall(r"[0-9a-f]{40}", revset)
+            node = found[0] if found else ""
+            if node not in self.hidden_nodes:
+                return (1, "", "hidden")
+            if revset.startswith("successors("):
+                return (0, f"{node}|1|{self.subjects.get(node, '')}\n", "")
+            return (0, f"{node}\n{self.subjects.get(node, '')}", "")
         if revset.startswith("successors(present("):
             node = revset[len("successors(present("):-2]
+            if node in self.hidden_nodes:
+                return (0, "", "")
             return (0, f"{node}\n" if node in self.subjects else "", "")
         if revset.startswith("public() &"):
             node = revset.rsplit("(", 1)[-1][:-1]
@@ -2569,7 +2579,7 @@ def test_eden_cli_create_heartbeat_finish_and_migration(
     capture = _cli_args(
         root, "capture-drafts", "eden-a", "--agent", "agent-eden",
         "--owner-pid", str(os.getpid()), "--expected-generation", "1",
-        "--include", abandoned,
+        "--include", abandoned, "--disown", foreign,
     )
     assert capture.handler(capture) == 0
     ledger = wrkslots_cli._load_eden_draft_ledger(
@@ -2577,6 +2587,7 @@ def test_eden_cli_create_heartbeat_finish_and_migration(
     )
     assert ledger is not None
     assert set(ledger.nodes) == {own, abandoned} and foreign not in ledger.nodes
+    assert [node for node, _by, _at in ledger.disowned] == [foreign]
 
     # Once the own drafts are public, finish passes end to end.
     stub.public_nodes = {own, abandoned}
@@ -2616,6 +2627,139 @@ def test_capture_drafts_needs_owner_and_rebuild_repairs_corrupt(
         ledger_path, slot="eden-a", checkout=record.checkouts[0], generation=1
     )
     assert ledger is not None and ledger.nodes == ()
+
+
+def test_capture_rebuild_carries_hidden_and_generation_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--rebuild never drops a recorded (hidden) node; generation is free."""
+    root = _eden_project(tmp_path)
+    config = wrkslots_cli._load_config(str(root), "node-a")
+    stub = _EdenDraftStub()
+    monkeypatch.setattr(wrkslots_cli, "_eden_runner", stub)
+    hidden = "d" * 40
+    stub.subjects = {hidden: "hidden own work"}
+    assert wrkslots_cli._cmd_create(_eden_create_args(root)) == 0
+    record = wrkslots_cli._load_active(config).slots[0]
+    ledger_path = wrkslots_cli._eden_draft_ledger_path(config, record.checkouts[0])
+    stub.stack = [hidden]
+    heartbeat = _cli_args(
+        root, "heartbeat", "eden-a", "--agent", "agent-eden",
+        "--owner-pid", str(os.getpid()), "--expected-generation", "1",
+    )
+    assert heartbeat.handler(heartbeat) == 0
+
+    # A generation bump (transfer-owner, supersede) must not strand
+    # automatic captures: the ledger is per slot and checkout.
+    captured = wrkslots_cli._capture_eden_draft_ledger(
+        config, record.checkouts[0], slot="eden-a", generation=7,
+        runner=stub, create=False,
+    )
+    assert captured is not None and captured.nodes == (hidden,)
+
+    stub.stack = []
+    stub.hidden_nodes = {hidden}
+    rebuild = _cli_args(
+        root, "capture-drafts", "eden-a", "--agent", "agent-eden",
+        "--owner-pid", str(os.getpid()), "--expected-generation", "1",
+        "--rebuild",
+    )
+    assert rebuild.handler(rebuild) == 0
+    ledger = wrkslots_cli._load_eden_draft_ledger(
+        ledger_path, slot="eden-a", checkout=record.checkouts[0], generation=1
+    )
+    assert ledger is not None and ledger.nodes == (hidden,)
+
+    disown = _cli_args(
+        root, "capture-drafts", "eden-a", "--agent", "agent-eden",
+        "--owner-pid", str(os.getpid()), "--expected-generation", "1",
+        "--rebuild", "--disown", hidden,
+    )
+    with pytest.raises(wrkslots_cli.Refusal, match="never dropped silently"):
+        disown.handler(disown)
+    ledger = wrkslots_cli._load_eden_draft_ledger(
+        ledger_path, slot="eden-a", checkout=record.checkouts[0], generation=1
+    )
+    assert ledger is not None and ledger.nodes == (hidden,)
+
+
+def test_capture_first_lists_older_drafts_and_records_disown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Drafts older than the slot are listed, judged and recorded."""
+    root = _eden_project(tmp_path)
+    config = wrkslots_cli._load_config(str(root), "node-a")
+    stub = _EdenDraftStub()
+    monkeypatch.setattr(wrkslots_cli, "_eden_runner", stub)
+    old = "d" * 40
+    stub.subjects = {old: "backdated own work"}
+    stub.authors = {old: "Lane <lane@example.invalid>"}
+    assert wrkslots_cli._cmd_create(_eden_create_args(root)) == 0
+    record = wrkslots_cli._load_active(config).slots[0]
+    ledger_path = wrkslots_cli._eden_draft_ledger_path(config, record.checkouts[0])
+    ledger_path.unlink()
+    stub.candidates = [(old, stub.authors[old], 1_000_000, "backdated own work")]
+
+    capture = _cli_args(
+        root, "capture-drafts", "eden-a", "--agent", "agent-eden",
+        "--owner-pid", str(os.getpid()), "--expected-generation", "1",
+    )
+    with pytest.raises(wrkslots_cli.Refusal) as listed:
+        capture.handler(capture)
+    assert old in str(listed.value) and "date=1970-01-12" in str(listed.value)
+    assert not ledger_path.exists()
+
+    capture = _cli_args(
+        root, "capture-drafts", "eden-a", "--agent", "agent-eden",
+        "--owner-pid", str(os.getpid()), "--expected-generation", "1",
+        "--disown", old,
+    )
+    assert capture.handler(capture) == 0
+    ledger = wrkslots_cli._load_eden_draft_ledger(
+        ledger_path, slot="eden-a", checkout=record.checkouts[0], generation=1
+    )
+    assert ledger is not None and ledger.nodes == ()
+    assert [(n, b) for n, b, _a in ledger.disowned] == [(old, "agent-eden")]
+
+
+def test_capture_after_real_transfer_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real transfer-owner generation bump strands no capture."""
+    root = _eden_project(tmp_path)
+    config = wrkslots_cli._load_config(str(root), "node-a")
+    stub = _EdenDraftStub()
+    monkeypatch.setattr(wrkslots_cli, "_eden_runner", stub)
+    node = "c" * 40
+    stub.subjects = {node: "successor work"}
+    sleeper = subprocess.Popen(["sleep", "30"])
+    try:
+        assert wrkslots_cli._cmd_create(
+            _eden_create_args(root, owner_pid=sleeper.pid)
+        ) == 0
+    finally:
+        sleeper.terminate()
+        sleeper.wait()
+    transfer = _cli_args(
+        root, "transfer-owner", "eden-a", "--agent", "agent-eden",
+        "--owner-pid", str(os.getpid()), "--expected-generation", "1",
+    )
+    assert transfer.handler(transfer) == 0
+    record = wrkslots_cli._load_active(config).slots[0]
+
+    stub.stack = [node]
+    heartbeat = _cli_args(
+        root, "heartbeat", "eden-a", "--agent", "agent-eden",
+        "--owner-pid", str(os.getpid()),
+        "--expected-generation", str(record.generation),
+    )
+    assert heartbeat.handler(heartbeat) == 0
+    ledger = wrkslots_cli._load_eden_draft_ledger(
+        wrkslots_cli._eden_draft_ledger_path(config, record.checkouts[0]),
+        slot="eden-a", checkout=record.checkouts[0],
+        generation=record.generation,
+    )
+    assert ledger is not None and ledger.nodes == (node,)
 
 
 def test_real_sl_shared_store_scopes_drafts(tmp_path: Path) -> None:
@@ -2689,6 +2833,37 @@ def test_real_sl_shared_store_scopes_drafts(tmp_path: Path) -> None:
     )
     assert [node for node, _s in entry["unaccounted"]] == [amended]  # type: ignore[attr-defined]
     assert nodes["wc2"] not in str(entry)
+
+    # The per-working-copy journal closes the between-captures
+    # window: wc1 sat on the amended draft, left it for the base,
+    # and built a second draft. A ledger that missed the first
+    # stack still finishes accounting for it, and never for wc2's.
+    base_node = run("-R", str(backing), "log", "-r", ".", "-T", "{node}")
+    run("-R", wc1, "goto", base_node)
+    (copies["wc1"] / "d.txt").write_text("wc1 second\n")
+    run("-R", wc1, "add", str(copies["wc1"] / "d.txt"))
+    run("-R", wc1, "commit", "-m", "wc1 second draft")
+    second = run("-R", wc1, "log", "-r", ".", "-T", "{node}")
+    config = dataclasses.replace(
+        _scoped_config(tmp_path), eden_mount_root=tmp_path
+    )
+    checkout = dataclasses.replace(
+        wrkslots_cli._checkout_from_obj(_eden_obj(), "row.checkouts[0]"),
+        path=wc1, repository=str(backing),
+    )
+    ledger_path = wrkslots_cli._eden_draft_ledger_path(config, checkout)
+    wrkslots_cli._write_eden_draft_ledger(
+        ledger_path,
+        eden.DraftLedger(
+            slot="slot", checkout="main", generation=1, nodes=(),
+            captured_at="2026-11-19T00:00:00+00:00", last_error=None,
+        ),
+    )
+    scoped = wrkslots_cli._eden_scoped_draft_nodes(
+        config, checkout, slot="slot", generation=1, runner=runner
+    )
+    assert set(scoped) >= {amended, second}
+    assert nodes["wc2"] not in scoped
 
     # A hidden own draft is named as hidden, never silently dropped.
     run("-R", wc1, "hide", amended)

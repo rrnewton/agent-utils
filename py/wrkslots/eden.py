@@ -652,6 +652,10 @@ class DraftLedger:
     nodes: tuple[str, ...]
     captured_at: str | None
     last_error: str | None
+    #: Nodes an operator explicitly declared not this slot's, as
+    #: (node, declared-by, declared-at); the audit record of a
+    #: first-capture judgement (#1925 review, fix round 2).
+    disowned: tuple[tuple[str, str, str], ...] = ()
 
 
 def draft_ledger_payload(ledger: DraftLedger) -> dict[str, object]:
@@ -666,6 +670,10 @@ def draft_ledger_payload(ledger: DraftLedger) -> dict[str, object]:
         "nodes": list(ledger.nodes),
         "captured_at": ledger.captured_at,
         "last_error": ledger.last_error,
+        "disowned": [
+            {"node": node, "by": by, "at": at}
+            for node, by, at in ledger.disowned
+        ],
     }
 
 
@@ -676,7 +684,9 @@ def draft_ledger_from_obj(raw: object, label: str) -> DraftLedger:
         raise EdenError(f"{label} is not a JSON object")
     expected = {"schema", "kind", "slot", "checkout", "generation",
                 "nodes", "captured_at", "last_error"}
-    if set(raw) != expected:
+    # Ledgers written before the disowned record existed are read
+    # with an empty one; every other key stays exact.
+    if set(raw) not in (expected, expected | {"disowned"}):
         raise EdenError(f"{label} has unexpected or missing keys")
     if raw["schema"] != DRAFT_LEDGER_SCHEMA or raw["kind"] != DRAFT_LEDGER_KIND:
         raise EdenError(f"{label} is not a schema {DRAFT_LEDGER_SCHEMA} draft ledger")
@@ -700,9 +710,28 @@ def draft_ledger_from_obj(raw: object, label: str) -> DraftLedger:
         raise EdenError(f"{label} has an invalid captured_at")
     if last_error is not None and not isinstance(last_error, str):
         raise EdenError(f"{label} has an invalid last_error")
+    disowned: list[tuple[str, str, str]] = []
+    disowned_raw = raw.get("disowned", [])
+    if not isinstance(disowned_raw, list):
+        raise EdenError(f"{label} has an invalid disowned record")
+    for item in disowned_raw:
+        if (
+            not isinstance(item, dict) or set(item) != {"node", "by", "at"}
+            or not isinstance(item["node"], str)
+            or not _NODE_RE.fullmatch(item["node"])
+            or not isinstance(item["by"], str) or not item["by"]
+            or not isinstance(item["at"], str) or not item["at"]
+        ):
+            raise EdenError(f"{label} holds an invalid disowned entry")
+        disowned.append((item["node"], item["by"], item["at"]))
+    if disowned != sorted(disowned):
+        raise EdenError(f"{label} disowned entries are not sorted")
+    if {node for node, _by, _at in disowned} & set(nodes_raw):
+        raise EdenError(f"{label} both owns and disowns a node")
     return DraftLedger(
         slot=slot, checkout=checkout, generation=generation,
         nodes=tuple(nodes_raw), captured_at=captured_at, last_error=last_error,
+        disowned=tuple(disowned),
     )
 
 
@@ -769,10 +798,14 @@ def present_successor_nodes(runner: Runner, mount: str, node: str) -> tuple[str,
 
 
 def hidden_node_subject(runner: Runner, mount: str, node: str) -> str | None:
-    """The subject of a known-but-hidden node, or None when unknown."""
+    """The subject of a known-but-hidden node, or None when unknown.
+
+    ``present()`` keeps the query from autopulling an unknown node
+    from the store's default path (#1925 review, fix round 2).
+    """
 
     rc, stdout, _stderr = runner(
-        ["sl", "-R", mount, "log", "--hidden", "-r", node,
+        ["sl", "-R", mount, "log", "--hidden", "-r", f"present({node})",
          "-T", "{node}\n{desc|firstline}"]
     )
     if rc != 0:
@@ -781,6 +814,78 @@ def hidden_node_subject(runner: Runner, mount: str, node: str) -> str | None:
     if not lines or lines[0].strip() != node:
         return None
     return lines[1] if len(lines) > 1 else ""
+
+
+def latest_hidden_successor(runner: Runner, mount: str, node: str) -> tuple[str, str] | None:
+    """The newest hidden successor of ``node`` as (node, subject), or None.
+
+    When an amended successor is itself hidden, finish must name
+    that successor (the current content), not the stale recorded
+    predecessor (#1925 review, fix round 2).
+    """
+
+    rc, stdout, _stderr = runner(
+        ["sl", "-R", mount, "log", "--hidden", "-r",
+         f"successors(present({node}))", "-T", "{node}|{rev}|{desc|firstline}\n"]
+    )
+    if rc != 0:
+        return None
+    best: tuple[int, str, str] | None = None
+    for line in stdout.splitlines():
+        parts = line.split("|", 2)
+        if len(parts) != 3 or not _NODE_RE.fullmatch(parts[0]):
+            continue
+        try:
+            rev = int(parts[1])
+        except ValueError:
+            continue
+        if best is None or rev > best[0]:
+            best = (rev, parts[0], parts[2])
+    if best is None or best[1] == node:
+        return None
+    return (best[1], best[2])
+
+
+_JOURNAL_LINE_RE = re.compile(r"^([0-9a-f]{12,40}) -> ([0-9a-f]{12,40})\b")
+
+
+def journal_visited_nodes(runner: Runner, mount: str) -> tuple[str, ...]:
+    """Full nodes this working copy has sat on, from ``sl journal``.
+
+    The journal is per working copy: an Eden mount's Sapling repo
+    dir is its own (its ``shared`` file names only bookmarks), and
+    the same holds for a sharedpath working copy, so the previous
+    locations of ``.`` here are this checkout's alone. Short
+    journal ids are expanded through ``present()`` (hidden
+    included), never pulled.
+    """
+
+    rc, stdout, stderr = runner(["sl", "-R", mount, "journal"])
+    if rc != 0:
+        raise EdenError(
+            f"Sapling journal failed (sl -R {mount} journal): "
+            f"{stderr.strip() or stdout.strip()}"
+        )
+    short: list[str] = []
+    for line in stdout.splitlines():
+        match = _JOURNAL_LINE_RE.match(line.strip())
+        if match:
+            for token in match.groups():
+                if set(token) != {"0"} and token not in short:
+                    short.append(token)
+    full: list[str] = []
+    for token in short:
+        rc, stdout, _stderr = runner(
+            ["sl", "-R", mount, "log", "--hidden", "-r", f"present({token})",
+             "-T", "{node}\n"]
+        )
+        if rc != 0:
+            continue
+        for line in stdout.splitlines():
+            node = line.strip()
+            if _NODE_RE.fullmatch(node) and node not in full:
+                full.append(node)
+    return tuple(full)
 
 
 def node_is_public(runner: Runner, mount: str, node: str) -> bool:
@@ -889,7 +994,8 @@ def classify_drafts(
                     "(which lists the store's candidates for explicit "
                     "inclusion) before finishing"
                 )
-            hidden.append((ledger_node, subject))
+            latest = latest_hidden_successor(runner, mount, ledger_node)
+            hidden.append(latest if latest is not None else (ledger_node, subject))
     public_text = run(
         ["sl", "-R", mount, "log", "-r", "public()", "-l", "1000",
          "-T", "{desc}\n"]
