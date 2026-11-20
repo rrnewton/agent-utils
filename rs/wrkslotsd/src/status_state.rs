@@ -266,8 +266,7 @@ fn host_alias_counts(
     if recorded_host_id == current_host_id {
         return true;
     }
-    let mut links: std::collections::HashMap<&str, Vec<&str>> =
-        std::collections::HashMap::new();
+    let mut links: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
     for entry in aliases {
         if entry.hostname != hostname
             || entry
