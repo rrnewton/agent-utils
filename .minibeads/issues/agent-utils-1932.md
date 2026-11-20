@@ -1,6 +1,6 @@
 ---
 title: 'agentctl-muse-hooks-trust-auto-decline: answer Muse plugin-hooks trust dialog by policy instead of stalling launches'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 labels:
@@ -31,3 +31,7 @@ updated_at: 2026-11-19T00:00:00+00:00
 # Notes
 
 Owner-urgent (2026-11-19). Builds on #1893 agentctl-launch-failed-but-live, which recognised the dialog and deliberately left answering unbuilt pending the owner's decision; this issue is that decision. Config key and file were reported to the coordinator before implementing (reader skew: profiles.json vs watch.json readers).
+
+## Resolution
+
+[watermelon-full-preview] Landed 62f03e1d on github/main (gate on 9c14124c, base dc2c5fdb: only reds the 4 pidfd_open EINVAL foreign-ownership ids, identical on main, coordb waiver; combined tree with #1928 verified: mypy strict, py 713, rs 1030; third review SAFE on all 17 scenarios in both editions). Both editions answer the exact Muse plugin-hooks trust dialog (bottom-anchored parse of the real Muse 1.4.25 capture) per `muse_hooks_trust` in profiles.json (profile > registry default > built-in decline; trust only when explicit; invalid refuses at load; no record field added), in start/revive/restart/restore launches and revive-candidate verification, and the Rust watchers answer only this registry's managed Muse lanes; every answer re-reads before each key and logs decision, count and source. `common/docs/agentctl/harness-support-matrix.md` Muse row updated in the same change. Follow-ups filed: #1936 hooks-quote-scrolled-marker, #1937 hooks-dialog-require-count-line, #1938 hooks-dialog-real-capture-answer-test, #1939 hooks-dialog-shell-prompt-veto.
