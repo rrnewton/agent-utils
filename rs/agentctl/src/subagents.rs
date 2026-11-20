@@ -20072,7 +20072,10 @@ fi
         );
         assert_eq!(
             unstructured.manager().load("worker").unwrap().arguments,
-            vec!["--no-alt-screen".to_owned(), "--reasoning-effort=high".to_owned()]
+            vec![
+                "--no-alt-screen".to_owned(),
+                "--reasoning-effort=high".to_owned()
+            ]
         );
         assert_eq!(unstructured_status["workspace_id"], "workspace");
 
@@ -20091,13 +20094,7 @@ fi
             .unwrap();
         assert_eq!(
             codex_status["arguments"],
-            json!([
-                "--no-alt-screen",
-                "--model",
-                "<set>",
-                "-c",
-                "<set>"
-            ])
+            json!(["--no-alt-screen", "--model", "<set>", "-c", "<set>"])
         );
         assert_eq!(
             codex.manager().load("worker").unwrap().arguments,

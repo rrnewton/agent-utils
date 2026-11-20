@@ -64,11 +64,15 @@ def _generated_conversations(value: object) -> set[str]:
     if isinstance(value, dict):
         # Status redacts argv values (#1937), so the launch vector no longer
         # corroborates the native session; the asserted native session itself
-        # is the recorded conversation.
+        # is the recorded conversation. Only UUID-shaped values are generated
+        # conversations: a caller-chosen resume id (session-1) stays raw, so
+        # contract checks can still compare it literally.
         native = value.get("native_session")
         if (isinstance(native, dict) and native.get("agent") == "claude"
                 and native.get("source") == "asserted"
-                and isinstance(native.get("value"), str)):
+                and isinstance(native.get("value"), str)
+                and re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                                 native["value"]) is not None):
             return {native["value"]}
     return set()
 
@@ -538,7 +542,7 @@ def _launch_specs(harness: Harness, report: Report) -> None:
     secret = "[REDACTED]"
     secret_outcomes = _pair(harness, report, secret_case, "primary/launch-spec/secret/start", (
         "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1", "--harness", "claude",
-        "--harness-arg=--api-key", f"--harness-arg={secret}", f"--harness-arg=--effort={secret}", *_COMMON,
+        "--harness-arg=--api-key", f"--harness-arg={secret}", f"--harness-arg=--meta-tag={secret}", *_COMMON,
     ))
     _pair(harness, report, secret_case, "primary/launch-spec/secret/status", ("status", "worker", *_COMMON))
     _pair(harness, report, secret_case, "primary/launch-spec/secret/list", ("list", *_COMMON))
@@ -548,7 +552,9 @@ def _launch_specs(harness: Harness, report: Report) -> None:
         report.require(f"primary/launch-spec/secret/{edition}",
                        outcome.returncode == 0 and secret not in outcome.stdout
                        and isinstance(spec, dict)
-                       and spec.get("argv") == ["--session-id", "<set>", "--api-key", "<set>", "--effort=<set>"],
+                       and spec.get("argv") == ["--session-id", "<set>", "--effort", "<set>",
+                                                "--dangerously-skip-permissions", "--api-key", "<set>",
+                                                "--meta-tag=<set>"],
                        f"a secret-looking launch value reached status output: {outcome.stdout!r}")
         state = _state(secret_case.python_root if edition == "python" else secret_case.rust_root)
         report.require(f"primary/launch-spec/secret/record/{edition}",
@@ -1056,14 +1062,19 @@ def _profile_resume(harness: Harness, report: Report) -> None:
                 "schema": "agentctl-native-session/v1", "agent": kind,
                 "value": conversation, "source": "asserted",
             }
+            # Only Claude's generated conversations are normalized to the
+            # placeholder; other harnesses carry the caller-chosen id raw.
+            shown_conversation = "<CONVERSATION_UUID>" if kind == "claude" else conversation
+            shown_native = dict(native, value=shown_conversation)
             report.require(f"primary/profile/resume/{kind}/policy/{edition}",
                            isinstance(value, dict) and value.get("profile") == "local-policy"
                            and value.get("model") == "selected-model"
                            and value.get("reasoning_effort") == "high"
                            and value.get("cwd") == "<ROOT>" and value.get("mode") == "interactive"
                            and value.get("arguments") == _redacted(expected_arguments[kind])
-                           and value.get("native_session") == native and value.get("resume") == conversation
-                           and value.get("session_agent") == kind and value.get("session_value") == conversation
+                           and value.get("native_session") == shown_native
+                           and value.get("resume") == shown_conversation
+                           and value.get("session_agent") == kind and value.get("session_value") == shown_conversation
                            and value.get("environment_names") == ["PROFILE_SELECTOR"],
                            f"profile resume did not retain its conversation and policy: {value!r}")
             state = _state(root)

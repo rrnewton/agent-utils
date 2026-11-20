@@ -116,14 +116,20 @@ fn profile_resume_preserves_loaded_policy_and_literal_conversation_for_each_loca
         assert_eq!(
             status["arguments"],
             json!(crate::subagents::launch_spec::redacted_argv(
-                &expected.iter().map(|item| item.to_string()).collect::<Vec<_>>(),
+                &expected
+                    .iter()
+                    .map(|item| item.to_string())
+                    .collect::<Vec<_>>(),
                 false
             ))
         );
         let record = fixture.manager().load("worker").unwrap();
         assert_eq!(
             record.arguments,
-            expected.iter().map(|item| item.to_string()).collect::<Vec<_>>()
+            expected
+                .iter()
+                .map(|item| item.to_string())
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             fixture.client.launches.lock().unwrap()["owned"].1,

@@ -3475,7 +3475,10 @@ mod tests {
         .unwrap();
         assert_ne!(result.verdict, PinVerdict::Alive);
         assert!(result.process.is_none());
-        assert!(child.try_wait().unwrap().is_none(), "child must be untouched");
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "child must be untouched"
+        );
         reap(&mut child);
     }
 
