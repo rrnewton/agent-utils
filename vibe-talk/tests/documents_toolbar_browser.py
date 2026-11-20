@@ -320,6 +320,13 @@ def main() -> int:
                     label = f"{scheme} {folder_name}"
                     page.goto(base + "/?v=docs", wait_until="load")
                     walk(page, label, shots)
+                    if touch:
+                        # The audio choice the phone list bar gave up (`#2001`):
+                        # one tap on the gear, the same Settings select.
+                        page.locator("#open-settings").click()
+                        page.wait_for_selector("#settings-audio-source", state="visible", timeout=20_000)
+                        page.screenshot(path=str(shots / "documents-toolbar-settings-audio.png"))
+                        page.locator("#close-settings").click()
                     if folder_name == "dark-phone-412":
                         functional_walk(page, base, label)
                     ctx.close()
