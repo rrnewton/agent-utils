@@ -1,5 +1,5 @@
 ---
-title: 'eden-daemon-restart: restart per-slot Eden daemons after a reboot as each team'\''s own restore step'
+title: 'eden-daemon-restart: restart per-slot Eden daemons after a reboot as each teams own restore step'
 status: open
 priority: 2
 issue_type: task
