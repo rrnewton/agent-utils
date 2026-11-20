@@ -58,6 +58,18 @@ def main() -> int:
                     page.goto(url, wait_until="load")
                     page.fill("#api-token", TOKEN)
                     page.click("#save-token")
+                    # First run lands on the Welcome, where the bar (and its Settings
+                    # button) is still hidden; the harness walks the same path.
+                    try:
+                        page.wait_for_function(
+                            "() => !document.getElementById('screen-welcome').hidden"
+                            " || !document.getElementById('screen-main').hidden",
+                            timeout=3000,
+                        )
+                        if page.evaluate("() => !document.getElementById('screen-welcome').hidden"):
+                            page.click("#welcome-start")
+                    except Exception:
+                        pass  # no first-run Welcome on this path
                     page.wait_for_selector("#open-settings", state="visible", timeout=STATE_MS)
                     page.click("#open-settings")
                     page.wait_for_selector("#colour-theme", state="attached", timeout=STATE_MS)
