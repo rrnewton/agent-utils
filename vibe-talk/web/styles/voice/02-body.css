@@ -580,7 +580,7 @@
 
 #channel-view-tabs button[aria-pressed="true"] {
   background: var(--accent);
-  color: var(--bg);
+  color: var(--on-accent);
 }
 
 /* `#298 thread-card-header`. Over a thread across the window the heading is the thread's card, drawn
@@ -1206,7 +1206,7 @@
   border: 1px solid var(--edge);
   border-radius: 0.85rem;
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   font: inherit;
   touch-action: manipulation;
   -webkit-tap-highlight-color: transparent;

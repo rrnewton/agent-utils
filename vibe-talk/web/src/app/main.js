@@ -8660,6 +8660,9 @@ const appearanceControl = mountAppearance({
   stored: () => deviceSettings().get(DEVICE_SETTINGS.appearance),
   keep: (choice) => deviceSettings().keep(DEVICE_SETTINGS.appearance, choice),
   keptAs: (choice) => deviceSettings().keptAs(DEVICE_SETTINGS.appearance, choice),
+  storedColour: () => deviceSettings().get(DEVICE_SETTINGS.colourTheme),
+  keepColour: (choice) => deviceSettings().keep(DEVICE_SETTINGS.colourTheme, choice),
+  keptAsColour: (choice) => deviceSettings().keptAs(DEVICE_SETTINGS.colourTheme, choice),
   systemQuery: () => window.matchMedia("(prefers-color-scheme: dark)"),
 });
 application.track(appearanceControl);

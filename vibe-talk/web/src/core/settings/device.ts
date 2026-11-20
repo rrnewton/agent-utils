@@ -86,6 +86,11 @@ export type AfterDone = "stay" | "next" | "unread";
 /** The Appearance choice (`#1845 vibe-talk-appearance-setting`): follow the system, or force light or dark. */
 export type Appearance = "light" | "dark" | "system";
 
+/** The Colour theme preset (`#1961 vibe-talk-colour-themes`): which family paints the accent
+ * colours. `blue` is the look the page has always had; `blue-hc` is blue with dark ink on the
+ * dark scheme's accent, the AA repair the default keeps as a documented exception. */
+export type ColourTheme = "blue" | "blue-hc" | "teal" | "plum" | "amber";
+
 /** An offset on screen, in CSS pixels. */
 export interface SteerOffset {
   readonly x: number;
@@ -170,6 +175,18 @@ export const DEVICE_SETTINGS = Object.freeze({
     write: (choice: Appearance) => choice,
     refused: { value: "system" },
   } satisfies DeviceSetting<Appearance>,
+  /**
+   * `#1961 vibe-talk-colour-themes`. The Colour theme preset: "blue" unless the reader chose
+   * another family. ABSENT MEANS BLUE, the look the page has always had. Synced, so the choice
+   * follows the owner across devices. A refused read is blue.
+   */
+  colourTheme: {
+    key: "vibe-talk.voice.colour-theme",
+    read: (raw: string | null): ColourTheme =>
+      (raw === "teal" || raw === "plum" || raw === "amber" || raw === "blue-hc" ? raw : "blue"),
+    write: (choice: ColourTheme) => choice,
+    refused: { value: "blue" },
+  } satisfies DeviceSetting<ColourTheme>,
   /** Which voice reads messages aloud, as chosen: null for no choice (or one this page does not know). */
   readAudioSource: {
     key: "vibe-talk.voice.read-audio-source",

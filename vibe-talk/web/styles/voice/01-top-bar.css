@@ -235,7 +235,7 @@ a.search-hit-link {
 .switch[aria-pressed="true"] {
   background: var(--accent);
   border-color: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
 }
 
 /* Wide enough for the longest word, "Documents", so the switch is ONE box in every view

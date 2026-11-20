@@ -157,6 +157,8 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   container-type: inline-size;
   margin: 0 calc(-10px - env(safe-area-inset-right)) 0 calc(-10px - env(safe-area-inset-left));
   padding: 6px calc(10px + env(safe-area-inset-right)) 6px calc(10px + env(safe-area-inset-left));
+  /* `#1960`/`#1961 vibe-talk-colour-themes`: the header highlight is a themed variable; the
+     default preset keeps it at the panel colour, other presets tint it. */
   background: var(--discuss-head-bg, var(--panel));
   border-bottom: 1px solid var(--edge);
 }

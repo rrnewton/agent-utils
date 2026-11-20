@@ -9,7 +9,7 @@ import { join } from "node:path";
 
 import { WEB } from "../../../web/page_sources.mjs";
 
-import { CHANNEL, CSS_CODE, CSS_UNCONDITIONAL, DESKTOP_QUERY, HELP_SLUGS, HTML, HTML_CODE,
+import { BASE_CSS, CHANNEL, CSS_CODE, CSS_UNCONDITIONAL, DESKTOP_QUERY, HELP_SLUGS, HTML, HTML_CODE,
   OTHER_CHANNEL, PAGE_CODE, PAGE_ELEMENTS, SCRIPT, SCRIPT_CODE, SEND_UNDO_MS, SETTINGS, SPACE_A, TEAM_A,
   TEAM_B, assertMarkupContains, brokenModule, brokenScript, browsingPage, cardRow, channelBoxCode, chooseService,
   clearingPage, cssBlock, cssBlockIn, cssRules, cssWithoutIn, dismissedItems, dismissedOpenerOf,
@@ -3025,4 +3025,44 @@ test("`#1845 vibe-talk-appearance-setting`: each Appearance choice is applied, k
   const initAt = HTML.indexOf("data-appearance-init");
   assert.ok(initAt >= 0 && initAt < HTML.indexOf('rel="stylesheet"'), "the pre-paint script does not stand before the stylesheet");
   assert.match(HTML, /<meta name="theme-color" content="#14161a" \/>/, "the shell has no theme-color to keep in sync");
+});
+
+test("`#1961 vibe-talk-colour-themes`: a Colour theme choice is applied, kept, and repaints the accent family", async () => {
+  const page = newPage();
+  await signIn(page);
+  const root = () => page.document.documentElement;
+  assert.equal(page.el("colour-theme").value, "blue", "the control does not start at the default blue");
+  assert.equal(root().getAttribute("data-colour-theme"), "blue");
+  page.el("colour-theme").value = "teal";
+  await page.el("colour-theme").dispatch("change");
+  await page.settle();
+  const theme = root().getAttribute("data-theme");
+  assert.deepStrictEqual(
+    [root().getAttribute("data-colour-theme"), page.pure("localStorage.getItem('vibe-talk.voice.colour-theme')")],
+    ["teal", "teal"],
+    "Teal was not applied and kept",
+  );
+  assert.equal(root().style.getPropertyValue("--accent"), theme === "dark" ? "#4cc2b0" : "#0f766e", "the accent was not repainted");
+  assert.equal(root().style.getPropertyValue("--discuss-head-bg"), theme === "dark" ? "#1d4a42" : "#d9f0ea", "the Discuss header was not repainted");
+  // The pre-paint script carries the same preset, so a reload cannot flash blue first.
+  assert.match(HTML, /vibe-talk\.voice\.colour-theme/, "the shell does not read the preset before paint");
+  assert.match(HTML, /#4cc2b0/, "the shell does not carry the teal preset before paint");
+});
+
+test("`#1961 vibe-talk-colour-themes`: no accent blue stands hard-coded outside the token tables", () => {
+  // The themed blues, in either scheme. Outside a `:root` token declaration they may not
+  // appear: a preset could not repaint them. Deliberately unthemed literals stay (the syntax
+  // palette in the message text sheet, the always-dark outline popover in documents).
+  const themed = ["#5b9dd9", "#24618f", "#7ab3e3"];
+  // The outline popover is always dark in either scheme by its own stated design (its sheet
+  // says so), so its block is exempt beside the token tables; everything else must theme.
+  const withoutRoots = (css) => css.replace(/:root\s*\{[^}]*\}/g, "").replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/#doc-outline[^{]*\{[^}]*\}/g, "");
+  for (const [name, css] of [["voice.css", CSS_CODE], ["style.css", BASE_CSS]]) {
+    const bare = withoutRoots(css);
+    for (const hex of themed) {
+      assert.ok(!bare.includes(hex), `${name} still hard-codes ${hex} outside its tokens`);
+    }
+  }
+  assert.match(cssRules(CSS_CODE, ".discuss-head").join("\n"), /background:\s*var\(--discuss-head-bg\)/, "the Discuss header does not paint the themed variable");
 });

@@ -347,7 +347,7 @@
   border: 2px solid var(--panel);
   border-radius: 50%;
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   box-shadow: 0 1px 4px rgb(0 0 0 / 0.4);
   touch-action: manipulation;
   animation: quick-reply-mic-pulse 1.6s ease-in-out infinite;

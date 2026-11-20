@@ -4578,6 +4578,20 @@ def _act_settings_find_opens(driver: Driver) -> None:
     driver.settle(300)
 
 
+def _act_colour_themes(driver: Driver) -> None:
+    """`#1961 vibe-talk-colour-themes`: Settings' Appearance fold with Teal picked, so the
+    picker's own repaint (buttons, links, chips in the new family) is what is photographed."""
+    _act_settings_folded(driver)
+    _unfold(driver, "colour-theme")
+    driver.js("(() => { const s = document.getElementById('colour-theme'); s.value = 'teal'; "
+              "s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()")
+    driver.page.wait_for_function(
+        "() => document.documentElement.getAttribute('data-colour-theme') === 'teal'", timeout=5_000
+    )
+    driver.js("(() => { document.getElementById('colour-theme').scrollIntoView({ block: 'center' }); return true; })()")
+    driver.settle(300)
+
+
 def _act_settings_columns(driver: Driver) -> None:
     """`#345 settings-multi-column`: Settings with everything open (Expand all), in as many columns as
     the window has room for on a desk, and one on the phone."""
@@ -7952,6 +7966,25 @@ SCENES: tuple[Scene, ...] = (
                 "const root = parseFloat(getComputedStyle(document.documentElement).fontSize); "
                 "return parseFloat(getComputedStyle(s, '::before').fontSize) >= root "
                 "&& s.getBoundingClientRect().height >= 32; })()",
+            ),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="86-colour-themes",
+        what="Settings' Appearance fold with the Teal colour theme picked: the picker, its state line and the repainted controls",
+        act=_act_colour_themes,
+        profiles=SETTINGS_PROFILES,
+        expect=(
+            ("the settings screen is up", "window.__visible('screen-settings')"),
+            ("Teal is the preset in force", "document.documentElement.getAttribute('data-colour-theme') === 'teal'"),
+            ("the picker says Teal and kept it", "document.getElementById('colour-theme').value === 'teal' && localStorage.getItem('vibe-talk.voice.colour-theme') === 'teal'"),
+            (
+                "the accent family really repainted, Discuss header included",
+                "(() => { const root = getComputedStyle(document.documentElement); "
+                "const dark = document.documentElement.getAttribute('data-theme') === 'dark'; "
+                "return root.getPropertyValue('--accent').trim() === (dark ? '#4cc2b0' : '#0f766e') "
+                "&& root.getPropertyValue('--discuss-head-bg').trim() === (dark ? '#1d4a42' : '#d9f0ea'); })()",
             ),
             ("no error banner is up", "!window.__visible('error-wrap')"),
         ),

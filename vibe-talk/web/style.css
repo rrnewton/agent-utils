@@ -10,6 +10,12 @@
   --ink: #e7e9ee;
   --muted: #99a1b0;
   --accent: #5b9dd9;
+  /* `#1961 vibe-talk-colour-themes`. The accent family a Colour theme preset repaints; the
+     values here and in the light block are the default `blue` preset, so the sheets alone
+     (before any script) already paint the look the page has always had. */
+  --on-accent: #ffffff;
+  --accent-bright: #5b9dd9;
+  --discuss-head-bg: #1d2026;
   --warn: #d98a5b;
 }
 
@@ -21,6 +27,9 @@
     --ink: #1a1d22;
     --muted: #5d6674;
     --accent: #24618f;
+    --on-accent: #ffffff;
+    --accent-bright: #5b9dd9;
+    --discuss-head-bg: #ffffff;
     --warn: #9a5416;
   }
 }
@@ -90,7 +99,7 @@ input {
 button {
   padding: 0.55rem 0.9rem;
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   border: none;
   border-radius: 0.4rem;
   font: inherit;

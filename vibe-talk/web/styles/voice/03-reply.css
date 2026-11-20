@@ -283,7 +283,7 @@
 #draft-chip {
   background: var(--accent);
   border-color: var(--accent);
-  color: var(--panel);
+  color: var(--on-accent);
   font-weight: 700;
 }
 

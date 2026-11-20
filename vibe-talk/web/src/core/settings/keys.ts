@@ -26,6 +26,8 @@ export const SYNCED_SETTING_KEYS: readonly string[] = [
   "vibe-talk.voice.after-done",
   // `#1845 vibe-talk-appearance-setting`. Light, Dark or System.
   "vibe-talk.voice.appearance",
+  // `#1961 vibe-talk-colour-themes`. The accent-family preset.
+  "vibe-talk.voice.colour-theme",
   "vibe-talk.voice.collapsed-lines",
   "vibe-talk.voice.hidden-link-kinds",
   // `#620 link-url-chip`. Whether the Links view writes each link as its address.

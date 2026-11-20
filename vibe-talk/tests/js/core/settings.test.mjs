@@ -121,6 +121,7 @@ test("`#624 voice-page-modularity`: each device setting reads, keeps and refuses
     ["openInView", "vibe-talk.voice.open-in-view", "flat", [["main", "main"], ["flat", "flat"]], THROWN],
     ["afterDone", "vibe-talk.voice.after-done", "stay", [["next", "next"], ["unread", "unread"], ["stay", "stay"]], "stay"],
     ["appearance", "vibe-talk.voice.appearance", "system", [["light", "light"], ["dark", "dark"], ["system", "system"]], "system"],
+    ["colourTheme", "vibe-talk.voice.colour-theme", "blue", [["teal", "teal"], ["plum", "plum"], ["amber", "amber"], ["blue-hc", "blue-hc"], ["blue", "blue"]], "blue"],
     ["readAudioSource", "vibe-talk.voice.read-audio-source", null, [["agent", "agent"], ["device", "device"], ["wit", "wit"]], null],
     ["witVoice", "vibe-talk.voice.wit-voice", "", [["Charlie", "Charlie"], ["", null]], ""],
     ["readSteerOffset", "vibe-talk.voice.read-steer-offset", null, [[{ x: 3, y: -4 }, '{"x":3,"y":-4}'], [null, null]], null],
@@ -373,6 +374,46 @@ test("`#1845 vibe-talk-appearance-setting`: Appearance defaults to System, resol
   assert.equal(themeColorFor("light"), "#f6f7f9");
   assert.equal(DEVICE_SETTINGS.appearance.key, "vibe-talk.voice.appearance");
   assert.ok(SYNCED_SETTING_KEYS.includes(DEVICE_SETTINGS.appearance.key), "the choice is not synced");
+});
+
+test("`#1961 vibe-talk-colour-themes`: presets resolve, blue is today's tokens, and every non-default pair is AA", () => {
+  const { colourThemeOf, COLOUR_PRESETS, THEME_TOKENS, DEVICE_SETTINGS, SYNCED_SETTING_KEYS } = SETTINGS;
+  assert.equal(colourThemeOf(null), "blue");
+  assert.equal(colourThemeOf("teal"), "teal");
+  assert.equal(colourThemeOf("sepia"), "blue", "an unknown kept value is blue, never a fifth family");
+  assert.equal(DEVICE_SETTINGS.colourTheme.key, "vibe-talk.voice.colour-theme");
+  assert.ok(SYNCED_SETTING_KEYS.includes(DEVICE_SETTINGS.colourTheme.key), "the preset is not synced");
+  const luminance = (hex) => {
+    const [r, g, b] = [1, 3, 5].map((at) => parseInt(hex.slice(at, at + 2), 16) / 255)
+      .map((c) => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4));
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  };
+  const contrast = (a, b) => {
+    const [hi, lo] = [luminance(a), luminance(b)].sort((x, y) => y - x);
+    return (hi + 0.05) / (lo + 0.05);
+  };
+  for (const theme of ["dark", "light"]) {
+    // The default preset is the page's existing scheme, token for token.
+    for (const [name, value] of Object.entries(COLOUR_PRESETS.blue[theme])) {
+      if (name in THEME_TOKENS[theme]) assert.equal(value, THEME_TOKENS[theme][name], `blue ${theme} ${name} drifted from today's token`);
+    }
+    assert.equal(COLOUR_PRESETS.blue[theme]["--discuss-head-bg"], THEME_TOKENS[theme]["--panel"], "the default Discuss header is the panel colour");
+  }
+  // WCAG AA (4.5:1) for words on the accent and the accent as words on the panel, in both
+  // themes, for every preset except the one documented default: blue in dark keeps white on
+  // #5b9dd9 (2.9:1), the look the owner already has; `blue-hc` is that pair repaired.
+  for (const [preset, themes] of Object.entries(COLOUR_PRESETS)) {
+    for (const [theme, tokens] of Object.entries(themes)) {
+      const panel = THEME_TOKENS[theme]["--panel"];
+      if (!(preset === "blue" && theme === "dark")) {
+        assert.ok(contrast(tokens["--on-accent"], tokens["--accent"]) >= 4.5, `${preset} ${theme}: words on accent under AA`);
+      }
+      assert.ok(contrast(tokens["--accent"], panel) >= 4.5, `${preset} ${theme}: accent on panel under AA`);
+      assert.ok(contrast(tokens["--muted-on-mine"], tokens["--mine"]) >= 4.5, `${preset} ${theme}: quiet words on the owner's row under AA`);
+    }
+  }
+  assert.ok(contrast("#ffffff", COLOUR_PRESETS.blue.dark["--accent"]) < 4.5, "the documented blue-dark exception is not measured as one");
+  assert.ok(contrast(COLOUR_PRESETS["blue-hc"].dark["--on-accent"], COLOUR_PRESETS["blue-hc"].dark["--accent"]) >= 4.5, "blue-hc does not repair the pair");
 });
 
 test("`#1846 vibe-talk-windowed-rendering`: two knobs apart — data reach-back deep on a desk, render window small everywhere, both overridable", () => {

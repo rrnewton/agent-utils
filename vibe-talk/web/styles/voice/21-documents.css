@@ -815,7 +815,7 @@ body:has(#control-bar[data-placement="top"]) #doc-outline-pop {
 .doc-bucket[aria-pressed="true"] {
   background: var(--accent, Highlight);
   border-color: var(--accent, Highlight);
-  color: #fff;
+  color: var(--on-accent, #fff);
   font-weight: 700;
 }
 .doc-bucket[aria-pressed="true"]::before {
@@ -851,7 +851,7 @@ body:has(#control-bar[data-placement="top"]) #doc-outline-pop {
   font-weight: 700;
 }
 .doc-issue-status {
-  border: 1px solid #5b9dd9;
+  border: 1px solid var(--accent-bright);
   border-radius: 999px;
   padding: 1px 8px;
   font-size: 0.85em;
