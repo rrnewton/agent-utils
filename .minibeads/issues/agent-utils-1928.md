@@ -1,12 +1,13 @@
 ---
 title: 'agentctl-permission-prompt-auto-deny: a lane launched before a profile gained its permission settings keeps the old argv on revive, so the settings never reach it'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - agentctl
 created_at: 2026-11-19T00:00:00+00:00
-updated_at: 2026-11-19T00:00:00+00:00
+updated_at: 2026-11-20T02:53:55-05:00
+closed_at: 2026-11-20T02:53:55-05:00
 ---
 
 # Description
@@ -59,3 +60,25 @@ Filed by the investigating lane before coding, pending the
 coordinator's decision on whether revive should auto-refresh from
 the profile or refuse on drift. The plugin-hook trust prompt is out
 of scope: the owner reserves that decision and no tool may answer it.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as 598c8f92 (replay
+of gated 978f8a35, verified combined tree f0442477). Revive, restart
+and restore now rebuild a profile-started lane's launch from the
+profile's current definition, as `start --resume` already did, record
+the new launch spec, and report `profile_refresh` with changed fields
+and flags by name only; running lanes are never restarted for an edit
+and `status` keeps showing `profile_drift` while one is pending.
+Explicit model and effort overrides keep winning, and a profile that
+names another harness, mode or a cloud launch refuses by name.
+Root cause of the incident: the affected lane was launched before
+its profile gained the permission settings and every later revive
+replayed its stored arguments, so the settings never reached it.
+Gate: 61 steps passed; the only failure was python.agentctl.shard-1's
+four foreign-ownership `pidfd_open` EINVAL tests, waived by the
+coordinator after they failed identically on unmodified main under
+the new kernel. The throwaway Claude probe of the dangerous-rm dialog
+stayed inconclusive on this host's build (recorded in the handoff);
+the fix does not depend on it, because a correctly launched lane now
+receives the configured settings at its next natural restart.
