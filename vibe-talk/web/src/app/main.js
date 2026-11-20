@@ -998,6 +998,16 @@ const shellNavigation = createPageNavigation({
   replyOnScreen: () => replyOnScreen(),
   setLinkedMark: (channel, id) => linkedMark.set(channel, id),
   noteJumpAnchor: (row, id) => jumpAnchor.note(/** @type {HTMLElement} */ (row), id),
+  readerActive: () => readAloudOwner().nowPlaying !== null || readAloudOwner().pendingRead !== null,
+  startReadingMessage: (id) => {
+    const owner = readAloudOwner();
+    // Restart from the start where this message is the one already reading:
+    // a plain ask would toggle it off (`readAloud`'s second-tap abort).
+    if ((owner.nowPlaying && owner.nowPlaying.id === String(id)) || owner.pendingRead === String(id)) owner.stopReading();
+    void guardQuietly(() => owner.readAloud([String(id)]))();
+  },
+  noteReadJump: ({ id, ms }) => console.info(`[readjump] click-to-reading-start ${Math.round(ms)}ms message=${id}`),
+  nowMs: () => performance.now(),
   cardsCycle: () => cardsCycle(),
   rowShown: (row) => rowShown(/** @type {any} */ (row)),
   visibleList: () => visibleList(),

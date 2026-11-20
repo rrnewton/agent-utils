@@ -1,0 +1,18 @@
+steps:
+  # `#1959 vibe-talk-reader-one-click-jump` against the real server binary: with
+  # the reader on, one Discuss citation click lands the message expanded with
+  # its top on screen and starts reading it; with the reader off, landing only.
+  - group: check
+    job: discuss-readjump-browser
+    desc: the reader one-click jump (a Discuss citation click with the reader on lands expanded, top visible, and starts reading that message; reader off unchanged), against the real server (fake chat upstream) in current Chromium at 412x915 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/discuss_readjump_browser.py
+    jobs_flag: ""
+    deps: [build.release, setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 90
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824

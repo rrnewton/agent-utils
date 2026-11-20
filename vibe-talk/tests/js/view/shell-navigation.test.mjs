@@ -72,7 +72,12 @@ function makeNavigation(state) {
     defaultChannelView: () => "main", threadsOfChannel: () => [], threadIdOf: (thread) => thread.id,
     token: () => "tok", channels: () => [{ id: "C1" }], chooseChannel: () => {},
     viewKey: () => "main", viewsHas: () => true, readsBusy: () => false, readsStarted: () => 1,
-    seekMessage: async () => {}, rowHolding: () => null, answeredElsewhere: () => false,
+    seekMessage: async (target, land) => { calls.push(["seek", target]); if (state.landSeek) land(); },
+    rowHolding: () => state.row ?? null, answeredElsewhere: () => false,
+    readerActive: () => state.readerActive === true,
+    startReadingMessage: (id) => calls.push(["startReading", id]),
+    noteReadJump: (info) => calls.push(["readJumpTiming", info]),
+    nowMs: () => (state.nowMs = (state.nowMs ?? 1000) + 7),
     providerNameOf: () => "discord", providerName: () => "discord", threadOf: () => null,
     setStatus: (text) => calls.push(["status", text]), showError: (text) => calls.push(["error", text]),
     guardQuietly: (run) => (...args) => run(...args), settleFocus: () => {}, replyOnScreen: () => false,
@@ -271,4 +276,53 @@ test("`#624` shell navigation: showView swaps the panes and names the view now u
   assert.deepStrictEqual(calls.filter((call) => Array.isArray(call) && call[0] === "restore"),
     [["restore", { pinned: false, anchor, anchorId: "m1", top: 44 }]],
     "the returning restore did not pass the captured mark through whole");
+});
+
+test("`#1959 vibe-talk-reader-one-click-jump`: the decision starts a read only for an active reader, a landed message, and a current jump", () => {
+  const plan = SHELL.shouldStartReadingAfterJump;
+  assert.equal(plan({ readerActive: true, messageId: "m1", landed: true, current: true }), true);
+  assert.equal(plan({ readerActive: false, messageId: "m1", landed: true, current: true }), false,
+    "reader off must keep the old link behaviour");
+  assert.equal(plan({ readerActive: true, messageId: null, landed: true, current: true }), false);
+  assert.equal(plan({ readerActive: true, messageId: "", landed: true, current: true }), false);
+  assert.equal(plan({ readerActive: true, messageId: "m1", landed: false, current: true }), false,
+    "a message the walk never landed is not read");
+  assert.equal(plan({ readerActive: true, messageId: "m1", landed: true, current: false }), false,
+    "a jump the reader backed out of does not start a read");
+});
+
+test("`#1959`: one click with the reader on lands, then starts reading that message, with timing logged", async () => {
+  const state = freshState();
+  state.readerActive = true;
+  state.landSeek = true;
+  state.row = { className: "" };
+  const { nav, calls } = makeNavigation(state);
+  await nav.jumpToMessageLink({ service: "discord", channel: "C1", message: "m42", thread: null });
+  assert.deepStrictEqual(calls.filter((call) => Array.isArray(call) && call[0] === "startReading"),
+    [["startReading", "m42"]], "the landed message was not handed to the reader");
+  const timing = calls.filter((call) => Array.isArray(call) && call[0] === "readJumpTiming");
+  assert.equal(timing.length, 1, "click-to-reading-start timing was not logged");
+  assert.equal(timing[0][1].id, "m42");
+  assert.ok(timing[0][1].ms >= 0, "timing must be a duration");
+});
+
+test("`#1959`: one click with the reader off jumps exactly as before and starts nothing", async () => {
+  const state = freshState();
+  state.readerActive = false;
+  state.landSeek = true;
+  state.row = { className: "" };
+  const { nav, calls } = makeNavigation(state);
+  await nav.jumpToMessageLink({ service: "discord", channel: "C1", message: "m42", thread: null });
+  assert.deepStrictEqual(calls.filter((call) => Array.isArray(call) && call[0] === "seek"), [["seek", "m42"]]);
+  assert.deepStrictEqual(calls.filter((call) => Array.isArray(call) && call[0] === "startReading"), []);
+});
+
+test("`#1959`: a target the walk cannot land (not yet loaded, never arrives) starts no read", async () => {
+  const state = freshState();
+  state.readerActive = true;
+  state.landSeek = false;
+  state.row = null;
+  const { nav, calls } = makeNavigation(state);
+  await nav.jumpToMessageLink({ service: "discord", channel: "C1", message: "m404", thread: null });
+  assert.deepStrictEqual(calls.filter((call) => Array.isArray(call) && call[0] === "startReading"), []);
 });

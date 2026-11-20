@@ -379,6 +379,17 @@ export interface PageNavigationDependencies<Column, ThreadLike, Pane> {
    * a host does not wire the anchor; the landing itself is unchanged there.
    */
   noteJumpAnchor?(row: HTMLElement, id: string): void;
+  /**
+   * `#1959 vibe-talk-reader-one-click-jump`. Whether the read-aloud reader
+   * is active (playing or pending) at the tap. Unwired, no jump starts a read.
+   */
+  readerActive?(): boolean;
+  /** `#1959`. Start reading message `id` from its start, restarting it where it is the one already reading. */
+  startReadingMessage?(id: string): unknown;
+  /** `#1959`. The tap-to-reading-start timing line for a read jump. */
+  noteReadJump?(info: { id: string; ms: number }): void;
+  /** `#1959`. A millisecond clock for the read-jump timing; `Date.now` unwired. */
+  nowMs?(): number;
   idsOf(row: HTMLElement): string[];
   // In-app links.
   inAppLinksOn(): boolean;
@@ -472,6 +483,22 @@ export interface PageNavigation {
 
 /** How long opening from a link waits for sign-in and a first read, in `pullWaitMs` waits. */
 const DEEP_LINK_WAITS = 600;
+
+/**
+ * `#1959 vibe-talk-reader-one-click-jump`. The owner's invariant as one
+ * decision: a message link tapped while the reader is active starts reading
+ * that message once the jump has landed it; every other tap keeps the old
+ * behaviour exactly. Pure, so the page tests drive every case directly.
+ */
+export function shouldStartReadingAfterJump(input: {
+  readerActive: boolean;
+  messageId: string | null;
+  landed: boolean;
+  current: boolean;
+}): boolean {
+  return input.readerActive && input.messageId !== null && input.messageId !== "" &&
+    input.landed && input.current;
+}
 
 /** The orchestration, with nothing created yet: the owners below are made in the legacy order. */
 export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigationDependencies<Column, ThreadLike, Pane>): PageNavigation {
@@ -1536,10 +1563,32 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
       const name = deps.providerNameOf(channel);
       deepLinks.setFocus({ provider: String(name || ref.service).toLowerCase(), channel, message: ref.message, thread: ref.thread });
       const target = ref.message;
+      // `#1959`: whether the reader was active is the tap's fact, taken
+      // before the walk; a read the walk itself ends must not revive it.
+      const readerWasActive = deps.readerActive ? deps.readerActive() : false;
+      const tapAt = deps.nowMs ? deps.nowMs() : Date.now();
+      let landed = false;
       // A Back while the walk looks further back ends it: nothing lands over the place put back.
-      await deps.seekMessage(target, () => linkJumps.current(ticket) && landOnDeepLink(target, Boolean(options.center)),
+      await deps.seekMessage(target, () => {
+        const ok = linkJumps.current(ticket) && landOnDeepLink(target, Boolean(options.center));
+        if (ok) landed = true;
+        return ok;
+      },
         () => linkJumps.current(ticket) && deps.threading() && deps.selection().view !== "flat" && deps.answeredElsewhere(target));
       if (linkJumps.current(ticket) && !deps.rowHolding(target)) deepLinks.setFocus(null);
+      // `#1959 vibe-talk-reader-one-click-jump`: the landing above has
+      // expanded the row and put its top on screen (revealRow re-asserts
+      // while the Discuss sheet settles); now, with no second tap, start
+      // reading that message from its start.
+      if (shouldStartReadingAfterJump({
+        readerActive: readerWasActive, messageId: target, landed,
+        current: linkJumps.current(ticket),
+      }) && deps.startReadingMessage) {
+        deps.startReadingMessage(target);
+        if (deps.noteReadJump) {
+          deps.noteReadJump({ id: target, ms: (deps.nowMs ? deps.nowMs() : Date.now()) - tapAt });
+        }
+      }
     } finally {
       // Landed, or given up: what is open now is the jump's, and what opens after is over it.
       if (jump.landed === null && linkJumps.holds(jump)) {

@@ -72,7 +72,7 @@ export type { DocumentListeners, DocumentListenersDependencies } from "./documen
 export { mountPageListeners } from "./pagelisteners.ts";
 export type { PageListeners, PageListenersDependencies } from "./pagelisteners.ts";
 export { mountMenuOpeners } from "./menuopeners.ts";
-export { createPageNavigation } from "./navigation.ts";
+export { createPageNavigation, shouldStartReadingAfterJump } from "./navigation.ts";
 export type { NavChannelPlace, NavDeepLinkWanted, NavHistoryPort, NavLinkJump, NavLinkSpot, NavMessage, PageNavigation, PageNavigationDependencies } from "./navigation.ts";
 export type { MenuOpeners, MenuOpenersDependencies } from "./menuopeners.ts";
 export { READER_WORDS, createReaderRow } from "./readerrow.ts";
