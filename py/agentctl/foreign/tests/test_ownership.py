@@ -324,6 +324,117 @@ def test_pin_einval_on_a_live_process_is_unproven_never_dead(
     assert _running(child.pid, int(exact.started_at or "0"))
 
 
+def test_pin_einval_with_an_unreadable_stat_raises_unknown(
+    child: subprocess.Popen[bytes], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """EINVAL must not swallow a procfs read error as death (#1938 review)."""
+    exact = _identity(child.pid)
+    real_open, real_read = os.pidfd_open, ownership._read_stat_bytes
+
+    def refuse(pid: int) -> int:
+        if pid == child.pid:
+            raise OSError(22, "Invalid argument")
+        return real_open(pid)
+
+    def unreadable(pid: int) -> bytes:
+        if pid == child.pid:
+            raise PermissionError(13, "Permission denied")
+        return real_read(pid)
+
+    monkeypatch.setattr(os, "pidfd_open", refuse)
+    monkeypatch.setattr(ownership, "_read_stat_bytes", unreadable)
+    with pytest.raises(lib.AgentOperationError) as caught:
+        ownership.pin(exact)
+    assert caught.value.code == "runner_identity_unknown"
+    assert child.poll() is None
+
+
+def test_pin_einval_with_a_malformed_stat_raises_unknown(
+    child: subprocess.Popen[bytes], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """EINVAL plus a stably malformed stat record raises, never certifies (#1938 review)."""
+    exact = _identity(child.pid)
+    real_open = os.pidfd_open
+
+    def refuse(pid: int) -> int:
+        if pid == child.pid:
+            raise OSError(22, "Invalid argument")
+        return real_open(pid)
+
+    monkeypatch.setattr(os, "pidfd_open", refuse)
+    monkeypatch.setattr(ownership, "_read_stat_bytes", lambda pid: b"not a stat record")
+    with pytest.raises(lib.AgentOperationError) as caught:
+        ownership.pin(exact)
+    assert caught.value.code == "runner_identity_unknown"
+    assert child.poll() is None
+
+
+def test_stop_process_refuses_a_live_exact_match_under_einval(
+    child: subprocess.Popen[bytes], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """stop_process under EINVAL refuses and leaves the child untouched (#1938 review)."""
+    exact = _identity(child.pid)
+    real_open = os.pidfd_open
+
+    def refuse(pid: int) -> int:
+        if pid == child.pid:
+            raise OSError(22, "Invalid argument")
+        return real_open(pid)
+
+    monkeypatch.setattr(os, "pidfd_open", refuse)
+    with pytest.raises(lib.AgentOperationError) as caught:
+        ownership.stop_process(exact, grace=0)
+    assert caught.value.code == "runner_identity_unproven"
+    assert _running(child.pid, int(exact.started_at or "0"))
+
+
+def test_a_reaped_session_leader_whose_session_lives_on_pins_gone(
+    descendants: _Descendants,
+) -> None:
+    """Real kernel: a reaped session leader EINVALs pidfd_open while its
+    session survives; pin must still certify gone from procfs (#1938 review)."""
+    script = (
+        "import subprocess, sys, time\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+        "print(child.pid, flush=True)\n"
+        "time.sleep(0.2)\n"
+    )
+    leader = subprocess.Popen(
+        [sys.executable, "-c", script], start_new_session=True,
+        stdout=subprocess.PIPE, text=True,
+    )
+    descendants.add(leader.pid)
+    assert leader.stdout is not None
+    session_child = int(leader.stdout.readline())
+    descendants.add(session_child)
+    identity = _identity(leader.pid)
+    leader.wait(timeout=5)
+    assert _wait_until(lambda: ownership._quiet_stat(leader.pid) is None)
+    result = ownership.pin(identity)
+    assert result.verdict == ownership.GONE and result.process is None
+    assert _running(session_child)
+
+
+def test_a_skipped_cgroup_member_is_reported_remaining_and_never_signalled(
+    tmp_path: Path, child: subprocess.Popen[bytes], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cgroup member pidfd_open refuses (EINVAL) stays remaining (#1938 review)."""
+    directory = tmp_path / "agentctl-harness-fake"
+    directory.mkdir()
+    (directory / "cgroup.events").write_text("populated 1\n")
+    (directory / "cgroup.procs").write_text(f"{child.pid}\n")
+
+    def refuse(pid: int) -> int:
+        raise OSError(22, "Invalid argument")
+
+    monkeypatch.setattr(ownership, "_open_pidfd", refuse)
+    monkeypatch.setattr(ownership, "_cgroup_relative", lambda path: "/agentctl-harness-fake")
+    killed, remaining = ownership._kill_cgroup(directory, time.monotonic() + 0.2)
+    assert killed == 1
+    assert any(f"pid {child.pid}" in item for item in remaining), remaining
+    assert _running(child.pid)
+
+
 def test_pin_a_thread_id_is_never_the_recorded_leader(descendants: _Descendants) -> None:
     """A live non-leader thread id EINVALs pidfd_open; pinning it proves nothing."""
     script = (

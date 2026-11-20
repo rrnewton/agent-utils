@@ -1,6 +1,7 @@
 ---
 title: 'agentctl-status-redact-argv: redact launch arguments in status and other human-facing output'
-status: open
+status: closed
+closed_at: 2026-11-20T08:08:18-05:00
 priority: 1
 issue_type: bug
 labels:
@@ -35,3 +36,7 @@ Goal: human-facing output shows that a launch happened and which flags were used
 # Notes
 
 Security hygiene, requested 2026-11-19 by a consumer's lead via the coordinator; the consumer is not named (repository boundary rule). Lane mu-agentctlfix, nested worktree `.muse/worktrees/agentctlfix` on branch `mu-agentctlfix/1936`. Related: #813 agent-record-schema-forward-compat (spec keys are preserved; redaction is render-only). Companion: #1938 agentctl-pidfd-open-einval, same lane, separate commit.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as 776f69ff (redaction b83cfa0c, contract checks 12896b7b and 776f69ff). `status`, `list`, and every status-shaped row in both editions now show launch flag names with values elided (`--model <set>`, `--flag=<set>`, other values `<set>`) across `launch_spec.argv`, the nested `launch.argv` (program kept), and the record `arguments` field; the full vector needs `status NAME --show-argv` or `list --show-argv`. The persisted record and revive replay keep the exact vector; no persisted field changed, so no reader-skew. Environment values were and remain never printed (names only). The cross differential compares the two editions' redacted outputs exactly and gained a paired case proving a secret-looking argument is redacted identically in both while the record keeps it.

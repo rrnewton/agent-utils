@@ -3483,6 +3483,177 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn threaded_child() -> (std::process::Child, i64, ProcessIdentity) {
+        let mut child = std::process::Command::new("python3")
+            .args([
+                "-c",
+                "import threading, time\nthreading.Thread(target=lambda: (print(threading.get_native_id(), flush=True), time.sleep(30)), daemon=True).start()\ntime.sleep(30)\n",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn threaded child");
+        let mut line = String::new();
+        {
+            use std::io::BufRead;
+            let stdout = child.stdout.take().expect("child stdout");
+            std::io::BufReader::new(stdout)
+                .read_line(&mut line)
+                .expect("read thread id");
+        }
+        let tid: i64 = line.trim().parse().expect("thread id");
+        let leader = identity_of(i64::from(child.id()));
+        (child, tid, leader)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pin_einval_with_malformed_or_unreadable_stat_raises_unknown() {
+        // EINVAL must not swallow a procfs read error as death (#1938 review).
+        if !pidfds_supported() {
+            return;
+        }
+        let (mut child, tid, leader) = threaded_child();
+        let identity = ProcessIdentity::new(tid, leader.started_at.clone(), leader.boot_id.clone());
+        for (name, contents) in [
+            ("malformed", Some("not a stat record")),
+            ("unreadable", None),
+        ] {
+            let root = fake_proc(name);
+            std::fs::write(
+                root.join("sys/kernel/random/boot_id"),
+                format!("{}\n", current_boot_id().unwrap()),
+            )
+            .unwrap();
+            write_stat(&root, tid, contents.unwrap_or(""));
+            if contents.is_none() {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(
+                    root.join(tid.to_string()).join("stat"),
+                    std::fs::Permissions::from_mode(0o000),
+                )
+                .unwrap();
+            }
+            let err = pin_at(&root, &identity, None).unwrap_err();
+            assert_eq!(err.code, "runner_identity_unknown", "{name}: {err}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "child must be untouched"
+        );
+        reap(&mut child);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stop_process_refuses_a_live_exact_match_under_einval() {
+        // The thread id shares its leader's start ticks, so procfs shows a
+        // live exact match pidfd_open refuses: unproven, never signalled.
+        if !pidfds_supported() {
+            return;
+        }
+        let (mut child, tid, leader) = threaded_child();
+        let identity = ProcessIdentity::new(tid, leader.started_at.clone(), leader.boot_id.clone());
+        // Fake procfs shows the live exact record for the refused number.
+        let root = fake_proc("stop-einval");
+        std::fs::write(
+            root.join("sys/kernel/random/boot_id"),
+            format!("{}\n", current_boot_id().unwrap()),
+        )
+        .unwrap();
+        write_stat(
+            &root,
+            tid,
+            &stat_record(tid, leader.started_at.as_deref().unwrap().parse().unwrap()),
+        );
+        let err =
+            stop_process_at(&root, &identity, Duration::ZERO, None, None, "runner").unwrap_err();
+        assert_eq!(err.code, "runner_identity_unproven");
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "child must be untouched"
+        );
+        reap(&mut child);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_reaped_session_leader_whose_session_lives_on_pins_gone() {
+        // Real kernel: a reaped session leader EINVALs pidfd_open while its
+        // session survives; pin certifies gone from procfs (#1938 review).
+        if !pidfds_supported() {
+            return;
+        }
+        let mut leader = std::process::Command::new("setsid")
+            .args([
+                "python3",
+                "-c",
+                "import subprocess, sys, time\nchild = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\nprint(child.pid, flush=True)\ntime.sleep(30)\n",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn session leader");
+        let mut line = String::new();
+        {
+            use std::io::BufRead;
+            let stdout = leader.stdout.take().expect("leader stdout");
+            std::io::BufReader::new(stdout)
+                .read_line(&mut line)
+                .expect("read session child");
+        }
+        let session_child: i64 = line.trim().parse().expect("session child pid");
+        let identity = identity_of(i64::from(leader.id()));
+        leader.kill().unwrap();
+        leader.wait().unwrap();
+        let result = pin(&identity, None).unwrap();
+        assert_eq!(result.verdict, PinVerdict::Gone);
+        assert!(result.process.is_none());
+        // SAFETY: the session child is this test's own descendant.
+        assert_eq!(unsafe { libc::kill(session_child as libc::pid_t, 0) }, 0);
+        // SAFETY: same descendant, now cleaned up.
+        unsafe { libc::kill(session_child as libc::pid_t, libc::SIGKILL) };
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_skipped_cgroup_member_is_reported_remaining_and_never_signalled() {
+        // A cgroup member pidfd_open refuses (a thread id) stays remaining.
+        if !pidfds_supported() {
+            return;
+        }
+        let (mut child, tid, _leader) = threaded_child();
+        let root = std::env::temp_dir().join(format!(
+            "agentctl-cgroup-skip-{}-{}",
+            std::process::id(),
+            tid
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("cgroup.events"), "populated 1\n").unwrap();
+        std::fs::write(root.join("cgroup.procs"), format!("{tid}\n")).unwrap();
+        let (killed, remaining) = kill_cgroup_at(
+            Path::new(PROC),
+            &root,
+            Instant::now() + Duration::from_millis(200),
+        )
+        .unwrap();
+        assert_eq!(killed, 1);
+        assert!(
+            remaining
+                .iter()
+                .any(|item| item.contains(&format!("pid {tid}"))),
+            "{remaining:?}"
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "child must be untouched"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        reap(&mut child);
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn pin_rejects_invalid_recorded_values() {
         for identity in [

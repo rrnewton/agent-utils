@@ -1,6 +1,7 @@
 ---
 title: 'agentctl-pidfd-open-einval: pidfd_open EINVAL on a new kernel must fail closed, never read as death'
-status: open
+status: closed
+closed_at: 2026-11-20T08:08:18-05:00
 priority: 1
 issue_type: bug
 labels:
@@ -34,3 +35,7 @@ Why EINVAL happens is not yet known: candidates are a thread id passed instead o
 # Notes
 
 New-kernel robustness, reported 2026-11-19 after the host reprovision (kernel 6.13). Lane mu-agentctlfix, nested worktree `.muse/worktrees/agentctlfix` on branch `mu-agentctlfix/1936`. Companion: #1937 agentctl-status-redact-argv, same lane, separate commit. Browser checks failing for a missing system library are unrelated and tracked separately.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as 776f69ff (pidfd fix fb6b7b50, prctl naming bbcbeb0f). Root cause, measured on kernel 6.13: two shapes make `pidfd_open` answer EINVAL instead of ESRCH for a dead leader. (1) The freed number is reused as a non-leader thread id of another process. (2) A reaped session or process-group leader whose session survives (noted 2026-11-20 from the cold review): this is the normal harness-tree shape, leader dead with session members alive. In both editions `pin()` now treats EINVAL as unproven until procfs positively shows the recorded generation gone (absent, newer, or dead-state); a live exact match stays unproven and is never signalled, and procfs read errors (EACCES, malformed) raise `runner_identity_unknown` instead of certifying death. The cgroup fallback skips refused numbers and reports their members remaining. The cold review (2026-11-20) found no fail-open path. `PR_SET_CHILD_SUBREAPER` refusal in `_command_supervisor._become_subreaper` now fails by name with its errno, since orphan adoption is load-bearing for the frozen-census proof; on this kernel the call itself succeeds in plain and systemd-scope processes, and a readable gate log showed the named crash test failing on an empty pids file under load. Follow-ups: #1952 agentctl-cgroup-events-read-error-fails-open, #1953 agentctl-cleanup-unproven-unlisted, #1942 agentctl-watch-stale-background-shell-footer.
