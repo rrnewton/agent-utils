@@ -319,7 +319,10 @@ impl CodexReplacement {
             .position(|line| line.trim() == "Press enter to confirm or esc to go back")?;
         let status_row = |line: &str| {
             let line = line.trim();
-            line.is_empty() || line.contains(" · ")
+            // A composer row below the footer (it starts with the
+            // prompt glyph, draft or not) means this block is quoted
+            // text above the live composer, never a live picker.
+            !line.starts_with('›') && (line.is_empty() || line.contains(" · "))
         };
         if !rest[footer_at + 1..].iter().all(|line| status_row(line)) {
             return None;
@@ -354,20 +357,32 @@ impl CodexReplacement {
             new.push(' ');
             new.push_str(row.trim());
         }
-        let last_row = objective_rows.last()?;
+        objective_rows.last()?;
         // Cut only on a trailing ellipsis, or when the last objective
-        // row reaches the widest non-objective line on screen (the
-        // pane edge, as far as screen text can say) (#1939 D3).
+        // row reaches the pane edge as the raw read proves it: Herdr
+        // reads that pad rows to the pane width (trailing spaces)
+        // make the edge measurable, and only then does reaching the
+        // widest padded non-objective row count. With no padding in
+        // the read, only an ellipsis proves a cut — a complete
+        // objective that happens to be the longest line on screen is
+        // never misread as cut (#1939 review).
         let objective_range =
             (start + 1 + objective_at)..(start + 1 + objective_at + objective_rows.len());
-        let width = lines
-            .iter()
+        let raw_width = screen
+            .lines()
             .enumerate()
             .filter(|(index, _)| !objective_range.contains(index))
             .map(|(_, line)| line.chars().count())
             .max()
             .unwrap_or(0);
-        let new_cut = new.ends_with('…') || (width > 0 && last_row.chars().count() >= width);
+        let padded = screen
+            .lines()
+            .any(|line| line.chars().count() != line.trim_end().chars().count());
+        let raw_last = screen
+            .lines()
+            .nth(start + 1 + objective_at + objective_rows.len() - 1)
+            .map_or(0, |line| line.chars().count());
+        let new_cut = new.ends_with('…') || (padded && raw_width > 0 && raw_last >= raw_width);
         if new.ends_with('…') {
             new = new.trim_end_matches('…').trim_end().to_owned();
         }
@@ -754,6 +769,29 @@ mod tests {
             question.choice("finish this task"),
             ReplacementChoice::Replace
         );
+    }
+
+    #[test]
+    fn a_complete_objective_that_is_the_longest_line_is_not_cut() {
+        // Review repro (#1939): a picker-only screen whose complete
+        // objective is the longest line must not read as cut, so a
+        // different longer goal is never confirmed from it.
+        let objective = "refactor the parser module and update every caller in the tree";
+        let question =
+            CodexReplacement::read(&codex_picker(objective, 1)).expect("picker");
+        assert!(!question.new_cut, "{question:?}");
+        assert_eq!(question.choice(objective), ReplacementChoice::Replace);
+        assert!(matches!(
+            question.choice(&format!("{objective} then delete legacy code")),
+            ReplacementChoice::Cancel(_)
+        ));
+        // A composer draft below the footer, status row and all, is
+        // still a quote above the live composer, never a live picker.
+        let quoted = format!(
+            "{}\n› fix a · b\n  GPT-6 · /work   Pursuing goal (3s)\n",
+            codex_picker(objective, 1)
+        );
+        assert!(CodexReplacement::read(&quoted).is_none());
     }
 
     #[test]

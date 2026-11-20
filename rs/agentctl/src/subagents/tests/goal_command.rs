@@ -227,6 +227,10 @@ fn a_registered_goal_never_types_over_an_open_picker() {
             "{error}"
         );
     }
+    // Not staged, never filed as possibly submitted: the goal is
+    // still pending for a later drain (#1939 review).
+    let pending = manager.pending_prompts("worker").unwrap();
+    assert_eq!(pending.len(), 1, "{pending:?}");
 }
 
 #[test]

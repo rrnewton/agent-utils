@@ -2264,7 +2264,10 @@ class _WorkspaceClient:
         # (#1939 D4): its Enter would answer the other goal's picker.
         # This edition never cancels a picker; it only ever confirms
         # its own registered goal in wait_agent_status below.
-        if self.record.harness == "codex" and command.startswith("/goal "):
+        stripped = command.lstrip()
+        is_goal = (stripped.startswith("/goal") and len(stripped) > 5
+                   and stripped[5] in (" ", "\t"))
+        if self.record.harness == "codex" and is_goal:
             from agentctl.harness_tui.codex import read_replace_goal_picker
 
             screen = self.client.read(pane_id, source="visible", lines=200)

@@ -6365,7 +6365,14 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             if crate::goal_command::CodexReplacement::read(&crate::harness_tui::plain(&screen))
                 .is_some()
             {
-                return Err(crate::error::AdapterError::unavailable(
+                // Not staged, like the raw flow and Python's
+                // PromptNotStaged: the goal stays pending for a later
+                // drain, never filed as possibly submitted (#1939).
+                *self
+                    .goal_objective
+                    .lock()
+                    .expect("goal operation lock poisoned") = None;
+                return Err(crate::error::AdapterError::not_staged(
                     "a Codex Replace-goal picker is already open; nothing was typed; answer \
                      it with `agentctl answer` or in the pane, then resend the goal",
                 ));
@@ -6612,7 +6619,14 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             if crate::goal_command::CodexReplacement::read(&crate::harness_tui::plain(&screen))
                 .is_some()
             {
-                return Err(crate::error::AdapterError::unavailable(
+                // Not staged, like the raw flow and Python's
+                // PromptNotStaged: the goal stays pending for a later
+                // drain, never filed as possibly submitted (#1939).
+                *self
+                    .goal_objective
+                    .lock()
+                    .expect("goal operation lock poisoned") = None;
+                return Err(crate::error::AdapterError::not_staged(
                     "a Codex Replace-goal picker is already open; nothing was typed; answer \
                      it with `agentctl answer` or in the pane, then resend the goal",
                 ));

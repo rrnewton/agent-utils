@@ -12,7 +12,8 @@ def read_replace_goal_picker(screen: str) -> tuple[str, bool, int | None, str, s
     Returns (objective as shown, whether it was cut, selected option,
     option 1 text, option 2 text). The objective wraps at the pane edge,
     so a showing cut there (or ended with an ellipsis) counts as cut."""
-    lines = [line.rstrip() for line in screen.splitlines()]
+    raw = screen.splitlines()
+    lines = [line.rstrip() for line in raw]
     # The LAST title: a quoted picker in the transcript above a live
     # one is history, never the live question (#1939 D2).
     starts = [i for i, line in enumerate(lines) if line.strip() == "Replace goal?"]
@@ -26,7 +27,10 @@ def read_replace_goal_picker(screen: str) -> tuple[str, bool, int | None, str, s
                if line.strip() == "Press enter to confirm or esc to go back"]
     if not footers:
         return None
-    if any(line.strip() and " · " not in line for line in rest[footers[0] + 1:]):
+    # A composer row below the footer (prompt glyph first) means the
+    # block is quoted text above the live composer, never live.
+    if any(line.strip() and (line.strip().startswith("›") or " · " not in line)
+           for line in rest[footers[0] + 1:]):
         return None
     objective_at = next(
         (i for i, line in enumerate(rest)
@@ -47,13 +51,18 @@ def read_replace_goal_picker(screen: str) -> tuple[str, bool, int | None, str, s
     for row in rows[1:]:
         shown += " " + row.strip()
     # Cut only on a trailing ellipsis, or when the last objective row
-    # reaches the widest non-objective line (the pane edge, as far as
-    # screen text can say) (#1939 D3).
+    # reaches the pane edge as the raw read proves it: reads padded
+    # to the pane width (trailing spaces) make the edge measurable.
+    # With no padding in the read, only an ellipsis proves a cut, so
+    # a complete objective that is the longest line never counts
+    # as cut (#1939 review).
     objective_rows = set(range(start + 1 + objective_at,
                                start + 1 + objective_at + len(rows)))
-    width = max((len(line) for i, line in enumerate(lines) if i not in objective_rows),
+    width = max((len(line) for i, line in enumerate(raw) if i not in objective_rows),
                 default=0)
-    cut = shown.endswith("…") or (width > 0 and len(rows[-1]) >= width)
+    padded = any(len(line) != len(line.rstrip()) for line in raw)
+    last_raw = raw[start + 1 + objective_at + len(rows) - 1] if rows else ""
+    cut = shown.endswith("…") or (padded and width > 0 and len(last_raw) >= width)
     if shown.endswith("…"):
         shown = shown[:-1].rstrip()
     if not shown:

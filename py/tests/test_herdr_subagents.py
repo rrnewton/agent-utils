@@ -2394,9 +2394,20 @@ def test_replace_goal_picker_is_an_answerable_question() -> None:
     quoted = screen + "\n› Ask Codex to do anything\n  GPT · /work"
     assert read_replace_goal_picker(quoted) is None
     assert CodexTui().classify(quoted).question is None
-    # #1939 D3: a short cut showing never matches a different goal.
     from agentctl.subagents import _goal_replacement_selected
 
+    # Review repro (#1939): a complete objective that is the longest
+    # line on a picker-only screen is not cut, so a longer goal differs.
+    objective = "refactor the parser module and update every caller in the tree"
+    full = screen.replace("finish this task", objective)
+    picker = read_replace_goal_picker(full)
+    assert picker is not None and picker[1] is False
+    assert _goal_replacement_selected(full, objective) is True
+    assert not _goal_replacement_selected(full, objective + " then delete legacy code")
+    # A composer draft below the footer is a quote, never live.
+    quoted_draft = full + "\n› fix a · b\n  GPT-6 · /work   Pursuing goal (3s)"
+    assert read_replace_goal_picker(quoted_draft) is None
+    # #1939 D3: a short cut showing never matches a different goal.
     short = screen.replace("finish this task", "f…")
     assert not _goal_replacement_selected(short, "force-push main")
     assert not _goal_replacement_selected(
