@@ -804,12 +804,17 @@ def hidden_node_subject(runner: Runner, mount: str, node: str) -> str | None:
     from the store's default path (#1925 review, fix round 2).
     """
 
-    rc, stdout, _stderr = runner(
+    rc, stdout, stderr = runner(
         ["sl", "-R", mount, "log", "--hidden", "-r", f"present({node})",
          "-T", "{node}\n{desc|firstline}"]
     )
     if rc != 0:
-        return None
+        # A failed query is not an unknown node: refuse rather
+        # than drop a hidden draft on a transient Sapling error.
+        raise EdenError(
+            f"Sapling hidden query failed (sl -R {mount} log --hidden "
+            f"-r present({node})): {stderr.strip() or stdout.strip()}"
+        )
     lines = stdout.splitlines()
     if not lines or lines[0].strip() != node:
         return None

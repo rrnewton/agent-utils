@@ -31442,8 +31442,9 @@ def _load_eden_draft_ledger(
     return ledger
 
 
-def _write_eden_draft_ledger(path: Path, ledger: eden.DraftLedger) -> None:
-    payload = eden.draft_ledger_payload(ledger)
+def _write_ledger_json(path: Path, payload: object) -> None:
+    """Atomic JSON write for ledger-side files, with the .tmp remedy."""
+
     try:
         _atomic_write_json(path, payload)
     except StateError as exc:
@@ -31455,6 +31456,11 @@ def _write_eden_draft_ledger(path: Path, ledger: eden.DraftLedger) -> None:
                 "checkout, then remove that .tmp file by hand and retry"
             ) from exc
         raise
+
+
+def _write_eden_draft_ledger(path: Path, ledger: eden.DraftLedger) -> None:
+    payload = eden.draft_ledger_payload(ledger)
+    _write_ledger_json(path, payload)
     label = f"Eden draft ledger {path}"
     written = eden.draft_ledger_from_obj(
         _strict_json_object(
@@ -31591,7 +31597,7 @@ def _load_draft_listing_marker(path: Path) -> tuple[str, ...] | None:
 
 
 def _write_draft_listing_marker(path: Path, nodes: Sequence[str]) -> None:
-    _atomic_write_json(
+    _write_ledger_json(
         path, {"nodes": sorted(nodes), "shown_at": _utc_now()}
     )
 
@@ -31640,21 +31646,23 @@ def _eden_scoped_draft_nodes(
     # The per-working-copy journal closes most of the window
     # between captures: drafts this checkout sat on and later left
     # are still its own, provided they are still drafts in the
-    # store and were never explicitly disowned. A journal that
-    # cannot be read never refuses finish by itself; the ledger
-    # remains the primary record.
+    # store and were never explicitly disowned. A journal or store
+    # query that fails refuses: finish must never pass because a
+    # query dropped a draft.
     mount = str(_stored_path(config, checkout.path, "checkout path"))
     try:
         visited = eden.journal_visited_nodes(runner, mount)
         store_drafts = set(eden.all_draft_nodes(runner, mount))
-    except eden.EdenError:
-        visited, store_drafts = (), set()
+    except eden.EdenError as exc:
+        raise Refusal(str(exc)) from exc
     disowned = {node for node, _by, _at in captured.disowned}
     # Expand every visited node: a draft rewritten while not
     # checked out (metaedit, rebase) is hidden at its recorded
     # node, so filtering the journal by draft() would drop its
     # visible successor; a draft hidden with no visible successor
     # is included as itself so classification names it hidden.
+    # Any failed expansion refuses: finish must never pass
+    # because a journal query dropped a draft.
     extra_list: list[str] = []
     try:
         for node in visited:
@@ -31671,8 +31679,8 @@ def _eden_scoped_draft_nodes(
             ) is not None:
                 if node not in extra_list:
                     extra_list.append(node)
-    except eden.EdenError:
-        extra_list = []
+    except eden.EdenError as exc:
+        raise Refusal(str(exc)) from exc
     extra = tuple(extra_list)
     if extra:
         try:
@@ -50079,31 +50087,34 @@ def _cmd_capture_drafts(args: argparse.Namespace) -> int:
                     marker_path = _draft_listing_marker_path(
                         ledger_path, checkout.name
                     )
+                    # The marker is written only where the full list
+                    # is printed: a rerun may trust it because the
+                    # operator has seen every candidate it names.
+                    listing = [
+                        f"draft capture for slot {record.slot} checkout "
+                        f"{checkout.name}: the shared store holds "
+                        f"{len(candidates)} draft(s) outside the current "
+                        "stack, of every date:"
+                    ]
+                    for node, author, when, subject in candidates:
+                        day = (
+                            dt.datetime.fromtimestamp(
+                                when, dt.timezone.utc
+                            ).date().isoformat()
+                            if when else "unknown-date"
+                        )
+                        mark = (
+                            "recorded" if node in recorded else "candidate"
+                        )
+                        listing.append(
+                            f"{mark} {node} date={day} "
+                            f"author={author} {subject}"
+                        )
                     if undecided:
                         _write_draft_listing_marker(
                             marker_path, sorted(by_node)
                         )
-                        lines = [
-                            f"draft capture for slot {record.slot} checkout "
-                            f"{checkout.name}: the shared store holds "
-                            f"{len(candidates)} draft(s) outside the current "
-                            "stack, of every date:"
-                        ]
-                        for node, author, when, subject in candidates:
-                            day = (
-                                dt.datetime.fromtimestamp(
-                                    when, dt.timezone.utc
-                                ).date().isoformat()
-                                if when else "unknown-date"
-                            )
-                            mark = (
-                                "recorded" if node in recorded else "candidate"
-                            )
-                            lines.append(
-                                f"{mark} {node} date={day} "
-                                f"author={author} {subject}"
-                            )
-                        lines.append(
+                        raise Refusal("\n".join(listing + [
                             "state: REFUSED -- no ledger was written. Judge "
                             "every listed draft: '--include NODE' for this "
                             "slot's (repeatable), '--disown NODE' for each "
@@ -50112,21 +50123,21 @@ def _cmd_capture_drafts(args: argparse.Namespace) -> int:
                             "or '--none-of-these-are-mine' for the "
                             "unrecorded drafts in a list already shown by "
                             "an earlier capture (also recorded per node)"
-                        )
-                        raise Refusal("\n".join(lines))
+                        ]))
                     if args.none_of_these_are_mine and _load_draft_listing_marker(
                         marker_path
                     ) != tuple(sorted(by_node)):
                         _write_draft_listing_marker(
                             marker_path, sorted(by_node)
                         )
-                        raise Refusal(
-                            "the candidate list for checkout "
-                            f"{checkout.name} has now been shown in full; "
-                            "rerun the same '--none-of-these-are-mine' "
-                            "command to declare exactly that list, so the "
-                            "declaration can never cover drafts nobody saw"
-                        )
+                        raise Refusal("\n".join(listing + [
+                            "state: REFUSED -- no ledger was written. The "
+                            "candidate list above has now been shown in "
+                            "full; rerun the same "
+                            "'--none-of-these-are-mine' command to declare "
+                            "exactly that list, so the declaration can "
+                            "never cover drafts nobody saw"
+                        ]))
                     chosen = tuple(sorted(set(includes) | set(journal_include)))
                     disowned_now = tuple(sorted(set(disowns) | none_decided))
                 else:

@@ -2360,9 +2360,7 @@ def test_classify_drafts_unknown_node_refuses_with_rebuild() -> None:
     node = "a" * 40
 
     def runner(argv: Sequence[str]) -> tuple[int, str, str]:
-        args = list(argv)
-        if "--hidden" in args:
-            return (1, "", "unknown")
+        # present() on an unknown node exits 0 with no output.
         return (0, "", "")
 
     with pytest.raises(eden.EdenError, match="not known to the store"):
@@ -2796,8 +2794,11 @@ def test_capture_none_needs_shown_list_and_never_covers_recorded(
         )
 
     first = capture("--none-of-these-are-mine")
-    with pytest.raises(wrkslots_cli.Refusal, match="has now been shown"):
+    with pytest.raises(wrkslots_cli.Refusal, match="has now been shown") as shown:
         first.handler(first)
+    # The refusal that writes the shown-list marker prints every
+    # candidate node id, so the rerun can never disown unseen work.
+    assert foreign in str(shown.value)
     assert not ledger_path.exists()
     second = capture("--none-of-these-are-mine")
     assert second.handler(second) == 0
@@ -2835,6 +2836,49 @@ def test_draft_ledger_tmp_leftover_names_manual_remedy(tmp_path: Path) -> None:
             path,
             eden.DraftLedger(slot="slot", checkout="main", generation=1,
                              nodes=(), captured_at=None, last_error=None),
+        )
+
+
+def test_hidden_query_failure_refuses_not_drops() -> None:
+    """A failed hidden query is an error, never an unknown node."""
+
+    def runner(argv: Sequence[str]) -> tuple[int, str, str]:
+        return (1, "", "daemon boom")
+
+    with pytest.raises(eden.EdenError, match="hidden query failed"):
+        eden.hidden_node_subject(runner, "/m", "a" * 40)
+
+
+def test_scoped_journal_expansion_failure_refuses(tmp_path: Path) -> None:
+    """A failed journal expansion refuses finish, dropping nothing."""
+    config = _scoped_config(tmp_path)
+    checkout = wrkslots_cli._checkout_from_obj(_eden_obj(), "row.checkouts[0]")
+    full = "f" * 40
+    ledger_path = wrkslots_cli._eden_draft_ledger_path(config, checkout)
+    wrkslots_cli._write_eden_draft_ledger(
+        ledger_path,
+        eden.DraftLedger(slot="slot", checkout="main", generation=1,
+                         nodes=(), captured_at=None, last_error=None),
+    )
+
+    def runner(argv: Sequence[str]) -> tuple[int, str, str]:
+        args = list(argv)
+        if "journal" in args:
+            return (0, "aaaaaaaaaaaa -> bbbbbbbbbbbb someone\n", "")
+        if "--hidden" in args:
+            return (0, f"{full}\n", "")
+        revset = args[args.index("-r") + 1] if "-r" in args else ""
+        if revset == "draft() & ::.":
+            return (0, "", "")
+        if revset == "draft()":
+            return (0, f"{full}\n", "")
+        if revset.startswith("successors(present("):
+            return (1, "", "expansion boom")
+        return (0, "", "")
+
+    with pytest.raises(wrkslots_cli.Refusal, match="expansion boom"):
+        wrkslots_cli._eden_scoped_draft_nodes(
+            config, checkout, slot="slot", generation=1, runner=runner
         )
 
 
