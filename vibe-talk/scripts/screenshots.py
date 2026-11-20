@@ -4848,14 +4848,20 @@ def _act_discuss_timeline_layout(driver: Driver) -> None:
 def _act_discuss_terms(driver: Driver) -> None:
     """`#1924` (c): summarize through the real route, then open the Terms
     block the stub answer carries and bring it into view, so the shot
-    shows Terms rendering (heading, triangle, list)."""
+    shows Terms rendering (heading, triangle, list).
+
+    `#1960`: Terms starts folded and only the header toggle (or its own
+    heading) opens it. The summary walk above presses that toggle, so
+    Terms may already stand open here; press its heading only when it
+    is still folded, never to close it again."""
     _act_discuss_summary(driver)
     driver.page.wait_for_function(
         "() => !document.getElementById('discuss-terms').hidden "
         "&& document.getElementById('discuss-terms-list').children.length >= 2",
         timeout=30_000,
     )
-    driver.page.locator("#discuss-terms > summary").click()
+    if not bool(driver.js("document.getElementById('discuss-terms').open")):
+        driver.page.locator("#discuss-terms > summary").click()
     driver.page.wait_for_function(
         "() => document.getElementById('discuss-terms').open",
         timeout=5_000,
