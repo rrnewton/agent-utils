@@ -3644,6 +3644,50 @@ fn a_muse_lane_records_the_session_the_store_names_by_pid_at_start() {
 }
 
 #[test]
+fn the_store_report_wins_over_a_held_peer_lock() {
+    // #1945: Muse's own report for the pinned pid is preferred over
+    // anything the fd walk happens to hold, so a peer lock can never
+    // outrank it.
+    let fixture = unreported();
+    let (store, _store_guard) = pretend_muse_store(&fixture);
+    let id = "88888888-8888-8888-8888-888888888888";
+    let runtime = store.join("runtime/muse/sessions");
+    fs::create_dir_all(&runtime).unwrap();
+    fs::write(
+        runtime.join(format!("{id}.json")),
+        json!({"session_id": id, "process_generation_hint": "pid=4242"}).to_string(),
+    )
+    .unwrap();
+    let peer = fake_muse_session_as(&fixture, "99999999-9999-4999-8999-999999999999", 424_242);
+    let _held = pretend_held(vec![peer]);
+    start_worker(&fixture, "muse");
+    let record = fixture.manager().load("worker").unwrap();
+    assert_eq!(record.native_session.as_ref().unwrap().value, id);
+}
+
+#[test]
+fn a_held_path_outside_the_store_tree_attributes_nothing() {
+    // #1945: held paths count only inside the store's own sessions
+    // tree; a same-shaped path elsewhere is never this lane's session.
+    let fixture = unreported();
+    let (_store, _store_guard) = pretend_muse_store(&fixture);
+    let dir = fixture
+        .root
+        .join("elsewhere/muse/sessions/2026/11/06/01a1ab0f-0a3c-73c1-8056-ee5296bc1574");
+    fs::create_dir_all(&dir).unwrap();
+    let lock = dir.join(".session.lock");
+    fs::write(&lock, "pid=4242\nhost=localhost\n").unwrap();
+    let _held = pretend_held(vec![lock]);
+    start_worker(&fixture, "muse");
+    assert!(fixture
+        .manager()
+        .load("worker")
+        .unwrap()
+        .native_session
+        .is_none());
+}
+
+#[test]
 fn doctor_names_a_live_muse_lane_whose_store_match_is_ambiguous() {
     // #948 condition 4: the pre-reboot check. Several store sessions name
     // the lane's cwd, so revive would refuse; doctor says so while the

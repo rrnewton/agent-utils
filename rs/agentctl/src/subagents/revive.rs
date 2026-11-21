@@ -149,6 +149,32 @@ fn verified_runtime_pid(record: &AgentRecord, pid: u64) -> bool {
     }
 }
 
+/// When the runtime process `pid` started, as far as this lane can prove
+/// it (#1945): in production the `/proc/<pid>` directory's own mtime,
+/// which the kernel stamps at process start. A session lock older than
+/// that cannot belong to this process, however well its pid line matches
+/// after a pid reuse.
+fn runtime_start_time(record: &AgentRecord, pid: u64) -> Option<std::time::SystemTime> {
+    #[cfg(not(test))]
+    {
+        let _ = record;
+        fs::metadata(format!("/proc/{pid}"))
+            .and_then(|metadata| metadata.modified())
+            .ok()
+    }
+    #[cfg(test)]
+    {
+        let pinned = record
+            .harness_anchor()
+            .or(record.custom_process_identity.as_ref())?;
+        let _ = pid;
+        Some(
+            std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(pinned.starttime_ticks / 100),
+        )
+    }
+}
+
 /// Sessions the Muse runtime names for itself under `root` (#948): the
 /// runtime session json whose `process_generation_hint` is one of the
 /// record's verified runtime pids, and any dated `.session.lock` whose
@@ -158,7 +184,7 @@ fn muse_sessions_for_runtime(root: &Path, record: &AgentRecord) -> Vec<String> {
     let mut ids: Vec<String> = Vec::new();
     for pid in record_runtime_pids(record) {
         if verified_runtime_pid(record, pid) {
-            for id in muse_sessions_for_pid(root, pid) {
+            for id in muse_sessions_for_pid(root, record, pid) {
                 if !ids.contains(&id) {
                     ids.push(id);
                 }
@@ -168,7 +194,8 @@ fn muse_sessions_for_runtime(root: &Path, record: &AgentRecord) -> Vec<String> {
     ids
 }
 
-fn muse_sessions_for_pid(root: &Path, pid: u64) -> Vec<String> {
+fn muse_sessions_for_pid(root: &Path, record: &AgentRecord, pid: u64) -> Vec<String> {
+    let started = runtime_start_time(record, pid);
     let mut ids: Vec<String> = Vec::new();
     let hint = format!("pid={pid}");
     if let Ok(entries) = fs::read_dir(root.join("runtime/muse/sessions")) {
@@ -203,7 +230,16 @@ fn muse_sessions_for_pid(root: &Path, pid: u64) -> Vec<String> {
                             continue;
                         };
                         let names_pid = text.lines().any(|line| line.trim() == hint);
-                        if names_pid {
+                        // A lock older than the runtime process itself
+                        // names a previous owner of the reused pid
+                        // (#1945): never attribute it. Unknown freshness
+                        // fails closed the same way.
+                        let fresh = started.is_some_and(|start| {
+                            fs::metadata(&lock)
+                                .and_then(|metadata| metadata.modified())
+                                .is_ok_and(|modified| modified >= start)
+                        });
+                        if names_pid && fresh {
                             if let Some(id) = session.file_name().to_str() {
                                 if !ids.iter().any(|seen| seen == id) {
                                     ids.push(id.to_owned());
@@ -6889,7 +6925,16 @@ mod discovery_tests {
             ],
             &[("33333333-3333-3333-3333-333333333333", 4242, "/tmp/proj")],
         );
-        let mut ids = muse_sessions_for_pid(&root, 4242);
+        let mut record = rec("/tmp/proj");
+        record.custom_process_identity = Some(crate::client::CustomProcessIdentity {
+            version: 1,
+            boot_id: "11111111-2222-3333-4444-555555555555".into(),
+            pid: 4242,
+            starttime_ticks: 9001,
+            executable_device: 7,
+            executable_inode: 11,
+        });
+        let mut ids = muse_sessions_for_pid(&root, &record, 4242);
         ids.sort();
         assert_eq!(
             ids,
@@ -6898,7 +6943,38 @@ mod discovery_tests {
                 "33333333-3333-3333-3333-333333333333"
             ]
         );
-        assert!(muse_sessions_for_pid(&root, 999).is_empty());
+        assert!(muse_sessions_for_pid(&root, &record, 999).is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pid_keyed_store_rejects_a_lock_older_than_the_runtime() {
+        // #1945: a lock left by the pid's previous owner (reused pid)
+        // names the right number with an old mtime; never attributed.
+        let root = std::env::temp_dir().join(format!("muse-stale-{}", std::process::id()));
+        muse_store(
+            &root,
+            &[],
+            &[("11111111-1111-1111-1111-111111111111", 4242, "/tmp/proj")],
+        );
+        let lock =
+            root.join("sessions/2026/11/06/11111111-1111-1111-1111-111111111111/.session.lock");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&lock)
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap();
+        let mut record = rec("/tmp/proj");
+        record.custom_process_identity = Some(crate::client::CustomProcessIdentity {
+            version: 1,
+            boot_id: "11111111-2222-3333-4444-555555555555".into(),
+            pid: 4242,
+            starttime_ticks: 9001,
+            executable_device: 7,
+            executable_inode: 11,
+        });
+        assert!(muse_sessions_for_pid(&root, &record, 4242).is_empty());
         let _ = fs::remove_dir_all(&root);
     }
 
