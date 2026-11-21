@@ -19,6 +19,18 @@
  * so that the phone declaration is still the first one `cssBlock()` finds.
  */
 @media (min-width: 900px) and (pointer: fine) {
+  /* `#2071 vibe-talk-thread-picker-grid-toggle`: on a desk the thread
+     picker's fixed views are one equal row (the 2x2 grid in
+     18-control-bar.css is the phone default); an odd fifth option does
+     not span. */
+  .thread-picker-fixedbar {
+    grid-template-columns: repeat(var(--fixed-count, 4), minmax(0, 1fr));
+  }
+
+  .thread-picker-fixed:last-child:nth-child(odd) {
+    grid-column: auto;
+  }
+
   /* `#1399 toggle-labels-active-style`: on a desk there is no separate reader row to hide,
      so the Reader box holds Autoplay alone — no Hide reader button is drawn. */
   #reader-toggle {

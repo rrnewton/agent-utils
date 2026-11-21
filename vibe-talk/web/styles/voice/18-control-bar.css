@@ -478,14 +478,6 @@
 .thread-picker-fixed:last-child:nth-child(odd) {
   grid-column: 1 / -1;
 }
-@media (min-width: 900px) and (pointer: fine) {
-  .thread-picker-fixedbar {
-    grid-template-columns: repeat(var(--fixed-count, 4), minmax(0, 1fr));
-  }
-  .thread-picker-fixed:last-child:nth-child(odd) {
-    grid-column: auto;
-  }
-}
 .thread-picker-head {
   flex: none;
   display: flex;
