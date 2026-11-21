@@ -238,6 +238,31 @@ impl From<crate::cache::lifecycle::SwitchError> for ApiError {
     }
 }
 
+/// The routes the test credential may use at all (`#2060` Part B,
+/// deny-by-default after the cold review of 19e8be93): the page's boot
+/// configuration, and the cache-served newest timeline page. Everything
+/// else is refused at the extractor, so a route added tomorrow is
+/// denied until it is listed here. The clone needs exactly these: the
+/// page cannot render without its configuration, and the timeline is
+/// the measured surface. Config routes beyond client-config, every
+/// other read (messages windows, pages, counts, summaries, digest,
+/// activity, search, documents, diagnostics, voices, streams) stay
+/// off the list.
+fn test_read_route_allowed(path: &str) -> bool {
+    path == "/api/v1/client-config"
+        || (path.starts_with("/api/v1/channels/") && path.ends_with("/timeline"))
+}
+
+/// The test credential's route refusal: distinct from an ordinary 403,
+/// so a test report can tell "refused by design" from a broken route.
+fn test_read_route_refused() -> ApiError {
+    ApiError::new(
+        StatusCode::FORBIDDEN,
+        "test_read_route_refused",
+        "the test credential may only use the routes the test allowlist names",
+    )
+}
+
 /// The test credential's speech refusal (`#2060` Part B, B1): distinct, so
 /// a test report can tell "refused by design" from a broken deployment.
 fn test_read_speech_refused() -> ApiError {
@@ -293,7 +318,35 @@ impl axum::extract::FromRequestParts<AppState> for ReadScope {
         parts: &mut axum::http::request::Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        Ok(Self(require(&parts.headers, state, Scope::Read)?))
+        let scope = require(&parts.headers, state, Scope::Read)?;
+        // `#2060` Part B deny-by-default: the test credential is refused
+        // here, before any other extractor runs, on every route the
+        // allowlist does not name.
+        if scope == Scope::TestRead && !test_read_route_allowed(parts.uri.path()) {
+            return Err(test_read_route_refused());
+        }
+        Ok(Self(scope))
+    }
+}
+
+/// A read scope for a speech route: as [`ReadScope`], except the test
+/// credential is refused with the speech refusal. Taken as the first
+/// extractor after `State` so the refusal precedes `Path`, `Query` and
+/// `Json` (#41/#42 scope-first), as the cold review of 19e8be93 required.
+pub struct SpeechScope(pub Scope);
+
+impl axum::extract::FromRequestParts<AppState> for SpeechScope {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let scope = require(&parts.headers, state, Scope::Read)?;
+        if scope == Scope::TestRead {
+            return Err(test_read_speech_refused());
+        }
+        Ok(Self(scope))
     }
 }
 
@@ -2277,15 +2330,11 @@ pub async fn page_freeze(
 /// balance on arbitrary strings.
 pub async fn speak(
     State(state): State<AppState>,
-    ReadScope(caller): ReadScope,
+    SpeechScope(caller): SpeechScope,
     Path((channel_id, message_id)): Path<(String, String)>,
     Query(query): Query<SpeakQuery>,
 ) -> Result<Response, ApiError> {
-    // `#2060` Part B (B1): as in `prepare_speech`, the test credential
-    // never reaches the server's speech providers.
-    if caller == crate::auth::Scope::TestRead {
-        return Err(test_read_speech_refused());
-    }
+    let _ = caller;
     // TIMED IN THREE PARTS, because "reading a message aloud is slow" has three candidate causes
     // and they are fixed by completely different work. Looking up the message is a round trip to
     // DISCORD — this route asks for a whole window and finds one message in it. Generating the
@@ -8103,16 +8152,11 @@ pub struct PrepareSpeechResponse {
 /// - one content-free line records how long each phase took.
 pub async fn prepare_speech(
     State(state): State<AppState>,
-    ReadScope(caller): ReadScope,
+    SpeechScope(caller): SpeechScope,
     Path(channel_id): Path<String>,
     Json(request): Json<PrepareSpeechRequest>,
 ) -> Result<Json<PrepareSpeechResponse>, ApiError> {
-    // `#2060 vibe-talk-realistic-testing` Part B (B1): server-side
-    // read-aloud shares the owner's conversation session, so the test
-    // credential is refused here, distinctly, before any warm-up.
-    if caller == crate::auth::Scope::TestRead {
-        return Err(test_read_speech_refused());
-    }
+    let _ = caller;
     let preparation_began = std::time::Instant::now();
     if state.speech.describe().playback == crate::speech::Playback::Browser {
         return Err(SpeechError::BrowserPlaybackRequired.into());
@@ -10094,14 +10138,11 @@ async fn discuss_summary_text(
 /// `unknown_discuss_summary`, never `unknown_document`.
 pub async fn prepare_document_speech(
     State(state): State<AppState>,
-    ReadScope(caller): ReadScope,
+    SpeechScope(caller): SpeechScope,
     Path(key): Path<String>,
     Json(request): Json<PrepareDocumentSpeechRequest>,
 ) -> Result<Json<PrepareSpeechResponse>, ApiError> {
-    // `#2060` Part B (B1): document speech is server-side speech too.
-    if caller == crate::auth::Scope::TestRead {
-        return Err(test_read_speech_refused());
-    }
+    let _ = caller;
     let preparation_began = std::time::Instant::now();
     if state.speech.describe().playback == crate::speech::Playback::Browser {
         return Err(SpeechError::BrowserPlaybackRequired.into());

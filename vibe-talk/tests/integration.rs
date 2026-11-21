@@ -304,6 +304,9 @@ mod thread_pins;
 #[path = "thread_reads.rs"]
 mod thread_reads;
 
+#[path = "test_read.rs"]
+mod test_read;
+
 #[path = "threads.rs"]
 mod threads;
 

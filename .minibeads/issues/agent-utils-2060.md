@@ -127,6 +127,27 @@ release build of the Part B commit. Statuses and counts only:
   SHA-2 dependency is in the lockfile, so the token is stored as the
   existing Secret type; B3's hash clause is conditional on support.
 
+## Part B -- cold-review fix (deny-by-default)
+
+The cold review of 19e8be93 found the scope allow-by-default. Fixed:
+the test credential is refused at the ReadScope extractor on every
+route an explicit allowlist does not name (client-config and the
+channel timeline only -- what the clone needs), with a distinct
+`test_read_route_refused`; speech routes refuse through a dedicated
+extractor before Path/Query/Json (#41/#42). may_serve is narrowed
+back to write-only, with timeline serving for the test credential
+local to ops::timeline and its refresh claim suppressed; the
+TestRead refusal now precedes the live-fed stand-in (whose thread-list
+refresh reads upstream). Token collisions with voice_token and
+ingest.token are refused at config load; the kill switch fails closed
+and can come from the environment; the access log has a test-read
+class. Tests (tests/test_read.rs): every non-allowlisted route in an
+enumerated table returns 403 with the provider fetch count unchanged,
+the allowlisted timeline refuses rather than fetch when unserved,
+speech/MCP refuse distinctly, and the read token keeps its routes.
+Re-verified on the clone with the fixed binary: same B5 matrix, plus
+diagnostics and messages now answer test_read_route_refused.
+
 # Acceptance Criteria
 
 - Part A: the script above, with the clone verification recorded here.

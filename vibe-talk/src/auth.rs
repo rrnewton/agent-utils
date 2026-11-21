@@ -69,7 +69,15 @@ pub fn scope_of(header: Option<&str>, config: &AuthConfig) -> Option<Scope> {
     // The test credential, unless its kill file exists: checked on every
     // request, so creating the file disables it without a restart.
     if let Some(test) = config.test_token.as_ref() {
-        let killed = test.kill_file.as_deref().is_some_and(|path| path.exists());
+        // Fails closed: a stat that errors for any reason other than the
+        // file's absence counts as killed.
+        let killed = test
+            .kill_file
+            .as_deref()
+            .is_some_and(|path| match std::fs::metadata(path) {
+                Ok(_) => true,
+                Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+            });
         if !killed && test.token.matches(token) {
             return Some(Scope::TestRead);
         }

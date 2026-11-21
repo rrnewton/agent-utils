@@ -552,13 +552,7 @@ pub(crate) async fn messages_for(
 /// the caller's own grant, and a read-scope caller has none — its reads write nothing durable
 /// — so the read token keeps today's upstream path in this milestone, shadowed as ever.
 fn may_serve(state: &AppState, caller: crate::auth::Scope) -> bool {
-    // `#2060 vibe-talk-realistic-testing` Part B: the test credential is
-    // answered from the cache exactly as a write caller is, and never
-    // from the provider (see the refusal in `timeline`).
-    matches!(
-        caller,
-        crate::auth::Scope::Write | crate::auth::Scope::TestRead
-    ) && state.message_cache.serve_enabled()
+    caller == crate::auth::Scope::Write && state.message_cache.serve_enabled()
 }
 
 /// The messages a served snapshot answers with, oldest first and unstamped exactly as the
@@ -1579,7 +1573,12 @@ pub async fn timeline(
         // all the same when the rule serves it, and starts no second refresh: that one corrects
         // it. It used to go upstream beside the refresh, two reads of one page at once, and a
         // provider slow enough to keep the first refresh waiting failed the second as a 502.
-        let serving = may_serve(state, caller);
+        // `#2060` Part B, narrowed after the cold review of 19e8be93: the
+        // test credential may be served here, on this timeline path only
+        // (its route allowlist admits nothing else), and its served page
+        // spawns no refresh (the claim below is filtered for it).
+        let serving = may_serve(state, caller)
+            || (caller == crate::auth::Scope::TestRead && state.message_cache.serve_enabled());
         let claim = serving
             .then(|| {
                 state.message_cache.claim_refresh(RefreshKey::timeline(
@@ -1673,17 +1672,19 @@ pub async fn timeline(
             });
         }
     }
+    // `#2060 vibe-talk-realistic-testing` Part B (B2): everything below
+    // this line can call the chat provider -- including the live-fed
+    // stand-in, whose thread-list refresh reads upstream. A test caller
+    // is refused here, distinctly, rather than fetched for. (Moved
+    // ahead of the stand-in by the cold review of 19e8be93.)
+    if caller == crate::auth::Scope::TestRead {
+        return Err(OpError::TestReadCacheOnly);
+    }
     // `#614 timeline-read-failures`: the thread list and All's counts read of a live-fed channel,
     // from the cache, while an upstream read of the view answered lately or is running.
     if let Some(held) = live_fed_answer(state, caller, &channel.id, request).await {
         crate::cache_first::note(crate::cache_first::Source::LiveFed);
         return stood_in(state, channel, request, held).await;
-    }
-    // `#2060 vibe-talk-realistic-testing` Part B (B2): everything below
-    // this line can call the chat provider. A test caller is refused
-    // here, distinctly, rather than fetched for.
-    if caller == crate::auth::Scope::TestRead {
-        return Err(OpError::TestReadCacheOnly);
     }
     // A step back from a served page offers each provider page it reads as it reads it.
     let fill = served_below

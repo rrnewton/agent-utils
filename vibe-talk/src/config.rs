@@ -34,6 +34,8 @@ pub const ENV_VOICE_TOKEN: &str = "VIBE_TALK_VOICE_TOKEN";
 /// Environment variable carrying the read-only test credential. `#2060
 /// vibe-talk-realistic-testing` Part B.
 pub const ENV_TEST_TOKEN: &str = "VIBE_TALK_TEST_TOKEN";
+/// Environment variable naming the test credential's kill file. `#2060` Part B.
+pub const ENV_TEST_TOKEN_KILL_FILE: &str = "VIBE_TALK_TEST_TOKEN_KILL_FILE";
 /// Environment variable selecting read-aloud: `elevenlabs` (default), `browser`, or `conversation`.
 pub const ENV_READ_ALOUD_BACKEND: &str = "VIBE_TALK_READ_ALOUD_BACKEND";
 /// Environment variable naming the file the Wit.ai app token is read from.
@@ -2540,7 +2542,18 @@ impl Config {
                             .to_owned(),
                     });
                 }
-                let kill_file = match file.auth.test_token_kill_file.as_deref() {
+                if Some(&token) == voice_token.as_ref() {
+                    return Err(ConfigError::Invalid {
+                        field: "auth.test_token".to_owned(),
+                        detail: "must differ from auth.voice_token, or the test credential \
+                                 opens the voice-socket relay"
+                            .to_owned(),
+                    });
+                }
+                let kill_raw = get(ENV_TEST_TOKEN_KILL_FILE)
+                    .map(|value| value.to_string())
+                    .or_else(|| file.auth.test_token_kill_file.clone());
+                let kill_file = match kill_raw.as_deref() {
                     Some(raw) if std::path::Path::new(raw).is_absolute() => {
                         Some(std::path::PathBuf::from(raw))
                     }
@@ -2555,7 +2568,27 @@ impl Config {
                 Ok(TestCredential { token, kill_file })
             })
             .transpose()?;
+        if test_token.is_none()
+            && (get(ENV_TEST_TOKEN_KILL_FILE).is_some() || file.auth.test_token_kill_file.is_some())
+        {
+            return Err(ConfigError::Invalid {
+                field: "auth.test_token_kill_file".to_owned(),
+                detail: "names a kill file but no auth.test_token is configured; the switch \
+                         would silently do nothing"
+                    .to_owned(),
+            });
+        }
         let ingest_token = get(ENV_INGEST_TOKEN).map(Secret::new).or(file.ingest.token);
+        if let (Some(test), Some(ingest)) = (test_token.as_ref(), ingest_token.as_ref()) {
+            if &test.token == ingest {
+                return Err(ConfigError::Invalid {
+                    field: "auth.test_token".to_owned(),
+                    detail: "must differ from ingest.token, or the test credential is \
+                             accepted on the live-ingest routes"
+                        .to_owned(),
+                });
+            }
+        }
         if let Some(token) = ingest_token.as_ref() {
             check_token_strength("ingest.token", token)?;
             if token == &read_token || token == &write_token || Some(token) == voice_token.as_ref()

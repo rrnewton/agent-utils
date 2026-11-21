@@ -47,6 +47,8 @@ pub enum Credential {
     Read,
     /// The write-scope token.
     Write,
+    /// The read-only test credential. `#2060 vibe-talk-realistic-testing` Part B.
+    TestRead,
     /// The adapter-only live-event ingestion token.
     Ingest,
     /// The voice-only token, which opens the voice-socket relay alone. `#553 voice-ws-relay-auth`.
@@ -62,7 +64,8 @@ impl Credential {
     pub fn classify(header: Option<&str>, config: &AuthConfig) -> Self {
         match auth::scope_of(header, config) {
             Some(Scope::Write) => Self::Write,
-            Some(Scope::Read | Scope::TestRead) => Self::Read,
+            Some(Scope::TestRead) => Self::TestRead,
+            Some(Scope::Read) => Self::Read,
             None if auth::bearer_token(header).is_none() => Self::Absent,
             None => Self::Unrecognized,
         }
@@ -94,6 +97,7 @@ impl Credential {
             Self::Unrecognized => "unrecognized",
             Self::Read => "read",
             Self::Write => "write",
+            Self::TestRead => "test-read",
             Self::Ingest => "ingest",
             Self::Voice => "voice",
         }
@@ -111,7 +115,8 @@ impl From<Scope> for Credential {
     /// recognized classes are reachable here.
     fn from(scope: Scope) -> Self {
         match scope {
-            Scope::Read | Scope::TestRead => Self::Read,
+            Scope::Read => Self::Read,
+            Scope::TestRead => Self::TestRead,
             Scope::Write => Self::Write,
         }
     }
