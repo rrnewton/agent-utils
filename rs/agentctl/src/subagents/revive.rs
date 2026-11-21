@@ -3973,6 +3973,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn exit_to_shell_stopping(
         &self,
         agent_name: &str,
@@ -4112,6 +4113,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
     /// stop-tasks choice for operator-confirmed stale tasks (lesson 18),
     /// and optionally relaunching from the profile's current definition
     /// instead of the recorded launch (#1023 agentctl-restart-profile-refresh).
+    #[allow(clippy::too_many_arguments)]
     pub fn restart_stopping(
         &self,
         agent_name: &str,
