@@ -7058,7 +7058,7 @@ mod discovery_tests {
             ],
         );
         // Rewrite one lock as a copied foreign lock (attributes
-        // nothing), the other with no host line at all (predates the
+        // nothing), the other with no host line at all (was written before the field existed, keeping
         // field: pid attribution only, as before #2013).
         for id in [
             "11111111-1111-1111-1111-111111111111",
