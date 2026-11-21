@@ -18,9 +18,12 @@ When a new read-aloud selection supersedes the current turn, the session sends a
 
 While yielding, extend the deadline on any inbound frame, with a hard cap of about 15 s (or a fixed 8-10 s window); keep 3 s only as the bound for complete silence.
 
+Refined by mu-s2s (2026-11-21): `SessionTask` records when the yield began. `interrupt()` sets the deadline to now + 3 s as today; every inbound frame while yielding moves it to min(now + 3 s, yield-start + 15 s). Only the superseded turn's `turn_complete` clears the yield, as today. `expire()` keeps the session-death path and its `Failed{retry:true}` fan-out unchanged; only its reason text distinguishes the silence bound from the cap. Overlap with #2056 (mu-readretry): that branch renames `interrupt(cause)` and adds yield counters; this change keeps the current signature, so a rebase over it is confined to the `interrupt()`/`complete()` bodies. The ack-timeout counter gap (timeouts never reach `complete()`) stays with #2056's follow-up, not this issue.
+
 # Acceptance Criteria
 
 - A slow but live provider is not killed during an interrupt; a silent one still is.
+- The retry-once behaviour for queued/unheard blocks is unchanged.
 - Deterministic tests with a fake provider (condition-based, no wall-clock budgets).
 
 # Notes

@@ -423,6 +423,10 @@ const IDLE_SESSION_TTL: Duration = Duration::from_secs(300);
 /// The provider acknowledges an interrupt as soon as it has queued the cancellation; silence for
 /// this long means the session cannot be trusted with the next message.
 const INTERRUPT_ACK_TIMEOUT: Duration = Duration::from_secs(3);
+/// Longest an interrupted turn may keep yielding while its provider keeps sending frames
+/// (`#2075 read-aloud-interrupt-ack-window`): a live but slow cancel is given room, a provider
+/// that never completes the superseded turn is not.
+const INTERRUPT_ACK_MAX: Duration = Duration::from_secs(15);
 /// Longest a prompt may wait for its first audio before the session is closed and the read is
 /// repeated once on a fresh one.
 ///
@@ -677,6 +681,7 @@ impl ConversationSpeech {
                 yielding: false,
                 yield_cause: None,
                 counters: self.counters.clone(),
+                yield_since: None,
                 pending: VecDeque::new(),
                 retired: VecDeque::new(),
                 deadline: tokio::time::Instant::now() + IDLE_SESSION_TTL,
@@ -853,6 +858,9 @@ struct SessionTask {
     yield_cause: Option<InterruptCause>,
     /// The day's read-aloud counters (`#2056`), shared with `healthz`.
     counters: Option<Arc<crate::speech_tickets::ReadAloudCounters>>,
+    /// When the current yield began; live frames extend its deadline up to
+    /// `INTERRUPT_ACK_MAX` from here. `None` unless `yielding`.
+    yield_since: Option<tokio::time::Instant>,
     pending: VecDeque<ReadCommand>,
     retired: VecDeque<String>,
     /// When the current phase gives up: idle expiry, the first-audio or turn limit, or the
@@ -959,10 +967,21 @@ impl SessionTask {
     }
 
     async fn interrupt(&mut self, cause: InterruptCause) -> Result<(), Ending> {
+        let now = tokio::time::Instant::now();
         self.yielding = true;
         self.yield_cause = Some(cause);
-        self.deadline = tokio::time::Instant::now() + INTERRUPT_ACK_TIMEOUT;
+        self.yield_since = Some(now);
+        self.deadline = now + INTERRUPT_ACK_TIMEOUT;
         self.send_frame(&VibeTalkV1ClientFrame::Interrupt).await
+    }
+
+    /// A frame from the superseded turn proves its provider is still working on the cancel:
+    /// give it another silence bound, but never past the hard cap from the interrupt.
+    fn note_yield_frame(&mut self) {
+        if let Some(since) = self.yield_since {
+            let now = tokio::time::Instant::now();
+            self.deadline = (now + INTERRUPT_ACK_TIMEOUT).min(since + INTERRUPT_ACK_MAX);
+        }
     }
 
     /// The HTTP response went away (the reader stopped, or the browser dropped the request).
@@ -1013,6 +1032,9 @@ impl SessionTask {
             None => return Err(Ending::Failed("the provider closed the session".to_owned())),
         };
         self.unanswered_ping = false;
+        if self.yielding {
+            self.note_yield_frame();
+        }
         match message {
             Message::Binary(chunk) => {
                 // With no current turn the chunk belongs to one nobody is listening to any more.
@@ -1138,6 +1160,7 @@ impl SessionTask {
             "read-aloud turn ended"
         );
         self.yielding = false;
+        self.yield_since = None;
         self.advance().await
     }
 
@@ -1157,10 +1180,21 @@ impl SessionTask {
 
     fn expire(&mut self) -> Result<(), Ending> {
         if self.yielding {
-            return Err(Ending::Failed(format!(
-                "the interrupted read was not acknowledged within {} seconds",
-                INTERRUPT_ACK_TIMEOUT.as_secs()
-            )));
+            let capped = self
+                .yield_since
+                .is_some_and(|since| since.elapsed() >= INTERRUPT_ACK_MAX);
+            return Err(Ending::Failed(if capped {
+                format!(
+                    "the interrupted read was still not acknowledged after {} seconds, \
+                     though its provider kept sending frames",
+                    INTERRUPT_ACK_MAX.as_secs()
+                )
+            } else {
+                format!(
+                    "the interrupted read was not acknowledged within {} seconds",
+                    INTERRUPT_ACK_TIMEOUT.as_secs()
+                )
+            }));
         }
         if let Some(turn) = self.current.take() {
             // Unheard, the prompt got no answer at all, so this session is abandoned and the read

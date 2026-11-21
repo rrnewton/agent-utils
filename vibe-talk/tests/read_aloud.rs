@@ -447,6 +447,128 @@ async fn an_unacknowledged_interrupt_is_bounded_and_the_next_read_reconnects() {
     server.await.expect("server exits");
 }
 
+/// One live frame from the superseded turn, sent after a wait.
+async fn live_frame(socket: &mut bridge::Socket, wait: Duration) {
+    tokio::time::sleep(wait).await;
+    let _ = socket.send(Message::Binary(vec![9, 9].into())).await;
+}
+
+#[tokio::test]
+async fn a_slow_but_live_provider_is_not_killed_during_an_interrupt() {
+    let (listener, url) = bridge::listen().await;
+    let server = tokio::spawn(async move {
+        // ONE accept: frames every 2 s keep the yield alive past the 3 s silence bound.
+        let mut socket = bridge::accept(&listener).await;
+        bridge::expect_prompt(&mut socket, "interrupt this message").await;
+        bridge::pcm(&mut socket, &[3, 3]).await;
+        bridge::expect_interrupt(&mut socket).await;
+        // Frames every 500 ms for 4 s: past the 3 s silence bound, each well inside it.
+        for _ in 0..8 {
+            live_frame(&mut socket, Duration::from_millis(500)).await;
+        }
+        bridge::complete(&mut socket, 1, true).await;
+        bridge::serve(&mut socket, "clean second message", &[4, 4], 2).await;
+        bridge::no_more_connections(&listener).await;
+    });
+    let provider = provider(&url);
+    let mut first = provider
+        .speak_stream_for_selection("interrupt this message", None, Some("tap-a"))
+        .await
+        .expect("starts the first read");
+    assert!(first.chunks.next().await.is_some());
+    let first_generation = first.session.expect("first session").generation;
+    let second = tokio::time::timeout(
+        Duration::from_secs(15),
+        provider.speak_stream_for_selection("clean second message", None, Some("tap-b")),
+    )
+    .await
+    .expect("the second read did not begin")
+    .expect("reuses the interrupted session");
+    let session = second.session.expect("second session");
+    assert_eq!(
+        session.generation, first_generation,
+        "a live provider's session was killed during the interrupt"
+    );
+    assert!(!session.retried, "the second read was retried: {session:?}");
+    assert_eq!(collect(second).await, vec![vec![4, 4]]);
+    server.await.expect("one session served the switch");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_silent_provider_is_still_killed_during_an_interrupt() {
+    let (listener, url) = bridge::listen().await;
+    let server = tokio::spawn(async move {
+        let mut silent = bridge::accept(&listener).await;
+        bridge::expect_prompt(&mut silent, "first message").await;
+        bridge::pcm(&mut silent, &[1, 1]).await;
+        bridge::expect_interrupt(&mut silent).await;
+        // Complete silence: the next connection is the retry on a fresh session.
+        let mut fresh = bridge::accept(&listener).await;
+        bridge::serve(&mut fresh, "second message", &[2, 2], 1).await;
+        drop(silent);
+    });
+    let provider = provider(&url);
+    let mut first = provider
+        .speak_stream_for_selection("first message", None, Some("tap-a"))
+        .await
+        .expect("first read");
+    assert!(first.chunks.next().await.is_some());
+    let second = tokio::time::timeout(
+        Duration::from_secs(30),
+        provider.speak_stream_for_selection("second message", None, Some("tap-b")),
+    )
+    .await
+    .expect("the silent interrupt was not bounded")
+    .expect("second read on a fresh session");
+    let session = second.session.expect("session");
+    assert_eq!(session.generation, 2, "the silent session was reused");
+    assert!(
+        session.retried,
+        "the queued read was not retried: {session:?}"
+    );
+    assert_eq!(collect(second).await, vec![vec![2, 2]]);
+    server.await.expect("server exits");
+}
+
+#[tokio::test]
+async fn live_frames_do_not_extend_an_interrupt_past_the_hard_cap() {
+    let (listener, url) = bridge::listen().await;
+    let server = tokio::spawn(async move {
+        let mut socket = bridge::accept(&listener).await;
+        bridge::expect_prompt(&mut socket, "first message").await;
+        bridge::pcm(&mut socket, &[1, 1]).await;
+        bridge::expect_interrupt(&mut socket).await;
+        // Frames every 500 ms for 18 s, never completing: the cap must still kill the session.
+        for _ in 0..36 {
+            live_frame(&mut socket, Duration::from_millis(500)).await;
+        }
+        let mut fresh = bridge::accept(&listener).await;
+        bridge::serve(&mut fresh, "second message", &[2, 2], 1).await;
+        drop(socket);
+    });
+    let provider = provider(&url);
+    let mut first = provider
+        .speak_stream_for_selection("first message", None, Some("tap-a"))
+        .await
+        .expect("first read");
+    assert!(first.chunks.next().await.is_some());
+    let second = tokio::time::timeout(
+        Duration::from_secs(40),
+        provider.speak_stream_for_selection("second message", None, Some("tap-b")),
+    )
+    .await
+    .expect("the interrupt was not capped")
+    .expect("second read on a fresh session");
+    let session = second.session.expect("session");
+    assert_eq!(session.generation, 2, "the capped session was reused");
+    assert!(
+        session.retried,
+        "the queued read was not retried: {session:?}"
+    );
+    assert_eq!(collect(second).await, vec![vec![2, 2]]);
+    server.await.expect("server exits");
+}
+
 #[tokio::test]
 async fn a_socket_that_accepts_the_prompt_and_then_drops_is_retried_once() {
     let (listener, url) = bridge::listen().await;
