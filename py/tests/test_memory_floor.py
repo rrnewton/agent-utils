@@ -135,3 +135,11 @@ def test_cli_nan_need_exits_2(tmp_path: Path) -> None:
                   "--config", str(_config(tmp_path, "")),
                   "--meminfo", str(_meminfo(tmp_path, 200.0, 100.0)))
     assert result.returncode == 2, result.stdout + result.stderr
+
+
+def test_never_admissible_flag(tmp_path: Path) -> None:
+    cfg = mf.load_config(str(_config(tmp_path, "")))
+    info = _meminfo(tmp_path, 200.0, 190.0)
+    # 200 total, heavy floor 64: a 137 GiB need can never fit.
+    assert mf.check("heavy", 137.0, cfg, str(info))["never_admissible"] is True
+    assert mf.check("heavy", 136.0, cfg, str(info))["never_admissible"] is False

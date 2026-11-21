@@ -350,6 +350,7 @@ import json
 import math
 import os
 import re
+import resource
 import shlex
 import shutil
 import signal
@@ -1425,6 +1426,12 @@ def defer_poll_s() -> float:
 #: ledger peak exists: heavy is the agreed 32 GiB, light a single step.
 MEMORY_NEED_COLD_GIB = {"heavy": 32.0, "light": 8.0}
 
+#: Measured-peak need window (#2062 decay): the last this many gates'
+#: peaks feed the percentile, and the estimate never exceeds this
+#: fraction of MemTotal.
+MEMORY_PEAK_WINDOW = 50
+MEMORY_PEAK_TOTAL_FRACTION = 0.5
+
 
 _MEMORY_FLOOR_MODULE: ModuleType | None = None
 
@@ -1484,19 +1491,31 @@ def memory_need_gib(args: argparse.Namespace, cls: str) -> tuple[float, str]:
     raw_max = os.environ.get("GATE_MEMORY_MAX_GIB")
     if raw_max:
         return _finite_need(raw_max, "$GATE_MEMORY_MAX_GIB"), "MemoryMax"
+    # Measured peaks only, from a bounded recent window (#2062 decay
+    # follow-up): recorded NEEDS are never read back (a need gate.py
+    # itself wrote once ratcheted the host's need up forever), and one
+    # old giant scrolls out. The estimate is the 90th percentile of
+    # the last MEMORY_PEAK_WINDOW peaks, capped at half of MemTotal
+    # so a poisoned window still leaves a gate that can start.
     try:
         peaks = []
         for line in ledger_path(getattr(args, "ledger", None)).read_text().splitlines():
             try:
-                row = json.loads(line)
-                peak = row.get("memory_peak_gib", row.get("memory_need_gib"))
+                peak = json.loads(line).get("memory_peak_gib")
             except json.JSONDecodeError:
                 continue
             if (isinstance(peak, (int, float)) and not isinstance(peak, bool)
-                    and math.isfinite(peak)):
+                    and math.isfinite(peak) and peak > 0):
                 peaks.append(float(peak))
         if peaks:
-            return max(peaks), "measured peak (ledger)"
+            window = sorted(peaks[-MEMORY_PEAK_WINDOW:])
+            estimate = window[math.ceil(0.9 * len(window)) - 1]
+            try:
+                _avail, total = _memory_floor().read_meminfo()
+                estimate = min(estimate, MEMORY_PEAK_TOTAL_FRACTION * total)
+            except Exception:
+                pass  # no readable meminfo: the percentile stands alone
+            return estimate, "measured peaks, recent window (ledger)"
     except OSError:
         pass
     return MEMORY_NEED_COLD_GIB[cls], f"cold-start default ({cls})"
@@ -1532,6 +1551,47 @@ def _memory_error_persist_s() -> float:
         if value > 0:
             return value
     return 300.0
+
+
+def _scope_peak_gib(run_id: str) -> float | None:
+    """The admitted run's own cgroup memory.peak (#2062 decay).
+
+    The gate's command runs in a systemd scope (agent-utils-gate-<id>);
+    its cgroup peak counts every child at once, which a largest-child
+    RSS cannot. Read it just after the command ends, before the scope
+    is reaped; any failure returns None and the caller falls back."""
+    try:
+        shown = subprocess.run(
+            ["systemctl", "--user", "show", f"agent-utils-gate-{run_id}.scope",
+             "-p", "ControlGroup", "--value"],
+            capture_output=True, text=True, timeout=10)
+        group = shown.stdout.strip()
+        if shown.returncode != 0 or not group:
+            return None
+        peak = Path("/sys/fs/cgroup", group.lstrip("/"), "memory.peak")
+        return round(int(peak.read_text().strip()) / (1024.0 ** 3), 3)
+    except Exception:
+        return None
+
+
+def _group_rss_gib(pgid: int) -> float:
+    """Sum of live RSS over one process group (#2062 decay fallback):
+    children sampled while the gate runs, so simultaneous children
+    count together, unlike the largest single child's RSS."""
+    total_kib = 0.0
+    for entry in Path("/proc").glob("[0-9]*"):
+        try:
+            stat = (entry / "stat").read_text()
+            fields = stat[stat.rfind(")") + 2:].split()
+            if int(fields[2]) != pgid:  # pgrp is field 5, index 2 here
+                continue
+            for line in (entry / "status").read_text().splitlines():
+                if line.startswith("VmRSS:"):
+                    total_kib += float(line.split()[1])
+                    break
+        except Exception:
+            continue
+    return total_kib / (1024.0 * 1024.0)
 
 
 def _wait_memory_floor(cls: str, need_gib: float, need_source: str,
@@ -1571,6 +1631,15 @@ def _wait_memory_floor(cls: str, need_gib: float, need_source: str,
                   flush=True)
             error_since = None
             error_noted = None
+        if verdict.get("never_admissible"):
+            # A need above MemTotal - floor can never fit: waiting
+            # would be forever (and floor time has no timeout). Admit
+            # with the warning loud in the log instead.
+            print(f"gate: warning: memory need {need_gib:g} GiB ({need_source}, class={cls}) "
+                  f"exceeds MemTotal {verdict['mem_total_gib']} GiB minus the "
+                  f"{verdict['floor_gib']} GiB floor and can never be admitted; "
+                  "starting anyway rather than wait forever (#2062)", flush=True)
+            return time.time() - waited_from, ever
         if verdict["admit"]:
             if ever:
                 print("gate: memory floor admits this gate; continuing (#2062)", flush=True)
@@ -2953,6 +3022,7 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
     # #2078: this gate's durable step-log directory, outside the worktree.
     log_dir = gate_log_dir(run_id)
     print(f"gate: step logs kept in {log_dir} (recorded in the ledger, #2078)", flush=True)
+    rss_peak_gib = 0.0
     try:
         for sig in _ABORT_SIGNALS:
             signal.signal(sig, _raise_aborted)
@@ -2969,7 +3039,13 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
             preexec_fn=os.setpgrp,
         )
         assert proc.stdout is not None
+        rss_sampled_at = 0.0
         for line in proc.stdout:
+            # #2062 decay fallback sample: summed live RSS of the whole
+            # process group, a few times a minute at most.
+            if time.time() - rss_sampled_at > 5.0:
+                rss_sampled_at = time.time()
+                rss_peak_gib = max(rss_peak_gib, _group_rss_gib(proc.pid))
             sys.stdout.write(line)
             if line.strip():
                 last_line = line
@@ -2993,6 +3069,22 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
         finished = time.time()
+        # #2062 decay: the run's measured peak is the only peak the
+        # next need estimate may read back. Prefer the scope cgroup's
+        # memory.peak (every child at once); fall back to the sampled
+        # sum of child RSS, then to the largest child's RSS. The
+        # ledger says which source measured it.
+        mem_peak_gib = _scope_peak_gib(run_id)
+        mem_peak_source = "cgroup-peak" if mem_peak_gib is not None else None
+        if mem_peak_gib is None and rss_peak_gib > 0:
+            mem_peak_gib, mem_peak_source = round(rss_peak_gib, 3), "children-rss-sum"
+        if mem_peak_gib is None:
+            try:
+                mem_peak_gib = round(
+                    resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / (1024.0 * 1024.0), 3)
+                mem_peak_source = "children-max-rss"
+            except Exception:
+                mem_peak_gib = None
         adm.finish(run_id)
         adm.record({"id": run_id, "class": args.cls, "command": command,
                     "queued_at": queued_at, "started_at": started,
@@ -3004,7 +3096,9 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
                     "defer_waiting": defer_ever, "defer_wait_s": round(defer_wait_s, 2),
                     "memory_waiting": memory_ever, "memory_wait_s": round(memory_wait_s, 2),
                     "memory_class": mem_cls, "memory_need_gib": mem_need,
-                    "log_path": str(log_dir)})
+                    "log_path": str(log_dir),
+                    "memory_peak_gib": mem_peak_gib,
+                    "memory_peak_source": mem_peak_source})
         # After the slot is released, so no other gate waits on it (#940). A
         # nested gate leaves it to its parent, which is still building.
         prune_gate_logs()
@@ -3021,7 +3115,8 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
                        defer_waiting=defer_ever, defer_wait_s=defer_wait_s,
                        memory_waiting=memory_ever, memory_wait_s=memory_wait_s,
                        memory_class=mem_cls, memory_need_gib=mem_need,
-                       log_path=str(log_dir))
+                       log_path=str(log_dir),
+                       memory_peak_gib=mem_peak_gib, memory_peak_source=mem_peak_source)
     return rc
 
 
@@ -3109,6 +3204,8 @@ def _record_ledger(
     memory_class: str | None = None,
     memory_need_gib: float | None = None,
     log_path: str | None = None,
+    memory_peak_gib: float | None = None,
+    memory_peak_source: str | None = None,
 ) -> None:
     """Append one durable ledger line for the finished run (#827). Best effort:
     a ledger failure must never change the gate's own result. `queued_utc` and
@@ -3158,6 +3255,8 @@ def _record_ledger(
             "memory_class": memory_class,
             "memory_need_gib": memory_need_gib,
             "log_path": log_path,
+            "memory_peak_gib": memory_peak_gib,
+            "memory_peak_source": memory_peak_source,
             "target_bytes_before": (pruned or {}).get("target_bytes_before"),
             "target_bytes_after": (pruned or {}).get("target_bytes_after"),
             "host_bytes_before": (pruned or {}).get("host_bytes_before"),

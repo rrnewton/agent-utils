@@ -184,6 +184,10 @@ def check(cls: str, need_gib: float, config: FloorConfig | None = None,
     return {"class": cls, "need_gib": need_gib, "floor_gib": round(floor, 3),
             "mem_available_gib": round(available, 3),
             "mem_total_gib": round(total, 3), "admit": margin >= 0,
+            # A need larger than MemTotal - floor can never be admitted;
+            # callers must not wait forever on it (they admit with a
+            # logged warning instead).
+            "never_admissible": need_gib > total - floor,
             "margin_gib": round(margin, 3), "source": cfg.source}
 
 

@@ -2641,3 +2641,48 @@ def test_gate_memory_need_refuses_non_finite(tmp_path: Path, raw: str) -> None:
     args = type("A", (), {"memory_need_gib": raw, "ledger": None})()
     with pytest.raises(ValueError):
         gate.memory_need_gib(args, "heavy")
+
+
+def _peaks_ledger(tmp_path: Path, rows: list[dict[str, object]]) -> Path:
+    ledger = tmp_path / "peaks-ledger.jsonl"
+    ledger.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    return ledger
+
+
+def test_measured_need_decays_and_never_reads_recorded_needs(tmp_path: Path) -> None:
+    """#2062 decay: needs gate.py recorded are never read back; only
+    measured peaks, in a bounded recent window, feed the estimate."""
+    gate = _gate_module()
+    giant_need = [{"memory_need_gib": 900.0, "memory_peak_gib": None}]
+    args = type("A", (), {"memory_need_gib": None,
+                          "ledger": str(_peaks_ledger(tmp_path, giant_need))})()
+    need, source = gate.memory_need_gib(args, "light")
+    assert need == 8.0 and "cold-start" in source  # the 900 GiB need is ignored
+    rows = [{"memory_peak_gib": 100.0}] + [{"memory_peak_gib": 10.0}] * 60
+    args = type("A", (), {"memory_need_gib": None,
+                          "ledger": str(_peaks_ledger(tmp_path, rows))})()
+    need, source = gate.memory_need_gib(args, "heavy")
+    # The old 100 GiB peak scrolled out of the last-50 window; p90 of 10s.
+    assert need == 10.0 and "recent window" in source
+
+
+def test_measured_need_capped_at_half_of_memtotal(tmp_path: Path) -> None:
+    gate = _gate_module()
+    rows = [{"memory_peak_gib": 500.0}] * 5
+    args = type("A", (), {"memory_need_gib": None,
+                          "ledger": str(_peaks_ledger(tmp_path, rows))})()
+    need, _source = gate.memory_need_gib(args, "heavy")
+    # The fixture meminfo totals 200 GiB, so the cap is 100 GiB.
+    assert need == 100.0
+
+
+def test_a_need_that_can_never_fit_admits_with_a_warning(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """#2062: need > MemTotal - floor must not wait forever."""
+    gate = _gate_module()
+    (tmp_path / "memory-floor.toml").write_text("poll_s = 0.05\n")
+    _meminfo_file(tmp_path, 200.0, 190.0)
+    monkeypatch.setenv("MEMORY_FLOOR_CONFIG", str(tmp_path / "memory-floor.toml"))
+    waited, ever = gate._wait_memory_floor("heavy", 500.0, "test", 0.05)
+    assert waited < 5 and ever is False
+    assert "can never be admitted; starting anyway" in capsys.readouterr().out
