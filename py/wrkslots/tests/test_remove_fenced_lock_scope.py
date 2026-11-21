@@ -339,8 +339,15 @@ def test_private_finish_compare_fails_closed_without_sidecar(
 
     The canonical compare expands both sides; if the sidecar file a
     journal points at is gone, expansion refuses and the reload must
-    not treat the journals as the same.
+    not treat the journals as the same. The direct compare call makes
+    this test sensitive to a compare that always answers equal or an
+    expansion that treats a missing sidecar as nothing: the reload on
+    its own never reaches the compare, because journal loading expands
+    sidecars while validating shape and refuses first. Both faults
+    leave the direct call returning ``True`` instead of raising.
     """
+
+    import json
 
     project, _repository, _remote = make_project(tmp_path)
     assert create(project).returncode == 0
@@ -368,8 +375,11 @@ def test_private_finish_compare_fails_closed_without_sidecar(
     wrkslots._write_journal(config, payload, journal_path=path)
     sidecars = list((config.control / "containing-refs").glob("*.json"))
     assert sidecars, "the payload never sidecarred its inventory"
+    shrunk = json.loads(path.read_text(encoding="utf-8"))
     for sidecar in sidecars:
         sidecar.unlink()
+    with pytest.raises(wrkslots.StateError, match="sidecar"):
+        wrkslots._finish_journals_equal(config, shrunk, payload)
     prepared = wrkslots._PreparedPrivateFinish(record, payload, path)
     with pytest.raises((wrkslots.Refusal, wrkslots.StateError)):
         wrkslots._load_prepared_private_finish(config, prepared)
