@@ -91,6 +91,195 @@ pub struct WakeRecord {
     pub unit: Option<String>,
 }
 
+/// Who asked for a `team act` request, proved from process ancestry
+/// when an agent, never from an environment claim.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RequesterRecord {
+    /// `agent` for a proved registered caller, else `other`.
+    pub kind: String,
+    /// Agent name, or the sender-header other label (`human@host`, ...).
+    pub label: String,
+}
+
+/// One allowlisted `team act` action. Typed end to end: no free-form
+/// shell, unit, or argument string ever reaches an effect.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "action", rename_all = "kebab-case")]
+pub enum TeamAction {
+    /// Rebuild and return the current manifest; no effect.
+    Facts,
+    /// Revive one desired agent with a recorded native session.
+    Revive {
+        /// Registered agent to revive.
+        agent: String,
+    },
+    /// Start one configured unit.
+    StartUnit {
+        /// Configured unit name.
+        unit: String,
+    },
+    /// Reset-failed, then start, one configured unit.
+    ResetUnit {
+        /// Configured unit name.
+        unit: String,
+    },
+    /// Drain one agent's queued prompts once its pane is at a prompt.
+    Drain {
+        /// Registered agent whose queue drains.
+        agent: String,
+    },
+    /// Guarded process kill with every identity expectation required.
+    KillPid {
+        /// Process to signal.
+        pid: u32,
+        /// Expected command-line substring.
+        expect_cmdline: String,
+        /// Expected `/proc` start time, exactly as read.
+        expect_start: String,
+        /// Boot the expectations were read in.
+        boot_id: String,
+        /// Signal name or number; the effects layer supplies its default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signal: Option<String>,
+    },
+    /// Run the full verify and require the explicit YES judgement.
+    DeclareDone,
+    /// Escalate bounded operator text through the usual routes.
+    Escalate {
+        /// Operator text, at most 1000 chars.
+        text: String,
+    },
+}
+
+impl TeamAction {
+    /// The closed action name used in receipts and details.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Facts => "facts",
+            Self::Revive { .. } => "revive",
+            Self::StartUnit { .. } => "start-unit",
+            Self::ResetUnit { .. } => "reset-unit",
+            Self::Drain { .. } => "drain",
+            Self::KillPid { .. } => "kill-pid",
+            Self::DeclareDone => "declare-done",
+            Self::Escalate { .. } => "escalate",
+        }
+    }
+}
+
+/// Schema of one durable `team act` request file.
+pub const ACT_REQUEST_SCHEMA: &str = "agentctl-team-act-request/v1";
+
+/// The terminal half of a request file and its state-record mirror.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ActionReceipt {
+    /// Terminal status: done, failed, refused, or unknown.
+    pub status: String,
+    /// One closed detail line.
+    pub detail: String,
+    /// Whole-verify result after the effect, when one ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_ok: Option<bool>,
+    /// Explicit per-team YES judgement after the effect, when judged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explicit_yes: Option<bool>,
+    /// Unix seconds execution began.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<f64>,
+    /// Unix seconds execution finished.
+    pub finished_at: f64,
+    /// Process exit the requesting CLI reports.
+    pub exit_code: i32,
+}
+
+/// One create-only request under `actions/`, its terminal receipt
+/// written back before the state record mirrors it. The files are the
+/// durable idempotence ledger if an older writer ever rewrites state.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ActionRequestFile {
+    /// Always [`ACT_REQUEST_SCHEMA`].
+    pub schema: String,
+    /// Incident the request is bound to.
+    pub incident: String,
+    /// Driver epoch as recorded in state at enqueue.
+    pub epoch: Value,
+    /// Caller-chosen idempotence slug, unique per incident.
+    pub request_id: String,
+    /// The typed action as canonical JSON.
+    pub action: Value,
+    /// SHA-256 of the canonical request fields.
+    pub action_sha256: String,
+    /// Validate and record only; run no effect.
+    pub dry_run: bool,
+    /// Who asked, proved from ancestry when an agent.
+    pub requester: RequesterRecord,
+    /// Unix seconds the request was enqueued.
+    pub requested_at: f64,
+    /// Terminal receipt, written back before state mirrors it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<ActionReceipt>,
+}
+
+/// One action's state-record mirror: enough to dedupe, resume, and
+/// answer a poll without re-reading its request file.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ActionRecord {
+    /// Caller-chosen idempotence slug, unique per incident.
+    pub request_id: String,
+    /// Incident the request is bound to.
+    pub incident: String,
+    /// Driver epoch it was bound to at enqueue.
+    pub epoch: Value,
+    /// The typed action as canonical JSON.
+    pub action: Value,
+    /// SHA-256 of the canonical request fields.
+    pub action_sha256: String,
+    /// Validate and record only; run no effect.
+    pub dry_run: bool,
+    /// Who asked, proved from ancestry when an agent.
+    pub requester: RequesterRecord,
+    /// queued, running, done, failed, refused, or unknown.
+    pub status: String,
+    /// Unix seconds the request was enqueued.
+    pub requested_at: f64,
+    /// Unix seconds execution began.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<f64>,
+    /// Unix seconds execution finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<f64>,
+    /// One closed detail line for the current status.
+    pub detail: String,
+    /// Whole-verify result after the effect, when one ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_ok: Option<bool>,
+    /// Explicit per-team YES judgement after the effect, when judged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explicit_yes: Option<bool>,
+    /// Process exit the requesting CLI reports when terminal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+}
+
+/// The outcome one concrete action execution returns to the core.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ActionOutcome {
+    /// `done`, `failed`, `refused`, or `unknown`.
+    pub status: String,
+    /// One closed detail line; no free-form effect output.
+    pub detail: String,
+    /// Escalation delivery bookkeeping for an escalate action.
+    pub escalation: Option<EscalationOutcome>,
+}
+
+fn done_outcome(detail: &str) -> ActionOutcome {
+    ActionOutcome {
+        status: "done".to_owned(),
+        detail: detail.to_owned(),
+        escalation: None,
+    }
+}
+
 /// The persisted driver record: model snapshot plus concrete deadlines
 /// and receipts the abstract machine deliberately does not carry.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -134,6 +323,14 @@ pub struct DriverRecord {
     pub wake: WakeRecord,
     /// Latest effect or load error, for the next reader.
     pub last_error: Option<String>,
+    /// The whole latest recovery manifest, once a `team act` validation
+    /// or verify-after built one (bounded, token-free by construction).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<Value>,
+    /// This incident's `team act` receipts, mirrored from the durable
+    /// per-request files under `actions/`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<ActionRecord>,
     /// Unix seconds this record was last written.
     pub updated_at: f64,
 }
@@ -214,6 +411,8 @@ impl DriverRecord {
                 ..WakeRecord::default()
             },
             last_error: None,
+            manifest: None,
+            actions: Vec::new(),
             updated_at: now,
         }
     }
@@ -311,6 +510,342 @@ pub fn save_record(directory: &Path, record: &mut DriverRecord, now: f64) -> Res
         .map_err(|error| fail(error.to_string()))
 }
 
+/// Whether `request_id` can name one request file: a bounded slug, so
+/// it is always one filename component and one poll key.
+pub fn valid_request_id(request_id: &str) -> bool {
+    !request_id.is_empty()
+        && request_id.len() <= 128
+        && !matches!(request_id, "." | "..")
+        && request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+/// Bounds on the free-form fields a typed action carries, checked at
+/// enqueue and again at fold time so a hand-written request file cannot
+/// smuggle an unbounded payload past the CLI.
+fn validate_action_shape(action: &TeamAction) -> Result<()> {
+    let bounded = |label: &str, value: &str, max: usize| {
+        if value.is_empty() || value.chars().count() > max {
+            return Err(fail(format!("{label} must be 1..={max} chars")));
+        }
+        Ok(())
+    };
+    match action {
+        TeamAction::Facts | TeamAction::DeclareDone => Ok(()),
+        TeamAction::Revive { agent } | TeamAction::Drain { agent } => {
+            crate::subagents::name(agent).map(|_| ())
+        }
+        TeamAction::StartUnit { unit } | TeamAction::ResetUnit { unit } => {
+            bounded("unit", unit, 256)
+        }
+        TeamAction::KillPid {
+            pid,
+            expect_cmdline,
+            expect_start,
+            boot_id,
+            signal,
+        } => {
+            if *pid == 0 {
+                return Err(fail("kill-pid pid must be non-zero"));
+            }
+            bounded("expect_cmdline", expect_cmdline, 256)?;
+            bounded("expect_start", expect_start, 128)?;
+            bounded("boot_id", boot_id, 128)?;
+            if let Some(signal) = signal {
+                bounded("signal", signal, 32)?;
+            }
+            Ok(())
+        }
+        TeamAction::Escalate { text } => bounded("escalate text", text, 1000),
+    }
+}
+
+fn action_sha256(
+    incident: &str,
+    epoch: &Value,
+    request_id: &str,
+    action: &Value,
+    dry_run: bool,
+    requester: &RequesterRecord,
+) -> String {
+    let document = serde_json::json!({
+        "incident": incident,
+        "epoch": epoch,
+        "request_id": request_id,
+        "action": action,
+        "dry_run": dry_run,
+        "requester": requester,
+    });
+    format!("{:x}", Sha256::digest(document.to_string().as_bytes()))
+}
+
+/// Build one validated request file document for [`enqueue_action`].
+pub fn new_action_request(
+    incident: &str,
+    epoch: Value,
+    request_id: &str,
+    action: &TeamAction,
+    dry_run: bool,
+    requester: RequesterRecord,
+    requested_at: f64,
+) -> Result<ActionRequestFile> {
+    if !valid_request_id(request_id) {
+        return Err(fail(
+            "request id must be a bounded slug (letters, digits, '-', '_', '.')",
+        ));
+    }
+    validate_action_shape(action)?;
+    let action = serde_json::to_value(action).map_err(|error| fail(error.to_string()))?;
+    let action_sha256 = action_sha256(incident, &epoch, request_id, &action, dry_run, &requester);
+    Ok(ActionRequestFile {
+        schema: ACT_REQUEST_SCHEMA.to_owned(),
+        incident: incident.to_owned(),
+        epoch,
+        request_id: request_id.to_owned(),
+        action,
+        action_sha256,
+        dry_run,
+        requester,
+        requested_at,
+        receipt: None,
+    })
+}
+
+fn actions_dir(directory: &Path) -> PathBuf {
+    directory.join("actions")
+}
+
+fn action_request_path(directory: &Path, incident: &str, request_id: &str) -> PathBuf {
+    actions_dir(directory).join(format!("{incident}-{request_id}.json"))
+}
+
+fn read_action_request(path: &Path) -> Option<ActionRequestFile> {
+    let mut text = String::new();
+    File::open(path)
+        .and_then(|file| file.take(1 << 20).read_to_string(&mut text))
+        .ok()?;
+    let file: ActionRequestFile = serde_json::from_str(&text).ok()?;
+    if file.schema != ACT_REQUEST_SCHEMA
+        || !valid_request_id(&file.request_id)
+        || file.action_sha256
+            != action_sha256(
+                &file.incident,
+                &file.epoch,
+                &file.request_id,
+                &file.action,
+                file.dry_run,
+                &file.requester,
+            )
+    {
+        return None;
+    }
+    serde_json::from_value::<TeamAction>(file.action.clone())
+        .ok()
+        .filter(|action| validate_action_shape(action).is_ok())?;
+    Some(file)
+}
+
+/// Create one request file, or find the identical one already there.
+/// The same request id naming a different action is a conflict, never
+/// an overwrite.
+pub fn enqueue_action(directory: &Path, request: &ActionRequestFile) -> Result<PathBuf> {
+    let typed: TeamAction = serde_json::from_value(request.action.clone())
+        .map_err(|error| fail(format!("invalid action: {error}")))?;
+    validate_action_shape(&typed)?;
+    if request.schema != ACT_REQUEST_SCHEMA || !valid_request_id(&request.request_id) {
+        return Err(fail("invalid team act request"));
+    }
+    if request.action_sha256
+        != action_sha256(
+            &request.incident,
+            &request.epoch,
+            &request.request_id,
+            &request.action,
+            request.dry_run,
+            &request.requester,
+        )
+    {
+        return Err(fail("team act request hash does not match its fields"));
+    }
+    let dir = actions_dir(directory);
+    agent_queue::fsio::create_private_directory(&dir, "team act requests", true, true)
+        .map_err(|error| fail(error.to_string()))?;
+    let path = action_request_path(directory, &request.incident, &request.request_id);
+    let value = serde_json::to_value(request).map_err(|error| fail(error.to_string()))?;
+    match agent_queue::fsio::atomic_json_create(&path, &value) {
+        Ok(()) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = read_action_request(&path)
+                .ok_or_else(|| fail("existing team act request is unreadable"))?;
+            if existing.action_sha256 == request.action_sha256 && existing.incident == request.incident {
+                Ok(path)
+            } else {
+                Err(fail(format!(
+                    "request id {} already names a different action for incident {}",
+                    request.request_id, request.incident
+                )))
+            }
+        }
+        Err(error) => Err(fail(error.to_string())),
+    }
+}
+
+fn is_terminal(status: &str) -> bool {
+    matches!(status, "done" | "failed" | "refused" | "unknown")
+}
+
+/// The process exit a terminal receipt reports to its `team act` caller:
+/// the kick mirror (0 healthy/delivered, 75 still pending, 1 refused).
+fn terminal_exit_code(action: &ActionRecord) -> i32 {
+    match action.status.as_str() {
+        "done" => {
+            let name = action.action["action"].as_str().unwrap_or_default();
+            if action.dry_run || matches!(name, "facts" | "escalate") {
+                0
+            } else if name == "declare-done" {
+                if action.explicit_yes == Some(true) {
+                    0
+                } else {
+                    1
+                }
+            } else if action.verify_ok == Some(true) {
+                0
+            } else {
+                75
+            }
+        }
+        _ => 1,
+    }
+}
+
+fn receipt_of(action: &ActionRecord) -> Option<ActionReceipt> {
+    is_terminal(&action.status).then(|| ActionReceipt {
+        status: action.status.clone(),
+        detail: action.detail.clone(),
+        verify_ok: action.verify_ok,
+        explicit_yes: action.explicit_yes,
+        started_at: action.started_at,
+        finished_at: action.finished_at.unwrap_or(action.requested_at),
+        exit_code: action.exit_code.unwrap_or_else(|| terminal_exit_code(action)),
+    })
+}
+
+fn write_action_receipt(directory: &Path, action: &ActionRecord) -> Result<()> {
+    let Some(receipt) = receipt_of(action) else {
+        return Ok(());
+    };
+    let path = action_request_path(directory, &action.incident, &action.request_id);
+    let Some(mut file) = read_action_request(&path) else {
+        return Ok(());
+    };
+    file.receipt = Some(receipt);
+    let value = serde_json::to_value(&file).map_err(|error| fail(error.to_string()))?;
+    crate::agent::atomic_json(&path, &value).map_err(|error| fail(error.to_string()))
+}
+
+/// Fold this incident's request files into the record: new files become
+/// queued actions; a terminal receipt a state rewrite lost is restored
+/// from its file, so no effect ever runs twice for one request id.
+fn reconcile_action_requests(directory: &Path, record: &mut DriverRecord) {
+    let Ok(entries) = std::fs::read_dir(actions_dir(directory)) else {
+        return;
+    };
+    let mut files: Vec<ActionRequestFile> = entries
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .filter_map(|entry| read_action_request(&entry.path()))
+        .filter(|file| file.incident == record.incident)
+        .collect();
+    files.sort_by(|a, b| {
+        a.requested_at
+            .total_cmp(&b.requested_at)
+            .then_with(|| a.request_id.cmp(&b.request_id))
+    });
+    for file in files {
+        if let Some(seen) = record
+            .actions
+            .iter_mut()
+            .find(|seen| seen.request_id == file.request_id)
+        {
+            if !is_terminal(&seen.status) {
+                if let Some(receipt) = file.receipt {
+                    seen.status = receipt.status;
+                    seen.detail = receipt.detail;
+                    seen.verify_ok = receipt.verify_ok;
+                    seen.explicit_yes = receipt.explicit_yes;
+                    seen.started_at = receipt.started_at;
+                    seen.finished_at = Some(receipt.finished_at);
+                    seen.exit_code = Some(receipt.exit_code);
+                }
+            }
+            continue;
+        }
+        let mut entry = ActionRecord {
+            request_id: file.request_id.clone(),
+            incident: file.incident.clone(),
+            epoch: file.epoch.clone(),
+            action: file.action.clone(),
+            action_sha256: file.action_sha256.clone(),
+            dry_run: file.dry_run,
+            requester: file.requester.clone(),
+            status: "queued".to_owned(),
+            requested_at: file.requested_at,
+            started_at: None,
+            finished_at: None,
+            detail: String::new(),
+            verify_ok: None,
+            explicit_yes: None,
+            exit_code: None,
+        };
+        if let Some(receipt) = file.receipt {
+            entry.status = receipt.status;
+            entry.detail = receipt.detail;
+            entry.verify_ok = receipt.verify_ok;
+            entry.explicit_yes = receipt.explicit_yes;
+            entry.started_at = receipt.started_at;
+            entry.finished_at = Some(receipt.finished_at);
+            entry.exit_code = Some(receipt.exit_code);
+        }
+        record.actions.push(entry);
+    }
+}
+
+/// Close out actions a dead driver left `running`: re-runnable verbs
+/// requeue (their effects are idempotent or already-locked downstream),
+/// while drain and kill-pid become `unknown` — nobody can prove whether
+/// they fired, and they must never fire twice on a guess.
+fn recover_running_actions(directory: &Path, record: &mut DriverRecord, now: f64) -> Result<()> {
+    for index in 0..record.actions.len() {
+        if record.actions[index].status != "running"
+            || record.actions[index].incident != record.incident
+        {
+            continue;
+        }
+        let typed: std::result::Result<TeamAction, _> =
+            serde_json::from_value(record.actions[index].action.clone());
+        match typed {
+            Ok(TeamAction::Drain { .. } | TeamAction::KillPid { .. }) => {
+                finish_action(
+                    directory,
+                    record,
+                    index,
+                    "unknown",
+                    "driver died while running",
+                    None,
+                    None,
+                    now,
+                )?;
+            }
+            _ => {
+                record.actions[index].status = "queued".to_owned();
+                record.actions[index].started_at = None;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The one-driver lock, held only while a run can still return it.
 /// Its holder unlocks explicitly on drop: releasing by closing the
 /// descriptor alone would keep the lock held while any child forked
@@ -406,6 +941,292 @@ fn apply_event(
     Ok(())
 }
 
+/// Validate one typed action against the fresh manifest and state.
+/// Production effects re-check their own domain rules (configured
+/// units, pins, bridge targets) before acting.
+fn validate_action(
+    record: &DriverRecord,
+    manifest: &Value,
+    action: &TeamAction,
+) -> std::result::Result<(), String> {
+    validate_action_shape(action).map_err(|error| error.to_string())?;
+    let recovery_effect = matches!(
+        action,
+        TeamAction::Revive { .. }
+            | TeamAction::StartUnit { .. }
+            | TeamAction::ResetUnit { .. }
+            | TeamAction::Drain { .. }
+            | TeamAction::KillPid { .. }
+    );
+    if recovery_effect && record.abstract_state.driver == State::Healthy {
+        return Err("team is healthy; no recovery action runs".to_owned());
+    }
+    let desired: Vec<&str> = manifest["desired"]
+        .as_array()
+        .map(|rows| rows.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let agent_row = |agent: &str| {
+        manifest["agents"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["name"] == agent))
+    };
+    match action {
+        TeamAction::Revive { agent } => {
+            if !desired.contains(&agent.as_str()) {
+                return Err("agent is not in the desired set".to_owned());
+            }
+            match agent_row(agent) {
+                Some(row) if row["native_session_present"] == serde_json::json!(true) => Ok(()),
+                _ => Err("no recorded native session; candidates are report-only".to_owned()),
+            }
+        }
+        TeamAction::Drain { agent } => {
+            if !desired.contains(&agent.as_str()) {
+                return Err("agent is not in the desired set".to_owned());
+            }
+            let at_prompt = manifest["verify"]["checks"].as_array().is_some_and(|checks| {
+                checks.iter().any(|row| {
+                    row["name"] == "pane-at-prompt"
+                        && row["subject"] == agent.as_str()
+                        && row["status"] == "pass"
+                })
+            });
+            if at_prompt {
+                Ok(())
+            } else {
+                Err("pane is not explicitly at a prompt".to_owned())
+            }
+        }
+        TeamAction::StartUnit { unit } | TeamAction::ResetUnit { unit } => {
+            let configured = manifest["units"].as_array().is_some_and(|rows| {
+                rows.iter().any(|row| row["name"] == unit.as_str())
+            });
+            if configured {
+                Ok(())
+            } else {
+                Err("unit is not configured for this team".to_owned())
+            }
+        }
+        TeamAction::KillPid { boot_id, .. } => {
+            if boot_id == &record.boot_id {
+                Ok(())
+            } else {
+                Err("kill-pid boot id does not match this boot".to_owned())
+            }
+        }
+        TeamAction::Facts | TeamAction::DeclareDone | TeamAction::Escalate { .. } => Ok(()),
+    }
+}
+
+fn finish_action(
+    directory: &Path,
+    record: &mut DriverRecord,
+    index: usize,
+    status: &str,
+    detail: &str,
+    verify_ok: Option<bool>,
+    explicit_yes: Option<bool>,
+    now: f64,
+) -> Result<()> {
+    record.actions[index].status = status.to_owned();
+    record.actions[index].detail = detail.to_owned();
+    record.actions[index].verify_ok = verify_ok;
+    record.actions[index].explicit_yes = explicit_yes;
+    record.actions[index].finished_at = Some(now);
+    record.actions[index].exit_code = Some(terminal_exit_code(&record.actions[index]));
+    let action = record.actions[index].clone();
+    write_action_receipt(directory, &action)
+}
+
+/// Execute the oldest queued action for this incident. The caller has
+/// already applied the model transition persisting RunQueuedAction.
+fn run_queued_action<E: DriverEffects>(
+    directory: &Path,
+    record: &mut DriverRecord,
+    effects: &mut E,
+    now: f64,
+) -> Result<()> {
+    let Some(index) = record
+        .actions
+        .iter()
+        .position(|action| action.status == "queued" && action.incident == record.incident)
+    else {
+        return Ok(());
+    };
+    let entry = record.actions[index].clone();
+    let typed: TeamAction = match serde_json::from_value(entry.action.clone()) {
+        Ok(action) if validate_action_shape(&action).is_ok() => action,
+        _ => {
+            return finish_action(
+                directory,
+                record,
+                index,
+                "refused",
+                "invalid action",
+                None,
+                None,
+                now,
+            );
+        }
+    };
+    if entry.epoch != record.epoch {
+        return finish_action(
+            directory,
+            record,
+            index,
+            "refused",
+            "stale epoch",
+            None,
+            None,
+            now,
+        );
+    }
+    record.actions[index].status = "running".to_owned();
+    record.actions[index].started_at = Some(now);
+    save_record(directory, record, now)?;
+    let manifest = match effects.manifest(record) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            record.last_error = Some(error.to_string());
+            return finish_action(
+                directory,
+                record,
+                index,
+                "failed",
+                "manifest unavailable",
+                None,
+                None,
+                now,
+            );
+        }
+    };
+    record.manifest = Some(manifest.clone());
+    if let Err(detail) = validate_action(record, &manifest, &typed) {
+        return finish_action(
+            directory,
+            record,
+            index,
+            "refused",
+            &detail,
+            Some(crate::team_verify::verify_ok(&manifest["verify"])),
+            Some(explicit_yes_of(&manifest)),
+            now,
+        );
+    }
+    if entry.dry_run {
+        return finish_action(
+            directory,
+            record,
+            index,
+            "done",
+            "dry run: validated, no effect run",
+            Some(crate::team_verify::verify_ok(&manifest["verify"])),
+            Some(explicit_yes_of(&manifest)),
+            now,
+        );
+    }
+    let outcome = match effects.act(record, &typed, &manifest) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            record.last_error = Some(error.to_string());
+            return finish_action(
+                directory,
+                record,
+                index,
+                "failed",
+                "effect failed",
+                None,
+                None,
+                now,
+            );
+        }
+    };
+    if let Some(escalation) = &outcome.escalation {
+        record.escalation.last_attempt_at = Some(now);
+        match escalation {
+            EscalationOutcome::Delivered => {
+                if record.escalation.delivered_at.is_some() {
+                    record.escalation.reminded_at = Some(now);
+                } else {
+                    record.escalation.delivered_at = Some(now);
+                }
+                let next = now + 3600.0;
+                record.escalation.next_attempt_at = Some(next);
+                record.deadline = Some(next);
+            }
+            EscalationOutcome::Failed(detail) => {
+                record.last_error = Some(detail.clone());
+                let next = now
+                    + crate::team_escalate::backoff_seconds(record.abstract_state.attempts) as f64;
+                record.escalation.next_attempt_at = Some(next);
+                record.deadline = Some(next);
+            }
+            EscalationOutcome::Unconfigured => {
+                let next = now
+                    + crate::team_escalate::backoff_seconds(record.abstract_state.attempts) as f64;
+                record.escalation.next_attempt_at = Some(next);
+                record.deadline = Some(next);
+            }
+        }
+    }
+    if outcome.status != "done" {
+        return finish_action(
+            directory,
+            record,
+            index,
+            &outcome.status,
+            &outcome.detail,
+            None,
+            None,
+            now,
+        );
+    }
+    let after = match effects.manifest(record) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            record.last_error = Some(error.to_string());
+            return finish_action(
+                directory,
+                record,
+                index,
+                "unknown",
+                "verify-after unavailable",
+                None,
+                None,
+                now,
+            );
+        }
+    };
+    record.manifest = Some(after.clone());
+    record.last_verify = after["verify"].clone();
+    record.held = report_held(&record.last_verify);
+    let explicit = explicit_yes_of(&after);
+    let (status, detail) = if matches!(typed, TeamAction::DeclareDone) && !explicit {
+        ("failed", "explicit YES checks did not all pass".to_owned())
+    } else {
+        ("done", outcome.detail.clone())
+    };
+    finish_action(
+        directory,
+        record,
+        index,
+        status,
+        &detail,
+        Some(crate::team_verify::verify_ok(&after["verify"])),
+        Some(explicit),
+        now,
+    )
+}
+
+fn explicit_yes_of(manifest: &Value) -> bool {
+    manifest["coordinator"]
+        .as_str()
+        .filter(|coordinator| !coordinator.is_empty())
+        .is_some_and(|coordinator| {
+            crate::team_verify::explicit_yes(&manifest["verify"], coordinator)
+        })
+}
+
 /// The wake request for the record's concrete deadline.
 fn wake_request(
     record: &DriverRecord,
@@ -447,6 +1268,14 @@ fn resident_wait<E: DriverEffects>(
             return Ok(Resident::Wake);
         };
         if now >= deadline {
+            return Ok(Resident::Wake);
+        }
+        reconcile_action_requests(directory, record);
+        if record
+            .actions
+            .iter()
+            .any(|action| action.status == "queued" && action.incident == record.incident)
+        {
             return Ok(Resident::Wake);
         }
         host.sleep(Duration::from_secs_f64(
@@ -511,6 +1340,39 @@ pub fn run_with_effects<E: DriverEffects>(
         "epoch": record.epoch,
     }));
     if recorded.as_ref() != Some(&epoch) {
+        // Close out the old epoch's queued actions under their receipts,
+        // then prune them: request files stay as the durable audit, and
+        // an action bound to a dead epoch never runs in the new one.
+        let new_incident = incident_id(registry, &epoch);
+        for index in 0..record.actions.len() {
+            if record.actions[index].incident == new_incident {
+                continue;
+            }
+            if record.actions[index].status == "queued" {
+                finish_action(
+                    &directory,
+                    &mut record,
+                    index,
+                    "refused",
+                    "stale epoch",
+                    None,
+                    None,
+                    host.now(),
+                )?;
+            } else if record.actions[index].status == "running" {
+                finish_action(
+                    &directory,
+                    &mut record,
+                    index,
+                    "unknown",
+                    "epoch changed while running",
+                    None,
+                    None,
+                    host.now(),
+                )?;
+            }
+        }
+        record.actions.retain(|action| action.incident == new_incident);
         // A new boot or user-manager restart: the model resets the
         // incident facts; the concrete receipts reset with them. The
         // incident id itself is boot-scoped and recomputed either way.
@@ -527,9 +1389,13 @@ pub fn run_with_effects<E: DriverEffects>(
             ..WakeRecord::default()
         };
         record.last_error = None;
+        record.manifest = None;
         apply_event(&table, &mut record, Event::NewEpoch, host.now(), options)?;
         save_record(&directory, &mut record, host.now())?;
     }
+    reconcile_action_requests(&directory, &mut record);
+    recover_running_actions(&directory, &mut record, host.now())?;
+    save_record(&directory, &mut record, host.now())?;
     let mut first_healthy_kick = true;
     for _ in 0..10_000 {
         let now = host.now();
@@ -540,6 +1406,11 @@ pub fn run_with_effects<E: DriverEffects>(
             )
         {
             record.abstract_state.deadline_expired = true;
+        }
+        let actions_before = record.actions.clone();
+        reconcile_action_requests(&directory, &mut record);
+        if record.actions != actions_before {
+            save_record(&directory, &mut record, now)?;
         }
         if let Some(effect) = record.pending_effects.first().copied() {
             match effect {
@@ -740,6 +1611,10 @@ pub fn run_with_effects<E: DriverEffects>(
                     }
                     record.pending_effects.remove(0);
                 }
+                Effect::RunQueuedAction => {
+                    run_queued_action(&directory, &mut record, effects, now)?;
+                    record.pending_effects.remove(0);
+                }
                 Effect::Exit => {
                     if record.abstract_state.driver == State::Healthy
                         || record.wake.outcome == "armed"
@@ -766,6 +1641,17 @@ pub fn run_with_effects<E: DriverEffects>(
                     }
                 }
             }
+            save_record(&directory, &mut record, host.now())?;
+            continue;
+        }
+        // No pending effect: a queued action pre-empts the next
+        // observation, exactly one per loop pass.
+        if record
+            .actions
+            .iter()
+            .any(|action| action.status == "queued" && action.incident == record.incident)
+        {
+            apply_event(&table, &mut record, Event::ActRequested, now, options)?;
             save_record(&directory, &mut record, host.now())?;
             continue;
         }
@@ -1053,6 +1939,40 @@ impl<A: crate::subagents::ManagedApi + ?Sized> DriverEffects for ProductionEffec
             },
         )
     }
+
+    fn manifest(&mut self, _record: &DriverRecord) -> Result<Value> {
+        let options = crate::team_verify::VerifyOptions {
+            dismiss_allowlisted: false,
+            ..self.verify_options.clone()
+        };
+        crate::team_manifest::manifest_team(
+            self.client,
+            &self.registry,
+            self.host,
+            &self.config,
+            &options,
+        )
+        .map_err(|error| fail(error.to_string()))
+    }
+
+    fn act(
+        &mut self,
+        _record: &DriverRecord,
+        action: &TeamAction,
+        _manifest: &Value,
+    ) -> Result<ActionOutcome> {
+        // Stage 1 wires the queue and receipts; concrete verbs land in
+        // the next internal commit and replace these refusals.
+        Ok(ActionOutcome {
+            status: "refused".to_owned(),
+            detail: match action {
+                TeamAction::Facts => return Ok(done_outcome("facts recorded")),
+                TeamAction::DeclareDone => return Ok(done_outcome("verify requested")),
+                _ => "action effects are not wired yet".to_owned(),
+            },
+            escalation: None,
+        })
+    }
 }
 
 /// Inputs the CLI gathers once (designation-resolved config, resolved
@@ -1267,6 +2187,17 @@ pub trait DriverEffects {
         text: &str,
         resolved: bool,
     ) -> Result<EscalationOutcome>;
+    /// Build the current recovery manifest (facts validation and the
+    /// verify-after snapshot for one queued action).
+    fn manifest(&mut self, record: &DriverRecord) -> Result<Value>;
+    /// Execute one validated queued action. The core has persisted it
+    /// running; retry after a crash is governed by the action's status.
+    fn act(
+        &mut self,
+        record: &DriverRecord,
+        action: &TeamAction,
+        manifest: &Value,
+    ) -> Result<ActionOutcome>;
 }
 
 /// The failed-check names in a verify report, in report order.
@@ -1427,6 +2358,130 @@ mod tests {
     }
 
     #[test]
+    fn action_ledger_dedupes_conflicts_stale_and_recovers_running() {
+        let root = temp_root("actions");
+        let registry = root.join("registry");
+        let state_root = root.join("state");
+        let directory = prepare_driver_dir(&registry, Some(&state_root)).unwrap();
+        let mut record = DriverRecord::new(&registry, &epoch("boot-a", None), 100.0);
+        save_record(&directory, &mut record, 100.0).unwrap();
+        let requester = RequesterRecord {
+            kind: "agent".to_owned(),
+            label: "test".to_owned(),
+        };
+        let facts = new_action_request(
+            &record.incident,
+            record.epoch.clone(),
+            "facts-1",
+            &TeamAction::Facts,
+            false,
+            requester.clone(),
+            100.0,
+        )
+        .unwrap();
+        let path = enqueue_action(&directory, &facts).unwrap();
+        assert_eq!(enqueue_action(&directory, &facts).unwrap(), path);
+        let conflict = new_action_request(
+            &record.incident,
+            record.epoch.clone(),
+            "facts-1",
+            &TeamAction::DeclareDone,
+            false,
+            requester.clone(),
+            100.0,
+        )
+        .unwrap();
+        assert!(enqueue_action(&directory, &conflict).is_err());
+
+        let host = FakeHost::new(100.0);
+        let mut fake = Fake::default();
+        let record = run(&root, &host, &mut fake).unwrap();
+        assert_eq!(record.actions.len(), 1);
+        assert_eq!(record.actions[0].status, "done");
+        assert_eq!(record.actions[0].exit_code, Some(0));
+        assert_eq!(fake.acted, [TeamAction::Facts]);
+        assert_eq!(
+            read_action_request(&path).unwrap().receipt.unwrap().status,
+            "done"
+        );
+        // A second run replays nothing for the same request id.
+        let record = run(&root, &host, &mut fake).unwrap();
+        assert_eq!(fake.acted.len(), 1);
+
+        // A request bound to another manager epoch never executes.
+        let stale = new_action_request(
+            &record.incident,
+            epoch("boot-a", Some("invocation:m2")).as_json(),
+            "facts-2",
+            &TeamAction::Facts,
+            false,
+            requester.clone(),
+            100.0,
+        )
+        .unwrap();
+        enqueue_action(&directory, &stale).unwrap();
+        let record = run(&root, &host, &mut fake).unwrap();
+        let stale_row = record
+            .actions
+            .iter()
+            .find(|action| action.request_id == "facts-2")
+            .unwrap();
+        assert_eq!(stale_row.status, "refused");
+        assert_eq!(fake.acted.len(), 1);
+
+        // A driver that died mid-action requeues a re-runnable verb and
+        // closes a non-idempotent one unknown without firing it again.
+        for (id, action) in [
+            ("facts-3", TeamAction::Facts),
+            (
+                "kill-1",
+                TeamAction::KillPid {
+                    pid: 4242,
+                    expect_cmdline: "fixture-proc".to_owned(),
+                    expect_start: "99".to_owned(),
+                    boot_id: "boot-a".to_owned(),
+                    signal: None,
+                },
+            ),
+        ] {
+            let request = new_action_request(
+                &record.incident,
+                record.epoch.clone(),
+                id,
+                &action,
+                false,
+                requester.clone(),
+                100.0,
+            )
+            .unwrap();
+            enqueue_action(&directory, &request).unwrap();
+        }
+        let mut crashed = load_record(&directory, &registry).unwrap().unwrap();
+        reconcile_action_requests(&directory, &mut crashed);
+        for action in crashed
+            .actions
+            .iter_mut()
+            .filter(|action| matches!(action.request_id.as_str(), "facts-3" | "kill-1"))
+        {
+            action.status = "running".to_owned();
+            action.started_at = Some(100.0);
+        }
+        save_record(&directory, &mut crashed, 100.0).unwrap();
+        let record = run(&root, &host, &mut fake).unwrap();
+        let by_id = |id: &str| {
+            record
+                .actions
+                .iter()
+                .find(|action| action.request_id == id)
+                .unwrap()
+        };
+        assert_eq!(by_id("facts-3").status, "done");
+        assert_eq!(by_id("kill-1").status, "unknown");
+        assert_eq!(fake.acted.len(), 2, "only the requeued facts ran");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn foreign_or_mismatched_state_is_refused_not_replaced() {
         let root = temp_root("foreign");
         let registry = root.join("registry");
@@ -1510,9 +2565,38 @@ mod tests {
         queue_fails: bool,
         escalations: VecDeque<EscalationOutcome>,
         escalate_calls: Vec<bool>,
+        manifests: VecDeque<Value>,
+        act_outcomes: VecDeque<ActionOutcome>,
+        acted: Vec<TeamAction>,
         crash: Option<&'static str>,
     }
     impl Fake {
+        fn fake_manifest(record: &DriverRecord, ok: bool) -> Value {
+            json!({
+                "schema": "agentctl-team-manifest/v1",
+                "registry": record.registry,
+                "coordinator": "coord",
+                "desired": ["coord", "lane"],
+                "ok": ok,
+                "agents": [
+                    {"name": "coord", "native_session_present": true},
+                    {"name": "lane", "native_session_present": true},
+                ],
+                "units": [{"name": "bridge.service", "active": ok, "held": false}],
+                "verify": {
+                    "schema": "agentctl-team-verify/v1",
+                    "ok": ok,
+                    "desired": ["coord", "lane"],
+                    "checks": [
+                        {"name": "desired-live", "status": if ok { "pass" } else { "fail" }, "subject": "coord"},
+                        {"name": "units-bridges", "status": if ok { "pass" } else { "fail" }, "subject": "bridge chat"},
+                        {"name": "pane-at-prompt", "status": "pass", "subject": "lane"},
+                        {"name": "coordinator-ack", "status": if ok { "pass" } else { "fail" }, "subject": "coord"},
+                    ],
+                },
+            })
+        }
+
         fn maybe_crash(&mut self, name: &'static str) -> Result<()> {
             if self.crash == Some(name) {
                 self.crash = None;
@@ -1564,6 +2648,27 @@ mod tests {
                 .escalations
                 .pop_front()
                 .unwrap_or(EscalationOutcome::Delivered))
+        }
+        fn manifest(&mut self, record: &DriverRecord) -> Result<Value> {
+            self.maybe_crash("manifest")?;
+            Ok(self
+                .manifests
+                .pop_front()
+                .unwrap_or_else(|| Self::fake_manifest(record, !self.missing)))
+        }
+        fn act(
+            &mut self,
+            _record: &DriverRecord,
+            action: &TeamAction,
+            _manifest: &Value,
+        ) -> Result<ActionOutcome> {
+            self.maybe_crash("act")?;
+            self.acted.push(action.clone());
+            Ok(self.act_outcomes.pop_front().unwrap_or_else(|| ActionOutcome {
+                status: "done".to_owned(),
+                detail: "fake action done".to_owned(),
+                escalation: None,
+            }))
         }
     }
 

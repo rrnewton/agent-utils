@@ -91,6 +91,8 @@ pub enum Event {
     EscalateFailed,
     /// The driver process died; re-entry repeats the persisted step.
     Crash,
+    /// A validated `team act` request is queued for this incident.
+    ActRequested,
 }
 
 /// Effects a transition asks the driver to perform, in order. State is
@@ -116,6 +118,9 @@ pub enum Effect {
     SendResolved,
     /// Exit healthy (0) or recovery-pending (75), per the exit rule.
     Exit,
+    /// Execute one queued `team act` request; replay is safe through its
+    /// persisted request-id receipt, never by repeating the effect.
+    RunQueuedAction,
 }
 
 /// Whether a transition leaves the driver running or dormant. Dormant is
@@ -305,6 +310,20 @@ pub fn transitions() -> Vec<Transition> {
             mode: Running,
             effects: NONE,
         });
+        rows.push(Transition {
+            from: state,
+            event: ActRequested,
+            // From a dormant deadline state an action re-enters VERIFY:
+            // a self-loop there would strand the machine running with a
+            // wake still armed and no fair event left to fire.
+            to: if matches!(state, Handoff | Escalate) {
+                Verify
+            } else {
+                state
+            },
+            mode: Running,
+            effects: &[RunQueuedAction],
+        });
     }
     rows
 }
@@ -373,7 +392,7 @@ fn event_enabled(state: &Abstract, event: Event) -> bool {
     use Event::*;
     use State::*;
     match event {
-        Kick | NewEpoch => true,
+        Kick | NewEpoch | ActRequested => true,
         WakeFired => state.mode == Mode::Dormant && state.wake_armed,
         Crash => state.mode == Mode::Running,
         DetectClean => state.driver == Detect && !state.env.missing,
@@ -396,7 +415,10 @@ fn event_enabled(state: &Abstract, event: Event) -> bool {
 /// the environment step that sets `route_ok`). Kicks, epochs, crashes,
 /// lead deaths, and underlying fixes are unfair: they may never happen.
 fn is_fair(event: Event) -> bool {
-    !matches!(event, Event::Kick | Event::NewEpoch | Event::Crash)
+    !matches!(
+        event,
+        Event::Kick | Event::NewEpoch | Event::Crash | Event::ActRequested
+    )
 }
 
 /// One table step: the row for `(driver, event)`, with incident facts
@@ -412,7 +434,10 @@ pub fn step(
         return None;
     }
     if state.mode == Mode::Dormant
-        && !matches!(event, Event::Kick | Event::WakeFired | Event::NewEpoch)
+        && !matches!(
+            event,
+            Event::Kick | Event::WakeFired | Event::NewEpoch | Event::ActRequested
+        )
     {
         return None;
     }
@@ -537,7 +562,7 @@ fn apply(table: &[Transition], state: &Abstract, input: Input) -> Option<(Abstra
     }
 }
 
-const ALL_EVENTS: [Event; 16] = [
+const ALL_EVENTS: [Event; 17] = [
     Event::Kick,
     Event::WakeFired,
     Event::NewEpoch,
@@ -554,6 +579,7 @@ const ALL_EVENTS: [Event; 16] = [
     Event::EscalateDelivered,
     Event::EscalateFailed,
     Event::Crash,
+    Event::ActRequested,
 ];
 
 const ALL_ENV_STEPS: [EnvStep; 3] = [EnvStep::EnvFix, EnvStep::LeadDies, EnvStep::RouteFixes];

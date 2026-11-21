@@ -1088,6 +1088,53 @@ pub fn verify_ok(report: &Value) -> bool {
     report["ok"] == json!(true)
 }
 
+/// The per-team YES judgement recovery completion requires: the lead is
+/// in the desired set and its desired-live row explicitly passes, every
+/// row for the team's bridge(s) explicitly passes, and the
+/// coordinator-ack row explicitly passes. Held and skipped rows never
+/// count, so this is stricter than [`verify_ok`] on exactly those rows.
+/// A team with no bridge state directories has no bridge to pass; its
+/// skipped no-evidence row does not block YES.
+pub fn explicit_yes(report: &Value, coordinator: &str) -> bool {
+    if coordinator.is_empty()
+        || !report["desired"]
+            .as_array()
+            .is_some_and(|desired| desired.iter().any(|name| name == coordinator))
+    {
+        return false;
+    }
+    let Some(checks) = report["checks"].as_array() else {
+        return false;
+    };
+    let passes = |name: &str, subject: &str| {
+        checks.iter().any(|row| {
+            row["name"] == name && row["subject"] == subject && row["status"] == "pass"
+        })
+    };
+    if !passes("desired-live", coordinator) || !passes("coordinator-ack", coordinator) {
+        return false;
+    }
+    let bridges: Vec<&Value> = checks
+        .iter()
+        .filter(|row| {
+            row["name"] == "units-bridges"
+                && row["subject"]
+                    .as_str()
+                    .is_some_and(|subject| subject.starts_with("bridge "))
+        })
+        .collect();
+    if !bridges.is_empty() {
+        return bridges.iter().all(|row| row["status"] == "pass");
+    }
+    checks.iter().any(|row| {
+        row["name"] == "units-bridges"
+            && row["status"] == "skipped"
+            && row["evidence"]
+                .as_str()
+                .is_some_and(|evidence| evidence.starts_with("no bridge state directories"))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
