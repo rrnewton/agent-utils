@@ -188,6 +188,9 @@ export interface ElementById {
   "dismissed-sends-state": HTMLParagraphElement;
   "doc-back": HTMLButtonElement;
   "doc-body": HTMLDivElement;
+  "doc-jump-discussion": HTMLButtonElement;
+  "doc-jump-mention": HTMLButtonElement;
+  "doc-jumps": HTMLDivElement;
   "doc-kind": HTMLParagraphElement;
   "doc-nav": HTMLDivElement;
   "doc-outline": HTMLUListElement;
@@ -223,6 +226,7 @@ export interface ElementById {
   "docs-since-title": HTMLParagraphElement;
   "docs-starred-toggle": HTMLButtonElement;
   "documents-list": HTMLDivElement;
+  "documents-react-policy": HTMLSelectElement;
   "draft-autosync": HTMLInputElement;
   "draft-chip": HTMLButtonElement;
   "draft-chip-label": HTMLSpanElement;
@@ -605,10 +609,6 @@ export interface ElementById {
   "service-facts": HTMLParagraphElement;
   "settings-agent-audio": HTMLOptionElement;
   "settings-audio-source": HTMLSelectElement;
-  "documents-react-policy": HTMLSelectElement;
-  "doc-jumps": HTMLDivElement;
-  "doc-jump-mention": HTMLButtonElement;
-  "doc-jump-discussion": HTMLButtonElement;
   "settings-chain-order": HTMLParagraphElement;
   "settings-channel": HTMLSelectElement;
   "settings-channels": HTMLElement;
