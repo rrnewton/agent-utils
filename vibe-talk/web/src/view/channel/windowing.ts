@@ -33,6 +33,11 @@ export function sliceFor(
   const count = offsets.length - 1;
   if (count <= 0) return { from: 0, to: 0 };
   const total = offsets[count] as number;
+  // `#2008`: the reader at or past the priced end (the height estimates running
+  // short of the real layout, as a send lands): the window is the last `cap`
+  // groups, never an empty range - an empty slice unmounts every row the
+  // reader is looking at for that render (the send-flash A -> B -> A).
+  if (scrollTop >= total) return { from: Math.max(0, count - cap), to: count };
   const top = Math.max(0, Math.min(scrollTop - prefetchPx, total));
   const bottom = Math.max(top, Math.min(scrollTop + viewPx + prefetchPx, total));
   let from = 0;

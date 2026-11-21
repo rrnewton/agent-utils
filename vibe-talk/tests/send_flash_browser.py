@@ -472,22 +472,12 @@ def main() -> int:
                     server.shutdown()
                     server.server_close()
                     thread.join()
-    # Expected to fail while #2008 (the windowed path's one-frame row drop and
-    # anchor move on a phone) is open, and only those two phone windowed walks:
-    # they still run, record and print as every other walk, and a pass while so
-    # marked is shouted, not failed, so the mark is never left standing stale.
-    expected_fail_2008 = {"phone-412-dark-plainwindowed", "phone-412-dark-late-readwindowed"}
     # Every walk is reported first, so one run shows phone and desk, light and dark,
     # plain and late-read, and windowed, before any of them is judged.
     for name, bad, missing, moved, failure in results:
-        marked = " [expected-fail #2008]" if name in expected_fail_2008 else ""
         print(f"RESULT {name}: flash frames {bad} (missing {missing}); anchor moved at most "
-              f"{moved:.1f}px; failure {failure}{marked}")
+              f"{moved:.1f}px; failure {failure}")
     for name, bad, missing, moved, failure in results:
-        if name in expected_fail_2008:
-            if failure is None and bad == 0 and moved <= ANCHOR_PX:
-                print(f"XPASS: un-mark it (#2008) — {name} passed while marked expected-fail")
-            continue
         check(failure is None, f"{name}: the walk failed: {failure}")
         check(bad == 0,
               f"{name}: in {bad} frames a message on screen before and after the send "

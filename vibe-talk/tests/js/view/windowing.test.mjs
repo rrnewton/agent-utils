@@ -27,6 +27,10 @@ test("`#1846` step 3: the slice covers the viewport plus prefetch, capped, at ev
   // One screenful of scrolling moves the window by about a screenful, not a rebuild.
   const before = sliceFor(offsets, 100000, 800, 1200, 60);
   const after = sliceFor(offsets, 100800, 800, 1200, 60);
+  const past = sliceFor(offsets, 5000 * 84 + 500, 800, 1200, 60);
+  // `#2008`: a reader priced past the end keeps the last cap of groups, never an
+  // empty slice (the send-landing render unmounted the rows being read).
+  assert.deepEqual(past, { from: 4940, to: 5000 });
   assert.ok(after.from - before.from <= 20, `one screenful moved the window ${after.from - before.from} groups`);
   // No rows, no window.
   assert.deepEqual(sliceFor([0], 0, 800, 1200, 60), { from: 0, to: 0 });
