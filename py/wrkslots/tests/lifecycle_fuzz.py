@@ -38,8 +38,8 @@ import tempfile
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import e2e_stress as e2e  # noqa: E402  (same-directory harness)
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from wrkslots.tests import e2e_stress as e2e  # noqa: E402
 
 SLOTS = ("fz-a", "fz-b")
 CRASH_POINTS = (
