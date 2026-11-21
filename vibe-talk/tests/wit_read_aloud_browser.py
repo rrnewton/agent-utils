@@ -295,6 +295,13 @@ def walk(page: "Page", api: FakeApi, url: str, shot: Callable[[str], None], benc
     # Reading asks for the picked voice, and a tap is heard.
     page.click("#read-aloud")
     page.wait_for_function(f"() => readAloudOwner().preparedSpeech.size() === {len(MESSAGES)}", timeout=int(STATE_S * 1000))
+    # `#2003`: the press now starts the first visible message at once.
+    # Stop it (mode stays armed) and forget its asks: the tap below then
+    # asks first, as it did when Read only armed.
+    page.evaluate("() => readAloudOwner().stopReading()")
+    with api.lock:
+        api.timings.clear()
+        api.reads.clear()
     with api.lock:
         prepares = list(api.prepares)
     check(len(prepares) > 0 and all(p.get("voice") == "wit$Clara" for p in prepares),

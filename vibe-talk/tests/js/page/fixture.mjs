@@ -5235,6 +5235,10 @@ const TUNING_BANDS = {
   // long the output stays alive after a read: enough to wake a sleeping Bluetooth sink and to
   // bridge back-to-back reads, never so long that a cold chunk waits seconds or the output is
   // held for minutes.
+  // `#2003 vibe-talk-read-starts-on-screen`. How much of the first item must
+  // show for Read to start there: a visible slice a reader can recognise,
+  // never the whole screenful (a tall first item would never start).
+  MEANINGFUL_VISIBLE_PX: [8, 200, "visible pixels of the first item for Read to start there"],
   MIN_READ_PREROLL_MS: [0, 0, "the least pre-roll before a cold chunk (0 turns it off)"],
   MAX_READ_PREROLL_MS: [500, 5000, "the most pre-roll before a cold chunk"],
   DEFAULT_READ_PREROLL_MS: [100, 1000, "the default pre-roll before a cold chunk"],
@@ -6741,7 +6745,11 @@ const readButton = (page) => page.el("read-aloud");
 
 async function inReadingMode(page, messages) {
   const rows = await showDiscord(page, messages);
-  await readButton(page).click();
+  // `#2003 vibe-talk-read-starts-on-screen`: the Read button now starts
+  // the first visible row at once, so this helper arms the mode through
+  // the page's own mode act instead — the armed, untapped state its
+  // tests premise, with turning-on's preparation exactly as the button's.
+  page.pure("setReadingMode(true)");
   await page.settle();
   return rows;
 }

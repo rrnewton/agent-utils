@@ -39,7 +39,7 @@ test("reading mode turns on, prepares speech and says so; Stop leaves it", () =>
     "state=ready",
     "clear",
     "prepare",
-    "status=reading mode: tap a message to hear it, and it archives when it finishes.",
+    "status=reading from the first message on screen, and it archives when it finishes.",
     "controls",
     "rows",
   ]);

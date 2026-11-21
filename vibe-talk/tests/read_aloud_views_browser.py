@@ -333,7 +333,22 @@ class Walk:
         audio_before = self.page.evaluate("() => window.audioProbe.sources.length")
         device_before = self.page.evaluate("() => window.deviceSpeech.length")
         tickets_before = len(self.api.tickets(message_id))
-        self.click(selector)
+        # `#2003 vibe-talk-read-starts-on-screen`: pressing Read at the
+        # walk's start already started the first message on screen. Where
+        # that is this read's message, it is not clicked again (a click
+        # on what is playing stops it); its ask already stands.
+        already = self.page.evaluate(
+            f"() => readAloudOwner().nowPlaying && readAloudOwner().nowPlaying.id === '{message_id}'")
+        if already:
+            if self.voice == "agent":
+                self.desk.check(tickets_before > 0,
+                                f"{label}: the started read never asked for {message_id}")
+                tickets_before = tickets_before - 1
+                audio_before = audio_before - 1
+            else:
+                device_before = 0
+        else:
+            self.click(selector)
         if self.voice == "agent":
             deadline = time.monotonic() + STATE_S
             while time.monotonic() < deadline and len(self.api.tickets(message_id)) <= tickets_before:

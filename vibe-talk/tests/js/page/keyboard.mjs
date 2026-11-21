@@ -177,11 +177,13 @@ test("`#429 keyboard-hides-bar`: a reading playing as the keyboard comes up goes
   await page.resizeViewport({ visual: 480 });
   assert.equal(keyboardSaid(page), "open");
   assert.equal(page.el("read-aloud").getAttribute("data-active"), "true", "the keyboard stopped the reading");
-  assert.equal(page.el("read-aloud-label").text(), "Stop", "the way out no longer says it is one");
-  assert.equal(page.el("read-aloud").hidden, false, "Stop went with the bars");
+  // (`#2003`: the Read press already started the read, so the control
+  // says Pause and the way out is the Stop beside it, both on screen.)
+  assert.equal(page.el("read-aloud-label").text(), "Pause", "the way out no longer says it is one");
+  assert.equal(page.el("read-aloud-stop").hidden, false, "Stop went with the bars");
   assert.equal(page.players.filter((player) => !player.paused).length, playing, "the keyboard paused the audio");
   // And Stop, pressed with the keyboard up, stops it.
-  await page.el("read-aloud").click();
+  await page.el("read-aloud-stop").click();
   await page.settle();
   assert.equal(page.el("read-aloud").getAttribute("data-active"), "false", "Stop did nothing with the keyboard up");
 });

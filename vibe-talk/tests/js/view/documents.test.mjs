@@ -2204,8 +2204,8 @@ test("documents view: the reader's Back button takes the page's pop where wired,
 test("documents reader: Read hands the owner the retained document in one call (#1039 stage 3)", async () => {
   await withReader(
     { title: "Field notes", content: "Alpha block here.\n\nBeta **block** here.\n", outline: [] },
-    async ({ els, reads, stops, statuses }) => {
-      dispatchClick(els["doc-read"]);
+    async ({ reader, els, reads, stops, statuses }) => {
+      reader.readAloud();
       assert.equal(reads.length, 1, "Read did not hand the owner the whole document at once");
       assert.deepEqual(
         { key: reads[0].key, title: reads[0].title, texts: reads[0].texts },
@@ -2222,9 +2222,24 @@ test("documents reader: Read hands the owner the retained document in one call (
       assert.deepEqual(statuses, [], "starting a read said there was nothing to read");
       // A second Read is forwarded as it comes: what it means for the document
       // already playing is the owner's check, not a flag of the reader's.
-      dispatchClick(els["doc-read"]);
+      reader.readAloud();
       assert.equal(reads.length, 2, "a second Read was swallowed by the reader");
       assert.deepEqual(reads[1], reads[0]);
+    },
+  );
+});
+
+test("documents reader: readAloud() hands the owner the open document, as its Read button does (#2004)", async () => {
+  await withReader(
+    { title: "Field notes", content: "Alpha block here.\n\nBeta **block** here.\n", outline: [] },
+    async ({ reader, reads }) => {
+      reader.readAloud();
+      assert.equal(reads.length, 1, "readAloud() handed the owner nothing");
+      assert.deepEqual(
+        { key: reads[0].key, title: reads[0].title, texts: reads[0].texts },
+        { key: "demo-doc", title: "Field notes", texts: ["Alpha block here.", "Beta block here."] },
+        "readAloud() did not hand the owner the whole document at once");
+      assert.equal(typeof reads[0].onReadingBlock, "function", "readAloud() asked for no position report");
     },
   );
 });
@@ -2257,8 +2272,8 @@ function drawnListBody(els) {
 }
 
 test("documents reader: Read hands the block model — kinds aligned with texts (#1505)", async () => {
-  await withReader({ content: LIST_DOC, outline: [] }, async ({ els, reads }) => {
-    dispatchClick(els["doc-read"]);
+  await withReader({ content: LIST_DOC, outline: [] }, async ({ reader, els, reads }) => {
+    reader.readAloud();
     assert.equal(reads.length, 1);
     assert.deepEqual(reads[0].texts, ["Notes", "first item", "second item", "third item", "Closing words."],
       "a bulleted list was handed over as one chunk, not a block an item");
@@ -2268,9 +2283,9 @@ test("documents reader: Read hands the block model — kinds aligned with texts 
 });
 
 test("documents reader: the reading light is the reported block itself (#1505)", async () => {
-  await withReader({ content: LIST_DOC, outline: [] }, async ({ els, reads }) => {
+  await withReader({ content: LIST_DOC, outline: [] }, async ({ reader, els, reads }) => {
     const { items, closing } = drawnListBody(els);
-    dispatchClick(els["doc-read"]);
+    reader.readAloud();
     const report = reads[0].onReadingBlock;
     report(3);
     assert.equal(items[2].getAttribute("data-reading-block"), "current", "block 3 did not light the third item");
@@ -2285,8 +2300,26 @@ test("documents reader: the reading light is the reported block itself (#1505)",
   });
 });
 
+test("documents reader: Read starts at the first meaningful visible block, without scrolling (#2003)", async () => {
+  await withReader({ content: LIST_DOC, outline: [] }, async ({ reader, els, reads, readFroms }) => {
+    const { heading, items, closing } = drawnListBody(els);
+    const place = (el, top, bottom) => { el.getBoundingClientRect = () => ({ top, bottom }); };
+    els["scroll-area"].getBoundingClientRect = () => ({ top: 0, bottom: 600 });
+    // The heading shows only a sliver; the first item is the first
+    // meaningful block on screen, so Read starts there.
+    place(heading, -100, 10);
+    place(items[0], 10, 100);
+    place(items[1], 100, 200);
+    place(items[2], 200, 300);
+    place(closing, 300, 400);
+    reader.readAloud();
+    assert.equal(reads.length, 1, "Read started no read");
+    assert.deepEqual(readFroms[0], { part: 0, block: 1 }, "Read did not start at the first meaningful visible block");
+  });
+});
+
 test("documents reader: a tap on a block reads from that block only while reading (#1505, #1543)", async () => {
-  await withReader({ content: LIST_DOC, outline: [] }, async ({ els, reads, readFroms }) => {
+  await withReader({ content: LIST_DOC, outline: [] }, async ({ reader, els, reads, readFroms }) => {
     const { items } = drawnListBody(els);
     const label = readerEl("span");
     label.textContent = "second item";
@@ -2295,7 +2328,7 @@ test("documents reader: a tap on a block reads from that block only while readin
     await flush(dispatchClick(els["doc-body"], { target: label }));
     assert.equal(reads.length, 0, "a tap on a list item started a read while the reader was inactive");
     // Active: Read starts the read, then a tap jumps it to that block.
-    dispatchClick(els["doc-read"]);
+    reader.readAloud();
     assert.equal(reads.length, 1, "Read started no read");
     await flush(dispatchClick(els["doc-body"], { target: label }));
     assert.equal(reads.length, 2, "a tap on a list item read nothing while reading");
@@ -2311,8 +2344,8 @@ test("documents reader: a tap on a block reads from that block only while readin
 });
 
 test("documents reader: with nothing open to say, Read says so and hands the owner nothing (#1039 stage 3)", async () => {
-  await withReader({ content: "" }, async ({ els, reads, statuses }) => {
-    dispatchClick(els["doc-read"]);
+  await withReader({ content: "" }, async ({ reader, els, reads, statuses }) => {
+    reader.readAloud();
     assert.deepEqual(reads, [], "an empty document was handed to the owner");
     assert.deepEqual(statuses, ["Nothing to read yet."]);
   });
@@ -2331,7 +2364,7 @@ test("documents reader: close and Back stop only the open document's key (#1039 
 test("documents view: each step back stops the document being left, by its key (#1039 stage 3)", async () => {
   await withDocumentsView({}, async ({ view, reads, stops, byId }) => {
     await view.show("doc-a");
-    dispatchClick(byId("doc-read"));
+    view.readAloud();
     assert.deepEqual(reads.map((doc) => doc.key), ["doc-a"], "the view's reader read another document");
     assert.deepEqual(reads[0].texts, ["Doc A", "Alpha."]);
     await view.show("doc-b");

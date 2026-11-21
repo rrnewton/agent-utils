@@ -523,6 +523,16 @@ def main() -> int:
                 page.wait_for_selector(f'#discord-log > li[data-id="{last}"]', timeout=30_000)
                 page.click("#read-aloud")
                 page.wait_for_function(f"() => readAloudOwner().preparedSpeech.size() === {len(MESSAGES)}", timeout=30_000)
+                # `#2003 vibe-talk-read-starts-on-screen`: the press now
+                # starts the first visible message at once. This walk's
+                # steps tap their own messages, so stop that start (the
+                # mode stays armed) and forget its asks: every step below
+                # then asks first, as it did when Read only armed.
+                page.evaluate("() => readAloudOwner().stopReading()")
+                with api.lock:
+                    api.timings.clear()
+                    api.reads.clear()
+                    api.dismissed.clear()
                 return context, page
 
             def tap(page: Page, message_id: str) -> None:

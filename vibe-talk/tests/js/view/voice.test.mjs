@@ -73,6 +73,26 @@ test("`#1587 autoplay-follow-scroll`: the band is the middle third; only a highl
   assert.equal(pause.paused("m2", false), false, "following stayed paused into the next read");
 });
 
+test("`#2003 vibe-talk-read-starts-on-screen`: the first meaningful visible item starts the read; a sliver does not", () => {
+  const { firstMeaningfulVisible, MEANINGFUL_VISIBLE_PX } = VIEW_VOICE;
+  assert.equal(MEANINGFUL_VISIBLE_PX, 40);
+  const band = { top: 100, bottom: 700 };
+  // A 10px sliver of the first item, then one fully showing: the second starts.
+  assert.equal(firstMeaningfulVisible([{ top: 0, bottom: 110 }, { top: 110, bottom: 300 }], band), 1,
+    "a sliver of the top item counted as the start");
+  // Forty pixels of a tall item showing counts, though most of it is below.
+  assert.equal(firstMeaningfulVisible([{ top: 650, bottom: 1400 }], band), 0,
+    "forty visible pixels of a tall item did not count");
+  // A short item counts by half of itself, under the pixel floor.
+  assert.equal(firstMeaningfulVisible([{ top: 90, bottom: 120 }], band), 0,
+    "half of a short item showing did not count");
+  assert.equal(firstMeaningfulVisible([{ top: 80, bottom: 110 }], band), -1,
+    "under half of a short item counted");
+  // Nothing in the band, and an empty list, start nothing.
+  assert.equal(firstMeaningfulVisible([{ top: 800, bottom: 900 }], band), -1);
+  assert.equal(firstMeaningfulVisible([], band), -1);
+});
+
 test("`#886 voice-page-autoplay`: off by default and kept; on, a read heard to its end goes on to the next unread row below it in its view, and stops at the end or when halted", async () => {
   const { createAutoplay, AUTOPLAY_WORDS } = VIEW_VOICE;
   const toggle = { attributes: {}, getAttribute(name) { return this.attributes[name] ?? null; }, setAttribute(name, value) { this.attributes[name] = value; } };

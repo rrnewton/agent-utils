@@ -133,7 +133,7 @@ def walk_big(page: Page, touch: bool, card_name: str, label: str, width: int) ->
         page.wait_for_function(
             "() => document.getElementById('audio-source').getAttribute('aria-checked') === 'false'",
             timeout=20_000)
-    act("#doc-read")
+    act("#read-aloud")
     page.wait_for_function(
         "() => document.querySelectorAll('#doc-body [data-reading-block=\"current\"]').length === 1",
         timeout=20_000)
@@ -232,7 +232,7 @@ def walk_table(page: Page, touch: bool) -> None:
         page.wait_for_function(
             "() => document.getElementById('audio-source').getAttribute('aria-checked') === 'false'",
             timeout=20_000)
-    page.tap("#doc-read") if touch else page.click("#doc-read")
+    page.tap("#read-aloud") if touch else page.click("#read-aloud")
     page.wait_for_selector("#read-steer #doc-nav:not([hidden]) .doc-nav-chunk", timeout=20_000)
     # Section 1's chunks in order: 1 heading, 2 before, 3 the table,
     # 4 after. Each tap must light exactly that block.

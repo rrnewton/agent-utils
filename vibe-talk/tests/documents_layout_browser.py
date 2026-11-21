@@ -193,7 +193,7 @@ def check_header_fit(page: Page) -> None:
             scrollWidth: document.documentElement.scrollWidth,
           };
           for (const id of ['doc-back', 'doc-title', 'doc-kind',
-                            'doc-star', 'doc-read']) {
+                            'doc-star']) {
             const el = document.getElementById(id);
             out[id] = el === null ? null : box(el);
           }
@@ -201,14 +201,14 @@ def check_header_fit(page: Page) -> None:
         }""")
     check(fit["scrollWidth"] <= fit["innerWidth"] + 1,
           f"the reader grew sideways past the phone: {fit}")
-    for id_ in ["doc-back", "doc-title", "doc-kind", "doc-star", "doc-read"]:
+    for id_ in ["doc-back", "doc-title", "doc-kind", "doc-star"]:
         part = fit[id_]
         check(part is not None and not part["hidden"] and part["width"] > 0
               and part["height"] > 0,
               f"#{id_} has no room in the header bar: {fit}")
         check(part["left"] >= -1 and part["right"] <= fit["innerWidth"] + 1,
               f"#{id_} spills out of the phone's width: {fit}")
-    for id_ in ["doc-back", "doc-star", "doc-read"]:
+    for id_ in ["doc-back", "doc-star"]:
         check(fit[id_]["hit"] is True,
               f"the centre of #{id_} hits something else: {fit}")
 

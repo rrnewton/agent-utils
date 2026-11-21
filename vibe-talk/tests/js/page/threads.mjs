@@ -1249,7 +1249,10 @@ test("thread-aware speech batches never mix threads and summaries and read marks
   await signIn(page);
   await showDiscord(page, data.messages);
   await page.el("channel-view-flat").click();
-  await readButton(page).click();
+  // Armed through the mode act: the button itself now starts the first
+  // visible row at once (`#2003`), whose tap-prepare is not this test's
+  // batch-composition premise.
+  page.pure("setReadingMode(true)");
   await page.settle();
   assert.equal(page.prepareCalls.length, 3);
   // In any order: the rows on screen go first (`#375 read-aloud-latency`).

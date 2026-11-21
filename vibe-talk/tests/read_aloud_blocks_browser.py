@@ -854,6 +854,14 @@ def main() -> int:
                 page.wait_for_function(
                     f"() => readAloudOwner().preparedSpeech.has('{LONG}') && readAloudOwner().preparedSpeech.get('{LONG}').blocks",
                     timeout=int(STATE_S * 1000))
+                # `#2003`: the press now starts the first visible message
+                # at once (here, this walk's own long message, already
+                # blocks in). Stop it (mode stays armed) and forget its
+                # reads: the walk's first tap then starts from block 1.
+                page.evaluate("() => readAloudOwner().stopReading()")
+                with api.lock:
+                    api.reads.clear()
+                    api.dismissed.clear()
                 return context, page
 
             row = f'#discord-log > li[data-id="{LONG}"]'

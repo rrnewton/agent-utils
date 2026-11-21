@@ -26,6 +26,7 @@ screen in a document this long) brings the lit block inside the scroller,
 and finishing, stopping and Back all take the light off.
 """
 
+import argparse
 import io
 import json
 import math
@@ -40,9 +41,9 @@ import urllib.request
 import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
-from playwright.sync_api import Page, sync_playwright
+from playwright.sync_api import Browser, BrowserContext, Page, sync_playwright
 
 from browser_audio import CHROMIUM_AUDIO_ARGS
 
@@ -343,6 +344,43 @@ def walk(page: Page, base: str, touch: bool, name: str, blocks: list[str]) -> No
         "() => document.getElementById('audio-source').getAttribute('aria-checked') === 'false'",
         timeout=20_000)
 
+    # `#2003 vibe-talk-read-starts-on-screen`: Read starts at the first
+    # meaningful visible block with no scroll change, Pause beside it,
+    # and the header's own Read button is gone.
+    check(page.locator("#doc-read").count() == 0,
+          "the redundant header Read button still stands")
+    page.evaluate("() => { document.getElementById('scroll-area').scrollTop = 400; }")
+    before = page.evaluate(
+        """() => {
+          const area = document.getElementById('scroll-area');
+          const view = area.getBoundingClientRect();
+          const blocks = [...document.querySelectorAll('#doc-body > p')];
+          let first = -1;
+          blocks.forEach((el, at) => {
+            if (first !== -1) return;
+            const r = el.getBoundingClientRect();
+            const visible = Math.min(r.bottom, view.bottom) - Math.max(r.top, view.top);
+            if (visible > 0 && visible >= Math.min(40, (r.bottom - r.top) / 2)) first = at;
+          });
+          return { top: area.scrollTop, first };
+        }""")
+    check(before["first"] > 0,
+          f"the premise: no later block is first on screen after scrolling: {before}")
+    act("#read-aloud")
+    wait_lit(page, blocks[before["first"]])
+    after_top = page.evaluate("() => document.getElementById('scroll-area').scrollTop")
+    check(after_top == before["top"],
+          f"Read moved the scroll: {before['top']} -> {after_top}")
+    check(page.locator("#read-aloud-label").inner_text().strip() == "Pause",
+          "Pause does not stand beside the started read")
+    act("#read-aloud-stop")
+    wait_stopped(page)
+    wait_unlit(page)
+    page.evaluate("() => { document.getElementById('scroll-area').scrollTop = 0; }")
+    # The walk below counts the device voice from silence: forget this
+    # segment's utterances, as if Read had not been pressed yet.
+    page.evaluate("() => { window.deviceSpeech.length = 0; }")
+
     count = len(blocks)
     # `#1543`: inactive — tapping document text starts no read.
     inactive_block = page.locator("#doc-body > p", has_text=blocks[1][:20])
@@ -358,7 +396,7 @@ def walk(page: Page, base: str, touch: bool, name: str, blocks: list[str]) -> No
     # Read: the strip counts the blocks, the device voice says them in order,
     # and the read is the owner's document read — no queue of the reader's own.
     # The block being read is lit in the reader (`#1330 doc-read-highlight`).
-    act("#doc-read")
+    act("#read-aloud")
     wait_count(page, f"1 of {count}")
     wait_lit(page, blocks[0])
     wait_lit_in_view(page)
@@ -445,8 +483,11 @@ def walk(page: Page, base: str, touch: bool, name: str, blocks: list[str]) -> No
     check(len(utterances(page)) == said_before_finish, "finishing the read said something after it")
     # The strip's own Next on the last block finishes it the same way, with a
     # real press (Playwright tap/click, no wall-clock wait: `wait_stopped`
-    # waits on the owner's read state).
-    act("#doc-read")
+    # waits on the owner's read state). Back at the document's top first:
+    # Read starts at the first visible block (`#2003`), and the read just
+    # finished left the last block in view.
+    page.evaluate("() => { document.getElementById('scroll-area').scrollTop = 0; }")
+    act("#read-aloud")
     wait_count(page, f"1 of {count}")
     act(f'#doc-nav .doc-nav-chunks .doc-nav-chunk:text-is("{count}")')
     wait_count(page, f"{count} of {count}")
@@ -464,7 +505,8 @@ def walk(page: Page, base: str, touch: bool, name: str, blocks: list[str]) -> No
     page.wait_for_function(
         "() => document.getElementById('audio-source').getAttribute('aria-checked') === 'true'",
         timeout=20_000)
-    act("#doc-read")
+    page.evaluate("() => { document.getElementById('scroll-area').scrollTop = 0; }")
+    act("#read-aloud")
     page.wait_for_function(
         """(tail) => {
           const strip = document.getElementById('read-steer');
@@ -485,7 +527,7 @@ def walk(page: Page, base: str, touch: bool, name: str, blocks: list[str]) -> No
     check(len(utterances(page)) == said, "the server read also spoke on the device")
     state = owner_state(page)
     check(state["kind"] == "document", f"the cloud read is not the document's: {state}")
-    act("#doc-read")
+    act("#read-aloud-stop")
     wait_stopped(page)
     wait_unlit(page)
 
@@ -495,7 +537,8 @@ def walk(page: Page, base: str, touch: bool, name: str, blocks: list[str]) -> No
     page.wait_for_function(
         "() => document.getElementById('audio-source').getAttribute('aria-checked') === 'false'",
         timeout=20_000)
-    act("#doc-read")
+    page.evaluate("() => { document.getElementById('scroll-area').scrollTop = 0; }")
+    act("#read-aloud")
     wait_count(page, f"1 of {count}")
     wait_lit(page, blocks[0])
     act("#doc-back")
@@ -585,7 +628,7 @@ def walk_list(page: Page, base: str) -> None:
             "() => document.getElementById('audio-source').getAttribute('aria-checked') === 'false'",
             timeout=20_000)
     count = len(LIST_BLOCKS)
-    page.tap("#doc-read")
+    page.tap("#read-aloud")
     wait_count(page, f"1 of {count}")
     # Step the whole list: at every block the voice's latest words are the
     # lit block's words — asserted on the read's own state, never on time.
@@ -617,7 +660,7 @@ def walk_list(page: Page, base: str) -> None:
     # Tap-to-read while active (`#1505`, `#1543`): Read restarts the read,
     # then a tap on the closing paragraph jumps there, and a tap on a list
     # item jumps to that item.
-    page.tap("#doc-read")
+    page.tap("#read-aloud")
     wait_count(page, f"1 of {count}")
     said_before = len(utterances(page))
     page.locator("#doc-body > p", has_text="Closing paragraph").tap()
@@ -639,7 +682,243 @@ def walk_list(page: Page, base: str) -> None:
     page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
 
 
+def write_build_stamp(folder: Path) -> None:
+    """The shot folder's BUILD.txt: what build the shots show."""
+    def git(*argv: str) -> str:
+        return subprocess.run(["git", "-C", str(Path(__file__).resolve().parent.parent.parent), *argv],
+                              capture_output=True, text=True).stdout.strip() or "unknown"
+
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "BUILD.txt").write_text(
+        f"commit {git('rev-parse', 'HEAD')}\n"
+        f"commit-date {git('log', '-1', '--format=%cI', 'HEAD')}\n"
+        "server target/release/vibe-talk (this checkout)\n",
+        encoding="utf-8",
+    )
+
+
+def screenshot_matrix(browser: Browser, base: str, out: Path) -> None:
+    """The #2004/#2003 shot matrix (coordb, 2026-11-20): Documents and a
+    channel, before and after pressing Read with the lit block visible,
+    light and dark at phone 412 and desktop 1280, Discuss open on the
+    phone, and the lit block in every colour preset. Photographic only:
+    the behaviour is asserted by the walks above; bar presses that an
+    open panel would cover go through the element's own click.
+    """
+    name, blocks = DOCS[0]
+
+    def stamp(*parts: str) -> Path:
+        folder = out.joinpath(*parts)
+        write_build_stamp(folder)
+        return folder
+
+    def new_page(ctx: BrowserContext) -> Page:
+        page = ctx.new_page()
+        page.add_init_script(
+            f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")
+        page.add_init_script(DEVICE_VOICE)
+        page.add_init_script(MEDIA_PROBE)
+        return page
+
+    def pick_device(page: Page) -> None:
+        page.wait_for_function(
+            "() => { const t = document.getElementById('audio-source');"
+            " return !!t && !t.hidden && t.getAttribute('aria-checked') !== null; }",
+            timeout=20_000)
+        if page.evaluate("() => document.getElementById('audio-source').getAttribute('aria-checked')") == "true":
+            page.evaluate("() => document.getElementById('audio-source').click()")
+            page.wait_for_function(
+                "() => document.getElementById('audio-source').getAttribute('aria-checked') === 'false'",
+                timeout=20_000)
+
+    def open_document(page: Page) -> None:
+        page.goto(base + "/?v=docs", wait_until="load")
+        page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
+        page.locator("#documents-list .doc-card", has_text=name).first.click()
+        page.wait_for_function(
+            "(words) => (document.getElementById('doc-body')?.textContent || '').includes(words)",
+            arg=blocks[0][:20], timeout=20_000)
+        pick_device(page)
+
+    def open_channel(page: Page) -> None:
+        page.goto(base + "/", wait_until="load")
+        page.wait_for_selector("#view-switch", state="visible", timeout=20_000)
+        for _ in range(3):
+            if not page.locator("#discord-channel").is_hidden():
+                break
+            page.click("#view-switch")
+            try:
+                page.wait_for_selector("#discord-channel", state="visible", timeout=5_000)
+                break
+            except Exception:
+                continue
+        page.wait_for_selector("#discord-log > li[data-id]", state="visible", timeout=20_000)
+
+    def press(page: Page, element_id: str) -> None:
+        page.evaluate(f"() => document.getElementById('{element_id}').click()")
+
+    schemes: tuple[Literal["dark", "light"], ...] = ("dark", "light")
+    for scheme in schemes:
+        for label, width, height, touch in (("phone412", 412, 915, True), ("desktop1280", 1280, 800, False)):
+            ctx = browser.new_context(
+                viewport={"width": width, "height": height},
+                has_touch=touch, is_mobile=touch, color_scheme=scheme)
+            page = new_page(ctx)
+            docs = stamp("documents")
+            open_document(page)
+            page.screenshot(path=str(docs / f"documents-{scheme}-{label}-before.png"))
+            press(page, "read-aloud")
+            wait_lit(page, blocks[0])
+            page.screenshot(path=str(docs / f"documents-{scheme}-{label}-after.png"))
+            press(page, "read-aloud-stop")
+            wait_stopped(page)
+
+            chan = stamp("channel")
+            open_channel(page)
+            page.screenshot(path=str(chan / f"channel-{scheme}-{label}-before.png"))
+            press(page, "read-aloud")
+            page.wait_for_function(
+                "() => readAloudOwner().nowPlaying !== null"
+                " && document.querySelector('#discord-log [data-reading-block=\"current\"]') !== null",
+                timeout=20_000)
+            page.screenshot(path=str(chan / f"channel-{scheme}-{label}-after.png"))
+            press(page, "read-aloud-stop")
+            wait_stopped(page)
+
+            if touch:
+                # Discuss open over the channel on the phone, before/after
+                # Read. This fixture server has no summariser, so answer
+                # Discuss's routes with a saved summary, as
+                # discuss_readjump_browser does.
+                summary: dict[str, object] = {
+                    "backend": "fake", "model": "fake-model", "view": "flat",
+                    "since_ms": None, "created_ms": 1760000099999,
+                    "window": {"count": 120, "unread_count": 2, "read_count": 118,
+                               "from_id": "x", "through_id": "y", "truncated": False,
+                               "noise_hidden": 0},
+                    "covered_ids": [], "markable_ids": [], "cited_ids": [],
+                    "fresh_ids": [], "footer_links": [],
+                    "text": "Saved summary for the screenshot walk.",
+                    "text_html": "<p>Saved summary for the screenshot walk.</p>",
+                    "unknown_terms": [],
+                    "stamp": {"context_ms": 1, "model_ms": 1, "first_token_ms": None,
+                              "total_ms": 2, "input_tokens": None, "output_tokens": None,
+                              "input_chars": 10, "output_chars": 10},
+                }
+
+                def discuss_config(route: object) -> None:
+                    body = call(base, "GET", "/api/v1/client-config", WRITE_TOKEN)
+                    body["discuss_available"] = True
+                    route.fulfill(status=200, content_type="application/json",  # type: ignore[attr-defined]
+                                  body=json.dumps(body))
+
+                def discuss_preview(route: object) -> None:
+                    route.fulfill(status=200, content_type="application/json",  # type: ignore[attr-defined]
+                                  body=json.dumps({
+                                      "channel": {"id": CHANNEL, "label": "lead team"},
+                                      "thread_id": None, "view": "flat",
+                                      "window": summary["window"], "unread": [],
+                                  }))
+
+                def discuss_record(route: object) -> None:
+                    route.fulfill(status=200, content_type="application/json",  # type: ignore[attr-defined]
+                                  body=json.dumps({
+                                      "exists": True, "thread_id": None,
+                                      "current_summary": summary,
+                                      "timeline": [{"kind": "summary", "summary": summary}],
+                                      "staleness": None,
+                                  }))
+
+                page.route("**/api/v1/client-config", discuss_config)
+                page.route(f"**/api/v1/channels/{CHANNEL}/catchup/preview*", discuss_preview)
+                page.route(f"**/api/v1/channels/{CHANNEL}/catchup/record*", discuss_record)
+                open_channel(page)
+                if page.locator("#discuss-open").is_visible():
+                    page.click("#discuss-open")
+                else:
+                    page.click("#action-menu-open")
+                    page.wait_for_selector("#discuss-menu-open", state="visible", timeout=20_000)
+                    page.click("#discuss-menu-open")
+                page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
+                page.screenshot(path=str(chan / f"channel-{scheme}-{label}-discuss-before.png"))
+                # With Discuss open the bar's Read reads the summary
+                # (`#1531`); on the device voice it speaks the panel's
+                # saved words, which this fixture's routes provide.
+                pick_device(page)
+                press(page, "read-aloud")
+                try:
+                    page.wait_for_function(
+                        "() => readAloudOwner().nowPlaying !== null", timeout=20_000)
+                except Exception:
+                    state = page.evaluate("""() => ({
+                      playing: readAloudOwner().nowPlaying ? readAloudOwner().nowPlaying.id : null,
+                      pending: readAloudOwner().pendingRead,
+                      mode: readAloudOwner().readingMode,
+                      label: document.getElementById('read-aloud-label')?.textContent,
+                      rows: document.querySelectorAll('#discord-log > li[data-id]').length,
+                      status: document.getElementById('status')?.textContent,
+                      error: document.getElementById('error')?.textContent,
+                    })""")
+                    check(False, f"discuss-after: Read started nothing with Discuss open: {state}")
+                page.screenshot(path=str(chan / f"channel-{scheme}-{label}-discuss-after.png"))
+                press(page, "read-aloud-stop")
+                wait_stopped(page)
+            ctx.close()
+
+    # The lit block in every colour preset (owner 273: "no highlight"),
+    # dark and light on the phone.
+    presets = stamp("presets")
+    for scheme in schemes:
+        ctx = browser.new_context(
+            viewport={"width": 412, "height": 915}, has_touch=True, is_mobile=True,
+            color_scheme=scheme)
+        page = new_page(ctx)
+        open_document(page)
+        for preset in ("blue", "blue-hc", "teal", "plum", "amber"):
+            page.evaluate("() => document.getElementById('open-settings').click()")
+            page.wait_for_selector("#colour-theme", state="attached", timeout=20_000)
+            page.evaluate("""(id) => {
+              const node = document.getElementById(id); const bodies = [];
+              for (let n = node; n; n = n.parentElement) {
+                if (n.classList && n.classList.contains('fold-body')) bodies.unshift(n);
+              }
+              for (const body of bodies) {
+                const toggle = document.querySelector(`[aria-controls="${body.id}"]`);
+                if (toggle && toggle.getAttribute('aria-expanded') !== 'true') toggle.click();
+              }
+            }""", "colour-theme")
+            page.wait_for_function(
+                "() => document.getElementById('colour-theme').checkVisibility()",
+                timeout=20_000)
+            page.select_option("#colour-theme", preset)
+            page.wait_for_function(
+                f"() => document.documentElement.getAttribute('data-colour-theme') === '{preset}'",
+                timeout=20_000)
+            page.evaluate("() => document.getElementById('close-settings').click()")
+            press(page, "read-aloud")
+            wait_lit(page, blocks[0])
+            # The light must be a colour of its own, not the block's ground.
+            distinct = page.evaluate("""() => {
+              const lit = document.querySelector('#doc-body [data-reading-block="current"]');
+              if (!lit) return false;
+              const bg = getComputedStyle(lit).backgroundColor;
+              const parent = getComputedStyle(lit.parentElement).backgroundColor;
+              const box = lit.getBoundingClientRect();
+              return box.width > 0 && box.height > 0 && bg !== parent && bg !== 'rgba(0, 0, 0, 0)';
+            }""")
+            check(distinct, f"presets/{scheme}-{preset}: the lit block has no distinct visible colour")
+            page.screenshot(path=str(presets / f"presets-{scheme}-{preset}.png"))
+            press(page, "read-aloud-stop")
+            wait_stopped(page)
+        ctx.close()
+    print(f"screenshot matrix written under {out} (documents, channel, presets; BUILD.txt per folder)")
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--screenshots", type=Path, default=None,
+                        help="also write the #2004/#2003 shot matrix under this directory")
+    args = parser.parse_args()
     port = free_port()
     base = f"http://127.0.0.1:{port}"
     sidecar = ThreadingHTTPServer(("127.0.0.1", 0), SidecarHandler)
@@ -719,6 +998,8 @@ def main() -> int:
                 page.add_init_script(MEDIA_PROBE)
                 walk_list(page, base)
                 ctx.close()
+                if args.screenshots is not None:
+                    screenshot_matrix(browser, base, args.screenshots)
                 browser.close()
             print("documents read browser check: strip, device blocks, Next/Prev, media next, "
                   "finish-on-last, device/cloud toggle, Back-stop, pause from the pane, "

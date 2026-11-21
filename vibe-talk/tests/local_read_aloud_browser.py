@@ -285,6 +285,13 @@ def walk(page: "Page", api: FakeApi, url: str, shot: Callable[[str], None], benc
     # A tap is heard.
     page.click("#read-aloud")
     page.wait_for_function(f"() => readAloudOwner().preparedSpeech.size() === {len(MESSAGES)}", timeout=int(STATE_S * 1000))
+    # `#2003`: the press now starts the first visible message at once.
+    # Stop it (mode stays armed) and forget its asks: the tap below then
+    # asks first, as it did when Read only armed.
+    page.evaluate("() => readAloudOwner().stopReading()")
+    with api.lock:
+        api.timings.clear()
+        api.reads.clear()
     viewport = page.viewport_size or {"width": 1440, "height": 900}
     if viewport["width"] < 600:
         page.tap('#discord-log > li[data-id="401"] .body')
