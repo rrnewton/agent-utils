@@ -494,6 +494,7 @@
         "py/wrkslots/tests/test_image_convert_rust.py",
         "py/wrkslots/tests/test_image_mount_family_rust.py",
         "py/wrkslots/tests/test_image_set_default_rust.py",
+        "py/wrkslots/tests/test_image_status_readonly.py",
         "py/wrkslots/tests/test_image_status_rust.py",
         "py/wrkslots/tests/test_image_trim_rust.py",
         "py/wrkslots/tests/test_journal_actor_liveness.py",

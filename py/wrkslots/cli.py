@@ -5313,7 +5313,12 @@ def _assert_writer_level(config: Config, level: int, what: str) -> None:
         )
 
 
-def _load_config(explicit_root: str | None, machine_override: str | None) -> Config:
+def _load_config(
+    explicit_root: str | None,
+    machine_override: str | None,
+    *,
+    mount_images: bool = True,
+) -> Config:
     root = _discover_root(explicit_root)
     path = root / CONFIG_NAME
     raw = _forward_compatible_config(_read_config(path), path)
@@ -5633,7 +5638,7 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
                     f"wrkslots: WARNING: worktrees image not mounted: {reason}",
                     file=sys.stderr,
                 )
-    _activate_representation(config)
+    _activate_representation(config, mount=mount_images)
     return config
 
 
@@ -5771,13 +5776,15 @@ _DISCARDED_STALE_MOUNTS: frozenset[tuple[Path, str, str]] = frozenset()
 _STALE_COPY_MARK = " [stale-image-copy="
 
 
-def _activate_representation(config: Config) -> None:
+def _activate_representation(config: Config, *, mount: bool = True) -> None:
     """Mount any image-backed slot whose image is not mounted, then note owned mounts.
 
     Runs whenever a configuration is loaded, so that after a reboot (or a crash
     between unmount and remount during relocation) every image-backed slot is
     back at its recorded location before any lifecycle logic inspects it. A
     slot that cannot be mounted does not stop the others; each is named.
+    With ``mount=False`` (read-only reporting such as `image status`) nothing
+    is mounted; mount state is only observed.
     """
 
     global _OWNED_REPRESENTATION_MOUNTS, _STALE_REPRESENTATION_MOUNTS, _DISCARDED_STALE_MOUNTS
@@ -5789,6 +5796,9 @@ def _activate_representation(config: Config) -> None:
         _STALE_REPRESENTATION_MOUNTS = frozenset()
         _DISCARDED_STALE_MOUNTS = frozenset()
         _refresh_worktrees_bind_mounts(config)
+        return
+    if not mount:
+        _refresh_owned_mounts(config)
         return
     try:
         actions, failures = slotimage.ensure_all_mounted(config.control)

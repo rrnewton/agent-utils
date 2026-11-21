@@ -39,7 +39,8 @@ def register(subparsers: argparse._SubParsersAction[_ParserT], formatter: type[a
             "second small image holding the sandbox's private HOME and /tmp. Representation is "
             "a storage choice only: ownership, heartbeats, salvage, and reclaim are unchanged. "
             "Every wrkslots command remounts image-backed slots that are not mounted (after a "
-            "reboot, for example) before doing anything else."
+            "reboot, for example) before doing anything else, except the read-only "
+            "`image status`, which only reports the observed mount state."
         ),
         formatter_class=formatter,
     )
@@ -1728,10 +1729,10 @@ def _cmd_image_help(args: argparse.Namespace) -> int:
     return 0
 
 
-def _config(args: argparse.Namespace) -> "cli.Config":
+def _config(args: argparse.Namespace, *, mount_images: bool = True) -> "cli.Config":
     from wrkslots import cli
 
-    return cli._load_config(args.project_root, args.machine)
+    return cli._load_config(args.project_root, args.machine, mount_images=mount_images)
 
 
 def _refuse(message: str) -> "cli.Refusal":
@@ -1751,7 +1752,9 @@ def _load_image(config: "cli.Config", slot_type: str, slot: str) -> slotimage.Sl
 
 
 def _cmd_image_status(args: argparse.Namespace) -> int:
-    config = _config(args)
+    # Status is read-only (#2061): it must never mount. It reports the
+    # observed mount state (not mounted / unknown) instead.
+    config = _config(args, mount_images=False)
     try:
         reports = [slotimage.usage(image) for image in slotimage.all_images(config.control)]
     except slotimage.ImageError as exc:

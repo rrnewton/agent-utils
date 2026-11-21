@@ -15,11 +15,11 @@ updated_at: 2026-11-21T11:45:00-05:00
 
 # Design
 
-Status reports mount state without mounting anything; whatever needed the ensure-mount keeps it out of status. A test shows status on an unmounted slot leaves it unmounted.
+[watermelon-full-preview] Cause: `cli._load_config` runs `_activate_representation`, which mounts every unmounted image slot (`slotimage.ensure_all_mounted`) on every command, including the read-only `image status`. Fix: `_load_config(..., mount_images=False)` skips the ensure-mount (mount state is only observed via `_refresh_owned_mounts`); `image status` loads with it, all other commands keep the ensure-mount. The Rust edition's loader already never activates, so this also closes that divergence. No persisted-format or lock change.
 
 # Acceptance Criteria
 
-- The behaviour described under Design, covered by a deterministic regression test (condition-based, no wall-clock budgets).
+- The behaviour described under Design, covered by a deterministic regression test (condition-based, no wall-clock budgets): `test_image_status_readonly.py` proves status on an unmounted slot never calls the ensure-mounted path and reports `mounted=False`, and that an ordinary load still ensures mounts.
 
 # Notes
 
