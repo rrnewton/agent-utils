@@ -8596,9 +8596,23 @@ def run_captures(
                         for name, _path, verdict in driver.judged(wait=True):
                             print(f"  ok    {name:<30} {verdict.describe()}")
                         everything.extend(driver.results)
-                        context.close()
+                        # `#2014`: close the page before its context; a target
+                        # already closed by teardown racing the walk must not
+                        # mask a finished profile's verdicts as a failure.
+                        for close in (page.close, context.close):
+                            try:
+                                close()
+                            except Exception as error:
+                                if "TargetClosed" not in type(error).__name__ \
+                                        and "has been closed" not in str(error):
+                                    raise
             finally:
-                browser.close()
+                try:
+                    browser.close()
+                except Exception as error:
+                    if "TargetClosed" not in type(error).__name__ \
+                            and "has been closed" not in str(error):
+                        raise
     finally:
         judges.shutdown(wait=True, cancel_futures=True)
     return everything
