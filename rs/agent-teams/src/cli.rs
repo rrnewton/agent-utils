@@ -2037,7 +2037,20 @@ fn cmd_status(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
                     .to_string()
             })
     });
+    // Same-host ledger: reconcile before answering, so status never
+    // reports the hand-over state after typing finished (#2029 a-d).
+    if let Some((team, _)) = find_ledger_entry_any_team(globals, &id) {
+        let _ = crate::ledger::reconcile_queue_delivery(&globals.state, &team, &id);
+    }
     let ledger = find_ledger_entry_any_team(globals, &id);
+    // Exit by the reconciled recipient state when one is known (#2029 e):
+    // a delivered recipient must exit 0 even while the outbox still
+    // says accepted.
+    let exit_state = recipient_state.clone().or_else(|| {
+        ledger
+            .as_ref()
+            .and_then(|(_, entry)| entry["state"].as_str().map(str::to_string))
+    });
     if globals.json || has_flag(args, "--json") {
         println!(
             "{}",
@@ -2049,9 +2062,13 @@ fn cmd_status(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
                 "ledger": ledger.map(|(team, entry)| json!({"team": team, "entry": entry})),
             }))?
         );
-        let state = outbox
-            .as_ref()
-            .and_then(|o| o["state"].as_str().map(str::to_string))
+        let state = exit_state
+            .clone()
+            .or_else(|| {
+                outbox
+                    .as_ref()
+                    .and_then(|o| o["state"].as_str().map(str::to_string))
+            })
             .unwrap_or_else(|| "unknown".to_string());
         return Ok(exit_code_for(&state));
     }
@@ -2077,7 +2094,11 @@ fn cmd_status(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
                     );
                 }
             }
-            Ok(exit_code_for(entry["state"].as_str().unwrap_or("deferred")))
+            Ok(exit_code_for(
+                exit_state
+                    .as_deref()
+                    .unwrap_or_else(|| entry["state"].as_str().unwrap_or("deferred")),
+            ))
         }
         (None, Some((team, entry))) => {
             println!(
@@ -2548,6 +2569,13 @@ fn cmd_receipt(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         .next()
         .ok_or_else(|| err("usage", "receipt needs an ID"))?;
     let team = flag_value(args, "--team");
+    // Reconcile on read (#2029): a receipt must reflect the real queue
+    // outcome, not the hand-over state recorded at accept.
+    if let Some(team) = &team {
+        let _ = crate::ledger::reconcile_queue_delivery(&globals.state, team, &id);
+    } else if let Some((team, _)) = find_ledger_entry_any_team(globals, &id) {
+        let _ = crate::ledger::reconcile_queue_delivery(&globals.state, &team, &id);
+    }
     let value = match &team {
         Some(team) => receipt(&globals.state, team, &id),
         None => match find_ledger_entry_any_team(globals, &id) {

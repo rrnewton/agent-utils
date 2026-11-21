@@ -1096,11 +1096,20 @@ fn reconcile_folds_queue_terminal_state_into_the_ledger() {
         std::fs::rename(from, queue_dir.join(to).join(format!("{id}.json"))).expect("move");
     };
 
+
+    let stamp_processed = |id: &str| {
+        let path = queue_dir.join("processed").join(format!("{id}.json"));
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        doc["confirmed_at"] = serde_json::json!(1.0);
+        std::fs::write(&path, doc.to_string()).unwrap();
+    };
     let done = "tm-sim-3333333333333333";
     deliver(done, 1);
     assert_eq!(reconcile_queue_delivery(&state, "tools", done), None);
     assert_eq!(receipt(&state, "tools", done)["state"], "accepted");
     move_item(done, "processed");
+    stamp_processed(done);
     assert_eq!(
         reconcile_queue_delivery(&state, "tools", done).as_deref(),
         Some("delivered")
@@ -1151,6 +1160,7 @@ fn reconcile_folds_queue_terminal_state_into_the_ledger() {
     assert_eq!(answer["held"]["since"], since, "{answer}");
     assert_eq!(answer["held"]["reason"], "a draft is there", "{answer}");
     move_item(held, "processed");
+    stamp_processed(held);
     assert_eq!(
         reconcile_queue_delivery(&state, "tools", held).as_deref(),
         Some("delivered")
@@ -1184,11 +1194,116 @@ fn reconcile_folds_queue_terminal_state_into_the_ledger() {
     .expect("sidecar");
     assert_eq!(
         reconcile_queue_delivery(&state, "tools", archived).as_deref(),
-        Some("possibly_submitted")
+        Some("failed")
     );
     let answer = receipt(&state, "tools", archived);
-    assert_eq!(answer["state"], "possibly_submitted", "{answer}");
+    assert_eq!(answer["state"], "failed", "{answer}");
     assert_eq!(answer["detail"], reason, "{answer}");
+
+    // #2029: a processed item with no delivery proof is stranded, never delivered.
+    let proof_free = "tm-sim-5555555555555555";
+    deliver(proof_free, 5);
+    move_item(proof_free, "processed");
+    let proof_path = queue_dir.join("processed").join(format!("{proof_free}.json"));
+    let mut proof_doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&proof_path).unwrap()).unwrap();
+    proof_doc["delivery_state"] = serde_json::json!("queued");
+    std::fs::write(&proof_path, proof_doc.to_string()).unwrap();
+    assert_eq!(
+        reconcile_queue_delivery(&state, "tools", proof_free).as_deref(),
+        Some("stranded")
+    );
+    let answer = receipt(&state, "tools", proof_free);
+    assert_eq!(answer["state"], "stranded", "{answer}");
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+/// #2029 gaps (a)-(d): however typing finished, a later read reconciles.
+/// (a) an already-processed drain, (b) typing in another drain's batch,
+/// (c) a drain helper that died before reconciling, (d) an archived
+/// coordinator orphaning the ledger. All four end at the same read.
+#[test]
+fn reconcile_covers_drain_gaps_a_to_d() {
+    use agent_teams::deliver::AgentctlQueueDeliverer;
+    use agent_teams::ledger::{receipt, reconcile_queue_delivery};
+    let state = temp_state("reconcile-gaps");
+    declaration_for(&state, "tools", "sim");
+    let declarations = agent_teams::proof::load_declarations(&state).expect("decls");
+    let (_, _, declaration) = &declarations[0];
+    let registry = state.join("registry");
+    let queue_dir = registry.join("agents/coord/queue");
+    std::fs::create_dir_all(registry.join("agents/coord")).unwrap();
+    std::fs::write(registry.join("coordinator.json"), "{\"name\": \"coord\"}").unwrap();
+    let deliverer = AgentctlQueueDeliverer {
+        team: "tools".into(),
+        queue_dir: queue_dir.clone(),
+        ledger_path: state.join("ledger.json"),
+        registry: registry.clone(),
+        agent: "coord".into(),
+        auto_drain: agent_teams::deliver::AutoDrain { enabled: false, ..Default::default() },
+        drain_state_dir: None,
+    };
+    let ctx = AcceptContext {
+        state: &state, this_host: "host-a", declaration, via: "test",
+        proof_note: "proved", relayed_by: None, peer_host: "host-a", via_chat_relay: false,
+    };
+    let now_ms = agent_teams::timeutil::now_unix_ms();
+    let deliver = |id: &str, seq: i64| {
+        let envelope = build_envelope(
+            id, "k", "sim", "host-a", seq, "harness-ancestry", "tools", "host-a",
+            "info", None, &[], false, now_ms, now_ms + 7_200_000, None, "body",
+        );
+        assert_eq!(accept(&ctx, &envelope, &deliverer).expect("accept").state.as_deref(), Some("accepted"));
+    };
+    let confirm_processed = |queue: &Path, id: &str| {
+        let directories = agent_queue::queue::QueueDirectories::new(queue);
+        let from = [&directories.inbox_v2, &directories.inbox, &directories.inflight]
+            .into_iter().map(|dir| dir.join(format!("{id}.json"))).find(|path| path.exists()).expect("queued");
+        let to = queue.join("processed").join(format!("{id}.json"));
+        std::fs::rename(from, to.clone()).expect("move");
+        let mut doc: Value = serde_json::from_str(&std::fs::read_to_string(&to).unwrap()).unwrap();
+        doc["confirmed_at"] = json!(1.0);
+        doc["delivery_state"] = json!("processed");
+        std::fs::write(&to, doc.to_string()).unwrap();
+    };
+
+    // (a)+(c): typed and filed processed; no reconcile ever ran.
+    let a = "tm-sim-1111111111111111";
+    deliver(a, 1);
+    confirm_processed(&queue_dir, a);
+    assert_eq!(reconcile_queue_delivery(&state, "tools", a).as_deref(), Some("delivered"));
+
+    // (b): typed under the designated coordinator's queue after a re-designation.
+    let b = "tm-sim-2222222222222222";
+    deliver(b, 2);
+    let new_queue = registry.join("agents/coord2/queue");
+    std::fs::create_dir_all(registry.join("agents/coord2")).unwrap();
+    std::fs::write(registry.join("agents/coord2/agent.json"), "{}").unwrap();
+    std::fs::write(registry.join("coordinator.json"), "{\"name\": \"coord2\"}").unwrap();
+    let new_dirs = agent_queue::queue::prepare(&new_queue).unwrap();
+    agent_queue::queue::prepare_lane(&new_queue, &new_dirs.inbox_v2).unwrap();
+    let directories = agent_queue::queue::QueueDirectories::new(&queue_dir);
+    let from = [&directories.inbox_v2, &directories.inbox].into_iter()
+        .map(|dir| dir.join(format!("{b}.json"))).find(|path| path.exists()).expect("queued");
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(&from).unwrap()).unwrap();
+    std::fs::write(new_queue.join("inbox.v2").join(format!("{b}.json")), doc.to_string()).unwrap();
+    std::fs::remove_file(&from).unwrap();
+    confirm_processed(&new_queue, b);
+    assert_eq!(reconcile_queue_delivery(&state, "tools", b).as_deref(), Some("delivered"));
+
+    // (d): the coordinator is archived with the item still inflight.
+    let d = "tm-sim-6666666666666666";
+    deliver(d, 3);
+    let directories = agent_queue::queue::QueueDirectories::new(&queue_dir);
+    let from = [&directories.inbox_v2, &directories.inbox].into_iter()
+        .map(|dir| dir.join(format!("{d}.json"))).find(|path| path.exists()).expect("queued");
+    std::fs::create_dir_all(queue_dir.join("inflight")).unwrap();
+    std::fs::rename(from, queue_dir.join("inflight").join(format!("{d}.json"))).unwrap();
+    let archived_queue = registry.join("archive/coord-1-2/queue");
+    std::fs::create_dir_all(archived_queue.parent().unwrap()).unwrap();
+    std::fs::rename(&queue_dir, &archived_queue).unwrap();
+    assert_eq!(reconcile_queue_delivery(&state, "tools", d).as_deref(), Some("stranded"));
+    assert_eq!(receipt(&state, "tools", d)["state"], "stranded");
     let _ = std::fs::remove_dir_all(&state);
 }
 

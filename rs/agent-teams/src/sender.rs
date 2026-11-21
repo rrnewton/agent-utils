@@ -119,7 +119,8 @@ pub fn exit_code_for(state: &str) -> i32 {
         "delivered" | "journaled" => 0,
         "accepted" | "deferred" | "awaiting-pull" | "in-custody" | "claimed" | "typing"
         | "presented" | "undeliverable" => 75,
-        "ambiguous" | "ambiguous-expired" | "possibly_submitted" | "lost" => 76,
+        "ambiguous" | "ambiguous-expired" | "possibly_submitted" | "lost" | "failed"
+        | "stranded" => 76,
         "expired" | "superseded" | "retracted" | "refused" | "fenced" | "journaled-halted" => 65,
         _ => 75,
     }
@@ -137,6 +138,7 @@ pub fn is_terminal(state: &str) -> bool {
             | "fenced"
             | "journaled"
             | "journaled-halted"
+            | "failed"
     )
 }
 
@@ -573,6 +575,7 @@ pub fn delivery_outcome(recipient_state: &str) -> &'static str {
     match recipient_state {
         "delivered" | "journaled" => "delivered",
         "possibly_submitted" => "possibly_submitted",
+        "failed" | "stranded" => "failed",
         "refused" | "fenced" | "expired" | "retracted" | "superseded" | "lost"
         | "ambiguous-expired" | "journaled-halted" => "failed",
         _ => "pending",

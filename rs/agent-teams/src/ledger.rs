@@ -745,15 +745,112 @@ pub fn fence(
     }
 }
 
-/// Fold the agentctl queue's terminal state for an accepted entry back
-/// into the ledger: `processed` becomes `delivered`, `cancelled` becomes
-/// the set-aside reason's terminal state, and `failed` becomes
-/// `possibly_submitted` (its detail the queue's reason when a revive archived
-/// the item untyped). This is how a sender's receipt ever leaves
-/// `accepted` (gap 2): `accept` ends at hand-over, but typing finishes
-/// later and usually in a different process - our `drain-one`, the
-/// coordinator's bridge, or any `agentctl send` that drains the queue on
-/// its way. Returns the new state when it changed one. Only entries
+/// Queue directories that may now hold `id` for a ledger entry whose
+/// recorded queue belonged to a coordinator record that was later
+/// archived, replaced or re-designated (#2029): the recorded queue
+/// (layout-relocated), every archived generation of that agent, and the
+/// current designated coordinator's queue. First hit wins; the recorded
+/// queue is always first so a live item is never shadowed by history.
+fn queue_candidates(recorded: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut push = |path: PathBuf| {
+        if !out.contains(&path) {
+            out.push(path);
+        }
+    };
+    push(agent_queue::registry::relocated(recorded));
+    // Derive (registry, agent) from .../<agent>/queue or
+    // .../agents/<agent>/queue or .../archive/<agent>-<token>/queue.
+    let agent_dir = recorded.parent();
+    let (registry, agent) = match (agent_dir, recorded) {
+        (Some(dir), _) => {
+            let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let parent = dir.parent();
+            match parent.and_then(|p| p.file_name()).and_then(|n| n.to_str()) {
+                Some("agents") => (
+                    parent.and_then(|p| p.parent()).map(Path::to_path_buf),
+                    Some(name.to_string()),
+                ),
+                Some("archive") => {
+                    // Entry is <agent>-<digits>-<digits>[/-adopt-failed].
+                    let agent = name
+                        .rsplit_once('-')
+                        .map(|(head, _)| head)
+                        .and_then(|head| head.rsplit_once('-').map(|(a, _)| a.to_string()))
+                        .unwrap_or_else(|| name.to_string());
+                    (
+                        parent.and_then(|p| p.parent()).map(Path::to_path_buf),
+                        Some(agent),
+                    )
+                }
+                _ => (parent.map(Path::to_path_buf), Some(name.to_string())),
+            }
+        }
+        _ => (None, None),
+    };
+    if let (Some(registry), Some(agent)) = (registry, agent) {
+        if let Ok(entries) = fs::read_dir(registry.join("archive")) {
+            let prefix = format!("{agent}-");
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with(&prefix) {
+                    push(entry.path().join("queue"));
+                }
+            }
+        }
+        let designated = fs::read_to_string(registry.join("coordinator.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|value| {
+                value.get("name").and_then(Value::as_str).map(str::to_owned)
+            });
+        if let Some(designated) = designated {
+            if designated != agent {
+                if let Ok(dir) = agent_queue::registry::directory(&registry, &designated) {
+                    push(dir.join("queue"));
+                }
+            }
+        }
+        // Re-designation fallback: every live agent queue in the same
+        // registry, so a successor is found even when the designation
+        // reader cannot answer in this process.
+        if let Ok(entries) = fs::read_dir(registry.join("agents")) {
+            for entry in entries.flatten() {
+                let queue = entry.path().join("queue");
+                if queue.is_dir() {
+                    push(queue);
+                }
+            }
+        }
+        if let Ok(names) = agent_queue::registry::names(&registry) {
+            for name in names {
+                if let Ok(dir) = agent_queue::registry::directory(&registry, &name) {
+                    push(dir.join("queue"));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Whether a queue directory lives under an `archive/` generation.
+fn in_archive(queue_dir: &Path) -> bool {
+    queue_dir
+        .components()
+        .any(|part| part.as_os_str() == "archive")
+}
+
+/// Fold the agentctl queue's real outcome for an accepted entry back
+/// into the ledger (#2029): confirmed `processed` becomes `delivered`,
+/// an unconfirmed `processed` (still `queued`/`inflight`, never proved
+/// typed) becomes `stranded`, `cancelled` becomes its set-aside
+/// terminal state, `failed` with revive proof of never-typed becomes
+/// `failed` and any other `failed` stays `possibly_submitted`, and an
+/// item `inflight` or missing only in an archived/gone queue becomes
+/// `stranded`. This is how a sender's receipt ever leaves `accepted`:
+/// `accept` ends at hand-over, but typing finishes later and usually
+/// in a different process. Called on receipt/status/seen reads and by
+/// the drain. Returns the new state when it changed one. Only entries
 /// still `accepted` with an `agentctl-queue` target are touched.
 pub fn reconcile_queue_delivery(state: &Path, team: &str, id: &str) -> Option<String> {
     use agent_queue::queue::MessageState;
@@ -768,20 +865,73 @@ pub fn reconcile_queue_delivery(state: &Path, team: &str, id: &str) -> Option<St
         unlock(lock);
         return None;
     }
-    // A queue recorded before its registry moved to layout 2 is found where it is now (#593
-    // registry-agents-subdir).
-    let queue_dir = agent_queue::registry::relocated(&PathBuf::from(
-        target.get("queue_dir").and_then(Value::as_str)?,
-    ));
-    let queue_state = agent_queue::queue::message_state(&queue_dir, id)
-        .ok()
-        .flatten();
-    let (new_state, detail): (&str, String) = match queue_state {
-        Some(MessageState::Processed) => (
-            "delivered",
-            "typed into the coordinator's pane (queue item processed)".to_string(),
-        ),
-        Some(MessageState::Cancelled) => {
+    let recorded = PathBuf::from(target.get("queue_dir").and_then(Value::as_str)?);
+    let candidates = queue_candidates(&recorded);
+    let mut found: Option<(PathBuf, MessageState)> = None;
+    for queue_dir in &candidates {
+        if let Ok(Some(queue_state)) = agent_queue::queue::message_state(queue_dir, id) {
+            found = Some((queue_dir.clone(), queue_state));
+            break;
+        }
+    }
+    let (new_state, detail): (&str, String) = match found {
+        Some((queue_dir, MessageState::Processed)) => {
+            let item = fs::read_to_string(
+                queue_dir.join("processed").join(format!("{id}.json")),
+            )
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+            let delivery_state = item
+                .as_ref()
+                .and_then(|item| item.get("delivery_state"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let confirmed = item.as_ref().is_some_and(|item| {
+                item.get("confirmed_at").is_some() || item.get("transcript_proof").is_some()
+            });
+            if confirmed {
+                (
+                    "delivered",
+                    "typed into the coordinator's pane (queue item processed)".to_string(),
+                )
+            } else {
+                // No confirmation: never call it delivered. An item that
+                // was actually attempted may have been typed, so it is
+                // possibly_submitted; only an item with no attempt at
+                // all (attempts 0, or a block/error before any attempt)
+                // is known stranded.
+                let attempts = item
+                    .as_ref()
+                    .and_then(|item| {
+                        item.get("delivery_attempts")
+                            .and_then(Value::as_u64)
+                            .or_else(|| {
+                                item.get("tui_delivery_attempts").and_then(Value::as_u64)
+                            })
+                    })
+                    .unwrap_or(0);
+                if attempts > 0 {
+                    (
+                        "possibly_submitted",
+                        format!(
+                            "queue item filed processed with delivery_state \
+                             {delivery_state:?} after {attempts} attempt(s) and no \
+                             delivery confirmation; may have been typed"
+                        ),
+                    )
+                } else {
+                    (
+                        "stranded",
+                        format!(
+                            "stranded: queue item filed processed with delivery_state \
+                             {delivery_state:?}, no delivery attempt and no \
+                             confirmation; never typed"
+                        ),
+                    )
+                }
+            }
+        }
+        Some((queue_dir, MessageState::Cancelled)) => {
             let item = fs::read_to_string(queue_dir.join("cancelled").join(format!("{id}.json")))
                 .ok()
                 .and_then(|text| serde_json::from_str::<Value>(&text).ok());
@@ -789,12 +939,15 @@ pub fn reconcile_queue_delivery(state: &Path, team: &str, id: &str) -> Option<St
                 .as_ref()
                 .and_then(|item| item.get("cancel_reason"))
                 .and_then(Value::as_str)
-                .unwrap_or("cancelled");
+                .unwrap_or("cancelled")
+                .to_string();
             if reason == "expired" {
                 (
                     "expired",
                     "set aside untyped at drain: past not_after".to_string(),
                 )
+            } else if reason.starts_with("retargeted") || reason.starts_with("stranded") {
+                ("stranded", format!("set aside untyped: {reason}"))
             } else {
                 (
                     "retracted",
@@ -802,23 +955,47 @@ pub fn reconcile_queue_delivery(state: &Path, team: &str, id: &str) -> Option<St
                 )
             }
         }
-        // A revive that archived the item untyped says so in the queue's failed record (#899
-        // revive-abandon-dead-candidate): the sender learns it was never delivered.
-        Some(MessageState::Failed) => (
-            "possibly_submitted",
-            fs::read_to_string(queue_dir.join("failed").join(format!("{id}.json.error")))
+        Some((queue_dir, MessageState::Failed)) => {
+            let error = fs::read_to_string(queue_dir.join("failed").join(format!("{id}.json.error")))
                 .ok()
                 .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-                .and_then(|sidecar| sidecar.get("error")?.as_str().map(str::to_owned))
-                .filter(|reason| reason.starts_with("archived by revive"))
-                .unwrap_or_else(|| {
+                .and_then(|sidecar| sidecar.get("error")?.as_str().map(str::to_owned));
+            match error {
+                Some(reason)
+                    if reason.starts_with("archived by revive")
+                        || reason.contains("not delivered") =>
+                {
+                    ("failed", reason)
+                }
+                _ => (
+                    "possibly_submitted",
                     "queue quarantined the item as possibly submitted; settle with resolve"
-                        .to_string()
-                }),
+                        .to_string(),
+                ),
+            }
+        }
+        Some((queue_dir, MessageState::Inflight)) if in_archive(&queue_dir) => (
+            "stranded",
+            "stranded: item left inflight in an archived coordinator queue; never confirmed typed"
+                .to_string(),
         ),
-        _ => {
+        Some(_) => {
             unlock(lock);
             return None;
+        }
+        None => {
+            // Nowhere holds the item. That is stranded only when the
+            // recorded queue itself is gone (archived away); a live
+            // queue that simply has not got it yet changes nothing.
+            if recorded.exists() {
+                unlock(lock);
+                return None;
+            }
+            (
+                "stranded",
+                "stranded: recorded coordinator queue is gone and no current or archived queue holds the item"
+                    .to_string(),
+            )
         }
     };
     entry["state"] = json!(new_state);
@@ -837,10 +1014,10 @@ pub fn reconcile_queue_delivery(state: &Path, team: &str, id: &str) -> Option<St
     // as a reply-kind outcome report under this team's notices, so the
     // sender's next receipt query (and any watcher reading notices) learns
     // the message may not have arrived instead of seeing bare `accepted`.
-    if new_state == "possibly_submitted" {
+    if matches!(new_state, "possibly_submitted" | "failed" | "stranded") {
         let notice = json!({
             "event": "delivery-outcome", "kind": "reply", "team": team, "id": id,
-            "outcome": "possibly_submitted", "detail": detail,
+            "outcome": new_state, "detail": detail,
             "at": format_rfc3339_ms(now_unix_ms()),
         });
         crate::sender::log_event(state, &notice);
@@ -907,7 +1084,7 @@ pub fn note_held(state: &Path, team: &str, id: &str, reason: &str) -> bool {
 /// may be pruned at its retention horizon. `possibly_submitted` and
 /// `claimed`/`accepted` are never terminal here: the former needs a
 /// human, the latter may still be typed.
-const PRUNABLE_STATES: [&str; 7] = [
+const PRUNABLE_STATES: [&str; 8] = [
     "delivered",
     "expired",
     "superseded",
@@ -915,6 +1092,7 @@ const PRUNABLE_STATES: [&str; 7] = [
     "fenced",
     "refused",
     "lost",
+    "failed",
 ];
 
 /// The retention horizon of one entry in Unix ms: 30 days past its own
