@@ -1184,6 +1184,9 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     // Invalidate every read in flight, not only the one that is audible. A fetch that has not come
     // back yet is still going to build a player unless its ticket is stale.
     readingTicket += 1;
+    // `#2058`: an ordinary stop takes the optimistic paint with it; a jump's own
+    // teardown keeps it, because the paint IS the position the restart is chasing.
+    if (!readJumping) jumpPaint = null;
     // `#1872`: an ordinary stop (not a retry's own restart, which jumps) frees every
     // segment's one retry for the next read the reader starts.
     if (!readJumping) segmentRetries.clear();
@@ -2041,9 +2044,13 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     const box = body && body.children ? body.children[part]! : null;
     const id = idsOf(row)[part]!;
     // The read in progress keeps the blocks it was prepared in; any other row asks what is prepared.
+    // `#2058`: a jump in flight keeps them too, though its re-prepare may have forgotten the entry.
     const playing = nowPlaying !== null && nowPlaying!.blocks! && nowPlaying!.id === row.getAttribute("data-id");
     const entry = id ? preparedSpeech.get(String(id)) : null;
-    const listed = playing ? nowPlaying!.blocks![part]! : entry && entry.blocks;
+    const listed = playing ? nowPlaying!.blocks![part]!
+      : jumpPaint !== null && jumpPaint.id === row.getAttribute("data-id") && jumpPaint.blocks
+        ? jumpPaint.blocks[part]!
+        : entry && entry.blocks;
     if (!box || !listed) return null;
     const drawn = readingBlocks(box);
     const elementOf = (block: PreparedBlock, index: number) => (Number.isInteger(block.element) ? block.element as number : index);
@@ -2080,7 +2087,9 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
       clear(row);
       row.removeAttribute("data-reading-marked");
     }
-    const playing = nowPlaying;
+    // `#2058`: a jump in flight paints its target block from the paint, not the voice.
+    const playing = nowPlaying ?? (jumpPaint === null ? null
+      : { id: jumpPaint.id, segments: jumpPaint.segments, segment: jumpPaint.segment });
     if (playing === null || !playing.segments || playing.id !== row.getAttribute("data-id")) return;
     const segment = playing.segments![playing.segment!]!;
     if (!segment || segment.block === null) return;
@@ -2622,7 +2631,12 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
 
   /** "2 of 5" for a read of several parts; "" for a read of one, or none. */
   function readingPosition() {
-    if (nowPlaying === null || !nowPlaying!.segments || nowPlaying!.segments!.length < 2) return "";
+    // `#2058`: while a jump's speech is still in flight the painted position speaks.
+    if (nowPlaying === null) {
+      if (jumpPaint === null || jumpPaint.segments.length < 2) return "";
+      return `${jumpPaint.segment + 1} of ${jumpPaint.segments.length}`;
+    }
+    if (!nowPlaying!.segments || nowPlaying!.segments!.length < 2) return "";
     return `${nowPlaying!.segment! + 1} of ${nowPlaying!.segments!.length}`;
   }
 
@@ -2641,7 +2655,15 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
    */
   function showDocumentBlock() {
     const playing = nowPlaying;
-    if (playing === null || playing.kind !== "document" || !playing.document || !playing.document.onReadingBlock) return;
+    // `#2058`: a document jump in flight reports its painted block at once.
+    if (playing === null) {
+      if (jumpPaint !== null && jumpPaint.document && jumpPaint.document.onReadingBlock) {
+        const segment = jumpPaint.segments[jumpPaint.segment];
+        if (segment && segment.block !== null) jumpPaint.document.onReadingBlock(segment.block, segment.block);
+      }
+      return;
+    }
+    if (playing.kind !== "document" || !playing.document || !playing.document.onReadingBlock) return;
     const tell = playing.document.onReadingBlock;
     const segment = playing.segments && playing.segment !== undefined ? playing.segments[playing.segment] : undefined;
     if (!segment || segment.block === null) {
@@ -2718,7 +2740,9 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     showDocumentBlock();
     // `#540 read-aloud-desktop`: in every list a row of the read is drawn in, the cards' list included.
     for (const row of READABLE_LISTS.flatMap(listRows)) {
-      const reading = nowPlaying !== null && row.getAttribute("data-id") === nowPlaying!.id;
+      // `#2058`: the painted jump target is the reading row while its voice is in flight.
+      const readingId = nowPlaying !== null ? nowPlaying!.id : jumpPaint === null ? null : jumpPaint.id;
+      const reading = readingId !== null && row.getAttribute("data-id") === readingId;
       if (!reading && row.getAttribute("data-reading-marked") === null) continue;
       // `#1587`: a new message or block brings its row into the band; the sentence
       // light refines from there. With no sentence light this is the only follow.
@@ -2776,8 +2800,9 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     // the read through the natural-end path (`stepReading`); disabling it there stranded the
     // reader on the last block with the button, the media key and the arrow disagreeing.
     deps.el("read-next").disabled = false;
-    const at = nowPlaying!.segment!;
-    deps.el("read-section-next").disabled = !readSectionStarts(nowPlaying! as Playing & { segments: SpeechSegment[] }).some((start) => start > at);
+    // `#2058`: mid-jump the strip counts from the paint; the rebuilt read recounts on arrival.
+    const steer = effectivePlaying()!;
+    deps.el("read-section-next").disabled = !readSectionStarts(steer as Playing & { segments: SpeechSegment[] }).some((start) => start > steer.segment!);
     if (wasHidden) placeReadSteer();
   }
 
@@ -2915,7 +2940,8 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   function renderReadTimeline() {
     const line = deps.el("read-timeline");
     if (!line) return;
-    const playing = nowPlaying;
+    // `#2058`: the timeline marks the painted position while a jump's voice is in flight.
+    const playing = effectivePlaying();
     if (playing === null || !playing.segments || playing.segments!.length < 2) {
       if (readTimelineOf !== null) line.replaceChildren();
       readTimelineOf = null;
@@ -2954,8 +2980,19 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
    * Move the read in progress to part `index` of it. The same row, read again from there under a new
    * selection, so the server cuts off what it was saying and begins the block asked for.
    */
+  /** `#2058`: the read as the arrows see it — the painted jump target while its voice is in flight. */
+  function effectivePlaying(): Playing | null {
+    if (nowPlaying !== null) return nowPlaying;
+    if (jumpPaint === null) return null;
+    return {
+      id: jumpPaint.id, kind: jumpPaint.document ? "document" as const : "message" as const,
+      document: jumpPaint.document, segments: jumpPaint.segments, segment: jumpPaint.segment,
+      blocks: jumpPaint.blocks, parts: jumpPaint.parts, paused: false,
+    } as Playing;
+  }
+
   function jumpReading(index: number) {
-    const playing = nowPlaying;
+    const playing = effectivePlaying();
     if (playing === null || !playing.segments) return false;
     const at = Math.max(0, Math.min(playing.segments!.length - 1, index));
     const segment = playing.segments![at]!;
@@ -2964,6 +3001,13 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     // `#434 read-aloud-pause`: a jump made while held cues the block up HELD — Next on a steering
     // wheel is not a Play the reader never pressed.
     const hold = readingPaused();
+    // `#2058`: paint the target NOW, synchronously, before any speech work: the
+    // position, block light and scroll move in this frame, paused or playing, and
+    // the restart below only makes the voice follow. A later press overwrites this
+    // paint and bumps the ticket, so audio in flight for the old position is dropped.
+    jumpPaint = { id: playing.id, segment: at, segments: playing.segments!, blocks: playing.blocks, parts: playing.parts, document: playing.document };
+    playing.segment = at;
+    showReadingPosition();
     readJumping = true;
     readJumpPending = true;
     try {
@@ -3041,6 +3085,13 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
    */
   let readJumpPending = false;
   /**
+   * `#2058 vibe-talk-reader-arrows-instant`. The position an arrow press has already
+   * painted while its speech restart is still in flight: the UI state is authoritative
+   * and the audio follows it, so the block light, the strip count and the follow scroll
+   * read this while `nowPlaying` is torn down, and the rebuilt read takes over from it.
+   */
+  let jumpPaint: { id: string; segment: number; segments: SpeechSegment[]; blocks: Playing["blocks"]; parts: string[]; document: DocumentPayload | undefined } | null = null;
+  /**
    * `scrubber-full-width`. True from `recoverRead` stopping a read cut off until its retry is under way
    * (then `readJumpPending`) or abandoned: the strip stays up through the wait, as through a jump's.
    */
@@ -3048,7 +3099,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
 
   /** Previous (-1) or Next (+1). Previous on the first block starts it again. */
   function stepReading(delta: number) {
-    const playing = nowPlaying;
+    const playing = effectivePlaying();
     if (playing === null || !playing.segments) return false;
     if (delta > 0 && playing.segment! + 1 >= playing.segments!.length) {
       // `#1039 documents-read-parity`: finishing a document archives nothing and goes nowhere.
@@ -3074,7 +3125,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
    * chapter does; on the first section it starts it again, as Previous on the first block does.
    */
   function stepSection(delta: number) {
-    const playing = nowPlaying;
+    const playing = effectivePlaying();
     if (playing === null || !playing.segments) return false;
     const starts = readSectionStarts(playing as Playing & { segments: SpeechSegment[] });
     const at = playing.segment!;
@@ -3831,6 +3882,8 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     const tickets = ready.map((entry) => (entry && entry.until ? { url: entry.url, until: entry.until } : null));
     nowPlaying = { id, kind, ...(payload !== null ? { document: payload } : {}),
       audio: players[first]!, urls: objectUrls, players, parts, segments, segment: first, blocks, streamed, tickets, paused: false };
+    // `#2058`: the real read has taken over from the jump's optimistic paint.
+    jumpPaint = null;
     setReadState("ready");
     // A document read lights no channel row: there is none of it to redraw.
     if (!isDocument) deps.eachColumn(deps.renderChannelRows);

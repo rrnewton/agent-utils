@@ -1171,6 +1171,45 @@ test("THE BLOCK BEING READ IS LIT and the row counts it, 'reading 1 of 3', with 
   assert.equal(litBlock(page.el("discord-log").children[0]), "li:the rewrite is a draft", "the rebuild lost the light");
 });
 
+test("`#2058 vibe-talk-reader-arrows-instant`: an arrow press paints its block before slow speech answers, rapid presses land right, stale audio never plays", async () => {
+  const { page, rows } = await blockedRead();
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  const row = () => page.el("discord-log").children[0];
+  assert.equal(litBlock(row()), "p:The run finished.");
+  // Slow fake TTS: tickets expired, the re-prepare held open indefinitely.
+  page.setClock(page.clock() + 601_000);
+  let releasePrepare = () => {};
+  page.prepareHold = () => new Promise((resolve) => { releasePrepare = resolve; });
+  const streamsBefore = page.audioStreams.length;
+  // The press itself, with no settle: the highlight and count have already moved.
+  await page.el("read-next").click();
+  assert.equal(litBlock(row()), "li:the budget landed", "Next did not paint its block while speech was still preparing");
+  assert.equal(page.el("read-steer-count").text(), "2 of 3", "the strip count did not move with the paint");
+  // A second press while the first restart is still in flight lands on the next block.
+  await page.el("read-next").click();
+  assert.equal(litBlock(row()), "li:the rewrite is a draft", "a rapid second press did not land on its block");
+  assert.equal(page.el("read-steer-count").text(), "3 of 3");
+  releasePrepare();
+  page.prepareHold = null;
+  await page.settle();
+  // Only the final position's audio is ever started: nothing was played for block 2.
+  const started = page.audioStreams.slice(streamsBefore).map((stream) => blockOf(stream.url));
+  assert.deepEqual(started, ["2"], `stale audio was started for a superseded position: ${started}`);
+  assert.equal(litBlock(row()), "li:the rewrite is a draft", "the rebuilt read lost the painted block");
+  // Back, paused: the paint still moves at once, with the voice held.
+  await page.el("read-aloud").click();
+  await page.settle();
+  page.setClock(page.clock() + 601_000);
+  page.prepareHold = () => new Promise((resolve) => { releasePrepare = resolve; });
+  await page.el("read-prev").click();
+  assert.equal(litBlock(row()), "li:the budget landed", "Previous while paused did not paint its block at once");
+  releasePrepare();
+  page.prepareHold = null;
+  await page.settle();
+  assert.equal(litBlock(row()), "li:the budget landed", "the held read did not take over the painted block");
+});
+
 test("a tap on ANOTHER block of the message being read jumps there; on the block being read, stops it", async () => {
   const { page, rows } = await blockedRead();
   await rows[0].dispatch("click", {});
@@ -1799,7 +1838,8 @@ test("`scrubber-full-width`: a jump that waits for its block keeps the strip and
   const blocks = page.el("read-timeline").children.length;
   await page.el("read-next").click();
   assert.equal(page.el("read-steer").hidden, false, "the strip went for the jump's wait");
-  assert.equal(page.el("read-steer-count").text(), "1 of 3", "the held strip does not say where the read was");
+  // `#2058`: the count says where the press asked to go at once; the voice follows.
+  assert.equal(page.el("read-steer-count").text(), "2 of 3", "the held strip does not say where the press asked to go");
   assert.equal(page.el("read-timeline").children.length, blocks, "the held strip lost its timeline");
   assert.equal(readStrip(page), "playing", "the playback layout dropped for the jump's wait");
   // `#828 voice-page-read-nav-center`: React keeps its place in the row through the wait, which stays centred,
