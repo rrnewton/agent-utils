@@ -54,7 +54,8 @@ pub fn pending_entries(root: &Path) -> Vec<PendingEntry> {
             let queued_at = fs::read_to_string(&path)
                 .ok()
                 .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-                .and_then(|value| value.get("queued_at").and_then(serde_json::Value::as_i64));
+                .and_then(|value| value.get("queued_at").and_then(serde_json::Value::as_f64))
+                .map(|seconds| seconds as i64);
             entries.push(PendingEntry { id, queued_at });
         }
     }
