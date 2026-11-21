@@ -239,6 +239,32 @@ steps:
       rss_baseline_bytes: 268435456
 
   - group: hygiene
+    job: confidential-names-self-test
+    desc: prove the confidential-name guard can fail
+    cmd: python3 scripts/check_confidential_names.py --self-test
+    jobs_flag: ""
+    labels: [validation-hygiene]
+    timeout: 480
+    cpu_timeout: 60
+    hint:
+      est_duration_s: 1
+      classification: light
+      rss_baseline_bytes: 134217728
+
+  - group: hygiene
+    job: confidential-names
+    desc: reject confidential names anywhere in the repository, by digest
+    cmd: python3 scripts/check_confidential_names.py
+    jobs_flag: ""
+    labels: [validation-hygiene]
+    timeout: 480
+    cpu_timeout: 60
+    hint:
+      est_duration_s: 2
+      classification: light
+      rss_baseline_bytes: 268435456
+
+  - group: hygiene
     job: issue-numbers-self-test
     desc: prove the issue-number collision guard can fail
     cmd: python3 scripts/check_issue_numbers.py --self-test

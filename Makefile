@@ -1,6 +1,6 @@
 # `make` just runs ./setup (both python and rust), per repo convention.
 .PHONY: all both py rs check check-workspace check-deps check-test-suite-selector \
-	check-validation-components check-pytest-sharder check-validate-selector check-client-names \
+	check-validation-components check-pytest-sharder check-validate-selector check-client-names check-confidential-names \
 	check-documented-defaults check-issue-numbers check-issue-parse check-site mypy test cross check-packages check-python-packages \
 	check-rust-packages validate validate-all soak-agent-teams fmt clean
 
@@ -26,7 +26,7 @@ mypy:
 # hygiene group once, then execute only the code-facing half here. `make check` remains the complete
 # standalone target for callers that did not already run those guards.
 check: check-workspace check-validate-selector check-validation-components check-pytest-sharder \
-	check-client-names check-documented-defaults check-issue-numbers check-issue-parse check-site
+	check-client-names check-confidential-names check-documented-defaults check-issue-numbers check-issue-parse check-site
 
 check-workspace: check-deps mypy check-test-suite-selector
 	@host_target="$$(rustc -vV | sed -n 's/^host: //p')"; \
@@ -82,6 +82,12 @@ check-pytest-sharder:
 check-client-names:
 	python3 scripts/check_client_names.py --self-test
 	python3 scripts/check_client_names.py
+
+# Confidential model names must not appear anywhere; this guard knows them
+# only by salted digest, never by name (#2068).
+check-confidential-names:
+	python3 scripts/check_confidential_names.py --self-test
+	python3 scripts/check_confidential_names.py
 
 # A number a guide states as a default is a promise about the code. Compare the two artifacts:
 # the value PARSED OUT OF THE PROSE against the constant, never a sentence formatted from it.

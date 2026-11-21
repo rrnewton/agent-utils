@@ -277,6 +277,7 @@ PREFIX_RULES: tuple[tuple[str, frozenset[str]], ...] = (
     ("scripts/check_wrkviz_schemas.py", frozenset()),
     ("scripts/check_rust_only.py", frozenset()),
     ("scripts/check_client_names.py", frozenset()),
+    ("scripts/check_confidential_names.py", frozenset()),
     ("scripts/check_documented_defaults.py", frozenset()),
     ("scripts/check_issue_numbers.py", frozenset()),
     ("scripts/check_issue_parse.py", frozenset()),
@@ -2004,6 +2005,12 @@ def self_test() -> int:
         ["scripts/check_client_names.py"],
         {PYTHON},
         "a hygiene implementation change also runs its owned infrastructure tests",
+        {"repository-infrastructure"},
+    )
+    expect(
+        ["scripts/check_confidential_names.py"],
+        {PYTHON},
+        "a confidential-names guard change also runs its owned infrastructure tests",
         {"repository-infrastructure"},
     )
     expect(
