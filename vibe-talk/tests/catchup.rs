@@ -1026,6 +1026,128 @@ async fn an_update_without_a_summary_refuses_and_without_news_spends_nothing() {
     );
 }
 
+#[tokio::test]
+async fn a_new_summary_covers_only_the_new_ids_and_archives_the_old() {
+    // `#2073 vibe-talk-new-summary-button`: New summary spends one
+    // cache-only call over only the unread ids the saved summary did not
+    // cover, with no old summary text as context; the fresh summary
+    // becomes the record's top and the old one joins the timeline.
+    let messages: Vec<Message> = (0..5).map(|seq| message(seq, None, false)).collect();
+    let new_id = message(6, None, false).id.clone();
+    let backend = backend_with(messages.clone());
+    let (state, store, summarizer, _dir) =
+        cached_state(&testing::config_toml(), backend.clone()).await;
+    fill(&state, TimelineView::Flat, None).await;
+    let mut state = state;
+    state.catchup_summarizer = Some(summarizer.clone());
+    state.catchup_model = Some(Arc::from("fake-model"));
+    let app = vibe_talk::http::router(state.clone());
+    let channel_path = format!("/api/v1/channels/{WRITE_CHANNEL}/catchup");
+
+    // No summary yet: New summary refuses, spending nothing.
+    let (status, _body) = post(
+        &app,
+        &format!("{channel_path}/new-summary"),
+        Some(WRITE_TOKEN),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(summarizer.prompt_calls().is_empty());
+
+    summarizer.answer_with("## Old\n- first point worth knowing");
+    let (status, _body) = post(&app, &channel_path, Some(WRITE_TOKEN), &json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Nothing new yet: New summary refuses, spending nothing.
+    let (status, body) = post(
+        &app,
+        &format!("{channel_path}/new-summary"),
+        Some(WRITE_TOKEN),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        summarizer.prompt_calls().len(),
+        1,
+        "a no-news New summary spent a call"
+    );
+
+    // Two messages arrive; one is read in the channel before the press.
+    {
+        let mut held = backend.messages.lock().expect("messages");
+        held.push(message(5, None, false));
+        held.push(message(6, None, false));
+    }
+    fill(&state, TimelineView::Flat, None).await;
+    let channel = ChannelId(WRITE_CHANNEL.to_owned());
+    store
+        .dismiss(&channel, &[message(5, None, false).id])
+        .await
+        .expect("dismiss");
+
+    summarizer.answer_with(&format!("## Fresh\n- second point [m:{}]", new_id.as_str()));
+    let reads = backend.reads();
+    let (status, body) = post(
+        &app,
+        &format!("{channel_path}/new-summary"),
+        Some(WRITE_TOKEN),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(backend.reads(), reads, "the New summary read upstream");
+    let calls = summarizer.prompt_calls();
+    assert_eq!(calls.len(), 2, "the New summary spent another call");
+    assert!(
+        calls[1].1.contains("message 6") && !calls[1].1.contains("message 5"),
+        "the fresh prompt held more than the new unread: {}",
+        calls[1].1
+    );
+    assert!(
+        !calls[1].1.contains("first point worth knowing"),
+        "the fresh prompt carried the old summary as context: {}",
+        calls[1].1
+    );
+    let text = body["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("second point") && !text.contains("first point"),
+        "the fresh text is not fresh alone: {body}"
+    );
+    assert_eq!(
+        body["unread_ids"],
+        json!([new_id.as_str()]),
+        "covered is only the new unread: {body}"
+    );
+    // Round-trip (reload persistence): a reopen shows the fresh summary on
+    // top and the old one in the timeline under it.
+    let (status, record) = get(&app, &format!("{channel_path}/record"), WRITE_TOKEN).await;
+    assert_eq!(status, StatusCode::OK, "{record}");
+    assert_eq!(record["current_summary"]["text"], body["text"], "{record}");
+    let timeline = record["timeline"].as_array().expect("timeline");
+    assert_eq!(
+        timeline.len(),
+        1,
+        "the old summary left the timeline: {record}"
+    );
+    assert_eq!(timeline[0]["kind"], json!("summary"), "{record}");
+    assert!(
+        timeline[0]["summary"]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("first point worth knowing"),
+        "the archived summary lost its text: {record}"
+    );
+    assert_eq!(
+        timeline[0]["summary"]["covered_ids"]
+            .as_array()
+            .map(Vec::len),
+        Some(5),
+        "the archived summary lost its covered range: {record}"
+    );
+}
+
 #[test]
 fn a_record_saved_before_fresh_ids_still_loads() {
     // Backward compatibility (`#1388` landing 2): records written before

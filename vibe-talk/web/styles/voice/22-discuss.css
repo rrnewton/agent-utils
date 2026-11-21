@@ -447,7 +447,8 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   font-size: 0.85rem;
 }
 
-#discuss-update {
+#discuss-update,
+#discuss-new-summary {
   padding: 2px 8px;
   cursor: pointer;
   background: var(--row-hover);
@@ -455,6 +456,12 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   border: 1px solid var(--edge);
   border-radius: 6px;
   font: inherit;
+}
+
+#discuss-new-summary:disabled,
+#discuss-update:disabled {
+  cursor: default;
+  opacity: 0.55;
 }
 
 .discuss-turn {

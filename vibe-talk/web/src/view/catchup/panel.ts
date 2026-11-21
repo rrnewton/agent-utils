@@ -107,6 +107,8 @@ export interface DiscussPanelDependencies {
   catchupFollowup(channelId: string, scope: DiscussScope, text: string): Promise<unknown>;
   /** POST one incremental Update for `channelId` (`#1388` landing 2); answers the merged summary. */
   catchupUpdate?(channelId: string, scope: DiscussScope): Promise<unknown>;
+  /** POST one fresh New summary for `channelId` (`#2073`); answers the fresh summary. */
+  catchupNewSummary?(channelId: string, scope: DiscussScope): Promise<unknown>;
   /**
    * `#1388` landing 1. Whether message `id` is read NOW, from the page's read
    * set; absent, nothing is ever struck. Read on every strike recompute.
@@ -1606,6 +1608,18 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     if (!staleNow || stale === null) return;
     deps.byId("discuss-stale-text").textContent =
       `${stale.new_unread} new unread · ${stale.marked_read} marked read since summary`;
+    // `#2073`: New summary is disabled with its reason when nothing is
+    // new; Update stays offered (it still clears the green).
+    const fresh = maybe("discuss-new-summary") as HTMLButtonElement | null;
+    if (fresh !== null) {
+      const none = stale.new_unread === 0;
+      fresh.disabled = pending || none;
+      fresh.title = none ? "No new messages since the last summary" : "Summarize only the new messages as a fresh summary";
+      if (none) fresh.setAttribute("aria-disabled", "true");
+      else fresh.removeAttribute("aria-disabled");
+    }
+    const update = maybe("discuss-update") as HTMLButtonElement | null;
+    if (update !== null) update.disabled = pending;
   }
 
   /**
@@ -1670,7 +1684,13 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         const label = document.createElement("span");
         label.className = "discuss-collapsible-label";
         const count = entry.answer.window?.unread_count ?? entry.answer.unread_ids.length;
-        label.textContent = `Earlier summary · ${entry.created_ms > 0 ? summaryTimeLabel(entry.created_ms, nowMs()) : "—"} · ${count} unread`;
+        // `#2073`: the range this earlier summary covers, from its own
+        // covered links (oldest first): first to last covered time.
+        const links = entry.answer.footer_links;
+        const first = links.at(0)?.label.split(" · ")[0] ?? "";
+        const last = links.at(-1)?.label.split(" · ")[0] ?? "";
+        const range = first !== "" && last !== "" ? (first === last ? ` · covers ${first}` : ` · covers ${first}–${last}`) : "";
+        label.textContent = `Earlier summary · ${entry.created_ms > 0 ? summaryTimeLabel(entry.created_ms, nowMs()) : "—"} · ${count} unread${range}`;
         summary.appendChild(label);
         const body = document.createElement("div");
         body.className = "discuss-old-body";
@@ -1754,6 +1774,63 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         setPending(false);
         if (asked !== generation || !isOpen()) return;
         // `#1787`: the old summary stands again, its terms current once more.
+        if (lastAnswer !== null) drawTerms(lastAnswer);
+        if (isDiscussUnavailable(error)) {
+          sayError(DISCUSS_UNAVAILABLE_HINT);
+          deps.showError?.(DISCUSS_UNAVAILABLE_HINT);
+          return;
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        sayError(message);
+        deps.showError?.(message);
+      },
+    );
+  }
+
+  /**
+   * One fresh New summary (`#2073`): the banner's second button. One call
+   * over only the new messages; the answer stands alone on top and the
+   * previous summary joins the timeline as an earlier summary (drawn by
+   * the record reload after it). A host without the route falls back to a
+   * full Summarize, as Update does without its route.
+   */
+  function newSummaryFor(scope: DiscussScope): void {
+    if (pending) return;
+    if (!deps.catchupNewSummary) {
+      fetchFor(scope, null);
+      return;
+    }
+    generation += 1;
+    const asked = generation;
+    lastScope = scope;
+    deps.byId("discuss-scope").textContent = scope.label;
+    setTitle(scope);
+    sayStatus("Summarizing the new messages…");
+    deps.byId("discuss-retry").hidden = true;
+    markTermsStale();
+    setPending(true);
+    void deps.catchupNewSummary(scope.channelId, scope).then(
+      (value) => {
+        setPending(false);
+        if (asked !== generation || !isOpen()) return;
+        const answer = asCatchupAnswer(value);
+        lastAnswer = answer;
+        scopeAnswers.set(scopeKeyOf(scope), { scope, answer, readCreatedMs });
+        const coveredTimes = previewUnread.filter((ref) => answer.unread_ids.includes(ref.id) && ref.at_ms !== null).map((ref) => ref.at_ms as number);
+        if (coveredTimes.length) recordCoverage(scope, Math.min(...coveredTimes), Math.max(...coveredTimes));
+        drawUncovered();
+        sayStatus("New summary.");
+        drawAnswer(answer, null);
+        drawTerms(answer);
+        drawFooter(answer, scope);
+        const stampLine = formatStampLine(answer.stamp);
+        deps.byId("discuss-stamp").textContent = stampLine;
+        deps.byId("discuss-stamp").hidden = stampLine === "";
+        recordFor(scope, true);
+      },
+      (error: unknown) => {
+        setPending(false);
+        if (asked !== generation || !isOpen()) return;
         if (lastAnswer !== null) drawTerms(lastAnswer);
         if (isDiscussUnavailable(error)) {
           sayError(DISCUSS_UNAVAILABLE_HINT);
@@ -2239,6 +2316,14 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
           if (pending || lastScope === null) return;
           updateFor(lastScope);
         });
+        const newSummaryButton = maybe("discuss-new-summary");
+        if (newSummaryButton !== null) {
+          listening.listen(newSummaryButton, "click", () => {
+            if (pending || lastScope === null) return;
+            if ((newSummaryButton as HTMLButtonElement).disabled) return;
+            newSummaryFor(lastScope);
+          });
+        }
         listening.listen(deps.byId("discuss-retry"), "click", () => {
           if (lastScope !== null) fetchFor(lastScope, lastSinceMs);
         });

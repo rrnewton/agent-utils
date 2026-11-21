@@ -104,7 +104,7 @@ const IDS = [
   "discuss-answer", "discuss-footer", "discuss-covers", "discuss-links",
   "discuss-mark-read", "discuss-mark-unread", "discuss-unmarkable",
   "discuss-stamp", "discuss-retry", "discuss-terms", "discuss-terms-summary", "discuss-terms-list",
-  "discuss-stale", "discuss-stale-text", "discuss-update", "discuss-timeline", "discuss-current-covers", "discuss-current-head", "discuss-current-section",
+  "discuss-stale", "discuss-stale-text", "discuss-update", "discuss-new-summary", "discuss-timeline", "discuss-current-covers", "discuss-current-head", "discuss-current-section",
   "discuss-followup", "discuss-send", "discuss-uncovered", "discuss-uncovered-go", "discuss-uncovered-text",
   "discuss-actions", "discuss-resize", "discuss-head", "discuss-title",
   "discuss-dock-toggle", "discuss-full-toggle", "screen-main",
@@ -162,7 +162,7 @@ function fixture({ selection = { view: "flat", threadId: null, thread: null }, r
   els["discuss-footer"].hidden = true;
   els["discuss-retry"].hidden = true;
   els["read-steer"].hidden = true;
-  const calls = { posts: [], previews: [], records: [], followups: [], updates: [], dismiss: [], restore: [], jumps: [], errors: [], statuses: [], templates: [], bound: [], history: [] };
+  const calls = { posts: [], previews: [], records: [], followups: [], updates: [], newSummaries: [], dismiss: [], restore: [], jumps: [], errors: [], statuses: [], templates: [], bound: [], history: [] };
   // `#1344`: the device's kept layout, in memory; the clamp mirrors the device setting's.
   const kept = { width: null, keeps: [], sheetFull: false, sheetKeeps: [], mode: "overlay", modeKeeps: [], dockedHeight: null, dockedKeeps: [] };
   const clampW = (value) => {
@@ -194,6 +194,10 @@ function fixture({ selection = { view: "flat", threadId: null, thread: null }, r
     catchupUpdate: (channelId, scope) => {
       calls.updates.push({ channelId, scope });
       return Promise.resolve(answer({ fresh_ids: ["m2"], text: "old and new" }));
+    },
+    catchupNewSummary: (channelId, scope) => {
+      calls.newSummaries.push({ channelId, scope });
+      return Promise.resolve(answer({ text: "fresh point", unread_ids: ["m2"], footer_links: [{ id: "m2", label: "09:52 · Ben", thread_id: null }] }));
     },
     catchupFollowup: (channelId, scope, text) => {
       calls.followups.push({ channelId, scope, text });
@@ -2476,6 +2480,87 @@ test("catchup update: the banner's Update is one delta call; new parts green unt
     view.refreshStrikes();
     assert.equal(hasWord(li, FRESH_CLASS), false, "a read bullet stayed green");
     assert.equal(hasWord(li, STRUCK_BULLET_CLASS), true, "a read fresh bullet was not struck");
+  } finally { fx.restore(); }
+});
+
+test("catchup new summary: New summary adds a fresh card and keeps the first in the timeline (#2073)", async () => {
+  const fx = fixture();
+  const before = savedRecord();
+  const after = savedRecord({
+    current_summary: { ...before.current_summary, text: "fresh point", covered_ids: ["m2"], created_ms: T2 + 60_000 },
+    timeline: [{ kind: "summary", summary: before.current_summary }],
+    staleness: null,
+  });
+  let recordCalls = 0;
+  fx.deps.catchupRecord = (channelId, scope) => {
+    fx.calls.records.push({ channelId, scope });
+    recordCalls += 1;
+    return Promise.resolve(recordCalls === 1 ? before : after);
+  };
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    view.open();
+    await flush();
+    assert.equal(fx.els["discuss-answer"].textContent, "saved point", "the first summary did not stand first");
+    click(fx.els["discuss-new-summary"]);
+    await flush();
+    assert.equal(fx.calls.newSummaries.length, 1, "New summary did not make its one fresh call");
+    assert.deepEqual(fx.calls.posts, [], "New summary refetched a full summary");
+    assert.deepEqual(fx.calls.updates, [], "New summary merged in place like Update");
+    assert.equal(fx.els["discuss-status"].textContent, "New summary.");
+    assert.equal(fx.els["discuss-answer"].textContent, "fresh point", "the fresh summary did not stand on top");
+    const timeline = fx.els["discuss-timeline"].children;
+    assert.equal(timeline.length, 2, "the timeline did not keep the first summary under the fresh one");
+    assert.match(timeline[1].children[0].textContent, /Earlier summary/, "the first summary is not labelled earlier");
+    assert.match(timeline[1].children[0].textContent, /covers 09:51–09:52/, "the earlier summary does not name the range it covers");
+  } finally { fx.restore(); }
+});
+
+test("catchup new summary: disabled with its reason when nothing is new (#2073)", async () => {
+  const fx = fixture();
+  fx.deps.catchupRecord = (channelId, scope) => {
+    fx.calls.records.push({ channelId, scope });
+    return Promise.resolve(savedRecord({ staleness: { new_unread: 0, marked_read: 1 } }));
+  };
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    view.open();
+    await flush();
+    const button = fx.els["discuss-new-summary"];
+    assert.equal(button.disabled, true, "New summary stayed offered with nothing new");
+    assert.equal(button.title, "No new messages since the last summary", "the disabled reason is missing");
+    click(button);
+    await flush();
+    assert.equal(fx.calls.newSummaries.length, 0, "a disabled New summary still called");
+  } finally { fx.restore(); }
+});
+
+test("catchup new summary: a second press while one is in flight starts nothing (#2073)", async () => {
+  const fx = fixture();
+  fx.deps.catchupRecord = (channelId, scope) => {
+    fx.calls.records.push({ channelId, scope });
+    return Promise.resolve(savedRecord());
+  };
+  const attempt = deferred();
+  fx.deps.catchupNewSummary = (channelId, scope) => {
+    fx.calls.newSummaries.push({ channelId, scope });
+    return attempt.promise;
+  };
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    view.open();
+    await flush();
+    click(fx.els["discuss-new-summary"]);
+    click(fx.els["discuss-new-summary"]);
+    click(fx.els["discuss-update"]);
+    assert.equal(fx.calls.newSummaries.length, 1, "an in-flight New summary started another");
+    assert.equal(fx.calls.updates.length, 0, "Update started while a New summary was in flight");
+    attempt.resolve(answer({ text: "fresh point" }));
+    await flush();
+    assert.equal(fx.els["discuss-status"].textContent, "New summary.");
   } finally { fx.restore(); }
 });
 

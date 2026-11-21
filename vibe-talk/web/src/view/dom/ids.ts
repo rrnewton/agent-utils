@@ -172,6 +172,7 @@ export interface ElementById {
   "discuss-uncovered-go": HTMLButtonElement;
   "discuss-uncovered-text": HTMLSpanElement;
   "discuss-unmarkable": HTMLParagraphElement;
+  "discuss-new-summary": HTMLButtonElement;
   "discuss-update": HTMLButtonElement;
   "dismiss-banner": HTMLButtonElement;
   "dismiss-error": HTMLButtonElement;

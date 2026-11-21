@@ -1,0 +1,15 @@
+steps:
+  - group: check
+    job: discuss-new-summary-browser
+    desc: New summary next to Update in Discuss, against the real server (model stub at the network edge) in current Chromium at 412 and 1280 — a fresh card over the newer range, the first kept in the timeline, reload persistence, Update still in place
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/discuss_new_summary_browser.py
+    jobs_flag: ""
+    deps: [build.release, setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 60
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824

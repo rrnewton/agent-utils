@@ -106,6 +106,8 @@ export interface DiscussViewDependencies {
   catchupFollowup?(channelId: string, scope: DiscussScope, text: string): Promise<unknown>;
   /** POST one incremental Update, where the page (or a test) injects its own (`#1388` landing 2). */
   catchupUpdate?(channelId: string, scope: DiscussScope): Promise<unknown>;
+  /** POST one fresh New summary, where the page (or a test) injects its own (`#2073`). */
+  catchupNewSummary?(channelId: string, scope: DiscussScope): Promise<unknown>;
   /** `#1388` landing 1. Whether a message is read now, from the page's read set. */
   isReadNow?(id: string): boolean;
   /** Whether a bare Enter sends, handed to the panel's composer keys. */
@@ -484,6 +486,14 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
       if (deps.catchupUpdate) return deps.catchupUpdate(channelId, scope);
       if (!deps.api) return Promise.reject(new Error("Discuss has no way to reach the server."));
       return deps.api(`/api/v1/channels/${encodeURIComponent(channelId)}/catchup/update`, {
+        method: "POST",
+        body: { thread_id: scope.threadId, view: scope.view },
+      });
+    },
+    catchupNewSummary(channelId: string, scope: DiscussScope): Promise<unknown> {
+      if (deps.catchupNewSummary) return deps.catchupNewSummary(channelId, scope);
+      if (!deps.api) return Promise.reject(new Error("Discuss has no way to reach the server."));
+      return deps.api(`/api/v1/channels/${encodeURIComponent(channelId)}/catchup/new-summary`, {
         method: "POST",
         body: { thread_id: scope.threadId, view: scope.view },
       });

@@ -342,6 +342,12 @@ fn routes(state: AppState) -> Router {
             "/api/v1/channels/{channel_id}/catchup/update",
             post(api::catchup_update),
         )
+        // `#2073 vibe-talk-new-summary-button`. WRITE scope: one fresh
+        // summary over only the new messages spends one model call.
+        .route(
+            "/api/v1/channels/{channel_id}/catchup/new-summary",
+            post(api::catchup_new_summary),
+        )
         // `#1840 vibe-talk-draft-sync-across-devices`. WRITE scope all three,
         // reads included: a draft is the owner's unsent words. NO MCP TOOL.
         .route(
