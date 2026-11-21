@@ -1,6 +1,6 @@
 ---
 title: 'agentctl-redact: rewrite a literal string across one agent processed history and archives'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
