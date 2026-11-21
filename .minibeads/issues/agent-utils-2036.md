@@ -1,12 +1,12 @@
 ---
 title: 'agentctl-send-timeout-inotify-wait: a send runs hours past its timeout on an unbounded wait'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - agentctl
 created_at: 2026-11-21T01:57:00-05:00
-updated_at: 2026-11-21T01:57:00-05:00
+updated_at: 2026-11-21T03:23:00-05:00
 ---
 
 # Description
@@ -56,3 +56,20 @@ flock acquisition blocks in the kernel indefinitely.
 [watermelon-full-preview] Filed for lane mu-musedeliver, before
 #2011 agentctl-claude-permission-answer (coordinated by coordb).
 No lane, host or person is named here.
+
+## Resolution
+
+[watermelon-full-preview] Landed 2f703edc on github/main (tree
+cb16dfc7, verified on the replayed tree with the merged hunks read;
+gate on 6182045f plus an exclusive rerun for its two fixed check
+steps). The Rust send funnel wraps its runtime in the deadline
+runtime so the enqueue queue-lock wait ends at the send deadline,
+and a given-up enqueue names the queue id and how to check or
+cancel it, leaving any queued copy intact; even a queue-only
+enqueue is bounded by the default deadline. The Python edition
+gained --deadline on send/drain (600s default), a LOCK_NB polling
+flock bounded by it at the drain's lock takes, enqueue
+serialisation bounded the same way, and readiness capped by what
+remains. Tests hold the lock and put a fake clock at the deadline
+in both editions, with no real long waits; normal sends are
+unchanged when nothing contends.
