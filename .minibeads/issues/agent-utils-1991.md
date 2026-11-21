@@ -1,6 +1,6 @@
 ---
 title: 'watch-agents-stale-background-tasks: report screen-counted background tasks with no live process once, as info'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
