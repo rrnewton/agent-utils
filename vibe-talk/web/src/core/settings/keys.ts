@@ -28,6 +28,8 @@ export const SYNCED_SETTING_KEYS: readonly string[] = [
   "vibe-talk.voice.appearance",
   // `#1961 vibe-talk-colour-themes`. The accent-family preset.
   "vibe-talk.voice.colour-theme",
+  // `#2006 vibe-talk-documents-react`. Where a Documents React posts.
+  "vibe-talk.voice.documents-react-policy",
   "vibe-talk.voice.collapsed-lines",
   "vibe-talk.voice.hidden-link-kinds",
   // `#620 link-url-chip`. Whether the Links view writes each link as its address.

@@ -122,6 +122,7 @@ test("`#624 voice-page-modularity`: each device setting reads, keeps and refuses
     ["afterDone", "vibe-talk.voice.after-done", "stay", [["next", "next"], ["unread", "unread"], ["stay", "stay"]], "stay"],
     ["appearance", "vibe-talk.voice.appearance", "system", [["light", "light"], ["dark", "dark"], ["system", "system"]], "system"],
     ["colourTheme", "vibe-talk.voice.colour-theme", "blue", [["teal", "teal"], ["plum", "plum"], ["amber", "amber"], ["blue-hc", "blue-hc"], ["blue", "blue"]], "blue"],
+    ["documentsReactPolicy", "vibe-talk.voice.documents-react-policy", "mention", [["discussion", "discussion"], ["mention", "mention"]], "mention"],
     ["readAudioSource", "vibe-talk.voice.read-audio-source", null, [["agent", "agent"], ["device", "device"], ["wit", "wit"]], null],
     ["witVoice", "vibe-talk.voice.wit-voice", "", [["Charlie", "Charlie"], ["", null]], ""],
     ["readSteerOffset", "vibe-talk.voice.read-steer-offset", null, [[{ x: 3, y: -4 }, '{"x":3,"y":-4}'], [null, null]], null],

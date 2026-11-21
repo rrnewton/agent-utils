@@ -3568,7 +3568,7 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
           mention_count: 1,
           first_mentioned_ms: null,
           last_mentioned_ms: null,
-          mentions: [],
+          mentions: doc.mentions ?? [],
         }));
         if (String(path).startsWith("/api/v1/documents?")) {
           return json(200, { documents: rows, total: rows.length, revision: 1 });

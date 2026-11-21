@@ -266,6 +266,12 @@ export interface Quoting {
    */
   openSentenceReply(row: QuotedRow, id: string, quote: string, box: Box | null): void;
   /**
+   * `#2006 vibe-talk-documents-react`. The same box for a Documents React: quoting `quote`
+   * under `box`, its context line naming where Send will post, and `send` posting the
+   * quoted words plus what was written. No row, no thread route: the caller owns the post.
+   */
+  openDocumentReply(quote: string, box: Box | null, context: string, send: (text: string) => Promise<void>): void;
+  /**
    * `#1978 vibe-talk-cmd-d-dock-toggle`. Float a docked quoted reply back out: the floating
    * box on `message` quoting `quote`, holding `written` (the docked box's words past its
    * quote), its Post to main choice carried where it was ticked there.
@@ -285,6 +291,8 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
    * the key its draft is kept under, and the selection's box it stands under.
    */
   let quickReply: { row: QuotedRow; message: Message; channel: string; quote: string; key: string; box: Box | null } | null = null;
+  /** `#2006`. The Documents React open in the same box, where one is: its quote, box, context and post. */
+  let documentReply: { quote: string; box: Box | null; context: string; send: (text: string) => Promise<void>; key: string } | null = null;
   /** What was written in quick replies closed unsent, by message and quoted words (`quickReplyKey`). */
   const quickReplyDrafts = deps.drafts;
   /**
@@ -578,6 +586,27 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
     deps.opened?.();
   }
 
+  /** `#2006`. Open the box for a Documents React (see the interface). */
+  function openDocumentReply(quote: string, box: Box | null, context: string, send: (text: string) => Promise<void>): void {
+    if (quickReply || documentReply) closeQuickReply();
+    const key = quickReplyKey("document", quote, quote);
+    documentReply = { quote, box, context, send, key };
+    const form = deps.byId("quick-reply");
+    setTextIfChanged(deps.byId("quick-reply-quote"), quote);
+    deps.byId("quick-reply-text").value = quickReplyDrafts.get(key) || "";
+    setHiddenIfChanged(deps.byId("quick-reply-to-main-row"), true);
+    const dock = deps.byId("quick-reply-dock");
+    if (dock) dock.hidden = true;
+    setTextIfChanged(deps.byId("quick-reply-state"), context);
+    setHiddenIfChanged(form, false);
+    placeQuickReply();
+    const text = deps.byId("quick-reply-text");
+    text.focus({ preventScroll: true });
+    const end = text.value.length;
+    if (typeof text.setSelectionRange === "function") text.setSelectionRange(end, end);
+    deps.opened?.();
+  }
+
   /** The chip's own box, where a touch let the selection go before the press: the box opens under it. */
   function chipBox(): Box | null {
     const chip = deps.byId("selection-chip");
@@ -593,7 +622,7 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
    * words rather than under the keyboard where there is no room below them.
    */
   function placeQuickReply(): void {
-    if (!quickReply) return;
+    if (!quickReply && !documentReply) return;
     const form = deps.byId("quick-reply");
     const viewWidth = (document.documentElement && document.documentElement.clientWidth) || 0;
     const visual = window.visualViewport;
@@ -602,7 +631,7 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
     const width = viewWidth > 0 ? Math.min(QUICK_REPLY_MAX_WIDTH_PX, viewWidth - 2 * SELECTION_CHIP_EDGE_PX) : QUICK_REPLY_MAX_WIDTH_PX;
     form.style.width = `${Math.round(width)}px`;
     const height = Number(form.getBoundingClientRect().height) || 0;
-    const box = quickReply.box || { top: shownTop, bottom: shownTop, left: 0, right: viewWidth };
+    const box = (quickReply ? quickReply.box : documentReply!.box) || { top: shownTop, bottom: shownTop, left: 0, right: viewWidth };
     const left = Math.max(SELECTION_CHIP_EDGE_PX,
       Math.min((box.left + box.right) / 2 - width / 2, viewWidth - SELECTION_CHIP_EDGE_PX - width));
     const top = Math.max(shownTop + SELECTION_CHIP_EDGE_PX,
@@ -613,6 +642,14 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
 
   /** Close the quick reply, keeping what was written for the same words (`quickReplyDrafts`). */
   function closeQuickReply(): void {
+    if (documentReply) {
+      keepQuickDraft(documentReply.key, "", deps.byId("quick-reply-text").value);
+      documentReply = null;
+      deps.closed();
+      setHiddenIfChanged(deps.byId("quick-reply"), true);
+      deps.byId("quick-reply-text").blur();
+      return;
+    }
     if (!quickReply) return;
     keepQuickDraft(quickReply.key, quickReply.channel, deps.byId("quick-reply-text").value);
     quickReply = null;
@@ -627,6 +664,10 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
    * nothing for those words, the draft being the stream reply's now, where it can be seen.
    */
   function putDownQuickReply(): boolean {
+    if (documentReply && !quickReply) {
+      closeQuickReply();
+      return false;
+    }
     const open = quickReply;
     if (!open) return false;
     const written = deps.byId("quick-reply-text").value;
@@ -651,6 +692,7 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
    * and the floating box closes holding nothing for those words.
    */
   function dockQuickReply(): void {
+    if (documentReply && !quickReply) return;
     const open = quickReply;
     if (!open) return;
     const written = deps.byId("quick-reply-text").value;
@@ -662,6 +704,25 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
 
   /** Send the quick reply: the quoted words and what was written, in the message's thread; then close it. */
   async function sendQuickReply(): Promise<void> {
+    if (documentReply && !quickReply) {
+      const doc = documentReply;
+      const written = deps.byId("quick-reply-text").value;
+      if (!written.trim()) {
+        setTextIfChanged(deps.byId("quick-reply-state"), "Nothing to send yet — write something first.");
+        return;
+      }
+      try {
+        await doc.send(`${quoteBlock(doc.quote)}${written.trim()}`);
+      } catch (error) {
+        setTextIfChanged(deps.byId("quick-reply-state"),
+          error instanceof Error ? error.message : "The reply could not be sent.");
+        return;
+      }
+      deps.byId("quick-reply-text").value = "";
+      closeQuickReply();
+      if (typeof deps.resumeAfterSend === "function") deps.resumeAfterSend();
+      return;
+    }
     const open = quickReply;
     if (!open) return;
     const written = deps.byId("quick-reply-text").value;
@@ -753,9 +814,9 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
   return {
     held: () => quoteHeld, holdQuote, noteQuoteSelection, takeQuote, placeSelectionChip, pressSelectionChip, dismissSelection,
     quoteSelectionNow,
-    quickReplyHolds, quickReplyListMoved, quickReplyOpen: () => quickReply !== null,
-    quickReplyOpenKey: () => (quickReply ? quickReply.key : null), placeQuickReply,
-    closeQuickReply, putDownQuickReply, dockQuickReply, sendQuickReply, noteQuickReplyInput, openQuickDraft, openSentenceReply, openFloatedReply,
+    quickReplyHolds, quickReplyListMoved, quickReplyOpen: () => quickReply !== null || documentReply !== null,
+    quickReplyOpenKey: () => (quickReply ? quickReply.key : documentReply ? documentReply.key : null), placeQuickReply,
+    closeQuickReply, putDownQuickReply, dockQuickReply, sendQuickReply, noteQuickReplyInput, openQuickDraft, openSentenceReply, openDocumentReply, openFloatedReply,
     quickDraftLive: (key) => Boolean((quickReplyDrafts.get(key) || "").trim()),
     quickDraftMessage: (key) => keyParts(key).id,
   };

@@ -51,7 +51,11 @@ export interface DocumentsReaderDependencies {
     /** The block model's kind of each of `texts`, in the same order (`#1505`). */
     kinds?: readonly string[];
     onReadingBlock?: (block: number | null, element?: number | null) => unknown;
+    /** `#2006`: React pressed on this read: its block and words, for the view's reply. */
+    onReact?: (block: number, text: string) => unknown;
   }, from?: { part: number; block: number | null }): unknown;
+  /** `#2006`: React was pressed on the open document's read (its block, words and box). */
+  onDocumentReact?: (react: { key: string; block: number; text: string; box: { top: number; bottom: number; left: number; right: number } | null }) => unknown;
   /** Stop the reading of document `key`, where that document's is the one playing; no other. */
   stopSpeaking?(key: string): unknown;
   onBack(): unknown;
@@ -1123,6 +1127,15 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
       texts: blocks.map((block) => block.text),
       kinds: blocks.map((block) => block.kind),
       onReadingBlock,
+      onReact: (block: number, text: string) => {
+        if (currentDoc === null) return;
+        let box: { top: number; bottom: number; left: number; right: number } | null = null;
+        if (litElement !== null && typeof litElement.getBoundingClientRect === "function") {
+          const rect = litElement.getBoundingClientRect();
+          box = { top: rect.top, bottom: rect.bottom, left: rect.left, right: rect.right };
+        }
+        deps.onDocumentReact?.({ key: currentDoc.key, block, text, box });
+      },
     };
     // The owner reports its own failures; nothing here follows the ask.
     void Promise.resolve(

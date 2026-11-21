@@ -86,6 +86,8 @@ export interface DocumentsList {
   capturePlace(): ListAnchor | null;
   /** Put a captured place back: the foot where parked there, else its anchor card. */
   restorePlace(place: ListAnchor | null): void;
+  /** The row held for `key`, or null where the list has not drawn it (`#2006`). */
+  rowFor(key: string): DocumentRow | null;
   unmount(): void;
 }
 
@@ -1442,6 +1444,7 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
     nameFilter: () => nameFilterText,
     capturePlace,
     restorePlace,
+    rowFor: (key) => rowsNow.find((row) => row.key === key) ?? null,
     unmount(): void {
       endUndoOffer();
       wiredOuter = false;

@@ -5656,6 +5656,46 @@ test("`#2004 vibe-talk-read-highlight-missing`: the bottom-bar Read is the open 
   assert.equal(playingId(page), null, "Stop left the document playing");
 });
 
+test("`#2006 vibe-talk-documents-react`: React in the reader quotes the lit block and posts in the last mention's thread", async () => {
+  const page = devicePage();
+  page.documents = [{
+    key: "field-notes", title: "Field notes",
+    content: WIRE_BLOCKS.join("\n\n") + "\n", outline: [],
+    mentions: [{ channel_id: "100000000000000001", message_id: "9001", thread_id: "9001", posted_ms: 100, author: "Ada", label: null }],
+  }];
+  await signIn(page);
+  await enterDocs(page);
+  let card;
+  for (let tries = 0; tries < 10 && !card; tries += 1) {
+    await page.settle();
+    card = page.el("documents-list").querySelectorAll(".doc-card")[0];
+  }
+  assert.ok(card, "fixture: no document card was drawn");
+  await card.click();
+  await page.settle();
+  assert.equal(page.el("doc-jump-mention").hidden, false, "Jump to last mention does not stand in the reader's toolbar");
+  assert.equal(page.el("doc-jump-discussion").hidden, false, "Jump to discussion does not stand in the reader's toolbar");
+  await page.el("read-aloud").click();
+  await page.settle();
+  assert.equal(playingId(page), "doc:field-notes", "the premise: the document is not playing");
+  assert.equal(page.el("read-react").disabled, false, "React waits through a document read that offers it");
+  await page.el("read-react").click();
+  await page.settle();
+  assert.equal(page.el("quick-reply").hidden, false, "React opened no reply for the document");
+  assert.equal(page.el("quick-reply-quote").text(), WIRE_BLOCKS[0],
+    "the reply does not quote the block being read");
+  assert.match(page.el("quick-reply-state").text(), /thread of the last mention/,
+    "the context line does not name where Send will post");
+  page.el("quick-reply-text").value = "Following up from the reader.";
+  await page.el("quick-reply-send").click();
+  await page.settle();
+  const posts = page.requests.filter((one) => one.includes("/reply"));
+  assert.ok(posts.some((one) => one.startsWith("POST /api/v1/channels/100000000000000001/reply")),
+    `Send posted no reply in the mention's channel: ${JSON.stringify(page.requests.slice(-6))}`);
+  await page.el("read-aloud-stop").click();
+  await page.settle();
+});
+
 test("`#2004 vibe-talk-read-highlight-missing`: a cloud read whose cuts disagree still reports a block, never a false stop", async () => {
   const page = newPage();
   // The server's cut carries one block the drawn body does not (an issue's

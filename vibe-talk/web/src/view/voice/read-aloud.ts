@@ -82,6 +82,8 @@ interface DocumentPayload {
   kinds?: readonly string[];
   /** `#1330 doc-read-highlight`: where this read is, for the surface that drew it. */
   onReadingBlock?: DocumentReadingBlock;
+  /** `#2006 vibe-talk-documents-react`: React pressed on this read: its block and words. */
+  onReact?: (block: number, text: string) => unknown;
 }
 /** Fields are filled by the selected transport; guards retain the original read ticket and lifetime rules. */
 interface Playing {
@@ -2572,7 +2574,44 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
    * voice-page-read-nav-center`: pressed while the read plays, it pauses the read first, which holds the
    * sentence being heard, and replies to that at once.
    */
+  /** The caller's block-model index of the current document segment, as `showDocumentBlock` reports it. */
+  function documentModelBlock(): number {
+    const playing = nowPlaying;
+    if (playing === null || !playing.document) return 0;
+    const segment = playing.segments && playing.segment !== undefined ? playing.segments[playing.segment] : undefined;
+    if (!segment || segment.block === null) return 0;
+    const kinds = playing.document.kinds;
+    if (!kinds || kinds.length === 0) return segment.block;
+    const listed = playing.blocks && playing.blocks[segment.part] ? playing.blocks[segment.part]! : null;
+    if (!listed) return kinds.length === 1 ? 0 : segment.block;
+    const currentBlock = listed[segment.block];
+    const drawn = currentBlock && Number.isInteger(currentBlock.element) ? currentBlock.element as number : segment.block;
+    const groups: { kind: string; members: number[] }[] = [];
+    listed.forEach((block, index) => {
+      const element = block && Number.isInteger(block.element) ? block.element as number : null;
+      const last = groups[groups.length - 1];
+      if (last && element !== null && (last as { element?: number }).element === element) last.members.push(index);
+      else groups.push({ kind: String(block && block.kind || ""), members: [index], ...(element !== null ? { element } : {}) } as { kind: string; members: number[] });
+    });
+    if (groups.length !== kinds.length || groups.some((group, at) => group.kind !== kinds[at])) return drawn;
+    const mapped = new Map<number, number>();
+    for (let at = 0; at < groups.length; at += 1) {
+      for (const member of groups[at]!.members) mapped.set(member, at);
+    }
+    const model = mapped.get(segment.block);
+    return model === undefined ? drawn : model;
+  }
+
   function reactToHeldSentence() {
+    // `#2006`: a document read Reacts on its lit block, through its surface.
+    if (nowPlaying !== null && nowPlaying!.kind === "document" && nowPlaying!.document?.onReact) {
+      if (!readingPaused()) pauseReading();
+      const playing = nowPlaying!;
+      const block = documentModelBlock();
+      const text = playing.document!.texts[block] ?? playing.document!.texts[0] ?? "";
+      playing.document!.onReact!(block, text);
+      return;
+    }
     if (nowPlaying !== null && !readingPaused()) pauseForComposer();
     const held = heldSentence;
     if (!readingPaused() || held === null) return;
@@ -3072,9 +3111,10 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
       const waiting = nowPlaying === null && (readJumpPending || readRecovering);
       const hidden = nowPlaying === null && !waiting;
       if (react.hidden !== hidden) react.hidden = hidden;
-      // `#1039 documents-read-parity`: a document read holds no sentence, so React waits throughout.
-      const idle = waiting || (paused && heldSentence === null) ||
-        (nowPlaying !== null && nowPlaying!.kind === "document");
+      // `#2006`: a document read Reacts on its lit block, so it waits only
+      // where its surface offered no React (no `onReact` on the read).
+      const idle = waiting || (paused && heldSentence === null && nowPlaying?.kind !== "document") ||
+        (nowPlaying !== null && nowPlaying!.kind === "document" && !nowPlaying!.document?.onReact);
       if (react.disabled !== idle) react.disabled = idle;
     }
     const button = deps.el("read-aloud");
@@ -3979,7 +4019,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
    * read alone. Nothing calls this yet: the documents view wires it in a later stage.
    */
   async function readDocument(
-    doc: { key: string; title?: string; texts: readonly string[]; kinds?: readonly string[]; entry?: PreparedEntry | null; onReadingBlock?: DocumentReadingBlock },
+    doc: { key: string; title?: string; texts: readonly string[]; kinds?: readonly string[]; entry?: PreparedEntry | null; onReadingBlock?: DocumentReadingBlock; onReact?: (block: number, text: string) => unknown },
     from: ReadFrom | null = null
   ) {
     const tapBegan = speechTimingNow();
@@ -3996,7 +4036,8 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     setReadState("working");
     const payload: DocumentPayload = { key, title: doc.title, entry: doc.entry ?? null, texts: doc.texts,
       ...(doc.kinds ? { kinds: doc.kinds } : {}),
-      ...(doc.onReadingBlock ? { onReadingBlock: doc.onReadingBlock } : {}) };
+      ...(doc.onReadingBlock ? { onReadingBlock: doc.onReadingBlock } : {}),
+      ...(doc.onReact ? { onReact: doc.onReact } : {}) };
     if (readAloudPlayback !== "audio") {
       try {
         if (readAloudPlayback !== "browser") throw new Error("This speech playback method is not supported by this page.");

@@ -45,7 +45,12 @@ export interface DocumentsViewDependencies {
     key: string; title?: string; texts: readonly string[];
     kinds?: readonly string[];
     onReadingBlock?: (block: number | null, element?: number | null) => unknown;
+    onReact?: (block: number, text: string) => unknown;
   }, from?: { part: number; block: number | null }): unknown;
+  /** `#2006`: where a Documents React posts, as kept in Settings. */
+  reactPolicy(): "mention" | "discussion";
+  /** `#2006`: open the quick reply for a document React, posting through `send`. */
+  openDocumentReply(quote: string, box: { top: number; bottom: number; left: number; right: number } | null, context: string, send: (text: string) => Promise<void>): unknown;
   /** Stop the reading of document `key`, where that document's is the one playing; no other. */
   stopSpeaking?(key: string): unknown;
   /**
@@ -269,6 +274,7 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     // open path `#1082 documents-back-chain` builds its chain on.
     onOpenDocument: (key) => openDocument(key),
     onOutlineChange: () => deps.onLevelChange?.(),
+    onDocumentReact: (react) => reactToDocument(react),
   });
   const list = createDocumentsList({
     api: deps.api,
@@ -303,6 +309,133 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     onFilter: (query) => list.setNameFilter(query),
     onStatus: deps.onStatus,
   });
+
+  // ---- React and the discussion jumps (`#2006`) ---------------------------------------------
+  //
+  // The open document's row, held for its mentions: the list drew it, and
+  // a document opened by a link the list has not drawn has none, which
+  // both jumps and React say so for rather than guessing a channel.
+  let currentRow: import("./types.ts").DocumentRow | null = null;
+
+  /** The most recent mention of the open document, or null where none is held. */
+  function lastMention(): import("./types.ts").DocumentMention | null {
+    const mentions = currentRow?.mentions ?? [];
+    let best: import("./types.ts").DocumentMention | null = null;
+    for (const mention of mentions) {
+      if (best === null || (mention.posted_ms ?? -1) >= (best.posted_ms ?? -1)) best = mention;
+    }
+    return best;
+  }
+
+  /** The name a discussion root calls this document: its title, else its file name. */
+  function discussionName(): string {
+    const doc = reader.current();
+    return (currentRow?.title || currentRow?.file_name || doc?.title || "document").trim() || "document";
+  }
+
+  /** The discussion root's exact words (`#2006` policy B). */
+  function discussionRootText(): string {
+    return `Discussion of document ${discussionName()}`;
+  }
+
+  /** A fresh idempotency key for one React post. */
+  function reactKey(part: string): string {
+    return `doc-react-${part}-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e9).toString(36)}`;
+  }
+
+  /** The discussion root's message id in `channel`, or null where none stands (first page only). */
+  async function findDiscussionRoot(channel: string): Promise<string | null> {
+    const wanted = discussionRootText();
+    const answer = await deps.api(
+      `/api/v1/channels/${encodeURIComponent(channel)}/page?limit=100`) as {
+        messages?: Array<{ id?: unknown; content?: unknown; text?: unknown; thread_id?: unknown }> } | null;
+    for (const message of answer?.messages ?? []) {
+      const words = typeof message.content === "string" ? message.content
+        : typeof message.text === "string" ? message.text : "";
+      if (words.trim() !== wanted) continue;
+      if (message.thread_id !== null && message.thread_id !== undefined && String(message.thread_id) !== String(message.id)) continue;
+      return typeof message.id === "string" ? message.id : String(message.id ?? "") || null;
+    }
+    return null;
+  }
+
+  /** Post as the owner through the one reply route. */
+  async function postReply(channel: string, body: Record<string, unknown>): Promise<{ posted?: { id?: unknown } } | null> {
+    return await deps.api(`/api/v1/channels/${encodeURIComponent(channel)}/reply`, {
+      method: "POST", body,
+    }) as { posted?: { id?: unknown } } | null;
+  }
+
+  /** React pressed on the open document's read: open its reply, resolved at Send. */
+  function reactToDocument(react: { key: string; block: number; text: string; box: { top: number; bottom: number; left: number; right: number } | null }): void {
+    const mention = lastMention();
+    if (mention === null) {
+      deps.onStatus?.("No message has mentioned this document yet, so there is nowhere for a reply to go.");
+      return;
+    }
+    const policy = deps.reactPolicy();
+    const name = discussionName();
+    const context = policy === "discussion"
+      ? `Replying in 'Discussion of document ${name}' — will start 'Discussion of document ${name}' in the channel that last mentioned it if it is not there yet`
+      : `Replying in the thread of the last mention of this document${mention.author ? `, by ${mention.author}` : ""}`;
+    deps.openDocumentReply(react.text, react.box, context, async (text) => {
+      if (policy === "discussion") {
+        let root = await findDiscussionRoot(mention.channel_id);
+        if (root === null) {
+          const rootText = discussionRootText();
+          let hash = 0;
+          for (const ch of react.key) hash = (hash * 31 + ch.charCodeAt(0)) | 0;
+          await postReply(mention.channel_id, {
+            text: rootText, idempotency_key: `doc-discussion-${(hash >>> 0).toString(36)}`,
+          });
+          root = await findDiscussionRoot(mention.channel_id);
+          if (root === null) throw new Error("The discussion could not be started; try again.");
+        }
+        await postReply(mention.channel_id, {
+          text, reply_to: root, thread_id: root, idempotency_key: reactKey("reply"),
+        });
+        return;
+      }
+      await postReply(mention.channel_id, {
+        text,
+        reply_to: mention.message_id,
+        thread_id: mention.thread_id ?? mention.message_id,
+        idempotency_key: reactKey("reply"),
+      });
+    });
+  }
+
+  /** Jump to last mention: the mentioning message, through the page's jump. */
+  function jumpToLastMention(): void {
+    const mention = lastMention();
+    if (mention === null) {
+      deps.onStatus?.("This document has not been mentioned yet.");
+      return;
+    }
+    deps.onJumpToMention?.(mention);
+  }
+
+  /** Jump to discussion: policy B's root, or under A the mention's thread. */
+  async function jumpToDiscussion(): Promise<void> {
+    const mention = lastMention();
+    if (mention === null) {
+      deps.onStatus?.("This document has not been mentioned yet.");
+      return;
+    }
+    if (deps.reactPolicy() === "discussion") {
+      const root = await findDiscussionRoot(mention.channel_id);
+      if (root === null) {
+        deps.onStatus?.("No discussion yet — Jump to last mention takes you to where it was last mentioned.");
+        return;
+      }
+      deps.onJumpToMention?.({
+        channel_id: mention.channel_id, message_id: root, thread_id: root,
+        posted_ms: null, author: "", label: null,
+      });
+      return;
+    }
+    deps.onJumpToMention?.(mention);
+  }
 
   /** The mentioning messages of `row`: straight to one, a choice for several. */
   function showMentions(row: import("./types.ts").DocumentRow): void {
@@ -347,6 +480,13 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     chain = [];
     if (wasReading) deps.onLevelChange?.();
     reader.close();
+    currentRow = null;
+    try {
+      deps.byId("doc-jump-mention").hidden = true;
+      deps.byId("doc-jump-discussion").hidden = true;
+    } catch {
+      // A host without the jump buttons keeps the list as it was.
+    }
     deps.byId("docs-reader").hidden = true;
     deps.byId("docs-list-view").hidden = false;
     deps.byId("docs-fetch").hidden = false;
@@ -427,8 +567,16 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
       captureListPlace();
       chain = [{ key, scrollTop: 0, anchor: null }];
     }
+    currentRow = list.rowFor(key);
     deps.byId("docs-list-view").hidden = true;
     deps.byId("docs-reader").hidden = false;
+    // The reader's jumps stand with it (`#2006`).
+    try {
+      deps.byId("doc-jump-mention").hidden = false;
+      deps.byId("doc-jump-discussion").hidden = false;
+    } catch {
+      // A host without the jump buttons keeps the reader as it was.
+    }
     // Fetch is the list's button and Outline the reader's (`#1544`): never both.
     deps.byId("docs-fetch").hidden = true;
     try {
@@ -484,6 +632,13 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
       });
     } catch {
       // A host without the scroller keeps the places taken at each open.
+
+    // The reader's jumps (`#2006`), where the host drew them.
+    try {
+      listening.listen(deps.byId("doc-jump-mention"), "click", () => jumpToLastMention());
+      listening.listen(deps.byId("doc-jump-discussion"), "click", () => { void jumpToDiscussion(); });
+    } catch {
+      // A host without the jump buttons keeps the view as it was.
     }
     const button = deps.byId("docs-fetch") as HTMLButtonElement;
     const menu = deps.byId("docs-fetch-menu");

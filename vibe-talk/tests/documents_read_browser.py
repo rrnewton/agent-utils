@@ -865,6 +865,59 @@ def screenshot_matrix(browser: Browser, base: str, out: Path) -> None:
                 wait_stopped(page)
             ctx.close()
 
+    # `#2006`: React's context line under both policies, and the
+    # no-discussion notice, on the phone in each scheme. The bar's two
+    # jump buttons stand in every documents after frame above.
+    for scheme in ("dark", "light"):
+        ctx = browser.new_context(
+            viewport={"width": 412, "height": 915}, has_touch=True, is_mobile=True,
+            color_scheme=scheme)
+        page = new_page(ctx)
+        docs = stamp("documents")
+        open_document(page)
+        press(page, "read-aloud")
+        wait_lit(page, blocks[0])
+        page.evaluate("() => document.getElementById('read-react').click()")
+        page.wait_for_selector("#quick-reply", state="visible", timeout=20_000)
+        page.screenshot(path=str(docs / f"documents-{scheme}-phone412-react-mention.png"))
+        page.evaluate("() => document.getElementById('quick-reply-cancel').click()")
+        press(page, "read-aloud-stop")
+        wait_stopped(page)
+        page.evaluate("() => document.getElementById('open-settings').click()")
+        page.wait_for_selector("#documents-react-policy", state="attached", timeout=20_000)
+        page.evaluate("""(id) => {
+          const node = document.getElementById(id); const bodies = [];
+          for (let n = node; n; n = n.parentElement) {
+            if (n.classList && n.classList.contains('fold-body')) bodies.unshift(n);
+          }
+          for (const body of bodies) {
+            const toggle = document.querySelector(`[aria-controls="${body.id}"]`);
+            if (toggle && toggle.getAttribute('aria-expanded') !== 'true') toggle.click();
+          }
+        }""", "documents-react-policy")
+        page.select_option("#documents-react-policy", "discussion")
+        page.wait_for_function(
+            "() => document.getElementById('documents-react-policy').value === 'discussion'",
+            timeout=20_000)
+        page.evaluate("() => document.getElementById('close-settings').click()")
+        press(page, "read-aloud")
+        wait_lit(page, blocks[0])
+        page.evaluate("() => document.getElementById('read-react').click()")
+        page.wait_for_selector("#quick-reply", state="visible", timeout=20_000)
+        page.wait_for_function(
+            "() => (document.getElementById('quick-reply-state')?.textContent || '').includes('will start')",
+            timeout=20_000)
+        page.screenshot(path=str(docs / f"documents-{scheme}-phone412-react-discussion.png"))
+        page.evaluate("() => document.getElementById('quick-reply-cancel').click()")
+        press(page, "read-aloud-stop")
+        wait_stopped(page)
+        page.evaluate("() => document.getElementById('doc-jump-discussion').click()")
+        page.wait_for_function(
+            "() => (document.getElementById('status')?.textContent || '').includes('No discussion yet')",
+            timeout=20_000)
+        page.screenshot(path=str(docs / f"documents-{scheme}-phone412-discussion-notice.png"))
+        ctx.close()
+
     # The lit block in every colour preset (owner 273: "no highlight"),
     # dark and light on the phone.
     presets = stamp("presets")

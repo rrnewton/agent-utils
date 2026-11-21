@@ -1573,7 +1573,7 @@ test("`#332 settings-voice-agent-section`: the check refuses the Settings from b
  * settings-collapsible` made each group's heading the button that folds it, a stop before its `?`.
  */
 const SETTINGS_TAB_STOPS = ["help-link-resuming", "resume-toggle", "help-link-live-messages",
-  "relay-to-agent", "fold-reading-full", "settings-audio-source", "settings-wit-voice", "help-link-speech-prep"];
+  "relay-to-agent", "fold-reading-full", "settings-audio-source", "documents-react-policy", "settings-wit-voice", "help-link-speech-prep"];
 
 /**
  * Where the markup breaks `stops` as consecutive Tab stops on Settings, as sentences. The focus order

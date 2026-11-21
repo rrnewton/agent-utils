@@ -104,7 +104,7 @@ import {createAutoplay, createReadAloud, createReadingJump, createVoiceCall, cre
 import {CANNED_PROMPTS,
   mountAgentPrefix,
   mountAgentSettings,
-  mountAppearance,
+  mountAppearance, mountDocumentsReact,
   mountAudioDevices,
   mountBarPlacement,
   mountCannedPrompts,
@@ -1250,6 +1250,8 @@ const documentsView = createDocumentsView({
   closeActionMenu: () => setActionMenuOpen(false),
   readDocument: (doc, from) => readAloudOwner().readDocument(doc, from),
   internalLinkHosts: () => serverFacts.internalLinkHosts(),
+  reactPolicy: () => deviceSettings().get(DEVICE_SETTINGS.documentsReactPolicy),
+  openDocumentReply: (quote, box, context, send) => quoteOwner.openDocumentReply(quote, box, context, send),
   // Page-side kind-and-id awareness (`#1039` stage 3): the reader names only its
   // own document's key; whether that document's is the read playing (or pending)
   // is read off the owner's surface here, so no other read is ever stopped.
@@ -8767,6 +8769,15 @@ application.track(mountSettingsSwitches({
 }));
 
 // `#1845 vibe-talk-appearance-setting`. The Appearance control: painted here, restored first below.
+// `#2006 vibe-talk-documents-react`. Where a Documents React posts, kept in Settings.
+const documentsReactControl = mountDocumentsReact({
+  lookup: (id) => el(id),
+  stored: () => deviceSettings().get(DEVICE_SETTINGS.documentsReactPolicy),
+  keep: (choice) => deviceSettings().keep(DEVICE_SETTINGS.documentsReactPolicy, choice),
+});
+application.track(documentsReactControl);
+documentsReactControl.restore();
+
 const appearanceControl = mountAppearance({
   lookup: (id) => el(id),
   stored: () => deviceSettings().get(DEVICE_SETTINGS.appearance),

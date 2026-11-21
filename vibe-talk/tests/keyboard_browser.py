@@ -769,7 +769,7 @@ def settings_keys(walk: Walk) -> None:
 # group's heading the button that folds it, a stop before its ?; the walk opens the three first.
 SETTINGS_TAB_STOPS = ["help-link-resuming", "resume-toggle",
                       "help-link-live-messages", "relay-to-agent", "fold-reading-full",
-                      "settings-audio-source", "help-link-speech-prep"]
+                      "settings-audio-source", "documents-react-policy", "help-link-speech-prep"]
 SETTINGS_FOLDS_OPENED = ["fold-settings-voice-agent", "fold-reading-full"]
 
 

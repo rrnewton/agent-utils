@@ -1839,6 +1839,12 @@
                         <option value="device">Device voice</option>
                       </select>
                       <p id="settings-chain-order" class="hint" hidden></p>
+                      <label for="documents-react-policy">React in Documents posts to</label>
+                      <select id="documents-react-policy">
+                        <option value="mention">The thread of the last mention</option>
+                        <option value="discussion">A discussion thread for the document</option>
+                      </select>
+                      <p class="hint">Where the reading strip's React sends a reply from the Documents reader.</p>
                       <div id="wit-voice-picker" hidden>
                         <label for="settings-wit-voice">Wit.ai voice</label>
                         <select id="settings-wit-voice">
@@ -4873,6 +4879,17 @@ writable = true</pre>
                 title="Device audio. Tap to use the configured agent instead." hidden>
           <svg id="audio-device-icon" class="mini-icon" data-icon="device" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="2.5" width="10" height="19" rx="2" /><path d="M10 5h4M11 18.5h2" /></svg>
           <svg id="audio-agent-icon" class="mini-icon" data-icon="cloud" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" hidden><path d="M7.5 18.5h9a4.5 4.5 0 0 0 .7-8.95A6 6 0 0 0 5.8 8.2 4.25 4.25 0 0 0 7.5 18.5Z" /><path d="M10 12.5v3M14 11v4.5" /></svg>
+        </button>
+
+        <!-- `#2006 vibe-talk-documents-react`. The Documents reader's jumps, in
+             its bottom toolbar: shown only while a document is open. -->
+        <button id="doc-jump-mention" class="control control-read" type="button" hidden
+                title="Go to the message that mentioned this document last">
+          <span class="control-label">Last mention</span>
+        </button>
+        <button id="doc-jump-discussion" class="control control-read" type="button" hidden
+                title="Go to this document's discussion">
+          <span class="control-label">Discussion</span>
         </button>
 
         <!--

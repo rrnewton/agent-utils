@@ -91,6 +91,8 @@ pub const SYNCED_KEYS: &[&str] = &[
     "vibe-talk.voice.appearance",
     // The accent-family preset (`#1961 vibe-talk-colour-themes`).
     "vibe-talk.voice.colour-theme",
+    // Where a Documents React posts (`#2006 vibe-talk-documents-react`).
+    "vibe-talk.voice.documents-react-policy",
     "vibe-talk.voice.collapsed-lines",
     "vibe-talk.voice.hidden-link-kinds",
     // Whether the search bar's Links view writes each link as its address (`#620 link-url-chip`).

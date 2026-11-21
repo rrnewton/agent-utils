@@ -7,7 +7,7 @@ export { IDENTITY_KEY, SYNCED_SETTING_KEYS } from "./keys.ts";
 export { createSettingsSync, mergedIdentities } from "./sync.ts";
 export type { AgreedSetting, SettingsSync, SettingsSyncDependencies } from "./sync.ts";
 export { DEVICE_SETTINGS, createDeviceSettings } from "./device.ts";
-export type { AfterDone, Appearance, ColourTheme, DeviceSetting, DeviceSettings, DiscussPanelState, ReadAudioSource, SteerOffset } from "./device.ts";
+export type { AfterDone, Appearance, ColourTheme, DeviceSetting, DeviceSettings, DiscussPanelState, DocumentsReactPolicy, ReadAudioSource, SteerOffset } from "./device.ts";
 export { THEME_TOKENS, appearanceOf, effectiveTheme, themeColorFor } from "./appearance.ts";
 export { COLOUR_PRESETS, COLOUR_THEME_WORDS, colourThemeOf } from "./colour.ts";
 export type { EffectiveTheme } from "./appearance.ts";

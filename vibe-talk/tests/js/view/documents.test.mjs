@@ -2069,6 +2069,13 @@ async function withDocumentsView(options, run) {
       const answered = await options.onApi(path, callOptions);
       if (answered !== undefined) return answered;
     }
+    if (String(path).startsWith("/api/v1/channels/") && String(path).endsWith("/reply")) {
+      posts.push({ path, body: callOptions?.body });
+      return { posted: { id: "posted-1" } };
+    }
+    if (String(path).startsWith("/api/v1/channels/") && String(path).includes("/page?")) {
+      return { messages: options.pageMessages ?? [] };
+    }
     if (String(path).startsWith("/api/v1/documents?")) {
       if (options.listGate) await options.listGate;
       return { documents: options.listRows ?? [], total: (options.listRows ?? []).length, revision: 1 };
@@ -2085,11 +2092,17 @@ async function withDocumentsView(options, run) {
   };
   const reads = [];
   const stops = [];
+  const posts = [];
+  const jumps = [];
+  const replies = [];
   const view = mod.createDocumentsView({
     api, byId,
     intoView: (element, block, inline) => { if (element && typeof element.scrollIntoView === "function") element.scrollIntoView(inline === undefined ? { block } : { block, inline }); },
     nudge: (scroller, delta) => { scroller.scrollTop += delta; }, toPosition: (scroller, top) => { scroller.scrollTop = top; }, toFoot: (scroller) => { scroller.scrollTop = scroller.scrollHeight; },
     readDocument: (doc) => { reads.push(doc); },
+    reactPolicy: () => options.policy ?? "mention",
+    openDocumentReply: (quote, box, context, send) => { replies.push({ quote, box, context, send }); },
+    onJumpToMention: (mention) => { jumps.push(mention); },
     stopSpeaking: (key) => { stops.push(key); },
     onStatus: (text) => { statuses.push(text); options.onStatus?.(text); },
     ...(options.onBack ? { onBack: options.onBack } : {}),
@@ -2102,7 +2115,7 @@ async function withDocumentsView(options, run) {
     querySelector: () => null,
   };
   try {
-    await run({ view, els, byId, opened, reads, stops, statuses });
+    await run({ view, els, byId, opened, reads, stops, statuses, posts, jumps, replies });
   } finally {
     view.unmount();
     if (savedDocument === undefined) delete globalThis.document; else globalThis.document = savedDocument;
@@ -2364,7 +2377,10 @@ test("documents reader: Read hands the owner the retained document in one call (
       // already playing is the owner's check, not a flag of the reader's.
       reader.readAloud();
       assert.equal(reads.length, 2, "a second Read was swallowed by the reader");
-      assert.deepEqual(reads[1], reads[0]);
+      assert.deepEqual(
+        { key: reads[1].key, texts: reads[1].texts, kinds: reads[1].kinds },
+        { key: reads[0].key, texts: reads[0].texts, kinds: reads[0].kinds },
+        "a second Read handed the owner a different document");
     },
   );
 });
@@ -2516,6 +2532,101 @@ test("documents view: each step back stops the document being left, by its key (
     await flush([]);
     assert.deepEqual(stops, ["doc-b", "doc-a"], "reaching the list left the document's read unstopped");
     assert.equal(view.reading(), false);
+  });
+});
+
+// ---- 8. React and the discussion jumps (`#2006`) ------------------------------------------------
+
+const MENTION_ROW = {
+  ...docRow("doc-a", 300),
+  mentions: [
+    { channel_id: "chan-1", message_id: "m-old", thread_id: "t-old", posted_ms: 100, author: "Ada", label: null },
+    { channel_id: "chan-1", message_id: "m-new", thread_id: "t-new", posted_ms: 300, author: "Ben", label: null },
+  ],
+};
+
+test("documents react: policy A posts in the last mention's thread, quoting the block (#2006)", async () => {
+  await withDocumentsView({ listRows: [MENTION_ROW] }, async ({ view, reads, replies, posts }) => {
+    await view.show();
+    await view.show("doc-a");
+    view.readAloud();
+    assert.equal(typeof reads[0].onReact, "function", "the read offered no React");
+    reads[0].onReact(0, "Doc A");
+    assert.equal(replies.length, 1, "React opened no reply");
+    assert.match(replies[0].context, /thread of the last mention/);
+    await replies[0].send("the quoted words plus mine");
+    assert.equal(posts.length, 1, "Send posted nothing");
+    assert.equal(posts[0].body.reply_to, "m-new", "the reply does not answer the last mention");
+    assert.equal(posts[0].body.thread_id, "t-new", "the reply is not in the last mention's thread");
+    assert.match(posts[0].path, /chan-1\/reply$/);
+  });
+});
+
+test("documents react: policy B reuses a standing discussion root, and creates it once where none stands (#2006)", async () => {
+  const root = { id: "root-1", content: "Discussion of document doc-a title", thread_id: null };
+  await withDocumentsView(
+    { listRows: [MENTION_ROW], policy: "discussion", pageMessages: [root] },
+    async ({ view, reads, replies, posts }) => {
+      await view.show();
+      await view.show("doc-a");
+      view.readAloud();
+      reads[0].onReact(0, "Doc A");
+      assert.match(replies[0].context, /Discussion of document doc-a title/);
+      await replies[0].send("words");
+      assert.equal(posts.length, 1, "a standing root was created again");
+      assert.equal(posts[0].body.thread_id, "root-1");
+    },
+  );
+  let rooted = false;
+  let rootText = "";
+  await withDocumentsView(
+    {
+      listRows: [MENTION_ROW], policy: "discussion",
+      onApi: async (path, callOptions) => {
+        if (String(path).includes("/page?")) return { messages: rooted ? [root] : [] };
+        if (String(path).endsWith("/reply") && String(callOptions?.body?.text ?? "").startsWith("Discussion of document")) {
+          rooted = true;
+          rootText = String(callOptions.body.text);
+          return { posted: { id: "root-1" } };
+        }
+        return undefined;
+      },
+    },
+    async ({ view, reads, replies, posts }) => {
+      await view.show();
+      await view.show("doc-a");
+      view.readAloud();
+      reads[0].onReact(0, "Doc A");
+      assert.match(replies[0].context, /will start 'Discussion of document doc-a title'/);
+      await replies[0].send("words");
+      assert.equal(rootText, "Discussion of document doc-a title", "the discussion root was not posted first");
+      assert.equal(posts.length, 1, "more than its reply was posted after the root");
+      assert.equal(posts[0].body.thread_id, "root-1", "the reply did not land in the new root's thread");
+    },
+  );
+});
+
+test("documents jumps: last mention jumps, discussion under B fizzles with its notice, no mentions say so (#2006)", async () => {
+  await withDocumentsView(
+    { listRows: [MENTION_ROW], policy: "discussion", pageMessages: [] },
+    async ({ view, byId, jumps, statuses }) => {
+      await view.show();
+      await view.show("doc-a");
+      dispatchClick(byId("doc-jump-mention"));
+      assert.deepEqual(jumps.map((one) => one.message_id), ["m-new"], "Jump to last mention went elsewhere");
+      dispatchClick(byId("doc-jump-discussion"));
+      await flush([]);
+      assert.equal(jumps.length, 1, "Jump to discussion jumped with no discussion standing");
+      assert.ok(statuses.some((text) => text.includes("No discussion yet")), `the notice was not said: ${statuses}`);
+    },
+  );
+  await withDocumentsView({ listRows: [docRow("doc-a", 100)] }, async ({ view, reads, replies, statuses }) => {
+    await view.show();
+    await view.show("doc-a");
+    view.readAloud();
+    reads[0].onReact(0, "Doc A");
+    assert.equal(replies.length, 0, "React opened a reply with nowhere to post");
+    assert.ok(statuses.some((text) => text.includes("No message has mentioned")), `the notice was not said: ${statuses}`);
   });
 });
 

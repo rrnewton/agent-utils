@@ -91,6 +91,11 @@ export type Appearance = "light" | "dark" | "system";
  * dark scheme's accent, the AA repair the default keeps as a documented exception. */
 export type ColourTheme = "blue" | "blue-hc" | "teal" | "plum" | "amber";
 
+/** Where a Documents React posts (`#2006 vibe-talk-documents-react`): the thread of the most
+ * recent mention ("mention", the default), or one top-level discussion thread in that
+ * mention's channel ("discussion"). */
+export type DocumentsReactPolicy = "mention" | "discussion";
+
 /** An offset on screen, in CSS pixels. */
 export interface SteerOffset {
   readonly x: number;
@@ -187,6 +192,17 @@ export const DEVICE_SETTINGS = Object.freeze({
     write: (choice: ColourTheme) => choice,
     refused: { value: "blue" },
   } satisfies DeviceSetting<ColourTheme>,
+  /**
+   * `#2006 vibe-talk-documents-react`. Where a Documents React posts: the thread of the
+   * most recent mention unless the reader chose the discussion thread. ABSENT MEANS
+   * "mention". Synced, so the choice follows the owner. A refused read is "mention".
+   */
+  documentsReactPolicy: {
+    key: "vibe-talk.voice.documents-react-policy",
+    read: (raw: string | null): DocumentsReactPolicy => (raw === "discussion" ? "discussion" : "mention"),
+    write: (choice: DocumentsReactPolicy) => choice,
+    refused: { value: "mention" },
+  } satisfies DeviceSetting<DocumentsReactPolicy>,
   /** Which voice reads messages aloud, as chosen: null for no choice (or one this page does not know). */
   readAudioSource: {
     key: "vibe-talk.voice.read-audio-source",
