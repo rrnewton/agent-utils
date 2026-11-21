@@ -1,13 +1,14 @@
 ---
 title: 'agentctl-tabs-scheduled-hygiene: scheduled tab hygiene, bounded dry-run, headless viewer recreation'
-status: open
+status: closed
+closed_at: 2026-11-21T00:00:00-05:00
 priority: 1
 issue_type: feature
 labels:
 - agentctl
 - tabs
 created_at: 2026-11-20T11:27:00-05:00
-updated_at: 2026-11-20T11:27:00-05:00
+updated_at: 2026-11-21T00:00:00-05:00
 ---
 
 # Description
@@ -32,3 +33,7 @@ updated_at: 2026-11-20T11:27:00-05:00
 # Notes
 
 Scratch registries and a fake Herdr only; never touch another team's registry or panes not created for this work. Related: #1793 agentctl-workspace-cultivation, #1225 workspace-goal-reconciler, #1004 liaison-first-tab-order, #979 canonical-tab-order.
+
+## Resolution
+
+[watermelon-full-preview] Closed 2026-11-21, landed as `af3d9b41` on main (tree `6fc0d248`, verified-tree landing after a cold review and two re-reviews by coordb). The dry-run hang was the census, not a stuck call: per pane it paid two `pane get`s, an idle-shell proof whose stable-identity observation costs seconds on a dead or exec-ing shell, and a screen read, plus two live Herdr calls per record through `status()` — about 480 calls for 80 records. It now reads record fields from the record file (`ManagedAgents::census_record`), gets each pane once, probes only unclaimed panes (a claim counts only when verified by recorded workspace or terminal, and any by-id claim still blocks a close), and gives the census a 60 s budget after which unprobed panes are kept; the tab socket caps the replies one request will skip. `coordinator`/`coordinator-hands` record roles rank as coordinators, and a viewer tab is renamed only when its pane is an idle shell or this agent's own `agentctl tail|console`. `agentctl tabs --apply` runs one pass with grace clocks in `REGISTRY/tab-hygiene.json` (dropped on a boot change or after about two passes, under a registry flock), `restore` runs it at its end, and `install-units --tab-hygiene` installs the per-registry timer pair (every five minutes, `TimeoutStartSec=5min`); the enablement recipe is in the userguide. Headless viewer creation stayed with #1973 and is suppressed in the standalone passes. Verified: the scratch 80-record fake-Herdr dry run completes in 82 Herdr calls; gates on three successive bases red only on the #2027 pidfd family (waived by coordb; the pair passes on current main) and Python shards run directly were green apart from the pidfd twin; the verified tree passed fmt, clippy with warnings denied, 188 focused Rust tests, 315 queue/team tests and both hygiene checkers. Nothing was enabled on any live registry: each team opts in with the recipe.
