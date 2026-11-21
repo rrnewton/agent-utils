@@ -2094,11 +2094,9 @@ fn cmd_status(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
                     );
                 }
             }
-            Ok(exit_code_for(
-                exit_state
-                    .as_deref()
-                    .unwrap_or_else(|| entry["state"].as_str().unwrap_or("deferred")),
-            ))
+            Ok(exit_code_for(exit_state.as_deref().unwrap_or_else(|| {
+                entry["state"].as_str().unwrap_or("deferred")
+            })))
         }
         (None, Some((team, entry))) => {
             println!(

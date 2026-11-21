@@ -28,10 +28,16 @@ fn retire_stale_archives_exact_record_and_queue_without_touching_runtime() {
         .unwrap();
     let archive = PathBuf::from(report["archive"].as_str().unwrap());
     assert_eq!(fs::read(archive.join("agent.json")).unwrap(), bytes);
-    assert_eq!(
-        agent::queued_prompts(&archive.join("queue")).unwrap(),
-        ["retained-prompt"]
-    );
+    // #2028 v2: the retained prompt is set aside raised in the
+    // archived queue, never left pending and never replayed.
+    assert!(agent::queued_prompts(&archive.join("queue"))
+        .unwrap()
+        .is_empty());
+    let aside: Value = serde_json::from_str(
+        &fs::read_to_string(archive.join("queue/cancelled/retained-prompt.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(aside["cancel_reason"], "stranded-archived");
     assert!(!fixture.root.join("registry/agents/worker").exists());
     assert!(fixture.client.closed.lock().unwrap().is_empty());
     assert!(fixture.client.runs.lock().unwrap().is_empty());

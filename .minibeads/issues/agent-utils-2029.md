@@ -18,6 +18,8 @@ updated_at: 2026-11-21T02:50:00-05:00
 - Receipt, status, seen and serve reconcile before answering.
 - Confirmed processed is delivered; attempted-but-unconfirmed is possibly_submitted; never-attempted or archived-only items are stranded; revive-proved never-typed failures are failed.
 
-# Exit-code table (sender-visible)
+# Notes
+
+## Exit-code table (sender-visible)
 
 [watermelon-full-preview] agent-teams status/receipt exit by the reconciled recipient state: delivered/journaled 0; accepted/deferred/claimed/typing/presented/undeliverable 75 (pending, retry); possibly_submitted/failed/stranded/lost/ambiguous 76 (needs a human); expired/superseded/retracted/refused/fenced 65 (definite refusal). Before this fix status exited 75 from the outbox even when the recipient was delivered; a sender reading rc 75 as success must change.

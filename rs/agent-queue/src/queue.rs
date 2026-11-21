@@ -1445,7 +1445,9 @@ pub fn set_aside_archived_queue(root: &Path, now_ms: u64) -> ArchiveSetAsideRepo
         }
     }
     for (path, id) in pending {
-        let Ok(document) = load_message(&path) else { continue };
+        let Ok(document) = load_message(&path) else {
+            continue;
+        };
         let expired = document
             .get(NOT_AFTER)
             .filter(|value| !value.is_null())
@@ -1457,8 +1459,16 @@ pub fn set_aside_archived_queue(root: &Path, now_ms: u64) -> ArchiveSetAsideRepo
             ("stranded-archived", "stranded-archived")
         };
         let item = stranded_item(&document, &id, outcome);
-        if set_aside(root, &directories, &path, document, reason,
-                     "coordinator archived; raised, not delivered").is_ok() {
+        if set_aside(
+            root,
+            &directories,
+            &path,
+            document,
+            reason,
+            "coordinator archived; raised, not delivered",
+        )
+        .is_ok()
+        {
             report.items.push(item);
         }
     }
@@ -1469,7 +1479,9 @@ pub fn set_aside_archived_queue(root: &Path, now_ms: u64) -> ArchiveSetAsideRepo
             if claim_owner_alive(&directories, &filename) {
                 continue;
             }
-            let Ok(mut document) = load_message(&path) else { continue };
+            let Ok(mut document) = load_message(&path) else {
+                continue;
+            };
             let may_have_typed = document.get("paste_started_at").is_some()
                 || document.get("possibly_submitted").and_then(Value::as_bool) == Some(true)
                 || document.get("stranded_at").is_some()
@@ -1494,8 +1506,16 @@ pub fn set_aside_archived_queue(root: &Path, now_ms: u64) -> ArchiveSetAsideRepo
                 }
             } else {
                 let item = stranded_item(&document, &id, "stranded-archived");
-                if set_aside(root, &directories, &path, document, "stranded-archived",
-                             "coordinator archived while inflight untyped; raised, not delivered").is_ok() {
+                if set_aside(
+                    root,
+                    &directories,
+                    &path,
+                    document,
+                    "stranded-archived",
+                    "coordinator archived while inflight untyped; raised, not delivered",
+                )
+                .is_ok()
+                {
                     report.items.push(item);
                 }
             }
@@ -1611,13 +1631,22 @@ mod tests {
         .unwrap();
         let report = set_aside_archived_queue(root, 1_700_000_000_000);
         assert_eq!(report.items.len(), 2, "{report:?}");
-        assert_eq!(message_state(root, "keep-1").unwrap(), Some(MessageState::Cancelled));
-        assert_eq!(message_state(root, "old-1").unwrap(), Some(MessageState::Cancelled));
+        assert_eq!(
+            message_state(root, "keep-1").unwrap(),
+            Some(MessageState::Cancelled)
+        );
+        assert_eq!(
+            message_state(root, "old-1").unwrap(),
+            Some(MessageState::Cancelled)
+        );
         let kept = load_message(&root.join("cancelled/keep-1.json")).unwrap();
         assert_eq!(kept["cancel_reason"], "stranded-archived");
         let old = load_message(&root.join("cancelled/old-1.json")).unwrap();
         assert_eq!(old["cancel_reason"], "stranded-expired");
-        assert!(report.items.iter().all(|item| item.outcome.starts_with("stranded")));
+        assert!(report
+            .items
+            .iter()
+            .all(|item| item.outcome.starts_with("stranded")));
     }
 
     #[test]

@@ -1266,10 +1266,8 @@ mod tests {
     #[test]
     fn stranded_notices_row_fails_while_a_notice_is_filed() {
         // #2028: a .stranded-notices file is a raise until re-sent.
-        let dir = std::env::temp_dir().join(format!(
-            "agentctl-verify-stranded-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("agentctl-verify-stranded-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".stranded-notices")).unwrap();
         assert_eq!(stranded_notices_row(&dir)["status"], "pass");

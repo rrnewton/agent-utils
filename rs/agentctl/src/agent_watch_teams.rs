@@ -223,7 +223,12 @@ pub(super) fn report_stranded_notices(
     }
     let names: Vec<String> = files
         .iter()
-        .map(|path| path.file_name().unwrap_or_default().to_string_lossy().into_owned())
+        .map(|path| {
+            path.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        })
         .collect();
     let mut row = json!({"count": files.len(), "files": names, "reported": false});
     if options.check_only {

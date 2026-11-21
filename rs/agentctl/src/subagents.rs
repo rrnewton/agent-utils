@@ -7586,7 +7586,11 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 serde_json::from_str::<Value>(&text)
                     .map_err(|_| ())
                     .and_then(|value| {
-                        value.get("name").and_then(Value::as_str).map(str::to_owned).ok_or(())
+                        value
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                            .ok_or(())
                     })
             })
         else {
@@ -7626,7 +7630,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             );
             return;
         }
-        let Ok(directory) = self.directory(&designated) else { return };
+        let Ok(directory) = self.directory(&designated) else {
+            return;
+        };
         if !directory.join("agent.json").exists() {
             return;
         }

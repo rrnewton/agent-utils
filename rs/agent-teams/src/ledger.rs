@@ -764,7 +764,9 @@ fn queue_candidates(recorded: &Path) -> Vec<PathBuf> {
     // .../<agent>/queue whose parent is a real registry (it holds
     // coordinator.json or agents/). Anything else (a scratch queue
     // root in a temp dir) has no registry to scan.
-    let Some(agent_dir) = recorded.parent() else { return out };
+    let Some(agent_dir) = recorded.parent() else {
+        return out;
+    };
     let name = agent_dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let parent = agent_dir.parent();
     let (registry, agent) = match parent.and_then(|p| p.file_name()).and_then(|n| n.to_str()) {
@@ -776,18 +778,15 @@ fn queue_candidates(recorded: &Path) -> Vec<PathBuf> {
             let recorded_name = fs::read_to_string(agent_dir.join("agent.json"))
                 .ok()
                 .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-                .and_then(|value| {
-                    value.get("name").and_then(Value::as_str).map(str::to_owned)
-                });
+                .and_then(|value| value.get("name").and_then(Value::as_str).map(str::to_owned));
             (
                 parent.and_then(|p| p.parent()).map(Path::to_path_buf),
                 recorded_name,
             )
         }
         _ => {
-            let is_registry = parent.is_some_and(|p| {
-                p.join("coordinator.json").exists() || p.join("agents").is_dir()
-            });
+            let is_registry = parent
+                .is_some_and(|p| p.join("coordinator.json").exists() || p.join("agents").is_dir());
             if is_registry && agent_queue::registry::is_agent_name(name) {
                 (parent.map(Path::to_path_buf), Some(name.to_string()))
             } else {
@@ -816,9 +815,7 @@ fn queue_candidates(recorded: &Path) -> Vec<PathBuf> {
         let designated = fs::read_to_string(registry.join("coordinator.json"))
             .ok()
             .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-            .and_then(|value| {
-                value.get("name").and_then(Value::as_str).map(str::to_owned)
-            });
+            .and_then(|value| value.get("name").and_then(Value::as_str).map(str::to_owned));
         if let Some(designated) = designated {
             if designated != agent {
                 if let Ok(dir) = agent_queue::registry::directory(&registry, &designated) {
@@ -873,11 +870,9 @@ pub fn reconcile_queue_delivery(state: &Path, team: &str, id: &str) -> Option<St
     }
     let (new_state, detail): (&str, String) = match found {
         Some((queue_dir, MessageState::Processed)) => {
-            let item = fs::read_to_string(
-                queue_dir.join("processed").join(format!("{id}.json")),
-            )
-            .ok()
-            .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+            let item = fs::read_to_string(queue_dir.join("processed").join(format!("{id}.json")))
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok());
             let delivery_state = item
                 .as_ref()
                 .and_then(|item| item.get("delivery_state"))
@@ -902,9 +897,7 @@ pub fn reconcile_queue_delivery(state: &Path, team: &str, id: &str) -> Option<St
                     .and_then(|item| {
                         item.get("delivery_attempts")
                             .and_then(Value::as_u64)
-                            .or_else(|| {
-                                item.get("tui_delivery_attempts").and_then(Value::as_u64)
-                            })
+                            .or_else(|| item.get("tui_delivery_attempts").and_then(Value::as_u64))
                     })
                     .unwrap_or(0);
                 if attempts > 0 {
@@ -953,10 +946,11 @@ pub fn reconcile_queue_delivery(state: &Path, team: &str, id: &str) -> Option<St
             }
         }
         Some((queue_dir, MessageState::Failed)) => {
-            let error = fs::read_to_string(queue_dir.join("failed").join(format!("{id}.json.error")))
-                .ok()
-                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-                .and_then(|sidecar| sidecar.get("error")?.as_str().map(str::to_owned));
+            let error =
+                fs::read_to_string(queue_dir.join("failed").join(format!("{id}.json.error")))
+                    .ok()
+                    .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                    .and_then(|sidecar| sidecar.get("error")?.as_str().map(str::to_owned));
             match error {
                 Some(reason)
                     if reason.starts_with("archived by revive")
@@ -973,8 +967,7 @@ pub fn reconcile_queue_delivery(state: &Path, team: &str, id: &str) -> Option<St
         }
         Some((queue_dir, MessageState::Pending)) if in_archive(&queue_dir) => (
             "stranded",
-            "stranded: item left pending in an archived coordinator queue; never typed"
-                .to_string(),
+            "stranded: item left pending in an archived coordinator queue; never typed".to_string(),
         ),
         Some((queue_dir, MessageState::Inflight)) if in_archive(&queue_dir) => (
             "stranded",

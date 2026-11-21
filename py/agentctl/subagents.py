@@ -8401,7 +8401,7 @@ def _set_aside_archived_queue(queue: Path) -> list[dict[str, str]]:
         return items
     now_ms = time.time() * 1000
 
-    def describe(document: dict, identifier: str, outcome: str) -> dict[str, str]:
+    def describe(document: dict[str, object], identifier: str, outcome: str) -> dict[str, str]:
         sender = document.get("sender")
         if not isinstance(sender, str):
             envelope = document.get("envelope")

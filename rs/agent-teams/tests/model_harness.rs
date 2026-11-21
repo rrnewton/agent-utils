@@ -1096,7 +1096,6 @@ fn reconcile_folds_queue_terminal_state_into_the_ledger() {
         std::fs::rename(from, queue_dir.join(to).join(format!("{id}.json"))).expect("move");
     };
 
-
     let stamp_processed = |id: &str| {
         let path = queue_dir.join("processed").join(format!("{id}.json"));
         let mut doc: serde_json::Value =
@@ -1204,7 +1203,9 @@ fn reconcile_folds_queue_terminal_state_into_the_ledger() {
     let proof_free = "tm-sim-5555555555555555";
     deliver(proof_free, 5);
     move_item(proof_free, "processed");
-    let proof_path = queue_dir.join("processed").join(format!("{proof_free}.json"));
+    let proof_path = queue_dir
+        .join("processed")
+        .join(format!("{proof_free}.json"));
     let mut proof_doc: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&proof_path).unwrap()).unwrap();
     proof_doc["delivery_state"] = serde_json::json!("queued");
@@ -1240,25 +1241,61 @@ fn reconcile_covers_drain_gaps_a_to_d() {
         ledger_path: state.join("ledger.json"),
         registry: registry.clone(),
         agent: "coord".into(),
-        auto_drain: agent_teams::deliver::AutoDrain { enabled: false, ..Default::default() },
+        auto_drain: agent_teams::deliver::AutoDrain {
+            enabled: false,
+            ..Default::default()
+        },
         drain_state_dir: None,
     };
     let ctx = AcceptContext {
-        state: &state, this_host: "host-a", declaration, via: "test",
-        proof_note: "proved", relayed_by: None, peer_host: "host-a", via_chat_relay: false,
+        state: &state,
+        this_host: "host-a",
+        declaration,
+        via: "test",
+        proof_note: "proved",
+        relayed_by: None,
+        peer_host: "host-a",
+        via_chat_relay: false,
     };
     let now_ms = agent_teams::timeutil::now_unix_ms();
     let deliver = |id: &str, seq: i64| {
         let envelope = build_envelope(
-            id, "k", "sim", "host-a", seq, "harness-ancestry", "tools", "host-a",
-            "info", None, &[], false, now_ms, now_ms + 7_200_000, None, "body",
+            id,
+            "k",
+            "sim",
+            "host-a",
+            seq,
+            "harness-ancestry",
+            "tools",
+            "host-a",
+            "info",
+            None,
+            &[],
+            false,
+            now_ms,
+            now_ms + 7_200_000,
+            None,
+            "body",
         );
-        assert_eq!(accept(&ctx, &envelope, &deliverer).expect("accept").state.as_deref(), Some("accepted"));
+        assert_eq!(
+            accept(&ctx, &envelope, &deliverer)
+                .expect("accept")
+                .state
+                .as_deref(),
+            Some("accepted")
+        );
     };
     let confirm_processed = |queue: &Path, id: &str| {
         let directories = agent_queue::queue::QueueDirectories::new(queue);
-        let from = [&directories.inbox_v2, &directories.inbox, &directories.inflight]
-            .into_iter().map(|dir| dir.join(format!("{id}.json"))).find(|path| path.exists()).expect("queued");
+        let from = [
+            &directories.inbox_v2,
+            &directories.inbox,
+            &directories.inflight,
+        ]
+        .into_iter()
+        .map(|dir| dir.join(format!("{id}.json")))
+        .find(|path| path.exists())
+        .expect("queued");
         let to = queue.join("processed").join(format!("{id}.json"));
         std::fs::rename(from, to.clone()).expect("move");
         let mut doc: Value = serde_json::from_str(&std::fs::read_to_string(&to).unwrap()).unwrap();
@@ -1271,7 +1308,10 @@ fn reconcile_covers_drain_gaps_a_to_d() {
     let a = "tm-sim-1111111111111111";
     deliver(a, 1);
     confirm_processed(&queue_dir, a);
-    assert_eq!(reconcile_queue_delivery(&state, "tools", a).as_deref(), Some("delivered"));
+    assert_eq!(
+        reconcile_queue_delivery(&state, "tools", a).as_deref(),
+        Some("delivered")
+    );
 
     // (b): typed under the designated coordinator's queue after a re-designation.
     let b = "tm-sim-2222222222222222";
@@ -1283,26 +1323,42 @@ fn reconcile_covers_drain_gaps_a_to_d() {
     let new_dirs = agent_queue::queue::prepare(&new_queue).unwrap();
     agent_queue::queue::prepare_lane(&new_queue, &new_dirs.inbox_v2).unwrap();
     let directories = agent_queue::queue::QueueDirectories::new(&queue_dir);
-    let from = [&directories.inbox_v2, &directories.inbox].into_iter()
-        .map(|dir| dir.join(format!("{b}.json"))).find(|path| path.exists()).expect("queued");
+    let from = [&directories.inbox_v2, &directories.inbox]
+        .into_iter()
+        .map(|dir| dir.join(format!("{b}.json")))
+        .find(|path| path.exists())
+        .expect("queued");
     let doc: Value = serde_json::from_str(&std::fs::read_to_string(&from).unwrap()).unwrap();
-    std::fs::write(new_queue.join("inbox.v2").join(format!("{b}.json")), doc.to_string()).unwrap();
+    std::fs::write(
+        new_queue.join("inbox.v2").join(format!("{b}.json")),
+        doc.to_string(),
+    )
+    .unwrap();
     std::fs::remove_file(&from).unwrap();
     confirm_processed(&new_queue, b);
-    assert_eq!(reconcile_queue_delivery(&state, "tools", b).as_deref(), Some("delivered"));
+    assert_eq!(
+        reconcile_queue_delivery(&state, "tools", b).as_deref(),
+        Some("delivered")
+    );
 
     // (d): the coordinator is archived with the item still inflight.
     let d = "tm-sim-6666666666666666";
     deliver(d, 3);
     let directories = agent_queue::queue::QueueDirectories::new(&queue_dir);
-    let from = [&directories.inbox_v2, &directories.inbox].into_iter()
-        .map(|dir| dir.join(format!("{d}.json"))).find(|path| path.exists()).expect("queued");
+    let from = [&directories.inbox_v2, &directories.inbox]
+        .into_iter()
+        .map(|dir| dir.join(format!("{d}.json")))
+        .find(|path| path.exists())
+        .expect("queued");
     std::fs::create_dir_all(queue_dir.join("inflight")).unwrap();
     std::fs::rename(from, queue_dir.join("inflight").join(format!("{d}.json"))).unwrap();
     let archived_queue = registry.join("archive/coord-1-2/queue");
     std::fs::create_dir_all(archived_queue.parent().unwrap()).unwrap();
     std::fs::rename(&queue_dir, &archived_queue).unwrap();
-    assert_eq!(reconcile_queue_delivery(&state, "tools", d).as_deref(), Some("stranded"));
+    assert_eq!(
+        reconcile_queue_delivery(&state, "tools", d).as_deref(),
+        Some("stranded")
+    );
     assert_eq!(receipt(&state, "tools", d)["state"], "stranded");
     let _ = std::fs::remove_dir_all(&state);
 }

@@ -12,7 +12,7 @@ def _queue(root: Path) -> Path:
     return root
 
 
-def _put(queue: Path, lane: str, mid: str, text: str, not_after=None, **extra) -> None:
+def _put(queue: Path, lane: str, mid: str, text: str, not_after: float | None = None, **extra: object) -> None:
     doc = {"id": mid, "text": text, "queued_at": time.time(), "delivery_attempts": 0, **extra}
     if not_after is not None:
         doc["not_after"] = not_after
