@@ -295,7 +295,7 @@ fn muse_sessions_for_pid(root: &Path, record: &AgentRecord, pid: u64) -> Vec<Str
 /// DIFFERENT host's name is a copied lock (dotsync mirrors session
 /// directories between hosts) and attributes nothing, however well
 /// its pid line matches a local process. A lock with no host line
-/// predates the field and keeps the pid-only attribution.
+/// was written before the field existed and keeps the pid-only attribution.
 fn expected_lock_hosts() -> Vec<String> {
     #[cfg(test)]
     {
@@ -319,7 +319,7 @@ fn expected_lock_hosts() -> Vec<String> {
 
 /// Whether the lock text may attribute a session on this host: a
 /// `host=` line, when present, must name this host. A lock with no
-/// host line at all predates the field (about a third of the live
+/// host line at all was written before the field existed (about a third of the live
 /// locks on a real host) and falls back to the pid evidence alone,
 /// exactly as before #2013 - refusing those would break attribution
 /// for every lane whose lock was written before the field existed.
