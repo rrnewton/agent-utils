@@ -461,14 +461,60 @@
   font-weight: 600;
   white-space: nowrap;
 }
+/* `#2071 vibe-talk-thread-picker-grid-toggle` (owner 301): the fixed views
+   fill the popup's width as an equal 2x2 grid on a phone — no haphazard
+   wrap leaving one pill alone beside blank space. An odd fifth option
+   (Two columns, where it fits) takes the full last row rather than half
+   of it. On a desktop wide enough for one row, the bar is that one row. */
 .thread-picker-fixedbar {
   flex: none;
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(6.5rem, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0.4rem;
   padding: 0.5rem;
   border-top: 1px solid var(--edge, currentColor);
   background: var(--panel, Canvas);
+}
+.thread-picker-fixed:last-child:nth-child(odd) {
+  grid-column: 1 / -1;
+}
+@media (min-width: 900px) and (pointer: fine) {
+  .thread-picker-fixedbar {
+    grid-template-columns: repeat(var(--fixed-count, 4), minmax(0, 1fr));
+  }
+  .thread-picker-fixed:last-child:nth-child(odd) {
+    grid-column: auto;
+  }
+}
+.thread-picker-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.3rem 0.4rem 0.3rem 0.9rem;
+  border-bottom: 1px solid var(--edge, currentColor);
+}
+.thread-picker-headlabel {
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted, CanvasText);
+}
+.thread-picker-close {
+  flex: none;
+  width: 44px;
+  height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  color: inherit;
+  border: 1px solid var(--edge, currentColor);
+  border-radius: 0.4rem;
+  font-size: 1.35rem;
+  line-height: 1;
+  cursor: pointer;
 }
 .thread-picker-fixed {
   justify-content: center;

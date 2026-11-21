@@ -13,6 +13,12 @@ store does, unpins recorded), so they survive a reload; message pins stay
 a separate list.
 
 Pass --screenshots DIR to keep a PNG of each step for review.
+
+`#2071 vibe-talk-thread-picker-grid-toggle` (owner 301-302): the fixed
+views fill the pop-up as an equal 2x2 grid on a phone (one equal row on a
+desk), at least 48px tall; the toolbar thread button toggles the pop-up
+shut with no reopen from the same tap; an explicit X (aria-label "Close
+thread picker", focus returning to the thread button) and Escape close it.
 """
 
 from __future__ import annotations
@@ -229,6 +235,8 @@ POPUP_JS = """() => {
             fixed: row.classList.contains('thread-picker-fixed'),
             centred: getComputedStyle(row).textAlign,
             rowTop: row.getBoundingClientRect().top,
+            rect: (() => { const r = row.getBoundingClientRect();
+                return {left: r.left, top: r.top, width: r.width, height: r.height}; })(),
             pinLeft: pinRect ? pinRect.left : null,
             openLeft: openRect ? openRect.left : null,
             gold: pin ? getComputedStyle(pin).color : null,
@@ -404,6 +412,65 @@ def picker_walk(desk: Desk, api: PinApi) -> None:
                f"pop-up width {found['popupWidth']} is not min(560, viewport-16)={want}")
     desk.shot("1-popup-bang-pinned")
     desk.notes.append(f"pop-up order {names}; @liteinst pinned by default, gold, pin left")
+
+    # `#2071 vibe-talk-thread-picker-grid-toggle` (owner 301-302): the fixed
+    # views fill the popup — a 2x2 grid of equal cells on a phone, one equal
+    # row on a desk — and the popup closes three ways: the toolbar button
+    # again (a toggle, with no reopen from the same tap), its own X, and
+    # Escape (below). All waits are on conditions and frames, never a clock.
+    rects: list[dict[str, float]] = []
+    for row in fixed_rows:
+        rect = row["rect"]
+        assert isinstance(rect, dict)
+        rects.append({key: float(str(value)) for key, value in rect.items()})
+    for rect in rects:
+        desk.check(rect["height"] >= 48,
+                   f"a fixed option is under the 48px tap minimum: {rect}")
+    if desk.width < 900:
+        desk.check(len(fixed_rows) == 4, f"phone fixed views are not four: {texts(fixed_rows)}")
+        phone_tops = sorted({round(r["top"]) for r in rects})
+        desk.check(len(phone_tops) == 2, f"phone fixed views are not two rows: {rects}")
+        for top in phone_tops:
+            cells = [r for r in rects if round(r["top"]) == top]
+            desk.check(len(cells) == 2, f"a phone grid row does not hold two cells: {rects}")
+            desk.check(abs(cells[0]["width"] - cells[1]["width"]) <= 2,
+                       f"phone grid cells are not equal width: {cells}")
+        span = max(r["left"] + r["width"] for r in rects) - min(r["left"] for r in rects)
+        desk.check(span >= float(str(found_now["popupWidth"])) - 40,
+                   f"the 2x2 grid leaves blank space beside it: span {span} of {found_now['popupWidth']}")
+        desk.notes.append("phone: fixed views are an equal 2x2 grid filling the popup, 48px tall")
+    else:
+        desk_tops = {round(r["top"]) for r in rects}
+        desk.check(len(desk_tops) == 1, f"desk fixed views are not one row: {rects}")
+        widths = [r["width"] for r in rects]
+        desk.check(max(widths) - min(widths) <= 2, f"desk fixed cells are not equal width: {rects}")
+        desk.notes.append("desk: fixed views are one equal row")
+    # Toggle: a second tap on the toolbar button closes, and stays closed.
+    page.click("#thread-select")
+    desk.wait_for("() => document.querySelector('.thread-picker-popup').hidden",
+                  "a second tap on the thread button did not close the pop-up", seconds=120)
+    desk.settled()
+    desk.check(bool(page.evaluate("() => document.querySelector('.thread-picker-popup').hidden")),
+               "the pop-up reopened after the toggle tap (outside-click race)")
+    desk.notes.append("the toolbar thread button toggles the pop-up shut, with no reopen")
+    rows = open_popup(desk)
+    # The explicit close: named, focusable, at least 44px, and focus returns
+    # to the thread button that opened the popup.
+    close_info = page.evaluate("""() => { const b = document.querySelector('.thread-picker-close');
+        const r = b.getBoundingClientRect();
+        return {label: b.getAttribute('aria-label'), tag: b.tagName, disabled: b.disabled,
+                width: r.width, height: r.height}; }""")
+    desk.check(close_info["label"] == "Close thread picker" and close_info["tag"] == "BUTTON"
+               and not close_info["disabled"] and float(close_info["width"]) >= 44
+               and float(close_info["height"]) >= 44,
+               f"the explicit close is not a named, usable button: {close_info}")
+    page.click(".thread-picker-close")
+    desk.wait_for("() => document.querySelector('.thread-picker-popup').hidden",
+                  "the X did not close the pop-up", seconds=120)
+    desk.check(str(page.evaluate("() => document.activeElement && document.activeElement.id")) == "thread-select",
+               "closing with the X did not return focus to the thread button")
+    desk.notes.append("the X closes the pop-up and returns focus to the thread button")
+    rows = open_popup(desk)
 
     # Keyboard use keeps the native menu (`#1887`): Escape closes the pop-up,
     # and the select itself still takes the keyboard and changes its value.
