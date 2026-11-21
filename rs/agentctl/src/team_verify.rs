@@ -1107,9 +1107,9 @@ pub fn explicit_yes(report: &Value, coordinator: &str) -> bool {
         return false;
     };
     let passes = |name: &str, subject: &str| {
-        checks.iter().any(|row| {
-            row["name"] == name && row["subject"] == subject && row["status"] == "pass"
-        })
+        checks
+            .iter()
+            .any(|row| row["name"] == name && row["subject"] == subject && row["status"] == "pass")
     };
     if !passes("desired-live", coordinator) || !passes("coordinator-ack", coordinator) {
         return false;
@@ -1529,6 +1529,41 @@ mod tests {
         assert_eq!(unit_rows.len(), 2, "{report}");
         assert!(unit_rows.iter().all(|row| row["status"] == "pass"));
         let _ = fs::remove_dir_all(&registry);
+    }
+
+    #[test]
+    fn explicit_yes_needs_lead_bridge_and_ack_to_pass() {
+        let report = |bridge: &str, ack: &str| {
+            json!({
+                "ok": true,
+                "desired": ["coord", "lane"],
+                "checks": [
+                    {"name": "desired-live", "status": "pass", "subject": "coord"},
+                    {"name": "units-bridges", "status": bridge, "subject": "bridge chat"},
+                    {"name": "coordinator-ack", "status": ack, "subject": "coord"},
+                ],
+            })
+        };
+        assert!(explicit_yes(&report("pass", "pass"), "coord"));
+        // verify_ok alone would pass these (ok=true is the fixture's
+        // claim); held/skipped rows never count toward YES.
+        assert!(!explicit_yes(&report("held", "pass"), "coord"));
+        assert!(!explicit_yes(&report("skipped", "pass"), "coord"));
+        assert!(!explicit_yes(&report("pass", "skipped"), "coord"));
+        assert!(!explicit_yes(&report("pass", "pass"), "other"));
+        assert!(!explicit_yes(&report("pass", "pass"), ""));
+        // A team with no bridge state directories needs no bridge row.
+        let bridgeless = json!({
+            "ok": true,
+            "desired": ["coord"],
+            "checks": [
+                {"name": "desired-live", "status": "pass", "subject": "coord"},
+                {"name": "units-bridges", "status": "skipped", "subject": null,
+                 "evidence": "no bridge state directories under the registry"},
+                {"name": "coordinator-ack", "status": "pass", "subject": "coord"},
+            ],
+        });
+        assert!(explicit_yes(&bridgeless, "coord"));
     }
 
     #[test]

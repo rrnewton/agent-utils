@@ -1433,6 +1433,35 @@ come from the one verify snapshot; the raw-record facts behind
 `record_gaps` are read immediately after it, so on a live registry they
 can describe the instant just after the `agents[]` rows they sit beside.
 
+`agentctl team act` queues one allowlisted recovery action for that
+driver — the only effect owner — and polls its persisted receipt:
+
+```sh
+agentctl --registry ~/project/.agentctl team act --incident INCIDENT --request-id shepherd-1 revive lane
+agentctl --registry ~/project/.agentctl team act --incident INCIDENT --request-id check-1 declare-done
+```
+
+Actions are `facts`, `revive AGENT` (recorded session only; listed
+candidates are never bound or picked), `start-unit UNIT`, `reset-unit
+UNIT` (configured units only, turnover pins refused, a bridge only with
+its coordinator explicitly live), `drain AGENT` (bounded), `kill-pid PID
+--expect-cmdline TEXT --expect-start TICKS --boot-id ID [--signal NAME]`
+(the unchanged guarded-kill checks), `declare-done` (full verify plus
+the explicit lead/bridge/ack YES judgement), and `escalate TEXT`
+(1000 chars at most, through the usual routes, once per incident). A
+request is a create-only file bound to the incident, driver epoch, and
+the SHA-256 of its fields: repeating `--request-id` with identical
+fields returns the recorded receipt without re-running, different
+fields are refused, and a stale epoch never executes. `--dry-run`
+validates against a fresh manifest and runs nothing. `--wait-seconds`
+bounds the poll (default 600; 0 enqueues and kicks only). Prints schema
+`agentctl-team-act/v1`; exit 0 when done and verified (or delivered, or
+a dry run), 75 while queued/running or done with recovery still
+pending, 1 refused, failed, or unknown. The requester is proved from
+process ancestry when an agent, never from an environment claim. The
+driver record gains the latest manifest and an actions ledger mirrored
+from the request files; older readers ignore both fields.
+
 `agentctl team kick` starts or reports that driver, and
 `agentctl team restore-driver` runs it in the foreground:
 

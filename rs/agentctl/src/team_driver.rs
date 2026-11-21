@@ -678,7 +678,9 @@ pub fn enqueue_action(directory: &Path, request: &ActionRequestFile) -> Result<P
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let existing = read_action_request(&path)
                 .ok_or_else(|| fail("existing team act request is unreadable"))?;
-            if existing.action_sha256 == request.action_sha256 && existing.incident == request.incident {
+            if existing.action_sha256 == request.action_sha256
+                && existing.incident == request.incident
+            {
                 Ok(path)
             } else {
                 Err(fail(format!(
@@ -727,7 +729,9 @@ fn receipt_of(action: &ActionRecord) -> Option<ActionReceipt> {
         explicit_yes: action.explicit_yes,
         started_at: action.started_at,
         finished_at: action.finished_at.unwrap_or(action.requested_at),
-        exit_code: action.exit_code.unwrap_or_else(|| terminal_exit_code(action)),
+        exit_code: action
+            .exit_code
+            .unwrap_or_else(|| terminal_exit_code(action)),
     })
 }
 
@@ -984,13 +988,15 @@ fn validate_action(
             if !desired.contains(&agent.as_str()) {
                 return Err("agent is not in the desired set".to_owned());
             }
-            let at_prompt = manifest["verify"]["checks"].as_array().is_some_and(|checks| {
-                checks.iter().any(|row| {
-                    row["name"] == "pane-at-prompt"
-                        && row["subject"] == agent.as_str()
-                        && row["status"] == "pass"
-                })
-            });
+            let at_prompt = manifest["verify"]["checks"]
+                .as_array()
+                .is_some_and(|checks| {
+                    checks.iter().any(|row| {
+                        row["name"] == "pane-at-prompt"
+                            && row["subject"] == agent.as_str()
+                            && row["status"] == "pass"
+                    })
+                });
             if at_prompt {
                 Ok(())
             } else {
@@ -998,9 +1004,9 @@ fn validate_action(
             }
         }
         TeamAction::StartUnit { unit } | TeamAction::ResetUnit { unit } => {
-            let configured = manifest["units"].as_array().is_some_and(|rows| {
-                rows.iter().any(|row| row["name"] == unit.as_str())
-            });
+            let configured = manifest["units"]
+                .as_array()
+                .is_some_and(|rows| rows.iter().any(|row| row["name"] == unit.as_str()));
             if configured {
                 Ok(())
             } else {
@@ -1018,6 +1024,7 @@ fn validate_action(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish_action(
     directory: &Path,
     record: &mut DriverRecord,
@@ -1372,7 +1379,9 @@ pub fn run_with_effects<E: DriverEffects>(
                 )?;
             }
         }
-        record.actions.retain(|action| action.incident == new_incident);
+        record
+            .actions
+            .retain(|action| action.incident == new_incident);
         // A new boot or user-manager restart: the model resets the
         // incident facts; the concrete receipts reset with them. The
         // incident id itself is boot-scoped and recomputed either way.
@@ -1995,13 +2004,15 @@ impl<A: crate::subagents::ManagedApi + ?Sized> DriverEffects for ProductionEffec
                 if unit.starts_with("agentctl-bridge-") {
                     let coordinator = manifest["coordinator"].as_str().unwrap_or_default();
                     let live = !coordinator.is_empty()
-                        && manifest["verify"]["checks"].as_array().is_some_and(|checks| {
-                            checks.iter().any(|row| {
-                                row["name"] == "desired-live"
-                                    && row["subject"] == coordinator
-                                    && row["status"] == "pass"
-                            })
-                        });
+                        && manifest["verify"]["checks"]
+                            .as_array()
+                            .is_some_and(|checks| {
+                                checks.iter().any(|row| {
+                                    row["name"] == "desired-live"
+                                        && row["subject"] == coordinator
+                                        && row["status"] == "pass"
+                                })
+                            });
                     if !live {
                         return Ok(refused("bridge target not live"));
                     }
@@ -2060,9 +2071,7 @@ impl<A: crate::subagents::ManagedApi + ?Sized> DriverEffects for ProductionEffec
                 };
                 match manager.drain(agent, options) {
                     Ok(result) => Ok(match result.outcome {
-                        crate::agent::QueueOutcome::Delivered => {
-                            done_outcome("queue drained")
-                        }
+                        crate::agent::QueueOutcome::Delivered => done_outcome("queue drained"),
                         crate::agent::QueueOutcome::Pending => ActionOutcome {
                             status: "failed".to_owned(),
                             detail: "drain pending".to_owned(),
@@ -2493,6 +2502,10 @@ mod tests {
         assert_eq!(document["incident"].as_str().unwrap().len(), 12);
         assert_eq!(document["abstract"]["driver"], "healthy");
         assert_eq!(document["pending_effects"], json!([]));
+        // Empty landing-2 fields are omitted, so an untouched record is
+        // byte-identical for older readers; absent fields load as empty.
+        assert!(document.get("manifest").is_none());
+        assert!(document.get("actions").is_none());
         assert_eq!(load_record(&directory, &registry).unwrap(), Some(record));
         // Manager identity is recorded beside the incident, never keyed
         // into it: both sides of a namespace boundary derive one id.
@@ -2818,11 +2831,14 @@ mod tests {
         ) -> Result<ActionOutcome> {
             self.maybe_crash("act")?;
             self.acted.push(action.clone());
-            Ok(self.act_outcomes.pop_front().unwrap_or_else(|| ActionOutcome {
-                status: "done".to_owned(),
-                detail: "fake action done".to_owned(),
-                escalation: None,
-            }))
+            Ok(self
+                .act_outcomes
+                .pop_front()
+                .unwrap_or_else(|| ActionOutcome {
+                    status: "done".to_owned(),
+                    detail: "fake action done".to_owned(),
+                    escalation: None,
+                }))
         }
     }
 

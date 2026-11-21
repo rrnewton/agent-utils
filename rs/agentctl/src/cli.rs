@@ -622,6 +622,11 @@ enum TeamCommand {
         after_help = "Examples:\n  agentctl --registry ~/project/.agentctl team manifest\n  agentctl --registry ~/project/.agentctl team manifest --state-dir ~/.local/state/agentctl\n\nThe manifest is the facts contract the recovery shepherd and team act share (#1559 restore-recovery-agent-plan): desired_state_source (pinned-list when restore.json has an agents list, else registry-derived), agents[] (harness, profile, declared/effective model and effort, lifecycle, liveness, pane, slot, native_session_present, queued pending/inflight/archived_undelivered, and for a session-less interactive record session_candidates/session_candidate_count: the newest 16 report-only store matches with id, cwd, bounded first_prompt, last_activity), record_gaps[] per deficient record (a session gap also carries candidate_count/candidate_ids), units[] active/held booleans, lost[] for in-session work no restore can bring back, errors[] with one line per failed fact, and verify (a bounded projection of agentctl-team-verify/v1: closed fields and evidence classes, fix lines bounded free text, alarm present/absent only; checks run with check-only semantics)."
     )]
     Manifest(TeamManifest),
+    /// Queue one allowlisted recovery action for the team driver to execute: facts, revive, start-unit, reset-unit, drain, kill-pid, declare-done, escalate. The driver is the sole effect owner: it validates against a fresh manifest, persists the receipt, and re-verifies. Prints schema agentctl-team-act/v1; exit 0 done and verified (or delivered/dry-run), 75 queued/running or done with recovery still pending, 1 refused/failed/unknown. Refuses outside the host PID namespace
+    #[command(
+        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl team act --incident 0123abcd4567 --request-id shepherd-1 facts\n  agentctl --registry ~/project/.agentctl team act --incident 0123abcd4567 --request-id r2 revive lane\n  agentctl --registry ~/project/.agentctl team act --incident 0123abcd4567 --request-id k1 kill-pid 4242 --expect-cmdline 'sleep 99' --expect-start 12345 --boot-id BOOT\n\nA request is a durable create-only file under the driver's actions/ directory, bound to the incident and driver epoch at enqueue and to the SHA-256 of its canonical fields (typed action, --dry-run, requester). Repeating the same --request-id with identical fields returns the recorded receipt without re-running; the same id with different fields is refused. The requester is proved from process ancestry when an agent (never from an environment claim), else named human/unknown. The command kicks the driver, then polls the persisted receipt for --wait-seconds (default 600; 0 only enqueues and kicks). A session gap's candidates are report-only: revive runs only with a recorded native session, and no action binds a session or rewrites a record. Human operators may drive the same protocol by hand."
+    )]
+    Act(TeamAct),
     /// Run this registry's deterministic restore driver until its next exit point: DETECT, restore when something is missing, VERIFY with the same checks as team verify, then HANDOFF or ESCALATE with armed deadlines. One driver per team under its state flock; a second invocation only reports state. Prints the persisted agentctl-team-driver/v1 record; exit 0 verified healthy or escalation delivered, 75 recovery pending, 1 refused. Refuses outside the host PID namespace
     #[command(
         after_help = "Examples:\n  agentctl --registry ~/project/.agentctl team restore-driver\n  agentctl --registry ~/project/.agentctl team restore-driver --handoff-timeout-seconds 900\n\nState lives at <state root>/team-drivers/<key>/state.json (key: first 16 hex of the canonical registry path hash) beside driver.lock and alarm.json. The driver persists before every effect, so a crash repeats at most one idempotent effect. It exits only healthy, with a delivered escalation, or with a wake armed for its deadline (waiting in-process when no timer can be armed). Escalation routes come from --escalation-config or ~/.config/agent-utils/escalation.toml: ordered plain commands read the incident on stdin, with {host}, {team} and {incident} substituted in argv; the first exit 0 delivers."
@@ -655,6 +660,76 @@ struct TeamManifest {
     /// Seconds an unprocessed outage notice may wait before the embedded verify calls it overdue in its evidence, from 0 to 86400 (default: 1800); only a processed notice passes either way
     #[arg(long, default_value_t = 1800, value_parser = clap::value_parser!(u64).range(0..=86400), value_name = "SECONDS")]
     ack_timeout_seconds: u64,
+}
+
+#[derive(Args)]
+struct TeamAct {
+    #[command(flatten)]
+    driver: TeamDriverFlags,
+    /// Incident this request is bound to, from the manifest or kick report (12 hex)
+    #[arg(long, value_name = "ID")]
+    incident: String,
+    /// Idempotence key for this action in this incident: same id + same fields replays the receipt, different fields are refused
+    #[arg(long, value_name = "ID")]
+    request_id: String,
+    /// Validate and record only; run no effect
+    #[arg(long)]
+    dry_run: bool,
+    /// Seconds to poll for the terminal receipt after kicking, from 0 to 3600 (default: 600; 0 enqueues and kicks only)
+    #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(0..=3600), value_name = "SECONDS")]
+    wait_seconds: u64,
+    #[command(subcommand)]
+    action: TeamActAction,
+}
+
+#[derive(Subcommand)]
+enum TeamActAction {
+    /// Rebuild the recovery manifest and record it; no effect
+    Facts,
+    /// Revive one desired agent with a recorded native session
+    Revive {
+        /// Registered agent to revive
+        agent: String,
+    },
+    /// Start one configured unit
+    StartUnit {
+        /// Configured unit name from restore.json units
+        unit: String,
+    },
+    /// Reset-failed, then start, one configured unit
+    ResetUnit {
+        /// Configured unit name from restore.json units
+        unit: String,
+    },
+    /// Drain one agent's queued prompts (bounded: 30s ready, 60s deadline)
+    Drain {
+        /// Registered agent whose queue drains
+        agent: String,
+    },
+    /// Guarded kill of one exact process through the kill-pid guard; every expectation is required
+    KillPid {
+        /// Process identifier to signal
+        pid: u32,
+        /// Substring the verified command line must contain
+        #[arg(long = "expect-cmdline", value_name = "TEXT")]
+        expect_cmdline: String,
+        /// /proc start time (field 22), exactly as read
+        #[arg(long = "expect-start", value_name = "TICKS")]
+        expect_start: String,
+        /// Kernel boot id the expectations were read in
+        #[arg(long = "boot-id", value_name = "ID")]
+        boot_id: String,
+        /// Signal name from TERM, KILL, INT, HUP, QUIT, USR1, USR2, CONT (default: TERM)
+        #[arg(long, value_name = "NAME")]
+        signal: Option<String>,
+    },
+    /// Run the full verify and declare recovery done only on explicit YES
+    DeclareDone,
+    /// Escalate text (at most 1000 chars) through the configured routes
+    Escalate {
+        /// Text a route delivers to a human
+        text: String,
+    },
 }
 
 #[derive(Args)]
@@ -4502,6 +4577,150 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 write_json(&report).map_err(Failure::Output)?;
                 return Ok(0);
             }
+            TeamCommand::Act(act) => {
+                let (client, inputs, options, designation_problem) =
+                    team_driver_prep(&args.registry, &args.herdr_bin, &act.driver)?;
+                let host = crate::restore::SystemHost;
+                let directory = crate::team_driver::prepare_driver_dir(
+                    &args.registry,
+                    options.state_dir.as_deref(),
+                )?;
+                let typed = to_team_action(&act.action);
+                let refusal = |detail: &str| {
+                    let mut report = json!({
+                        "schema": "agentctl-team-act/v1",
+                        "registry": args.registry,
+                        "incident": act.incident,
+                        "request_id": act.request_id,
+                        "action_name": typed.name(),
+                        "status": "refused",
+                        "detail": detail,
+                        "exit_code": 1,
+                    });
+                    if designation_problem.is_some() {
+                        report["designation_problem"] = json!(
+                            "coordinator designation unreadable or disagrees with restore.json"
+                        );
+                    }
+                    report
+                };
+                if !crate::team_driver::valid_request_id(&act.request_id) {
+                    write_json(&refusal("invalid request id")).map_err(Failure::Output)?;
+                    return Ok(1);
+                }
+                let mut record = crate::team_driver::load_record(&directory, &args.registry)?;
+                if record.is_none() {
+                    let _ = crate::team_driver::kick(
+                        &client,
+                        &args.registry,
+                        &host,
+                        &inputs,
+                        &options,
+                    )?;
+                    record = crate::team_driver::load_record(&directory, &args.registry)?;
+                }
+                let Some(current) = record else {
+                    write_json(&refusal("driver state unavailable")).map_err(Failure::Output)?;
+                    return Ok(1);
+                };
+                if current.incident != act.incident {
+                    write_json(&refusal("stale incident")).map_err(Failure::Output)?;
+                    return Ok(1);
+                }
+                let manager = ManagedAgents::new(&client, &args.registry)?;
+                let sender = match manager.proved_caller() {
+                    Ok(name) => crate::sender_header::Sender::Agent(name),
+                    Err(_) => crate::sender_header::resolve_current(None, None),
+                };
+                let requester = crate::team_driver::RequesterRecord {
+                    kind: match &sender {
+                        crate::sender_header::Sender::Agent(_) => "agent".to_owned(),
+                        crate::sender_header::Sender::Other(_) => "other".to_owned(),
+                    },
+                    label: sender.label().to_owned(),
+                };
+                let request = match crate::team_driver::new_action_request(
+                    &act.incident,
+                    current.epoch.clone(),
+                    &act.request_id,
+                    &typed,
+                    act.dry_run,
+                    requester,
+                    crate::restore::Host::now(&host),
+                ) {
+                    Ok(request) => request,
+                    Err(_) => {
+                        write_json(&refusal("invalid action")).map_err(Failure::Output)?;
+                        return Ok(1);
+                    }
+                };
+                if crate::team_driver::enqueue_action(&directory, &request).is_err() {
+                    write_json(&refusal("request refused or hash conflict"))
+                        .map_err(Failure::Output)?;
+                    return Ok(1);
+                }
+                let kick_failed =
+                    crate::team_driver::kick(&client, &args.registry, &host, &inputs, &options)
+                        .is_err();
+                let deadline = std::time::Instant::now() + Duration::from_secs(act.wait_seconds);
+                let mut latest = "queued".to_owned();
+                loop {
+                    if let Some(current) =
+                        crate::team_driver::load_record(&directory, &args.registry)?
+                    {
+                        if let Some(action) = current
+                            .actions
+                            .iter()
+                            .find(|action| action.request_id == act.request_id)
+                        {
+                            latest = action.status.clone();
+                            if let Some(code) = action.exit_code {
+                                let mut report = json!({
+                                    "schema": "agentctl-team-act/v1",
+                                    "registry": args.registry,
+                                    "incident": act.incident,
+                                    "request_id": act.request_id,
+                                    "action_name": typed.name(),
+                                    "status": action.status,
+                                    "detail": action.detail,
+                                    "verify_ok": action.verify_ok,
+                                    "explicit_yes": action.explicit_yes,
+                                    "dry_run": action.dry_run,
+                                    "requester": action.requester,
+                                    "exit_code": code,
+                                });
+                                if designation_problem.is_some() {
+                                    report["designation_problem"] = json!(
+                                        "coordinator designation unreadable or disagrees with restore.json"
+                                    );
+                                }
+                                write_json(&report).map_err(Failure::Output)?;
+                                return Ok(code);
+                            }
+                        }
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                let mut report = json!({
+                    "schema": "agentctl-team-act/v1",
+                    "registry": args.registry,
+                    "incident": act.incident,
+                    "request_id": act.request_id,
+                    "action_name": typed.name(),
+                    "status": latest,
+                    "detail": if kick_failed { "driver kick failed; request remains queued" } else { "still pending" },
+                    "exit_code": 75,
+                });
+                if designation_problem.is_some() {
+                    report["designation_problem"] =
+                        json!("coordinator designation unreadable or disagrees with restore.json");
+                }
+                write_json(&report).map_err(Failure::Output)?;
+                return Ok(75);
+            }
             TeamCommand::RestoreDriver(driver) => {
                 let (client, inputs, options, designation_problem) =
                     team_driver_prep(&args.registry, &args.herdr_bin, &driver.driver)?;
@@ -6612,6 +6831,41 @@ fn queued_warning(name: &str, turn: &Value) -> Option<String> {
 /// Gather one production driver run for a registry: designated config,
 /// resolved binaries, escalation routes, and the wake argv that
 /// re-enters through `team kick` itself.
+fn to_team_action(action: &TeamActAction) -> crate::team_driver::TeamAction {
+    match action {
+        TeamActAction::Facts => crate::team_driver::TeamAction::Facts,
+        TeamActAction::Revive { agent } => crate::team_driver::TeamAction::Revive {
+            agent: agent.clone(),
+        },
+        TeamActAction::StartUnit { unit } => {
+            crate::team_driver::TeamAction::StartUnit { unit: unit.clone() }
+        }
+        TeamActAction::ResetUnit { unit } => {
+            crate::team_driver::TeamAction::ResetUnit { unit: unit.clone() }
+        }
+        TeamActAction::Drain { agent } => crate::team_driver::TeamAction::Drain {
+            agent: agent.clone(),
+        },
+        TeamActAction::KillPid {
+            pid,
+            expect_cmdline,
+            expect_start,
+            boot_id,
+            signal,
+        } => crate::team_driver::TeamAction::KillPid {
+            pid: *pid,
+            expect_cmdline: expect_cmdline.clone(),
+            expect_start: expect_start.clone(),
+            boot_id: boot_id.clone(),
+            signal: signal.clone(),
+        },
+        TeamActAction::DeclareDone => crate::team_driver::TeamAction::DeclareDone,
+        TeamActAction::Escalate { text } => {
+            crate::team_driver::TeamAction::Escalate { text: text.clone() }
+        }
+    }
+}
+
 fn team_driver_prep(
     registry: &Path,
     herdr_global: &Path,
@@ -8400,6 +8654,63 @@ mod tests {
             "record_gaps",
         ] {
             assert!(help.contains(option), "{option} missing from help");
+        }
+    }
+
+    #[test]
+    fn team_act_flags_parse_with_documented_defaults() {
+        let parsed = Cli::try_parse_from([
+            "agentctl",
+            "--registry",
+            "/home/owner/project/.agentctl",
+            "team",
+            "act",
+            "--incident",
+            "0123abcd4567",
+            "--request-id",
+            "shepherd-1",
+            "revive",
+            "lane",
+        ])
+        .unwrap();
+        let Some(Commands::Team(value)) = parsed.command else {
+            panic!("team command");
+        };
+        let TeamCommand::Act(act) = value.command else {
+            panic!("act command");
+        };
+        assert_eq!(act.incident, "0123abcd4567");
+        assert_eq!(act.request_id, "shepherd-1");
+        assert_eq!(act.wait_seconds, 600);
+        assert!(!act.dry_run);
+        assert!(matches!(act.action, TeamActAction::Revive { .. }));
+        assert!(writes_registry(&Commands::Team(Team {
+            command: TeamCommand::Act(act),
+        })));
+        let help = Cli::try_parse_from(["agentctl", "team", "act", "--help"])
+            .err()
+            .unwrap()
+            .to_string();
+        for option in [
+            "--incident",
+            "--request-id",
+            "--dry-run",
+            "--wait-seconds",
+            "agentctl-team-act/v1",
+        ] {
+            assert!(help.contains(option), "{option} missing from help");
+        }
+        let kill_help = Cli::try_parse_from(["agentctl", "team", "act", "kill-pid", "--help"])
+            .err()
+            .unwrap()
+            .to_string();
+        for option in [
+            "--expect-cmdline",
+            "--expect-start",
+            "--boot-id",
+            "--signal",
+        ] {
+            assert!(kill_help.contains(option), "{option} missing from help");
         }
     }
 
