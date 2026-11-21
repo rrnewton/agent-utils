@@ -104,8 +104,7 @@ fn a_codex_goal_that_agentctl_sent_confirms_its_own_replacement_picker() {
     fixture.start(None);
     *fixture.client.screen.lock().unwrap() =
         Some("› Ask Codex to do anything\n  GPT · /work\n".to_owned());
-    *fixture.client.screen_after_run.lock().unwrap() =
-        Some(codex_picker("ship the release"));
+    *fixture.client.screen_after_run.lock().unwrap() = Some(codex_picker("ship the release"));
     *fixture.client.screen_after_enter.lock().unwrap() = Some(
         "• Goal active Objective: ship the release\n› Ask Codex to do anything\n  GPT · /work   \
          Pursuing goal (3s)\n"
@@ -142,8 +141,7 @@ fn a_codex_picker_offering_another_goal_is_cancelled_never_confirmed() {
     fixture.start(None);
     *fixture.client.screen.lock().unwrap() =
         Some("› Ask Codex to do anything\n  GPT · /work\n".to_owned());
-    *fixture.client.screen_after_run.lock().unwrap() =
-        Some(codex_picker("a different task"));
+    *fixture.client.screen_after_run.lock().unwrap() = Some(codex_picker("a different task"));
     let manager = fixture.manager();
     let error = manager
         .send_identified_with_runtime(
@@ -154,10 +152,7 @@ fn a_codex_picker_offering_another_goal_is_cancelled_never_confirmed() {
             &Clock::default(),
         )
         .unwrap_err();
-    assert!(
-        error.to_string().contains("not the one sent"),
-        "{error}"
-    );
+    assert!(error.to_string().contains("not the one sent"), "{error}");
     let keys: Vec<String> = fixture
         .client
         .keys_sent
@@ -197,10 +192,7 @@ fn a_picker_already_open_is_never_typed_over_nor_cancelled() {
             "sent keys over an open picker offering {offered}"
         );
         if let Err(error) = outcome {
-            assert!(
-                error.to_string().contains("already open"),
-                "{error}"
-            );
+            assert!(error.to_string().contains("already open"), "{error}");
         }
     }
 }
@@ -213,19 +205,11 @@ fn a_registered_goal_never_types_over_an_open_picker() {
     fixture.start(None);
     *fixture.client.screen.lock().unwrap() = Some(codex_picker("a different task"));
     let manager = fixture.manager();
-    let outcome = manager.goal(
-        "worker",
-        Some("ship the release"),
-        quick(),
-        None,
-    );
+    let outcome = manager.goal("worker", Some("ship the release"), quick(), None);
     assert!(fixture.client.runs.lock().unwrap().is_empty());
     assert!(fixture.client.keys_sent.lock().unwrap().is_empty());
     if let Err(error) = outcome {
-        assert!(
-            error.to_string().contains("already open"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("already open"), "{error}");
     }
     // Not staged, never filed as possibly submitted: the goal is
     // still pending for a later drain (#1939 review).
@@ -267,16 +251,10 @@ fn the_registered_run_path_also_refuses_over_an_open_picker() {
         expected_workspace: None,
         readback: None,
     };
-    let error = <WorkspaceClient<'_, Fake> as AgentApi>::run(
-        &client,
-        &pane,
-        "/goal ship the release",
-    )
-    .unwrap_err();
-    assert!(
-        error.to_string().contains("already open"),
-        "{error}"
-    );
+    let error =
+        <WorkspaceClient<'_, Fake> as AgentApi>::run(&client, &pane, "/goal ship the release")
+            .unwrap_err();
+    assert!(error.to_string().contains("already open"), "{error}");
     assert!(fixture.client.runs.lock().unwrap().is_empty());
     assert!(fixture.client.keys_sent.lock().unwrap().is_empty());
 }

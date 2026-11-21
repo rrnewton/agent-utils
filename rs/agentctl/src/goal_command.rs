@@ -309,7 +309,9 @@ impl CodexReplacement {
         let lines: Vec<&str> = screen.lines().map(str::trim_end).collect();
         // The LAST title on screen: a quoted picker in the transcript
         // above a live one is history, never the live question (#1939 D2).
-        let start = lines.iter().rposition(|line| line.trim() == "Replace goal?")?;
+        let start = lines
+            .iter()
+            .rposition(|line| line.trim() == "Replace goal?")?;
         let rest = &lines[start + 1..];
         // The footer must end the picker: only status rows may follow
         // it, and no composer may stand below it, or the block is a
@@ -441,8 +443,10 @@ fn codex_shows(shown: &str, cut: bool, objective: &str) -> bool {
         return shown == objective;
     }
     let shown_words: Vec<&str> = shown.split(' ').filter(|word| !word.is_empty()).collect();
-    let objective_words: Vec<&str> =
-        objective.split(' ').filter(|word| !word.is_empty()).collect();
+    let objective_words: Vec<&str> = objective
+        .split(' ')
+        .filter(|word| !word.is_empty())
+        .collect();
     let mut whole = 0;
     while whole < shown_words.len()
         && whole < objective_words.len()
@@ -695,8 +699,8 @@ mod tests {
             ReplacementChoice::Cancel(_)
         ));
         // With Cancel highlighted, even the sent goal is not confirmed.
-        let cancel = CodexReplacement::read(&codex_picker("finish this task", 2))
-            .expect("question");
+        let cancel =
+            CodexReplacement::read(&codex_picker("finish this task", 2)).expect("question");
         assert_eq!(cancel.selected, Some(2));
         assert!(matches!(
             cancel.choice("finish this task"),
@@ -718,7 +722,9 @@ mod tests {
             &screen.replace("Replace current goal", "Replace the goal")
         )
         .is_none());
-        assert!(CodexReplacement::read(&screen.replace("New objective: ", "Objective: ")).is_none());
+        assert!(
+            CodexReplacement::read(&screen.replace("New objective: ", "Objective: ")).is_none()
+        );
         assert!(CodexReplacement::read("Replace goal?\n").is_none());
     }
 
@@ -758,8 +764,7 @@ mod tests {
         // objective is the longest line must not read as cut, so a
         // different longer goal is never confirmed from it.
         let objective = "refactor the parser module and update every caller in the tree";
-        let question =
-            CodexReplacement::read(&codex_picker(objective, 1)).expect("picker");
+        let question = CodexReplacement::read(&codex_picker(objective, 1)).expect("picker");
         assert!(!question.new_cut, "{question:?}");
         assert_eq!(question.choice(objective), ReplacementChoice::Replace);
         assert!(matches!(

@@ -2789,8 +2789,9 @@ fn goal_replacement_selected(screen: &str, objective: &str) -> bool {
     // picker must show, the offered objective must be the one sent, and
     // `Replace current goal` must be the highlighted option. This is the
     // only auto-answer authority, and only on goal delivery paths.
-    crate::goal_command::CodexReplacement::read(screen)
-        .is_some_and(|question| question.choice(objective) == crate::goal_command::ReplacementChoice::Replace)
+    crate::goal_command::CodexReplacement::read(screen).is_some_and(|question| {
+        question.choice(objective) == crate::goal_command::ReplacementChoice::Replace
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -5538,24 +5539,24 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                 // answer at all, so it is skipped here and at timeout.
                 if codex_picker_triggered {
                     if let Some(question) = crate::goal_command::CodexReplacement::read(&screen) {
-                    match question.choice(objective) {
-                        ReplacementChoice::Replace => {
-                            self.confirm_goal_replacement(pane_id, runtime)?;
-                            key_presses += 1;
-                            confirmed = true;
-                            continue;
+                        match question.choice(objective) {
+                            ReplacementChoice::Replace => {
+                                self.confirm_goal_replacement(pane_id, runtime)?;
+                                key_presses += 1;
+                                confirmed = true;
+                                continue;
+                            }
+                            ReplacementChoice::Keep => {
+                                return Err(self.cancel_goal_question(
+                                    pane_id,
+                                    "Codex asked about replacing the goal it already has",
+                                    runtime,
+                                ));
+                            }
+                            ReplacementChoice::Cancel(reason) => {
+                                return Err(self.cancel_goal_question(pane_id, &reason, runtime));
+                            }
                         }
-                        ReplacementChoice::Keep => {
-                            return Err(self.cancel_goal_question(
-                                pane_id,
-                                "Codex asked about replacing the goal it already has",
-                                runtime,
-                            ));
-                        }
-                        ReplacementChoice::Cancel(reason) => {
-                            return Err(self.cancel_goal_question(pane_id, &reason, runtime));
-                        }
-                    }
                     }
                 }
             }
@@ -6621,7 +6622,9 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
         // registered or not; ordinary non-goal text is refused by
         // the verified-submission baseline instead.
         if self.record.harness == "codex" && crate::goal_command::argument(text).is_some() {
-            let screen = self.client.read_with_runtime(pane_id, "visible", Some(200), runtime)?;
+            let screen = self
+                .client
+                .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
             if crate::goal_command::CodexReplacement::read(&crate::harness_tui::plain(&screen))
                 .is_some()
             {
