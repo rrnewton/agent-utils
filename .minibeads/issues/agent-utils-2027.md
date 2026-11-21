@@ -1,6 +1,7 @@
 ---
 title: 'agentctl-pidfd-open-enoent-thread: pidfd_open ENOENT on Linux 7.1 must fail closed, never read as death'
-status: open
+status: closed
+closed_at: 2026-11-21T03:02:08-05:00
 priority: 1
 issue_type: bug
 labels:
@@ -61,3 +62,20 @@ would read as dead, the dangerous direction for cleanup and stop.
 Muse delivery issue and is not this work). Companion to #1938
 agentctl-pidfd-open-einval on the older kernel. No lane, host or person
 is named here.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as b2a44d13 (fix
+85395e87, tests b2a44d13; written as aa84286b/971bdaff before replay).
+Kernel 7.1 confirmed: pidfd_open on a live non-leader thread answers
+ENOENT, a dead pid answers ESRCH. pin() in both editions now treats
+ENOENT as death only when /proc shows no such task; any present task,
+including a thread (status Tgid != Pid), is unproven and never
+signalled, and EINVAL fails closed for a thread the same way. Gate on
+971bdaff was red only on repository.hygiene.issue-parse (this branch's
+stale pre-fix copy of the #1934 bead; landed main parses clean,
+verified with scripts/check_issue_parse.py) under a coordinator
+waiver; rust.agentctl.test passed in the exclusive rerun. Follow-ups:
+#2031 agentctl-lib-load-flakes, #2037 revive host-process isolation,
+plus a separate later label-parity fix for the wrkslots status source
+(Python "pidfd" vs Rust "legacy-scan" on ENOENT; verdicts agree).
