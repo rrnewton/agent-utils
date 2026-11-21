@@ -810,7 +810,7 @@ pub fn select_warmup_files(
     channel_label: &str,
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    let mut push = |file: &String, out: &mut Vec<String>| {
+    let push = |file: &String, out: &mut Vec<String>| {
         if !out.contains(file) {
             out.push(file.clone());
         }
