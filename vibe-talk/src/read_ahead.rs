@@ -108,6 +108,18 @@ pub const WARM_UP_BOUND: Duration = Duration::from_secs(60);
 /// The content-free code logged when a warm-up outlasts [`WARM_UP_BOUND`].
 pub const WARM_UP_TIMED_OUT: &str = "warm_up_timed_out";
 
+/// How long a preparation waits for its missing messages' fetch before the held ones
+/// answer alone. `#2066 vibe-talk-page-freeze`: the shape of `ops::race_older`'s
+/// `OLDER_WAIT`, and the same 1.5 s — long enough for a healthy provider, short enough
+/// that a limiting one is never what a tap waits on (one fetch reached 28.5 s with
+/// every ticket held behind it). The wait is spent twice at most: once queueing for
+/// the channel's window turn behind another preparation's fetch, once on this one's
+/// own fetch — a tap that queued politely is not charged for the wait it queued in.
+/// Past either wait the fetch runs on behind the answer, remembering what it reads,
+/// so the next preparation finds it held; it mints no tickets, so nothing late can
+/// reorder or replace tickets a playing read captured.
+pub const PREPARE_WAIT: Duration = Duration::from_millis(1_500);
+
 type Key = (ChannelId, MessageId);
 
 #[derive(Debug)]
@@ -514,6 +526,12 @@ pub struct Found {
     pub lookup: Duration,
     /// Time spent fetching, or waiting for another preparation's fetch.
     pub fetch: Duration,
+    /// Whether the fetch for the missing ids was still running when this answer went
+    /// out ([`PREPARE_WAIT`] passed with it in flight). `#2066 vibe-talk-page-freeze`.
+    pub behind: bool,
+    /// How many asked-for ids this answer does not carry (still fetching behind it, or
+    /// their fetch failed while held tickets answered). `#2066 vibe-talk-page-freeze`.
+    pub missing: usize,
 }
 
 /// Find `ids` of `channel` for speech: from what was fetched recently, then from the message
@@ -529,9 +547,15 @@ pub struct Found {
 /// the same channel that has just made one at least as wide. An id that is not in the window is
 /// simply absent, as it always was. In a thread, each missing id is fetched on its own, up to
 /// [`THREAD_FETCH_CONCURRENCY`] at once for this preparation and [`THREAD_FETCHES_IN_FLIGHT`] for
-/// all of them, and the first failure fails the batch, as it did when they were fetched in series;
-/// unless the provider looks several messages up by id itself ([`ops::looks_up_by_ids`]), when
-/// every missing id is one lookup ([`ops::lookup_messages`], remote-ops-audit W11).
+/// all of them; unless the provider looks several messages up by id itself
+/// ([`ops::looks_up_by_ids`]), when every missing id is one lookup ([`ops::lookup_messages`],
+/// remote-ops-audit W11).
+///
+/// `#2066 vibe-talk-page-freeze`: that fetch is waited for at most [`PREPARE_WAIT`]. Past it
+/// the held messages answer alone and the fetch runs on behind ([`Found::behind`],
+/// [`Found::missing`] say so), remembering what it reads; a fetch that fails while anything
+/// is held likewise answers with the held messages rather than failing the batch. A fetch
+/// failure with nothing held is still this call's error, as it always was.
 ///
 /// `began` is when the preparation started. A window fetch that finished after it is fresh
 /// enough to answer this one.
@@ -589,19 +613,131 @@ pub async fn messages_for_speech(
     if missing.is_empty() {
         return Ok(found);
     }
+    // `#2066 vibe-talk-page-freeze`: the fetch runs on its own task and this answer
+    // waits for it at most [`PREPARE_WAIT`]. Past that the held messages answer alone
+    // (missing ids are simply absent, as they always could be) and the fetch runs on
+    // behind, remembering what it reads for the next preparation. It mints no tickets,
+    // so a late landing cannot reorder or replace tickets a playing read captured.
     let fetching = Instant::now();
-    match thread {
+    let missing_count = missing.len();
+    let (started_tx, mut started_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut task = tokio::spawn(fetch_missing(
+        MissingFetch {
+            state: state.clone(),
+            caller,
+            channel: channel.clone(),
+            thread: thread.map(str::to_owned),
+            missing,
+            limit,
+            began,
+            fetching,
+        },
+        started_tx,
+    ));
+    // Queueing for the window turn and fetching each get their own [`PREPARE_WAIT`]:
+    // a preparation that waited behind another's fetch still gets a healthy fetch's
+    // worth of its own before the held tickets answer alone.
+    let queued_ok = tokio::time::timeout(PREPARE_WAIT, &mut started_rx)
+        .await
+        .is_ok();
+    let joined = if queued_ok {
+        tokio::time::timeout(PREPARE_WAIT, &mut task).await.ok()
+    } else {
+        None
+    };
+    match joined {
+        Some(joined) => {
+            let outcome = joined.map_err(|_| {
+                OpError::Chat(crate::chat::ChatError::Transport(
+                    "the speech preparation fetch stopped before it answered".to_owned(),
+                ))
+            })?;
+            match outcome {
+                Ok((fetched, fetches, joined_fetch)) => {
+                    found.fetches = fetches;
+                    found.joined = joined_fetch;
+                    for message in fetched {
+                        found.messages.insert(message.id.0.clone(), message);
+                    }
+                }
+                Err(error) if !found.messages.is_empty() => {
+                    // Held tickets answer rather than none: the failure is the missing
+                    // ids', and a tap on one of those still has its direct speak path.
+                    tracing::warn!(
+                        missing = missing_count,
+                        held = found.messages.len(),
+                        "read-aloud preparation fetch failed; held tickets answer"
+                    );
+                    let _ = error;
+                    found.missing = missing_count;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        None => {
+            found.behind = true;
+            found.missing = missing_count;
+        }
+    }
+    found.fetch = fetching.elapsed();
+    Ok(found)
+}
+
+/// One preparation's missing-message fetch, owned so it can run on its own task and
+/// land behind its answer. `#2066 vibe-talk-page-freeze`.
+struct MissingFetch {
+    state: AppState,
+    caller: crate::auth::Scope,
+    channel: ChannelInfo,
+    thread: Option<String>,
+    missing: Vec<String>,
+    limit: Option<u16>,
+    began: Instant,
+    fetching: Instant,
+}
+
+/// Fetch a preparation's missing ids: one shared window fetch without a thread, one
+/// bulk lookup or a few-at-a-time per-id fetches in one, as [`messages_for_speech`]
+/// always did. Runs on its own task so the answer can stop waiting for it
+/// ([`PREPARE_WAIT`]); what it reads is remembered here, landed in time or behind.
+///
+/// Answers the fetched messages wanted, how many chat fetches were made, and whether
+/// another preparation's window fetch was joined instead of making one.
+async fn fetch_missing(
+    fetch: MissingFetch,
+    started: tokio::sync::oneshot::Sender<()>,
+) -> Result<(Vec<Message>, usize, bool), OpError> {
+    let MissingFetch {
+        state,
+        caller,
+        channel,
+        thread,
+        missing,
+        limit,
+        began,
+        fetching,
+    } = fetch;
+    let state = &state;
+    let channel = &channel;
+    let mut started = Some(started);
+    // The fetch phase has begun (any queueing for the window turn is over): the
+    // caller's fetching wait starts from here, not from when it queued.
+    let mut note_started = move || {
+        if let Some(sender) = started.take() {
+            let _ = sender.send(());
+        }
+    };
+    match thread.as_deref() {
         None => {
             let width = ops::window_limit(state, limit);
             let mut turn = state.read_ahead.window_turn(&channel.id).await;
+            note_started();
             if turn
                 .as_ref()
                 .is_some_and(|read| read.finished >= began && read.limit >= width)
             {
-                found.joined = true;
-                found
-                    .messages
-                    .extend(state.read_ahead.recall(&channel.id, None, &missing));
+                let recalled = state.read_ahead.recall(&channel.id, None, &missing);
+                Ok((recalled.into_values().collect(), 0, true))
             } else {
                 // `ops::messages` remembers the window for everyone else as well.
                 // `remote-ops-audit`: counted as speech preparation's.
@@ -615,16 +751,17 @@ pub async fn messages_for_speech(
                     ))
                     .await?;
                 *turn = Some(WindowRead::of(&window));
-                found.fetches = 1;
                 let wanted: HashSet<&str> = missing.iter().map(String::as_str).collect();
-                for message in window.messages {
-                    if wanted.contains(message.id.as_str()) {
-                        found.messages.insert(message.id.0.clone(), message);
-                    }
-                }
+                let fetched = window
+                    .messages
+                    .into_iter()
+                    .filter(|message| wanted.contains(message.id.as_str()))
+                    .collect();
+                Ok((fetched, 1, false))
             }
         }
         Some(thread) if ops::looks_up_by_ids(state, &channel.id) => {
+            note_started();
             // remote-ops-audit W11 `#287 bulk-reads`: every missing id in one lookup, holding one
             // of the permits a lookup of one message would. An id the provider proved absent is
             // simply absent, as one outside the window is.
@@ -645,16 +782,14 @@ pub async fn messages_for_speech(
                     ))
                     .await?
             };
-            found.fetches = looked.reads;
             let fetched: Vec<Message> = looked.messages.into_iter().flatten().collect();
             state
                 .read_ahead
                 .remember(&channel.id, Some(thread), &fetched, fetching);
-            for message in fetched {
-                found.messages.insert(message.id.0.clone(), message);
-            }
+            Ok((fetched, looked.reads, false))
         }
         Some(thread) => {
+            note_started();
             let lookups = &state.read_ahead.lookups;
             let fetched: Vec<Message> = futures_util::stream::iter(missing)
                 .map(|id| async move {
@@ -675,17 +810,13 @@ pub async fn messages_for_speech(
                 .buffered(THREAD_FETCH_CONCURRENCY)
                 .try_collect()
                 .await?;
-            found.fetches = fetched.len();
+            let fetches = fetched.len();
             state
                 .read_ahead
                 .remember(&channel.id, Some(thread), &fetched, fetching);
-            for message in fetched {
-                found.messages.insert(message.id.0.clone(), message);
-            }
+            Ok((fetched, fetches, false))
         }
     }
-    found.fetch = fetching.elapsed();
-    Ok(found)
 }
 
 #[cfg(test)]

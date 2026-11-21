@@ -2824,17 +2824,60 @@ async fn read_aloud_of_a_message_the_cache_holds_fetches_nothing_and_a_miss_stil
     let (status, body) = post(
         &state,
         &prepare,
-        &serde_json::json!({ "thread_id": root, "ids": [missing] }),
+        &serde_json::json!({ "thread_id": root, "ids": [missing.clone()] }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(calls() > before, "the miss went to Slack");
+    // `#2066 vibe-talk-page-freeze`: the delayed fetch (3 s) outlasts the preparation's
+    // bounded wait, so this answer carries no ticket yet and says the fetch is behind
+    // it. The fetch still goes to the provider and lands behind the answer, and the
+    // next preparation then finds the message held.
     let text = capture.text();
     assert!(
-        text.contains("cache_hits=0") && text.contains("fetches=1"),
+        text.contains("fetch_behind=true") && text.contains("missing=1"),
         "{text}"
     );
-    assert!(text.contains(" served_from=\"fetched\""), "{text}");
+    let waited = std::time::Instant::now();
+    while calls() <= before {
+        assert!(
+            waited.elapsed() < Duration::from_secs(10),
+            "the miss never went to Slack"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Landed behind: remembered, so asking again prepares it with no new call. The
+    // landing itself — the message held in read-ahead memory — is the condition
+    // waited for, checked without preparing (a re-ask would fetch of its own).
+    let chan = vibe_talk::model::ChannelId(SLACK_CH.to_owned());
+    let waited = std::time::Instant::now();
+    while state
+        .read_ahead
+        .recall(&chan, Some(root.as_str()), std::slice::from_ref(&missing))
+        .is_empty()
+    {
+        assert!(
+            waited.elapsed() < Duration::from_secs(15),
+            "the behind fetch never landed"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let landed_calls = calls();
+    let (status, body) = post(
+        &state,
+        &prepare,
+        &serde_json::json!({ "thread_id": root, "ids": [missing.clone()] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        !body["prepared"].as_array().expect("prepared").is_empty(),
+        "the landed message was not prepared from memory: {body}"
+    );
+    assert_eq!(
+        calls(),
+        landed_calls,
+        "the landed message was fetched again"
+    );
 }
 
 #[tokio::test]

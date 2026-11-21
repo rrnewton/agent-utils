@@ -8136,6 +8136,8 @@ pub async fn prepare_speech(
         cache_hits = found.cache_hits,
         fetches = found.fetches,
         joined_fetch = found.joined,
+        fetch_behind = found.behind,
+        missing = found.missing,
         resolved = resolved.len(),
         lookup_ms = millis(found.lookup),
         fetch_ms = millis(found.fetch),

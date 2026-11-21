@@ -25,7 +25,9 @@ use serde_json::{json, Value};
 use tower::ServiceExt as _;
 use vibe_talk::chat::{ChatClient, ChatError, ChatIdentity};
 use vibe_talk::model::{ChannelId, Message, MessageId, UserId};
-use vibe_talk::read_ahead::{THREAD_FETCHES_IN_FLIGHT, THREAD_FETCH_CONCURRENCY, WARM_UP_BOUND};
+use vibe_talk::read_ahead::{
+    PREPARE_WAIT, THREAD_FETCHES_IN_FLIGHT, THREAD_FETCH_CONCURRENCY, WARM_UP_BOUND,
+};
 use vibe_talk::speech::{Description, Playback, Speech, SpeechError, SpeechProvider};
 use vibe_talk::state::AppState;
 use vibe_talk::testing::{self, READ_CHANNEL, READ_TOKEN, WRITE_TOKEN};
@@ -117,6 +119,9 @@ struct SlowChat {
     /// What the next timeline read answers at once, once, without reading: a bridge serving a copy
     /// it could not bring up to date, with its `as_of`.
     stale_next_timeline: Mutex<Option<TimelinePage>>,
+    /// How much longer than [`FETCH`] the next window fetch takes, once: a provider limiting
+    /// the read a speech preparation is waiting on (`#2066 vibe-talk-page-freeze`).
+    stall_next_window: Mutex<Duration>,
 }
 
 impl SlowChat {
@@ -181,7 +186,8 @@ impl ChatClient for SlowChat {
         let mut window = self.window();
         let keep = usize::from(limit).min(window.len());
         window.drain(..window.len() - keep);
-        tokio::time::sleep(FETCH).await;
+        let stall = std::mem::take(&mut *self.stall_next_window.lock().unwrap());
+        tokio::time::sleep(FETCH + stall).await;
         Ok(window)
     }
 
@@ -434,6 +440,61 @@ async fn a_window_the_page_just_fetched_is_prepared_from_memory_without_a_fetch(
         began.elapsed() < FETCH,
         "the prepare took {:?}, as long as a fetch",
         began.elapsed()
+    );
+}
+
+/// `#2066 vibe-talk-page-freeze`: a fetch the provider is limiting must not hold every
+/// ticket hostage. Past [`PREPARE_WAIT`] the held messages answer alone, the missing id
+/// is simply absent, and the fetch lands behind the answer — remembered, minting
+/// nothing — so the next preparation finds the window held.
+#[tokio::test(start_paused = true)]
+async fn a_stalled_fetch_answers_with_the_held_tickets_and_lands_behind() {
+    let (app, _state, chat) = harness(Arc::new(TimedSpeech::new(Duration::ZERO)));
+    // The page fetched the window: 101 is in recent memory.
+    let (status, _) = call(
+        &app,
+        "GET",
+        &format!("/api/v1/channels/{READ_CHANNEL}/page?limit=20"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(chat.windows.load(Ordering::SeqCst), 1);
+
+    // The provider now limits the next window read far past the prepare bound.
+    *chat.stall_next_window.lock().unwrap() = Duration::from_secs(60);
+    let began = tokio::time::Instant::now();
+    let (status, body) = call(
+        &app,
+        "POST",
+        &prepare_path(),
+        Some(json!({"ids": ["101", "999"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        prepared_ids(&body),
+        ["101"],
+        "the held ticket waited for the stalled fetch"
+    );
+    assert!(
+        began.elapsed() >= PREPARE_WAIT && began.elapsed() < FETCH + Duration::from_secs(60),
+        "the prepare took {:?}, not the bounded wait",
+        began.elapsed()
+    );
+
+    // The fetch lands behind: it read the window (999 was never in it) and remembered
+    // it, so a later preparation of a window message needs no fetch of its own.
+    tokio::time::advance(Duration::from_secs(120)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(chat.windows.load(Ordering::SeqCst), 2);
+    let (status, body) = call(&app, "POST", &prepare_path(), Some(json!({"ids": ["102"]}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(prepared_ids(&body), ["102"]);
+    assert_eq!(
+        chat.windows.load(Ordering::SeqCst),
+        2,
+        "the window the behind-fetch read was fetched again"
     );
 }
 
