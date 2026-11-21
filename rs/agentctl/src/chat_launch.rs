@@ -949,6 +949,7 @@ pub fn launch(registry: &Path, herdr_bin: &Path, options: &LaunchOptions) -> Res
                     harness: options.harness.clone(),
                     session: current.session_value.clone(),
                     record_edges: true,
+                    profile: None,
                 },
             )
             .map_err(|error| fail(error.to_string()))?;

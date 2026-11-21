@@ -7105,6 +7105,9 @@ pub struct AdoptOptions {
     /// Record a `managed_by` edge naming the calling agent, when the caller can be proved to be
     /// one.
     pub record_edges: bool,
+    /// Launch profile to attach at adoption (#1993 attach-profile): validated to exist and to
+    /// name this harness kind. `None` adopts with the recorded recipe only, as before.
+    pub profile: Option<String>,
 }
 
 /// Explicit safety assertions for stop/recovery.
@@ -7676,6 +7679,39 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             .create(directory)
             .map_err(|error| fail(error.to_string()))?;
         agent::sync_directory(parent)
+    }
+
+    /// Validate an attachable launch profile (#1993): it must exist in the project's
+    /// `profiles.json` and name the same harness kind and mode. Refusing here is what makes an
+    /// attach fail before any record changes.
+    fn validate_attach_profile(
+        &self,
+        cwd: &Path,
+        profile_name: &str,
+        harness: &str,
+        mode: &str,
+    ) -> Result<()> {
+        let root = crate::profiles::configuration_root(cwd, &self.registry, false)?;
+        let (path, profiles) = crate::profiles::load_profiles(&root, false)?;
+        let profile = profiles.get(profile_name).ok_or_else(|| {
+            fail(format!(
+                "launch profile {profile_name:?} is not defined in {}",
+                path.display()
+            ))
+        })?;
+        if profile.harness != harness {
+            return Err(fail(format!(
+                "launch profile {profile_name:?} names harness {:?}, not {harness:?}: refusing to attach it",
+                profile.harness
+            )));
+        }
+        if profile.mode != mode {
+            return Err(fail(format!(
+                "launch profile {profile_name:?} names mode {:?}, not {mode:?}: refusing to attach it",
+                profile.mode
+            )));
+        }
+        Ok(())
     }
 
     fn lock(&self, agent_name: &str) -> Result<LifecycleLock> {
@@ -11677,6 +11713,21 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 "native session id must be nonempty and contain no NUL",
             ));
         }
+        // Attach at adoption (#1993): resolve the profile against the adopted lane's harness
+        // kind before anything is registered, so a bad name refuses cleanly.
+        if let Some(profile_name) = options.profile.as_deref() {
+            if profile_name.is_empty() || profile_name.contains('\0') {
+                return Err(fail(
+                    "launch profile name must be nonempty and contain no NUL",
+                ));
+            }
+            self.validate_attach_profile(
+                &cwd,
+                profile_name,
+                &options.harness,
+                &interactive_mode(),
+            )?;
+        }
         let target = Target {
             pane_id: Some(options.pane_id.clone()),
             session_agent: options.session.as_ref().map(|_| options.harness.clone()),
@@ -11956,7 +12007,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 .session_value
                 .as_deref()
                 .map(|value| NativeSession::new(&options.harness, value, "observed")),
-            profile: None,
+            profile: options.profile.clone(),
             slot: None,
             slot_project: None,
             slot_isolation: None,
@@ -15599,6 +15650,58 @@ its drain would also type, so it was not queued",
     /// out a sender that holds them: a busy record is an error saying so, and the bridge tries
     /// again at a later scan. `Ok(false)` when there is nothing to bind: the record is not a
     /// running Claude Code agent's, or already names a conversation.
+    /// Attach a launch profile to an existing record (#1993): an explicit operator action
+    /// pinned to the record's exact token. The profile must exist and name the record's harness
+    /// kind. No liveness assertion: an offline binding is the repair route for a dead lane,
+    /// exactly as `bind_session` is (#928). Restore and revive then rebuild the launch from the
+    /// profile; restore itself still only reports profile-less records (owner rule 257).
+    pub fn bind_profile(
+        &self,
+        agent_name: &str,
+        profile_name: &str,
+        expected_token: &str,
+    ) -> Result<Value> {
+        name(agent_name)?;
+        if profile_name.is_empty() || profile_name.contains('\0') {
+            return Err(fail(
+                "launch profile name must be nonempty and contain no NUL",
+            ));
+        }
+        if expected_token.is_empty() || expected_token.contains('\0') {
+            return Err(fail("expected token must be nonempty and contain no NUL"));
+        }
+        let _lock = self.lock(agent_name)?;
+        let _identity_lock = self.identity_lock()?;
+        let mut record = self.load(agent_name)?;
+        if record.token != expected_token {
+            return Err(fail(format!(
+                "agent {agent_name:?} was replaced since it was read (expected token {expected_token:?}, found {:?}); nothing changed",
+                record.token
+            )));
+        }
+        let cwd = fs::canonicalize(&record.cwd)
+            .map_err(|_| fail("recorded starting directory is unavailable"))?;
+        self.validate_attach_profile(&cwd, profile_name, &record.harness, &record.mode)?;
+        if record.profile.as_deref() == Some(profile_name) {
+            return self.status_record(&record);
+        }
+        if let Some(existing) = record.profile.as_deref() {
+            return Err(fail(format!(
+                "agent {agent_name:?} already has launch profile {existing:?} attached; stop it and remove the profile by hand before attaching {profile_name:?}"
+            )));
+        }
+        record.profile = Some(profile_name.to_owned());
+        self.save(&record)?;
+        self.status_record(&record)
+    }
+
+    /// [`Self::bind_session`] for a Claude Code conversation that the chat bridge found through
+    /// the live process in the agent's pane, for a record that names none (#783
+    /// chat-reply-capture-miss). The checks and the record written are `bind_session`'s; only
+    /// its locks are tried rather than waited for, since the bridge's owner loop must not wait
+    /// out a sender that holds them: a busy record is an error saying so, and the bridge tries
+    /// again at a later scan. `Ok(false)` when there is nothing to bind: the record is not a
+    /// running Claude Code agent's, or already names a conversation.
     pub(crate) fn bind_discovered_session(
         &self,
         agent_name: &str,
@@ -18104,6 +18207,7 @@ pub(crate) mod tests {
                 harness: "codex".to_owned(),
                 session: None,
                 record_edges: true,
+                profile: None,
             }
         }
         fn adopt(&self) -> Value {

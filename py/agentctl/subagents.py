@@ -60,6 +60,7 @@ from agentctl.errors import (
 from agentctl.profiles import (
     blocking_question_warning,
     check_required_env,
+    configuration_root,
     effective_environment,
     hooks_trust_policy,
     load_profiles,
@@ -4446,9 +4447,27 @@ class ManagedAgents:
             )
         _capture_native_session(record, final_info)
 
+    def _validate_attach_profile(self, cwd: str, profile_name: str, harness: str, mode: str) -> None:
+        """Validate an attachable launch profile (#1993): it must exist in the project's
+        profiles.json and name the same harness kind and mode."""
+        root = configuration_root(cwd, self.registry)
+        path, profiles = load_profiles(root)
+        profile = profiles.get(profile_name)
+        if profile is None:
+            raise AgentDeliveryError(f"launch profile {profile_name!r} is not defined in {path}")
+        if profile.harness != harness:
+            raise AgentDeliveryError(
+                f"launch profile {profile_name!r} names harness {profile.harness!r}, not {harness!r}: refusing to attach it"
+            )
+        if profile.mode != mode:
+            raise AgentDeliveryError(
+                f"launch profile {profile_name!r} names mode {profile.mode!r}, not {mode!r}: refusing to attach it"
+            )
+
     def adopt(
         self, name: str, *, pane_id: str, expected_workspace: str,
         expected_cwd: str, harness: str, session: str | None = None,
+        profile: str | None = None,
     ) -> dict[str, object]:
         """Register an existing interactive Herdr agent without owning its runtime.
 
@@ -4495,11 +4514,15 @@ class ManagedAgents:
             # register different panes that report the same native session.
             with self._identity_transaction():
                 self._refuse_pending_rename(name)
+                if profile is not None:
+                    if not profile or "\0" in profile:
+                        raise AgentDeliveryError("launch profile name must be nonempty and contain no NUL")
+                    self._validate_attach_profile(root, profile, harness, "interactive")
                 target_lock, _locked_pane, info = agent._lock_resolved_target(self.client, target)
                 try:
                     return self._adopt_locked(
                         name, directory, root, harness, pane_id, info,
-                        expected_workspace,
+                        expected_workspace, profile=profile,
                     )
                 finally:
                     target_lock.close()
@@ -4507,6 +4530,8 @@ class ManagedAgents:
     def _adopt_locked(
         self, name: str, directory: Path, root: str, harness: str,
         pane_id: str, info: AgentPaneInfo, workspace_label: str | None = None,
+        *,
+        profile: str | None = None,
     ) -> dict[str, object]:
         """Commit one adoption while its registry and live pane are locked."""
         if info.agent is None:
@@ -4620,7 +4645,7 @@ class ManagedAgents:
             )
         self._create_agent_directory(directory)
         record = AgentRecord(
-            name, uuid.uuid4().hex, harness, root, time.time(),
+            name, uuid.uuid4().hex, harness, root, time.time(), profile=profile,
             lifecycle="running", workspace_id=info.workspace_id,
             tab_id=presentation.tab_id, pane_id=info.pane_id,
             session_agent=info.session_agent,
@@ -5459,6 +5484,37 @@ class ManagedAgents:
                     record.goal_command = list(goal_command)
                 self._save(record)
                 return {"name": name, "session_id": session_id, "source": "explicit"}
+
+    def bind_profile(self, name: str, profile_name: str, expected_token: str) -> dict[str, object]:
+        """Attach a launch profile to an existing record (#1993), pinned to its exact token.
+
+        An explicit operator action. The profile must exist and name the record's harness kind.
+        Restore and revive then rebuild the launch from the profile; restore itself still only
+        reports profile-less records (owner rule 257).
+        """
+        _name(name)
+        if not profile_name or "\0" in profile_name:
+            raise AgentDeliveryError("launch profile name must be nonempty and contain no NUL")
+        if not expected_token or "\0" in expected_token:
+            raise AgentDeliveryError("expected token must be nonempty and contain no NUL")
+        with self._lock(name):
+            with self._identity_transaction():
+                record = self._load(name)
+                if record.token != expected_token:
+                    raise AgentDeliveryError(
+                        f"agent {name!r} was replaced since it was read (expected token {expected_token!r}, found {record.token!r}); nothing changed"
+                    )
+                root = str(Path(record.cwd).resolve())
+                self._validate_attach_profile(root, profile_name, record.harness, record.mode)
+                if record.profile == profile_name:
+                    return self._status_record(record)
+                if record.profile is not None:
+                    raise AgentDeliveryError(
+                        f"agent {name!r} already has launch profile {record.profile!r} attached; stop it and remove the profile by hand before attaching {profile_name!r}"
+                    )
+                record.profile = profile_name
+                self._save(record)
+                return self._status_record(record)
 
     def _goal_delivery(self, record: AgentRecord) -> str | None:
         if record.goal_message_id is not None:

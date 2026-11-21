@@ -2546,6 +2546,7 @@ fn register_elsewhere<A: ManagedApi + ?Sized>(
                 session: None,
                 // A second registration of the coordinator is no worker of whoever runs restore.
                 record_edges: false,
+                profile: None,
             },
         )?;
         Ok(json!({"action": "adopted"}))

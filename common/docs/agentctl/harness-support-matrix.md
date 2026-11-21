@@ -583,6 +583,17 @@ lane while a restart is pending.
 - **Claude Code, Codex, Muse**: supported — the interactive revive,
   restart and (Rust edition) restore paths all rebuild.
 - **Unknown TUI**: none — no launch spec and no profile argv apply.
+
+Attaching a profile later is an explicit operator action (#1993):
+`agentctl adopt --profile P` names it at adoption, and
+`agentctl bind-profile NAME --profile P --expected-token T` attaches
+it to an existing record, pinned to that record's exact token. The
+profile must exist and name the record's harness kind and mode, or
+the attach is refused; a second, different profile is refused while
+one is attached. Both editions behave the same. Afterwards revive,
+restart and (Rust edition) restore rebuild from the profile as above,
+and `status` shows the profile. Restore itself never attaches one:
+it only reports records without a profile (owner rule 257).
 - **Headless**: none — wrapper launches keep their recorded arguments;
   the headless approval surface is a separate path (#671).
 

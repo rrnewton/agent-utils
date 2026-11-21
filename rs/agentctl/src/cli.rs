@@ -389,6 +389,11 @@ enum Commands {
     /// Bind an explicitly known native conversation ID to a verified agent pane
     #[command(after_help = "Example: agentctl bind-session reviewer THREAD_ID")]
     BindSession(BindSession),
+    /// Attach a launch profile to an existing agent, pinned to its exact token
+    #[command(
+        after_help = "Example: agentctl bind-profile reviewer --profile fast --expected-token 123-456"
+    )]
+    BindProfile(BindProfile),
     /// Redo a slot launch's wrkslots owner bind from outside its box (#786)
     #[command(after_help = "Example: agentctl rebind-slot reviewer")]
     RebindSlot(Named),
@@ -1866,6 +1871,9 @@ struct Adopt {
     /// Stable native conversation ID already reported by this exact pane
     #[arg(long, value_name = "ID")]
     session: Option<String>,
+    /// Launch profile to attach at adoption: the profile must exist and name the adopted harness kind, or adoption is refused. `bind-profile` attaches one later instead
+    #[arg(long, value_name = "NAME")]
+    profile: Option<String>,
     /// Record no managed_by edge naming the calling agent (default: the adopting agent manages the adopted one, when it is a registered agent of this registry)
     #[arg(long)]
     no_edges: bool,
@@ -2101,6 +2109,18 @@ struct BindSession {
     /// JSON argv array for a native Codex goal-reader command
     #[arg(long, value_name = "JSON", value_parser = command_json)]
     goal_command_json: Option<GoalCommand>,
+}
+
+#[derive(Args)]
+struct BindProfile {
+    #[command(flatten)]
+    agent: Named,
+    /// Launch profile name to attach: the profile must exist and name this agent's harness kind
+    #[arg(long, value_name = "NAME")]
+    profile: String,
+    /// The record's exact current token; binding refuses unless it still matches
+    #[arg(long, value_name = "TOKEN")]
+    expected_token: String,
 }
 
 #[derive(Args)]
@@ -3563,6 +3583,7 @@ fn lineage_action(command: &Commands) -> Option<crate::lineage::Action> {
         Commands::Takeover(value) => Action::Takeover(value.agent.name.clone()),
         Commands::Handback(value) => Action::Handback(value.agent.name.clone()),
         Commands::BindSession(value) => Action::Bind(value.agent.name.clone()),
+        Commands::BindProfile(value) => Action::Bind(value.agent.name.clone()),
         Commands::RebindSlot(value) => Action::Bind(value.name.clone()),
         Commands::Anchor(value) => Action::Bind(value.agent.name.clone()),
         _ => return None,
@@ -4075,6 +4096,7 @@ fn writes_registry(command: &Commands) -> bool {
         | Commands::Answer(_)
         | Commands::Goal(_)
         | Commands::BindSession(_)
+        | Commands::BindProfile(_)
         | Commands::RebindSlot(_)
         | Commands::Pause(_)
         | Commands::Reset(_)
@@ -5483,6 +5505,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     harness: value.harness,
                     session: value.session,
                     record_edges: !value.no_edges,
+                    profile: value.profile,
                 },
             )?;
             manager.designate_after(&mut result, &value.agent.name, value.as_coordinator);
@@ -6302,6 +6325,9 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 .as_ref()
                 .map(|command| command.0.as_slice()),
         )?,
+        Commands::BindProfile(value) => {
+            manager.bind_profile(&value.agent.name, &value.profile, &value.expected_token)?
+        }
         Commands::Attach(value) => manager.attach(&value.name)?,
         Commands::AttachSelf(value) => {
             let mut result = manager.attach_self(

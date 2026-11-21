@@ -225,6 +225,8 @@ def parser() -> argparse.ArgumentParser:
         help="expected live harness kind, for example codex, claude, or muse (required)")
     adopt.add_argument("--session", metavar="ID",
         help="optional stable native conversation ID already reported by this exact pane")
+    adopt.add_argument("--profile", metavar="NAME",
+        help="launch profile to attach at adoption: the profile must exist and name the adopted harness kind, or adoption is refused. `bind-profile` attaches one later instead")
 
     command("move", "Move a running owned native Herdr agent into an existing workspace required by project configuration; adopted, custom-pane, and multi-pane tabs are refused.",
         "agentctl move reviewer", named=True)
@@ -457,6 +459,12 @@ def parser() -> argparse.ArgumentParser:
         "agentctl bind-session reviewer SESSION_ID", named=True)
     bind.add_argument("session", metavar="SESSION", help="native conversation ID reported by the harness")
     bind.add_argument("--goal-command-json", metavar="JSON", help="native goal RPC command as a nonempty JSON array of arguments")
+    bind_profile = command("bind-profile", "Attach a launch profile to an existing agent, pinned to its exact token.",
+        "agentctl bind-profile reviewer --profile fast --expected-token TOKEN", named=True)
+    bind_profile.add_argument("--profile", required=True, metavar="NAME",
+        help="launch profile name to attach: the profile must exist and name this agent's harness kind (required)")
+    bind_profile.add_argument("--expected-token", required=True, metavar="TOKEN",
+        help="the record's exact current token; binding refuses unless it still matches (required)")
     migrate = command("migrate", "Move an idle headless worker while preserving its conversation and queue.",
         "agentctl migrate worker --backend herdr", named=True)
     migrate.add_argument("--backend", choices=("herdr", "tmux"), required=True, help="destination terminal host")
@@ -542,7 +550,7 @@ _RUST_ONLY = ("restore", "restore-teams", "install-units", "watch", "watch-agent
 
 #: Commands that change agents' state, so idle layout-1 agents move to layout 2 first (not before a
 #: dry run). Everything else, reads and the chat services included, leaves the layout alone.
-_WRITES_AGENTS = frozenset(("start", "adopt", "move", "rename", "anchor", "promote", "stop", "revive",
+_WRITES_AGENTS = frozenset(("start", "adopt", "bind-profile", "move", "rename", "anchor", "promote", "stop", "revive",
                             "send", "drain", "answer", "goal", "bind-session", "pause", "resume",
                             "reset", "repair", "migrate"))
 
@@ -742,7 +750,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "adopt":
             result = sessions.adopt(name, pane_id=args.pane,
                 expected_workspace=args.workspace, expected_cwd=args.cwd,
-                harness=args.harness, session=args.session)
+                harness=args.harness, session=args.session, profile=args.profile)
+        elif args.command == "bind-profile":
+            result = sessions.bind_profile(name, args.profile, args.expected_token)
         elif args.command == "move":
             result = sessions.move_to_project_workspace(name)
         elif args.command == "list":

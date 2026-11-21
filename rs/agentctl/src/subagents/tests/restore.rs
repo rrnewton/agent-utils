@@ -1651,6 +1651,7 @@ fn restore_revives_the_coordinator_first_re_registers_it_and_queues_one_notice()
                 harness: "claude".to_owned(),
                 session: None,
                 record_edges: true,
+                profile: None,
             },
         )
         .unwrap();

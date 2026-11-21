@@ -1036,3 +1036,198 @@ fn a_goal_for_a_relayed_codex_is_refused_before_anything_is_queued() {
         "nothing is queued"
     );
 }
+
+// --- #1993: attach a launch profile at adoption, or afterwards by pinned verb -------------
+
+/// Write `profiles` as the fixture project's `.agentctl/profiles.json`, one `name -> argv` per
+/// entry, for the codex harness the adoption fixture runs.
+fn write_profiles(fixture: &Fixture, profiles: &[(&str, &str, &[&str])]) {
+    let output = std::process::Command::new("/usr/bin/git")
+        .args(["init", "--quiet"])
+        .current_dir(&fixture.root)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    fs::write(fixture.root.join(".gitignore"), ".agentctl/\n").unwrap();
+    let directory = fixture.root.join(".agentctl");
+    agent::create_private_directory(&directory, "test profile config", false, false).unwrap();
+    agent::atomic_json(
+        &directory.join("profiles.json"),
+        &json!({
+            "schema": "agentctl-profiles/v1",
+            "profiles": profiles
+                .iter()
+                .map(|(name, harness, argv)| {
+                    (
+                        (*name).to_owned(),
+                        json!({"harness": harness, "mode": "interactive", "argv": argv}),
+                    )
+                })
+                .collect::<serde_json::Map<String, Value>>(),
+        }),
+    )
+    .unwrap();
+}
+
+fn adopt_with_profile(fixture: &Fixture, profile: Option<&str>) -> Result<Value> {
+    fixture.prepare_foreign();
+    fixture
+        .client
+        .report_session
+        .store(false, Ordering::Relaxed);
+    let mut options = fixture.adopt_options();
+    options.profile = profile.map(str::to_owned);
+    fixture.manager().adopt("foreign", options)
+}
+
+#[test]
+fn adopt_with_profile_records_it_and_status_shows_it() {
+    let fixture = Fixture::new();
+    write_profiles(&fixture, &[("fast", "codex", &["--yolo"])]);
+    let result = adopt_with_profile(&fixture, Some("fast")).unwrap();
+    assert_eq!(result["profile"], "fast", "{result}");
+    let record = fixture.manager().load("foreign").unwrap();
+    assert_eq!(record.profile.as_deref(), Some("fast"));
+    let status = fixture.manager().status("foreign").unwrap();
+    assert_eq!(status["profile"], "fast", "{status}");
+}
+
+#[test]
+fn adopt_refuses_a_missing_or_mismatched_profile() {
+    let fixture = Fixture::new();
+    write_profiles(
+        &fixture,
+        &[("other", "claude", &["--dangerously-skip-permissions"])],
+    );
+    let missing = adopt_with_profile(&fixture, Some("nope")).unwrap_err();
+    assert!(missing.to_string().contains("is not defined"), "{missing}");
+    // The profile names another harness kind: never attached to a codex lane.
+    let mismatched = adopt_with_profile(&fixture, Some("other")).unwrap_err();
+    assert!(
+        mismatched.to_string().contains("names harness"),
+        "{mismatched}"
+    );
+    // A refused adoption registers nothing, so the name is still free.
+    let fixture = Fixture::new();
+    write_profiles(&fixture, &[("fast", "codex", &["--yolo"])]);
+    let result = adopt_with_profile(&fixture, Some("fast")).unwrap();
+    assert_eq!(result["profile"], "fast");
+}
+
+#[test]
+fn bind_profile_attaches_only_with_the_exact_token() {
+    let fixture = Fixture::new();
+    write_profiles(
+        &fixture,
+        &[
+            ("fast", "codex", &["--yolo"]),
+            ("slow", "claude", &["--dangerously-skip-permissions"]),
+        ],
+    );
+    fixture.adopt();
+    let old = fixture.manager().load("foreign").unwrap();
+    assert_eq!(old.profile, None);
+
+    // The exact token binds, and status names the profile.
+    let bound = fixture
+        .manager()
+        .bind_profile("foreign", "fast", &old.token)
+        .unwrap();
+    assert_eq!(bound["profile"], "fast", "{bound}");
+
+    // Binding the same profile again is a no-op success.
+    let again = fixture
+        .manager()
+        .bind_profile("foreign", "fast", &old.token)
+        .unwrap();
+    assert_eq!(again["profile"], "fast");
+
+    let record = fixture.manager().load("foreign").unwrap();
+    assert_eq!(record.profile.as_deref(), Some("fast"));
+    let status = fixture.manager().status("foreign").unwrap();
+    assert_eq!(status["profile"], "fast", "{status}");
+
+    // Wrong token, missing profile, another profile already attached, and another harness'
+    // profile all refuse and change nothing.
+    let wrong = fixture
+        .manager()
+        .bind_profile("foreign", "fast", "replaced-token")
+        .unwrap_err();
+    assert!(wrong.to_string().contains("was replaced"), "{wrong}");
+    let missing = fixture
+        .manager()
+        .bind_profile("foreign", "nope", &record.token)
+        .unwrap_err();
+    assert!(missing.to_string().contains("is not defined"), "{missing}");
+    let attached = fixture
+        .manager()
+        .bind_profile("foreign", "fast", &record.token)
+        .unwrap();
+    assert_eq!(attached["profile"], "fast");
+    write_profiles(
+        &fixture,
+        &[
+            ("fast", "codex", &["--yolo"]),
+            ("fast2", "codex", &["--yolo", "--profile-arg"]),
+            ("other", "claude", &["--dangerously-skip-permissions"]),
+        ],
+    );
+    let second = fixture
+        .manager()
+        .bind_profile("foreign", "fast2", &record.token)
+        .unwrap_err();
+    assert!(
+        second.to_string().contains("already has launch profile"),
+        "{second}"
+    );
+    let mismatched = fixture
+        .manager()
+        .bind_profile("foreign", "other", &record.token)
+        .unwrap_err();
+    assert!(
+        mismatched.to_string().contains("names harness"),
+        "{mismatched}"
+    );
+    assert_eq!(
+        fixture
+            .manager()
+            .load("foreign")
+            .unwrap()
+            .profile
+            .as_deref(),
+        Some("fast")
+    );
+}
+
+#[test]
+fn revive_after_binding_rebuilds_from_the_attached_profile() {
+    let fixture = Fixture::new();
+    write_profiles(&fixture, &[("fast", "codex", &["--yolo", "--profile-arg"])]);
+    let argv = [CODEX, "resume", "argv-conversation", "--yolo"];
+    fixture
+        .client
+        .command_lines
+        .lock()
+        .unwrap()
+        .insert(300, strings(&argv));
+    let adopted = fixture.adopt();
+    assert!(adopted["profile"].is_null(), "{adopted}");
+    let old = fixture.manager().load("foreign").unwrap();
+    fixture
+        .manager()
+        .bind_profile("foreign", "fast", &old.token)
+        .unwrap();
+    let record = fixture.manager().load("foreign").unwrap();
+    kill(&fixture, &record);
+    let revived = fixture
+        .manager()
+        .revive("foreign", false, Some(&record.token), TIMEOUT)
+        .unwrap();
+    assert_eq!(revived["revived"], true, "{revived}");
+    let new = fixture.manager().load("foreign").unwrap();
+    assert_eq!(new.profile.as_deref(), Some("fast"));
+    assert!(
+        new.arguments.contains(&"--profile-arg".to_owned()),
+        "{new:?}"
+    );
+}

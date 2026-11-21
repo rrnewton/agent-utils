@@ -2517,3 +2517,73 @@ def test_goal_operation_identifiers_cannot_escape_queue(tmp_path: Path, monkeypa
     path.write_text(json.dumps(record))
     with pytest.raises(AgentDeliveryError, match="invalid goal message"):
         manager.goal("worker")
+
+
+def _write_python_profiles(tmp_path: Path, profiles: dict[str, tuple[str, list[str]]]) -> None:
+    """Write `profiles.json` for the attach tests (#1993), one name per entry."""
+    import json as _json
+    import subprocess as _subprocess
+
+    assert _subprocess.run(["/usr/bin/git", "init", "--quiet"], cwd=tmp_path).returncode == 0
+    (tmp_path / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
+    directory = tmp_path / ".agentctl"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    directory.chmod(0o700)
+    document = {
+        "schema": "agentctl-profiles/v1",
+        "profiles": {name: {"harness": harness, "mode": "interactive", "argv": argv}
+                     for name, (harness, argv) in profiles.items()},
+    }
+    target = directory / "profiles.json"
+    target.write_text(_json.dumps(document), encoding="utf-8")
+    target.chmod(0o600)
+
+
+def test_adopt_with_profile_records_it_and_status_shows_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # #1993: adopt --profile records the profile; status shows it.
+    manager, fake = setup(tmp_path, monkeypatch)
+    _write_python_profiles(tmp_path, {"fast": ("codex", ["--yolo"])})
+    fake.workspace = "w1"
+    fake.presentations.append(Pane("w1:p1", "w1:t1", "w1"))
+    fake.infos["w1:p1"] = AgentPaneInfo(
+        "w1:p1", "w1", str(tmp_path), "codex", "idle", "codex", "foreign",
+    )
+    result = manager.adopt("worker", pane_id="w1:p1", expected_workspace="subagents",
+        expected_cwd=str(tmp_path), harness="codex", session="foreign", profile="fast")
+    assert result["profile"] == "fast"
+    assert manager.get("worker").profile == "fast"
+    assert manager.status("worker")["profile"] == "fast"
+
+
+def test_adopt_and_bind_profile_refusals(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # #1993: missing profile, harness mismatch, wrong token and an
+    # already-attached profile all refuse and change nothing.
+    from agentctl.errors import AgentDeliveryError
+
+    manager, fake = setup(tmp_path, monkeypatch)
+    _write_python_profiles(tmp_path, {
+        "fast": ("codex", ["--yolo"]),
+        "fast2": ("codex", ["--yolo", "--profile-arg"]),
+        "other": ("claude", ["--dangerously-skip-permissions"]),
+    })
+    with pytest.raises(AgentDeliveryError, match="is not defined"):
+        manager.adopt("worker", pane_id="w1:p1", expected_workspace="w1",
+            expected_cwd=str(tmp_path), harness="codex", session=None, profile="nope")
+    with pytest.raises(AgentDeliveryError, match="names harness"):
+        manager.adopt("worker", pane_id="w1:p1", expected_workspace="w1",
+            expected_cwd=str(tmp_path), harness="codex", session=None, profile="other")
+
+    manager.start("worker", cwd=str(tmp_path))
+    old = manager.get("worker")
+    assert old.profile is None
+    with pytest.raises(AgentDeliveryError, match="was replaced"):
+        manager.bind_profile("worker", "fast", "not-the-token")
+    with pytest.raises(AgentDeliveryError, match="is not defined"):
+        manager.bind_profile("worker", "nope", old.token)
+    with pytest.raises(AgentDeliveryError, match="names harness"):
+        manager.bind_profile("worker", "other", old.token)
+    bound = manager.bind_profile("worker", "fast", old.token)
+    assert bound["profile"] == "fast"
+    with pytest.raises(AgentDeliveryError, match="already has launch profile"):
+        manager.bind_profile("worker", "fast2", old.token)
+    assert manager.get("worker").profile == "fast"
