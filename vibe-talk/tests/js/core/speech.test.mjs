@@ -35,6 +35,20 @@ test("`#624 voice-page-modularity`: prepared read-aloud tickets end on either cl
   assert.equal(prepared.size(), 0);
 });
 
+test("`#2056`: which read-aloud failures a bounded retry may answer, from the module alone", () => {
+  const { isRecoverableReadFailure } = SPEECH_PIECES;
+  assert.deepStrictEqual(
+    ["lost", "malformed", "no_audio"].map((reason) => isRecoverableReadFailure(reason)),
+    [true, true, true],
+    "a recoverable class would not be retried",
+  );
+  assert.deepStrictEqual(
+    ["silent", "refused", "user_stop", "superseded", "jump", ""].map((reason) => isRecoverableReadFailure(reason)),
+    [false, false, false, false, false, false],
+    "a non-recoverable class, or no failure at all, would be retried",
+  );
+});
+
 test("`#624 voice-page-modularity`: when a cut-off read tries again, and when a ticket can no longer carry it, from the module alone", () => {
   const { recoveryWait, ticketEnded, ticketTooShortForBlocks, READ_RECOVERY_WAITS_MS, BLOCK_READ_TICKET_MARGIN_MS } = SPEECH_PIECES;
   assert.deepStrictEqual(READ_RECOVERY_WAITS_MS.map((_, at) => recoveryWait(at)), READ_RECOVERY_WAITS_MS);

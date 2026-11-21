@@ -341,6 +341,33 @@ pub struct ConversationSpeech {
     /// `#553 voice-ws-relay-auth`. What each dial presents: a relay's voice-only token and extra
     /// trusted roots, when read-aloud goes through another server's relay.
     credentials: crate::bridge_dial::Credentials,
+    /// `#2056 vibe-talk-reader-retry-and-error-telemetry`. The day's read-aloud
+    /// counters, shared with `healthz`: this adapter counts the turns it
+    /// interrupts, by cause. `None` in tests that do not show health.
+    counters: Option<Arc<crate::speech_tickets::ReadAloudCounters>>,
+}
+
+/// Why the server interrupted a provider turn: the only two reasons it ever
+/// does (`#2056`). `abandoned` — the page's audio consumer went away;
+/// `superseded` — a new selection took the floor. Until this distinction the
+/// two logged identically, and a read that died because its reader vanished
+/// was indistinguishable from one the reader replaced on purpose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InterruptCause {
+    /// The turn's HTTP response went away (the reader stopped, or the
+    /// browser dropped the request).
+    Abandoned,
+    /// A read for a new selection took the floor from this turn.
+    Superseded,
+}
+
+impl InterruptCause {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Abandoned => "abandoned",
+            Self::Superseded => "superseded",
+        }
+    }
 }
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -465,7 +492,19 @@ impl ConversationSpeech {
             first_audio_timeout: FIRST_AUDIO_TIMEOUT,
             own_sessions: None,
             credentials: crate::bridge_dial::Credentials::default(),
+            counters: None,
         }
+    }
+
+    /// Count this adapter's interrupted turns, by cause, in `counters`
+    /// (`#2056`): the same counters `healthz` shows.
+    #[must_use]
+    pub fn with_read_aloud_counters(
+        mut self,
+        counters: Arc<crate::speech_tickets::ReadAloudCounters>,
+    ) -> Self {
+        self.counters = Some(counters);
+        self
     }
 
     /// Present `credentials` on every dial (`#553 voice-ws-relay-auth`): see
@@ -636,6 +675,8 @@ impl ConversationSpeech {
                 turns: 0,
                 current: None,
                 yielding: false,
+                yield_cause: None,
+                counters: self.counters.clone(),
                 pending: VecDeque::new(),
                 retired: VecDeque::new(),
                 deadline: tokio::time::Instant::now() + IDLE_SESSION_TTL,
@@ -807,6 +848,11 @@ struct SessionTask {
     /// A superseded or abandoned turn is still running at the provider until its `turn_complete`;
     /// every frame before that boundary belongs to it and is discarded.
     yielding: bool,
+    /// Why the turn in flight was interrupted (`#2056`), for the turn-end log
+    /// and the day's counters. Set with `yielding`, cleared with it.
+    yield_cause: Option<InterruptCause>,
+    /// The day's read-aloud counters (`#2056`), shared with `healthz`.
+    counters: Option<Arc<crate::speech_tickets::ReadAloudCounters>>,
     pending: VecDeque<ReadCommand>,
     retired: VecDeque<String>,
     /// When the current phase gives up: idle expiry, the first-audio or turn limit, or the
@@ -905,15 +951,16 @@ impl SessionTask {
                     });
                     self.retire(turn.selection);
                 }
-                self.interrupt().await?;
+                self.interrupt(InterruptCause::Superseded).await?;
             }
         }
         self.pending.push_back(read);
         self.advance().await
     }
 
-    async fn interrupt(&mut self) -> Result<(), Ending> {
+    async fn interrupt(&mut self, cause: InterruptCause) -> Result<(), Ending> {
         self.yielding = true;
+        self.yield_cause = Some(cause);
         self.deadline = tokio::time::Instant::now() + INTERRUPT_ACK_TIMEOUT;
         self.send_frame(&VibeTalkV1ClientFrame::Interrupt).await
     }
@@ -921,7 +968,7 @@ impl SessionTask {
     /// The HTTP response went away (the reader stopped, or the browser dropped the request).
     async fn abandon_current(&mut self) -> Result<(), Ending> {
         self.current = None;
-        self.interrupt().await
+        self.interrupt(InterruptCause::Abandoned).await
     }
 
     /// Prompt the next queued read if the provider has the floor free.
@@ -1073,12 +1120,21 @@ impl SessionTask {
             // Not a boundary this client is waiting for; there is nothing to advance past.
             return Ok(());
         }
+        // `#2056`: name WHY an interrupted turn was interrupted. Until this
+        // the two causes logged identically (`superseded = yielding`), so a
+        // reader who vanished mid-read looked exactly like a deliberate
+        // supersede. The counters keep the same distinction for the day.
+        let cause = self.yield_cause.take();
+        if let (Some(cause), Some(counters)) = (cause, &self.counters) {
+            counters.interrupted(cause == InterruptCause::Abandoned);
+        }
         tracing::info!(
             session = self.generation,
             turn = self.turns,
             provider_turn,
             interrupted,
-            superseded = self.yielding,
+            superseded = cause == Some(InterruptCause::Superseded),
+            interrupt = cause.map_or("none", InterruptCause::as_str),
             "read-aloud turn ended"
         );
         self.yielding = false;

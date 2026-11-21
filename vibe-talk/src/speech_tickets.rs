@@ -126,6 +126,143 @@ pub struct ReadFailure {
     pub at: std::time::SystemTime,
 }
 
+/// `#2056 vibe-talk-reader-retry-and-error-telemetry`. Per-day read-aloud
+/// error-rate counters: how many reads failed, by class, how many failures were
+/// retried, how many retries recovered, how many gave up, and how many provider
+/// turns the server interrupted for each of the two reasons it ever does —
+/// `abandoned` (the page's audio consumer went away) and `superseded` (a new
+/// selection took the floor). Content-free by construction: classes are short
+/// slugs the failure routes already validate, and nothing here names a
+/// message, a reader, or a provider. Kept for the current UTC day only; a
+/// restart begins a new count, as the other health counters do.
+#[derive(Debug, Default)]
+pub struct ReadAloudCounters {
+    inner: Mutex<ReadAloudDay>,
+}
+
+#[derive(Debug, Default)]
+struct ReadAloudDay {
+    /// The UTC day (`YYYY-MM-DD`) the counts belong to; empty until first use.
+    day: String,
+    /// Failures by class (a page reason or a server stream error code).
+    failures: std::collections::BTreeMap<String, u64>,
+    /// Failures a retry was attempted for, by class.
+    retried: std::collections::BTreeMap<String, u64>,
+    /// Retries that went on to play, by class.
+    recovered: std::collections::BTreeMap<String, u64>,
+    /// Failures given up on after the last try, by class.
+    gave_up: std::collections::BTreeMap<String, u64>,
+    /// Provider turns interrupted because the reader went away.
+    abandoned: u64,
+    /// Provider turns interrupted because a new selection took the floor.
+    superseded: u64,
+}
+
+/// One day's counts, as `healthz` shows them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadAloudSnapshot {
+    /// The UTC day the counts belong to.
+    pub day: String,
+    /// Failures by class.
+    pub failures: std::collections::BTreeMap<String, u64>,
+    /// Failures a retry was attempted for, by class.
+    pub retried: std::collections::BTreeMap<String, u64>,
+    /// Retries that went on to play, by class.
+    pub recovered: std::collections::BTreeMap<String, u64>,
+    /// Failures given up on after the last try, by class.
+    pub gave_up: std::collections::BTreeMap<String, u64>,
+    /// Provider turns interrupted because the reader went away.
+    pub abandoned: u64,
+    /// Provider turns interrupted because a new selection took the floor.
+    pub superseded: u64,
+}
+
+fn today_utc() -> String {
+    jiff::Zoned::now()
+        .with_time_zone(jiff::tz::TimeZone::UTC)
+        .strftime("%Y-%m-%d")
+        .to_string()
+}
+
+impl ReadAloudCounters {
+    /// An empty set of counters.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn count(map: &mut std::collections::BTreeMap<String, u64>, class: &str) {
+        *map.entry(class.to_owned()).or_insert(0) += 1;
+    }
+
+    fn with_day<T>(&self, act: impl FnOnce(&mut ReadAloudDay) -> T) -> Option<T> {
+        let mut inner = self.inner.lock().ok()?;
+        let today = today_utc();
+        if inner.day != today {
+            *inner = ReadAloudDay {
+                day: today,
+                ..ReadAloudDay::default()
+            };
+        }
+        Some(act(&mut inner))
+    }
+
+    /// One read-aloud failure of `class` (a page reason or a stream error code).
+    pub fn failure(&self, class: &str) {
+        let _ = self.with_day(|day| Self::count(&mut day.failures, class));
+    }
+
+    /// A failure of `class` was tried again.
+    pub fn retried(&self, class: &str) {
+        let _ = self.with_day(|day| Self::count(&mut day.retried, class));
+    }
+
+    /// A retry of `class` went on to play.
+    pub fn recovered(&self, class: &str) {
+        let _ = self.with_day(|day| Self::count(&mut day.recovered, class));
+    }
+
+    /// A failure of `class` was given up on after the last try.
+    pub fn gave_up(&self, class: &str) {
+        let _ = self.with_day(|day| Self::count(&mut day.gave_up, class));
+    }
+
+    /// A provider turn was interrupted: `abandoned` when the reader went
+    /// away, `superseded` when a new selection took the floor.
+    pub fn interrupted(&self, abandoned: bool) {
+        let _ = self.with_day(|day| {
+            if abandoned {
+                day.abandoned += 1;
+            } else {
+                day.superseded += 1;
+            }
+        });
+    }
+
+    /// Today's counts.
+    #[must_use]
+    pub fn snapshot(&self) -> ReadAloudSnapshot {
+        self.with_day(|day| ReadAloudSnapshot {
+            day: day.day.clone(),
+            failures: day.failures.clone(),
+            retried: day.retried.clone(),
+            recovered: day.recovered.clone(),
+            gave_up: day.gave_up.clone(),
+            abandoned: day.abandoned,
+            superseded: day.superseded,
+        })
+        .unwrap_or(ReadAloudSnapshot {
+            day: today_utc(),
+            failures: std::collections::BTreeMap::new(),
+            retried: std::collections::BTreeMap::new(),
+            recovered: std::collections::BTreeMap::new(),
+            gave_up: std::collections::BTreeMap::new(),
+            abandoned: 0,
+            superseded: 0,
+        })
+    }
+}
+
 /// A short-lived table of prepared messages, keyed by an unguessable ticket.
 #[derive(Debug)]
 pub struct SpeechTickets {
@@ -396,6 +533,31 @@ mod tests {
                 "a ticket needs escaping to sit in a URL: {ticket}"
             );
         }
+    }
+
+    #[test]
+    fn read_aloud_counters_count_each_outcome_by_class_for_today() {
+        // `#2056`: the error-rate counters healthz shows: failures by class,
+        // retries, recoveries and give-ups, and the two interrupt causes.
+        let counters = ReadAloudCounters::new();
+        counters.failure("lost");
+        counters.failure("lost");
+        counters.failure("silent");
+        counters.retried("lost");
+        counters.recovered("lost");
+        counters.gave_up("silent");
+        counters.interrupted(true);
+        counters.interrupted(false);
+        counters.interrupted(false);
+        let shown = counters.snapshot();
+        assert_eq!(shown.failures.get("lost"), Some(&2));
+        assert_eq!(shown.failures.get("silent"), Some(&1));
+        assert_eq!(shown.retried.get("lost"), Some(&1));
+        assert_eq!(shown.recovered.get("lost"), Some(&1));
+        assert_eq!(shown.gave_up.get("silent"), Some(&1));
+        assert_eq!(shown.abandoned, 1);
+        assert_eq!(shown.superseded, 2);
+        assert_eq!(shown.day.len(), 10, "not a day: {}", shown.day);
     }
 
     #[test]

@@ -73,6 +73,10 @@ pub struct AppState {
     /// Per-route refusal counts over the current window (`#1848`); the access
     /// layer counts into it, a background tick evaluates closed windows.
     pub route_health: Arc<crate::route_health::RouteHealth>,
+    /// The day's read-aloud error-rate counters (`#2056`): the speech routes
+    /// and the conversation speech adapter count into this one set, and
+    /// `healthz` shows it.
+    pub read_aloud_counters: Arc<crate::speech_tickets::ReadAloudCounters>,
     /// The one place this server keeps anything between restarts.
     ///
     /// Reached only through the trait, never as a concrete database, so the backend can be

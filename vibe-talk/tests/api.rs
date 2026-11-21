@@ -3906,6 +3906,68 @@ async fn a_failed_read_is_reported_under_its_ticket_and_shown_in_diagnostics() {
     assert_eq!(body["error"], "unknown_speech_ticket");
 }
 
+/// `#2056 vibe-talk-reader-retry-and-error-telemetry`: the page's failure
+/// report carries its retry judgement, and `healthz` shows the day's
+/// read-aloud error rates: failures by class, retried, recovered, gave up,
+/// and interrupted turns by cause.
+#[tokio::test]
+async fn a_failure_report_with_its_retry_outcome_is_counted_on_healthz() {
+    let (harness, _store, ids) = todo_harness();
+    let (status, prepared) = call(
+        &harness,
+        "POST",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/speech/prepare"),
+        Some(READ_TOKEN),
+        Some(serde_json::json!({ "ids": [ids[0].clone()] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let url = prepared["prepared"][0]["url"].as_str().expect("a url");
+
+    // One failure retried and recovered, one given up on.
+    for (outcome, block) in [("recovered", 0), ("gave_up", 1)] {
+        let (status, body) = call(
+            &harness,
+            "POST",
+            &format!("{url}/failure?block={block}"),
+            None,
+            Some(serde_json::json!({
+                "reason": "lost",
+                "detail": "the connection to it kept dropping",
+                "recoverable": true,
+                "retried": true,
+                "outcome": outcome,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    }
+    // An outcome the page cannot mean is refused, not counted.
+    let (status, body) = call(
+        &harness,
+        "POST",
+        &format!("{url}/failure"),
+        None,
+        Some(serde_json::json!({
+            "reason": "lost",
+            "outcome": "vanished",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let (status, body) = call(&harness, "GET", "/healthz", None, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rates = &body["read_aloud"];
+    assert_eq!(rates["failures"]["lost"], 2, "{rates}");
+    assert_eq!(rates["retried"]["lost"], 2, "{rates}");
+    assert_eq!(rates["recovered"]["lost"], 1, "{rates}");
+    assert_eq!(rates["gave_up"]["lost"], 1, "{rates}");
+    assert_eq!(rates["interrupted"]["abandoned"], 0, "{rates}");
+    assert_eq!(rates["interrupted"]["superseded"], 0, "{rates}");
+    assert_eq!(rates["day"].as_str().map(str::len), Some(10), "{rates}");
+}
+
 /// `#191 read-aloud-first-lag`: the page may add when speech itself began, under the same bound
 /// as every other clock, and an older page that cannot tell still reports.
 #[tokio::test]

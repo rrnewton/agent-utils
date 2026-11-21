@@ -16,7 +16,7 @@ import { BASE_CSS, BOTTOM_SLACK_PX, CHANNEL, CODER, COLLAPSE_OVER_CHARS, CSS_COD
   delayedReply, deliver, doneButton, errorResponse, focusOn, foldButton, helpEntry, hold,
   inReadingMode, joined, json, keyboardPageAtTop, longMessage, mainOnlyThreadPage, markupPlace,
   message, newPage, openReplyOn, optionText, outgoingRetry, outgoingRows, outgoingSpinner,
-  parkMidway, pcm, pickThread, press, pressHere, pullDown, reReadChannel, readAloudMessages,
+  parkMidway, passTime, pcm, pickThread, press, pressHere, pullDown, reReadChannel, readAloudMessages,
   readButton, relayed, reloadWith, reopenedChannel, replyArrowOf, replyButton, replyInStream, row,
   rowState, rowWithId, runId, runThread, savedOutgoing, selectedId, sentWithoutKey, setReadNew,
   settingsGroup, showDiscord, shownIds, signIn, sourceConstant, speakRelay, splitPost, sseMessage,
@@ -3797,6 +3797,64 @@ test("A READ CUT OFF BY A RESTART prepares again and carries on from the block i
   assert.match(resumed.url, /-after-restart\?/, `the read went on from a ticket minted before the restart: ${resumed.url}`);
   assert.equal(blockOf(resumed.url), "1", "the read did not go on from the block it was cut off in");
   assert.equal(page.el("read-steer-count").text(), "2 of 3");
+});
+
+test("a recovered retry is reported recovered, under the failure it answered (#2056)", async () => {
+  // `#2056 vibe-talk-reader-retry-and-error-telemetry`: the server's counters
+  // learn that a cut-off read was retried and the retry played, so error
+  // rates say what was fixed by retrying and what was not.
+  const { page, rows } = await blockedRead();
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  page.audioStreams[0].controller.fail();
+  await page.settle();
+  assert.match(page.el("status").textContent, /cut off; trying again/);
+  assert.equal(page.expireTimers(SPEECH_PIECES.READ_RECOVERY_WAITS_MS[0]), 1);
+  await page.settle();
+  const resumed = page.audioStreams.at(-1);
+  resumed.controller.bytes(joined(wavHeader(1000, 1), pcm(0x2000, 0x2000)));
+  await page.settle();
+  // The resumed part announces `playing` on the audio clock: let it arrive.
+  await passTime(page, 5000);
+  await page.settle();
+  const recovered = page.speechFailureCalls.filter((call) => call.failure.outcome === "recovered");
+  assert.equal(recovered.length, 1, "the recovered retry was not reported, or was reported twice");
+  assert.equal(recovered[0].failure.reason, "lost");
+  assert.equal(recovered[0].failure.retried, true);
+  assert.equal(recovered[0].failure.recoverable, true);
+});
+
+test("a read that gives up after its tries reports gave_up, and says so where the reader can see it (#2056)", async () => {
+  const { page, rows } = await blockedRead();
+  page.ticketStatus = 404;
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  for (const wait of SPEECH_PIECES.READ_RECOVERY_WAITS_MS) {
+    assert.equal(page.expireTimers(wait), 1);
+    await page.settle();
+  }
+  // The reader is told, once, in short words: the standing failure notice.
+  assert.match(page.el("status").textContent, /Cloud voice: the connection to it kept dropping\./);
+  const gaveUp = page.speechFailureCalls.filter((call) => call.failure.outcome === "gave_up");
+  assert.equal(gaveUp.length, 1, "the give-up was not reported exactly once");
+  assert.equal(gaveUp.at(-1).failure.reason, "lost");
+  assert.equal(gaveUp.at(-1).failure.recoverable, true);
+});
+
+test("a deliberate stop is never retried and never reported as a failure (#2056)", async () => {
+  const { page, rows } = await blockedRead();
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  page.audioStreams[0].controller.bytes(joined(wavHeader(1000, 1), pcm(0x2000, 0x2000)));
+  await page.settle();
+  const asked = page.audioStreams.length;
+  // The reader stops the read themselves: a tap on the row being read.
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  page.expireTimers(60_000);
+  await page.settle();
+  assert.equal(page.audioStreams.length, asked, "a stopped read was tried again");
+  assert.equal(page.speechFailureCalls.length, 0, "a deliberate stop was reported as a failure");
 });
 
 test("a tap after a read that could not be played prepares again, rather than playing another dead URL", async () => {

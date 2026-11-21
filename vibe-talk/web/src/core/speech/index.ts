@@ -5,7 +5,7 @@
 export { balanceSentences, pieceSkewPasses, readPieces, sentenceEnds, speechSegments } from "./pieces.ts";
 export { createPreparedSpeech, ticketLeftMs } from "./prepared.ts";
 export type { PreparedBlock, PreparedEntry, PreparedSpeech, PreparedSpeechDependencies, SpeechMoment } from "./prepared.ts";
-export { BLOCK_READ_TICKET_MARGIN_MS, READ_RECOVERY_WAITS_MS, recoveryWait, ticketEnded, ticketTooShortForBlocks } from "./recovery.ts";
+export { BLOCK_READ_TICKET_MARGIN_MS, READ_RECOVERY_WAITS_MS, isRecoverableReadFailure, recoveryWait, ticketEnded, ticketTooShortForBlocks } from "./recovery.ts";
 export {
   BROWSER_SPEECH_CHUNK_CHARS,
   BROWSER_SPEECH_SENTENCE_MIN_CHARS,

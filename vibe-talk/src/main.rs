@@ -764,6 +764,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let bind = config.bind;
+    // `#2056`: one set of read-aloud counters for the speech adapter, the
+    // speech routes, and `healthz` to show.
+    let read_aloud_counters = Arc::new(vibe_talk::speech_tickets::ReadAloudCounters::new());
     let voice_bridge = Arc::new(vibe_talk::voice_bridge::BridgeHello::for_config(&config));
     // One provider per backend the chain names, in trying order
     // (`#563 read-aloud-fallback-chain`). A single-backend deployment
@@ -782,7 +785,8 @@ async fn main() -> anyhow::Result<()> {
                 .with_credentials(vibe_talk::bridge_dial::Credentials::for_read_aloud(
                     &config.read_aloud,
                 ))
-                .with_own_sessions(Arc::clone(voice_bridge.own_sessions())),
+                .with_own_sessions(Arc::clone(voice_bridge.own_sessions()))
+                .with_read_aloud_counters(Arc::clone(&read_aloud_counters)),
             ),
             ReadAloudBackend::ElevenLabs => {
                 Arc::new(vibe_talk::elevenlabs::speech::ElevenLabsSpeech::new(
@@ -932,6 +936,7 @@ async fn main() -> anyhow::Result<()> {
         thread_names,
         startup_probe: Arc::clone(&startup_probe),
         route_health: Arc::new(vibe_talk::route_health::RouteHealth::new()),
+        read_aloud_counters: Arc::clone(&read_aloud_counters),
     };
     // `#208 persistent-cache`. A cache installed behind the sink keeps the store's summaries in
     // step with what it learns: a summary of an edited or deleted message, or of an erased

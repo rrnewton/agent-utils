@@ -20,6 +20,23 @@ export function recoveryWait(recovery: number): number | null {
   return recovery < READ_RECOVERY_WAITS_MS.length ? READ_RECOVERY_WAITS_MS[recovery] as number : null;
 }
 
+/**
+ * `#2056 vibe-talk-reader-retry-and-error-telemetry`. The failure classes a
+ * bounded retry may answer: the connection went away (`lost`), the body was
+ * cut or unreadable (`malformed`), or no speech followed the first audio in
+ * time (`no_audio`) — each can be a dropped stream or a slow vendor rather
+ * than a dead one. Everything else (`silent`, a voice that answered with
+ * silence; `refused`, a request the server turned away) would only fail the
+ * same way again, and a deliberate stop or supersede is not a failure at
+ * all: none of those is ever retried.
+ */
+const RECOVERABLE_READ_FAILURES: ReadonlySet<string> = new Set(["lost", "malformed", "no_audio"]);
+
+/** Whether a read-aloud failure of class `reason` may be tried again (`#2056`). */
+export function isRecoverableReadFailure(reason: string): boolean {
+  return RECOVERABLE_READ_FAILURES.has(reason);
+}
+
 /** Whether a ticket (`until`, on both clocks) has ended at `now`: past either deadline is past. */
 export function ticketEnded(ticket: { readonly until: SpeechMoment }, now: SpeechMoment): boolean {
   return now.mono >= ticket.until.mono || now.wall >= ticket.until.wall;

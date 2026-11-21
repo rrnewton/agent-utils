@@ -899,6 +899,32 @@ fn health_body(state: &AppState) -> serde_json::Value {
             "routes": routes,
             "alerts": alerts,
         },
+        // `#2056`: the day's read-aloud error rates: failures by class,
+        // retries, recoveries, give-ups, and interrupted turns by cause.
+        // Counts only, as the rest of this body.
+        "read_aloud": read_aloud_health(state),
+    })
+}
+
+/// The day's read-aloud counters for `healthz` (`#2056`), as JSON maps.
+fn read_aloud_health(state: &AppState) -> serde_json::Value {
+    let shown = state.read_aloud_counters.snapshot();
+    let by_class = |counts: &std::collections::BTreeMap<String, u64>| {
+        counts
+            .iter()
+            .map(|(class, count)| (class.clone(), serde_json::json!(count)))
+            .collect::<serde_json::Map<String, serde_json::Value>>()
+    };
+    serde_json::json!({
+        "day": shown.day,
+        "failures": by_class(&shown.failures),
+        "retried": by_class(&shown.retried),
+        "recovered": by_class(&shown.recovered),
+        "gave_up": by_class(&shown.gave_up),
+        "interrupted": {
+            "abandoned": shown.abandoned,
+            "superseded": shown.superseded,
+        },
     })
 }
 
@@ -8418,12 +8444,23 @@ pub async fn play_speech(
     // audio, then an error naming why) can only cut the response off. Its reason is kept under the
     // ticket, where the page asks for it (`speech_stream_failure`) before trying the read again.
     let tickets = std::sync::Arc::clone(&state.speech_tickets);
+    let counters = std::sync::Arc::clone(&state.read_aloud_counters);
     let failed_block = query.block;
     let observation = prepared.observation.clone();
     let chunks = stream.chunks.inspect(move |chunk| {
         let Err(error) = chunk else { return };
-        // A read superseded by another selection was the reader's choice, not a failure.
+        // `#2056`: every stream failure is counted by class, superseded
+        // included. A supersede is the reader's choice, so it is logged at
+        // info and not kept as a failure reason for the page to ask after;
+        // anything else is a failure the page may retry or give up on.
+        counters.failure(error.code());
         if error.code() == "conversation_speech_superseded" {
+            tracing::info!(
+                observation = observation.as_str(),
+                block = failed_block,
+                code = error.code(),
+                "a read-aloud's audio stream was superseded by another selection"
+            );
             return;
         }
         let detail = error.to_string();
@@ -8590,6 +8627,18 @@ pub struct SpeechPlaybackFailure {
     /// What the reader was told. Bounded and logged as given; it names no message content.
     #[serde(default)]
     pub detail: String,
+    /// `#2056`. Whether the page judges this failure worth trying again.
+    /// Absent from pages older than the field, which are counted as before.
+    #[serde(default)]
+    pub recoverable: Option<bool>,
+    /// `#2056`. Whether a retry was attempted for this failure.
+    #[serde(default)]
+    pub retried: Option<bool>,
+    /// `#2056`. How the failure ended: `recovered`, `gave_up`, or `stopped`
+    /// (the reader's own stop, not a failure outcome). A short slug, validated
+    /// like `reason`; anything else is refused.
+    #[serde(default)]
+    pub outcome: Option<String>,
 }
 
 /// Record that the page stopped a read because the voice failed it, so the failure is in this
@@ -8622,13 +8671,29 @@ pub async fn speech_playback_failure(
         .filter(|c| !c.is_control())
         .take(MAX_DETAIL)
         .collect();
+    // `#2056`: the retry outcome, where the page says one. Only the three
+    // outcomes the page can mean are accepted; anything else is refused
+    // rather than echoed into the log or the counters.
+    let outcome = match failure.outcome.as_deref() {
+        None | Some("recovered" | "gave_up" | "stopped") => failure.outcome.as_deref(),
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "outcome must be recovered, gave_up, or stopped",
+            ));
+        }
+    };
     let Some(prepared) = state.speech_tickets.claim(&ticket) else {
         return Err(unknown_speech_ticket());
     };
+    // `#2056`: one structured line per page-reported failure, with the
+    // page's own judgement of it, and the day's counters kept beside it.
     tracing::warn!(
         observation = prepared.observation,
         block = read.block,
         reason,
+        recoverable = failure.recoverable,
+        retried = failure.retried,
+        outcome,
         detail = detail.as_str(),
         "the page stopped a read-aloud the voice failed"
     );
@@ -8639,6 +8704,15 @@ pub async fn speech_playback_failure(
             detail,
             at: std::time::SystemTime::now(),
         });
+    state.read_aloud_counters.failure(reason);
+    if failure.retried == Some(true) {
+        state.read_aloud_counters.retried(reason);
+    }
+    match outcome {
+        Some("recovered") => state.read_aloud_counters.recovered(reason),
+        Some("gave_up") => state.read_aloud_counters.gave_up(reason),
+        _ => {}
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

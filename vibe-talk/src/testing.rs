@@ -312,6 +312,9 @@ fn state_pieces_with(
         config.elevenlabs.clone(),
     );
     let voice_bridge = Arc::new(crate::voice_bridge::BridgeHello::for_config(&config));
+    // As `main` builds it (`#2056`): one set of read-aloud counters shared by
+    // the speech adapter, the speech routes, and `healthz`.
+    let read_aloud_counters = Arc::new(crate::speech_tickets::ReadAloudCounters::new());
     // As `main` builds it: one fake-backed provider per backend the
     // chain names, wrapped when the chain has more than one
     // (`#563 read-aloud-fallback-chain`).
@@ -326,7 +329,8 @@ fn state_pieces_with(
                     &config.conversation,
                     config.read_aloud.websocket_url.as_deref(),
                 )
-                .with_own_sessions(Arc::clone(voice_bridge.own_sessions())),
+                .with_own_sessions(Arc::clone(voice_bridge.own_sessions()))
+                .with_read_aloud_counters(Arc::clone(&read_aloud_counters)),
             ),
             crate::config::ReadAloudBackend::ElevenLabs => {
                 Arc::new(crate::elevenlabs::speech::ElevenLabsSpeech::new(
@@ -440,6 +444,7 @@ fn state_pieces_with(
         thread_names: Arc::new(crate::summarize::threads::ThreadNames::new()),
         startup_probe: Arc::new(crate::probe::StartupStatus::default()),
         route_health: Arc::new(crate::route_health::RouteHealth::new()),
+        read_aloud_counters,
     };
     crate::short_refs::set_thread_slugs(
         Arc::clone(&state.thread_names) as Arc<dyn crate::short_refs::ThreadSlugs>

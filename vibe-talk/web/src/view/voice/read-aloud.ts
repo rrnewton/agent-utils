@@ -1,5 +1,5 @@
 // Read-aloud transport and its controls, owned together (`#624 voice-page-modularity`).
-import { browserSpeechChunks, chunkStartSilenceMs, createPreparedSpeech, joinBytes, readClock, readPieces, readSectionStarts, readTimelineWeights, recoveryWait, sentenceEnds, silenceFrameCount, silentBefore, speechElapsedMs, speechSegments, ticketEnded, ticketTooShortForBlocks, wavLayout } from "../../core/speech/index.ts";
+import { browserSpeechChunks, chunkStartSilenceMs, createPreparedSpeech, isRecoverableReadFailure, joinBytes, readClock, readPieces, readSectionStarts, readTimelineWeights, recoveryWait, sentenceEnds, silenceFrameCount, silentBefore, speechElapsedMs, speechSegments, ticketEnded, ticketTooShortForBlocks, wavLayout } from "../../core/speech/index.ts";
 import { READ_NO_SPEECH_MS, cloudFailureText } from "../../present/call/index.ts";
 import { DEVICE_SETTINGS, MAX_READ_SPEED, MIN_READ_SPEED, clampReadSpeed } from "../../core/settings/index.ts";
 import { cardRootOf, idsOf, rowMessages, rowSeen } from "../../view/channel/index.ts";
@@ -1173,6 +1173,26 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   let readRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
 
   /**
+   * `#2056 vibe-talk-reader-retry-and-error-telemetry`. Why each recent stop
+   * stopped: `user_stop` (a tap, the Stop control, leaving the view),
+   * `superseded` (a new read took the floor), `jump` (an arrow, a timeline
+   * tap, a step), `error` (the voice failed the read), `connection_lost`
+   * (the audio stream went away and the read is being tried again). Every
+   * stop path names its reason through `noteReadStop` before it stops; the
+   * log keeps the last few, and non-user failures are reported to the server
+   * (`reportSpeechFailure`) so its counters see them too. A deliberate stop
+   * and a supersede are the reader's own acts: recorded here, never
+   * reported as failures, and never retried.
+   */
+  const readStopLog: { reason: string; at: number }[] = [];
+  let notedStopReason: string | null = null;
+  function noteReadStop(reason: string) {
+    notedStopReason = reason;
+  }
+  /** A failure a retry is answering, for its recovered report (`#2056`). */
+  let pendingRecoveryReport: { url: string | null; reason: string; block: number | null } | null = null;
+
+  /**
    * The message a tap has ASKED for, before any audio exists.
    *
    * The whole of the responsiveness complaint. A tap starts a fetch to this server, which starts a
@@ -1206,6 +1226,11 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
 
   /** Stop whatever is playing and forget it. Safe to call when nothing is. */
   function stopReading() {
+    // `#2056`: record why this stop happened (the reason its path noted,
+    // or the reader's own stop where none did), for the page's stop log.
+    readStopLog.push({ reason: notedStopReason ?? "user_stop", at: Date.now() });
+    if (readStopLog.length > 16) readStopLog.shift();
+    notedStopReason = null;
     // Invalidate every read in flight, not only the one that is audible. A fetch that has not come
     // back yet is still going to build a player unless its ticket is stale.
     readingTicket += 1;
@@ -1405,12 +1430,22 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
    * `#548 cloud-read-failures`. Tell the server why the page stopped a read, under the read's ticket,
    * so the failure is in its log and diagnostics as well as on the phone. Never fails the page.
    */
-  function reportSpeechFailure(url: string | null | undefined, reason: unknown, detail: unknown, block: number | null = null) {
+  function reportSpeechFailure(url: string | null | undefined, reason: unknown, detail: unknown, block: number | null = null,
+      telemetry: { recoverable?: boolean; retried?: boolean; outcome?: string } | null = null) {
     if (typeof url !== "string" || !url.startsWith("/api/v1/speech/")) return;
     deps.fetch(`${url}/failure${block === null ? "" : `?block=${block}`}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ reason: String(reason).replace(/[^a-z0-9_-]/gu, "") || "failed", detail: String(detail).slice(0, 300) }),
+      body: JSON.stringify({
+        reason: String(reason).replace(/[^a-z0-9_-]/gu, "") || "failed", detail: String(detail).slice(0, 300),
+        // `#2056`: the page's judgement of the failure, for the server's
+        // per-day counters: worth retrying, retried, and how it ended.
+        ...(telemetry === null ? {} : {
+          ...(telemetry.recoverable === undefined ? {} : { recoverable: telemetry.recoverable }),
+          ...(telemetry.retried === undefined ? {} : { retried: telemetry.retried }),
+          ...(telemetry.outcome === undefined ? {} : { outcome: telemetry.outcome }),
+        }),
+      }),
       keepalive: true,
     }).catch(() => {});
   }
@@ -1450,6 +1485,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
    * phone's own voice. `report` tells the server (`reportSpeechFailure`).
    */
   function cloudReadFailed(reason: string, detail: unknown, parts: string[], report: ((reason: string, text: string) => void) | null = null) {
+    noteReadStop("error");
     stopReading();
     if (readingMode) setReadState("failed");
     // The server's own word for a turn of silence (`conversation_speech_silent`), or the voice's
@@ -1471,6 +1507,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
    */
   function cloudDocumentFailed(reason: string, detail: unknown, payload: DocumentPayload, block: number | null,
       report: ((reason: string, text: string) => void) | null = null) {
+    noteReadStop("error");
     stopReading();
     setReadState("failed");
     if (/speech_silent/u.test(String(detail))) reason = "silent";
@@ -1937,7 +1974,10 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
       } catch (error) {
         // Includes a response cut off part-way: a read that did not arrive whole did not END, and
         // must not be archived as heard. Cut off is "lost"; audio this page cannot read is not.
-        fail(error && (error as { name?: unknown }).name === "TypeError" ? "lost" : "malformed");
+        // `#2056`: a fetch the browser aborted (its connection went away) is
+        // "lost" too, not malformed audio.
+        const name = error && (error as { name?: unknown }).name;
+        fail(name === "TypeError" || name === "AbortError" ? "lost" : "malformed");
         return;
       }
       // A body that stops inside a frame was cut short, or disagrees with its own format.
@@ -3033,6 +3073,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     jumpPaint = { id: playing.id, segment: at, segments: playing.segments!, blocks: playing.blocks, parts: playing.parts, document: playing.document };
     playing.segment = at;
     showReadingPosition();
+    noteReadStop("jump");
     readJumping = true;
     readJumpPending = true;
     try {
@@ -3423,6 +3464,11 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
    */
   function recoverRead(parts: string[], from: ReadFrom & { recovery: number }, wait: number,
       payload: DocumentPayload | null = null) {
+    // `#2056`: the failure this retry answers, kept for its recovered report
+    // when the resumed read plays. The ticket URL goes before the forgetting.
+    const failedEntry = preparedEntry(parts[from.part]!);
+    pendingRecoveryReport = { url: failedEntry ? failedEntry.url : null, reason: "lost", block: from.block };
+    noteReadStop("connection_lost");
     // Every ticket minted before this may be as dead as the one that failed.
     forgetPreparedSpeech();
     // `scrubber-full-width`: the strip stays up through the wait, as through a jump's.
@@ -3684,9 +3730,15 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
       }
     };
     // `#548 cloud-read-failures`. Where the voice failed this read, reported under the part's ticket.
+    // `#2056`: with the page's judgement — recoverable, retried, given up — for
+    // the server's per-day counters.
     const reportFailure = (at: number) => (reason: string, detail: string) => {
       const url = ready[segments[at]!.part] && ready[segments[at]!.part]!.url;
-      reportSpeechFailure(url, reason, detail, segments[at]!.block);
+      reportSpeechFailure(url, reason, detail, segments[at]!.block, {
+        recoverable: isRecoverableReadFailure(reason),
+        retried: segmentRetries.has(at) || recovery > 0,
+        outcome: "gave_up",
+      });
     };
     // `#1039 documents-read-parity`. A cloud failure of either kind, each to its own retry stash.
     const failCloud = (reason: string, detail: unknown, at: number) => {
@@ -3787,6 +3839,15 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
       });
       audio.addEventListener("playing", () => {
         if (ticket !== readingTicket) return;
+        // `#2056`: a read resumed by a retry is playing again: the failure it
+        // answers is reported recovered, once, under its old ticket.
+        if (recovery > 0 && pendingRecoveryReport !== null) {
+          const answered = pendingRecoveryReport;
+          pendingRecoveryReport = null;
+          reportSpeechFailure(answered.url, answered.reason, "", answered.block, {
+            recoverable: true, retried: true, outcome: "recovered",
+          });
+        }
         // This part is the one being heard now: the highlight moves to it.
         if (nowPlaying !== null && nowPlaying!.id === id && nowPlaying!.segment! !== at) {
           nowPlaying = { ...nowPlaying!, segment: at };
@@ -3849,8 +3910,10 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
           // the one being heard, so nothing is skipped.
           // `#1872`: a truncated or undecodable body gets its one retry at this
           // segment before any of the below: an aborted prefetch produces one
-          // without the vendor being at fault.
-          if (streamed && reason === "malformed" && retrySegmentOnce(at)) return;
+          // without the vendor being at fault. `#2056`: the retryable classes
+          // are one named policy (`isRecoverableReadFailure`); `lost` goes to
+          // the recovery schedule below instead of the segment retry.
+          if (streamed && reason !== "lost" && isRecoverableReadFailure(reason) && retrySegmentOnce(at)) return;
           const wait = streamed && lost ? recoveryWait(recovery) : null;
           if (wait !== null) {
             const heard = nowPlaying !== null && nowPlaying!.id === id && !started[at] ? nowPlaying!.segment! : at;
@@ -3966,6 +4029,9 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     //
     // `#376 read-aloud-blocks`. Not a JUMP: `from` moves a read to another of its blocks.
     const already = from === null && ((nowPlaying !== null && nowPlaying!.id === id) || pendingRead === id);
+    // `#2056`: a new read taking the floor from one in flight is a supersede;
+    // stopping the read already playing is the reader's own stop.
+    noteReadStop(already || (nowPlaying === null && pendingRead === null) ? "user_stop" : "superseded");
     // Also cancels anything still being fetched, so a double tap cannot end in two players.
     stopReading();
     if (already || parts.length === 0) {
@@ -4105,6 +4171,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     const id = `doc:${key}`;
     const parts = [id];
     const already = from === null && ((nowPlaying !== null && nowPlaying!.id === id) || pendingRead === id);
+    noteReadStop(already || (nowPlaying === null && pendingRead === null) ? "user_stop" : "superseded");
     stopReading();
     if (already) {
       return;
@@ -4206,6 +4273,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   get readState() { return readState; }, set readState(value: typeof readState) { readState = value; },
   setReadState,
   stopReading,
+  get readStopLog() { return readStopLog.slice(); },
   readerSnapshot,
   resumeReader,
   readOnDevice,
