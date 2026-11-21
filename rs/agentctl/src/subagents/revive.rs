@@ -257,7 +257,8 @@ fn muse_sessions_for_pid(root: &Path, record: &AgentRecord, pid: u64) -> Vec<Str
                         let Ok(text) = fs::read_to_string(&lock) else {
                             continue;
                         };
-                        let names_pid = text.lines().any(|line| line.trim() == hint);
+                        let names_pid = lock_names_this_host(&text)
+                            && text.lines().any(|line| line.trim() == hint);
                         // A lock older than the runtime process itself
                         // names a previous owner of the reused pid
                         // (#1945): never attribute it. Unknown freshness
@@ -289,6 +290,46 @@ fn muse_sessions_for_pid(root: &Path, record: &AgentRecord, pid: u64) -> Vec<Str
 /// the session files their runtime holds (Claude Code's is assigned at launch). One held
 /// session is recorded as observed; several are never guessed between: the record keeps no
 /// id and says why under [`NATIVE_SESSION_UNKNOWN`]. Returns what to tell the operator then.
+/// The host names a session lock may carry to be this host's (#2013):
+/// the full local host name or its short label. A lock is only ever
+/// written by its own host's runtime, so anything else - or no host
+/// line at all - is a copied lock (dotsync mirrors session directories
+/// between hosts) and attributes nothing, however well its pid line
+/// matches a local process.
+fn expected_lock_hosts() -> Vec<String> {
+    #[cfg(test)]
+    {
+        // Fixtures write the loopback name, as the fake locks always have.
+        vec!["localhost".to_owned()]
+    }
+    #[cfg(not(test))]
+    {
+        let mut names = Vec::new();
+        if let Some(host) = crate::subagents::local_hostname() {
+            names.push(host.clone());
+            if let Some(short) = host.split('.').next() {
+                if short != host {
+                    names.push(short.to_owned());
+                }
+            }
+        }
+        names
+    }
+}
+
+/// Whether the lock text names this host (fail closed when missing).
+fn lock_names_this_host(text: &str) -> bool {
+    let hosts = expected_lock_hosts();
+    if hosts.is_empty() {
+        return false;
+    }
+    text.lines().any(|line| {
+        line.trim()
+            .strip_prefix("host=")
+            .is_some_and(|host| hosts.iter().any(|name| name == host.trim()))
+    })
+}
+
 /// The Muse sessions attributable to this lane from the files its
 /// runtime holds open (#1934 D1): a held path counts only inside the
 /// store's own sessions tree, and a held `.session.lock` counts only
@@ -327,12 +368,13 @@ fn muse_held_ids(record: &AgentRecord, held: &[PathBuf]) -> Vec<String> {
         let Ok(text) = fs::read_to_string(&lock) else {
             continue;
         };
-        let names_own = text.lines().any(|line| {
-            line.trim()
-                .strip_prefix("pid=")
-                .and_then(|pid| pid.trim().parse::<u64>().ok())
-                .is_some_and(|pid| pids.contains(&pid))
-        });
+        let names_own = lock_names_this_host(&text)
+            && text.lines().any(|line| {
+                line.trim()
+                    .strip_prefix("pid=")
+                    .and_then(|pid| pid.trim().parse::<u64>().ok())
+                    .is_some_and(|pid| pids.contains(&pid))
+            });
         if !names_own {
             continue;
         }
@@ -6988,6 +7030,48 @@ mod discovery_tests {
             start > std::time::SystemTime::now() - std::time::Duration::from_secs(24 * 3600),
             "test processes start within a day of now"
         );
+    }
+
+    #[test]
+    fn pid_keyed_store_rejects_a_lock_from_another_host() {
+        // #2013: dotsync copies session directories between hosts, so
+        // a copied lock can name a pid that exists locally; its host
+        // line is what proves whose lock it is. A foreign (or missing)
+        // host line attributes nothing.
+        let root = std::env::temp_dir().join(format!("muse-host-{}", std::process::id()));
+        muse_store(
+            &root,
+            &[],
+            &[
+                ("11111111-1111-1111-1111-111111111111", 4242, "/tmp/proj"),
+                ("22222222-2222-2222-2222-222222222222", 4242, "/tmp/proj"),
+            ],
+        );
+        // Rewrite one lock as a copied foreign lock, the other with
+        // no host line at all: both must attribute nothing.
+        for id in [
+            "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        ] {
+            let lock = root.join(format!("sessions/2026/11/06/{id}/.session.lock"));
+            let text = if id.starts_with('1') {
+                "pid=4242\nhost=otherhost999\n".to_owned()
+            } else {
+                "pid=4242\n".to_owned()
+            };
+            fs::write(&lock, text).unwrap();
+        }
+        let mut record = rec("/tmp/proj");
+        record.custom_process_identity = Some(crate::client::CustomProcessIdentity {
+            version: 1,
+            boot_id: "11111111-2222-3333-4444-555555555555".into(),
+            pid: 4242,
+            starttime_ticks: 9001,
+            executable_device: 7,
+            executable_inode: 11,
+        });
+        assert!(muse_sessions_for_pid(&root, &record, 4242).is_empty());
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

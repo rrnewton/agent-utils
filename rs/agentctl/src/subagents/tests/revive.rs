@@ -3644,6 +3644,28 @@ fn a_muse_lane_records_the_session_the_store_names_by_pid_at_start() {
 }
 
 #[test]
+fn a_copied_lock_from_another_host_records_nothing() {
+    // #2013: a lock dotsync copied from another host names this
+    // lane's pid but a foreign host; it attributes nothing.
+    let fixture = unreported();
+    let dir = fixture
+        .root
+        .join("data/muse/sessions/2026/11/06/01a1ab0f-0a3c-73c1-8056-ee5296bc1574");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("session.jsonl"), "").unwrap();
+    let lock = dir.join(".session.lock");
+    fs::write(&lock, "pid=4242\nhost=otherhost999\n").unwrap();
+    let _held = pretend_held(vec![lock]);
+    start_worker(&fixture, "muse");
+    assert!(fixture
+        .manager()
+        .load("worker")
+        .unwrap()
+        .native_session
+        .is_none());
+}
+
+#[test]
 fn the_store_report_wins_over_a_held_peer_lock() {
     // #1945: Muse's own report for the pinned pid is preferred over
     // anything the fd walk happens to hold, so a peer lock can never
