@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-documents-keep-place: toggling away and back restores the open document and the list exactly'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -8,7 +8,8 @@ labels:
 - documents
 - ui
 created_at: 2026-11-20T17:25:00-05:00
-updated_at: 2026-11-20T17:25:00-05:00
+updated_at: 2026-11-21T00:58:00-05:00
+closed_at: 2026-11-21T00:58:00-05:00
 ---
 
 # Description
@@ -34,3 +35,7 @@ Why it exits the document today: entering Documents through the view switch call
 # Notes
 
 Owner-priority, fast-track (owner UI). Lane mu-docstate under coordb. Split with mu-docjump (#1999 download-tap jump, #2002 fresh load lands at the bottom): fresh = bottom (theirs), return = restore (this issue); coordination sent before touching list scroll code (agentctl messages to mu-docjump first, then mu-doctoolbar #2001 and mu-readstart #2003/#2004 — all queued pending against locked agents at send time, message ids in the lane handoff). Related: #1082 documents-back-chain, #1264 documents-scroll-landings, #1908 vibe-talk-documents-back-and-filter-place, #1251 scroll-single-owner.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as 7ff7217b (tree ef4d2c83, combined over #2003/#2004's Read start rule and verified there: documents JS suite, typecheck, scroll-writer-guard, and the keep-place/scroll/read/download-jump/fresh-load browser walks all green). One documents view state (paragraph anchor for the reader, card anchor for the list) is kept by the view and restored on return; first entry stays fresh at the bottom. Evidence: focused suites green at every gate; the final gate's only reds (send-flash, column-overscroll-1920) are green solo on the change and on untouched main. Coordb verified the browser walks at each SHA and deploys.
