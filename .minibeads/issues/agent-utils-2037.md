@@ -1,6 +1,6 @@
 ---
 title: 'agentctl-revive-host-process-isolation: revive tests refuse on unrelated same-uid host processes'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
@@ -58,3 +58,14 @@ coordinator's direction during #2027 agentctl-pidfd-open-enoent-thread;
 number 2037 assigned by the coordinator. Related: #2031
 agentctl-lib-load-flakes (same gate, different wait). No lane, host or
 person is named here.
+
+## Resolution
+
+[watermelon-full-preview] Landed as 041006a7 on main. A
+test-only thread-local fake process table replaces the holder
+scan's host enumeration in the four named revive tests plus
+dead_native_retirement_previous_boot_missing_pane_stale_agent_archives
+(the retire path reads the same scan; the gate showed the same
+case there). The holder is scripted as a process row and the
+others install an empty table; no assertion was weakened and the
+production /proc scan is unchanged.
