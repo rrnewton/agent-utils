@@ -30,7 +30,7 @@ agentctl-send-timeout-inotify-wait (landed 2f703edc) now bounds
 every send wait, so new sends end; the counted entry they leave
 behind is this issue.
 
-# Reproduction (scratch Muse 1.4.25 session, 2026-11-21)
+## Reproduction (scratch Muse 1.4.25 session, 2026-11-21)
 
 [watermelon-full-preview] A scratch Muse session (never another
 lane's pane) ran plain `sleep` commands as stand-ins for a long
