@@ -152,6 +152,14 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
   })();
   const threadListFailures = new Map<string, string>();
   const threadListLandedAt = new Map<string, number>();
+  /**
+   * The thread index built this turn, and the canon it was built from (`#2066
+   * vibe-talk-page-freeze`): one picker render asks for the index several times
+   * (choices, the open thread, each known thread), and each asking used to rescan
+   * the whole canon. Within one task the canon cannot change, so the same index
+   * answers them all; it is forgotten as the turn ends, never across one.
+   */
+  let indexThisTurn: { canon: unknown; byId: Map<string, ThreadChoice> } | null = null;
 
   function noteThreadListLanded(channel: string): void {
     threadListFailures.delete(channel);
@@ -308,20 +316,22 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
   }
 
   function threadIndex(): Map<string, ThreadChoice> {
+    const canon = deps.currentCanon();
+    if (indexThisTurn && indexThisTurn.canon === canon) return indexThisTurn.byId;
     const byId = new Map<string, ThreadChoice>();
-    if (!deps.threading() || deps.currentCanon().channel !== String(deps.selectedChannelId())) return byId;
+    if (!deps.threading() || canon.channel !== String(deps.selectedChannelId())) return byId;
     const pending = deps.pendingThreadTimes();
-    const answered = new Set(deps.currentCanon().messages.filter((held: Message) => {
+    const answered = new Set(canon.messages.filter((held: Message) => {
       const thread = (held as { thread?: { is_root?: boolean; id?: unknown } }).thread;
       return threadOf(held as never) && thread && thread.is_root !== true;
     }).map((held: Message) => String(((held as { thread?: { id?: unknown } }).thread as { id?: unknown }).id)));
-    for (const summary of deps.currentCanon().threads) {
+    for (const summary of canon.threads) {
       const id = String((summary as { id: unknown }).id);
-      if (id !== deps.currentCanon().scope) byId.set(id, threadChoice(id, summary as never));
+      if (id !== canon.scope) byId.set(id, threadChoice(id, summary as never));
     }
-    for (const message of deps.currentCanon().messages) {
+    for (const message of canon.messages) {
       const id = threadOf(message as never);
-      if (!id || id === deps.currentCanon().scope) continue;
+      if (!id || id === canon.scope) continue;
       const at = deps.timeOf(message);
       const thread = (message as { thread?: { is_root?: boolean; reply_count?: number } }).thread;
       const root = thread && thread.is_root ? message : null;
@@ -340,6 +350,12 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
     for (const [id, at] of pending) {
       const known = byId.get(id);
       if (known) known.at = Number.isFinite(known.at) ? Math.max(known.at, at) : at;
+    }
+    if (typeof queueMicrotask === "function") {
+      indexThisTurn = { canon, byId };
+      queueMicrotask(() => {
+        if (indexThisTurn && indexThisTurn.byId === byId) indexThisTurn = null;
+      });
     }
     return byId;
   }
