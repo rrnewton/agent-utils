@@ -692,7 +692,13 @@ pub struct DrainOptions {
     /// taken back out of the composer and stays pending. Codex and Muse ordinary follow-ups are
     /// accepted while working by default (Muse steers its running turn with them). Slash commands
     /// and unsupported harnesses still wait for `idle` or `done`. Off by default for Claude.
+    /// Ignored when `idle_only` is set.
     pub deliver_while_working: bool,
+    /// Never type into a working pane on any harness: readiness requires
+    /// `idle` or `done`, overriding every follow-up policy (Codex/Muse
+    /// included). The recovery driver's drain action sets this so a
+    /// queued prompt can never steer a live turn.
+    pub idle_only: bool,
     /// Longest wait for the queue's delivery lock and the host-wide target lock; `None` waits
     /// until they are free.
     pub lock_timeout: Option<Duration>,
@@ -739,6 +745,7 @@ impl Default for DrainOptions {
             working_timeout: Duration::from_secs(30),
             max_attempts: 3,
             deliver_while_working: false,
+            idle_only: false,
             lock_timeout: None,
             deadline: None,
             max_items: None,
@@ -2328,8 +2335,9 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                     initial_info.take(),
                     (
                         message_text(&document)
-                            .is_ok_and(|text| !text.trim_start().starts_with('/')),
-                        options.deliver_while_working,
+                            .is_ok_and(|text| !text.trim_start().starts_with('/'))
+                            && !options.idle_only,
+                        options.deliver_while_working && !options.idle_only,
                     ),
                 )
             })();
@@ -7652,6 +7660,39 @@ mod tests {
             fake.screen.as_ref().unwrap().state().queued,
             ["never accepted"]
         );
+    }
+
+    #[test]
+    fn idle_only_refuses_typing_into_a_working_codex() {
+        let directory = TestDirectory::new("idle-only-codex");
+        let screen = crate::submission::fake::FakeScreen::new("codex", true);
+        let fake = FakeAgent::with_screen(screen);
+        {
+            let mut state = fake.state.lock().expect("fake state");
+            state.states.clear();
+            state.last_state = "working".to_owned();
+        }
+        let error = send_with_runtime(
+            &fake,
+            &target(),
+            directory.path(),
+            "must wait for idle",
+            DrainOptions {
+                ready_timeout: Duration::ZERO,
+                max_attempts: 1,
+                idle_only: true,
+                deliver_while_working: true,
+                ..DrainOptions::default()
+            },
+            &FakeRuntime::default(),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("did not become idle/done"),
+            "{error}"
+        );
+        assert!(fake.screen.as_ref().unwrap().state().steered.is_empty());
+        assert!(fake.runs().is_empty());
     }
 
     #[test]

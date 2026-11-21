@@ -2273,7 +2273,7 @@ impl<A: crate::subagents::ManagedApi + ?Sized> DriverEffects for ProductionEffec
                 }
             }
             TeamAction::Drain { agent } => {
-                const BOUNDS: &str = "bounds ready_timeout=30s deadline=60s lock_timeout=10s max_attempts=1 max_items=1 deliver_while_working=false";
+                const BOUNDS: &str = "bounds ready_timeout=30s deadline=60s lock_timeout=10s max_attempts=1 max_items=1 idle_only=true deliver_while_working=false";
                 let manager = self.manager()?;
                 let options = crate::agent::DrainOptions {
                     ready_timeout: Duration::from_secs(30),
@@ -2281,6 +2281,7 @@ impl<A: crate::subagents::ManagedApi + ?Sized> DriverEffects for ProductionEffec
                     lock_timeout: Some(Duration::from_secs(10)),
                     max_attempts: 1,
                     max_items: Some(1),
+                    idle_only: true,
                     deliver_while_working: false,
                     ..crate::agent::DrainOptions::default()
                 };
