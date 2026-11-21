@@ -11,6 +11,13 @@ have for N is refused, naming both slugs; editing issue N under its existing
 slug passes. A change that fields two files for the same new number is
 refused the same way.
 
+One deliberate exception: renaming the SAME issue. A rename keeps the file
+path and the `created_at` stamped at filing, changing only the title slug;
+a collision is a different issue written from a stale view, with its own
+`created_at`. A slug change at the same path with the same `created_at` as
+main is therefore the same issue renamed and passes; a missing or different
+`created_at` proves nothing and is refused as before (fail closed).
+
 `mb create` cannot reserve numbers atomically today (it takes the highest
 number in the local checkout); that belongs to the minibeads tool and is
 tracked as a follow-up (#951's notes). This landing guard is the half that
@@ -56,38 +63,57 @@ def slug_of(text: str) -> str | None:
     return None
 
 
+def created_of(text: str) -> str | None:
+    """The `created_at` stamped at filing, or None when absent or empty."""
+
+    for line in text.splitlines()[:20]:
+        if not line.startswith("created_at:"):
+            continue
+        value = line.partition(":")[2].strip().strip("'\"")
+        return value or None
+    return None
+
+
 def violations(
-    changed: dict[str, str | None],
-    base_files: dict[int, tuple[str, str | None]],
+    changed: dict[str, tuple[str | None, str | None]],
+    base_files: dict[int, tuple[str, str | None, str | None]],
 ) -> list[str]:
     """Collision lines for one change.
 
-    `changed` maps each touched issue path to its new slug (None when the file
-    is gone or its slug does not parse); `base_files` maps every issue number
-    on the target main to `(path, slug)`.
+    `changed` maps each touched issue path to `(slug, created_at)` (either is
+    None when the file is gone or the field does not parse); `base_files` maps
+    every issue number on the target main to `(path, slug, created_at)`.
     """
 
     hits: list[str] = []
-    by_number: dict[int, list[tuple[str, str | None]]] = {}
-    for path, slug in sorted(changed.items()):
+    by_number: dict[int, list[tuple[str, str | None, str | None]]] = {}
+    for path, identity in sorted(changed.items()):
         match = ISSUE_FILE.match(path)
         if match is None:
             continue
-        by_number.setdefault(int(match.group(1)), []).append((path, slug))
+        by_number.setdefault(int(match.group(1)), []).append((path, identity[0], identity[1]))
     for number, present in sorted(by_number.items()):
         base = base_files.get(number)
         if base is not None:
-            base_path, base_slug = base
-            for path, slug in present:
-                if slug != base_slug:
+            base_path, base_slug, base_created = base
+            for path, slug, created in present:
+                # Same file, same filing stamp, only the slug moved: a rename
+                # of the same issue, not a second issue taking the number.
+                renamed = (
+                    path == base_path
+                    and slug is not None
+                    and created is not None
+                    and created == base_created
+                )
+                if slug != base_slug and not renamed:
                     hits.append(
                         f"{path}: files issue #{number} as {slug!r}, but the target "
                         f"main already files #{number} as {base_slug!r} in {base_path}; "
                         "renumber this issue, or edit the existing one under its slug"
                     )
-        slugs = {slug for _path, slug in present}
+        slugs = {slug for _path, slug, _created in present}
         if len(present) > 1 and len(slugs) > 1:
-            named = ", ".join(f"{path} as {slug!r}" for path, slug in present)
+            named = ", ".join(f"{path} as {slug!r}" for path, slug, _created in present)
             hits.append(f"one change files issue #{number} twice: {named}")
     return hits
 
@@ -120,7 +146,7 @@ def resolve_base(explicit: str | None) -> str:
 
 def base_issue_files(
     base: str, numbers: set[int] | None = None
-) -> dict[int, tuple[str, str | None]]:
+) -> dict[int, tuple[str, str | None, str | None]]:
     """Issue files on `base`, optionally only the `numbers` the change touches.
 
     One `git show` per file cost ~830 forks and the gate's inner memory cap:
@@ -146,7 +172,7 @@ def base_issue_files(
         stdout=subprocess.PIPE,
     )
     assert proc.stdin is not None and proc.stdout is not None
-    out: dict[int, tuple[str, str | None]] = {}
+    out: dict[int, tuple[str, str | None, str | None]] = {}
     for number, path in wanted:
         proc.stdin.write(f"{base}:{path}\n".encode())
         proc.stdin.flush()
@@ -156,13 +182,13 @@ def base_issue_files(
         size = int(header[2])
         text = proc.stdout.read(size).decode("utf-8", "replace")
         proc.stdout.read(1)  # the newline cat-file appends after each object
-        out[number] = (path, slug_of(text))
+        out[number] = (path, slug_of(text), created_of(text))
     proc.stdin.close()
     proc.wait()
     return out
 
 
-def changed_issue_files(base: str) -> dict[str, str | None]:
+def changed_issue_files(base: str) -> dict[str, tuple[str | None, str | None]]:
     merge_base = _git("merge-base", base, "HEAD").stdout.strip() or base
     changed: dict[str, str | None] = {}
     for argv in (
@@ -175,13 +201,14 @@ def changed_issue_files(base: str) -> dict[str, str | None]:
     for path in _git("ls-files", "--others", "--exclude-standard").stdout.splitlines():
         if ISSUE_FILE.match(path):
             changed.setdefault(path, "")
-    out: dict[str, str | None] = {}
+    out: dict[str, tuple[str | None, str | None]] = {}
     for path in changed:
         local = REPO_ROOT / path
         # A deletion (or the old side of an in-change rename) claims no number:
         # it leaves the number free, it does not file under it.
         if local.is_file():
-            out[path] = slug_of(local.read_text(encoding="utf-8"))
+            text = local.read_text(encoding="utf-8")
+            out[path] = (slug_of(text), created_of(text))
     return out
 
 
@@ -198,23 +225,33 @@ def self_test() -> int:
     expect(slug_of("title: 'two words: a thing'\n") is None, "a non-slug title has no slug")
     expect(slug_of("no title here\n") is None, "a missing title has no slug")
 
-    base: dict[int, tuple[str, str | None]] = {
-        951: (".minibeads/issues/agent-utils-951.md", "slug-b")
+    filed = "2026-01-01T00:00:00+00:00"
+    other = "2026-01-02T00:00:00+00:00"
+    base: dict[int, tuple[str, str | None, str | None]] = {
+        951: (".minibeads/issues/agent-utils-951.md", "slug-b", filed)
     }
-    added: dict[str, str | None] = {".minibeads/issues/agent-utils-951.md": "slug-a"}
+    added: dict[str, tuple[str | None, str | None]] = {
+        ".minibeads/issues/agent-utils-951.md": ("slug-a", other)
+    }
     hits = violations(added, base)
     expect(len(hits) == 1 and "'slug-a'" in hits[0] and "'slug-b'" in hits[0],
            f"adding N under a new slug is refused naming both slugs, got {hits}")
-    expect(violations({".minibeads/issues/agent-utils-951.md": "slug-b"}, base) == [],
+    expect(violations({".minibeads/issues/agent-utils-951.md": ("slug-b", other)}, base) == [],
            "editing N under its existing slug passes")
-    expect(violations({".minibeads/issues/agent-utils-952.md": "slug-a"}, base) == [],
+    expect(violations({".minibeads/issues/agent-utils-951.md": ("slug-a", filed)}, base) == [],
+           "renaming N (same file, same created_at) passes")
+    expect(len(violations({".minibeads/issues/agent-utils-951.md": ("slug-a", other)}, base)) == 1,
+           "a new slug with a different created_at is still refused")
+    expect(len(violations({".minibeads/issues/agent-utils-951.md": ("slug-a", None)}, base)) == 1,
+           "a new slug with no created_at is refused (fail closed)")
+    expect(violations({".minibeads/issues/agent-utils-952.md": ("slug-a", other)}, base) == [],
            "a fresh number passes")
-    both: dict[str, str | None] = {
-        ".minibeads/issues/agent-utils-960.md": "one-slug",
-        ".minibeads/issues/other-960.md": "two-slugs",
+    both: dict[str, tuple[str | None, str | None]] = {
+        ".minibeads/issues/agent-utils-960.md": ("one-slug", filed),
+        ".minibeads/issues/other-960.md": ("two-slugs", filed),
     }
     expect(len(violations(both, base)) == 1, "one change filing N twice under two slugs is refused")
-    expect(len(violations({".minibeads/issues/agent-utils-951.md": None}, base)) == 1,
+    expect(len(violations({".minibeads/issues/agent-utils-951.md": (None, filed)}, base)) == 1,
            "an unparseable slug for an owned number is refused")
 
     import tempfile
@@ -235,13 +272,15 @@ def self_test() -> int:
         issues = root / ".minibeads" / "issues"
         issues.mkdir(parents=True)
         (issues / "agent-utils-951.md").write_text(
-            "---\ntitle: 'slug-b: the first filing'\n---\n", encoding="utf-8"
+            "---\ntitle: 'slug-b: the first filing'\ncreated_at: 2026-01-01T00:00:00+00:00\n---\n",
+            encoding="utf-8",
         )
         git("add", ".")
         git("commit", "-q", "-m", "base")
         git("switch", "-q", "-c", "lane")
         (issues / "agent-utils-951.md").write_text(
-            "---\ntitle: 'slug-a: a different issue'\n---\n", encoding="utf-8"
+            "---\ntitle: 'slug-a: a different issue'\ncreated_at: 2026-01-02T00:00:00+00:00\n---\n",
+            encoding="utf-8",
         )
         git("add", ".")
         git("commit", "-q", "-m", "colliding lane")
@@ -251,16 +290,26 @@ def self_test() -> int:
         try:
             REPO_ROOT = root
             files = base_issue_files("main")
-            expect(files.get(951, (None, None))[1] == "slug-b", f"base slug read, got {files}")
+            expect(files.get(951, (None, None, None))[1] == "slug-b", f"base slug read, got {files}")
             changed = changed_issue_files("main")
-            expect(changed.get(".minibeads/issues/agent-utils-951.md") == "slug-a",
-                   f"changed slug read, got {changed}")
+            expect(changed.get(".minibeads/issues/agent-utils-951.md")
+                   == ("slug-a", "2026-01-02T00:00:00+00:00"),
+                   f"changed identity read, got {changed}")
             expect(len(violations(changed, files)) == 1, "temp-repo collision is refused")
             (issues / "agent-utils-951.md").write_text(
-                "---\ntitle: 'slug-b: edited under its slug'\n---\n", encoding="utf-8"
+                "---\ntitle: 'slug-b: edited under its slug'\n"
+                "created_at: 2026-01-01T00:00:00+00:00\n---\n",
+                encoding="utf-8",
             )
             changed = changed_issue_files("main")
             expect(violations(changed, files) == [], "temp-repo same-slug edit passes")
+            (issues / "agent-utils-951.md").write_text(
+                "---\ntitle: 'slug-c: renamed in place'\n"
+                "created_at: 2026-01-01T00:00:00+00:00\n---\n",
+                encoding="utf-8",
+            )
+            changed = changed_issue_files("main")
+            expect(violations(changed, files) == [], "temp-repo rename of the same issue passes")
         finally:
             REPO_ROOT = saved
 
@@ -300,7 +349,8 @@ def main(argv: list[str] | None = None) -> int:
         print(
             "\n  Two lanes took the same issue number from stale views of main. Renumber the\n"
             "  new issue (and its slug references), or edit the existing issue under the slug\n"
-            "  main already has for that number. See #951 mb-id-collision-guard.",
+            "  main already has for that number. Renaming that same issue (same file, same\n"
+            "  created_at, new slug) passes. See #951 mb-id-collision-guard.",
             file=sys.stderr,
         )
         return 1

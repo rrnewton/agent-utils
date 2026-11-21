@@ -8,7 +8,6 @@
 - **vibe-talk**: the chat client/server in this repo; its Discuss panel is the catch-up side agent.
 - **MCP**: Model Context Protocol; vibe-talk exposes read tools over it.
 - **Spark / muse-spark-1.4-internal**: the Muse Spark 1.4 model served by the internal AI gateway.
-- **small-elk-internal / Ember**: newer small internal preview models on the same gateway; small-elk-internal is the live Discuss model.
 - **P0**: highest priority.
 - **wrkslots**: the tool managing isolated git worktree slots, one per agent.
 - **dagrun**: the validation DAG runner; `make validate` selects the checks a change can affect.

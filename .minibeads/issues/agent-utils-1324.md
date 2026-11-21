@@ -39,7 +39,7 @@ wrkviz has one phase default plus one rollup default.
 
 # Notes
 
-Related: #1275 muse-ember-summarizer (the bake-off this mechanism serves),
+Related: #1275 muse-model-summarizer (the bake-off this mechanism serves),
 #1027 vibe-talk-spark-summarizer (gateway backend).
 
 ## Resolution
