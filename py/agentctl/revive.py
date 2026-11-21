@@ -908,7 +908,16 @@ def _slot_project_matches(candidate: AgentRecord, old: AgentRecord) -> bool:
 def _same_policy(candidate: AgentRecord, old: AgentRecord,
                  refresh: _ProfileRefresh | None = None) -> bool:
     # A candidate launched by a refreshing revive carries the profile's
-    # current policy, not the old generation's (#1928).
+    # current policy, not the old generation's (#1928). An in-flight
+    # journal also finishes against its own recorded launch spec
+    # (#1992): either generation's policy verifies.
+    if refresh is not None and _same_policy_recorded(candidate, old, None):
+        return True
+    return _same_policy_recorded(candidate, old, refresh)
+
+
+def _same_policy_recorded(candidate: AgentRecord, old: AgentRecord,
+                          refresh: _ProfileRefresh | None = None) -> bool:
     return not (candidate.name != old.name
             or candidate.token == old.token or candidate.harness != old.harness
             or candidate.cwd != old.cwd or candidate.adapter != _revived_adapter(old)

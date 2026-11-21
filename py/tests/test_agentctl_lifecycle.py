@@ -2675,6 +2675,28 @@ def test_revive_heals_a_slot_project_recorded_as_the_slot_itself(
     assert recovery._same_policy(candidate, old)
 
 
+def test_same_policy_accepts_the_recorded_generation_beside_a_drifted_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #1992: a candidate launched before the profile gained an
+    # argument still verifies (recorded generation), and one
+    # matching neither generation does not.
+    from agentctl import revive as recovery
+
+    manager, _fake, old = prepare_revive(tmp_path, monkeypatch)
+    policy = recovery._policy(manager, old)
+    candidate = recovery._new_candidate(old, "a" * 32, policy)
+    drifted = recovery._ProfileRefresh(
+        arguments=(*candidate.arguments, "--settings", "drifted.json"),
+        environment=(), environment_names=tuple(candidate.environment_names),
+        model=candidate.model, reasoning_effort=candidate.reasoning_effort,
+        fields=[], flags=[])
+    assert recovery._same_policy(candidate, old, drifted)
+    neither = recovery._new_candidate(old, "b" * 32, policy)
+    neither.arguments = ["--resume", "other-session", "--bogus"]
+    assert not recovery._same_policy(neither, old, drifted)
+
+
 def test_revive_cli_dry_run_and_batch_blocked_exit_are_reviewable_json(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:

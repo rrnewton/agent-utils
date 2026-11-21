@@ -2935,32 +2935,44 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         } else {
             None
         };
-        let effective = refreshed.as_ref().unwrap_or(old);
-        let expected_arguments = expected_arguments(effective)?;
-        Ok(record.name == old.name
-            && record.token != old.token
-            && record.harness == old.harness
-            && record.paused == old.paused
-            && record.goal == old.goal
-            && record.name_history == old.name_history
-            && record.former_names == old.former_names
-            && record.mode == old.mode
-            && record.backend == old.backend
-            && record.adapter == revived_adapter(old)
-            && record.cwd == old.cwd
-            && record.profile == old.profile
-            && record.model == effective.model
-            && record.reasoning_effort == effective.reasoning_effort
-            && record.arguments == expected_arguments
-            && record.environment_names == effective.environment_names
-            && record.slot == old.slot
-            && self.slot_project_matches(record, old)
-            && record.slot_isolation == old.slot_isolation
-            && record.extra.get("project_box") == old.extra.get("project_box")
-            && record.resume.as_deref() == Some(&native.value)
-            && record.native_session.as_ref().is_some_and(|session| {
-                session.agent == native.agent && session.value == native.value
-            }))
+        // #1992: the recorded generation is accepted beside the
+        // refreshed one, so an in-flight journal finishes against
+        // its own launch spec even after the profile drifted.
+        let mut effectives: Vec<&AgentRecord> = vec![old];
+        if let Some(refreshed) = refreshed.as_ref() {
+            effectives.insert(0, refreshed);
+        }
+        for effective in effectives {
+            let expected_arguments = expected_arguments(effective)?;
+            if record.name == old.name
+                && record.token != old.token
+                && record.harness == old.harness
+                && record.paused == old.paused
+                && record.goal == old.goal
+                && record.name_history == old.name_history
+                && record.former_names == old.former_names
+                && record.mode == old.mode
+                && record.backend == old.backend
+                && record.adapter == revived_adapter(old)
+                && record.cwd == old.cwd
+                && record.profile == old.profile
+                && record.model == effective.model
+                && record.reasoning_effort == effective.reasoning_effort
+                && record.arguments == expected_arguments
+                && record.environment_names == effective.environment_names
+                && record.slot == old.slot
+                && self.slot_project_matches(record, old)
+                && record.slot_isolation == old.slot_isolation
+                && record.extra.get("project_box") == old.extra.get("project_box")
+                && record.resume.as_deref() == Some(&native.value)
+                && record.native_session.as_ref().is_some_and(|session| {
+                    session.agent == native.agent && session.value == native.value
+                })
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Clear a Muse candidate's plugin-hooks trust dialog (#1932).

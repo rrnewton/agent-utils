@@ -4716,3 +4716,107 @@ fn revive_refuses_a_live_candidate_on_a_different_session() {
         agent::read_private_json(&fixture.root.join("registry/agents/worker/agent.json")).unwrap();
     assert_eq!(active["token"], json!(old.token), "{active}");
 }
+
+/// Write the fixture's profiles document with one claude profile
+/// carrying `argv` (#1992 scratch-registry reproduction helper).
+fn write_drift_profile(fixture: &Fixture, argv: &[&str]) {
+    let output = std::process::Command::new("/usr/bin/git")
+        .args(["init", "--quiet"])
+        .current_dir(&fixture.root)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    fs::write(fixture.root.join(".gitignore"), ".agentctl/\n").unwrap();
+    let directory = fixture.root.join(".agentctl");
+    agent::create_private_directory(&directory, "test profile config", false, false).unwrap();
+    agent::atomic_json(
+        &directory.join("profiles.json"),
+        &json!({
+            "schema": "agentctl-profiles/v1",
+            "profiles": {"driftp": {"harness": "claude", "mode": "interactive", "argv": argv}},
+        }),
+    )
+    .unwrap();
+}
+
+#[test]
+fn an_interrupted_revive_finishes_against_its_recorded_spec_after_the_profile_drifts() {
+    // #1992: a candidate launched from the profile as it was, then
+    // the profile gained an argument. Finishing must verify against
+    // the recorded launch spec, not today's profile, and publish
+    // the live candidate.
+    let (fixture, mut old, candidate) = {
+        // Start the candidate's generation as a revive would record
+        // it: old carries the profile and the recorded spec of the
+        // launching build, before the interrupted revive runs.
+        let (fixture, old) = recoverable("claude", true);
+        let mut old = old;
+        write_drift_profile(&fixture, &["--dangerously-skip-permissions"]);
+        old.profile = Some("driftp".to_owned());
+        old.launch_spec.as_mut().unwrap()["argv"] = json!(["--dangerously-skip-permissions"]);
+        fixture.manager().save(&old).unwrap();
+        super::super::revive::fail_once("launched");
+        assert!(fixture
+            .manager()
+            .revive("worker", false, None, TIMEOUT)
+            .is_err());
+        let path = stage_path(&fixture, &old);
+        let (_, candidate, _) = super::super::revive::read_record_at(&path, "worker").unwrap();
+        (fixture, old, candidate)
+    };
+    let _ = &mut old;
+    // The profile drifts after the candidate launched.
+    write_drift_profile(
+        &fixture,
+        &[
+            "--dangerously-skip-permissions",
+            "--settings",
+            "drifted.json",
+        ],
+    );
+    let result = fixture
+        .manager()
+        .revive("worker", false, None, TIMEOUT)
+        .unwrap();
+    assert_eq!(result["revived"], true, "{result}");
+    let published = fixture.manager().load("worker").unwrap();
+    assert_eq!(published.token, candidate.token);
+    assert!(!journal_path(&fixture, &old).exists());
+}
+
+#[test]
+fn a_dead_candidate_in_a_vanished_pane_abandons_only_with_the_pinned_token() {
+    // #1992 (b): the candidate died and its pane vanished; the
+    // pinned abandon (expected old token, journal-pinned candidate)
+    // is the way out, and a wrong token refuses.
+    let (fixture, old, candidate) = interrupted_after_launch("claude");
+    let pane = candidate.pane_id.clone().unwrap();
+    fixture
+        .client
+        .panes
+        .lock()
+        .unwrap()
+        .retain(|item| item.pane_id != pane);
+    fixture.client.herdr_closed.lock().unwrap().insert(pane);
+    fixture.client.started.store(false, Ordering::Relaxed);
+    fixture.client.custom_alive.store(false, Ordering::Relaxed);
+    // A wrong expected token refuses and keeps the journal.
+    let error = fixture
+        .manager()
+        .revive_with("worker", false, Some("not-the-token"), TIMEOUT, true)
+        .unwrap_err()
+        .to_string();
+    assert!(!error.is_empty(), "wrong token must refuse");
+    assert!(journal_path(&fixture, &old).exists());
+    // The pinned token abandons the dead candidate and relaunches.
+    let result = fixture
+        .manager()
+        .revive_with("worker", false, Some(&old.token), TIMEOUT, true)
+        .unwrap();
+    assert_eq!(result["revived"], true, "{result}");
+    assert!(!journal_path(&fixture, &old).exists());
+    assert_ne!(
+        fixture.manager().load("worker").unwrap().token,
+        candidate.token
+    );
+}
