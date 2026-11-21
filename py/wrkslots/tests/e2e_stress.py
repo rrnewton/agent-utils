@@ -828,6 +828,58 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _detach_project_images(project_root: Path, trace: Trace) -> list[str]:
+    """Unmount every slot image of one project through wrkslots (#2048).
+
+    Hand umounts and deleting mounted image files strand loop
+    devices; `wrkslots image unmount` proves the slot unused,
+    releases copies in other namespaces, and is idempotent.
+    Returns one problem string per slot that did not detach.
+    """
+    problems: list[str] = []
+    images = project_root / "worktrees" / "slot-images"
+    if not images.is_dir():
+        return problems
+    for type_dir in sorted(images.iterdir()):
+        if not type_dir.is_dir():
+            continue
+        for slot_dir in sorted(type_dir.iterdir()):
+            if not slot_dir.is_dir():
+                continue
+            done = _run(
+                [sys.executable, "-m", "wrkslots", "--project-root",
+                 str(project_root), "--machine", MACHINE,
+                 "image", "unmount", slot_dir.name,
+                 "--slot-type", type_dir.name],
+                cwd=project_root, env=_environment(),
+                expected=(0, 3), trace=trace,
+            )
+            if done.returncode != 0:
+                problems.append(
+                    f"{type_dir.name}/{slot_dir.name}: image unmount "
+                    f"returned {done.returncode}"
+                )
+    return problems
+
+
+def _mount_points_under(root: Path) -> list[str]:
+    """Mount points at or under ``root`` per this process's mount table."""
+    points: list[str] = []
+    try:
+        lines = Path("/proc/self/mountinfo").read_text(
+            encoding="utf-8").splitlines()
+    except OSError:
+        return points
+    prefix = str(root) + "/"
+    for line in lines:
+        fields = line.split(" - ", 1)[0].split()
+        if len(fields) >= 5:
+            point = fields[4].replace("\\040", " ")
+            if point == str(root) or point.startswith(prefix):
+                points.append(point)
+    return sorted(points)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.worker_project is not None:
@@ -874,6 +926,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             trace.add("scenario-fail", name=name, error=repr(exc))
         else:
             trace.add("scenario-pass", name=name)
+    # Detach every scenario's images through wrkslots itself,
+    # on success AND failure, before anything is removed (#2048).
+    for scenario_dir in sorted(root.iterdir()):
+        project_dir = scenario_dir / "project"
+        if project_dir.is_dir():
+            for problem in _detach_project_images(project_dir, trace):
+                failures.append(f"teardown {scenario_dir.name}: {problem}")
+    remaining = _mount_points_under(root)
+    if remaining:
+        failures.append(
+            "teardown: mounts remain under scratch root: "
+            + ", ".join(remaining)
+        )
     if failures:
         trace.add("suite-fail", failures=failures)
         print(

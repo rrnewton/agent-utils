@@ -341,6 +341,10 @@ def _run_seed(
     problems = _oracle(final, step=f"seed={seed} final")
     if problems:
         raise FuzzFailure("; ".join(problems))
+    # Detach images through wrkslots before the scratch rmtree,
+    # so a plain-directory host never notices and an image host
+    # leaves no loop mount behind (#2048).
+    e2e._detach_project_images(project.root, trace)
     print(f"lifecycle fuzz passed; seed={seed} steps={steps}")
 
 
