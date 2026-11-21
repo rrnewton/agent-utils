@@ -87,18 +87,16 @@ DEVICE_VOICE = """(() => {
     paused: false, speaking: false, pending: false,
     getVoices: () => [voice], addEventListener() {}, removeEventListener() {},
     speak(utterance) {
-      const entry = {text: String(utterance.text), started: null, ended: null, cancelled: false};
+      // `#2051`: onset is synchronous, never a timer racing a later cancel(): an
+      // utterance is started when it is spoken unless it was already cancelled.
+      const entry = {text: String(utterance.text), started: performance.now(), ended: null, cancelled: false};
       spoken.push(entry);
+      if (utterance.onstart) utterance.onstart({});
       setTimeout(() => {
         if (entry.cancelled) return;
-        entry.started = performance.now();
-        if (utterance.onstart) utterance.onstart({});
-        setTimeout(() => {
-          if (entry.cancelled) return;
-          entry.ended = performance.now();
-          if (utterance.onend) utterance.onend({});
-        }, %d * entry.text.length);
-      }, 30);
+        entry.ended = performance.now();
+        if (utterance.onend) utterance.onend({});
+      }, %d * entry.text.length);
     },
     cancel() { for (const entry of spoken) if (entry.ended === null) entry.cancelled = true; },
     pause() { this.paused = true; },
