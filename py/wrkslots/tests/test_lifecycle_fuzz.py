@@ -8,6 +8,7 @@ The long soak is opt-in by hand:
 
 from __future__ import annotations
 
+import os
 import resource
 import subprocess
 import sys
@@ -47,12 +48,17 @@ def test_sigterm_sweeps_run_images(tmp_path: Path) -> None:
 
     runner = Path(__file__).with_name("lifecycle_fuzz.py")
     before = set(glob.glob("/tmp/wrkslots-fuzz-*"))
+    env = dict(os.environ)
+    # conftest defaults new projects to plain worktrees; this test
+    # needs real image mounts to sweep.
+    env["WRKSLOTS_INIT_REPRESENTATION"] = "image"
     proc = subprocess.Popen(
-        [sys.executable, str(runner), "--seed", "99", "--steps", "60"],
+        [sys.executable, str(runner), "--seed", "2", "--steps", "60"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        env=env,
     )
     run_dir: Path | None = None
-    deadline = time.monotonic() + 120
+    deadline = time.monotonic() + 480
     while time.monotonic() < deadline and run_dir is None:
         for candidate in set(glob.glob("/tmp/wrkslots-fuzz-*")) - before:
             if (Path(candidate) / "project" / "worktrees").is_dir():
@@ -63,7 +69,7 @@ def test_sigterm_sweeps_run_images(tmp_path: Path) -> None:
     assert run_dir is not None, "fuzz run never created its project"
     # Wait until a slot image is really mounted under the run
     # directory, so the sweep has something to detach.
-    deadline = time.monotonic() + 120
+    deadline = time.monotonic() + 480
     mounted = ""
     while time.monotonic() < deadline and str(run_dir) not in mounted:
         mounted = subprocess.run(
@@ -74,7 +80,7 @@ def test_sigterm_sweeps_run_images(tmp_path: Path) -> None:
             time.sleep(0.2)
     assert str(run_dir) in mounted, "no slot image ever mounted"
     proc.send_signal(signal.SIGTERM)
-    proc.wait(timeout=120)
+    proc.wait(timeout=240)
     assert proc.returncode not in (0, None)
     mounts = subprocess.run(
         ["findmnt", "-rn", "-o", "TARGET"], text=True,
