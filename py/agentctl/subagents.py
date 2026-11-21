@@ -2597,6 +2597,16 @@ class ManagedAgents:
         agent._fsync_dir(str(source.parent))
         self._raise_archived_stranded(name, destination / "queue")
 
+    def _raise_archived_at(self, destination: Path) -> None:
+        """Raise stranded items for an archive just published at destination (#2028)."""
+        try:
+            record = json.loads((destination / "agent.json").read_text(encoding="utf-8"))
+            name = record.get("name") if isinstance(record, dict) else None
+        except (OSError, ValueError):
+            return
+        if isinstance(name, str):
+            self._raise_archived_stranded(name, destination / "queue")
+
     def _raise_archived_stranded(self, name: str, queue: Path) -> None:
         """Set aside the archived queue's undelivered items and raise them (#2028 v2)."""
         items = _set_aside_archived_queue(queue)
@@ -2607,7 +2617,13 @@ class ManagedAgents:
             designated = designation.get("name") if isinstance(designation, dict) else None
         except (OSError, ValueError):
             return
-        if not isinstance(designated, str) or designated == name:
+        if not isinstance(designated, str):
+            return
+        if designated == name:
+            notices = self.registry / "stranded-notices"
+            notices.mkdir(mode=0o700, parents=True, exist_ok=True)
+            agent._atomic_json(str(notices / f"{name}-{int(time.time())}.json"),
+                               {"agent": name, "items": items})
             return
         directory = registry_layout.directory(self.registry, designated)
         if not (directory / "agent.json").exists():
@@ -3287,6 +3303,7 @@ class ManagedAgents:
                         pinned, destination, expected_record=initial.content,
                         before_publish=before_publish,
                     )
+        self._raise_archived_at(destination)
         return {
             "name": record.name, "archive": str(destination), "pane_closed": False,
             "tab_closed": False, "runtime_preserved": True, "retired_dead_native": True,
@@ -3475,6 +3492,7 @@ class ManagedAgents:
                         pinned, destination, expected_record=initial.content,
                         before_publish=before_publish,
                     )
+        self._raise_archived_at(destination)
         return {
             "name": record.name, "archive": str(destination), "pane_closed": False,
             "tab_closed": False, "runtime_preserved": True, "retired_dead_adoption": True,
@@ -6416,6 +6434,7 @@ class ManagedAgents:
             expected_record=initial.content,
             before_publish=reprove_before_publish,
         )
+        self._raise_archived_at(destination)
         return {
             "name": record.name,
             "archive": str(destination),
@@ -6581,6 +6600,7 @@ class ManagedAgents:
         self._publish_pinned_directory(
             pinned, destination, expected_record=stopped_bytes,
         )
+        self._raise_archived_at(destination)
         try:
             tab_closed: bool | None = not any(
                 pane.tab_id == final.tab_id for pane in self.client.panes()

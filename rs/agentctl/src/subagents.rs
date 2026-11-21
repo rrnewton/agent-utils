@@ -7592,13 +7592,6 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         else {
             return;
         };
-        if designated == agent_name {
-            return;
-        }
-        let Ok(directory) = self.directory(&designated) else { return };
-        if !directory.join("agent.json").exists() {
-            return;
-        }
         let mut text = format!(
             "stranded by archive of {agent_name}: {} undelivered item(s) were set aside, not delivered:\n",
             report.items.len()
@@ -7608,6 +7601,34 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 "- {} from {} first queued {}: {}\n",
                 item.id, item.sender, item.queued_et, item.first_line
             ));
+        }
+        if designated == agent_name {
+            // The archived agent was itself the coordinator: no live
+            // queue can take the notice, so it is filed in the
+            // registry's own stranded-notices collection, where the
+            // next designated coordinator and status readers find it.
+            let dir = self.registry.join("stranded-notices");
+            let _ = fs::create_dir_all(&dir);
+            let name = format!(
+                "{agent_name}-{}.json",
+                agent_queue::queue::unix_seconds() as u64
+            );
+            let _ = fs::write(
+                dir.join(name),
+                serde_json::to_string_pretty(&json!({
+                    "agent": agent_name, "items": report.items.iter().map(|item| json!({
+                        "id": item.id, "sender": item.sender,
+                        "first_line": item.first_line, "queued_et": item.queued_et,
+                        "outcome": item.outcome,
+                    })).collect::<Vec<_>>(),
+                }))
+                .unwrap_or_default(),
+            );
+            return;
+        }
+        let Ok(directory) = self.directory(&designated) else { return };
+        if !directory.join("agent.json").exists() {
+            return;
         }
         let notice_id = format!(
             "stranded-{agent_name}-{}",
@@ -7621,6 +7642,18 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             &agent_queue::fsio::Blocking,
             |id| agent_queue::queue::plain_item(id, &text),
         );
+    }
+
+    /// Raise stranded items for an archive just published at
+    /// `destination`, whichever publication path put it there (#2028).
+    fn raise_archived_at(&self, destination: &Path) {
+        let name = fs::read_to_string(destination.join("agent.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|value| value.get("name").and_then(Value::as_str).map(str::to_owned));
+        if let Some(name) = name {
+            self.raise_archived_stranded(&name, &destination.join("queue"));
+        }
     }
 
     /// Create a new agent's `directory` (from [`Self::directory`]), private, and publish its
@@ -16765,6 +16798,7 @@ its drain would also type, so it was not queued",
                 Ok(())
             },
         )?;
+        self.raise_archived_at(&destination);
         Ok(json!({
             "name": record.name,
             "archive": destination,
@@ -17151,6 +17185,7 @@ its drain would also type, so it was not queued",
                 |directory: &File, _label| directory.sync_all(),
             ),
         )?;
+        self.raise_archived_at(&destination);
         Ok(json!({
             "name": record.name,
             "archive": destination,
@@ -17226,6 +17261,7 @@ its drain would also type, so it was not queued",
                 |directory: &File, _label| directory.sync_all(),
             ),
         )?;
+        self.raise_archived_at(&destination);
         Ok(json!({
             "name": record.name,
             "archive": destination,
@@ -17436,6 +17472,7 @@ its drain would also type, so it was not queued",
         self.client.close_pane(pane_id)?;
         atomic_replace_bytes(pinned, "agent.json", &stopped_bytes).map_err(|error| *error.error)?;
         self.publish_pinned_directory(pinned, &destination, &stopped_bytes)?;
+        self.raise_archived_at(&destination);
         let tab_closed = self.client.panes().ok().map(|panes| {
             panes
                 .iter()

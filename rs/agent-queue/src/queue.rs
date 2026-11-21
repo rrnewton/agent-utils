@@ -1420,7 +1420,20 @@ pub fn set_aside_archived_queue(root: &Path, now_ms: u64) -> ArchiveSetAsideRepo
     let Ok(identity) = directory_identity(root) else {
         return report;
     };
-    let Ok(_lock) = lock_delivery(root, identity, &NoWait) else {
+    // Retry briefly once the current holder releases instead of
+    // abandoning the sweep: a drain holds this lock only while it
+    // moves items between phases.
+    struct DeadlineWaiter(std::time::Instant);
+    impl Waiter for DeadlineWaiter {
+        fn cancelled(&self) -> bool {
+            std::time::Instant::now() >= self.0
+        }
+        fn sleep(&self, duration: std::time::Duration) {
+            std::thread::sleep(duration.min(std::time::Duration::from_millis(50)));
+        }
+    }
+    let waiter = DeadlineWaiter(std::time::Instant::now() + std::time::Duration::from_secs(5));
+    let Ok(_lock) = lock_delivery(root, identity, &waiter) else {
         return report;
     };
     let mut pending: Vec<(PathBuf, String)> = Vec::new();

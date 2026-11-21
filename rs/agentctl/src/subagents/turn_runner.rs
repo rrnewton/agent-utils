@@ -1006,6 +1006,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         atomic_replace_bytes(&pinned, "agent.json", &stopped_bytes)
             .map_err(|error| *error.error)?;
         self.publish_pinned_directory(&pinned, &destination, &stopped_bytes)?;
+        self.raise_archived_at(&destination);
         drop(runtime_lock);
         let runtime = relocate_receipt_paths(
             json!({

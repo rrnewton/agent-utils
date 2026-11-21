@@ -1878,11 +1878,25 @@ def test_suggestion4_offline_retirement_preserves_exact_artifacts_and_lazy_queue
     assert not directory.exists() and (archive / "agent.json").read_bytes() == raw
     assert (archive / "agent.json").stat().st_ino == agent_inode
     assert json.loads(raw)["lifecycle"] == "running"
-    assert {name: (archive / name).read_bytes() for name in before} == before
+    assert {
+        name: (archive / name).read_bytes()
+        for name in before
+        if name != "queue/inbox/pending-work.json"
+    } == {
+        name: data
+        for name, data in before.items()
+        if name != "queue/inbox/pending-work.json"
+    }
     if queued:
         assert (archive / "queue/.binding.lock").read_bytes() == b""
         assert not (archive / "queue/target.json").exists()
-        assert (archive / "queue/inbox/pending-work.json").read_bytes() == before["queue/inbox/pending-work.json"]
+        # #2028 v2: the undelivered item is set aside raised in the
+        # archived queue, never left pending and never processed.
+        assert not (archive / "queue/inbox/pending-work.json").exists()
+        aside = json.loads((archive / "queue/cancelled/pending-work.json").read_text())
+        assert aside["cancel_reason"] == "stranded-archived"
+        assert aside["delivery_state"] == "cancelled"
+        assert not (archive / "queue/processed/pending-work.json").exists()
     else:
         assert not (archive / "queue").exists()
     assert fake.closed == [] and fake.submitted == [] and fake.keys_sent == []

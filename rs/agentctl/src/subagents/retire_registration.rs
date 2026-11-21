@@ -143,6 +143,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 ));
             }
             self.publish_pinned_directory(&pinned, &destination, &bytes)?;
+            self.raise_archived_at(&destination);
         }
         if let Some((journal, operation)) = transaction {
             self.retire_revive_archive(&record, &destination, &journal, &operation, options).map_err(|error| fail(format!("registration archived at {}; revive archival incomplete: {error}; rerun with the same pins", destination.display())))?;

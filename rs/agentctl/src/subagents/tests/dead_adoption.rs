@@ -256,13 +256,35 @@ fn dead_adoption_retirement_preserves_every_original_artifact_without_server_cal
     );
     let after = artifacts(&archive);
     for (path, artifact) in &before {
+        // #2028 v2: the pending item is set aside in the archived
+        // queue (checked below), not preserved in the inbox.
+        if path.ends_with("queue/inbox/saved-task.json")
+            || path.ends_with("queue/inflight/ambiguous.json")
+        {
+            continue;
+        }
         assert_eq!(after.get(path), Some(artifact), "{path:?}");
     }
+    let aside: Value = serde_json::from_str(
+        &fs::read_to_string(archive.join("queue/cancelled/saved-task.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(aside["cancel_reason"], "stranded-archived");
+    assert!(!archive.join("queue/processed/saved-task.json").exists());
     let additions: Vec<_> = after
         .keys()
         .filter(|path| !before.contains_key(*path))
         .collect();
-    assert_eq!(additions, [&PathBuf::from("queue/.binding.lock")]);
+    assert_eq!(
+        additions,
+        [
+            &PathBuf::from("queue/.binding.lock"),
+            &PathBuf::from("queue/cancelled"),
+            &PathBuf::from("queue/cancelled/saved-task.json"),
+            &PathBuf::from("queue/failed/ambiguous.json"),
+            &PathBuf::from("queue/failed/ambiguous.json.error"),
+        ]
+    );
     assert_eq!(
         fs::read(archive.join("agent.json")).unwrap(),
         raw.as_bytes()
