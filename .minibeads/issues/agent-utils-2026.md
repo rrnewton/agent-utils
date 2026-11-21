@@ -1,12 +1,13 @@
 ---
 title: 'wrkslots-fence-breaks-nested-submodule-gitdir: fencing a slot breaks salvage in nested worktrees whose submodules record the unfenced path'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-11-21T05:30:00-05:00
-updated_at: 2026-11-21T05:30:00-05:00
+updated_at: 2026-11-21T05:50:34-05:00
+closed_at: 2026-11-21T05:50:34-05:00
 ---
 
 # Description
@@ -30,3 +31,7 @@ Status already survives this shape (#1483: per-invocation submodule overrides, n
 # Notes
 
 Related: #1483 (status read of the same stale-`core.worktree` shape), #788 (nested repository repair after a slot move), #1735 wrkslots-remove-holds-state-lock-through-salvage (the fence this rename belongs to).
+
+## Resolution
+
+[watermelon-full-preview] Landed as 8e1bfc62 on github/main (gated clean on 9f9fdb67; replay matched). `_index_state_trees` now falls back per-invocation when `git add -u` hits the stale-submodule chdir failure: populated gitlinks come out of the copied index, the rest of the worktree is added, then each gitlink goes back at the submodule's current HEAD read straight from its gitdir. Only the copied index is written — no Git file, journal, or registry state changes. The new regression test renames a slot to its fenced name over a nested worktree + submodule and asserts the salvaged worktree tree carries the gitlink at the submodule's current HEAD; the existing nested-repair tests (including the live pinned `core.worktree` refusal) still pass.
