@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-windowed-viewport-fill: windowed window must fill the viewport after a fold'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -29,3 +29,7 @@ updated_at: 2026-11-20T17:59:00-05:00
 # Notes
 
 [watermelon-full-preview] Number pre-assigned by the lead coordinator (2026-11-20). Related: #1985 vibe-talk-windowed-all-view-fixes (landed as b1c721cc; its coverage shift only fired when less than one row of the band was covered, which is why this case survived), #2008 vibe-talk-windowed-send-frame-drop.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as 33991464 (2026-11-20): after mounting, the windowed render shifts its slice until the mounted rows reach the visible band's foot, and symmetrically its head, so a fold that repriced every row can no longer leave the reader looking at a settled band of spacer. Proven in real Chromium: settled elementFromPoint mid-band on a row after ';', and the windowed All walk's no-empty-band assertion green at 412x915 and 1280x800 with windowed on (anchor within 0.5px, END/Newest at the foot, zero settle direction changes), the refresh walk green, and the gate's only red steps pre-existing on main.
