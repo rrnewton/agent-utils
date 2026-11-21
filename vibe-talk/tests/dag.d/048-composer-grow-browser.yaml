@@ -3,15 +3,16 @@ steps:
     job: composer-grow-browser
     desc: the Grow checkbox and the message box growing with a long paste up to 60% of the window, Send on screen, in current Chromium at 1280x800, 1920x1080, 1280x600 and two columns, without field-sizing, and unchanged on a 393x852 phone
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && python3 tests/composer_grow_browser.py
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/composer_grow_browser.py
     jobs_flag: ""
-    deps: [setup.contract-tools]
+    deps: [setup.contract-tools, build.page]
     timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
       est_duration_s: 25
       classification: latency-bound
+      preferred_inner_jobs: 4
       rss_baseline_bytes: 1073741824
 
   # `#220 view-switch-instant` in the browser engine: All to Main and back in the bar's real picker

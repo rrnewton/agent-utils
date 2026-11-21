@@ -3,15 +3,16 @@ steps:
     job: search-unmatched-browser
     desc: a search's unmatched lines opened by real presses, in All, in a thread and among the thread cards, in current Chromium at 393x852 and 1280x800
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && python3 tests/search_unmatched_browser.py
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/search_unmatched_browser.py
     jobs_flag: ""
-    deps: [setup.contract-tools]
+    deps: [setup.contract-tools, build.page]
     timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
       est_duration_s: 6
       classification: latency-bound
+      preferred_inner_jobs: 4
       rss_baseline_bytes: 1073741824
 
   # `#247 reply-continuity` in the browser engine, at 1280x800 with a mouse and at 412x915 by touch, at

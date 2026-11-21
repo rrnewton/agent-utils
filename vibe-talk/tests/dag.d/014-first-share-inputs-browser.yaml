@@ -3,15 +3,16 @@ steps:
     job: first-share-inputs-browser
     desc: the first-share sentence commits typed numbers, snaps past its bounds, restores when emptied, and greys out with its guard, in current Chromium
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && python3 tests/first_share_inputs_browser.py
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/first_share_inputs_browser.py
     jobs_flag: ""
-    deps: [setup.contract-tools]
+    deps: [setup.contract-tools, build.page]
     timeout: 480
     cpu_timeout: 60
     hint:
       resources: {browser: 1}
       est_duration_s: 20
       classification: latency-bound
+      preferred_inner_jobs: 4
       rss_baseline_bytes: 1073741824
 
   # `#369 pairing-link` in the browser engine: a fresh phone-sized browser opens a pairing link, the

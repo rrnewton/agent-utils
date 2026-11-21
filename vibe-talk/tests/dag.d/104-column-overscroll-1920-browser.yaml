@@ -3,15 +3,16 @@ steps:
     job: column-overscroll-1920-browser
     desc: the right column scrolls past its foot into blank room at a desk until the last card's top is mid-column, by the wheel after a rest and by PgDn, Space and the down arrow, closes it going back up, by End and by a search, holds the reader in it as the last card changes size and as replies arrive, and stops a fling or a held key on the foot, in current Chromium at 1920x1080, with six negative controls
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && python3 tests/column_overscroll_browser.py --size desk-1920
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/column_overscroll_browser.py --size desk-1920
     jobs_flag: ""
-    deps: [setup.contract-tools]
+    deps: [setup.contract-tools, build.page]
     timeout: 960
     cpu_timeout: 120
     hint:
       resources: {browser: 1}
       est_duration_s: 120
       classification: latency-bound
+      preferred_inner_jobs: 4
       rss_baseline_bytes: 1073741824
 
   # `#240 reading-bookmark` in the browser engine, at 1280x800 with a mouse and keys and at 412x915 by

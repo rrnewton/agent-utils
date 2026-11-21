@@ -3,15 +3,16 @@ steps:
     job: provider-groups-browser
     desc: the bar's channel picker grouped by chat service, stepped with Alt+Down/Up through CDP and restored after a reload, in current Chromium at 1280x800 and 375x812
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && python3 tests/provider_groups_browser.py
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/provider_groups_browser.py
     jobs_flag: ""
-    deps: [setup.contract-tools]
+    deps: [setup.contract-tools, build.page]
     timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
       est_duration_s: 6
       classification: latency-bound
+      preferred_inner_jobs: 4
       rss_baseline_bytes: 1073741824
 
   # `#402 who-is-who-channel-box` and `#401 hidden-channels-fold` in the browser engine at 1280x800 and a

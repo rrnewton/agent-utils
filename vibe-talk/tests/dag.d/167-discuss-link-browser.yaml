@@ -16,4 +16,5 @@ steps:
       resources: {browser: 1}
       est_duration_s: 90
       classification: latency-bound
+      preferred_inner_jobs: 4
       rss_baseline_bytes: 1073741824

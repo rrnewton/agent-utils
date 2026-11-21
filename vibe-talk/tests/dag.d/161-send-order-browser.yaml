@@ -12,6 +12,7 @@ steps:
       resources: {browser: 1}
       est_duration_s: 15
       classification: latency-bound
+      preferred_inner_jobs: 4
       rss_baseline_bytes: 1073741824
 
   # THE ONE THAT LEAKED. It starts a real server and drives a real Chromium at it. Boxed, its

@@ -3,15 +3,16 @@ steps:
     job: voice-reconnect-browser
     desc: a voice bridge that loses a turn and asks to reconnect — the call carried on a new session, the lost relay sent again once, the bound and a non-reconnect error still ending it — in current Chromium
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && python3 tests/voice_reconnect_browser.py
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/voice_reconnect_browser.py
     jobs_flag: ""
-    deps: [setup.contract-tools]
+    deps: [setup.contract-tools, build.page]
     timeout: 720
     cpu_timeout: 90
     hint:
       resources: {browser: 1}
       est_duration_s: 21
       classification: latency-bound
+      preferred_inner_jobs: 4
       rss_baseline_bytes: 1073741824
 
   # `#431 voice-transcript-expand` in the browser engine, at 393x852 by touch and 1280x800 by mouse: a

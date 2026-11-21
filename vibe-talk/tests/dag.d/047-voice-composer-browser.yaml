@@ -3,15 +3,16 @@ steps:
     job: voice-composer-browser
     desc: the call's message box and the view switch on screen while the box is focused, and its first send, in current Chromium at 412x915 and 1280x800
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && python3 tests/voice_composer_browser.py
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/voice_composer_browser.py
     jobs_flag: ""
-    deps: [setup.contract-tools]
+    deps: [setup.contract-tools, build.page]
     timeout: 240
     cpu_timeout: 30
     hint:
       resources: {browser: 1}
       est_duration_s: 4
       classification: latency-bound
+      preferred_inner_jobs: 4
       rss_baseline_bytes: 1073741824
 
   # `#340 composer-grow-box` in the browser engine, a real paste (the clipboard written, then Ctrl+V

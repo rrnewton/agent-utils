@@ -3,15 +3,16 @@ steps:
     job: fold-latency-browser
     desc: Shift+O folds and e marks Done in an unpacked Threads view, each drawn as promised, and hiding a row restyles only what it touches (#532), in current Chromium at 393x852 and 1280x800
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && python3 tests/fold_latency_browser.py
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/fold_latency_browser.py
     jobs_flag: ""
-    deps: [setup.contract-tools]
+    deps: [setup.contract-tools, build.page]
     timeout: 960
     cpu_timeout: 120
     hint:
       # A latency budget measures the page, so it owns every browser slot,
       # like timeline.browser.benchmark.
-      resources: {browser: 8}
+      resources: {browser: 4}
+      preferred_inner_jobs: 4
       est_duration_s: 25
 
   # `#459 pack-keeps-card-still` and `#460 pack-gap-slide` in the browser engine, at 1280x800 with a mouse and

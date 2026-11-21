@@ -3,15 +3,16 @@ steps:
     job: channel-box-browser
     desc: Settings' channel section in current Chromium at 1280x800 and 393x852, Who is who in the channel box following its picker, and the hidden channels a folded fold at its foot that moves nothing above it
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && python3 tests/channel_box_browser.py
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/channel_box_browser.py
     jobs_flag: ""
-    deps: [setup.contract-tools]
+    deps: [setup.contract-tools, build.page]
     timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
       est_duration_s: 6
       classification: latency-bound
+      preferred_inner_jobs: 4
       rss_baseline_bytes: 1073741824
 
   # `#1781 vibe-talk-first-run-welcome-channel-default` in the browser engine at 412x915 (scale

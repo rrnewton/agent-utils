@@ -3,15 +3,16 @@ steps:
     job: thread-split-regroup-browser
     desc: three parts of one bridge reply in a thread regroup when Combine messages is turned on, in current Chromium at 412x915 and 1280x800
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && python3 tests/thread_split_regroup_browser.py
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/thread_split_regroup_browser.py
     jobs_flag: ""
-    deps: [setup.contract-tools]
+    deps: [setup.contract-tools, build.page]
     timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
       est_duration_s: 6
       classification: latency-bound
+      preferred_inner_jobs: 4
       rss_baseline_bytes: 1073741824
 
   # `#377 compact-collapsed-rows` in the browser engine, at 393x852 by touch and 1280x800 with a mouse, in

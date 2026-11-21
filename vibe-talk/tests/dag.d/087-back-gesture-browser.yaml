@@ -3,15 +3,16 @@ steps:
     job: back-gesture-browser
     desc: the browser's Back closes a thread, the thread list, a thread opened from it and a menu over either in the same document, one per press, keeping the reader's place, stands on the earlier load's entries after a reload, and leaves the app only from the top, in current Chromium at a 412x915 Android phone in standalone mode and a 1440x900 desk
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && python3 tests/back_gesture_browser.py
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/back_gesture_browser.py
     jobs_flag: ""
-    deps: [setup.contract-tools]
+    deps: [setup.contract-tools, build.page]
     timeout: 480
     cpu_timeout: 60
     hint:
       resources: {browser: 1}
       est_duration_s: 8
       classification: latency-bound
+      preferred_inner_jobs: 4
       rss_baseline_bytes: 1073741824
 
   # `#324 live-pill-covers-row` in the browser engine, at a 412x915 phone with touch, in the dark scheme and the

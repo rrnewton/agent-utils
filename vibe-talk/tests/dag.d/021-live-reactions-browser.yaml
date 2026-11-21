@@ -3,15 +3,16 @@ steps:
     job: live-reactions-browser
     desc: a live reaction update drawn on the open page in current Chromium at a 412x915 Android viewport
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && python3 tests/live_reactions_browser.py
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/live_reactions_browser.py
     jobs_flag: ""
-    deps: [setup.contract-tools]
+    deps: [setup.contract-tools, build.page]
     timeout: 240
     cpu_timeout: 30
     hint:
       resources: {browser: 1}
       est_duration_s: 4
       classification: latency-bound
+      preferred_inner_jobs: 4
       rss_baseline_bytes: 1073741824
 
   # `#323 slack-system-bots` in the browser engine: a Slack welcome bot alone in a channel drawn as

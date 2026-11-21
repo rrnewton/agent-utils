@@ -22,8 +22,8 @@
 #
 # THE BROWSER CAP IS THE POINT OF THE `resource_caps` BLOCK. Playwright is the only genuinely
 # expensive thing here — a real Chromium per run — and a pile of them at once on a laptop is how a
-# test suite becomes the reason the laptop is unusable. `browser: 8` is a semaphore: any number of
-# steps may DECLARE the resource, and at most eight hold it at a time.
+# test suite becomes the reason the laptop is unusable. `browser: 4` is a semaphore: any number of
+# steps may DECLARE the resource, and at most four hold it at a time.
 #
 # It was 1 until `#474 browser-lane-critical-path` (2026-10-23). The browser steps then ran one after
 # another, and their sum was nearly all of a 2470s gate. They are latency-bound, not
@@ -42,6 +42,13 @@
 # It went from 4 to 8 on 2026-11-07: two paired page-only runs on a 316-core host took 869/840 s at 4
 # and 500/450 s at 8 (-42%/-46%), with no failed step at either cap, the cap-8 runs starting at equal
 # or higher load. The timing checks that hold every slot still run alone among browsers.
+#
+# It returned to 4 on 2026-11-21 (#2077 vibe-talk-browser-checks-hot-host): those paired runs were
+# page-only on an otherwise idle-ish host, but in production three gates share the host, each capped
+# at 48 CPUs (#1254), so cap 8 meant up to 24 one-core-boxed Chromiums timesharing with the builders
+# inside each gate — and unrelated gates went red in rotating sets of 4-14 browser timeouts. Cap 4
+# with a four-core box per browser sizes the lane to the gate allowance (16 of 48 CPUs); the same
+# change builds the page once per gate (`build.page`) instead of once per walk.
 #
 # DISABLED UNTIL ROBUST (#1250 vibe-talk-timing-robust; owner reply 346, 2026-11-10: tests
 # that are real-time-sensitive leave gating until they are fast, high-signal and robust on a
@@ -71,9 +78,16 @@
 description: vibe-talk fmt, lint, unit, PWA, offline-cache, page and screenshot suites, boxed
 
 resource_caps:
-  # A real browser. Eight at a time, however many steps ask for it. validation/timeline.dag.yaml
+  # A real browser. Four at a time, however many steps ask for it. validation/timeline.dag.yaml
   # states the same number: the composed graph refuses two fragments that disagree.
-  browser: 8
+  #
+  # It went from 8 back to 4 for #2077 vibe-talk-browser-checks-hot-host (2026-11-21): inside a
+  # gate's 48-CPU allowance (#1254), eight Chromiums each boxed to one core starved beside the
+  # builders and timed out in rotating sets of 4-14 whenever several gates shared a loaded host.
+  # Four browsers at `preferred_inner_jobs: 4` apiece keep the browser lane's ceiling at 16 of the
+  # gate's 48 CPUs, sized to the allowance instead of to the host. The cap is per gate process (no
+  # shared resource-caps path is wired), so concurrent gates still multiply it.
+  browser: 4
 
 include:
   # One file per check under tests/dag.d/ (#1891 vibe-talk-dag-append-conflicts):

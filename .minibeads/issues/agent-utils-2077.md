@@ -26,3 +26,19 @@ Find why: concurrent Chromium instances inside one gate's CPU allowance, page bu
 # Notes
 
 Filed by the coordinator so the issue link resolves on main; the owning lane refines this file as it works.
+
+## Diagnosis (2026-11-21, mu-browserload)
+
+[watermelon-full-preview] Three stacked bounds starve Chromium, then fixed wall-clock waits convert starvation into rotating timeouts:
+
+- Scheduling: 158 runnable browser steps hold `browser: 1` under cap `browser: 8`, per gate process only (no shared resource-caps path), so three concurrent gates run up to 24 Chromiums (27 counting `check.keyboard-browser`, whose fragment declared no `browser` resource at all). Inside a gate's 48-CPU allowance (#1254), each browser step was boxed to one core (no `preferred_inner_jobs`, dagrun's small default) beside CPU-bound builders admitted on the same ready set; admission never sums CPU demand.
+- Page build: 134 fake-server walks each ran `node web/build.mjs` per Python process (`page_sources.served` caches per process only), about 134 esbuild builds per gate bursting beside sibling Chromiums. The 30 real-server checks already share `build.release`.
+- Waits: 1190 clicks, 220 gotos and about 871 locator `wait_for`s carry no timeout and inherit Playwright's 30 s default; only two files set a hang backstop. Explicit short bounds (3000 ms welcome gate in 104 files, 10000 ms in 93) are likewise wall-clock verdicts. No shared waiting helper exists; the `STATE_S` poll-then-`check` idiom and #2012's condition wait are copy-pasted.
+
+Gate ledger rows a4100efa, e1ecd02f, bf300e59, 3d872668, d2d5db8f share no single failing step; `offline-cache-phone-360` fails in four of five. Step output is not retained anywhere durable (ledger `log_path` is always null; no `DAGRUN_LOG_DIR` is set), tracked separately by the coordinator.
+
+## Fix in progress
+
+- A (scheduling + build): cap `browser: 8` to `4` in both fragments (sole-holder demands follow), `preferred_inner_jobs: 4` on every browser step (browser lane ceiling 16 of the gate's 48 CPUs), the missing hint on `keyboard-browser`, and one `build.page` step per gate serving all fake-server walks through `VIBE_TALK_WEB_ROOT` (134 page builds to 1; a stale build refuses by recorded input digests).
+- B (waits): shared `browser_waits` helper (hang backstop defaults + condition waits) applied suite-wide.
+- C (proof): the browser group repeatedly above 75% host CPU; quarantine only what still fails, as `disabled-optin` with a pointer here.

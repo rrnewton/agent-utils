@@ -3,13 +3,14 @@ steps:
     job: thread-card-markdown-browser
     desc: a long Markdown first message's thread card keeps its formatting, splits only between lines, waits for its summary in the summary's layout, and draws a known summary with the page, a table first is one line on the card and whole under it from the first frame (#533), and a page older than the server's offers a reload (#529), in current Chromium at 393x852 and 1280x800
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && python3 tests/thread_card_markdown_browser.py
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/thread_card_markdown_browser.py
     jobs_flag: ""
-    deps: [setup.contract-tools]
+    deps: [setup.contract-tools, build.page]
     timeout: 960
     cpu_timeout: 120
     hint:
       resources: {browser: 1}
+      preferred_inner_jobs: 4
       est_duration_s: 30
 
   # `#532 shift-o-latency` in the browser engine: twenty threads of long replies unpacked in the Threads view;

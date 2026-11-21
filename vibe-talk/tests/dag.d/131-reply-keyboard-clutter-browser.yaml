@@ -3,15 +3,16 @@ steps:
     job: reply-keyboard-clutter-browser
     desc: one Send only, no floating chips and a compact reply row while the keyboard is up, all back as it goes, in current Chromium at 393x852 by touch and 1280x800
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && python3 tests/reply_keyboard_clutter_browser.py
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/reply_keyboard_clutter_browser.py
     jobs_flag: ""
-    deps: [setup.contract-tools]
+    deps: [setup.contract-tools, build.page]
     timeout: 360
     cpu_timeout: 60
     hint:
       resources: {browser: 1}
       est_duration_s: 16
       classification: latency-bound
+      preferred_inner_jobs: 4
       rss_baseline_bytes: 1073741824
 
   # `#1725 vibe-talk-undo-chip-stretched` in the browser engine: at a 412x915 phone (device scale

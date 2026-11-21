@@ -3,7 +3,7 @@ description: Browser-functional and interaction-budget checks for the timeline v
 resource_caps:
   # Real browsers, as many at once as vibe-talk/tests.dag.yaml allows its own: the composed graph
   # refuses two fragments that disagree on a cap.
-  browser: 8
+  browser: 4
   # The three steps below share py/tests/js/browser's output directory, so they take turns with
   # each other whatever the browser cap. The functional suite serves its fixture on an ephemeral
   # port (bind :0 via the config's free-port probe; AGENT_TIMELINE_E2E_PORT pins one explicitly).
@@ -130,7 +130,7 @@ steps:
     hint:
       # A redraw budget is a timing: it holds every browser slot, so it is still measured with no
       # other browser running, as it was when the cap was 1.
-      resources: {browser: 8, timeline-fixture: 1}
+      resources: {browser: 4, timeline-fixture: 1}
       est_duration_s: 15
       classification: latency-bound
       preferred_inner_jobs: 2

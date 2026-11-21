@@ -12,6 +12,7 @@ steps:
       resources: {browser: 1}
       est_duration_s: 60
       classification: latency-bound
+      preferred_inner_jobs: 4
       rss_baseline_bytes: 1073741824
 
   # `#1176 doc-kind-buckets`: one item of each kind in the Documents view.

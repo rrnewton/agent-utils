@@ -1,0 +1,20 @@
+steps:
+  # One page build per gate (#2077 vibe-talk-browser-checks-hot-host): the fake-server walks serve
+  # this build through `VIBE_TALK_WEB_ROOT` instead of each running `node web/build.mjs` in its own
+  # step box (~134 esbuild builds per gate, bursting beside sibling Chromiums). `page_sources.served`
+  # returns a directory holding `assets.json` unbuilt, and refuses a build whose recorded input
+  # digests differ from the current sources, so a stale copy fails closed instead of passing stale.
+  - group: build
+    job: page
+    desc: the one page build the fake-server browser walks serve
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && ../scripts/with-node22 node web/build.mjs --out target/web
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 1200
+    cpu_timeout: 300
+    hint:
+      est_duration_s: 30
+      classification: cpu-bound
+      preferred_inner_jobs: 4
+      rss_baseline_bytes: 1073741824

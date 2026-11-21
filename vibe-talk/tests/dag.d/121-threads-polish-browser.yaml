@@ -3,13 +3,14 @@ steps:
     job: threads-polish-browser
     desc: the Threads view's chips pressed alike, Cmd+S keeping it with Main channel on, the owner's main rows centred, and Cmd+[ and Cmd+] through the views, in current Chromium at 1280x800 and 393x852
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && python3 tests/threads_polish_browser.py
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/threads_polish_browser.py
     jobs_flag: ""
-    deps: [setup.contract-tools]
+    deps: [setup.contract-tools, build.page]
     timeout: 480
     cpu_timeout: 60
     hint:
       resources: {browser: 1}
+      preferred_inner_jobs: 4
       est_duration_s: 9
 
   # `#501 thread-bridge-gutter` in the browser engine, at 393x852 and 412x915 by touch and 1280x800

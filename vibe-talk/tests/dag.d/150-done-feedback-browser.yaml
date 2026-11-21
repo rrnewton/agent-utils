@@ -3,15 +3,16 @@ steps:
     job: done-feedback-browser
     desc: selected read ringed dashed grey and selected unread solid in the accent in both schemes, the moment of a Done and every Undo, reduced motion, a plain Undo chip on phones and a named one on a desk, and nothing floating over the message box at any scroll position, in current Chromium
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && python3 tests/done_feedback_browser.py
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/done_feedback_browser.py
     jobs_flag: ""
-    deps: [setup.contract-tools]
+    deps: [setup.contract-tools, build.page]
     timeout: 720
     cpu_timeout: 90
     hint:
       resources: {browser: 1}
       est_duration_s: 40
       classification: latency-bound
+      preferred_inner_jobs: 4
       rss_baseline_bytes: 1073741824
 
   # `#244 elision-word-count` in the browser engine, in seven layouts — phones at 360 and 412px, at 80%

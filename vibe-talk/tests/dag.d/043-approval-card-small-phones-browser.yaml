@@ -3,9 +3,9 @@ steps:
     job: approval-card-small-phones-browser
     desc: the send card's place, reach, hold, docked layout, frozen card and recap line, the channel's list held still and a reader who saw only the card, at 360x780 and 375x667, and the trips to Settings and Help at 375x667, in current Chromium
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && python3 tests/approval_card_browser.py --part small-phones
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/approval_card_browser.py --part small-phones
     jobs_flag: ""
-    deps: [setup.contract-tools]
+    deps: [setup.contract-tools, build.page]
     timeout: 800
     # CPU, measured: ~55 CPU-s solo (systemd scope accounting) against
     # ~180 s wall. Under gate load the wall stretches several-fold and
@@ -18,5 +18,6 @@ steps:
       resources: {browser: 1}
       est_duration_s: 200
       classification: latency-bound
+      preferred_inner_jobs: 4
       rss_baseline_bytes: 1073741824
 

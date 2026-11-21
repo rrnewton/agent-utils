@@ -3,15 +3,16 @@ steps:
     job: elision-browser
     desc: every folded message's label claims no more than its clamp hides, in seven layouts, in current Chromium
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && python3 tests/elision_browser.py
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/elision_browser.py
     jobs_flag: ""
-    deps: [setup.contract-tools]
+    deps: [setup.contract-tools, build.page]
     timeout: 480
     cpu_timeout: 60
     hint:
       resources: {browser: 1}
       est_duration_s: 7
       classification: latency-bound
+      preferred_inner_jobs: 4
       rss_baseline_bytes: 1073741824
 
   # `#301 semicolon-expand-cycle` in the browser engine, at a 1280x800 desk with the keys: ; four times and :

@@ -3,15 +3,16 @@ steps:
     job: reactions-browser
     desc: emoji reaction strips laid out in current Chromium at 412x915 and 360x800 Android viewports and a 1280x800 desk
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && python3 tests/reactions_browser.py
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/reactions_browser.py
     jobs_flag: ""
-    deps: [setup.contract-tools]
+    deps: [setup.contract-tools, build.page]
     timeout: 240
     cpu_timeout: 30
     hint:
       resources: {browser: 1}
       est_duration_s: 4
       classification: latency-bound
+      preferred_inner_jobs: 4
       rss_baseline_bytes: 1073741824
 
   # `#378 live-reactions` in the browser engine: a reaction pushed as a live update appears under

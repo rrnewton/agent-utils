@@ -3,15 +3,16 @@ steps:
     job: live-pill-browser
     desc: the live pill and the search glass float over the channel's list with no reserved band at its head, in Main and in a thread, at any scroll position and as a thread lands, in current Chromium at a 412x915 phone in both schemes
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && python3 tests/live_pill_browser.py
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/live_pill_browser.py
     jobs_flag: ""
-    deps: [setup.contract-tools]
+    deps: [setup.contract-tools, build.page]
     timeout: 960
     cpu_timeout: 120
     hint:
       resources: {browser: 1}
       est_duration_s: 22
       classification: latency-bound
+      preferred_inner_jobs: 4
       rss_baseline_bytes: 1073741824
 
   # `#1711 vibe-talk-floating-chip-overlap` in the browser engine: at a 412x915 phone (device scale

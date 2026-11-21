@@ -3,15 +3,16 @@ steps:
     job: scroll-stability-browser
     desc: the message lists hold the reader's row through live messages, refreshes, a read landing after a scroll, summaries, focus moves, the view keys and the mouse crossing the cards with or without a card highlighted, follow only a reader on the newest line, and open threads and the thread list at their foot, in current Chromium at 1280x800 and 412x915; and the thread list holds the card being read while replies move other cards to its foot, at 393x852 and 1280x800; every hold judged when its drawn batch settles, never by a held window or a frame count
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && python3 tests/scroll_stability_browser.py
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/scroll_stability_browser.py
     jobs_flag: ""
-    deps: [setup.contract-tools]
+    deps: [setup.contract-tools, build.page]
     timeout: 960
     cpu_timeout: 120
     hint:
       resources: {browser: 1}
       est_duration_s: 140
       classification: latency-bound
+      preferred_inner_jobs: 4
       rss_baseline_bytes: 1073741824
 
   # `#1210 ui-stability-no-async-shift` in the browser engine, at 393x852 by touch and 1280x800: a reader

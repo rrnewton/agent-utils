@@ -3,15 +3,16 @@ steps:
     job: desktop-layout-browser
     desc: Settings' head one quiet row (two on a phone) in reading and Tab order, and in two columns every row but the owner's across its column with the glass floating over the list, in current Chromium at 1280x800, 1920x1080, 2560x1080 and 393x852
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && python3 tests/desktop_layout_browser.py
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/desktop_layout_browser.py
     jobs_flag: ""
-    deps: [setup.contract-tools]
+    deps: [setup.contract-tools, build.page]
     timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
       est_duration_s: 8
       classification: latency-bound
+      preferred_inner_jobs: 4
       rss_baseline_bytes: 1073741824
 
   # `#277 thread-card-focus` in the browser engine, at 1280x800 over the right column's cards with a mouse

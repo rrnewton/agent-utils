@@ -3,9 +3,9 @@ steps:
     job: offline-cache-phone-browser
     desc: saved-message snapshot and a read-scope sign-in in current Chromium at a 412x915 Android viewport
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && python3 tests/offline_cache_browser.py --profile phone
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/offline_cache_browser.py --profile phone
     jobs_flag: ""
-    deps: [setup.contract-tools]
+    deps: [setup.contract-tools, build.page]
     # The walk has grown with every page feature it checks (search bar, Pinned, Links and their kinds,
     # tiles, the desktop dock, reply arrows) and measured 70-75 s wall and 42-46 s of CPU on a loaded
     # host on 2026-10-08, against the old 90 s / 45 s — so a passing run was killed for its CPU. The
@@ -21,5 +21,6 @@ steps:
       resources: {browser: 1}
       est_duration_s: 70
       classification: latency-bound
+      preferred_inner_jobs: 4
       rss_baseline_bytes: 1073741824
 

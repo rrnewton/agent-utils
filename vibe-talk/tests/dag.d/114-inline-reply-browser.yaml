@@ -3,15 +3,16 @@ steps:
     job: inline-reply-browser
     desc: Reply opening in the stream under the message and its replies, later rows below, one message box on screen, in two columns and one, at 1280x800 and 393x852, through Grow, Send, Cancel, a refusal, the view keys and two columns collapsing, in current Chromium
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && python3 tests/inline_reply_browser.py
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/inline_reply_browser.py
     jobs_flag: ""
-    deps: [setup.contract-tools]
+    deps: [setup.contract-tools, build.page]
     timeout: 720
     cpu_timeout: 90
     hint:
       resources: {browser: 1}
       est_duration_s: 25
       classification: latency-bound
+      preferred_inner_jobs: 4
       rss_baseline_bytes: 1073741824
 
   # `#419 threads-view-main-messages` in the browser engine, at 1280x800 with a mouse and 393x852 by touch:

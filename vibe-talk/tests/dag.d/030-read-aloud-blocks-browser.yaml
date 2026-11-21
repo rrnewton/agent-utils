@@ -3,9 +3,9 @@ steps:
     job: read-aloud-blocks-browser
     desc: a long message read block by block in current Chromium — blocks and sentences in order, jumps, media keys, pause and resume, and the strip's geometry — with audio-clock boundary gaps printed (budgets benchmark-only)
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && python3 tests/read_aloud_blocks_browser.py
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/read_aloud_blocks_browser.py
     jobs_flag: ""
-    deps: [setup.contract-tools]
+    deps: [setup.contract-tools, build.page]
     timeout: 480
     cpu_timeout: 60
     hint:
@@ -17,6 +17,7 @@ steps:
       # left the gate (was 80 s with them), ~8 CPU-seconds.
       est_duration_s: 45
       classification: latency-bound
+      preferred_inner_jobs: 4
       rss_baseline_bytes: 1073741824
 
   # `#540 read-aloud-desktop` in the browser engine: a message read aloud from every view — Main, All,

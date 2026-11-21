@@ -3,15 +3,16 @@ steps:
     job: readerbar-overlap-browser
     desc: Sound and the cloud/device selector do not overlap and each is tappable in the phone reader bar, in current Chromium at 412x915 and 1280x800
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && python3 tests/readerbar_overlap_browser.py
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/readerbar_overlap_browser.py
     jobs_flag: ""
-    deps: [setup.contract-tools]
+    deps: [setup.contract-tools, build.page]
     timeout: 360
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
       est_duration_s: 27
       classification: latency-bound
+      preferred_inner_jobs: 4
       rss_baseline_bytes: 1073741824
 
   # `#1717 vibe-talk-quote-reply-dismiss-x` in the browser engine: the dismiss X beside the
