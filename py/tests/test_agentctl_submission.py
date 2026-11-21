@@ -1979,3 +1979,34 @@ def test_cancelled_record_is_not_written_back_after_a_readiness_wait(tmp_path: P
     )
     assert not inbox_item.exists(), "the cancelled prompt was written back into inbox/"
     assert (tmp_path / "cancelled" / "cancel-race-1.json").is_file()
+
+
+PERMISSION_SCREEN = (
+    Path(__file__).resolve().parents[2]
+    / "rs/agentctl/tests/fixtures/tui/claude-permission-proceed.txt"
+).read_text(encoding="utf-8")
+
+
+def test_claude_permission_proceed_is_an_answerable_question() -> None:
+    # #2011: the captured Bash permission prompt classified as a menu,
+    # so `answer` refused it while `prompts` showed it. The dangerous
+    # variant answers too; a hook confirmation stays owner-only.
+    adapter = harness_tui("claude")
+    assert adapter is not None
+    view = adapter.classify(PERMISSION_SCREEN)
+    assert view.state == State.QUESTION
+    assert view.question is not None
+    assert view.question.selected == 1
+    assert adapter.answer_plan(view.question, 2, None) is not None
+    dangerous = PERMISSION_SCREEN.replace(
+        "Permission rule Bash requires confirmation for this command.",
+        "Dangerous rm operation: this command may delete files",
+    )
+    view = adapter.classify(dangerous)
+    assert view.state == State.QUESTION
+    assert view.question is not None
+    assert "Dangerous rm operation" in view.question.text
+    hook = adapter.classify(HOOK_SCREEN)
+    assert hook.question is not None
+    with pytest.raises(ValueError, match="owner-only"):
+        adapter.answer_plan(hook.question, 1, None)

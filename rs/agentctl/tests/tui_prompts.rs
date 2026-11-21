@@ -73,6 +73,41 @@ fn shared_state_corpus() {
 }
 
 #[test]
+fn claude_permission_proceed_is_an_answerable_question() {
+    // #2011: a captured Claude Bash permission prompt (`Do you want to
+    // proceed? ❯ 1. Yes  2. No`) classified as a menu, so `answer`
+    // refused it while `prompts` showed it. The dangerous-operation
+    // variant of the same form answers too; a hook confirmation stays
+    // owner-only.
+    let adapter = harness_tui(Some("claude")).unwrap();
+    let screen = include_str!("fixtures/tui/claude-permission-proceed.txt");
+    let view = adapter.classify(screen);
+    assert_eq!(view.state, State::BlockingQuestion);
+    let q = view.question.unwrap();
+    assert_eq!(q.selected, Some(1));
+    assert_eq!(q.options.len(), 2);
+    assert!(adapter.answer_plan(&q, Some(2), None).is_ok());
+    assert!(adapter.answer_plan(&q, Some(1), None).is_ok());
+    let dangerous = screen.replace(
+        "Permission rule Bash requires confirmation for this command.",
+        "Dangerous rm operation: this command may delete files",
+    );
+    let view = adapter.classify(&dangerous);
+    assert_eq!(view.state, State::BlockingQuestion);
+    assert!(view
+        .question
+        .unwrap()
+        .text
+        .contains("Dangerous rm operation"));
+    let hook = "──────\nHook PreToolUse:Bash requires confirmation\nRunning this command may delete files: rm -rf build\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel · Tab to amend\n";
+    let view = adapter.classify(hook);
+    assert_eq!(view.state, State::BlockingQuestion);
+    assert!(adapter
+        .answer_plan(&view.question.unwrap(), Some(1), None)
+        .is_err());
+}
+
+#[test]
 fn upstream_question_snapshots_and_unsupported_layouts() {
     let adapter = harness_tui(Some("codex")).unwrap();
     let q = adapter.classify(OPTIONS).question.unwrap();

@@ -27,7 +27,8 @@ class ClaudeTui:
         # can page a person. ``answer_plan`` refuses it: nothing answers
         # it automatically.
         hook = next(
-            (i for i, row in enumerate(rows) if "requires confirmation" in row.lower()),
+            (i for i, row in enumerate(rows)
+             if "hook" in row.lower() and "requires confirmation" in row.lower()),
             None,
         )
         if hook is not None and any("do you want to proceed" in row.lower() for row in rows):
@@ -57,6 +58,37 @@ class ClaudeTui:
                     State.QUESTION,
                     Question(text, tuple(hook_options), hook_selected, total=1),
                 )
+        # A permission prompt (`Do you want to proceed? ❯ 1. Yes  2. No`,
+        # under a `Bash command` form or a dangerous-operation warning) is
+        # an answerable question, not a menu (#2011
+        # agentctl-claude-permission-answer). Only the exact form counts:
+        # the proceed line, then numbered Yes/No options with one selected.
+        proceed = next(
+            (i for i, row in enumerate(rows) if "do you want to proceed" in row.lower()),
+            None,
+        )
+        if proceed is not None:
+            proceed_options: list[Option] = []
+            selected = None
+            for row in rows[proceed + 1:]:
+                match = re.match(r"^\s*(❯\s*)?(\d+)\.\s+(.+)$", row)
+                if match:
+                    number = int(match[2])
+                    proceed_options.append(Option(number, match[3].strip()))
+                    if match[1]:
+                        selected = number
+            yes_no = (any(o.text.lower().startswith("yes") for o in proceed_options)
+                      and any(o.text.lower().startswith("no") for o in proceed_options))
+            # A permission context must head the form: a bare proceed
+            # selection (the shared corpus's menu row) stays a menu.
+            context = next(
+                (row.strip() for row in reversed(rows[:proceed])
+                 if "dangerous" in row.lower() or "requires confirmation" in row.lower()
+                 or "bash command" in row.lower()),
+                None,
+            )
+            if len(proceed_options) >= 2 and selected is not None and yes_no and context is not None:
+                return View(State.QUESTION, Question(context, tuple(proceed_options), selected, total=1))
         # Transcript questions above the current form cannot supply its title/options.
         border = max((i for i, row in enumerate(rows) if len(row.strip()) >= 3
                       and set(row.strip()) <= set("─━═")), default=-1)
@@ -94,7 +126,7 @@ class ClaudeTui:
         """Plan only a recognized numbered selection; refuse unmodeled text editors."""
         # A hook confirmation is owner-only (#1784): never answered through
         # agentctl, automatically or otherwise; a person answers at the pane.
-        if "requires confirmation" in question.text.lower():
+        if "hook" in question.text.lower() and "requires confirmation" in question.text.lower():
             raise ValueError(
                 "this is an owner-only hook confirmation; answer it at the pane "
                 "in person — agentctl never answers it"

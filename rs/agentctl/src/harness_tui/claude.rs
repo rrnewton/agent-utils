@@ -18,9 +18,10 @@ impl HarnessTui for ClaudeTui {
         // `answer_plan` refuses it: nothing answers it automatically.
         {
             let rows: Vec<_> = clean.lines().collect();
-            let hook = rows
-                .iter()
-                .position(|row| row.to_lowercase().contains("requires confirmation"));
+            let hook = rows.iter().position(|row| {
+                let lower = row.to_lowercase();
+                lower.contains("hook") && lower.contains("requires confirmation")
+            });
             if let Some(hook) = hook {
                 let mut options = vec![];
                 let mut selected = None;
@@ -51,6 +52,60 @@ impl HarnessTui for ClaudeTui {
                     } else {
                         format!("{heading}: {reason}")
                     };
+                    return View::question(Question {
+                        text,
+                        options,
+                        selected,
+                        total: 1,
+                        collapsed: false,
+                        notes: false,
+                        draft: String::new(),
+                    });
+                }
+            }
+        }
+        // A permission prompt (`Do you want to proceed? ❯ 1. Yes  2. No`,
+        // under a `Bash command` form or a dangerous-operation warning) is
+        // an answerable question, not a menu: until this recogniser it
+        // classified as a menu, so `agentctl answer` refused it while
+        // `agentctl prompts` showed it (#2011
+        // agentctl-claude-permission-answer). Only the exact form counts:
+        // the proceed line, then numbered Yes/No options with one selected.
+        {
+            let rows: Vec<_> = clean.lines().collect();
+            if let Some(proceed) = rows
+                .iter()
+                .position(|row| row.to_lowercase().contains("do you want to proceed"))
+            {
+                let mut options = vec![];
+                let mut selected = None;
+                for row in &rows[proceed + 1..] {
+                    if let Some((option, is_selected)) = option_row(row, '❯') {
+                        if is_selected {
+                            selected = Some(option.number);
+                        }
+                        options.push(option);
+                    }
+                }
+                let yes_no = options
+                    .iter()
+                    .any(|option| option.text.to_lowercase().starts_with("yes"))
+                    && options
+                        .iter()
+                        .any(|option| option.text.to_lowercase().starts_with("no"));
+                // A permission context must head the form: a bare proceed
+                // selection (the shared corpus's menu row) stays a menu.
+                let context = rows[..proceed].iter().rev().find(|row| {
+                    let lower = row.to_lowercase();
+                    lower.contains("dangerous")
+                        || lower.contains("requires confirmation")
+                        || lower.contains("bash command")
+                });
+                if options.len() >= 2 && selected.is_some() && yes_no && context.is_some() {
+                    let text = context
+                        .expect("permission context checked")
+                        .trim()
+                        .to_owned();
                     return View::question(Question {
                         text,
                         options,
@@ -139,7 +194,9 @@ impl HarnessTui for ClaudeTui {
     ) -> Result<AnswerPlan, String> {
         // A hook confirmation is owner-only (#1784): never answered through
         // agentctl, automatically or otherwise; a person answers at the pane.
-        if q.text.to_lowercase().contains("requires confirmation") {
+        if q.text.to_lowercase().contains("hook")
+            && q.text.to_lowercase().contains("requires confirmation")
+        {
             return Err(
                 "this is an owner-only hook confirmation; answer it at the pane in person — agentctl never answers it"
                     .to_owned(),
