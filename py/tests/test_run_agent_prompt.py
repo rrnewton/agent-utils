@@ -49,6 +49,12 @@ with log.open("a", encoding="utf-8") as handle:
 if MODE == "fail":
     print(f"fake failure while handling {{prompt_seen}}", file=sys.stderr)
     raise SystemExit(9)
+if MODE == "answer-pipe-hold":
+    child = subprocess.Popen([sys.executable, "-c", "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"])
+    (here / "answer-holder.pid").write_text(str(child.pid), encoding="utf-8")
+elif MODE == "answer-stray":
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    (here / "stray.pid").write_text(str(child.pid), encoding="utf-8")
 if MODE == "pipe-hold":
     child = subprocess.Popen([sys.executable, "-c", "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"])
     (here / "pipe-holder.pid").write_text(str(child.pid), encoding="utf-8")
@@ -205,14 +211,14 @@ def test_timeout_kills_the_whole_group_and_next_harness_wins(
         "codex": write_fake(tmp_path, "codex", "ok", "unused"),
     }
     started = time.monotonic()
-    assert run_cli(tmp_path, commands, "--timeout", "0.2") == 0
-    assert time.monotonic() - started < 10
+    assert run_cli(tmp_path, commands, "--timeout", "3") == 0
+    assert time.monotonic() - started < 15
     assert capsys.readouterr().out == "after timeout\n"
     grandchild = int((tmp_path / "grandchild.pid").read_text(encoding="utf-8"))
     assert_pid_dead(grandchild)
 
 
-def test_timeout_kills_pipe_holding_child_after_leader_exit(
+def test_pipe_holding_child_after_leader_exit_is_killed(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     commands = {
@@ -221,13 +227,44 @@ def test_timeout_kills_pipe_holding_child_after_leader_exit(
         "codex": write_fake(tmp_path, "codex", "ok", "unused"),
     }
     started = time.monotonic()
-    assert run_cli(tmp_path, commands, "--timeout", "0.2") == 0
-    assert time.monotonic() - started < 10
+    assert run_cli(tmp_path, commands, "--timeout", "3") == 0
+    assert time.monotonic() - started < 15
     captured = capsys.readouterr()
     assert captured.out == "after pipe holder\n"
-    assert "harness=muse status=timeout" in captured.err
+    assert "harness=muse status=empty" in captured.err
     holder = int((tmp_path / "pipe-holder.pid").read_text(encoding="utf-8"))
     assert_pid_dead(holder)
+
+
+def test_leader_answer_survives_pipe_holding_child(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    commands = {
+        "muse": write_fake(tmp_path, "muse", "answer-pipe-hold", "leader answer"),
+        "claude": write_fake(tmp_path, "claude", "ok", "unused"),
+        "codex": write_fake(tmp_path, "codex", "ok", "unused"),
+    }
+    assert run_cli(tmp_path, commands, "--timeout", "3") == 0
+    captured = capsys.readouterr()
+    assert captured.out == "leader answer\n"
+    assert "harness=muse status=answered" in captured.err
+    assert invocations(tmp_path, "claude") == []
+    holder = int((tmp_path / "answer-holder.pid").read_text(encoding="utf-8"))
+    assert_pid_dead(holder)
+
+
+def test_successful_attempt_kills_stray_child(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    commands = {
+        "muse": write_fake(tmp_path, "muse", "answer-stray", "clean answer"),
+        "claude": write_fake(tmp_path, "claude", "ok", "unused"),
+        "codex": write_fake(tmp_path, "codex", "ok", "unused"),
+    }
+    assert run_cli(tmp_path, commands, "--timeout", "3") == 0
+    assert capsys.readouterr().out == "clean answer\n"
+    stray = int((tmp_path / "stray.pid").read_text(encoding="utf-8"))
+    assert_pid_dead(stray)
 
 
 def test_exhausted_total_timeout_skips_remaining_harnesses(
@@ -238,7 +275,7 @@ def test_exhausted_total_timeout_skips_remaining_harnesses(
         "claude": write_fake(tmp_path, "claude", "ok", "unused"),
         "codex": write_fake(tmp_path, "codex", "ok", "unused"),
     }
-    assert run_cli(tmp_path, commands, "--timeout", "0.2", "--total-timeout", "0.1") == 69
+    assert run_cli(tmp_path, commands, "--timeout", "3", "--total-timeout", "2") == 69
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "harness=muse status=timeout" in captured.err

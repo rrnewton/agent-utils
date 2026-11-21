@@ -3,7 +3,7 @@
 Each builder uses the harness's strict non-interactive form and
 extracts plain final text from its structured output. Every attempt
 is tool-free or read-confined by construction: Muse's isolation
-preset, Claude Code's empty tool list, and Muse with its shell
+preset, Claude Code's empty tool list, and Codex with its shell
 and MCP surfaces disabled inside a read-only sandbox. Effects belong
 to the caller, never to an agent's own tools.
 """

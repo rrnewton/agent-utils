@@ -28,7 +28,7 @@ run-agent-prompt --prompt-file prompt.txt --log-file attempts.jsonl
 
 The prompt comes from `--prompt-file PATH` or stdin. It never appears
 in the wrapper's argv. For Muse it is passed in a temporary prompt
-file; for Claude Code and Muse it is written to the child's
+file; for Claude Code and Codex it is written to the child's
 stdin.
 
 Stdout contains only the winning harness's final answer. The exit
@@ -37,6 +37,9 @@ codes are:
 - `0`: a harness answered.
 - `2`: a usage or config error.
 - `69`: every selected harness failed.
+- `129`: terminated by SIGHUP after cleanup.
+- `130`: interrupted by SIGINT after cleanup.
+- `143`: terminated by SIGTERM after cleanup.
 
 Every attempt also produces one stderr line with `harness=`,
 `status=`, `exit=`, `duration_s=`, `model=`, and `effort=`. The
@@ -48,7 +51,7 @@ per attempt.
 
 ## Attempts and time limits
 
-Attempts run in Muse, Claude Code, Muse order unless `--only HARNESS`
+Attempts run in Muse, Claude Code, Codex order unless `--only HARNESS`
 selects one. An attempt falls through to the next harness when the
 executable cannot start, the effort is unsupported, the child times
 out, the child exits nonzero, or its final answer is empty.
@@ -66,7 +69,7 @@ Attempts are judgement-only:
 - Claude Code runs in print mode with `--tools ""`, safe mode,
   restricted mode, `--strict-mcp-config`, slash commands disabled,
   permission prompts set to `none`, and no session persistence.
-- Muse is read-confined rather than claimed tool-free across
+- Codex is read-confined rather than claimed tool-free across
   builds. It runs `codex exec --ephemeral --ignore-user-config
   --ignore-rules --sandbox read-only`, disables the shell, apps,
   browser, computer-use, image, plugin, multi-agent, and code-host
@@ -81,10 +84,10 @@ deterministic responsibility.
 ## Workspace and environment
 
 By default each attempt creates its own fresh temporary workspace;
-the whole scratch tree is removed when the chain ends. A Muse
+the whole scratch tree is removed when the chain ends. A Codex
 workspace is initialized as a Git repository with a ten-second
 bound. `--cwd DIR` opts into a caller-selected workspace shared by
-the attempts. Muse's last-message file and Muse's prompt file
+the attempts. Codex's last-message file and Muse's prompt file
 stay in per-attempt wrapper-owned scratch space even when `--cwd` is
 used.
 
@@ -142,7 +145,7 @@ to create `TOOL_CHECK` in an explicit temporary `--cwd` directory:
 - Claude Code `2.1.319` answered `NO_TOOL_USED`; no `TOOL_CHECK`
   file was created. A project `UserPromptSubmit` hook placed in
   that directory also did not run.
-- Muse `0.170.0` answered `NO_TOOL_USED`; no `TOOL_CHECK`
+- Codex `0.170.0` answered `NO_TOOL_USED`; no `TOOL_CHECK`
   file was created. A follow-up prompt asking it to read a nonce
   file outside the working directory also answered `NO_TOOL_USED`
   and did not return the nonce.

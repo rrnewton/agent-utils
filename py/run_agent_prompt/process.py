@@ -15,7 +15,7 @@ import time
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import IO, Iterator
 
 
 class BackendProcessStopped(RuntimeError):
@@ -65,32 +65,60 @@ class BackendProcesses:
         if timeout is not None and timeout <= 0:
             raise ValueError("backend timeout must be positive")
         args = tuple(command)
-        with self._lock:
-            if self._stopped:
-                raise BackendProcessStopped("backend operation was interrupted")
-            process = subprocess.Popen(
-                args,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                cwd=cwd,
-                env=dict(env) if env is not None else None,
-                start_new_session=True,
-            )
-            self._processes.add(process)
+        process: subprocess.Popen[str] | None = None
+        try:
+            with self._lock:
+                if self._stopped:
+                    raise BackendProcessStopped("backend operation was interrupted")
+                process = subprocess.Popen(
+                    args,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    cwd=cwd,
+                    env=dict(env) if env is not None else None,
+                    start_new_session=True,
+                )
+                self._processes.add(process)
+        except BaseException:
+            if process is not None:
+                self._signal_group(process, signal.SIGKILL)
+            raise
+        assert process is not None
+        stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
+        threads = (
+            threading.Thread(
+                target=self._feed_stdin, args=(process, input_text), daemon=True
+            ),
+            threading.Thread(
+                target=self._drain_stream, args=(process.stdout, stdout_chunks), daemon=True
+            ),
+            threading.Thread(
+                target=self._drain_stream, args=(process.stderr, stderr_chunks), daemon=True
+            ),
+        )
+        for thread in threads:
+            thread.start()
         timed_out = False
         try:
             try:
-                stdout, stderr = process.communicate(input=input_text, timeout=timeout)
+                process.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 timed_out = True
                 self._stop_group(process)
-                stdout, stderr = self._reap_after_stop(process)
+            else:
+                if self._group_alive(process):
+                    self._stop_group(process)
+            stdout, stderr = self._collect_output(
+                process, threads, stdout_chunks, stderr_chunks
+            )
         except BaseException:
             self.terminate_all()
             raise
         finally:
+            self._signal_group(process, signal.SIGKILL)
             with self._lock:
                 self._processes.discard(process)
         if timed_out:
@@ -108,28 +136,58 @@ class BackendProcesses:
             stderr=stderr,
         )
 
-    def _reap_after_stop(
-        self, process: subprocess.Popen[str], timeout_seconds: float = 5.0
-    ) -> tuple[str, str]:
-        """Collect output after a stop without waiting on a pipe forever."""
-
+    @staticmethod
+    def _feed_stdin(process: subprocess.Popen[str], input_text: str) -> None:
+        if process.stdin is None:
+            return
         try:
-            return process.communicate(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired as expired:
+            process.stdin.write(input_text)
+            process.stdin.close()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+
+    @staticmethod
+    def _drain_stream(stream: IO[str] | None, chunks: list[str]) -> None:
+        if stream is None:
+            return
+        try:
+            while True:
+                chunk = stream.read(8192)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        except (OSError, ValueError):
+            pass
+
+    @staticmethod
+    def _close_streams(process: subprocess.Popen[str]) -> None:
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except (BrokenPipeError, OSError, ValueError):
+                    pass
+
+    def _collect_output(
+        self,
+        process: subprocess.Popen[str],
+        threads: Sequence[threading.Thread],
+        stdout_chunks: list[str],
+        stderr_chunks: list[str],
+        timeout_seconds: float = 5.0,
+    ) -> tuple[str, str]:
+        """Collect drained output with a short cap after the leader stops."""
+
+        deadline = time.monotonic() + timeout_seconds
+        for thread in threads:
+            thread.join(max(0.0, deadline - time.monotonic()))
+        if any(thread.is_alive() for thread in threads):
             self._signal_group(process, signal.SIGKILL)
-            for stream in (process.stdin, process.stdout, process.stderr):
-                if stream is not None:
-                    try:
-                        stream.close()
-                    except (BrokenPipeError, OSError, ValueError):
-                        pass
-            try:
-                process.wait(timeout=timeout_seconds)
-            except subprocess.TimeoutExpired:
-                pass
-            stdout = expired.output if isinstance(expired.output, str) else ""
-            stderr = expired.stderr if isinstance(expired.stderr, str) else ""
-            return stdout, stderr
+            self._close_streams(process)
+            close_deadline = time.monotonic() + 1.0
+            for thread in threads:
+                thread.join(max(0.0, close_deadline - time.monotonic()))
+        return "".join(stdout_chunks), "".join(stderr_chunks)
 
     def _stop_group(self, process: subprocess.Popen[str], grace_seconds: float = 2.0) -> None:
         """Terminate one call's process group, then kill it after *grace_seconds*."""

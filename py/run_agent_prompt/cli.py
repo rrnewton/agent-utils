@@ -6,9 +6,11 @@ import argparse
 import json
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Sequence
 from importlib.resources import files
@@ -70,7 +72,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  run-agent-prompt --prompt-file prompt.txt\n"
             "  cat prompt.txt | run-agent-prompt --timeout 120\n"
             "  run-agent-prompt --only claude --claude-model MODEL --prompt-file p.txt\n\n"
-            "Exit codes: 0 answered, 2 usage/config error, 69 every harness failed."
+            "Exit codes: 0 answered, 2 usage/config error, 69 every harness failed, "
+            "129 SIGHUP, 130 SIGINT, 143 SIGTERM."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -241,7 +244,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     temporary: tempfile.TemporaryDirectory[str] | None = None
     try:
         with termination_signals_as_exceptions():
-            temporary = tempfile.TemporaryDirectory(prefix="run-agent-prompt-")
+            blocked_signals = {
+                signum
+                for signum in (
+                    signal.SIGINT,
+                    getattr(signal, "SIGTERM", None),
+                    getattr(signal, "SIGHUP", None),
+                )
+                if isinstance(signum, int)
+            }
+            previous_mask: set[signal.Signals | int] | None = None
+            if threading.current_thread() is threading.main_thread():
+                previous_mask = signal.pthread_sigmask(
+                    signal.SIG_BLOCK, blocked_signals
+                )
+            try:
+                temporary = tempfile.TemporaryDirectory(prefix="run-agent-prompt-")
+            finally:
+                if previous_mask is not None:
+                    signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
             scratch = Path(temporary.name)
             for harness in harnesses:
                 remaining = deadline - time.monotonic()
