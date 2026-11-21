@@ -11,7 +11,7 @@ import {
   SUMMARY_FAILED_MARK, SUMMARY_MARK, SUMMARY_MODE_OFF, SUMMARY_MODE_ON, SUMMARY_WAITING,
   summaryFailureWords, summaryNoteWords,
 } from "../../present/rows/index.ts";
-import type { ClockPort } from "../../ports/index.ts";
+import type { ClockPort, TimerHandle } from "../../ports/index.ts";
 import { foldedTextLine } from "./fold.ts";
 import { rowsBelowReadingPosition } from "./scrollkeep.ts";
 
@@ -463,24 +463,62 @@ export function createFolding(deps: FoldingDependencies): Folding {
     return count;
   }
 
+  /** How long after a long scroll's last ask the deferred recount runs (`#2042`). */
+  const BELOW_SETTLE_MS = 150;
+  /** Asks for a recount, and the count standing at the last frame's end. */
+  let belowAsks = 0;
+  let belowAsksAtFrame = 0;
+  /** Frame windows running that each brought a recount ask: four is a long scroll. */
+  let belowAskedWindows = 0;
+  /** The settle countdown a long scroll arms, once while one is outstanding. */
+  let belowSettleTimer: TimerHandle | null = null;
+
+  /** Recount now, and draw the jump again where the count moved. In this column. */
+  function recountBelowNow(): void {
+    const before = belowHeld === null ? null : belowHeld.count;
+    if (recountBelow(belowKey()) === before) return;
+    belowFresh = true;
+    try {
+      renderJumpNewest();
+    } finally {
+      belowFresh = false;
+    }
+  }
+
   /**
-   * Count the rows below again in the next frame, and draw the jump again where the count moved:
-   * scroll events arrive oftener than frames, and one count a frame is all a changing number can
-   * show. In this column, captured now — a frame later, the page works on another.
+   * Ask for a recount of the rows below, settled in a frame while the asking stays a
+   * young burst and once a long scroll stops.
+   *
+   * `#2042 vibe-talk-scroll-style-recalc`: asks arriving in a fourth frame window
+   * running — a scroll well under way — defer the recount to one settle countdown
+   * armed behind them, and windows after that only rearm it. The per-frame recount
+   * was the scroll path's dearest frame script (about 140 ms a callback at 4x CPU on
+   * the lane fixture), and a count changing under the reader's thumb cannot be read
+   * mid-scroll anyway. Asks in their first windows, and every lone ask (a message
+   * landing below, a view drawn), recount in their frames exactly as before.
    */
   function scheduleBelow(): void {
+    belowAsks += 1;
     if (belowDue) return;
     belowDue = true;
     const again = deps.inThisColumn(() => {
-      belowDue = false;
-      const before = belowHeld === null ? null : belowHeld.count;
-      if (recountBelow(belowKey()) === before) return;
-      belowFresh = true;
-      try {
-        renderJumpNewest();
-      } finally {
-        belowFresh = false;
+      const askedThisWindow = belowAsks > belowAsksAtFrame;
+      belowAsksAtFrame = belowAsks;
+      belowAskedWindows = askedThisWindow ? belowAskedWindows + 1 : 0;
+      if (belowAskedWindows >= 4) {
+        if (belowSettleTimer === null) {
+          belowSettleTimer = deps.clock.setTimeout(deps.inThisColumn(() => {
+            belowSettleTimer = null;
+            belowAskedWindows = 0;
+            recountBelowNow();
+          }), BELOW_SETTLE_MS);
+        }
+        belowDue = true;
+        requestAnimationFrame(() => again());
+        return;
       }
+      belowDue = false;
+      recountBelowNow();
     });
     requestAnimationFrame(() => again());
   }

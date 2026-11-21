@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scrolling a loaded channel reads the screen, not the whole list (`#2034`).
+"""Scrolling a loaded channel reads the screen, not the whole list (`#2034`, `#2042`).
 
 Serves the real page and a fake chat upstream over an 816-message channel and checks, at
 phone and desktop sizes, with event counts only (owner rule 346):
@@ -9,7 +9,10 @@ phone and desktop sizes, with event counts only (owner rule 346):
   after the scroll the reader has moved (the first wholly-shown row is a later message),
   the jump-to-newest offer stands, and jumping with it lands at the foot;
   a burst of twenty scroll events in one frame asks for no more layout than a few
-  screenfuls — the passes behind the listener are the same ones a single event pays.
+  screenfuls — the passes behind the listener are the same ones a single event pays;
+  the jump offer is painted at most a handful of times during a screenful (its count
+  is recounted when the scroll settles — `#2042 vibe-talk-scroll-style-recalc`), and
+  the list takes only a few dozen style-affecting attribute writes over the scroll.
 
 Pass --screenshots DIR to keep a PNG of each stage.
 """
@@ -40,6 +43,16 @@ RECT_JS = """() => {
     Element.prototype.getBoundingClientRect = function () { window.__rect += 1; return orig.call(this); };
     window.__long = [];
     try { new PerformanceObserver((l) => { for (const e of l.getEntries()) window.__long.push(e.duration); }).observe({ entryTypes: ['longtask'] }); } catch (e) {}
+    // `#2042 vibe-talk-scroll-style-recalc`: paints of the jump offer while scrolling,
+    // counted on the elements the offer is drawn on; style-affecting writes per frame
+    // across the list, counted the same way.
+    window.__jumpPaints = 0;
+    window.__styleWrites = 0;
+    const jump = document.getElementById('jump-newest');
+    if (jump) new MutationObserver((ms) => { window.__jumpPaints += ms.length; })
+        .observe(jump, { subtree: true, attributes: true, characterData: true, childList: true });
+    new MutationObserver((ms) => { for (const m of ms) if (m.attributeName) window.__styleWrites += 1; })
+        .observe(document.getElementById('discord-log'), { subtree: true, attributes: true });
 }"""
 
 
@@ -64,15 +77,21 @@ def walk(page: Page, label: str, shots: Path | None) -> None:
     page.wait_for_function("() => document.querySelectorAll('#discord-log > li[data-id]').length >= 100", timeout=20_000)
     page.evaluate(RECT_JS)
     page.click("#discord-log > li[data-id]")
-    # One screenful down: the scroll lands, at a few hundred layout reads at most.
-    page.evaluate("() => { window.__rect = 0; window.__long = []; }")
+    # One screenful down: the scroll lands, at a few hundred layout reads at most, and
+    # the jump offer is painted at most once while the scroll is live — its count is
+    # recounted when the scroll settles, not once a frame.
+    page.evaluate("() => { window.__rect = 0; window.__long = []; window.__jumpPaints = 0; window.__styleWrites = 0; }")
     page.keyboard.press("PageDown")
     page.wait_for_timeout(600)
-    counts = page.evaluate("() => ({ rect: window.__rect, long: window.__long.length })")
+    counts = page.evaluate("() => ({ rect: window.__rect, long: window.__long.length, paints: window.__jumpPaints, writes: window.__styleWrites })")
     check(counts["rect"] <= MAX_RECT_PER_SCREEN,
           f"{label}: a screenful of scrolling read {counts['rect']} layouts (bound {MAX_RECT_PER_SCREEN})")
     check(counts["long"] <= MAX_LONG_PER_SCREEN,
           f"{label}: a screenful of scrolling made {counts['long']} long tasks (bound {MAX_LONG_PER_SCREEN})")
+    check(counts["paints"] <= 4,
+          f"{label}: the jump offer was painted {counts['paints']} times during one screenful of scrolling (bound 4; settles paint it last)")
+    check(counts["writes"] <= 40,
+          f"{label}: scrolling wrote {counts['writes']} style-affecting attributes on the list in one screenful (bound 40)")
     if shots is not None:
         page.screenshot(path=str(shots / f"{label}-scrolled.png"))
     # The jump back is offered, and taking it lands at the foot again.
