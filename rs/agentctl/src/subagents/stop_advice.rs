@@ -364,6 +364,7 @@ mod tests {
                 retire_dead_native: false,
                 expected_record_sha256: Some(digest),
                 skip_cloud_halt: false,
+                discard_queued_input: false,
             }),
             recovery
         );
@@ -375,6 +376,7 @@ mod tests {
                 retire_dead_native: false,
                 expected_record_sha256: Some("b".repeat(64)),
                 skip_cloud_halt: false,
+                discard_queued_input: false,
             }),
             RecoveryAction::Doctor
         );

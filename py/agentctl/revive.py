@@ -1548,7 +1548,8 @@ def revive(manager: ManagedAgents, name: str, *, dry_run: bool = False, expected
 
 def restart(manager: ManagedAgents, name: str, *, when_idle: bool = False,
             wait_timeout: float = 3600.0, startup_timeout: float = 30.0,
-            stop_background_tasks: bool = False) -> dict[str, object]:
+            stop_background_tasks: bool = False,
+            discard_queued_input: bool = False) -> dict[str, object]:
     """Restart one live agent in its own pane (R1 restart-when-idle): wait
     for an idle turn with nothing queued, exit the harness gracefully, then
     revive in the same pane with the recorded session. Refuses with no
@@ -1598,6 +1599,7 @@ def restart(manager: ManagedAgents, name: str, *, when_idle: bool = False,
         except Exception:
             return False
 
+    discarded_queued_input: list[str] = []
     if alive:
         deadline = time.monotonic() + wait_timeout
         if not idle() and not when_idle:
@@ -1609,6 +1611,12 @@ def restart(manager: ManagedAgents, name: str, *, when_idle: bool = False,
         time.sleep(3)
         if not idle():
             raise AgentDeliveryError(f"{name!r} did not stay idle; nothing was restarted")
+        # Right before the exit: the harness's own queued UI inputs are
+        # not in agentctl's queue and no resume replays them (#2045).
+        from agentctl.queued_input import check_queued_ui_input
+        queued_screen = manager.client.read(record.pane_id, source="visible", lines=200)
+        discarded_queued_input = check_queued_ui_input(
+            name, record.harness, queued_screen, discard_queued_input)
         manager.client.send_text(record.pane_id, "/exit")
         manager.client.send_keys(record.pane_id, "Enter")
         time.sleep(0.5)
@@ -1680,6 +1688,7 @@ def restart(manager: ManagedAgents, name: str, *, when_idle: bool = False,
         "harness_pid": None if new_identity is None else new_identity.pid,
         "previous_harness_pid": old_pid, "session": session,
         "token": result.get("token"), "renamed": renamed,
+        "discarded_queued_input": discarded_queued_input,
         "slot_owner": slot, "notified": notified,
         "profile_refresh": (
             cast(dict[str, object], refresh_report).get("fields")

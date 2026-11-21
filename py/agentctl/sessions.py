@@ -335,6 +335,7 @@ class Sessions(ManagedAgents):
         expected_record_sha256: str | None = None,
         retire_dead_adoption: bool = False,
         retire_dead_native: bool = False,
+        discard_queued_input: bool = False,
     ) -> dict[str, object]:
         """Retire a runtime, then archive its canonical identity and artifacts."""
         if retire_dead_native and (retire_dead_adoption or recover_legacy_adoption):
@@ -354,6 +355,7 @@ class Sessions(ManagedAgents):
                 expected_token_explicit=expected_token is not None,
                 retire_dead_adoption=retire_dead_adoption,
                 retire_dead_native=retire_dead_native,
+                discard_queued_input=discard_queued_input,
             )
         if retire_dead_native:
             raise AgentDeliveryError(

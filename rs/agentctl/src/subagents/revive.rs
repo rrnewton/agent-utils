@@ -2113,6 +2113,54 @@ fn validate_census(panes: &[Pane]) -> Result<()> {
     Ok(())
 }
 
+/// An exit drops the harness's own queued UI inputs (Muse's `◆ Queued
+/// input`, Codex's queued follow-ups, Claude Code's queued messages):
+/// they live in the TUI, not in agentctl's queue, and no resume replays
+/// them (#2045 agentctl-muse-phantom-background-send, traced on a live
+/// lane whose restart silently dropped one). Before any exit, read the
+/// pane and refuse while any are present, naming each entry's first
+/// line; only an explicit discard proceeds, and the caller records
+/// what was discarded. A screen that cannot be read, or that shows a
+/// queued block this read cannot parse, refuses too (fail closed).
+pub(super) fn check_queued_ui_input(
+    agent_name: &str,
+    harness: &str,
+    screen: &str,
+    discard: bool,
+    discarded: &mut Vec<String>,
+) -> Result<()> {
+    if screen.trim().is_empty() {
+        return Err(fail(format!(
+            "'{agent_name}' pane screen could not be read before exit, so its queued UI input cannot be checked; nothing was exited"
+        )));
+    }
+    if harness == "muse"
+        && screen.contains("◆ Queued input")
+        && crate::turn_state::read_screen(screen).queued == 0
+    {
+        return Err(fail(format!(
+            "'{agent_name}' shows a Muse queued-input block this read cannot parse; refusing to exit and drop it unrecorded — inspect the pane with `agentctl read {agent_name}`"
+        )));
+    }
+    let entries = crate::turn_state::queued_ui_entries(screen);
+    if entries.is_empty() {
+        return Ok(());
+    }
+    if discard {
+        discarded.extend(entries);
+        return Ok(());
+    }
+    let named = entries
+        .iter()
+        .map(|entry| format!("  - {entry}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Err(fail(format!(
+        "'{agent_name}' has {} queued UI input(s) its harness has not submitted, and exiting drops them without replay:\n{named}\nLet them submit, or have the human or coordinator confirm each is stale and rerun with --discard-queued-input (what was discarded is then recorded)",
+        entries.len()
+    )))
+}
+
 impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
     pub(super) fn resolve_recovery_target<D: AgentApi + ?Sized>(
         &self,
@@ -3908,19 +3956,33 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         &self,
         agent_name: &str,
         pane: &str,
+        harness: &str,
         when_idle: bool,
         wait_timeout: Duration,
     ) -> Result<()> {
-        self.exit_to_shell_stopping(agent_name, pane, when_idle, wait_timeout, false)
+        let mut discarded = Vec::new();
+        self.exit_to_shell_stopping(
+            agent_name,
+            pane,
+            harness,
+            when_idle,
+            wait_timeout,
+            false,
+            false,
+            &mut discarded,
+        )
     }
 
     fn exit_to_shell_stopping(
         &self,
         agent_name: &str,
         pane: &str,
+        harness: &str,
         when_idle: bool,
         wait_timeout: Duration,
         stop_background_tasks: bool,
+        discard_queued_input: bool,
+        discarded_queued_input: &mut Vec<String>,
     ) -> Result<()> {
         let deadline = std::time::Instant::now() + wait_timeout;
         let idle = |this: &Self| -> bool {
@@ -3951,6 +4013,19 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 "'{agent_name}' did not stay idle; nothing was exited"
             )));
         }
+        // Right before the exit: the harness's own queued UI inputs are
+        // not in agentctl's queue and no resume replays them (#2045).
+        let screen = self
+            .client
+            .read(pane, "visible", Some(200))
+            .unwrap_or_default();
+        check_queued_ui_input(
+            agent_name,
+            harness,
+            &screen,
+            discard_queued_input,
+            discarded_queued_input,
+        )?;
         self.client.run(pane, "/exit")?;
         std::thread::sleep(Duration::from_millis(500));
         let screen = self
@@ -4029,6 +4104,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             startup_timeout,
             false,
             false,
+            false,
         )
     }
 
@@ -4044,6 +4120,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         startup_timeout: Duration,
         stop_background_tasks: bool,
         refresh_profile: bool,
+        discard_queued_input: bool,
     ) -> Result<Value> {
         let record = self.load(agent_name)?;
         if record.agentcloud.is_some() {
@@ -4152,7 +4229,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
             .is_some_and(|doc| doc["phase"] == "exited" && doc["name"] == agent_name);
-        let write_journal = |phase: &str| -> Result<()> {
+        let write_journal = |phase: &str, discarded: &[String]| -> Result<()> {
             agent::create_private_directory(
                 &self.registry.join(".restarts"),
                 "restart journal directory",
@@ -4166,6 +4243,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 "old_token": record.token,
                 "session": session,
                 "phase": phase,
+                "discarded_queued_input": discarded,
                 "started_at": SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs_f64())
@@ -4176,16 +4254,20 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 .map_err(|error| *error.error)?;
             Ok(())
         };
+        let mut discarded_queued_input: Vec<String> = Vec::new();
         if alive && !resumed_exited {
-            write_journal("planned")?;
+            write_journal("planned", &discarded_queued_input)?;
             self.exit_to_shell_stopping(
                 agent_name,
                 &pane,
+                &record.harness,
                 when_idle,
                 wait_timeout,
                 stop_background_tasks,
+                discard_queued_input,
+                &mut discarded_queued_input,
             )?;
-            write_journal("exited")?;
+            write_journal("exited", &discarded_queued_input)?;
         }
         // The pane shows its shell before a Muse runtime has ended, and revive refuses a pinned
         // process it still sees alive: wait for the harness to be provably gone (#1023).
@@ -4331,6 +4413,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             "slot_owner": slot,
             "notified": notified,
             "restart_journal": restart_journal,
+            "discarded_queued_input": discarded_queued_input,
             // A plain restart now refreshes through its revive (#1928), so
             // report that refresh's changed fields when no explicit
             // --refresh-profile ran.
@@ -4409,7 +4492,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 rows.push(json!({"name": name, "action": "failed", "reason": "no recorded pane", "session": session}));
                 continue;
             };
-            match self.exit_to_shell(name, &pane, true, wait_timeout) {
+            match self.exit_to_shell(name, &pane, &record.harness, true, wait_timeout) {
                 Ok(()) => rows.push(json!({"name": name, "action": "exited", "pane_id": record.pane_id, "session": session})),
                 Err(error) => rows.push(json!({"name": name, "action": "failed", "reason": error.to_string(), "pane_id": record.pane_id, "session": session})),
             }

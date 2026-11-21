@@ -1553,6 +1553,9 @@ struct Restart {
     /// Accept Claude's exit-dialog stop-tasks choice (only when the agent confirms the listed tasks are stale)
     #[arg(long)]
     stop_background_tasks: bool,
+    /// Discard the harness's queued UI inputs that the exit would drop without replay (only when the human or coordinator confirms each is stale; what was discarded is recorded in the restart journal and report) (#2045)
+    #[arg(long)]
+    discard_queued_input: bool,
     /// Relaunch from the launch profile's current definition (argv, environment, model, reasoning effort), keeping the conversation, queue and token. A plain restart already rebuilds this way through its revive (#1928); this flag additionally rewrites the recorded launch before the harness exits. Checked before the harness exits; refused when the profile now names another harness or mode
     #[arg(long, conflicts_with = "team")]
     refresh_profile: bool,
@@ -1715,6 +1718,9 @@ struct Stop {
     /// Stop the live designated coordinator without handing over (prints a warning; inter-team delivery to this registry loses its target until a new coordinator is designated). Not needed when its harness is gone or on the dead-record retirement and recovery paths (--retire-dead-adoption, --retire-dead-native and the adoption-recovery flag), which warn the same way
     #[arg(long)]
     force_coordinator: bool,
+    /// Discard the harness's queued UI inputs that closing the pane would drop without replay (only when the human or coordinator confirms each is stale; what was discarded is recorded in the stop report) (#2045)
+    #[arg(long)]
+    discard_queued_input: bool,
 }
 
 #[derive(Args)]
@@ -5948,6 +5954,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     retire_dead_native: value.retire_dead_native,
                     expected_record_sha256: value.expected_record_sha256,
                     skip_cloud_halt: value.skip_cloud_halt,
+                    discard_queued_input: value.discard_queued_input,
                 },
             );
             match stopped {
@@ -6059,6 +6066,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     Duration::from_secs_f64(value.startup_timeout),
                     value.stop_background_tasks,
                     value.refresh_profile,
+                    value.discard_queued_input,
                 )?;
                 manager.bring_coordinator_tab_forward(name, tab_socket);
                 result

@@ -374,6 +374,8 @@ def parser() -> argparse.ArgumentParser:
         help="restart every agent managed by the caller (AGENTCTL_AGENT, else the designated coordinator), workers first, never the caller")
     restart.add_argument("--stop-background-tasks", action="store_true",
         help="accept Claude's exit-dialog stop-tasks choice (only when the agent confirms the listed tasks are stale)")
+    restart.add_argument("--discard-queued-input", action="store_true",
+        help="discard the harness's queued UI inputs that the exit would drop without replay (only when the human or coordinator confirms each is stale; what was discarded is recorded in the restart report) (#2045)")
     restart.add_argument("--refresh-profile", action="store_true",
         help="relaunch from the launch profile's current definition instead of the recorded launch "
         "(the Rust edition only; this edition refuses it)")
@@ -404,6 +406,8 @@ def parser() -> argparse.ArgumentParser:
         help="archive a running adopted record whose pinned harness is dead, without querying Herdr; requires --expected-token and --expected-record-sha256")
     stop.add_argument("--expected-record-sha256", metavar="SHA256",
         help="exact lowercase 64-hex SHA-256 of raw agent.json bytes; requires --recover-legacy-adoption, --retire-dead-adoption, or --retire-dead-native")
+    stop.add_argument("--discard-queued-input", action="store_true",
+        help="discard the harness's queued UI inputs that closing the pane would drop without replay (only when the human or coordinator confirms each is stale; what was discarded is recorded in the stop report) (#2045)")
     attach_self = command("attach-self",
         "Show the agentcloud session this process runs in through its viewer in a Herdr tab and "
         "register it (Rust edition only; this edition refuses).",
@@ -823,7 +827,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 result = sessions.restart(name, when_idle=args.when_idle, wait_timeout=args.wait_idle,
                                           startup_timeout=args.startup_timeout,
-                                          stop_background_tasks=args.stop_background_tasks)
+                                          stop_background_tasks=args.stop_background_tasks,
+                                          discard_queued_input=args.discard_queued_input)
         elif args.command == "promote":
             result = sessions.promote(name, expected_token=args.expected_token)
         elif args.command == "anchor":
@@ -882,6 +887,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 retire_dead_adoption=args.retire_dead_adoption,
                 retire_dead_native=args.retire_dead_native,
                 expected_record_sha256=args.expected_record_sha256,
+                discard_queued_input=args.discard_queued_input,
             )
         elif args.command in ("reset", "repair"):
             result = sessions.runtime_operation(name, args.command)

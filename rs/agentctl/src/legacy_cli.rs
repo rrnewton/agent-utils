@@ -539,6 +539,7 @@ fn run_managed(args: Args) -> Result<i32, CliError> {
                 retire_dead_native: args.retire_dead_native,
                 expected_record_sha256: args.expected_record_sha256.clone(),
                 skip_cloud_halt: false,
+                discard_queued_input: false,
             },
         )?)?,
         "list" => {

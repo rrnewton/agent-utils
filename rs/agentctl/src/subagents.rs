@@ -7125,6 +7125,9 @@ pub struct StopOptions {
     pub expected_record_sha256: Option<String>,
     /// Retire an agentcloud agent's record and tab without halting or archiving its session.
     pub skip_cloud_halt: bool,
+    /// Explicitly discard the harness's queued UI inputs that closing the
+    /// pane would drop (#2045); recorded in the stop report.
+    pub discard_queued_input: bool,
 }
 
 /// Registry-backed coordinator interface to visible foreign-harness workers.
@@ -17939,6 +17942,7 @@ its drain would also type, so it was not queued",
         }
         let (archive, destination) = self.archive_destination(&record)?;
         let mut harness_ended = None;
+        let mut discarded_queued_input: Vec<String> = Vec::new();
         if !owned.is_empty() {
             if owned.len() != 1
                 || Some(&owned[0].pane_id) != record.pane_id.as_ref()
@@ -17957,6 +17961,16 @@ its drain would also type, so it was not queued",
             if text.is_empty() {
                 text = self.client.read(pane_id, "recent", Some(5000))?;
             }
+            // Closing this pane drops the harness's queued UI inputs with
+            // no replay (#2045): refuse while any are present unless the
+            // caller explicitly discards them.
+            revive::check_queued_ui_input(
+                agent_name,
+                &record.harness,
+                &text,
+                options.discard_queued_input,
+                &mut discarded_queued_input,
+            )?;
             self.snapshot(&record, &text)?;
             self.checked_or_launch_failed(&record, pane_id)?;
             record.lifecycle = "stopping".to_owned();
@@ -17995,6 +18009,9 @@ its drain would also type, so it was not queued",
         let mut stopped = json!({"name":agent_name,"archive":destination,"pane_closed":!owned.is_empty(),"tab_closed":tab_closed});
         if let Some(ended) = harness_ended {
             stopped["harness_exited"] = json!(ended);
+        }
+        if !discarded_queued_input.is_empty() {
+            stopped["discarded_queued_input"] = json!(discarded_queued_input);
         }
         Ok(stopped)
     }
@@ -22548,6 +22565,7 @@ fi
                     retire_dead_native: false,
                     expected_record_sha256: Some(digest.clone()),
                     skip_cloud_halt: false,
+                    discard_queued_input: false,
                 },
             )
             .unwrap();
@@ -22611,6 +22629,7 @@ fi
                     }
                 }),
                 skip_cloud_halt: false,
+                discard_queued_input: false,
             };
             assert!(fixture
                 .manager()
@@ -22675,6 +22694,7 @@ fi
                         retire_dead_native: false,
                         expected_record_sha256: Some(digest),
                         skip_cloud_halt: false,
+                        discard_queued_input: false,
                     },
                 )
                 .unwrap_err();
@@ -22721,6 +22741,7 @@ fi
                         retire_dead_native: false,
                         expected_record_sha256: Some(digest),
                         skip_cloud_halt: false,
+                        discard_queued_input: false,
                     },
                 )
                 .is_err());
@@ -22763,6 +22784,7 @@ fi
                         retire_dead_native: false,
                         expected_record_sha256: Some(digest),
                         skip_cloud_halt: false,
+                        discard_queued_input: false,
                     },
                 )
                 .unwrap_err();
@@ -22798,6 +22820,7 @@ fi
                     retire_dead_native: false,
                     expected_record_sha256: Some(digest),
                     skip_cloud_halt: false,
+                    discard_queued_input: false,
                 },
             )
             .unwrap_err();
@@ -22824,6 +22847,7 @@ fi
             retire_dead_native: false,
             expected_record_sha256: Some(digest),
             skip_cloud_halt: false,
+            discard_queued_input: false,
         };
 
         let error = manager
@@ -22862,6 +22886,7 @@ fi
                     retire_dead_native: false,
                     expected_record_sha256: Some(digest),
                     skip_cloud_halt: false,
+                    discard_queued_input: false,
                 },
             )
             .unwrap_err();
@@ -22898,6 +22923,7 @@ fi
                     retire_dead_native: false,
                     expected_record_sha256: Some(digest),
                     skip_cloud_halt: false,
+                    discard_queued_input: false,
                 },
             )
             .unwrap();
@@ -23804,6 +23830,7 @@ fi
                     retire_dead_native: false,
                     expected_record_sha256: Some(digest),
                     skip_cloud_halt: false,
+                    discard_queued_input: false,
                 },
             );
             fs::set_permissions(&active, fs::Permissions::from_mode(0o700)).unwrap();

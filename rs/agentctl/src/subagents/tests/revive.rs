@@ -75,6 +75,68 @@ fn restart_refuses_before_exit_when_the_recorded_cwd_is_gone() {
 }
 
 #[test]
+fn restart_refuses_to_drop_queued_ui_input_and_discard_records_it() {
+    // #2045: Muse's `◆ Queued input` block lives in the TUI, not in
+    // agentctl's queue; exiting drops it with no replay. Refuse, naming
+    // the entry, until the caller explicitly discards it.
+    let (fixture, mut old) = recoverable("muse", false);
+    old.session_agent = Some("muse".to_owned());
+    old.session_value = Some("sess-1".to_owned());
+    fixture.manager().save(&old).unwrap();
+    let pane = old.pane_id.clone().unwrap();
+    fixture.client.dead_panes.lock().unwrap().remove(&pane);
+    fixture.client.started.store(true, Ordering::Relaxed);
+    fixture.client.custom_alive.store(true, Ordering::Relaxed);
+    fixture.client.exit_to_shell.store(true, Ordering::Relaxed);
+    *fixture.client.screen.lock().unwrap() =
+        Some("◆ Queued input\n└ stale recovery request, do not act on it\n\n❯\n".to_owned());
+    let error = fixture
+        .manager()
+        .restart("worker", false, Duration::from_secs(30), TIMEOUT)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("stale recovery request, do not act on it"),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("--discard-queued-input"),
+        "{error}"
+    );
+    assert!(
+        !fixture
+            .client
+            .runs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|run| run.contains("/exit")),
+        "a refused restart must not exit the harness"
+    );
+    // With the explicit discard, the restart proceeds and records what
+    // was dropped in its report (and in the restart journal it wrote).
+    let result = fixture
+        .manager()
+        .restart_stopping(
+            "worker",
+            false,
+            Duration::from_secs(30),
+            TIMEOUT,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+    assert_eq!(result["action"], "restarted", "{result}");
+    assert_eq!(
+        result["discarded_queued_input"],
+        json!(["stale recovery request, do not act on it"]),
+        "{result}"
+    );
+}
+
+#[test]
 fn restart_resumes_from_an_exited_journal_without_exiting_again() {
     let (fixture, mut old) = recoverable("muse", false);
     old.session_agent = Some("muse".to_owned());
@@ -3085,6 +3147,7 @@ fn restart_with_a_refreshed_profile_relaunches_from_it() {
             TIMEOUT,
             false,
             true,
+            false,
         )
         .unwrap();
     assert_eq!(result["action"], "restarted", "{result}");

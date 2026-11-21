@@ -3878,12 +3878,14 @@ class ManagedAgents:
         self, name: str, *, when_idle: bool = False,
         wait_timeout: float = 3600.0, startup_timeout: float = 30.0,
         stop_background_tasks: bool = False,
+        discard_queued_input: bool = False,
     ) -> dict[str, object]:
         """Restart one live agent in its own pane with its recorded session."""
         from agentctl.revive import restart
         return restart(self, name, when_idle=when_idle, wait_timeout=wait_timeout,
                        startup_timeout=startup_timeout,
-                       stop_background_tasks=stop_background_tasks)
+                       stop_background_tasks=stop_background_tasks,
+                       discard_queued_input=discard_queued_input)
 
     def restart_team(
         self, caller: str, *, when_idle: bool = False,
@@ -6725,6 +6727,7 @@ class ManagedAgents:
         expected_record_sha256: str | None = None,
         retire_dead_adoption: bool = False,
         retire_dead_native: bool = False,
+        discard_queued_input: bool = False,
     ) -> dict[str, object]:
         """Retire one exact registered generation or recover an adopted runtime."""
         return self._stop(
@@ -6735,6 +6738,7 @@ class ManagedAgents:
             expected_token_explicit=expected_token is not None,
             retire_dead_adoption=retire_dead_adoption,
             retire_dead_native=retire_dead_native,
+            discard_queued_input=discard_queued_input,
         )
 
     def _stop(
@@ -6744,6 +6748,7 @@ class ManagedAgents:
         expected_token_explicit: bool,
         retire_dead_adoption: bool = False,
         retire_dead_native: bool = False,
+        discard_queued_input: bool = False,
     ) -> dict[str, object]:
         """Close only the owned single-pane tab and archive the complete record/queue.
 
@@ -6820,6 +6825,7 @@ class ManagedAgents:
                 return self._stop_runtime(
                     record, expected_token=expected_token,
                     expected_token_explicit=expected_token_explicit,
+                    discard_queued_input=discard_queued_input,
                 )
             except HerdrRunError as exc:
                 if recovery is not None and exc.recovery_action is None:
@@ -6829,6 +6835,7 @@ class ManagedAgents:
     def _stop_runtime(
         self, record: AgentRecord, *, expected_token: str | None,
         expected_token_explicit: bool,
+        discard_queued_input: bool = False,
     ) -> dict[str, object]:
         """Run ordinary runtime retirement under the caller's name lock."""
         name = record.name
@@ -7019,6 +7026,7 @@ class ManagedAgents:
                 raise AgentDeliveryError("refusing to close a tab whose pane ownership changed")
         archive, destination = self._archive_destination(record)
         harness_ended: bool | None = None
+        discarded_queued_input: list[str] = []
         if owned:
             if (record.adapter in ("herdr-pane", "herdr-relay") or record.lifecycle == "running"
                     or self.client.pane_info(owned[0].pane_id).agent is not None):
@@ -7031,6 +7039,12 @@ class ManagedAgents:
                                    {"text": output, "captured_at": time.time(), "pane_id": record.pane_id})
             except HerdrRunError as exc:
                 raise AgentDeliveryError(f"cannot preserve terminal output before stop: {exc}") from exc
+            # Closing this pane drops the harness's queued UI inputs with
+            # no replay (#2045): refuse while any are present unless the
+            # caller explicitly discards them.
+            from agentctl.queued_input import check_queued_ui_input
+            discarded_queued_input = check_queued_ui_input(
+                name, record.harness, output, discard_queued_input)
             # Output capture can involve another control round trip. Recheck
             # the owned native identity before acting on that pane again.
             if (record.adapter in ("herdr-pane", "herdr-relay") or record.lifecycle == "running"
@@ -7059,6 +7073,8 @@ class ManagedAgents:
         }
         if harness_ended is not None:
             stopped["harness_exited"] = harness_ended
+        if discarded_queued_input:
+            stopped["discarded_queued_input"] = discarded_queued_input
         return stopped
 
     def _closed_foreign_target(self, record: AgentRecord) -> tuple[str, str] | None:

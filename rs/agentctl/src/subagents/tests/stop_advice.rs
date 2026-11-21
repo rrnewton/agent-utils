@@ -17,6 +17,7 @@ fn retry_options(recovery: &RecoveryAction) -> StopOptions {
         retire_dead_native: false,
         expected_record_sha256: record_sha256.clone(),
         skip_cloud_halt: *skip_cloud_halt,
+        discard_queued_input: false,
     }
 }
 

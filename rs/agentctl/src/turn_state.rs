@@ -283,6 +283,26 @@ pub fn read_screen(screen: &str) -> ScreenTurn {
     turn
 }
 
+/// The queued UI inputs an exit would silently drop (#2045
+/// agentctl-muse-phantom-background-send): each one's first row as the
+/// screen shows it, or one placeholder naming the count when the harness
+/// (Claude Code's hint) proves queued messages without showing their text.
+/// Empty when the screen shows no queued-input block.
+#[must_use]
+pub fn queued_ui_entries(screen: &str) -> Vec<String> {
+    let turn = read_screen(screen);
+    if turn.queued == 0 {
+        return Vec::new();
+    }
+    if !turn.queued_preview.is_empty() {
+        return turn.queued_preview;
+    }
+    vec![format!(
+        "{} queued message(s) whose text the harness does not show on screen",
+        turn.queued
+    )]
+}
+
 /// Whether the screen shows a turn running: a running-turn row, or `esc to interrupt` as a
 /// `·`-separated or parenthesized segment of a row near the bottom (Claude Code's footer). Used
 /// where Herdr's own status cannot be trusted.
