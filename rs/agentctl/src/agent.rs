@@ -3458,7 +3458,10 @@ pub(crate) fn queue_identified_managed(
     supersede_key: Option<&str>,
     message_id: Option<&str>,
 ) -> AgentResult<QueueResult> {
-    let runtime = SystemRuntime::default();
+    let system = SystemRuntime::default();
+    // Even a queue-only enqueue waits no longer than the default send
+    // deadline for the queue lock (#2036).
+    let runtime = UntilRuntime::after(&system, crate::profiles::DEFAULT_SEND_DEADLINE);
     bind_queue_with_runtime(root, target, &runtime, true)?;
     let enqueued = enqueue_internal(
         root,
@@ -3541,11 +3544,23 @@ fn send_identified_with_runtime_binding<A: AgentApi + ?Sized>(
     priority: bool,
 ) -> AgentResult<QueueResult> {
     let (runtime, allow_legacy_workspace_binding) = runtime_and_binding_mode;
+    // Every wait in a send ends at its deadline, the enqueue's queue-lock
+    // wait included (#2036 agentctl-send-timeout-inotify-wait): a plain
+    // system runtime never reports cancelled, so a contended enqueue
+    // could wait for hours past --deadline behind a long drain.
+    let deadline_runtime;
+    let runtime = match options.deadline {
+        Some(limit) => {
+            deadline_runtime = UntilRuntime::after(runtime, limit);
+            &deadline_runtime as &dyn AgentRuntime
+        }
+        None => runtime,
+    };
     bind_queue_with_runtime(root, target, runtime, allow_legacy_workspace_binding)?;
     // Explicit IDs serialize their cross-directory check against delivery transitions. Generated
     // identifiers plus no-replace creation need not wait behind a long-running drain. The drain and terminal-artifact inspection below resolve any message
     // consumed by another sender between these phases.
-    let enqueued = enqueue_internal(
+    let enqueued = match enqueue_internal(
         root,
         text,
         message_id,
@@ -3554,7 +3569,27 @@ fn send_identified_with_runtime_binding<A: AgentApi + ?Sized>(
         options.raw_prompt,
         supersede_key,
         runtime,
-    )?;
+    ) {
+        Ok(enqueued) => enqueued,
+        Err(error) if runtime.cancelled() => {
+            // The deadline ended the enqueue's lock wait (#2036): the
+            // prompt was not queued by this call, and any copy already
+            // queued under this id is intact — name how to check or
+            // cancel it instead of waiting past the deadline.
+            let identifier = message_id.unwrap_or_default();
+            return Err(AgentError::Pending(UndeliveredMessage {
+                message: format!(
+                    "send gave up at its deadline waiting to queue the prompt: {error}; \
+                     the queued item (if any) is intact and was not duplicated: check it \
+                     with `agentctl status` for this agent, or retire it with \
+                     `agentctl queue retire` / `agentctl cancel` naming id {identifier:?}"
+                ),
+                message_id: identifier.to_owned(),
+                artifact: root.to_path_buf(),
+            }));
+        }
+        Err(error) => return Err(error),
+    };
     let identifier = enqueued.id;
     let mut result = drain_with_runtime_binding(
         client,
@@ -8714,6 +8749,48 @@ mod tests {
             pending_prompts(root).expect("pending").len(),
             1,
             "the prompt stays durable in the queue"
+        );
+    }
+
+    #[test]
+    fn an_identified_send_gives_up_at_its_deadline_behind_a_held_queue_lock() {
+        // #2036 agentctl-send-timeout-inotify-wait: the identified send's
+        // enqueue waits for the queue lock through the send's deadline
+        // runtime, so a lock held past the deadline ends the send at the
+        // deadline (a zero deadline, so no real wait) with the prompt
+        // named and not queued, instead of waiting for hours.
+        let directory = TestDirectory::new("send-deadline-enqueue");
+        let root = directory.path();
+        enqueue(root, "holder prompt", Some("holder-1")).unwrap();
+        let _held = agent_queue::queue::lock_delivery(
+            root,
+            queue_directory_identity(root).unwrap(),
+            &agent_queue::fsio::Blocking,
+        )
+        .unwrap();
+        let fake = FakeAgent::new(&["idle"]);
+        let error = send_identified_managed(
+            &fake,
+            &target_for("w1:p1"),
+            root,
+            "never queued",
+            DrainOptions {
+                deadline: Some(Duration::ZERO),
+                ..DrainOptions::default()
+            },
+            "deadline-1",
+            None,
+        )
+        .expect_err("the send gives up at its deadline");
+        assert_eq!(error.outcome(), Some(QueueOutcome::Pending), "{error}");
+        assert!(
+            error.to_string().contains("deadline-1"),
+            "the give-up names the queue id: {error}"
+        );
+        assert_eq!(
+            message_state(root, "deadline-1").unwrap(),
+            None,
+            "nothing was queued by the given-up send"
         );
     }
 

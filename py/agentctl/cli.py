@@ -101,6 +101,8 @@ def _message(parser: argparse.ArgumentParser) -> None:
 
 
 def _delivery(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--deadline", type=_ascii_float, default=600.0, metavar="SECONDS",
+        help="interactive only: hard wall-clock limit for the whole send or drain; every wait (locks, readiness, confirmation) ends by then and the prompt stays pending (default: 600 seconds)")
     parser.add_argument("--ready-timeout", type=_ascii_float, default=900.0, metavar="SECONDS",
         help="interactive only: maximum readiness wait; 0 leaves busy work queued (default: 900 seconds)")
     parser.add_argument("--working-timeout", type=_ascii_float, default=30.0, metavar="SECONDS",
@@ -646,7 +648,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             _auto_migrate(Path(args.registry))
         sessions = Sessions(HerdrClient(herdr_bin=args.herdr_bin), args.registry)
         options: dict[str, object] = {key: getattr(args, key) for key in
-            ("ready_timeout", "working_timeout", "max_attempts") if hasattr(args, key)}
+            ("ready_timeout", "working_timeout", "max_attempts", "deadline") if hasattr(args, key)}
         if getattr(args, "deliver_while_working", False):
             # Only when asked: a headless worker's request schema has no such option.
             options["deliver_while_working"] = True

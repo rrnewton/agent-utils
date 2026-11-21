@@ -1337,11 +1337,13 @@ def _enqueue(
     supersede_key: str | None = None,
     superseded_out: list[str] | None = None,
     max_artifact_bytes: int | None = None,
+    deadline_end: float | None = None,
 ) -> str:
     identifier, superseded = _enqueue_outcome(
         root, text, message_id=message_id, serialize=serialize,
         supersede_key=supersede_key,
         max_artifact_bytes=max_artifact_bytes,
+        deadline_end=deadline_end,
     )
     if superseded_out is not None:
         superseded_out.extend(superseded)
@@ -1356,6 +1358,7 @@ def _enqueue_outcome(
     serialize: bool,
     supersede_key: str | None = None,
     max_artifact_bytes: int | None = None,
+    deadline_end: float | None = None,
 ) -> tuple[str, list[str]]:
     max_artifact_bytes = _effective_artifact_limit(max_artifact_bytes)
     if not text:
@@ -1381,7 +1384,10 @@ def _enqueue_outcome(
             directory_identity = _queue_directory_identity(root)
             lock_path = os.path.join(root, ".delivery.lock")
             descriptor = _open_private_lock(lock_path, "queue delivery lock")
-            took_delivery = _acquire_flock(descriptor)
+            took_delivery = _acquire_flock_bounded(
+                descriptor, deadline=deadline_end, sleep=time.sleep,
+                monotonic=time.monotonic, purpose="queue delivery lock",
+            )
             _verify_queue_lock(root, directory_identity, lock_path, descriptor, "queue delivery lock")
         # A prompt the Rust edition set aside (or still holds in its second inbox) keeps its
         # identifier, so re-queueing it here can never type it a second time.
@@ -1585,6 +1591,37 @@ def _acquire_flock(descriptor: int) -> bool:
             _HELD_FLOCKS[key] += 1
             return False
     fcntl.flock(descriptor, fcntl.LOCK_EX)
+    with _HELD_FLOCKS_GUARD:
+        _HELD_FLOCKS[key] = _HELD_FLOCKS.get(key, 0) + 1
+    return True
+
+
+def _acquire_flock_bounded(descriptor: int, *, deadline: float | None,
+                           sleep: Callable[[float], None],
+                           monotonic: Callable[[], float],
+                           purpose: str) -> bool:
+    """As :func:`_acquire_flock`, but give up at `deadline` (a monotonic
+    time) instead of blocking in the kernel indefinitely: a send waits
+    no longer than its deadline for a lock (#2036
+    agentctl-send-timeout-inotify-wait)."""
+    key = _flock_key(descriptor)
+    with _HELD_FLOCKS_GUARD:
+        if key in _HELD_FLOCKS:
+            _HELD_FLOCKS[key] += 1
+            return False
+    while True:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if deadline is not None and monotonic() >= deadline:
+                raise AgentDeliveryError(
+                    f"send gave up at its deadline waiting to lock {purpose}; "
+                    "the queued item (if any) is intact and was not duplicated: "
+                    "check it with `agentctl status` for this agent, or retire "
+                    "it with `agentctl queue retire` / `agentctl cancel`"
+                ) from None
+            sleep(0.01)
     with _HELD_FLOCKS_GUARD:
         _HELD_FLOCKS[key] = _HELD_FLOCKS.get(key, 0) + 1
     return True
@@ -2432,8 +2469,12 @@ def drain(
     atomic_policy: AtomicWritePolicy | None = None,
     allow_legacy_workspace_binding: bool = False,
     deliver_while_working: bool = False,
+    deadline: float | None = None,
 ) -> QueueResult:
     """Drain a queue, optionally sharing a bounded atomic staging domain.
+
+    With `deadline` (seconds from the call), every wait — the queue
+    lock, readiness, confirmation — ends by then (#2036).
 
     With ``deliver_while_working``, a Claude Code pane that is working is also typed into and
     Claude Code queues the prompt; one it never accepts is taken back out and stays pending.
@@ -2446,7 +2487,8 @@ def drain(
                       max_artifact_bytes=max_artifact_bytes, sleep=sleep,
                       monotonic=monotonic,
                       allow_legacy_workspace_binding=allow_legacy_workspace_binding,
-                      deliver_while_working=deliver_while_working)
+                      deliver_while_working=deliver_while_working,
+                      deadline=deadline)
 
 
 def _drain(
@@ -2454,6 +2496,7 @@ def _drain(
     working_timeout: float, max_attempts: int, max_artifact_bytes: int | None,
     sleep: Callable[[float], None], monotonic: Callable[[], float],
     allow_legacy_workspace_binding: bool, deliver_while_working: bool = False,
+    deadline: float | None = None,
 ) -> QueueResult:
     """Serialize and drain a FIFO; poison prompts are retained in ``failed``.
 
@@ -2463,6 +2506,14 @@ def _drain(
     intact; a failed post-submission update retains the durable inflight barrier.
     """
     max_artifact_bytes = _effective_artifact_limit(max_artifact_bytes)
+    deadline_end = None if deadline is None else monotonic() + deadline
+
+    def _relock() -> None:
+        _acquire_flock_bounded(
+            descriptor, deadline=deadline_end, sleep=sleep,
+            monotonic=monotonic, purpose="queue delivery lock",
+        )
+
     _refuse_queue_lanes(root)
     directory_identity = _bind_queue(
         root, target, max_artifact_bytes=max_artifact_bytes,
@@ -2478,7 +2529,7 @@ def _drain(
     locked_pane_id = ""
     initial_info: AgentPaneInfo | None = None
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        _relock()
         _verify_queue_lock(root, directory_identity, lock_path, descriptor, "queue delivery lock")
         policy = _ACTIVE_ATOMIC_POLICY.get()
         if policy is not None:
@@ -2547,7 +2598,8 @@ def _drain(
                     info = _wait_ready(
                         client,
                         target,
-                        ready_timeout,
+                        ready_timeout if deadline_end is None else min(
+                            ready_timeout, max(0.0, deadline_end - monotonic())),
                         sleep=sleep,
                         monotonic=monotonic,
                         locked_pane_id=locked_pane_id,
@@ -2557,7 +2609,7 @@ def _drain(
                     )
                     initial_info = None
                 except (AgentDeliveryError, HerdrUnavailable) as exc:
-                    fcntl.flock(descriptor, fcntl.LOCK_EX)
+                    _relock()
                     blocked = _bounded_error(str(exc), max_artifact_bytes)
                     # Re-check the record's phase under the queue lock
                     # before writing it back (#1775 (c)): a prompt cancelled
@@ -2572,7 +2624,7 @@ def _drain(
                         document["delivery_blocked_at"] = time.time()
                         _atomic_json(path, document, max_artifact_bytes=max_artifact_bytes)
                     break
-                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                _relock()
                 # While the queue lock was released, a concurrent drain may have
                 # claimed or delivered this item; never claim it twice (#1480).
                 if not os.path.exists(path):
@@ -2785,6 +2837,10 @@ def _send(
     )
     if not isinstance(allow_legacy_workspace_binding, bool):
         raise AgentDeliveryError("allow_legacy_workspace_binding must be boolean")
+    deadline = kwargs.pop("deadline", None)
+    if deadline is not None and not isinstance(deadline, (int, float)):
+        raise AgentDeliveryError("deadline must be a number of seconds or None")
+    deadline_end = None if deadline is None else time.monotonic() + float(deadline)
     _bind_queue(
         root, target, max_artifact_bytes=max_artifact_bytes,
         allow_legacy_workspace_binding=allow_legacy_workspace_binding,
@@ -2802,11 +2858,14 @@ def _send(
         root, text, message_id=message_id,
         serialize=message_id is not None or supersede_key is not None,
         max_artifact_bytes=max_artifact_bytes,
+        deadline_end=deadline_end,
         **enqueue_kwargs,  # type: ignore[arg-type]
     )
     result = drain(client, target, root, max_artifact_bytes=max_artifact_bytes,
                    atomic_policy=atomic_policy,
                    allow_legacy_workspace_binding=allow_legacy_workspace_binding,
+                   deadline=None if deadline_end is None else max(
+                       0.0, deadline_end - time.monotonic()),
                    **kwargs)  # type: ignore[arg-type]
     if superseded:
         result = QueueResult(

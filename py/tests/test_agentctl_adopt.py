@@ -2431,3 +2431,63 @@ def test_retired_queue_item_is_set_aside_without_replacing_the_cancelled_copy(
     assert not source.exists()
     kept = json.loads((root / "cancelled" / "dup-1.json").read_text(encoding="utf-8"))
     assert kept["delivery_state"] == "cancelled"
+
+
+def test_bounded_flock_gives_up_at_the_deadline_without_a_real_wait(
+    tmp_path: Path,
+) -> None:
+    # #2036: a contended flock ends at the deadline (fake clock, no real
+    # waiting) instead of blocking in the kernel for hours.
+    import fcntl as _fcntl
+    from agentctl.errors import AgentDeliveryError
+
+    lock = tmp_path / ".delivery.lock"
+    lock.write_text("", encoding="utf-8")
+    holder = os.open(lock, os.O_RDWR)
+    _fcntl.flock(holder, _fcntl.LOCK_EX)
+    candidate = os.open(lock, os.O_RDWR)
+    clock = {"now": 100.0}
+
+    def fake_monotonic() -> float:
+        return clock["now"]
+
+    def fake_sleep(seconds: float) -> None:
+        clock["now"] += seconds
+
+    try:
+        with pytest.raises(AgentDeliveryError, match="gave up at its deadline"):
+            agent._acquire_flock_bounded(
+                candidate, deadline=100.05, sleep=fake_sleep,
+                monotonic=fake_monotonic, purpose="queue delivery lock",
+            )
+    finally:
+        os.close(candidate)
+        os.close(holder)
+    assert clock["now"] >= 100.05
+
+
+def test_serialized_enqueue_gives_up_at_the_deadline_and_queues_nothing(
+    tmp_path: Path,
+) -> None:
+    # #2036: an identified send whose enqueue lock is held past its
+    # deadline queues nothing and names how to check or cancel it.
+    import fcntl as _fcntl
+    from agentctl.errors import AgentDeliveryError
+
+    root = tmp_path / "queue"
+    (root / "inbox").mkdir(parents=True)
+    os.chmod(root / "inbox", 0o700)
+    lock = root / ".delivery.lock"
+    lock.write_text("", encoding="utf-8")
+    os.chmod(lock, 0o600)
+    holder = os.open(lock, os.O_RDWR)
+    _fcntl.flock(holder, _fcntl.LOCK_EX)
+    try:
+        with pytest.raises(AgentDeliveryError, match="gave up at its deadline"):
+            agent._enqueue(
+                str(root), "never queued", message_id="deadline-py-1",
+                serialize=True, deadline_end=time.monotonic() - 1.0,
+            )
+    finally:
+        os.close(holder)
+    assert not (root / "inbox" / "deadline-py-1.json").exists()
