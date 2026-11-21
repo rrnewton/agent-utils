@@ -2758,10 +2758,12 @@ def _dead_adopted_retirement(harness: Harness, report: Report) -> None:
         # archived queue (cancelled, stranded-archived), never
         # preserved pending and never replayed; both editions agree.
         and (archived[0].parent / "queue/cancelled/pending.json").exists()
+        and (archived[0].parent / "queue/cancelled/uncertain.json").exists()
         and not (archived[0].parent / "queue/inbox/pending.json").exists()
+        and not (archived[0].parent / "queue/inflight/uncertain.json").exists()
         and all((archived[0].parent / relative).read_bytes() == content
                 for relative, content in originals[index].items()
-                if relative != "queue/inbox/pending.json")
+                if relative not in ("queue/inbox/pending.json", "queue/inflight/uncertain.json"))
         and _fixture_calls(root) == calls[index]
         and _submitted(root) == []
         and _state(root).get("closed_panes") == []
