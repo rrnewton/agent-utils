@@ -1,0 +1,20 @@
+steps:
+  # `#2080 vibe-talk-summary-link-stays-in-view` against the real server binary: a
+  # Discuss citation (main message, thread reply, not-yet-loaded), footer times,
+  # a not-found link and a stale link, from All with Discuss open — the view and
+  # panel stay, the target lands marked, failures say why with their next step,
+  # and Back returns — at phone and desk, light and dark.
+  - group: check
+    job: summary-link-browser
+    desc: summary links stay in the current view and every link lands with the Linked bubble or a persistent reason (real server, fake chat upstream) in current Chromium at 412x915 and 1280x800, light and dark
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/summary_link_browser.py
+    jobs_flag: ""
+    deps: [build.release, setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 90
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824

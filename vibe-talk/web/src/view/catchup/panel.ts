@@ -1929,13 +1929,19 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       button.className = "discuss-link";
       button.textContent = link.label.split(" · ")[0] ?? link.label;
       listening.listen(button, "click", () => {
-        dropToPartialForLink();
-        deps.onJump({
+        const ref: MessageLinkRef = {
           service: deps.serviceName(scope.channelId),
           channel: scope.channelId,
           message: link.id,
           thread: link.thread_id,
-        });
+        };
+        // `#2080`: footer times route like citations, through the binding, so
+        // they stay in the current view too; a plain-jump host keeps the old way.
+        if (deps.onLinkTap) deps.onLinkTap(ref, false);
+        else {
+          dropToPartialForLink();
+          deps.onJump(ref);
+        }
       });
       item.appendChild(button);
       if (index < visible.length - 1) item.appendChild(document.createTextNode(", "));

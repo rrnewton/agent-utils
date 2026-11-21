@@ -62,6 +62,8 @@ export interface NavDeepLinkWanted {
   readonly view: string | null;
   readonly thread: string | null;
   readonly message: DeepLinkRef | null;
+  /** `#2080`: the raw `m` value where one was present but unreadable by this page, else null. */
+  readonly messageRaw?: string | null;
 }
 
 /** The history entries' owner, as created by `core/navigation`'s `createBackStack`. */
@@ -354,7 +356,13 @@ export interface PageNavigationDependencies<Column, ThreadLike, Pane> {
   providerName(): string;
   threadOf(message: NavMessage): string | null;
   setStatus(text: string): void;
-  showError(message: string): void;
+  showError(message: string, options?: { readonly stay?: boolean; readonly actionLabel?: string; readonly onAction?: () => unknown }): void;
+  /** `#2080`: take the persistent link-failure notice away after a retry lands. */
+  clearError?(): void;
+  /** `#2080`: read one older page, for a link retry that loads further back. */
+  loadOlder?(): unknown;
+  /** `#2080`: reload the page, for a link this page's code cannot read. */
+  reloadPage?(): void;
   guardQuietly<A extends unknown[], R>(run: (...args: A) => R): (...args: A) => Promise<Awaited<R>>;
   settleFocus(): void;
   replyOnScreen(): boolean;
@@ -472,6 +480,11 @@ export interface PageNavigation {
   jumpToDocumentLink(key: string, from?: Element | null): void;
   documentBack(): void;
   jumpToMessageLink(ref: MessageLinkRef): Promise<void>;
+  /** `#2080 vibe-talk-summary-link-stays-in-view`: jump without leaving the view on screen
+   * where that view can show the message (a summary's citation tap). */
+  jumpToMessageInPlace(ref: MessageLinkRef): Promise<void>;
+  /** `#2080`: jump landing in `view` (a Discuss return-to-bound tap). */
+  jumpToMessageInView(ref: MessageLinkRef, view: "flat" | "main"): Promise<void>;
   jumpToSentMessage(ref: MessageLinkRef): Promise<void>;
   returnFromLinkJump(): void;
   putBackOnSpot(spot: NavLinkSpot): boolean;
@@ -1157,7 +1170,11 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
       if (wanted.view === "voice") {
         deps.setStatus("Links never start a call.");
       }
-      if (!wanted.message) return;
+      if (!wanted.message) {
+        // `#2080`: an `m` this page cannot read is a newer link, not no link.
+        if (wanted.messageRaw) showStaleLinkFailure();
+        return;
+      }
       deepLinks.setFocus(wanted.message);
       syncDeepLinkAddress();
       const movesBeforeSeek = deepLinks.readerMoves();
@@ -1177,6 +1194,8 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
       if (!deps.rowHolding(target)) {
         deepLinks.setFocus(null);
         syncDeepLinkAddress();
+        // `#2080` landed-or-reason: the opened-by link names its failure too.
+        showLinkFailure(target);
       }
     } finally {
       deepLinks.setApplying(false);
@@ -1232,7 +1251,23 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
           kid.setAttribute("title", "Opens here");
         }
         const ref = messageLinkRef(kid.getAttribute("data-msg"));
-        if (!ref) continue;
+        if (!ref) {
+          // `#2080`: a marked link whose mark this page cannot read was minted by a
+          // newer server: say so and offer Reload instead of leaving the tap to
+          // follow the raw address with no word. Unmarked links are untouched.
+          if (kid.getAttribute("data-msg")) {
+            kid.addEventListener("click", deps.inThisColumn((event: Event) => {
+              const tap = event as { ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean; altKey?: boolean; button?: number; preventDefault?: () => void; stopPropagation?: () => void };
+              if (tap.ctrlKey || tap.metaKey || tap.shiftKey || tap.altKey || (tap.button || 0) > 0) return;
+              if (typeof tap.preventDefault === "function") tap.preventDefault();
+              if (typeof tap.stopPropagation === "function") tap.stopPropagation();
+              showStaleLinkFailure();
+            }));
+            kid.setAttribute("data-in-app", "");
+            kid.setAttribute("title", "Newer than this page");
+          }
+          continue;
+        }
         const shortKind = kid.getAttribute("data-shortref");
         kid.addEventListener("click", deps.inThisColumn((event: Event) => onMessageLinkTap(ref, event as {
           ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean; altKey?: boolean; button?: number;
@@ -1480,6 +1515,24 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
   }
 
   /**
+   * `#2080`: a summary's tap, which stays in the view on screen where that view can
+   * show the message (see the stay rule in `jumpFromSpot`). Still one link-jump
+   * level, so Back returns to the reader's previous position in the same view.
+   */
+  async function jumpToMessageInPlace(ref: MessageLinkRef): Promise<void> {
+    if (deps.screens().screen() !== "main" || deps.screens().view() !== "discord") return undefined;
+    const spot = linkJumpSpot();
+    return deps.inColumn(deps.mainColumn(), () => jumpFromSpot(ref, spot, { stay: true }));
+  }
+
+  /** `#2080`: a summary's return-to-bound tap: land in the bound scope's own view. */
+  async function jumpToMessageInView(ref: MessageLinkRef, view: "flat" | "main"): Promise<void> {
+    if (deps.screens().screen() !== "main" || deps.screens().view() !== "discord") return undefined;
+    const spot = linkJumpSpot();
+    return deps.inColumn(deps.mainColumn(), () => jumpFromSpot(ref, spot, { view }));
+  }
+
+  /**
    * Jump to the message a sent card names (`#580 open-in-chat-jump`), from the call's view or the
    * channel's: a link's jump (`jumpFromSpot`), landing in the view Settings names (All unless the
    * reader chose Main) with the message centred and lit. From the call's view the channel's view
@@ -1509,8 +1562,47 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
    * never over two columns, which keep their own. `options.center` centres the message rather than
    * putting it under the top. `options.enter` runs once the jump is a level, before anything else.
    */
+  /**
+   * `#2080 vibe-talk-summary-link-stays-in-view` (with OWNER 306): the landed-or-reason
+   * contract. A jump that could not land its message says why in the persistent error
+   * panel (it does not fade like the status line) and names the next step: Load older
+   * (which then retries the landing) where more history exists, or a plain not-found
+   * where the channel's read history is complete. A link this page cannot parse at
+   * all (minted by a newer server) says so and offers Reload. Never a silent no-op.
+   */
+  function showLinkFailure(target: string): void {
+    if (deps.olderPages().moreAbove) {
+      deps.showError("That message is further back than what's loaded.", {
+        stay: true,
+        actionLabel: "Load older",
+        onAction: async () => {
+          try {
+            await deps.loadOlder?.();
+          } catch {
+            // The failed read is reported where every failed read is.
+          }
+          if (landOnDeepLink(target)) deps.clearError?.();
+          else showLinkFailure(target);
+        },
+      });
+    } else {
+      deps.showError("That message couldn't be found in this channel.", { stay: true });
+    }
+  }
+
+  /** `#2080`: a link whose shape this page cannot read: fail visibly, offer Reload. */
+  function showStaleLinkFailure(): void {
+    deps.showError("This link is newer than this page and can't be opened by it.", {
+      stay: true,
+      actionLabel: "Reload",
+      onAction: () => deps.reloadPage?.(),
+    });
+  }
+
   async function jumpFromSpot(ref: MessageLinkRef, spot: NavLinkSpot, options: {
     view?: "flat" | "main"; center?: boolean; enter?: (() => Promise<void>) | null;
+    /** `#2080`: stay in the view on screen where it can show the message (summary taps). */
+    stay?: boolean;
   } = {}): Promise<void> {
     const here = String(deps.selectedChannelId() || "");
     if (ref.channel === here && !ref.message && !ref.thread) {
@@ -1535,10 +1627,19 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
       const now = channelPlace();
       let place: NavChannelPlace | null = null;
       const want = deps.threading() && ref.message && !(now && now.layout === "two") ? options.view || null : null;
+      // `#2080` stay rule (summary taps): All shows every message in place, replies
+      // included, so it never switches; the open thread shows its own messages in
+      // place; Main shows roots in place and falls back to All (the same global
+      // scope) for a reply it cannot show. Opening a thread stays explicit.
+      const stayHere = Boolean(options.stay) && !want && Boolean(now && now.layout === "one" &&
+        (now.view === "flat" ||
+          (now.view === "thread" && ref.thread !== null && String(ref.thread) === String(now.thread ?? ""))));
       if (want === "flat") {
         // All: every message in the order sent, a reply among them, so no thread is opened.
         place = { screen: "main", channel, layout: "one", view: "flat", thread: null, origin: null, side: null };
-      } else if (ref.thread && deps.threading()) {
+      } else if (options.stay && !want && now && now.layout === "one" && now.view === "main" && ref.thread && deps.threading()) {
+        place = { screen: "main", channel, layout: "one", view: "flat", thread: null, origin: null, side: null };
+      } else if (ref.thread && deps.threading() && !stayHere) {
         const origin = want === "main" ? "main"
           : now && now.layout === "one" && (now.view === "main" || now.view === "flat") ? now.view
             : now && now.view === "thread" && (now.origin === "main" || now.origin === "flat") ? now.origin
@@ -1576,6 +1677,8 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
       },
         () => linkJumps.current(ticket) && deps.threading() && deps.selection().view !== "flat" && deps.answeredElsewhere(target));
       if (linkJumps.current(ticket) && !deps.rowHolding(target)) deepLinks.setFocus(null);
+      // `#2080` landed-or-reason: no bubble landed, so say why, persistently.
+      if (linkJumps.current(ticket) && !landed && !deps.rowHolding(target)) showLinkFailure(target);
       // `#1959 vibe-talk-reader-one-click-jump`: the landing above has
       // expanded the row and put its top on screen (revealRow re-asserts
       // while the Discuss sheet settles); now, with no second tap, start
@@ -1913,7 +2016,7 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
     noteDeepLinkReaderMove, deepLinkReaderMoved, deepLinkRefOf, deepLinkFromAddress, deepLinkFor,
     syncDeepLinkAddress, linkedRowShown, landOnDeepLink, waitForDeepLink, applyDeepLink, copyDeepLink,
     keepsInApp, messageLinkLabel, wireMessageLinks, onMessageLinkTap, linkJumpSpot, withLinkJumps,
-    arriveOnChannel, arriveAtPlace, jumpToDocumentLink, documentBack, jumpToMessageLink, jumpToSentMessage, returnFromLinkJump,
+    arriveOnChannel, arriveAtPlace, jumpToDocumentLink, documentBack, jumpToMessageLink, jumpToMessageInPlace, jumpToMessageInView, jumpToSentMessage, returnFromLinkJump,
     putBackOnSpot, pressViewSwitch, readEnteredChannel, changeSelectedChannel, showView,
   };
 }

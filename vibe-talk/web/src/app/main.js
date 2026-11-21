@@ -992,7 +992,10 @@ const shellNavigation = createPageNavigation({
   providerName: () => channelDirectory.providerName(),
   threadOf: (message) => threadOf(message),
   setStatus: (text) => setStatus(text),
-  showError: (message) => showError(message),
+  showError: (message, options) => showError(message, options),
+  clearError: () => clearError(),
+  loadOlder: () => loadOlder(),
+  reloadPage: () => window.location.reload(),
   guardQuietly: (run) => guardQuietly(run),
   settleFocus: () => settleFocus(),
   replyOnScreen: () => replyOnScreen(),
@@ -1327,6 +1330,14 @@ const discussView = createDiscussView({
   // list); the list moves behind it, and the panel's state is untouched.
   onJump: (ref) => {
     void shellNavigation.jumpToMessageLink(ref);
+  },
+  // `#2080 vibe-talk-summary-link-stays-in-view`: a citation tap stays in the
+  // view on screen (All included); a return-to-bound tap lands in the bound view.
+  onJumpInPlace: (ref) => {
+    void shellNavigation.jumpToMessageInPlace(ref);
+  },
+  navigateToBound: (scope, ref) => {
+    void shellNavigation.jumpToMessageInView(ref, scope.view);
   },
   dismissMessages: (body) => dismissMessages(body),
   restoreMessages: (ids) => restoreMessages(ids),

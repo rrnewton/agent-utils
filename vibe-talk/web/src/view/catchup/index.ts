@@ -142,6 +142,12 @@ export interface DiscussViewDependencies {
   /** Jump to the message a footer link names. */
   onJump(ref: MessageLinkRef): unknown;
   /**
+   * `#2080 vibe-talk-summary-link-stays-in-view`. Jump as `onJump` does without
+   * leaving the view on screen where it can show the message (All included): a
+   * summary tap stays, Discuss open, summary scroll kept. Absent, `onJump`.
+   */
+  onJumpInPlace?(ref: MessageLinkRef): unknown;
+  /**
    * `#1395 discuss-scope-binding`. Show the bound global view, then jump to
    * `ref` there (rule `out-of-thread-link-returns-to-bound`); the panel
    * stays open. Absent, a return-to-bound tap jumps as `onJump` does.
@@ -452,8 +458,11 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
     });
     if (decision.action === "jump-in-place") {
       // `#1586`: out of full screen first, so the jump lands visibly.
+      // `#2080`: in place — the current view (All included) shows the message
+      // where it can, Discuss stays open and its scroll is untouched.
       panel.dropToPartialForLink();
-      deps.onJump(ref);
+      if (deps.onJumpInPlace) deps.onJumpInPlace(ref);
+      else deps.onJump(ref);
     } else if (decision.action === "return-to-bound" && boundRaw !== null) {
       panel.dropToPartialForLink();
       if (deps.navigateToBound) deps.navigateToBound(boundRaw, ref);

@@ -326,3 +326,53 @@ test("`#1959`: a target the walk cannot land (not yet loaded, never arrives) sta
   await nav.jumpToMessageLink({ service: "discord", channel: "C1", message: "m404", thread: null });
   assert.deepStrictEqual(calls.filter((call) => Array.isArray(call) && call[0] === "startReading"), []);
 });
+
+test("`#2080 vibe-talk-summary-link-stays-in-view`: an in-place jump to a thread reply from All stays in All", async () => {
+  const state = freshState();
+  state.selection = { view: "flat", threadId: null, origin: null };
+  state.landSeek = true;
+  state.row = { className: "" };
+  const { nav, calls } = makeNavigation(state);
+  await nav.jumpToMessageInPlace({ service: "discord", channel: "C1", message: "m42", thread: "T1" });
+  assert.deepStrictEqual(calls.filter((call) => Array.isArray(call) && call[0] === "seek"), [["seek", "m42"]],
+    "the reply was not sought in place");
+  assert.deepStrictEqual(calls.filter((call) => Array.isArray(call) && call[0] === "oneColumn"), [],
+    "the jump opened a thread over All");
+});
+
+test("`#2080`: a plain jump to a thread reply still drills into its thread (`#543` kept)", async () => {
+  const state = freshState();
+  state.selection = { view: "flat", threadId: null, origin: null };
+  state.landSeek = true;
+  state.row = { className: "" };
+  const { nav, calls } = makeNavigation(state);
+  await nav.jumpToMessageLink({ service: "discord", channel: "C1", message: "m42", thread: "T1" });
+  assert.deepStrictEqual(calls.filter((call) => Array.isArray(call) && call[0] === "oneColumn"), [["oneColumn", "thread"]],
+    "an ordinary message link no longer opens its thread");
+});
+
+test("`#2080`: a jump that lands nothing says why, persistently (not-found)", async () => {
+  const state = freshState();
+  state.selection = { view: "flat", threadId: null, origin: null };
+  state.landSeek = false;
+  state.row = null;
+  state.older = { moreAbove: false, cursor: null };
+  const { nav, calls } = makeNavigation(state);
+  await nav.jumpToMessageInPlace({ service: "discord", channel: "C1", message: "m404", thread: null });
+  assert.ok(calls.some((call) => Array.isArray(call) && call[0] === "error" &&
+    call[1] === "That message couldn't be found in this channel."),
+    "a failed jump was a silent no-op");
+});
+
+test("`#2080`: a jump short of loaded history offers Load older as its next step", async () => {
+  const state = freshState();
+  state.selection = { view: "flat", threadId: null, origin: null };
+  state.landSeek = false;
+  state.row = null;
+  state.older = { moreAbove: true, cursor: "c" };
+  const { nav, calls } = makeNavigation(state);
+  await nav.jumpToMessageInPlace({ service: "discord", channel: "C1", message: "m404", thread: null });
+  assert.ok(calls.some((call) => Array.isArray(call) && call[0] === "error" &&
+    call[1] === "That message is further back than what's loaded."),
+    "a further-back jump did not name its reason");
+});

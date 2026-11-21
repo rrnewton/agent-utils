@@ -96,7 +96,7 @@ test("`#624 voice-page-modularity`: a link is read from the address once, counts
   assert.equal(links.readerMoved(), false, "choices before the link was read are not counted against it");
   const wanted = links.wanted();
   assert.deepStrictEqual({ ...wanted, message: { ...wanted.message } },
-    { channel: "C1", view: "thread", thread: "T1", message: { provider: "discord", channel: "C1", message: "M1", thread: null } });
+    { channel: "C1", view: "thread", thread: "T1", message: { provider: "discord", channel: "C1", message: "M1", thread: null }, messageRaw: null });
   search = "?c=C2";
   assert.equal(links.wanted(), wanted, "the address is read once a load");
   assert.equal(reads, 1);

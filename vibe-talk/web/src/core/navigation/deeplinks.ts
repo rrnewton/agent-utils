@@ -16,6 +16,10 @@ export interface DeepLinkWanted {
   readonly view: string | null;
   readonly thread: string | null;
   readonly message: DeepLinkRef | null;
+  /** `#2080`: the raw `m` value where one was present but no ref could be read from it (a link
+   * minted by a newer server than this page), so the landing can say so instead of dropping
+   * the message silently. Null where no `m` was present or it parsed. */
+  readonly messageRaw: string | null;
 }
 
 /** What the links ask of the page. */
@@ -103,8 +107,9 @@ export function createDeepLinks(deps: DeepLinksDependencies): DeepLinks {
         const thread = deepLinkPart(params, "t");
         const messageText = deepLinkPart(params, "m");
         const message = messageText ? deepLinkRefFrom(messageText) : null;
-        if (channel || view || thread || message) {
-          deepLinkWanted = { channel, view, thread, message };
+        const messageRaw = messageText && message === null ? String(messageText) : null;
+        if (channel || view || thread || message || messageRaw) {
+          deepLinkWanted = { channel, view, thread, message, messageRaw };
           // Choices are counted from the link's first reading, wherever that is — the channel's
           // opening view may read it before any apply attempt runs.
           if (deepLinkStartMoves === null) deepLinkStartMoves = deepLinkReaderMoves;

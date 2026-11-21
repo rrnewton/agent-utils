@@ -56,8 +56,9 @@ export interface ShellNotices {
   holdStatus(): void;
   /** The state dot beside the line: idle, working, live, unresponsive, ended, suspended, error. */
   setState(name: string): void;
-  /** Show a failure in the error panel: for twelve seconds, or until the reader acts with `stay`. */
-  showError(text: unknown, options?: { readonly stay?: boolean }): void;
+  /** Show a failure in the error panel: for twelve seconds, or until the reader acts with `stay`.
+   * `#2080`: `actionLabel`/`onAction` offer one named next step (Load older, Reload). */
+  showError(text: unknown, options?: { readonly stay?: boolean; readonly actionLabel?: string; readonly onAction?: () => unknown }): void;
   /** Take the error panel away. */
   clearError(): void;
   /** Show the connection details in the banner, which takes itself away. */
@@ -135,12 +136,43 @@ export function createShellNotices(deps: ShellNoticesDependencies): ShellNotices
     el("status-line").setAttribute("data-state", name);
   }
 
-  function showError(text: unknown, options?: { readonly stay?: boolean }): void {
+  /** `#2080`: the pending next-step action for the error panel, and its one listener. */
+  let errorAction: (() => unknown) | null = null;
+  let errorActionWired = false;
+  function drawErrorAction(label: string | undefined, run: (() => unknown) | undefined): void {
+    let button: HTMLElement;
+    try {
+      button = el("error-action");
+    } catch {
+      return;
+    }
+    if (!errorActionWired) {
+      errorActionWired = true;
+      try {
+        button.addEventListener("click", () => {
+          const act = errorAction;
+          if (act) void act();
+        });
+      } catch {
+        // A host whose button cannot listen: the words still stand.
+      }
+    }
+    errorAction = typeof run === "function" ? run : null;
+    if (label && errorAction) {
+      button.textContent = label;
+      button.hidden = false;
+    } else {
+      button.hidden = true;
+    }
+  }
+
+  function showError(text: unknown, options?: { readonly stay?: boolean; readonly actionLabel?: string; readonly onAction?: () => unknown }): void {
     const box = el("error-wrap");
     // Try again is offered by one error only, and it shows it after this; see `reportUnreachable`.
     el("retry-start").hidden = true;
     // So is Read with device voice, by a cloud read that failed (`cloudReadFailed`).
     el("read-on-device").hidden = true;
+    drawErrorAction(options?.actionLabel, options?.onAction);
     deps.holdingReader(() => {
       // `#1726 vibe-talk-empty-red-banner`: a failure can arrive with no words of
       // its own — an `Error` with an empty message, a server answer whose detail
@@ -162,6 +194,7 @@ export function createShellNotices(deps: ShellNoticesDependencies): ShellNotices
     // `#209 voice-socket-open`. Try again belongs to the one error that offers it.
     el("retry-start").hidden = true;
     el("read-on-device").hidden = true;
+    drawErrorAction(undefined, undefined);
     // Most callers clear on the way into an action — Read, Talk, sign-in — whether or not anything is
     // showing. With nothing to take away there is nothing to hold, and holding anyway would snap a
     // reader within BOTTOM_SLACK_PX of the newest line down onto it.
