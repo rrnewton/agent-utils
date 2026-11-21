@@ -580,7 +580,9 @@ test("`#880 voice-page-menu-placement`: Hide reader takes the channel's row of b
       timestamp: "2026-08-19T05:31:00.000Z" }),
   ]);
   assert.equal(item.hidden, false, "Hide reader is not offered over the channel");
-  assert.equal(word(), "Hide reader");
+  assert.equal(word(), "Hide");
+  assert.deepStrictEqual([item.getAttribute("aria-label"), item.getAttribute("title")], ["Hide reader", "Hide reader"],
+    "the visible Hide lost its whole accessible name or title (#2052)");
   // The pace popover is the row's: open, it goes with the row rather than staying a level nobody can see.
   await page.el("read-speed").click();
   assert.equal(page.el("speed-popover").hidden, false, "the premise: the pace popover open");
@@ -589,7 +591,7 @@ test("`#880 voice-page-menu-placement`: Hide reader takes the channel's row of b
   await page.settle();
   assert.equal(said(), "hidden", "Hide reader hid nothing");
   assert.equal(page.el("speed-popover").hidden, true, "the pace popover stayed open with its row hidden");
-  assert.equal(word(), "Hide reader", "the fixed label followed the row (#1399)");
+  assert.equal(word(), "Hide", "the fixed label followed the row (#1399)");
   assert.equal(item.getAttribute("aria-pressed"), "true", "Hide reader does not say it is on");
   assert.equal(page.el("action-menu").hidden, true, "choosing Hide reader left the menu open");
   assert.equal(page.storage.get("vibe-talk.voice.reader-hidden"), "1", "the choice is not kept");
@@ -619,7 +621,7 @@ test("`#880 voice-page-menu-placement`: Hide reader takes the channel's row of b
   const again = newPage(page.storage);
   await signIn(again);
   assert.equal(again.documentElement.getAttribute("data-reader"), "hidden", "a reload forgot Hide reader");
-  assert.equal(again.el("reader-toggle-label").text(), "Hide reader");
+  assert.equal(again.el("reader-toggle-label").text(), "Hide");
   assert.equal(again.el("reader-toggle").getAttribute("aria-pressed"), "true", "Hide reader does not say it is on after a reload");
   assert.equal(again.tab(), "discord", "the premise: a reload opens on the view it was left on");
   assert.equal(again.el("reader-toggle").hidden, false, "Hide reader is not offered after a reload");
@@ -627,7 +629,7 @@ test("`#880 voice-page-menu-placement`: Hide reader takes the channel's row of b
   await again.el("reader-toggle").click();
   await again.settle();
   assert.equal(again.documentElement.getAttribute("data-reader"), null, "Hide reader off showed nothing");
-  assert.equal(again.el("reader-toggle-label").text(), "Hide reader");
+  assert.equal(again.el("reader-toggle-label").text(), "Hide");
   assert.equal(again.storage.get("vibe-talk.voice.reader-hidden"), "0");
 });
 
@@ -637,6 +639,16 @@ test("`#1399 toggle-labels-active-style`: the reader toggles are boxed, fixed-la
   assert.ok(box.includes('id="reader-toggle"') && box.includes('id="autoplay-toggle"'),
     "the Reader box does not hold Hide and Autoplay together");
   assert.match(box, />Reader</, "the box is not named Reader");
+  // `#2052 vibe-talk-hamburger-reader-group-right-hand`: the speaker the Read button
+  // wears stands before the word Reader, Autoplay stands first with Hide at the
+  // right end, and every menu row is right-justified for the thumb.
+  const label = box.slice(box.indexOf('class="reader-box-label"'), box.indexOf('id="autoplay-toggle"'));
+  assert.ok(label.includes("<svg") && label.includes('d="M11 5 6.5 9H3v6h3.5L11 19z"'),
+    "the Reader box's name carries no speaker");
+  assert.ok(box.indexOf('id="autoplay-toggle"') < box.indexOf('id="reader-toggle"'),
+    "Autoplay does not stand first, with Hide at the right end");
+  assert.match(cssBlock("#action-menu"), /justify-content:\s*flex-end/,
+    "the menu's rows are not right-justified");
   const desk = "(min-width: 900px) and (pointer: fine)";
   assert.match(cssBlockIn(desk, "#reader-toggle"), /display:\s*none/, "a desk still draws Hide reader");
   const active = cssBlock("#action-menu .tray-button[aria-pressed=\"true\"]");

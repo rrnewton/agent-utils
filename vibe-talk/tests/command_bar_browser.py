@@ -267,6 +267,7 @@ MENU_JS = """() => {
     folded: document.querySelectorAll('#discord-log > li[data-collapsed="true"]').length,
     hamburger: box('action-menu-open'), switch: box('view-switch'),
     pane: shown('control-pane'), reader: document.getElementById('reader-toggle-label').textContent,
+    readerName: document.getElementById('reader-toggle').getAttribute('aria-label'),
     dock: box('dock'), barHeight: document.getElementById('control-bar').getBoundingClientRect().height,
     list: box('scroll-area'), mode: document.getElementById('todo-filter').getAttribute('data-read-mode'),
     focus: document.activeElement ? document.activeElement.id : null,
@@ -315,14 +316,15 @@ def hide_reader(page: Page, where: str, touch: bool, shots: Path | None, width: 
               f"{where}: a desk drew the Hide reader button")
         return
     before = menu_state(page)
-    check(before["pane"] is True and before["reader"] == "Hide reader", f"{where}: the premise, the row shown: {before}")
+    check(before["pane"] is True and before["reader"] == "Hide" and before["readerName"] == "Hide reader",
+          f"{where}: the premise, the row shown: {before}")
     press(page, "#action-menu-open", touch)
     page.wait_for_timeout(200)
     press(page, "#reader-toggle", touch)
     page.wait_for_timeout(300)
     now = menu_state(page)
     shot(page, shots, f"{width}x{height}-reader-hidden")
-    check(now["pane"] is False and now["reader"] == "Hide reader" and now["open"] is False,
+    check(now["pane"] is False and now["reader"] == "Hide" and now["open"] is False,
           f"{where}: Hide reader left {now}")
     # No band where the row was: the dock holds only the bar, and the list took the room.
     check(number(now["dock"], "height") - float(now["barHeight"]) <= 14,  # type: ignore[arg-type]
@@ -366,13 +368,13 @@ def hide_reader(page: Page, where: str, touch: bool, shots: Path | None, width: 
     page.wait_for_selector(FIRST_ROW, state="visible", timeout=10_000)
     page.wait_for_timeout(300)
     now = menu_state(page)
-    check(now["pane"] is False and now["reader"] == "Hide reader", f"{where}: a reload forgot Hide reader: {now}")
+    check(now["pane"] is False and now["reader"] == "Hide", f"{where}: a reload forgot Hide reader: {now}")
     press(page, "#action-menu-open", touch)
     page.wait_for_timeout(200)
     press(page, "#reader-toggle", touch)
     page.wait_for_timeout(300)
     now = menu_state(page)
-    check(now["pane"] is True and now["reader"] == "Hide reader", f"{where}: Hide reader off left {now}")
+    check(now["pane"] is True and now["reader"] == "Hide", f"{where}: Hide reader off left {now}")
 
 
 def action_menu(browser: Browser, url: str, width: int, height: int, touch: bool, shots: Path | None,

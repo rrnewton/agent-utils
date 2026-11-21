@@ -173,6 +173,23 @@
   box-shadow: 0 0.4rem 1.2rem rgb(0 0 0 / 35%);
 }
 
+/*
+ * `#2052 vibe-talk-hamburger-reader-group-right-hand` — RIGHT-HAND BIASES in this menu.
+ * The owner holds the phone in the right hand, so the menu's rows end at the right edge,
+ * under the thumb; a later left-handed mode flips every one of these to the left:
+ *   1. every `#action-menu` row is right-justified (below), and a row that wraps puts
+ *      its second row at the right too, never spilling back to the left;
+ *   2. inside the Reader box, Hide stands at the right end, after Autoplay;
+ *   3. (already here) the hamburger itself stands immediately left of the view switch,
+ *      the bar's last button at the lower right in every view (`#1078`);
+ *   4. (already here) in the reader's own row, Read keeps the right edge and Stop
+ *      stands on its left, so the Pause thumb-place never moves (`#442`).
+ * The prompts tray is not the hamburger menu and keeps its left start.
+ */
+#action-menu {
+  justify-content: flex-end;
+}
+
 #control-bar[data-placement="bottom"] #prompts-tray,
 #control-bar[data-placement="bottom"] #action-menu {
   bottom: calc(100% + 0.35rem);
@@ -529,6 +546,9 @@ textarea {
 }
 
 .reader-box-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
   font-size: 0.85rem;
   color: var(--ink);
 }

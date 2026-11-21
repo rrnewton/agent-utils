@@ -75,7 +75,7 @@ export { mountMenuOpeners } from "./menuopeners.ts";
 export { createPageNavigation, shouldStartReadingAfterJump } from "./navigation.ts";
 export type { NavChannelPlace, NavDeepLinkWanted, NavHistoryPort, NavLinkJump, NavLinkSpot, NavMessage, PageNavigation, PageNavigationDependencies } from "./navigation.ts";
 export type { MenuOpeners, MenuOpenersDependencies } from "./menuopeners.ts";
-export { READER_WORDS, createReaderRow } from "./readerrow.ts";
+export { READER_NAME, READER_WORDS, createReaderRow } from "./readerrow.ts";
 export type { ReaderRow, ReaderRowDependencies } from "./readerrow.ts";
 export { createPageVisibility } from "./visibility.ts";
 export type { PageVisibility, PageVisibilityDependencies } from "./visibility.ts";

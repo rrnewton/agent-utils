@@ -6,8 +6,13 @@
 
 import type { ElementById } from "../dom/index.ts";
 
-/** The item's word for each state: what a press does. */
-const READER_WORDS = Object.freeze({ shown: "Hide reader", hidden: "Hide reader" } as const);
+/** The item's word for each state: what a press does. Just "Hide" since `#2052
+ * vibe-talk-hamburger-reader-group-right-hand` — the Reader box it stands in already
+ * says Reader; the button's accessible name and title keep the whole "Hide reader". */
+const READER_WORDS = Object.freeze({ shown: "Hide", hidden: "Hide" } as const);
+
+/** The item's whole name, for a screen reader and a tooltip: what "Hide" hides. */
+const READER_NAME = "Hide reader";
 
 /** What the row asks of the page. */
 export interface ReaderRowDependencies {
@@ -40,6 +45,8 @@ export function createReaderRow(deps: ReaderRowDependencies): ReaderRow {
     else deps.root().removeAttribute("data-reader");
     deps.byId("reader-toggle-label").textContent = hidden() ? READER_WORDS.hidden : READER_WORDS.shown;
     const toggle = deps.byId("reader-toggle");
+    if (toggle.getAttribute("aria-label") !== READER_NAME) toggle.setAttribute("aria-label", READER_NAME);
+    if (toggle.getAttribute("title") !== READER_NAME) toggle.setAttribute("title", READER_NAME);
     const pressed = hidden() ? "true" : "false";
     if (toggle.getAttribute("aria-pressed") !== pressed) toggle.setAttribute("aria-pressed", pressed);
   }
@@ -56,4 +63,4 @@ export function createReaderRow(deps: ReaderRowDependencies): ReaderRow {
 }
 
 // What the page and the tests use of it.
-export { READER_WORDS };
+export { READER_NAME, READER_WORDS };

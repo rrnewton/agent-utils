@@ -276,7 +276,7 @@ test("`#820 voice-page-action-menu`: the action menu's open state on its opener 
 });
 
 test("`#880 voice-page-menu-placement`: the reader's row, hidden or shown, on the root and in the item's word, kept and held", () => {
-  const { createReaderRow, READER_WORDS } = VIEW_SHELL;
+  const { createReaderRow, READER_NAME, READER_WORDS } = VIEW_SHELL;
   const attributes = new Map();
   const root = { setAttribute: (name, value) => attributes.set(name, value), removeAttribute: (name) => attributes.delete(name) };
   const label = { textContent: "" };
@@ -294,9 +294,12 @@ test("`#880 voice-page-menu-placement`: the reader's row, hidden or shown, on th
   assert.equal(reads, 0, "made, it read the storage before its first use");
   row.render();
   assert.deepStrictEqual([attributes.get("data-reader"), label.textContent, row.hidden(), toggleAttrs.get("aria-pressed")], ["hidden", READER_WORDS.hidden, true, "true"]);
-  assert.equal(READER_WORDS.hidden, "Hide reader", "the fixed label changed with state (#1399)");
+  assert.equal(READER_WORDS.hidden, "Hide", "the fixed label changed with state (#1399)");
+  assert.equal(READER_NAME, "Hide reader", "the item's whole name changed (#2052)");
+  assert.deepStrictEqual([toggleAttrs.get("aria-label"), toggleAttrs.get("title")], ["Hide reader", "Hide reader"],
+    "the visible Hide lost its whole accessible name or title (#2052)");
   row.setHidden(false);
-  assert.deepStrictEqual([attributes.has("data-reader"), label.textContent, row.hidden(), kept], [false, "Hide reader", false, [false]]);
+  assert.deepStrictEqual([attributes.has("data-reader"), label.textContent, row.hidden(), kept], [false, "Hide", false, [false]]);
   // A browser that will not keep it: the page still holds the choice it was given.
   stored = true;
   assert.equal(row.hidden(), false, "the choice made here was lost to the storage's answer");

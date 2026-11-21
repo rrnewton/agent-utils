@@ -4674,13 +4674,18 @@ writable = true</pre>
             -->
             <!-- `#1399 toggle-labels-active-style`: the reader toggles in their own boxed
                  section. Fixed labels; aria-pressed and the shared active style say on/off. -->
+            <!-- `#2052 vibe-talk-hamburger-reader-group-right-hand`: the box is the AUDIO
+                 reader, so its name carries the speaker the Read button wears (`#read-aloud`'s
+                 glyph, copied path for path); Autoplay stands first and Hide at the row's
+                 right end; and Hide's word is just "Hide" — the box already says Reader —
+                 while its accessible name and title keep the whole "Hide reader". -->
             <div id="reader-box" class="reader-box" role="group" aria-label="Reader">
-              <span class="reader-box-label">Reader</span>
-              <button id="reader-toggle" class="tray-button" type="button" aria-pressed="false" hidden>
-                <span id="reader-toggle-label" class="tray-label">Hide reader</span>
-              </button>
+              <span class="reader-box-label"><svg class="tray-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6.5 9H3v6h3.5L11 19z" /><path d="M15.5 8.5a5 5 0 0 1 0 7" /><path d="M18.5 5.5a9 9 0 0 1 0 13" /></svg>Reader</span>
               <button id="autoplay-toggle" class="tray-button" type="button" aria-pressed="false" hidden>
                 <span id="autoplay-toggle-label" class="tray-label">Autoplay</span>
+              </button>
+              <button id="reader-toggle" class="tray-button" type="button" aria-pressed="false" aria-label="Hide reader" title="Hide reader" hidden>
+                <span id="reader-toggle-label" class="tray-label">Hide</span>
               </button>
             </div>
             <!-- `#886 voice-page-autoplay`. The read strip's Autoplay, here too, so it can be turned on before a read and
