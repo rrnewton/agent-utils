@@ -1,6 +1,6 @@
 ---
 title: 'agentctl-restore-muse-sessions-and-timeout: record Muse sessions at start, make restore resume, publish live revive candidates'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -114,3 +114,19 @@ Session attribution was tightened after review (a held lock counts
 only when it names this lane's runtime pid, with Muse's own
 per-pid store report preferred and pid reuse rejected by full
 process identity), so another lane's session is never recorded.
+
+# Resolution
+
+[watermelon-full-preview] Landed as c8591bd3 on main
+(verified-overlap landing; replayed tree matched the verified tree).
+Muse lanes record their native session at start, adopt and promote
+from the pinned runtime (the session's own lock must name this
+lane's runtime pid; Muse's per-pid store report is preferred and
+pid reuse is rejected by full process identity), with
+`doctor --repair-native-sessions` as the backfill for live lanes.
+Restore writes a partial report as it goes and resumes from it in
+the same boot epoch; the units keep TimeoutStartSec=1800 as a
+per-attempt watchdog. A retained revive candidate whose harness
+lives in its pane on the recorded session is pinned and published;
+anything else is refused. No new record field was introduced.
+Follow-ups: #1945 (stale-lock pid reuse), #1992, #2013.
