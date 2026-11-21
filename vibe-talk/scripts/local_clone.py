@@ -53,6 +53,7 @@ import threading
 import time
 import urllib.request
 from pathlib import Path
+from typing import TypedDict
 
 REPO = Path(__file__).resolve().parent.parent
 DATA_DIR = Path.home() / ".local" / "share" / "vibe-talk"
@@ -62,7 +63,7 @@ BUILD_ROOT = Path.home() / "agent_scratch" / "vt-build"
 def free_port() -> int:
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()[1]
+        return int(probe.getsockname()[1])
 
 
 def find_cache(explicit: str | None) -> Path:
@@ -202,7 +203,7 @@ path = "{work}/message-cache.sqlite3"
     os.chmod(path, 0o600)
 
 
-def wait_up(port: int, proc: subprocess.Popen, timeout: float = 60.0) -> bool:
+def wait_up(port: int, proc: subprocess.Popen[bytes], timeout: float = 60.0) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
         if proc.poll() is not None:
@@ -218,8 +219,15 @@ def wait_up(port: int, proc: subprocess.Popen, timeout: float = 60.0) -> bool:
     return False
 
 
+class ProbeResult(TypedDict, total=False):
+    status: int
+    bytes: int
+    tickets: int
+    error: str
+
+
 def probe(port: int, write_token: str, channel: str,
-          thread: str | None, message_id: str) -> dict:
+          thread: str | None, message_id: str) -> ProbeResult:
     """Ask the clone to prepare speech for one message. Shape only."""
     body = json.dumps({
         "ids": [message_id],
@@ -280,7 +288,7 @@ def main() -> int:
     stub_port = stub.server_address[1]
     read_token = "local-clone-read-" + secrets.token_hex(12)
     write_token = "local-clone-write-" + secrets.token_hex(12)
-    proc: subprocess.Popen | None = None
+    proc: subprocess.Popen[bytes] | None = None
     try:
         copy_cache(source, work / "message-cache.sqlite3")
         write_config(work / "vibe-talk.toml", port=port, stub_port=stub_port,
