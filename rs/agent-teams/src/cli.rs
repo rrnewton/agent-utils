@@ -3764,7 +3764,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn service_reply_to_routes_to_the_declared_team() {
         // #2035: from stays the service; reply_to is the declared team.
         assert_eq!(
