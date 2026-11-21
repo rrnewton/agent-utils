@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-scroll-layout-reads: scrolling a loaded channel reads the screen, not the whole list'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -9,7 +9,8 @@ labels:
 - ui
 - performance
 created_at: 2026-11-21T03:00:00-05:00
-updated_at: 2026-11-21T03:00:00-05:00
+updated_at: 2026-11-21T06:00:00-05:00
+closed_at: 2026-11-21T06:00:00-05:00
 ---
 
 # Description
@@ -31,3 +32,7 @@ updated_at: 2026-11-21T03:00:00-05:00
 # Notes
 
 Owner-priority, fast-track. Standing lane mu-clientperf under coordb; one fix per issue, one commit per fix. Follow-ups in order after this: archive shared anchor measure, then `o` fold height change, each on its own issue.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as 96c60423, deployed 2026-11-21 5:39 AM ET. Scrolling layout reads per PageDown screenful fell from 4,960–6,002 to 267–315 at 1x and to 119–181 at 4x on the lane fixture (clean-tip re-measure 4,987–5,972 to 245–316 and 3,971–5,806 to 78–146); long tasks per screenful from one of 50–62 ms to none at 1x; scroll frames p95 from 33 ms to 16.8 ms.
