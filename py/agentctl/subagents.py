@@ -2595,6 +2595,33 @@ class ManagedAgents:
         os.rename(source, destination)
         agent._fsync_dir(str(archive))
         agent._fsync_dir(str(source.parent))
+        self._raise_archived_stranded(name, destination / "queue")
+
+    def _raise_archived_stranded(self, name: str, queue: Path) -> None:
+        """Set aside the archived queue's undelivered items and raise them (#2028 v2)."""
+        items = _set_aside_archived_queue(queue)
+        if not items:
+            return
+        try:
+            designation = json.loads((self.registry / "coordinator.json").read_text(encoding="utf-8"))
+            designated = designation.get("name") if isinstance(designation, dict) else None
+        except (OSError, ValueError):
+            return
+        if not isinstance(designated, str) or designated == name:
+            return
+        directory = registry_layout.directory(self.registry, designated)
+        if not (directory / "agent.json").exists():
+            return
+        lines = [f"stranded by archive of {name}: {len(items)} undelivered item(s) were set aside, not delivered:"]
+        for item in items:
+            lines.append(f"- {item['id']} from {item['sender']} first queued {item['queued_et']}: {item['first_line']}")
+        target = directory / "queue" / "inbox"
+        target.mkdir(mode=0o700, parents=True, exist_ok=True)
+        notice = {"id": f"stranded-{name}-{int(time.time())}", "text": "\n".join(lines) + "\n",
+                  "queued_at": time.time(), "delivery_attempts": 0}
+        path = target / f"{notice['id']}.json"
+        if not os.path.lexists(path):
+            agent._atomic_json(str(path), notice)
 
     def _read_alias(self, old: str) -> dict[str, object] | None:
         """The alias record for ``old``, when one is on disk (live or expired)."""
@@ -8338,3 +8365,91 @@ def _slot_shell_command(
             f"wrkslots shell-command {slot!r} returned invalid JSON: unknown isolation {effective!r}"
         )
     return line, slot_path, str(effective)
+
+
+def _set_aside_archived_queue(queue: Path) -> list[dict[str, str]]:
+    """Set aside an archived queue's undelivered items (#2028 v2, Python mirror).
+
+    Pending items are cancelled stranded-archived (stranded-expired past
+    not_after); inflight items that may have been typed are quarantined
+    failed as possibly_submitted. Nothing is filed processed and nothing
+    is re-enqueued. Returns the raised items for the caller's notice.
+    """
+    import datetime as _dt
+    items: list[dict[str, str]] = []
+    if not queue.is_dir():
+        return items
+    now_ms = time.time() * 1000
+
+    def describe(document: dict, identifier: str, outcome: str) -> dict[str, str]:
+        sender = document.get("sender")
+        if not isinstance(sender, str):
+            envelope = document.get("envelope")
+            sender = envelope.get("from", {}).get("team") if isinstance(envelope, dict) else None
+        text = document.get("text")
+        queued_at = document.get("queued_at")
+        stamp = _dt.datetime.fromtimestamp(
+            float(queued_at) if isinstance(queued_at, (int, float)) else time.time(),
+            tz=_dt.timezone.utc,
+        ).astimezone(_dt.timezone(_dt.timedelta(hours=-5))).strftime("%Y-%m-%d %H:%M ET")
+        return {"id": identifier, "sender": sender if isinstance(sender, str) else "unknown",
+                "first_line": (text.splitlines()[0][:80] if isinstance(text, str) and text else ""),
+                "queued_et": stamp, "outcome": outcome}
+
+    for lane in ("inbox", "inbox.v2"):
+        directory = queue / lane
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.glob("*.json")):
+            try:
+                document = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(document, dict):
+                continue
+            not_after = document.get("not_after")
+            expired = isinstance(not_after, (int, float)) and not isinstance(not_after, bool) and float(not_after) <= now_ms
+            reason = "stranded-expired" if expired else "stranded-archived"
+            aside = dict(document)
+            aside.update({"delivery_state": "cancelled", "cancel_reason": reason,
+                          "cancel_detail": "coordinator archived; raised, not delivered",
+                          "cancelled_at": time.time()})
+            cancelled = queue / "cancelled"
+            cancelled.mkdir(mode=0o700, parents=True, exist_ok=True)
+            agent._atomic_json(str(cancelled / path.name), aside)
+            items.append(describe(document, path.stem, reason))
+            path.unlink(missing_ok=True)
+    inflight = queue / "inflight"
+    if inflight.is_dir():
+        for path in sorted(inflight.glob("*.json")):
+            if (inflight / f"{path.name}.claim").exists():
+                continue
+            try:
+                document = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(document, dict):
+                continue
+            may_have_typed = ("paste_started_at" in document or document.get("possibly_submitted") is True
+                              or "stranded_at" in document or "typed_as" in document)
+            if may_have_typed:
+                failed = dict(document)
+                failed.update({"possibly_submitted": True, "delivery_state": "failed"})
+                failed_dir = queue / "failed"
+                failed_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+                agent._atomic_json(str(failed_dir / path.name), failed)
+                agent._atomic_json(f"{failed_dir / path.name}.error",
+                                   {"error": "archived while inflight; may have been typed, never replayed",
+                                    "failed_at": time.time()})
+                items.append(describe(document, path.stem, "possibly_submitted"))
+            else:
+                aside = dict(document)
+                aside.update({"delivery_state": "cancelled", "cancel_reason": "stranded-archived",
+                              "cancel_detail": "coordinator archived while inflight untyped; raised, not delivered",
+                              "cancelled_at": time.time()})
+                cancelled = queue / "cancelled"
+                cancelled.mkdir(mode=0o700, parents=True, exist_ok=True)
+                agent._atomic_json(str(cancelled / path.name), aside)
+                items.append(describe(document, path.stem, "stranded-archived"))
+            path.unlink(missing_ok=True)
+    return items

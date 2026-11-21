@@ -7561,7 +7561,66 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let source = self.directory(agent_name)?;
         fs::rename(&source, destination).map_err(|error| fail(error.to_string()))?;
         agent::sync_directory(archive)?;
+        // #2028 v2: undelivered items are set aside raised under the
+        // queue's delivery lock, never re-targeted and never processed;
+        // one coalesced notice goes to the designated coordinator.
+        self.raise_archived_stranded(agent_name, &destination.join("queue"));
         agent::sync_directory(source.parent().unwrap_or(&self.registry))
+    }
+
+    /// Raise the items `set_aside_archived_queue` stranded in an
+    /// archived agent's queue: one coalesced plain queue item to the
+    /// current designated coordinator of this registry (sender, id,
+    /// first line, first queued time in ET per item). No designated
+    /// live coordinator: the set-aside records themselves stay raised
+    /// through the existing archived counting.
+    fn raise_archived_stranded(&self, agent_name: &str, queue: &Path) {
+        let now_ms = (agent_queue::queue::unix_seconds() * 1000.0) as u64;
+        let report = agent_queue::queue::set_aside_archived_queue(queue, now_ms);
+        if report.items.is_empty() {
+            return;
+        }
+        let Ok(designated) = fs::read_to_string(self.registry.join("coordinator.json"))
+            .map_err(|_| ())
+            .and_then(|text| {
+                serde_json::from_str::<Value>(&text)
+                    .map_err(|_| ())
+                    .and_then(|value| {
+                        value.get("name").and_then(Value::as_str).map(str::to_owned).ok_or(())
+                    })
+            })
+        else {
+            return;
+        };
+        if designated == agent_name {
+            return;
+        }
+        let Ok(directory) = self.directory(&designated) else { return };
+        if !directory.join("agent.json").exists() {
+            return;
+        }
+        let mut text = format!(
+            "stranded by archive of {agent_name}: {} undelivered item(s) were set aside, not delivered:\n",
+            report.items.len()
+        );
+        for item in &report.items {
+            text.push_str(&format!(
+                "- {} from {} first queued {}: {}\n",
+                item.id, item.sender, item.queued_et, item.first_line
+            ));
+        }
+        let notice_id = format!(
+            "stranded-{agent_name}-{}",
+            agent_queue::queue::unix_seconds() as u64
+        );
+        let target_queue = directory.join("queue");
+        let _ = agent_queue::queue::enqueue(
+            &target_queue,
+            Some(&notice_id),
+            true,
+            &agent_queue::fsio::Blocking,
+            |id| agent_queue::queue::plain_item(id, &text),
+        );
     }
 
     /// Create a new agent's `directory` (from [`Self::directory`]), private, and publish its

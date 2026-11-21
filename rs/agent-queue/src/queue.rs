@@ -1298,6 +1298,199 @@ pub fn identifiers_if_directory(directory: &Path) -> Result<Vec<String>> {
     }
 }
 
+/// Format Unix seconds as an America/New_York wall time
+/// (`YYYY-MM-DD HH:MM ET`), with the US DST rule (second Sunday of
+/// March to first Sunday of November). Used only for the human header
+/// on a re-targeted item, never for ordering.
+fn format_eastern(unix_secs: f64) -> String {
+    let secs = unix_secs as i64;
+    let days = secs.div_euclid(86_400);
+    // Day of week: 1970-01-01 was a Thursday (4 with Sunday = 0).
+    let dow = (days + 4).rem_euclid(7);
+    let (year, _month, _day) = civil_from_days(days);
+    let nth_sunday = |y: i64, m: u32, n: i64| -> i64 {
+        let first = days_from_civil(y, m, 1);
+        let first_dow = (first + 4).rem_euclid(7);
+        first + (7 - first_dow) % 7 + (n - 1) * 7
+    };
+    let dst = days >= nth_sunday(year, 3, 2) && days < nth_sunday(year, 11, 1);
+    let _ = dow;
+    let offset: i64 = if dst { -4 * 3600 } else { -5 * 3600 };
+    let local = secs + offset;
+    let ldays = local.div_euclid(86_400);
+    let lsecs = local.rem_euclid(86_400);
+    let (ly, lm, ld) = civil_from_days(ldays);
+    format!(
+        "{ly:04}-{lm:02}-{ld:02} {:02}:{:02} ET",
+        lsecs / 3600,
+        (lsecs % 3600) / 60
+    )
+}
+
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = i64::from(if m > 2 { m - 3 } else { m + 9 });
+    let doy = (153 * mp + 2) / 5 + i64::from(d) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// One undelivered item set aside when its queue was archived (#2028 v2).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StrandedItem {
+    /// Message identifier.
+    pub id: String,
+    /// Sender as recorded on the item, when known.
+    pub sender: String,
+    /// First line of the item text.
+    pub first_line: String,
+    /// First queued time in ET.
+    pub queued_et: String,
+    /// `stranded-archived`, `stranded-expired` or `possibly_submitted`.
+    pub outcome: String,
+}
+
+/// Outcome of one archive set-aside sweep (#2028 v2).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ArchiveSetAsideReport {
+    /// Every item set aside or quarantined, oldest first.
+    pub items: Vec<StrandedItem>,
+}
+
+fn stranded_item(document: &Map<String, Value>, id: &str, outcome: &str) -> StrandedItem {
+    let sender = document
+        .get("sender")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            document
+                .get("envelope")
+                .and_then(|e| e.get("from"))
+                .and_then(|f| f.get("team"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("unknown")
+        .to_string();
+    let text = document.get("text").and_then(Value::as_str).unwrap_or("");
+    let first_line = text.lines().next().unwrap_or("").chars().take(80).collect();
+    let queued_at = document
+        .get("queued_at")
+        .and_then(Value::as_f64)
+        .unwrap_or_else(unix_seconds);
+    StrandedItem {
+        id: id.to_string(),
+        sender,
+        first_line,
+        queued_et: format_eastern(queued_at),
+        outcome: outcome.to_string(),
+    }
+}
+
+/// Set aside the undelivered items of a queue whose record is being
+/// archived, replaced or retired (#2028 v2: NO re-targeting). Pending
+/// items are cancelled `stranded-archived` (or `stranded-expired` past
+/// `not_after`); `inflight` items with no live claim owner follow, and
+/// one that may already have been typed (`paste_started_at` or
+/// `possibly_submitted`) is quarantined in `failed/` as
+/// `possibly_submitted`. Nothing is ever filed `processed` and nothing
+/// is re-enqueued: the caller raises the returned items in one
+/// coalesced notice and a human re-sends. The queue's delivery lock is
+/// taken without waiting; when a drain holds it, items are left for
+/// that drain and the report is empty. Live claims are respected.
+pub fn set_aside_archived_queue(root: &Path, now_ms: u64) -> ArchiveSetAsideReport {
+    let mut report = ArchiveSetAsideReport::default();
+    if fs::symlink_metadata(root).is_err() {
+        return report;
+    }
+    let directories = QueueDirectories::new(root);
+    let Ok(identity) = directory_identity(root) else {
+        return report;
+    };
+    let Ok(_lock) = lock_delivery(root, identity, &NoWait) else {
+        return report;
+    };
+    let mut pending: Vec<(PathBuf, String)> = Vec::new();
+    for directory in [&directories.inbox, &directories.inbox_v2] {
+        if let Ok(ids) = identifiers_if_directory(directory) {
+            for id in ids {
+                pending.push((directory.join(format!("{id}.json")), id));
+            }
+        }
+    }
+    for (path, id) in pending {
+        let Ok(document) = load_message(&path) else { continue };
+        let expired = document
+            .get(NOT_AFTER)
+            .filter(|value| !value.is_null())
+            .and_then(Value::as_u64)
+            .is_some_and(|deadline| deadline <= now_ms);
+        let (reason, outcome) = if expired {
+            ("stranded-expired", "stranded-expired")
+        } else {
+            ("stranded-archived", "stranded-archived")
+        };
+        let item = stranded_item(&document, &id, outcome);
+        if set_aside(root, &directories, &path, document, reason,
+                     "coordinator archived; raised, not delivered").is_ok() {
+            report.items.push(item);
+        }
+    }
+    if let Ok(ids) = identifiers_if_directory(&directories.inflight) {
+        for id in ids {
+            let path = directories.inflight.join(format!("{id}.json"));
+            let filename = path.file_name().expect("item filename").to_owned();
+            if claim_owner_alive(&directories, &filename) {
+                continue;
+            }
+            let Ok(mut document) = load_message(&path) else { continue };
+            let may_have_typed = document.get("paste_started_at").is_some()
+                || document.get("possibly_submitted").and_then(Value::as_bool) == Some(true)
+                || document.get("stranded_at").is_some()
+                || document.get("typed_as").is_some();
+            if may_have_typed {
+                let item = stranded_item(&document, &id, "possibly_submitted");
+                document.insert("possibly_submitted".to_owned(), Value::Bool(true));
+                document.insert("delivery_state".to_owned(), json!("failed"));
+                if atomic_json(&path, &Value::Object(document)).is_err() {
+                    continue;
+                }
+                let failed_path = directories.failed.join(&filename);
+                if transition(&path, &failed_path).is_ok() {
+                    let sidecar = PathBuf::from(format!("{}.error", failed_path.display()));
+                    let _ = fs::write(
+                        &sidecar,
+                        json!({"error": "archived while inflight; may have been typed, never replayed",
+                               "failed_at": unix_seconds()}).to_string(),
+                    );
+                    remove_claim_lock(&directories, &filename);
+                    report.items.push(item);
+                }
+            } else {
+                let item = stranded_item(&document, &id, "stranded-archived");
+                if set_aside(root, &directories, &path, document, "stranded-archived",
+                             "coordinator archived while inflight untyped; raised, not delivered").is_ok() {
+                    report.items.push(item);
+                }
+            }
+        }
+    }
+    report
+}
+
 /// The identifier an item's file name carries: the name without `.json`.
 pub fn message_id_from_path(path: &Path) -> Result<String> {
     path.file_name()
@@ -1383,6 +1576,35 @@ mod tests {
         let error = put(root, "a-3", false).unwrap_err().to_string();
         assert!(error.contains("group or others can write"), "{error}");
         assert_eq!(mode(&cancel), 0o777);
+    }
+
+    #[test]
+    fn archive_set_aside_raises_pending_and_expired_never_processed() {
+        // #2028 v2: pending items are set aside raised, expired apart,
+        // nothing re-enqueued, nothing processed.
+        let queue = TestQueue::new();
+        let root = &queue.0;
+        enqueue_into(root, Lane::InboxV2, Some("keep-1"), true, &Blocking, |id| {
+            let mut doc = plain_item(id, "hello world");
+            doc["not_after"] = json!(4_102_444_800_000u64);
+            doc
+        })
+        .unwrap();
+        enqueue_into(root, Lane::InboxV2, Some("old-1"), true, &Blocking, |id| {
+            let mut doc = plain_item(id, "stale");
+            doc["not_after"] = json!(1u64);
+            doc
+        })
+        .unwrap();
+        let report = set_aside_archived_queue(root, 1_700_000_000_000);
+        assert_eq!(report.items.len(), 2, "{report:?}");
+        assert_eq!(message_state(root, "keep-1").unwrap(), Some(MessageState::Cancelled));
+        assert_eq!(message_state(root, "old-1").unwrap(), Some(MessageState::Cancelled));
+        let kept = load_message(&root.join("cancelled/keep-1.json")).unwrap();
+        assert_eq!(kept["cancel_reason"], "stranded-archived");
+        let old = load_message(&root.join("cancelled/old-1.json")).unwrap();
+        assert_eq!(old["cancel_reason"], "stranded-expired");
+        assert!(report.items.iter().all(|item| item.outcome.starts_with("stranded")));
     }
 
     #[test]
