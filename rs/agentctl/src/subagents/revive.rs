@@ -291,11 +291,11 @@ fn muse_sessions_for_pid(root: &Path, record: &AgentRecord, pid: u64) -> Vec<Str
 /// session is recorded as observed; several are never guessed between: the record keeps no
 /// id and says why under [`NATIVE_SESSION_UNKNOWN`]. Returns what to tell the operator then.
 /// The host names a session lock may carry to be this host's (#2013):
-/// the full local host name or its short label. A lock is only ever
-/// written by its own host's runtime, so anything else - or no host
-/// line at all - is a copied lock (dotsync mirrors session directories
-/// between hosts) and attributes nothing, however well its pid line
-/// matches a local process.
+/// the full local host name or its short label. A lock carrying a
+/// DIFFERENT host's name is a copied lock (dotsync mirrors session
+/// directories between hosts) and attributes nothing, however well
+/// its pid line matches a local process. A lock with no host line
+/// predates the field and keeps the pid-only attribution.
 fn expected_lock_hosts() -> Vec<String> {
     #[cfg(test)]
     {
@@ -317,17 +317,27 @@ fn expected_lock_hosts() -> Vec<String> {
     }
 }
 
-/// Whether the lock text names this host (fail closed when missing).
+/// Whether the lock text may attribute a session on this host: a
+/// `host=` line, when present, must name this host. A lock with no
+/// host line at all predates the field (about a third of the live
+/// locks on a real host) and falls back to the pid evidence alone,
+/// exactly as before #2013 - refusing those would break attribution
+/// for every lane whose lock was written before the field existed.
 fn lock_names_this_host(text: &str) -> bool {
     let hosts = expected_lock_hosts();
     if hosts.is_empty() {
         return false;
     }
-    text.lines().any(|line| {
-        line.trim()
-            .strip_prefix("host=")
-            .is_some_and(|host| hosts.iter().any(|name| name == host.trim()))
-    })
+    let mut present = false;
+    for line in text.lines() {
+        if let Some(host) = line.trim().strip_prefix("host=") {
+            present = true;
+            if hosts.iter().any(|name| name == host.trim()) {
+                return true;
+            }
+        }
+    }
+    !present
 }
 
 /// The Muse sessions attributable to this lane from the files its
@@ -7047,8 +7057,9 @@ mod discovery_tests {
                 ("22222222-2222-2222-2222-222222222222", 4242, "/tmp/proj"),
             ],
         );
-        // Rewrite one lock as a copied foreign lock, the other with
-        // no host line at all: both must attribute nothing.
+        // Rewrite one lock as a copied foreign lock (attributes
+        // nothing), the other with no host line at all (predates the
+        // field: pid attribution only, as before #2013).
         for id in [
             "11111111-1111-1111-1111-111111111111",
             "22222222-2222-2222-2222-222222222222",
@@ -7070,7 +7081,10 @@ mod discovery_tests {
             executable_device: 7,
             executable_inode: 11,
         });
-        assert!(muse_sessions_for_pid(&root, &record, 4242).is_empty());
+        assert_eq!(
+            muse_sessions_for_pid(&root, &record, 4242),
+            ["22222222-2222-2222-2222-222222222222"]
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
