@@ -446,25 +446,93 @@ def test_stop_process_refuses_a_live_exact_match_under_enoent(
 
 
 def test_pin_enoent_with_no_such_task_in_procfs_is_gone(
-    descendants: _Descendants, monkeypatch: pytest.MonkeyPatch,
+    child: subprocess.Popen[bytes], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Forced ENOENT plus no task in procfs is the only ENOENT death proof (#2027)."""
-    proc = subprocess.Popen(SLEEP, start_new_session=True)
-    descendants.add(proc.pid)
-    identity = _identity(proc.pid)
-    proc.kill()
-    proc.wait(timeout=5)
-    assert ownership._quiet_stat(proc.pid) is None
-    real_open = os.pidfd_open
+    """Forced ENOENT plus no task in procfs is the only ENOENT death proof (#2027).
+
+    Seam-based: procfs is scripted absent for the child's pid, so no real
+    reaped pid (and no pid-reuse window) is involved; the child stays alive
+    and unsignalled while the verdict is read.
+    """
+    identity = _identity(child.pid)
+    real_open, real_read = os.pidfd_open, ownership._read_stat_bytes
 
     def refuse(pid: int) -> int:
-        if pid == proc.pid:
+        if pid == child.pid:
             raise OSError(2, "No such file or directory")
         return real_open(pid)
 
+    def absent(pid: int) -> bytes:
+        if pid == child.pid:
+            raise FileNotFoundError(2, "No such file or directory")
+        return real_read(pid)
+
     monkeypatch.setattr(os, "pidfd_open", refuse)
+    monkeypatch.setattr(ownership, "_read_stat_bytes", absent)
     result = ownership.pin(identity)
     assert result.verdict == ownership.GONE and result.process is None
+    assert child.poll() is None
+
+
+def test_pin_einval_on_a_thread_is_unproven_even_with_stale_ticks(
+    descendants: _Descendants, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Forced EINVAL with Tgid != pid in procfs is unproven (#2027 review).
+
+    On Linux 7.1 this branch never runs against the real kernel (which
+    answers ENOENT), so the errno is forced and procfs is the real one.
+    """
+    script = (
+        "import threading, time\n"
+        "threading.Thread(target=lambda: (print(threading.get_native_id(), flush=True),"
+        " time.sleep(30)), daemon=True).start()\n"
+        "time.sleep(30)\n"
+    )
+    proc = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE, text=True)
+    descendants.add(proc.pid)
+    try:
+        assert proc.stdout is not None
+        tid = int(proc.stdout.readline())
+        assert tid != proc.pid
+        leader = _identity(proc.pid)
+        real_open = os.pidfd_open
+
+        def refuse(pid: int) -> int:
+            if pid == tid:
+                raise OSError(22, "Invalid argument")
+            return real_open(pid)
+
+        monkeypatch.setattr(os, "pidfd_open", refuse)
+        stale = ownership.ProcessIdentity(
+            tid, str(int(leader.started_at or "0") + 999), leader.boot_id)
+        result = ownership.pin(stale)
+        assert result.verdict == ownership.UNPROVEN and result.process is None
+        assert _running(proc.pid)
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
+def test_pin_einval_with_unreadable_status_falls_back_to_ticks(
+    child: subprocess.Popen[bytes], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """EINVAL with no readable Tgid falls back to the ticks compare (#2027 review)."""
+    exact = _identity(child.pid)
+    real_open = os.pidfd_open
+
+    def refuse(pid: int) -> int:
+        if pid == child.pid:
+            raise OSError(22, "Invalid argument")
+        return real_open(pid)
+
+    monkeypatch.setattr(os, "pidfd_open", refuse)
+    monkeypatch.setattr(ownership, "_read_tgid", lambda pid: None)
+    stale = ownership.ProcessIdentity(
+        child.pid, str(int(exact.started_at or "0") + 1), exact.boot_id)
+    assert ownership.pin(stale).verdict == ownership.GONE
+    result = ownership.pin(exact)
+    assert result.verdict == ownership.UNPROVEN and result.process is None
+    assert _running(child.pid, int(exact.started_at or "0"))
 
 
 def test_a_reaped_session_leader_whose_session_lives_on_pins_gone(

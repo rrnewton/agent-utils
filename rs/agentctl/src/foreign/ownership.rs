@@ -3723,6 +3723,13 @@ mod tests {
         let result = pin_impl(&root, &identity, None, &einval).unwrap();
         assert_eq!(result.verdict, PinVerdict::Gone);
         let _ = std::fs::remove_dir_all(&root);
+        // EINVAL with a malformed status (no readable Tgid) falls back to
+        // the ticks compare: a newer leader under the number is gone.
+        let root = fake_with("refused-einval-bad-status", Some((4242, 999)), None);
+        std::fs::write(root.join("4242").join("status"), "not a status record\n").unwrap();
+        let result = pin_impl(&root, &identity, None, &einval).unwrap();
+        assert_eq!(result.verdict, PinVerdict::Gone);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[cfg(target_os = "linux")]
