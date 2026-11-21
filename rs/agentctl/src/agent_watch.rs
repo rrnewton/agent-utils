@@ -760,6 +760,12 @@ struct AgentMemory {
     /// check between passes, which reads no registry, sends its notices there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     route: Option<String>,
+    /// The stale-display line last info-reported for this agent (#1991): the
+    /// screen counts background work but no process runs under the harness.
+    /// An unchanged line is never reported twice; a changed count or a live
+    /// process clears it and the condition is judged afresh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stale_background: Option<String>,
     /// When a notice about this agent being blocked last went out past the rate limit; it may
     /// do so once per `--min-notice-interval`, so a prompt that comes and goes is not a stream.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2764,9 +2770,40 @@ fn update_episode(
     }
     let Some((kind, detail, given_since, window)) = found else {
         memory.episode = None;
+        memory.stale_background = None;
         state.agents.insert(observation.name.clone(), memory);
         return None;
     };
+    // Stale display (#1991): the screen counts background work, no shell
+    // runs under the harness, and the work list is empty (the sample has no
+    // tools — that is what selected this detail in `classify`). Report it
+    // once as info, then stay silent while the line is unchanged; a changed
+    // count or a live process (a different finding) re-flags.
+    let stale_key = (kind == EpisodeKind::BackgroundWait
+        && detail.contains("but no shell runs under its harness"))
+    .then(|| detail.clone());
+    if let Some(key) = &stale_key {
+        let already = memory.stale_background.as_deref() == Some(key.as_str())
+            && memory
+                .episode
+                .as_ref()
+                .is_some_and(|episode| episode.kind == EpisodeKind::BackgroundWait)
+            && (memory
+                .episode
+                .as_ref()
+                .is_some_and(|episode| episode.notified)
+                || owes_notice(state, &observation.name, kind));
+        if already {
+            state.agents.insert(observation.name.clone(), memory);
+            return None;
+        }
+        if memory.stale_background.as_deref() != Some(key.as_str()) {
+            memory.stale_background = Some(key.clone());
+            memory.episode = None;
+        }
+    } else {
+        memory.stale_background = None;
+    }
     // A finish with a different verdict line is a later turn: the earlier episode ends here,
     // with its unsent notice, and the new one is reported in its own right. A condition that
     // carries its own clock is a new episode when that clock moved by more than a few minutes
@@ -2867,7 +2904,7 @@ fn update_episode(
         });
     }
     let row = memory.episode.as_ref().map(|episode| {
-        json!({
+        let mut row = json!({
             "agent": observation.name,
             "kind": episode.kind.as_str(),
             "status": observation.status,
@@ -2877,7 +2914,11 @@ fn update_episode(
             "owed": false,
             "due": due,
             "detail": detail,
-        })
+        });
+        if stale_key.is_some() {
+            row["level"] = json!("info");
+        }
+        row
     });
     state.agents.insert(observation.name.clone(), memory);
     row
@@ -9827,6 +9868,52 @@ mod tests {
             "{}",
             notifier.sent[0].1
         );
+    }
+
+    #[test]
+    fn stale_background_count_is_info_once_then_silent_until_it_changes() {
+        // #1991: the screen counts shells, none runs, the work list is empty:
+        // one info line, silence while unchanged, a changed count re-flags.
+        let options = options();
+        let footer_one = "● Started the gate in the background.\n\n❯\u{a0}\n\n  ⏵⏵ auto mode on · 1 shell · ↓ to manage\n";
+        let footer_two = "● Started the gate in the background.\n\n❯\u{a0}\n\n  ⏵⏵ auto mode on · 2 shells · ↓ to manage\n";
+        let idle = |footer: &'static str, work: Option<WorkSample>| Observation {
+            work,
+            ..observation("lane-a", "idle", Some(footer))
+        };
+        let mut gone = FakeProc::default();
+        gone.spawn(100, 1, 'S', "claude");
+        let mut probe = ScriptedProbe(vec![
+            vec![idle(footer_one, sample(&gone, 100, None))],
+            vec![idle(footer_one, sample(&gone, 100, None))],
+            vec![idle(footer_one, sample(&gone, 100, None))],
+            vec![idle(footer_one, sample(&gone, 100, None))],
+            vec![idle(footer_two, sample(&gone, 100, None))],
+            vec![idle(footer_two, sample(&gone, 100, None))],
+        ]);
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        pass(&mut probe, &mut notifier, &mut state, 0.0, &options);
+        let first = pass(&mut probe, &mut notifier, &mut state, 900.0, &options);
+        assert_eq!(first["episodes"][0]["kind"], "background-wait", "{first}");
+        assert_eq!(first["episodes"][0]["level"], "info", "{first}");
+        assert_eq!(notifier.sent.len(), 1);
+        let silent = pass(&mut probe, &mut notifier, &mut state, 1_800.0, &options);
+        assert_eq!(silent["episodes"], json!([]), "{silent}");
+        assert_eq!(notifier.sent.len(), 1);
+        pass(&mut probe, &mut notifier, &mut state, 9_000.0, &options);
+        let changed = pass(&mut probe, &mut notifier, &mut state, 9_900.0, &options);
+        assert_eq!(
+            changed["episodes"][0]["kind"], "background-wait",
+            "{changed}"
+        );
+        assert!(
+            changed["episodes"][0]["detail"]
+                .to_string()
+                .contains("2 shells"),
+            "{changed}"
+        );
+        assert_eq!(changed["episodes"][0]["level"], "info", "{changed}");
     }
 
     // Rows drawn by Claude Code at the bottom of an idle pane while two background shells
