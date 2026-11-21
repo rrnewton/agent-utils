@@ -72652,13 +72652,38 @@ def _census_rerun_seconds(timeout_seconds: float) -> int:
     )
 
 
-def _validate_remove_batch_census_stderr_bytes(sealed_slots: int) -> int:
+#: Cap on one slot's process-scaled stderr allowance (#2082): stderr is
+#: retained only to classify vanished processes, so beyond this the census
+#: refuses as budget-exceeded rather than buffering without bound.
+_VALIDATE_REMOVE_BATCH_CENSUS_STDERR_CAP_BYTES = 1024 * 1024
+
+
+def _validate_remove_batch_census_stderr_bytes(
+    sealed_slots: int, process_count: int | None = None
+) -> int:
     """Return the combined census stderr bound for a validation batch.
 
-    One slot, or none, gets one allowance.  Each further slot adds one more.
+    Derivation (#2082): under churn, find notes each process that exits
+    during the scan, and the census parses those lines.  Measured at
+    4,400-5,500 processes: one privileged find up to 29 KiB, one census's
+    attempts up to 56 KiB, a whole eight-slot batch up to 83 KiB -- about
+    16 bytes per process at worst.  Each sealed slot therefore gets the
+    historical 64 KiB floor, scaled by 256 bytes per live process (16x
+    the measured worst case, the same allowance as the absent-slot
+    census) and capped at 1 MiB per slot; each further slot adds one
+    more per-slot allowance.
     """
 
-    return _VALIDATE_REMOVE_BATCH_CENSUS_STDERR_BYTES * max(1, sealed_slots)
+    if process_count is None:
+        process_count = _host_process_count()
+    per_slot = min(
+        _VALIDATE_REMOVE_BATCH_CENSUS_STDERR_CAP_BYTES,
+        max(
+            _VALIDATE_REMOVE_BATCH_CENSUS_STDERR_BYTES,
+            process_count * _ABSENT_CENSUS_STDERR_PER_PROCESS_BYTES,
+        ),
+    )
+    return per_slot * max(1, sealed_slots)
 
 
 def _remove_validate_batch_grouped(
@@ -72991,6 +73016,13 @@ def _remove_validate_batch(
             ),
             input_limit=_MOUNTINFO_CENSUS_BYTES_LIMIT,
             rerun_census_seconds=_census_rerun_seconds(resolved_census_seconds),
+            census_context=(
+                "slot "
+                + ", ".join(sorted(private_targets))
+                + " (validate-remove census)"
+            )
+            if private_targets
+            else "",
         )
         private_paths = [
             private_target.path for private_target in private_targets.values()
@@ -92062,6 +92094,10 @@ class _ReadOnlyCommandBudget:
     # When this budget backs a command that accepts --census-seconds, the
     # value its timeout refusal suggests rerunning with.  Zero names no flag.
     rerun_census_seconds: int = 0
+    # What this census decides about, for its refusals (#2082): the slot
+    # (or slots) and the phase, so a timeout names the slot, the phase,
+    # the failure shape and the next step.  Empty keeps the bare text.
+    census_context: str = ""
 
     @classmethod
     def start(
@@ -92073,6 +92109,7 @@ class _ReadOnlyCommandBudget:
         input_limit: int = 16 * 1024 * 1024,
         observation_limit: int = _PROCESS_CENSUS_OBSERVATION_LIMIT,
         rerun_census_seconds: int = 0,
+        census_context: str = "",
     ) -> "_ReadOnlyCommandBudget":
         return cls(
             deadline=time.monotonic() + timeout_seconds,
@@ -92082,6 +92119,15 @@ class _ReadOnlyCommandBudget:
             observations_remaining=observation_limit,
             timeout_seconds=timeout_seconds,
             rerun_census_seconds=rerun_census_seconds,
+            census_context=census_context,
+        )
+
+    def _failure_suffix(self, shape: str, next_step: str) -> str:
+        if not self.census_context:
+            return ""
+        return (
+            f"; census: {self.census_context}; failure: {shape}; "
+            f"next step: {next_step}"
         )
 
     def remaining_seconds(self) -> float:
@@ -92105,6 +92151,11 @@ class _ReadOnlyCommandBudget:
                 "read-only census exceeded its operation-wide time bound"
                 + detail
                 + hint
+                + self._failure_suffix(
+                    "time bound exceeded",
+                    "rerun with a larger --census-seconds where the command "
+                    "accepts it, or retry when the host is quieter",
+                )
             )
         return remaining
 
@@ -92120,11 +92171,21 @@ class _ReadOnlyCommandBudget:
             raise Refusal(
                 "read-only census exceeded its operation-wide output bound: "
                 f"stdout over by {-self.stdout_remaining} bytes"
+                + self._failure_suffix(
+                    "budget exceeded",
+                    "retry when fewer processes are churning, or narrow the "
+                    "batch and retry",
+                )
             )
         if self.stderr_remaining < 0:
             raise Refusal(
                 "read-only census exceeded its operation-wide output bound: "
                 f"stderr over by {-self.stderr_remaining} bytes"
+                + self._failure_suffix(
+                    "budget exceeded",
+                    "retry when fewer processes are churning, or narrow the "
+                    "batch and retry",
+                )
             )
 
     def consume_observation(self) -> None:
@@ -96777,7 +96838,10 @@ def _census_appearing_generations(
     raise Refusal(
         "process use is indeterminate because the process census did not close "
         f"within {_CENSUS_LISTING_ROUNDS} listings of /proc (most recently PIDs "
-        f"{', '.join(str(pid) for pid in unsettling[:16])})"
+        f"{', '.join(str(pid) for pid in unsettling[:16])}); "
+        f"targets: {', '.join(str(path) for path in targets)}; "
+        "failure: census not closed; next step: stop the named processes if "
+        "they hold a target, or retry the remove"
     )
 
 
@@ -96870,7 +96934,9 @@ def _capture_process_path_census_following(
             if attempt < 2:
                 continue
             raise Refusal(
-                "relevant process evidence changed during three liveness attempts"
+                "relevant process evidence changed during three liveness attempts; "
+                "failure: process evidence kept changing (unreadable or "
+                "replaced process); next step: retry the remove"
             )
         return _ProcessPathCensus(
             processes,
@@ -96916,7 +96982,9 @@ def _assert_absent_validate_processes_unrelated(
             if attempt < 2:
                 continue
             raise Refusal(
-                "relevant process evidence changed during three liveness attempts"
+                "relevant process evidence changed during three liveness attempts; "
+                "failure: process evidence kept changing (unreadable or "
+                "replaced process); next step: retry the remove"
             )
         if match is not None:
             pid, slot, kind, detail = match

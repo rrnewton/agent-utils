@@ -1340,7 +1340,7 @@ pub(crate) fn capture_process_snapshot_at(
     unsettling.sort_unstable();
     unsettling.dedup();
     Err(format!(
-        "process use is indeterminate because the process snapshot did not close within {SNAPSHOT_LISTING_ROUNDS} listings of /proc (most recently PIDs {})",
+        "process use is indeterminate because the process snapshot did not close within {SNAPSHOT_LISTING_ROUNDS} listings of /proc (most recently PIDs {}); failure: census not closed; next step: stop the named processes if they hold the slot, or retry the remove",
         unsettling
             .iter()
             .map(i64::to_string)
