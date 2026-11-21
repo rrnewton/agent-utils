@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-archive-single-row-dress: archive and unarchive dress only the acted rows and their neighbours'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -8,7 +8,8 @@ labels:
 - performance
 - ui
 created_at: 2026-11-20T15:10:00-05:00
-updated_at: 2026-11-20T15:10:00-05:00
+updated_at: 2026-11-21T01:40:00-05:00
+closed_at: 2026-11-21T01:40:00-05:00
 ---
 
 # Description
@@ -32,3 +33,7 @@ updated_at: 2026-11-20T15:10:00-05:00
 # Notes
 
 Owner-priority, fast-track. Standing lane mu-clientperf under coordb; one fix per issue, one commit per fix. Builds on the #1976 Phase 1 measurements and #1984's changed-only writes. A candidate follow-up (not this fix): mu-windowed's `refreshThreadDirectory` full dress pass once per directory read.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as 441f9c71, deployed 2026-11-21 1:29 AM ET. Archive and unarchive dress only the acted rows, neighbours, thread roots and copies; per press, DOM mutations 3,343 -> 69 and class writes 1,634 -> 2 on the lane fixture, archive 356 -> 184 ms at 1x and 1,902 -> 1,129 ms at 4x (report-only numbers; the gate counts events).
