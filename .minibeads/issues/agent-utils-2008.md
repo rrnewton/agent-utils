@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-windowed-send-frame-drop: windowed send on the phone drops on-screen rows for one frame and moves the anchor'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -30,3 +30,7 @@ updated_at: 2026-11-20T17:40:00-05:00
 # Notes
 
 [watermelon-full-preview] Number pre-assigned by the lead coordinator (2026-11-20). Related: #1985 vibe-talk-windowed-all-view-fixes (landed as b1c721cc; its appended-row stand-down is in this area), #1983 All-view send flash (default path, its lane still held for its own landing).
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as 5633ce89 (2026-11-21): sliceFor now returns the last cap of groups for a reader priced past the end of the offsets instead of an empty range, so a send-landing render can no longer unmount the rows being read for that frame; the two phone windowed send walks lost their expected-fail marks. Send-flash rc=0 on the coordinator's devbig030 run with all 12 walks at 0 flash frames (windowed anchor moves 0.2-0.7px), and windowed_all rc=0.
