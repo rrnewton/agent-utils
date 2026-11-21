@@ -80,8 +80,8 @@ export function createReadingModeActs(deps: ReadingModeActsDependencies): Readin
         deps.showError(speechProblem);
       }
       // AHEAD OF THE TAP. This is the request that makes every later tap cheap, and it is issued the
-      // moment the mode is entered rather than when a message is chosen, because the reader is
-      // already looking at the text and has not decided yet which line they want.
+      // moment the mode is entered rather than when a message is chosen: the start the Read press
+      // makes at once (`#2003`) and every jump after it ride on it.
       deps.guardQuietly(deps.readAloudOwner().prepareSpeech)();
     } else {
       deps.readAloudOwner().forgetPreparedSpeech();
@@ -89,8 +89,8 @@ export function createReadingModeActs(deps: ReadingModeActsDependencies): Readin
     deps.setStatus(
       deps.readAloudOwner().readingMode
         ? deps.readAloudOwner().readAloudPlayback === "browser"
-          ? deps.readAloudOwner().browserSpeechProblem() || `${deps.readAloudOwner().readAloudLabel}: tap a message to hear it, and it archives when it finishes.`
-          : "reading mode: tap a message to hear it, and it archives when it finishes."
+          ? deps.readAloudOwner().browserSpeechProblem() || `${deps.readAloudOwner().readAloudLabel}: reading from the first message on screen, and it archives when it finishes.`
+          : "reading from the first message on screen, and it archives when it finishes."
         : "reading mode off."
     );
     deps.renderControls();

@@ -193,7 +193,6 @@ export interface ElementById {
   "doc-outline": HTMLUListElement;
   "doc-outline-open": HTMLButtonElement;
   "doc-outline-pop": HTMLDivElement;
-  "doc-read": HTMLButtonElement;
   "doc-star": HTMLButtonElement;
   "doc-title": HTMLHeadingElement;
   "dock": HTMLElement;

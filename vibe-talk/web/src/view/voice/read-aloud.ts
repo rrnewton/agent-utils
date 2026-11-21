@@ -2613,19 +2613,32 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     // block-model index space (`texts`/`kinds`), never the prepared list's
     // own. A cloud read's server blocks are aligned onto the model (its
     // pieces of one drawn block land on that block); where the two cuts
-    // do not align, nothing is reported rather than a wrong block. A
+    // do not align, the server's drawn block is reported instead of
+    // nothing (`#2004`: silence here read as a stop and killed the light,
+    // the navigator and the tap gate under a playing voice). A
     // caller that cut no model (no `kinds`) is reported as it was.
     const payload = playing.document;
-    if (!payload.kinds || payload.kinds.length === 0) {
+    const kinds = payload.kinds;
+    if (!kinds || kinds.length === 0) {
       tell(segment.block, segment.block);
       return;
     }
     const listed = playing.blocks && playing.blocks[segment.part]
       ? playing.blocks[segment.part]! : null;
     if (!listed) {
-      tell(null);
+      // `#2004 vibe-talk-read-highlight-missing`. A one-block document read
+      // whole has no prepared list; its light is that one block, not silence.
+      if (kinds.length === 1) tell(0, 0);
+      else tell(null);
       return;
     }
+    // The drawn block the current prepared block is a piece of, in the
+    // server's own numbering: the fallback light where the two cuts
+    // disagree, so a playing read keeps a light (and its navigator)
+    // instead of reporting a stop that never happened.
+    const currentBlock = listed[segment.block];
+    const drawnOf = (block: PreparedBlock | undefined, fallback: number): number =>
+      (block && Number.isInteger(block.element) ? block.element as number : fallback);
     const groups: { kind: string; members: number[] }[] = [];
     listed.forEach((block, index) => {
       const element = block && Number.isInteger(block.element) ? block.element as number : null;
@@ -2636,20 +2649,25 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
         groups.push({ kind: String(block && block.kind || ""), members: [index], ...(element !== null ? { element } : {}) } as { kind: string; members: number[] });
       }
     });
-    if (groups.length !== payload.kinds.length) {
-      tell(null);
+    if (groups.length !== kinds.length
+        || groups.some((group, at) => group.kind !== kinds[at])) {
+      // `#2004`. The cuts disagree (an issue's front matter is the known
+      // case: the server counts it, the drawn body does not). Light the
+      // server's drawn block rather than nothing: a slightly early or
+      // late light beside a playing voice beats no light at all, and the
+      // surface keeps its read (a null here reads as "stopped" and takes
+      // the navigator and the tap gate down with it).
+      const drawn = drawnOf(currentBlock, segment.block);
+      tell(drawn, drawn);
       return;
     }
     const mapped = new Map<number, number>();
     for (let at = 0; at < groups.length; at += 1) {
-      if (groups[at]!.kind !== payload.kinds[at]) {
-        tell(null);
-        return;
-      }
       for (const member of groups[at]!.members) mapped.set(member, at);
     }
     const model = mapped.get(segment.block);
-    tell(model === undefined ? null : model, model === undefined ? null : model);
+    const drawn = drawnOf(currentBlock, segment.block);
+    tell(model === undefined ? drawn : model, model === undefined ? drawn : model);
   }
 
   /**

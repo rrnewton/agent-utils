@@ -9618,7 +9618,20 @@ pub async fn prepare_document_speech(
                     expires_in_seconds: crate::speech_tickets::TICKET_TTL.as_secs(),
                 }));
             };
-            cached.content
+            // `#2004`: an issue is drawn and cut from its body alone (the
+            // reader's header carries the front matter), so its speech is
+            // cut from that body too — never the YAML, and with block
+            // indices that name the drawn blocks.
+            let is_issue = state
+                .documents
+                .index
+                .get(&key)
+                .is_some_and(|entry| entry.kind == crate::documents::DocKind::GithubIssue);
+            if is_issue {
+                crate::documents::issue_body(&cached.content).to_owned()
+            } else {
+                cached.content
+            }
         }
     };
     let now = jiff::Timestamp::now().as_millisecond();

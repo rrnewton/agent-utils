@@ -216,6 +216,35 @@ pub fn issue_status_of(content: &str) -> Option<String> {
     None
 }
 
+/// The body of an issue document after its YAML front matter, or the whole
+/// content where it does not open with a complete `---` front-matter block.
+/// `#2004 vibe-talk-read-highlight-missing`: the reader draws (and cuts for
+/// reading) only this body — its header carries the front matter instead
+/// (`splitIssueHeader` in the page) — so the server's speech cut must be
+/// taken from the same body, or every block index shifts by the front
+/// matter's block and the reading light never lands.
+#[must_use]
+pub fn issue_body(content: &str) -> &str {
+    let mut offset = 0;
+    let mut first = true;
+    for line in content.split_inclusive('\n') {
+        let text = line.trim();
+        if first {
+            first = false;
+            if text != "---" {
+                return content;
+            }
+            offset += line.len();
+            continue;
+        }
+        if text == "---" {
+            return &content[offset + line.len()..];
+        }
+        offset += line.len();
+    }
+    content
+}
+
 fn valid_gist_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
@@ -3175,6 +3204,18 @@ mod tests {
             None,
             "no status line, no status"
         );
+    }
+
+    #[test]
+    fn issue_body_drops_only_a_complete_front_matter_block() {
+        // `#2004`: the speech cut is taken from this body, as the reader
+        // draws it, so its block indices name the drawn blocks.
+        let doc = "---\ntitle: \"Fix it\"\nstatus: open\n---\n\n# Body\n\nWords.\n";
+        assert_eq!(issue_body(doc), "\n# Body\n\nWords.\n");
+        assert_eq!(issue_body("# No frontmatter\n"), "# No frontmatter\n");
+        let open = "---\ntitle: x\n# Body\n";
+        assert_eq!(issue_body(open), open, "no closing fence, no split");
+        assert_eq!(issue_body("---\n---\nBody.\n"), "Body.\n");
     }
 
     #[test]

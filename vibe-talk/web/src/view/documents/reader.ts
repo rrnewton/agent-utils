@@ -21,6 +21,7 @@
 import { createListening } from "../dom/index.ts";
 import { centrePopupOver } from "../dom/index.ts";
 import { documentHeadingId, renderDocumentMarkdown } from "./render.ts";
+import { firstMeaningfulVisible } from "../dom/index.ts";
 import { documentReadBlocks } from "./blocks.ts";
 import { authorNumberOf, buildScrubberNav, buildSections } from "./sections.ts";
 import type { ScrubSectionCell, SectionModel } from "./sections.ts";
@@ -155,6 +156,13 @@ export interface DocumentsReader {
   closeOutline(): boolean;
   /** Redraw the header star for the open document, as state lands from elsewhere. */
   refreshStar(): void;
+  /**
+   * Start reading the open document aloud from the first block on screen,
+   * through the shared read-aloud owner (`#2004`, `#2003`): the bottom-bar
+   * Read's start while a document is open, with no scroll change. Offered
+   * on the reader itself; the header's own Read button is gone (`#2003`).
+   */
+  readAloud(): void;
   /** Stop any reading in progress. */
   close(): void;
   /** Take down every listener the reader added. */
@@ -1064,9 +1072,40 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     ).catch(() => undefined);
   }
 
-  /** The Read button: the whole document from its first block. */
+  /**
+   * The block Read starts at (`#2003`): the first drawn block whose visible
+   * part in the scroller is meaningful, measured live; the first block
+   * where nothing can be measured (a DOM without boxes) or none qualifies.
+   * Starting there never scrolls: the light lands on what is already on
+   * screen, and `onReadingBlock`'s keep-in-view leaves a visible block put.
+   */
+  function firstVisibleBlock(): number {
+    let body: HTMLElement;
+    let root: HTMLElement;
+    try {
+      body = deps.byId("doc-body");
+      root = deps.byId("scroll-area");
+    } catch {
+      return 0;
+    }
+    if (!body || !root || typeof root.getBoundingClientRect !== "function") return 0;
+    const blocks = documentBlocks(body);
+    if (blocks.length === 0) return 0;
+    if (blocks.some((block) => typeof block.getBoundingClientRect !== "function")) return 0;
+    const view = root.getBoundingClientRect();
+    const at = firstMeaningfulVisible(
+      blocks.map((block) => {
+        const box = block.getBoundingClientRect();
+        return { top: box.top, bottom: box.bottom };
+      }),
+      { top: view.top, bottom: view.bottom },
+    );
+    return at === -1 ? 0 : at;
+  }
+
+  /** Read: the document from the first block on screen (`#2003`). */
   function readAloud(): void {
-    startReading(null);
+    startReading(firstVisibleBlock());
   }
 
   /** Stop this reader's own document's reading, and only its own. */
@@ -1300,7 +1339,7 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     button.setAttribute("aria-label", starred ? "Unstar this document" : "Star this document");
   }
 
-  /** Add the Back, Read and Outline listeners, the first time the reader is opened. */
+  /** Add the Back and Outline listeners, the first time the reader is opened. */
   function wire(): void {
     if (wired) return;
     wired = true;
@@ -1310,9 +1349,6 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     listening.listen(deps.byId("doc-back"), "click", () => {
       stopOwnReading();
       deps.onBack();
-    });
-    listening.listen(deps.byId("doc-read"), "click", () => {
-      readAloud();
     });
     if (deps.star) {
       try {
@@ -1363,6 +1399,9 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
       if (!outlineOpen) return false;
       closeOutline(true);
       return true;
+    },
+    readAloud(): void {
+      readAloud();
     },
     refreshStar(): void {
       drawStarFor(currentDoc?.key);

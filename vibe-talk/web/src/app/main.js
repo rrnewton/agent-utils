@@ -100,7 +100,7 @@ import {PULL_WAIT_MS, REPLY_LANDING_GAP_PX, anchorOfRow, authorPasses, createCar
   createServiceWords,
   createOpenInView,
   createFreshness,} from "../view/channel/index.ts";
-import {createAutoplay, createReadAloud, createReadingJump, createVoiceCall, createVoiceTranscript, createWatchFrame, mountCallComposer, mountCallControls, mountPageButtons, mountReadControls, createReadingModeActs} from "../view/voice/index.ts";
+import {createAutoplay, createReadAloud, createReadingJump, createVoiceCall, createVoiceTranscript, createWatchFrame, firstMeaningfulVisible, mountCallComposer, mountCallControls, mountPageButtons, mountReadControls, createReadingModeActs} from "../view/voice/index.ts";
 import {CANNED_PROMPTS,
   mountAgentPrefix,
   mountAgentSettings,
@@ -9010,6 +9010,40 @@ application.track(mountReadingJumps({
   backToReply: () => backToReply(),
 }));
 
+/**
+ * `#2003 vibe-talk-read-starts-on-screen`. Start reading the first row of
+ * the list on screen whose visible part is meaningful, where it stands:
+ * no scroll, only the light. The same messages a tap on that row reads.
+ * Whether a start was made; with nothing meaningful showing, the caller
+ * keeps the arm-and-tap mode.
+ */
+function startReadingFirstVisibleRow() {
+  let list;
+  let area;
+  try {
+    list = visibleList();
+    area = el("scroll-area");
+  } catch (_error) {
+    return false;
+  }
+  if (!list || !area || typeof area.getBoundingClientRect !== "function") return false;
+  const rows = [...list.children].filter((row) => row && typeof row.getBoundingClientRect === "function" && idsOf(/** @type {any} */ (row)).length > 0);
+  if (rows.length === 0) return false;
+  const view = area.getBoundingClientRect();
+  const at = firstMeaningfulVisible(
+    rows.map((row) => {
+      const box = row.getBoundingClientRect();
+      return { top: box.top, bottom: box.bottom };
+    }),
+    { top: view.top, bottom: view.bottom },
+  );
+  if (at === -1) return false;
+  const parts = idsOf(/** @type {any} */ (rows[at])).map(String);
+  if (parts.length === 0) return false;
+  void guardQuietly(() => readAloudOwner().readAloud(parts))();
+  return true;
+}
+
 // The read-aloud controls (`#567 pace-stepper`, `#376 read-aloud-blocks`, `#442 read-strip-order`, `#434
 // read-aloud-pause`, `#451 read-strip-followups`, `#627 scrubber-thumb-arrows`, `#886 voice-page-autoplay`): the pace's
 // steps and box, the strip's arrows, grip and Autoplay, the window resizing under it, Read and Stop under the list.
@@ -9039,7 +9073,36 @@ application.track(mountReadControls({
   toggleReadingPaused: () => readAloudOwner().toggleReadingPaused(),
   pendingRead: () => readAloudOwner().pendingRead,
   readingMode: () => readAloudOwner().readingMode,
-  setReadingMode: (on) => setReadingMode(on),
+  setReadingMode: (on) => {
+    // `#2004 vibe-talk-read-highlight-missing`. While a document is open in
+    // the reader, the bottom-bar Read IS that document's read: the same
+    // start its header button makes, so the read stands as the document's
+    // own (its light, its navigator, Pause beside Stop, taps that jump).
+    // Arming channel reading mode instead left the document unread and
+    // every one of those dark. A read already playing or on its way is
+    // the Pause/Stop the controls already reach before this.
+    if (on && !readAloudOwner().readInProgress() && readAloudOwner().pendingRead === null) {
+      if (screens.view() === "docs" && documentsView.reading()) {
+        documentsView.readAloud();
+        return;
+      }
+      // `#2003 vibe-talk-read-starts-on-screen`. In a channel, Read arms
+      // the mode as it always has (so a later tap still jumps the read)
+      // and starts at once at the first row whose visible part is
+      // meaningful, with no scroll change: the row a tap would have read,
+      // chosen by where the screen already stands. Nothing meaningful on
+      // screen is the old arm-and-tap wait alone. With Discuss open the
+      // bar's Read is the summary's (`#1531`): arm only here, and the
+      // panel's own listener starts it (a channel start's strip would
+      // stand in its way).
+      if (screens.view() === "discord" && !discussView.isOpen()) {
+        setReadingMode(true);
+        startReadingFirstVisibleRow();
+        return;
+      }
+    }
+    setReadingMode(on);
+  },
   leaveReadingMode: () => leaveReadingMode(),
 }));
 

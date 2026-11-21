@@ -82,6 +82,12 @@ export interface DocumentsView {
   depth(): number;
   /** Whether the reader (rather than the list) is up. */
   reading(): boolean;
+  /**
+   * Start reading the open document aloud (`#2004`): the bottom-bar Read's
+   * start while a document is open, through the reader's one start path.
+   * Nothing where the list is up.
+   */
+  readAloud(): void;
   /** The document open in the reader while it is up, else null (`#1040`). */
   current(): OpenDocument | null;
   /** The voice notice for the open document, or null where none is open. */
@@ -546,6 +552,9 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     back,
     depth: () => (readingNow ? Math.max(1, chain.length) : 0),
     reading: () => readingNow,
+    readAloud(): void {
+      if (readingNow) reader.readAloud();
+    },
     current(): OpenDocument | null {
       return readingNow ? reader.current() : null;
     },

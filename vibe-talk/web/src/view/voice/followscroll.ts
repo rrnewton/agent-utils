@@ -27,6 +27,11 @@ export function followDelta(targetTop: number, targetBottom: number, band: { top
   return (targetTop + targetBottom) / 2 - (band.top + band.bottom) / 2;
 }
 
+// The first-visible rule Read starts by (`#2003`) lives with the DOM
+// geometry (view/dom/firstvisible.ts), shared with the Documents reader;
+// re-exported here with the follow's own geometry.
+export { firstMeaningfulVisible, MEANINGFUL_VISIBLE_PX } from "../dom/index.ts";
+
 /** Smooth unless the reader prefers reduced motion, where the follow jumps. */
 export function followBehavior(reducedMotion: boolean): "smooth" | "auto" {
   return reducedMotion ? "auto" : "smooth";
