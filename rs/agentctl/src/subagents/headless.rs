@@ -57,6 +57,12 @@ const SPEC_SCHEMA: &str = "agentctl-headless/v1";
 const STOP_WAIT: Duration = Duration::from_secs(150);
 /// How long a control request may take.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(20);
+/// How often the wrapper re-ensures its own console tab (#1973): at startup, when
+/// Herdr (re)appears, and after a viewer is killed, without ever blocking the agent.
+const VIEWER_ENSURE_INTERVAL: Duration = Duration::from_secs(15);
+/// Cap for the wrapper viewer's exponential backoff when ensuring keeps failing
+/// or the console keeps dying (#1973): 15 s doubling to at most five minutes.
+const VIEWER_ENSURE_MAX_INTERVAL: Duration = Duration::from_secs(300);
 
 /// How long the chat bridge waits for a wrapper to answer a wake. The input is already queued,
 /// and a wrapper that does not answer takes it at its next queue poll.
@@ -523,20 +529,15 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         } else {
             None
         };
-        // #1793: a headless agent always shows in a Herdr tab. Best-effort:
-        // viewer creation never fails the start, and the watch healer
-        // recreates a viewer that is later closed or dies.
-        if options.launch
-            && self
-                .load(agent_name)
-                .is_ok_and(|r| r.viewer_tab().is_none())
-        {
-            if let Some(workspace) = self.viewer_workspace() {
-                match self.ensure_headless_viewer(agent_name, &workspace) {
-                    Ok(tab) => eprintln!("agentctl: viewer tab {tab} opened for {agent_name}"),
-                    Err(error) => {
-                        eprintln!("agentctl: warning: no viewer tab for {agent_name}: {error}")
-                    }
+        // #1973: a headless agent always shows in a Herdr tab running the console.
+        // This goes through the ONE ensure path, unconditionally (a stale, blank or
+        // tail viewer heals here too); best-effort, so viewer failure never fails
+        // the start, and the wrapper keeps ensuring its own tab while it runs.
+        if options.launch {
+            match self.ensure_headless_console_tab(agent_name) {
+                Ok(tab) => eprintln!("agentctl: viewer tab {tab} opened for {agent_name}"),
+                Err(error) => {
+                    eprintln!("agentctl: warning: no viewer tab for {agent_name}: {error}")
                 }
             }
         }
@@ -789,13 +790,6 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             );
             return Ok(0);
         }
-        // #1793: starting the wrapper (install-units --headless path) also
-        // ensures the viewer tab exists; best-effort, healed by watch.
-        if record.viewer_tab().is_none() {
-            if let Some(workspace) = self.viewer_workspace() {
-                let _ = self.ensure_headless_viewer(agent_name, &workspace);
-            }
-        }
         let session = record.headless_session()?;
         let directory = self.directory(agent_name)?;
         let mut config =
@@ -880,7 +874,79 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             name: agent_name.to_owned(),
             token: record.token.clone(),
         };
-        wrapper::run(config, terminate, &hooks)
+        // #1973: the wrapper ensures its own console tab, so every path that starts
+        // or restarts it (the systemd unit's ExecStart/Restart, restore, revive,
+        // turnover, handback) gets the tab with no separate step to remember. The
+        // thread retries while the wrapper lives: Herdr not being up yet never
+        // blocks the agent, and the tab appears when Herdr does. It stands down
+        // while the agent is taken over (the interactive session owns the tab).
+        let viewer_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let expected_token = record.token.clone();
+        let result = std::thread::scope(|scope| {
+            let viewer_stop_thread = viewer_stop.clone();
+            let terminate_thread = terminate.clone();
+            scope.spawn(move || {
+                let stopped = |stop: &std::sync::Arc<std::sync::atomic::AtomicBool>| {
+                    stop.load(std::sync::atomic::Ordering::Relaxed)
+                        || terminate_thread.load(std::sync::atomic::Ordering::Relaxed)
+                };
+                // Short slices, so a stopping wrapper is never held up; the first
+                // wait also lets `wrapper::run` claim the wrapper lock first.
+                let wait_slices =
+                    |total: Duration, stop: &std::sync::Arc<std::sync::atomic::AtomicBool>| {
+                        let mut waited = Duration::ZERO;
+                        while waited < total && !stopped(stop) {
+                            std::thread::sleep(Duration::from_millis(200));
+                            waited += Duration::from_millis(200);
+                        }
+                    };
+                wait_slices(Duration::from_secs(1), &viewer_stop_thread);
+                let mut last_outcome: Option<String> = None;
+                let mut delay = VIEWER_ENSURE_INTERVAL;
+                let mut stable_tab: Option<String> = None;
+                loop {
+                    if stopped(&viewer_stop_thread) {
+                        break;
+                    }
+                    // Only this record generation, still headless and running, and
+                    // not taken over, gets a console tab from the wrapper.
+                    let ours = self.load(agent_name).is_ok_and(|record| {
+                        record.token == expected_token
+                            && record.is_headless()
+                            && record.lifecycle == "running"
+                            && takeover_marker(&record).is_none()
+                    });
+                    if ours {
+                        let outcome = match self.ensure_headless_console_tab(agent_name) {
+                            Ok(tab) => {
+                                // A different tab than last tick means churn (the
+                                // console keeps dying): back off like a failure.
+                                if stable_tab.as_deref() == Some(tab.as_str()) {
+                                    delay = VIEWER_ENSURE_INTERVAL;
+                                } else {
+                                    stable_tab = Some(tab.clone());
+                                    delay = (delay * 2).min(VIEWER_ENSURE_MAX_INTERVAL);
+                                }
+                                format!("console tab {tab}")
+                            }
+                            Err(error) => {
+                                delay = (delay * 2).min(VIEWER_ENSURE_MAX_INTERVAL);
+                                format!("no console tab yet: {error}")
+                            }
+                        };
+                        if last_outcome.as_deref() != Some(outcome.as_str()) {
+                            eprintln!("agentctl run-headless: {agent_name}: {outcome}");
+                            last_outcome = Some(outcome);
+                        }
+                    }
+                    wait_slices(delay, &viewer_stop_thread);
+                }
+            });
+            let result = wrapper::run(config, terminate, &hooks);
+            viewer_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            result
+        });
+        result
     }
 
     #[allow(clippy::too_many_arguments)]

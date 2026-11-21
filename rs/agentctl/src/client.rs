@@ -2411,6 +2411,26 @@ impl HerdrClient {
         })
     }
 
+    /// Argument vectors of every foreground process in the pane, as Herdr reports
+    /// them; empty when it reports none. Callers prove what a pane runs (for
+    /// example `agentctl tail NAME`) instead of trusting a tab label (#1973).
+    pub fn pane_foreground_argv(&self, pane_id: &str) -> Result<Vec<Vec<String>>> {
+        let (_, processes) = self.foreground_processes(pane_id, &|| false)?;
+        Ok(processes
+            .iter()
+            .filter_map(|process| match process.get("argv") {
+                Some(Value::Array(values)) => Some(
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect())
+    }
+
     fn custom_harness_observed(
         &self,
         pane_id: &str,

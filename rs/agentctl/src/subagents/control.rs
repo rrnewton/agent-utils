@@ -36,6 +36,11 @@ pub(crate) const VIEWER_TAB: &str = "viewer_tab_id";
 /// What the viewer tab runs: `console` (the paved view, #1879) or `tail`
 /// (stale for a live headless agent; hygiene recreates it as console).
 pub(crate) const VIEWER_KIND: &str = "viewer_kind";
+/// When the recorded viewer tab was created (unix seconds, #1973): a tab this
+/// young is never judged blank, because its console may still be starting.
+pub(crate) const VIEWER_CREATED: &str = "viewer_created_at";
+/// Grace for a just-created viewer tab before it may be judged blank (#1973).
+pub(crate) const VIEWER_GRACE_SECONDS: f64 = 60.0;
 /// A one-line description of what the agent is for (#1342 agent-purpose-line):
 /// display-only metadata recorded at start. Unlike `goal` it is never sent to
 /// the harness as an instruction.
@@ -766,6 +771,7 @@ impl AgentRecord {
     pub(super) fn set_viewer_tab(&mut self, tab: Option<&str>) {
         if tab.is_none() {
             self.set_viewer_kind(None);
+            self.set_viewer_created_at(None);
         }
         match &mut self.nested {
             Some(nested) => {
@@ -797,6 +803,40 @@ impl AgentRecord {
             None => self.extra.get(VIEWER_KIND),
         }?;
         value.as_str().map(str::to_owned)
+    }
+
+    /// When the recorded viewer tab was created (unix seconds, #1973).
+    pub(super) fn viewer_created_at(&self) -> Option<f64> {
+        let value = match &self.nested {
+            Some(nested) => nested.extensions().get(VIEWER_CREATED),
+            None => self.extra.get(VIEWER_CREATED),
+        }?;
+        value.as_f64()
+    }
+
+    /// Record when the viewer tab was created, or clear it with the tab.
+    pub(super) fn set_viewer_created_at(&mut self, at: Option<f64>) {
+        match &mut self.nested {
+            Some(nested) => {
+                let map = nested.extensions_mut();
+                match at {
+                    Some(at) => {
+                        map.insert(VIEWER_CREATED.to_owned(), json!(at));
+                    }
+                    None => {
+                        map.remove(VIEWER_CREATED);
+                    }
+                }
+            }
+            None => match at {
+                Some(at) => {
+                    self.extra.insert(VIEWER_CREATED.to_owned(), json!(at));
+                }
+                None => {
+                    self.extra.remove(VIEWER_CREATED);
+                }
+            },
+        }
     }
 
     /// Record what the viewer tab runs, or clear it with the tab.
@@ -1185,6 +1225,42 @@ fn now_seconds() -> f64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+/// Whether one foreground `argv` provably runs `agentctl tail NAME` (any
+/// `--registry` etc. arguments may intervene): the executable names agentctl
+/// and a `tail` argument is followed by the agent's name (#1973).
+fn argv_is_tail_for(argv: &[String], agent_name: &str) -> bool {
+    let Some(argv0) = argv.first() else {
+        return false;
+    };
+    let executable = argv0.rsplit('/').next().unwrap_or(argv0);
+    if !executable.starts_with("agentctl") {
+        return false;
+    }
+    argv.windows(2)
+        .any(|pair| pair[0] == "tail" && pair[1] == agent_name)
+}
+
+/// Which stage a console-tab ensure failed at (#1973): only a failure to
+/// create the tab in a workspace at all may fall back to another workspace.
+enum EnsureError {
+    /// Any failure; the caller reports it and may retry the same way.
+    Failed(AgentError),
+    /// `create_tab_with_pane` itself failed in the attempted workspace.
+    CreationFailed(AgentError),
+}
+
+impl From<AgentError> for EnsureError {
+    fn from(error: AgentError) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl From<crate::error::AdapterError> for EnsureError {
+    fn from(error: crate::error::AdapterError) -> Self {
+        Self::Failed(error.into())
+    }
 }
 
 impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
@@ -2012,29 +2088,186 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         self.client.inherited_workspace()
     }
 
-    /// Create the viewer tab of a headless agent (#1879, #1793): a fresh tab in
-    /// `workspace` running `agentctl console NAME`, recorded as the agent's
-    /// `viewer_tab_id` with kind `console`. The viewer is a pure client over
-    /// the control socket; the agent's process is never touched, so losing
-    /// Herdr loses only the view and restore reopens it.
+    /// The ONE viewer path every headless start goes through (#1973, #1879, #1793):
+    /// ensure `agent_name` has a Herdr tab running `agentctl console NAME` in
+    /// `workspace`, recorded as its `viewer_tab_id` with kind `console`, and return
+    /// that tab. Idempotent: a live console (recorded kind is not `tail`, its tab
+    /// holds a live pane, and that pane is not a bare shell) is left untouched; a
+    /// missing, dead, blank-shell or tail viewer is replaced by a fresh console tab.
+    /// The viewer is a pure client over the control socket; the agent's process is
+    /// never touched, so losing Herdr loses only the view. A Herdr failure is an
+    /// error the caller may retry, never a reason to fail the agent itself.
     pub fn ensure_headless_viewer(&self, agent_name: &str, workspace: &str) -> Result<String> {
+        self.ensure_headless_viewer_inner(agent_name, workspace, true)
+            .map_err(|error| match error {
+                EnsureError::Failed(error) | EnsureError::CreationFailed(error) => error,
+            })
+    }
+
+    /// [`Self::ensure_headless_viewer`], with closing the replaced tab allowed only
+    /// when `allow_close` (restore hygiene passes its `close_bare_shells`, #1973):
+    /// without it a stale viewer is left in place and a fresh console tab is
+    /// created and recorded instead.
+    pub fn ensure_headless_viewer_with_close(
+        &self,
+        agent_name: &str,
+        workspace: &str,
+        allow_close: bool,
+    ) -> Result<String> {
+        self.ensure_headless_viewer_inner(agent_name, workspace, allow_close)
+            .map_err(|error| match error {
+                EnsureError::Failed(error) | EnsureError::CreationFailed(error) => error,
+            })
+    }
+
+    fn ensure_headless_viewer_inner(
+        &self,
+        agent_name: &str,
+        workspace: &str,
+        allow_close: bool,
+    ) -> std::result::Result<String, EnsureError> {
+        // Inspect OUTSIDE the record lock (Herdr calls can be slow); the lock is
+        // taken only to re-check and record, so a wrapper hook is never starved.
+        let snapshot = self.load(agent_name)?;
+        let recorded = snapshot.viewer_tab();
+        if let Some(tab) = recorded.as_deref() {
+            let panes = self.client.panes()?;
+            let tab_panes: Vec<&crate::client::Pane> =
+                panes.iter().filter(|pane| pane.tab_id == tab).collect();
+            if let Some(pane) = tab_panes.first() {
+                let stale_tail = snapshot.viewer_kind().as_deref() == Some("tail");
+                // Ownership proof: the tab carries this agent's name. A recycled
+                // tab id after a reboot (another agent's shell, the coordinator's
+                // tab) does not, and is never closed or claimed as the viewer.
+                let ours = self
+                    .client
+                    .tab_label(tab)
+                    .is_ok_and(|label| label == agent_name);
+                let young = snapshot.viewer_created_at().is_some_and(|at| {
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .is_ok_and(|now| now.as_secs_f64() - at < VIEWER_GRACE_SECONDS)
+                });
+                // An unreadable idle-shell proof leaves the viewer alone: never
+                // close a tab on unknown state. A just-created tab is never blank.
+                let blank = !young
+                    && self
+                        .client
+                        .pane_is_idle_shell(&pane.pane_id)
+                        .unwrap_or(false);
+                if !stale_tail && !blank && ours {
+                    return Ok(tab.to_owned());
+                }
+                if !stale_tail && !blank && !ours && self.client.tab_label(tab).is_err() {
+                    // Label unreadable: state unknown, leave the viewer alone.
+                    return Ok(tab.to_owned());
+                }
+                // Replace: close ONLY a proven-ours, single-pane tab whose pane is
+                // an idle shell, or (for a recorded tail viewer) provably runs
+                // `agentctl tail NAME` in its foreground. A label alone never
+                // proves a tail tab: hygiene label-sync renames recorded viewer
+                // tabs, so a recycled id holding a live program would otherwise
+                // be renamed into looking ours and then closed. A multi-pane tab
+                // (a split holding someone else's live pane) is never closed.
+                let idle = self
+                    .client
+                    .pane_is_idle_shell(&pane.pane_id)
+                    .unwrap_or(false);
+                let runs_tail = stale_tail
+                    && self
+                        .client
+                        .pane_foreground_argv(&pane.pane_id)
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|argv| argv_is_tail_for(argv, agent_name));
+                let closable = allow_close && ours && tab_panes.len() == 1 && (idle || runs_tail);
+                if closable {
+                    self.client.close_tab(tab)?;
+                }
+            }
+        }
+        let (tab, pane) = self
+            .client
+            .create_tab_with_pane(workspace, agent_name, &snapshot.cwd, &[])
+            .map_err(|error: crate::error::AdapterError| {
+                EnsureError::CreationFailed(error.into())
+            })?;
+        // Anything that fails after the tab exists closes it again (it is ours,
+        // single-pane, labelled for this agent), so a failed ensure never leaks
+        // a tab the record does not name.
+        let finish = |manager: &Self| -> Result<String> {
+            let executable = std::env::current_exe()
+                .map_err(|error| fail(format!("locate this agentctl: {error}")))?;
+            let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
+            let command = format!(
+                "exec {} --registry {} console {}",
+                quote(&executable.display().to_string()),
+                quote(&manager.registry.display().to_string()),
+                agent_name,
+            );
+            manager.client.send_text(&pane, &command)?;
+            manager.client.send_keys(&pane, "Enter")?;
+            // Record under the lock, re-checking first: if another starter recorded
+            // a different viewer meanwhile, drop the tab just created, keep theirs.
+            let _lock = manager.lock(agent_name)?;
+            let mut record = manager.load(agent_name)?;
+            if record.viewer_tab() != recorded {
+                if let Some(theirs) = record.viewer_tab() {
+                    let _ = manager.client.close_tab(&tab);
+                    return Ok(theirs);
+                }
+            }
+            record.set_viewer_tab(Some(&tab));
+            record.set_viewer_kind(Some("console"));
+            record.set_viewer_created_at(Some(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|now| now.as_secs_f64())
+                    .unwrap_or_default(),
+            ));
+            manager.save(&record)?;
+            Ok(tab.clone())
+        };
+        match finish(self) {
+            Ok(tab) => Ok(tab),
+            Err(error) => {
+                let _ = self.client.close_tab(&tab);
+                Err(EnsureError::Failed(error))
+            }
+        }
+    }
+
+    /// [`Self::ensure_headless_viewer`] with the workspace resolved here (#1973):
+    /// the recorded viewer's workspace when it names one, else
+    /// [`Self::viewer_workspace`]. This is the entry `start --mode headless` and
+    /// the headless wrapper itself call, so no start path can forget the tab.
+    pub fn ensure_headless_console_tab(&self, agent_name: &str) -> Result<String> {
         let record = self.load(agent_name)?;
-        let (tab, pane) =
-            self.client
-                .create_tab_with_pane(workspace, agent_name, &record.cwd, &[])?;
-        let executable = std::env::current_exe()
-            .map_err(|error| fail(format!("locate this agentctl: {error}")))?;
-        let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
-        let command = format!(
-            "exec {} --registry {} console {}",
-            quote(&executable.display().to_string()),
-            quote(&self.registry.display().to_string()),
-            agent_name,
-        );
-        self.client.send_text(&pane, &command)?;
-        self.client.send_keys(&pane, "Enter")?;
-        self.set_viewer_tab_kind(agent_name, Some(tab.clone()), Some("console"))?;
-        Ok(tab)
+        let workspace = record
+            .viewer_tab()
+            .and_then(|tab| tab.split(':').next().map(str::to_owned))
+            .filter(|workspace| !workspace.is_empty())
+            .or_else(|| self.viewer_workspace())
+            .ok_or_else(|| {
+                fail(format!(
+                    "no Herdr workspace is known for the console tab of {agent_name:?}; \
+                     start it from a Herdr pane or designate a coordinator first"
+                ))
+            })?;
+        // A recorded workspace that no longer exists (reboot, workspace closed)
+        // falls back to the currently resolved viewer workspace — but only when
+        // creating the tab there failed at all; a later failure has already
+        // closed the tab it created and is reported as-is (#1973).
+        match self.ensure_headless_viewer_inner(agent_name, &workspace, true) {
+            Ok(tab) => Ok(tab),
+            Err(EnsureError::CreationFailed(error)) => match self.viewer_workspace() {
+                Some(fallback) if fallback != workspace => {
+                    self.ensure_headless_viewer(agent_name, &fallback)
+                }
+                _ => Err(error),
+            },
+            Err(EnsureError::Failed(error)) => Err(error),
+        }
     }
 
     /// Read, set, or clear what `agent_name` is for (#1342 agent-purpose-line).

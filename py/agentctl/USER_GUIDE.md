@@ -3402,6 +3402,21 @@ wrapper's socket goes away the console says so once and keeps the
 line. Leaving never touches the agent. `tail` stays the read-only
 follower for pipes, scripts, and extra views.
 
+Every headless agent also gets that console in a Herdr tab, automatically
+(#1973): `start --mode headless` opens one, and the wrapper itself keeps
+ensuring its own tab while it runs — a viewer tab that is missing, killed,
+blank (Herdr restored the tab as an empty shell), or still running the old
+read-only `tail --follow` is replaced by `agentctl console NAME`; a live
+console is left alone. Because the wrapper does this, a headless unit that
+starts at boot before Herdr is up still gets its tab when Herdr appears,
+with no separate step to remember. To bring a pre-#1973 headless unit up
+to date, no unit conversion is needed: its `ExecStart` already runs
+`run-headless`. Point the unit at a current agentctl (refresh the
+services snapshot it runs, or rewrite it with `install-units --headless`),
+then `systemctl --user daemon-reload` and restart the unit; the wrapper
+recreates the console tab itself on its next pass (within seconds), and
+`agentctl status NAME` shows the recorded `viewer_tab_id`.
+
 `start --mode headless --harness claude` registers an `adapter: harness-wrapper`,
 `mode: headless` record with a new session UUID (`--resume UUID` keeps an existing
 session begun in the same working directory). Without `--no-launch` it also starts

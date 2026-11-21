@@ -5584,7 +5584,11 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
                 agent,
                 workspace_id,
             } => {
-                let _ = manager.ensure_headless_viewer(&agent, &workspace_id);
+                let _ = manager.ensure_headless_viewer_with_close(
+                    &agent,
+                    &workspace_id,
+                    config.close_bare_shells,
+                );
             }
         }
     }

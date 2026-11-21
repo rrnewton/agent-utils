@@ -1370,6 +1370,11 @@ pub trait ManagedApi: AgentApi {
             "idle shell verification is unavailable",
         ))
     }
+    /// Argument vectors of the pane's foreground processes; empty when unknown,
+    /// which proves nothing (callers must treat it as unproven, #1973).
+    fn pane_foreground_argv(&self, _pane: &str) -> crate::error::Result<Vec<Vec<String>>> {
+        Ok(Vec::new())
+    }
     /// End the pinned harness process `identity` and every process under it with SIGTERM,
     /// the runtime first, and wait up to `timeout` for them to exit (#920
     /// revive-repeat-incomplete): a runtime that records its own shutdown, as Muse's does,
@@ -1968,6 +1973,9 @@ impl ManagedApi for HerdrClient {
     }
     fn pane_is_idle_shell(&self, pane: &str) -> crate::error::Result<bool> {
         HerdrClient::pane_is_idle_shell(self, pane)
+    }
+    fn pane_foreground_argv(&self, pane: &str) -> crate::error::Result<Vec<Vec<String>>> {
+        HerdrClient::pane_foreground_argv(self, pane)
     }
     fn pane_shell_identity(&self, pane: &str) -> crate::error::Result<CustomProcessIdentity> {
         HerdrClient::pane_shell_identity(self, pane)
@@ -17786,6 +17794,10 @@ pub(crate) mod tests {
                     fail_start_once: AtomicBool::new(false),
                     receipt: Mutex::new(None),
                     stranded_refusal: Mutex::new(None),
+                    viewer_commands: Mutex::new(Vec::new()),
+                    closed_tabs: Mutex::new(Vec::new()),
+                    allow_close_tab: AtomicBool::new(false),
+                    tail_panes: Mutex::new(BTreeSet::new()),
                 },
                 root,
                 registry_name: "registry",
@@ -18318,6 +18330,16 @@ pub(crate) mod tests {
         /// When set, a guarded prompt is typed and then refused with this detail, as a paste the
         /// composer never drew is stranded (#1099 claude-stranded-false-lost).
         pub(crate) stranded_refusal: Mutex<Option<String>>,
+        /// Console commands typed into a viewer pane by the headless viewer path (#1973):
+        /// `(pane, text)` for each `exec ... console NAME` send.
+        pub(crate) viewer_commands: Mutex<Vec<(String, String)>>,
+        /// Tabs closed through `close_tab`, in order (#1973).
+        pub(crate) closed_tabs: Mutex<Vec<String>>,
+        /// Opt-in for the #1973 viewer tests: without it `close_tab` keeps its
+        /// tripwire panic, so no other path can start closing whole tabs silently.
+        pub(crate) allow_close_tab: AtomicBool,
+        /// Panes whose foreground process is `agentctl tail lead --follow` (#1973).
+        pub(crate) tail_panes: Mutex<BTreeSet<String>>,
     }
     /// How a read that [`Fake::hold_reads`] holds ends.
     #[derive(Clone)]
@@ -19505,6 +19527,18 @@ pub(crate) mod tests {
             Ok(!self.custom_alive.load(Ordering::Relaxed)
                 && self.custom_at_idle_shell.load(Ordering::Relaxed))
         }
+        fn pane_foreground_argv(&self, pane: &str) -> AdapterResult<Vec<Vec<String>>> {
+            Ok(if self.tail_panes.lock().unwrap().contains(pane) {
+                vec![vec![
+                    "agentctl".to_owned(),
+                    "tail".to_owned(),
+                    "lead".to_owned(),
+                    "--follow".to_owned(),
+                ]]
+            } else {
+                Vec::new()
+            })
+        }
         fn end_harness(
             &self,
             identity: &CustomProcessIdentity,
@@ -19626,6 +19660,15 @@ pub(crate) mod tests {
             Ok(())
         }
         fn send_text(&self, pane: &str, text: &str) -> AdapterResult<()> {
+            // The headless viewer path types a plain `exec ... console NAME` line into a
+            // fresh shell (#1973); record it instead of demanding a Muse editor.
+            if text.starts_with("exec ") && text.contains(" console ") {
+                self.viewer_commands
+                    .lock()
+                    .unwrap()
+                    .push((pane.to_owned(), text.to_owned()));
+                return Ok(());
+            }
             let mut editor = self.muse_editor.lock().unwrap();
             let editor = editor
                 .as_mut()
@@ -19641,8 +19684,15 @@ pub(crate) mod tests {
             editor.paste(prompt);
             Ok(())
         }
-        fn close_tab(&self, _: &str) -> AdapterResult<()> {
-            panic!("managed lifecycle must close exactly the owned pane")
+        fn close_tab(&self, tab: &str) -> AdapterResult<()> {
+            // Tripwire: managed lifecycle paths close panes, never whole tabs. Only
+            // the #1973 viewer tests opt in, to prove viewer replacement closes.
+            if !self.allow_close_tab.load(Ordering::Relaxed) {
+                panic!("managed lifecycle must close exactly the owned pane")
+            }
+            self.closed_tabs.lock().unwrap().push(tab.to_owned());
+            self.panes.lock().unwrap().retain(|p| p.tab_id != tab);
+            Ok(())
         }
     }
 
@@ -25317,6 +25367,8 @@ fi
     mod goal_command;
     /// Takeover and handback of a headless agent: one writer per session.
     mod headless_takeover;
+    /// The one console-viewer path every headless start goes through (#1973).
+    mod headless_viewer;
     /// Herdr readiness and adopted Muse process ownership compatibility.
     mod herdr_compatibility;
     /// Muse plugin-hooks trust answers in managed panes (#1932).
