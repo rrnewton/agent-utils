@@ -160,3 +160,48 @@ the target slot is reasoned about in the report, not searched.
 The Rust edition is not transcribed; where its shape differs
 materially (the remove writer reloads fresh state and compares
 chain length) the report says so from code reading.
+
+## TLA+ mirror checked with TLC (#2043)
+
+`spec/WrkslotsTransition.tla` is the same model in temporal
+form — same two slots, actors, program counters and phase
+order, action names identical to the Python model — plus two
+dimensions the Python model folds away: finish-journal
+*content* (inline vs sidecar vs reloaded-expanded form, the
+#1757 64-entry inline limit as the `RefsLarge` constant) and
+the deferred out-of-lock deletion window whose completion
+compares the reloaded journal against the in-memory one
+(the #894/#1735 shape behind #2041). `spec/run_tlc.sh` runs
+TLC over the `spec/WrkslotsTransition-*.cfg` configurations;
+it is opt-in only — validation never downloads a toolchain
+and never runs TLC, and the Python explorer above stays the
+gated cross-check. Toolchain used for the first check:
+tla2tools.jar v1.7.4 (official tlaplus release asset,
+2,274,532 bytes, sha256
+`936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88`;
+that release publishes no checksum file), run with the
+host's Java 21.
+
+First TLC results (2026-11-21; an expected FAIL is the
+counterexample doing its job):
+
+| Config | Result | Distinct states (depth) |
+|---|---|---|
+| `current` (current main, small refs) | all invariants pass | 123,204 (29) |
+| `fork` (`NoViol`, current main) | FAIL: `forked-chain`, `ok=0` — RmLoadFree → RmSalvage → HbAppend → RmCaptureIdentity → RmAssert → RmAppendBasis (#1807) | 5,369 (10) |
+| `pre1766` (no fixes, foreign lock) | FAIL: `deleted-while-locked`, journal `vfence` left (#1766) | 765 (6) |
+| `allfix` | pass, incl. `NoViol` | 117,384 (29) |
+| `shapes` / `shapes2` (C1 shapes) | FAIL: buried fork + finish journal; fork at tip + dead seal (#1830) | 15,328 / 15,728 (12) |
+| `sidecar` (`RefsLarge`, raw compare) | FAIL: `ReloadEqualsMemory` at the fence step (#2041 class) | 73 (4) |
+| `sidecar-form` | FAIL: `NoFormStuck` — deletion done, completion refused, journal `ffence` left (RECOVERY REQUIRED) | 22,114 (13) |
+| `sidecar-fixed` (`NormalizeCompare`) | pass | 123,204 (29) |
+| `contention` | FAIL: `NoAdoptBusy` witness reachable; `contention-safety` (`NoViol` alone) passes | 402,732 (39) |
+| `liveness` (current main) | FAIL: `OneRecoverCompletes` — C1 interrupted states no fair recover completes | — |
+| `liveness-fixed` (all fixes) | pass under recover + hand-exit + actor-exit fairness | 117,384 |
+
+The two explorers agree on every known result: the #1807
+fork (same interleaving order), #1766, the C1/#1830 wedge
+shapes, the contention witness, and — new in the TLA+ model —
+the #2041 sidecar class, which appears exactly when
+`RefsLarge` holds and the completion compares raw forms,
+and closes when the comparison expands both sides first.
