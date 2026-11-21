@@ -3181,8 +3181,16 @@ pub async fn catchup(
     }
     let owner = crate::owner::Owner::of(&state);
     let mut built = crate::catchup::build_context(&fetched.messages, &fetched.read, &owner);
+    // `vibe-talk-discuss-glossary-per-channel` (#2069): this channel's glossary
+    // files after the default list; with no rules this is the default list.
+    let channel_label = state
+        .channel(&channel_id)
+        .map(|channel| channel.label)
+        .unwrap_or_default();
+    let warmup_files =
+        crate::catchup::select_warmup_files(&state.config.summaries, &channel_id, &channel_label);
     let (warmup, warmup_fingerprint) = crate::catchup::load_warmup_for_window(
-        &state.config.summaries.catchup_warmup_files,
+        &warmup_files,
         state.config.summaries.catchup_warmup_max_chars,
         &built.prompt,
     );

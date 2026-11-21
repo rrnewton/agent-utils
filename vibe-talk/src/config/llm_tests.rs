@@ -110,6 +110,37 @@ fn the_catchup_window_defaults_to_150_and_zero_is_refused() {
 }
 
 #[test]
+fn per_channel_glossaries_parse_and_an_empty_rule_is_refused() {
+    // `vibe-talk-discuss-glossary-per-channel` (#2069).
+    let cfg = load(
+        "catchup_warmup_files = [\"shared.md\"]\n\
+         [[summaries.catchup_glossaries]]\nchannels = [\"*hermit*\"]\nfiles = [\"hermit.md\"]\n",
+    )
+    .expect("valid");
+    assert_eq!(
+        cfg.summaries.catchup_warmup_files,
+        vec!["shared.md".to_owned()]
+    );
+    assert_eq!(
+        cfg.summaries.catchup_glossaries,
+        vec![ChannelGlossary {
+            channels: vec!["*hermit*".to_owned()],
+            files: vec!["hermit.md".to_owned()],
+        }]
+    );
+    // Absent rules keep today's behaviour: no per-channel files at all.
+    assert!(load("")
+        .expect("valid")
+        .summaries
+        .catchup_glossaries
+        .is_empty());
+    let field = invalid_field(load(
+        "[[summaries.catchup_glossaries]]\nchannels = []\nfiles = [\"hermit.md\"]\n",
+    ));
+    assert_eq!(field, "summaries.catchup_glossaries[0]");
+}
+
+#[test]
 fn an_anthropic_section_without_a_key_file_is_refused_by_name() {
     let err = load("[summaries.llm]\ndialect = \"anthropic\"\n").expect_err("no key");
     assert!(

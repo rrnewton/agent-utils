@@ -767,6 +767,71 @@ pub fn load_warmup(paths: &[String], max_chars: usize) -> (String, u64) {
     (text, fingerprint)
 }
 
+/// Whether `pattern` names `value`: `*` matches any run of characters
+/// (including none), comparison is case-insensitive, and a pattern with no
+/// `*` must equal the whole value. `vibe-talk-discuss-glossary-per-channel`.
+fn channel_pattern_matches(pattern: &str, value: &str) -> bool {
+    let pattern: Vec<char> = pattern.trim().to_lowercase().chars().collect();
+    let value: Vec<char> = value.to_lowercase().chars().collect();
+    // Classic glob match with backtracking on the last `*`.
+    let (mut p, mut v) = (0usize, 0usize);
+    let (mut star, mut retry) = (None::<usize>, 0usize);
+    while v < value.len() {
+        if p < pattern.len() && pattern[p] == value[v] {
+            p += 1;
+            v += 1;
+        } else if p < pattern.len() && pattern[p] == '*' {
+            star = Some(p);
+            retry = v;
+            p += 1;
+        } else if let Some(at) = star {
+            p = at + 1;
+            retry += 1;
+            v = retry;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == '*' {
+        p += 1;
+    }
+    p == pattern.len()
+}
+
+/// The warm-up files one channel loads: the default list, then the files of
+/// every matching per-channel rule in configuration order, each file once
+/// (first occurrence wins). A pattern matches the channel id or its
+/// configured label. With no rules this is exactly the default list, so
+/// existing configurations behave as before. `vibe-talk-discuss-glossary-per-channel`.
+#[must_use]
+pub fn select_warmup_files(
+    summaries: &crate::config::SummariesConfig,
+    channel_id: &str,
+    channel_label: &str,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |file: &String, out: &mut Vec<String>| {
+        if !out.contains(file) {
+            out.push(file.clone());
+        }
+    };
+    for file in &summaries.catchup_warmup_files {
+        push(file, &mut out);
+    }
+    for rule in &summaries.catchup_glossaries {
+        let matched = rule.channels.iter().any(|pattern| {
+            channel_pattern_matches(pattern, channel_id)
+                || channel_pattern_matches(pattern, channel_label)
+        });
+        if matched {
+            for file in &rule.files {
+                push(file, &mut out);
+            }
+        }
+    }
+    out
+}
+
 /// The warm-up in force for one window: like [`load_warmup`], except a file
 /// that parses as a glossary contributes only the entries relevant to
 /// `window_text`, most relevant first, within the same whole budget
@@ -1553,6 +1618,50 @@ mod tests {
             warmup_fingerprint(&["no/such/file.md".to_owned()]),
             warmup_fingerprint(&["no/such/other.md".to_owned()])
         );
+    }
+
+    #[test]
+    fn per_channel_warmup_selection_is_back_compatible_and_ordered() {
+        // `vibe-talk-discuss-glossary-per-channel` (#2069).
+        let summaries =
+            |glossaries: Vec<crate::config::ChannelGlossary>| crate::config::SummariesConfig {
+                catchup_warmup_files: vec!["shared.md".to_owned()],
+                catchup_glossaries: glossaries,
+                ..Default::default()
+            };
+        let rule = |channels: &[&str], files: &[&str]| crate::config::ChannelGlossary {
+            channels: channels.iter().map(|s| (*s).to_owned()).collect(),
+            files: files.iter().map(|s| (*s).to_owned()).collect(),
+        };
+        // No rules: exactly the default list, as before this feature.
+        assert_eq!(
+            select_warmup_files(&summaries(vec![]), "C1", "hermit chat"),
+            vec!["shared.md".to_owned()]
+        );
+        let configured = summaries(vec![
+            rule(&["*hermit*"], &["hermit.md", "shared.md"]),
+            rule(&["C9"], &["by-id.md"]),
+            rule(&["*other*"], &["other.md"]),
+        ]);
+        // Label pattern and id both match; defaults first, config order, deduped.
+        assert_eq!(
+            select_warmup_files(&configured, "C9", "Hermit Chat"),
+            vec![
+                "shared.md".to_owned(),
+                "hermit.md".to_owned(),
+                "by-id.md".to_owned()
+            ]
+        );
+        // A channel matching nothing keeps only the defaults.
+        assert_eq!(
+            select_warmup_files(&configured, "C1", "general"),
+            vec!["shared.md".to_owned()]
+        );
+        // Glob edges: bare `*`, exact id is case-insensitive, no partial match.
+        assert!(channel_pattern_matches("*", "anything"));
+        assert!(channel_pattern_matches("c9", "C9"));
+        assert!(!channel_pattern_matches("hermit", "hermit chat"));
+        assert!(channel_pattern_matches("*hermit*", "a Hermit chat"));
     }
 
     #[test]

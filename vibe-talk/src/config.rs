@@ -736,6 +736,22 @@ fn yes() -> bool {
     true
 }
 
+/// Warm-up files for the channels one rule names. `vibe-talk-discuss-glossary-per-channel`.
+///
+/// Each `channels` entry is a channel id or a name pattern matched
+/// case-insensitively against the channel id and its configured label; `*`
+/// matches any run of characters, so `*hermit*` names every channel whose id
+/// or label contains that word. A channel matching several rules gets every
+/// matching rule's `files`, in configuration order, after the default
+/// `catchup_warmup_files`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelGlossary {
+    /// Channel ids or `*` name patterns this rule applies to.
+    pub channels: Vec<String>,
+    /// Warm-up files loaded for a matching channel, in order.
+    pub files: Vec<String>,
+}
+
 /// What a summary is, in numbers.
 ///
 /// Every field that changes what a summary SAYS is folded into
@@ -789,6 +805,10 @@ pub struct SummariesConfig {
     /// glossary, the last weekly summary), in order. `discuss-warmup-context`. Empty
     /// (the default) means no warm-up, exactly as before.
     pub catchup_warmup_files: Vec<String>,
+    /// Extra warm-up files for matching channels, after `catchup_warmup_files`.
+    /// `vibe-talk-discuss-glossary-per-channel` (#2069). Empty (the default)
+    /// means every channel gets exactly `catchup_warmup_files`, as before.
+    pub catchup_glossaries: Vec<ChannelGlossary>,
     /// The most warm-up text one Discuss read carries, in characters, across all
     /// `catchup_warmup_files` together. `discuss-warmup-context`.
     pub catchup_warmup_max_chars: usize,
@@ -818,6 +838,7 @@ impl Default for SummariesConfig {
                 crate::summarize::threads::DEFAULT_NAMING_INTERVAL_SECONDS,
             catchup_window_messages: DEFAULT_CATCHUP_WINDOW_MESSAGES,
             catchup_warmup_files: Vec::new(),
+            catchup_glossaries: Vec::new(),
             catchup_warmup_max_chars: DEFAULT_CATCHUP_WARMUP_MAX_CHARS,
             catchup_unknown_terms_log: false,
             llm: None,
@@ -2238,9 +2259,18 @@ struct FileSummaries {
     thread_naming_interval_seconds: Option<u64>,
     catchup_window_messages: Option<usize>,
     catchup_warmup_files: Option<Vec<String>>,
+    catchup_glossaries: Option<Vec<FileChannelGlossary>>,
     catchup_warmup_max_chars: Option<usize>,
     catchup_unknown_terms_log: Option<bool>,
     llm: Option<FileLlm>,
+}
+
+/// One `[[summaries.catchup_glossaries]]` table as written. See [`ChannelGlossary`].
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileChannelGlossary {
+    channels: Option<Vec<String>>,
+    files: Option<Vec<String>>,
 }
 
 /// `[summaries.llm]` as written. See [`LlmConfig`].
@@ -3458,6 +3488,15 @@ fn summaries_config(
         catchup_warmup_files: file
             .catchup_warmup_files
             .unwrap_or(defaults.catchup_warmup_files),
+        catchup_glossaries: file
+            .catchup_glossaries
+            .unwrap_or_default()
+            .into_iter()
+            .map(|rule| ChannelGlossary {
+                channels: rule.channels.unwrap_or_default(),
+                files: rule.files.unwrap_or_default(),
+            })
+            .collect(),
         catchup_warmup_max_chars: file
             .catchup_warmup_max_chars
             .unwrap_or(defaults.catchup_warmup_max_chars),
@@ -3466,6 +3505,16 @@ fn summaries_config(
             .unwrap_or(defaults.catchup_unknown_terms_log),
         llm,
     };
+    for (index, rule) in summaries.catchup_glossaries.iter().enumerate() {
+        if rule.channels.is_empty() || rule.files.is_empty() {
+            return Err(ConfigError::Invalid {
+                field: format!("summaries.catchup_glossaries[{index}]"),
+                detail: "needs at least one channel (id or * pattern) and one file, or the \
+                         rule can never load anything"
+                    .to_owned(),
+            });
+        }
+    }
     if summaries.catchup_window_messages == 0 {
         return Err(ConfigError::Invalid {
             field: "summaries.catchup_window_messages".to_owned(),

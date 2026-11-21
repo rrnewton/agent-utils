@@ -778,6 +778,7 @@ mod tests {
             thread_naming_interval_seconds: _,
             catchup_window_messages: _,
             catchup_warmup_files: _,
+            catchup_glossaries: _,
             catchup_warmup_max_chars: _,
             catchup_unknown_terms_log: _,
             llm: _,
@@ -820,6 +821,18 @@ mod tests {
                 "catchup_warmup_files",
                 false,
                 moved(|c| c.catchup_warmup_files.push("glossary.md".to_owned())),
+            ),
+            // Which channels get which extra reference; the warm-up fingerprint
+            // already names the files a run used, and no summary wording changes.
+            (
+                "catchup_glossaries",
+                false,
+                moved(|c| {
+                    c.catchup_glossaries.push(crate::config::ChannelGlossary {
+                        channels: vec!["*".to_owned()],
+                        files: vec!["extra.md".to_owned()],
+                    })
+                }),
             ),
             (
                 "catchup_warmup_max_chars",
