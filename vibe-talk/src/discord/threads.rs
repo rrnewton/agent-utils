@@ -146,6 +146,17 @@ impl NativeThread {
             // Threads created before July 2022 have counters capped at 50. The wire count does
             // not promise exactness for every thread, so do not promote it to an exact count.
             reply_count_exact: false,
+            unread_count: None,
+            unread_exact: false,
+            last_reply_at: None,
+            last_reply_author: None,
+            last_reply_author_id: None,
+            last_reply_excerpt: None,
+            participants: Vec::new(),
+            participants_more: 0,
+            pinned: None,
+            root_done: None,
+            replies_done: None,
         }
     }
 
@@ -858,6 +869,17 @@ impl HttpDiscordClient {
                     broadcast: false,
                     reply_count: Some(0),
                     reply_count_exact: false,
+                    unread_count: None,
+                    unread_exact: false,
+                    last_reply_at: None,
+                    last_reply_author: None,
+                    last_reply_author_id: None,
+                    last_reply_excerpt: None,
+                    participants: Vec::new(),
+                    participants_more: 0,
+                    pinned: None,
+                    root_done: None,
+                    replies_done: None,
                 });
             }
             messages.push(message);
@@ -1763,6 +1785,17 @@ fn confirm_bridge_post(
                 broadcast: false,
                 reply_count: None,
                 reply_count_exact: false,
+                unread_count: None,
+                unread_exact: false,
+                last_reply_at: None,
+                last_reply_author: None,
+                last_reply_author_id: None,
+                last_reply_excerpt: None,
+                participants: Vec::new(),
+                participants_more: 0,
+                pinned: None,
+                root_done: None,
+                replies_done: None,
             });
             Ok(())
         }
@@ -3059,6 +3092,17 @@ mod tests {
                 broadcast: false,
                 reply_count: None,
                 reply_count_exact: false,
+                unread_count: None,
+                unread_exact: false,
+                last_reply_at: None,
+                last_reply_author: None,
+                last_reply_author_id: None,
+                last_reply_excerpt: None,
+                participants: Vec::new(),
+                participants_more: 0,
+                pinned: None,
+                root_done: None,
+                replies_done: None,
             })
         );
         for (thread, said) in [

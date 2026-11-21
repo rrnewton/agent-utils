@@ -4818,12 +4818,8 @@ const {
 // what the store holds, All is read once, behind it, with no loading line and nothing waiting on it —
 // a view switch included, which is drawn from the store as ever, and draws what this brought.
 //
-// BOUNDED, because it is not free: Slack's All is one history read and one per thread it carries,
-// about eleven of the chat service's calls. At most once per `COUNTS_ALL_READ_MS` per channel, counted
-// from the last read of All of any kind — the reader's own, or one saved with the device's copy — and
-// only for news: a root the last such read already saw at the same count does not ask again, so a
-// thread All does not carry (past Slack's ten) is not a reason to read All every few minutes. Not
-// while the page is hidden. A failure waits out the same interval; Main's own read is not affected.
+// (`#1986` slice 2: the server now counts a thread's unread onto its root's own record at serve
+// time, so this read of All behind Main is gone; what it says above is the history it replaced.)
 
 
 
@@ -4851,7 +4847,6 @@ const copyLedger = createCopyOrder();
 /** What reads say about read state, and where copies stand: web/src/view/channel's now (`createReadState`, `#624`). */
 const readState = createReadState({
   channelStore, readLedger, copyLedger, readOrder,
-  queueReadAllForCounts: () => queueReadAllForCounts(),
 });
 const { atOrAfter, foldReadState, noteReplyGaps, readSpeaksFor, sentEpochOf, sentNumberOf, orderCopy, buildCopyOn, orderCopiesRead, copyOlderThan } = readState;
 
@@ -7466,7 +7461,7 @@ const timelineView = createTimelineView({
   windowed: () => { const cfg = windowedConfig(deviceSettings(), document.documentElement.clientWidth < 900); return cfg.windowed ? { prefetchPx: cfg.prefetchPx, rowCap: cfg.rowCap } : null; },
   pinnedIds: () => { const id = jumpAnchor.id(); return id ? [id] : []; },
 });
-const { loadCanon, drawProjection, walkCursorOwed, heldViewRows, drawHeldRows, queueReadAllForCounts, readAllForCounts, rowsAsDrawn, applyTimelinePage, renderCachedTimeline, mutationAwaitsRead, loadTimeline, foldLateTimelinePage, loadOlderTimeline, foldLiveMessage, inView, projectView, holdingMessage, foldTimelinePage, foldTimelineDelta, loadOlder, maybeLoadOlder, takeDeferredOlder, appendChannelRow, appendToColumns, applyReadRuns, readRunPlan, readRunRows, cycleReadMode, readRunsSuspended, rowIsRead, openReadRun, openPinnedRun, peelReadRun, renderReadModeControl, applyNewestPage, channelReadPosition, settleAfterRead, landedReadPosition } = timelineView;
+const { loadCanon, drawProjection, walkCursorOwed, heldViewRows, drawHeldRows, rowsAsDrawn, applyTimelinePage, renderCachedTimeline, mutationAwaitsRead, loadTimeline, foldLateTimelinePage, loadOlderTimeline, foldLiveMessage, inView, projectView, holdingMessage, foldTimelinePage, foldTimelineDelta, loadOlder, maybeLoadOlder, takeDeferredOlder, appendChannelRow, appendToColumns, applyReadRuns, readRunPlan, readRunRows, cycleReadMode, readRunsSuspended, rowIsRead, openReadRun, openPinnedRun, peelReadRun, renderReadModeControl, applyNewestPage, channelReadPosition, settleAfterRead, landedReadPosition } = timelineView;
 /**
  * Walking back for older rows, and for a search (web/src/view/channel `mountOlderWalks`,
  * `#624 voice-page-modularity`): the step-back control, the search's bounded walk, the server

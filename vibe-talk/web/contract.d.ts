@@ -1886,6 +1886,38 @@ declare namespace VibeTalk {
      */
     is_root: boolean;
     /**
+     * See [`ThreadSummary::last_reply_at`]. On a root, as `unread_count` is.
+     */
+    last_reply_at?: string | null;
+    /**
+     * See [`ThreadSummary::last_reply_author`]. On a root, as `unread_count` is.
+     */
+    last_reply_author?: string | null;
+    /**
+     * See [`ThreadSummary::last_reply_author_id`]. On a root, as `unread_count` is.
+     */
+    last_reply_author_id?: UserId | null;
+    /**
+     * See [`ThreadSummary::last_reply_excerpt`]. On a root, as `unread_count` is.
+     */
+    last_reply_excerpt?: string | null;
+    /**
+     * See [`ThreadSummary::participants`]. On a root, as `unread_count` is.
+     */
+    participants?: ThreadParticipant[];
+    /**
+     * See [`ThreadSummary::participants_more`]. On a root, as `unread_count` is.
+     */
+    participants_more?: number;
+    /**
+     * See [`ThreadSummary::pinned`]. On a root, as `unread_count` is.
+     */
+    pinned?: boolean | null;
+    /**
+     * See [`ThreadSummary::replies_done`]. On a root, as `unread_count` is.
+     */
+    replies_done?: number | null;
+    /**
      * Number of replies, when the provider can supply it.
      */
     reply_count: number | null;
@@ -1893,6 +1925,10 @@ declare namespace VibeTalk {
      * Whether the reply count is exact rather than a provider estimate.
      */
     reply_count_exact: boolean;
+    /**
+     * See [`ThreadSummary::root_done`]. On a root, as `unread_count` is.
+     */
+    root_done?: boolean | null;
     /**
      * The original channel message, if this provider exposes one.
      */
@@ -1902,6 +1938,18 @@ declare namespace VibeTalk {
      * same rule as `display_name`.
      */
     summary?: string | null;
+    /**
+     * On a thread's ROOT, the serve-time facts of [`ThreadSummary`] for the same thread
+     * (`#1986 vibe-talk-one-page-complete-rows`, slice 2): counted by this server when the
+     * root is served, so a row on the messages page itself is complete from the first answer,
+     * before any thread-list read. Absent on replies, when this server cannot count, and from
+     * an older server. Each field means what [`ThreadSummary`]'s field of the same name means.
+     */
+    unread_count?: number | null;
+    /**
+     * See [`ThreadSummary::unread_exact`]. On a root, as `unread_count` is.
+     */
+    unread_exact?: boolean;
   }
 
   /**

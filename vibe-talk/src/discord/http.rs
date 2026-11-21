@@ -905,6 +905,17 @@ pub fn parse_message(value: &serde_json::Value) -> Result<Message, ChatError> {
                             .get("message_count")
                             .and_then(serde_json::Value::as_u64),
                         reply_count_exact: false,
+                        unread_count: None,
+                        unread_exact: false,
+                        last_reply_at: None,
+                        last_reply_author: None,
+                        last_reply_author_id: None,
+                        last_reply_excerpt: None,
+                        participants: Vec::new(),
+                        participants_more: 0,
+                        pinned: None,
+                        root_done: None,
+                        replies_done: None,
                     })
                 }
             })

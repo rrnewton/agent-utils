@@ -82,6 +82,12 @@ export function tallyRecord(message: Message, tally: ReplyTally): MessageThread 
   return summary ? {
     id: String(summary.id), root_message_id: id, is_root: true,
     reply_count: summary.reply_count, reply_count_exact: summary.reply_count_exact,
+    // `#1986` slice 2: the summary's server facts, so a record built from it says what it says.
+    unread_count: summary.unread_count, unread_exact: summary.unread_exact,
+    last_reply_at: summary.last_reply_at, last_reply_author: summary.last_reply_author,
+    last_reply_author_id: summary.last_reply_author_id, last_reply_excerpt: summary.last_reply_excerpt,
+    participants: summary.participants, participants_more: summary.participants_more,
+    pinned: summary.pinned, root_done: summary.root_done, replies_done: summary.replies_done,
   } as MessageThread : null;
 }
 

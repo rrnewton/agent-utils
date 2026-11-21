@@ -112,7 +112,7 @@ export function restoreCanon(canon: ChannelCanon, entry: SavedTimeline): void {
   // kept may hold a wrong gap for a thread All's page passed over: nothing, which made its unknown
   // replies "N new" for good, past Done; or its whole count, set by Main's read after the copy was
   // cut, which hid an unread answer. Its gaps are not trusted, and All's cover goes with them, so
-  // All is read behind Main once more and places them afresh (`readAllForCounts`).
+  // All's own next read places them afresh.
   const trusted = entry.passedOver !== undefined && entry.settledByDone !== undefined;
   canon.replyGaps = trusted ? new Map(Object.entries(entry.replyGaps || {})) : new Map();
   canon.passedOver = new Set((entry.passedOver || []).map(String));

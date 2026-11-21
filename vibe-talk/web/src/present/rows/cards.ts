@@ -114,19 +114,21 @@ function threadChoice(id: unknown, summary: ThreadSummary | null = null, root: M
  * Last ACTIVITY rather than when it started, because that is the order every list of threads is in:
  * a start age put "38w" above "2h" in a list sorted newest-activity-first, which reads as unsorted.
  */
-function threadFacts(choice: Pick<ThreadChoice, "at" | "started" | "count" | "summary">): string {
+function threadFacts(choice: Pick<ThreadChoice, "at" | "started" | "count" | "summary" | "named">): string {
   const age = briefAge(Number.isFinite(choice.at) ? choice.at : choice.started);
   // A count of 0 is never printed: "Thread 0" read as a thread numbered zero, not an empty one.
   const parts = [age, typeof choice.count === "number" && choice.count > 0 ? String(choice.count) : ""];
   // `#1986 vibe-talk-one-page-complete-rows`: who last replied and who is in the thread, when
-  // the server counted them onto the summary; absent from an older server, nothing is added.
-  const summary = choice.summary;
-  if (summary && typeof summary.last_reply_author === "string" && summary.last_reply_author !== "") {
-    parts.push(`last by ${summary.last_reply_author}`);
+  // the server counted them onto a record; absent from an older server, nothing is added.
+  // Slice 2: the thread list's summary, else the root's own record on the messages page.
+  const facts = choice.summary && typeof choice.summary.last_reply_author === "string"
+    ? choice.summary : choice.named;
+  if (facts && typeof facts.last_reply_author === "string" && facts.last_reply_author !== "") {
+    parts.push(`last by ${facts.last_reply_author}`);
   }
-  if (summary && Array.isArray(summary.participants) && summary.participants.length > 0) {
-    const names = summary.participants.slice(0, 3).map((who) => who.author);
-    const rest = summary.participants.length - names.length + (summary.participants_more || 0);
+  if (facts && Array.isArray(facts.participants) && facts.participants.length > 0) {
+    const names = facts.participants.slice(0, 3).map((who) => who.author);
+    const rest = facts.participants.length - names.length + (facts.participants_more || 0);
     parts.push(rest > 0 ? `${names.join(", ")} +${rest}` : names.join(", "));
   }
   return parts.filter((part) => part !== "").join(" · ");

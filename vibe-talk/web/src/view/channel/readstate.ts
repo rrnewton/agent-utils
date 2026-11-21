@@ -24,7 +24,6 @@ export interface ReadStateDependencies {
   readLedger: ReadLedger;
   copyLedger: CopyOrder;
   readOrder: { sentNumberOf(payload: object): number };
-  queueReadAllForCounts(): void;
 }
 
 /** Folding reads' read state and ordering the store's copies. */
@@ -94,10 +93,9 @@ export function createReadState(deps: ReadStateDependencies): ReadState {
   /**
    * What one page says of the replies the store lacks for being old, by thread (web/src/core/channels
    * `noteReplyGapsIn`, `#222 unread-replies`), into the selected channel's store; a newest read of
-   * Main may then be followed by one of All, behind it (`deps.queueReadAllForCounts`).
    */
   function noteReplyGaps(payload: unknown, view: string, older: boolean, delta: boolean, before: Map<string, Message>): void {
-    noteReplyGapsIn(deps.channelStore.current(), payload as GapPage, view, older, delta, before, deps.queueReadAllForCounts);
+    noteReplyGapsIn(deps.channelStore.current(), payload as GapPage, view, older, delta, before);
   }
 
 

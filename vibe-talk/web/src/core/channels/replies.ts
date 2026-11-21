@@ -67,7 +67,8 @@ export function allReachesThread(canon: ChannelCanon, id: unknown, summary: Thre
  * Every root's count, read now, is also the thread's count from here on: the summary the store holds
  * is put to it (`exactReplyCount` takes the higher of the two, so a summary from a thread read before
  * a reply was deleted kept saying "1 new" for a reply that is gone). And a read of Main may be followed
- * by one of All, behind it: `readAllForCounts`, called last, after a newest read of Main.
+ * by one of All. (Until `#1986` slice 2 a read of All behind Main refreshed those counts;
+ * the server now counts them onto the root's own record, and no such read is made.)
  */
 export function noteReplyGapsIn(
   canon: ChannelCanon,
@@ -76,7 +77,6 @@ export function noteReplyGapsIn(
   older: boolean,
   delta: boolean,
   before: Map<string, Message>,
-  readAllForCounts: () => void,
 ): void {
   if (view === "threads" || canon.scope) return;
   const gaps = canon.replyGaps;
@@ -154,5 +154,4 @@ export function noteReplyGapsIn(
     else if (allReachesThread(canon, id, null)) place(id, 0);
     else if (allRead) place(id, short);
   }
-  if (view === "main" && !older) readAllForCounts();
 }

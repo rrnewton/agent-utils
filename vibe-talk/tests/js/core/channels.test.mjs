@@ -194,8 +194,7 @@ test("`#624 voice-page-modularity`: the replies a store lacks for being old, by 
   const root = (id, s, count) => ({ id: `r${id}`, timestamp: at(s), thread: { id, is_root: true, reply_count: count, reply_count_exact: true } });
   const reply = (id, n, s) => ({ id: `${id}-${n}`, timestamp: at(s), thread: { id, is_root: false, reply_count: null, reply_count_exact: false } });
   const canon = emptyCanon("c");
-  let asked = 0;
-  const readAll = () => { asked += 1; };
+  const readAll = () => {};
   // A thread's own newest page with its count sets the gap: its count less the replies held.
   canon.messages = [root("t", 1, 5), reply("t", 1, 2), reply("t", 2, 3)];
   noteReplyGapsIn(canon, { messages: [], thread: { id: "t", reply_count: 5, reply_count_exact: true } }, "thread", false, false, new Map(), readAll);
@@ -204,14 +203,15 @@ test("`#624 voice-page-modularity`: the replies a store lacks for being old, by 
   canon.messages.push(reply("t", 3, 1));
   noteReplyGapsIn(canon, { messages: [reply("t", 3, 1)] }, "thread", true, false, new Map(), readAll);
   assert.equal(canon.replyGaps.get("t"), 2);
-  // Main's newest page, with no read of All: no gap is set for a thread it is first to name, and All is read behind it.
+  // Main's newest page, with no read of All: no gap is set for a thread it is first to name.
+  // (Until `#1986` slice 2 that also asked for a read of All behind Main; the server counts
+  // the thread onto its root's record now, and nothing is asked.)
   canon.messages.push(root("u", 6, 4));
   noteReplyGapsIn(canon, { messages: [root("u", 6, 4)] }, "main", false, false, new Map(), readAll);
-  assert.deepStrictEqual([canon.replyGaps.has("u"), asked], [false, 1]);
+  assert.deepStrictEqual([canon.replyGaps.has("u")], [false]);
   // A scoped channel, or the thread list, says nothing of gaps.
   canon.scope = "u";
   noteReplyGapsIn(canon, { messages: [root("u", 6, 4)] }, "main", false, false, new Map(), readAll);
-  assert.equal(asked, 1, "a scoped channel asked for All");
   canon.scope = null;
   // All's cover reaches a thread whose root is no older than its floor, or All is the whole channel.
   assert.equal(allReachesThread(canon, "u", null), false, "All reached a thread with no read of All");
@@ -459,7 +459,11 @@ test("`#624 voice-page-modularity`: what a store holds of every thread's replies
   assert.equal(unseenRepliesIn(canon, "t", root, tally), 1);
   // A root whose copy came without a record has its summary's.
   assert.deepStrictEqual(tallyRecord({ id: "r" }, { ...emptyTally(), byRoot: new Map([["r", { id: "t", reply_count: 3, reply_count_exact: true }]]) }),
-    { id: "t", root_message_id: "r", is_root: true, reply_count: 3, reply_count_exact: true });
+    { id: "t", root_message_id: "r", is_root: true, reply_count: 3, reply_count_exact: true,
+      unread_count: undefined, unread_exact: undefined, last_reply_at: undefined,
+      last_reply_author: undefined, last_reply_author_id: undefined, last_reply_excerpt: undefined,
+      participants: undefined, participants_more: undefined, pinned: undefined,
+      root_done: undefined, replies_done: undefined });
   // A scoped channel's replies are not a thread's.
   canon.scope = "t";
   assert.equal(replyTallyOf(canon, () => true).threads.has("t"), false);

@@ -290,6 +290,17 @@ mod tests {
             broadcast: false,
             reply_count: Some(0),
             reply_count_exact: true,
+            unread_count: None,
+            unread_exact: false,
+            last_reply_at: None,
+            last_reply_author: None,
+            last_reply_author_id: None,
+            last_reply_excerpt: None,
+            participants: Vec::new(),
+            participants_more: 0,
+            pinned: None,
+            root_done: None,
+            replies_done: None,
         });
         assert_eq!(thread_id(&message), None);
         if let Some(thread) = message.thread.as_mut() {

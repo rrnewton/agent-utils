@@ -47,6 +47,17 @@ fn slack_thread(root_ts: &str, is_root: bool) -> MessageThread {
         broadcast: false,
         reply_count: None,
         reply_count_exact: false,
+        unread_count: None,
+        unread_exact: false,
+        last_reply_at: None,
+        last_reply_author: None,
+        last_reply_author_id: None,
+        last_reply_excerpt: None,
+        participants: Vec::new(),
+        participants_more: 0,
+        pinned: None,
+        root_done: None,
+        replies_done: None,
     }
 }
 
@@ -199,6 +210,17 @@ fn a_discord_clients_links_come_from_its_configured_guild() {
         broadcast: false,
         reply_count: None,
         reply_count_exact: false,
+        unread_count: None,
+        unread_exact: false,
+        last_reply_at: None,
+        last_reply_author: None,
+        last_reply_author_id: None,
+        last_reply_excerpt: None,
+        participants: Vec::new(),
+        participants_more: 0,
+        pinned: None,
+        root_done: None,
+        replies_done: None,
     };
     assert_eq!(
         client.upstream_url(&chan, &id, Some(&thread)),
@@ -247,6 +269,17 @@ fn a_google_chat_bridges_links_come_from_its_resource_names() {
         broadcast: false,
         reply_count: None,
         reply_count_exact: false,
+        unread_count: None,
+        unread_exact: false,
+        last_reply_at: None,
+        last_reply_author: None,
+        last_reply_author_id: None,
+        last_reply_excerpt: None,
+        participants: Vec::new(),
+        participants_more: 0,
+        pinned: None,
+        root_done: None,
+        replies_done: None,
     };
     assert_eq!(
         client.upstream_url(

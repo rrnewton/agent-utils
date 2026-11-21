@@ -6969,6 +6969,17 @@ fn fill_pin_links<'p>(
                 broadcast: false,
                 reply_count: None,
                 reply_count_exact: false,
+                unread_count: None,
+                unread_exact: false,
+                last_reply_at: None,
+                last_reply_author: None,
+                last_reply_author_id: None,
+                last_reply_excerpt: None,
+                participants: Vec::new(),
+                participants_more: 0,
+                pinned: None,
+                root_done: None,
+                replies_done: None,
             });
         pin.upstream_url =
             client.upstream_url(&channel.id, &pin.snapshot.message_id, thread.as_ref());
@@ -9733,6 +9744,17 @@ mod transcript_exclusion_tests {
             broadcast: false,
             reply_count: Some(2),
             reply_count_exact: true,
+            unread_count: None,
+            unread_exact: false,
+            last_reply_at: None,
+            last_reply_author: None,
+            last_reply_author_id: None,
+            last_reply_excerpt: None,
+            participants: Vec::new(),
+            participants_more: 0,
+            pinned: None,
+            root_done: None,
+            replies_done: None,
         });
         message
     }

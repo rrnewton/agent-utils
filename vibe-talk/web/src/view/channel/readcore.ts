@@ -13,16 +13,13 @@ import type { Message, ThreadSummary, TimelineResponse } from "../../contract/in
 import {
   answerUnplaced,
   DISCORD_PAGE_LIMIT,
-  exactReplyCount,
   foldDeltaIn,
   foldLiveIn,
   foldPageIn,
   heldNow,
   inViewOf,
-  newerPage,
   newerPageSpeaksFor,
   pageFoldIn,
-  placeFromPageIn as placeFromPage,
   projectionOf,
   restoreCanon,
   sameMessage,
@@ -342,8 +339,6 @@ export interface TimelineView {
   walkCursorOwed(): boolean;
   heldViewRows(): Message[];
   drawHeldRows(rows: readonly Message[], freshAt: number, freshness: string): boolean;
-  queueReadAllForCounts(): void;
-  readAllForCounts(channel: string, soon?: boolean): Promise<void>;
   rowsAsDrawn(pages: readonly TimelineResponse[]): boolean;
   applyTimelinePage(payload: TimelineResponse, older?: boolean, saved?: boolean, delta?: boolean, rows?: readonly Message[] | null, held?: Map<string, Message> | null): Message[];
   renderCachedTimeline(): void;
@@ -381,10 +376,6 @@ export interface TimelineView {
   dispose(): void;
 }
 
-/** How long after a read of All a read of Main asks for none for its counts: five minutes. */
-const COUNTS_ALL_READ_MS = 300000;
-/** How soon after a counts read the server answered from its own copy the page asks once more. */
-const COUNTS_SOON_MS = 10000;
 /** How long one timeline read may run before the page gives up on it. */
 const CHANNEL_READ_TIMEOUT_MS = 20000;
 /** How many older pages `pagesBackTo` follows at most. */
@@ -464,10 +455,6 @@ export function createTimelineView(deps: TimelineViewDependencies): TimelineView
   const columnWork = deps.columnWork;
   const settleReplays = deps.settleReplays;
   const unplacedArrivals = { count: () => deps.unplacedCount(), next: () => deps.unplacedNext() };
-  const countsAllReadInFlight = (() => {
-    let inFlight: string | null = null;
-    return { busy: () => inFlight !== null, begin: (channel: string) => { inFlight = channel; }, end: () => { inFlight = null; } };
-  })();
   const noteServerPageBuild = deps.noteServerPageBuild;
   const noteServerThreadHuesIn = deps.noteServerThreadHuesIn;
   const renderColumns = deps.renderColumns;
@@ -909,8 +896,6 @@ export function createTimelineView(deps: TimelineViewDependencies): TimelineView
   const inColumn = deps.inColumn;
   const inOtherColumn = deps.inOtherColumn;
   const replyTally = deps.replyTally;
-  const unseenReplies = deps.unseenReplies;
-  const followPlacement = deps.followPlacement;
   const heldUnansweredRoot = deps.heldUnansweredRoot;
   const restoreSavedBookmark = deps.restoreSavedBookmark;
   const knownChannel = deps.knownChannel;
@@ -932,12 +917,9 @@ export function createTimelineView(deps: TimelineViewDependencies): TimelineView
   const scrollToNewest = deps.scrollToNewest;
   const keepFilterHold = deps.keepFilterHold;
   let disposed = false;
-  const countsAllReadAt = new Map<string, number>();
-  const countsAllReadFor = new Map<string, Map<string, number>>();
   const unchangedDeltas = new WeakSet<object>();
 
 const viewKey = deps.viewKey;
-  const clock = deps.clock;
 
 /** Whether `message` belongs in `view` (web/src/core/channels `inViewOf`), in this channel's scope by default. */
 
@@ -1230,101 +1212,6 @@ function drawHeldRows(rows: readonly Message[], freshAt: number, freshness: stri
   setChannelFreshness(freshness);
   renderOutgoingMessages();
   return true;
-}
-
-/**
- * Record what the channel holds. Called after every read that succeeded and after every local
- * change to the rows — a live arrival, an acknowledged send, an archive — so a reload shows what
- * the reader last saw.
- *
- * NOT in the legacy to-do filter: that list is `/todo`, a filtered answer, and saving it as the
- * channel would show a reload a channel with its dealt-with messages missing.
- */
-
-function queueReadAllForCounts(): void {
-  const channel = String(selectedChannelId());
-  Promise.resolve().then(() => readAllForCounts(channel)).catch(() => {});
-}
-
-/**
- * The roots the store holds whose threads have replies it has not brought (`unseenReplies`), by
- * thread id, with the count each is reported to have.
- *
- * @returns {Map<string, number>}
- */
-
-function outrunningThreads(): Map<string, number> {
-  const tally = replyTally();
-  /** @type {Map<string, number>} */
-  const found = new Map();
-  for (const message of channelStore.current().messages) {
-    const id = threadOf(message);
-    if (!id || !message.thread || message.thread.is_root !== true || id === channelStore.current().scope) continue;
-    if (unseenReplies(id, message, tally) > 0) found.set(id, exactReplyCount(id, message, tally) || 0);
-  }
-  return found;
-}
-
-/**
- * Read All's newest page behind Main, for Main's counts, when they call for it and it is due: see
- * above. Folded as a read of All landing behind Main is (`foldLateTimelinePage`), which brings Main's
- * rows and chips up to date from it, and saves it with the device's copy — only over the copies older
- * than it, and never bringing back a message removed upstream since (`pageFold`, `#316
- * late-counts-resurrect`).
- */
-
-async function readAllForCounts(channel: string, soon = false): Promise<void> {
-  if (!providerFacts.threading() || !channel || String(selectedChannelId()) !== channel || selection().view !== "main" ||
-      channelStore.current().channel !== channel || channelStore.current().scope || countsAllReadInFlight.busy() ||
-      document.visibilityState === "hidden") return;
-  const all = channelStore.current().views.get(viewKey("flat"));
-  const now = Date.now();
-  if (!soon && now - Math.max(countsAllReadAt.get(channel) || 0, all ? all.at || 0 : 0) < COUNTS_ALL_READ_MS) return;
-  const outrun = outrunningThreads();
-  const saw = countsAllReadFor.get(channel);
-  if (![...outrun].some(([id, count]) => !(saw && (saw.get(id) || 0) >= count))) return;
-  countsAllReadAt.set(channel, now);
-  countsAllReadInFlight.begin(channel);
-  // What the page can speak for: the store's copies as it is sent, and those older than it (`copyOrder`).
-  // One the store gains while it is out — a reply the stream delivers, placed by a delta of All while
-  // this page is still on its way, or the reader's own send — is newer than the page, which would take
-  // it out as deleted (`#310`); one a later read replaces — an edit Main's read brings — the page would
-  // undo; one it loses, the page would put back.
-  const read = { context: JSON.stringify([channel, "flat", null]), channel, view: "flat", thread: null, canon: channelStore.current(),
-    held: heldNow(channelStore.current()) };
-  const seen = unplacedArrivals.count();
-  try {
-    const payload = await within(CHANNEL_READ_TIMEOUT_MS, (signal) => timelineReader.readTimeline(
-      `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=flat&limit=${DISCORD_PAGE_LIMIT}&reason=counts`,
-      { signal }));
-    // `#614 timeline-read-failures`: the server's own copy, the chat service having failed or kept
-    // it waiting, may lack the very replies the counts outran: the next counts read asks again.
-    if (!refreshFailed(payload)) countsAllReadFor.set(channel, outrun);
-    // `#650 cache-first-older-reads`: ...and asks once more soon, for the read the server made behind it.
-    else if (!soon) clock.setTimeout(() => void readAllForCounts(channel, true).catch(() => {}), COUNTS_SOON_MS);
-    const current = channelStore.current() === read.canon && read.canon.channel === channel &&
-      String(selectedChannelId()) === channel;
-    const number = sentNumberOf(payload);
-    // Not over a newest page of All sent after this one — the reader switched to All, or tapped N
-    // replies, and that read answered first: this answer is the older, and folded over it would put
-    // back what that page says is gone, and its older copies over that page's. Sent after, not landed
-    // after (`#308`): one sent before this and landing while it was on the wire is the older, and this
-    // is folded over it.
-    if (!newerPage(channelStore.current(), "flat", number)) {
-      foldLateTimelinePage(payload, read);
-    } else if (current && placeFromPage(payload, read.canon, number, read.held, copyLedger)) {
-      // Not folded, it still says where each message the stream left unplaced that it carries is.
-      followPlacement();
-    }
-    // ...and, folded or not, answers for what the stream had left unplaced before it was sent, as any
-    // newest page of All does. `#308 live-reply-in-main`.
-    if (current) answerUnplaced(read.canon, seen);
-  } catch (_error) {
-    // The counts stay as they were until a read of All or of the thread; the next read of Main past
-    // the interval asks again.
-  } finally {
-    countsAllReadInFlight.end();
-  }
 }
 
 // `#222 unread-replies`. DONE HERE RACES THE READS ON THE WIRE. A read sent before a Done or a put
@@ -2995,7 +2882,7 @@ function readRunsSuspended() {
   return {
     placeReplyTarget,
     loadCanon, drawProjection, walkCursorOwed, heldViewRows, drawHeldRows,
-    queueReadAllForCounts, readAllForCounts, rowsAsDrawn, applyTimelinePage,
+    rowsAsDrawn, applyTimelinePage,
     renderCachedTimeline, mutationAwaitsRead, loadTimeline, foldLateTimelinePage,
     loadOlderTimeline, foldLiveMessage, inView, projectView, holdingMessage, foldTimelinePage, foldTimelineDelta,
     loadDiscord, loadOlder, maybeLoadOlder, takeDeferredOlder, appendChannelRow, appendToColumns, applyReadRuns, readRunPlan, readRunRows, cycleReadMode, readRunsSuspended, rowIsRead, openReadRun, openPinnedRun, peelReadRun, renderReadModeControl, applyNewestPage, channelReadPosition, settleAfterRead, landedReadPosition,

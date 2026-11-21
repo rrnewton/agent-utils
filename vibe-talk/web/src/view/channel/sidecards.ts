@@ -194,8 +194,12 @@ export function createSideCards(deps: SideCardsDependencies): SideCards {
    * the root or any reply, makes the whole thread unread, packed under its card or unpacked.
    */
   function threadIsRead(choice: SideChoice, unread: string): boolean {
-    // `#1986`: the server's word on the root's Done state, when the summary carries it (a
+    // `#1986`: the server's word on the root's Done state, when a record carries it (a
     // threads page's roots are not among its messages, so the page's own marks may not say).
+    // Slice 2: the root's own record first, then its summary.
+    if (typeof choice.root?.thread?.root_done === "boolean") {
+      return unread === "" && choice.root.thread.root_done;
+    }
     if (typeof choice.summary?.root_done === "boolean") {
       return unread === "" && choice.summary.root_done;
     }
@@ -204,8 +208,13 @@ export function createSideCards(deps: SideCardsDependencies): SideCards {
 
   /** What a card says of its thread's unread replies, as a root on Main says it ("3 unread", "1 new"), or "". */
   function sideCardUnread(choice: SideChoice, tally: SideTally): string {
-    // `#1986 vibe-talk-one-page-complete-rows`: the server's count on the summary, when it
-    // carries one, stands over the held count; absent, the held count below as before.
+    // `#1986 vibe-talk-one-page-complete-rows`: the server's count, when a record carries one,
+    // stands over the held count; absent, the held count below as before. Slice 2: the root's
+    // own record on the messages page first, then the thread list's summary.
+    const rootCount = choice.root && choice.root.thread ? choice.root.thread.unread_count : undefined;
+    if (typeof rootCount === "number") {
+      return rootCount > 0 ? `${rootCount}${choice.root?.thread?.unread_exact === false ? "+" : ""} unread` : "";
+    }
     if (choice.summary && typeof choice.summary.unread_count === "number") {
       const counted = choice.summary.unread_count;
       return counted > 0 ? `${counted}${choice.summary.unread_exact === false ? "+" : ""} unread` : "";

@@ -45,6 +45,18 @@ def _thread(root_id: str, is_root: bool, count: int) -> dict[str, object]:
         # every timeline answer (summarize annotate's root naming), not only
         # on the thread list's summary.
         record["display_name"] = "runner-wedged"
+        # Slice 2: the serve-time facts on the root's own record too, counted
+        # by the server over all 120 replies it holds, not the 3 held here.
+        record.update({
+            "unread_count": 7, "unread_exact": True,
+            "last_reply_author": "grace", "last_reply_author_id": "1000000000000000009",
+            "last_reply_excerpt": "third reply the page holds",
+            "participants": [
+                {"author": "grace", "author_id": "1000000000000000009", "reply_count": 70},
+                {"author": "ada", "author_id": "1000000000000000008", "reply_count": 50},
+            ],
+            "participants_more": 0, "pinned": False, "root_done": False, "replies_done": 113,
+        })
     return record
 
 
@@ -112,14 +124,18 @@ def walk_through(walk: Walk, api: OnePageApi) -> None:
     walk.until("""() => { const row = document.querySelector('#discord-log > li[data-id="210"]');
       return !!row && row.textContent.includes('120'); }""",
                "the row does not say 120 replies on the first page")
-    # The unread chip stands on Main, where thread chips live; the thread
-    # directory (a summaries page, not a message reach-back) lands behind it
-    # when the reader touches the thread picker, as it does for a person.
+    # Slice 2: the unread chip stands on Main from the FIRST Main answer, on
+    # the root's own record — no summaries page has been read yet, and the
+    # picker already says who last replied, from the same record.
     page.evaluate("() => document.getElementById('channel-view-main')?.click()")
-    page.focus("#thread-select")
     walk.until("""() => { const chip = document.querySelector('#discord-log > li[data-id="210"] .thread-unread');
       return !!chip && chip.textContent.trim() === '7 unread'; }""",
-               "the unread chip is not the server's 7 on the first page")
+               "the unread chip is not the server's 7 from the first Main answer")
+    reads = api.reads()
+    walk.check(not any("view=threads" in read for read in reads),
+               f"a summaries page was read before the chip stood: {reads}")
+    walk.check(page.evaluate("() => document.querySelector('#thread-select')?.textContent.includes('last by grace')"),
+               "the picker does not say who last replied from the first answer")
 
     # The event count: no thread read, no step back was spent on any of it.
     reads = api.reads()
@@ -130,6 +146,9 @@ def walk_through(walk: Walk, api: OnePageApi) -> None:
     walk.shot("1-first-page-complete")
 
     # The thread list's card says who last replied and who is in the thread.
+    # (Touching the picker first lands the thread directory behind it, as it
+    # does for a person; the chip above needed none of it.)
+    page.focus("#thread-select")
     page.evaluate("() => document.getElementById('channel-view-threads')?.click()")
     walk.until("""() => document.body.textContent.includes('last by grace')
       && document.body.textContent.includes('grace, ada')""",

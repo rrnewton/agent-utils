@@ -26,7 +26,6 @@ function makeReadState() {
       copyOlderThan: () => true,
     },
     readOrder: { sentNumberOf: () => 9 },
-    queueReadAllForCounts: () => { state.queued += 1; },
   });
   return { rs, canon, state, calls };
 }

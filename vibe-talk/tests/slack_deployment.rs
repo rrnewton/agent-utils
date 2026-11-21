@@ -301,11 +301,15 @@ async fn a_slack_message_nobody_has_answered_can_have_its_thread_started_from_th
         .expect("the message nobody has answered")
         .clone();
     // `#427 server-thread-hues`: the one field this server forms on the record, its thread's
-    // colour — 210, the first hue, for the channel's earliest thread.
+    // colour — 210, the first hue, for the channel's earliest thread. `#1986` slice 2: the
+    // serve-time facts of an unanswered thread ride the same record (none unread, none Done,
+    // not pinned), so the row is complete from this answer.
     assert_eq!(
         message["thread"],
         json!({"id": first, "root_message_id": message["id"], "is_root": true,
-            "reply_count": 0, "reply_count_exact": true, "hue": 210}),
+            "reply_count": 0, "reply_count_exact": true, "hue": 210,
+            "unread_count": 0, "unread_exact": true, "replies_done": 0,
+            "pinned": false, "root_done": false}),
         "{message}"
     );
 

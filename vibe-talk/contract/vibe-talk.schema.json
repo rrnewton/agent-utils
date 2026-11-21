@@ -2283,6 +2283,67 @@
           "description": "Whether this message is the original thread root.",
           "type": "boolean"
         },
+        "last_reply_at": {
+          "description": "See [`ThreadSummary::last_reply_at`]. On a root, as `unread_count` is.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_reply_author": {
+          "description": "See [`ThreadSummary::last_reply_author`]. On a root, as `unread_count` is.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_reply_author_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UserId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "See [`ThreadSummary::last_reply_author_id`]. On a root, as `unread_count` is."
+        },
+        "last_reply_excerpt": {
+          "description": "See [`ThreadSummary::last_reply_excerpt`]. On a root, as `unread_count` is.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "participants": {
+          "description": "See [`ThreadSummary::participants`]. On a root, as `unread_count` is.",
+          "items": {
+            "$ref": "#/$defs/ThreadParticipant"
+          },
+          "type": "array"
+        },
+        "participants_more": {
+          "description": "See [`ThreadSummary::participants_more`]. On a root, as `unread_count` is.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pinned": {
+          "description": "See [`ThreadSummary::pinned`]. On a root, as `unread_count` is.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "replies_done": {
+          "description": "See [`ThreadSummary::replies_done`]. On a root, as `unread_count` is.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "reply_count": {
           "description": "Number of replies, when the provider can supply it.",
           "format": "uint64",
@@ -2295,6 +2356,13 @@
         "reply_count_exact": {
           "description": "Whether the reply count is exact rather than a provider estimate.",
           "type": "boolean"
+        },
+        "root_done": {
+          "description": "See [`ThreadSummary::root_done`]. On a root, as `unread_count` is.",
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "root_message_id": {
           "anyOf": [
@@ -2313,6 +2381,19 @@
             "string",
             "null"
           ]
+        },
+        "unread_count": {
+          "description": "On a thread's ROOT, the serve-time facts of [`ThreadSummary`] for the same thread\n(`#1986 vibe-talk-one-page-complete-rows`, slice 2): counted by this server when the\nroot is served, so a row on the messages page itself is complete from the first answer,\nbefore any thread-list read. Absent on replies, when this server cannot count, and from\nan older server. Each field means what [`ThreadSummary`]'s field of the same name means.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "unread_exact": {
+          "description": "See [`ThreadSummary::unread_exact`]. On a root, as `unread_count` is.",
+          "type": "boolean"
         }
       },
       "required": [

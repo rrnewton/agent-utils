@@ -1070,6 +1070,17 @@ fn a_deleted_root_with_replies_leaves_its_replies_in_their_thread() {
         broadcast: false,
         reply_count: Some(2),
         reply_count_exact: true,
+        unread_count: None,
+        unread_exact: false,
+        last_reply_at: None,
+        last_reply_author: None,
+        last_reply_author_id: None,
+        last_reply_excerpt: None,
+        participants: Vec::new(),
+        participants_more: 0,
+        pinned: None,
+        root_done: None,
+        replies_done: None,
     });
     fx.list(vec![root, m(5)], T0 + 100, None);
     fx.list_scope(
@@ -1385,6 +1396,17 @@ fn thread_records_need_replies_and_their_activity_only_moves_forward() {
         broadcast: false,
         reply_count: Some(0),
         reply_count_exact: true,
+        unread_count: None,
+        unread_exact: false,
+        last_reply_at: None,
+        last_reply_author: None,
+        last_reply_author_id: None,
+        last_reply_excerpt: None,
+        participants: Vec::new(),
+        participants_more: 0,
+        pinned: None,
+        root_done: None,
+        replies_done: None,
     });
     fx.list(vec![unanswered], T0, None);
     assert_eq!(
@@ -1632,6 +1654,17 @@ fn a_bounded_flat_page_never_deletes_a_reply_or_stamps_a_thread() {
                 broadcast: false,
                 reply_count: Some(if i == 0 { 60 } else { 1 }),
                 reply_count_exact: true,
+                unread_count: None,
+                unread_exact: false,
+                last_reply_at: None,
+                last_reply_author: None,
+                last_reply_author_id: None,
+                last_reply_excerpt: None,
+                participants: Vec::new(),
+                participants_more: 0,
+                pinned: None,
+                root_done: None,
+                replies_done: None,
             });
             root
         })
@@ -2298,6 +2331,17 @@ fn a_channel_erase_cascades_everywhere_and_the_index_stays_intact() {
         broadcast: false,
         reply_count: Some(1),
         reply_count_exact: true,
+        unread_count: None,
+        unread_exact: false,
+        last_reply_at: None,
+        last_reply_author: None,
+        last_reply_author_id: None,
+        last_reply_excerpt: None,
+        participants: Vec::new(),
+        participants_more: 0,
+        pinned: None,
+        root_done: None,
+        replies_done: None,
     });
     fx.list(
         vec![root, m(2), m(3)],
@@ -2467,6 +2511,17 @@ fn with_a_thread(tag: &str) -> (Fixture, ChanKey, Scope) {
         broadcast: false,
         reply_count: Some(2),
         reply_count_exact: true,
+        unread_count: None,
+        unread_exact: false,
+        last_reply_at: None,
+        last_reply_author: None,
+        last_reply_author_id: None,
+        last_reply_excerpt: None,
+        participants: Vec::new(),
+        participants_more: 0,
+        pinned: None,
+        root_done: None,
+        replies_done: None,
     });
     fx.list(
         vec![root.clone(), m(2), m(3)],

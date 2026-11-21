@@ -6361,6 +6361,17 @@ async fn post_each(
                             broadcast: false,
                             reply_count: None,
                             reply_count_exact: false,
+                            unread_count: None,
+                            unread_exact: false,
+                            last_reply_at: None,
+                            last_reply_author: None,
+                            last_reply_author_id: None,
+                            last_reply_excerpt: None,
+                            participants: Vec::new(),
+                            participants_more: 0,
+                            pinned: None,
+                            root_done: None,
+                            replies_done: None,
                         });
                     }
                 }
@@ -8290,6 +8301,15 @@ pub async fn attach_thread_facts(
             ids.push(single.id.clone());
         }
     }
+    // Slice 2 (`#1986`): the roots on the messages page itself carry the same facts, so their
+    // ids are counted in the same one read.
+    for message in &page.messages {
+        if let Some(thread) = &message.thread {
+            if thread.is_root && !ids.contains(&thread.id) {
+                ids.push(thread.id.clone());
+            }
+        }
+    }
     let facts = if ids.is_empty() {
         None
     } else {
@@ -8316,16 +8336,11 @@ pub async fn attach_thread_facts(
                 .map(|root| marks.contains(root.id.as_str()));
         }
         if let Some(records) = &pins {
-            let explicit = records
-                .records
-                .iter()
-                .find(|record| record.thread_id == summary.id)
-                .map(|record| record.pinned);
-            let bang = summary
-                .root
-                .as_ref()
-                .is_some_and(|root| crate::threads::bang_agent_of(&root.content).is_some());
-            summary.pinned = Some(explicit.unwrap_or(bang));
+            summary.pinned = Some(effective_pin(
+                summary.root.as_ref().map(|root| root.content.as_str()),
+                &summary.id,
+                records,
+            ));
         }
         match by_id.get(&summary.id) {
             Some(fact) if !fact.replies.is_empty() => {
@@ -8337,6 +8352,43 @@ pub async fn attach_thread_facts(
                 summary.replies_done = Some(0);
             }
             _ => {}
+        }
+    }
+    // Slice 2: stamp every root on the messages page with its thread's facts, counted in the
+    // same read above, so its row is complete from this answer alone.
+    for message in page.messages.iter_mut() {
+        let Some((id, reply_count, reply_count_exact)) = message
+            .thread
+            .as_ref()
+            .filter(|thread| thread.is_root)
+            .map(|thread| {
+                (
+                    thread.id.clone(),
+                    thread.reply_count,
+                    thread.reply_count_exact,
+                )
+            })
+        else {
+            continue;
+        };
+        let root_done = dismissed
+            .as_ref()
+            .map(|marks| marks.contains(message.id.as_str()));
+        let pinned = pins
+            .as_ref()
+            .map(|records| effective_pin(Some(message.content.as_str()), &id, records));
+        let fact = by_id.get(&id).filter(|fact| !fact.replies.is_empty());
+        let thread = message.thread.as_mut().expect("root thread just read");
+        thread.root_done = root_done;
+        thread.pinned = pinned;
+        match fact {
+            Some(fact) => stamp_root_facts(thread, fact, dismissed.as_ref(), &noise),
+            None if reply_count == Some(0) => {
+                thread.unread_count = Some(0);
+                thread.unread_exact = reply_count_exact;
+                thread.replies_done = Some(0);
+            }
+            None => {}
         }
     }
     let totals = state.message_cache.thread_totals(channel).await;
@@ -8359,6 +8411,66 @@ pub async fn attach_thread_facts(
             }
         }),
     }
+}
+
+/// A thread's effective pin: its explicit record where one stands, else its bang-bound
+/// default from its root's text (`#1550 thread-list-pins`), resolved server-side (`#1986`).
+fn effective_pin(
+    root_content: Option<&str>,
+    thread_id: &str,
+    pins: &crate::store::ThreadPins,
+) -> bool {
+    pins.records
+        .iter()
+        .find(|record| record.thread_id == thread_id)
+        .map_or_else(
+            || root_content.is_some_and(|content| crate::threads::bang_agent_of(content).is_some()),
+            |record| record.pinned,
+        )
+}
+
+/// Stamp one root's thread record with its thread's counted facts: [`apply_thread_fact`] for
+/// the record a messages page carries (`#1986`, slice 2). Counted through a summary so the
+/// two surfaces can never count differently.
+fn stamp_root_facts(
+    thread: &mut crate::threads::MessageThread,
+    fact: &crate::cache::ThreadFact,
+    dismissed: Option<&std::collections::HashSet<String>>,
+    noise: &crate::noise::NoiseFilter,
+) {
+    let mut probe = crate::threads::ThreadSummary {
+        class: thread.class.clone(),
+        id: thread.id.clone(),
+        root: None,
+        title: String::new(),
+        reply_count: thread.reply_count,
+        reply_count_exact: thread.reply_count_exact,
+        updated_at: String::new(),
+        display_name: None,
+        summary: None,
+        hue: None,
+        unread_count: None,
+        unread_exact: false,
+        last_reply_at: None,
+        last_reply_author: None,
+        last_reply_author_id: None,
+        last_reply_excerpt: None,
+        participants: Vec::new(),
+        participants_more: 0,
+        pinned: None,
+        root_done: None,
+        replies_done: None,
+    };
+    apply_thread_fact(&mut probe, fact, dismissed, noise);
+    thread.unread_count = probe.unread_count;
+    thread.unread_exact = probe.unread_exact;
+    thread.last_reply_at = probe.last_reply_at;
+    thread.last_reply_author = probe.last_reply_author;
+    thread.last_reply_author_id = probe.last_reply_author_id;
+    thread.last_reply_excerpt = probe.last_reply_excerpt;
+    thread.participants = probe.participants;
+    thread.participants_more = probe.participants_more;
+    thread.replies_done = probe.replies_done;
 }
 
 /// Count one held thread into its summary: see [`attach_thread_facts`]. `dismissed` is the
@@ -9040,6 +9152,69 @@ mod tests {
         assert_eq!(summary.participants.len(), MAX_THREAD_PARTICIPANTS);
         assert_eq!(summary.participants_more, 2);
         assert_eq!(summary.participants[0].reply_count, 12);
+    }
+
+    #[test]
+    fn root_facts_stamp_the_same_counts_onto_a_root_record() {
+        // `#1986` slice 2: a root on the messages page carries what its summary carries.
+        let mut thread = crate::threads::MessageThread {
+            class: None,
+            id: "t".to_owned(),
+            root_message_id: None,
+            is_root: true,
+            broadcast: false,
+            reply_count: Some(2),
+            reply_count_exact: true,
+            hue: None,
+            display_name: None,
+            summary: None,
+            unread_count: None,
+            unread_exact: false,
+            last_reply_at: None,
+            last_reply_author: None,
+            last_reply_author_id: None,
+            last_reply_excerpt: None,
+            participants: Vec::new(),
+            participants_more: 0,
+            pinned: None,
+            root_done: None,
+            replies_done: None,
+        };
+        let fact = crate::cache::ThreadFact {
+            thread_id: "t".to_owned(),
+            replies: vec![
+                crate::cache::ThreadFactReply {
+                    id: crate::model::MessageId("r1".to_owned()),
+                    author: "ada".to_owned(),
+                    author_id: crate::model::UserId("U-ada".to_owned()),
+                    created_ms: 1_790_812_800_000,
+                    content: "first".to_owned(),
+                },
+                crate::cache::ThreadFactReply {
+                    id: crate::model::MessageId("r2".to_owned()),
+                    author: "grace".to_owned(),
+                    author_id: crate::model::UserId("U-grace".to_owned()),
+                    created_ms: 1_790_812_900_000,
+                    content: "latest reply words".to_owned(),
+                },
+            ],
+        };
+        let dismissed: std::collections::HashSet<String> = ["r1".to_owned()].into_iter().collect();
+        stamp_root_facts(
+            &mut thread,
+            &fact,
+            Some(&dismissed),
+            &crate::noise::NoiseFilter::nothing(),
+        );
+        assert_eq!(thread.unread_count, Some(1));
+        assert!(thread.unread_exact);
+        assert_eq!(thread.replies_done, Some(1));
+        assert_eq!(thread.last_reply_author.as_deref(), Some("grace"));
+        assert_eq!(
+            thread.last_reply_excerpt.as_deref(),
+            Some("latest reply words")
+        );
+        assert_eq!(thread.participants.len(), 2);
     }
 
     #[test]

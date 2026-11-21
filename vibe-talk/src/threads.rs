@@ -157,6 +157,43 @@ pub struct MessageThread {
     /// same rule as `display_name`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// On a thread's ROOT, the serve-time facts of [`ThreadSummary`] for the same thread
+    /// (`#1986 vibe-talk-one-page-complete-rows`, slice 2): counted by this server when the
+    /// root is served, so a row on the messages page itself is complete from the first answer,
+    /// before any thread-list read. Absent on replies, when this server cannot count, and from
+    /// an older server. Each field means what [`ThreadSummary`]'s field of the same name means.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread_count: Option<u64>,
+    /// See [`ThreadSummary::unread_exact`]. On a root, as `unread_count` is.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unread_exact: bool,
+    /// See [`ThreadSummary::last_reply_at`]. On a root, as `unread_count` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reply_at: Option<String>,
+    /// See [`ThreadSummary::last_reply_author`]. On a root, as `unread_count` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reply_author: Option<String>,
+    /// See [`ThreadSummary::last_reply_author_id`]. On a root, as `unread_count` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reply_author_id: Option<crate::model::UserId>,
+    /// See [`ThreadSummary::last_reply_excerpt`]. On a root, as `unread_count` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reply_excerpt: Option<String>,
+    /// See [`ThreadSummary::participants`]. On a root, as `unread_count` is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub participants: Vec<ThreadParticipant>,
+    /// See [`ThreadSummary::participants_more`]. On a root, as `unread_count` is.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub participants_more: u32,
+    /// See [`ThreadSummary::pinned`]. On a root, as `unread_count` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned: Option<bool>,
+    /// See [`ThreadSummary::root_done`]. On a root, as `unread_count` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_done: Option<bool>,
+    /// See [`ThreadSummary::replies_done`]. On a root, as `unread_count` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replies_done: Option<u64>,
 }
 
 /// One thread in the thread list, independent of the underlying provider's channel model.

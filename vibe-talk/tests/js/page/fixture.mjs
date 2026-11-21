@@ -6008,18 +6008,6 @@ const TUNING_BANDS = {
     "it and hides the reader's own words between the two answers around them; past three, a pair " +
     "or trio of long read messages between two unread ones is a screen of scrolling Fold read " +
     "was chosen to take away"],
-  // `#222 unread-replies`. How seldom a read of Main may read All behind it for its counts.
-  COUNTS_ALL_READ_MS: [120000, 900000,
-    "the least time between two reads of All that Main's counts ask for. Under two minutes a reader " +
-    "sitting on Main while agents answer reads All, about eleven of Slack's calls, nearly as often " +
-    "as Main itself is polled; past a quarter of an hour, a read that failed on a cold open leaves " +
-    "every answered root saying 'N new' for that long"],
-  // `#650 cache-first-older-reads`. How soon a counts read the server answered from its copy is asked again.
-  COUNTS_SOON_MS: [3000, 14000,
-    "how soon after a counts read the server answered from its own copy the page asks once more, for " +
-    "the read the server made behind it. Under three seconds that read, about Slack's ten calls, has " +
-    "seldom landed; past fourteen the server, which keeps it fifteen, has let it go, and the page asks " +
-    "Slack again five minutes on, for good"],
   UI_STATE_CHARS: [20000, 200000,
     "the whole record in UTF-16 units. A remembered thread carries its root message, so under " +
     "twenty thousand a few long roots push every other channel's choice out; past two hundred " +
@@ -8116,8 +8104,7 @@ function holdCountsRead(page) {
 /**
  * The same channel, read only in Main: the reader chose Main in an earlier session, and this device
  * no longer holds that session's snapshot — a full quota gives it up first — so the reopen reads
- * Main alone, and the read of All it asks for behind it for its counts is left on the wire
- * (`holdCountsRead`). A thread opened here is read for itself, where one opened with All covered is
+ * Main alone. A thread opened here is read for itself, where one opened with All covered is
  * drawn from All's rows (`#189 restore-ui-state` made All the default); this is the page the reading
  * of a thread, its cursor and its walk back are tested on.
  */
@@ -8128,13 +8115,11 @@ async function mainOnlyThreadPage() {
   const page = reloadWith(first.storage, data.messages, (p) => {
     p.threadingSupported = true;
     p.threads = data.threads;
-    holdCountsRead(p);
   });
   await reopenedChannel(page);
   await page.settle();
   assert.deepStrictEqual(page.timelineCalls.map((call) => new URL(call, "http://fixture.test").searchParams.get("view")),
     ["main"], "the reopen read more than the Main the reader chose");
-  assert.equal(page.countsReads.length, 1, "the reopen did not ask for All behind Main, for its counts");
   return page;
 }
 
@@ -9143,7 +9128,10 @@ function allLeavingOut(page, left, notice = BOUND_NOTICE) {
   };
 }
 
-const COUNTS_ALL_READ_MS = sourceConstant("COUNTS_ALL_READ_MS");
+// A long step of the fake clock (five minutes), for tests that wait out poll and
+// reconcile intervals; named for the counts interval it once stepped past (`#1986` slice 2
+// deleted that read, and with it the product constant).
+const COUNTS_ALL_READ_MS = 300000;
 
 // --- two columns on a desk (#229 desktop-two-column) -----------------------------------------------
 //

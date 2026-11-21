@@ -252,8 +252,10 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
   function threadIsPinned(choice: ThreadChoice): boolean {
     const explicit = pinRecords.get(choice.id);
     if (explicit !== undefined) return explicit;
-    // `#1986 vibe-talk-one-page-complete-rows`: the server's resolved pin on the summary,
-    // when it carries one, before the local bang derivation it replaces.
+    // `#1986 vibe-talk-one-page-complete-rows`: the server's resolved pin, when a record
+    // carries one, before the local bang derivation it replaces. Slice 2: the root's own
+    // record on the messages page, then the thread list's summary.
+    if (typeof choice.root?.thread?.pinned === "boolean") return choice.root.thread.pinned;
     if (typeof choice.summary?.pinned === "boolean") return choice.summary.pinned;
     return bangAgent(choice) !== null;
   }

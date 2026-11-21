@@ -288,9 +288,9 @@ export function createReplyCounts(deps: ReplyCountsDependencies): ReplyCounts {
   // state comes from those pages (`foldReadState`), from Done here (`markHeldDone`), and from Main's own
   // reads, which carry every mark from their oldest row up (`reply_dismissals`): a reply dealt with or
   // put back on another device is known at Main's next read, without reading All or the thread.
-  // Counting on the server would read every thread on Main's page from the chat service on every read
-  // of Main; the store already holds what is recent, and the one read this adds is bounded: All's newest
-  // page, behind Main, when Main's counts outrun the store, at most every few minutes (`readAllForCounts`).
+  // The server counts a thread's unread onto its root's record and its summary at serve time from
+  // its own cached copies (`#1986`), and that count stands here; the held count below is only an
+  // older server's answer, or a thread it could not count.
   //
   // WHAT IS NOT HELD BUT IS REPORTED IS NEW. The store holds a reply only once a read of All or of its
   // thread, or the stream, brought it — and while the reader sits on Main only Main is read. Slack's
@@ -400,12 +400,17 @@ export function createReplyCounts(deps: ReplyCountsDependencies): ReplyCounts {
     const id = deps.selection().view === "main" ? rootThreadOf(message, tally) : null;
     if (id === null) return { id: null, unread: 0, unseen: 0, server: null as { count: number; exact: boolean } | null };
     const entry = tally.threads.get(id);
-    // `#1986 vibe-talk-one-page-complete-rows`: a server-counted unread on the thread's summary
-    // stands over any count of the replies this page happens to hold; absent (older server, or
-    // a thread it cannot count) the held count below is the answer, as before.
+    // `#1986 vibe-talk-one-page-complete-rows`: a server-counted unread stands over any count
+    // of the replies this page happens to hold; absent (older server, or a thread it cannot
+    // count) the held count below is the answer, as before. Slice 2: the root's own record on
+    // the messages page carries it first; the thread list's summary is the same count by
+    // another route.
+    const record = tallyRecord(message, tally);
     const counted = tally.summaries.get(id);
-    const server = counted && typeof counted.unread_count === "number"
-      ? { count: counted.unread_count, exact: counted.unread_exact !== false } : null;
+    const server = record && typeof record.unread_count === "number"
+      ? { count: record.unread_count, exact: record.unread_exact !== false }
+      : counted && typeof counted.unread_count === "number"
+        ? { count: counted.unread_count, exact: counted.unread_exact !== false } : null;
     return { id, unread: entry ? entry.unread : 0, unseen: unseenReplies(id, message, tally), server };
   }
 

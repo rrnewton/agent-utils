@@ -165,14 +165,6 @@ test("`#624 voice-page-modularity`: a view no page has covered draws nothing hel
   assert.equal(view.drawProjection(), false);
 });
 
-test("`#624 voice-page-modularity`: the counts read is not begun for another channel or a hidden page, from the module alone", async () => {
-  const { createTimelineView } = READCORE;
-  const { deps } = fakeDeps();
-  const view = createTimelineView(deps);
-  await view.readAllForCounts("other-channel");
-  await view.readAllForCounts("");
-});
-
 test("`#624 voice-page-modularity`: the older walks mount and dispose without a page, from the module alone", () => {
   const { mountOlderWalks } = READCORE;
   const column = { searchWalk: null, searchNote: null, searched: null };

@@ -453,6 +453,17 @@ fn a_new_reply_counts_on_its_held_root() {
         broadcast: false,
         reply_count: Some(0),
         reply_count_exact: true,
+        unread_count: None,
+        unread_exact: false,
+        last_reply_at: None,
+        last_reply_author: None,
+        last_reply_author_id: None,
+        last_reply_excerpt: None,
+        participants: Vec::new(),
+        participants_more: 0,
+        pinned: None,
+        root_done: None,
+        replies_done: None,
     });
     fx.clock.set(T0 + MINUTE);
     fx.list(
@@ -554,6 +565,17 @@ fn a_second_held_reply_makes_an_exact_count_a_lower_bound() {
         broadcast: false,
         reply_count: Some(1),
         reply_count_exact: true,
+        unread_count: None,
+        unread_exact: false,
+        last_reply_at: None,
+        last_reply_author: None,
+        last_reply_author_id: None,
+        last_reply_excerpt: None,
+        participants: Vec::new(),
+        participants_more: 0,
+        pinned: None,
+        root_done: None,
+        replies_done: None,
     });
     fx.clock.set(T0 + MINUTE);
     fx.list(
