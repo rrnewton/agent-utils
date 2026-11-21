@@ -1,6 +1,7 @@
 ---
 title: 'agentctl-headless-chat-transcript-parity: follow headless event log as transcript for CHAT_REPLY and trace harvest'
-status: open
+status: closed
+closed_at: 2026-11-21T06:18:40Z
 priority: 0
 issue_type: feature
 labels:
@@ -42,3 +43,5 @@ Confirmed (owner 241 via coordb, 2026-11-20): reply mode switches per target and
 [watermelon-full-preview] Review fixes: (1) follower identity (record token + agent/events dir dev/ino, plus generation regression) resets a replaced log under the same name, clearing prior blocks; (2) the Muse headless adapter logs every completed agentMessage phase as assistant text (not only finalAnswer), tested; (3) `chat help` follows the request's recorded `reply_mode` (`BridgeState::recorded_reply_mode`), harness kind only as fallback; (4) the capture tick polls the reader cheaply, skips the full state scan/state lock when nothing changed, rescans when the delivered-and-unanswered set changes or at each reconciliation, and treats a capture error as logged-and-retried, never fatal; (5) first open is bounded via `events::read_recent(FIRST_READ_BYTES)` with the follower at end (trace first open still at end only). Prompt marks are emitted at `input.started` with the queued excerpt; the headless record is re-resolved only on the relocate cadence (pending-log appearance uses the cached dir).
 
 [watermelon-full-preview] Noted nit (not fixed): a same-name headless-to-TUI switch under a running bridge keeps following the old event log until `chat run` restarts (per-target settings other than reply mode are already startup/repoint-scoped).
+
+[watermelon-full-preview] Landed 2026-11-21 as 8b15e47f on main via the verified-overlap replay (gate on the pre-squash tree red only on the two waivable foreign::ownership pidfd tests; the replayed tree was verified for formatting, clippy and the focused headless/chat tests, and the landed tree re-verified the same way). Closing.
