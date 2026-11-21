@@ -1,12 +1,12 @@
 ---
 title: 'agentctl-claude-permission-answer: answer sees no question on a permission prompt prompts classifies as menu_or_picker'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - agentctl
 created_at: 2026-11-20T18:36:00-05:00
-updated_at: 2026-11-20T18:36:00-05:00
+updated_at: 2026-11-21T04:09:00-05:00
 ---
 
 # Description
@@ -45,3 +45,22 @@ cannot answer it through agentctl and must type into the pane.
 [watermelon-full-preview] Filed for lane mu-musedeliver, queued
 after #1995 agentctl-muse-working-delivery (coordinated by
 coordb). No lane, host or person is named here.
+
+## Resolution
+
+[watermelon-full-preview] Landed 3a988846 on github/main (tree
+76f6b4bf; acf21b67 + d805df7c cherry-picked onto a clean main and
+checked there: fmt, clippy, tui_prompts, Rust submission, Python
+submission, mypy and issue-parse all green). Both TUI editions now
+recognise a Claude permission prompt — the proceed line, then
+numbered Yes/No options with one selected, headed by a permission
+context (a dangerous-operation warning, a requires-confirmation
+rule, or the Bash command form) — as an answerable question, and
+the hook-confirmation claim and its owner-only refusal now require
+a heading that names a hook, so a permission rule line is no
+longer mistaken for one. A bare proceed selection stays a menu.
+The fixture is a real capture with its path neutralised; a live
+answer through the CLI was not run (managed Claude lanes launch
+with a bypass flag, and adopting a capture pane failed at anchor
+for unrelated reasons), so the guarded answer rests on the
+existing fake-terminal answer tests.
