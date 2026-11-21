@@ -233,6 +233,40 @@ class ProbeResult(TypedDict, total=False):
     error: str
 
 
+def get_status(port: int, token: str, path: str) -> int:
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as reply:
+            reply.read()
+            return reply.status
+    except urllib.error.HTTPError as error:
+        return error.code
+    except Exception:
+        return 0
+
+
+def serve_matrix(port: int, write_token: str, channel: str,
+                 thread: str | None, message_id: str | None) -> dict[str, int]:
+    """What this clone actually serves, by surface. Statuses only."""
+    matrix = {
+        "timeline (main, write token)": get_status(
+            port, write_token,
+            f"/api/v1/channels/{channel}/timeline?limit=5"),
+    }
+    if thread:
+        matrix["timeline (thread view, write token)"] = get_status(
+            port, write_token,
+            f"/api/v1/channels/{channel}/timeline?view=thread"
+            f"&thread_id={thread}&limit=5")
+    if message_id:
+        result = probe(port, write_token, channel, thread, message_id)
+        matrix["speech prepare"] = result["status"]
+    return matrix
+
+
 def probe(port: int, write_token: str, channel: str,
           thread: str | None, message_id: str) -> ProbeResult:
     """Ask the clone to prepare speech for one message. Shape only."""
@@ -284,12 +318,16 @@ def main() -> int:
     parser.add_argument("--test-token", action="store_true",
                         help="also issue the fake read-only test credential "
                              "(#2060 Part B) and print it")
+    parser.add_argument("--strict", action="store_true",
+                        help="exit 3 when any probed surface is not "
+                             "cache-served (default: print the matrix "
+                             "loudly and keep running)")
     args = parser.parse_args()
 
     global ACCOUNT_ID, TEAM_ID
     ACCOUNT_ID = args.account_id
     TEAM_ID = args.team_id
-    binary = find_binary(args.sha, args.binary)
+    binary = find_binary(args.sha, args.binary).resolve()
     source = find_cache(args.cache)
     work = Path(tempfile.mkdtemp(prefix="vibe-talk-local-clone-"))
     os.chmod(work, 0o700)
@@ -322,6 +360,25 @@ def main() -> int:
             return 1
         print(f"http://127.0.0.1:{port}/")
         print(f"read token (fake, local only): {read_token}", flush=True)
+        if not args.account_id:
+            print(
+                "local_clone: WARNING: no --account-id/--team-id, so the "
+                "cache cannot verify its account and timeline reads will "
+                "fall back to the stub backend (0 rows / 502). Pass the "
+                "recorded provider account to serve from the cache.",
+                file=sys.stderr, flush=True)
+        matrix = serve_matrix(port, write_token, args.channel,
+                              args.thread, args.message_id)
+        for surface, status in matrix.items():
+            print(f"served[{status}]: {surface}", flush=True)
+        if args.strict and any(status != 200 for status in matrix.values()):
+            print(
+                "local_clone: --strict: a probed surface is not "
+                "cache-served (see served[...] lines above); stopping. "
+                "Thread-view timelines are not cache-served on any "
+                "current build; main timeline and speech prepare are.",
+                file=sys.stderr)
+            return 3
         if test_token:
             print(f"test token (fake, local only): {test_token}", flush=True)
         if args.probe:
