@@ -74,9 +74,13 @@ them implicit:
   unowned non-zero flaky count. A retry that eventually passes is a
   FLAKY result to fix, not a clean pass.
 - **No assertion depends on timing.** Synchronize on observable
-  state, not sleeps. Run synthetic-load proofs only inside a
-  CPU-capped cgroup (about 64 spinners at most) and only at low host
-  load; never flood a shared host.
+  state, not sleeps. Run synthetic-load proofs inside a CPU-capped
+  cgroup (about 64 spinners at most), and the proof must pass on a
+  LOADED host — high load is the condition being proved against, not
+  a reason to wait (owner directive, 2026-11-21). A quiet host is
+  only for a rare, named benchmark, behind an explicit measurement
+  hold; it is never the precondition for a load proof. Never flood a
+  shared host beyond the cgroup cap.
 - **Skips and disables are named.** A test that cannot run here is a
   capability-gated skip naming the missing capability, never a silent
   pass. A known-failing test is disabled by name with a P1 tracked

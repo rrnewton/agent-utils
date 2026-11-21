@@ -1,6 +1,6 @@
 ---
 name: testing-with-buck
-description: "Apply testing-principles in Buck terms: timeouts that say wall or CPU, capped parallelism, memory-boxed steps and host admission, load-abort guard, local versus remote execution, third-party version sync with Cargo. Use when defining or reviewing Buck test targets or CI that runs them. The principles are testing-principles; Buck command mechanics belong to the platform docs."
+description: "Apply testing-principles in Buck terms: timeouts that say wall or CPU, capped parallelism, memory-boxed steps and host admission by the free-memory floor, local versus remote execution, third-party version sync with Cargo. Use when defining or reviewing Buck test targets or CI that runs them. The principles are testing-principles; Buck command mechanics belong to the platform docs."
 ---
 
 # Testing with Buck
@@ -8,9 +8,14 @@ description: "Apply testing-principles in Buck terms: timeouts that say wall or 
 Apply `testing-principles` to Buck targets: every test timeout states
 whether it is wall or CPU and fits the same caps; `-j` is capped
 deliberately rather than inherited from the host; steps are
-memory-boxed from measured cold peaks and host admission caps total
-load, with a load-abort guard so a run started into an already-hot
-host stops instead of producing garbage timings. Prefer remote
+memory-boxed from measured cold peaks and host admission is by the
+free-memory floor (#2062: a heavy job starts only when MemAvailable
+minus its need stays above the host floor). Normal tests never abort
+on load (owner directive, 2026-11-21): a run started into an
+already-hot host keeps running, its routine cost checks stay
+load-invariant (CPU time, instructions, event counts — never wall
+time), and the generous outer caps (CPU time, memory) are the
+livelock backstop, not a load tripwire. Prefer remote
 execution or dedicated capacity for monorepo test runs; do not run
 them on shared development hosts, where one unbounded run eats every
 other tenant's headroom. Keep third-party dependency versions in sync
