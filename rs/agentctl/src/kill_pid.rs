@@ -522,6 +522,9 @@ pub fn evaluate(
 
 /// Arguments of one guarded kill.
 pub struct KillRequest<'a> {
+    /// Who asked for the kill, as the log should name them. `None`
+    /// keeps the CLI's environment-derived actor.
+    pub actor: Option<&'a str>,
     /// The single process to signal.
     pub pid: u64,
     /// Text the command line must contain.
@@ -594,7 +597,9 @@ pub fn guarded_kill(
             .map(|duration| duration.as_secs_f64())
             .unwrap_or(0.0)
     });
-    let actor = std::env::var("AGENTCTL_AGENT").unwrap_or_else(|_| "unknown".to_owned());
+    let actor = request.actor.map(str::to_owned).unwrap_or_else(|| {
+        std::env::var("AGENTCTL_AGENT").unwrap_or_else(|_| "unknown".to_owned())
+    });
     let record = json!({
         "schema": "agentctl-kill-pid/v1",
         "time": stamp,
@@ -648,7 +653,31 @@ pub fn run_kill_pid(
     signal_name: &str,
     registry: &Path,
 ) -> Result<KillReport, KillRefused> {
+    run_kill_pid_as(
+        pid,
+        expect_cmdline,
+        expect_start,
+        signal_name,
+        registry,
+        None,
+    )
+}
+
+/// [`run_kill_pid`] with the actor the kill log names: a requester
+/// another layer already proved, instead of this process's environment.
+///
+/// # Errors
+/// Returns [`KillRefused`] when any check refuses, or the send fails.
+pub fn run_kill_pid_as(
+    pid: u64,
+    expect_cmdline: &str,
+    expect_start: u64,
+    signal_name: &str,
+    registry: &Path,
+    actor: Option<&str>,
+) -> Result<KillReport, KillRefused> {
     let request = KillRequest {
+        actor,
         pid,
         expect_cmdline,
         expect_start,
@@ -776,6 +805,7 @@ mod tests {
         expect_start: u64,
     ) -> Result<KillReport, KillRefused> {
         let request = KillRequest {
+            actor: None,
             pid,
             expect_cmdline,
             expect_start,

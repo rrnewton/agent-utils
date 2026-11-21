@@ -99,6 +99,15 @@ pub struct RequesterRecord {
     pub kind: String,
     /// Agent name, or the sender-header other label (`human@host`, ...).
     pub label: String,
+    /// `proved` only when the CLI proved the caller from process
+    /// ancestry at enqueue; anything else, including a hand-written
+    /// request file or a terminal fallback label, is `claimed`.
+    #[serde(default = "default_claimed")]
+    pub proof: String,
+}
+
+fn default_claimed() -> String {
+    "claimed".to_owned()
 }
 
 /// One allowlisted `team act` action. Typed end to end: no free-form
@@ -190,6 +199,18 @@ pub struct ActionReceipt {
     pub finished_at: f64,
     /// Process exit the requesting CLI reports.
     pub exit_code: i32,
+    /// Command line the guarded kill verified, for a kill-pid action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_cmdline: Option<String>,
+    /// Start ticks the guarded kill verified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_start: Option<u64>,
+    /// Working directory the guarded kill verified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_cwd: Option<String>,
+    /// Guarded-kill log the performed kill was appended to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kill_log: Option<String>,
 }
 
 /// One create-only request under `actions/`, its terminal receipt
@@ -259,6 +280,41 @@ pub struct ActionRecord {
     /// Process exit the requesting CLI reports when terminal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
+    /// Command line the guarded kill verified, for a kill-pid action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_cmdline: Option<String>,
+    /// Start ticks the guarded kill verified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_start: Option<u64>,
+    /// Working directory the guarded kill verified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_cwd: Option<String>,
+    /// Guarded-kill log the performed kill was appended to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kill_log: Option<String>,
+}
+
+/// What one performed guarded kill verified, for its receipt.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KillEvidence {
+    /// Command line that was verified.
+    pub cmdline: String,
+    /// Start ticks that were verified.
+    pub starttime: u64,
+    /// Working directory that was verified.
+    pub cwd: Option<String>,
+    /// Kill log the performed kill was appended to.
+    pub log_path: String,
+}
+
+/// One manifest build: the bounded document plus the raw verify report
+/// it was projected from (declare-done is judged on the raw rows).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ManifestOutcome {
+    /// The bounded `agentctl-team-manifest/v1` document.
+    pub manifest: Value,
+    /// The raw `agentctl-team-verify/v1` report inside it.
+    pub verify: Value,
 }
 
 /// The outcome one concrete action execution returns to the core.
@@ -270,6 +326,8 @@ pub struct ActionOutcome {
     pub detail: String,
     /// Escalation delivery bookkeeping for an escalate action.
     pub escalation: Option<EscalationOutcome>,
+    /// Verified identity evidence for a performed kill-pid action.
+    pub kill: Option<KillEvidence>,
 }
 
 fn done_outcome(detail: &str) -> ActionOutcome {
@@ -277,6 +335,7 @@ fn done_outcome(detail: &str) -> ActionOutcome {
         status: "done".to_owned(),
         detail: detail.to_owned(),
         escalation: None,
+        kill: None,
     }
 }
 
@@ -521,6 +580,15 @@ pub fn valid_request_id(request_id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
+/// Whether `incident` has the one shape [`incident_id`] mints:
+/// twelve lowercase hex characters naming one request-file prefix.
+pub fn valid_incident_id(incident: &str) -> bool {
+    incident.len() == 12
+        && incident
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 /// Bounds on the free-form fields a typed action carries, checked at
 /// enqueue and again at fold time so a hand-written request file cannot
 /// smuggle an unbounded payload past the CLI.
@@ -551,9 +619,20 @@ fn validate_action_shape(action: &TeamAction) -> Result<()> {
             }
             bounded("expect_cmdline", expect_cmdline, 256)?;
             bounded("expect_start", expect_start, 128)?;
+            if expect_start.parse::<u64>().is_err() {
+                return Err(fail("expect_start must be numeric clock ticks"));
+            }
             bounded("boot_id", boot_id, 128)?;
             if let Some(signal) = signal {
                 bounded("signal", signal, 32)?;
+                if !matches!(
+                    signal.as_str(),
+                    "TERM" | "KILL" | "INT" | "HUP" | "QUIT" | "USR1" | "USR2" | "CONT"
+                ) {
+                    return Err(fail(
+                        "signal must be one of TERM, KILL, INT, HUP, QUIT, USR1, USR2, CONT",
+                    ));
+                }
             }
             Ok(())
         }
@@ -590,6 +669,9 @@ pub fn new_action_request(
     requester: RequesterRecord,
     requested_at: f64,
 ) -> Result<ActionRequestFile> {
+    if !valid_incident_id(incident) {
+        return Err(fail("incident must be twelve lowercase hex characters"));
+    }
     if !valid_request_id(request_id) {
         return Err(fail(
             "request id must be a bounded slug (letters, digits, '-', '_', '.')",
@@ -618,6 +700,10 @@ fn actions_dir(directory: &Path) -> PathBuf {
 
 fn action_request_path(directory: &Path, incident: &str, request_id: &str) -> PathBuf {
     actions_dir(directory).join(format!("{incident}-{request_id}.json"))
+}
+
+fn action_running_marker_path(directory: &Path, incident: &str, request_id: &str) -> PathBuf {
+    actions_dir(directory).join(format!("{incident}-{request_id}.running"))
 }
 
 fn read_action_request(path: &Path) -> Option<ActionRequestFile> {
@@ -653,7 +739,10 @@ pub fn enqueue_action(directory: &Path, request: &ActionRequestFile) -> Result<P
     let typed: TeamAction = serde_json::from_value(request.action.clone())
         .map_err(|error| fail(format!("invalid action: {error}")))?;
     validate_action_shape(&typed)?;
-    if request.schema != ACT_REQUEST_SCHEMA || !valid_request_id(&request.request_id) {
+    if request.schema != ACT_REQUEST_SCHEMA
+        || !valid_incident_id(&request.incident)
+        || !valid_request_id(&request.request_id)
+    {
         return Err(fail("invalid team act request"));
     }
     if request.action_sha256
@@ -732,6 +821,10 @@ fn receipt_of(action: &ActionRecord) -> Option<ActionReceipt> {
         exit_code: action
             .exit_code
             .unwrap_or_else(|| terminal_exit_code(action)),
+        matched_cmdline: action.matched_cmdline.clone(),
+        matched_start: action.matched_start,
+        matched_cwd: action.matched_cwd.clone(),
+        kill_log: action.kill_log.clone(),
     })
 }
 
@@ -745,7 +838,13 @@ fn write_action_receipt(directory: &Path, action: &ActionRecord) -> Result<()> {
     };
     file.receipt = Some(receipt);
     let value = serde_json::to_value(&file).map_err(|error| fail(error.to_string()))?;
-    crate::agent::atomic_json(&path, &value).map_err(|error| fail(error.to_string()))
+    crate::agent::atomic_json(&path, &value).map_err(|error| fail(error.to_string()))?;
+    let _ = std::fs::remove_file(action_running_marker_path(
+        directory,
+        &action.incident,
+        &action.request_id,
+    ));
+    Ok(())
 }
 
 /// Fold this incident's request files into the record: new files become
@@ -772,6 +871,17 @@ fn reconcile_action_requests(directory: &Path, record: &mut DriverRecord) {
             .iter_mut()
             .find(|seen| seen.request_id == file.request_id)
         {
+            if file.receipt.is_some() {
+                let _ = std::fs::remove_file(action_running_marker_path(
+                    directory,
+                    &file.incident,
+                    &file.request_id,
+                ));
+            } else if seen.status == "queued"
+                && action_running_marker_path(directory, &file.incident, &file.request_id).exists()
+            {
+                seen.status = "running".to_owned();
+            }
             if !is_terminal(&seen.status) {
                 if let Some(receipt) = file.receipt {
                     seen.status = receipt.status;
@@ -781,6 +891,10 @@ fn reconcile_action_requests(directory: &Path, record: &mut DriverRecord) {
                     seen.started_at = receipt.started_at;
                     seen.finished_at = Some(receipt.finished_at);
                     seen.exit_code = Some(receipt.exit_code);
+                    seen.matched_cmdline = receipt.matched_cmdline;
+                    seen.matched_start = receipt.matched_start;
+                    seen.matched_cwd = receipt.matched_cwd;
+                    seen.kill_log = receipt.kill_log;
                 }
             }
             continue;
@@ -801,8 +915,17 @@ fn reconcile_action_requests(directory: &Path, record: &mut DriverRecord) {
             verify_ok: None,
             explicit_yes: None,
             exit_code: None,
+            matched_cmdline: None,
+            matched_start: None,
+            matched_cwd: None,
+            kill_log: None,
         };
         if let Some(receipt) = file.receipt {
+            let _ = std::fs::remove_file(action_running_marker_path(
+                directory,
+                &file.incident,
+                &file.request_id,
+            ));
             entry.status = receipt.status;
             entry.detail = receipt.detail;
             entry.verify_ok = receipt.verify_ok;
@@ -810,6 +933,12 @@ fn reconcile_action_requests(directory: &Path, record: &mut DriverRecord) {
             entry.started_at = receipt.started_at;
             entry.finished_at = Some(receipt.finished_at);
             entry.exit_code = Some(receipt.exit_code);
+            entry.matched_cmdline = receipt.matched_cmdline;
+            entry.matched_start = receipt.matched_start;
+            entry.matched_cwd = receipt.matched_cwd;
+            entry.kill_log = receipt.kill_log;
+        } else if action_running_marker_path(directory, &file.incident, &file.request_id).exists() {
+            entry.status = "running".to_owned();
         }
         record.actions.push(entry);
     }
@@ -817,8 +946,10 @@ fn reconcile_action_requests(directory: &Path, record: &mut DriverRecord) {
 
 /// Close out actions a dead driver left `running`: re-runnable verbs
 /// requeue (their effects are idempotent or already-locked downstream),
-/// while drain and kill-pid become `unknown` — nobody can prove whether
-/// they fired, and they must never fire twice on a guess.
+/// while drain, kill-pid, and escalate become `unknown` — nobody can
+/// prove whether they fired, and they must never fire twice on a guess.
+/// A leftover `.running` marker beside the request file is the proof an
+/// effect may have started even when state.json was rewritten since.
 fn recover_running_actions(directory: &Path, record: &mut DriverRecord, now: f64) -> Result<()> {
     for index in 0..record.actions.len() {
         if record.actions[index].status != "running"
@@ -829,7 +960,9 @@ fn recover_running_actions(directory: &Path, record: &mut DriverRecord, now: f64
         let typed: std::result::Result<TeamAction, _> =
             serde_json::from_value(record.actions[index].action.clone());
         match typed {
-            Ok(TeamAction::Drain { .. } | TeamAction::KillPid { .. }) => {
+            Ok(
+                TeamAction::Drain { .. } | TeamAction::KillPid { .. } | TeamAction::Escalate { .. },
+            ) => {
                 finish_action(
                     directory,
                     record,
@@ -842,6 +975,11 @@ fn recover_running_actions(directory: &Path, record: &mut DriverRecord, now: f64
                 )?;
             }
             _ => {
+                let _ = std::fs::remove_file(action_running_marker_path(
+                    directory,
+                    &record.actions[index].incident,
+                    &record.actions[index].request_id,
+                ));
                 record.actions[index].status = "queued".to_owned();
                 record.actions[index].started_at = None;
             }
@@ -962,8 +1100,13 @@ fn validate_action(
             | TeamAction::Drain { .. }
             | TeamAction::KillPid { .. }
     );
-    if recovery_effect && record.abstract_state.driver == State::Healthy {
-        return Err("team is healthy; no recovery action runs".to_owned());
+    if recovery_effect
+        && !matches!(
+            record.abstract_state.driver,
+            State::Restore | State::Verify | State::Handoff | State::Escalate
+        )
+    {
+        return Err("no recovery action outside an incident state".to_owned());
     }
     let desired: Vec<&str> = manifest["desired"]
         .as_array()
@@ -995,10 +1138,24 @@ fn validate_action(
                         row["name"] == "pane-at-prompt"
                             && row["subject"] == agent.as_str()
                             && row["status"] == "pass"
+                            && row["evidence"]
+                                .as_str()
+                                .is_some_and(|text| text.contains("input prompt"))
                     })
                 });
-            if at_prompt {
+            // A pass also covers a working pane with a follow-up editor;
+            // the act layer refuses working delivery on every harness.
+            let idle = agent_row(agent).is_some_and(|row| {
+                matches!(row["agent_status"].as_str(), Some("idle" | "done"))
+                    && matches!(
+                        row["lifecycle"].as_str(),
+                        Some("running" | "starting" | "adopted")
+                    )
+            });
+            if at_prompt && idle {
                 Ok(())
+            } else if at_prompt {
+                Err("pane is working; drain requires an idle composer".to_owned())
             } else {
                 Err("pane is not explicitly at a prompt".to_owned())
             }
@@ -1090,9 +1247,35 @@ fn run_queued_action<E: DriverEffects>(
     }
     record.actions[index].status = "running".to_owned();
     record.actions[index].started_at = Some(now);
+    // The create-only marker is the crash proof an effect may have
+    // started, independent of any later state.json rewrite.
+    let marker = action_running_marker_path(directory, &entry.incident, &entry.request_id);
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+    {
+        Ok(mut file) => {
+            use std::io::Write;
+            let _ = writeln!(file, "{}", entry.request_id);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return finish_action(
+                directory,
+                record,
+                index,
+                "unknown",
+                "running marker already present",
+                None,
+                None,
+                now,
+            );
+        }
+        Err(error) => return Err(fail(error.to_string())),
+    }
     save_record(directory, record, now)?;
-    let manifest = match effects.manifest(record) {
-        Ok(manifest) => manifest,
+    let pre = match effects.manifest(record) {
+        Ok(outcome) => outcome,
         Err(error) => {
             record.last_error = Some(error.to_string());
             return finish_action(
@@ -1107,6 +1290,7 @@ fn run_queued_action<E: DriverEffects>(
             );
         }
     };
+    let manifest = pre.manifest.clone();
     record.manifest = Some(manifest.clone());
     if let Err(detail) = validate_action(record, &manifest, &typed) {
         return finish_action(
@@ -1115,8 +1299,8 @@ fn run_queued_action<E: DriverEffects>(
             index,
             "refused",
             &detail,
-            Some(crate::team_verify::verify_ok(&manifest["verify"])),
-            Some(explicit_yes_of(&manifest)),
+            Some(crate::team_verify::verify_ok(&pre.verify)),
+            Some(explicit_yes_of(&manifest, &pre.verify)),
             now,
         );
     }
@@ -1127,12 +1311,22 @@ fn run_queued_action<E: DriverEffects>(
             index,
             "done",
             "dry run: validated, no effect run",
-            Some(crate::team_verify::verify_ok(&manifest["verify"])),
-            Some(explicit_yes_of(&manifest)),
+            Some(crate::team_verify::verify_ok(&pre.verify)),
+            Some(explicit_yes_of(&manifest, &pre.verify)),
             now,
         );
     }
-    let outcome = match effects.act(record, &typed, &manifest) {
+    // An escalate action is recorded as delivered before any route runs,
+    // so a crash in the delivery window closes unknown (above) instead
+    // of ever sending the same text twice.
+    let escalate_was_delivered = record.escalation.delivered_at.is_some();
+    let escalate_pre_delivered =
+        matches!(typed, TeamAction::Escalate { .. }) && !escalate_was_delivered;
+    if escalate_pre_delivered {
+        record.escalation.delivered_at = Some(now);
+        save_record(directory, record, now)?;
+    }
+    let outcome = match effects.act(record, &typed, &manifest, &entry.requester) {
         Ok(outcome) => outcome,
         Err(error) => {
             record.last_error = Some(error.to_string());
@@ -1148,31 +1342,39 @@ fn run_queued_action<E: DriverEffects>(
             );
         }
     };
+    if let Some(kill) = &outcome.kill {
+        record.actions[index].matched_cmdline = Some(kill.cmdline.clone());
+        record.actions[index].matched_start = Some(kill.starttime);
+        record.actions[index].matched_cwd = kill.cwd.clone();
+        record.actions[index].kill_log = Some(kill.log_path.clone());
+    }
     if let Some(escalation) = &outcome.escalation {
         record.escalation.last_attempt_at = Some(now);
         match escalation {
             EscalationOutcome::Delivered => {
-                if record.escalation.delivered_at.is_some() {
+                if escalate_was_delivered {
                     record.escalation.reminded_at = Some(now);
-                } else {
-                    record.escalation.delivered_at = Some(now);
                 }
-                let next = now + 3600.0;
-                record.escalation.next_attempt_at = Some(next);
-                record.deadline = Some(next);
+                record.escalation.next_attempt_at = Some(now + 3600.0);
             }
             EscalationOutcome::Failed(detail) => {
                 record.last_error = Some(detail.clone());
-                let next = now
-                    + crate::team_escalate::backoff_seconds(record.abstract_state.attempts) as f64;
-                record.escalation.next_attempt_at = Some(next);
-                record.deadline = Some(next);
+                if escalate_pre_delivered {
+                    record.escalation.delivered_at = None;
+                }
+                record.escalation.next_attempt_at = Some(
+                    now + crate::team_escalate::backoff_seconds(record.abstract_state.attempts)
+                        as f64,
+                );
             }
             EscalationOutcome::Unconfigured => {
-                let next = now
-                    + crate::team_escalate::backoff_seconds(record.abstract_state.attempts) as f64;
-                record.escalation.next_attempt_at = Some(next);
-                record.deadline = Some(next);
+                if escalate_pre_delivered {
+                    record.escalation.delivered_at = None;
+                }
+                record.escalation.next_attempt_at = Some(
+                    now + crate::team_escalate::backoff_seconds(record.abstract_state.attempts)
+                        as f64,
+                );
             }
         }
     }
@@ -1204,10 +1406,10 @@ fn run_queued_action<E: DriverEffects>(
             );
         }
     };
-    record.manifest = Some(after.clone());
-    record.last_verify = after["verify"].clone();
+    record.manifest = Some(after.manifest.clone());
+    record.last_verify = after.verify.clone();
     record.held = report_held(&record.last_verify);
-    let explicit = explicit_yes_of(&after);
+    let explicit = explicit_yes_of(&after.manifest, &after.verify);
     let (status, detail) = if matches!(typed, TeamAction::DeclareDone) && !explicit {
         ("failed", "explicit YES checks did not all pass".to_owned())
     } else {
@@ -1219,19 +1421,17 @@ fn run_queued_action<E: DriverEffects>(
         index,
         status,
         &detail,
-        Some(crate::team_verify::verify_ok(&after["verify"])),
+        Some(crate::team_verify::verify_ok(&after.verify)),
         Some(explicit),
         now,
     )
 }
 
-fn explicit_yes_of(manifest: &Value) -> bool {
+fn explicit_yes_of(manifest: &Value, verify: &Value) -> bool {
     manifest["coordinator"]
         .as_str()
         .filter(|coordinator| !coordinator.is_empty())
-        .is_some_and(|coordinator| {
-            crate::team_verify::explicit_yes(&manifest["verify"], coordinator)
-        })
+        .is_some_and(|coordinator| crate::team_verify::explicit_yes(verify, coordinator))
 }
 
 /// The wake request for the record's concrete deadline.
@@ -1949,19 +2149,20 @@ impl<A: crate::subagents::ManagedApi + ?Sized> DriverEffects for ProductionEffec
         )
     }
 
-    fn manifest(&mut self, _record: &DriverRecord) -> Result<Value> {
+    fn manifest(&mut self, _record: &DriverRecord) -> Result<ManifestOutcome> {
         let options = crate::team_verify::VerifyOptions {
             dismiss_allowlisted: false,
             ..self.verify_options.clone()
         };
-        crate::team_manifest::manifest_team(
+        let (manifest, verify) = crate::team_manifest::manifest_team_with_verify(
             self.client,
             &self.registry,
             self.host,
             &self.config,
             &options,
         )
-        .map_err(|error| fail(error.to_string()))
+        .map_err(|error| fail(error.to_string()))?;
+        Ok(ManifestOutcome { manifest, verify })
     }
 
     fn act(
@@ -1969,20 +2170,29 @@ impl<A: crate::subagents::ManagedApi + ?Sized> DriverEffects for ProductionEffec
         record: &DriverRecord,
         action: &TeamAction,
         manifest: &Value,
+        requester: &RequesterRecord,
     ) -> Result<ActionOutcome> {
         let refused = |detail: &str| ActionOutcome {
             status: "refused".to_owned(),
             detail: detail.to_owned(),
             escalation: None,
+            kill: None,
         };
         match action {
             TeamAction::Facts => Ok(done_outcome("facts recorded")),
             TeamAction::DeclareDone => Ok(done_outcome("verify requested")),
             TeamAction::Revive { agent } => {
                 let manager = self.manager()?;
-                match manager.revive(agent, false, None, self.startup_timeout) {
+                // Recorded-only: revive can never discover or bind a
+                // candidate from the manifest at act time.
+                match manager.revive_recorded_only(agent, self.startup_timeout) {
                     Ok(_) => Ok(done_outcome("revive completed")),
-                    Err(_) => Ok(refused("revive refused")),
+                    Err(_) => Ok(ActionOutcome {
+                        status: "unknown".to_owned(),
+                        detail: "revive outcome unknown".to_owned(),
+                        escalation: None,
+                        kill: None,
+                    }),
                 }
             }
             TeamAction::StartUnit { unit } | TeamAction::ResetUnit { unit } => {
@@ -2033,6 +2243,7 @@ impl<A: crate::subagents::ManagedApi + ?Sized> DriverEffects for ProductionEffec
                             status: "failed".to_owned(),
                             detail: "unit reset-failed failed".to_owned(),
                             escalation: None,
+                            kill: None,
                         });
                     }
                 }
@@ -2057,33 +2268,46 @@ impl<A: crate::subagents::ManagedApi + ?Sized> DriverEffects for ProductionEffec
                         status: "failed".to_owned(),
                         detail: "unit start failed".to_owned(),
                         escalation: None,
+                        kill: None,
                     })
                 }
             }
             TeamAction::Drain { agent } => {
+                const BOUNDS: &str = "bounds ready_timeout=30s deadline=60s lock_timeout=10s max_attempts=1 max_items=1 deliver_while_working=false";
                 let manager = self.manager()?;
                 let options = crate::agent::DrainOptions {
                     ready_timeout: Duration::from_secs(30),
                     deadline: Some(Duration::from_secs(60)),
                     lock_timeout: Some(Duration::from_secs(10)),
                     max_attempts: 1,
+                    max_items: Some(1),
+                    deliver_while_working: false,
                     ..crate::agent::DrainOptions::default()
                 };
                 match manager.drain(agent, options) {
                     Ok(result) => Ok(match result.outcome {
-                        crate::agent::QueueOutcome::Delivered => done_outcome("queue drained"),
+                        crate::agent::QueueOutcome::Delivered => {
+                            done_outcome(&format!("queue drained ({BOUNDS})"))
+                        }
                         crate::agent::QueueOutcome::Pending => ActionOutcome {
                             status: "failed".to_owned(),
-                            detail: "drain pending".to_owned(),
+                            detail: format!("drain pending ({BOUNDS})"),
                             escalation: None,
+                            kill: None,
                         },
                         crate::agent::QueueOutcome::PossiblySubmitted => ActionOutcome {
                             status: "unknown".to_owned(),
-                            detail: "drain quarantined".to_owned(),
+                            detail: format!("drain quarantined ({BOUNDS})"),
                             escalation: None,
+                            kill: None,
                         },
                     }),
-                    Err(_) => Ok(refused("drain refused")),
+                    Err(_) => Ok(ActionOutcome {
+                        status: "unknown".to_owned(),
+                        detail: format!("drain outcome unknown ({BOUNDS})"),
+                        escalation: None,
+                        kill: None,
+                    }),
                 }
             }
             TeamAction::KillPid {
@@ -2103,25 +2327,42 @@ impl<A: crate::subagents::ManagedApi + ?Sized> DriverEffects for ProductionEffec
                 {
                     return Ok(refused("invalid signal"));
                 }
-                match crate::kill_pid::run_kill_pid(
+                match crate::kill_pid::run_kill_pid_as(
                     u64::from(*pid),
                     expect_cmdline,
                     expect_start,
                     signal,
                     &self.registry,
+                    Some(requester.label.as_str()),
                 ) {
-                    Ok(_) => Ok(done_outcome("process signalled")),
+                    Ok(report) => Ok(ActionOutcome {
+                        status: "done".to_owned(),
+                        detail: "process signalled".to_owned(),
+                        escalation: None,
+                        kill: Some(KillEvidence {
+                            cmdline: report.cmdline,
+                            starttime: report.starttime,
+                            cwd: report.cwd,
+                            log_path: report.log_path.display().to_string(),
+                        }),
+                    }),
+                    Err(refusal) if refusal.reason == "log-failed" => Ok(ActionOutcome {
+                        status: "unknown".to_owned(),
+                        detail: "kill outcome unknown (log-failed)".to_owned(),
+                        escalation: None,
+                        kill: None,
+                    }),
                     Err(refusal) => Ok(ActionOutcome {
                         status: "refused".to_owned(),
                         detail: format!("kill refused ({})", refusal.reason),
                         escalation: None,
+                        kill: None,
                     }),
                 }
             }
             TeamAction::Escalate { text } => {
-                if record.escalation.delivered_at.is_some() {
-                    return Ok(done_outcome("escalation already delivered"));
-                }
+                // New text is always delivered; an earlier delivery this
+                // incident never makes this text count as sent.
                 let outcome = self.escalate(record, text, false)?;
                 let (status, detail) = match &outcome {
                     EscalationOutcome::Delivered => ("done", "escalation delivered"),
@@ -2132,6 +2373,7 @@ impl<A: crate::subagents::ManagedApi + ?Sized> DriverEffects for ProductionEffec
                     status: status.to_owned(),
                     detail: detail.to_owned(),
                     escalation: Some(outcome),
+                    kill: None,
                 })
             }
         }
@@ -2352,7 +2594,7 @@ pub trait DriverEffects {
     ) -> Result<EscalationOutcome>;
     /// Build the current recovery manifest (facts validation and the
     /// verify-after snapshot for one queued action).
-    fn manifest(&mut self, record: &DriverRecord) -> Result<Value>;
+    fn manifest(&mut self, record: &DriverRecord) -> Result<ManifestOutcome>;
     /// Execute one validated queued action. The core has persisted it
     /// running; retry after a crash is governed by the action's status.
     fn act(
@@ -2360,6 +2602,7 @@ pub trait DriverEffects {
         record: &DriverRecord,
         action: &TeamAction,
         manifest: &Value,
+        requester: &RequesterRecord,
     ) -> Result<ActionOutcome>;
 }
 
@@ -2535,6 +2778,7 @@ mod tests {
         let requester = RequesterRecord {
             kind: "agent".to_owned(),
             label: "test".to_owned(),
+            proof: "claimed".to_owned(),
         };
         let facts = new_action_request(
             &record.incident,
@@ -2575,6 +2819,87 @@ mod tests {
         let record = run(&root, &host, &mut fake).unwrap();
         assert_eq!(fake.acted.len(), 1);
 
+        // Recovery verbs refuse outside an incident state (this team is
+        // Healthy), while an escalate delivers without setting a deadline.
+        for (id, action) in [
+            (
+                "revive-healthy",
+                TeamAction::Revive {
+                    agent: "lane".to_owned(),
+                },
+            ),
+            (
+                "escalate-healthy",
+                TeamAction::Escalate {
+                    text: "owner note".to_owned(),
+                },
+            ),
+        ] {
+            let request = new_action_request(
+                &record.incident,
+                record.epoch.clone(),
+                id,
+                &action,
+                false,
+                requester.clone(),
+                100.0,
+            )
+            .unwrap();
+            enqueue_action(&directory, &request).unwrap();
+        }
+        let _first = run(&root, &host, &mut fake).unwrap();
+        // A Healthy act exits after one action; the next kick takes the
+        // next queued one.
+        let record = run(&root, &host, &mut fake).unwrap();
+        let by_id = |id: &str| {
+            record
+                .actions
+                .iter()
+                .find(|action| action.request_id == id)
+                .unwrap()
+        };
+        assert_eq!(by_id("revive-healthy").status, "refused");
+        assert_eq!(by_id("escalate-healthy").status, "done");
+        assert_eq!(record.deadline, None);
+        assert!(record.escalation.delivered_at.is_some());
+        assert_eq!(fake.acted.len(), 2, "only the escalate ran");
+
+        // Declare-done judges the raw verify: the bounded projection says
+        // only "no bridge evidence", the raw report names the bridgeless
+        // skip, and only the raw row can pass explicit YES.
+        let mut bounded = Fake::fake_manifest(&record, true);
+        bounded["verify"]["checks"][1] = json!({
+            "name": "units-bridges",
+            "status": "skipped",
+            "subject": null,
+            "evidence": "no bridge evidence",
+        });
+        let mut raw = bounded["verify"].clone();
+        raw["checks"][1]["evidence"] = json!("no bridge state directories under the registry");
+        fake.manifests.push_back(bounded.clone());
+        fake.manifests.push_back(bounded);
+        fake.manifest_verifies.push_back(raw.clone());
+        fake.manifest_verifies.push_back(raw);
+        let declare = new_action_request(
+            &record.incident,
+            record.epoch.clone(),
+            "declare-1",
+            &TeamAction::DeclareDone,
+            false,
+            requester.clone(),
+            100.0,
+        )
+        .unwrap();
+        enqueue_action(&directory, &declare).unwrap();
+        let record = run(&root, &host, &mut fake).unwrap();
+        let declared = record
+            .actions
+            .iter()
+            .find(|action| action.request_id == "declare-1")
+            .unwrap();
+        assert_eq!(declared.status, "done", "{declared:?}");
+        assert_eq!(declared.explicit_yes, Some(true));
+
         // A request bound to another manager epoch never executes.
         let stale = new_action_request(
             &record.incident,
@@ -2594,12 +2919,18 @@ mod tests {
             .find(|action| action.request_id == "facts-2")
             .unwrap();
         assert_eq!(stale_row.status, "refused");
-        assert_eq!(fake.acted.len(), 1);
+        assert_eq!(fake.acted.len(), 3, "facts, escalate, and declare-done ran");
 
         // A driver that died mid-action requeues a re-runnable verb and
         // closes a non-idempotent one unknown without firing it again.
         for (id, action) in [
             ("facts-3", TeamAction::Facts),
+            (
+                "escalate-crash",
+                TeamAction::Escalate {
+                    text: "crash window".to_owned(),
+                },
+            ),
             (
                 "kill-1",
                 TeamAction::KillPid {
@@ -2625,11 +2956,12 @@ mod tests {
         }
         let mut crashed = load_record(&directory, &registry).unwrap().unwrap();
         reconcile_action_requests(&directory, &mut crashed);
-        for action in crashed
-            .actions
-            .iter_mut()
-            .filter(|action| matches!(action.request_id.as_str(), "facts-3" | "kill-1"))
-        {
+        for action in crashed.actions.iter_mut().filter(|action| {
+            matches!(
+                action.request_id.as_str(),
+                "facts-3" | "kill-1" | "escalate-crash"
+            )
+        }) {
             action.status = "running".to_owned();
             action.started_at = Some(100.0);
         }
@@ -2644,7 +2976,8 @@ mod tests {
         };
         assert_eq!(by_id("facts-3").status, "done");
         assert_eq!(by_id("kill-1").status, "unknown");
-        assert_eq!(fake.acted.len(), 2, "only the requeued facts ran");
+        assert_eq!(by_id("escalate-crash").status, "unknown");
+        assert_eq!(fake.acted.len(), 4, "only the requeued facts also ran");
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -2733,6 +3066,7 @@ mod tests {
         escalations: VecDeque<EscalationOutcome>,
         escalate_calls: Vec<bool>,
         manifests: VecDeque<Value>,
+        manifest_verifies: VecDeque<Value>,
         act_outcomes: VecDeque<ActionOutcome>,
         acted: Vec<TeamAction>,
         crash: Option<&'static str>,
@@ -2816,18 +3150,24 @@ mod tests {
                 .pop_front()
                 .unwrap_or(EscalationOutcome::Delivered))
         }
-        fn manifest(&mut self, record: &DriverRecord) -> Result<Value> {
+        fn manifest(&mut self, record: &DriverRecord) -> Result<ManifestOutcome> {
             self.maybe_crash("manifest")?;
-            Ok(self
+            let manifest = self
                 .manifests
                 .pop_front()
-                .unwrap_or_else(|| Self::fake_manifest(record, !self.missing)))
+                .unwrap_or_else(|| Self::fake_manifest(record, !self.missing));
+            let verify = self
+                .manifest_verifies
+                .pop_front()
+                .unwrap_or_else(|| manifest["verify"].clone());
+            Ok(ManifestOutcome { manifest, verify })
         }
         fn act(
             &mut self,
             _record: &DriverRecord,
             action: &TeamAction,
             _manifest: &Value,
+            _requester: &RequesterRecord,
         ) -> Result<ActionOutcome> {
             self.maybe_crash("act")?;
             self.acted.push(action.clone());
@@ -2838,6 +3178,7 @@ mod tests {
                     status: "done".to_owned(),
                     detail: "fake action done".to_owned(),
                     escalation: None,
+                    kill: None,
                 }))
         }
     }

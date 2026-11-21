@@ -336,6 +336,47 @@ fn manifest_candidate_index_enumerates_muse_for_a_session_less_record() {
             .as_deref(),
         Some("recover lane A")
     );
+    // Recorded-only revive refuses the same record before any write:
+    // discovery over these very candidates can never bind one.
+    fn tree_snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, (u32, Vec<u8>)> {
+        use std::os::unix::fs::PermissionsExt;
+        let mut out = std::collections::BTreeMap::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(path) = stack.pop() {
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            let relative = path.strip_prefix(root).unwrap().to_path_buf();
+            if metadata.is_dir() {
+                out.insert(relative, (metadata.permissions().mode(), Vec::new()));
+                let mut children: Vec<_> = fs::read_dir(&path)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .collect();
+                children.sort();
+                stack.extend(children);
+            } else if metadata.is_file() {
+                out.insert(
+                    relative,
+                    (metadata.permissions().mode(), fs::read(&path).unwrap()),
+                );
+            }
+        }
+        out
+    }
+    let registry = fixture.root.join("registry");
+    let before = tree_snapshot(&registry);
+    let refused = manager
+        .revive_recorded_only("worker", Duration::from_secs(30))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("recorded-only revive refuses discovery"),
+        "{refused}"
+    );
+    assert_eq!(
+        tree_snapshot(&registry),
+        before,
+        "refusal changed the registry"
+    );
     // Enumeration is report-only: the record still names no session.
     assert!(manager.load("worker").unwrap().native_session.is_none());
 }

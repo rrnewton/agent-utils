@@ -3772,6 +3772,17 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         self.revive_with(agent_name, dry_run, expected_token, startup_timeout, false)
     }
 
+    /// Revive only a recorded native session: discovery and binding are
+    /// refused before any candidate or launch write, so a session-less
+    /// record is left exactly as found (`team act`, #1559).
+    pub(crate) fn revive_recorded_only(
+        &self,
+        agent_name: &str,
+        startup_timeout: Duration,
+    ) -> Result<Value> {
+        self.revive_with_mode(agent_name, false, None, startup_timeout, false, true)
+    }
+
     /// Wait for an idle turn with nothing queued, exit the harness in
     /// `pane` gracefully, and prove the bare shell. Shared by restart
     /// and the gentle shutdown.
@@ -4361,12 +4372,32 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         startup_timeout: Duration,
         abandon_candidate: bool,
     ) -> Result<Value> {
+        self.revive_with_mode(
+            agent_name,
+            dry_run,
+            expected_token,
+            startup_timeout,
+            abandon_candidate,
+            false,
+        )
+    }
+
+    fn revive_with_mode(
+        &self,
+        agent_name: &str,
+        dry_run: bool,
+        expected_token: Option<&str>,
+        startup_timeout: Duration,
+        abandon_candidate: bool,
+        recorded_only: bool,
+    ) -> Result<Value> {
         let mut result = self.revive_once(
             agent_name,
             dry_run,
             expected_token,
             startup_timeout,
             abandon_candidate,
+            recorded_only,
         )?;
         if let Some(archive) = result["archive"].as_str().filter(|_| !dry_run) {
             match self.carry_over_queue(agent_name, Path::new(archive)) {
@@ -4426,6 +4457,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         expected_token: Option<&str>,
         startup_timeout: Duration,
         abandon_candidate: bool,
+        recorded_only: bool,
     ) -> Result<Value> {
         name(agent_name)?;
         if startup_timeout.is_zero() || startup_timeout > Duration::from_secs(300) {
@@ -4438,6 +4470,20 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         let pending = journals(&self.registry)?
             .into_iter()
             .find(|journal| journal.name == agent_name);
+        if recorded_only {
+            let has_recorded = match &pending {
+                Some(journal) => stopped_artifact(&self.registry, journal)
+                    .is_ok_and(|(old, _)| old.effective_native_session().is_some()),
+                None => self
+                    .read_record(agent_name)
+                    .is_ok_and(|record| record.effective_native_session().is_some()),
+            };
+            if !has_recorded {
+                return Err(fail(
+                    "no recorded native session; recorded-only revive refuses discovery",
+                ));
+            }
+        }
         if dry_run {
             if let Some(journal) = pending {
                 if expected_token.is_some_and(|value| value != journal.old_token) {
@@ -4542,6 +4588,11 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 return Err(fail("agent was replaced before revive"));
             }
             let (old, _) = stopped_artifact(&self.registry, &journal)?;
+            if recorded_only && old.effective_native_session().is_none() {
+                return Err(fail(
+                    "no recorded native session; recorded-only revive refuses discovery",
+                ));
+            }
             let old_path = self.directory(agent_name)?;
             let old_path = if fs::symlink_metadata(&old_path).is_ok()
                 && self.read_record(agent_name)?.token == journal.old_token
@@ -4607,8 +4658,14 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             };
             // The attempt is out of the way: revive again from the start, under fresh locks.
             drop((pane, queue, _identity, _name));
-            let mut result =
-                self.revive_once(agent_name, false, expected_token, startup_timeout, false)?;
+            let mut result = self.revive_once(
+                agent_name,
+                false,
+                expected_token,
+                startup_timeout,
+                false,
+                recorded_only,
+            )?;
             result["abandoned_candidate"] = abandoned;
             return Ok(result);
         }
@@ -4620,6 +4677,11 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         let record = self.read_record(agent_name)?;
         if expected_token.is_some_and(|value| value != record.token) {
             return Err(fail("agent was replaced before revive"));
+        }
+        if recorded_only && record.effective_native_session().is_none() {
+            return Err(fail(
+                "no recorded native session; recorded-only revive refuses discovery",
+            ));
         }
         let (plan, proof) = self.preflight_revive(&record, startup_timeout)?;
         let pinned = self.pinned_agent_directory(agent_name)?;

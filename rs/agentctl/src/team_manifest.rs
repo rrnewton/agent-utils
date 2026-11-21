@@ -74,6 +74,19 @@ pub fn manifest_team<A: ManagedApi + ?Sized>(
     config: &RestoreConfig,
     options: &VerifyOptions,
 ) -> Result<Value> {
+    Ok(manifest_team_with_verify(client, registry, host, config, options)?.0)
+}
+
+/// [`manifest_team`], also returning the raw verify report the bounded
+/// embedded copy was projected from, for callers that must judge on the
+/// unprojected rows (declare-done's explicit YES).
+pub fn manifest_team_with_verify<A: ManagedApi + ?Sized>(
+    client: &A,
+    registry: &Path,
+    host: &dyn Host,
+    config: &RestoreConfig,
+    options: &VerifyOptions,
+) -> Result<(Value, Value)> {
     let (verify, snapshot) = verify_team_with_snapshot(client, registry, host, config, options)?;
     let manager = ManagedAgents::new(client, registry)?;
     let mut errors: Vec<String> = Vec::new();
@@ -149,18 +162,21 @@ pub fn manifest_team<A: ManagedApi + ?Sized>(
         .iter()
         .map(|(unit, outcome)| unit_fact(unit, outcome, pins.reason_for(unit).is_some()))
         .collect();
-    Ok(build_manifest(
-        registry,
-        config,
-        &snapshot.desired.names,
-        &snapshot.desired.excluded,
-        &snapshot.desired.undecidable,
-        &snapshot.statuses,
-        &facts,
-        &queued,
-        units,
-        bounded_verify(&verify),
-        errors,
+    Ok((
+        build_manifest(
+            registry,
+            config,
+            &snapshot.desired.names,
+            &snapshot.desired.excluded,
+            &snapshot.desired.undecidable,
+            &snapshot.statuses,
+            &facts,
+            &queued,
+            units,
+            bounded_verify(&verify),
+            errors,
+        ),
+        verify,
     ))
 }
 

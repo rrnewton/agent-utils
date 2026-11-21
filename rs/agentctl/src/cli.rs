@@ -4608,6 +4608,10 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     write_json(&refusal("invalid request id")).map_err(Failure::Output)?;
                     return Ok(1);
                 }
+                if crate::team_driver::require_host_namespace(&host).is_err() {
+                    write_json(&refusal("host namespace required")).map_err(Failure::Output)?;
+                    return Ok(1);
+                }
                 let mut record = crate::team_driver::load_record(&directory, &args.registry)?;
                 if record.is_none() {
                     let _ = crate::team_driver::kick(
@@ -4628,9 +4632,11 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     return Ok(1);
                 }
                 let manager = ManagedAgents::new(&client, &args.registry)?;
-                let sender = match manager.proved_caller() {
-                    Ok(name) => crate::sender_header::Sender::Agent(name),
-                    Err(_) => crate::sender_header::resolve_current(None, None),
+                // Only an ancestry-proved registered caller is "proved";
+                // every fallback label (including a tty human) is claimed.
+                let (sender, proof) = match manager.proved_caller() {
+                    Ok(name) => (crate::sender_header::Sender::Agent(name), "proved"),
+                    Err(_) => (crate::sender_header::resolve_current(None, None), "claimed"),
                 };
                 let requester = crate::team_driver::RequesterRecord {
                     kind: match &sender {
@@ -4638,6 +4644,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                         crate::sender_header::Sender::Other(_) => "other".to_owned(),
                     },
                     label: sender.label().to_owned(),
+                    proof: proof.to_owned(),
                 };
                 let request = match crate::team_driver::new_action_request(
                     &act.incident,

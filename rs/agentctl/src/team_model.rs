@@ -310,19 +310,25 @@ pub fn transitions() -> Vec<Transition> {
             mode: Running,
             effects: NONE,
         });
+        // An act never moves the recovery state, its deadline, or its
+        // wake: deadline states execute it and return to the same armed
+        // dormant wait, active states stay running.
         rows.push(Transition {
             from: state,
             event: ActRequested,
-            // From a dormant deadline state an action re-enters VERIFY:
-            // a self-loop there would strand the machine running with a
-            // wake still armed and no fair event left to fire.
-            to: if matches!(state, Handoff | Escalate) {
-                Verify
+            to: state,
+            mode: if matches!(state, Healthy | Verify | Handoff | Escalate) {
+                Dormant
             } else {
-                state
+                Running
             },
-            mode: Running,
-            effects: &[RunQueuedAction],
+            effects: if matches!(state, Verify | Handoff | Escalate) {
+                &[RunQueuedAction, ArmWake, Exit] as &[Effect]
+            } else if matches!(state, Healthy) {
+                &[RunQueuedAction, Exit] as &[Effect]
+            } else {
+                &[RunQueuedAction] as &[Effect]
+            },
         });
     }
     rows
@@ -885,6 +891,46 @@ mod tests {
                     "dormant exit without ArmWake: {row:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn act_requested_never_moves_state_mode_or_wake() {
+        let table = transitions();
+        let rows: Vec<_> = table
+            .iter()
+            .filter(|row| row.event == Event::ActRequested)
+            .collect();
+        assert_eq!(rows.len(), 6, "one act row per state");
+        for row in &rows {
+            assert_eq!(row.to, row.from, "act moved state: {row:?}");
+            assert_eq!(row.effects.first(), Some(&Effect::RunQueuedAction));
+            if matches!(row.from, State::Verify | State::Handoff | State::Escalate) {
+                assert_eq!(row.mode, Mode::Dormant, "{row:?}");
+                assert!(row.effects.contains(&Effect::ArmWake), "{row:?}");
+                assert!(row.effects.contains(&Effect::Exit), "{row:?}");
+            }
+        }
+        // Stepping one from an armed dormant deadline state preserves
+        // the state and its armed wake exactly.
+        for driver in [State::Handoff, State::Escalate] {
+            let before = Abstract {
+                driver,
+                mode: Mode::Dormant,
+                wake_armed: true,
+                deadline_expired: false,
+                restore_in_flight: false,
+                delivered: driver == State::Escalate,
+                alarm: false,
+                attempts: 1,
+                env: env(true, true, true, false),
+            };
+            let (after, effects) = step(&table, &before, Event::ActRequested).unwrap();
+            assert_eq!(after.driver, before.driver);
+            assert_eq!(after.mode, Mode::Dormant);
+            assert!(after.wake_armed);
+            assert_eq!(after.deadline_expired, before.deadline_expired);
+            assert_eq!(effects.first(), Some(&Effect::RunQueuedAction));
         }
     }
 
