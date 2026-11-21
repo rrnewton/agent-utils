@@ -2947,7 +2947,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             // an error: the refusal stays the ordinary one (#1992).
             let expected_arguments = match expected_arguments(effective) {
                 Ok(arguments) => arguments,
-                Err(error) if std::ptr::eq(effective, old) => return Ok(false),
+                Err(_) if std::ptr::eq(effective, old) => return Ok(false),
                 Err(error) => return Err(error),
             };
             if record.name == old.name
