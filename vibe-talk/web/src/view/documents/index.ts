@@ -630,6 +630,7 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
       });
     } catch {
       // A host without the scroller keeps the places taken at each open.
+    }
 
     // The reader's jumps (`#2006`), where the host drew them.
     try {
