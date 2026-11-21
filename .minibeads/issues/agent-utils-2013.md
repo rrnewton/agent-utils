@@ -1,6 +1,6 @@
 ---
 title: 'agentctl-muse-lock-host-attribution: require the session lock host line to match this host'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
@@ -39,3 +39,13 @@ host's session in both the revive and restore paths.
 the #1934 delta review, coordinated by coordb. Related: #1934
 agentctl-restore-muse-sessions-and-timeout, #1945
 agentctl-muse-store-stale-lock-pid-reuse.
+
+## Resolution
+
+[watermelon-full-preview] Landed as bb7532a8 on main. Held-lock
+and pid-keyed store attribution require the lock's host line,
+when present, to name this host (full name or short label); a
+foreign host attributes nothing. Live evidence on one host
+(1123 locks: 758 with host=, all this host's FQDN; 365 without)
+showed a third of real locks predate the field, so a missing host
+line falls back to the pid evidence instead of failing closed.
