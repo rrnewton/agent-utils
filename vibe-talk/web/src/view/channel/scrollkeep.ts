@@ -363,11 +363,39 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
    * taking every row up by the shrink.
    */
   function writeHold(area: HTMLElement, anchor: Element, delta: number): void {
+    // A hold that would move nothing writes nothing and grows no room (`#2066`).
+    if (Math.abs(delta) <= 0.5) return;
     const wanted = area.scrollTop + delta;
     const max = area.scrollHeight - (area.clientHeight || 0);
     if (wanted > max) addFootRoom(anchor, wanted - max);
     noteOwnWrite();
     area.scrollTop = wanted;
+  }
+
+  /**
+   * Move `area` by `delta`, or not at all when it would not move (`#2066
+   * vibe-talk-page-freeze`): every other writer in the page already guards this way
+   * (readcore, threadentry, the read-aloud follow), and an unguarded same-value write
+   * is still a style-and-scroll pass per redraw — the owner's trace shows writes to
+   * the same `scrollTop` on almost every frame. Skipping the write also skips the
+   * own-write note, so a reader's scroll inside the next second is not mistaken for
+   * this keeper's echo. Answers whether it wrote.
+   */
+  function writeDelta(area: HTMLElement, delta: number): boolean {
+    if (Math.abs(delta) <= 0.5) return false;
+    noteOwnWrite();
+    area.scrollTop += delta;
+    return true;
+  }
+
+  /** Put `area` at `top` (clamped as the browser clamps it), or not at all when already there. */
+  function writeTo(area: HTMLElement, top: number): boolean {
+    const max = Math.max(0, area.scrollHeight - area.clientHeight);
+    const clamped = Math.min(Math.max(top, 0), max);
+    if (Math.abs(area.scrollTop - clamped) <= 0.5) return false;
+    noteOwnWrite();
+    area.scrollTop = top;
+    return true;
   }
 
   /** Stand the input watch on `area`, once a port. */
@@ -576,18 +604,15 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     // A deliberate write to the foot reclaims the held room (`#2076`): the rows'
     // foot is the foot the reader is taken to.
     clearFootRoom();
-    noteOwnWrite();
-    area.scrollTop = area.scrollHeight;
+    writeTo(area, area.scrollHeight);
   }
 
   function nudge(area: HTMLElement, delta: number): void {
-    noteOwnWrite();
-    area.scrollTop += delta;
+    writeDelta(area, delta);
   }
 
   function toPosition(area: HTMLElement, top: number): void {
-    noteOwnWrite();
-    area.scrollTop = top;
+    writeTo(area, top);
   }
 
   function wheelBy(area: HTMLElement, px: number): void {
@@ -650,14 +675,13 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     if (!rect || rect.height <= 0) return true;
     // `#1880b`: the place kept is where the reader's own scroll since the capture
     // left the box, not where it stood at the capture.
-    noteOwnWrite();
-    area.scrollTop += rect.top - (beforeTop - userDelta);
+    writeDelta(area, rect.top - (beforeTop - userDelta));
     // The restore can still leave the box past an edge (the list grew at the foot):
     // bring it just inside, never through the history between.
     const band = visibleBand(area);
     const now = composer.getBoundingClientRect();
-    if (now.bottom > band.foot) { noteOwnWrite(); area.scrollTop += now.bottom - band.foot; }
-    else if (now.top < band.head) { noteOwnWrite(); area.scrollTop += now.top - band.head; }
+    if (now.bottom > band.foot) writeDelta(area, now.bottom - band.foot);
+    else if (now.top < band.head) writeDelta(area, now.top - band.head);
     return true;
   }
 
@@ -722,8 +746,7 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     }
     if (deps.currentView() !== "discord" && deps.atBottom(area, deps.restSlackPx)) {
       mutate();
-      noteOwnWrite();
-      area.scrollTop = area.scrollHeight;
+      writeTo(area, area.scrollHeight);
       deps.renderJumpNewest();
       return;
     }
@@ -965,8 +988,7 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
       deps.renderJumpNewest();
     } else {
       const rect = row.getBoundingClientRect();
-      noteOwnWrite();
-      area.scrollTop += rect.top + (rect.bottom - rect.top) / 2 - (head + foot) / 2;
+      writeDelta(area, rect.top + (rect.bottom - rect.top) / 2 - (head + foot) / 2);
       deps.renderJumpNewest();
     }
     if (selection && deps.restoreSelectionIn) deps.restoreSelectionIn(area, selection);

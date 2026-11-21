@@ -408,6 +408,7 @@ export function createReplyArrows(deps: ReplyArrowsDependencies): ReplyArrows {
     // screen, leaves the list, or a newer landing replaces this one.
     if (typeof requestAnimationFrame === "function") {
       let frames = 0;
+      let lastSettled: readonly [number, number] | null = null;
       const reassert = (): void => {
         frames += 1;
         if (replyArrows().landed !== landed) return;
@@ -419,7 +420,15 @@ export function createReplyArrows(deps: ReplyArrowsDependencies): ReplyArrows {
         const heightAgain = row.getBoundingClientRect().bottom - drawnTop(row);
         const leadAgain = center ? Math.max(clearAgain, (clearAgain + again.getBoundingClientRect().bottom - heightAgain) / 2) : clearAgain;
         deps.nudge(again, drawnTop(row) - leadAgain);
-        if (!rowOnScreen(row) && frames <= 30) requestAnimationFrame(reassert);
+        if (rowOnScreen(row)) return;
+        // Settled and still off screen — the list is clamped at its end, or the row
+        // is taller than the room for it: another frame would measure and write the
+        // same place again (`#2066 vibe-talk-page-freeze`, the owner's same-value
+        // write trace). A layout that is still moving changes one of these readings.
+        const settled: readonly [number, number] = [again.scrollTop, drawnTop(row)];
+        if (lastSettled && settled[0] === lastSettled[0] && settled[1] === lastSettled[1]) return;
+        lastSettled = settled;
+        if (frames <= 30) requestAnimationFrame(reassert);
       };
       requestAnimationFrame(reassert);
     }

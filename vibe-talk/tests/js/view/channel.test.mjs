@@ -638,6 +638,42 @@ test("`#624 voice-page-modularity`: the reader is left on the message their eye 
   assert.equal(calls.at(-1), "newest");
 });
 
+test("`#2066 vibe-talk-page-freeze`: a hold that would move nothing writes no scroll at all", () => {
+  const { createScrollKeeping } = CHANNEL_VIEW;
+  let shift = 0;
+  let writes = 0;
+  let top = 300;
+  const row = (id, at) => ({ id, parentNode: {}, getAttribute: () => null, getBoundingClientRect: () => ({ top: at + shift, bottom: at + shift + 40 }) });
+  const rows = [row("a", -80), row("b", -40), row("c", 0), row("d", 40)];
+  const log = { id: "discord-log", children: rows };
+  const area = { getBoundingClientRect: () => ({ top: 0 }), scrollHeight: 5000, clientHeight: 500 };
+  Object.defineProperty(area, "scrollTop", {
+    get: () => top,
+    set: (value) => { writes += 1; top = value; },
+  });
+  const chip = { hidden: true, getBoundingClientRect: () => ({ top: 0 }) };
+  const els = { "discord-log": log, "pinned-log": { id: "pinned-log", children: [] }, "scroll-area": area, "load-older": chip, transcript: { children: [] } };
+  const keep = createScrollKeeping({
+    el: (id) => els[id], onMain: () => true, currentView: () => "discord", channelView: () => "main", pinnedOnly: () => false,
+    heldFilterRow: () => null, searchWalk: () => null, atBottom: () => false,
+    scrollToNewest: () => {}, renderJumpNewest: () => {}, setJumpNewest: () => {},
+  });
+  // A redraw that moved nothing: the owner's trace showed a same-value write here
+  // on almost every frame. Zero writes, and the reader stays where they were.
+  keep.holdingRows(() => {});
+  assert.equal(writes, 0, "an unchanged hold wrote the scroll place it already had");
+  assert.equal(top, 300);
+  keep.preservingScroll(() => {});
+  assert.equal(writes, 0, "an unchanged preserving write landed");
+  // A change above still writes exactly once, by exactly the growth.
+  keep.holdingRows(() => { shift = 25; });
+  assert.equal(writes, 1, "a real change did not write exactly once");
+  assert.equal(top, 325);
+  // And a nudge of nothing (the reply landing's re-assert at a clamped foot) is no write.
+  keep.nudge(area, 0);
+  assert.equal(writes, 1, "a zero nudge wrote");
+});
+
 test("`#1880 vibe-talk-no-programmatic-scroll-after-user-scroll` x `#1880b`: a restore holds the anchor's screen place, compensating only the change's growth", () => {
   const { createScrollKeeping } = CHANNEL_VIEW;
   let shift = 0;
