@@ -1,12 +1,13 @@
 ---
 title: 'agentctl-headless-single-start-path-console-tab: one start path ensures the Herdr console tab for every headless agent'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 labels:
 - agentctl
 created_at: 2026-11-20T16:46:01.334275441+00:00
-updated_at: 2026-11-20T16:46:01.334275441+00:00
+updated_at: 2026-11-21T08:56:30.902631473+00:00
+closed_at: 2026-11-21T08:56:30.902631343+00:00
 ---
 
 # Description
@@ -26,3 +27,9 @@ One ensure function (ensure_headless_console_tab) in subagents/control.rs: inspe
 # Acceptance Criteria
 
 Fake-Herdr/scratch-registry tests: killed viewer comes back; unit-path (run-headless) start recreates it; restore-after-reboot shape (stale recorded tab, blank shell) heals to console; a tail viewer is replaced by a console; a live console is untouched with no duplicates. Herdr down at wrapper start does not block the agent and the tab appears when Herdr appears. Focused suites pass under nice -n 10; one gate run; cold review by coordb of the SHA before gating (tab creation/replacement is closing-adjacent). Recipe written for the affected consumer team.
+
+# Notes
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as 3afebc51 (tree 43fc5a33203fee09c19a18d7fadc71e6c5428760), a verified-tree landing under the coordb gate waiver for the #2027 pidfd pair and the #2024 console_pty artefact. One idempotent ensure path now creates/replaces/leaves the console tab from every headless start, with the wrapper retrying while it runs; the consumer recipe is in the headless userguide.
