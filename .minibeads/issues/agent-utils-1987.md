@@ -34,3 +34,5 @@ Bring the Rust transfer-owner to the Python contract before the wrkslots Rust cu
 # Notes
 
 Related: #1975 restore-boot-recovery (Phase 1 introduced the lock-light transfer in both editions; the Python side is complete there). Not a Phase 1 blocker: Rust writers are fixture-registries-only until cutover. Persisted fields: none — parity of behaviour, not of storage.
+
+Update (from #2000 wrkslots-lock-order): [watermelon-full-preview] The Rust mutation-lock configuration gate in `hold_write::acquire_mutation_locks_inner` now compares the configuration file's SHA-256 (mirroring the Python registry identity's `config_sha256`) plus every field the Rust `Cfg` carries, instead of only six fields. What remains weaker than Python here, and stays inside this issue's existing scope, is the registry-identity compare itself: the Rust edition still has no `_registry_identity` analogue under its mutation locks (item (2) above), so a Rust writer does not yet re-judge against the exact registry identity its prepare validated.

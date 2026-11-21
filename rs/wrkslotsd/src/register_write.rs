@@ -347,6 +347,7 @@ pub(crate) fn register_slot(
             )
         }
     };
+    // Keeps the configuration locks while queueing (#2000): the new record is stamped with the configuration's heartbeat TTL and slot cap.
     let _locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
     refuse_partial_state(&cfg.control)?;
     let journals = parse_journals(root)?;

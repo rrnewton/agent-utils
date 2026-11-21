@@ -668,6 +668,7 @@ pub(crate) fn quarantine_journal(
             plan.sha256
         ));
     }
+    // Keeps the configuration locks while queueing (#2000): the quarantine destination is judged from the configuration's control layout.
     let _locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
     assert_caller(&coordinator, "coordinator")?;
     refuse_partial_state(&cfg.control)?;

@@ -658,6 +658,7 @@ pub(crate) fn image_mount_cli(
     crate::ensure_states::require_fixture()?;
     let (control, worktrees, tools) = mount_ctx(root, machine)?;
     let (cfg, selected) = crate::active_state::load_cfg(root, machine)?;
+    // Keeps the configuration locks while queueing (#2000): the image operation is provisioned from the configuration's layout and image policy.
     let _locks = crate::hold_write::acquire_mutation_locks(root, machine, &cfg, &selected)?;
     let entries = mount_entries();
     let kind = box_kind(&entries);
@@ -691,6 +692,7 @@ pub(crate) fn image_unmount_cli(
     crate::ensure_states::require_fixture()?;
     let (control, worktrees, tools) = mount_ctx(root, machine)?;
     let (cfg, selected) = crate::active_state::load_cfg(root, machine)?;
+    // Keeps the configuration locks while queueing (#2000): the image operation is provisioned from the configuration's layout and image policy.
     let _locks = crate::hold_write::acquire_mutation_locks(root, machine, &cfg, &selected)?;
     // Python loads the image first (a non-image slot refuses in
     // the handler) and asserts use of its location, which may not
@@ -731,6 +733,7 @@ pub(crate) fn image_grow_cli(
     crate::ensure_states::require_fixture()?;
     let (control, worktrees, tools) = mount_ctx(root, machine)?;
     let (cfg, selected) = crate::active_state::load_cfg(root, machine)?;
+    // Keeps the configuration locks while queueing (#2000): the image operation is provisioned from the configuration's layout and image policy.
     let _locks = crate::hold_write::acquire_mutation_locks(root, machine, &cfg, &selected)?;
     let slot_path = |_: &str, slot: &str| worktrees.join(slot);
     let ctx = crate::imagecmd::MountCtx {
@@ -771,6 +774,7 @@ pub(crate) fn image_convert_cli(
     crate::ensure_states::require_fixture()?;
     let config = crate::config_validate::load_config(root, machine)?;
     let (cfg, selected) = crate::active_state::load_cfg(root, machine)?;
+    // Keeps the configuration locks while queueing (#2000): the image operation is provisioned from the configuration's layout and image policy.
     let _locks = crate::hold_write::acquire_mutation_locks(root, machine, &cfg, &selected)?;
     crate::ensure_states::refuse_partial_state(&cfg.control)?;
     let state = crate::active_state::parse_state(root, machine)?;
@@ -1290,6 +1294,7 @@ pub(crate) fn wt_migrate_cli(
     }
     // Mutation locks, then the migratable gate in Python's order.
     let (cfg, selected) = crate::active_state::load_cfg(root, machine)?;
+    // Keeps the configuration locks while queueing (#2000): the image operation is provisioned from the configuration's layout and image policy.
     let _locks = crate::hold_write::acquire_mutation_locks(root, machine, &cfg, &selected)?;
     if !slot_path.is_dir() {
         return Ok(migrate_refusal(&format!(

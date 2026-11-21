@@ -143,6 +143,7 @@ pub(crate) fn recover_ownerless_agent_cache(
         let pid = coordinator_pid.ok_or("--apply requires --coordinator-pid")?;
         read_process_identity(pid)?;
     }
+    // Keeps the configuration locks while queueing (#2000): the cache recovery is judged from the configuration's cache policy and layout.
     let _locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
     refuse_partial_state(&cfg.control)?;
     // Interrupted-journal outcomes (kind match only, as in Python's

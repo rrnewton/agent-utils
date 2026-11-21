@@ -221,6 +221,7 @@ pub(crate) fn recover_ownerless_agent_worktree(
     }
     validate_name(&name, "slot")?;
     let relative = lexical.to_string_lossy().into_owned();
+    // Keeps the configuration locks while queueing (#2000): the ownerless recovery is judged from the configuration's layout and remotes.
     let _locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
     refuse_partial_state(&cfg.control)?;
     // Interrupted-journal outcomes.

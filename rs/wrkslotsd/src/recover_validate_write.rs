@@ -1413,6 +1413,7 @@ pub(crate) fn recover_absent_validate_rows(
         let (planned, already, active, archives) = classified.unwrap();
         if !apply {
             let lock_started = std::time::Instant::now();
+            // Keeps the configuration locks while queueing (#2000): the validation recovery is judged from the configuration's layout and validation policy.
             let _locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
             if !history_proof_matches(root, &cfg, &proof) {
                 continue;
@@ -1421,6 +1422,7 @@ pub(crate) fn recover_absent_validate_rows(
             let _ = lock_started;
             return Ok(plan_outcomes(&rows, &planned, &already, &input_sha256));
         }
+        // Keeps the configuration locks while queueing (#2000): the validation recovery is judged from the configuration's layout and validation policy.
         let lock_started = std::time::Instant::now();
         let _locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
         if !history_proof_matches(root, &cfg, &proof) {
@@ -1448,6 +1450,7 @@ pub(crate) fn recover_absent_validate_rows(
         let payload = json!({"schema": 1, "rows": outcomes});
         return Ok(with_lock_seconds(payload, lock_started));
     }
+    // Keeps the configuration locks while queueing (#2000): the validation recovery is judged from the configuration's layout and validation policy.
     let lock_started = std::time::Instant::now();
     let _locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
     refuse_partial_state(&cfg.control)?;

@@ -22,7 +22,8 @@ use crate::handoff_state::{identity_to_obj, read_regular_file_identity, sidecar_
 use crate::handoff_write::{committed_project_file, validate_publication, write_noreplace};
 use crate::heartbeat_write::{assert_caller, identity_value};
 use crate::hold_write::{
-    acquire_mutation_locks, active_document, refuse_target_storage, storage_absent, validate_global,
+    acquire_mutation_locks_releasing_config, active_document, refuse_target_storage,
+    storage_absent, validate_global,
 };
 use crate::journals_state::parse_journals;
 use crate::status_state::read_process_identity;
@@ -51,7 +52,9 @@ pub(crate) fn read_handoff(
     if adopt_legacy_change {
         return Err("--adopt-legacy-change is unavailable because handoff sidecars are immutable once published; preserve both artifacts for manual review".to_string());
     }
-    let _locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
+    // Queues without the configuration locks (#2000): the read event is built
+    // only from the re-judged record and its handoff artifact.
+    let _locks = acquire_mutation_locks_releasing_config(root, machine_override, &cfg, &selected)?;
     refuse_partial_state(&cfg.control)?;
     let journals = parse_journals(root)?;
     if let Some(names) = journals.get("journals").and_then(Value::as_array) {

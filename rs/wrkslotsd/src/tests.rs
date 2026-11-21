@@ -7070,6 +7070,7 @@ fn flat_cfg(scratch: &Scratch) -> crate::active_state::Cfg {
         eden_backing_paths: Vec::new(),
         validation_exclusion_roots: Vec::new(),
         remote_ssh_commands: Vec::new(),
+        config_sha256: String::new(),
     }
 }
 
@@ -7205,6 +7206,80 @@ fn append_refuses_an_active_record_from_a_stale_previous_revision() {
     assert!(error.contains("currently ends at revision 1"), "{error}");
     assert_eq!(event_names(&events), before);
     replay(&events).expect("the log still replays");
+}
+
+#[test]
+fn mutation_lock_identity_gate_refuses_a_config_change_since_load() {
+    // #2000: the mutation-lock re-check gates on the configuration
+    // file's hash, so a change to a field the Rust `Cfg` does not
+    // carry (heartbeat_ttl_seconds) still refuses, fail-closed.
+    let scratch = Scratch::new();
+    let root = scratch.0.join("project");
+    fs::create_dir_all(&root).expect("project root");
+    fs::write(root.join("liveness.py"), "#!/usr/bin/env python3\n").expect("liveness file");
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("repository root");
+    let output = python_command()
+        .arg("-c")
+        .arg("import sys; sys.path.insert(0, sys.argv[1]); from wrkslots import cli; raise SystemExit(cli.main(['--machine', 'node-a', 'init', sys.argv[2], '--liveness-command', 'liveness.py']))")
+        .arg(repository.join("py"))
+        .arg(&root)
+        .output()
+        .expect("run Python init");
+    assert!(
+        output.status.success(),
+        "init: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (cfg, selected) = crate::active_state::load_cfg(Some(&root), None).expect("load cfg");
+    assert!(!cfg.config_sha256.is_empty());
+    // The unchanged configuration still takes the locks.
+    drop(
+        crate::hold_write::acquire_mutation_locks(Some(&root), None, &cfg, &selected)
+            .expect("unchanged config locks"),
+    );
+    let config_path = root.join(".wrkslots.yml");
+    let text = fs::read_to_string(&config_path).expect("read config");
+    let changed = text.replacen(
+        "heartbeat_ttl_seconds: 600",
+        "heartbeat_ttl_seconds: 601",
+        1,
+    );
+    if changed == text {
+        // JSON-shaped or differently spaced rendering: change the value token generically.
+        let position = text.find("heartbeat_ttl_seconds").expect("ttl key present");
+        let rest = &text[position..];
+        let digits: String = rest
+            .chars()
+            .skip_while(|c| !c.is_ascii_digit())
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        assert!(!digits.is_empty(), "ttl value in {text}");
+        let bumped = (digits.parse::<i64>().unwrap() + 1).to_string();
+        let tail = &text[position..];
+        fs::write(
+            &config_path,
+            format!(
+                "{}{}",
+                &text[..position],
+                tail.replacen(&digits, &bumped, 1)
+            ),
+        )
+        .expect("write changed config");
+    } else {
+        fs::write(&config_path, changed).expect("write changed config");
+    }
+    let error = match crate::hold_write::acquire_mutation_locks(Some(&root), None, &cfg, &selected)
+    {
+        Ok(_locks) => panic!("a changed configuration must refuse under the identity gate"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains("configuration changed while this command was starting"),
+        "{error}"
+    );
 }
 
 #[test]

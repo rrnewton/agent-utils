@@ -23,7 +23,9 @@ use crate::global_state::{event_log_status, load_event_chain, EventLogStatus};
 use crate::handoff_state::{
     identity_to_obj, read_regular_file_identity, sidecar_path, FileIdentity,
 };
-use crate::hold_write::{acquire_mutation_locks, active_document, validate_global};
+use crate::hold_write::{
+    acquire_mutation_locks_releasing_config, active_document, validate_global,
+};
 use crate::journals_state::parse_journals;
 use crate::status_state::{process_state, read_process_identity, Identity};
 
@@ -606,7 +608,9 @@ pub(crate) fn write_handoff(
     }
     let source = canonical_source(&requested, &contents, &source_identity)?;
     assert_external(&source)?;
-    let _locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
+    // Queues without the configuration locks (#2000): the sidecar is built only
+    // from the re-judged record and the supplied contents.
+    let _locks = acquire_mutation_locks_releasing_config(root, machine_override, &cfg, &selected)?;
     refuse_partial_state(&cfg.control)?;
     crate::hold_write::report_dead_findings(root, slot)?;
     let journals = parse_journals(root)?;

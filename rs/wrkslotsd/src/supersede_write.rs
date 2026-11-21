@@ -23,7 +23,8 @@ use crate::ensure_states::{
 use crate::global_state::load_event_chain;
 use crate::heartbeat_write::{assert_caller, identity_value};
 use crate::hold_write::{
-    acquire_mutation_locks, active_document, refuse_target_storage, validate_global,
+    acquire_mutation_locks_releasing_config, active_document, refuse_target_storage,
+    validate_global,
 };
 use crate::journals_state::parse_journals;
 use crate::proc_reads;
@@ -314,7 +315,9 @@ pub(crate) fn supersede_handoff(
     let coordinator = read_process_identity(coordinator_pid)?;
     assert_caller(&coordinator, "coordinator")?;
     let successor = read_process_identity(owner_pid)?;
-    let _locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
+    // Queues without the configuration locks (#2000): the write replaces only
+    // agent/owner/generation/heartbeat on the re-judged record.
+    let _locks = acquire_mutation_locks_releasing_config(root, machine_override, &cfg, &selected)?;
     refuse_partial_state(&cfg.control)?;
     crate::hold_write::report_dead_findings(root, slot)?;
     let journals = parse_journals(root)?;

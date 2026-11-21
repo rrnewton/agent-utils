@@ -23,7 +23,8 @@ use crate::heartbeat_write::{
     assert_caller, refuse_seal_overlap_action, release_in_effect, seal_paths,
 };
 use crate::hold_write::{
-    acquire_mutation_locks, active_document, current_hold, refuse_target_storage, validate_global,
+    acquire_mutation_locks_releasing_config, active_document, current_hold, refuse_target_storage,
+    validate_global,
 };
 use crate::journals_state::parse_journals;
 use crate::status_state::{process_state, read_process_identity, Identity};
@@ -49,7 +50,9 @@ pub(crate) fn release_slot(
     validate_name(agent, "agent")?;
     let supplied = read_process_identity(owner_pid)?;
     assert_caller(&supplied, "owner")?;
-    let _locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
+    // Queues without the configuration locks (#2000): the release event is built
+    // only from the re-judged record and its handoff artifact.
+    let _locks = acquire_mutation_locks_releasing_config(root, machine_override, &cfg, &selected)?;
     refuse_partial_state_allow_seals(&cfg.control)?;
     validate_global(root, &cfg)?;
     crate::hold_write::report_dead_findings(root, slot)?;

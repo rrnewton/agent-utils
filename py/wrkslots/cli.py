@@ -16862,6 +16862,8 @@ def _cmd_quarantine_journal(args: argparse.Namespace) -> int:
             f"do not match {plan.path.absolute()} sha256={plan.identity.sha256}; "
             "rerun the dry run"
         )
+    # Keeps the configuration locks while queueing (#2000): the quarantine destination and its
+    # event are judged from the configuration's control layout.
     with _mutation_locks(config, args.wait_lock):
         _assert_caller_process(coordinator, "coordinator")
         _refuse_partial_state(config)
@@ -17145,6 +17147,8 @@ def _cmd_recover_tail_event(args: argparse.Namespace) -> int:
             "with the exact values the dry run printed"
         )
     coordinator = _capture_caller_process(args.coordinator_pid, "coordinator")
+    # Keeps the configuration locks while queueing (#2000): the set-aside destination and
+    # machine shard are judged from the configuration's control layout.
     with _mutation_locks(config, args.wait_lock):
         _assert_caller_process(coordinator, "coordinator")
         _refuse_partial_state(config)
@@ -31782,6 +31786,8 @@ def _cmd_ttl_teardown(args: argparse.Namespace) -> int:
             for checkout, checkout_receipt in zip(before.checkouts, rescue["checkouts"])
         ],
     }
+    # Keeps the configuration locks while queueing (#2000): the rescue refs, archive write and
+    # slot teardown are judged from the configuration's layout and rescue-ref policy.
     with _mutation_locks(config, args.wait_lock):
         _refuse_partial_state(config)
         _assert_no_journal(config)
@@ -44829,6 +44835,8 @@ def _cmd_init(args: argparse.Namespace) -> int:
     config = _load_config(str(root), machine)
     worktrees = config.worktrees
     control = config.control
+    # Keeps the configuration locks while queueing (#2000): it writes the initial registry
+    # from the configuration's layout, worktrees and control paths themselves.
     with _mutation_locks(config, args.wait_lock):
         _recover_partial_updates(config, True)
         _refuse_partial_state(config)
@@ -49742,6 +49750,8 @@ def _cmd_register(
     coordinator_lease = _capture_caller_process(
         args.coordinator_pid, "coordinator"
     )
+    # Keeps the configuration locks while queueing (#2000): the new record is stamped with
+    # heartbeat_ttl_seconds and judged against the slot cap and identity in the configuration.
     with _mutation_locks(config, args.wait_lock):
         _refuse_partial_state(config)
         _assert_no_journal(config)
@@ -49926,6 +49936,8 @@ def _cmd_import_existing(args: argparse.Namespace) -> int:
     coordinator_lease = _capture_caller_process(
         args.coordinator_pid, "coordinator"
     )
+    # Keeps the configuration locks while queueing (#2000): the imported record is stamped
+    # with heartbeat_ttl_seconds, layout and identity from the configuration.
     with _mutation_locks(config, args.wait_lock):
         _refuse_partial_state(config)
         _assert_no_journal(config)
@@ -51027,9 +51039,23 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
             # record from the prepared state and writes only owner,
             # agent, generation and heartbeat time, none of which a
             # configuration value feeds.
+            fallback_config_sha256 = _registry_identity(config).config_sha256
             with _mutation_locks(
                 config, args.wait_lock, release_config_after_check=True
             ):
+                # Fail closed on the configuration only (#2000): as the
+                # heartbeat fallback below. Registry churn by other
+                # writers is re-judged fresh by the locked body and must
+                # never refuse here, or this fallback would refuse in
+                # exactly the storm it exists for.
+                if _registry_identity(config).config_sha256 != fallback_config_sha256:
+                    raise Refusal(
+                        "configuration changed while this command was queueing "
+                        "for its locks. "
+                        "state: REFUSED -- nothing was written",
+                        remedy="retry 'wrkslots transfer-owner' after the "
+                        "other wrkslots mutations exit",
+                    )
                 (
                     outcome,
                     final_record,
@@ -51154,7 +51180,9 @@ def _cmd_supersede_handoff(args: argparse.Namespace) -> int:
         raise Refusal("handoff supersession requires a non-empty --reason")
     coordinator = _capture_caller_process(args.coordinator_pid, "coordinator")
     successor = _read_process_identity(args.owner_pid)
-    with _mutation_locks(config, args.wait_lock):
+    # Queues without the configuration locks (#2000): the write replaces only
+    # agent/owner/generation/heartbeat on the re-judged record.
+    with _mutation_locks(config, args.wait_lock, release_config_after_check=True):
         _refuse_partial_state(config)
         _assert_no_journal(config)
         states, archives = _validate_global_state(config)
@@ -51249,6 +51277,8 @@ def _cmd_recover_unbound_owner(args: argparse.Namespace) -> int:
     if not validation or any(not item.strip() for item in validation):
         raise Refusal("coordinator recovery requires non-empty --validation evidence")
     coordinator = _capture_caller_process(args.coordinator_pid, "coordinator")
+    # Keeps the configuration locks while queueing (#2000): the recovery handoff and storage
+    # judgement are derived from the configuration's layout and checkout paths.
     with _mutation_locks(config, args.wait_lock):
         _refuse_partial_state(config)
         _assert_no_journal(config, wait_seconds=float(args.wait_lock))
@@ -51580,11 +51610,15 @@ def _cmd_relocate_repository(args: argparse.Namespace) -> int:
             if _history_tip_proof(config) == proof:
                 raise
             continue
+        # Keeps the configuration locks while queueing (#2000): the repository relocation rewrites
+        # checkout paths judged against the configuration's root and layout.
         with _mutation_locks(config, args.wait_lock):
             if _history_tip_proof(config) != proof:
                 continue
             _refuse_partial_state(config)
             return commit(prepared, proven=True)
+    # Keeps the configuration locks while queueing (#2000): the repository relocation rewrites
+    # checkout paths judged against the configuration's root and layout.
     with _mutation_locks(config, args.wait_lock):
         _refuse_partial_state(config)
         _assert_no_journal(config)
@@ -51988,9 +52022,25 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
             # without the configuration locks while it queues (#2000):
             # it validates from the in-memory configuration and writes
             # only the heartbeat time under the ACTIVE locks.
+            fallback_config_sha256 = _registry_identity(config).config_sha256
             with _mutation_locks(
                 config, wait_seconds, release_config_after_check=True
             ):
+                # Fail closed on the configuration only (#2000): the
+                # fallback validates from the in-memory configuration, so
+                # a configuration change while it queued must refuse,
+                # never write. Registry churn by other writers is not
+                # gated here: the locked body re-validates it fresh, and
+                # refusing on it would make this fallback refuse in
+                # exactly the storm it exists for.
+                if _registry_identity(config).config_sha256 != fallback_config_sha256:
+                    raise Refusal(
+                        "configuration changed while this command was queueing "
+                        "for its locks. "
+                        "state: REFUSED -- nothing was written",
+                        remedy="retry 'wrkslots heartbeat' after the other "
+                        "wrkslots mutations exit",
+                    )
                 updated, warnings = locked_body_captured()
     finally:
         for stdout_text, stderr_text in captured_notes:
@@ -52025,7 +52075,9 @@ def _cmd_release(args: argparse.Namespace) -> int:
     _validate_name(args.agent, "agent")
     owner = _capture_caller_process(args.owner_pid, "owner")
     tail = "state: REFUSED -- the slot was not released and its owner still holds it."
-    with _mutation_locks(config, args.wait_lock):
+    # Queues without the configuration locks (#2000): the write is an owner-released
+    # event built only from the re-judged record and its handoff artifact.
+    with _mutation_locks(config, args.wait_lock, release_config_after_check=True):
         _refuse_partial_state(config, allow_validate_batch_seals=True)
         states, archives = _validate_global_state(config)
         state = _load_active(config)
@@ -52197,6 +52249,8 @@ def _cmd_capture_drafts(args: argparse.Namespace) -> int:
         if getattr(args, "coordinator_pid", None) is not None else None
     )
     results: list[tuple[str, eden.DraftLedger, tuple[str, ...]]] = []
+    # Keeps the configuration locks while queueing (#2000): the draft ledger path and
+    # candidates are derived from the configuration's Eden mount root and slot layout.
     with _mutation_locks(config, args.wait_lock):
         _refuse_partial_state(config)
         _assert_no_journal(config, target_slot=args.slot)
@@ -52421,7 +52475,9 @@ def _cmd_hold(args: argparse.Namespace) -> int:
     reason = args.reason.strip()
     if not reason:
         raise Refusal("hold requires a non-empty --reason")
-    with _mutation_locks(config, args.wait_lock):
+    # Queues without the configuration locks (#2000): the write is a hold file and
+    # event built only from the re-judged record and the --reason argument.
+    with _mutation_locks(config, args.wait_lock, release_config_after_check=True):
         _refuse_partial_state(config)
         _assert_no_journal(config, target_slot=args.slot)
         states, _archives = _validate_global_state(config)
@@ -52506,7 +52562,9 @@ def _cmd_unhold(args: argparse.Namespace) -> int:
     _reset_dead_mount_findings()
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
-    with _mutation_locks(config, args.wait_lock):
+    # Queues without the configuration locks (#2000): the write removes the hold file
+    # and appends an event built only from the re-judged record.
+    with _mutation_locks(config, args.wait_lock, release_config_after_check=True):
         _refuse_partial_state(config)
         _assert_no_journal(config, target_slot=args.slot)
         states, _archives = _validate_global_state(config)
@@ -52656,6 +52714,8 @@ def _cmd_adopt_checkout(args: argparse.Namespace) -> int:
         raise Refusal(
             f"adopt-checkout path must lie inside the project: {raw_path!r}"
         ) from None
+    # Keeps the configuration locks while queueing (#2000): the declared checkout is stamped
+    # with the configuration's default remote and landed ref.
     with _mutation_locks(config, args.wait_lock):
         _refuse_partial_state(config)
         _assert_no_journal(config)
@@ -52813,7 +52873,11 @@ def _cmd_read_handoff(args: argparse.Namespace) -> int:
     except Refusal as exc:
         pre_artifact = None
         pre_artifact_refusal = exc
-    with _mutation_locks(config, args.wait_lock, shared=not pre_journals):
+    # Queues without the configuration locks (#2000): this phase compares lock-free
+    # fingerprints and writes only a handoff-read event from the re-judged record.
+    with _mutation_locks(
+        config, args.wait_lock, shared=not pre_journals, release_config_after_check=True
+    ):
         _refuse_partial_state(config)
         if pre_journals:
             _assert_no_journal(config)
@@ -52896,7 +52960,8 @@ def _cmd_read_handoff(args: argparse.Namespace) -> int:
     )
     pre2_sidecar = _load_handoff_sidecar(config, pre2_record)
     pre2_artifact = _resolve_handoff_artifact(config, pre2_record, pre2_slot_path)
-    with _mutation_locks(config, args.wait_lock):
+    # Queues without the configuration locks (#2000): as the first phase above.
+    with _mutation_locks(config, args.wait_lock, release_config_after_check=True):
         _refuse_partial_state(config)
         if pre2_journals:
             _assert_no_journal(config)
@@ -53040,7 +53105,9 @@ def _cmd_write_handoff(args: argparse.Namespace) -> int:
         requested_source, contents, _source_identity, "handoff input"
     )
     _assert_external_handoff_source(source)
-    with _mutation_locks(config, args.wait_lock):
+    # Queues without the configuration locks (#2000): the sidecar is built only from
+    # the re-judged record and the supplied contents.
+    with _mutation_locks(config, args.wait_lock, release_config_after_check=True):
         _refuse_partial_state(config)
         _assert_no_journal(config)
         states, _archives = _validate_global_state(config, require_repository=False)
@@ -53637,6 +53704,8 @@ def _retirement_outcome_after_refusal(
             f"{refusal}"
         ) from refusal
     try:
+        # Keeps the configuration locks while queueing (#2000): part of the
+        # removal path, whose salvage and layout judgements come from it.
         with _mutation_locks(
             config,
             _remaining_lock_wait(deadline),
@@ -53738,6 +53807,8 @@ def _confirm_unchanged_after_target_storage_drift(
     """
 
     try:
+        # Keeps the configuration locks while queueing (#2000): part of the
+        # removal path, whose storage judgement comes from its layout.
         with _mutation_locks(
             config,
             _remaining_lock_wait(deadline),
@@ -60489,6 +60560,8 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
     for slot in only:
         _validate_name(slot, "slot")
     with contextlib.ExitStack() as locks:
+        # Keeps the configuration locks while queueing (#2000): the deletions are selected by
+        # the configuration's cache_globs and repo_cache_globs.
         locks.enter_context(_mutation_locks(config, args.wait_lock))
         _refuse_partial_state(config)
         # #1791: retirement is an apply-only mutation.  A report run (no
@@ -61774,6 +61847,8 @@ def _cmd_share_submodules(args: argparse.Namespace) -> int:
         return 0
 
     if args.apply:
+        # Keeps the configuration locks while queueing (#2000): the submodule sharing it
+        # performs is the configuration's share_submodules policy in action.
         with _mutation_locks(config, args.wait_lock):
             _refuse_partial_state(config)
             _assert_no_journal(config)
@@ -70072,6 +70147,8 @@ def _cmd_finish(args: argparse.Namespace) -> int:
     # #1367/#1276); under the lock it is reused only while the record,
     # fingerprint, and landed tips still match, else it is regathered.
     prepared_accounting = _prepare_finish_accounting(config, args.slot)
+    # Keeps the configuration locks while queueing (#2000): the handoff accounting is judged
+    # against the configuration's provisioned_allowlist and checkout layout.
     with _mutation_locks(config, args.wait_lock):
         _refuse_partial_state(config, allow_validate_batch_seals=True)
         states, archives = _validate_global_state(config)
@@ -71164,6 +71241,8 @@ def _prepare_retirement_removal(
             # leaves the attempt in the log for the queue's rotation. This
             # append is the one record-sized lock hold of the lock-free
             # validation; the commit below re-checks the identity it leaves.
+            # Keeps the configuration locks while queueing (#2000): the
+            # removal preparation is judged from its layout/salvage policy.
             attempt_scope = (
                 _mutation_locks(config, float(args.wait_lock))
                 if wait_deadline is None
@@ -71679,6 +71758,8 @@ def _reconcile_deleted_bind_validate_row(
     item = AbsentValidateRow(
         record.machine, record.slot, record.generation, _record_sha256(record)
     )
+    # Keeps the configuration locks while queueing (#2000): it is part of the validation-
+    # removal path, judged from the configuration's layout and storage policy.
     with _mutation_locks(config, args.wait_lock):
         _refuse_partial_state(config)
         planned = _plan_absent_validate_rows(config, (item,))
@@ -72106,6 +72187,9 @@ def _cmd_remove_in_scope(
                 wait_deadline=getattr(args, "_wait_deadline", None),
             )
     wait_deadline = getattr(args, "_wait_deadline", None)
+    # Without a prepared removal this keeps the configuration locks while
+    # queueing (#2000): removal deletes/salvages judged from the config's
+    # layout, salvage remotes and hooks; a prepared removal releases.
     lock_scope = (
         _mutation_locks(
             config,
@@ -73016,6 +73100,8 @@ def _seal_validate_batch_targets(
     ``owned_seal`` receives the exact seal file this invocation publishes.
     """
 
+    # Keeps the configuration locks while queueing (#2000): the batch seal is judged from the
+    # configuration's validation layout and exclusion policy.
     with _mutation_locks(config, wait_seconds):
         _refuse_partial_state(config)
         states, archives = _validate_global_state(
@@ -73418,6 +73504,8 @@ def _remove_validate_batch_grouped(
         )
         census_budget.remaining_seconds()
     except Refusal as exc:
+        # Keeps the configuration locks while queueing (#2000): it is part of the validation-
+        # removal path, judged from the configuration's layout and salvage policy.
         with _mutation_locks(config, args.wait_lock):
             for slot, generation in prepared_slots:
                 prepared = contexts[slot].prepared_finish
@@ -73481,6 +73569,9 @@ def _remove_validate_batch_grouped(
         )
         try:
             census_budget.remaining_seconds()
+            # Keeps the configuration locks while queueing (#2000): it is part of the
+            # validation-removal path, judged from the configuration's layout and salvage
+            # policy.
             with _mutation_locks(config, args.wait_lock):
                 _refuse_partial_state(
                     config, allow_validate_batch_seals=True
@@ -73774,6 +73865,9 @@ def _remove_validate_batch(
                 )
     finally:
         try:
+            # Keeps the configuration locks while queueing (#2000): it is part of the
+            # validation-removal path, judged from the configuration's layout and salvage
+            # policy.
             with _mutation_locks(config, args.wait_lock):
                 # A refused invocation may find another operation's seal here; only
                 # the exact file this invocation published is its to retire.
@@ -76381,6 +76475,8 @@ def _interrupted_removal_journal(
 
     if _removal_journal_candidate(config, slot) is None:
         return None
+    # Keeps the configuration locks while queueing (#2000): it is part of the removal path,
+    # whose salvage and layout judgements come from the configuration.
     with _mutation_locks(config, wait_seconds):
         return _removal_journal_candidate(config, slot)
 
@@ -81552,6 +81648,8 @@ def _frozen_release_classify(
     """
 
     coordinator, runner, handoff_writer, proof_fd = processes
+    # Keeps the configuration locks while queueing (#2000): the frozen-release classification
+    # is judged from the configuration's layout and storage policy.
     with _mutation_locks(config, args.wait_lock):
         _assert_remove_processes(coordinator, runner, handoff_writer, proof_fd)
         _refuse_partial_state(config, allow_validate_batch_seals=True)
@@ -85316,6 +85414,8 @@ def _abandon_prepared_ownerless_agent_journal(
             "without NUL bytes"
         )
     coordinator = processes.coordinator
+    # Keeps the configuration locks while queueing (#2000): the ownerless recovery it abandons
+    # was judged from the configuration's layout and remotes.
     with _mutation_locks(config, args.wait_lock):
         processes.assert_current(coordinator)
         _refuse_partial_state(config)
@@ -85406,6 +85506,8 @@ def _cmd_recover_ownerless_agent_worktree(args: argparse.Namespace) -> int:
         coordinator = processes.coordinator
     else:
         coordinator = _read_process_identity(os.getpid())
+    # Keeps the configuration locks while queueing (#2000): the ownerless recovery rewrites
+    # worktrees judged from the configuration's layout and remotes.
     with _mutation_locks(config, args.wait_lock), _remote_proof_scope(remote_proof):
         if processes is not None:
             processes.assert_current(coordinator)
@@ -87821,6 +87923,8 @@ def _cmd_recover_ownerless_agent_clone_checked(args: argparse.Namespace) -> int:
         args, "ownerless agent clone recovery"
     )
     coordinator = processes.coordinator
+    # Keeps the configuration locks while queueing (#2000): the ownerless recovery rewrites
+    # clones judged from the configuration's layout and remotes.
     with _mutation_locks(config, args.wait_lock):
         processes.assert_current(coordinator)
         _refuse_partial_state(config)
@@ -88094,6 +88198,8 @@ def _cmd_recover_ownerless_agent_cache(args: argparse.Namespace) -> int:
         coordinator = processes.coordinator
     else:
         coordinator = _read_process_identity(os.getpid())
+    # Keeps the configuration locks while queueing (#2000): the ownerless recovery rewrites
+    # caches judged from the configuration's cache policy and layout.
     with _mutation_locks(config, args.wait_lock):
         if processes is not None:
             processes.assert_current(coordinator)
@@ -90941,6 +91047,8 @@ def _recover_absent_agent_row_item(
     Everything it prints is the single-row command's output.
     """
 
+    # Keeps the configuration locks while queueing (#2000): the absent-row recovery is judged
+    # from the configuration's layout and salvage policy.
     with _mutation_locks(config, wait_seconds):
         _refuse_partial_state(config)
         if _outstanding_journals(config):
@@ -100217,6 +100325,8 @@ def _cmd_recover_absent_validate_rows(args: argparse.Namespace) -> int:
                 )
                 return 0
         lock_started = time.monotonic()
+        # Keeps the configuration locks while queueing (#2000): the absent-row recovery is
+        # judged from the configuration's layout and validation policy.
         with _mutation_locks(config, args.wait_lock):
             _refuse_partial_state(config)
             journals = _outstanding_journals(config, stream_events=True)
@@ -100475,6 +100585,8 @@ def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
     prepared: list[
         tuple[str, str, str, str | None, Path, _PrivateCleanupIdentity]
     ] = []
+    # Keeps the configuration locks while queueing (#2000): the ownerless validation recovery
+    # is judged from the configuration's layout and validation policy.
     with _mutation_locks(config, args.wait_lock):
         _assert_remove_processes(coordinator, runner, handoff_writer, proof_fd)
         _refuse_partial_state(config, allow_validate_batch_seals=True)
@@ -101154,6 +101266,8 @@ def _cmd_recover(
                     "still refused: " + "; ".join(_refused)
                 )
     exact_create_before_seal = False
+    # Keeps the configuration locks while queueing (#2000): the recovery it drives rewrites
+    # rows and checkouts judged from the configuration's layout, remotes and salvage policy.
     with _mutation_locks(config, args.wait_lock):
         _assert_remove_processes(coordinator, runner, handoff_writer, proof_fd)
         recovered_partial = _recover_partial_updates(config, args.discard_partial)

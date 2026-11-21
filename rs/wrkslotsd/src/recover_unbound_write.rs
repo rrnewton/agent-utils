@@ -58,6 +58,7 @@ pub(crate) fn recover_unbound_owner(
     validate_name(slot, "slot")?;
     let coordinator = read_process_identity(coordinator_pid)?;
     assert_caller(&coordinator, "coordinator")?;
+    // Keeps the configuration locks while queueing (#2000): the unbound recovery is judged from the configuration's layout and checkout paths.
     let _locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
     refuse_partial_state(&cfg.control)?;
     let journals = parse_journals(root)?;

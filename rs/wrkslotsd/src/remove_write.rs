@@ -5017,6 +5017,7 @@ pub(crate) fn remove_slot(
             crate::journals_state::wait_for_control_change(&cfg.control, remaining);
         }
     }
+    // Keeps the configuration locks while queueing (#2000): the removal deletes and salvages judged from the configuration's layout, salvage remotes and hooks.
     let locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
     refuse_partial_state(&cfg.control)?;
     let journals = parse_journals(root)?;
@@ -5547,6 +5548,7 @@ pub(crate) fn remove_slot(
     // Re-take the registry lock only to record completion (#894).  Other
     // slots may have changed while the deletion ran unlocked; this slot's
     // record must still be the fenced one.
+    // Keeps the configuration locks while queueing (#2000): the removal deletes and salvages judged from the configuration's layout, salvage remotes and hooks.
     let _locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
     let archives_before: Value = if archives_path.exists() {
         serde_json::from_str(
@@ -5859,6 +5861,7 @@ mod private_history_tests {
             eden_backing_paths: Vec::new(),
             validation_exclusion_roots: Vec::new(),
             remote_ssh_commands: Vec::new(),
+            config_sha256: String::new(),
         };
         let history = submodule_private_history(&cfg, &repo, &repo, &kept, false)
             .unwrap()
@@ -5900,6 +5903,7 @@ mod private_history_tests {
             eden_backing_paths: Vec::new(),
             validation_exclusion_roots: Vec::new(),
             remote_ssh_commands: Vec::new(),
+            config_sha256: String::new(),
         };
         (base, repo, kept, cfg)
     }

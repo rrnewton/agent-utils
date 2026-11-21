@@ -337,7 +337,15 @@ pub(crate) fn acquire_lock_with_deadline(
     match flock_wait(&file, deadline) {
         Ok(()) => {
             if let Some(name) = lock_order_class(path) {
-                lock_order_acquire(name)?;
+                // A violation refusal must not leak the intent record:
+                // the stack is thread-local, so a leaked entry would
+                // poison the next acquisition on this thread (the
+                // order-check flake seen in the full test run).
+                if let Err(error) = lock_order_acquire(name) {
+                    drop(_intent);
+                    lock_order_release("ACTIVE.global.intent");
+                    return Err(error);
+                }
             }
             drop(_intent);
             lock_order_release("ACTIVE.global.intent");

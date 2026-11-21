@@ -2698,6 +2698,7 @@ pub(crate) fn finish_slot(
     // Accounting gathered with no lock held (#1488); reused under the
     // lock only while the record and checkout tips still match.
     let prepared = prepare_finish_accounting(root, &cfg, &selected, &config, slot);
+    // Keeps the configuration locks while queueing (#2000): the handoff accounting is judged against the configuration's provisioned allowlist and layout.
     let _locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
     refuse_partial_state_allow_seals(&cfg.control)?;
     validate_global(root, &cfg)?;

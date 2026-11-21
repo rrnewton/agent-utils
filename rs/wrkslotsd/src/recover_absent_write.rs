@@ -186,6 +186,7 @@ pub(crate) fn recover_absent_agent_row(
         None
     };
     let _ = coordinator;
+    // Keeps the configuration locks while queueing (#2000): the absent-row recovery is judged from the configuration's layout and salvage policy.
     let _locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
     refuse_partial_state(&cfg.control)?;
     // Other outstanding journals refuse before this row is judged.

@@ -334,6 +334,7 @@ pub(crate) fn recover_main(
     }
     let (cfg, selected) = load_cfg(root, machine_override)?;
     validate_name(&selected, "machine")?;
+    // Keeps the configuration locks while queueing (#2000): the recovery rewrites rows judged from the configuration's layout and remotes.
     let _locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
     // #1007: roll a lagging scoped journal forward before any other
     // refusal in this run; the repair persists even when the rest

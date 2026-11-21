@@ -56,6 +56,12 @@ pub(crate) struct Cfg {
     pub(crate) validation_exclusion_roots: Vec<PathBuf>,
     /// Declared per-remote SSH settings (#1940), from the config payload.
     pub(crate) remote_ssh_commands: Vec<Value>,
+    /// SHA-256 of the configuration file bytes this `Cfg` was loaded
+    /// from (#2000): the Rust mirror of the Python registry identity's
+    /// `config_sha256`, so a mutation-lock re-check can gate on the
+    /// whole configuration, not only the fields this struct carries.
+    /// Empty for fixture configurations built by hand in tests.
+    pub(crate) config_sha256: String,
 }
 
 impl Cfg {
@@ -1573,7 +1579,15 @@ pub(crate) fn load_cfg(
     let worktrees_path = PathBuf::from(text("worktrees")?);
     let (eden_backing_root, eden_backing_paths) =
         eden_backing_config(&config, &control_path, &worktrees_path);
+    let config_sha256 = {
+        use sha2::{Digest, Sha256};
+        let path = PathBuf::from(text("root")?).join(".wrkslots.yml");
+        std::fs::read(&path)
+            .map(|bytes| format!("{:x}", Sha256::digest(&bytes)))
+            .unwrap_or_default()
+    };
     let cfg = Cfg {
+        config_sha256,
         root: PathBuf::from(text("root")?),
         worktrees: worktrees_path,
         control: control_path,
@@ -1657,6 +1671,7 @@ mod eden_mount_tests {
             eden_backing_paths: Vec::new(),
             validation_exclusion_roots: Vec::new(),
             remote_ssh_commands: Vec::new(),
+            config_sha256: String::new(),
             root,
         }
     }

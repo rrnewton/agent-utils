@@ -18,6 +18,9 @@ if str(PY_ROOT) not in sys.path:
 import os  # noqa: E402
 
 os.environ.setdefault("WRKSLOTS_INIT_REPRESENTATION", "worktree")
+# The whole wrkslots suite runs with the lock-order assertion on
+# (#2000); production leaves WRKSLOTS_LOCK_ORDER_CHECK unset.
+os.environ["WRKSLOTS_LOCK_ORDER_CHECK"] = "1"
 
 import pytest  # noqa: E402
 

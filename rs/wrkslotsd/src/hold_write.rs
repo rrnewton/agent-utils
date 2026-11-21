@@ -178,12 +178,26 @@ fn acquire_mutation_locks_inner(
     let deadline = std::time::Instant::now() + wait;
     let config = acquire_config_lock_with_deadline(cfg, deadline)?;
     let (reloaded, reloaded_selected) = load_cfg(root, machine_override)?;
+    // Real identity gate (#2000): the configuration file's SHA-256
+    // (mirroring the Python registry identity's `config_sha256`) plus
+    // every field this edition's `Cfg` carries, not only the six
+    // path/layout fields this check used to compare. A hand-built
+    // fixture `Cfg` has no file hash; the field comparison still gates
+    // it. Anything the Rust `Cfg` does not carry at all is covered by
+    // the file hash, because `load_cfg` hashes the file it loaded.
     if reloaded_selected != selected
         || reloaded.root != cfg.root
         || reloaded.control != cfg.control
+        || reloaded.worktrees != cfg.worktrees
         || reloaded.layout != cfg.layout
         || reloaded.default_remote != cfg.default_remote
         || reloaded.default_landed_ref != cfg.default_landed_ref
+        || reloaded.machine != cfg.machine
+        || reloaded.harness_repo != cfg.harness_repo
+        || reloaded.eden_mount_root != cfg.eden_mount_root
+        || reloaded.validation_exclusion_roots != cfg.validation_exclusion_roots
+        || reloaded.remote_ssh_commands != cfg.remote_ssh_commands
+        || (!cfg.config_sha256.is_empty() && reloaded.config_sha256 != cfg.config_sha256)
     {
         return Err(
             "configuration changed while this command was starting; rerun so it uses one coherent policy"
@@ -549,6 +563,9 @@ pub(crate) fn acquire_config_lock_with_deadline(
         .mode(0o600)
         .open(&lock_file_path)
         .map_err(|error| {
+            // The order record is thread-local: never leak it on an
+            // error path (see ensure_states::acquire_lock_with_deadline).
+            crate::ensure_states::lock_order_release("project-root");
             format!(
                 "cannot open configuration lock {}: {error}",
                 lock_file_path.display()
@@ -556,7 +573,10 @@ pub(crate) fn acquire_config_lock_with_deadline(
         })?;
     match crate::ensure_states::flock_wait(&config_file, deadline) {
         Ok(()) => {
-            crate::ensure_states::lock_order_acquire("config.lock")?;
+            if let Err(error) = crate::ensure_states::lock_order_acquire("config.lock") {
+                crate::ensure_states::lock_order_release("project-root");
+                return Err(error);
+            }
             Ok(ConfigLock {
                 _file: file,
                 _config_file: Some(config_file),
@@ -784,7 +804,9 @@ pub(crate) fn hold_slot(
     if reason.is_empty() {
         return Err("hold requires a non-empty --reason".to_string());
     }
-    let _locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
+    // Queues without the configuration locks (#2000): the hold write is built
+    // only from the re-judged record and the reason argument.
+    let _locks = acquire_mutation_locks_releasing_config(root, machine_override, &cfg, &selected)?;
     refuse_partial_state(&cfg.control)?;
     let journals = parse_journals(root)?;
     if let Some(names) = journals.get("journals").and_then(Value::as_array) {
@@ -934,7 +956,9 @@ pub(crate) fn unhold_slot(
     let (cfg, selected): (Cfg, String) = load_cfg(root, machine_override)?;
     validate_name(&selected, "machine")?;
     validate_name(slot, "slot")?;
-    let _locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
+    // Queues without the configuration locks (#2000): releasing a hold writes
+    // only a hold-released event from the re-judged record.
+    let _locks = acquire_mutation_locks_releasing_config(root, machine_override, &cfg, &selected)?;
     refuse_partial_state(&cfg.control)?;
     let journals = parse_journals(root)?;
     if let Some(names) = journals.get("journals").and_then(Value::as_array) {
