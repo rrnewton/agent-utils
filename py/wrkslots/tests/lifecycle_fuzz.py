@@ -28,10 +28,12 @@ The gated subset is test_lifecycle_fuzz.py (seeds 1..4).
 from __future__ import annotations
 
 import argparse
+import atexit
 import dataclasses
 import json
 import os
 import random
+import signal
 import subprocess
 import sys
 import tempfile
@@ -245,11 +247,37 @@ def _wait_chain_loads(
     return state
 
 
+_ACTIVE: dict[str, object] = {}
+
+
+def _exit_sweep() -> None:
+    """Detach this run's slot images through wrkslots (#2048).
+
+    Every exit path funnels here (finally, atexit, signal), so a
+    run never leaves a mounted image for its rmtree to delete
+    under: that is what stranded loop devices in /tmp.
+    """
+    project = _ACTIVE.get("project")
+    trace = _ACTIVE.get("trace")
+    if isinstance(project, e2e.TestProject) and isinstance(trace, e2e.Trace):
+        try:
+            e2e._detach_project_images(project.root, trace)
+        except Exception:
+            pass
+
+
+def _on_signal(signum: int, _frame: object) -> None:
+    _exit_sweep()
+    os._exit(128 + signum)
+
+
 def _run_seed(
     seed: int, steps: int, base: Path, *, keep: bool, faults: bool = False
 ) -> None:
     trace = e2e.Trace(base / "trace.jsonl", seed=seed)
     project = e2e._make_project(base, trace, ttl_seconds=2)
+    _ACTIVE.update(project=project, trace=trace)
+    atexit.register(_exit_sweep)
     rng = random.Random(seed)
     live: set[str] = set()
     archived: set[str] = set()
@@ -356,17 +384,25 @@ def main() -> int:
     parser.add_argument("--faults", action="store_true",
                         help="include injected directory-fsync failures")
     args = parser.parse_args()
+    signal.signal(signal.SIGTERM, _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
     base = Path(tempfile.mkdtemp(prefix="wrkslots-fuzz-"))
     try:
         _run_seed(args.seed, args.steps, base, keep=args.keep,
                   faults=args.faults)
     finally:
+        _exit_sweep()
         if not args.keep:
-            # Slot-image mounts can outlive the run; teardown is
-            # best-effort, the scratch dir is under the system tmp.
             import shutil
 
-            shutil.rmtree(base, ignore_errors=True)
+            remaining = e2e._mount_points_under(base)
+            if remaining:
+                # Never delete files under a live mount (#2048):
+                # retain and say so instead of stranding loops.
+                print(f"retained {base}: mounts remain: {remaining}",
+                      file=sys.stderr)
+            else:
+                shutil.rmtree(base, ignore_errors=True)
     return 0
 
 
