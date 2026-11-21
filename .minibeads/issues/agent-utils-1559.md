@@ -6,7 +6,7 @@ issue_type: feature
 labels:
 - agentctl
 created_at: 2026-11-20T22:08:11+00:00
-updated_at: 2026-11-20T22:08:11+00:00
+updated_at: 2026-11-21T10:04:11+00:00
 ---
 
 # Description
@@ -29,3 +29,9 @@ updated_at: 2026-11-20T22:08:11+00:00
 # Notes
 
 Reserved 2026-11-15 with the plan; filed 2026-11-20 with landing 0 of the mu-recoveragent lane (coordb approved the phase plan the same day). Live drill evidence for the acceptance scenarios: shepherd-v0 stamp 2026-11-20 11:55 AM ET (`agent=muse`, unit success) and the harness report `ai_docs/reports/measurements/2026-11-20-reboot-drill-devbig014.md`.
+
+Landing 1 (manifest + record-gap reporting) landed 2026-11-21 as `437a5262`: read-only `agentctl-team-manifest/v1` on one shared verify probe pass, raw-record gap judgement, bounded embedded verify, Python `team` Rust-only refusal; gate red only on `rust.agentctl.test` (foreign pidfd pair plus the console-in-harness artefact), waived by coordb after cold review and combined-tree verification. No persisted data was added.
+
+Landing 1b (structured session candidates) landed 2026-11-21 as `5dd8708b` (verified tree `f10d1489`): session-less interactive records list report-only candidates from bounded newest-first store scans, matched by structured canonical cwd with sanitized bounded first prompts; revive walks whole stores head-only and its structured-cwd binds were verified as corrections against real stores (prefix collisions, mentions, parent dirs, Codex root-over-subdir). Gate red only on the upstream #1934 issue-parse heading (fixed on main in `080df8bf`, present in the combined tree) and the #2027 pidfd pair; landed under coordb's waiver after re-review GO and combined-tree verification. Still no persisted data and no record rewrites.
+
+Remaining for this issue: `team act` (landing 2) — its DriverRecord `manifest`/`actions[]` persisted-data report goes to coordb with the design check before code — then the wrapper, shepherd loop/unit, and deployment landings. Python revive still single-picks a Muse discovery and has no Claude/Codex discovery; whether that parity folds into a later landing is coordb's call at the landing-2 design check (restorefix owns #1934/#1992/#1993).
