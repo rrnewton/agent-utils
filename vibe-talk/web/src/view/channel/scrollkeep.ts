@@ -21,6 +21,17 @@ export interface ScrollMark {
   readonly inputAt?: number;
   /** The list's scroll position as the mark was taken (`#1880b`): how far the reader has scrolled since is the part of a restore that is theirs, not the change's. */
   readonly scrollTop?: number;
+  /**
+   * Whether the change this mark was taken for is one the reader caused (`#2076
+   * vibe-talk-top-anchor-policy`): their own act on a message — a click, a fold, a
+   * details sheet — whose height change holds the touched row's top and never
+   * follows the foot, even at the end of the history. Arrivals are not user-caused.
+   */
+  readonly userCaused?: boolean;
+  /** The last hold-opening act as the mark was taken (`#2076`): a restore made
+   * after a later fold or press would follow the foot over the anchor that act
+   * just made, as `#1880`'s input stamp guards a reader's scroll. */
+  readonly actAt?: number;
 }
 
 /** A walk for the search whose control holds still while it reads, as far as keeping the reader reads it. */
@@ -130,12 +141,36 @@ export interface ScrollKeeping {
   preservingScroll(mutate: () => void): void;
   /**
    * Collapse or expand `row` in `area` under the per-act anchor choice (`#1251
-   * scroll-single-owner`, `#1215 collapse-anchor-below`): a reader following the foot stays on
-   * it; while the row's top is on screen the row itself is held; with its top above the
-   * viewport the next drawn row is held and the history above absorbs the change; with
-   * neither on screen (inside a row taller than the room) the collapsed row is centered.
+   * scroll-single-owner`, `#1215 collapse-anchor-below`, `#2076
+   * vibe-talk-top-anchor-policy`): the touched row's top is held wherever it stands
+   * on screen, even at the end of the history — following the foot is for arrivals,
+   * never for the reader's own act; with its top above the viewport the next drawn
+   * row is held and the history above absorbs the change; with neither on screen
+   * (inside a row taller than the room) the collapsed row is centered.
    */
   preservingCollapse(area: HTMLElement, row: HTMLElement, head: number, foot: number, mutate: () => void): void;
+  /**
+   * Whether a user-caused height change is settling (`#2076`): the reader's own act
+   * opened a hold (a fold, a click in the list within the act window), and until it
+   * clears the foot keepers write nothing and an arrival is counted on the jump
+   * chip instead of followed. The one question every foot writer outside the
+   * arrival path asks.
+   */
+  userChangeActive(): boolean;
+  /**
+   * Open the user-caused hold for an act that changes a message's height outside
+   * the collapse act (`#2076`): an expand-all step, a details sheet. The act's own
+   * restore and the keeper pass after it keep the touched top; arrivals chip.
+   */
+  beginUserChange(): void;
+  /**
+   * The room past the rows' foot this owner is holding in `area` (`#2076`): a
+   * user-caused shrink at the foot (a fold, a sheet closing) whose touched top is
+   * held by standing the list in room it adds below its last row, as the right
+   * column's rooms do (`#338`, `#459`). No message stands in it; the foot measures
+   * count it as room, and the next deliberate write to the foot reclaims it.
+   */
+  footRoom(area: HTMLElement): number;
   /**
    * Run a redraw of the channel's rows with the reader held where they are, and nothing
    * else decided: no jump recount, which the landing that asked for the redraw owns.
@@ -193,6 +228,18 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
 
   /** When the reader last scrolled or touched in the view, in `Date.now` terms. */
   let userInputAt = Number.NEGATIVE_INFINITY;
+  /** Whether a user-caused height change's hold stands (`#2076`), and which opening it is. */
+  let userHold = false;
+  let holdGen = 0;
+  /** When a hold-opening act last ran (`#2076`): only the acts that change a
+   * message's height open one — a fold, an expand-all step, a details sheet — never
+   * a navigation key or a selection press, whose lists keep their own rules. */
+  let holdActAt = Number.NEGATIVE_INFINITY;
+  /** The room past the foot held for a user-caused shrink (`#2076`): its height, the
+   * list it stands under, and that list's own padding as it was before the room. */
+  let roomPx = 0;
+  let roomList: HTMLElement | null = null;
+  let roomPadding = "";
   /** When this owner last wrote the list's place, in `Date.now` terms. */
   let ownWriteAt = Number.NEGATIVE_INFINITY;
   /** The port the input watch stands on; re-armed when the column swaps its area. */
@@ -203,6 +250,82 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     ownWriteAt = Date.now();
   }
 
+  /**
+   * Open the user-caused hold (`#2076`): for the act's own restore and the keeper
+   * pass that follows it (three frames), no foot writer moves the list and no
+   * arrival is followed — the touched row's top is the place kept. Where no frames
+   * run (a fake DOM), the hold ends with the task: nothing async races it there.
+   */
+  function openUserHold(): void {
+    userHold = true;
+    holdActAt = Date.now();
+    const gen = ++holdGen;
+    if (typeof requestAnimationFrame === "function") {
+      let frames = 3;
+      const step = (): void => {
+        if (gen !== holdGen) return;
+        frames -= 1;
+        if (frames <= 0) { userHold = false; return; }
+        requestAnimationFrame(step);
+      };
+      requestAnimationFrame(step);
+    } else if (typeof queueMicrotask === "function") {
+      queueMicrotask(() => { if (gen === holdGen) userHold = false; });
+    } else {
+      userHold = false;
+    }
+  }
+
+  /** Whether a user-caused height change is settling (`#2076`): its hold stands.
+   * Only acts that change a message's height open one, so a keeper or arrival
+   * gated by this is never held off by a navigation key or a selection press. */
+  function userChangeActive(): boolean {
+    return userHold;
+  }
+
+  /** Give the list under `anchor` `px` more room past its foot (`#2076`). */
+  function addFootRoom(anchor: Element, px: number): void {
+    const list = anchor.parentNode as HTMLElement | null;
+    if (!list || typeof list.style !== "object" || px <= 0) return;
+    if (roomList !== list) {
+      clearFootRoom();
+      roomList = list;
+      roomPadding = list.style.paddingBottom || "";
+      roomPx = 0;
+    }
+    roomPx += px;
+    list.style.paddingBottom = `${roomPx}px`;
+  }
+
+  /** Take the held room past the foot away (`#2076`): the rows' foot is the foot again. */
+  function clearFootRoom(): void {
+    if (roomList === null) return;
+    roomList.style.paddingBottom = roomPadding;
+    roomList = null;
+    roomPx = 0;
+    roomPadding = "";
+  }
+
+  /** The room held past the foot of the list standing in `area`, else 0 (`#2076`). */
+  function footRoom(area: HTMLElement): number {
+    return roomList !== null && typeof area.contains === "function" && area.contains(roomList) ? roomPx : 0;
+  }
+
+  /**
+   * Write `area`'s place to hold an anchor's top (`#2076`): where holding it would
+   * scroll past the foot of what stands — a user-caused shrink at the end of the
+   * history — the room past the foot is grown by the deficit first, so the top
+   * holds and the foot lifts, as the policy asks, instead of the browser's clamp
+   * taking every row up by the shrink.
+   */
+  function writeHold(area: HTMLElement, anchor: Element, delta: number): void {
+    const wanted = area.scrollTop + delta;
+    const max = area.scrollHeight - (area.clientHeight || 0);
+    if (wanted > max) addFootRoom(anchor, wanted - max);
+    noteOwnWrite();
+    area.scrollTop = wanted;
+  }
+
   /** Stand the input watch on `area`, once a port. */
   function watchInput(area: HTMLElement): void {
     if (inputPort === area || typeof area.addEventListener !== "function") return;
@@ -210,7 +333,9 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     area.addEventListener("wheel", () => { userInputAt = Date.now(); }, { passive: true });
     area.addEventListener("touchstart", () => { userInputAt = Date.now(); }, { passive: true });
     area.addEventListener("scroll", () => {
-      if (Date.now() - ownWriteAt > 1000) userInputAt = Date.now();
+      // The reader's own scroll (not this owner's write) reclaims the held room
+      // past the foot (`#2076`): the place is theirs again, room included.
+      if (Date.now() - ownWriteAt > 1000) { userInputAt = Date.now(); clearFootRoom(); }
     }, { passive: true });
   }
 
@@ -290,7 +415,8 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
    * whole point is that it does not hold for a change made above the viewport.
    *
    * A reader who was already at the bottom is the one exception: for them "the same thing" IS the
-   * newest line, so the view follows it.
+   * newest line, so the view follows it — unless the change is their own act (`#2076`): then the
+   * row they touched is held by its top, like any other reader, and only an arrival follows.
    */
   function preservingScroll(mutate: () => void): void {
     const mark = captureScroll();
@@ -365,6 +491,11 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
       composerTop: composerBefore(area),
       inputAt: userInputAt,
       scrollTop: area.scrollTop,
+      // The top-anchor rule is the channel lists' (`#2076`): the call transcript
+      // keeps its own following contract for a tapped card (`#431`), so a hold
+      // never reclassifies a change there.
+      userCaused: userHold && deps.currentView() === "discord",
+      actAt: holdActAt,
     };
   }
 
@@ -391,14 +522,16 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     } else {
       const shown = shownRowFor(anchor);
       const held = shown !== anchor ? shown as Element : anchor;
-      noteOwnWrite();
-      area.scrollTop += held.getBoundingClientRect().top - targetTop;
+      writeHold(area, held, held.getBoundingClientRect().top - targetTop);
       deps.renderJumpNewest();
     }
     if (selection && deps.restoreSelectionIn) deps.restoreSelectionIn(area, selection);
   }
 
   function toFoot(area: HTMLElement): void {
+    // A deliberate write to the foot reclaims the held room (`#2076`): the rows'
+    // foot is the foot the reader is taken to.
+    clearFootRoom();
     noteOwnWrite();
     area.scrollTop = area.scrollHeight;
   }
@@ -521,16 +654,20 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     if (mark.anchor && mark.anchor.parentNode) {
       const shown = shownRowFor(mark.anchor);
       const held = shown !== mark.anchor ? shown as Element : mark.anchor;
-      noteOwnWrite();
-      area.scrollTop += compensatedDelta(area, mark, held.getBoundingClientRect().top);
+      writeHold(area, held, compensatedDelta(area, mark, held.getBoundingClientRect().top));
     } else if (mark.anchorId) {
       const refound = [...visibleList().children].find((one) => one.getAttribute("data-id") === mark.anchorId);
-      if (refound) { noteOwnWrite(); area.scrollTop += compensatedDelta(area, mark, (refound as Element).getBoundingClientRect().top); }
+      if (refound) writeHold(area, refound as Element, compensatedDelta(area, mark, (refound as Element).getBoundingClientRect().top));
     }
     if (selection && deps.restoreSelectionIn) deps.restoreSelectionIn(area, selection);
   }
 
   function preservingCollapse(area: HTMLElement, row: HTMLElement, head: number, foot: number, mutate: () => void): void {
+    // The reader's own act in a channel list (`#2076`): its hold stands over the
+    // keeper pass that follows, so nothing takes the list to its foot while the
+    // fold settles. The call transcript is not a channel list: a tapped card
+    // there keeps the foot it was following (`#431 voice-transcript-expand`).
+    if (deps.currentView() === "discord") openUserHold();
     // A live held anchor (a filter hold, a search walk, a landed jump on another row) owns
     // the reader's place over this act's own choice, as `captureScroll` has it: the act's
     // readerActed is what ends such a hold, and it has not run here.
@@ -539,13 +676,17 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
       preservingScroll(mutate);
       return;
     }
-    if (deps.atBottom(area, deps.restSlackPx)) {
+    if (deps.currentView() !== "discord" && deps.atBottom(area, deps.restSlackPx)) {
       mutate();
       noteOwnWrite();
       area.scrollTop = area.scrollHeight;
       deps.renderJumpNewest();
       return;
     }
+    // No foot branch in a channel list (`#2076 vibe-talk-top-anchor-policy`): at
+    // the end of the history the touched row is held by its top like anywhere
+    // else, and what is below it moves — the composer lifting off the bottom
+    // included. Following the foot is the arrival path's (`followIfPinned`).
     const box = row.getBoundingClientRect();
     if (box.top >= head - 1) {
       preservingScrollAt(area, row, box.top, mutate);
@@ -592,7 +733,13 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     // `#1856`: while Read is following, no restore at all — neither the newest line nor
     // the captured anchor may be put back over the sentence being read.
     if (deps.readFollowing && deps.readFollowing()) return;
-    if (mark.pinned) {
+    // `#2076`: a user-caused change never follows the foot, even at the end of the
+    // history: the anchor below is held by its top and everything below it moves.
+    // Nor does a restore whose capture predates the reader's act (a read sent
+    // before a fold, landing after it): following the foot there would undo the
+    // anchor the act just made, so it is held like the act's own change.
+    const actedSince = mark.actAt !== undefined && holdActAt > mark.actAt;
+    if (mark.pinned && !mark.userCaused && !actedSince) {
       deps.scrollToNewest();
       return;
     }
@@ -611,8 +758,7 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     // where it went. `#221 read-modes`.
     const shown = shownRowFor(mark.anchor);
     if (shown !== mark.anchor) mark = { ...mark, anchor: shown as Element };
-    noteOwnWrite();
-    area.scrollTop += compensatedDelta(area, mark, (mark.anchor as Element).getBoundingClientRect().top);
+    writeHold(area, mark.anchor as Element, compensatedDelta(area, mark, (mark.anchor as Element).getBoundingClientRect().top));
     // Wherever that put the reader decides the jump, now: up the history it is offered, on the
     // newest line it is not. `#207 scrollback-jump`.
     deps.renderJumpNewest();
@@ -632,7 +778,11 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
    * belongs to a list nobody is looking at, so the only right act is to raise that list's chip.
    */
   function followIfPinned(pinned: boolean, turns = 0, view = "voice"): void {
-    if (pinned && deps.currentView() === view) {
+    // `#2076`: while a user-caused change is settling, an arrival never undoes the
+    // touched row's anchor: it is counted on the jump chip like any arrival the
+    // reader is not following, with no retroactive follow when the hold clears —
+    // only a later arrival whose own capture finds the reader at the foot sticks.
+    if (pinned && deps.currentView() === view && !(view === "discord" && userChangeActive())) {
       deps.scrollToNewest();
       return;
     }
@@ -680,5 +830,5 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     return onScreen;
   }
 
-  return { visibleList, shownChannelList, scrollAnchor, preservingScroll, preservingCollapse, holdingRows, toFoot, nudge, toPosition, wheelBy, glideTo, intoView, holdingReader, captureScroll, restoreScroll, followIfPinned, rowsOnScreen, userMovedSince, inputStamp: () => userInputAt };
+  return { visibleList, shownChannelList, scrollAnchor, preservingScroll, preservingCollapse, holdingRows, toFoot, nudge, toPosition, wheelBy, glideTo, intoView, holdingReader, captureScroll, restoreScroll, followIfPinned, rowsOnScreen, userMovedSince, inputStamp: () => userInputAt, userChangeActive, beginUserChange: openUserHold, footRoom };
 }

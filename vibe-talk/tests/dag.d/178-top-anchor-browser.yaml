@@ -1,0 +1,15 @@
+steps:
+  - group: check
+    job: top-anchor-browser
+    desc: the touched message's top never moves for the reader's own act (expand, fold, details sheet) at the end of the history or mid-list, at 412x915 and 1280x800, windowed on and off; an arrival alone still sticks to the bottom, and one landing while an act settles is counted on the Newest chip
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/top_anchor_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 720
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 180
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824

@@ -2580,7 +2580,7 @@ const footRooms = createFootRooms({
   paddingBottom: (area) => (typeof window.getComputedStyle === "function"
     ? parseFloat(window.getComputedStyle(area).paddingBottom) || 0 : 0),
   pageStep: (area) => pageStep(area),
-  keyboardRoom: (area) => (screenKeyboardRoom ? screenKeyboardRoom.roomIn(area) : 0),
+  keyboardRoom: (area) => (screenKeyboardRoom ? screenKeyboardRoom.roomIn(area) : 0) + scrollKeeping.footRoom(area),
   bottomSlack: BOTTOM_SLACK_PX,
   followRestPx: FOLLOW_REST_PX,
   filterState: () => filterState(),
@@ -2775,6 +2775,7 @@ const folding = createFolding({
   inOtherColumn,
   eachColumn,
   readerActed,
+  beginUserChange: () => scrollKeeping.beginUserChange(),
   preservingScroll,
   nudge: (area, delta) => scrollKeeping.nudge(area, delta),
   preservingCollapse,
@@ -5432,7 +5433,13 @@ const messageDetails = createMessageDetails({
   toggleBookmarkAt: (row) => toggleBookmarkAt(row),
   inThisColumn: (act) => inThisColumn(act),
 });
-const { toggleMessageDetails } = messageDetails;
+const { toggleMessageDetails: rawToggleMessageDetails } = messageDetails;
+/** Opening or closing a details sheet changes its row's height: the reader's own
+ * act (`#2076`), held on the row's top by the scroll owner like a fold. */
+const toggleMessageDetails = (row, messages) => {
+  scrollKeeping.beginUserChange();
+  preservingScroll(() => rawToggleMessageDetails(row, messages));
+};
 
 
 /**
@@ -9938,6 +9945,7 @@ const listKeepersMount = mountListKeepers({
   footTop: (area) => footTop(area),
   atBottom: (...args) => atBottom(...args),
   followFoot: (area) => followFoot(area),
+  userChangeActive: () => scrollKeeping.userChangeActive(),
   toFoot: (area) => scrollKeeping.toFoot(area),
   toPosition: (area, top) => scrollKeeping.toPosition(area, top),
   sideColumnUp: () => sideColumnUp(),

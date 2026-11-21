@@ -78,10 +78,11 @@ export interface FootRoomsDependencies {
   /** What a page key moves `area` by (`pageStep`). */
   pageStep(area: Scroller): number;
   /**
-   * The room in `area`'s height that is the on-screen keyboard's, not the rows' (`#1144
-   * scrollback-typing-jump`): the inset a composer at the list's foot keeps under itself while the
-   * keyboard is up, which `scrollHeight` counts but no message stands in. 0 where no keyboard is up
-   * over a composer in `area`.
+   * The room in `area`'s height that is not the rows' (`#1144 scrollback-typing-jump`,
+   * `#2076 vibe-talk-top-anchor-policy`): the inset a composer at the list's foot keeps under
+   * itself while the keyboard is up, and the scroll owner's held room past the foot for a
+   * user-caused shrink — both counted by `scrollHeight`, with no message standing in either.
+   * 0 where neither stands in `area`.
    */
   keyboardRoom?(area: Scroller): number;
   /** How far above the foot still counts as parked on the newest line (`BOTTOM_SLACK_PX`). */

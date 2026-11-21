@@ -8111,6 +8111,24 @@ scrolled up while it was out was thrown back to the bottom. The rules, in both c
   line follows it. That holds for the first read behind the rows this device saved, too.
 - **A message arriving live is followed only by a reader already on the newest line**, asked before it
   goes in; everyone else is left exactly where they are and offered the jump to it.
+- **The reader's own act never follows the foot** (`#2076 vibe-talk-top-anchor-policy`, owner request
+  304): in the channel lists, for any user-caused height change — clicking to select or expand a
+  message, folding or unfolding, the action row, a quote or reply box — the top of the touched
+  message stays where it is and everything below it moves, including at the end of the history,
+  even if the list's foot lifts off the composer. (The call transcript is not a channel list: a
+  tapped card there keeps the foot it was following, `#431`.) One rule, in the one scroll owner
+  (`createScrollKeeping`): such a change is held on its touched row's top and never consults the
+  pinned-to-the-foot restore, the collapse act has no foot branch, and while the act settles the
+  foot keepers write nothing. Only the acts that change a message's height open that hold — a
+  fold, an expand-all step, a details sheet — never a navigation key or a selection press. A shrink at the
+  very foot whose top must hold stands in room the owner holds past the foot (as the right column's
+  rooms do, `#338`/`#459`), reclaimed by the reader's next scroll or deliberate write to the foot.
+  An arrival that lands while an act is settling is counted on the Newest chip and never undoes the
+  touched row's anchor, with no retroactive follow when the act clears: only a later arrival whose
+  own capture finds the reader at the foot sticks. Before this, at the end of the history the
+  touched row's bottom was pinned and its top absorbed the whole change (-226px on a phone,
+  -104px at desk width). `tests/top_anchor_browser.py` (DAG step `top-anchor-browser`) measures
+  the touched top on every frame for each act, at the end and mid-list, windowed on and off.
 - **A message the stream has drawn stays drawn** (`#310 stale-live-read-flicker`). A read asked before it
   arrived, landing after, never takes away a message that arrived meanwhile. Two live messages a moment
   apart used to have the first one's read redraw the list without the second for a dozen frames. Reads

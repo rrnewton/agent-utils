@@ -788,11 +788,47 @@ test("`#1251 scroll-single-owner` + `#1215 collapse-anchor-below`: a collapse ho
   tops.set("b", [-80, 500]);
   keep.preservingCollapse(area, b, 0, 200, () => tops.set("b", [-80, 60]));
   assert.equal(area.scrollTop, 190, "a row taller than the screen was not centered in the room");
-  // Following the foot: the foot is held, whatever the row.
+  // At the foot (`#2076 vibe-talk-top-anchor-policy`): the touched row is held by
+  // its top like anywhere else — following the foot is the arrival path's, never a
+  // fold's — and the act's hold stands for the keeper pass that follows.
   area.scrollTop = 300;
   bottom = true;
+  tops.set("b", [40, 120]);
   keep.preservingCollapse(area, b, 0, 200, () => {});
-  assert.equal(area.scrollTop, 900, "a reader following the foot was not kept on it");
+  assert.equal(area.scrollTop, 300, "a fold at the foot took the list to its foot instead of holding the row");
+  assert.equal(keep.userChangeActive(), true, "a fold opened no user-caused hold");
+});
+
+test("`#2076 vibe-talk-top-anchor-policy`: a user-caused change at the foot holds the anchor's top; an arrival during it is chipped, not followed", () => {
+  const { createScrollKeeping } = CHANNEL_VIEW;
+  const handlers = {};
+  const area = { scrollTop: 300, scrollHeight: 900, clientHeight: 200,
+    getBoundingClientRect: () => ({ top: 0 }),
+    addEventListener: (type, fn) => { handlers[type] = fn; } };
+  const row = (id, top) => ({ id, parentNode: {}, getAttribute: () => null,
+    getBoundingClientRect: () => ({ top, bottom: top + 40 }) });
+  const rows = [row("a", -80), row("b", -40), row("c", 0), row("d", 40)];
+  const log = { id: "discord-log", children: rows };
+  for (const one of rows) one.parentNode = log;
+  const chip = { hidden: true, getBoundingClientRect: () => ({ top: 0 }) };
+  const els = { "discord-log": log, "pinned-log": { id: "pinned-log", children: [] }, "scroll-area": area, "load-older": chip, transcript: { children: [] } };
+  const calls = [];
+  const keep = createScrollKeeping({
+    el: (id) => els[id], onMain: () => true, currentView: () => "discord", channelView: () => "main", pinnedOnly: () => false,
+    heldFilterRow: () => null, searchWalk: () => null, atBottom: () => true,
+    scrollToNewest: () => calls.push("newest"), renderJumpNewest: () => calls.push("jump"),
+    setJumpNewest: (on, view, turns) => calls.push(["chip", view, turns]),
+  });
+  const before = keep.captureScroll();
+  assert.equal(before.pinned, true, "the reader at the foot was not marked pinned");
+  assert.equal(before.userCaused, false, "no act yet: the mark reads as an arrival's");
+  keep.beginUserChange();
+  const acted = keep.captureScroll();
+  assert.equal(acted.userCaused, true, "a press in the list did not mark the change user-caused");
+  keep.restoreScroll(acted);
+  assert.equal(calls.includes("newest"), false, "a user-caused change followed the foot");
+  keep.followIfPinned(true, 1, "discord");
+  assert.deepStrictEqual(calls.at(-1), ["chip", "discord", 1], "an arrival during the act was followed instead of chipped");
 });
 
 test("`#1251 scroll-single-owner`: a redraw that replaces the anchor row is held by the row re-found by id", () => {

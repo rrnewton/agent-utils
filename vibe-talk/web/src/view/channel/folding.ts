@@ -80,6 +80,8 @@ export interface FoldingDependencies {
   inOtherColumn(fn: () => void): void;
   eachColumn(fn: () => void): void;
   readerActed(): void;
+  /** Open the scroll owner's user-caused hold for a step that changes many rows' heights (`#2076`). Absent: unheld, as before. */
+  beginUserChange?(): void;
   preservingScroll(fn: () => void): void;
   /** Move a scroller by a measured delta, through the scroll owner (`#1251 scroll-single-owner`). */
   nudge(area: HTMLElement, delta: number): void;
@@ -776,6 +778,7 @@ export function createFolding(deps: FoldingDependencies): Folding {
 
   function setAllFolded(folded: boolean): void {
     deps.readerActed();
+    if (deps.beginUserChange) deps.beginUserChange();
     foldBuildStep = folded ? "collapse" : "expand";
     deps.preservingScroll(() => {
       for (const entry of visibleFolds()) setFolded(entry, folded);
@@ -829,6 +832,7 @@ export function createFolding(deps: FoldingDependencies): Folding {
 
   function applyFoldStep(step: string, folds: FoldEntry[], field: HTMLElement | null = null): void {
     deps.readerActed();
+    if (deps.beginUserChange) deps.beginUserChange();
     foldBuildStep = step;
     if (field) {
       deps.entryState().landing = null;

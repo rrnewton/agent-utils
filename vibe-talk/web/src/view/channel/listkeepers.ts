@@ -66,6 +66,13 @@ export interface ListKeepersDependencies<Column> extends SizeWatching {
   /** Take `area` to its foot, or to a measured scroll position, through the scroll owner (`#1251`). */
   toFoot(area: HTMLElement): void;
   toPosition(area: HTMLElement, top: number): void;
+  /**
+   * Whether a user-caused height change is settling in the scroll owner (`#2076
+   * vibe-talk-top-anchor-policy`): while it stands, no foot keeper takes a list to
+   * its foot for a size change — the touched row's top is the place kept. Absent:
+   * never settling, as before.
+   */
+  userChangeActive?(): boolean;
   /** Whether the right column is drawn, and showing. */
   sideColumnUp(): boolean;
   sideShowing(): boolean;
@@ -315,8 +322,11 @@ export function mountListKeepers<Column>(deps: ListKeepersDependencies<Column>):
       holdOverscrollReader(area);
       const was = footing;
       const context = contextOf();
+      // `#2076`: a user-caused height change settling in this list is held by its
+      // touched row's top (the scroll owner's hold), never taken to the foot here.
       if (was && was.foot && was.width === area.clientWidth && was.height === area.clientHeight &&
-          was.context === context && !atBottom(area, 1) && free()) {
+          was.context === context && !atBottom(area, 1) && free() &&
+          !(deps.userChangeActive && deps.userChangeActive())) {
         followFoot(area);
       }
       note(context);
@@ -395,8 +405,11 @@ export function mountListKeepers<Column>(deps: ListKeepersDependencies<Column>):
       }
       const was = footing;
       const context = contextOf();
+      // `#2076`: as the right column's keeper — a user-caused change settling here
+      // is held by its touched row's top, not taken to the foot.
       if (was && was.foot && was.width === area.clientWidth && was.height === area.clientHeight
-          && was.context === context && !atBottom(area, 1) && free()) {
+          && was.context === context && !atBottom(area, 1) && free()
+          && !(deps.userChangeActive && deps.userChangeActive())) {
         // To the rows' foot, not past it: room the keyboard keeps under the composer (a row
         // parked under the box, #1135) stays below the keys, where the reader left it.
         if (footTop) deps.toPosition(area, footTop(area));

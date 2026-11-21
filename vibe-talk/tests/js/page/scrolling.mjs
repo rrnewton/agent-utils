@@ -57,7 +57,7 @@ test("YOUR OWN TURN DOES NOT YANK YOU TO THE BOTTOM once you have scrolled up", 
   // The control: the OLD rule, an unconditional scroll on every arrival. It has to fail.
   const control = await parked(
     await brokenModule([{ file: "src/view/channel/scrollkeep.ts",
-      find: "    if (pinned && deps.currentView() === view) {", replace: "    if (true) {" }])
+      find: "    if (pinned && deps.currentView() === view && !(view === \"discord\" && userChangeActive())) {", replace: "    if (true) {" }])
   );
   assert.notEqual(
     control.area.scrollTop,
@@ -105,7 +105,7 @@ test("COLLAPSING A MESSAGE ABOVE THE VIEWPORT LEAVES THE READER LOOKING AT THE S
   // able to SEE the difference, so it has to be shown seeing it.
   const control = await run(
     await brokenModule([{ file: "src/view/channel/scrollkeep.ts",
-      find: "      area.scrollTop += held.getBoundingClientRect().top - targetTop;",
+      find: "      writeHold(area, held, held.getBoundingClientRect().top - targetTop);",
       replace: "      void held;" }])
   );
   assert.notEqual(
@@ -741,7 +741,7 @@ test("LOADING OLDER MESSAGES LEAVES THE READER LOOKING AT THE SAME LINE", async 
   // THE CONTROL. Without it the fixture could be one that never moves scrollTop at all.
   const control = await run(
     await brokenModule([{ file: "src/view/channel/scrollkeep.ts",
-      find: "    area.scrollTop += compensatedDelta(area, mark, (mark.anchor as Element).getBoundingClientRect().top);",
+      find: "    writeHold(area, mark.anchor as Element, compensatedDelta(area, mark, (mark.anchor as Element).getBoundingClientRect().top));",
       replace: "    void mark;" }])
   );
   assert.notEqual(
@@ -758,8 +758,8 @@ test("LOADING OLDER MESSAGES LEAVES THE READER LOOKING AT THE SAME LINE", async 
   // the same row it was.
   const wrongAnchor = await run(
     await brokenModule([{ file: "src/view/channel/scrollkeep.ts",
-      find: "    area.scrollTop += compensatedDelta(area, mark, (mark.anchor as Element).getBoundingClientRect().top);",
-      replace: '    area.scrollTop += compensatedDelta(area, mark, (el("discord-log").children[0] as Element).getBoundingClientRect().top);' }])
+      find: "    writeHold(area, mark.anchor as Element, compensatedDelta(area, mark, (mark.anchor as Element).getBoundingClientRect().top));",
+      replace: '    writeHold(area, mark.anchor as Element, compensatedDelta(area, mark, (el("discord-log").children[0] as Element).getBoundingClientRect().top));' }])
   );
   assert.notEqual(
     wrongAnchor.moved,
