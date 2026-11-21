@@ -228,12 +228,11 @@ before the window no longer matches inside it.
 The older `spec/WrkslotsLifecycle.tla` (#1568) was also
 checked with this toolchain. No record of a prior TLC run
 exists — the docs present it as a mirror whose gated checker
-is the Python explorer — and as shipped it does not complete
-one: TLC's deadlock check stops at depth 2 (5 states) on the
-stray-storage start state, which has no successor and is not
-terminal. With deadlock checking off it explores 11,795
-distinct states: `Safety` holds in the baseline config and
-`Liveness` fails, as its config comment expects (no finisher
-in the baseline). The deadlock finding is a spec-completeness
-note, not a product issue; the Python explorer treats the
-same state as an ordinary leaf.
+is the Python explorer — and as first checked it did not
+complete one: TLC's deadlock check stopped at depth 2
+(5 states) on the stray-storage start state, which has no
+successor and is not terminal. The spec now stutters there,
+exactly the leaf the Python explorer already treats it as;
+a default TLC run explores 11,795 distinct states, `Safety`
+holds in the baseline config, and `Liveness` fails as its
+config comment expects (no finisher in the baseline).

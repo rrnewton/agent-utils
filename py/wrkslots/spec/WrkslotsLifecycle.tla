@@ -320,6 +320,11 @@ Next ==
   \/ Remove \/ RemoveArchive \/ RemoveDrift \/ RemoveCrash
   \/ RecoverAbsent \/ RecoverAbsentRefusedApply \/ TtlTeardown
   \/ (Terminal /\ UNCHANGED vars)
+  \* The stray-storage start (row absent, storage present) has no
+  \* enabled action and is not terminal; stutter there so TLC's
+  \* deadlock check treats it as the leaf the Python explorer
+  \* already treats it as (#2043).
+  \/ (row = "absent" /\ storage = "present" /\ UNCHANGED vars)
 
 \* The finisher policy actions: the same transitions, taken as scheduled
 \* work.  Fairness is asserted for them (and Tick) only.
