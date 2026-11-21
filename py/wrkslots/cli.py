@@ -8270,6 +8270,22 @@ def _fsync_directory(directory: Path) -> None:
         os.close(fd)
 
 
+def _fsync_directory_may_be_committed(directory: Path, what: str) -> None:
+    """Fsync a directory after its entry was created, as a classified refusal.
+
+    No retry (fsyncgate): a retry returning 0 would not prove durability.
+    """
+
+    try:
+        _fsync_directory(directory)
+    except OSError as exc:
+        raise Refusal(
+            f"{what} was created in {directory} but its durability is "
+            f"unknown (directory fsync failed: {exc}); the state may be "
+            "committed; run 'wrkslots recover'"
+        ) from exc
+
+
 def _atomic_write_json(path: Path, payload: object) -> None:
     text = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
     _atomic_write_bytes(path, text.encode("utf-8"))
@@ -8300,11 +8316,26 @@ def _atomic_write_bytes(path: Path, contents: bytes) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp, path)
-        _fsync_directory(path.parent)
     except OSError as exc:
         with contextlib.suppress(FileNotFoundError):
             temp.unlink()
         raise Refusal(f"cannot durably replace state file {path}: {exc}") from exc
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            temp.unlink()
+        raise
+    # The rename has landed: only the directory fsync is outstanding. Do not
+    # retry it: a failed fsync can clear the error state (fsyncgate), so a
+    # second fsync returning 0 would not prove durability. Refuse at once as
+    # renamed-but-durability-unknown; the state may be committed.
+    try:
+        _fsync_directory(path.parent)
+    except OSError as exc:
+        raise Refusal(
+            f"state file {path} was renamed but its durability is unknown "
+            f"(directory fsync failed: {exc}); the state may be committed; "
+            "run 'wrkslots recover'"
+        ) from exc
     except BaseException:
         with contextlib.suppress(FileNotFoundError):
             temp.unlink()
@@ -48031,20 +48062,20 @@ def _cmd_create(args: argparse.Namespace) -> int:
                     worktreesimage.bind_slot(config.control, mount_dir, args.slot, slot_path)
             except worktreesimage.WorktreesImageError as exc:
                 raise Refusal(str(exc)) from exc
-            _fsync_directory(slot_path.parent)
+            _fsync_directory_may_be_committed(slot_path.parent, "the slot directory")
         if representation == "image":
             # The slot directory becomes the mount point of a fresh image; for
             # the flat layout `git worktree add` then fills the empty image root.
             _provision_slot_image(
                 config, args.slot, args.slot_type, slot_path, image_settings
             )
-            _fsync_directory(slot_path.parent)
+            _fsync_directory_may_be_committed(slot_path.parent, "the slot directory")
         elif config.layout == "nested" and not (
             config.worktrees_image is not None
             and config.worktrees_image_state == worktreesimage.MOUNTED
         ):
             slot_path.mkdir(mode=0o755)
-            _fsync_directory(slot_path.parent)
+            _fsync_directory_may_be_committed(slot_path.parent, "the slot directory")
         for item in plan:
             _relative, repository = _stored_repository_path(config, item.repository)
             destination = _stored_path(config, item.destination, "checkout destination")

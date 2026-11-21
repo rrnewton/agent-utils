@@ -471,6 +471,7 @@
         "py/wrkslots/tests/test_ensure_states_rust.py",
         "py/wrkslots/tests/test_event_index.py",
         "py/wrkslots/tests/test_event_memo.py",
+        "py/wrkslots/tests/test_fault_fsync.py",
         "py/wrkslots/tests/test_fence_salvage_recovery.py",
         "py/wrkslots/tests/test_finish_accounting.py",
         "py/wrkslots/tests/test_finish_provisioned.py",

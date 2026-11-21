@@ -423,12 +423,23 @@ pub(crate) fn atomic_write_bytes(path: &Path, contents: &[u8]) -> Result<()> {
                 path.display()
             )
         })?;
-        fsync_directory(parent)
+        Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temp);
+        return result;
     }
-    result
+    // No retry (fsyncgate): a retry returning Ok would not prove durability.
+    std::fs::File::open(parent)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| {
+            format!(
+                "state file {} was renamed but its durability is unknown \
+                 (directory fsync failed: {error}); the state may be \
+                 committed; run 'wrkslots recover'",
+                path.display()
+            )
+        })
 }
 
 pub(crate) fn utc_now() -> String {

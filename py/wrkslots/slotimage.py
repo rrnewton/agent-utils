@@ -254,14 +254,27 @@ def _record_to_obj(image: SlotImage) -> dict[str, object]:
 def _write_record(image: SlotImage) -> None:
     temporary = image.record_path.with_name(RECORD_NAME + ".tmp")
     data = json.dumps(_record_to_obj(image), indent=2, sort_keys=True) + "\n"
-    with open(temporary, "w", encoding="utf-8") as handle:
-        handle.write(data)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, image.record_path)
+    try:
+        with open(temporary, "w", encoding="utf-8") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, image.record_path)
+    except OSError as exc:
+        raise ImageError(
+            f"cannot write slot image record {image.record_path}: {exc}"
+        ) from exc
+    # As in the registry's atomic write: no fsync retry after the rename
+    # (fsyncgate); refuse as renamed-but-durability-unknown.
     descriptor = os.open(image.directory, os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(descriptor)
+    except OSError as exc:
+        raise ImageError(
+            f"slot image record {image.record_path} was renamed but its "
+            f"durability is unknown (directory fsync failed: {exc}); "
+            "the state may be committed; run 'wrkslots recover'"
+        ) from exc
     finally:
         os.close(descriptor)
 

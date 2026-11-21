@@ -92,7 +92,16 @@ pub(crate) fn write_record(record: &ImageRecord) -> Result<(), String> {
     sync_file(&temporary)?;
     std::fs::rename(&temporary, &path)
         .map_err(|error| format!("cannot replace slot image record {path:?}: {error}"))?;
-    sync_directory(&record.directory)
+    // No retry (fsyncgate): a retry returning Ok would not prove durability.
+    std::fs::File::open(&record.directory)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| {
+            format!(
+                "slot image record {path:?} was renamed but its durability is \
+                 unknown (directory fsync failed: {error}); the state may be \
+                 committed; run 'wrkslots recover'"
+            )
+        })
 }
 
 fn sorted_pretty(value: &Value) -> String {
@@ -138,12 +147,6 @@ fn sync_file(path: &Path) -> Result<(), String> {
     std::fs::File::open(path)
         .and_then(|file| file.sync_all())
         .map_err(|error| format!("cannot sync slot image record {path:?}: {error}"))
-}
-
-fn sync_directory(path: &Path) -> Result<(), String> {
-    std::fs::File::open(path)
-        .and_then(|file| file.sync_all())
-        .map_err(|error| format!("cannot sync slot image directory {path:?}: {error}"))
 }
 
 /// Validate one `IMAGE.json` the way Python `slotimage.read_record`
