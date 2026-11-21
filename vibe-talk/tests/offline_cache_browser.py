@@ -1370,6 +1370,20 @@ CENTRE_ROW_JS = """async (id) => {
     await new Promise((settled) => requestAnimationFrame(() => requestAnimationFrame(settled)));
 }"""
 
+ROW_IN_BAND_JS = """(id) => {
+    const row = document.querySelector(`#discord-log > li[data-id="${id}"]`);
+    const area = document.getElementById('scroll-area');
+    if (!row || !area) return false;
+    const a = area.getBoundingClientRect();
+    const arrow = row.querySelector(':scope > .reply-jump');
+    if (arrow) {
+        const r = arrow.getBoundingClientRect();
+        return r.top >= a.top - 1 && r.bottom <= a.bottom + 1;
+    }
+    const r = row.getBoundingClientRect();
+    return r.top >= a.top - 1 && r.top < a.bottom;
+}"""
+
 # Each row's id, top, and where it is in a stack, and each arrow's style and reach.
 COALESCE_ROWS_JS = """() => [...document.querySelectorAll('#discord-log > li')].map((row) => {
     const arrow = row.querySelector(':scope > .reply-jump');
@@ -3839,10 +3853,27 @@ def coalesce_walk(chromium: BrowserType, args: argparse.Namespace, label: str, w
             def top(row_id: str) -> float:
                 return float(str(next(row["top"] for row in rows() if row["id"] == row_id)))
 
+            def centre_in_band(row_id: str) -> None:
+                """Centre `row_id`, waiting until it stands inside the visible band.
+
+                # `#2012`: centring alone races layout settling under load: the row
+                # could end below #scroll-area's bottom (scrollTop short of centred),
+                # where the static dock below the list is what elementFromPoint
+                # sees. Wait on the condition, re-centring while it settles outside.
+                """
+                for _ in range(5):
+                    page.evaluate(CENTRE_ROW_JS, row_id)
+                    try:
+                        page.wait_for_function(ROW_IN_BAND_JS, arg=row_id, timeout=5_000)
+                        return
+                    except Exception:
+                        continue
+                check(bool(page.evaluate(ROW_IN_BAND_JS, row_id)),
+                      f"{label}: row {row_id} never settled inside the visible band")
+
             def look(kind: str, row_id: str, parent: str = "", stack: list[str] | None = None,
                      why: str = "") -> dict[str, object]:
-                page.evaluate(CENTRE_ROW_JS, row_id)
-                page.wait_for_timeout(120)
+                centre_in_band(row_id)
                 # `#228 reply-visible`. A head is found by the accent in its pixels, and a circle on
                 # the row above's corner is the accent too: photographed without it. That the two
                 # keep apart is `circle_beside`'s to say, with the circle drawn.
@@ -3859,12 +3890,18 @@ def coalesce_walk(chromium: BrowserType, args: argparse.Namespace, label: str, w
 
             def head(kind: str, row_id: str, parent: str, over: bool, why: str) -> tuple[float, float]:
                 """Where the adjacent arrow of `row_id` has its head, and that a press there is that arrow."""
-                found = look(kind, row_id, parent, why=why)
-                hit = page.evaluate(HEAD_HIT_JS, {"id": row_id, "kind": kind, "tip": found["tip"], "over": over})
-                problems = [str(problem) for problem in hit["problems"]]
-                check(not problems, f"{label}, {why}: {problems}")
-                circle_beside(kind, row_id, parent, found["tip"], why)
-                return float(hit["at"][0]), float(hit["at"][1])
+                for _ in range(3):
+                    found = look(kind, row_id, parent, why=why)
+                    if not bool(page.evaluate(ROW_IN_BAND_JS, row_id)):
+                        continue
+                    hit = page.evaluate(HEAD_HIT_JS, {"id": row_id, "kind": kind, "tip": found["tip"], "over": over})
+                    problems = [str(problem) for problem in hit["problems"]]
+                    if problems and not bool(page.evaluate(ROW_IN_BAND_JS, row_id)):
+                        continue
+                    check(not problems, f"{label}, {why}: {problems}")
+                    circle_beside(kind, row_id, parent, found["tip"], why)
+                    return float(hit["at"][0]), float(hit["at"][1])
+                raise AssertionError(f"{label}, {why}: row {row_id} never stayed inside the visible band")
 
             def circle_beside(kind: str, row_id: str, parent: str, tip: object, why: str) -> None:
                 """`#228 reply-visible`. A circle on the row above's corner keeps clear of the head."""
