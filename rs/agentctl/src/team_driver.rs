@@ -865,7 +865,10 @@ fn reconcile_action_requests(directory: &Path, record: &mut DriverRecord) {
             .total_cmp(&b.requested_at)
             .then_with(|| a.request_id.cmp(&b.request_id))
     });
-    for file in files {
+    for mut file in files {
+        // A file's proof is its writer's claim, however it was written:
+        // the driver never treats a requester from disk as proved.
+        file.requester.proof = "claimed".to_owned();
         if let Some(seen) = record
             .actions
             .iter_mut()
@@ -1452,6 +1455,7 @@ fn wake_request(
 
 enum Resident {
     Wake,
+    ActQueued,
     Terminated,
 }
 
@@ -1483,7 +1487,9 @@ fn resident_wait<E: DriverEffects>(
             .iter()
             .any(|action| action.status == "queued" && action.incident == record.incident)
         {
-            return Ok(Resident::Wake);
+            // Not WakeFired: the deadline has not expired, and feeding
+            // WakeFired would mark it expired and page a human early.
+            return Ok(Resident::ActQueued);
         }
         host.sleep(Duration::from_secs_f64(
             (deadline - now).min(RESIDENT_POLL.as_secs_f64()),
@@ -1825,27 +1831,46 @@ pub fn run_with_effects<E: DriverEffects>(
                     record.pending_effects.remove(0);
                 }
                 Effect::Exit => {
-                    if record.abstract_state.driver == State::Healthy
+                    // Never exit past queued work: drain every queued
+                    // current-incident action in this pass, one model
+                    // self-loop at a time, before any exit is honoured.
+                    if record.actions.iter().any(|action| {
+                        action.status == "queued" && action.incident == record.incident
+                    }) {
+                        record.pending_effects.remove(0);
+                        apply_event(&table, &mut record, Event::ActRequested, now, options)?;
+                    } else if record.abstract_state.driver == State::Healthy
                         || record.wake.outcome == "armed"
                     {
                         record.pending_effects.remove(0);
                         save_record(&directory, &mut record, now)?;
                         return Ok((record, RunAction::Ran));
-                    }
-                    match resident_wait(&directory, &mut record, host, effects, options)? {
-                        Resident::Terminated => {
-                            save_record(&directory, &mut record, host.now())?;
-                            return Ok((record, RunAction::Ran));
-                        }
-                        Resident::Wake => {
-                            record.pending_effects.remove(0);
-                            apply_event(
-                                &table,
-                                &mut record,
-                                Event::WakeFired,
-                                host.now(),
-                                options,
-                            )?;
+                    } else {
+                        match resident_wait(&directory, &mut record, host, effects, options)? {
+                            Resident::Terminated => {
+                                save_record(&directory, &mut record, host.now())?;
+                                return Ok((record, RunAction::Ran));
+                            }
+                            Resident::ActQueued => {
+                                record.pending_effects.remove(0);
+                                apply_event(
+                                    &table,
+                                    &mut record,
+                                    Event::ActRequested,
+                                    host.now(),
+                                    options,
+                                )?;
+                            }
+                            Resident::Wake => {
+                                record.pending_effects.remove(0);
+                                apply_event(
+                                    &table,
+                                    &mut record,
+                                    Event::WakeFired,
+                                    host.now(),
+                                    options,
+                                )?;
+                            }
                         }
                     }
                 }
@@ -2328,13 +2353,18 @@ impl<A: crate::subagents::ManagedApi + ?Sized> DriverEffects for ProductionEffec
                 {
                     return Ok(refused("invalid signal"));
                 }
+                let actor = if requester.proof == "proved" {
+                    requester.label.clone()
+                } else {
+                    format!("{} (claimed)", requester.label)
+                };
                 match crate::kill_pid::run_kill_pid_as(
                     u64::from(*pid),
                     expect_cmdline,
                     expect_start,
                     signal,
                     &self.registry,
-                    Some(requester.label.as_str()),
+                    Some(actor.as_str()),
                 ) {
                     Ok(report) => Ok(ActionOutcome {
                         status: "done".to_owned(),
@@ -2848,9 +2878,7 @@ mod tests {
             .unwrap();
             enqueue_action(&directory, &request).unwrap();
         }
-        let _first = run(&root, &host, &mut fake).unwrap();
-        // A Healthy act exits after one action; the next kick takes the
-        // next queued one.
+        // One pass drains every queued action before any exit is honoured.
         let record = run(&root, &host, &mut fake).unwrap();
         let by_id = |id: &str| {
             record
@@ -2979,7 +3007,100 @@ mod tests {
         assert_eq!(by_id("kill-1").status, "unknown");
         assert_eq!(by_id("escalate-crash").status, "unknown");
         assert_eq!(fake.acted.len(), 4, "only the requeued facts also ran");
+
+        // An older writer rewrote state.json from a snapshot taken
+        // before this action folded: the request file and its running
+        // marker survive, the state entry does not. The marker alone
+        // must close it unknown, never re-run it.
+        let lost = new_action_request(
+            &record.incident,
+            record.epoch.clone(),
+            "kill-lost",
+            &TeamAction::KillPid {
+                pid: 4242,
+                expect_cmdline: "fixture-proc".to_owned(),
+                expect_start: "99".to_owned(),
+                boot_id: "boot-a".to_owned(),
+                signal: None,
+            },
+            false,
+            RequesterRecord {
+                kind: "agent".to_owned(),
+                label: "forged".to_owned(),
+                proof: "proved".to_owned(),
+            },
+            100.0,
+        )
+        .unwrap();
+        enqueue_action(&directory, &lost).unwrap();
+        fs::write(
+            action_running_marker_path(&directory, &record.incident, "kill-lost"),
+            "kill-lost\n",
+        )
+        .unwrap();
+        let record = run(&root, &host, &mut fake).unwrap();
+        let lost_row = record
+            .actions
+            .iter()
+            .find(|action| action.request_id == "kill-lost")
+            .unwrap();
+        assert_eq!(lost_row.status, "unknown");
+        assert_eq!(lost_row.requester.proof, "claimed");
+        assert_eq!(fake.acted.len(), 4, "the lost kill never re-ran");
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn resident_act_never_expires_the_deadline_it_woke_inside() {
+        for (driver, delivered) in [(State::Handoff, false), (State::Escalate, true)] {
+            let root = temp_root("resident-act");
+            let registry = root.join("registry");
+            let state_root = root.join("state");
+            let directory = prepare_driver_dir(&registry, Some(&state_root)).unwrap();
+            let mut record = DriverRecord::new(&registry, &epoch("boot-a", None), 100.0);
+            record.abstract_state.driver = driver;
+            record.abstract_state.mode = Mode::Dormant;
+            record.abstract_state.wake_armed = true;
+            record.abstract_state.delivered = delivered;
+            record.abstract_state.attempts = 1;
+            record.abstract_state.env.missing = false;
+            record.abstract_state.env.lead_up = true;
+            record.abstract_state.env.route_ok = true;
+            record.abstract_state.env.fixed = true;
+            record.deadline = Some(130.0);
+            record.pending_effects = vec![Effect::Exit];
+            save_record(&directory, &mut record, 100.0).unwrap();
+            let request = new_action_request(
+                &record.incident,
+                record.epoch.clone(),
+                "resident-facts",
+                &TeamAction::Facts,
+                false,
+                RequesterRecord {
+                    kind: "agent".to_owned(),
+                    label: "test".to_owned(),
+                    proof: "claimed".to_owned(),
+                },
+                100.0,
+            )
+            .unwrap();
+            enqueue_action(&directory, &request).unwrap();
+            let mut host = FakeHost::new(100.0);
+            host.armed = false;
+            let mut fake = Fake {
+                verifies: [vpass(true), vpass(true), vpass(true)].into(),
+                ..Fake::default()
+            };
+            let record = run(&root, &host, &mut fake).unwrap();
+            assert_eq!(record.abstract_state.driver, State::Healthy, "{record:?}");
+            assert!(
+                fake.escalate_calls.is_empty(),
+                "act paged early from {driver:?}"
+            );
+            assert_eq!(fake.acted, [TeamAction::Facts]);
+            assert_eq!(record.actions[0].status, "done");
+            fs::remove_dir_all(&root).unwrap();
+        }
     }
 
     #[test]
