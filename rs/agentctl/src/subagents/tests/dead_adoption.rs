@@ -1247,6 +1247,8 @@ fn dead_native_retirement_refuses_while_the_herdr_agent_still_exists() {
 #[test]
 fn dead_native_retirement_previous_boot_missing_pane_stale_agent_archives() {
     // #1944: previous boot + pane gone (pane_not_found) + stale Herdr agent object.
+    // The holder proof reads the fake process table, never host processes (#2037).
+    let _procs = super::pretend_processes(Vec::new());
     let fixture = Fixture::new();
     fixture.start(None);
     let mut record = fixture.manager().load("worker").unwrap();
