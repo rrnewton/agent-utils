@@ -1218,14 +1218,16 @@ fn revive_live_session_holder_refuses() {
         .unwrap()
         .retain(|item| item.pane_id != pane);
     fixture.client.herdr_closed.lock().unwrap().insert(pane);
-    let mut holder = std::process::Command::new("sleep")
-        .arg("30")
-        .env("HOLDER_SESSION", token)
-        .spawn()
-        .unwrap();
+    // Script the holder process in the fake process table (#2037): the scan
+    // reads these rows instead of the host's same-uid population.
+    let _procs = super::pretend_processes(vec![(
+        424_242,
+        unsafe { libc::getuid() },
+        "sleep 30".into(),
+        format!("HOLDER_SESSION={token}\0").into_bytes(),
+        Vec::new(),
+    )]);
     let result = fixture.manager().revive("worker", false, None, TIMEOUT);
-    let _ = holder.kill();
-    let _ = holder.wait();
     let error = result.unwrap_err();
     assert!(error.to_string().contains("live process"), "{error}");
     assert!(!journal_path(&fixture, &old).exists());
@@ -1656,6 +1658,7 @@ fn revive_dry_run_with_a_gone_pane_never_proves_unrelated_shells() {
         tab_id: "other-tab".to_owned(),
         workspace_id: "workspace".to_owned(),
     });
+    let _procs = super::pretend_processes(Vec::new());
     let plan = fixture
         .manager()
         .revive("worker", true, None, TIMEOUT)
@@ -3159,6 +3162,7 @@ fn revive_checks_recorded_slot_path_and_isolation_in_read_only_preflight() {
 
 #[test]
 fn revive_heals_a_slot_project_recorded_as_the_slot_itself() {
+    let _procs = super::pretend_processes(Vec::new());
     // #1140: the record names its own slot directory as the project.
     // Forcing that root resolves double-nested, so the plan retries
     // unforced, the slot manager discovers the holding root, and only the
@@ -4047,6 +4051,7 @@ fn stop_revive_cycles(harness: &str, cycles: usize) -> Fixture {
 
 #[test]
 fn five_stop_and_revive_cycles_complete_for_every_harness_that_revives() {
+    let _procs = super::pretend_processes(Vec::new());
     for harness in ["claude", "codex", "muse"] {
         let fixture = stop_revive_cycles(harness, 5);
         let ended = fixture.client.ended.lock().unwrap().len();

@@ -7162,6 +7162,45 @@ pub struct ManagedAgents<'a, A: ManagedApi + ?Sized> {
     caller_ancestry: Option<Option<agent_queue::identity::Ancestry>>,
 }
 
+#[cfg(test)]
+type FakeProcessRows = Vec<(u32, u32, Vec<u8>, Vec<u8>, Vec<PathBuf>)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Fake process rows for the holder scan (#2037): when installed, the holder scan reads
+    /// these `(pid, uid, cmdline, environ, fd_targets)` rows instead of enumerating the host's
+    /// same-uid processes, so revive tests never depend on unrelated host processes.
+    /// Production builds always scan `/proc`: this is a test-only seam.
+    static FAKE_PROCESS_ROWS: std::cell::RefCell<Option<FakeProcessRows>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Held test guard: dropping restores the prior fake process table.
+#[cfg(test)]
+pub struct PretendProcesses {
+    previous: Option<FakeProcessRows>,
+}
+
+/// Install a fake process table; the returned guard is live while held.
+#[cfg(test)]
+#[must_use = "a pretend process table is only live while the guard is held"]
+pub fn pretend_processes(rows: FakeProcessRows) -> PretendProcesses {
+    let previous = FAKE_PROCESS_ROWS.with(|cell| cell.borrow_mut().replace(rows));
+    PretendProcesses { previous }
+}
+
+#[cfg(test)]
+fn fake_processes() -> Option<FakeProcessRows> {
+    FAKE_PROCESS_ROWS.with(|cell| cell.borrow().clone())
+}
+
+#[cfg(test)]
+impl Drop for PretendProcesses {
+    fn drop(&mut self) {
+        FAKE_PROCESS_ROWS.with(|cell| *cell.borrow_mut() = self.previous.take());
+    }
+}
+
 impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     /// Use an explicit registry, independent of the agents' working directories.
     pub fn new(client: &'a A, registry: &Path) -> Result<Self> {
@@ -17001,6 +17040,34 @@ its drain would also type, so it was not queued",
         // Short ids are matched exactly as recorded (the full string), per
         // the re-review's "refuse, or match exactly" alternative.
         let needle = session.as_bytes();
+        // Tests may replace the host scan with scripted process rows (#2037).
+        #[cfg(test)]
+        if let Some(rows) = fake_processes() {
+            for (_, _, cmdline, environ, fds) in &rows {
+                if cmdline.windows(needle.len()).any(|w| w == needle) {
+                    return Some(
+                        "live process holds the recorded native session (its command line carries it); refusing to retire or revive over it — remedy: stop the process first".to_owned(),
+                    );
+                }
+                if environ.windows(needle.len()).any(|w| w == needle) {
+                    return Some(
+                        "live process holds the recorded native session (its environment carries it); refusing to retire or revive over it — remedy: stop the process first".to_owned(),
+                    );
+                }
+                if fds.iter().any(|target| {
+                    target
+                        .to_string_lossy()
+                        .as_bytes()
+                        .windows(needle.len())
+                        .any(|w| w == needle)
+                }) {
+                    return Some(
+                        "live process holds the recorded native session (an open file names it); refusing to retire or revive over it — remedy: stop the process first".to_owned(),
+                    );
+                }
+            }
+            return None;
+        }
         // Long ids match as a substring; short ids match exactly as recorded
         // (a whole NUL-separated field, an `=value`, or a path component),
         // so a generic short id cannot incriminate an unrelated process.
