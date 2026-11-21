@@ -2620,7 +2620,7 @@ class ManagedAgents:
         if not isinstance(designated, str):
             return
         if designated == name:
-            notices = self.registry / "stranded-notices"
+            notices = self.registry / ".stranded-notices"
             notices.mkdir(mode=0o700, parents=True, exist_ok=True)
             agent._atomic_json(str(notices / f"{name}-{int(time.time())}.json"),
                                {"agent": name, "items": items})

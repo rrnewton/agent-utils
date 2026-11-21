@@ -7605,9 +7605,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         if designated == agent_name {
             // The archived agent was itself the coordinator: no live
             // queue can take the notice, so it is filed in the
-            // registry's own stranded-notices collection, where the
+            // registry's own .stranded-notices collection, where the
             // next designated coordinator and status readers find it.
-            let dir = self.registry.join("stranded-notices");
+            let dir = self.registry.join(".stranded-notices");
             let _ = fs::create_dir_all(&dir);
             let name = format!(
                 "{agent_name}-{}.json",

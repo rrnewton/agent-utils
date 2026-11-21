@@ -510,6 +510,46 @@ pub(crate) fn ack_row(
     }
 }
 
+/// `.stranded-notices`: the registry's `.stranded-notices/` collection
+/// holds one coalesced notice per coordinator archived while it was
+/// itself the designated coordinator (#2028). Any file there is an
+/// undelivered-item raise a human has not cleared, so it fails until
+/// the items are re-sent and the notice removed.
+pub(crate) fn stranded_notices_row(registry: &Path) -> Value {
+    let dir = registry.join(".stranded-notices");
+    let mut names: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".json") {
+                names.push(name);
+            }
+        }
+    }
+    names.sort();
+    if names.is_empty() {
+        row(
+            ".stranded-notices",
+            "pass",
+            None,
+            "no stranded coordinator notices".to_owned(),
+            None,
+        )
+    } else {
+        row(
+            ".stranded-notices",
+            "fail",
+            None,
+            format!(
+                "{} stranded notice(s) in .stranded-notices/ ({}); their items were set aside undelivered",
+                names.len(),
+                names.join(", ")
+            ),
+            Some("read each notice, re-send its items, then remove the notice file".to_owned()),
+        )
+    }
+}
+
 /// `queued-not-archived` from the fields revive itself records: status
 /// carries `queued_archived_undelivered` per agent (cancelled plus
 /// revive-quarantined failed items), and this boot's restore report rows
@@ -917,6 +957,7 @@ pub(crate) fn verify_team_from_snapshot<A: ManagedApi + ?Sized>(
     }
     checks.extend(bridge_rows(client, registry, &pins));
     checks.extend(queued_rows(&desired.names, statuses, boot_report.as_ref()));
+    checks.push(stranded_notices_row(registry));
     let health_path = watch_health_path(options.state_dir.as_deref());
     let health = health_path.as_deref().and_then(crate::restore::read_report);
     checks.push(watcher_row(
@@ -1220,6 +1261,27 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Teach auto mode"));
+    }
+
+    #[test]
+    fn stranded_notices_row_fails_while_a_notice_is_filed() {
+        // #2028: a .stranded-notices file is a raise until re-sent.
+        let dir = std::env::temp_dir().join(format!(
+            "agentctl-verify-stranded-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".stranded-notices")).unwrap();
+        assert_eq!(stranded_notices_row(&dir)["status"], "pass");
+        std::fs::write(
+            dir.join(".stranded-notices/coord-1.json"),
+            "{\"agent\": \"coord\", \"items\": []}",
+        )
+        .unwrap();
+        let found = stranded_notices_row(&dir);
+        assert_eq!(found["status"], "fail", "{found}");
+        assert!(found["evidence"].as_str().unwrap().contains("coord-1.json"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
