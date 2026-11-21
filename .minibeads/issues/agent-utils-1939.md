@@ -1,6 +1,6 @@
 ---
 title: 'agentctl-codex-replace-goal-picker: recognise Codex Replace goal picker in prompts/answer and auto-answer only agentctl-set goals'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -61,3 +61,15 @@ coordb. Recorded picker text: "Replace goal?" / "New objective:
 <objective>" / "› 1. Replace current goal  Set the new objective and
 start it now" / "2. Cancel  Keep the current goal" / "Press enter
 to confirm or esc to go back".
+
+## Resolution
+
+[watermelon-full-preview] Landed as 738e3333 on main. Codex's
+Replace-goal picker is recognised by strict recorded text in both
+editions (last block on screen, footer ending it, selection from
+the highlighted row), so prompts names it and answer chooses in
+it. A goal delivery flow confirms only its own offered goal
+(exact, or a cut showing cut only on an ellipsis with whole-word
+agreement), refuses before typing over any picker already open,
+and never cancels a picker it did not trigger. The cross-edition
+differential passes (104 paired checks).
