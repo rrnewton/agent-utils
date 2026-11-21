@@ -4572,6 +4572,12 @@ def _act_all_thread_selected(driver: Driver) -> None:
     rest dimmed and drained, nothing scrolled."""
     page = driver.page
     _open_threaded_all(driver)
+    # The walk positions the strip in view first and only then records
+    # the offset: a click that has to scroll to its target moves the
+    # list itself (measured 1455 -> 399), which is the walk positioning
+    # the shot, not the selection scrolling. The claim starts once the
+    # strip stands in view.
+    page.locator(f"#discord-log > li[data-id='{THREADED_STRIP_ROW}'] > .thread-strip").scroll_into_view_if_needed()
     _wait_scroll_stable(driver)
     before_top = float(page.evaluate("() => document.getElementById('scroll-area').scrollTop"))
     page.evaluate(f"() => {{ window.__beforeTop = {before_top}; }}")
