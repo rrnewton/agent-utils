@@ -737,11 +737,15 @@ async fn back_to_back_reloads_are_each_served_and_a_step_back_still_reaches_olde
     );
     let next = served_cursor(&older);
     // Below them the file holds two messages, and its claims stop at the age limit, so older ones
-    // may be missing from it: that step walks the provider back to them, which says nothing is
-    // older.
+    // may be missing from it. `#2066 vibe-talk-page-freeze`: those two now answer at once as a
+    // partial page (never claiming the end), the provider's step reads behind filling the
+    // stretch, and the NEXT step is the one that learns nothing is older.
     let oldest = d.step_back(5, &next).await;
     assert_eq!(texts(&oldest), ["message 0", "message 1"], "{oldest}");
-    assert_eq!(oldest["has_more"], false, "{oldest}");
+    assert_eq!(oldest["has_more"], true, "{oldest}");
+    let end = d.step_back(5, &served_cursor(&oldest)).await;
+    assert_eq!(texts(&end), Vec::<String>::new(), "{end}");
+    assert_eq!(end["has_more"], false, "{end}");
 
     // And the step back held nothing back either: the next reload is served too.
     d.clock.advance(SECOND);
@@ -3324,6 +3328,68 @@ async fn a_step_back_the_copy_cannot_prove_still_reads_the_provider() {
         "{older}"
     );
     assert_eq!(served_from(&capture, READ_CHANNEL), ["upstream"]);
+}
+
+#[tokio::test]
+async fn a_step_back_the_copy_cannot_prove_answers_its_covered_rows_at_once() {
+    // `#2066 vibe-talk-page-freeze`: the copy holds the newest eight, so a step of three
+    // from a served page of three is proven once — and the NEXT step is short (two held,
+    // nothing more) without coverage from the start, which proof refuses. It used to wait
+    // the provider race out and answer empty; now the covered rows answer at once,
+    // saying there is more (never a false end of history), marked as the copy's
+    // provisional answer, with this server's cursor at the oldest row served — and the
+    // step after that continues from there to the provider for what the copy never held.
+    let d = deployment("older-partial").await;
+    d.fill_newest(8).await;
+    d.clock.advance(2 * HOUR);
+    d.state.message_cache.set_serve(true);
+    let body = d.served_reload(3).await;
+    let cursor = served_cursor(&body);
+    let proven_step = d.step_back(3, &cursor).await;
+    assert_eq!(
+        texts(&proven_step),
+        ["message 6", "message 7", "message 8"],
+        "{proven_step}"
+    );
+    let cursor = served_cursor(&proven_step);
+    let capture = vibe_talk::testing::LogCapture::start();
+    let began = std::time::Instant::now();
+    let partial = d.step_back(3, &cursor).await;
+    assert!(began.elapsed() < AT_ONCE, "{:?}", began.elapsed());
+    assert_eq!(texts(&partial), ["message 4", "message 5"], "{partial}");
+    assert_eq!(
+        partial["has_more"], true,
+        "a partial page claimed the end of history: {partial}"
+    );
+    assert!(partial["refresh_failed"].is_string(), "{partial}");
+    assert!(
+        partial["next_before"]
+            .as_str()
+            .is_some_and(|next| next.starts_with(vibe_talk::timeline_served::PREFIX)),
+        "a partial page carried a provider cursor: {partial}"
+    );
+    assert_eq!(served_from(&capture, READ_CHANNEL), ["cache-older-partial"]);
+    // From the partial page's own cursor the walk continues correctly: the copy holds
+    // nothing below message 4, so the provider answers — no row skipped, none repeated.
+    let mut cursor = served_cursor(&partial);
+    let mut rest: Vec<String> = Vec::new();
+    loop {
+        let step = d.step_back(3, &cursor).await;
+        rest.extend(texts(&step));
+        if step["has_more"] == false {
+            break;
+        }
+        cursor = step["next_before"]
+            .as_str()
+            .expect("a step with more below carries a cursor")
+            .to_owned();
+        assert!(
+            rest.len() <= 4,
+            "the walk never reached the start: {rest:?}"
+        );
+    }
+    rest.sort();
+    assert_eq!(rest, ["message 0", "message 1", "message 2", "message 3"]);
 }
 
 #[tokio::test]

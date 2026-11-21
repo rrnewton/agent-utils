@@ -277,6 +277,16 @@ pub enum Source {
     /// with the provider's step read behind it when it could correct anything. `#650
     /// cache-first-older-reads` (`crate::ops`).
     Older,
+    /// The cache, for a step back it could not prove whole: the covered suffix below the
+    /// page, always saying there is more, with the provider's step read behind it when
+    /// the walk can reach it. `#2066 vibe-talk-page-freeze` (`crate::ops`).
+    OlderPartial,
+    /// No rows at all: a step back whose provider read outlasted its bounded wait and
+    /// whose cache held nothing servable below the cursor — an empty page saying there
+    /// is more, at the same cursor, while the read fills the cache behind it. Split
+    /// from [`Source::Older`] so the log never calls an empty answer a cache answer
+    /// (`#2066 vibe-talk-page-freeze`).
+    OlderEmpty,
     /// The provider, read for this request.
     Upstream,
     /// The cache, after the provider failed the read or kept it waiting (`#611`).
@@ -297,6 +307,8 @@ impl Source {
             Self::LiveFed => "live-fed",
             Self::Landed => "landed",
             Self::Older => "cache-older",
+            Self::OlderPartial => "cache-older-partial",
+            Self::OlderEmpty => "cache-older-empty",
             Self::Upstream => "upstream",
             Self::StandIn => "stand-in",
             Self::Held => "held",

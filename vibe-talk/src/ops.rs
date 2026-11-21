@@ -1682,7 +1682,7 @@ pub async fn timeline(
     let (mut page, position) = match (served_below.as_ref(), stand_in) {
         (Some(below), _) => {
             if let Some(page) = older_from_cache(state, caller, &channel, request, below).await? {
-                crate::cache_first::note(crate::cache_first::Source::Older);
+                // Noted inside, proven or partial (`#2066 vibe-talk-page-freeze`).
                 return Ok((channel, page));
             }
             // `#1886` addendum-1: a step back the copy cannot prove no
@@ -1707,7 +1707,7 @@ pub async fn timeline(
                     (page, None)
                 }
                 OlderStep::Fallback(page) => {
-                    crate::cache_first::note(crate::cache_first::Source::Older);
+                    crate::cache_first::note(crate::cache_first::Source::OlderEmpty);
                     (*page, None)
                 }
             }
@@ -1758,7 +1758,7 @@ pub async fn timeline(
                         answer
                     }
                     OlderStep::Fallback(page) => {
-                        crate::cache_first::note(crate::cache_first::Source::Older);
+                        crate::cache_first::note(crate::cache_first::Source::OlderEmpty);
                         (*page, None)
                     }
                 }
@@ -3019,9 +3019,14 @@ async fn incompleteness(
 /// (fifteen minutes, as the cache's held threads). `#650 cache-first-older-reads`.
 pub const OLDER_REFRESH_AFTER_MS: i64 = 15 * 60 * 1000;
 
-/// One step back from a page answered from the cache, answered from the file when its claims prove
-/// the step whole (`crate::cache::below`): at once, with no read upstream before the answer. `None`
-/// when they do not, and the step reads upstream as before ([`step_back_from_served`]). `#650
+/// One step back from a page answered from the cache, answered from the file: at once, with no
+/// read upstream before the answer, when its claims prove the step whole — and, since
+/// `#2066 vibe-talk-page-freeze`, also when they prove only its covered suffix
+/// (`crate::cache::below`): the rows down to the first coverage gap, marked
+/// `refresh_failed` like a stand-in, always with more below and this server's cursor at
+/// the oldest row SERVED, so the next step continues from there and no row that could
+/// stand in the gap is ever claimed absent. `None` when neither holds, and the step
+/// reads upstream as before ([`step_back_from_served`], raced). `#650
 /// cache-first-older-reads`.
 ///
 /// After `#622 cache-first-reads` every newest page the page read came from the cache with this
@@ -3078,9 +3083,16 @@ async fn older_from_cache(
         .message_cache
         .cache()
         .map_or_else(crate::store::now_ms, |cache| cache.now_ms());
-    if held.newer < reach && now_ms - held.listed_ms > OLDER_REFRESH_AFTER_MS {
+    // An unproven (partial) step reads behind however fresh its claims are: the walk
+    // is what fills the gap the suffix stopped at (`#2066 vibe-talk-page-freeze`).
+    if held.newer < reach && (!held.proven || now_ms - held.listed_ms > OLDER_REFRESH_AFTER_MS) {
         spawn_behind_older(state, caller, &channel.id, request, below, &held.messages);
     }
+    crate::cache_first::note(if held.proven {
+        crate::cache_first::Source::Older
+    } else {
+        crate::cache_first::Source::OlderPartial
+    });
     let thread = request.thread_id.as_deref();
     let next_before = held
         .has_more

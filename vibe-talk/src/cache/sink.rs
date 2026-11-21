@@ -1179,6 +1179,11 @@ pub struct HeldBelow {
     /// Whether the claims prove every message of the answer: false for Slack's All, whose replies
     /// are the newest the file holds of each thread, as its stand-in's are.
     pub whole: bool,
+    /// Whether the claims prove the whole STEP (nothing of the stretch missing, and
+    /// `has_more` decided): false for a covered-suffix answer (`#2066
+    /// vibe-talk-page-freeze`), whose rows are whole as far as they go but whose
+    /// stretch may hold more upstream — it always says there is more below.
+    pub proven: bool,
     /// When the oldest claim the step rests on was listed, local time: what it is as of.
     pub listed_ms: i64,
     /// How many messages of the view's scope are at or above the page's oldest, counted to
@@ -2716,9 +2721,11 @@ impl Sink {
     }
 
     /// A step back of `limit` from a page answered from the cache, whose oldest message was
-    /// written at `at_ms` with the id `id`, answered from the file: `None` when its claims do not
-    /// prove the step whole ([`super::below::proven`]), and then the step reads upstream. `#650
-    /// cache-first-older-reads`.
+    /// written at `at_ms` with the id `id`, answered from the file. Proven whole
+    /// ([`super::below::proven`]) it is the step itself; unproven, the covered suffix
+    /// ([`super::below::covered_suffix`], `proven` false, always more below) still answers
+    /// at once (`#2066 vibe-talk-page-freeze`). `None` when neither holds, and then the
+    /// step reads upstream. `#650 cache-first-older-reads`.
     ///
     /// Under the gates [`Self::stale_timeline`] keeps (serving on, the channel routed, its
     /// provider's account checked against the file before and after the read, the scope not
@@ -2790,16 +2797,30 @@ impl Sink {
                 return None;
             }
             let thread = matches!(scope, Scope::Thread(_));
-            let proven = super::below::proven(
+            // Proven whole, the step answers as it always did. Unproven, the covered
+            // suffix still answers at once (`#2066 vibe-talk-page-freeze`): rows newer
+            // than the first coverage gap, always saying there is more below, never
+            // claiming rows are absent. The hard gates above (a text no read proved
+            // whole, a step that would not advance) refuse both, as does a dropped
+            // offer newer than the claims either rests on.
+            let (has_more, is_proven, listed_ms) = match super::below::proven(
                 &view.coverage,
                 &view.rows,
                 at_ms,
                 (limit, more_held),
                 thread,
-            )?;
+            ) {
+                Some(proven) => (proven.has_more, true, proven.cover.listed_ms),
+                None => {
+                    let (first, cover) =
+                        super::below::covered_suffix(&view.coverage, &view.rows, at_ms)?;
+                    view.rows.drain(..first);
+                    (true, false, cover.listed_ms)
+                }
+            };
             // A drop the writer has not recorded yet counts as one it has, as for a serve.
             let dropped_ms = view.dropped_ms.max(cache.last_drop_ms(&chan));
-            if dropped_ms.is_some_and(|dropped| proven.cover.listed_ms <= dropped) {
+            if dropped_ms.is_some_and(|dropped| listed_ms <= dropped) {
                 return None;
             }
             let newer = match cache.newest(&chan, &scope, newer_cap) {
@@ -2833,9 +2854,10 @@ impl Sink {
             view.rows.retain(|row| !row.content_partial);
             Some(HeldBelow {
                 has_threads: view.has_threads,
-                has_more: proven.has_more,
-                whole: !slack_flat,
-                listed_ms: proven.cover.listed_ms,
+                has_more,
+                whole: !slack_flat && is_proven,
+                proven: is_proven,
+                listed_ms,
                 newer,
                 messages: view
                     .rows

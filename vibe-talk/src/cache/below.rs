@@ -81,6 +81,24 @@ pub fn proven(
     })
 }
 
+/// The longest suffix of `rows` (as [`proven`] takes them) the claims cover without a
+/// gap up to and including `at_ms`, as `(first kept row, its cover)`: what a step back
+/// may serve at once while the whole step stays unproven (`#2066
+/// vibe-talk-page-freeze`). Rows older than the first gap are NOT in it — a message
+/// could stand in that gap upstream, and serving past it would put a hole in the
+/// page. `None` when not even the newest row is covered up to the page.
+#[must_use]
+pub fn covered_suffix(
+    coverage: &[Interval],
+    rows: &[CachedMessage],
+    at_ms: i64,
+) -> Option<(usize, Cover)> {
+    let to_ms = at_ms.checked_add(1)?;
+    (0..rows.len()).find_map(|first| {
+        covers(coverage, rows[first].created_ms, to_ms).map(|cover| (first, cover))
+    })
+}
+
 /// Whether `row` is a thread's root.
 fn is_root(row: &CachedMessage) -> bool {
     row.message
@@ -199,6 +217,23 @@ mod tests {
                 .has_more
         );
         assert_eq!(proven(&[claim(10, 400)], &[], 300, (5, false), false), None);
+    }
+
+    #[test]
+    fn a_covered_suffix_stops_at_the_first_gap_and_needs_the_newest_row_covered() {
+        let rows = [row(100), row(200), row(250)];
+        // The whole stretch covered: the suffix is every row (proven's own case).
+        let (first, cover) = covered_suffix(&[claim(80, 400)], &rows, 300).expect("covered");
+        assert_eq!(first, 0);
+        assert_eq!(cover.listed_ms, 1_000);
+        // A gap between the oldest rows: only what is newer than it may be served —
+        // a message could stand in the gap, and serving row 100 would skip it.
+        let (first, _) =
+            covered_suffix(&[claim(80, 150), claim(180, 400)], &rows, 300).expect("suffix");
+        assert_eq!(first, 1, "the row older than the gap rode along");
+        // The newest row itself uncovered up to the page: nothing may be served.
+        assert_eq!(covered_suffix(&[claim(80, 240)], &rows, 300), None);
+        assert_eq!(covered_suffix(&[claim(80, 400)], &[], 300), None);
     }
 
     #[test]
