@@ -740,10 +740,12 @@ def main_walk(reader: Reader) -> None:
     deadline = time.monotonic() + 5
     while api.timeline_requests() <= reads and time.monotonic() < deadline:
         page.wait_for_timeout(25)
-    reader.quiet()
+    # `#2021`: the offer is painted by a later batch than the row that
+    # triggers it; a fixed quiet() as the only wait races that batch on a
+    # hot host. Wait for the offer itself, then judge the position.
+    reader.wait_for("() => document.getElementById('jump-newest').hasAttribute('data-arrivals')",
+                    "nothing offered the reader up the list the message that arrived")
     reader.still(before, "a message arriving live")
-    reader.check(bool(page.evaluate("() => document.getElementById('jump-newest').hasAttribute('data-arrivals')")),
-                 "nothing offered the reader up the list the message that arrived")
     reader.notes.append("a live message left the row on screen where it was and offered the jump")
 
     # A reply arriving live in a thread whose root is in Main: its count changes, and on the desk its card
