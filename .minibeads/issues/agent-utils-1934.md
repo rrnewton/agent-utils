@@ -115,7 +115,7 @@ only when it names this lane's runtime pid, with Muse's own
 per-pid store report preferred and pid reuse rejected by full
 process identity), so another lane's session is never recorded.
 
-# Resolution
+## Resolution
 
 [watermelon-full-preview] Landed as c8591bd3 on main
 (verified-overlap landing; replayed tree matched the verified tree).
