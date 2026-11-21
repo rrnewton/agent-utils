@@ -319,6 +319,31 @@ async fn a_message_is_read_through_the_fake_sidecar() {
 }
 
 #[tokio::test]
+async fn the_readers_pace_reaches_the_sidecar() {
+    // `#2053 vibe-talk-pace-has-no-effect`: ?speed= on the speak route is the
+    // sidecar's `speed`, exactly as the reader chose it.
+    let server = Arc::new(FakeSidecar::default());
+    let base = serve_fake_sidecar(Arc::clone(&server));
+    let harness = harness(&base);
+
+    let (status, _headers, body) = call_bytes(
+        &harness,
+        &format!(
+            "/api/v1/channels/{WRITE_CHANNEL}/messages/{}/speak?speed=1.5",
+            harness.message
+        ),
+        Some(READ_TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+    let seen = server.seen();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    let sent: Value = serde_json::from_str(&seen[0].body).expect("json body");
+    assert_eq!(sent["speed"], 1.5, "{sent}");
+}
+
+#[tokio::test]
 async fn a_down_sidecar_and_a_refusing_one_stop_the_read_differently() {
     let server = Arc::new(FakeSidecar::default());
     server.set(Mode::Refuse);

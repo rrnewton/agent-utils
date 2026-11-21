@@ -70,6 +70,24 @@ def wav_bytes(samples: list[float], sample_rate: int) -> bytes:
     return out.getvalue()
 
 
+def clamp_speed(speed: float) -> float:
+    """The pace bounds the server clamps to (0.5 to 2.0), applied again here.
+
+    The server clamps before it sends (`clamp_speed` in the Rust local_tts
+    adapter), but this sidecar's contract is the JSON it is handed: a caller
+    that sends 4.0 gets a doubled voice, not a quadrupled one.
+    """
+    return min(2.0, max(0.5, speed))
+
+
+def piper_length_scale(speed: float) -> float:
+    """Piper's pace knob for a pace multiplier: it stretches, so it inverts.
+
+    A length scale of 2.0 says every sound twice as long — half the pace.
+    """
+    return 1.0 / clamp_speed(speed)
+
+
 class Engine:
     """What the handlers speak through; one model, serialized calls."""
 
@@ -107,10 +125,17 @@ class Engine:
         with self.lock:
             if self.kind == "kokoro":
                 samples, rate = self._kokoro.create(  # type: ignore[attr-defined]
-                    text, voice=voice, speed=speed, lang=self.lang)
+                    text, voice=voice, speed=clamp_speed(speed), lang=self.lang)
                 return wav_bytes([float(sample) for sample in samples], int(rate))
+            # Piper has no speed: its synthesis config stretches every sound
+            # by a length scale, so the pace arrives inverted (`#2053
+            # vibe-talk-pace-has-no-effect`: this call used to pass nothing,
+            # and a piper deployment heard no pace change ever).
+            from piper.config import SynthesisConfig  # type: ignore[import-not-found]
+
+            config = SynthesisConfig(length_scale=piper_length_scale(speed))
             chunks: list[float] = []
-            for chunk in self._piper.synthesize(text):  # type: ignore[attr-defined]
+            for chunk in self._piper.synthesize(text, config):  # type: ignore[attr-defined]
                 floats = getattr(chunk, "audio_float_array", None)
                 if floats is not None:
                     chunks.extend(float(sample) for sample in floats)
@@ -177,15 +202,153 @@ def handler_for(engine: Engine) -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
+class _FakeChunk:
+    """One piper audio chunk, as the fake voice below yields it."""
+
+    def __init__(self, samples: list[float]) -> None:
+        self.audio_float_array = samples
+        self.audio_int16_bytes = b""
+
+
+class _FakeSynthesisConfig:
+    """`piper.config.SynthesisConfig`, recording what it was built with."""
+
+    def __init__(self, length_scale: float = 1.0) -> None:
+        self.length_scale = length_scale
+
+
+class _FakePiperVoice:
+    """A piper voice that records the length scale of every synthesis."""
+
+    instances: list["_FakePiperVoice"] = []
+
+    def __init__(self) -> None:
+        self.config = argparse.Namespace(sample_rate=22050)
+        self.scales: list[float] = []
+        _FakePiperVoice.instances.append(self)
+
+    @classmethod
+    def load(cls, _path: str) -> "_FakePiperVoice":
+        return cls()
+
+    def synthesize(self, text: str, config: _FakeSynthesisConfig) -> list[_FakeChunk]:
+        self.scales.append(config.length_scale)
+        return [_FakeChunk([0.1, -0.1])]
+
+
+class _FakeKokoro:
+    """A kokoro engine that records the speed of every synthesis."""
+
+    instances: list["_FakeKokoro"] = []
+
+    def __init__(self, *_paths: str) -> None:
+        self.speeds: list[float] = []
+        _FakeKokoro.instances.append(self)
+
+    def get_voices(self) -> list[str]:
+        return ["af_heart"]
+
+    def create(
+        self, _text: str, voice: str, speed: float, lang: str
+    ) -> tuple[list[float], int]:
+        del voice, lang
+        self.speeds.append(speed)
+        return ([0.1, -0.1], 24000)
+
+
+def self_test() -> int:
+    """Prove a pace reaches each engine, with recording fakes and no models.
+
+    Run as `--self-test`: no model files, no network beyond loopback, and no
+    piper or kokoro installation — both are stubbed in `sys.modules` with
+    voices that record the pace parameter they were handed.
+    """
+    import tempfile
+    import types
+    import urllib.request
+
+    failures: list[str] = []
+
+    def check(name: str, ok: bool) -> None:
+        print(f"{'ok' if ok else 'FAIL'}: {name}")
+        if not ok:
+            failures.append(name)
+
+    check("clamp_speed keeps the server's bounds", clamp_speed(4.0) == 2.0
+          and clamp_speed(0.1) == 0.5 and clamp_speed(1.5) == 1.5)
+    check("piper_length_scale inverts the pace", piper_length_scale(2.0) == 0.5
+          and piper_length_scale(0.5) == 2.0 and piper_length_scale(1.0) == 1.0)
+
+    piper_module = types.ModuleType("piper")
+    piper_module.PiperVoice = _FakePiperVoice  # type: ignore[attr-defined]
+    piper_config = types.ModuleType("piper.config")
+    piper_config.SynthesisConfig = _FakeSynthesisConfig  # type: ignore[attr-defined]
+    kokoro_module = types.ModuleType("kokoro_onnx")
+    kokoro_module.Kokoro = _FakeKokoro  # type: ignore[attr-defined]
+    sys.modules["piper"] = piper_module
+    sys.modules["piper.config"] = piper_config
+    sys.modules["kokoro_onnx"] = kokoro_module
+
+    with tempfile.TemporaryDirectory() as model_dir:
+        (Path(model_dir) / "fake-voice.onnx").write_bytes(b"fake")
+        piper_engine = Engine(argparse.Namespace(
+            engine="piper", lang="en-us", model_dir=model_dir))
+        piper_engine.synthesize("hello there", "fake-voice", 1.5)
+        voice = _FakePiperVoice.instances[-1]
+        check("piper is handed the inverted pace", voice.scales == [1.0 / 1.5])
+        piper_engine.synthesize("hello there", "fake-voice", 4.0)
+        check("piper pace is clamped before it inverts", voice.scales[-1] == 0.5)
+
+        # The whole HTTP contract: a {"speed": 1.5} body becomes that scale.
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(piper_engine))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            body = json.dumps(
+                {"q": "hello there", "voice": "fake-voice", "speed": 1.5}).encode()
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/synthesize",
+                data=body, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(request, timeout=10) as response:
+                audio = response.read()
+            check("the sidecar answers audio for a paced request", len(audio) > 44)
+            check("the posted speed reaches piper as a length scale",
+                  voice.scales[-1] == 1.0 / 1.5)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        kokoro_engine = Engine(argparse.Namespace(
+            engine="kokoro", lang="en-us", model_dir=model_dir))
+        kokoro_engine.synthesize("hello there", "af_heart", 1.5)
+        kokoro = _FakeKokoro.instances[-1]
+        check("kokoro is handed the pace itself", kokoro.speeds == [1.5])
+        kokoro_engine.synthesize("hello there", "af_heart", 4.0)
+        check("kokoro pace is clamped", kokoro.speeds[-1] == 2.0)
+
+    if failures:
+        print(f"self-test: {len(failures)} failure(s)", file=sys.stderr)
+        return 1
+    print("self-test: all checks passed")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--engine", choices=["kokoro", "piper"], default="kokoro")
-    parser.add_argument("--model-dir", required=True,
+    parser.add_argument("--model-dir",
                         help="directory holding the model files (outside any repository)")
+    parser.add_argument("--self-test", action="store_true",
+                        help="prove each engine receives the pace, with recording "
+                             "fakes; needs no models and no TTS installation")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18771)
     parser.add_argument("--lang", default="en-us", help="kokoro language (default en-us)")
     args = parser.parse_args()
+    if args.self_test:
+        return self_test()
+    if not args.model_dir:
+        parser.error("--model-dir is required unless --self-test is given")
     engine = Engine(args)
     server = ThreadingHTTPServer((args.host, args.port), handler_for(engine))
     print(f"local tts sidecar ({engine.kind}) on http://{args.host}:{args.port} "

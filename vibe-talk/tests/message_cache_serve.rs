@@ -2717,6 +2717,7 @@ impl vibe_talk::speech::SpeechProvider for QuickSpeech {
             label: "Quick test voice".to_owned(),
             playback: vibe_talk::speech::Playback::Audio,
             local_only: false,
+            pace_supported: true,
             chain: vec![],
         }
     }

@@ -39,11 +39,29 @@ pub struct Description {
     /// Whether browser speech must select a voice advertised as running locally.
     /// This is the browser's `localService` flag; the device engine controls actual networking.
     pub local_only: bool,
+    /// Whether this backend honours the reader's Pace (`#2053 vibe-talk-pace-has-no-effect`).
+    ///
+    /// False only where the pace cannot reach the voice at all: the conversational
+    /// cascade's wire carries a verbatim-read prompt and no rate, so a pace sent to
+    /// it is discarded (`ConversationSpeech::speak_stream_for_selection`). The page
+    /// reads this from client-config and greys the Pace controls with the reason
+    /// instead of letting the reader move a control that does nothing. Sent only
+    /// when false, as [`Description::chain`] is sent only when non-empty: an older
+    /// server's silence reads as a pace that works, never as one that does not.
+    #[serde(default, skip_serializing_if = "is_supported")]
+    pub pace_supported: bool,
     /// The ordered voice labels a fallback chain will try, first first
     /// (`#563 read-aloud-fallback-chain`): Settings shows them in this
     /// order. Empty for a single provider.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chain: Vec<String>,
+}
+
+/// `skip_serializing_if` for [`Description::pace_supported`]: the common case
+/// (a pace that works) is the one not worth the bytes, exactly as an empty
+/// [`Description::chain`] is not sent.
+fn is_supported(supported: &bool) -> bool {
+    *supported
 }
 
 /// One voice a provider offers, for a Settings picker.
@@ -287,6 +305,7 @@ impl SpeechProvider for BrowserSpeech {
             label: "Device voice".to_owned(),
             playback: Playback::Browser,
             local_only: true,
+            pace_supported: true,
             chain: Vec::new(),
         }
     }
@@ -1154,6 +1173,7 @@ impl SpeechProvider for ConversationSpeech {
             label: self.label.clone(),
             playback: Playback::Audio,
             local_only: false,
+            pace_supported: false,
             chain: Vec::new(),
         }
     }
@@ -1201,6 +1221,11 @@ impl SpeechProvider for ConversationSpeech {
     async fn speak_stream_for_selection(
         &self,
         text: &str,
+        // The pace is discarded here, deliberately: the cascade's wire is a
+        // verbatim-read prompt with no rate to carry it (`#2053
+        // vibe-talk-pace-has-no-effect`). `describe` says `pace_supported:
+        // false` for this backend, and the page greys the Pace controls on
+        // that word rather than letting a pace be sent into this discard.
         _speed: Option<f64>,
         selection: Option<&str>,
     ) -> Result<SpeechStream, SpeechError> {

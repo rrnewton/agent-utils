@@ -1109,6 +1109,18 @@ export interface Description {
    */
   local_only: boolean;
   /**
+   * Whether this backend honours the reader's Pace (`#2053 vibe-talk-pace-has-no-effect`).
+   *
+   * False only where the pace cannot reach the voice at all: the conversational
+   * cascade's wire carries a verbatim-read prompt and no rate, so a pace sent to
+   * it is discarded (`ConversationSpeech::speak_stream_for_selection`). The page
+   * reads this from client-config and greys the Pace controls with the reason
+   * instead of letting the reader move a control that does nothing. Sent only
+   * when false, as [`Description::chain`] is sent only when non-empty: an older
+   * server's silence reads as a pace that works, never as one that does not.
+   */
+  pace_supported?: boolean;
+  /**
    * Which playback interface the browser should use.
    */
   playback: Playback;

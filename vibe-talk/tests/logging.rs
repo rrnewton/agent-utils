@@ -1231,6 +1231,7 @@ impl vibe_talk::speech::SpeechProvider for FailingWarmUp {
             label: "Failing warm-up".to_owned(),
             playback: vibe_talk::speech::Playback::Audio,
             local_only: false,
+            pace_supported: true,
             chain: vec![],
         }
     }

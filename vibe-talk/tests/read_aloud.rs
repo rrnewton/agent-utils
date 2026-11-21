@@ -173,6 +173,15 @@ async fn conversational_read_aloud_drives_the_provider_neutral_socket_and_return
     };
     let provider = ConversationSpeech::new(&config, Some(&url));
     assert_eq!(provider.describe().label, "Test agent");
+    // `#2053 vibe-talk-pace-has-no-effect`: the cascade's wire carries no
+    // rate, so this backend says so and the page greys the Pace controls.
+    assert!(
+        !provider.describe().pace_supported,
+        "the conversation backend claims a pace it discards"
+    );
+    // ...and client-config carries that word: false is the one value sent.
+    let described = serde_json::to_value(provider.describe()).expect("description serializes");
+    assert_eq!(described["pace_supported"], json!(false), "{described}");
     provider.warm_up().await.expect("warms a ready session");
     let spoken = provider
         .speak_stream("hello from the channel", None)
@@ -986,6 +995,7 @@ impl SpeechProvider for IndependentSpeech {
             label: "Independent voice".to_owned(),
             playback: Playback::Audio,
             local_only: false,
+            pace_supported: true,
             chain: vec![],
         }
     }
@@ -1018,6 +1028,7 @@ impl SpeechProvider for DeniedAfterAudio {
             label: "Denied test voice".to_owned(),
             playback: Playback::Audio,
             local_only: false,
+            pace_supported: true,
             chain: vec![],
         }
     }
@@ -1182,6 +1193,7 @@ impl SpeechProvider for SlowWarmSpeech {
             label: "Timed test voice".to_owned(),
             playback: Playback::Audio,
             local_only: false,
+            pace_supported: true,
             chain: vec![],
         }
     }

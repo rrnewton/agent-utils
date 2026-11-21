@@ -18,6 +18,7 @@ interface VoiceConfig {
   readonly playback?: string;
   readonly label?: string;
   readonly chain?: readonly string[];
+  readonly pace_supported?: boolean;
 }
 interface PrepareReply {
   readonly voices?: readonly { name: string }[];
@@ -220,6 +221,16 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
    */
   const READ_SPEED_SETTLE_MS = 600;
   let readSpeed: number | null = null;
+  /**
+   * `#2053 vibe-talk-pace-has-no-effect`. Whether the voice that will read can
+   * be paced at all, as client-config's `read_aloud.pace_supported` reports it.
+   * True until a server says otherwise: every backend but the conversational
+   * cascade honours a pace, and an older server that does not send the field
+   * keeps the controls live rather than greyed on a guess.
+   */
+  let paceSupported = true;
+  /** Why Pace is greyed, in the popover, the button's title and its aria. */
+  const PACE_UNAVAILABLE = "Pace isn't available with this voice";
 
   /** Put the pace on the page and remember it. */
   function applyReadSpeed(value: number | null) {
@@ -227,8 +238,14 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     readSpeed = value === null ? null : clampReadSpeed(value);
     const shown = readSpeed === null ? 100 : readSpeed;
     deps.el("read-speed-box").value = `${shown}%`;
-    deps.el("read-speed-down").disabled = shown <= MIN_READ_SPEED;
-    deps.el("read-speed-up").disabled = shown >= MAX_READ_SPEED;
+    // A voice that cannot be paced greys the whole stepper, bounds included:
+    // the controls must not move a number nothing will honour (`#2053`).
+    deps.el("read-speed-down").disabled = !paceSupported || shown <= MIN_READ_SPEED;
+    deps.el("read-speed-up").disabled = !paceSupported || shown >= MAX_READ_SPEED;
+    deps.el("read-speed-box").disabled = !paceSupported;
+    deps.el("read-speed").title = paceSupported ? "" : PACE_UNAVAILABLE;
+    if (paceSupported) deps.el("read-speed").removeAttribute("aria-label");
+    else deps.el("read-speed").setAttribute("aria-label", `Pace. ${PACE_UNAVAILABLE}.`);
     // A button disabled under the focus would drop it to the page: it goes to the box instead.
     const focused = document.activeElement;
     if ((focused === deps.el("read-speed-down") && deps.el("read-speed-down").disabled) ||
@@ -239,13 +256,17 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
       readSpeed === null
         ? readAloudPlayback === "browser" ? "Pace: device default" : "Pace: as the agent speaks"
         : `Pace: ${readSpeed}%`;
-    deps.el("read-pace-help").textContent = readAloudPlayback === "browser"
-      ? "Unset, a message uses the device voice's normal pace. A change applies at once, from the " +
-        "sentence being read."
-      : "Unset, a message is read at whatever pace the voice agent is configured with. A change " +
-        "applies at once, from the block being read (a message read whole starts again).";
-    deps.el("read-speed-box").setAttribute("aria-label", readAloudPlayback === "browser"
-      ? "reading pace, percent of the device voice's normal pace" : "reading pace, percent of the agent's own");
+    deps.el("read-pace-help").textContent = !paceSupported
+      ? `${PACE_UNAVAILABLE}.`
+      : readAloudPlayback === "browser"
+        ? "Unset, a message uses the device voice's normal pace. A change applies at once, from the " +
+          "sentence being read."
+        : "Unset, a message is read at whatever pace the voice agent is configured with. A change " +
+          "applies at once, from the block being read (a message read whole starts again).";
+    deps.el("read-speed-box").setAttribute("aria-label", !paceSupported
+      ? `reading pace. ${PACE_UNAVAILABLE}`
+      : readAloudPlayback === "browser"
+        ? "reading pace, percent of the device voice's normal pace" : "reading pace, percent of the agent's own");
     deps.el("read-speed-label").textContent = readSpeed === null ? "Pace" : `${readSpeed}%`;
     try {
       deps.deviceSettings().keep(DEVICE_SETTINGS.readSpeed, readSpeed);
@@ -447,6 +468,10 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     forgetPreparedSpeech();
     const serverSpeech = readAudioSource === "wit" ? witReadAloud
       : readAudioSource === "agent" ? agentReadAloud : null;
+    // `#2053 vibe-talk-pace-has-no-effect`: the pace lives or dies with the
+    // voice that will read. The device voice always takes a rate; a server
+    // voice takes one only where its backend says so in client-config.
+    paceSupported = serverSpeech ? serverSpeech.pace_supported !== false : true;
     if (serverSpeech) {
       readAloudPlayback = String(serverSpeech.playback || "audio");
       readAloudLabel = String(serverSpeech["label"] || "Agent voice");
@@ -4150,6 +4175,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   get preparedSpeech() { return preparedSpeech; },
   get readAloudContext() { return readAloudContext; },
   get readSpeed() { return readSpeed; }, set readSpeed(value: typeof readSpeed) { readSpeed = value; },
+  get paceSupported() { return paceSupported; }, set paceSupported(value: typeof paceSupported) { paceSupported = value; },
   applyReadSpeed,
   stepReadSpeed,
   commitReadSpeedBox,

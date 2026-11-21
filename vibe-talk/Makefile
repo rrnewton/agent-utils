@@ -16,7 +16,7 @@
 #
 # UNBOXED, and deliberately the default: it needs Rust, Node, and the repository's Python typing
 # tools, but no cgroup delegation. `validate-boxed` is the bounded version where cgroups exist.
-validate: fmt check scripts-check contract-check typecheck test dag-check voice-read-acceptance-self-test android-speech-self-test live-relay-check-self-test screenshots-self-test
+validate: fmt check scripts-check contract-check typecheck test dag-check voice-read-acceptance-self-test android-speech-self-test live-relay-check-self-test screenshots-self-test local-tts-sidecar-self-test
 
 # The complete portable suite, run through dagrun: per-step wall and CPU timeouts, memory caps,
 # and process-tree teardown inside nested cgroups. Container-runtime and alternate-toolchain

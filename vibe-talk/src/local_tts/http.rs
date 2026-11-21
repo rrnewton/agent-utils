@@ -192,6 +192,22 @@ mod tests {
     }
 
     #[test]
+    fn the_body_carries_an_asked_for_speed_to_the_sidecar() {
+        // `#2053 vibe-talk-pace-has-no-effect`: the pace the reader chose is
+        // the sidecar's `speed`, pinned so a refactor cannot drop it quietly.
+        assert_eq!(
+            synthesize_body("hello there", "af_heart", Some(1.5)),
+            serde_json::json!({"q": "hello there", "voice": "af_heart", "speed": 1.5})
+        );
+        // No pace chosen: no key at all, so the sidecar uses its own default
+        // rather than a 1.0 the reader never asked for.
+        assert_eq!(
+            synthesize_body("hello there", "af_heart", None),
+            serde_json::json!({"q": "hello there", "voice": "af_heart"})
+        );
+    }
+
+    #[test]
     fn voices_parse_from_the_sidecar_shape() {
         let value = serde_json::json!({"voices": [{"name": "af_heart", "locale": "en"}, "am_michael", {"x": 1}]});
         let voices = parse_voices(&value);

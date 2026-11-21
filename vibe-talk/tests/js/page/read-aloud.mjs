@@ -3123,6 +3123,43 @@ test("`#567 pace-stepper`: the pace is a box between − and +, ten a step, with
   assert.equal(page.storage.get("vibe-talk.voice.read-speed"), "60");
 });
 
+test("`#2053 vibe-talk-pace-has-no-effect`: a voice that cannot be paced greys Pace and says why", async () => {
+  const page = newPage();
+  // The conversational cascade's description: client-config's one word that
+  // Pace cannot be honoured (`pace_supported: false` from the server).
+  page.readAloud = { backend: "conversation", label: "Internal voice preview", playback: "audio", local_only: false, pace_supported: false };
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1000000000000000001" })]);
+  // The button still opens the popover: the reason has to be reachable.
+  await page.el("read-speed").click();
+  await page.settle();
+  assert.equal(page.el("read-speed-down").disabled, true, "− is live with a voice that cannot be paced");
+  assert.equal(page.el("read-speed-up").disabled, true, "+ is live with a voice that cannot be paced");
+  assert.equal(page.el("read-speed-box").disabled, true, "the pace box is live with a voice that cannot be paced");
+  assert.equal(page.el("read-pace-help").text(), "Pace isn't available with this voice.");
+  assert.equal(page.el("read-speed").title, "Pace isn't available with this voice");
+  assert.equal(page.el("read-speed").getAttribute("aria-label"), "Pace. Pace isn't available with this voice.");
+  assert.equal(page.el("read-speed-box").getAttribute("aria-label"), "reading pace. Pace isn't available with this voice");
+  // Nothing has been stored: the pace was never the reader's to choose here.
+  assert.equal(page.storage.has("vibe-talk.voice.read-speed"), false, "opening Pace stored a pace");
+});
+
+test("`#2053 vibe-talk-pace-has-no-effect`: a capable voice keeps Pace live, and the device voice always does", async () => {
+  const page = newPage();
+  page.readAloud = { backend: "elevenlabs", label: "ElevenLabs", playback: "audio", local_only: false, pace_supported: true };
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1000000000000000001" })]);
+  await page.el("read-speed").click();
+  await page.settle();
+  assert.equal(page.el("read-speed-box").disabled, false, "a capable voice greys its pace box");
+  assert.equal(page.el("read-speed").title, "");
+  assert.equal(page.el("read-speed").getAttribute("aria-label"), null);
+  // Switching to the device voice keeps it live: a rate is its own to set.
+  page.el("audio-source").click();
+  await page.settle();
+  assert.equal(page.el("read-speed-box").disabled, false, "the device voice greys its pace box");
+});
+
 test("`#567 pace-stepper`: the keyboard the pace box raises leaves its popover and the bar open, and a disabled end gives the focus to the box", async () => {
   const page = newPage();
   await signIn(page);

@@ -1176,7 +1176,7 @@ return errors === 0;
 }
 validate27.evaluated = {"props":{"broadcast_supported":true,"channel_discovery_supported":true,"channel_registration_supported":true,"coding_agent_ids":true,"coding_agents_named_only":true,"idempotent_posts_supported":true,"key":true,"live_delivery":true,"live_poll_seconds":true,"name":true,"owner_author_id":true,"replies_in_thread":true,"self_author_id":true,"threading_supported":true,"upstream_clear_supported":true,"upstream_read_mark_supported":true},"dynamicProps":false,"dynamicItems":false};
 
-const schema44 = {"properties":{"backend":{"type":"string"},"chain":{"items":{"type":"string"},"type":"array"},"label":{"type":"string"},"local_only":{"type":"boolean"},"playback":{"$ref":"#/$defs/Playback"}},"required":["backend","label","playback","local_only"],"type":"object"};
+const schema44 = {"properties":{"backend":{"type":"string"},"chain":{"items":{"type":"string"},"type":"array"},"label":{"type":"string"},"local_only":{"type":"boolean"},"pace_supported":{"default":false,"type":"boolean"},"playback":{"$ref":"#/$defs/Playback"}},"required":["backend","label","playback","local_only"],"type":"object"};
 const schema45 = {"oneOf":[{"const":"browser","type":"string"},{"const":"audio","type":"string"}]};
 
 function validate29(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
@@ -1263,14 +1263,26 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.playback !== undefined){
-let data5 = data.playback;
+if(data.pace_supported !== undefined){
 const _errs11 = errors;
+if(typeof data.pace_supported !== "boolean"){
+validate29.errors = [{instancePath:instancePath+"/pace_supported",schemaPath:"#/properties/pace_supported/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+return false;
+}
+var valid0 = _errs11 === errors;
+}
+else {
+var valid0 = true;
+}
+if(valid0){
+if(data.playback !== undefined){
+let data6 = data.playback;
 const _errs13 = errors;
+const _errs15 = errors;
 let valid3 = false;
 let passing0 = null;
-const _errs14 = errors;
-if(typeof data5 !== "string"){
+const _errs16 = errors;
+if(typeof data6 !== "string"){
 const err0 = {instancePath:instancePath+"/playback",schemaPath:"#/$defs/Playback/oneOf/0/type",keyword:"type",params:{type: "string"},message:"must be string"};
 if(vErrors === null){
 vErrors = [err0];
@@ -1280,7 +1292,7 @@ vErrors.push(err0);
 }
 errors++;
 }
-if("browser" !== data5){
+if("browser" !== data6){
 const err1 = {instancePath:instancePath+"/playback",schemaPath:"#/$defs/Playback/oneOf/0/const",keyword:"const",params:{allowedValue: "browser"},message:"must be equal to constant"};
 if(vErrors === null){
 vErrors = [err1];
@@ -1290,13 +1302,13 @@ vErrors.push(err1);
 }
 errors++;
 }
-var _valid0 = _errs14 === errors;
+var _valid0 = _errs16 === errors;
 if(_valid0){
 valid3 = true;
 passing0 = 0;
 }
-const _errs16 = errors;
-if(typeof data5 !== "string"){
+const _errs18 = errors;
+if(typeof data6 !== "string"){
 const err2 = {instancePath:instancePath+"/playback",schemaPath:"#/$defs/Playback/oneOf/1/type",keyword:"type",params:{type: "string"},message:"must be string"};
 if(vErrors === null){
 vErrors = [err2];
@@ -1306,7 +1318,7 @@ vErrors.push(err2);
 }
 errors++;
 }
-if("audio" !== data5){
+if("audio" !== data6){
 const err3 = {instancePath:instancePath+"/playback",schemaPath:"#/$defs/Playback/oneOf/1/const",keyword:"const",params:{allowedValue: "audio"},message:"must be equal to constant"};
 if(vErrors === null){
 vErrors = [err3];
@@ -1316,7 +1328,7 @@ vErrors.push(err3);
 }
 errors++;
 }
-var _valid0 = _errs16 === errors;
+var _valid0 = _errs18 === errors;
 if(_valid0 && valid3){
 valid3 = false;
 passing0 = [passing0, 1];
@@ -1340,20 +1352,21 @@ validate29.errors = vErrors;
 return false;
 }
 else {
-errors = _errs13;
+errors = _errs15;
 if(vErrors !== null){
-if(_errs13){
-vErrors.length = _errs13;
+if(_errs15){
+vErrors.length = _errs15;
 }
 else {
 vErrors = null;
 }
 }
 }
-var valid0 = _errs11 === errors;
+var valid0 = _errs13 === errors;
 }
 else {
 var valid0 = true;
+}
 }
 }
 }
@@ -1369,7 +1382,7 @@ return false;
 validate29.errors = vErrors;
 return errors === 0;
 }
-validate29.evaluated = {"props":{"backend":true,"chain":true,"label":true,"local_only":true,"playback":true},"dynamicProps":false,"dynamicItems":false};
+validate29.evaluated = {"props":{"backend":true,"chain":true,"label":true,"local_only":true,"pace_supported":true,"playback":true},"dynamicProps":false,"dynamicItems":false};
 
 const schema50 = {"properties":{"changeable":{"type":"boolean"},"delivery":{"$ref":"#/$defs/PromptDelivery"},"edited_from_version":{"format":"uint32","minimum":0,"type":["integer","null"]},"instructions":{"type":"string"},"max_instructions_chars":{"format":"uint32","minimum":0,"type":"integer"},"max_system_prompt_chars":{"format":"uint32","minimum":0,"type":"integer"},"prompt_version":{"format":"uint32","minimum":0,"type":"integer"},"system_prompt":{"type":"string"},"system_prompt_edited":{"type":"boolean"}},"required":["instructions","system_prompt","system_prompt_edited","prompt_version","max_instructions_chars","max_system_prompt_chars","changeable","delivery"],"type":"object"};
 const schema51 = {"oneOf":[{"const":"profile","type":"string"},{"const":"page","type":"string"}]};

@@ -42,6 +42,7 @@ impl SpeechProvider for ElevenLabsSpeech {
             label: "ElevenLabs".to_owned(),
             playback: Playback::Audio,
             local_only: false,
+            pace_supported: true,
             chain: Vec::new(),
         }
     }

@@ -339,6 +339,7 @@ impl SpeechProvider for WitSpeech {
             label: "Wit.ai voice".to_owned(),
             playback: Playback::Audio,
             local_only: false,
+            pace_supported: true,
             chain: Vec::new(),
         }
     }

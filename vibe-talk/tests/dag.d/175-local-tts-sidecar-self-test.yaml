@@ -1,0 +1,16 @@
+steps:
+  - group: check
+    job: local-tts-sidecar-self-test
+    desc: the local TTS sidecar hands each engine the reader's pace
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 scripts/local_tts_sidecar.py --self-test
+    jobs_flag: ""
+    timeout: 240
+    cpu_timeout: 30
+    hint:
+      est_duration_s: 2
+      classification: light
+      rss_baseline_bytes: 268435456
+
+  # Recording fakes stand in for piper and kokoro: neither model is installed
+  # in validation, and the verdict is the pace parameter each fake was handed.

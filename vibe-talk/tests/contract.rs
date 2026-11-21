@@ -249,6 +249,7 @@ fn client_config(
                 Playback::Browser
             },
             local_only: !full,
+            pace_supported: true,
             chain: Vec::new(),
         },
         version: "0.0.0",

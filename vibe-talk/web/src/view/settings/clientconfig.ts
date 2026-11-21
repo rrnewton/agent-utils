@@ -24,7 +24,7 @@ export interface ReadAloudConfigTarget {
 
 /** The client-config answer, as this owner reads it. */
 export interface ClientConfigLike {
-  read_aloud?: { backend?: string; label?: string; playback?: string; local_only?: boolean; chain?: string[] } | null;
+  read_aloud?: { backend?: string; label?: string; playback?: string; local_only?: boolean; chain?: string[]; pace_supported?: boolean } | null;
   threading_supported?: boolean;
   broadcast_supported?: boolean;
   live_poll_seconds?: unknown;

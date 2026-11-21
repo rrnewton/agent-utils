@@ -55,6 +55,7 @@ impl SpeechProvider for ChainSpeech {
             label: first.label.clone(),
             playback: first.playback,
             local_only: first.local_only,
+            pace_supported: first.pace_supported,
             chain: self
                 .providers
                 .iter()
@@ -182,6 +183,7 @@ mod tests {
                 label: self.label.to_owned(),
                 playback: Playback::Audio,
                 local_only: false,
+                pace_supported: true,
                 chain: Vec::new(),
             }
         }

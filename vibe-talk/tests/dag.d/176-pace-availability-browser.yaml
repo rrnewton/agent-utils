@@ -1,0 +1,15 @@
+steps:
+  - group: check
+    job: pace-availability-browser
+    desc: Pace greyed with its reason for a voice that cannot be paced, live for one that can, in current Chromium at 412 and 1280, light and dark
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/pace_availability_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 40
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
