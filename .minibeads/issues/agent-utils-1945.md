@@ -1,6 +1,6 @@
 ---
 title: 'agentctl-muse-store-stale-lock-pid-reuse: reject stale session locks after pid reuse in the Muse store lookup'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
@@ -43,3 +43,16 @@ window.
 [watermelon-full-preview] Filed by mu-restorefix at coordb's
 request; does not block the #1934 landing. Related: #1934
 agentctl-restore-muse-sessions-and-timeout.
+
+## Resolution
+
+[watermelon-full-preview] Landed as 39a15a65 on main. The
+pid-keyed Muse store lookup requires the session lock to be at
+least as new as the pinned runtime process, whose start is derived
+from field 22 of /proc/<pid>/stat plus btime (never the proc
+directory's instantiation mtime), with a 2-second granularity
+tolerance; unknown freshness fails closed. Tests reject a reused
+pid's stale lock, prefer Muse's own report over a held peer lock,
+and attribute nothing to held paths outside the store tree. The
+Python edition has no pid-keyed store lookup, so nothing mirrored
+there.
