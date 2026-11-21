@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-all-view-send-flash: sending in the All view must not flash different messages'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -8,7 +8,8 @@ labels:
 - ui
 - owner-bug
 created_at: 2026-11-20T13:47:00-05:00
-updated_at: 2026-11-20T13:47:00-05:00
+updated_at: 2026-11-20T23:24:00-05:00
+closed_at: 2026-11-20T23:24:00-05:00
 ---
 
 # Description
@@ -34,3 +35,7 @@ In the All (cross-thread) view, after Send, the visible window near the end of t
 # Notes
 
 Owner-priority, fast-track: deployed on landing. Related owner rules: dynamic testing through the real server before landing (thread 193), screenshot matrix (thread 124), condition-based waits only (rule 346).
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as 575385c5 (a55f08fb the fix): a send in All now adds its row at the foot and moves nothing — no scroll at the Send tap or at the answer outside the fitted-keyboard regime, the composer hold (#1839) released at the press so the send's redraws keep the reader's anchor, and a keeping re-read that brought nothing new (or only the reader's own send) no longer re-takes the foot. Verified by the frame-capture check (tests/send_flash_browser.py, all eight non-windowed walks at 0 flash frames and 0.0px on devbig030), the page anchor tests, and the focused suites; the final owner gate's only red was screenshots-desks scene 59, waived as the known load flake #2014. Remaining, owned by #2008 (mu-windowed): the late-read windowed walk can still drop rows for one frame (0.3px) on the combined tree, which the two [expected-fail #2008] marks in the flash check name until that lands and they are removed.
