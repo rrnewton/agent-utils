@@ -10606,7 +10606,167 @@ class _EventWriter:
         _forget_event_chain(self.directory, self.machine)
         _atomic_write_json(path, event)
         self.previous_sha256 = _as_str(event["sha256"], "append-only event.sha256")
+        _note_event_in_index(self.directory, self.machine, event)
         return event
+
+
+_EVENT_INDEX_SCHEMA = 1
+
+
+def _event_index_path(directory: Path, machine: str) -> Path:
+    """The scoped-status index beside one machine's event log (#2039).
+
+    It lives at the control top level, never inside ``EVENTS.<machine>/``:
+    the event log refuses unexpected entries, while readers of every
+    vintage simply never look at this file.
+    """
+
+    return directory.parent / f"EVENT-INDEX.{machine}.json"
+
+
+def _load_event_index(directory: Path, machine: str) -> dict[str, object] | None:
+    """The parsed scoped-status index, or None when unusable (#2039)."""
+
+    try:
+        raw = _read_json(_event_index_path(directory, machine), "event index")
+    except (OSError, Refusal, StateError, ValueError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    if raw.get("schema") != _EVENT_INDEX_SCHEMA or raw.get("machine") != machine:
+        return None
+    tip = raw.get("tip")
+    if not isinstance(tip, dict):
+        return None
+    if not isinstance(tip.get("sequence"), int) or not isinstance(
+        tip.get("sha256"), str
+    ):
+        return None
+    if not isinstance(raw.get("slots"), dict):
+        return None
+    return raw
+
+
+def _index_observe(index: dict[str, object], event: Mapping[str, object]) -> None:
+    """Fold one appended event into the scoped-status index (#2039)."""
+
+    payload = event.get("payload")
+    if not isinstance(payload, Mapping):
+        payload = {}
+    sequence = _as_int(event["sequence"], "append-only event.sequence")
+    index["tip"] = {"sequence": sequence, "sha256": event["sha256"]}
+    slots = index.setdefault("slots", {})
+    assert isinstance(slots, dict)
+    kind = event.get("kind")
+
+    def entry(slot: str) -> dict[str, object]:
+        found = slots.setdefault(slot, {})
+        assert isinstance(found, dict)
+        return found
+
+    if kind == "active-state-recorded":
+        revision = payload.get("revision")
+        index["active_revision"] = revision if isinstance(revision, int) else None
+    elif kind == "state-imported":
+        active = payload.get("active")
+        revision = active.get("revision") if isinstance(active, Mapping) else None
+        index["active_revision"] = revision if isinstance(revision, int) else None
+        holds = payload.get("holds")
+        if isinstance(holds, list):
+            for item in holds:
+                if isinstance(item, Mapping) and isinstance(item.get("slot"), str):
+                    entry(item["slot"])["imported"] = sequence
+    slot = payload.get("slot")
+    if isinstance(slot, str):
+        if kind == "slot-held":
+            entry(slot)["held"] = sequence
+        elif kind == "slot-hold-released":
+            entry(slot)["hold_released"] = sequence
+        elif kind == "owner-released":
+            entry(slot)["released"] = sequence
+    pending = index.setdefault("pending", {})
+    assert isinstance(pending, dict)
+    if kind == "operation-progress-recorded":
+        journal = payload.get("journal")
+        name = payload.get("journal_path")
+        if not isinstance(name, str) or Path(name).name != name:
+            name = f"ACTIVE.{index['machine']}.journal"
+        identity = (
+            (journal.get("kind"), journal.get("slot"))
+            if isinstance(journal, Mapping)
+            else (None, None)
+        )
+        if any(
+            existing_name != name
+            and (existing.get("kind"), existing.get("slot")) == identity
+            for existing_name, existing in pending.items()
+            if isinstance(existing, Mapping)
+        ):
+            index["pending_conflict"] = True
+        pending[name] = {"kind": identity[0], "slot": identity[1]}
+    elif kind in {"operation-completed", "operation-quarantined"}:
+        name = payload.get("journal_path")
+        if not isinstance(name, str) or Path(name).name != name:
+            name = f"ACTIVE.{index['machine']}.journal"
+        current = pending.get(name)
+        if isinstance(current, Mapping):
+            if (
+                payload.get("slot") == current.get("slot")
+                and payload.get("operation") == current.get("kind")
+            ):
+                del pending[name]
+            else:
+                index["pending_conflict"] = True
+
+
+def _rebuild_event_index(directory: Path, machine: str) -> dict[str, object]:
+    """Rebuild the scoped-status index from a chain-verified scan (#2039)."""
+
+    index: dict[str, object] = {
+        "schema": _EVENT_INDEX_SCHEMA,
+        "machine": machine,
+        "tip": {"sequence": 0, "sha256": "0" * 64},
+        "active_revision": None,
+        "slots": {},
+    }
+    previous = "0" * 64
+    for sequence, name in enumerate(_event_file_names(directory), start=1):
+        event = _event_from_path(directory / name, machine, sequence, previous)
+        previous = _as_str(event["sha256"], "append-only event.sha256")
+        _index_observe(index, event)
+    return index
+
+
+def _note_event_in_index(
+    directory: Path, machine: str, event: Mapping[str, object]
+) -> None:
+    """Maintain the scoped-status index after one append (#2039).
+
+    The update applies incrementally only when the index tip is exactly
+    the chain tip this append extended (its previous sequence and sha);
+    anything else — a missing index, an old-build append in between, a
+    corrupt file — rebuilds from a full chain-verified scan. Advisory
+    only and never allowed to fail the mutation: a stale index is
+    rejected by readers, and the next append retries.
+    """
+
+    try:
+        index = _load_event_index(directory, machine)
+        tip = index.get("tip") if index is not None else None
+        continuous = (
+            isinstance(tip, dict)
+            and tip.get("sequence")
+            == _as_int(event["sequence"], "append-only event.sequence") - 1
+            and tip.get("sha256") == event["previous_sha256"]
+        )
+        if continuous:
+            assert index is not None
+            _index_observe(index, event)
+        else:
+            index = _rebuild_event_index(directory, machine)
+        _atomic_write_json(_event_index_path(directory, machine), index)
+    except Exception:  # noqa: BLE001 -- advisory index; readers reject a stale one
+        return
 
 
 def _event_writer(config: Config, machine: str) -> _EventWriter:
@@ -63432,6 +63592,93 @@ def _cmd_doctor_scan_timed(args: argparse.Namespace, config: Config) -> int:
     return 2 if partial_detail is not None else 0
 
 
+def _scoped_status_state(
+    config: Config, machine: str
+) -> tuple[ActiveState, dict[str, object]] | None:
+    """The ACTIVE snapshot proven current for a scoped status read (#2039).
+
+    Proven only when the event index tip is exactly the chain tip (file
+    count and last file's digest) and the snapshot revision is the
+    index's recorded active revision.  Anything else returns None and
+    the caller takes the ordinary full replay.
+    """
+
+    directory = _event_directory(config, machine)
+    names = _event_file_names(directory)
+    if not names or names[-1] != f"{len(names):020d}.json":
+        return None
+    index = _load_event_index(directory, machine)
+    if index is None:
+        return None
+    tip = index["tip"]
+    if not isinstance(tip, dict) or tip.get("sequence") != len(names):
+        return None
+    count, digest = _chain_tip(config, machine)
+    if count != len(names) or digest != tip.get("sha256"):
+        return None
+    try:
+        snapshot = _load_active_snapshot(config, machine, require_repository=False)
+    except (OSError, Refusal, StateError):
+        return None
+    if snapshot.revision != index.get("active_revision"):
+        return None
+    return snapshot, index
+
+
+def _scoped_slot_hold(
+    config: Config, machine: str, slot: str, entry: Mapping[str, object]
+) -> dict[str, object] | None:
+    """One slot's hold from the index's sequence-addressed events (#2039).
+
+    Mirrors ``_holds_from_events`` for a single slot: the latest of its
+    imported, held and hold-released events decides, and only that one
+    event (plus its chain predecessor) is read.
+    """
+
+    directory = _event_directory(config, machine)
+
+    def read_event(sequence: int) -> Mapping[str, object]:
+        previous = "0" * 64
+        if sequence > 1:
+            prior = _read_json(
+                directory / f"{sequence - 1:020d}.json", "append-only event"
+            )
+            previous = _as_str(
+                _as_mapping(prior, "append-only event")["sha256"],
+                "append-only event.sha256",
+            )
+        return _event_from_path(
+            directory / f"{sequence:020d}.json", machine, sequence, previous
+        )
+
+    hold: dict[str, object] | None = None
+    best = -1
+    imported = entry.get("imported")
+    if isinstance(imported, int):
+        event = read_event(imported)
+        payload = _as_mapping(event["payload"], "append-only event.payload")
+        for item in _as_list(payload.get("holds", []), "imported holds"):
+            candidate = dict(_as_mapping(item, "imported hold"))
+            if candidate.get("slot") == slot:
+                hold, best = candidate, imported
+    held = entry.get("held")
+    if isinstance(held, int) and held > best:
+        event = read_event(held)
+        payload = _as_mapping(event["payload"], "append-only event.payload")
+        hold = {
+            "schema": HOLD_SCHEMA,
+            "machine": machine,
+            "slot": slot,
+            "held_at": event["recorded_at"],
+            "reason": payload.get("reason"),
+        }
+        best = held
+    released = entry.get("hold_released")
+    if isinstance(released, int) and released > best:
+        hold = None
+    return hold
+
+
 def _cmd_status(args: argparse.Namespace) -> int:
     # Run in a copy of the caller's context: status sets _VERBOSE_DIAGNOSTICS and
     # _TEARING_DOWN_PIDNS for itself, and an in-process caller (tests, a reader
@@ -63451,11 +63698,19 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
     tearing_down: list[str] = []
     _TEARING_DOWN_PIDNS.set(tearing_down)
     config = _load_config(args.project_root, args.machine)
-    _prewarm_registry_read(
-        lambda: _validate_global_state_beside_absent_batch(
-            config, require_repository=False, announce=False
-        )
+    scoped_slot: str | None = (
+        args.slot
+        if getattr(args, "slot", None) is not None and not args.all_machines
+        else None
     )
+    scoped_hold_results: dict[tuple[str, str], _HoldResult] = {}
+    scoped_event_count: dict[str, int] = {}
+    if scoped_slot is None:
+        _prewarm_registry_read(
+            lambda: _validate_global_state_beside_absent_batch(
+                config, require_repository=False, announce=False
+            )
+        )
     deadline = _scan_deadline(args)
     _bound_event_retention()
     cache = _PhasedReadCache(deadline=deadline)
@@ -63464,6 +63719,97 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
         list[ActiveState], list[str], tuple[StorageInconsistency, ...]
     ]:
         _refuse_partial_state(config, allow_validate_batch_seals=True)
+        seal_journals = _validate_batch_seal_journals(config)
+        if scoped_slot is not None:
+            # Scoped read (#2039): the ACTIVE snapshots, proven current
+            # against the event index, instead of a full replay.  Any
+            # gap in the proof takes the ordinary path below.
+            scoped_states: list[ActiveState] = []
+            scoped_index: dict[str, object] | None = None
+            scoped_indexes: dict[str, dict[str, object]] = {}
+            proven = True
+            for machine in _state_machines(config):
+                proven_state = _scoped_status_state(config, machine)
+                if proven_state is None:
+                    proven = False
+                    break
+                state, index = proven_state
+                scoped_states.append(state)
+                scoped_indexes[machine] = index
+                if machine == config.machine:
+                    scoped_index = index
+            if proven and any(
+                index.get("pending_conflict") for index in scoped_indexes.values()
+            ):
+                proven = False
+            if proven and scoped_index is not None:
+                slots_index = scoped_index.get("slots")
+                entry = (
+                    slots_index.get(scoped_slot, {})
+                    if isinstance(slots_index, dict)
+                    else {}
+                )
+                if not isinstance(entry, dict) or "released" in entry:
+                    proven = False
+                else:
+                    try:
+                        hold = _scoped_slot_hold(
+                            config, config.machine, scoped_slot, entry
+                        )
+                    except (OSError, Refusal, StateError):
+                        proven = False
+                    else:
+                        scoped_hold_results.clear()
+                        scoped_hold_results[(config.machine, scoped_slot)] = (
+                            _HoldResult(hold)
+                        )
+                        tip = scoped_index["tip"]
+                        assert isinstance(tip, dict)
+                        scoped_event_count.clear()
+                        scoped_event_count[config.machine] = _as_int(
+                            tip["sequence"], "event index tip.sequence"
+                        )
+                        ordinary_paths: set[Path] = set()
+                        for pattern in (
+                            "ACTIVE.*.journal",
+                            "CREATE.*.journal",
+                            "FINISH.*.journal",
+                        ):
+                            ordinary_paths.update(config.control.glob(pattern))
+                        pending_missing = False
+                        for index in scoped_indexes.values():
+                            pending = index.get("pending", {})
+                            if not isinstance(pending, dict):
+                                pending_missing = True
+                                break
+                            for name in pending:
+                                if not isinstance(name, str):
+                                    pending_missing = True
+                                    break
+                                path = config.control / name
+                                if not path.exists() and not path.is_symlink():
+                                    pending_missing = True
+                                    break
+                                ordinary_paths.add(path)
+                            if pending_missing:
+                                break
+                        if pending_missing:
+                            proven = False
+                        else:
+                            ordinary_journals = sorted(ordinary_paths)
+                            journals = [
+                                path.name
+                                for path in (*ordinary_journals, *seal_journals)
+                            ]
+                            return (
+                                scoped_states,
+                                journals,
+                                _journal_inconsistencies(
+                                    config, ordinary_journals
+                                ),
+                            )
+            scoped_hold_results.clear()
+            scoped_event_count.clear()
         # validate-run reads status after admission (scorecard handoff and its
         # sweep), so a run admitted beside an interrupted absent-row batch
         # must still read it; the batch's journal stays listed below.
@@ -63473,7 +63819,6 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
             )
         )
         ordinary_journals = _outstanding_journals(config)
-        seal_journals = _validate_batch_seal_journals(config)
         journals = [
             path.name for path in (*ordinary_journals, *seal_journals)
         ]
@@ -63501,8 +63846,16 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
             if args.all_machines
             else [state for state in all_states if state.machine == config.machine]
         )
-        hold_results = _load_record_holds(config, states)
-        status_releases = _owner_release_states(config, states)
+        if scoped_event_count:
+            # Scoped read (#2039): hold already derived from the index;
+            # a release-bearing slot never takes this path.
+            hold_results = scoped_hold_results
+            status_releases: dict[
+                tuple[str, str], tuple[_OwnerRelease, str | None]
+            ] = {}
+        else:
+            hold_results = _load_record_holds(config, states)
+            status_releases = _owner_release_states(config, states)
         visible_records = [
             record
             for state in states
@@ -63550,7 +63903,7 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
             else [state for state in snap_states if state.machine == config.machine]
         )
         storage_inconsistencies = tuple(journal_inconsistencies)
-        hold_results = _load_record_holds(config, states)
+        hold_results = scoped_hold_results or _load_record_holds(config, states)
         records = [
             _status_record(
                 config,
@@ -63633,11 +63986,16 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
         return 2 if partial_detail is not None else 0
     if partial_detail is not None:
         print(f"PARTIAL: {partial_detail}")
+    events_total = (
+        sum(scoped_event_count.get(state.machine, 0) for state in states)
+        if scoped_event_count
+        else sum(len(_load_events(config, state.machine)) for state in states)
+    )
     print(
         f"project={config.root} worktrees={config.worktrees} control={config.control} "
         f"layout={config.layout} "
         f"active={len(records)} journals={len(journals)} "
-        f"events={sum(len(_load_events(config, state.machine)) for state in states)} "
+        f"events={events_total} "
         f"registry_storage={'INCONSISTENT' if storage_inconsistencies else 'CONSISTENT'} "
         f"inconsistencies={len(storage_inconsistencies)}"
     )

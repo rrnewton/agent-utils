@@ -547,7 +547,201 @@ pub(crate) fn append_event(cfg: &Cfg, machine: &str, kind: &str, payload: Value)
         ));
     }
     atomic_write_json(&path, &event)?;
+    note_event_in_index(cfg, machine, &events, &event);
     Ok(event)
+}
+
+/// Fold one event into the scoped-status index state (#2039).
+fn index_observe(index: &mut Map<String, Value>, event: &Value) {
+    let payload = event.get("payload").cloned().unwrap_or(Value::Null);
+    let sequence = event.get("sequence").cloned().unwrap_or(Value::Null);
+    let kind = event
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let machine = index
+        .get("machine")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if let Some(tip) = index.get_mut("tip").and_then(Value::as_object_mut) {
+        tip.insert("sequence".to_string(), sequence.clone());
+        tip.insert(
+            "sha256".to_string(),
+            event.get("sha256").cloned().unwrap_or(Value::Null),
+        );
+    }
+    match kind.as_str() {
+        "active-state-recorded" => {
+            index.insert(
+                "active_revision".to_string(),
+                payload.get("revision").cloned().unwrap_or(Value::Null),
+            );
+        }
+        "state-imported" => {
+            index.insert(
+                "active_revision".to_string(),
+                payload
+                    .pointer("/active/revision")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            );
+            if let Some(holds) = payload.get("holds").and_then(Value::as_array) {
+                let imported: Vec<String> = holds
+                    .iter()
+                    .filter_map(|item| item.get("slot").and_then(Value::as_str).map(str::to_string))
+                    .collect();
+                if let Some(slots) = index
+                    .entry("slots".to_string())
+                    .or_insert_with(|| Value::Object(Map::new()))
+                    .as_object_mut()
+                {
+                    for slot in imported {
+                        slots
+                            .entry(slot)
+                            .or_insert_with(|| Value::Object(Map::new()))
+                            .as_object_mut()
+                            .expect("slot entry is an object")
+                            .insert("imported".to_string(), sequence.clone());
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    let key = match kind.as_str() {
+        "slot-held" => Some("held"),
+        "slot-hold-released" => Some("hold_released"),
+        "owner-released" => Some("released"),
+        _ => None,
+    };
+    if let (Some(key), Some(slot)) = (key, payload.get("slot").and_then(Value::as_str)) {
+        let slot = slot.to_string();
+        if let Some(slots) = index
+            .entry("slots".to_string())
+            .or_insert_with(|| Value::Object(Map::new()))
+            .as_object_mut()
+        {
+            slots
+                .entry(slot)
+                .or_insert_with(|| Value::Object(Map::new()))
+                .as_object_mut()
+                .expect("slot entry is an object")
+                .insert(key.to_string(), sequence.clone());
+        }
+    }
+    if kind != "operation-progress-recorded"
+        && kind != "operation-completed"
+        && kind != "operation-quarantined"
+    {
+        return;
+    }
+    let name = payload
+        .get("journal_path")
+        .and_then(Value::as_str)
+        .filter(|name| std::path::Path::new(name).file_name().is_some_and(|file| file == *name))
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("ACTIVE.{machine}.journal"));
+    let mut pending_conflict = false;
+    {
+        let pending = index
+            .entry("pending".to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        let Some(pending_obj) = pending.as_object_mut() else {
+            return;
+        };
+        if kind == "operation-progress-recorded" {
+        let journal = payload.get("journal");
+        let identity = (
+            journal.and_then(|j| j.get("kind")).cloned().unwrap_or(Value::Null),
+            journal.and_then(|j| j.get("slot")).cloned().unwrap_or(Value::Null),
+        );
+        let conflict = pending_obj.iter().any(|(existing_name, existing)| {
+            *existing_name != name
+                && (
+                    existing.get("kind").cloned().unwrap_or(Value::Null),
+                    existing.get("slot").cloned().unwrap_or(Value::Null),
+                ) == identity
+        });
+            if conflict {
+                pending_conflict = true;
+            }
+            pending_obj.insert(name, json!({"kind": identity.0, "slot": identity.1}));
+        } else {
+            let matched = pending_obj.get(&name).is_some_and(|current| {
+                payload.get("slot").cloned().unwrap_or(Value::Null)
+                    == current.get("slot").cloned().unwrap_or(Value::Null)
+                    && payload.get("operation").cloned().unwrap_or(Value::Null)
+                        == current.get("kind").cloned().unwrap_or(Value::Null)
+            });
+            if matched {
+                pending_obj.remove(&name);
+            } else if pending_obj.contains_key(&name) {
+                pending_conflict = true;
+            }
+        }
+    }
+    if pending_conflict {
+        index.insert("pending_conflict".to_string(), Value::Bool(true));
+    }
+}
+
+/// Maintain the scoped-status index after one append (#2039).
+///
+/// Applies incrementally only when the index tip is exactly the chain
+/// tip this append extended; otherwise rebuilds from the chain the
+/// caller just loaded. Advisory only: a stale index is rejected by
+/// readers, so failures here never fail the append.
+fn note_event_in_index(cfg: &Cfg, machine: &str, events_before: &[Value], event: &Value) {
+    let path = cfg.control.join(format!("EVENT-INDEX.{machine}.json"));
+    let mut events: Vec<Value> = events_before.to_vec();
+    events.push(event.clone());
+    let rebuilt = |events: &[Value]| -> Value {
+        let mut index = Map::new();
+        index.insert("schema".to_string(), json!(1));
+        index.insert("machine".to_string(), json!(machine));
+        index.insert(
+            "tip".to_string(),
+            json!({"sequence": 0, "sha256": "0".repeat(64)}),
+        );
+        index.insert("active_revision".to_string(), Value::Null);
+        index.insert("slots".to_string(), Value::Object(Map::new()));
+        index.insert("pending".to_string(), Value::Object(Map::new()));
+        for item in events {
+            index_observe(&mut index, item);
+        }
+        Value::Object(index)
+    };
+    let _ = (|| -> Result<()> {
+        let loaded: Option<Value> = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok());
+        let previous_sha = events_before
+            .last()
+            .and_then(|item| item.get("sha256"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| "0".repeat(64));
+        let continuous = loaded.as_ref().is_some_and(|index| {
+            index.get("schema").and_then(Value::as_i64) == Some(1)
+                && index.get("machine").and_then(Value::as_str) == Some(machine)
+                && index.pointer("/tip/sequence").and_then(Value::as_i64)
+                    == Some(events_before.len() as i64)
+                && index.pointer("/tip/sha256").and_then(Value::as_str)
+                    == Some(previous_sha.as_str())
+        });
+        let index = if continuous {
+            let mut index = loaded
+                .and_then(|value| value.as_object().cloned())
+                .unwrap_or_default();
+            index_observe(&mut index, event);
+            Value::Object(index)
+        } else {
+            rebuilt(&events)
+        };
+        atomic_write_json(&path, &index)
+    })();
 }
 
 fn empty_active(machine: &str) -> Value {

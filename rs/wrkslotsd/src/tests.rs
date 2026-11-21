@@ -7136,6 +7136,43 @@ fn append_refuses_an_active_record_the_loader_rejects() {
 }
 
 #[test]
+fn append_maintains_the_scoped_status_index() {
+    // #2039: the Rust append path maintains EVENT-INDEX.<machine>.json
+    // with the same continuity rule as the Python writer.
+    let scratch = Scratch::new();
+    let events = scratch.events();
+    import_log(&events, vec![], vec![]);
+    let cfg = flat_cfg(&scratch);
+    crate::ensure_states::append_event(
+        &cfg,
+        "node-a",
+        "active-state-recorded",
+        flat_created("slot-a", "worktrees/slots/slot-a"),
+    )
+    .expect("the record is appended");
+    crate::ensure_states::append_event(
+        &cfg,
+        "node-a",
+        "slot-held",
+        json!({"slot": "slot-a", "reason": "probe"}),
+    )
+    .expect("the hold is appended");
+    let index: Value = serde_json::from_str(
+        &fs::read_to_string(cfg.control.join("EVENT-INDEX.node-a.json"))
+            .expect("index file is written"),
+    )
+    .expect("index parses");
+    assert_eq!(index["schema"], json!(1));
+    assert_eq!(index["machine"], json!("node-a"));
+    assert_eq!(index["active_revision"], json!(1));
+    assert_eq!(index["slots"]["slot-a"]["held"], index["tip"]["sequence"]);
+    assert_eq!(
+        index["tip"]["sequence"].as_i64(),
+        Some(event_names(&events).len() as i64)
+    );
+}
+
+#[test]
 fn append_refuses_an_active_record_from_a_stale_previous_revision() {
     // #1807: a prepared writer advancing a state captured before another
     // slot's event landed must never append, and must not fork the log.
