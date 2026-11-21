@@ -341,6 +341,7 @@
         "scripts/embed_userguides.py",
         "scripts/gate.py",
         "scripts/gate_stats.py",
+        "scripts/memory_floor.py",
         "scripts/pid_namespace_init.py",
         "scripts/pytest_shard_weights.json",
         "scripts/rebase-delta-guard",
@@ -369,6 +370,7 @@
         "py/tests/test_gh_resolve.py",
         "py/tests/test_gh_resolve_copies.py",
         "py/tests/test_gitconfig_guard.py",
+        "py/tests/test_memory_floor.py",
         "py/tests/test_pid_namespace_init.py",
         "py/tests/test_rebase_delta_guard.py",
         "py/tests/test_rust_only.py"

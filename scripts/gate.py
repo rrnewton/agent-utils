@@ -65,6 +65,24 @@ recorded in the ledger. A ticket queued before a window begins likewise keeps
 its place and is granted only when the window ends. Running gates are never
 touched.
 
+Memory floor (#2062): a gate must not START while starting it would
+leave the host below its shared memory floor. The floor is the single
+host file both teams read (~/.local/etc/host-limits/memory-floor.toml,
+override $MEMORY_FLOOR_CONFIG; the reader and file contract live in
+scripts/memory_floor.py): admit when MemAvailable - this job's need >=
+floor(class), heavy = max(64 GiB, 10% of MemTotal), light = 16 GiB.
+This gate's need is its MemoryMax when a launcher passes one
+($GATE_MEMORY_MAX_GIB), else the measured peak recorded in the ledger,
+else 32 GiB heavy / 8 GiB light cold-start. Class is heavy for a full
+validation, build or test run, light for a `--rerun --selected` single
+step (--memory-class and $GATE_MEMORY_CLASS override; --exclusive is
+always heavy). A missing floor file means the agreed defaults; a
+malformed file or meminfo refuses the start (exit 2).
+Waiting is poll-driven, observable, recorded in the ticket, history
+and ledger as memory_waiting/memory_wait_s, and never counts against
+--wait-timeout. Running gates are never paused: start-only, exactly
+like blackout windows and deferral.
+
 Merge-queue deferral (#1406 gate-defer-merge-queue): a gate must not START
 while a host-protected validation outside this repository is running, because
 synthetic or heavy load during it can eject a good change on CPU inflation
@@ -314,6 +332,7 @@ import time
 import uuid
 from collections import Counter
 from pathlib import Path
+from types import ModuleType
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 if sys.version_info >= (3, 11):
@@ -1268,6 +1287,112 @@ def defer_poll_s() -> float:
         if value > 0:
             return value
     return DEFER_POLL_DEFAULT_S
+
+
+#: Cold-start needs (#2062) when neither a MemoryMax nor a measured
+#: ledger peak exists: heavy is the agreed 32 GiB, light a single step.
+MEMORY_NEED_COLD_GIB = {"heavy": 32.0, "light": 8.0}
+
+
+_MEMORY_FLOOR_MODULE: ModuleType | None = None
+
+
+def _memory_floor() -> ModuleType:
+    """The sibling shared reader (scripts/memory_floor.py), loaded once."""
+    global _MEMORY_FLOOR_MODULE
+    if _MEMORY_FLOOR_MODULE is not None:
+        return _MEMORY_FLOOR_MODULE
+    import importlib.util
+    path = Path(__file__).with_name("memory_floor.py")
+    spec = importlib.util.spec_from_file_location("agent_utils_memory_floor", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module  # dataclasses look their module up there
+    spec.loader.exec_module(module)
+    _MEMORY_FLOOR_MODULE = module
+    return module
+
+
+def memory_class(args: argparse.Namespace, command: list[str], rerun: bool) -> str:
+    """Job class for the floor (#2062): explicit, else light only for a
+    `--rerun --selected` single step; --exclusive is always heavy."""
+    raw = getattr(args, "memory_class", None) or os.environ.get("GATE_MEMORY_CLASS")
+    if raw:
+        return str(raw).strip().lower()
+    if getattr(args, "cls", "shared") == "exclusive":
+        return "heavy"
+    selected = _selected_steps(command) if rerun else []
+    if selected and _timing_sensitive_steps(selected):
+        return "heavy"
+    return "light" if selected else "heavy"
+
+
+def memory_need_gib(args: argparse.Namespace, cls: str) -> tuple[float, str]:
+    """This job's need (#2062): --memory-need-gib/$GATE_MEMORY_NEED_GIB,
+    then a launcher-passed MemoryMax ($GATE_MEMORY_MAX_GIB), then the
+    largest measured peak the ledger records, then the cold default."""
+    raw = getattr(args, "memory_need_gib", None)
+    if raw is None:
+        raw = os.environ.get("GATE_MEMORY_NEED_GIB")
+    if raw not in (None, ""):
+        return float(raw), "explicit need"
+    raw_max = os.environ.get("GATE_MEMORY_MAX_GIB")
+    if raw_max:
+        return float(raw_max), "MemoryMax"
+    try:
+        peaks = []
+        for line in ledger_path(getattr(args, "ledger", None)).read_text().splitlines():
+            try:
+                row = json.loads(line)
+                peak = row.get("memory_peak_gib", row.get("memory_need_gib"))
+            except json.JSONDecodeError:
+                continue
+            if isinstance(peak, (int, float)) and not isinstance(peak, bool):
+                peaks.append(float(peak))
+        if peaks:
+            return max(peaks), "measured peak (ledger)"
+    except OSError:
+        pass
+    return MEMORY_NEED_COLD_GIB[cls], f"cold-start default ({cls})"
+
+
+def memory_verdict(cls: str, need_gib: float) -> dict[str, object]:
+    # An older checkout copied without its sibling reader cannot check:
+    # warn and proceed, like a broken defer probe, never wait forever.
+    if not Path(__file__).with_name("memory_floor.py").is_file():
+        return {"class": cls, "need_gib": need_gib, "floor_gib": None,
+                "mem_available_gib": None, "mem_total_gib": None, "admit": True,
+                "margin_gib": None,
+                "source": "memory_floor.py absent in this checkout; not checking"}
+    verdict: dict[str, object] = _memory_floor().check(cls, need_gib)
+    return verdict
+
+
+def _wait_memory_floor(cls: str, need_gib: float, need_source: str,
+                       poll_s: float) -> tuple[float, bool]:
+    """Wait until the floor admits this job; (waited_s, ever_waited).
+
+    Observable like deferral: each changed verdict is printed with the
+    live numbers, and the poll re-reads the file, so an operator's
+    floor change reaches waiters without a re-queue."""
+    waited_from = time.time()
+    noted: object = None
+    ever = False
+    while True:
+        verdict = memory_verdict(cls, need_gib)
+        if verdict["admit"]:
+            if ever:
+                print("gate: memory floor admits this gate; continuing (#2062)", flush=True)
+            return time.time() - waited_from, ever
+        ever = True
+        key = (verdict["mem_available_gib"], verdict["floor_gib"])
+        if key != noted:
+            print(f"gate: memory-floor: waiting: MemAvailable={verdict['mem_available_gib']} GiB "
+                  f"- need {need_gib:g} GiB ({need_source}, class={cls}) would leave the host "
+                  f"below its {verdict['floor_gib']} GiB floor ({verdict['source']}); "
+                  "this gate starts when memory frees (#2062)", flush=True)
+            noted = key
+        time.sleep(poll_s)
 
 
 def active_defer_units(
@@ -2272,6 +2397,22 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
     except DeferConfigError as exc:
         print(f"gate: {exc}", flush=True)
         return 2
+    # #2062: resolve the floor verdict inputs now (fail closed on a
+    # malformed file or meminfo); the waits themselves sit before the
+    # preflight and before the grant, like deferral.
+    mem_cls = memory_class(args, command, bool(getattr(args, "rerun", False)))
+    try:
+        mem_need, mem_need_source = memory_need_gib(args, mem_cls)
+        try:
+            mem_poll = _memory_floor().load_config().poll_s
+        except Exception:
+            mem_poll = 5.0  # sibling reader absent; memory_verdict admits
+        memory_verdict(mem_cls, mem_need)
+    except Exception as exc:
+        print(f"gate: memory floor unusable: {exc}; refusing the start (#2062)", flush=True)
+        return 2
+    memory_wait_s = 0.0
+    memory_ever = False
     rerun = bool(getattr(args, "rerun", False))
     if rerun:
         problem = _rerun_problem(command)
@@ -2394,6 +2535,13 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
             print("gate: deferral cleared; continuing to the preflight", flush=True)
     finally:
         adm.clear_deferred(defer_id)
+    # #2062: the floor waits before anything expensive runs, and again
+    # before the grant below. A nested gate belongs to a run already
+    # admitted, and running gates are never touched.
+    if not nested:
+        waited, ever = _wait_memory_floor(mem_cls, mem_need, mem_need_source, mem_poll)
+        memory_wait_s += waited
+        memory_ever = memory_ever or ever
     if nested:
         preflight = "skipped: nested gate"
     elif rerun:
@@ -2497,7 +2645,16 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
                 if queue_defer_began is not None:
                     defer_wait_s += time.time() - queue_defer_began
                     queue_defer_began = None
-        if args.wait_timeout and time.time() - queued_at - defer_wait_s > args.wait_timeout:
+        # #2062: memory freed or taken while queueing re-decides the
+        # start; floor time never counts against --wait-timeout.
+        if not nested:
+            verdict = memory_verdict(mem_cls, mem_need)
+            if not verdict["admit"]:
+                waited, ever = _wait_memory_floor(mem_cls, mem_need, mem_need_source, mem_poll)
+                memory_wait_s += waited
+                memory_ever = memory_ever or ever
+                continue
+        if args.wait_timeout and time.time() - queued_at - defer_wait_s - memory_wait_s > args.wait_timeout:
             adm.finish(run_id)
             (state_dir() / "queue" / f"{run_id}.json").unlink(missing_ok=True)
             print(f"gate: gave up after {time.time() - queued_at:.0f}s in queue", flush=True)
@@ -2588,7 +2745,9 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
                     "rerun": rerun, "nested_phase": nested_phase,
                     "phase_priority": phase_mark_source,
                     "priority": priority, "priority_reason": priority_reason,
-                    "defer_waiting": defer_ever, "defer_wait_s": round(defer_wait_s, 2)})
+                    "defer_waiting": defer_ever, "defer_wait_s": round(defer_wait_s, 2),
+                    "memory_waiting": memory_ever, "memory_wait_s": round(memory_wait_s, 2),
+                    "memory_class": mem_cls, "memory_need_gib": mem_need})
         # After the slot is released, so no other gate waits on it (#940). A
         # nested gate leaves it to its parent, which is still building.
         pruned = None if nested or getattr(args, "no_prune", False) else _prune_after_gate()
@@ -2601,7 +2760,9 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
                        preflight=preflight, aborted=aborted, rerun_flag=rerun, local_preflight=local_preflight,
                        nested_phase=nested_phase, phase_priority_source=phase_mark_source,
                        priority=priority, priority_reason=priority_reason,
-                       defer_waiting=defer_ever, defer_wait_s=defer_wait_s)
+                       defer_waiting=defer_ever, defer_wait_s=defer_wait_s,
+                       memory_waiting=memory_ever, memory_wait_s=memory_wait_s,
+                       memory_class=mem_cls, memory_need_gib=mem_need)
     return rc
 
 
@@ -2684,6 +2845,10 @@ def _record_ledger(
     priority_reason: str | None = None,
     defer_waiting: list[str] | None = None,
     defer_wait_s: float = 0.0,
+    memory_waiting: bool = False,
+    memory_wait_s: float = 0.0,
+    memory_class: str | None = None,
+    memory_need_gib: float | None = None,
 ) -> None:
     """Append one durable ledger line for the finished run (#827). Best effort:
     a ledger failure must never change the gate's own result. `queued_utc` and
@@ -2728,6 +2893,10 @@ def _record_ledger(
             "priority_reason": priority_reason,
             "defer_waiting": defer_waiting or [],
             "defer_wait_s": round(defer_wait_s, 2),
+            "memory_waiting": memory_waiting,
+            "memory_wait_s": round(memory_wait_s, 2),
+            "memory_class": memory_class,
+            "memory_need_gib": memory_need_gib,
             "log_path": None,
             "target_bytes_before": (pruned or {}).get("target_bytes_before"),
             "target_bytes_after": (pruned or {}).get("target_bytes_after"),
@@ -3699,6 +3868,15 @@ def main(argv: list[str] | None = None) -> int:
                              "test censuses), ~20 s, and refuses to queue (exit "
                              f"{PREFLIGHT_EXIT}) if either fails, printing the failing lines. A nested "
                              "gate and --rerun skip it. The skip is recorded in the ledger")
+    parser.add_argument("--memory-class", choices=["heavy", "light"], default=None,
+                        help="memory-floor job class (#2062; default $GATE_MEMORY_CLASS, else "
+                             "heavy, or light for a --rerun --selected single step; --exclusive "
+                             "is always heavy). Admission: MemAvailable - need >= the host floor "
+                             "in ~/.local/etc/host-limits/memory-floor.toml")
+    parser.add_argument("--memory-need-gib", type=float, default=None,
+                        help="this job's memory need in GiB for the floor (#2062; default "
+                             "$GATE_MEMORY_NEED_GIB, then $GATE_MEMORY_MAX_GIB, then the ledger's "
+                             "measured peak, then 32 GiB heavy / 8 GiB light)")
     parser.add_argument("--ledger", default=None,
                         help="durable ledger path (default ~/.local/state/agent-utils/gate-ledger.jsonl, or $GATE_LEDGER)")
     parser.add_argument("--no-prune", action="store_true",

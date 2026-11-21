@@ -35,6 +35,15 @@ def _hermetic_gate_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setenv("GATE_PHASE_PRIORITY_CONFIG", str(tmp_path / "hostless-gate-phase-priority.toml"))
     monkeypatch.setenv("GATE_BLACKOUT_CONFIG", str(tmp_path / "hostless-gate.toml"))
     monkeypatch.setenv("GATE_DEFER_CONFIG", str(tmp_path / "hostless-gate-defer.toml"))
+    monkeypatch.setenv("MEMORY_FLOOR_CONFIG", str(tmp_path / "hostless-memory-floor.toml"))
+    # #2062: a missing floor file means defaults, so tests fake a roomy
+    # meminfo (200 GiB total, 190 available) rather than depend on the host.
+    (tmp_path / "meminfo").write_text(
+        "MemTotal:       209715200 kB\nMemAvailable:   199229440 kB\n")
+    monkeypatch.setenv("MEMORY_FLOOR_MEMINFO", str(tmp_path / "meminfo"))
+    monkeypatch.delenv("GATE_MEMORY_CLASS", raising=False)
+    monkeypatch.delenv("GATE_MEMORY_NEED_GIB", raising=False)
+    monkeypatch.delenv("GATE_MEMORY_MAX_GIB", raising=False)
     monkeypatch.setenv("GATE_DEFER_POLL_S", "0.05")
     monkeypatch.delenv("GATE_INTERLEAVE_AFTER", raising=False)
     monkeypatch.delenv("GATE_DEFER_UNIT_PATTERN", raising=False)
@@ -71,6 +80,8 @@ def _env(tmp_path: Path) -> dict[str, str]:
             "GATE_PHASE_PRIORITY_CONFIG": str(tmp_path / "gate-phase-priority.toml"),
             "GATE_BLACKOUT_CONFIG": str(tmp_path / "gate.toml"),
             "GATE_DEFER_CONFIG": str(tmp_path / "gate-defer.toml"),
+            "MEMORY_FLOOR_CONFIG": str(tmp_path / "memory-floor.toml"),
+            "MEMORY_FLOOR_MEMINFO": str(tmp_path / "meminfo"),
             "GATE_DEFER_SHARED_HOLDS_DIR": str(tmp_path / "no-shared-holds"),
             "GATE_DEFER_HOLD_REPORT_STATE": str(tmp_path / "hold-reports.json"),
             "GATE_DEFER_POLL_S": "0.05",
@@ -2346,3 +2357,50 @@ def test_shared_holds_config_and_owner_exempt_gate(tmp_path: Path) -> None:
     status = subprocess.run([PY, str(GATE), "status"], env=env,
                             capture_output=True, text=True, timeout=30)
     assert "1800s remaining" in status.stdout, status.stdout
+
+
+def _meminfo_file(tmp_path: Path, total_gib: float, avail_gib: float) -> Path:
+    path = tmp_path / "meminfo"
+    path.write_text(
+        f"MemTotal:       {int(total_gib * 1024 * 1024)} kB\n"
+        f"MemAvailable:   {int(avail_gib * 1024 * 1024)} kB\n")
+    return path
+
+
+def test_memory_floor_waits_then_admits_and_is_recorded(tmp_path: Path) -> None:
+    """#2062: below the floor the gate waits (observably); when memory
+    frees it starts, and the wait lands in the ledger. Heavy floor on a
+    200 GiB host is 64 GiB; need 32, so 90 available (58 left) waits
+    and 150 available (118 left) admits."""
+    (tmp_path / "memory-floor.toml").write_text("poll_s = 0.05\n")
+    info = _meminfo_file(tmp_path, 200.0, 90.0)
+    env = {**_env(tmp_path), "MEMORY_FLOOR_MEMINFO": str(info)}
+    proc = _start_env(tmp_path, env, "--memory-need-gib", "32", "--", PY, "-c", "pass")
+    time.sleep(1.0)
+    assert proc.poll() is None, "the gate must still be waiting below the floor"
+    _meminfo_file(tmp_path, 200.0, 150.0)
+    out, _ = proc.communicate(timeout=30)
+    assert proc.returncode == 0, out
+    assert "memory-floor: waiting" in out
+    assert "memory floor admits" in out
+    rows = [json.loads(line) for line in (tmp_path / "ledger.jsonl").read_text().splitlines()]
+    assert rows[-1]["memory_waiting"] is True and rows[-1]["memory_wait_s"] > 0
+    assert rows[-1]["memory_class"] == "heavy" and rows[-1]["memory_need_gib"] == 32.0
+
+
+def test_memory_floor_malformed_config_refuses(tmp_path: Path) -> None:
+    (tmp_path / "memory-floor.toml").write_text("heavy_min_gib = 'lots'\n")
+    info = _meminfo_file(tmp_path, 200.0, 200.0)
+    env = {**_env(tmp_path), "MEMORY_FLOOR_MEMINFO": str(info)}
+    result = subprocess.run([PY, str(GATE), "--", PY, "-c", "pass"], env=env,
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 2, result.stdout
+    assert "memory floor unusable" in result.stdout
+
+
+def test_memory_floor_light_rerun_class(tmp_path: Path) -> None:
+    """#2062 (c): a --rerun --selected single step is light (16 GiB)."""
+    gate = _gate_module()
+    args = type("A", (), {"memory_class": None, "cls": "shared"})()
+    assert gate.memory_class(args, ["x", "--selected", "repository.hygiene.site"], True) == "light"
+    assert gate.memory_class(args, ["validate.py"], False) == "heavy"
