@@ -362,13 +362,30 @@ export function createKeySelection<Pane extends KeyPane>(deps: KeySelectionDepen
     nearRow,
     rowInView,
     firstRowInView(pane) {
-      const seen = paneRows(pane).filter((row) => rowInView(pane, row));
+      // `#2034 vibe-talk-scroll-layout-reads`: head and foot are measured once, then the
+      // rows' bottoms — which do not decrease down a laid-out list — are binary-searched
+      // for the visible band and only that band is read, where testing every loaded row
+      // re-measured the head and foot for each of them (~5,000 layout reads a screenful).
+      const rows = paneRows(pane);
+      if (rows.length === 0) return null;
       const head = pane.head();
       const foot = pane.foot();
-      return seen.find((row) => {
-        const box = row.getBoundingClientRect();
-        return box.top >= head - 1 && box.bottom <= foot + 1;
-      }) || seen[0] || null;
+      let lo = 0;
+      let hi = rows.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if ((rows[mid] as HTMLElement).getBoundingClientRect().bottom > head) hi = mid;
+        else lo = mid + 1;
+      }
+      let firstSeen: HTMLElement | null = null;
+      for (let at = lo; at < rows.length; at += 1) {
+        const box = (rows[at] as HTMLElement).getBoundingClientRect();
+        if (box.top >= foot && box.bottom > box.top) break;
+        if (box.bottom <= head || box.top >= foot) continue;
+        if (firstSeen === null) firstSeen = rows[at] as HTMLElement;
+        if (box.top >= head - 1 && box.bottom <= foot + 1) return rows[at] as HTMLElement;
+      }
+      return firstSeen;
     },
     selectRow(pane, row, bring = true, from = 1) {
       takeRow(pane, row, true);
