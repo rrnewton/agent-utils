@@ -2,9 +2,11 @@
 
 Run one judgement-only prompt through the first agent harness that
 answers (`muse`, then `claude`, then `codex`) and print only its
-final answer. Each attempt is tool-free or confined to a read-only
-sandbox, runs in a fresh temporary workspace by default, and has its
-own timeout. The whole fallback chain also has a deadline.
+final answer. Muse and Claude Code attempts are tool-free; Muse
+attempts are read-confined with their shell and MCP surfaces
+disabled. Each attempt runs in its own fresh temporary workspace by
+default and has its own timeout. The whole fallback chain also has a
+deadline.
 
 Install from the package index:
 

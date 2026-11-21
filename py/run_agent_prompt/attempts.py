@@ -2,16 +2,16 @@
 
 Each builder uses the harness's strict non-interactive form and
 extracts plain final text from its structured output. Every attempt
-is tool-free or confined by construction — Muse's isolation preset,
-Muse's empty tool list, Codex's read-only sandbox — because effects
-belong to the caller, never to an agent's own tools.
+is tool-free or read-confined by construction: Muse's isolation
+preset, Claude Code's empty tool list, and Muse with its shell
+and MCP surfaces disabled inside a read-only sandbox. Effects belong
+to the caller, never to an agent's own tools.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
 import time
 from dataclasses import dataclass
@@ -69,24 +69,49 @@ _ENV_KEYS = (
     "REQUESTS_CA_BUNDLE",
     "CURL_CA_BUNDLE",
     "NODE_EXTRA_CA_CERTS",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CONFIG_DIR",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_ORG_ID",
+    "OPENAI_PROJECT_ID",
+    "AZURE_OPENAI_API_KEY",
+    "AZURE_OPENAI_ENDPOINT",
+    "AZURE_OPENAI_API_VERSION",
+    "CODEX_HOME",
+    "CODEX_API_KEY",
+    "CODEX_ACCESS_TOKEN",
+    "CODEX_CLIENT_CERT",
+    "CODEX_CLIENT_KEY",
+    "MUSE_API_KEY",
+    "MUSE_CLIENT_CERT",
+    "MUSE_CLIENT_KEY",
+    "MUSE_CUSTOM_HEADERS",
+    "THRIFT_TLS_CL_CERT_PATH",
+    "THRIFT_TLS_CL_KEY_PATH",
+    "X2P_AGENT_PROXY_ADDRESS",
+    "META_AI_GATEWAY_URL",
+    "META_CLAUDE_AI_GATEWAY",
+    "META_CLAUDE_USE_AI_GATEWAY",
+    "META_CODEX_AI_GATEWAY",
+    "META_CODEX_USE_AZURE_DIRECT",
+    "META_CODEX_USE_OPENAI_DIRECT",
+    "META_MUSE_OPENAI_ROUTE",
 )
-
-_ENV_PREFIXES = ("ANTHROPIC_", "CLAUDE_", "CODEX_", "OPENAI_", "META_", "MUSE_")
 
 
 def child_env(source: Mapping[str, str] | None = None) -> dict[str, str]:
     """The minimal allowlisted environment a harness attempt inherits.
 
-    Values are never logged by callers; this only decides which names
-    cross into the child at all.
+    Only the explicit names above cross into the child. In particular,
+    no `CLAUDE_CODE_*` session or IDE variables are inherited. Values
+    are never logged by callers.
     """
 
     source = os.environ if source is None else source
-    env = {key: source[key] for key in _ENV_KEYS if key in source}
-    for key, value in source.items():
-        if key.startswith(_ENV_PREFIXES):
-            env[key] = value
-    return env
+    return {key: source[key] for key in _ENV_KEYS if key in source}
 
 
 @dataclass(frozen=True)
@@ -99,55 +124,6 @@ class AttemptResult:
     duration_s: float
     answer: str | None = None
     model: str | None = None
-    detail: str | None = None
-
-
-_MAX_DETAIL_CHARS = 240
-_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
-_BANNER_PREFIXES = (
-    "Muse at Meta",
-    "Claude Code at Meta",
-    "Codex CLI at Meta",
-    "Using AI Gateway",
-)
-
-
-def _failure_detail(stderr: str | None, prompt: str) -> str | None:
-    """One bounded diagnostic line from harness stderr, prompt-redacted."""
-
-    if not stderr:
-        return None
-    candidates: list[str] = []
-    for raw_line in stderr.splitlines():
-        line = _ANSI_ESCAPE.sub("", raw_line)
-        line = "".join(
-            char if (char.isprintable() or char.isspace()) else " " for char in line
-        )
-        line = " ".join(line.split())
-        if not line or line.startswith(_BANNER_PREFIXES):
-            continue
-        if prompt:
-            normalized_prompt = " ".join(prompt.split())
-            if normalized_prompt:
-                line = line.replace(normalized_prompt, "[prompt redacted]")
-            for fragment in prompt.splitlines():
-                fragment = " ".join(fragment.split())
-                if len(fragment) >= 4:
-                    line = line.replace(fragment, "[prompt redacted]")
-        candidates.append(line)
-    if not candidates:
-        return None
-    diagnostic = next(
-        (
-            line
-            for line in reversed(candidates)
-            if any(word in line.lower() for word in ("error", "fail", "requires", "refused"))
-        ),
-        candidates[-1],
-    )
-    if len(diagnostic) > _MAX_DETAIL_CHARS:
-        diagnostic = f"{diagnostic[:_MAX_DETAIL_CHARS]}..."
-    return diagnostic
 
 
 def _find_model(value: object) -> str | None:
@@ -206,30 +182,20 @@ def _verdict(
     duration_s: float,
     answer: str | None,
     model: str | None,
-    prompt: str,
 ) -> AttemptResult:
     if spawn_error is not None:
-        return AttemptResult(
-            harness,
-            "spawn-error",
-            None,
-            duration_s,
-            detail=_failure_detail(str(spawn_error), prompt),
-        )
+        return AttemptResult(harness, "spawn-error", None, duration_s)
     assert completed is not None
     returncode = completed.returncode
     if returncode == 0 and answer is not None and answer.strip():
         return AttemptResult(harness, "answered", returncode, duration_s, answer, model)
-    detail = _failure_detail(completed.stderr, prompt)
     if returncode == TIMED_OUT_EXIT:
         status = "timeout"
     elif returncode != 0:
         status = "failed"
     else:
         status = "empty"
-    return AttemptResult(
-        harness, status, returncode, duration_s, model=model, detail=detail
-    )
+    return AttemptResult(harness, status, returncode, duration_s, model=model)
 
 
 def attempt_muse(
@@ -273,7 +239,7 @@ def attempt_muse(
         timeout_seconds=timeout_seconds,
     )
     if spawn_error is not None:
-        return _verdict("muse", completed, spawn_error, duration_s, None, model, prompt)
+        return _verdict("muse", completed, spawn_error, duration_s, None, model)
     terminal: str | None = None
     text: str | None = None
     found_model = model
@@ -291,7 +257,7 @@ def attempt_muse(
             terminal = payload.get("terminal") if isinstance(payload.get("terminal"), str) else None
             text = payload.get("text") if isinstance(payload.get("text"), str) else None
     answer = text if terminal == "completed" else None
-    return _verdict("muse", completed, None, duration_s, answer, found_model, prompt)
+    return _verdict("muse", completed, None, duration_s, answer, found_model)
 
 
 def attempt_claude(
@@ -313,9 +279,14 @@ def attempt_claude(
         "--output-format",
         "json",
         "--safe-mode",
+        "--restricted",
+        "--strict-mcp-config",
+        "--disable-slash-commands",
         "--no-session-persistence",
         "--permission-mode",
         "dontAsk",
+        "--permission-prompts",
+        "none",
         "--tools",
         "",
         "--effort",
@@ -332,7 +303,7 @@ def attempt_claude(
         timeout_seconds=timeout_seconds,
     )
     if spawn_error is not None:
-        return _verdict("claude", completed, spawn_error, duration_s, None, model, prompt)
+        return _verdict("claude", completed, spawn_error, duration_s, None, model)
     answer: str | None = None
     found_model = model
     try:
@@ -348,7 +319,7 @@ def attempt_claude(
             and isinstance(root.get("result"), str)
         ):
             answer = root["result"]
-    return _verdict("claude", completed, None, duration_s, answer, found_model, prompt)
+    return _verdict("claude", completed, None, duration_s, answer, found_model)
 
 
 def attempt_codex(
@@ -370,14 +341,48 @@ def attempt_codex(
         *command,
         "exec",
         "--ephemeral",
+        "--ignore-user-config",
+        "--ignore-rules",
         "--skip-git-repo-check",
         "--sandbox",
         "read-only",
+        "--disable",
+        "shell_tool",
+        "--disable",
+        "apps",
+        "--disable",
+        "browser_use",
+        "--disable",
+        "browser_use_external",
+        "--disable",
+        "browser_use_full_cdp_access",
+        "--disable",
+        "in_app_browser",
+        "--disable",
+        "computer_use",
+        "--disable",
+        "image_generation",
+        "--disable",
+        "plugins",
+        "--disable",
+        "hooks",
+        "--disable",
+        "multi_agent",
+        "--disable",
+        "code_mode_host",
+        "--disable",
+        "code_mode_host_grpc",
         "--cd",
         str(workspace),
         "--json",
         "--output-last-message",
         str(last_message),
+        "-c",
+        "mcp_servers={}",
+        "-c",
+        "mcp_servers.meta_core.enabled=false",
+        "-c",
+        'web_search="disabled"',
         "-c",
         f'model_reasoning_effort="{effort}"',
     ]
@@ -393,7 +398,7 @@ def attempt_codex(
         timeout_seconds=timeout_seconds,
     )
     if spawn_error is not None:
-        return _verdict("codex", completed, spawn_error, duration_s, None, model, prompt)
+        return _verdict("codex", completed, spawn_error, duration_s, None, model)
     found_model = model
     for line in completed.stdout.splitlines():  # type: ignore[union-attr]
         try:
@@ -408,4 +413,4 @@ def attempt_codex(
             answer = last_message.read_text(encoding="utf-8")
         except OSError:
             answer = None
-    return _verdict("codex", completed, None, duration_s, answer, found_model, prompt)
+    return _verdict("codex", completed, None, duration_s, answer, found_model)

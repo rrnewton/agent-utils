@@ -24,7 +24,12 @@ from run_agent_prompt.attempts import (
     child_env,
 )
 from run_agent_prompt.config import Config, load_config
-from run_agent_prompt.process import BackendProcesses, defer_sigint_during_cleanup
+from run_agent_prompt.process import (
+    BackendProcesses,
+    TerminationSignal,
+    defer_signals_during_cleanup,
+    termination_signals_as_exceptions,
+)
 
 ALL_HARNESSES = ("muse", "claude", "codex")
 ALL_FAILED_EXIT = 69
@@ -55,7 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Run one judgement-only prompt through the first agent harness "
             "that answers (muse, then claude, then codex) and print only "
-            "its final answer. Attempts are tool-free, individually timed "
+            "its final answer. Attempts are tool-free or read-confined, individually timed "
             "out, and logged to stderr without prompt or answer text."
         ),
         epilog=(
@@ -150,14 +155,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _attempt_line(result: AttemptResult, effort: str) -> str:
     exit_text = "-" if result.exit_code is None else str(result.exit_code)
-    line = (
+    return (
         f"run-agent-prompt: harness={result.harness} status={result.status} "
         f"exit={exit_text} duration_s={result.duration_s:.3f} "
         f"model={result.model or 'unknown'} effort={effort}"
     )
-    if result.detail:
-        line += f" detail={json.dumps(result.detail)}"
-    return line
 
 
 def _log_attempt(
@@ -175,7 +177,6 @@ def _log_attempt(
             "duration_s": round(result.duration_s, 3),
             "model": result.model,
             "effort": effort,
-            "detail": result.detail,
         }
         log_file.parent.mkdir(parents=True, exist_ok=True)
         with log_file.open("a", encoding="utf-8") as handle:
@@ -237,45 +238,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     env = child_env()
     deadline = time.monotonic() + args.total_timeout
     processes = BackendProcesses()
-    with defer_sigint_during_cleanup(), tempfile.TemporaryDirectory(
-        prefix="run-agent-prompt-"
-    ) as temporary:
-        scratch = Path(temporary)
-        workspace = args.cwd or scratch / "workspace"
-        workspace.mkdir(parents=True, exist_ok=True)
-        if "codex" in harnesses and args.cwd is None:
-            # Codex wants a repo-backed cwd even with --skip-git-repo-check.
-            subprocess.run(
-                ["git", "init", "--quiet"],
-                cwd=workspace,
-                env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-        try:
+    temporary: tempfile.TemporaryDirectory[str] | None = None
+    try:
+        with termination_signals_as_exceptions():
+            temporary = tempfile.TemporaryDirectory(prefix="run-agent-prompt-")
+            scratch = Path(temporary.name)
             for harness in harnesses:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    result = AttemptResult(
-                        harness,
-                        "total-timeout",
-                        None,
-                        0.0,
-                        detail="total timeout exhausted before this attempt",
-                    )
+                    result = AttemptResult(harness, "total-timeout", None, 0.0)
                     _log_attempt(result, _resolve(harness, args, config)[1], args.log_file)
                     continue
                 model, effort = _resolve(harness, args, config)
                 command = _command(getattr(args, f"{harness}_command"), harness)
                 if effort not in EFFORT_LEVELS[harness]:
                     result = AttemptResult(
-                        harness,
-                        "invalid-effort",
-                        None,
-                        0.0,
-                        model=model,
-                        detail="unsupported effort level for this harness",
+                        harness, "invalid-effort", None, 0.0, model=model
                     )
                     _log_attempt(result, effort, args.log_file)
                     continue
@@ -283,22 +261,40 @@ def main(argv: Sequence[str] | None = None) -> int:
                     command[0]
                 ).is_file():
                     result = AttemptResult(
-                        harness,
-                        "spawn-error",
-                        None,
-                        0.0,
-                        model=model,
-                        detail="executable not found",
+                        harness, "spawn-error", None, 0.0, model=model
                     )
                     _log_attempt(result, effort, args.log_file)
                     continue
                 timeout = min(args.timeout, remaining)
+                attempt_scratch = scratch / harness
+                workspace = args.cwd or attempt_scratch / "workspace"
+                attempt_scratch.mkdir(parents=True, exist_ok=True)
+                workspace.mkdir(parents=True, exist_ok=True)
+                if harness == "codex" and args.cwd is None:
+                    try:
+                        subprocess.run(
+                            ["git", "init", "--quiet"],
+                            cwd=workspace,
+                            env=env,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            check=False,
+                            timeout=min(10.0, timeout),
+                        )
+                    except (OSError, subprocess.TimeoutExpired):
+                        pass
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        result = AttemptResult(harness, "total-timeout", None, 0.0)
+                        _log_attempt(result, effort, args.log_file)
+                        continue
+                    timeout = min(args.timeout, remaining)
                 if harness == "muse":
                     result = attempt_muse(
                         processes,
                         command,
                         prompt=prompt,
-                        prompt_path=scratch / "prompt.txt",
+                        prompt_path=attempt_scratch / "prompt.txt",
                         workspace=workspace,
                         model=model,
                         effort=effort,
@@ -322,7 +318,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         command,
                         prompt=prompt,
                         workspace=workspace,
-                        last_message_path=scratch / "codex-last-message.txt",
+                        last_message_path=attempt_scratch / "codex-last-message.txt",
                         model=model,
                         effort=effort,
                         timeout_seconds=timeout,
@@ -334,8 +330,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                     if not result.answer.endswith("\n"):
                         sys.stdout.write("\n")
                     return 0
-        finally:
-            processes.terminate_all()
+    except KeyboardInterrupt:
+        return 130
+    except TerminationSignal as signal_error:
+        return 128 + signal_error.signum
+    finally:
+        with defer_signals_during_cleanup():
+            try:
+                processes.terminate_all()
+            finally:
+                if temporary is not None:
+                    temporary.cleanup()
     print("run-agent-prompt: every harness failed", file=sys.stderr, flush=True)
     return ALL_FAILED_EXIT
 

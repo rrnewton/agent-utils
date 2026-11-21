@@ -22,6 +22,14 @@ class BackendProcessStopped(RuntimeError):
     """A backend launch raced with cancellation of its owning operation."""
 
 
+class TerminationSignal(Exception):
+    """A SIGTERM or SIGHUP converted into an exception for cleanup."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(f"received signal {signum}")
+        self.signum = signum
+
+
 #: Exit status reported for a backend call stopped at its time limit (as ``timeout(1)`` does).
 TIMED_OUT_EXIT: int = 124
 
@@ -78,7 +86,7 @@ class BackendProcesses:
             except subprocess.TimeoutExpired:
                 timed_out = True
                 self._stop_group(process)
-                stdout, stderr = process.communicate()
+                stdout, stderr = self._reap_after_stop(process)
         except BaseException:
             self.terminate_all()
             raise
@@ -100,22 +108,54 @@ class BackendProcesses:
             stderr=stderr,
         )
 
+    def _reap_after_stop(
+        self, process: subprocess.Popen[str], timeout_seconds: float = 5.0
+    ) -> tuple[str, str]:
+        """Collect output after a stop without waiting on a pipe forever."""
+
+        try:
+            return process.communicate(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired as expired:
+            self._signal_group(process, signal.SIGKILL)
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except (BrokenPipeError, OSError, ValueError):
+                        pass
+            try:
+                process.wait(timeout=timeout_seconds)
+            except subprocess.TimeoutExpired:
+                pass
+            stdout = expired.output if isinstance(expired.output, str) else ""
+            stderr = expired.stderr if isinstance(expired.stderr, str) else ""
+            return stdout, stderr
+
     def _stop_group(self, process: subprocess.Popen[str], grace_seconds: float = 2.0) -> None:
         """Terminate one call's process group, then kill it after *grace_seconds*."""
 
         self._signal_group(process, signal.SIGTERM)
         deadline = time.monotonic() + grace_seconds
-        while process.poll() is None and time.monotonic() < deadline:
+        while self._group_alive(process) and time.monotonic() < deadline:
             time.sleep(0.01)
         self._signal_group(process, signal.SIGKILL)
 
     @staticmethod
+    def _group_alive(process: subprocess.Popen[str]) -> bool:
+        process.poll()  # reap the leader so only live descendants count
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    @staticmethod
     def _signal_group(process: subprocess.Popen[str], signum: int) -> None:
-        if process.poll() is not None:
-            return
         try:
             os.killpg(process.pid, signum)
-        except ProcessLookupError:
+        except (PermissionError, ProcessLookupError):
             pass
 
     def terminate_all(self, timeout_seconds: float = 2.0) -> None:
@@ -136,23 +176,62 @@ class BackendProcesses:
 
 
 @contextmanager
-def defer_sigint_during_cleanup() -> Iterator[None]:
-    """Ignore a repeated Ctrl-C while bounded executor/process cleanup completes."""
+def termination_signals_as_exceptions() -> Iterator[None]:
+    """Turn SIGTERM and SIGHUP into exceptions so finally cleanup can run."""
 
     if threading.current_thread() is not threading.main_thread():
         yield
         return
-    previous = signal.getsignal(signal.SIGINT)
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signums = tuple(
+        signum
+        for signum in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGHUP", None))
+        if isinstance(signum, int)
+    )
+    previous = {signum: signal.getsignal(signum) for signum in signums}
+
+    def _raise(signum: int, _frame: object) -> None:
+        raise TerminationSignal(signum)
+
     try:
+        for signum in signums:
+            signal.signal(signum, _raise)
         yield
     finally:
-        signal.signal(signal.SIGINT, previous)
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
+@contextmanager
+def defer_signals_during_cleanup() -> Iterator[None]:
+    """Ignore termination signals while bounded process/temp cleanup completes."""
+
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    signums = tuple(
+        signum
+        for signum in (
+            signal.SIGINT,
+            getattr(signal, "SIGTERM", None),
+            getattr(signal, "SIGHUP", None),
+        )
+        if isinstance(signum, int)
+    )
+    previous = {signum: signal.getsignal(signum) for signum in signums}
+    try:
+        for signum in signums:
+            signal.signal(signum, signal.SIG_IGN)
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
 
 
 __all__ = [
     "TIMED_OUT_EXIT",
     "BackendProcessStopped",
     "BackendProcesses",
-    "defer_sigint_during_cleanup",
+    "TerminationSignal",
+    "defer_signals_during_cleanup",
+    "termination_signals_as_exceptions",
 ]

@@ -14,8 +14,8 @@ run-agent-prompt --only claude --prompt-file prompt.txt
 ```
 
 The prompt is read from `--prompt-file PATH` or stdin and never
-appears in argv. Attempts run in a fresh temporary workspace unless
-`--cwd DIR` selects another directory. Exit 0 means stdout holds the
+appears in argv. Each attempt runs in its own fresh temporary
+workspace unless `--cwd DIR` selects another directory. Exit 0 means stdout holds the
 winning answer; exit 69 means every harness failed; exit 2 means a
 usage or config error.
 

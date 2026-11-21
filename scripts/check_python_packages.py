@@ -545,6 +545,7 @@ def _doc_violations(project: Project, text: str, *, document_name: str | None = 
     if project.distribution == "dagrun":
         for value in ("cargo-build", "cargo-test", "cargo-nextest"):
             checked_text = checked_text.replace(value, " " * len(value))
+    common_checked_text = text
     if project.distribution == "run-agent-prompt":
         # The default config path is part of this command's standalone
         # interface; exempt that exact path, not other suite references.
@@ -552,7 +553,7 @@ def _doc_violations(project: Project, text: str, *, document_name: str | None = 
             "~/.config/agent-utils/run-agent-prompt.toml",
             "agent-utils/run-agent-prompt.toml",
         ):
-            checked_text = checked_text.replace(value, " " * len(value))
+            common_checked_text = common_checked_text.replace(value, " " * len(value))
     for foreign in _FOREIGN_DOC_TERMS.finditer(checked_text):
         # The unified operator guide deliberately names the distributions whose
         # supported adapters differ. This does not waive public API/README lint.
@@ -562,7 +563,7 @@ def _doc_violations(project: Project, text: str, *, document_name: str | None = 
         if foreign.group(0).lower() not in project.doc_term_exemptions:
             errors.append(f"foreign-language term {foreign.group(0)!r}")
     for description, pattern in _COMMON_DOC_TERMS:
-        match = pattern.search(checked_text)
+        match = pattern.search(common_checked_text)
         if match is not None:
             errors.append(f"{description} {match.group(0)!r}")
     for sibling in PROJECTS:

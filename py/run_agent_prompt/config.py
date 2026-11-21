@@ -27,11 +27,6 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-if sys.version_info >= (3, 11):
-    import tomllib
-else:  # Python 3.10: the tomli package provides the same API.
-    import tomli as tomllib
-
 HARNESSES = ("muse", "claude", "codex")
 
 
@@ -65,6 +60,11 @@ def load_config(path: Path | None) -> Config:
         if explicit:
             raise ValueError(f"config file does not exist: {path}")
         return Config()
+    if sys.version_info >= (3, 11):
+        import tomllib
+    else:  # Python 3.10: the tomli package provides the same API.
+        import tomli as tomllib
+
     try:
         with path.open("rb") as handle:
             document = tomllib.load(handle)

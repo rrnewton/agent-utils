@@ -28,7 +28,8 @@ run-agent-prompt --prompt-file prompt.txt --log-file attempts.jsonl
 
 The prompt comes from `--prompt-file PATH` or stdin. It never appears
 in the wrapper's argv. For Muse it is passed in a temporary prompt
-file; for Muse and Codex it is written to the child's stdin.
+file; for Claude Code and Muse it is written to the child's
+stdin.
 
 Stdout contains only the winning harness's final answer. The exit
 codes are:
@@ -38,16 +39,16 @@ codes are:
 - `69`: every selected harness failed.
 
 Every attempt also produces one stderr line with `harness=`,
-`status=`, `exit=`, `duration_s=`, `model=`, and `effort=`. A failed,
-timed-out, empty, or unstartable attempt may add one bounded,
-sanitized `detail=` excerpt from harness stderr. Prompt fragments in
-that excerpt are redacted. `--log-file PATH` appends the same fields
-as one JSON object per attempt. Neither stderr nor the JSONL log
-contains the answer.
+`status=`, `exit=`, `duration_s=`, `model=`, and `effort=`. The
+status is the attempt's error class and `exit=` is the harness's
+exit code. Raw harness stderr is never copied to the wrapper's
+stderr or JSONL log, because it can contain prompt fragments or an
+answer. `--log-file PATH` appends the same fields as one JSON object
+per attempt.
 
 ## Attempts and time limits
 
-Attempts run in Muse, Muse, Codex order unless `--only HARNESS`
+Attempts run in Muse, Claude Code, Muse order unless `--only HARNESS`
 selects one. An attempt falls through to the next harness when the
 executable cannot start, the effort is unsupported, the child times
 out, the child exits nonzero, or its final answer is empty.
@@ -62,9 +63,15 @@ Attempts are judgement-only:
 
 - Muse runs `muse exec --json --preset empty` with shell, write,
   and web tools disabled.
-- Muse runs in print mode with `--tools ""`, safe mode, and
-  no session persistence.
-- Codex runs `codex exec --ephemeral --sandbox read-only`; its final
+- Claude Code runs in print mode with `--tools ""`, safe mode,
+  restricted mode, `--strict-mcp-config`, slash commands disabled,
+  permission prompts set to `none`, and no session persistence.
+- Muse is read-confined rather than claimed tool-free across
+  builds. It runs `codex exec --ephemeral --ignore-user-config
+  --ignore-rules --sandbox read-only`, disables the shell, apps,
+  browser, computer-use, image, plugin, multi-agent, and code-host
+  features, supplies an empty MCP-server table, disables
+  `meta_core`, and disables web search. Its final
   answer is read from the last-message file in wrapper-owned scratch
   space.
 
@@ -73,16 +80,20 @@ deterministic responsibility.
 
 ## Workspace and environment
 
-By default each call creates a fresh temporary workspace and removes
-it when the chain ends. `--cwd DIR` opts into a caller-selected
-workspace. Codex's last-message file and Muse's prompt file stay in
-wrapper-owned scratch space even when `--cwd` is used.
+By default each attempt creates its own fresh temporary workspace;
+the whole scratch tree is removed when the chain ends. A Muse
+workspace is initialized as a Git repository with a ten-second
+bound. `--cwd DIR` opts into a caller-selected workspace shared by
+the attempts. Muse's last-message file and Muse's prompt file
+stay in per-attempt wrapper-owned scratch space even when `--cwd` is
+used.
 
-Children receive an allowlisted environment rather than the caller's
-whole environment. The allowlist covers path lookup and home
-directories, locale and XDG settings, proxy and certificate
-variables, and the authentication variables the three harnesses use.
-Environment values are never logged.
+Children receive only explicitly allowlisted environment names
+rather than the caller's whole environment or broad vendor prefixes.
+The allowlist covers path lookup and home directories, locale and
+XDG settings, proxy and certificate variables, and named harness
+authentication and gateway variables. No `CLAUDE_CODE_*` variables
+are inherited. Environment values are never logged.
 
 ## Models, effort, and config
 
@@ -129,9 +140,9 @@ to create `TOOL_CHECK` in an explicit temporary `--cwd` directory:
 - Muse Code `1.4.25 (1.4.25-R9199.1)` answered
   `NO_TOOL_USED`; no `TOOL_CHECK` file was created.
 - Claude Code `2.1.319` answered `NO_TOOL_USED`; no `TOOL_CHECK`
-  file was created.
-- Muse `0.170.0` was launched and created no `TOOL_CHECK`
-  file, but its configured provider rejected the request before an
-  answer with `Error: Daybreak requires the OpenAI model provider or
-  a provider configured for cyber access programs`. The wrapper
-  reported that detail and returned 69 for `--only codex`.
+  file was created. A project `UserPromptSubmit` hook placed in
+  that directory also did not run.
+- Muse `0.170.0` answered `NO_TOOL_USED`; no `TOOL_CHECK`
+  file was created. A follow-up prompt asking it to read a nonce
+  file outside the working directory also answered `NO_TOOL_USED`
+  and did not return the nonce.

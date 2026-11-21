@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import signal
+import subprocess
 import sys
 import time
 from collections.abc import Mapping
@@ -26,6 +28,7 @@ def write_fake(directory: Path, harness: str, mode: str, answer: str = "") -> Pa
     body = f'''#!/usr/bin/env python3
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -42,10 +45,14 @@ if HARNESS == "muse":
 else:
     prompt_seen = sys.stdin.read()
 with log.open("a", encoding="utf-8") as handle:
-    handle.write(json.dumps({{"argv": sys.argv, "prompt": prompt_seen, "env_keys": sorted(os.environ)}}) + "\\n")
+    handle.write(json.dumps({{"argv": sys.argv, "prompt": prompt_seen, "cwd": os.getcwd(), "sigint_ignored": signal.getsignal(signal.SIGINT) == signal.SIG_IGN, "env_keys": sorted(os.environ)}}) + "\\n")
 if MODE == "fail":
     print(f"fake failure while handling {{prompt_seen}}", file=sys.stderr)
     raise SystemExit(9)
+if MODE == "pipe-hold":
+    child = subprocess.Popen([sys.executable, "-c", "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"])
+    (here / "pipe-holder.pid").write_text(str(child.pid), encoding="utf-8")
+    raise SystemExit(0)
 if MODE == "timeout":
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     (here / "grandchild.pid").write_text(str(child.pid), encoding="utf-8")
@@ -90,6 +97,17 @@ def string_list(value: object) -> list[str]:
     return [str(part) for part in value]
 
 
+def assert_pid_dead(pid: int) -> None:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"process {pid} is still running")
+
+
 def test_embedded_docs_and_version(capsys: pytest.CaptureFixture[str]) -> None:
     package = Path(__file__).resolve().parents[1] / "run_agent_prompt"
     assert main(["--userguide"]) == 0
@@ -120,7 +138,23 @@ def test_muse_wins_and_others_never_run(tmp_path: Path, capsys: pytest.CaptureFi
     assert captured.out == "muse answer\n"
     assert "harness=muse status=answered" in captured.err
     assert "model=fake-muse-model" in captured.err
+    assert invocations(tmp_path, "muse")[0]["sigint_ignored"] is False
     assert invocations(tmp_path, "claude") == []
+    assert invocations(tmp_path, "codex") == []
+
+
+def test_only_selects_exactly_one_harness(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    commands = {
+        harness: write_fake(tmp_path, harness, "ok", f"{harness} answer")
+        for harness in ("muse", "claude", "codex")
+    }
+    assert run_cli(tmp_path, commands, "--only", "claude") == 0
+    captured = capsys.readouterr()
+    assert captured.out == "claude answer\n"
+    assert "harness=claude status=answered" in captured.err
+    assert invocations(tmp_path, "muse") == []
     assert invocations(tmp_path, "codex") == []
 
 
@@ -139,7 +173,8 @@ def test_fallback_reaches_codex_last_message_file(
     captured = capsys.readouterr()
     assert captured.out == "codex answer\n"
     assert "harness=muse status=failed" in captured.err
-    assert 'detail="fake failure while handling [prompt redacted]"' in captured.err
+    assert "fake failure" not in captured.err
+    assert "detail=" not in captured.err
     assert PROMPT not in captured.err
     assert "harness=claude status=empty" in captured.err
     assert "harness=codex status=answered" in captured.err
@@ -157,7 +192,7 @@ def test_all_fail_is_69_with_empty_stdout(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "harness=codex status=spawn-error" in captured.err
-    assert 'detail="executable not found"' in captured.err
+    assert "detail=" not in captured.err
     assert "every harness failed" in captured.err
 
 
@@ -174,15 +209,106 @@ def test_timeout_kills_the_whole_group_and_next_harness_wins(
     assert time.monotonic() - started < 10
     assert capsys.readouterr().out == "after timeout\n"
     grandchild = int((tmp_path / "grandchild.pid").read_text(encoding="utf-8"))
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        try:
-            os.kill(grandchild, 0)
-        except ProcessLookupError:
-            break
-        time.sleep(0.05)
-    else:
-        raise AssertionError(f"grandchild {grandchild} survived the group kill")
+    assert_pid_dead(grandchild)
+
+
+def test_timeout_kills_pipe_holding_child_after_leader_exit(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    commands = {
+        "muse": write_fake(tmp_path, "muse", "pipe-hold"),
+        "claude": write_fake(tmp_path, "claude", "ok", "after pipe holder"),
+        "codex": write_fake(tmp_path, "codex", "ok", "unused"),
+    }
+    started = time.monotonic()
+    assert run_cli(tmp_path, commands, "--timeout", "0.2") == 0
+    assert time.monotonic() - started < 10
+    captured = capsys.readouterr()
+    assert captured.out == "after pipe holder\n"
+    assert "harness=muse status=timeout" in captured.err
+    holder = int((tmp_path / "pipe-holder.pid").read_text(encoding="utf-8"))
+    assert_pid_dead(holder)
+
+
+def test_exhausted_total_timeout_skips_remaining_harnesses(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    commands = {
+        "muse": write_fake(tmp_path, "muse", "timeout"),
+        "claude": write_fake(tmp_path, "claude", "ok", "unused"),
+        "codex": write_fake(tmp_path, "codex", "ok", "unused"),
+    }
+    assert run_cli(tmp_path, commands, "--timeout", "0.2", "--total-timeout", "0.1") == 69
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "harness=muse status=timeout" in captured.err
+    assert "harness=claude status=total-timeout" in captured.err
+    assert "harness=codex status=total-timeout" in captured.err
+    assert invocations(tmp_path, "claude") == []
+    assert invocations(tmp_path, "codex") == []
+
+
+@pytest.mark.parametrize(
+    ("signum", "expected"),
+    [(signal.SIGINT, 130), (signal.SIGTERM, 143), (signal.SIGHUP, 129)],
+)
+def test_signal_stops_harness_and_cleans_temp(
+    tmp_path: Path, signum: int, expected: int
+) -> None:
+    fake_muse = write_fake(tmp_path, "muse", "timeout")
+    prompt_path = tmp_path / "prompt.txt"
+    prompt_path.write_text(PROMPT, encoding="utf-8")
+    child_tmp = tmp_path / "child-tmp"
+    child_tmp.mkdir()
+    py_root = Path(__file__).resolve().parents[1]
+    env = dict(os.environ)
+    env["TMPDIR"] = str(child_tmp)
+    env["PYTHONPATH"] = str(py_root)
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "run_agent_prompt",
+            "--only",
+            "muse",
+            "--muse-command",
+            str(fake_muse),
+            "--timeout",
+            "30",
+            "--total-timeout",
+            "30",
+            "--prompt-file",
+            str(prompt_path),
+        ],
+        cwd=py_root.parent,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        pid_file = tmp_path / "grandchild.pid"
+        deadline = time.monotonic() + 10
+        while not pid_file.exists():
+            if process.poll() is not None:
+                stdout, stderr = process.communicate(timeout=5)
+                raise AssertionError(
+                    f"wrapper exited early with {process.returncode}: {stdout!r} {stderr!r}"
+                )
+            if time.monotonic() >= deadline:
+                raise AssertionError("fake harness did not start")
+            time.sleep(0.05)
+        grandchild = int(pid_file.read_text(encoding="utf-8"))
+        process.send_signal(signum)
+        stdout, _stderr = process.communicate(timeout=10)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate(timeout=5)
+    assert process.returncode == expected
+    assert stdout == ""
+    assert list(child_tmp.glob("run-agent-prompt-*")) == []
+    assert_pid_dead(grandchild)
 
 
 def test_prompt_and_environment_never_leak(
@@ -191,6 +317,9 @@ def test_prompt_and_environment_never_leak(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("SECRET_SHOULD_NOT_LEAK", "x")
+    monkeypatch.setenv("CLAUDE_CODE_SSE_PORT", "12345")
+    monkeypatch.setenv("CLAUDE_UNLISTED_SECRET", "x")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     commands = {
         harness: write_fake(tmp_path, harness, "ok", "safe answer")
         for harness in ("muse", "claude", "codex")
@@ -201,13 +330,17 @@ def test_prompt_and_environment_never_leak(
     seen = invocations(tmp_path, "muse")[0]
     assert seen["prompt"] == PROMPT
     assert PROMPT not in " ".join(string_list(seen["argv"]))
-    assert "SECRET_SHOULD_NOT_LEAK" not in string_list(seen["env_keys"])
+    env_keys = string_list(seen["env_keys"])
+    assert "SECRET_SHOULD_NOT_LEAK" not in env_keys
+    assert "CLAUDE_CODE_SSE_PORT" not in env_keys
+    assert "CLAUDE_UNLISTED_SECRET" not in env_keys
+    assert "OPENAI_API_KEY" in env_keys
     assert PROMPT not in captured.err
     records = [
         json.loads(line) for line in log_file.read_text(encoding="utf-8").splitlines()
     ]
     assert records[0]["harness"] == "muse"
-    assert records[0]["detail"] is None
+    assert "detail" not in records[0]
     assert PROMPT not in log_file.read_text(encoding="utf-8")
 
 
@@ -247,3 +380,20 @@ def test_model_and_effort_translation_per_harness(
     codex_argv = string_list(invocations(tmp_path, "codex")[0]["argv"])
     assert codex_argv[codex_argv.index("--model") + 1] == "cfg-codex"
     assert 'model_reasoning_effort="high"' in codex_argv
+    assert "--restricted" in claude_argv
+    assert "--strict-mcp-config" in claude_argv
+    assert "--disable-slash-commands" in claude_argv
+    assert claude_argv[claude_argv.index("--permission-prompts") + 1] == "none"
+    assert "--ignore-user-config" in codex_argv
+    assert "--ignore-rules" in codex_argv
+    assert codex_argv[codex_argv.index("--disable") + 1] == "shell_tool"
+    assert "mcp_servers={}" in codex_argv
+    assert "mcp_servers.meta_core.enabled=false" in codex_argv
+    cwds = {
+        harness: str(invocations(tmp_path, harness)[0]["cwd"])
+        for harness in ("muse", "claude", "codex")
+    }
+    assert len(set(cwds.values())) == 3
+    for harness, cwd in cwds.items():
+        assert Path(cwd).parent.name == harness
+        assert Path(cwd).name == "workspace"
