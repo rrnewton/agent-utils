@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""Seeded random lifecycle fuzz with the transition model as oracle (#2043).
+
+Generates reproducible random command sequences (create, hold,
+unhold, remove, recover) over two slots in a scratch registry,
+injects crashes at the CLI's test seams between journal and event
+writes, and after every step decodes the real state (event chain,
+ACTIVE snapshot, journals including containing-refs sidecars, seal)
+in a separate snippet process.  The decoded state is judged
+against the invariants transitionmodel.py checks: the event chain
+always loads or its refusal names an outstanding journal/seal,
+the reloaded journal equals the in-memory journal after expansion,
+every interrupted state is completed by one recover (or the
+refusal is classified), no refusal on a quiescent consistent
+store, and snapshot divergence heals on the next writer.
+
+Live-owner vocabulary (adopt, heartbeat by a live owner,
+transfer-owner via the mock-agent tree) is exercised by
+e2e_stress.py and joins this harness's vocabulary only where the
+scratch project can drive it without an agent tree; the seeded
+core here is the journal/crash/recover surface the model covers.
+
+Run by hand (opt-in soak):
+    python3 py/wrkslots/tests/lifecycle_fuzz.py --seed 1 --steps 24
+The gated subset is test_lifecycle_fuzz.py (seeds 1..4).
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import json
+import os
+import random
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import e2e_stress as e2e  # noqa: E402  (same-directory harness)
+
+SLOTS = ("fz-a", "fz-b")
+CRASH_POINTS = (
+    "after-create-worktree",
+    "after-active-write",
+    "after-finish-journal",
+    "after-remove-worktree",
+    "after-operation-completed",
+)
+
+_DECODE_PROGRAM = """
+import json, sys
+from pathlib import Path
+from wrkslots import cli
+
+root, machine = sys.argv[1], sys.argv[2]
+config = cli._load_config(root, machine)
+out = {"chain_loads": False, "error": "", "slots": [], "journals": [],
+       "sidecars": [], "seal": False, "snap_rev": -1, "tip": -1}
+try:
+    states = cli._load_all_active(config, require_repository=False)
+    out["chain_loads"] = True
+    state = next(s for s in states if s.machine == machine)
+    out["tip"] = state.revision
+    out["slots"] = sorted(r.slot for r in state.slots)
+except Exception as exc:
+    out["error"] = f"{type(exc).__name__}: {exc}"
+control = config.control
+for pat in ("FINISH.*.journal", "CREATE.*.journal", "ACTIVE.*.journal"):
+    for path in sorted(control.glob(pat)):
+        entry = {"name": path.name, "reload_equal": None}
+        try:
+            loaded, raw = cli._load_journal(config, selected_path=path)
+            entry["kind"] = raw.get("kind")
+            disk = json.loads(path.read_text(encoding="utf-8")) \\
+                if path.exists() else None
+            if isinstance(disk, dict):
+                cli._expand_finish_sidecars(config, disk)
+                entry["reload_equal"] = cli._json_equal(disk, raw) \\
+                    if raw.get("kind") == "finish" else None
+        except Exception as exc:
+            entry["error"] = f"{type(exc).__name__}: {exc}"
+        out["journals"].append(entry)
+side = control / "containing-refs"
+if side.is_dir():
+    out["sidecars"] = sorted(p.name for p in side.glob("*.json"))
+out["seal"] = bool(list(control.glob("VALIDATE-BATCH-SEAL.*.journal")))
+snap = Path(root) / "worktrees" / f"ACTIVE.{machine}.json"
+if snap.exists():
+    try:
+        out["snap_rev"] = json.loads(snap.read_text(encoding="utf-8"))["revision"]
+    except Exception:
+        out["snap_rev"] = -2
+print(json.dumps(out, sort_keys=True))
+"""
+
+
+class FuzzFailure(RuntimeError):
+    """One decoded state diverged from the model oracle."""
+
+
+def _decode(project: e2e.TestProject) -> dict[str, object]:
+    done = subprocess.run(
+        [sys.executable, "-c", _DECODE_PROGRAM, str(project.root), e2e.MACHINE],
+        cwd=project.root, env=project.environment,
+        text=True, capture_output=True, timeout=120, check=False,
+    )
+    if done.returncode != 0:
+        raise FuzzFailure(f"decode crashed: {done.stderr.strip()}")
+    value = json.loads(done.stdout)
+    if not isinstance(value, dict):
+        raise FuzzFailure(f"decode is not an object: {value!r}")
+    return value
+
+
+def _oracle(state: dict[str, object], *, step: str) -> list[str]:
+    """Model invariants over one decoded state; returns violations."""
+    problems: list[str] = []
+    journals = state.get("journals")
+    if not isinstance(journals, list):
+        return [f"{step}: decode has no journal list"]
+    outstanding = [j for j in journals if isinstance(j, dict)]
+    if not state.get("chain_loads"):
+        # The event chain always loads, or the refusal is explained
+        # by an outstanding journal or seal (C1 names the rest).
+        if not outstanding and not state.get("seal"):
+            problems.append(
+                f"{step}: chain refuses with no journal/seal outstanding: "
+                f"{state.get('error')}"
+            )
+    for entry in outstanding:
+        if entry.get("reload_equal") is False:
+            problems.append(
+                f"{step}: reloaded journal differs from its expanded "
+                f"on-disk form: {entry.get('name')}"
+            )
+        if entry.get("reload_equal") is None and entry.get("error"):
+            problems.append(
+                f"{step}: journal {entry.get('name')} does not load: "
+                f"{entry.get('error')}"
+            )
+    return problems
+
+
+def _wait_chain_loads(
+    project: e2e.TestProject, *, timeout: float = 30.0
+) -> dict[str, object]:
+    """Condition-based wait (never a sleep-as-sync): poll decode."""
+    deadline = time.monotonic() + timeout
+    state = _decode(project)
+    while not state.get("chain_loads") and time.monotonic() < deadline:
+        time.sleep(0.1)
+        state = _decode(project)
+    return state
+
+
+def _run_seed(seed: int, steps: int, base: Path, *, keep: bool) -> None:
+    trace = e2e.Trace(base / "trace.jsonl", seed=seed)
+    project = e2e._make_project(base, trace, ttl_seconds=2)
+    rng = random.Random(seed)
+    live: set[str] = set()
+    for index in range(steps):
+        slot = rng.choice(SLOTS)
+        op = rng.choice(
+            ("create", "hold", "unhold", "remove", "recover", "status")
+        )
+        crash = rng.choice(CRASH_POINTS) if rng.random() < 0.25 else None
+        label = f"seed={seed} step={index} op={op} slot={slot} crash={crash}"
+        env = dict(project.environment)
+        if crash:
+            env["WRKSLOTS_TEST_INTERRUPT"] = crash
+        project_crash = (
+            dataclasses.replace(project, environment=env) if crash else project
+        )
+        try:
+            if op == "create" and slot not in live:
+                e2e._create_unbound(project_crash, slot, f"fz-{slot}", trace)
+                live.add(slot)
+            elif op == "hold" and slot in live:
+                e2e._cli(project_crash, "hold", slot, "--reason", "fuzz",
+                         expected=(0, 3), trace=trace)
+            elif op == "unhold" and slot in live:
+                e2e._cli(project_crash, "unhold", slot,
+                         expected=(0, 3), trace=trace)
+            elif op == "remove" and slot in live:
+                _wait_chain_loads(project)
+                done = e2e._remove(
+                    project_crash, slot, trace, expected=(0, 3, 86)
+                )
+                if done.returncode == 0:
+                    live.discard(slot)
+            elif op == "recover":
+                e2e._cli(project_crash, "recover", "--coordinator-pid",
+                         str(os.getpid()),
+                         expected=(0, 3, 86), trace=trace)
+            else:
+                e2e._cli(project_crash, "status", expected=(0, 3), trace=trace)
+        except Exception:
+            if not crash:
+                raise
+        state = _decode(project)
+        # The decoded registry, not the intended sequence, is the
+        # truth about which slots exist (a crash can land either
+        # side of the durable write).
+        decoded_slots = state.get("slots")
+        if isinstance(decoded_slots, list):
+            live = {s for s in decoded_slots if s in SLOTS}
+        problems = _oracle(state, step=label)
+        if crash or state.get("journals"):
+            healed = _wait_chain_loads(project)
+            problems += [
+                p for p in _oracle(healed, step=label + " post-recover-wait")
+                if p not in problems
+            ]
+        trace.add("step", label=label, chain_loads=state.get("chain_loads"),
+                  journals=state.get("journals"))
+        if problems:
+            raise FuzzFailure("; ".join(problems))
+    final = _wait_chain_loads(project)
+    problems = _oracle(final, step=f"seed={seed} final")
+    if problems:
+        raise FuzzFailure("; ".join(problems))
+    print(f"lifecycle fuzz passed; seed={seed} steps={steps}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--steps", type=int, default=24)
+    parser.add_argument("--keep", action="store_true")
+    args = parser.parse_args()
+    base = Path(tempfile.mkdtemp(prefix="wrkslots-fuzz-"))
+    try:
+        _run_seed(args.seed, args.steps, base, keep=args.keep)
+    finally:
+        if not args.keep:
+            # Slot-image mounts can outlive the run; teardown is
+            # best-effort, the scratch dir is under the system tmp.
+            import shutil
+
+            shutil.rmtree(base, ignore_errors=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

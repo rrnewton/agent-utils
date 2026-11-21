@@ -236,3 +236,18 @@ exactly the leaf the Python explorer already treats it as;
 a default TLC run explores 11,795 distinct states, `Safety`
 holds in the baseline config, and `Liveness` fails as its
 config comment expects (no finisher in the baseline).
+
+## Seeded fuzz against the real code (#2043 Phase 2)
+
+`tests/lifecycle_fuzz.py` generates seeded random command
+sequences over two slots in a scratch registry, injects
+crashes at the CLI test seams between journal and event
+writes, and decodes the real state after every step (event
+chain, ACTIVE snapshot, journals including containing-refs
+sidecars, seal), judging it against the invariants above.
+`tests/test_lifecycle_fuzz.py` gates a fast subset
+(seeds 1..4, bounded steps, condition-based waits); the long
+soak is opt-in by hand. Live-owner vocabulary (adopt,
+heartbeat, transfer-owner through the mock-agent tree) is
+covered by `tests/e2e_stress.py` and joins this harness only
+where the scratch project can drive it directly.

@@ -504,6 +504,7 @@
         "py/wrkslots/tests/test_journal_actor_liveness.py",
         "py/wrkslots/tests/test_journal_state_rust.py",
         "py/wrkslots/tests/test_journals_state_rust.py",
+        "py/wrkslots/tests/test_lifecycle_fuzz.py",
         "py/wrkslots/tests/test_lifecycle_model.py",
         "py/wrkslots/tests/test_limits_show_rust.py",
         "py/wrkslots/tests/test_liveness_evidence.py",
