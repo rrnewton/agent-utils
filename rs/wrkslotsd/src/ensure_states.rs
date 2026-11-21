@@ -640,7 +640,11 @@ fn index_observe(index: &mut Map<String, Value>, event: &Value) {
     let name = payload
         .get("journal_path")
         .and_then(Value::as_str)
-        .filter(|name| std::path::Path::new(name).file_name().is_some_and(|file| file == *name))
+        .filter(|name| {
+            std::path::Path::new(name)
+                .file_name()
+                .is_some_and(|file| file == *name)
+        })
         .map(str::to_string)
         .unwrap_or_else(|| format!("ACTIVE.{machine}.journal"));
     let mut pending_conflict = false;
@@ -652,18 +656,24 @@ fn index_observe(index: &mut Map<String, Value>, event: &Value) {
             return;
         };
         if kind == "operation-progress-recorded" {
-        let journal = payload.get("journal");
-        let identity = (
-            journal.and_then(|j| j.get("kind")).cloned().unwrap_or(Value::Null),
-            journal.and_then(|j| j.get("slot")).cloned().unwrap_or(Value::Null),
-        );
-        let conflict = pending_obj.iter().any(|(existing_name, existing)| {
-            *existing_name != name
-                && (
-                    existing.get("kind").cloned().unwrap_or(Value::Null),
-                    existing.get("slot").cloned().unwrap_or(Value::Null),
-                ) == identity
-        });
+            let journal = payload.get("journal");
+            let identity = (
+                journal
+                    .and_then(|j| j.get("kind"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                journal
+                    .and_then(|j| j.get("slot"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            );
+            let conflict = pending_obj.iter().any(|(existing_name, existing)| {
+                *existing_name != name
+                    && (
+                        existing.get("kind").cloned().unwrap_or(Value::Null),
+                        existing.get("slot").cloned().unwrap_or(Value::Null),
+                    ) == identity
+            });
             if conflict {
                 pending_conflict = true;
             }
