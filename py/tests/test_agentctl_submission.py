@@ -2010,3 +2010,49 @@ def test_claude_permission_proceed_is_an_answerable_question() -> None:
     assert hook.question is not None
     with pytest.raises(ValueError, match="owner-only"):
         adapter.answer_plan(hook.question, 1, None)
+
+
+def test_dangerous_permission_answer_requires_confirm_dangerous() -> None:
+    # #2046: without --confirm-dangerous the answer refuses, names the
+    # warning line, and types nothing; with it, the answer goes through
+    # and its report names the same line. A hook confirmation refuses
+    # even with the flag.
+    from agentctl.tui_prompts import answer
+
+    dangerous = PERMISSION_SCREEN.replace(
+        "Permission rule Bash requires confirmation for this command.",
+        "Dangerous rm operation: this command may delete files",
+    )
+
+    class PermissionTerminal(FormTerminal):
+        def send_keys(self, pane: str, key: str) -> None:
+            assert pane == "w1:p1"
+            self.keys.append(key)
+            if key == "Enter" and not self.drop:
+                self.screen = (
+                    "────────────────────────────────────────\n"
+                    "❯\n"
+                    "────────────────────────────────────────\n"
+                )
+
+    adapter = harness_tui("claude")
+    assert adapter is not None
+    terminal = PermissionTerminal("options")
+    terminal.screen = dangerous
+    with pytest.raises(AgentDeliveryError, match="Dangerous rm operation"):
+        answer(terminal, "w1:p1", adapter, option=1, verify=lambda p: None,
+               sleep=terminal.sleep, monotonic=lambda: terminal.seconds)
+    assert not terminal.keys
+    result = answer(terminal, "w1:p1", adapter, option=1, confirm_dangerous=True,
+                    verify=lambda p: None,
+                    sleep=terminal.sleep, monotonic=lambda: terminal.seconds)
+    assert result["answered"] is True
+    assert "Dangerous rm operation" in str(result["question"])
+    assert terminal.keys == ["Enter"]
+    hook_terminal = PermissionTerminal("options")
+    hook_terminal.screen = HOOK_SCREEN
+    with pytest.raises(AgentDeliveryError, match="owner-only"):
+        answer(hook_terminal, "w1:p1", adapter, option=1, confirm_dangerous=True,
+               verify=lambda p: None,
+               sleep=hook_terminal.sleep, monotonic=lambda: hook_terminal.seconds)
+    assert not hook_terminal.keys

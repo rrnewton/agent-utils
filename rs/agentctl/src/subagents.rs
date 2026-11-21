@@ -15443,6 +15443,7 @@ its drain would also type, so it was not queued",
         &self,
         agent_name: &str,
         selection: Option<(Option<usize>, Option<&str>)>,
+        confirm_dangerous: bool,
     ) -> Result<Value> {
         let _lock = self.lock(agent_name)?;
         let record = self.load(agent_name)?;
@@ -15476,6 +15477,7 @@ its drain would also type, so it was not queued",
                 pane,
                 adapter,
                 selection,
+                confirm_dangerous,
                 &|pane| workspace.verify_recipient(pane, true),
                 &runtime,
             )

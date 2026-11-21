@@ -1006,7 +1006,7 @@ pub(crate) fn verify_team_from_snapshot<A: ManagedApi + ?Sized>(
                 // The one write verify may do: answer the allowlisted
                 // dialog at its default, then prove it gone by re-reading.
                 let dismissed = manager
-                    .prompts(name, Some((None, None)))
+                    .prompts(name, Some((None, None)), false)
                     .map_err(|error| error.to_string())
                     .and_then(|_| {
                         manager

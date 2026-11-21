@@ -18,6 +18,7 @@ struct Answering<'a> {
     adapter: &'a dyn HarnessTui,
     verify: &'a dyn Fn(&str) -> crate::error::Result<()>,
     runtime: &'a dyn AgentRuntime,
+    confirm_dangerous: bool,
     attempted: bool,
 }
 impl Answering<'_> {
@@ -94,6 +95,18 @@ impl Answering<'_> {
         let q = view
             .question
             .ok_or_else(|| fail("question did not open into a supported form"))?;
+        // A dangerous-operation permission prompt needs its own explicit
+        // confirmation (#2046 agentctl-answer-dangerous-confirm): the
+        // refusal names the matched warning line, and so does the
+        // confirmed answer's report (the `question` field below). Hook
+        // confirmations are refused separately in `answer_plan`, with or
+        // without this flag.
+        if !self.confirm_dangerous && q.text.to_lowercase().contains("dangerous") {
+            return Err(fail(format!(
+                "refusing to answer a dangerous-operation prompt without --confirm-dangerous: {}; rerun with --confirm-dangerous only when a human has confirmed this exact warning",
+                q.text
+            )));
+        }
         let plan = self.adapter.answer_plan(&q, option, text).map_err(fail)?;
         let mut selected = q.selected;
         for key in &plan.keys {
@@ -155,6 +168,7 @@ pub fn answer(
     pane: &str,
     adapter: &dyn HarnessTui,
     selection: (Option<usize>, Option<&str>),
+    confirm_dangerous: bool,
     verify: &dyn Fn(&str) -> crate::error::Result<()>,
     runtime: &dyn AgentRuntime,
 ) -> AgentResult<Value> {
@@ -167,6 +181,7 @@ pub fn answer(
         adapter,
         verify,
         runtime,
+        confirm_dangerous,
         attempted: false,
     };
     answering.run(selection.0, selection.1).map_err(|error| {
@@ -196,6 +211,7 @@ pub fn inspect_question(
         adapter,
         verify,
         runtime,
+        confirm_dangerous: false,
         attempted: false,
     };
     inspection.inspect().map_err(|error| {

@@ -322,6 +322,8 @@ def parser() -> argparse.ArgumentParser:
     selection.add_argument("--text", metavar="TEXT", help="literal single-line answer for a supported empty or identical-draft free-text form")
     answer.add_argument("--replace-draft", action="store_true",
         help="with --text, clear an inspected unsent draft in a single Codex free-text form; default preserves drafts")
+    answer.add_argument("--confirm-dangerous", action="store_true",
+        help="confirm answering a dangerous-operation permission prompt (the refusal and the answer both name the matched warning line; hook confirmations stay refused) (#2046)")
     read = command("read", "Read a terminal snapshot or a headless transcript/answer.",
         "agentctl read reviewer --lines 100", named=True)
     read.add_argument("--lines", type=_bounded_uint, default=500, metavar="COUNT", help="maximum tail/snapshot lines (default: 500)")
@@ -777,7 +779,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "prompts":
             result = sessions.prompts(name)
         elif args.command == "answer":
-            result = sessions.prompts(name, option=args.option, text=args.text, answering=True, replace_draft=args.replace_draft)
+            result = sessions.prompts(name, option=args.option, text=args.text, answering=True, replace_draft=args.replace_draft, confirm_dangerous=args.confirm_dangerous)
         elif args.command == "read":
             sys.stdout.write(sessions.read_session(name, lines=args.lines, output=args.output, since_turn=args.since_turn))
             return 0

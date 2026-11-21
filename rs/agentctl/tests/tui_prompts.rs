@@ -45,6 +45,7 @@ fn rate_limit_guarded_answer_selects_current_model_once() {
             "pane",
             harness_tui(Some("codex")).unwrap(),
             (Some(2), None),
+            false,
             &|_| Ok(()),
             &Runtime::default(),
         );
@@ -105,6 +106,71 @@ fn claude_permission_proceed_is_an_answerable_question() {
     assert!(adapter
         .answer_plan(&view.question.unwrap(), Some(1), None)
         .is_err());
+}
+
+#[test]
+fn dangerous_permission_answer_requires_confirm_dangerous() {
+    // #2046: without --confirm-dangerous the answer refuses, names the
+    // warning line, and types nothing; with it, the answer goes through
+    // and its report names the same line. A hook confirmation refuses
+    // even with the flag.
+    let screen = include_str!("fixtures/tui/claude-permission-proceed.txt").replace(
+        "Permission rule Bash requires confirmation for this command.",
+        "Dangerous rm operation: this command may delete files",
+    );
+    let mut terminal = Terminal::new(&screen);
+    let error = agentctl::tui_prompts::answer(
+        &terminal,
+        "pane",
+        harness_tui(Some("claude")).unwrap(),
+        (Some(1), None),
+        false,
+        &|_| Ok(()),
+        &Runtime::default(),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Dangerous rm operation: this command may delete files"),
+        "{error}"
+    );
+    assert!(error.to_string().contains("--confirm-dangerous"), "{error}");
+    assert!(terminal.keys.borrow().is_empty(), "no key may be sent");
+    let result = agentctl::tui_prompts::answer(
+        &terminal,
+        "pane",
+        harness_tui(Some("claude")).unwrap(),
+        (Some(1), None),
+        true,
+        &|_| Ok(()),
+        &Runtime::default(),
+    )
+    .unwrap();
+    assert_eq!(result["answered"], true);
+    assert!(
+        result["question"]
+            .as_str()
+            .unwrap()
+            .contains("Dangerous rm operation"),
+        "{result}"
+    );
+    assert_eq!(*terminal.keys.borrow(), ["Enter"]);
+    terminal = Terminal::new(
+        "──────\nHook PreToolUse:Bash requires confirmation\nRunning this command may delete files: rm -rf build\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel · Tab to amend\n",
+    );
+    let error = agentctl::tui_prompts::answer(
+        &terminal,
+        "pane",
+        harness_tui(Some("claude")).unwrap(),
+        (Some(1), None),
+        true,
+        &|_| Ok(()),
+        &Runtime::default(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("owner-only"), "{error}");
+    assert!(terminal.keys.borrow().is_empty());
 }
 
 #[test]
@@ -199,7 +265,14 @@ impl GuardedInput for Terminal {
                 .replace("  tab or esc", "  › Add notes\n\n  tab or esc");
             *self.screen.borrow_mut() = screen;
         } else if key == "Enter" && !self.drop_submit {
-            *self.screen.borrow_mut() = WORKING.to_owned();
+            if self.screen.borrow().contains("Do you want to proceed?") {
+                // A Claude permission prompt dismisses to its idle composer.
+                *self.screen.borrow_mut() =
+                    "────────────────────────────────────────\n❯\n────────────────────────────────────────\n"
+                        .to_owned();
+            } else {
+                *self.screen.borrow_mut() = WORKING.to_owned();
+            }
         }
         Ok(())
     }
@@ -243,6 +316,7 @@ fn option_answer_expands_selects_and_confirms() {
         "pane",
         harness_tui(Some("codex")).unwrap(),
         (Some(2), None),
+        false,
         &|_| Ok(()),
         &Runtime::default(),
     )
@@ -260,6 +334,7 @@ fn free_text_and_other_option_use_literal_paste() {
             "pane",
             harness_tui(Some("codex")).unwrap(),
             (None, Some("A literal answer")),
+            false,
             &|_| Ok(()),
             &Runtime::default(),
         )
@@ -309,6 +384,7 @@ fn dropped_submission_is_uncertain_and_not_repeated() {
         "pane",
         harness_tui(Some("codex")).unwrap(),
         (Some(1), None),
+        false,
         &|_| Ok(()),
         &Runtime::default(),
     )
@@ -325,6 +401,7 @@ fn bad_selection_and_recipient_refusal_send_nothing() {
         "pane",
         harness_tui(Some("codex")).unwrap(),
         (Some(99), None),
+        false,
         &|_| Ok(()),
         &Runtime::default(),
     )
@@ -336,6 +413,7 @@ fn bad_selection_and_recipient_refusal_send_nothing() {
         "pane",
         harness_tui(Some("codex")).unwrap(),
         (Some(1), None),
+        false,
         &|_| Err(agentctl::error::AdapterError::recipient_changed("replaced")),
         &Runtime::default(),
     )
@@ -423,6 +501,7 @@ fn async_options_navigate_and_submit_at_most_once() {
             "pane",
             harness_tui(Some("codex")).unwrap(),
             (Some(2), None),
+            false,
             &|_| Ok(()),
             &Runtime::default(),
         );
@@ -452,6 +531,7 @@ fn async_options_refuse_incomplete_or_ambiguous_forms() {
             "pane",
             harness_tui(Some("codex")).unwrap(),
             (Some(2), None),
+            false,
             &|_| Ok(()),
             &Runtime::default(),
         )
@@ -477,6 +557,7 @@ fn matching_wrapped_draft_is_confirmed_without_retyping() {
                 None,
                 Some("Keep the paid lifecycle and prepare separate boundary companions."),
             ),
+            false,
             &|_| Ok(()),
             &Runtime::default(),
         );
@@ -496,6 +577,7 @@ fn matching_wrapped_draft_is_confirmed_without_retyping() {
         "pane",
         harness_tui(Some("codex")).unwrap(),
         (None, Some("Replacement")),
+        false,
         &|_| Ok(()),
         &Runtime::default(),
     )

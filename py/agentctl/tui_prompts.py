@@ -55,6 +55,7 @@ def inspect_question(
 def answer(
     terminal: GuardedInput, pane: str, adapter: HarnessTui, *,
     option: int | None = None, text: str | None = None, replace_draft: bool = False,
+    confirm_dangerous: bool = False,
     verify: Callable[[str], None], sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> dict[str, object]:
@@ -110,6 +111,19 @@ def answer(
         q = view.question
         if q is None:
             raise AgentDeliveryError("question did not open into a supported form")
+        # A dangerous-operation permission prompt needs its own explicit
+        # confirmation (#2046 agentctl-answer-dangerous-confirm): the
+        # refusal names the matched warning line, and so does the
+        # confirmed answer's report (the `question` field below). Hook
+        # confirmations are refused separately in `answer_plan`, with or
+        # without this flag.
+        if not confirm_dangerous and "dangerous" in q.text.lower():
+            raise AgentDeliveryError(
+                "refusing to answer a dangerous-operation prompt without "
+                f"--confirm-dangerous: {q.text}; rerun with "
+                "--confirm-dangerous only when a human has confirmed this "
+                "exact warning"
+            )
         if replace_draft:
             if (adapter.free_text_clear_key is None or q.options or q.total != 1
                     or q.collapsed or q.notes):

@@ -552,6 +552,9 @@ struct Answer {
     /// Literal single-line answer for a supported empty or identical-draft free-text form
     #[arg(long, value_name = "TEXT")]
     text: Option<String>,
+    /// Confirm answering a dangerous-operation permission prompt (the refusal and the answer both name the matched warning line; hook confirmations stay refused) (#2046)
+    #[arg(long)]
+    confirm_dangerous: bool,
 }
 
 #[derive(Args)]
@@ -6078,10 +6081,11 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         }
         Commands::List(value) => json!(manager.list_showing(value.show_argv)?),
         Commands::Status(value) => manager.status_showing(&value.name, value.show_argv)?,
-        Commands::Prompts(value) => manager.prompts(&value.name, None)?,
+        Commands::Prompts(value) => manager.prompts(&value.name, None, false)?,
         Commands::Answer(value) => manager.prompts(
             &value.agent.name,
             Some((value.option, value.text.as_deref())),
+            value.confirm_dangerous,
         )?,
         Commands::Console(value) => {
             return run_console(&manager, &args.registry, value);
