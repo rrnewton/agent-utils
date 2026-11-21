@@ -83,7 +83,7 @@ goes stale. The stale row is a Muse-side defect; a short written
 report for the owner is the deliverable for that part (filing
 upstream needs the owner's OK).
 
-# Design (awaiting coordb approval before code)
+# Design
 
 [watermelon-full-preview]
 
