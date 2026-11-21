@@ -512,6 +512,92 @@ def _run_seed(
     print(f"lifecycle fuzz passed; seed={seed} steps={steps}")
 
 
+def _run_ops_file(ops_path: Path, root: Path) -> None:
+    """Child mode: execute a fixed op list against a shared project."""
+    spec = json.loads(ops_path.read_text(encoding="utf-8"))
+    project = e2e.TestProject(
+        root=root, repository=root / "product",
+        remote=root.parent / "product.git", environment=e2e._environment(),
+    )
+    trace = e2e.Trace(ops_path.with_suffix(".trace.jsonl"), seed=int(spec["seed"]))
+    for item in spec["ops"]:
+        op, slot = item["op"], item["slot"]
+        label = f"worker step op={op} slot={slot}"
+        before = _decode(project)
+        raw_slots = before.get("slots")
+        known = (
+            {s for s in raw_slots if isinstance(s, str)}
+            if isinstance(raw_slots, list) else set()
+        )
+        raw_arch = before.get("archived")
+        gone = (
+            {s for s in raw_arch if isinstance(s, str)}
+            if isinstance(raw_arch, list) else set()
+        )
+        if op == "create" and (slot in known or slot in gone):
+            continue
+        if op in ("hold", "unhold", "remove") and slot not in known:
+            continue
+        if op == "create":
+            _create_unbound(project, slot, f"fz-{slot}", trace)
+        elif op == "hold":
+            _cli(project, "hold", slot, "--reason", "fuzz",
+                     expected=(0, 3), trace=trace)
+        elif op == "unhold":
+            _cli(project, "unhold", slot, expected=(0, 3), trace=trace)
+        elif op == "remove":
+            done = _remove(project, slot, trace, expected=(0, 3))
+        elif op == "recover":
+            _cli(project, "recover", "--coordinator-pid",
+                     str(os.getpid()), expected=(0, 3), trace=trace)
+        state = _decode(project)
+        problems = _oracle(state, step=label)
+        if problems:
+            raise FuzzFailure("; ".join(problems))
+    print(f"worker done seed={spec['seed']}")
+
+
+def _run_concurrent(seed: int, base: Path) -> None:
+    """Two processes, disjoint slots, one shared registry."""
+    trace = e2e.Trace(base / "trace.jsonl", seed=seed)
+    project = e2e._make_project(base, trace, ttl_seconds=2)
+    rng = random.Random(seed)
+    children: list[subprocess.Popen[str]] = []
+    specs: list[Path] = []
+    for worker, slot in enumerate(SLOTS):
+        ops = []
+        for _ in range(10):
+            op = rng.choice(("create", "hold", "unhold", "remove", "recover"))
+            ops.append({"op": op, "slot": slot})
+        spec_path = base / f"ops-{worker}.json"
+        spec_path.write_text(
+            json.dumps({"seed": seed + worker, "ops": ops}), encoding="utf-8"
+        )
+        specs.append(spec_path)
+        children.append(subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()),
+             "--ops-file", str(spec_path), "--project-root", str(project.root)],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        ))
+    failures = []
+    for child in children:
+        out, err = child.communicate(timeout=600)
+        if child.returncode != 0:
+            failures.append(f"worker pid={child.pid} rc={child.returncode}: {err[-400:]}")
+    if failures:
+        raise FuzzFailure(" | ".join(failures))
+    healed = _wait_chain_loads(project)
+    problems = _oracle(healed, step=f"seed={seed} concurrent final")
+    e2e._cli(project, "recover", "--coordinator-pid", str(os.getpid()),
+             expected=(0, 3), trace=trace)
+    final = _wait_chain_loads(project)
+    problems += _oracle(final, step=f"seed={seed} concurrent post-recover")
+    if problems:
+        raise FuzzFailure("; ".join(problems))
+    print(f"lifecycle fuzz concurrent passed; seed={seed}")
+
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seed", type=int, default=1)
@@ -519,13 +605,24 @@ def main() -> int:
     parser.add_argument("--keep", action="store_true")
     parser.add_argument("--faults", action="store_true",
                         help="include injected directory-fsync failures")
+    parser.add_argument("--concurrent", action="store_true",
+                        help="two worker processes on disjoint slots")
+    parser.add_argument("--ops-file", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--project-root", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.ops_file is not None:
+        assert args.project_root is not None
+        _run_ops_file(args.ops_file, args.project_root)
+        return 0
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
     base = Path(tempfile.mkdtemp(prefix="wrkslots-fuzz-"))
     try:
-        _run_seed(args.seed, args.steps, base, keep=args.keep,
-                  faults=args.faults)
+        if args.concurrent:
+            _run_concurrent(args.seed, base)
+        else:
+            _run_seed(args.seed, args.steps, base, keep=args.keep,
+                      faults=args.faults)
     finally:
         _exit_sweep()
         if not args.keep:

@@ -163,3 +163,12 @@ def test_sigterm_sweeps_run_images(tmp_path: Path) -> None:
     assert str(run_dir) not in mounts, f"mounts remain under {run_dir}"
 
 
+def test_lifecycle_fuzz_concurrent_seed(tmp_path: Path) -> None:
+    runner = Path(__file__).with_name("lifecycle_fuzz.py")
+    done = subprocess.run(
+        [sys.executable, str(runner), "--seed", "21", "--concurrent"],
+        text=True, capture_output=True, check=False,
+        timeout=600, preexec_fn=_limits, cwd=tmp_path,
+    )
+    assert done.returncode == 0, f"{done.stdout}\n{done.stderr}"
+    assert "lifecycle fuzz concurrent passed; seed=21" in done.stdout
