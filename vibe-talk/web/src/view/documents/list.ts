@@ -13,6 +13,8 @@ import { createListening } from "../dom/index.ts";
 import { createDocStatesStore, docStateOf } from "./docstate.ts";
 import type { DocStatesStore } from "./docstate.ts";
 import type { DocumentRow, DocumentsListAnswer } from "./types.ts";
+import { listAnchorDelta, listAnchorOf } from "./viewstate.ts";
+import type { ListAnchor } from "./viewstate.ts";
 
 export interface DocumentsListDependencies {
   api(path: string, options?: { method?: string; body?: unknown }): Promise<unknown>;
@@ -76,6 +78,14 @@ export interface DocumentsList {
   setNameFilter(text: string): void;
   /** The current local name filter's text. */
   nameFilter(): string;
+  /**
+   * The list's place for the view state (`#2005 vibe-talk-documents-keep-place`):
+   * the top card, every card's offset, and whether parked at the bottom; null
+   * where no card's place can be measured (off screen, no boxes).
+   */
+  capturePlace(): ListAnchor | null;
+  /** Put a captured place back: the foot where parked there, else its anchor card. */
+  restorePlace(place: ListAnchor | null): void;
   unmount(): void;
 }
 
@@ -950,6 +960,47 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
     }
   }
 
+  /**
+   * The list's place as the view state keeps it (`#2005`): the same anchor a
+   * redraw keeps (`#1908`), named for a return after the pane was hidden —
+   * captured while the list is on screen, restored after its rows render
+   * again, however late they arrive. Null off screen or unmeasured, where
+   * the caller keeps the raw offset it already holds.
+   */
+  function capturePlace(): ListAnchor | null {
+    if (!listOnScreen()) return null;
+    const band = visibleBand();
+    if (!band) return null;
+    const cards: { key: string; top: number; bottom: number }[] = [];
+    for (const card of cardElements()) {
+      const rect = usableRect(card.element);
+      if (rect) cards.push({ key: card.key, top: rect.top, bottom: rect.bottom });
+    }
+    const scroller = scrollerOrNull();
+    const follow = scroller !== null && atBottom(scroller, FOLLOW_SLACK_PX);
+    return listAnchorOf(cards, band.top, follow);
+  }
+
+  /** Put a captured place back (`#2005`): one measured nudge, or the foot. */
+  function restorePlace(place: ListAnchor | null): void {
+    if (!place) return;
+    const scroller = scrollerOrNull();
+    if (!scroller || !listOnScreen()) return;
+    if (place.follow) {
+      deps.toFoot(scroller);
+      return;
+    }
+    const band = visibleBand();
+    if (!band) return;
+    const cards: { key: string; top: number }[] = [];
+    for (const card of cardElements()) {
+      const rect = usableRect(card.element);
+      if (rect) cards.push({ key: card.key, top: rect.top });
+    }
+    const delta = listAnchorDelta(place, cards, band.top);
+    if (delta !== null && delta !== 0) deps.nudge(scroller, delta);
+  }
+
   function render(rows: readonly DocumentRow[], keepAnchor = true): void {
     anchoredOnRender = false;
     const anchor = keepAnchor ? captureAnchor() : null;
@@ -1389,6 +1440,8 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
       render(rowsNow);
     },
     nameFilter: () => nameFilterText,
+    capturePlace,
+    restorePlace,
     unmount(): void {
       endUndoOffer();
       wiredOuter = false;

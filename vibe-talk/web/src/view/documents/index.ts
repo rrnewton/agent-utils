@@ -10,6 +10,8 @@ export { createDocumentsSearch } from "./search.ts";
 export type { DocumentsSearch, DocumentsSearchDependencies, DocumentSearchHit } from "./search.ts";
 export type { DocumentsReader, DocumentsReaderDependencies, OpenDocument } from "./reader.ts";
 export { renderDocumentMarkdown, documentHeadingId } from "./render.ts";
+export { listAnchorDelta, listAnchorOf, readerAnchorDelta, readerAnchorOf } from "./viewstate.ts";
+export type { ListAnchor, ReaderAnchor } from "./viewstate.ts";
 export { documentReadBlocks } from "./blocks.ts";
 export type { DocumentReadBlock } from "./blocks.ts";
 export { createViewSelector, nextView, otherViews, VIEW_CARDS_SETTLE_MS, VIEW_LABELS, VIEW_ORDER } from "./selector.ts";
@@ -25,6 +27,7 @@ import { createDocumentsReader, openDocumentNotice } from "./reader.ts";
 import { centrePopupOver } from "../dom/index.ts";
 import { createDocumentsSearch } from "./search.ts";
 import type { OpenDocument } from "./reader.ts";
+import type { ListAnchor, ReaderAnchor } from "./viewstate.ts";
 
 /** What the Documents view needs from the page. */
 export interface DocumentsViewDependencies {
@@ -122,7 +125,7 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
    * page's wiring); where the chain's first document was opened from — a
    * channel, the list — is the page navigation's jump, not the view's.
    */
-  let chain: { key: string; scrollTop: number }[] = [];
+  let chain: { key: string; scrollTop: number; anchor: ReaderAnchor | null }[] = [];
   /**
    * The list's place when a document opened from it (`#1264
    * documents-scroll-landings`): where Back to the list lands — the bottom
@@ -130,6 +133,23 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
    * scrolled up. Null where no document was opened from the list.
    */
   let listPlace: DocumentsListPlace | null = null;
+  /**
+   * The documents view state (`#2005 vibe-talk-documents-keep-place`): the
+   * list's anchor (its top card and every card's offset, kept beside the raw
+   * `listPlace` above) and whether the view was ever entered — the first
+   * entry is fresh (the list at its bottom), every later bare showing is a
+   * return that restores the anchors. Written by the scroll capture below
+   * and at each open; read only by a return.
+   */
+  let listAnchor: ListAnchor | null = null;
+  let entered = false;
+  /**
+   * A list landing is in flight (a Back or return refresh whose rows have
+   * not landed): scrolls in that window describe the transition — the shared
+   * scroller still holding the reader's offset over a half-swapped pane —
+   * not the list, so the scroll capture must not record them (`#2005`).
+   */
+  let listLanding = false;
 
   /** The shared scroller's place now, or 0 where it cannot be read. */
   function scrollTopNow(): number {
@@ -167,6 +187,43 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
       deps.toPosition(deps.byId("scroll-area"), top);
     } catch {
       // A host without the scroller keeps the reader where it opened.
+    }
+  }
+
+  /**
+   * Record where the reader stands in the open document (`#2005`): the raw
+   * offset, and its paragraph anchor where one can be measured (the anchor
+   * already recorded stands where this look measures nothing).
+   */
+  function captureReaderPlace(): void {
+    const topEntry = readingNow ? chain[chain.length - 1] : undefined;
+    if (!topEntry) return;
+    topEntry.scrollTop = scrollTopNow();
+    topEntry.anchor = reader.captureAnchor() ?? topEntry.anchor;
+  }
+
+  /**
+   * Record where the list stands (`#2005`): its anchor and its raw place,
+   * each kept where this look finds nothing (off screen, unmeasured).
+   */
+  function captureListPlace(): void {
+    if (readingNow || listLanding) return;
+    const anchor = list.capturePlace();
+    if (anchor !== null) listAnchor = anchor;
+    const raw = listPlaceNow();
+    if (raw !== null) listPlace = raw;
+  }
+
+  /** Land the open document back on its recorded place: raw, then anchored. */
+  function restoreReaderPlace(entry: { scrollTop: number; anchor: ReaderAnchor | null }): void {
+    restoreScrollTop(entry.scrollTop);
+    const delta = reader.anchorDelta(entry.anchor);
+    if (delta !== null && delta !== 0) {
+      try {
+        deps.nudge(deps.byId("scroll-area"), delta);
+      } catch {
+        // A host without the scroller keeps the raw place just restored.
+      }
     }
   }
 
@@ -296,8 +353,23 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     }
     // Back from a fetch: the rows redraw with their fetched state, landing
     // where the list was left (`#1264`), applied by the refresh after its
-    // rows render however late they arrive.
-    if (redraw) void list.refresh(takeListPlace()).catch(() => undefined);
+    // rows render however late they arrive; the anchor recorded when the
+    // document opened then puts the top card exactly back (`#2005`), where
+    // it can be measured. The landing window is guarded: scrolls while the
+    // rows are in flight are the transition, not the list, and must not
+    // overwrite the anchor being landed on.
+    if (redraw) {
+      listLanding = true;
+      const place = listAnchor;
+      void list.refresh(takeListPlace())
+        .then(() => {
+          listLanding = false;
+          if (!readingNow) list.restorePlace(place);
+        })
+        .catch(() => {
+          listLanding = false;
+        });
+    }
   }
 
   /**
@@ -312,7 +384,7 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
       return;
     }
     chain.pop();
-    const previous = chain[chain.length - 1] as { key: string; scrollTop: number };
+    const previous = chain[chain.length - 1] as { key: string; scrollTop: number; anchor: ReaderAnchor | null };
     // The depth changed before the reopen lands, so its entry syncs at once.
     deps.onLevelChange?.();
     // Stop the reading of the document being left, as reaching the list does.
@@ -323,7 +395,7 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
       } catch {
         // The reader already said what happened; stay on the reader so Back works.
       }
-      if (readingNow && chain[chain.length - 1] === previous) restoreScrollTop(previous.scrollTop);
+      if (readingNow && chain[chain.length - 1] === previous) restoreReaderPlace(previous);
     })();
   }
 
@@ -335,14 +407,15 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     const firstOpen = !current || current.key !== key;
     if (current) {
       // The place a Back to this document returns to.
-      current.scrollTop = scrollTopNow();
+      captureReaderPlace();
       // Reopening the document already open adds no step of its own.
-      if (current.key !== key) chain.push({ key, scrollTop: 0 });
+      if (current.key !== key) chain.push({ key, scrollTop: 0, anchor: null });
     } else {
       // Opening from the list records the list's place for the return
-      // (`#1264`), before the shared scroller becomes the reader's.
-      listPlace = listPlaceNow() ?? listPlace;
-      chain = [{ key, scrollTop: 0 }];
+      // (`#1264`, anchored by `#2005`), before the shared scroller becomes
+      // the reader's.
+      captureListPlace();
+      chain = [{ key, scrollTop: 0, anchor: null }];
     }
     deps.byId("docs-list-view").hidden = true;
     deps.byId("docs-reader").hidden = false;
@@ -383,6 +456,25 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
   function wire(): void {
     if (wired) return;
     wired = true;
+    // Keep the view state's places current while Documents is up (`#2005`):
+    // a switch away hands the shared scroller to another view, so both
+    // anchors must already stand recorded when it happens — every scroll
+    // refreshes them. Synchronously, asking for no frame of its own: the
+    // page's energy profile allows a burst of scrolls one frame in total
+    // (`#226`), and a second requester would spend it.
+    try {
+      listening.listen(deps.byId("scroll-area"), "scroll", () => {
+        try {
+          if (deps.byId("pane-docs").hidden) return;
+        } catch {
+          return;
+        }
+        if (readingNow) captureReaderPlace();
+        else captureListPlace();
+      });
+    } catch {
+      // A host without the scroller keeps the places taken at each open.
+    }
     const button = deps.byId("docs-fetch") as HTMLButtonElement;
     const menu = deps.byId("docs-fetch-menu");
     const since = deps.byId("docs-since");
@@ -534,19 +626,59 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
         liveTimer = setTimeout(tick, 60_000) as unknown as number;
       }
       if (key) {
+        entered = true;
         await openDocument(key);
         return;
       }
-      // Shown with no document named — a switch to this view: the list, the
-      // chain forgotten, however the reader was last left. A recorded list
-      // place (`#1264`) lands the switch's return there too; with none, the
-      // refresh keeps the place the page restored for this view.
-      toList(false);
+      if (!entered) {
+        // The first entry ever is FRESH (`#2002` split: fresh lands at the
+        // bottom, a return restores): the list as it first stands, however
+        // the reader was last left in a prior page life — none stands here.
+        entered = true;
+        toList(false);
+        try {
+          await list.refresh(takeListPlace());
+        } catch (error) {
+          deps.onStatus?.(error instanceof Error ? error.message : "Could not load the documents.");
+        }
+        return;
+      }
+      // A RETURN (`#2005 vibe-talk-documents-keep-place`): exactly the prior
+      // screen. An open document was never closed — its content, outline and
+      // chain stand — so only its chrome and its place are put back; the
+      // list behind it is not redrawn under it. With no document open, the
+      // list refreshes and lands where it was left: the recorded place
+      // first (as Back lands), refined by its anchor card.
+      if (readingNow) {
+        deps.byId("docs-list-view").hidden = true;
+        deps.byId("docs-reader").hidden = false;
+        deps.byId("docs-fetch").hidden = true;
+        try {
+          deps.byId("docs-filter-bar").hidden = true;
+          deps.byId("docs-starred-toggle").hidden = true;
+        } catch {
+          // A host without the fixed bar keeps the reader as it was.
+        }
+        try {
+          deps.byId("control-pane").insertBefore(deps.byId("audio-source"), deps.byId("read-speed"));
+        } catch {
+          // A host without the reader row keeps the bar's own toggle.
+        }
+        syncShowHiddenOffer();
+        const topEntry = chain[chain.length - 1];
+        if (topEntry) restoreReaderPlace(topEntry);
+        return;
+      }
+      listLanding = true;
+      const place = listAnchor;
       try {
         await list.refresh(takeListPlace());
       } catch (error) {
         deps.onStatus?.(error instanceof Error ? error.message : "Could not load the documents.");
+      } finally {
+        listLanding = false;
       }
+      list.restorePlace(place);
     },
     showList: back,
     back,

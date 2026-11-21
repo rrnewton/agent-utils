@@ -1,0 +1,15 @@
+steps:
+  - group: check
+    job: documents-keepplace-browser
+    desc: toggling Documents -> channel -> Documents restores the open document at its paragraph (within 3px), the list, and Back after a toggle, against the real server (fake chat upstream) in current Chromium at 412x915 and 1280, light and dark (#2005)
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/documents_keepplace_browser.py
+    jobs_flag: ""
+    deps: [build.release, setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 90
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824

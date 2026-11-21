@@ -26,6 +26,8 @@ import { documentReadBlocks } from "./blocks.ts";
 import { authorNumberOf, buildScrubberNav, buildSections } from "./sections.ts";
 import type { ScrubSectionCell, SectionModel } from "./sections.ts";
 import { splitIssueHeader } from "./issueheader.ts";
+import { readerAnchorDelta, readerAnchorOf } from "./viewstate.ts";
+import type { ReaderAnchor } from "./viewstate.ts";
 
 /** What the reader asks of the page. */
 export interface DocumentsReaderDependencies {
@@ -163,6 +165,15 @@ export interface DocumentsReader {
    * on the reader itself; the header's own Read button is gone (`#2003`).
    */
   readAloud(): void;
+  /**
+   * Where the reader stands (`#2005 vibe-talk-documents-keep-place`): the
+   * drawn block at the top of the screen and its offset, or null where no
+   * block's place can be measured. Measurement only — the view owns every
+   * scroll write, as it owns the scroller.
+   */
+  captureAnchor(): ReaderAnchor | null;
+  /** How far the scroller must move for `anchor` to stand again; null unmeasurable. */
+  anchorDelta(anchor: ReaderAnchor | null): number | null;
   /** Stop any reading in progress. */
   close(): void;
   /** Take down every listener the reader added. */
@@ -962,6 +973,53 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     return found;
   }
 
+  /** One drawn block's span, or null where it reports none usable (no boxes). */
+  function spanOf(element: HTMLElement): { top: number; bottom: number } | null {
+    try {
+      if (typeof element.getBoundingClientRect !== "function") return null;
+      const rect = element.getBoundingClientRect();
+      if (!rect || typeof rect.top !== "number" || typeof rect.bottom !== "number") return null;
+      if (!Number.isFinite(rect.top) || !Number.isFinite(rect.bottom)) return null;
+      if (rect.top === 0 && rect.bottom === 0) return null;
+      return { top: rect.top, bottom: rect.bottom };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Every drawn block's span with the scroller's top (`#2005`): the
+   * measurements the view-state anchors are taken from. Null where the body,
+   * the scroller, or any block cannot be measured — the caller then keeps
+   * the raw offset it already holds, exactly as an unmeasured host always did.
+   */
+  function blockSpans(): { spans: { top: number; bottom: number }[]; bandTop: number } | null {
+    let body: HTMLElement;
+    let root: HTMLElement;
+    try {
+      body = deps.byId("doc-body");
+      root = deps.byId("scroll-area");
+    } catch {
+      return null;
+    }
+    if (!body || !root || typeof root.getBoundingClientRect !== "function") return null;
+    let bandTop: number;
+    try {
+      const rect = root.getBoundingClientRect();
+      if (!rect || typeof rect.top !== "number" || !Number.isFinite(rect.top)) return null;
+      bandTop = rect.top;
+    } catch {
+      return null;
+    }
+    const spans: { top: number; bottom: number }[] = [];
+    for (const block of documentBlocks(body)) {
+      const span = spanOf(block);
+      if (span === null) return null;
+      spans.push(span);
+    }
+    return spans.length === 0 ? null : { spans, bandTop };
+  }
+
   /** Take the reading light off whichever block holds it. */
   function clearReadingLight(): void {
     if (litElement !== null && typeof litElement.removeAttribute === "function") {
@@ -1405,6 +1463,15 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     },
     refreshStar(): void {
       drawStarFor(currentDoc?.key);
+    },
+    captureAnchor(): ReaderAnchor | null {
+      const measured = blockSpans();
+      return measured === null ? null : readerAnchorOf(measured.spans, measured.bandTop);
+    },
+    anchorDelta(anchor: ReaderAnchor | null): number | null {
+      if (anchor === null) return null;
+      const measured = blockSpans();
+      return measured === null ? null : readerAnchorDelta(anchor, measured.spans, measured.bandTop);
     },
     close(): void {
       stopOwnReading();

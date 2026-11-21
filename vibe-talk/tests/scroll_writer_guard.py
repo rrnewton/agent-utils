@@ -108,7 +108,7 @@ PATH_TITLES: dict[str, str] = {
 ALLOW_LIST: tuple[tuple[str, str, str], ...] = (
     (
         "web/src/view/documents/index.ts",
-        "current.scrollTop = scrollTopNow()",
+        "topEntry.scrollTop = scrollTopNow()",
         "a stored reading-chain record field, not a scroller write",
     ),
     (

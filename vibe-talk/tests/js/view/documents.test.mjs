@@ -36,6 +36,7 @@ const LIST = await load("src/view/documents/list.ts");
 const READER = await load("src/view/documents/reader.ts");
 const VIEW = await load("src/view/documents/index.ts");
 const SEARCH = await load("src/view/documents/search.ts");
+const VIEWSTATE = await load("src/view/documents/viewstate.ts");
 
 function requireModule(loaded, entry) {
   assert.ok(loaded.mod, `${entry} did not load: ${loaded.error ? loaded.error.message : "unknown error"}`);
@@ -777,6 +778,29 @@ test("documents list: a successful retry replaces the fetch failure status (#199
       `the successful retry did not replace the failure (statuses: ${statuses.join(" | ")})`);
     assert.ok(!after.some((text) => text.includes("Could not fetch")),
       `the failure status survived its retry (statuses: ${statuses.join(" | ")})`);
+  });
+});
+
+test("documents list: capturePlace/restorePlace holds the top card across a re-layout (#2005)", async () => {
+  const rows = ["a", "b", "c", "d", "e", "f"].map((key, i) => docRow(key, (i + 1) * 100));
+  await withMeasuredList(() => ({ documents: rows, total: rows.length }), async ({ list, scroller, topOf }) => {
+    await list.refresh();
+    scroller.scrollTop = 250;
+    const place = list.capturePlace();
+    assert.equal(place?.key, "c", "the captured anchor is not the card at the band's top");
+    assert.equal(place?.follow, false, "a mid-list place captured follow");
+    // The pane was hidden and the shared scroller moved on meanwhile.
+    scroller.scrollTop = 400;
+    list.restorePlace(place);
+    assert.equal(scroller.scrollTop, 250, "the restore did not put the anchor card back");
+    assert.ok(Math.abs(topOf("c") - -50) <= 1, `the anchor card stands at ${topOf("c")}, not its captured height`);
+    // Parked at the bottom, the place follows to the foot instead.
+    scroller.scrollTop = 580; // within FOLLOW_SLACK of the foot, last card still in the band
+    const foot = list.capturePlace();
+    assert.equal(foot?.follow, true, "a parked list did not capture follow");
+    scroller.scrollTop = 0;
+    list.restorePlace(foot);
+    assert.equal(scroller.scrollTop, scroller.scrollHeight, "a follow restore did not land at the foot");
   });
 });
 
@@ -2009,7 +2033,9 @@ test("documents reader kind: a failed or different open leaves no stale kind", a
 // through the view's single open entry (`show(key)`), the way a list tap, a
 // deep link and a later in-reader link all open: each open stacks, `back()`
 // (and `showList()`, the history's close of one `document` level) pops one
-// step, and showing the view with no key — a view switch — forgets it all.
+// step, and showing the view with no key — a return from another view —
+// restores whatever was on screen (`#2005`); the first showing ever is the
+// fresh entry and lands on the list.
 
 async function withDocumentsView(options, run) {
   const mod = requireModule(VIEW, "src/view/documents/index.ts");
@@ -2165,16 +2191,130 @@ test("documents view: Back after scrolling up in the list returns exactly there 
   });
 });
 
-test("documents view: showing it with no key (a view switch) forgets the chain", async () => {
-  await withDocumentsView({}, async ({ view }) => {
+test("documents view: showing it with no key (a return) restores the open document (#2005)", async () => {
+  await withDocumentsView({}, async ({ view, byId }) => {
+    const fireScroll = () => {
+      for (const fn of [...(byId("scroll-area").listeners?.scroll ?? [])]) fn({ type: "scroll" });
+    };
     await view.show("doc-a");
     await view.show("doc-b");
     assert.equal(view.depth(), 2);
+    byId("scroll-area").scrollTop = 120;
+    fireScroll();
+    byId("scroll-area").scrollTop = 1900; // another view held the scroller meanwhile
     await view.show();
-    assert.equal(view.reading(), false, "a switch to the view did not land on the list");
-    assert.equal(view.depth(), 0, "the chain survived a switch to the list");
+    assert.equal(view.reading(), true, "a return exited the open document");
+    assert.equal(view.depth(), 2, "a return forgot the chain");
+    assert.equal(view.current()?.key, "doc-b", "a return changed the open document");
+    assert.equal(byId("scroll-area").scrollTop, 120, "a return lost the reader's place");
+    assert.equal(byId("docs-reader").hidden, false, "a return hid the reader");
+    assert.equal(byId("docs-list-view").hidden, true, "a return showed the list over the reader");
+    // Back still walks the restored chain one step at a time, list at its end.
+    view.showList();
+    await flush([]);
+    assert.equal(view.current()?.key, "doc-a", "Back after a return did not walk the chain");
+    view.showList();
+    await flush([]);
+    assert.equal(view.reading(), false, "Back at the chain's start did not reach the list");
+    assert.equal(view.depth(), 0);
+  });
+});
+
+test("documents view: a return with no document open restores the list's place (#2005)", async () => {
+  const rows = [docRow("old", 100), docRow("new", 300)];
+  await withDocumentsView({ listRows: rows }, async ({ view, byId }) => {
+    const fireScroll = () => {
+      for (const fn of [...(byId("scroll-area").listeners?.scroll ?? [])]) fn({ type: "scroll" });
+    };
+    await view.show();
+    assert.equal(view.reading(), false);
+    byId("scroll-area").scrollTop = 150; // scrolled up from the bottom landing
+    fireScroll();
+    byId("scroll-area").scrollTop = 1900; // another view held the scroller meanwhile
+    await view.show();
+    assert.equal(view.reading(), false, "a list return opened a document");
+    assert.equal(byId("scroll-area").scrollTop, 150, "a list return lost the list's place");
+  });
+});
+
+test("documents view: Back from a document after a toggle lands on the list's place (#2005)", async () => {
+  const rows = [docRow("old", 100), docRow("new", 300)];
+  await withDocumentsView({ listRows: rows }, async ({ view, byId }) => {
+    const fireScroll = () => {
+      for (const fn of [...(byId("scroll-area").listeners?.scroll ?? [])]) fn({ type: "scroll" });
+    };
+    await view.show();
+    byId("scroll-area").scrollTop = 150;
+    fireScroll();
     await view.show("doc-a");
-    assert.equal(view.depth(), 1, "an open after the switch did not start a new chain");
+    byId("scroll-area").scrollTop = 700; // worked down the document
+    fireScroll();
+    byId("scroll-area").scrollTop = 0; // toggled away and back
+    await view.show();
+    assert.equal(view.current()?.key, "doc-a", "the toggle return changed the open document");
+    assert.equal(byId("scroll-area").scrollTop, 700, "the toggle return lost the reader's place");
+    view.showList();
+    await flush([]);
+    assert.equal(view.reading(), false);
+    assert.equal(byId("scroll-area").scrollTop, 150, "Back after a toggle lost the list's place");
+  });
+});
+
+test("documents viewstate: reader anchors pick the top block and measure re-layout drift (#2005)", () => {
+  const { readerAnchorOf, readerAnchorDelta } = requireModule(VIEWSTATE, "src/view/documents/viewstate.ts");
+  const spans = [{ top: -50, bottom: 30 }, { top: 30, bottom: 120 }, { top: 120, bottom: 220 }];
+  assert.deepEqual(readerAnchorOf(spans, 0), { block: 0, offset: -50 }, "the top block is not the first below the band");
+  const scrolled = spans.map((span) => ({ top: span.top - 100, bottom: span.bottom - 100 }));
+  assert.deepEqual(readerAnchorOf(scrolled, 0), { block: 1, offset: -70 }, "a block scrolled past still anchors");
+  assert.equal(readerAnchorOf([], 0), null, "an empty body anchored");
+  assert.equal(readerAnchorOf([{ top: -100, bottom: -10 }], 0), null, "a body above the band anchored");
+  const anchor = readerAnchorOf(spans, 0);
+  assert.equal(readerAnchorDelta(anchor, spans, 0), 0, "an unmoved anchor asks for a move");
+  const grown = spans.map((span) => ({ top: span.top + 40, bottom: span.bottom + 40 }));
+  assert.equal(readerAnchorDelta(anchor, grown, 0), 40, "content grown above is not the drift to undo");
+  assert.equal(readerAnchorDelta(anchor, [], 0), null, "a vanished block still measures");
+});
+
+test("documents viewstate: list anchors fall back to the nearest surviving card (#2005)", () => {
+  const { listAnchorOf, listAnchorDelta } = requireModule(VIEWSTATE, "src/view/documents/viewstate.ts");
+  const cards = [
+    { key: "a", top: -150, bottom: -50 }, { key: "b", top: -50, bottom: 50 }, { key: "c", top: 50, bottom: 150 },
+  ];
+  const anchor = listAnchorOf(cards, 0, false);
+  assert.equal(anchor?.key, "b", "the anchor is not the first card below the band's top");
+  assert.equal(listAnchorDelta(anchor, cards, 0), 0, "an unmoved list asks for a move");
+  // The anchor filtered out: the next surviving card stands at its own height.
+  assert.equal(listAnchorDelta(anchor, [{ key: "a", top: -160 }, { key: "c", top: 40 }], 0), -10,
+    "the survivor was not put at its own recorded height");
+  assert.equal(listAnchorDelta(anchor, [{ key: "z", top: 0 }], 0), null, "no survivor still measures");
+  assert.equal(listAnchorOf([], 0, false), null, "an empty list anchored");
+  assert.equal(listAnchorOf(cards, 0, true)?.follow, true, "follow was not kept");
+});
+
+test("documents reader: captureAnchor names the top block; anchorDelta survives a re-layout (#2005)", async () => {
+  await withReader({}, async ({ reader, els }) => {
+    let layout = [[-50, 30], [30, 120], [120, 220]];
+    const blocks = layout.map((_, at) => {
+      const el = readerEl("p");
+      el.getBoundingClientRect = () => ({
+        top: layout[at][0], bottom: layout[at][1], left: 0, right: 100,
+        width: 100, height: layout[at][1] - layout[at][0],
+      });
+      return el;
+    });
+    els["doc-body"].children = blocks;
+    els["scroll-area"].getBoundingClientRect = () => ({
+      top: 0, bottom: 100, left: 0, right: 100, width: 100, height: 100,
+    });
+    assert.deepEqual(reader.captureAnchor(), { block: 0, offset: -50 },
+      "the capture is not the paragraph at the top and its offset");
+    const anchor = reader.captureAnchor();
+    layout = layout.map(([top, bottom]) => [top + 40, bottom + 40]);
+    assert.equal(reader.anchorDelta(anchor), 40, "a re-layout above is not measured for the view to undo");
+    assert.equal(reader.anchorDelta(null), null, "no anchor still measures");
+    layout = [[-220, -130], [-130, -40], [-40, 50]];
+    assert.deepEqual(reader.captureAnchor(), { block: 2, offset: -40 },
+      "blocks scrolled wholly past still anchor on the first below the top");
   });
 });
 
