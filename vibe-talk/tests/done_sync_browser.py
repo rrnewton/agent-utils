@@ -318,13 +318,15 @@ def views_walk(chromium: BrowserType, args: argparse.Namespace) -> str:
             wait_until(lambda: rows() == api.ids("flat"), "the channel did not open in All")
             pick("main")
             wait_until(lambda: rows() == api.ids("main"), "Main was not drawn")
-            # Reopened in Main with no saved rows: Main is read for itself, then All behind its held rows.
+            # Reopened in Main with no saved rows: Main is read for itself alone. (`#1986`
+            # slice 2: no read of All behind Main for its counts any more - the server counts
+            # them onto the roots' own records.)
             page.evaluate(f"() => localStorage.removeItem({json.dumps(CACHE_KEY)})")
-            fail_counts_read.set()
             reads.clear()
             page.reload(wait_until="load")
             wait_until(lambda: rows() == api.ids("main"), "the reload did not reopen on Main")
-            wait_until(lambda: not fail_counts_read.is_set(), "reopening on Main did not ask for All behind it")
+            settled()
+            check(reads == ["main"], f"{label}: reopening on Main read {reads} behind it")
             pick("flat")
             wait_until(lambda: rows() == api.ids("flat") and reads == ["main", "flat"], f"All was not read as All: {reads}")
             settled()

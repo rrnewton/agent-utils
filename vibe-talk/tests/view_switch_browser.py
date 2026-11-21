@@ -352,20 +352,18 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             check(seen() == {"emptied": 0, "loading": 0}, f"{label}: switching between Main and All showed {seen()}")
             shot("1-local")
 
-            # 2. Reopened in Main with no saved rows, so All has never been read -- the read of All
-            # Main asks for behind it, for the counts its roots report, fails: picked, All is drawn
-            # from what the page holds at once, read once behind those rows, and merged under the reader.
+            # 2. Reopened in Main with no saved rows, so All has never been read: Main asks for
+            # no All behind it any more (`#1986` slice 2: the server counts its roots' replies
+            # onto their own records). Picked, All is drawn from what the page holds at once,
+            # read once behind those rows, and merged under the reader.
             pick("main")
             wait_rows(api.ids("main"), "Main was not drawn before the reload")
             page.evaluate(f"() => localStorage.removeItem({json.dumps(CACHE_KEY)})")
             reads.clear()
-            fail_counts_read.set()
             page.reload(wait_until="load")
             wait_rows(api.ids("main"), "the reload did not reopen on Main")
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline and not counts_reads:
-                page.wait_for_timeout(25)
-            check(counts_reads == ["flat"], f"{label}: reopening on Main did not ask for All behind it, once")
+            page.wait_for_timeout(1000)
+            check(counts_reads == [], f"{label}: reopening on Main asked for All behind it: {counts_reads}")
             check(reads == ["main"], f"{label}: reopening on Main read {reads}")
             page.evaluate(WATCH_JS)
             page.evaluate(PARK_JS, ANCHOR)
