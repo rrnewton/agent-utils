@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-documents-react: React and discussion jumps in the Documents reader'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
@@ -33,3 +33,7 @@ Design note sent to the coordinator before code; the settled design is recorded 
 # Notes
 
 [watermelon-full-preview] mu-readstart. Owner-priority, queued after #2003/#2004 (landed 47454e8a, closed 366598dc). Design note first; no code until the coordinator approves it.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as 46541238 (combined tree 2ed82b48 over 09e7256c, coordinator waiver on the gate's single load-timing red; combined tree verified: typecheck, page shards 0-3, and the documents/keep-place/discuss/done-sync/view-switch/resume browser checks). The strip's React works while a document read stands, quoting the lit block and posting as the owner: policy A (default) into the last mention's thread, or policy B into one "Discussion of document <name>" thread, created only by a Send. The reader's toolbar carries Jump to last mention and Jump to discussion, with the no-discussion notice where none stands. Follow-on found in the same shots: #2033 vibe-talk-documents-newest-chip (pre-existing, filed separately).
