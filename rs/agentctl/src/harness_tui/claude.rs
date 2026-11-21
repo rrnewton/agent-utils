@@ -101,11 +101,10 @@ impl HarnessTui for ClaudeTui {
                         || lower.contains("requires confirmation")
                         || lower.contains("bash command")
                 });
-                if options.len() >= 2 && selected.is_some() && yes_no && context.is_some() {
-                    let text = context
-                        .expect("permission context checked")
-                        .trim()
-                        .to_owned();
+                if let (true, Some(context)) =
+                    (options.len() >= 2 && selected.is_some() && yes_no, context)
+                {
+                    let text = context.trim().to_owned();
                     return View::question(Question {
                         text,
                         options,
