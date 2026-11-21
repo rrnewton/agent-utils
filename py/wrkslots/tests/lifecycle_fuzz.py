@@ -57,14 +57,19 @@ from wrkslots import cli
 
 root, machine = sys.argv[1], sys.argv[2]
 config = cli._load_config(root, machine)
-out = {"chain_loads": False, "error": "", "slots": [], "journals": [],
-       "sidecars": [], "seal": False, "snap_rev": -1, "tip": -1}
+out = {"chain_loads": False, "error": "", "slots": [], "archived": [],
+       "journals": [], "sidecars": [], "seal": False, "snap_rev": -1,
+       "tip": -1}
 try:
     states = cli._load_all_active(config, require_repository=False)
     out["chain_loads"] = True
     state = next(s for s in states if s.machine == machine)
     out["tip"] = state.revision
     out["slots"] = sorted(r.slot for r in state.slots)
+    archives = cli._load_all_archives(config, require_repository=False)
+    out["archived"] = sorted(
+        r["slot"] for a in archives if a.machine == machine
+        for r in a.records)
 except Exception as exc:
     out["error"] = f"{type(exc).__name__}: {exc}"
 control = config.control
@@ -161,6 +166,7 @@ def _run_seed(seed: int, steps: int, base: Path, *, keep: bool) -> None:
     project = e2e._make_project(base, trace, ttl_seconds=2)
     rng = random.Random(seed)
     live: set[str] = set()
+    archived: set[str] = set()
     for index in range(steps):
         slot = rng.choice(SLOTS)
         op = rng.choice(
@@ -175,7 +181,7 @@ def _run_seed(seed: int, steps: int, base: Path, *, keep: bool) -> None:
             dataclasses.replace(project, environment=env) if crash else project
         )
         try:
-            if op == "create" and slot not in live:
+            if op == "create" and slot not in live and slot not in archived:
                 e2e._create_unbound(project_crash, slot, f"fz-{slot}", trace)
                 live.add(slot)
             elif op == "hold" and slot in live:
@@ -207,6 +213,9 @@ def _run_seed(seed: int, steps: int, base: Path, *, keep: bool) -> None:
         decoded_slots = state.get("slots")
         if isinstance(decoded_slots, list):
             live = {s for s in decoded_slots if s in SLOTS}
+        decoded_arch = state.get("archived")
+        if isinstance(decoded_arch, list):
+            archived = {s for s in decoded_arch if s in SLOTS}
         problems = _oracle(state, step=label)
         if crash or state.get("journals"):
             healed = _wait_chain_loads(project)
