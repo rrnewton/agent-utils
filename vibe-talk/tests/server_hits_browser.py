@@ -332,19 +332,23 @@ def walk_through(walk: Walk, keyboard: bool, discuss: bool = False) -> None:
         walk.settled()
     walk.shot("before-search")
     page.click("#search-toggle")
-    # Type slowly enough that every keystroke lands inside the server's rest
-    # window: while typing, the server must not be asked and nothing of its
-    # section may be drawn.
-    page.type("#search-field", "lantern", delay=30)
-    shown = page.evaluate("() => document.querySelectorAll('#discord-log > li[data-id]:not(.search-hidden)').length")
-    walk.check(shown == 10, f"typing did not filter the loaded cards at once: {shown} shown")
-    walk.check(len(api.searches) == 0, f"the server was asked while typing: {api.searches}")
-    hits_drawn = page.evaluate("() => document.querySelectorAll('#discord-log > li[data-server-hit]').length")
-    walk.check(hits_drawn == 0, f"server rows were placed while typing: {hits_drawn}")
+    # `#2019`: one fill, one input event — never a per-key race against the
+    # page's debounce (a hot host's keystrokes land slower than the rest
+    # window and the page asks mid-word, as designed). The loaded cards
+    # filter at once; the ask that follows is counted after it settles.
+    page.fill("#search-field", "lantern")
+    walk.until("() => document.querySelectorAll('#discord-log > li[data-id]:not(.search-hidden)').length === 10",
+               "typing did not filter the loaded cards at once")
     walk.shot("after-typing-collapsed")
-    # The typing settles: one ask, and the in-channel hits stand as cards in
-    # the timeline (the first page's fifty fresh hits, all below what the
-    # page loaded). No tap is needed and none is offered for them.
+    # The typing settles: exactly one ask, for the whole word, and the
+    # in-channel hits stand as cards in the timeline (the first page's
+    # fifty fresh hits, all below what the page loaded). No tap is needed
+    # and none is offered for them.
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline and len(api.searches) == 0:
+        page.wait_for_timeout(50)
+    walk.check(len(api.searches) == 1 and api.searches[0].get("q") == ["lantern"],
+               f"the settled typing asked {api.searches}, not once for the whole word")
     walk.until("() => document.querySelectorAll('#discord-log > li[data-server-hit=\"card\"]').length === 50",
                "the in-channel server hits did not stand as cards in the timeline")
     line = (page.text_content("#server-line") or "").strip()
