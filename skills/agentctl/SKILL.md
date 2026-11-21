@@ -40,6 +40,12 @@ Use the installed command as the authority:
   the turn and submits the queued input instead of anyone pressing Escape and Enter by hand; every
   prompt arrives opened with a sender header such as
   `[from cl-foo via agentctl · reply: agentctl send cl-foo]`, which nothing suppresses)
+- `agentctl send --queue-only NAME --file PROMPT` when messaging your coordinator (or any managed
+  target where you do not need delivery proof in this turn): it returns at once, the prompt is
+  durable in the queue and is delivered when the target is ready, and your own turn never runs a
+  blocking send that the harness can move to its background and leave counted as running after it
+  has ended (#2045 agentctl-muse-phantom-background-send). Use the blocking form above when you
+  need delivery proof in this turn.
 - `agentctl send --to-manager --file PROMPT` / `agentctl send --to-children --file PROMPT`
   (relationship addressing: `--to-manager` delivers to your recorded
   `managed_by` without naming it — with no manager, to the designated coordinator, said so in the

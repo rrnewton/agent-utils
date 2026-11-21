@@ -62,7 +62,11 @@ Start, message, read, and stop agents only through `agentctl`, never with raw te
 commands. `agentctl send` opens every prompt with a sender header
 (`[from NAME via agentctl · reply: agentctl send NAME]`); a line typed into a pane with
 `herdr pane send-text` carries none, so its reader cannot tell who wrote it. Say so in every
-brief: agents message each other with `agentctl send`, never by raw pane typing. If a suite tool fails or lacks a capability, report it (and fix it in agent-utils if
+brief: agents message each other with `agentctl send`, never by raw pane typing, and a lane
+messaging you (its coordinator) uses `agentctl send --queue-only` unless it needs delivery proof
+in that turn, so its turn never blocks on a busy coordinator and its harness cannot move a send
+to the background and leave it counted as running (#2045 agentctl-muse-phantom-background-send).
+If a suite tool fails or lacks a capability, report it (and fix it in agent-utils if
 that is your job) rather than routing around it.
 
 ## Agent lifetime

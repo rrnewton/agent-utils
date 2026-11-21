@@ -1901,8 +1901,8 @@ fn classify(
                     return Some(Finding::timed(
                         EpisodeKind::BackgroundWait,
                         format!(
-                            "status {} waiting on background work the screen counts ({what}), but no shell runs under its harness",
-                            observation.status
+                            "status {} waiting on background work the screen counts ({what}), but no shell runs under its harness; if {} confirms the entry is stale, clear it with `agentctl restart {} --when-idle` (add --stop-background-tasks only after that confirmation); nothing is cleared automatically (#2045 agentctl-muse-phantom-background-send)",
+                            observation.status, observation.name, observation.name
                         ),
                         since,
                         Some(options.idle.as_secs_f64()),
@@ -9920,6 +9920,21 @@ mod tests {
         let first = pass(&mut probe, &mut notifier, &mut state, 900.0, &options);
         assert_eq!(first["episodes"][0]["kind"], "background-wait", "{first}");
         assert_eq!(first["episodes"][0]["level"], "info", "{first}");
+        // #2045: the one info line names the verified clear, and only as a
+        // human-confirmed remedy — nothing is cleared automatically.
+        assert!(
+            first["episodes"][0]["detail"]
+                .to_string()
+                .contains("agentctl restart lane-a --when-idle"),
+            "{first}"
+        );
+        assert!(
+            only_notice(&notifier).contains(
+                "if lane-a confirms the entry is stale, clear it with `agentctl restart lane-a --when-idle` (add --stop-background-tasks only after that confirmation); nothing is cleared automatically"
+            ),
+            "{}",
+            only_notice(&notifier)
+        );
         assert_eq!(notifier.sent.len(), 1);
         let silent = pass(&mut probe, &mut notifier, &mut state, 1_800.0, &options);
         assert_eq!(silent["episodes"], json!([]), "{silent}");

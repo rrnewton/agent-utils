@@ -351,7 +351,8 @@ Sandbox off (`cgroup`):
   --owner-pid <pid> --expected-generation <n>.
 - Message the coordinator or another agent only with agentctl send NAME TEXT, which opens the
   prompt with a sender header naming you; never type into a pane with herdr pane send-text or
-  herdr pane run.
+  herdr pane run. To the coordinator use agentctl send --queue-only NAME TEXT unless you need
+  delivery proof in this turn: it returns at once and is delivered when the coordinator is ready.
 - Then reply with a short summary. The coordinator stops you and removes the slot.
 ```
 
@@ -364,7 +365,8 @@ Sandbox on (`userns` or `root`):
   repository's rules require.
 - Message the coordinator or another agent only with agentctl send NAME TEXT, which opens the
   prompt with a sender header naming you; never type into a pane with herdr pane send-text or
-  herdr pane run.
+  herdr pane run. To the coordinator use agentctl send --queue-only NAME TEXT unless you need
+  delivery proof in this turn: it returns at once and is delivered when the coordinator is ready.
 - When done, reply with your handoff: what changed, the commit, how it was validated, and open
   questions. The coordinator stops you and removes the slot after its time-to-live.
 ```

@@ -55,6 +55,9 @@ call runs in (check with `ps -o pid,comm -p $PPID`).
 2. Start the subagent in it: `AGENTCTL_WRKSLOTS_BIN=$WS $AU/agentctl start <name> --cwd
    {{HARNESS}} --profile <profile> --slot <slot> --file <brief>`
 3. Brief it with the goal, the slot and branch, how to validate, and the slot protocol below.
+   The brief tells the lane to message you with `agentctl send --queue-only coordinator ...`
+   unless it needs delivery proof in that turn, so its turn never blocks on you and its harness
+   cannot leave a backgrounded send counted as running (#2045 agentctl-muse-phantom-background-send).
 4. When it reports done: verify the work, `$WS read-handoff <slot> --coordinator-pid <pid>`,
    `$AU/agentctl stop <name>`, then `$WS remove <slot> --coordinator-pid <pid>
    --expected-generation <n>`.
