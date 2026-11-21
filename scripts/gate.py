@@ -1368,18 +1368,63 @@ def memory_verdict(cls: str, need_gib: float) -> dict[str, object]:
     return verdict
 
 
+class _MemoryFloorRefused(Exception):
+    """The memory floor has been unreadable for the whole persistence
+    window: the wait ends in a clean refusal (exit 2), never a crash."""
+
+
+def _memory_error_persist_s() -> float:
+    """How long a meminfo error must persist before a waiting gate
+    refuses (#2062 torn-read follow-up): $GATE_MEMORY_ERROR_PERSIST_S,
+    else 300s. A single torn read never reaches it."""
+    raw = os.environ.get("GATE_MEMORY_ERROR_PERSIST_S")
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = 0.0
+        if value > 0:
+            return value
+    return 300.0
+
+
 def _wait_memory_floor(cls: str, need_gib: float, need_source: str,
                        poll_s: float) -> tuple[float, bool]:
     """Wait until the floor admits this job; (waited_s, ever_waited).
 
     Observable like deferral: each changed verdict is printed with the
     live numbers, and the poll re-reads the file, so an operator's
-    floor change reaches waiters without a re-queue."""
+    floor change reaches waiters without a re-queue. A transient
+    meminfo read/parse error is 'not admitted this poll' (logged, kept
+    waiting): a queued gate is never killed by one torn read. Only an
+    error on every poll for the persistence window refuses, cleanly,
+    via _MemoryFloorRefused. (A malformed floor CONFIG still refuses
+    at once, at start, before any queueing.)"""
     waited_from = time.time()
     noted: object = None
     ever = False
+    error_since: float | None = None
+    error_noted: str | None = None
     while True:
-        verdict = memory_verdict(cls, need_gib)
+        try:
+            verdict = memory_verdict(cls, need_gib)
+        except Exception as exc:
+            if error_since is None:
+                error_since = time.time()
+            message = str(exc)
+            if message != error_noted:
+                print(f"gate: memory-floor: cannot read the floor this poll ({message}); "
+                      "treating as not admitted and continuing to wait (#2062)", flush=True)
+                error_noted = message
+            if time.time() - error_since > _memory_error_persist_s():
+                raise _MemoryFloorRefused(message) from exc
+            time.sleep(poll_s)
+            continue
+        if error_since is not None:
+            print("gate: memory floor readable again; resuming the floor wait (#2062)",
+                  flush=True)
+            error_since = None
+            error_noted = None
         if verdict["admit"]:
             if ever:
                 print("gate: memory floor admits this gate; continuing (#2062)", flush=True)
@@ -2539,7 +2584,12 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
     # before the grant below. A nested gate belongs to a run already
     # admitted, and running gates are never touched.
     if not nested:
-        waited, ever = _wait_memory_floor(mem_cls, mem_need, mem_need_source, mem_poll)
+        try:
+            waited, ever = _wait_memory_floor(mem_cls, mem_need, mem_need_source, mem_poll)
+        except _MemoryFloorRefused as exc:
+            print(f"gate: memory floor unusable for {_memory_error_persist_s():.0f}s "
+                  f"({exc}); refusing the start (#2062)", flush=True)
+            return 2
         memory_wait_s += waited
         memory_ever = memory_ever or ever
     if nested:
@@ -2648,9 +2698,19 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
         # #2062: memory freed or taken while queueing re-decides the
         # start; floor time never counts against --wait-timeout.
         if not nested:
-            verdict = memory_verdict(mem_cls, mem_need)
+            try:
+                verdict = memory_verdict(mem_cls, mem_need)
+            except Exception:
+                verdict = {"admit": False}  # torn read: the wait below logs and rides it out
             if not verdict["admit"]:
-                waited, ever = _wait_memory_floor(mem_cls, mem_need, mem_need_source, mem_poll)
+                try:
+                    waited, ever = _wait_memory_floor(mem_cls, mem_need, mem_need_source, mem_poll)
+                except _MemoryFloorRefused as exc:
+                    print(f"gate: memory floor unusable for {_memory_error_persist_s():.0f}s "
+                          f"({exc}); refusing the start (#2062)", flush=True)
+                    adm.finish(run_id)
+                    (state_dir() / "queue" / f"{run_id}.json").unlink(missing_ok=True)
+                    return 2
                 memory_wait_s += waited
                 memory_ever = memory_ever or ever
                 continue

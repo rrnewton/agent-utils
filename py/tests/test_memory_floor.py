@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -27,9 +28,11 @@ mf = _load()
 
 def _meminfo(tmp_path: Path, total_gib: float, avail_gib: float) -> Path:
     path = tmp_path / "meminfo"
-    path.write_text(
+    staging = tmp_path / "meminfo.staging"
+    staging.write_text(
         f"MemTotal:       {int(total_gib * 1024 * 1024)} kB\n"
         f"MemAvailable:   {int(avail_gib * 1024 * 1024)} kB\n")
+    os.replace(staging, path)
     return path
 
 

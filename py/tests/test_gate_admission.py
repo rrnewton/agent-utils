@@ -2360,10 +2360,14 @@ def test_shared_holds_config_and_owner_exempt_gate(tmp_path: Path) -> None:
 
 
 def _meminfo_file(tmp_path: Path, total_gib: float, avail_gib: float) -> Path:
+    # Atomic (tmp + replace): a gate polling this file at 0.05s must
+    # never read a half-written meminfo (#2062 torn-read follow-up).
     path = tmp_path / "meminfo"
-    path.write_text(
+    staging = tmp_path / "meminfo.staging"
+    staging.write_text(
         f"MemTotal:       {int(total_gib * 1024 * 1024)} kB\n"
         f"MemAvailable:   {int(avail_gib * 1024 * 1024)} kB\n")
+    os.replace(staging, path)
     return path
 
 
@@ -2404,3 +2408,28 @@ def test_memory_floor_light_rerun_class(tmp_path: Path) -> None:
     args = type("A", (), {"memory_class": None, "cls": "shared"})()
     assert gate.memory_class(args, ["x", "--selected", "repository.hygiene.site"], True) == "light"
     assert gate.memory_class(args, ["validate.py"], False) == "heavy"
+
+
+def test_a_torn_meminfo_read_mid_wait_neither_crashes_nor_refuses(tmp_path: Path) -> None:
+    """#2062 torn-read follow-up: one torn read during a floor wait is
+    'not admitted this poll', logged; the gate keeps waiting and
+    starts when memory frees. No traceback, no refusal."""
+    (tmp_path / "memory-floor.toml").write_text("poll_s = 0.05\n")
+    info = _meminfo_file(tmp_path, 200.0, 90.0)
+    env = {**_env(tmp_path), "MEMORY_FLOOR_MEMINFO": str(info)}
+    proc = _start_env(tmp_path, env, "--memory-need-gib", "32", "--", PY, "-c", "pass")
+    try:
+        time.sleep(1.0)
+        assert proc.poll() is None, "the gate must be waiting below the floor"
+        info.write_text("MemTotal:")  # a torn, half-written meminfo
+        time.sleep(0.5)
+        assert proc.poll() is None, "one torn read must not kill or refuse the gate"
+        _meminfo_file(tmp_path, 200.0, 150.0)
+        out, _ = proc.communicate(timeout=30)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    assert proc.returncode == 0, out
+    assert "cannot read the floor this poll" in out
+    assert "Traceback" not in out
+    assert "memory floor admits" in out
