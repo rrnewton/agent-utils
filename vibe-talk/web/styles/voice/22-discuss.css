@@ -464,6 +464,15 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   opacity: 0.55;
 }
 
+/* `#2073`: Update and New summary are one group — same row, same size,
+ * never split across lines; the group wraps under the status text whole. */
+.discuss-stale-buttons {
+  display: inline-flex;
+  gap: 6px;
+  white-space: nowrap;
+  vertical-align: baseline;
+}
+
 .discuss-turn {
   margin: 8px 0 0;
 }
