@@ -120,6 +120,31 @@ def register(subparsers: argparse._SubParsersAction[_ParserT], formatter: type[a
     _slot_arguments(unmount)
     unmount.set_defaults(handler=_cmd_image_unmount)
 
+    detach = actions.add_parser(
+        "detach-orphan",
+        help="detach a loop mount whose backing image was deleted",
+        description=(
+            "Unmount and detach one literal loop device whose backing image file was "
+            "deleted while mounted (so the normal unmount, which verifies the image by "
+            "device and inode, can no longer act). Acts only when the kernel shows the "
+            "device's backing file as deleted, that path is exactly --image under this "
+            "registry's slot-images/<type>/<slot>/ tree, and the device is mounted "
+            "exactly at --mount-point. A busy mount refuses; nothing is lazily "
+            "unmounted. Prints the exact device, image path, and mount point acted on."
+        ),
+        epilog=(
+            "example:\n"
+            "  wrkslots image detach-orphan --device /dev/loop7 "
+            "--image <control>/slot-images/agent/slot07/slot.img "
+            "--mount-point <slot location>"
+        ),
+        formatter_class=formatter,
+    )
+    detach.add_argument("--device", required=True, help="the literal loop device, e.g. /dev/loop7")
+    detach.add_argument("--image", required=True, help="the deleted image's recorded path (slot.img or state.img under slot-images/<type>/<slot>/)")
+    detach.add_argument("--mount-point", required=True, help="the mount point the device is mounted at (the slot location, or the image directory's state/ for state.img)")
+    detach.set_defaults(handler=_cmd_image_detach_orphan)
+
     trim = actions.add_parser(
         "trim",
         help="return blocks freed inside a slot image to the host now",
@@ -1965,6 +1990,19 @@ def _cmd_image_unmount(args: argparse.Namespace) -> int:
             "command remounts the slot through the same device"
         )
     print(f"unmounted {args.slot_type}/{args.slot}; the next wrkslots command remounts it")
+    return 0
+
+
+def _cmd_image_detach_orphan(args: argparse.Namespace) -> int:
+    # No slot is loaded: the image (and possibly its record) is deleted.
+    # The privileged helper verifies the orphan shape before acting.
+    try:
+        receipt = slotimage.detach_orphan(
+            args.device, Path(args.image), Path(args.mount_point)
+        )
+    except slotimage.ImageError as exc:
+        raise _refuse(str(exc)) from exc
+    print(receipt)
     return 0
 
 

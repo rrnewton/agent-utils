@@ -15,11 +15,12 @@ A test teardown deleted slot images while they were still loop-mounted. imagehel
 
 # Design
 
-Add `wrkslots image detach-orphan --device --image --mount-point`: act only when the backing file shows deleted, its path is exactly the expected slot image under this registry, and the device is mounted exactly at the expected point; refuse anything else, refuse a busy mount without lazy unmount, and print exactly what was acted on.
+[watermelon-full-preview] Add `wrkslots image detach-orphan --device /dev/loopN --image <expected-path> --mount-point <path>`, run through the same privileged-argv helper (`imagehelper.py` `detach-orphan DEVICE IMAGE MOUNT-POINT`). Act only when the loop device's backing file shows ` (deleted)`, the stripped path is exactly `--image`, `--image` is `slot.img`/`state.img` under a registry's `slot-images/<type>/<slot>/` tree, and the mount table shows that literal device mounted exactly at `--mount-point` (for `state.img` the image directory's `state/`; for `slot.img` the recorded location when the record survives). Then `umount2(UMOUNT_NOFOLLOW)` and `LOOP_CLR_FD` on that literal device. Refuse a non-deleted backing file (pointing at the normal umount), any path/mount mismatch, and a busy mount (EBUSY named, never a lazy unmount). The receipt names the exact device, image path, and mount point acted on. No persisted-format or lock change; the Rust CLI keeps refusing `image detach-orphan` by name until its phased wiring, sharing the same helper file when wired.
 
 # Acceptance Criteria
 
-- The behaviour described under Design, covered by a deterministic regression test (condition-based, no wall-clock budgets).
+- The behaviour described under Design, covered by a deterministic regression test (condition-based, no wall-clock budgets): `test_imagehelper_orphan.py` accepts the sanctioned slot/state shapes and refuses each single-condition violation; the privileged act itself is exercised only on the owning lane's own scratch images.
+- The exact operator command is written into the user guide (`common/docs/wrkslots/USER_GUIDE.md`).
 
 # Notes
 

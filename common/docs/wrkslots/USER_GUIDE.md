@@ -3312,6 +3312,26 @@ device and inode. A sudoers rule that pins the helper's exact arguments must be 
 The end-to-end check with a real private-namespace copy, `wrkslots/tests/e2e_foreign_namespace.sh`,
 needs passwordless sudo and unprivileged user namespaces.
 
+**A loop mount whose backing image was deleted.** If an image file is deleted while still
+loop-mounted (a teardown that removed the slot tree under a live mount, for example), the normal
+unmount cannot act: it verifies the image by device and inode, which no longer exist, and the
+loop device is stranded. Detach exactly that device with:
+
+```sh
+wrkslots image detach-orphan --device /dev/loop7 \
+  --image <control>/slot-images/agent/slot07/slot.img \
+  --mount-point <slot location>
+```
+
+For a state image, `--image .../state.img` takes `--mount-point <image directory>/state`. The
+helper (through the same `sudo -n` path) acts only when the kernel shows the device's backing
+file as deleted, that path is exactly `--image` under this registry's
+`slot-images/<type>/<slot>/` tree, and the device is mounted exactly at `--mount-point`; it
+refuses anything else, refuses a backing file that is not deleted (use the normal unmount),
+and refuses a busy mount rather than unmounting lazily. It prints the exact device, image
+path, and mount point it acted on. A sudoers rule pinning the helper's exact arguments must
+allow the `detach-orphan DEVICE IMAGE MOUNT-POINT` form.
+
 ### Converting an existing slot in place
 
 ```sh

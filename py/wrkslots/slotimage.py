@@ -1485,6 +1485,21 @@ def unmount(image_file: Path, mount_point: Path) -> list[str]:
     return residual
 
 
+def detach_orphan(device: str, image_file: Path, mount_point: Path) -> str:
+    """Detach a loop mount whose backing image was deleted (#2050).
+
+    Runs the helper's ``detach-orphan`` operation, which acts only when
+    the device's backing file shows deleted, names exactly
+    ``image_file`` under a registry's slot-images tree, and is mounted
+    exactly at ``mount_point``. Returns the helper's receipt line.
+    """
+
+    return _privileged(
+        "detach-orphan", device, str(image_file), str(mount_point),
+        anchor=image_file.parent,
+    ).strip()
+
+
 def _prepare_fresh_root(image_file: Path, mount_point: Path, anchor: Path | None = None) -> None:
     lost = mount_point / "lost+found"
     if lost.is_dir() and not lost.is_symlink():

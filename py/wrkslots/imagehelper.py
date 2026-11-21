@@ -26,7 +26,11 @@ invoking user, so nothing is trusted by name:
 
 Operations: ``mount IMAGE MOUNT-POINT [--fresh]``, ``umount IMAGE MOUNT-POINT
 [--discard-stale-copies]``, ``rmdir-lost-found IMAGE MOUNT-POINT``,
-``trim IMAGE MOUNT-POINT``, ``grow IMAGE MOUNT-POINT``.
+``trim IMAGE MOUNT-POINT``, ``grow IMAGE MOUNT-POINT``,
+``detach-orphan DEVICE IMAGE MOUNT-POINT`` (only for a mount whose backing
+image was deleted: the backing file must show deleted, name exactly IMAGE
+under a registry's ``slot-images/<type>/<slot>/`` tree, and DEVICE must be
+mounted exactly at MOUNT-POINT; a busy mount refuses, never lazily).
 """
 
 from __future__ import annotations
@@ -34,6 +38,7 @@ from __future__ import annotations
 import ctypes
 import errno
 import fcntl
+import json
 import os
 import stat
 import struct
@@ -369,6 +374,124 @@ def umount(image_path: str, mount_point: str, *options: str) -> None:
     _check(_libc().umount2(mount_point.encode(), 8), f"umount {mount_point}")  # UMOUNT_NOFOLLOW
 
 
+_DELETED_SUFFIX = " (deleted)"
+_IMAGE_NAMES = ("slot.img", "state.img")
+
+
+def _verify_orphan(
+    backing_raw: str,
+    image_path: str,
+    mount_point: str,
+    mounts: list[tuple[str, str]],
+    record_location: str | None,
+    device: str,
+    device_id: str,
+) -> None:
+    """Refuse unless DEVICE is the sanctioned orphan of IMAGE at MOUNT_POINT.
+
+    ``mounts`` is (major:minor, mount point) pairs from the mount table and
+    ``device_id`` is DEVICE's own major:minor. Pure checks only; the caller
+    performs the unmount and detach.
+    """
+
+    if not backing_raw.endswith(_DELETED_SUFFIX):
+        raise HelperError(
+            f"the backing file of {device} is not deleted ({backing_raw!r}); "
+            "use the normal umount for a live image"
+        )
+    backing = backing_raw[: -len(_DELETED_SUFFIX)]
+    if backing != image_path:
+        raise HelperError(
+            f"the deleted backing file of {device} is {backing}, not {image_path}"
+        )
+    image = os.path.normpath(image_path)
+    parts = image.split(os.sep)
+    if len(parts) < 5 or parts[-1] not in _IMAGE_NAMES or parts[-4] != "slot-images":
+        raise HelperError(
+            f"{image_path} is not a slot image under a registry's "
+            "slot-images/<type>/<slot>/ tree"
+        )
+    if parts[-1] == "state.img":
+        expected = os.path.join(os.path.dirname(image), "state")
+        if os.path.normpath(mount_point) != expected:
+            raise HelperError(
+                f"the expected mount point of {image_path} is {expected}, "
+                f"not {mount_point}"
+            )
+    elif record_location is not None and os.path.normpath(
+        mount_point
+    ) != os.path.normpath(record_location):
+        raise HelperError(
+            f"the expected mount point of {image_path} is {record_location}, "
+            f"not {mount_point}"
+        )
+    if mount_point not in [point for dev, point in mounts if dev == device_id]:
+        raise HelperError(f"{device} is not mounted at {mount_point}")
+
+
+def detach_orphan(device: str, image_path: str, mount_point: str, *options: str) -> None:
+    """Unmount and detach a loop mount whose backing image was deleted.
+
+    Acts only on the sanctioned orphan shape checked by
+    :func:`_verify_orphan`; a busy mount refuses (never a lazy unmount).
+    Prints the exact device, image path, and mount point acted on.
+    """
+
+    if options:
+        raise HelperError(f"detach-orphan takes no options, got {' '.join(options)}")
+    _invoking_uid()
+    if not device.startswith("/dev/loop") or not device[9:].isdigit():
+        raise HelperError(f"not a loop device: {device}")
+    entry = device[5:]
+    try:
+        with open(f"/sys/block/{entry}/loop/backing_file", encoding="utf-8") as handle:
+            backing_raw = handle.read().strip()
+    except OSError as exc:
+        raise HelperError(f"cannot read the backing file of {device}: {exc}") from exc
+    record_location: str | None = None
+    record = os.path.join(os.path.dirname(image_path), "IMAGE.json")
+    if os.path.exists(record):
+        try:
+            with open(record, encoding="utf-8") as handle:
+                raw = json.load(handle)
+            if isinstance(raw, dict) and isinstance(raw.get("location"), str):
+                record_location = raw["location"]
+        except (OSError, ValueError) as exc:
+            raise HelperError(f"cannot read slot image record {record}: {exc}") from exc
+    mounts: list[tuple[str, str]] = []
+    with open("/proc/self/mountinfo", encoding="utf-8") as handle:
+        for line in handle:
+            fields = line.split()
+            if len(fields) >= 6:
+                mounts.append((fields[2], fields[4].replace("\\040", " ")))
+    dev_stat = os.stat(device)
+    major_minor = f"{os.major(dev_stat.st_rdev)}:{os.minor(dev_stat.st_rdev)}"
+    _verify_orphan(
+        backing_raw, image_path, mount_point, mounts, record_location,
+        device, major_minor,
+    )
+    libc = _libc()
+    result = libc.umount2(mount_point.encode(), 8)  # UMOUNT_NOFOLLOW, never lazy
+    if result != 0:
+        error = ctypes.get_errno()
+        if error == errno.EBUSY:
+            raise HelperError(
+                f"the mount at {mount_point} is busy; refusing to detach "
+                f"{device} (no lazy unmount)"
+            )
+        raise HelperError(f"umount {mount_point}: {os.strerror(error)}")
+    descriptor = os.open(device, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        try:
+            fcntl.ioctl(descriptor, _LOOP_CLR_FD)
+        except OSError as exc:
+            if exc.errno != errno.ENXIO:  # autoclear already detached it
+                raise HelperError(f"detach {device}: {os.strerror(exc.errno or 0)}") from exc
+    finally:
+        os.close(descriptor)
+    print(f"detached {device} (deleted image {image_path}) from {mount_point}")
+
+
 def rmdir_lost_found(image_path: str, mount_point: str, *options: str) -> None:
     """Remove the root-owned lost+found directory mkfs leaves at a slot image's root."""
     if options:
@@ -446,10 +569,12 @@ _OPERATIONS: dict[str, tuple[_Operation, int, int]] = {
     "rmdir-lost-found": (rmdir_lost_found, 2, 2),
     "trim": (trim, 2, 2),
     "grow": (grow, 2, 2),
+    "detach-orphan": (detach_orphan, 3, 3),  # type: ignore[dict-item]
 }
 _USAGE = (
     "usage: imagehelper.py mount IMAGE MOUNT-POINT [--fresh] | umount IMAGE MOUNT-POINT "
-    "[--discard-stale-copies] | rmdir-lost-found|trim|grow IMAGE MOUNT-POINT"
+    "[--discard-stale-copies] | rmdir-lost-found|trim|grow IMAGE MOUNT-POINT | "
+    "detach-orphan DEVICE IMAGE MOUNT-POINT"
 )
 
 

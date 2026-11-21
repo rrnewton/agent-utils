@@ -498,6 +498,7 @@
         "py/wrkslots/tests/test_image_status_readonly.py",
         "py/wrkslots/tests/test_image_status_rust.py",
         "py/wrkslots/tests/test_image_trim_rust.py",
+        "py/wrkslots/tests/test_imagehelper_orphan.py",
         "py/wrkslots/tests/test_journal_actor_liveness.py",
         "py/wrkslots/tests/test_journal_state_rust.py",
         "py/wrkslots/tests/test_journals_state_rust.py",
