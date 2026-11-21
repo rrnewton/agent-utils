@@ -28,7 +28,7 @@
 //! so a slow disk cannot stall the executor that is also serving HTTP.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension as _};
@@ -536,6 +536,13 @@ pub const MIGRATIONS: &[&str] = &[
 /// A [`StateStore`] backed by one SQLite file.
 pub struct SqliteStore {
     connection: Arc<Mutex<Connection>>,
+    /// The synced-settings document as last written, held in memory: at most a few dozen
+    /// tiny entries, read on the owner's interactive path (every page load, several times
+    /// a minute) and written only here. `#2066 vibe-talk-page-freeze`: that read used to
+    /// queue behind every other holder of the one connection — a two-second
+    /// client-settings answer beside a long timeline read — so it is answered from this
+    /// copy, which `open` loads and every write replaces under the connection's own lock.
+    client_settings_held: Arc<RwLock<Option<Vec<crate::client_settings::SyncedSetting>>>>,
     retention: Retention,
     path: PathBuf,
 }
@@ -630,8 +637,12 @@ impl SqliteStore {
                 ) STRICT;",
             )
             .map_err(backend)?;
+        // The held copy starts as the document stands, so the first read never waits
+        // either (`#2066`); a file whose settings cannot be read is not opened at all.
+        let held = read_client_settings(&connection)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
+            client_settings_held: Arc::new(RwLock::new(Some(held))),
             retention,
             path: path.to_owned(),
         })
@@ -2864,8 +2875,24 @@ impl StateStore for SqliteStore {
     async fn client_settings(
         &self,
     ) -> Result<Vec<crate::client_settings::SyncedSetting>, StoreError> {
-        self.with_connection(|connection| read_client_settings(connection))
-            .await
+        // Answered from the held copy (`#2066`): never the blocking pool, never the one
+        // connection's queue. The copy is loaded at open, so the fall-through below is
+        // only a belt over a brace that cannot come undone in this impl.
+        let held = self
+            .client_settings_held
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(document) = held {
+            return Ok(document);
+        }
+        let memory = Arc::clone(&self.client_settings_held);
+        self.with_connection(move |connection| {
+            let document = read_client_settings(connection)?;
+            *memory.write().unwrap_or_else(PoisonError::into_inner) = Some(document.clone());
+            Ok(document)
+        })
+        .await
     }
 
     async fn apply_client_settings(
@@ -2881,6 +2908,7 @@ impl StateStore for SqliteStore {
     > {
         let set = set.to_vec();
         let seed = seed.to_vec();
+        let memory = Arc::clone(&self.client_settings_held);
         self.with_connection(move |connection| {
             let transaction = connection.transaction().map_err(backend)?;
             // One stamp for the whole write, strictly past every stamp already handed
@@ -2929,6 +2957,9 @@ impl StateStore for SqliteStore {
             }
             let document = read_client_settings(&transaction)?;
             transaction.commit().map_err(backend)?;
+            // The held copy is replaced here, still under the connection's lock, so
+            // concurrent writes replace it in the order they landed (`#2066`).
+            *memory.write().unwrap_or_else(PoisonError::into_inner) = Some(document.clone());
             // What this write changed, decided against the document as it stood inside
             // the same transaction: a changed or new entry as stored, and a forgotten
             // key as no value under THIS write's stamp — past any stamp a page could
@@ -4032,7 +4063,8 @@ impl StateStore for SqliteStore {
     }
 
     async fn purge_everything(&self) -> Result<(), StoreError> {
-        self.with_connection(|connection| {
+        let memory = Arc::clone(&self.client_settings_held);
+        self.with_connection(move |connection| {
             let transaction = connection.transaction().map_err(backend)?;
             // The threads' colours with everything else: a thread read afterwards is coloured
             // afresh, by the same policy in the order threads arrive. `#427 server-thread-hues`.
@@ -4142,7 +4174,10 @@ impl StateStore for SqliteStore {
             transaction
                 .execute("DELETE FROM client_settings", [])
                 .map_err(backend)?;
-            transaction.commit().map_err(backend)
+            transaction.commit().map_err(backend)?;
+            // The held copy goes with its rows (`#2066`): an empty document, not a stale one.
+            *memory.write().unwrap_or_else(PoisonError::into_inner) = Some(Vec::new());
+            Ok(())
         })
         .await
     }
@@ -7208,6 +7243,53 @@ mod tests {
         assert!(
             reopened.client_settings().await.expect("read").is_empty(),
             "the purge left a synced setting behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_settings_answers_from_memory_while_the_connection_is_held() {
+        // `#2066 vibe-talk-page-freeze`: the read on the owner's interactive path must
+        // never queue behind the one connection. With the connection's lock held by
+        // this test, a read that needed it could not finish at all; the held copy
+        // answers on its first poll. Condition-based: one poll, no clock.
+        use std::future::Future as _;
+        use std::task::{Context, Poll};
+        let dir = TempDir::new("sqlite-client-settings-held");
+        let store = store(&dir, Retention::default());
+        let key = "vibe-talk.voice.combine".to_owned();
+        store
+            .apply_client_settings(&[(key.clone(), Some("1".into()))], &[])
+            .await
+            .expect("set");
+        let held_connection = store
+            .connection
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut read = Box::pin(store.client_settings());
+        let waker = std::task::Waker::noop().clone();
+        let answered = read.as_mut().poll(&mut Context::from_waker(&waker));
+        drop(held_connection);
+        let Poll::Ready(Ok(document)) = answered else {
+            panic!("the settings read waited on the held connection: {answered:?}");
+        };
+        assert_eq!(document.len(), 1);
+        assert_eq!(document[0].value.as_deref(), Some("1"));
+        // A later write replaces the held copy, and the purge empties it with its rows.
+        store
+            .apply_client_settings(&[(key.clone(), Some("0".into()))], &[])
+            .await
+            .expect("set again");
+        assert_eq!(
+            store.client_settings().await.expect("read")[0]
+                .value
+                .as_deref(),
+            Some("0"),
+            "the held copy did not follow the write"
+        );
+        store.purge_everything().await.expect("purge");
+        assert!(
+            store.client_settings().await.expect("read").is_empty(),
+            "the held copy survived the purge"
         );
     }
 
