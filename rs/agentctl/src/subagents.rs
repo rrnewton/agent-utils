@@ -14905,6 +14905,33 @@ its drain would also type, so it was not queued",
         crate::failed_digest::ack_failed(&queue, ids, all).map_err(fail)
     }
 
+    /// Retire one registered agent's pending queue entries
+    /// (`agentctl queue retire`): the record is loaded first, so an
+    /// unregistered name never creates a queue.
+    pub fn retire_queue(
+        &self,
+        agent_name: &str,
+        ids: &[String],
+        all_pending: bool,
+        reason: &str,
+        dry_run: bool,
+    ) -> Result<Vec<crate::queue_retire::RetireEntry>> {
+        let record = self.load(agent_name)?;
+        let queue = self.queue(&record.name)?;
+        crate::queue_retire::retire(&queue, ids, all_pending, reason, dry_run).map_err(fail)
+    }
+
+    /// One registered agent's pending queue entries, oldest first
+    /// (`agentctl queue retire --dry-run` with no selection).
+    pub fn pending_queue_entries(
+        &self,
+        agent_name: &str,
+    ) -> Result<Vec<crate::queue_retire::PendingEntry>> {
+        let record = self.load(agent_name)?;
+        let queue = self.queue(&record.name)?;
+        Ok(crate::queue_retire::pending_entries(&queue))
+    }
+
     /// One registered agent's failed queue entries (`agentctl failed list`).
     pub fn failed_entries(
         &self,

@@ -44,6 +44,7 @@ pub mod plugins;
 pub(crate) mod profiles;
 pub mod progress_metric;
 pub(crate) mod prompt_time;
+pub mod queue_retire;
 pub mod recovery_ladder;
 pub mod registry_layout;
 pub mod restore;

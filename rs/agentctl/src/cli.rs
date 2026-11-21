@@ -278,6 +278,11 @@ enum Commands {
         after_help = "Examples:\n  agentctl failed list reviewer\n  agentctl failed ack reviewer --all\n  agentctl failed ack reviewer msg-1 msg-2\n\n`failed list NAME` shows the agent's failed entries. `failed ack` moves the named entries (or every one with --all) to failed-archive-<date>/ beside the queue's failed/ and records them shown, so no digest names them again. NAME must be a registered agent: an unknown name is refused and never creates a queue. Exit 0 when every named entry was archived, 1 when one names no failed entry."
     )]
     Failed(Failed),
+    /// Retire pending queue entries so they are never typed
+    #[command(
+        after_help = "Examples:\n  agentctl queue retire reviewer --dry-run\n  agentctl queue retire reviewer --entry msg-1 --reason 'delivered by hand'\n  agentctl queue retire reviewer --all-pending --reason 'delivered by hand'\n\n`queue retire NAME` moves pending entries (inbox/ and inbox.v2/) to cancelled/ with --reason recorded, through the same tombstone as `agentctl cancel`, so no drain types them later as duplicates of a prompt delivered by hand. NAME must be a registered agent: an unknown name is refused and never creates a queue. --entry names one message ID and may be repeated; --all-pending takes every pending entry. --dry-run lists what would be retired and moves nothing (with no selection it lists every pending entry). Retiring an entry already in cancelled/ is a no-op. Prints one JSON object {agent, dry_run, retired: [{id, outcome}]}; exit 0 when every named entry is retired, already cancelled, or tombstoned for the drain holding the queue, 1 when one is inflight, too late, or unknown."
+    )]
+    Queue(Queue),
     /// Follow a headless agent's event log: one line per event (turns, prose, tools, inputs with their sender), read-only and lock-free
     #[command(
         after_help = "Examples:\n  agentctl tail coordinator --follow\n  agentctl tail coordinator --last 50 --types assistant.text,turn.\n  agentctl tail coordinator --json --since 4180\n  agentctl tail coordinator --at 4182\n\nThe log is REGISTRY/agents/NAME/events/<generation>.jsonl (schema v1, one JSON object per line; see\n`agentctl userguide`). Any number of tails may run beside the agent; closing one never touches it.\nA hole in the sequence (pruned or unreadable lines) prints as a gap line. Not to be confused with\n`agentctl read --output tail`, which reads an interactive agent's pane."
@@ -1996,6 +2001,36 @@ struct FailedAck {
     /// Failed message identifiers to acknowledge
     #[arg(value_name = "MESSAGE_ID")]
     ids: Vec<String>,
+}
+
+#[derive(Args)]
+struct Queue {
+    #[command(subcommand)]
+    action: QueueAction,
+}
+
+#[derive(Subcommand)]
+enum QueueAction {
+    /// Move pending entries to cancelled/ so no drain types them
+    Retire(QueueRetire),
+}
+
+#[derive(Args)]
+struct QueueRetire {
+    #[command(flatten)]
+    agent: Named,
+    /// Pending message ID to retire; repeatable
+    #[arg(long = "entry", value_name = "MESSAGE_ID")]
+    entries: Vec<String>,
+    /// Retire every pending entry for this agent
+    #[arg(long)]
+    all_pending: bool,
+    /// Why, recorded in the tombstone and the cancelled item (required unless --dry-run)
+    #[arg(long, value_name = "TEXT")]
+    reason: Option<String>,
+    /// List what would be retired and move nothing
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Args)]
@@ -6112,6 +6147,50 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 76
             });
         }
+        Commands::Queue(value) => match value.action {
+            QueueAction::Retire(value) => {
+                if value.dry_run && value.entries.is_empty() && !value.all_pending {
+                    let pending = manager.pending_queue_entries(&value.agent.name)?;
+                    write_json(&json!({
+                        "agent": value.agent.name,
+                        "dry_run": true,
+                        "pending": pending,
+                    }))
+                    .map_err(Failure::Output)?;
+                    return Ok(0);
+                }
+                if !value.all_pending && value.entries.is_empty() {
+                    return Err(Failure::Usage(
+                        "agentctl queue retire needs --entry, --all-pending, or --dry-run"
+                            .to_owned(),
+                    ));
+                }
+                let reason = match (&value.reason, value.dry_run) {
+                    (Some(reason), _) if !reason.trim().is_empty() => reason.as_str(),
+                    (_, true) => "",
+                    _ => {
+                        return Err(Failure::Usage(
+                            "agentctl queue retire needs a non-empty --reason".to_owned(),
+                        ));
+                    }
+                };
+                let retired = manager.retire_queue(
+                    &value.agent.name,
+                    &value.entries,
+                    value.all_pending,
+                    reason,
+                    value.dry_run,
+                )?;
+                let settled = crate::queue_retire::all_settled(&retired);
+                write_json(&json!({
+                    "agent": value.agent.name,
+                    "dry_run": value.dry_run,
+                    "retired": retired,
+                }))
+                .map_err(Failure::Output)?;
+                return Ok(if settled { 0 } else { 1 });
+            }
+        },
         Commands::Failed(value) => match value.action {
             FailedAction::List(agent) => {
                 let entries = manager.failed_entries(&agent.name)?;

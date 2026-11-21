@@ -63,6 +63,13 @@ symptom by two days, so this needs evidence, not timing alone).
   backgrounded-task idle question is answered in the resolution.
 - A stopgap note reaches the coordinator and affected operators
   if the fix takes more than an hour.
+- (Scope addition, separate commit) `agentctl queue retire NAME
+  --entry ID|--all-pending --reason TEXT` retires stale pending
+  entries so a prompt delivered by hand is never typed later as a
+  duplicate: entries move to `cancelled/` with the reason recorded,
+  the agent must be registered (an unknown name creates no queue),
+  retiring an already-cancelled entry is a no-op, and `--dry-run`
+  lists what would be retired without moving anything.
 - `common/docs/agentctl/harness-support-matrix.md` is updated in
   the same change if any per-harness support cell changes.
 
