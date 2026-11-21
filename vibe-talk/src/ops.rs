@@ -1579,7 +1579,10 @@ pub async fn timeline(
         // spawns no refresh (the claim below is filtered for it).
         let serving = may_serve(state, caller)
             || (caller == crate::auth::Scope::TestRead && state.message_cache.serve_enabled());
-        let claim = serving
+        // Not taken at all for the test credential (second cold review):
+        // holding it, even filtered from spawning, would starve an owner
+        // read of the same page of its background correction.
+        let claim = (serving && caller != crate::auth::Scope::TestRead)
             .then(|| {
                 state.message_cache.claim_refresh(RefreshKey::timeline(
                     channel.id.clone(),
@@ -1613,9 +1616,7 @@ pub async fn timeline(
                             crate::timeline_served::encode(&channel.id, request.view, thread, &raw)
                         })
                         .transpose()?;
-                    // `#2060` Part B (B2): a test caller's served page is
-                    // never refreshed from the provider either.
-                    if let Some(claim) = claim.filter(|_| caller != crate::auth::Scope::TestRead) {
+                    if let Some(claim) = claim {
                         spawn_timeline_refresh(
                             state.clone(),
                             caller,

@@ -148,6 +148,25 @@ speech/MCP refuse distinctly, and the read token keeps its routes.
 Re-verified on the clone with the fixed binary: same B5 matrix, plus
 diagnostics and messages now answer test_read_route_refused.
 
+Second cold review (of 515b4f76) blockers fixed: the allowlist
+compares the exact five-segment route shape (a message id of
+"timeline" is refused as a route; axum's MatchedPath needs a
+dependency feature the crate does not enable), and client-config for
+the test credential returns the kept replay answer without refreshing
+the shared voice bridge. Should-fix items in: the test token joins
+diagnostics' secrets_of redaction list; client-config blanks
+noise_rules, voice_settings, voice_prompt and voice_post_prefix for
+the test credential; timeline rendering takes fill_page_readonly for
+test reads; the refresh claim is never taken for the test credential;
+the kill file's parent directory must exist at config load and the
+environment form is documented. Tests grew to the full ReadScope
+route table plus suffix variants, a write-route sweep, and a
+served-page case proving no claim is taken and no refresh spawns
+(provider held, fetch count unchanged). Lib 2010 pass, integration
+1412 pass (3 host node-v16 failures; one cache timing test flaked
+under full-suite load and passes solo). Clone re-verified: suffix
+route refused, boot fields blanked, timeline 200.
+
 # Acceptance Criteria
 
 - Part A: the script above, with the clone verification recorded here.

@@ -90,7 +90,94 @@ fn non_allowlisted() -> Vec<(&'static str, String, Option<Value>)> {
             format!("/api/v1/channels/{c}/resolve"),
             Some(json!({"query": "cats"})),
         ),
+        // The rest of the ReadScope surface (second cold review).
+        ("GET", "/api/v1/channels".into(), None),
+        ("GET", "/api/v1/agent-tools".into(), None),
+        ("GET", "/api/v1/inbox".into(), None),
+        ("GET", "/api/v1/voice-agent".into(), None),
+        ("GET", "/api/v1/voice-post-prefix".into(), None),
+        ("GET", "/api/v1/documents".into(), None),
+        ("GET", "/api/v1/documents/search?q=cats".into(), None),
+        ("GET", "/api/v1/documents/some-key".into(), None),
+        ("GET", "/api/v1/transcripts".into(), None),
+        (
+            "GET",
+            format!("/api/v1/transcripts/{c}/1795263665.619359"),
+            None,
+        ),
+        ("GET", format!("/api/v1/channels/{c}/recap"), None),
+        (
+            "GET",
+            format!("/api/v1/channels/{c}/messages/123/summary"),
+            None,
+        ),
+        ("GET", format!("/api/v1/channels/{c}/pins"), None),
+        ("GET", format!("/api/v1/channels/{c}/thread-pins"), None),
+        ("GET", format!("/api/v1/channels/{c}/bookmark"), None),
+        ("GET", "/api/v1/labels".into(), None),
+        // Suffix variants: paths that merely look like the timeline
+        // route (B1). Each must be refused as a route, before any
+        // handler or provider call.
+        (
+            "GET",
+            format!("/api/v1/channels/{c}/messages/timeline"),
+            None,
+        ),
     ]
+}
+
+/// Write-scope routes with the test credential: refused by scope, as
+/// every mutating route is. A representative sweep.
+fn write_routes() -> Vec<(&'static str, String, Option<Value>)> {
+    let c = READ_CHANNEL;
+    vec![
+        (
+            "POST",
+            format!("/api/v1/channels/{c}/reply"),
+            Some(json!({"content": "x"})),
+        ),
+        (
+            "POST",
+            format!("/api/v1/channels/{c}/dismiss"),
+            Some(json!({"messages": []})),
+        ),
+        (
+            "POST",
+            format!("/api/v1/channels/{c}/read"),
+            Some(json!({"message_id": "1"})),
+        ),
+        (
+            "PUT",
+            "/api/v1/client-settings".into(),
+            Some(json!({"settings": []})),
+        ),
+        ("POST", "/api/v1/channels".into(), Some(json!({"id": "9"}))),
+        (
+            "PUT",
+            format!("/api/v1/channels/{c}/alias"),
+            Some(json!({"alias": "x"})),
+        ),
+        (
+            "DELETE",
+            format!("/api/v1/channels/{c}/pins/timeline"),
+            None,
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn the_test_credential_is_refused_on_write_routes_too() {
+    let (state, discord) = state();
+    let spent = discord.fetch_count();
+    for (method, uri, body) in write_routes() {
+        let (status, answer) = call(&state, method, &uri, TEST_TOKEN, body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}: {answer}");
+        assert_eq!(
+            discord.fetch_count(),
+            spent,
+            "{method} {uri} reached the provider"
+        );
+    }
 }
 
 #[tokio::test]
@@ -156,6 +243,90 @@ async fn speech_and_mcp_refuse_the_test_credential_distinctly() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// A served newest page for the test credential (second cold review):
+/// it answers from the cache while the provider's next read is held,
+/// it reaches the provider zero times, and it leaves the refresh claim
+/// free for the owner's own correction.
+#[tokio::test]
+async fn a_served_page_for_the_test_credential_takes_no_claim_and_spawns_no_refresh() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    use vibe_talk::cache::RefreshKey;
+    use vibe_talk::model::ChannelId;
+    use vibe_talk::testing::{ManualClock, TempDir, TimelineChat};
+    use vibe_talk::threads::TimelineView;
+
+    const T0: i64 = 1_787_054_400_000;
+    const MINUTE: i64 = 60_000;
+    const HOUR: i64 = 60 * MINUTE;
+
+    let dir = TempDir::new("test-read-served");
+    let toml = testing::config_toml().replace(
+        &format!("write_token = \"{WRITE_TOKEN}\""),
+        &format!("write_token = \"{WRITE_TOKEN}\"\ntest_token = \"{TEST_TOKEN}\""),
+    );
+    let (mut state, fake, _voice) = testing::state_from_toml(&toml);
+    let read = ChannelId(READ_CHANNEL.to_owned());
+    for n in 0..12 {
+        fake.seed_at(&read, "Ada", &format!("message {n}"), T0 + n * MINUTE);
+    }
+    let chat = Arc::new(TimelineChat::new(fake.clone()));
+    state.replace_chat(chat.clone());
+    let clock = ManualClock::at(T0 + HOUR);
+    let state = testing::with_message_cache(state, dir.path(), clock.clone()).await;
+    let (status, answer) = call(
+        &state,
+        "GET",
+        &format!("/api/v1/channels/{READ_CHANNEL}/timeline?view=main&limit=50"),
+        WRITE_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert!(
+        state
+            .message_cache
+            .shadow_settled(Duration::from_secs(20))
+            .await,
+        "every evaluation was counted"
+    );
+    if let Some(cache) = state.message_cache.cache() {
+        assert!(
+            cache.quiesce_blocking(Duration::from_secs(20)),
+            "the writer caught up"
+        );
+    }
+    clock.advance(2 * HOUR);
+    state.message_cache.set_serve(true);
+
+    let _hold = chat.hold_next_timeline();
+    let spent = fake.fetch_count();
+    let (status, answer) = tokio::time::timeout(
+        Duration::from_secs(10),
+        call(
+            &state,
+            "GET",
+            &format!("/api/v1/channels/{READ_CHANNEL}/timeline?view=main&limit=5"),
+            TEST_TOKEN,
+            None,
+        ),
+    )
+    .await
+    .expect("a served page answers while the provider is held");
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["messages"].as_array().map(Vec::len), Some(5));
+    assert_eq!(
+        fake.fetch_count(),
+        spent,
+        "the served read reached the provider"
+    );
+    let key = RefreshKey::timeline(read, TimelineView::Main, None, 5);
+    assert!(
+        state.message_cache.claim_refresh(key).is_some(),
+        "the test credential took the owner's refresh claim"
+    );
 }
 
 #[tokio::test]

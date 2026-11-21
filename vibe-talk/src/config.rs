@@ -2555,7 +2555,22 @@ impl Config {
                     .or_else(|| file.auth.test_token_kill_file.clone());
                 let kill_file = match kill_raw.as_deref() {
                     Some(raw) if std::path::Path::new(raw).is_absolute() => {
-                        Some(std::path::PathBuf::from(raw))
+                        // The parent must exist at load: a kill file in a
+                        // directory that is not there can never be created,
+                        // so the switch would silently never fire.
+                        let path = std::path::PathBuf::from(raw);
+                        match path.parent() {
+                            Some(parent) if parent.is_dir() => {}
+                            _ => {
+                                return Err(ConfigError::Invalid {
+                                    field: "auth.test_token_kill_file".to_owned(),
+                                    detail: "its parent directory does not exist, so the \
+                                             kill file could never be created"
+                                        .to_owned(),
+                                });
+                            }
+                        }
+                        Some(path)
                     }
                     Some(_) => {
                         return Err(ConfigError::Invalid {

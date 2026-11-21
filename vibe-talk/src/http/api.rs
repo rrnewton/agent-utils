@@ -249,8 +249,20 @@ impl From<crate::cache::lifecycle::SwitchError> for ApiError {
 /// activity, search, documents, diagnostics, voices, streams) stay
 /// off the list.
 fn test_read_route_allowed(path: &str) -> bool {
-    path == "/api/v1/client-config"
-        || (path.starts_with("/api/v1/channels/") && path.ends_with("/timeline"))
+    // Compared by exact shape, never by start-and-end: the timeline
+    // route is exactly five segments, so a path that merely ends in
+    // "timeline" deeper down (a message id of "timeline" on the
+    // messages route) is a different route and is refused. (Axum's
+    // MatchedPath would say the same; it needs a dependency feature
+    // this crate does not enable.) Second cold review of Part B, B1.
+    if path == "/api/v1/client-config" {
+        return true;
+    }
+    let segments: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    matches!(
+        segments.as_slice(),
+        ["api", "v1", "channels", _, "timeline"]
+    )
 }
 
 /// The test credential's route refusal: distinct from an ordinary 403,
@@ -1173,7 +1185,14 @@ pub async fn client_config(
     };
     // `#331 resume-on-websocket`. What a `vibe-talk-v1` bridge last said about taking a recap; an
     // old answer is asked again in the background, never waited for here.
-    let bridge = crate::replay::bridge_support(&state);
+    // `#2060` Part B (second cold review, B2): for the test credential,
+    // the kept answer only -- asking again would open a session on the
+    // shared voice bridge.
+    let bridge = if scope == Scope::TestRead {
+        state.voice_bridge.replay_support()
+    } else {
+        crate::replay::bridge_support(&state)
+    };
     Ok(Json(ClientConfigResponse {
         app_name: Some(state.config.app_name.clone()),
         chat_provider_name: state.chat.provider_name().to_owned(),
@@ -1251,10 +1270,28 @@ pub async fn client_config(
         // instead of offering a button whose every click refuses.
         discuss_available: state.catchup_summarizer.is_some(),
         token_scope: scope.into(),
-        noise_rules: noise_rules_view(&state).await,
-        voice_settings: Some(crate::send_approval::view(&state).await),
-        voice_prompt: Some(crate::voice_prompt::view(&state).await),
-        voice_post_prefix: Some(crate::post_prefix::view(&state).await),
+        // `#2060` Part B: the owner's rules, prompt and prefix stay off
+        // the test credential's boot answer, as their own routes refuse it.
+        noise_rules: if scope == Scope::TestRead {
+            None
+        } else {
+            noise_rules_view(&state).await
+        },
+        voice_settings: if scope == Scope::TestRead {
+            None
+        } else {
+            Some(crate::send_approval::view(&state).await)
+        },
+        voice_prompt: if scope == Scope::TestRead {
+            None
+        } else {
+            Some(crate::voice_prompt::view(&state).await)
+        },
+        voice_post_prefix: if scope == Scope::TestRead {
+            None
+        } else {
+            Some(crate::post_prefix::view(&state).await)
+        },
         message_cache,
         client_settings_supported: true,
     }))
@@ -3001,7 +3038,14 @@ pub async fn timeline(
     ops::attach_page_hues(&state, caller, &channel.id, &mut page).await;
     // `#217 markdown-blocks`. Here and not in `ops::timeline`: this route's only reader is the
     // page, and the operation under it is shared with paths toward a model.
-    crate::render::fill_page(&state.config, &state.headings, &channel, &mut page);
+    // `#2060` Part B: a test read must not record heading tags either
+    // (the recording is a write to shared rendering state), so it takes
+    // the readonly fill, as read-scope search does.
+    if caller == Scope::TestRead {
+        crate::render::fill_page_readonly(&state.config, &state.headings, &channel, &mut page);
+    } else {
+        crate::render::fill_page(&state.config, &state.headings, &channel, &mut page);
+    }
     // `#182 thread-display-names`. Known names and sentences ride along on every thread list and
     // thread heading; due threads are queued for the background, and only for a caller with write
     // scope, because a read token never spends the model or fills the cache.

@@ -202,7 +202,7 @@ write_token = "REPLACE-ME-different-and-at-least-24-characters"
 # speech, its MCP calls, and any read the message cache cannot answer (never the chat
 # provider). test_token_kill_file names a kill switch: while that file exists the credential
 # is refused, checked per request, no restart needed. Revoke by deleting test_token.
-# Environment: VIBE_TALK_TEST_TOKEN
+# Environment: VIBE_TALK_TEST_TOKEN / VIBE_TALK_TEST_TOKEN_KILL_FILE
 # test_token = "REPLACE-ME-a-fourth-distinct-token-of-at-least-24-characters"
 # test_token_kill_file = "/absolute/path/to/test-token-killed"
 # Optional voice-only token (#553 voice-ws-relay-auth): it opens GET /api/v1/voice-socket, the relay
