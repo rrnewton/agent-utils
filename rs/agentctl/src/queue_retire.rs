@@ -4,8 +4,8 @@
 //! directly while delivery was broken), its queued copy must never be
 //! typed later as a duplicate. Retiring moves a pending item to
 //! `cancelled/` with the operator's reason recorded, through the same
-//! tombstone primitive as `agentctl cancel` ([`agent_queue::queue::cancel`]),
-//! so no drainer of any version types it afterwards. Retiring an entry
+//! tombstone primitive as `agentctl cancel`, so no drainer of any
+//! version types it afterwards. Retiring an entry
 //! that is already cancelled is a no-op, so the command is idempotent.
 
 use std::fs;
