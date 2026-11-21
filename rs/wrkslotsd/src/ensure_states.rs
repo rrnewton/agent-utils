@@ -713,7 +713,7 @@ fn note_event_in_index(cfg: &Cfg, machine: &str, events_before: &[Value], event:
         }
         Value::Object(index)
     };
-    let _ = (|| -> Result<()> {
+    let _ = {
         let loaded: Option<Value> = std::fs::read_to_string(&path)
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok());
@@ -741,7 +741,7 @@ fn note_event_in_index(cfg: &Cfg, machine: &str, events_before: &[Value], event:
             rebuilt(&events)
         };
         atomic_write_json(&path, &index)
-    })();
+    };
 }
 
 fn empty_active(machine: &str) -> Value {
