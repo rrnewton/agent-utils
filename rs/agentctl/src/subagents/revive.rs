@@ -149,18 +149,46 @@ fn verified_runtime_pid(record: &AgentRecord, pid: u64) -> bool {
     }
 }
 
+/// A process's real start time (#1945): field 22 (starttime, in clock
+/// ticks) of `/proc/<pid>/stat` plus `btime` from `/proc/stat`, the same
+/// derivation the ownership code uses for start ticks. The `/proc/<pid>`
+/// directory's mtime is NOT this: the kernel stamps it when the proc
+/// entry is first instantiated, which can be long after the process
+/// started, so a lock Muse wrote at startup would look older than its
+/// own process.
+fn process_start_time(pid: u64) -> Option<std::time::SystemTime> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let close = stat.rfind(')')?;
+    let fields: Vec<&str> = stat[close + 2..].split_whitespace().collect();
+    let ticks: u64 = fields.get(19)?.parse().ok()?;
+    let btime: u64 = fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()?;
+    // USER_HZ is 100 on the mainstream Linux architectures; the
+    // freshness comparison carries a tolerance that absorbs it.
+    const TICKS_PER_SECOND: u64 = 100;
+    Some(
+        std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(btime + ticks / TICKS_PER_SECOND)
+            + std::time::Duration::from_millis(
+                (ticks % TICKS_PER_SECOND) * 1000 / TICKS_PER_SECOND,
+            ),
+    )
+}
+
 /// When the runtime process `pid` started, as far as this lane can prove
-/// it (#1945): in production the `/proc/<pid>` directory's own mtime,
-/// which the kernel stamps at process start. A session lock older than
+/// it (#1945): its real start time (above). A session lock older than
 /// that cannot belong to this process, however well its pid line matches
 /// after a pid reuse.
 fn runtime_start_time(record: &AgentRecord, pid: u64) -> Option<std::time::SystemTime> {
     #[cfg(not(test))]
     {
         let _ = record;
-        fs::metadata(format!("/proc/{pid}"))
-            .and_then(|metadata| metadata.modified())
-            .ok()
+        process_start_time(pid)
     }
     #[cfg(test)]
     {
@@ -237,7 +265,9 @@ fn muse_sessions_for_pid(root: &Path, record: &AgentRecord, pid: u64) -> Vec<Str
                         let fresh = started.is_some_and(|start| {
                             fs::metadata(&lock)
                                 .and_then(|metadata| metadata.modified())
-                                .is_ok_and(|modified| modified >= start)
+                                .is_ok_and(|modified| {
+                                    modified + std::time::Duration::from_secs(2) >= start
+                                })
                         });
                         if names_pid && fresh {
                             if let Some(id) = session.file_name().to_str() {
@@ -6945,6 +6975,19 @@ mod discovery_tests {
         );
         assert!(muse_sessions_for_pid(&root, &record, 999).is_empty());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn process_start_time_comes_from_stat_not_the_proc_directory() {
+        // #1945: the derivation reads starttime + btime, never the
+        // proc entry's instantiation mtime, so a lock written at a
+        // long-running process's startup is not older than its process.
+        let start = process_start_time(u64::from(std::process::id())).expect("own start time");
+        assert!(start <= std::time::SystemTime::now());
+        assert!(
+            start > std::time::SystemTime::now() - std::time::Duration::from_secs(24 * 3600),
+            "test processes start within a day of now"
+        );
     }
 
     #[test]
