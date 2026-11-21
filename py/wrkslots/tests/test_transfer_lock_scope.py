@@ -50,10 +50,11 @@ _INSTRUMENTED = {
 @pytest.fixture(autouse=True)
 def fixture_machine(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("WRKSLOTS_MACHINE", "testhost")
+    monkeypatch.setenv("WRKSLOTS_LOCK_ORDER_CHECK", "1")
 
 
-def _exclusive_lock_held(project: Path) -> bool:
-    fd = os.open(project, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+def _flock_held(path: Path, flags: int) -> bool:
+    fd = os.open(path, flags | os.O_CLOEXEC)
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -63,6 +64,15 @@ def _exclusive_lock_held(project: Path) -> bool:
         return False
     finally:
         os.close(fd)
+
+
+def _exclusive_lock_held(project: Path) -> bool:
+    """The project-root flock, or the ACTIVE write lock a transfer now
+    commits under without the configuration locks (#2000)."""
+    registry = control_directory(project) / "ACTIVE.global.lock"
+    return _flock_held(project, os.O_RDONLY | os.O_DIRECTORY) or (
+        registry.exists() and _flock_held(registry, os.O_RDONLY)
+    )
 
 
 class _LockLedger:

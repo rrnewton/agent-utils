@@ -131,7 +131,78 @@ pub(crate) struct Flock {
 
 impl Drop for Flock {
     fn drop(&mut self) {
+        lock_order_release_path(&self.path);
         held_lock_release(&self.path);
+    }
+}
+
+/// The global lock order (#2000), mirroring the Python edition:
+/// project-root, config.lock, ACTIVE.global.intent, ACTIVE.global,
+/// ACTIVE.<machine>. Recorded only when WRKSLOTS_LOCK_ORDER_CHECK=1.
+pub(crate) fn lock_order_rank(name: &str) -> Option<u8> {
+    match name {
+        "project-root" => Some(0),
+        "config.lock" => Some(1),
+        "ACTIVE.global.intent" => Some(2),
+        "ACTIVE.global" => Some(3),
+        "ACTIVE.machine" => Some(4),
+        _ => None,
+    }
+}
+
+pub(crate) fn lock_order_class(path: &Path) -> Option<&'static str> {
+    let name = path.file_name()?.to_str()?;
+    if name == "ACTIVE.global.lock" {
+        Some("ACTIVE.global")
+    } else if name == "ACTIVE.global.intent.lock" {
+        Some("ACTIVE.global.intent")
+    } else if name.starts_with("ACTIVE.") && name.ends_with(".json.lock") {
+        Some("ACTIVE.machine")
+    } else {
+        None
+    }
+}
+
+thread_local! {
+    static LOCK_ORDER_STACK: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+}
+
+pub(crate) fn lock_order_acquire(name: &'static str) -> Result<()> {
+    if std::env::var_os("WRKSLOTS_LOCK_ORDER_CHECK").is_none_or(|value| value != "1") {
+        return Ok(());
+    }
+    let rank = lock_order_rank(name).unwrap_or(0);
+    LOCK_ORDER_STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        if let Some(above) = stack
+            .iter()
+            .rev()
+            .find(|held| lock_order_rank(held).unwrap_or(0) > rank)
+        {
+            return Err(format!(
+                "lock order violation: acquiring {name} while holding {above}"
+            ));
+        }
+        stack.push(name);
+        Ok(())
+    })
+}
+
+pub(crate) fn lock_order_release(name: &str) {
+    if std::env::var_os("WRKSLOTS_LOCK_ORDER_CHECK").is_none_or(|value| value != "1") {
+        return;
+    }
+    LOCK_ORDER_STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        if let Some(index) = stack.iter().rposition(|held| *held == name) {
+            stack.remove(index);
+        }
+    });
+}
+
+pub(crate) fn lock_order_release_path(path: &Path) {
+    if let Some(name) = lock_order_class(path) {
+        lock_order_release(name);
     }
 }
 
@@ -230,7 +301,10 @@ fn enter_turnstile(
     let file = open_lock_file(&intent_path, &intent_path)?;
     if exclusive {
         match flock_wait(&file, deadline) {
-            Ok(()) => Ok(Some(file)),
+            Ok(()) => {
+                lock_order_acquire("ACTIVE.global.intent")?;
+                Ok(Some(file))
+            }
             Err(_) => Err(format!(
                 "state lock is busy for {}; another writer is waiting for it; retry after the current command exits",
                 subject.display()
@@ -239,6 +313,8 @@ fn enter_turnstile(
     } else {
         let defer_until = std::cmp::min(deadline, std::time::Instant::now() + INTENT_DEFER);
         if flock_wait_shared(&file, defer_until).is_ok() {
+            lock_order_acquire("ACTIVE.global.intent")?;
+            lock_order_release("ACTIVE.global.intent");
             let _ = rustix::fs::flock(&file, rustix::fs::FlockOperation::Unlock);
         }
         Ok(None)
@@ -260,16 +336,24 @@ pub(crate) fn acquire_lock_with_deadline(
     let _intent = enter_turnstile(path, subject, true, deadline)?;
     match flock_wait(&file, deadline) {
         Ok(()) => {
+            if let Some(name) = lock_order_class(path) {
+                lock_order_acquire(name)?;
+            }
+            drop(_intent);
+            lock_order_release("ACTIVE.global.intent");
             held_lock_acquire(path);
             Ok(Flock {
                 _file: file,
                 path: path.to_path_buf(),
             })
         }
-        Err(_) => Err(format!(
-            "state lock is busy for {}; retry after the current command exits",
-            subject.display()
-        )),
+        Err(_) => {
+            lock_order_release("ACTIVE.global.intent");
+            Err(format!(
+                "state lock is busy for {}; retry after the current command exits",
+                subject.display()
+            ))
+        }
     }
 }
 
@@ -284,6 +368,9 @@ pub(crate) fn acquire_shared_lock(path: &Path, subject: &Path) -> Result<Flock> 
     let _passed = enter_turnstile(path, subject, false, deadline)?;
     match flock_wait_shared(&file, deadline) {
         Ok(()) => {
+            if let Some(name) = lock_order_class(path) {
+                lock_order_acquire(name)?;
+            }
             held_lock_acquire(path);
             Ok(Flock {
                 _file: file,

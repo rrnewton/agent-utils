@@ -46,10 +46,11 @@ _INSTRUMENTED = {
 @pytest.fixture(autouse=True)
 def fixture_machine(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("WRKSLOTS_MACHINE", "testhost")
+    monkeypatch.setenv("WRKSLOTS_LOCK_ORDER_CHECK", "1")
 
 
-def _exclusive_lock_held(project: Path) -> bool:
-    fd = os.open(project, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+def _flock_held(path: Path, flags: int) -> bool:
+    fd = os.open(path, flags | os.O_CLOEXEC)
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -59,6 +60,20 @@ def _exclusive_lock_held(project: Path) -> bool:
         return False
     finally:
         os.close(fd)
+
+
+def _project_root_flock_held(project: Path) -> bool:
+    """The configuration lock's legacy half: the exclusive flock on the project root."""
+    return _flock_held(project, os.O_RDONLY | os.O_DIRECTORY)
+
+
+def _exclusive_lock_held(project: Path) -> bool:
+    """Is a mutation's exclusive lock held: the project-root flock, or the ACTIVE
+    registry write lock that a heartbeat now commits under without it (#2000)?"""
+    registry = control_directory(project) / "ACTIVE.global.lock"
+    return _project_root_flock_held(project) or (
+        registry.exists() and _flock_held(registry, os.O_RDONLY)
+    )
 
 
 class _LockLedger:

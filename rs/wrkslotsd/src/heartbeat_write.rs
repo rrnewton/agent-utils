@@ -456,7 +456,9 @@ pub(crate) fn heartbeat(
     } else {
         std::time::Duration::from_secs_f64((ttl_seconds / 3.0).clamp(1.0, 10.0))
     };
-    let _locks = crate::hold_write::acquire_mutation_locks_with_wait(
+    // Queue for the registry locks without the configuration locks,
+    // as the Python edition's heartbeat does (#2000).
+    let _locks = crate::hold_write::acquire_mutation_locks_with_wait_releasing_config(
         root,
         machine_override,
         &cfg,

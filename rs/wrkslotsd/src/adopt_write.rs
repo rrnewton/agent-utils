@@ -19,7 +19,8 @@ use crate::ensure_states::{
     utc_now,
 };
 use crate::hold_write::{
-    acquire_mutation_locks, active_document, refuse_target_storage, validate_global,
+    acquire_mutation_locks_releasing_config, active_document, refuse_target_storage,
+    validate_global,
 };
 use crate::journals_state::parse_journals;
 use crate::status_state::{process_state, read_process_identity, Identity};
@@ -248,7 +249,11 @@ pub(crate) fn adopt_slot(
         (Some(unit), Some(invocation)) => Some(verify_task_scope(&supplied, unit, invocation)?),
         _ => None,
     };
-    let _locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
+    // This edition's adopt still validates under the registry locks
+    // (it has no lock-free prepare yet); it queues for them without
+    // the configuration locks, as the Python edition's adopt does
+    // (#2000), and writes only owner, heartbeat time and task scope.
+    let _locks = acquire_mutation_locks_releasing_config(root, machine_override, &cfg, &selected)?;
     refuse_partial_state(&cfg.control)?;
     crate::hold_write::report_dead_findings(root, slot)?;
     let journals = parse_journals(root)?;

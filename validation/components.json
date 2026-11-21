@@ -487,6 +487,7 @@
         "py/wrkslots/tests/test_limits_show_rust.py",
         "py/wrkslots/tests/test_liveness_evidence.py",
         "py/wrkslots/tests/test_load_quarantine.py",
+        "py/wrkslots/tests/test_lock_order.py",
         "py/wrkslots/tests/test_lock_scope.py",
         "py/wrkslots/tests/test_lock_turnstile_rust.py",
         "py/wrkslots/tests/test_nested_module_name_path.py",

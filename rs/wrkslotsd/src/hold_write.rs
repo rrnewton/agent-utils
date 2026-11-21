@@ -100,7 +100,7 @@ pub(crate) fn validate_global(root: Option<&Path>, cfg: &Cfg) -> Result<()> {
 /// Take the config-directory, global, and machine locks in the
 /// existing order, refusing a configuration changed while starting.
 pub(crate) struct MutationLocks {
-    _config: ConfigLock,
+    _config: Option<ConfigLock>,
     _global: crate::ensure_states::Flock,
     _machine: crate::ensure_states::Flock,
 }
@@ -120,12 +120,57 @@ pub(crate) fn acquire_mutation_locks(
     )
 }
 
+/// As `acquire_mutation_locks`, but the configuration locks are
+/// released right after the configuration re-check, so the caller
+/// queues for the registry locks holding nothing (#2000, mirroring
+/// the Python edition's `release_config_after_check`). Only callers
+/// whose locked section re-judges one record and writes no
+/// configuration-derived value may use it.
+pub(crate) fn acquire_mutation_locks_releasing_config(
+    root: Option<&Path>,
+    machine_override: Option<&str>,
+    cfg: &Cfg,
+    selected: &str,
+) -> Result<MutationLocks> {
+    acquire_mutation_locks_inner(
+        root,
+        machine_override,
+        cfg,
+        selected,
+        crate::ensure_states::lock_wait(),
+        true,
+    )
+}
+
 pub(crate) fn acquire_mutation_locks_with_wait(
     root: Option<&Path>,
     machine_override: Option<&str>,
     cfg: &Cfg,
     selected: &str,
     wait: std::time::Duration,
+) -> Result<MutationLocks> {
+    acquire_mutation_locks_inner(root, machine_override, cfg, selected, wait, false)
+}
+
+/// As `acquire_mutation_locks_with_wait`, releasing the configuration
+/// locks after the re-check (#2000).
+pub(crate) fn acquire_mutation_locks_with_wait_releasing_config(
+    root: Option<&Path>,
+    machine_override: Option<&str>,
+    cfg: &Cfg,
+    selected: &str,
+    wait: std::time::Duration,
+) -> Result<MutationLocks> {
+    acquire_mutation_locks_inner(root, machine_override, cfg, selected, wait, true)
+}
+
+fn acquire_mutation_locks_inner(
+    root: Option<&Path>,
+    machine_override: Option<&str>,
+    cfg: &Cfg,
+    selected: &str,
+    wait: std::time::Duration,
+    release_config_after_check: bool,
 ) -> Result<MutationLocks> {
     // One shared deadline across the config, global and machine locks
     // (#1808 review), as in the Python edition's _mutation_locks: the
@@ -145,6 +190,12 @@ pub(crate) fn acquire_mutation_locks_with_wait(
                 .to_string(),
         );
     }
+    let config = if release_config_after_check {
+        drop(config);
+        None
+    } else {
+        Some(config)
+    };
     let global = crate::ensure_states::acquire_lock_with_deadline(
         &cfg.control.join("ACTIVE.global.lock"),
         &cfg.control.join("ACTIVE"),
@@ -449,6 +500,15 @@ pub(crate) struct ConfigLock {
     _config_file: Option<std::fs::File>,
 }
 
+impl Drop for ConfigLock {
+    fn drop(&mut self) {
+        if self._config_file.is_some() {
+            crate::ensure_states::lock_order_release("config.lock");
+        }
+        crate::ensure_states::lock_order_release("project-root");
+    }
+}
+
 pub(crate) fn acquire_config_lock(cfg: &Cfg) -> Result<ConfigLock> {
     acquire_config_lock_with_wait(cfg, crate::ensure_states::lock_wait())
 }
@@ -479,6 +539,7 @@ pub(crate) fn acquire_config_lock_with_deadline(
             cfg.root.display()
         )
     })?;
+    crate::ensure_states::lock_order_acquire("project-root")?;
     let lock_file_path = cfg.control.join("config.lock");
     let config_file = std::fs::OpenOptions::new()
         .read(true)
@@ -494,14 +555,20 @@ pub(crate) fn acquire_config_lock_with_deadline(
             )
         })?;
     match crate::ensure_states::flock_wait(&config_file, deadline) {
-        Ok(()) => Ok(ConfigLock {
-            _file: file,
-            _config_file: Some(config_file),
-        }),
-        Err(_) => Err(format!(
-            "configuration lock is busy for {}; retry after the other wrkslots mutation exits",
-            lock_file_path.display()
-        )),
+        Ok(()) => {
+            crate::ensure_states::lock_order_acquire("config.lock")?;
+            Ok(ConfigLock {
+                _file: file,
+                _config_file: Some(config_file),
+            })
+        }
+        Err(_) => {
+            crate::ensure_states::lock_order_release("project-root");
+            Err(format!(
+                "configuration lock is busy for {}; retry after the other wrkslots mutation exits",
+                lock_file_path.display()
+            ))
+        }
     }
 }
 

@@ -6793,6 +6793,77 @@ def _lock_path(subject: Path) -> Path:
     return subject.with_name(f"{subject.name}.lock")
 
 
+#: The single global lock order (#2000), in acquisition order. Every
+#: path that takes more than one of these locks takes them in this
+#: order, and no path waits for a later lock while holding an earlier
+#: one it could release first (see ``_mutation_locks``):
+#: (1) the legacy flock on the project root directory, (2) the
+#: dedicated ``<control>/config.lock`` file, (3) the writer-intent
+#: turnstile ``ACTIVE.global.intent.lock``, (4) ``ACTIVE.global.lock``,
+#: (5) the per-machine ``ACTIVE.<machine>.json.lock``. Readers take
+#: (3) shared only in passing and then (4)/(5) shared; the coordinator
+#: adopted config lock is (1) or (2), already held by the coordinator
+#: before this process starts, so adopting it cannot invert the order;
+#: ``release_config_after_check`` users drop (1)+(2) after the config
+#: check and therefore hold nothing while they queue at (3).
+LOCK_ORDER_CHECK_ENV = "WRKSLOTS_LOCK_ORDER_CHECK"
+
+_LOCK_ORDER_RANKS = {
+    "project-root": 0,
+    "config.lock": 1,
+    "ACTIVE.global.intent": 2,
+    "ACTIVE.global": 3,
+    "ACTIVE.machine": 4,
+}
+
+_LOCK_ORDER_STATE = threading.local()
+
+
+def _lock_order_acquire(name: str) -> None:
+    """Record one lock-class acquisition; fail on an out-of-order take.
+
+    A no-op unless ``WRKSLOTS_LOCK_ORDER_CHECK=1`` (the test suites set
+    it; production never does). Re-acquiring a class this thread already
+    holds is counted, not a violation; acquiring any class ranked below
+    a class still held is.
+    """
+
+    if os.environ.get(LOCK_ORDER_CHECK_ENV) != "1":
+        return
+    stack: list[str] = getattr(_LOCK_ORDER_STATE, "stack", None) or []
+    _LOCK_ORDER_STATE.stack = stack
+    rank = _LOCK_ORDER_RANKS[name]
+    held_above = [held for held in stack if _LOCK_ORDER_RANKS[held] > rank]
+    if held_above:
+        raise AssertionError(
+            f"lock order violation: acquiring {name} while holding "
+            f"{held_above[-1]} (sequence: {' -> '.join([*stack, name])}); "
+            f"the global order is {' -> '.join(_LOCK_ORDER_RANKS)}"
+        )
+    stack.append(name)
+
+
+def _lock_order_release(name: str) -> None:
+    if os.environ.get(LOCK_ORDER_CHECK_ENV) != "1":
+        return
+    stack: list[str] = getattr(_LOCK_ORDER_STATE, "stack", None) or []
+    for index in range(len(stack) - 1, -1, -1):
+        if stack[index] == name:
+            del stack[index]
+            break
+
+
+def _lock_order_class(path: Path) -> str | None:
+    name = path.name
+    if name == "ACTIVE.global.lock":
+        return "ACTIVE.global"
+    if name == "ACTIVE.global.intent.lock":
+        return "ACTIVE.global.intent"
+    if name.startswith("ACTIVE.") and name.endswith(".json.lock"):
+        return "ACTIVE.machine"
+    return None
+
+
 # The lock files this thread holds a flock on, counted per path. A thread that holds the
 # registry lock must not wait for it again through a second descriptor (that waits for
 # itself), so a reader checks this before it takes the lock on its own.
@@ -6956,6 +7027,12 @@ def _enter_registry_turnstile(
     fd = _open_lock_file(intent, "state lock intent")
     if exclusive:
         if _flock_until(fd, fcntl.LOCK_EX, deadline):
+            try:
+                _lock_order_acquire("ACTIVE.global.intent")
+            except BaseException:
+                _flock_release(fd)
+                os.close(fd)
+                raise
             return fd
         os.close(fd)
         raise _LockBusy(
@@ -6965,6 +7042,8 @@ def _enter_registry_turnstile(
     try:
         defer_until = min(deadline, time.monotonic() + _REGISTRY_INTENT_DEFER_SECONDS)
         if _flock_until(fd, fcntl.LOCK_SH, defer_until):
+            _lock_order_acquire("ACTIVE.global.intent")
+            _lock_order_release("ACTIVE.global.intent")
             _flock_release(fd)
     finally:
         os.close(fd)
@@ -6979,15 +7058,28 @@ def _locked(subject: Path, *, exclusive: bool, wait_seconds: float | None) -> It
     deadline = time.monotonic() + _resolved_wait_seconds(wait_seconds)
     try:
         intent = _enter_registry_turnstile(subject, exclusive=exclusive, deadline=deadline)
+        acquired = False
         try:
             if not _flock_until(fd, operation, deadline):
                 raise _LockBusy(
                     f"state lock is busy for {subject}; retry after the current command exits"
                 )
+            acquired = True
+        finally:
+            if not acquired and intent is not None:
+                _flock_release(intent)
+                os.close(intent)
+                _lock_order_release("ACTIVE.global.intent")
+                intent = None
+        lock_class = _lock_order_class(path)
+        try:
+            if lock_class is not None:
+                _lock_order_acquire(lock_class)
         finally:
             if intent is not None:
                 _flock_release(intent)
                 os.close(intent)
+                _lock_order_release("ACTIVE.global.intent")
         held: dict[Path, int] = getattr(_HELD_LOCKS, "paths", None) or {}
         _HELD_LOCKS.paths = held
         held[path] = held.get(path, 0) + 1
@@ -6997,6 +7089,8 @@ def _locked(subject: Path, *, exclusive: bool, wait_seconds: float | None) -> It
             held[path] -= 1
             if not held[path]:
                 del held[path]
+            if lock_class is not None:
+                _lock_order_release(lock_class)
     finally:
         try:
             _flock_release(fd)
@@ -7314,6 +7408,8 @@ def _locked_config(
         held, adopted = _adopt_held_config_lock(claim, lock_path, file_path)
         other_fd: int | None = None
         try:
+            # Not recorded by the lock-order check: the adopted lock was
+            # acquired by the coordinator before this process started.
             # Take whichever lock the coordinator did not delegate, in the
             # same fixed order relative to the adopted one: the adopted
             # lock is already held, so acquiring the other cannot cycle.
@@ -7361,12 +7457,16 @@ def _locked_config(
         os.close(fd)
         raise Refusal(f"configuration lock is not a directory: {lock_path}")
     file_fd: int | None = None
+    root_recorded = False
+    file_recorded = False
     try:
         if not _flock_until(fd, operation, deadline):
             raise _LockBusy(
                 f"configuration lock is busy for {lock_path}; retry after the "
                 "other wrkslots mutation exits"
             )
+        _lock_order_acquire("project-root")
+        root_recorded = True
         if file_path is not None:
             file_fd = _open_config_lock_file(file_path)
             if not _flock_until(file_fd, operation, deadline):
@@ -7374,6 +7474,8 @@ def _locked_config(
                     f"configuration lock is busy for {file_path}; retry after the "
                     "other wrkslots mutation exits"
                 )
+            _lock_order_acquire("config.lock")
+            file_recorded = True
         yield
     finally:
         try:
@@ -7382,17 +7484,40 @@ def _locked_config(
                     _flock_release(file_fd)
                 finally:
                     os.close(file_fd)
+                    if file_recorded:
+                        _lock_order_release("config.lock")
         finally:
             try:
                 _flock_release(fd)
             finally:
                 os.close(fd)
+                if root_recorded:
+                    _lock_order_release("project-root")
 
 
 def _remaining_lock_wait(deadline: float) -> float:
     return max(0.0, deadline - time.monotonic())
 
 
+# Lock-order inventory (#2000). The global order defined at
+# ``_LOCK_ORDER_RANKS`` is the only order any holder uses:
+# - mutation locks (here): project-root, config.lock, intent,
+#   ACTIVE.global, ACTIVE.<machine>;
+# - phased/shared readers: intent (shared, in passing), then
+#   ACTIVE.global shared, then ACTIVE.<machine> shared;
+# - the intent turnstile itself is taken only immediately before
+#   ACTIVE.global, by a thread that does not already hold it;
+# - coordinator-adopted config locks: project-root or config.lock,
+#   held by the coordinator before this process starts;
+# - ``release_config_after_check`` users (prepared removals, deferred
+#   finish completion, and the prevalidated heartbeat/adopt/
+#   transfer-owner rounds and their busy fallbacks): project-root and
+#   config.lock only for the check, then nothing held while queueing
+#   at the intent turnstile, then ACTIVE.global and ACTIVE.<machine>.
+# A party that releases the config locks before queueing therefore
+# holds no lock a party on the old order can wait for, and takes the
+# remaining locks in the same relative order the old order uses, so
+# old and new parties cannot deadlock each other.
 @contextlib.contextmanager
 def _mutation_locks(
     config: Config,
@@ -7909,6 +8034,8 @@ def _run_prevalidated_mutation(
         [_RegistryIdentity, _RegistryIdentity, _PreparedFacts], _PreparedFacts | None
     ]
     | None = None,
+    *,
+    release_config_after_check: bool = False,
 ) -> _CommitResult:
     """Validate without any lock, then commit under the mutation locks (#1276).
 
@@ -7933,6 +8060,11 @@ def _run_prevalidated_mutation(
 
     ``wait_seconds`` bounds the time spent waiting for the locks over all rounds together; the
     clock starts at the first wait.
+
+    ``release_config_after_check`` is passed to ``_mutation_locks``: each round then holds the
+    configuration locks only while it re-reads the configuration, and queues for the ACTIVE
+    registry locks without them (#1367 piece 2b), so a long registry reader no longer blocks
+    every other holder of the project-root flock behind this command (#2000).
     """
 
     wait_seconds = _resolved_wait_seconds(wait_seconds)
@@ -7953,7 +8085,11 @@ def _run_prevalidated_mutation(
         if lock_deadline is None:
             lock_deadline = time.monotonic() + _resolved_wait_seconds(wait_seconds)
         try:
-            with _mutation_locks(config, _remaining_lock_wait(lock_deadline)):
+            with _mutation_locks(
+                config,
+                _remaining_lock_wait(lock_deadline),
+                release_config_after_check=release_config_after_check,
+            ):
                 current = _registry_identity(config)
                 if current == identity:
                     if facts is None:
@@ -48892,6 +49028,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
             facts, states=tuple(states), archives=tuple(archives), rebased=True
         )
 
+    # Create deliberately keeps the configuration locks while it
+    # queues (#2000): its commit builds the checkout plan, provisions
+    # images and hooks, and stamps the new record with configuration
+    # values (layout, heartbeat TTL, identity, sharing policy), so a
+    # configuration the check no longer pins must not feed the write.
     record, storage_inconsistencies = _run_prevalidated_mutation(
         config, args.wait_lock, "create", prepare, commit, tolerate=tolerate
     )
@@ -50030,8 +50171,21 @@ def _cmd_adopt(args: argparse.Namespace) -> int:
         )
         return refreshed
 
+    # Adopt queues without the configuration locks, like heartbeat
+    # (#2000): its commit re-judges the one record from the prepared
+    # state and writes only owner, heartbeat time and task scope, none
+    # of which a configuration value feeds; the configuration check
+    # and the registry identity comparison still gate the write. The
+    # journal-deferred path runs its validation from the in-memory
+    # configuration under the ACTIVE locks alone.
     adopted = _run_prevalidated_mutation(
-        config, args.wait_lock, "adopt", prepare, commit, tolerate=tolerate
+        config,
+        args.wait_lock,
+        "adopt",
+        prepare,
+        commit,
+        tolerate=tolerate,
+        release_config_after_check=True,
     )
     if adopted is None:
         return 0
@@ -50856,14 +51010,26 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
                 final_nested,
                 final_ignored,
             ) = _run_prevalidated_mutation(
-                config, args.wait_lock, "transfer-owner", prepare, commit
+                config,
+                args.wait_lock,
+                "transfer-owner",
+                prepare,
+                commit,
+                release_config_after_check=True,
             )
         except _RegistryBusy:
             # Every lock-free round was overtaken (e.g. dozens of lanes
             # transferring at once after a reboot): fall back to the old
             # behaviour — wait for the lock and validate there — instead
-            # of refusing a transfer as busy, as heartbeat does.
-            with _mutation_locks(config, args.wait_lock):
+            # of refusing a transfer as busy, as heartbeat does. Like
+            # heartbeat, the fallback queues without the configuration
+            # locks (#2000): the transfer commit re-judges the one
+            # record from the prepared state and writes only owner,
+            # agent, generation and heartbeat time, none of which a
+            # configuration value feeds.
+            with _mutation_locks(
+                config, args.wait_lock, release_config_after_check=True
+            ):
                 (
                     outcome,
                     final_record,
@@ -51797,17 +51963,34 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
             facts, states=tuple(states), archives=tuple(archives)
         )
 
+    # A heartbeat never holds the configuration locks while it queues
+    # for the ACTIVE registry write lock (#2000): the configuration is
+    # still re-read and compared under its locks, the registry identity
+    # (which covers the configuration bytes) is still compared under
+    # the ACTIVE locks, and the commit writes only its own record's
+    # heartbeat time, which no configuration value feeds.
     try:
         try:
             updated, warnings = _run_prevalidated_mutation(
-                config, wait_seconds, "heartbeat", prepare, commit, tolerate=tolerate
+                config,
+                wait_seconds,
+                "heartbeat",
+                prepare,
+                commit,
+                tolerate=tolerate,
+                release_config_after_check=True,
             )
         except _RegistryBusy:
             # Every lock-free round was overtaken by writers the classifier
             # could not tolerate: fall back to the old behaviour — wait for
             # the lock and validate there — instead of refusing a heartbeat
-            # as busy (#1808-A review).
-            with _mutation_locks(config, wait_seconds):
+            # as busy (#1808-A review). The fallback body also runs
+            # without the configuration locks while it queues (#2000):
+            # it validates from the in-memory configuration and writes
+            # only the heartbeat time under the ACTIVE locks.
+            with _mutation_locks(
+                config, wait_seconds, release_config_after_check=True
+            ):
                 updated, warnings = locked_body_captured()
     finally:
         for stdout_text, stderr_text in captured_notes:
