@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-documents-toolbar-star-downloaded: star and downloaded filters beside the hamburger on Documents'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 labels:
@@ -29,3 +29,11 @@ updated_at: 2026-11-20T16:54:00.000000000+00:00
 # Notes
 
 Owner screenshot (phone) showed the star at the left of the toolbar, away from the thumb-side hamburger. The downloaded filter was requested with the download icon in the same breath.
+
+## Resolution
+
+[watermelon-full-preview] Landed 132433df on github/main (gated tree ec5adcf1, replayed over 93cf0b15). The Downloaded/Starred pair stands left of the hamburger, both filters compose with the bucket chips, page tests and the documents toolbar/documents/download-jump/fresh-load browser walks pass, and the screenshot matrix (dark/light, phone 412, desktop 1280, each filter on) was reviewed.
+
+## Follow-up
+
+Phone card meta (pre-existing on 93cf0b15, not introduced here, verified with the same seeded list on untouched main): on a 412px phone the file-name part flex-shrinks to zero width, so the meta reads "· mentioned …" with a leading separator, and unfetched rows cut the mentions part mid-word ("·1 menti"). The DOM join is correct (`#1994`); the defect is the `.doc-meta` flex sizing — the file name should keep a floor or drop with its separator, and the tail should ellipsise cleanly. Filed here as a follow-up for the documents meta owner.
