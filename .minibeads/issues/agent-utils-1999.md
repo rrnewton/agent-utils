@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-documents-download-jump: pressing download on a Documents card jumps the list'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -8,7 +8,8 @@ labels:
 - documents
 - ui
 created_at: 2026-11-20T16:46:00-05:00
-updated_at: 2026-11-20T16:46:00-05:00
+updated_at: 2026-11-20T23:22:00-05:00
+closed_at: 2026-11-20T23:22:00-05:00
 ---
 
 # Description
@@ -32,3 +33,8 @@ updated_at: 2026-11-20T16:46:00-05:00
 # Notes
 
 Owner-priority, fast-track. Browser verification runs on the host with browser libraries; this lane hands the exact commands to the coordinator.
+
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as 7e341b3a (tip eb52c80c with #2002), deployed by coordb 2026-11-20. The moving writer was the success refresh: it restored the absolute scrollTop captured before its reads, undoing the redraw's relative anchor wherever a fetched title wrapped taller above the reader, and its follow-to-foot moved a bottom-parked tapped card. The tapped card now holds its own top across the busy, error and success redraws (captureCardPlace/restoreCardPlace), a refresh whose redraw already anchored no longer restores the stale absolute offset, and a successful retry replaces the "Could not fetch" status with "Fetched <file>.". Proof: per-frame browser traces at 412x915, 393x852 and 1280x800 (error, retry-to-success, first-try success, bottom-parked; worst move 0.0px, locally and on the coordinator's host), fake-DOM geometry tests that fail on the old code (tapped card moved 60px; stale toast reproduced), documents JS suite, typecheck and scripts checks green; gate on the rebased tree (209 steps) red only on five waived main/load failures.
