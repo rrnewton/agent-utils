@@ -1,12 +1,13 @@
 ---
 title: 'wrkslots-remove-holds-state-lock-through-salvage: a long remove holds the registry lock through its slow phases'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-11-16T15:45:41-05:00
-updated_at: 2026-11-16T15:45:41-05:00
+updated_at: 2026-11-21T03:52:24-05:00
+closed_at: 2026-11-21T03:52:24-05:00
 ---
 
 # Description
@@ -34,3 +35,7 @@ Related: #1213 wrkslots-state-lock-deletion (remaining shapes: fence repair, pri
 Addition (2026-11-16, from the owner-ordered cleanup): with `--no-lock-budget`, the finish runs the lsof and /proc use checks inside the journal (`_finish_remove_paths` > `_assert_slot_unused` > `_read_process_mountinfo`), so each finish is long and serializes the host. As part of this issue: move the use checks BEFORE the journal is written, and inside it re-check only something cheap (fence identity, owner liveness), keeping the proof sound.
 
 Review additions (2026-11-16): grouped batch members must keep deferred deletion on the locked path too; `recover` must refuse a finish journal whose recorded remover is still alive (it currently stamps its own pid over the journal and would delete concurrently); a deletion refusal in a batch item rolls the fence back instead of leaving a journal that poisons later items; the private completion keeps the process and hold re-checks of the deferred completion. The Rust edition's `remove` already defers its deletion; its non-deferred `finish` still deletes under `acquire_mutation_locks` and is explicitly out of scope here (narrowed acceptance; a follow-up can mirror the defer). Noted, not fixed here: `reap-stray-worktrees --apply` takes no lock and treats checkouts under a fenced path as stray (pre-existing); file a follow-up if it is not fixed with this issue.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as fc848a75 (replayed from gated 0b80709e; combined tree 6414f1ea/dcf71a49 was verified with json.tool, strict mypy, the component-manifest self-test, the 7 fenced tests, and the lifecycle fence/finish_journal/deferred subset). The private and scoped validation finishes and grouped batch members now delete their fenced trees outside the registry lock (revalidate under the lock, delete unlocked, record completion under the lock), the shape plain removes already used. The window is held shut by a per-journal deletion flock (a transient `DELETION-LOCK.<journal name>.lock` file beside the journal, unlinked under the lock when the deletion completes; no journal, seal or registry field changes): recover refuses a finish whose recorded remover is alive unless the flock proves that remover has stopped, and holds the flock for its whole resume. Three cold reviews ended SAFE. Remaining follow-ups from the reviews: the narrowed Rust non-deferred `finish` under `acquire_mutation_locks` (explicitly left here), the review items filed as #1956/#1766 notes, and the pre-existing `reap-stray-worktrees --apply` lock gap noted above.
