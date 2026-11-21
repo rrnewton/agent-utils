@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-one-page-complete-rows: complete thread rows from one page fetch'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -9,7 +9,8 @@ labels:
 - ui
 - performance
 created_at: 2026-11-20T11:00:00-05:00
-updated_at: 2026-11-20T16:40:00-05:00
+updated_at: 2026-11-21T05:10:00-05:00
+closed_at: 2026-11-21T05:10:00-05:00
 ---
 
 # Description
@@ -51,3 +52,7 @@ Requests until the unread chip shows correctly (after): 2 timeline fetches in th
 Plainly: slice 1 does NOT yet deliver "complete rows from one page fetch" for the Main unread chip. One page fetch (answer 1) gives slug + count on the badge; the server-correct unread still waits for the summaries page to land behind the row, exactly as the count it replaces did — it is correct when it arrives, and exact, but it is a second fetch. Slice 2 must close that last step: carry the per-thread unread (and the other summary facts the row stands on) on the messages page itself — on the root's record or as `page.threads` summaries on Main/flat — so the chip is right from the first answer in every view that draws it, and delete the client's `readAllForCounts` approximation once it is.
 
 The gate for this stack ran from the lane's nested worktree on the pre-scrub tip (a test fix plus this file) with a recorded local-preflight waiver (Chromium could not launch on the gate host, libnspr4.so missing; browser evidence on the browser test host). Its one-page-complete step was green; it was red only in the load-sensitive census family, two foreign-ownership pidfd tests, the Discuss steps (red on main) and a screenshot step (green solo on main) — coordb's waiver for landing. The gate for 055d548a itself was refused preflight (no local pass on that host) and is superseded by that stack gate, which covers the same tree plus this test fix.
+
+## Resolution
+
+[watermelon-full-preview] Landed and deployed. Slice 1 (055d548a): the additive ThreadSummary facts, thread_pins_revision and ChannelSummary, counted at serve time in O(page); the page prefers them over counting held messages. Slice 2 (01306303, verified on main by coordb, tree e5ecd578; deployed 2026-11-21): the same facts on the root's own record on the messages page itself, so the Main row is complete from the first timeline answer (before: 2 fetches for a server-correct unread; after: 1), and the client's readAllForCounts approximation is deleted with its dedicated tests. Watch: coordb's 15-minute post-deploy watch. Audit: ai_docs/reports/research/2026-11-20-vibe-talk-one-page-complete-rows.md.
