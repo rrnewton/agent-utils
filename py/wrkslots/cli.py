@@ -63944,6 +63944,26 @@ def _expand_finish_sidecars(config: Config, journal: Mapping[str, object]) -> No
                 )
 
 
+def _finish_journals_equal(
+    config: Config, left: Mapping[str, object], right: Mapping[str, object]
+) -> bool:
+    """Whether two finish journals are the same journal (#2041).
+
+    The payload builder stamps #1757 sidecar keys into the in-memory
+    journal, while a journal read back from disk has them expanded
+    away; both forms are the same journal. Expand copies of both
+    sides, then apply the ordinary whole-JSON comparison, so any
+    other difference still refuses.
+    """
+
+    def expanded(journal: Mapping[str, object]) -> dict[str, object]:
+        clone: dict[str, object] = json.loads(json.dumps(dict(journal)))
+        _expand_finish_sidecars(config, clone)
+        return clone
+
+    return _json_equal(expanded(left), expanded(right))
+
+
 def _shrink_finish_journal(
     config: Config, payload: Mapping[str, object]
 ) -> dict[str, object]:
@@ -68017,7 +68037,9 @@ def _load_prepared_private_finish(
     """Reload one deferred finish without accepting journal substitution."""
 
     path, journal = _load_journal(config, selected_path=prepared.journal_path)
-    if path != prepared.journal_path or not _json_equal(journal, prepared.journal):
+    if path != prepared.journal_path or not _finish_journals_equal(
+        config, journal, prepared.journal
+    ):
         raise Refusal(
             f"private finish journal changed during its out-of-lock census: {path}"
         )
@@ -68182,7 +68204,9 @@ def _complete_prepared_private_finish(
     """
 
     path, journal = _load_journal(config, selected_path=prepared.journal_path)
-    if path != prepared.journal_path or not _json_equal(journal, deleted_journal):
+    if path != prepared.journal_path or not _finish_journals_equal(
+        config, journal, deleted_journal
+    ):
         raise Refusal(
             f"private finish journal changed during its out-of-lock deletion: {path}"
         )
@@ -68224,7 +68248,9 @@ def _delete_prepared_deferred_finish(
     """
 
     path, journal = _load_journal(config, selected_path=prepared.journal_path)
-    if path != prepared.journal_path or not _json_equal(journal, prepared.journal):
+    if path != prepared.journal_path or not _finish_journals_equal(
+        config, journal, prepared.journal
+    ):
         raise Refusal(
             f"deferred finish journal changed before its out-of-lock deletion: {path}"
         )
@@ -68258,7 +68284,9 @@ def _complete_deferred_finish(
     """
 
     path, journal = _load_journal(config, selected_path=prepared.journal_path)
-    if path != prepared.journal_path or not _json_equal(journal, deleted_journal):
+    if path != prepared.journal_path or not _finish_journals_equal(
+        config, journal, deleted_journal
+    ):
         raise Refusal(
             f"deferred finish journal changed during its out-of-lock deletion: {path}"
         )

@@ -24,6 +24,7 @@ import pytest
 from wrkslots import cli as wrkslots
 from wrkslots.tests.test_lifecycle import (
     active_slots,
+    checkout,
     command,
     control_directory,
     create,
@@ -200,6 +201,178 @@ def test_coordinator_remover_blocked_mid_deletion_refuses_child_recover(
     assert results == [0]
     lock_file = control_directory(project) / "DELETION-LOCK.ACTIVE.testhost.journal.lock"
     assert not lock_file.exists(), "deletion-lock file was not cleaned up"
+
+
+def _add_containing_remote_branches(target: Path, remote: Path) -> None:
+    """Give the checkout 100 remote branches containing its HEAD (#2041).
+
+    That pushes its `containing_remote_refs` inventory past the 64-ref
+    inline limit, so the finish journal payload sidecars it (#1757).
+    """
+
+    import subprocess
+
+    def run(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            list(args), cwd=cwd, check=False, capture_output=True, text=True, timeout=120
+        )
+
+    head = run(target, "git", "rev-parse", "HEAD").stdout.strip()
+    assert head
+    for index in range(100):
+        made = run(remote, "git", "update-ref", f"refs/heads/probe-{index}", head)
+        assert made.returncode == 0, made.stderr
+    fetched = run(target, "git", "fetch", "-q", "origin")
+    assert fetched.returncode == 0, fetched.stderr
+
+
+def test_deferred_remove_with_sidecarred_refs_completes(tmp_path: Path) -> None:
+    """A deferred remove survives its own sidecarred journal (#2041).
+
+    With more than 64 containing remote refs, the finish journal
+    payload carries sidecar keys in memory while the loaded journal is
+    read back expanded; the identity compare must still recognise the
+    same journal. On the old code the removal refuses "deferred finish
+    journal changed before its out-of-lock deletion" with no other
+    writer involved.
+    """
+
+    project, _repository, remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    assert finish(project).returncode == 0
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    _add_containing_remote_branches(checkout(project), remote)
+    assert _remove_agent_in_process(project) == 0
+    assert active_slots(project) == []
+
+
+def test_private_finish_compare_accepts_sidecarred_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The private finish reload accepts its own sidecarred journal (#2041).
+
+    Same asymmetry, at the private compare site: the payload builder
+    stamps sidecar keys into the in-memory journal, the loaded journal
+    comes back expanded, and the reload must still recognise it.
+    """
+
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    config = wrkslots._load_config(str(project), "testhost")
+    record = wrkslots._load_active(config).slots[0]
+    refs = [f"refs/remotes/origin/probe-{index}" for index in range(100)]
+    payload = wrkslots._finish_journal_payload(
+        config,
+        record,
+        finished_at="2026-11-21T00:00:00-05:00",
+        removed=(),
+        phase="prepared",
+        finish=wrkslots._FinishContext(
+            mode="remove",
+            actor="coordinator",
+            salvage=(
+                {
+                    "checkout": record.checkouts[0].name,
+                    "containing_remote_refs": refs,
+                },
+            ),
+        ),
+    )
+    path = wrkslots._journal_path(config)
+    wrkslots._write_journal(config, payload, journal_path=path)
+    prepared = wrkslots._PreparedPrivateFinish(record, payload, path)
+    monkeypatch.setattr(
+        wrkslots,
+        "_assert_validate_batch_seal_recovery_kind",
+        lambda _config, _kind: (record,),
+    )
+    loaded = wrkslots._load_prepared_private_finish(config, prepared)
+    assert loaded["slot"] == record.slot
+
+
+def test_private_finish_compare_refuses_a_substituted_journal(
+    tmp_path: Path,
+) -> None:
+    """A different journal at the same path still refuses (#2041).
+
+    The canonical compare must not become a rubber stamp: a journal
+    whose phase was substituted after the prepare is another journal,
+    sidecars or not.
+    """
+
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    config = wrkslots._load_config(str(project), "testhost")
+    record = wrkslots._load_active(config).slots[0]
+    refs = [f"refs/remotes/origin/probe-{index}" for index in range(100)]
+    payload = wrkslots._finish_journal_payload(
+        config,
+        record,
+        finished_at="2026-11-21T00:00:00-05:00",
+        removed=(),
+        phase="prepared",
+        finish=wrkslots._FinishContext(
+            mode="remove",
+            actor="coordinator",
+            salvage=(
+                {
+                    "checkout": record.checkouts[0].name,
+                    "containing_remote_refs": refs,
+                },
+            ),
+        ),
+    )
+    path = wrkslots._journal_path(config)
+    wrkslots._write_journal(config, payload, journal_path=path)
+    substituted = dict(payload)
+    substituted["phase"] = "fenced"
+    prepared = wrkslots._PreparedPrivateFinish(record, substituted, path)
+    with pytest.raises(wrkslots.Refusal, match="private finish journal changed"):
+        wrkslots._load_prepared_private_finish(config, prepared)
+
+
+def test_private_finish_compare_fails_closed_without_sidecar(
+    tmp_path: Path,
+) -> None:
+    """A missing sidecar at compare time refuses, never equals (#2041).
+
+    The canonical compare expands both sides; if the sidecar file a
+    journal points at is gone, expansion refuses and the reload must
+    not treat the journals as the same.
+    """
+
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    config = wrkslots._load_config(str(project), "testhost")
+    record = wrkslots._load_active(config).slots[0]
+    refs = [f"refs/remotes/origin/probe-{index}" for index in range(100)]
+    payload = wrkslots._finish_journal_payload(
+        config,
+        record,
+        finished_at="2026-11-21T00:00:00-05:00",
+        removed=(),
+        phase="prepared",
+        finish=wrkslots._FinishContext(
+            mode="remove",
+            actor="coordinator",
+            salvage=(
+                {
+                    "checkout": record.checkouts[0].name,
+                    "containing_remote_refs": refs,
+                },
+            ),
+        ),
+    )
+    path = wrkslots._journal_path(config)
+    wrkslots._write_journal(config, payload, journal_path=path)
+    sidecars = list((config.control / "containing-refs").glob("*.json"))
+    assert sidecars, "the payload never sidecarred its inventory"
+    for sidecar in sidecars:
+        sidecar.unlink()
+    prepared = wrkslots._PreparedPrivateFinish(record, payload, path)
+    with pytest.raises((wrkslots.Refusal, wrkslots.StateError)):
+        wrkslots._load_prepared_private_finish(config, prepared)
 
 
 def test_coordinator_remover_paused_before_completion_refuses_child_recover(
