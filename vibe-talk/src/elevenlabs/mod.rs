@@ -59,6 +59,19 @@ pub enum SignedUrlError {
     Shape(String),
 }
 
+/// Truncate to at most `max` bytes at a character boundary. Vendor text is
+/// arbitrary UTF-8: a bare `truncate(500)` panics when that byte falls inside
+/// a multi-byte character (#2055 vibe-talk-server-panic-char-boundary).
+fn truncate_at_boundary(text: &mut String, max: usize) {
+    if text.len() > max {
+        let mut end = max;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+}
+
 impl SignedUrlError {
     /// Build a [`SignedUrlError::Status`] from a vendor response body.
     ///
@@ -68,7 +81,7 @@ impl SignedUrlError {
     #[must_use]
     pub fn from_response(status: u16, body: &str, api_key: &Secret) -> Self {
         let mut body = redact(body, api_key);
-        body.truncate(500);
+        truncate_at_boundary(&mut body, 500);
         Self::Status { status, body }
     }
 
@@ -217,7 +230,7 @@ impl SpeechError {
     #[must_use]
     pub fn from_response(status: u16, body: &str, api_key: &Secret) -> Self {
         let mut body = redact(body, api_key);
-        body.truncate(500);
+        truncate_at_boundary(&mut body, 500);
         Self::Status { status, body }
     }
 }
@@ -469,7 +482,7 @@ impl ChatError {
     #[must_use]
     pub fn from_response(status: u16, body: &str, secrets: &[Secret]) -> Self {
         let mut body = redact_all(body, secrets);
-        body.truncate(500);
+        truncate_at_boundary(&mut body, 500);
         Self::Refused(format!("HTTP {status}: {body}"))
     }
 
@@ -480,7 +493,7 @@ impl ChatError {
     #[must_use]
     pub fn from_close(code: u16, reason: &str, secrets: &[Secret]) -> Self {
         let mut reason = redact_all(reason, secrets);
-        reason.truncate(500);
+        truncate_at_boundary(&mut reason, 500);
         if reason.trim().is_empty() {
             reason = "(the vendor gave no reason)".to_owned();
         }
@@ -594,6 +607,31 @@ mod tests {
             error.to_string().contains("elevenlabs.api_key"),
             "the operator must be told WHICH setting is missing: {error}"
         );
+    }
+
+    #[test]
+    fn truncating_vendor_text_never_panics_on_a_multibyte_boundary() {
+        // #2055: byte 500 inside a 3-byte '…' panicked a bare truncate(500).
+        let mut body = "x".repeat(499) + &"…".repeat(200);
+        truncate_at_boundary(&mut body, 500);
+        assert_eq!(body.len(), 499);
+        assert!(body.is_char_boundary(body.len()));
+        // Random UTF-8, multi-byte starts included: never panics, always a
+        // valid prefix of at most 500 bytes.
+        const POOL: [char; 8] = ['…', 'é', '世', '🦋', 'a', 'e', '\u{301}', ' '];
+        let mut state: u64 = 0x2055_11bb_8765_4321;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as usize
+        };
+        for _ in 0..500 {
+            let original: String = (0..600).map(|_| POOL[next() % POOL.len()]).collect();
+            let mut cut = original.clone();
+            truncate_at_boundary(&mut cut, 500);
+            assert!(cut.len() <= 500 && original.starts_with(&cut));
+        }
     }
 
     #[test]

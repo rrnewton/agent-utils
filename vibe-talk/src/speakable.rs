@@ -966,7 +966,11 @@ const INTERNAL_KINDS: [InternalKind; 3] = [
 /// An id token as an internal path writes one — a kind's letter and its digits, `P123` —
 /// as `(kind, digits)`, or `None` where the segment is not one.
 fn internal_id(segment: &str) -> Option<(&'static str, &str)> {
-    let (letter, digits) = segment.split_at(1.min(segment.len()));
+    // The first CHARACTER, not the first byte: a segment starting with a
+    // multi-byte character (a pasted, truncated link's '…') is not an id, and
+    // slicing at byte 1 panicked on it (#2055 vibe-talk-server-panic-char-boundary).
+    let first = segment.chars().next()?;
+    let (letter, digits) = segment.split_at(first.len_utf8());
     let row = INTERNAL_KINDS
         .iter()
         .find(|row| letter.starts_with(row.prefix))?;
@@ -2344,6 +2348,48 @@ mod tests {
         // saying a bare instant.
         let said = for_speech("at 2026-08-05T03:00:00Z", NOW, &eastern());
         assert!(said.contains("August 4th"), "{said}");
+    }
+
+    #[test]
+    fn an_internal_link_segment_starting_with_a_multibyte_char_does_not_panic() {
+        // #2055 vibe-talk-server-panic-char-boundary: a path segment that starts
+        // with the 3-byte '…' (a pasted, truncated link) reached split_at(1).
+        let hosts = vec!["internal.example".to_owned()];
+        assert_eq!(
+            say_address("https://internal.example/…/P123", &hosts),
+            "an internal link"
+        );
+        assert_eq!(internal_id("…"), None);
+        assert_eq!(internal_id("…123"), None);
+        assert_eq!(internal_id("P123"), Some(("paste", "123")));
+        assert_eq!(internal_id(""), None);
+    }
+
+    #[test]
+    fn random_utf8_segments_never_panic_internal_id_or_say_address() {
+        // Property-style (#2055): any UTF-8 segment, multi-byte starts
+        // included, is classified or refused — never a panic, and a hit's
+        // digits are always ASCII digits.
+        const POOL: [char; 16] = [
+            '…', 'é', 'e', '\u{301}', '世', '界', '🦋', 'P', 'D', 'T', '1', '2', '/', ' ', 'ß', 'x',
+        ];
+        let hosts = vec!["internal.example".to_owned()];
+        let mut state: u64 = 0x2055_00aa_1234_5678;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as usize
+        };
+        for _ in 0..2_000 {
+            let len = next() % 12;
+            let segment: String = (0..len).map(|_| POOL[next() % POOL.len()]).collect();
+            if let Some((_kind, digits)) = internal_id(&segment) {
+                assert!(!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()));
+            }
+            let said = say_address(&format!("https://internal.example/{segment}"), &hosts);
+            assert!(!said.is_empty());
+        }
     }
 
     #[test]
