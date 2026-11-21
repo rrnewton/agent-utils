@@ -167,6 +167,16 @@ def walk(page: Page, base: str, grow: object, label: str) -> None:
         f"() => document.querySelectorAll('#documents-list .doc-card').length === {len(STARRED)}",
         timeout=20_000)
     total = DOCS + EXTRA
+    # `#2023`: the restored list draws at once over the pre-growth total;
+    # the Back refresh that re-reads the grown set lands later under load.
+    # Wait for the head to show the grown total before reading it.
+    page.wait_for_function(
+        """(want) => {
+          const head = document.querySelector('#documents-list .doc-list-head');
+          return !!head && head.textContent === want;
+        }""",
+        arg=f"Oldest first · {len(STARRED)} of {total} documents · newest at the bottom",
+        timeout=20_000)
     after = list_facts(page)
     check(after["head"] == f"Oldest first · {len(STARRED)} of {total} documents · newest at the bottom",
           f"{label}: Back read {after['head']!r}, not the restored starred list over {total}")
