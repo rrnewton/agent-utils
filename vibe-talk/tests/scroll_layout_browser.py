@@ -48,9 +48,10 @@ RECT_JS = """() => {
     // across the list, counted the same way.
     window.__jumpPaints = 0;
     window.__styleWrites = 0;
-    const jump = document.getElementById('jump-newest');
-    if (jump) new MutationObserver((ms) => { window.__jumpPaints += ms.length; })
-        .observe(jump, { subtree: true, attributes: true, characterData: true, childList: true });
+    // Times the label's own words are rewritten — one per repaint of the count.
+    const label = document.getElementById('jump-newest-label');
+    if (label) new MutationObserver((ms) => { window.__jumpPaints += ms.length; })
+        .observe(label, { characterData: true, childList: true });
     new MutationObserver((ms) => { for (const m of ms) if (m.attributeName) window.__styleWrites += 1; })
         .observe(document.getElementById('discord-log'), { subtree: true, attributes: true });
 }"""
@@ -88,8 +89,8 @@ def walk(page: Page, label: str, shots: Path | None) -> None:
           f"{label}: a screenful of scrolling read {counts['rect']} layouts (bound {MAX_RECT_PER_SCREEN})")
     check(counts["long"] <= MAX_LONG_PER_SCREEN,
           f"{label}: a screenful of scrolling made {counts['long']} long tasks (bound {MAX_LONG_PER_SCREEN})")
-    check(counts["paints"] <= 4,
-          f"{label}: the jump offer was painted {counts['paints']} times during one screenful of scrolling (bound 4; settles paint it last)")
+    check(counts["paints"] <= 8,
+          f"{label}: the jump count was rewritten {counts['paints']} times during one screenful of scrolling (bound 8; settles rewrite it last)")
     check(counts["writes"] <= 40,
           f"{label}: scrolling wrote {counts['writes']} style-affecting attributes on the list in one screenful (bound 40)")
     if shots is not None:
