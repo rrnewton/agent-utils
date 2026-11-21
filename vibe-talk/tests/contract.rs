@@ -291,6 +291,7 @@ fn client_config(
         broadcast_supported: full,
         idempotent_posts_supported: full,
         speech_prep_enabled: full,
+        test_read_only: false,
         // `#2007 vibe-talk-speech-short-links`. A fake internal host in the full
         // sample, absent in the other, as from an unconfigured deployment.
         internal_link_hosts: if full {

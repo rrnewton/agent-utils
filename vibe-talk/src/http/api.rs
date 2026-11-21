@@ -181,7 +181,7 @@ impl From<OpError> for ApiError {
             | OpError::InvalidHours
             | OpError::HoursWithSpan
             | OpError::CursorMismatch => StatusCode::BAD_REQUEST,
-            OpError::ChannelNotWritable => StatusCode::FORBIDDEN,
+            OpError::ChannelNotWritable | OpError::TestReadCacheOnly => StatusCode::FORBIDDEN,
             OpError::KeyReused => StatusCode::CONFLICT,
             // A fallback only: the reply route handles this itself, because an `ApiError` body
             // carries a code and prose and this case has to carry the UNSENT TEXT. Reaching here
@@ -236,6 +236,17 @@ impl From<crate::cache::lifecycle::SwitchError> for ApiError {
         };
         Self::new(status, code, value.to_string())
     }
+}
+
+/// The test credential's speech refusal (`#2060` Part B, B1): distinct, so
+/// a test report can tell "refused by design" from a broken deployment.
+fn test_read_speech_refused() -> ApiError {
+    ApiError::new(
+        StatusCode::FORBIDDEN,
+        "test_read_speech_refused",
+        "the test credential cannot use server-side read-aloud; it would share the owner's \
+         conversation session",
+    )
 }
 
 fn require(headers: &HeaderMap, state: &AppState, scope: Scope) -> Result<Scope, ApiError> {
@@ -1133,6 +1144,7 @@ pub async fn client_config(
         broadcast_supported: state.chat.supports_broadcast(),
         idempotent_posts_supported: state.chat.supports_idempotent_posts(),
         speech_prep_enabled: state.config.speakable.enabled,
+        test_read_only: scope == crate::auth::Scope::TestRead,
         internal_link_hosts: state.config.speakable.internal_link_hosts.clone(),
         replay_enabled: crate::replay::offered(
             &state.config.replay,
@@ -2269,6 +2281,11 @@ pub async fn speak(
     Path((channel_id, message_id)): Path<(String, String)>,
     Query(query): Query<SpeakQuery>,
 ) -> Result<Response, ApiError> {
+    // `#2060` Part B (B1): as in `prepare_speech`, the test credential
+    // never reaches the server's speech providers.
+    if caller == crate::auth::Scope::TestRead {
+        return Err(test_read_speech_refused());
+    }
     // TIMED IN THREE PARTS, because "reading a message aloud is slow" has three candidate causes
     // and they are fixed by completely different work. Looking up the message is a round trip to
     // DISCORD — this route asks for a whole window and finds one message in it. Generating the
@@ -8090,6 +8107,12 @@ pub async fn prepare_speech(
     Path(channel_id): Path<String>,
     Json(request): Json<PrepareSpeechRequest>,
 ) -> Result<Json<PrepareSpeechResponse>, ApiError> {
+    // `#2060 vibe-talk-realistic-testing` Part B (B1): server-side
+    // read-aloud shares the owner's conversation session, so the test
+    // credential is refused here, distinctly, before any warm-up.
+    if caller == crate::auth::Scope::TestRead {
+        return Err(test_read_speech_refused());
+    }
     let preparation_began = std::time::Instant::now();
     if state.speech.describe().playback == crate::speech::Playback::Browser {
         return Err(SpeechError::BrowserPlaybackRequired.into());
@@ -10071,10 +10094,14 @@ async fn discuss_summary_text(
 /// `unknown_discuss_summary`, never `unknown_document`.
 pub async fn prepare_document_speech(
     State(state): State<AppState>,
-    _scope: ReadScope,
+    ReadScope(caller): ReadScope,
     Path(key): Path<String>,
     Json(request): Json<PrepareDocumentSpeechRequest>,
 ) -> Result<Json<PrepareSpeechResponse>, ApiError> {
+    // `#2060` Part B (B1): document speech is server-side speech too.
+    if caller == crate::auth::Scope::TestRead {
+        return Err(test_read_speech_refused());
+    }
     let preparation_began = std::time::Instant::now();
     if state.speech.describe().playback == crate::speech::Playback::Browser {
         return Err(SpeechError::BrowserPlaybackRequired.into());

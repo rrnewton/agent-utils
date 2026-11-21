@@ -903,6 +903,14 @@ export interface ClientConfigResponse {
    */
   summarizer_warning?: string | null;
   /**
+   * The caller holds the read-only test credential (`#2060
+   * vibe-talk-realistic-testing` Part B): the server refuses its
+   * writes, its server-side speech, and any read the cache cannot
+   * answer, so a page can say so instead of discovering it per
+   * request. Sent only when true: absent means an ordinary caller.
+   */
+  test_read_only?: boolean;
+  /**
    * Whether this server names threads and sums them up. `#528 thread-card-markdown-and-cap`.
    *
    * The page reads it as "a summary is coming": a thread whose first message is too long for

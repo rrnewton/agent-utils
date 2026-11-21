@@ -31,6 +31,9 @@ pub const ENV_WRITE_TOKEN: &str = "VIBE_TALK_WRITE_TOKEN";
 pub const ENV_INGEST_TOKEN: &str = "VIBE_TALK_INGEST_TOKEN";
 /// Environment variable carrying the voice-only token. `#553 voice-ws-relay-auth`.
 pub const ENV_VOICE_TOKEN: &str = "VIBE_TALK_VOICE_TOKEN";
+/// Environment variable carrying the read-only test credential. `#2060
+/// vibe-talk-realistic-testing` Part B.
+pub const ENV_TEST_TOKEN: &str = "VIBE_TALK_TEST_TOKEN";
 /// Environment variable selecting read-aloud: `elevenlabs` (default), `browser`, or `conversation`.
 pub const ENV_READ_ALOUD_BACKEND: &str = "VIBE_TALK_READ_ALOUD_BACKEND";
 /// Environment variable naming the file the Wit.ai app token is read from.
@@ -1629,6 +1632,24 @@ impl ProviderConfig {
     }
 }
 
+/// The read-only test credential (`#2060 vibe-talk-realistic-testing` Part B).
+///
+/// Issued for live-server testing only. The server refuses every mutating
+/// route, server-side speech, and any read that would call the chat
+/// provider for this credential (see [`crate::auth::Scope::TestRead`]).
+/// Stored as a plain secret because the auth layer has no hashed-storage
+/// support; revocation is deleting it from the configuration, or the
+/// kill file below, which is checked on every request and needs no
+/// restart.
+#[derive(Debug)]
+pub struct TestCredential {
+    /// The token itself.
+    pub token: Secret,
+    /// Kill switch: while this file exists, the credential is refused.
+    /// Absolute path, or `None` for no switch.
+    pub kill_file: Option<std::path::PathBuf>,
+}
+
 /// API credentials this server requires of its callers.
 #[derive(Debug)]
 pub struct AuthConfig {
@@ -1640,6 +1661,8 @@ pub struct AuthConfig {
     /// voice-ws-relay-auth`. Handed to another server that reads messages aloud through this
     /// one's bridge, so it opens no `/api/` route and no `/mcp`. `None`: nothing holds it.
     pub voice_token: Option<Secret>,
+    /// Read-only test credential, or `None` when none is issued.
+    pub test_token: Option<TestCredential>,
 }
 
 /// Authentication for provider-neutral live-event and change-hint ingestion.
@@ -2183,6 +2206,8 @@ struct FileAuth {
     read_token: Option<Secret>,
     write_token: Option<Secret>,
     voice_token: Option<Secret>,
+    test_token: Option<Secret>,
+    test_token_kill_file: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2502,6 +2527,34 @@ impl Config {
                 });
             }
         }
+        let test_token = get(ENV_TEST_TOKEN)
+            .map(Secret::new)
+            .or(file.auth.test_token)
+            .map(|token| -> Result<TestCredential, ConfigError> {
+                check_token_strength("auth.test_token", &token)?;
+                if token == read_token || token == write_token {
+                    return Err(ConfigError::Invalid {
+                        field: "auth.test_token".to_owned(),
+                        detail: "must differ from both API tokens, or the test scope grants \
+                                 reading as the owner or posting"
+                            .to_owned(),
+                    });
+                }
+                let kill_file = match file.auth.test_token_kill_file.as_deref() {
+                    Some(raw) if std::path::Path::new(raw).is_absolute() => {
+                        Some(std::path::PathBuf::from(raw))
+                    }
+                    Some(_) => {
+                        return Err(ConfigError::Invalid {
+                            field: "auth.test_token_kill_file".to_owned(),
+                            detail: "must be an absolute path".to_owned(),
+                        });
+                    }
+                    None => None,
+                };
+                Ok(TestCredential { token, kill_file })
+            })
+            .transpose()?;
         let ingest_token = get(ENV_INGEST_TOKEN).map(Secret::new).or(file.ingest.token);
         if let Some(token) = ingest_token.as_ref() {
             check_token_strength("ingest.token", token)?;
@@ -2738,6 +2791,7 @@ impl Config {
                 read_token,
                 write_token,
                 voice_token,
+                test_token,
             },
             ingest: IngestConfig {
                 token: ingest_token,

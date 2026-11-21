@@ -111,7 +111,9 @@ impl FillGrant {
     #[must_use]
     pub fn for_caller(scope: Scope) -> Option<Self> {
         match scope {
-            Scope::Read => None,
+            // The test credential's reads write nothing durable either
+            // (`#2060` Part B): no fill grant, as for a read caller.
+            Scope::Read | Scope::TestRead => None,
             Scope::Write => Some(Self {
                 authority: Authority::Caller,
             }),

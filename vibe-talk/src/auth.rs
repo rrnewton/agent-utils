@@ -18,6 +18,11 @@ use crate::config::AuthConfig;
 pub enum Scope {
     /// Read channel history and summaries.
     Read,
+    /// Read-only live testing (`#2060 vibe-talk-realistic-testing` Part B):
+    /// satisfies a read requirement, never a write one, and is told apart
+    /// by the routes that must refuse it distinctly (server-side speech,
+    /// reads that would call the chat provider, and MCP).
+    TestRead,
     /// Read, and post messages to a writable channel.
     Write,
 }
@@ -60,6 +65,14 @@ pub fn scope_of(header: Option<&str>, config: &AuthConfig) -> Option<Scope> {
     }
     if config.read_token.matches(token) {
         return Some(Scope::Read);
+    }
+    // The test credential, unless its kill file exists: checked on every
+    // request, so creating the file disables it without a restart.
+    if let Some(test) = config.test_token.as_ref() {
+        let killed = test.kill_file.as_deref().is_some_and(|path| path.exists());
+        if !killed && test.token.matches(token) {
+            return Some(Scope::TestRead);
+        }
     }
     None
 }
@@ -105,6 +118,7 @@ mod tests {
             read_token: Secret::new("read-token-that-is-long-enough"),
             write_token: Secret::new("write-token-that-is-long-enough"),
             voice_token: None,
+            test_token: None,
         }
     }
 
@@ -189,6 +203,31 @@ mod tests {
                 Scope::Write
             ),
             Ok(Scope::Write)
+        );
+    }
+
+    #[test]
+    fn the_test_token_reads_but_never_writes() {
+        let mut config = config();
+        config.test_token = Some(crate::config::TestCredential {
+            token: Secret::new("test-token-that-is-long-enough"),
+            kill_file: None,
+        });
+        assert_eq!(
+            authorize(
+                Some("Bearer test-token-that-is-long-enough"),
+                &config,
+                Scope::Read
+            ),
+            Ok(Scope::TestRead)
+        );
+        assert_eq!(
+            authorize(
+                Some("Bearer test-token-that-is-long-enough"),
+                &config,
+                Scope::Write
+            ),
+            Err(AuthError::Forbidden)
         );
     }
 

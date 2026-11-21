@@ -153,8 +153,15 @@ class StubHandler(http.server.BaseHTTPRequestHandler):
 
 def write_config(path: Path, *, port: int, stub_port: int, work: Path,
                  channel: str, internal_hosts: list[str],
-                 read_token: str, write_token: str) -> None:
+                 read_token: str, write_token: str,
+                 test_token: str | None = None) -> None:
     hosts = ", ".join(f'"{h}"' for h in internal_hosts)
+    test_lines = ""
+    if test_token:
+        test_lines = (
+            f'\ntest_token = "{test_token}"'
+            f'\ntest_token_kill_file = "{work}/test-kill"'
+        )
     text = f"""\
 [server]
 bind = "127.0.0.1:{port}"
@@ -171,7 +178,7 @@ live_poll_seconds = 0
 
 [auth]
 read_token = "{read_token}"
-write_token = "{write_token}"
+write_token = "{write_token}"{test_lines}
 
 [[channels]]
 id = "{channel}"
@@ -274,6 +281,9 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=0, help="loopback port (0 = free)")
     parser.add_argument("--keep", action="store_true",
                         help="keep the copied cache on exit (debugging only)")
+    parser.add_argument("--test-token", action="store_true",
+                        help="also issue the fake read-only test credential "
+                             "(#2060 Part B) and print it")
     args = parser.parse_args()
 
     global ACCOUNT_ID, TEAM_ID
@@ -291,10 +301,14 @@ def main() -> int:
     proc: subprocess.Popen[bytes] | None = None
     try:
         copy_cache(source, work / "message-cache.sqlite3")
+        test_token = (
+            "local-clone-test-" + secrets.token_hex(12) if args.test_token else None
+        )
         write_config(work / "vibe-talk.toml", port=port, stub_port=stub_port,
                      work=work, channel=args.channel,
                      internal_hosts=args.internal_host,
-                     read_token=read_token, write_token=write_token)
+                     read_token=read_token, write_token=write_token,
+                     test_token=test_token)
         threading.Thread(target=stub.serve_forever, daemon=True).start()
         log = open(work / "server.log", "wb")
         proc = subprocess.Popen(
@@ -308,6 +322,8 @@ def main() -> int:
             return 1
         print(f"http://127.0.0.1:{port}/")
         print(f"read token (fake, local only): {read_token}", flush=True)
+        if test_token:
+            print(f"test token (fake, local only): {test_token}", flush=True)
         if args.probe:
             if not args.message_id:
                 print("local_clone: --probe needs --message-id", file=sys.stderr)

@@ -62,7 +62,7 @@ impl Credential {
     pub fn classify(header: Option<&str>, config: &AuthConfig) -> Self {
         match auth::scope_of(header, config) {
             Some(Scope::Write) => Self::Write,
-            Some(Scope::Read) => Self::Read,
+            Some(Scope::Read | Scope::TestRead) => Self::Read,
             None if auth::bearer_token(header).is_none() => Self::Absent,
             None => Self::Unrecognized,
         }
@@ -111,7 +111,7 @@ impl From<Scope> for Credential {
     /// recognized classes are reachable here.
     fn from(scope: Scope) -> Self {
         match scope {
-            Scope::Read => Self::Read,
+            Scope::Read | Scope::TestRead => Self::Read,
             Scope::Write => Self::Write,
         }
     }
@@ -435,6 +435,7 @@ mod tests {
             read_token: Secret::new("read-token-that-is-long-enough"),
             write_token: Secret::new("write-token-that-is-long-enough"),
             voice_token: None,
+            test_token: None,
         }
     }
 

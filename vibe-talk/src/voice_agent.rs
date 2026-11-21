@@ -476,6 +476,7 @@ pub fn profile(
         mcp_path: crate::mcp::transport::MCP_PATH,
         scope: match scope {
             Scope::Read => "read",
+            Scope::TestRead => "test-read",
             Scope::Write => "write",
         },
         tools,

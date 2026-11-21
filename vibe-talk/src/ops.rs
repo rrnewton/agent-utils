@@ -124,6 +124,15 @@ pub enum OpError {
     #[error("that idempotency_key already names another post; send a new message under a new key")]
     KeyReused,
 
+    /// The test credential asked for a read the cache cannot answer, and
+    /// answering it would call the chat provider. `#2060
+    /// vibe-talk-realistic-testing` Part B (B2): refused, never fetched.
+    #[error(
+        "this read is not held in the message cache, and the test credential is never \
+         answered from the chat provider"
+    )]
+    TestReadCacheOnly,
+
     /// The configured chat provider failed, or refused the request before it was sent.
     #[error(transparent)]
     Chat(#[from] ChatError),
@@ -151,6 +160,7 @@ impl OpError {
             Self::PartiallyPosted { .. } => "partially_posted",
             Self::NotReadInTime => "not_read_in_time",
             Self::KeyReused => "key_reused",
+            Self::TestReadCacheOnly => "test_read_cache_only",
             Self::Chat(error) if matches!(error.cause(), ChatError::Refused(_)) => "refused",
             Self::Chat(error) if matches!(error.cause(), ChatError::CursorExpired(_)) => {
                 "cursor_expired"
@@ -542,7 +552,13 @@ pub(crate) async fn messages_for(
 /// the caller's own grant, and a read-scope caller has none — its reads write nothing durable
 /// — so the read token keeps today's upstream path in this milestone, shadowed as ever.
 fn may_serve(state: &AppState, caller: crate::auth::Scope) -> bool {
-    caller == crate::auth::Scope::Write && state.message_cache.serve_enabled()
+    // `#2060 vibe-talk-realistic-testing` Part B: the test credential is
+    // answered from the cache exactly as a write caller is, and never
+    // from the provider (see the refusal in `timeline`).
+    matches!(
+        caller,
+        crate::auth::Scope::Write | crate::auth::Scope::TestRead
+    ) && state.message_cache.serve_enabled()
 }
 
 /// The messages a served snapshot answers with, oldest first and unstamped exactly as the
@@ -1598,7 +1614,9 @@ pub async fn timeline(
                             crate::timeline_served::encode(&channel.id, request.view, thread, &raw)
                         })
                         .transpose()?;
-                    if let Some(claim) = claim {
+                    // `#2060` Part B (B2): a test caller's served page is
+                    // never refreshed from the provider either.
+                    if let Some(claim) = claim.filter(|_| caller != crate::auth::Scope::TestRead) {
                         spawn_timeline_refresh(
                             state.clone(),
                             caller,
@@ -1660,6 +1678,12 @@ pub async fn timeline(
     if let Some(held) = live_fed_answer(state, caller, &channel.id, request).await {
         crate::cache_first::note(crate::cache_first::Source::LiveFed);
         return stood_in(state, channel, request, held).await;
+    }
+    // `#2060 vibe-talk-realistic-testing` Part B (B2): everything below
+    // this line can call the chat provider. A test caller is refused
+    // here, distinctly, rather than fetched for.
+    if caller == crate::auth::Scope::TestRead {
+        return Err(OpError::TestReadCacheOnly);
     }
     // A step back from a served page offers each provider page it reads as it reads it.
     let fill = served_below

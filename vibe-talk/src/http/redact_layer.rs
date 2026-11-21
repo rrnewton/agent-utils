@@ -43,7 +43,11 @@ pub async fn redact_for_read_scope(
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
-    let read_only = private && auth::scope_of(header, &state.config.auth) == Some(Scope::Read);
+    let read_only = private
+        && matches!(
+            auth::scope_of(header, &state.config.auth),
+            Some(Scope::Read | Scope::TestRead)
+        );
     let response = next.run(request).await;
     if !read_only {
         return response;

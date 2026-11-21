@@ -94,6 +94,21 @@ pub async fn post(State(state): State<AppState>, headers: HeaderMap, body: Bytes
     let Some(scope) = auth::scope_of(header, &state.config.auth) else {
         return unauthorized();
     };
+    // `#2060 vibe-talk-realistic-testing` Part B: the test credential has
+    // no MCP surface at all -- its read tools would call the provider,
+    // which B2 forbids, so the refusal is here rather than per tool.
+    if scope == auth::Scope::TestRead {
+        return encode(
+            &headers,
+            StatusCode::FORBIDDEN,
+            &RpcResponse {
+                jsonrpc: "2.0",
+                id: Value::Null,
+                result: None,
+                error: Some(RpcError::new(-32003, "the test credential cannot use MCP")),
+            },
+        );
+    }
 
     let Ok(value) = serde_json::from_slice::<Value>(&body) else {
         let response = RpcResponse {

@@ -208,6 +208,13 @@ pub struct ClientConfigResponse {
     /// the data would tell the operator the feature was off every time the channel was plain prose.
     /// They are flipping this switch to compare two runs; guessing is exactly what they cannot do.
     pub speech_prep_enabled: bool,
+    /// The caller holds the read-only test credential (`#2060
+    /// vibe-talk-realistic-testing` Part B): the server refuses its
+    /// writes, its server-side speech, and any read the cache cannot
+    /// answer, so a page can say so instead of discovering it per
+    /// request. Sent only when true: absent means an ordinary caller.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub test_read_only: bool,
     /// The deployment's internal link hosts (`[speakable] internal_link_hosts`,
     /// `#2007 vibe-talk-speech-short-links`), so a device voice on the page
     /// shortens the same links the server's speech pass does: a link on one is
@@ -1403,7 +1410,7 @@ pub enum TokenScope {
 impl From<crate::auth::Scope> for TokenScope {
     fn from(scope: crate::auth::Scope) -> Self {
         match scope {
-            crate::auth::Scope::Read => Self::Read,
+            crate::auth::Scope::Read | crate::auth::Scope::TestRead => Self::Read,
             crate::auth::Scope::Write => Self::Write,
         }
     }
