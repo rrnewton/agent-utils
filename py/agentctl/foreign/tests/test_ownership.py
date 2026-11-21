@@ -388,6 +388,85 @@ def test_stop_process_refuses_a_live_exact_match_under_einval(
     assert _running(child.pid, int(exact.started_at or "0"))
 
 
+def test_pin_enoent_on_a_live_process_is_unproven_never_dead(
+    child: subprocess.Popen[bytes], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """pidfd_open ENOENT (Linux 7.1 thread refusal, #2027) must fail closed."""
+    exact = _identity(child.pid)
+    real_open = os.pidfd_open
+
+    def refuse(pid: int) -> int:
+        if pid == child.pid:
+            raise OSError(2, "No such file or directory")
+        return real_open(pid)
+
+    monkeypatch.setattr(os, "pidfd_open", refuse)
+    result = ownership.pin(exact)
+    assert result.verdict == ownership.UNPROVEN and result.process is None
+    assert _running(child.pid, int(exact.started_at or "0"))
+
+
+def test_pin_enoent_with_a_malformed_stat_raises_unknown(
+    child: subprocess.Popen[bytes], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ENOENT must not swallow a procfs read error as death (#2027)."""
+    exact = _identity(child.pid)
+    real_open = os.pidfd_open
+
+    def refuse(pid: int) -> int:
+        if pid == child.pid:
+            raise OSError(2, "No such file or directory")
+        return real_open(pid)
+
+    monkeypatch.setattr(os, "pidfd_open", refuse)
+    monkeypatch.setattr(ownership, "_read_stat_bytes", lambda pid: b"not a stat record")
+    with pytest.raises(lib.AgentOperationError) as caught:
+        ownership.pin(exact)
+    assert caught.value.code == "runner_identity_unknown"
+    assert child.poll() is None
+
+
+def test_stop_process_refuses_a_live_exact_match_under_enoent(
+    child: subprocess.Popen[bytes], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """stop_process under ENOENT refuses and leaves the child untouched (#2027)."""
+    exact = _identity(child.pid)
+    real_open = os.pidfd_open
+
+    def refuse(pid: int) -> int:
+        if pid == child.pid:
+            raise OSError(2, "No such file or directory")
+        return real_open(pid)
+
+    monkeypatch.setattr(os, "pidfd_open", refuse)
+    with pytest.raises(lib.AgentOperationError) as caught:
+        ownership.stop_process(exact, grace=0)
+    assert caught.value.code == "runner_identity_unproven"
+    assert _running(child.pid, int(exact.started_at or "0"))
+
+
+def test_pin_enoent_with_no_such_task_in_procfs_is_gone(
+    descendants: _Descendants, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Forced ENOENT plus no task in procfs is the only ENOENT death proof (#2027)."""
+    proc = subprocess.Popen(SLEEP, start_new_session=True)
+    descendants.add(proc.pid)
+    identity = _identity(proc.pid)
+    proc.kill()
+    proc.wait(timeout=5)
+    assert ownership._quiet_stat(proc.pid) is None
+    real_open = os.pidfd_open
+
+    def refuse(pid: int) -> int:
+        if pid == proc.pid:
+            raise OSError(2, "No such file or directory")
+        return real_open(pid)
+
+    monkeypatch.setattr(os, "pidfd_open", refuse)
+    result = ownership.pin(identity)
+    assert result.verdict == ownership.GONE and result.process is None
+
+
 def test_a_reaped_session_leader_whose_session_lives_on_pins_gone(
     descendants: _Descendants,
 ) -> None:
@@ -436,7 +515,8 @@ def test_a_skipped_cgroup_member_is_reported_remaining_and_never_signalled(
 
 
 def test_pin_a_thread_id_is_never_the_recorded_leader(descendants: _Descendants) -> None:
-    """A live non-leader thread id EINVALs pidfd_open; pinning it proves nothing."""
+    """A live non-leader thread id is refused by pidfd_open (EINVAL on older
+    kernels, ENOENT on Linux 7.1); pinning it proves nothing on either."""
     script = (
         "import threading, time\n"
         "threading.Thread(target=lambda: (print(threading.get_native_id(), flush=True),"
@@ -451,7 +531,7 @@ def test_pin_a_thread_id_is_never_the_recorded_leader(descendants: _Descendants)
         assert tid != proc.pid
         leader = _identity(proc.pid)
         result = ownership.pin(ownership.ProcessIdentity(tid, leader.started_at, leader.boot_id))
-        assert result.verdict in (ownership.UNPROVEN, ownership.GONE) and result.process is None
+        assert result.verdict == ownership.UNPROVEN and result.process is None
         assert _running(proc.pid)
     finally:
         proc.kill()

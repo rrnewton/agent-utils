@@ -314,6 +314,20 @@ fn quiet_stat_at(proc_root: &Path, pid: i64) -> Option<ProcessStat> {
     read_stat_at(proc_root, pid).ok().flatten()
 }
 
+/// The thread-group id procfs reports for `pid`; `None` when unreadable.
+///
+/// A non-leader thread's `/proc/<pid>` entry names the thread itself, so
+/// its status `Tgid` differs from `pid`; a leader's equals it.
+fn read_tgid_at(proc_root: &Path, pid: i64) -> Option<i64> {
+    let text = std::fs::read_to_string(proc_root.join(pid.to_string()).join("status")).ok()?;
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("Tgid:") {
+            return value.trim().parse().ok();
+        }
+    }
+    None
+}
+
 /// List every process procfs shows; vanished or unreadable ones are skipped.
 pub fn scan_processes() -> Result<Vec<ProcessStat>, ForeignOwnershipError> {
     scan_processes_at(Path::new(PROC))
@@ -389,7 +403,9 @@ pub fn pidfds_supported() -> bool {
     false
 }
 
-/// Open a pidfd; `None` when the number names no process.
+/// Open a pidfd; `None` when the number names no process. A non-leader
+/// thread's number is refused (`EINVAL` on older kernels, `ENOENT` on
+/// Linux 7.1) and stays an error here; callers decide what that proves.
 #[cfg(target_os = "linux")]
 fn open_pidfd(pid: i64) -> std::io::Result<Option<OwnedFd>> {
     for _attempt in 0..4 {
@@ -768,6 +784,17 @@ pub fn pin_at(
     identity: &ProcessIdentity,
     legacy_proof: Option<LegacyProof<'_>>,
 ) -> Result<Pin, ForeignOwnershipError> {
+    pin_impl(proc_root, identity, legacy_proof, &open_pidfd)
+}
+
+/// [`pin_at`] with an explicit pidfd opener (for tests, so the kernel's
+/// refusal errno can be forced without depending on the host kernel).
+fn pin_impl(
+    proc_root: &Path,
+    identity: &ProcessIdentity,
+    legacy_proof: Option<LegacyProof<'_>>,
+    open: &dyn Fn(i64) -> std::io::Result<Option<OwnedFd>>,
+) -> Result<Pin, ForeignOwnershipError> {
     let pid = identity.pid;
     if !(2..=MAX_PROCESS_ID).contains(&pid) {
         return Ok(unproven(format!(
@@ -815,21 +842,45 @@ pub fn pin_at(
             "this host does not provide pidfds, so the process cannot be pinned".to_owned(),
         ));
     }
-    let descriptor = match open_pidfd(pid) {
+    let descriptor = match open(pid) {
         Ok(descriptor) => descriptor,
-        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
+        Err(error)
+            if error.raw_os_error() == Some(libc::EINVAL)
+                || error.raw_os_error() == Some(libc::ENOENT) =>
+        {
             // The number names no thread-group leader: a non-leader thread
-            // bears it now, or nothing does (#1938). EINVAL alone is not a
-            // death certificate; procfs must positively show the recorded
+            // bears it now, or nothing does. Neither errno alone is a death
+            // certificate (EINVAL on older kernels, #1938; ENOENT on Linux
+            // 7.1, #2027); procfs must positively show the recorded
             // generation is gone, and a live exact match stays unproven.
+            let refused_enoent = error.raw_os_error() == Some(libc::ENOENT);
             let current = read_stat_at(proc_root, pid)?;
-            let gone_proven = match (&current, &identity.started_at) {
-                (None, _) => true,
-                (Some(current), Some(started_at)) => {
+            let Some(current) = current else {
+                if current_boot_id_at(proc_root)? == boot {
+                    return Ok(gone(format!("pid {pid} has exited")));
+                }
+                return Ok(unproven(
+                    "the boot identity changed while it was read".to_owned(),
+                ));
+            };
+            if refused_enoent {
+                // A task still in procfs is never proven dead by ENOENT alone.
+                return Ok(unproven(format!(
+                    "pid {pid} cannot be pinned: pidfd_open refused the number"
+                )));
+            }
+            if read_tgid_at(proc_root, pid).is_some_and(|tgid| tgid != pid) {
+                // A live non-leader thread bears the number now.
+                return Ok(unproven(format!(
+                    "pid {pid} cannot be pinned: pidfd_open refused the number"
+                )));
+            }
+            let gone_proven = match &identity.started_at {
+                Some(started_at) => {
                     current.starttime.to_string() != *started_at
                         || DEAD_STATES.contains(&current.state.as_str())
                 }
-                (Some(current), None) => DEAD_STATES.contains(&current.state.as_str()),
+                None => DEAD_STATES.contains(&current.state.as_str()),
             };
             if gone_proven {
                 if current_boot_id_at(proc_root)? == boot {
@@ -951,7 +1002,28 @@ pub fn stop_process_at(
     kill_wait: Option<Duration>,
     label: &str,
 ) -> Result<bool, ForeignOwnershipError> {
-    let result = pin_at(proc_root, identity, legacy_proof)?;
+    stop_impl(
+        proc_root,
+        identity,
+        grace,
+        legacy_proof,
+        kill_wait,
+        label,
+        &open_pidfd,
+    )
+}
+
+/// [`stop_process_at`] with an explicit pidfd opener (for tests).
+fn stop_impl(
+    proc_root: &Path,
+    identity: &ProcessIdentity,
+    grace: Duration,
+    legacy_proof: Option<LegacyProof<'_>>,
+    kill_wait: Option<Duration>,
+    label: &str,
+    open: &dyn Fn(i64) -> std::io::Result<Option<OwnedFd>>,
+) -> Result<bool, ForeignOwnershipError> {
+    let result = pin_impl(proc_root, identity, legacy_proof, open)?;
     if result.verdict == PinVerdict::Gone {
         return Ok(false);
     }
@@ -3261,6 +3333,16 @@ mod tests {
         std::fs::write(dir.join("stat"), record).unwrap();
     }
 
+    fn write_status(root: &Path, dir_pid: i64, tgid: i64) {
+        let dir = root.join(dir_pid.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("status"),
+            format!("Pid:\t{dir_pid}\nTgid:\t{tgid}\n"),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn current_boot_id_reads_only_canonical_evidence() {
         let root = fake_proc("boot");
@@ -3443,8 +3525,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn pin_a_thread_id_is_never_the_recorded_leader() {
-        // A live non-leader thread id EINVALs pidfd_open (#1938); pinning it
-        // must prove nothing and leave the leader untouched.
+        // A live non-leader thread id is refused by pidfd_open (EINVAL on
+        // older kernels, #1938; ENOENT on Linux 7.1, #2027); pinning it must
+        // prove nothing on either kernel and leave the leader untouched.
         if !pidfds_supported() {
             return;
         }
@@ -3473,7 +3556,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_ne!(result.verdict, PinVerdict::Alive);
+        assert_eq!(result.verdict, PinVerdict::Unproven);
         assert!(result.process.is_none());
         assert!(
             child.try_wait().unwrap().is_none(),
@@ -3575,6 +3658,106 @@ mod tests {
             "child must be untouched"
         );
         reap(&mut child);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pin_refused_pidfd_verdicts_do_not_depend_on_the_kernel_errno() {
+        // The refusal errno is forced through the opener seam, so these
+        // verdicts hold on a kernel answering EINVAL and on one answering
+        // ENOENT alike (#2027): death needs procfs to show no such task.
+        if !pidfds_supported() {
+            return;
+        }
+        let boot = current_boot_id().unwrap();
+        let enoent = |_: i64| Err(std::io::Error::from_raw_os_error(libc::ENOENT));
+        let einval = |_: i64| Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        let fake_with = |test: &str, record: Option<(i64, u64)>, tgid: Option<i64>| {
+            let root = fake_proc(test);
+            std::fs::write(root.join("sys/kernel/random/boot_id"), format!("{boot}\n")).unwrap();
+            if let Some((pid, ticks)) = record {
+                write_stat(&root, pid, &stat_record(pid, ticks));
+            }
+            if let Some(tgid) = tgid {
+                write_status(&root, 4242, tgid);
+            }
+            root
+        };
+        let identity = ProcessIdentity::new(4242, Some("777".to_owned()), Some(boot.clone()));
+        for (name, open) in [
+            (
+                "enoent",
+                &enoent as &dyn Fn(i64) -> std::io::Result<Option<OwnedFd>>,
+            ),
+            (
+                "einval",
+                &einval as &dyn Fn(i64) -> std::io::Result<Option<OwnedFd>>,
+            ),
+        ] {
+            // Still in procfs: unproven, never gone.
+            let root = fake_with(&format!("refused-{name}-present"), Some((4242, 777)), None);
+            let result = pin_impl(&root, &identity, None, open).unwrap();
+            assert_eq!(result.verdict, PinVerdict::Unproven, "{name}");
+            assert!(result.process.is_none(), "{name}");
+            let _ = std::fs::remove_dir_all(&root);
+            // Absent from procfs: the recorded generation is gone.
+            let root = fake_with(&format!("refused-{name}-absent"), None, None);
+            let result = pin_impl(&root, &identity, None, open).unwrap();
+            assert_eq!(result.verdict, PinVerdict::Gone, "{name}");
+            let _ = std::fs::remove_dir_all(&root);
+            // Malformed procfs evidence raises, never certifies.
+            let root = fake_with(&format!("refused-{name}-malformed"), None, None);
+            write_stat(&root, 4242, "not a stat record");
+            let err = pin_impl(&root, &identity, None, open).unwrap_err();
+            assert_eq!(err.code, "runner_identity_unknown", "{name}: {err}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // EINVAL with a thread in procfs (Tgid != Pid) stays unproven even
+        // when the thread's ticks differ from the recorded leader's.
+        let root = fake_with("refused-einval-thread", Some((4242, 999)), Some(1111));
+        let result = pin_impl(&root, &identity, None, &einval).unwrap();
+        assert_eq!(result.verdict, PinVerdict::Unproven);
+        let _ = std::fs::remove_dir_all(&root);
+        // EINVAL with a newer leader under the number keeps certifying gone.
+        let root = fake_with("refused-einval-newer", Some((4242, 999)), Some(4242));
+        let result = pin_impl(&root, &identity, None, &einval).unwrap();
+        assert_eq!(result.verdict, PinVerdict::Gone);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stop_process_refuses_a_live_exact_match_under_enoent() {
+        // Forced ENOENT with a live exact match in procfs: unproven, and no
+        // signal is ever attempted through this seam (#2027).
+        if !pidfds_supported() {
+            return;
+        }
+        let root = fake_proc("stop-enoent");
+        std::fs::write(
+            root.join("sys/kernel/random/boot_id"),
+            format!("{}\n", current_boot_id().unwrap()),
+        )
+        .unwrap();
+        write_stat(&root, 4242, &stat_record(4242, 777));
+        let identity = ProcessIdentity::new(
+            4242,
+            Some("777".to_owned()),
+            Some(current_boot_id().unwrap()),
+        );
+        let enoent = |_: i64| Err(std::io::Error::from_raw_os_error(libc::ENOENT));
+        let err = stop_impl(
+            &root,
+            &identity,
+            Duration::ZERO,
+            None,
+            None,
+            "runner",
+            &enoent,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "runner_identity_unproven");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[cfg(target_os = "linux")]

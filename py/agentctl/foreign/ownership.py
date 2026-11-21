@@ -241,10 +241,11 @@ def pidfds_supported() -> bool:
 def _open_pidfd(pid: int) -> Optional[int]:
     """Open a pidfd; ``None`` when the number names no process.
 
-    ``EINVAL`` is deliberately not translated here: the kernel answers it
-    when the number names a non-leader thread, which is what a dead leader's
-    number looks like once the kernel hands it to another process's thread
-    (#1938). Callers decide what that proves; see :func:`pin`.
+    A refusal is deliberately not translated here: the kernel answers
+    ``EINVAL`` (older kernels, #1938) or ``ENOENT`` (Linux 7.1) when the
+    number names a non-leader thread, which is what a dead leader's number
+    looks like once the kernel hands it to another process's thread.
+    Callers decide what that proves; see :func:`pin`.
     """
     for _attempt in range(4):
         try:
@@ -254,6 +255,25 @@ def _open_pidfd(pid: int) -> Optional[int]:
         except ProcessLookupError:
             return None
     raise InterruptedError("pidfd_open was interrupted repeatedly")
+
+
+def _read_tgid(pid: int) -> Optional[int]:
+    """The thread-group id procfs reports for ``pid``; ``None`` when unreadable.
+
+    A non-leader thread's ``/proc/<pid>`` entry names the thread itself, so
+    its status ``Tgid`` differs from ``pid``; a leader's equals it.
+    """
+    try:
+        text = (PROC / str(pid) / "status").read_text()
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if line.startswith("Tgid:"):
+            try:
+                return int(line.partition(":")[2].strip())
+            except ValueError:
+                return None
+    return None
 
 
 def _fd_readable(descriptor: int, timeout: Optional[float]) -> bool:
@@ -422,16 +442,26 @@ def pin(
     try:
         descriptor = _open_pidfd(pid)
     except OSError as exc:
-        if exc.errno != errno.EINVAL:
+        if exc.errno not in (errno.EINVAL, errno.ENOENT):
             raise
         # The number names no thread-group leader: a non-leader thread bears
-        # it now, or nothing does. EINVAL alone is not a death certificate;
-        # procfs must positively show the recorded generation is gone, and a
-        # live exact match stays unproven, never dead (#1938).
+        # it now, or nothing does. Neither errno alone is a death
+        # certificate (EINVAL on older kernels, #1938; ENOENT on Linux 7.1,
+        # #2027): procfs must positively show the recorded generation gone.
         current = read_stat(pid)
-        if current is None or (
+        if current is None:
+            if current_boot_id() == boot:
+                return Pin(GONE, f"pid {pid} has exited")
+            return Pin(UNPROVEN, "the boot identity changed while it was read")
+        if exc.errno == errno.ENOENT:
+            # A task still in procfs is never proven dead by ENOENT alone.
+            return Pin(UNPROVEN, f"pid {pid} cannot be pinned: pidfd_open refused the number")
+        if _read_tgid(pid) not in (None, pid):
+            # A live non-leader thread bears the number now.
+            return Pin(UNPROVEN, f"pid {pid} cannot be pinned: pidfd_open refused the number")
+        if (
             identity.started_at is not None and str(current.starttime) != identity.started_at
-        ) or (current is not None and current.state in _DEAD_STATES):
+        ) or current.state in _DEAD_STATES:
             if current_boot_id() == boot:
                 return Pin(GONE, f"pid {pid} has exited")
             return Pin(UNPROVEN, "the boot identity changed while it was read")
@@ -719,8 +749,9 @@ def _kill_cgroup(path: Path, deadline: float) -> tuple[int, list[str]]:
                 try:
                     descriptor = _open_pidfd(pid)
                 except OSError:
-                    # EINVAL: the number names a thread, not this member;
-                    # leave it to the census, never signal by number (#1938).
+                    # Refused (EINVAL/ENOENT): the number names a thread, not
+                    # this member; leave it to the census, never signal by
+                    # number (#1938, #2027).
                     continue
                 if descriptor is None:
                     continue
