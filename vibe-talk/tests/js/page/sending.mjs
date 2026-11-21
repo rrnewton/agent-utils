@@ -17,6 +17,93 @@ import { CHANNEL, CSS, RETRY_FIRST_MS, SEND_UNDO_MS, SLOW_SEND, THREADS_MAIN_STO
 
 const RETRY_FLOOR_MS = sourceConstant("OUTGOING_RETRY_FLOOR_MS");
 
+// --- a send never moves the reader in All (`#1983 vibe-talk-all-view-send-flash`) -------------------
+//
+// The owner, 2026-11-20: sending in All "flashed" different messages into the spot he
+// was looking at near the end of the scrollback for about a second, then his messages
+// were back. The send took him to the foot at the tap (by the outgoing row's height)
+// and again at the answer (by the new row's), and the receipt going put them back:
+// the rows on screen moved by a row at a time and a different thread's message stood
+// where his had been. A send now adds its row at the foot and moves nothing: the
+// anchor row — the first on screen — keeps its place at the tap, while the post is
+// on its way, at the answer, and after the echo's re-read, and the only row that
+// joins the screen is the one sent.
+
+/** Several threads in All, tall enough that the newest line is a screen of its own. */
+function flashChannel(page) {
+  const threads = [];
+  const messages = [];
+  let id = 2000;
+  for (let t = 0; t < 6; t++) {
+    const record = { id: `th-${t}`, root_message_id: String(id), is_root: true,
+      reply_count: 7, reply_count_exact: true };
+    threads.push({ id: record.id, root: null, title: `T${t}`, reply_count: 7,
+      reply_count_exact: true, updated_at: null });
+    for (let k = 0; k < 8; k++, id++) {
+      messages.push(message({ id: String(id),
+        content: `thread${t} message${k} with enough words to take a line of room on screen here`,
+        thread: k === 0 ? { ...record, is_root: true } : { ...record, is_root: false } }));
+    }
+  }
+  page.threadingSupported = true;
+  page.threads = threads.map((th, t) => ({ ...th, root: messages[t * 8] }));
+  page.messages = messages;
+  return forwardTimeline(page);
+}
+
+/** The rows on screen, the first of them, and where it stands, as the reader sees them. */
+function anchorOf(page) {
+  const area = page.el("scroll-area");
+  const top = area.getBoundingClientRect().top;
+  const foot = top + area.clientHeight;
+  const visible = [...page.el("discord-log").children]
+    .filter((li) => { const r = li.getBoundingClientRect(); return r.bottom > top && r.top < foot; });
+  const first = visible[0];
+  return { ids: visible.map((li) => li.getAttribute("data-id")),
+    anchor: first.getAttribute("data-id"), top: first.getBoundingClientRect().top,
+    scrollTop: area.scrollTop };
+}
+
+for (const [where, aboveFoot] of [["on the newest line", 0], ["a little above the newest line", 120]]) {
+  test(`\`#1983 vibe-talk-all-view-send-flash\`: a send in All ${where} never moves the anchor or changes what is on screen, other than adding the sent row`, async () => {
+    const page = newPage();
+    const server = flashChannel(page);
+    await signIn(page);
+    await showDiscord(page, page.messages);
+    assert.equal(page.el("thread-select").value, "flat", "the channel did not open in All");
+    const area = page.el("scroll-area");
+    area.scrollTop = area.scrollHeight - area.clientHeight - aboveFoot;
+    const before = anchorOf(page);
+    assert.ok(before.ids.length >= 3, `the premise: a screen of rows in All, got ${before.ids}`);
+
+    // The invariant at each stage: the anchor row and where it stands, and the
+    // reader's scroll, exactly as before; the rows on screen before still on
+    // screen, in their order; the only row that may join them is the one sent.
+    const held = (now, stage) => {
+      assert.equal(now.anchor, before.anchor, `${stage}: the anchor row changed`);
+      assert.equal(now.top, before.top, `${stage}: the anchor row moved from ${before.top} to ${now.top}`);
+      assert.equal(now.scrollTop, before.scrollTop, `${stage}: the reader was scrolled`);
+      assert.deepEqual(now.ids.filter((id) => id !== "9002"), before.ids,
+        `${stage}: what was on screen changed, other than the sent row joining it`);
+    };
+    const finish = delayedReply(page);
+    await sendBehind(page, "mine, sent in All");
+    held(anchorOf(page), "while the post was on its way");
+    const mine = message({ id: "9002", content: "mine, sent in All" });
+    finish(json(200, { posted: server.post(mine) }));
+    await page.settle();
+    held(anchorOf(page), "at the post's answer");
+    await deliver(page, page.stream(), sseMessage(mine, { self_posted: true }));
+    await page.settle();
+    await page.settle();
+    held(anchorOf(page), "after the echo's re-read");
+    assert.ok(shownIds(page).includes("9002"), "the sent message is not in All after the send");
+    assert.equal(shownIds(page)[shownIds(page).length - 1], "9002",
+      "the sent message does not stand at the foot of All");
+  });
+}
+
+
 // --- one destination, in the order written -------------------------------------------------------
 //
 // `#277 send-order`. The owner: "I write A then B but B lands first." A's POST failed, A went to
