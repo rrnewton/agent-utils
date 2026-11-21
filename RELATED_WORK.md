@@ -1,6 +1,6 @@
 # agent-utils: related work for the suite
 
-Checked 2026-10-18. This document does two things. It indexes the per-tool comparisons, each of
+Checked 2026-10-18; per-tool index updated 2026-11-21. This document does two things. It indexes the per-tool comparisons, each of
 which compares one tool with the public systems closest to it. It then compares the suite as a
 whole with other systems that orchestrate a team of coding agents, along the axis that matters most
 when choosing one: **what runs where**.
@@ -17,6 +17,7 @@ documentation link the page. Claims that could not be confirmed for this review 
 | `wrkslots` | [common/docs/wrkslots/RELATED_WORK.md](common/docs/wrkslots/RELATED_WORK.md) | Git and standalone worktree managers (Worktrunk, WTP, git-worktree-runner), agent harnesses that create worktrees (Claude Code, Codex, OpenCode, Vibe Kanban, Gas Town, Parallel Code), jj workspaces, ephemeral CI runners, and Kubernetes controllers. |
 | `herdr-run` | [common/docs/herdr-run/RELATED_WORK.md](common/docs/herdr-run/RELATED_WORK.md) | Herdr's own command API, tmux, OpenSSH, and Pexpect. This is also where Herdr, the suite's terminal server, is compared with tmux. |
 | `wrkviz` | [common/docs/wrkviz/RELATED_WORK.md](common/docs/wrkviz/RELATED_WORK.md) | Transcript browsers and trace viewers, above all AgentsView, plus Perfetto and AgentPrism. |
+| `run-agent-prompt` | [common/docs/run-agent-prompt/RELATED_WORK.md](common/docs/run-agent-prompt/RELATED_WORK.md) | General multi-model prompt CLIs (`llm`, `aichat`, `mods`) and the coding-agent harnesses it invokes in restricted one-shot modes. |
 | `gh-paced` | [common/docs/gh-paced/RELATED_WORK.md](common/docs/gh-paced/RELATED_WORK.md) | Client-side GitHub rate limiting: GitHub CLI's cache, octokit's throttling plugin, Bottleneck, PyGithub, go-github. |
 | `agent-usage` | [common/docs/agent-usage/RELATED_WORK.md](common/docs/agent-usage/RELATED_WORK.md) | The harnesses' own `/status` screens, ccusage, Claude Code Usage Monitor, and status-line scripts. |
 | `vibe-talk` | [vibe-talk/RELATED_WORK.md](vibe-talk/RELATED_WORK.md) | Happy Coder, Claude mobile voice mode with a Discord connector, ElevenLabs Agents with a phone number, Discord bots, and voice frameworks. |

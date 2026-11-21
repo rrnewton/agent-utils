@@ -167,6 +167,16 @@ steps:
       preferred_inner_jobs: 1
       rss_baseline_bytes: 134217728
 
+  - group: run-agent-prompt
+    job: test
+    desc: run-agent-prompt Python tests
+    cmd: python3 scripts/run_component_tests.py --component run-agent-prompt -- -q
+    jobs_flag: ""
+    labels: [validation-workspace, validation-python-component-tests, component-run-agent-prompt]
+    timeout: 7200
+    cpu_timeout: 900
+    hint: *python_test_hint
+
   - group: repository-infrastructure
     job: test
     desc: repository wiring and validation infrastructure tests

@@ -6,12 +6,14 @@ import json
 import os
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from run_agent_prompt import __version__
 from run_agent_prompt.cli import main
 
 PROMPT = "judge this fact set"
@@ -42,7 +44,7 @@ else:
 with log.open("a", encoding="utf-8") as handle:
     handle.write(json.dumps({{"argv": sys.argv, "prompt": prompt_seen, "env_keys": sorted(os.environ)}}) + "\\n")
 if MODE == "fail":
-    print("fake failure", file=sys.stderr)
+    print(f"fake failure while handling {{prompt_seen}}", file=sys.stderr)
     raise SystemExit(9)
 if MODE == "timeout":
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
@@ -65,7 +67,7 @@ else:
     return path
 
 
-def run_cli(tmp_path: Path, commands: dict[str, Path | str], *extra: str) -> int:
+def run_cli(tmp_path: Path, commands: Mapping[str, Path | str], *extra: str) -> int:
     args = ["--timeout", "5", "--total-timeout", "30"]
     for harness, command in commands.items():
         args += [f"--{harness}-command", str(command)]
@@ -81,6 +83,31 @@ def invocations(directory: Path, harness: str) -> list[dict[str, object]]:
     if not log.exists():
         return []
     return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines() if line]
+
+
+def string_list(value: object) -> list[str]:
+    assert isinstance(value, list)
+    return [str(part) for part in value]
+
+
+def test_embedded_docs_and_version(capsys: pytest.CaptureFixture[str]) -> None:
+    package = Path(__file__).resolve().parents[1] / "run_agent_prompt"
+    assert main(["--userguide"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == (package / "USER_GUIDE.md").read_text(encoding="utf-8")
+    assert captured.err == ""
+
+    assert main(["quickstart"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == (package / "QUICKSTART.md").read_text(encoding="utf-8")
+    assert captured.err == ""
+
+    with pytest.raises(SystemExit) as raised:
+        main(["--version"])
+    assert raised.value.code == 0
+    captured = capsys.readouterr()
+    assert __version__ in captured.out
+    assert captured.err == ""
 
 
 def test_muse_wins_and_others_never_run(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -105,10 +132,15 @@ def test_fallback_reaches_codex_last_message_file(
         "claude": write_fake(tmp_path, "claude", "empty"),
         "codex": write_fake(tmp_path, "codex", "ok", "codex answer"),
     }
-    assert run_cli(tmp_path, commands) == 0
+    cwd = tmp_path / "caller-cwd"
+    cwd.mkdir()
+    assert run_cli(tmp_path, commands, "--cwd", str(cwd)) == 0
+    assert not (cwd / "codex-last-message.txt").exists()
     captured = capsys.readouterr()
     assert captured.out == "codex answer\n"
     assert "harness=muse status=failed" in captured.err
+    assert 'detail="fake failure while handling [prompt redacted]"' in captured.err
+    assert PROMPT not in captured.err
     assert "harness=claude status=empty" in captured.err
     assert "harness=codex status=answered" in captured.err
 
@@ -125,6 +157,7 @@ def test_all_fail_is_69_with_empty_stdout(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "harness=codex status=spawn-error" in captured.err
+    assert 'detail="executable not found"' in captured.err
     assert "every harness failed" in captured.err
 
 
@@ -167,13 +200,14 @@ def test_prompt_and_environment_never_leak(
     captured = capsys.readouterr()
     seen = invocations(tmp_path, "muse")[0]
     assert seen["prompt"] == PROMPT
-    assert PROMPT not in " ".join(str(part) for part in seen["argv"])  # type: ignore[index]
-    assert "SECRET_SHOULD_NOT_LEAK" not in seen["env_keys"]  # type: ignore[operator]
+    assert PROMPT not in " ".join(string_list(seen["argv"]))
+    assert "SECRET_SHOULD_NOT_LEAK" not in string_list(seen["env_keys"])
     assert PROMPT not in captured.err
     records = [
         json.loads(line) for line in log_file.read_text(encoding="utf-8").splitlines()
     ]
     assert records[0]["harness"] == "muse"
+    assert records[0]["detail"] is None
     assert PROMPT not in log_file.read_text(encoding="utf-8")
 
 
@@ -204,12 +238,12 @@ def test_model_and_effort_translation_per_harness(
         == 69
     )
     capsys.readouterr()
-    muse_argv = [str(part) for part in invocations(tmp_path, "muse")[0]["argv"]]  # type: ignore[index]
+    muse_argv = string_list(invocations(tmp_path, "muse")[0]["argv"])
     assert muse_argv[muse_argv.index("--model") + 1] == "flag-muse"
     assert muse_argv[muse_argv.index("--reasoning-effort") + 1] == "ultra"
-    claude_argv = [str(part) for part in invocations(tmp_path, "claude")[0]["argv"]]  # type: ignore[index]
+    claude_argv = string_list(invocations(tmp_path, "claude")[0]["argv"])
     assert claude_argv[claude_argv.index("--model") + 1] == "cfg-claude"
     assert claude_argv[claude_argv.index("--effort") + 1] == "high"
-    codex_argv = [str(part) for part in invocations(tmp_path, "codex")[0]["argv"]]  # type: ignore[index]
+    codex_argv = string_list(invocations(tmp_path, "codex")[0]["argv"])
     assert codex_argv[codex_argv.index("--model") + 1] == "cfg-codex"
     assert 'model_reasoning_effort="high"' in codex_argv

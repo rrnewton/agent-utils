@@ -119,6 +119,18 @@
       "python_entrypoint": "py/bin/pr-landing-planner"
     },
     {
+      "name": "run-agent-prompt",
+      "primary": "python",
+      "mirror": {
+        "edition": "rust",
+        "state": "absent"
+      },
+      "parity_check": null,
+      "rust_entrypoint": null,
+      "python_entrypoint": "py/bin/run-agent-prompt",
+      "note": "Python-only standalone one-shot harness fallback wrapper."
+    },
+    {
       "name": "tick-hub",
       "primary": "rust",
       "mirror": {

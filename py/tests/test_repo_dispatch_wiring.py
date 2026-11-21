@@ -25,6 +25,7 @@ RUST_TOOLS = (
 PYTHON_ONLY_TOOLS = (
     "wrkviz",
     "parallel-experiment-runner",
+    "run-agent-prompt",
     "wrkslots",
     "herdr-chat",
     "local-ci-hub",

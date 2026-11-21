@@ -159,6 +159,7 @@ one Rust type, a generated schema, and generated consumers.
 |---|---|---|
 | `wrkviz` | Build durable, zoomable local timelines from coordinator and subagent transcripts. | `wrkviz` |
 | `parallel-experiment-runner` | Run boxed, resource-bounded concurrent seed sweeps through `dagrun`. | `parallel-experiment-runner` |
+| `run-agent-prompt` | Run one judgement-only prompt through the first answering harness. | `run-agent-prompt` |
 | `wrkslots` | Provision, box, hand off, and safely reclaim isolated Git worktree slots, one per agent. | `wrkslots` |
 | `agentctl` extensions | Headless workers in Herdr or tmux, the legacy polling Chat transport and launcher, and an MCP interface over the same sessions. | Included in `agentctl` |
 

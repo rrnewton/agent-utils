@@ -285,6 +285,24 @@ STANDALONE_DOCUMENTS: tuple[StandaloneDocument, ...] = (
         source="common/docs/parallel-experiment-runner/USER_GUIDE.md",
         exemptions=("sibling package",),
     ),
+    StandaloneDocument(
+        tool="run-agent-prompt",
+        document="README",
+        language="python",
+        source="common/docs/run-agent-prompt/README.md",
+    ),
+    StandaloneDocument(
+        tool="run-agent-prompt",
+        document="USER_GUIDE",
+        language="python",
+        source="common/docs/run-agent-prompt/USER_GUIDE.md",
+    ),
+    StandaloneDocument(
+        tool="run-agent-prompt",
+        document="QUICKSTART",
+        language="python",
+        source="common/docs/run-agent-prompt/QUICKSTART.md",
+    ),
 )
 
 
@@ -390,6 +408,19 @@ def _package_links() -> tuple[PackageLink, ...]:
                 "common/docs/parallel-experiment-runner/USER_GUIDE.md",
             ),
             PackageLink("py/parallel_experiment_runner/LICENSE", "LICENSE"),
+            PackageLink(
+                "py/run_agent_prompt/README.md",
+                "common/docs/run-agent-prompt/README.md",
+            ),
+            PackageLink(
+                "py/run_agent_prompt/USER_GUIDE.md",
+                "common/docs/run-agent-prompt/USER_GUIDE.md",
+            ),
+            PackageLink(
+                "py/run_agent_prompt/QUICKSTART.md",
+                "common/docs/run-agent-prompt/QUICKSTART.md",
+            ),
+            PackageLink("py/run_agent_prompt/LICENSE", "LICENSE"),
         )
     )
     return tuple(links)
@@ -428,6 +459,14 @@ def _lint(item: Render | StandaloneDocument, text: str) -> list[str]:
     language_text = text
     if item.language == "python" and item.tool == "dagrun":
         for value in ("cargo-build", "cargo-test", "cargo-nextest"):
+            language_text = language_text.replace(value, " " * len(value))
+    if item.tool == "run-agent-prompt":
+        # The default config path is part of this command's standalone
+        # interface; exempt that exact path, not other suite references.
+        for value in (
+            "~/.config/agent-utils/run-agent-prompt.toml",
+            "agent-utils/run-agent-prompt.toml",
+        ):
             language_text = language_text.replace(value, " " * len(value))
     for description, pattern in COMMON_FORBIDDEN + LANGUAGE_FORBIDDEN[item.language]:
         if description in exemptions:

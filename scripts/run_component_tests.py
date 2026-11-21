@@ -84,6 +84,7 @@ EXPECTED_COMPONENTS = frozenset(
         "merge-queue",
         "planner",
         "repository-infrastructure",
+        "run-agent-prompt",
         "tick-hub",
         "wrkslots",
         "wrkviz",

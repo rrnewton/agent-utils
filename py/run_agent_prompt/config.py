@@ -23,9 +23,14 @@ where it reports one.
 from __future__ import annotations
 
 import os
-import tomllib
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # Python 3.10: the tomli package provides the same API.
+    import tomli as tomllib
 
 HARNESSES = ("muse", "claude", "codex")
 

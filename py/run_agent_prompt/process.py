@@ -1,9 +1,8 @@
 """Interrupt-safe ownership of one-shot harness subprocess groups.
 
-Copied from wrkviz's backend runner (py/wrkviz/backend_process.py) so
-this boot-time tool stays standalone: every attempt runs in its own
-process group and a timeout stops the whole group, grandchildren
-included.
+Every attempt runs in its own process group. A timeout stops the
+whole group, grandchildren included, so a stalled harness cannot
+outlive the attempt that launched it.
 """
 
 from __future__ import annotations

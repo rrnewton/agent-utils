@@ -11,8 +11,10 @@ import sys
 import tempfile
 import time
 from collections.abc import Sequence
+from importlib.resources import files
 from pathlib import Path
 
+from run_agent_prompt import __version__
 from run_agent_prompt.attempts import (
     EFFORT_LEVELS,
     AttemptResult,
@@ -26,6 +28,18 @@ from run_agent_prompt.process import BackendProcesses, defer_sigint_during_clean
 
 ALL_HARNESSES = ("muse", "claude", "codex")
 ALL_FAILED_EXIT = 69
+
+
+def _load_userguide() -> str:
+    """Return the complete embedded operator guide."""
+
+    return (files("run_agent_prompt") / "USER_GUIDE.md").read_text(encoding="utf-8")
+
+
+def _load_quickstart() -> str:
+    """Return the embedded one-screen introduction."""
+
+    return (files("run_agent_prompt") / "QUICKSTART.md").read_text(encoding="utf-8")
 
 
 def _command(value: str | None, default: str) -> list[str]:
@@ -46,12 +60,25 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         epilog=(
             "Examples:\n"
+            "  run-agent-prompt quickstart\n"
+            "  run-agent-prompt --userguide\n"
             "  run-agent-prompt --prompt-file prompt.txt\n"
             "  cat prompt.txt | run-agent-prompt --timeout 120\n"
             "  run-agent-prompt --only claude --claude-model MODEL --prompt-file p.txt\n\n"
             "Exit codes: 0 answered, 2 usage/config error, 69 every harness failed."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+        help="show the run-agent-prompt version and exit",
+    )
+    parser.add_argument(
+        "--userguide",
+        action="store_true",
+        help="print the complete embedded operator guide and exit",
     )
     parser.add_argument(
         "--prompt-file",
@@ -123,11 +150,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _attempt_line(result: AttemptResult, effort: str) -> str:
     exit_text = "-" if result.exit_code is None else str(result.exit_code)
-    return (
+    line = (
         f"run-agent-prompt: harness={result.harness} status={result.status} "
         f"exit={exit_text} duration_s={result.duration_s:.3f} "
         f"model={result.model or 'unknown'} effort={effort}"
     )
+    if result.detail:
+        line += f" detail={json.dumps(result.detail)}"
+    return line
 
 
 def _log_attempt(
@@ -145,6 +175,7 @@ def _log_attempt(
             "duration_s": round(result.duration_s, 3),
             "model": result.model,
             "effort": effort,
+            "detail": result.detail,
         }
         log_file.parent.mkdir(parents=True, exist_ok=True)
         with log_file.open("a", encoding="utf-8") as handle:
@@ -172,8 +203,18 @@ def _resolve(
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the fallback chain; print only the winning answer."""
 
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if raw_argv == ["quickstart"]:
+        sys.stdout.write(_load_quickstart())
+        return 0
+    if raw_argv == ["userguide"]:
+        sys.stdout.write(_load_userguide())
+        return 0
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw_argv)
+    if args.userguide:
+        sys.stdout.write(_load_userguide())
+        return 0
     if args.timeout <= 0 or args.total_timeout <= 0:
         parser.error("--timeout and --total-timeout must be positive")
     try:
@@ -216,14 +257,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             for harness in harnesses:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    result = AttemptResult(harness, "total-timeout", None, 0.0)
+                    result = AttemptResult(
+                        harness,
+                        "total-timeout",
+                        None,
+                        0.0,
+                        detail="total timeout exhausted before this attempt",
+                    )
                     _log_attempt(result, _resolve(harness, args, config)[1], args.log_file)
                     continue
                 model, effort = _resolve(harness, args, config)
                 command = _command(getattr(args, f"{harness}_command"), harness)
                 if effort not in EFFORT_LEVELS[harness]:
                     result = AttemptResult(
-                        harness, "invalid-effort", None, 0.0, model=model
+                        harness,
+                        "invalid-effort",
+                        None,
+                        0.0,
+                        model=model,
+                        detail="unsupported effort level for this harness",
                     )
                     _log_attempt(result, effort, args.log_file)
                     continue
@@ -231,7 +283,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     command[0]
                 ).is_file():
                     result = AttemptResult(
-                        harness, "spawn-error", None, 0.0, model=model
+                        harness,
+                        "spawn-error",
+                        None,
+                        0.0,
+                        model=model,
+                        detail="executable not found",
                     )
                     _log_attempt(result, effort, args.log_file)
                     continue
@@ -265,6 +322,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         command,
                         prompt=prompt,
                         workspace=workspace,
+                        last_message_path=scratch / "codex-last-message.txt",
                         model=model,
                         effort=effort,
                         timeout_seconds=timeout,

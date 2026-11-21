@@ -416,7 +416,7 @@ def test_embed_check_rejects_regular_copy_and_wrong_link_target(
 def test_package_docs_and_licenses_are_authoritative_links() -> None:
     docs = _load_script("embed_userguides")
 
-    assert len(docs.PACKAGE_LINKS) == 57
+    assert len(docs.PACKAGE_LINKS) == 61
     assert {
         "rs/chat-subscription/README.md",
         "rs/chat-subscription/LICENSE",

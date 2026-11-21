@@ -1,17 +1,18 @@
 """One judgement-only one-shot attempt per harness, with its own argv.
 
-Flag discipline and event parsing copy the wrkviz backends (the proven
-strict forms), minus their schema requirement: the external contract
-here is plain final text. Every attempt is tool-free by construction —
-muse's isolation preset, Muse's empty tool list, Codex's read-only
-sandbox — because recovery effects belong to `team act`, never to an
-agent's own tools.
+Each builder uses the harness's strict non-interactive form and
+extracts plain final text from its structured output. Every attempt
+is tool-free or confined by construction — Muse's isolation preset,
+Muse's empty tool list, Codex's read-only sandbox — because effects
+belong to the caller, never to an agent's own tools.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,7 +28,7 @@ EFFORT_LEVELS: dict[str, tuple[str, ...]] = {
 }
 
 #: ``muse exec`` flags keeping one call a pure prompt-to-answer
-#: transformation (wrkviz's isolation set).
+#: transformation.
 MUSE_ISOLATION_FLAGS: tuple[str, ...] = (
     "--preset",
     "empty",
@@ -98,6 +99,55 @@ class AttemptResult:
     duration_s: float
     answer: str | None = None
     model: str | None = None
+    detail: str | None = None
+
+
+_MAX_DETAIL_CHARS = 240
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_BANNER_PREFIXES = (
+    "Muse at Meta",
+    "Claude Code at Meta",
+    "Codex CLI at Meta",
+    "Using AI Gateway",
+)
+
+
+def _failure_detail(stderr: str | None, prompt: str) -> str | None:
+    """One bounded diagnostic line from harness stderr, prompt-redacted."""
+
+    if not stderr:
+        return None
+    candidates: list[str] = []
+    for raw_line in stderr.splitlines():
+        line = _ANSI_ESCAPE.sub("", raw_line)
+        line = "".join(
+            char if (char.isprintable() or char.isspace()) else " " for char in line
+        )
+        line = " ".join(line.split())
+        if not line or line.startswith(_BANNER_PREFIXES):
+            continue
+        if prompt:
+            normalized_prompt = " ".join(prompt.split())
+            if normalized_prompt:
+                line = line.replace(normalized_prompt, "[prompt redacted]")
+            for fragment in prompt.splitlines():
+                fragment = " ".join(fragment.split())
+                if len(fragment) >= 4:
+                    line = line.replace(fragment, "[prompt redacted]")
+        candidates.append(line)
+    if not candidates:
+        return None
+    diagnostic = next(
+        (
+            line
+            for line in reversed(candidates)
+            if any(word in line.lower() for word in ("error", "fail", "requires", "refused"))
+        ),
+        candidates[-1],
+    )
+    if len(diagnostic) > _MAX_DETAIL_CHARS:
+        diagnostic = f"{diagnostic[:_MAX_DETAIL_CHARS]}..."
+    return diagnostic
 
 
 def _find_model(value: object) -> str | None:
@@ -134,7 +184,7 @@ def _timed(
     cwd: Path,
     env: Mapping[str, str],
     timeout_seconds: float,
-) -> tuple[object | None, float, OSError | None]:
+) -> tuple[subprocess.CompletedProcess[str] | None, float, OSError | None]:
     started = time.monotonic()
     try:
         completed = processes.run(
@@ -151,22 +201,35 @@ def _timed(
 
 def _verdict(
     harness: str,
-    completed: object,
+    completed: subprocess.CompletedProcess[str] | None,
     spawn_error: OSError | None,
     duration_s: float,
     answer: str | None,
     model: str | None,
+    prompt: str,
 ) -> AttemptResult:
     if spawn_error is not None:
-        return AttemptResult(harness, "spawn-error", None, duration_s)
-    returncode = completed.returncode  # type: ignore[union-attr]
+        return AttemptResult(
+            harness,
+            "spawn-error",
+            None,
+            duration_s,
+            detail=_failure_detail(str(spawn_error), prompt),
+        )
+    assert completed is not None
+    returncode = completed.returncode
+    if returncode == 0 and answer is not None and answer.strip():
+        return AttemptResult(harness, "answered", returncode, duration_s, answer, model)
+    detail = _failure_detail(completed.stderr, prompt)
     if returncode == TIMED_OUT_EXIT:
-        return AttemptResult(harness, "timeout", returncode, duration_s, model=model)
-    if returncode != 0:
-        return AttemptResult(harness, "failed", returncode, duration_s, model=model)
-    if answer is None or not answer.strip():
-        return AttemptResult(harness, "empty", returncode, duration_s, model=model)
-    return AttemptResult(harness, "answered", returncode, duration_s, answer, model)
+        status = "timeout"
+    elif returncode != 0:
+        status = "failed"
+    else:
+        status = "empty"
+    return AttemptResult(
+        harness, status, returncode, duration_s, model=model, detail=detail
+    )
 
 
 def attempt_muse(
@@ -210,7 +273,7 @@ def attempt_muse(
         timeout_seconds=timeout_seconds,
     )
     if spawn_error is not None:
-        return _verdict("muse", completed, spawn_error, duration_s, None, model)
+        return _verdict("muse", completed, spawn_error, duration_s, None, model, prompt)
     terminal: str | None = None
     text: str | None = None
     found_model = model
@@ -228,7 +291,7 @@ def attempt_muse(
             terminal = payload.get("terminal") if isinstance(payload.get("terminal"), str) else None
             text = payload.get("text") if isinstance(payload.get("text"), str) else None
     answer = text if terminal == "completed" else None
-    return _verdict("muse", completed, None, duration_s, answer, found_model)
+    return _verdict("muse", completed, None, duration_s, answer, found_model, prompt)
 
 
 def attempt_claude(
@@ -269,7 +332,7 @@ def attempt_claude(
         timeout_seconds=timeout_seconds,
     )
     if spawn_error is not None:
-        return _verdict("claude", completed, spawn_error, duration_s, None, model)
+        return _verdict("claude", completed, spawn_error, duration_s, None, model, prompt)
     answer: str | None = None
     found_model = model
     try:
@@ -284,8 +347,8 @@ def attempt_claude(
             and root.get("is_error") is False
             and isinstance(root.get("result"), str)
         ):
-            answer = root["result"]  # type: ignore[assignment]
-    return _verdict("claude", completed, None, duration_s, answer, found_model)
+            answer = root["result"]
+    return _verdict("claude", completed, None, duration_s, answer, found_model, prompt)
 
 
 def attempt_codex(
@@ -294,6 +357,7 @@ def attempt_codex(
     *,
     prompt: str,
     workspace: Path,
+    last_message_path: Path,
     model: str | None,
     effort: str,
     timeout_seconds: float,
@@ -301,7 +365,7 @@ def attempt_codex(
 ) -> AttemptResult:
     """One `codex exec` call; the last-message file is the answer."""
 
-    last_message = workspace / "codex-last-message.txt"
+    last_message = last_message_path
     args = [
         *command,
         "exec",
@@ -329,7 +393,7 @@ def attempt_codex(
         timeout_seconds=timeout_seconds,
     )
     if spawn_error is not None:
-        return _verdict("codex", completed, spawn_error, duration_s, None, model)
+        return _verdict("codex", completed, spawn_error, duration_s, None, model, prompt)
     found_model = model
     for line in completed.stdout.splitlines():  # type: ignore[union-attr]
         try:
@@ -344,4 +408,4 @@ def attempt_codex(
             answer = last_message.read_text(encoding="utf-8")
         except OSError:
             answer = None
-    return _verdict("codex", completed, None, duration_s, answer, found_model)
+    return _verdict("codex", completed, None, duration_s, answer, found_model, prompt)

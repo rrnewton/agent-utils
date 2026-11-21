@@ -378,6 +378,18 @@
         "py/tests/test_rust_only.py"
       ]
     },
+    "run-agent-prompt": {
+      "source_prefixes": [
+        "common/bin/run-agent-prompt",
+        "common/docs/run-agent-prompt/",
+        "py/bin/run-agent-prompt",
+        "py/run_agent_prompt/"
+      ],
+      "reverse_dependencies": [],
+      "test_files": [
+        "py/tests/test_run_agent_prompt.py"
+      ]
+    },
     "tick-hub": {
       "source_prefixes": [
         "common/docs/tick-hub/",
