@@ -2754,8 +2754,14 @@ def _dead_adopted_retirement(harness: Harness, report: Report) -> None:
     report.require("primary/dead-adopted/whole-original-preserved", all(
         not (root / "registry/agents/foreign").exists()
         and len(archived := list((root / "registry/archive").glob("*/agent.json"))) == 1
+        # #2028 v2: the pending prompt is set aside raised in the
+        # archived queue (cancelled, stranded-archived), never
+        # preserved pending and never replayed; both editions agree.
+        and (archived[0].parent / "queue/cancelled/pending.json").exists()
+        and not (archived[0].parent / "queue/inbox/pending.json").exists()
         and all((archived[0].parent / relative).read_bytes() == content
-                for relative, content in originals[index].items())
+                for relative, content in originals[index].items()
+                if relative != "queue/inbox/pending.json")
         and _fixture_calls(root) == calls[index]
         and _submitted(root) == []
         and _state(root).get("closed_panes") == []
