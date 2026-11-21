@@ -2433,3 +2433,77 @@ def test_a_torn_meminfo_read_mid_wait_neither_crashes_nor_refuses(tmp_path: Path
     assert "cannot read the floor this poll" in out
     assert "Traceback" not in out
     assert "memory floor admits" in out
+def test_defer_settings_reload_sees_changes_and_keeps_last_good(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#2064: each poll re-reads the host file; a signal dropped there
+    reaches a queued gate, and a file turned malformed mid-wait keeps
+    the last good settings with a named problem, never a silent drop."""
+    gate = _gate_module()
+    cfg = tmp_path / "gate-defer.toml"
+    cfg.write_text('defer_unit_pattern = "protected-*"\n')
+    monkeypatch.setenv("GATE_DEFER_CONFIG", str(cfg))
+    first, problem = gate.reload_defer_settings(gate.defer_settings())
+    assert problem is None and first.patterns == ("protected-*",)
+    cfg.write_text("")
+    second, problem = gate.reload_defer_settings(first)
+    assert problem is None and second.patterns == ()
+    cfg.write_text("defer_unit_pattern = [\n")
+    third, problem = gate.reload_defer_settings(second)
+    assert third is second and problem is not None and "gate-defer.toml" in problem
+
+
+def test_a_defer_waiting_head_holds_no_slot_and_blocks_nobody(tmp_path: Path) -> None:
+    """#2064 (deterministic): with one slot, a defer-waiting head ticket
+    does not block the admissible ticket behind it; once its deferral
+    clears (field emptied, as its own gate does), it blocks again."""
+    gate = _gate_module()
+    root = tmp_path / "admission"
+    adm = gate.Admission(root, 1)
+    _write_ticket(root, "queue", "100-deferred", {
+        "id": "100-deferred", "pid": os.getpid(), "class": "shared",
+        "queued_at": 0, "command": [], "rerun": False,
+        "defer_waiting": ["unit protected-x.service"]})
+    _write_ticket(root, "queue", "200-ready", {
+        "id": "200-ready", "pid": os.getpid(), "class": "shared",
+        "queued_at": 1, "command": [], "rerun": False})
+    tickets = adm.tickets()
+    assert [str(data["id"]) for _, data in tickets] == ["100-deferred", "200-ready"]
+    assert adm.grant_blockers("200-ready", "shared", tickets, []) == []
+    assert adm.try_grant("200-ready", "shared")
+    # The deferred ticket, deferral cleared, takes its place again.
+    _write_ticket(root, "queue", "100-deferred", {
+        "id": "100-deferred", "pid": os.getpid(), "class": "shared",
+        "queued_at": 0, "command": [], "rerun": False, "defer_waiting": []})
+    _write_ticket(root, "queue", "300-later", {
+        "id": "300-later", "pid": os.getpid(), "class": "shared",
+        "queued_at": 2, "command": [], "rerun": False})
+    tickets = adm.tickets()
+    assert adm.grant_blockers("300-later", "shared", tickets,
+                              adm.runs()) != []
+
+
+def test_a_queued_gate_sees_a_signal_removed_from_the_host_file(tmp_path: Path) -> None:
+    """#2064 (the incident): a gate queued behind a defer signal starts
+    when the operator drops that signal from the host file, even while
+    the protected unit itself is still active."""
+    bindir, flag, _calls = _stub_systemctl(tmp_path)
+    flag.touch()
+    config = tmp_path / "gate-defer.toml"
+    config.write_text('defer_unit_pattern = "protected-*"\n')
+    env = _defer_env(tmp_path, bindir)
+    del env["GATE_DEFER_UNIT_PATTERN"]  # the host file decides
+    marker = tmp_path / "ran"
+    gate = subprocess.Popen(
+        [PY, str(GATE), "--", PY, "-c", f"open({str(marker)!r}, 'w').close()"],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        _wait_for_deferred(tmp_path)
+        assert not marker.exists() and gate.poll() is None
+        config.write_text("")  # operator drops the signal mid-wait
+        out, _ = gate.communicate(timeout=30)
+    finally:
+        if gate.poll() is None:
+            gate.kill()
+    assert gate.returncode == 0, out
+    assert marker.exists()  # started while the unit is still active
+    assert "deferral cleared" in out

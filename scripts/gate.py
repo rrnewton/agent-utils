@@ -123,6 +123,15 @@ validation whoever asked for the gate — unless the host file sets
 like a malformed blackout file; if systemctl itself cannot be run, the gate
 warns and proceeds rather than wait forever on a broken probe.
 
+Config reload (#2064 gate-defer-config-reload): the defer settings are
+re-read on every defer poll and at admission, so dropping or adding a
+signal in the host file reaches gates already queued at their next
+poll. A file that turns malformed mid-wait keeps the last good
+settings with a logged warning — protection is neither dropped nor
+fatal to the waiter. A defer-waiting ticket holds no slot and blocks
+nobody: admissible tickets behind it are granted, and the deferred
+ticket takes its place in grant order again when its deferral clears.
+
 Patterns, exclusions and observe mode (#1489 gate-defer-patterns-and-observe):
 `defer_unit_pattern` also accepts a list of globs
 (`defer_unit_pattern = ["<glob>", ...]`); a gate defers while any listed
@@ -1273,6 +1282,23 @@ def defer_settings() -> DeferSettings:
     return settings
 
 
+def reload_defer_settings(
+    last_good: DeferSettings,
+) -> tuple[DeferSettings, str | None]:
+    """Re-read the defer settings for one poll (#2064).
+
+    The host file can change while a gate queues (signals dropped or
+    added by the operator), and a queued gate must see that at its
+    next poll, not at its next invocation. A file that has become
+    malformed mid-wait keeps the last good settings: the returned
+    problem names the failure so the caller can log it once, and
+    protection is neither dropped nor fatal to the waiting gate."""
+    try:
+        return defer_settings(), None
+    except DeferConfigError as exc:
+        return last_good, str(exc)
+
+
 def defer_poll_s() -> float:
     """Seconds between protected-unit checks for a deferred gate (#1406):
     $GATE_DEFER_POLL_S, else DEFER_POLL_DEFAULT_S. An unusable value means
@@ -2081,7 +2107,13 @@ class Admission:
         if run_id not in ids:
             return []
         index = ids.index(run_id)
-        ahead = tickets[:index]
+        # #2064: a defer-waiting ticket holds no slot and blocks nobody.
+        # It is not admissible (its own gate is parked in its defer
+        # poll), so an admissible ticket behind it must not wait idle
+        # behind it; when its deferral clears it takes its place in
+        # grant order again. Its defer_waiting field is written by its
+        # own gate process (set_defer_waiting), so this reads live.
+        ahead = [ticket for ticket in tickets[:index] if not _defer_waiting(ticket[1])]
         if cls == "exclusive":
             return (
                 [("ticket", data, "ahead") for _, data in ahead]
@@ -2442,6 +2474,23 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
     except DeferConfigError as exc:
         print(f"gate: {exc}", flush=True)
         return 2
+    # #2064: the settings are re-read on every defer poll and at
+    # admission (the queue loop), not only here: an operator dropping
+    # or adding a signal reaches gates already queued. A file that
+    # turns malformed mid-wait keeps the last good settings, logged.
+    defer_stale_problem: str | None = None
+
+    def fresh_defer() -> DeferSettings:
+        nonlocal defer, defer_stale_problem
+        defer, problem = reload_defer_settings(defer)
+        if problem is not None and problem != defer_stale_problem:
+            print(f"gate: warning: defer config reload failed ({problem}); "
+                  "keeping the last good defer settings (#2064)", flush=True)
+        elif problem is None and defer_stale_problem is not None:
+            print("gate: defer config reloaded after the malformed file was fixed; "
+                  "using the fresh settings (#2064)", flush=True)
+        defer_stale_problem = problem
+        return defer
     # #2062: resolve the floor verdict inputs now (fail closed on a
     # malformed file or meminfo); the waits themselves sit before the
     # preflight and before the grant, like deferral.
@@ -2539,7 +2588,7 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
     # #1489 observe mode: never wait — check once here (and once before
     # the grant below), record each would-have-deferred check in the
     # observe log, and proceed. Enforce mode waits as before.
-    if defer.mode == "observe" and _defer_applies(defer, priority):
+    if fresh_defer().mode == "observe" and _defer_applies(defer, priority):
         observed, observe_problem = record_observe(defer, defer_id, defer_now())
         if observe_problem is not None:
             print(f"gate: warning: {observe_problem}; proceeding without the unit check",
@@ -2555,7 +2604,7 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
         defer_noted: tuple[str, ...] = ()
         defer_problem: str | None = None
         defer_began = time.time()
-        while defer.mode != "observe" and _defer_applies(defer, priority):
+        while fresh_defer().mode != "observe" and _defer_applies(defer, priority):
             blockers, problem = defer_blockers(defer, defer_now())
             if problem is not None and problem != defer_problem:
                 print(f"gate: warning: {problem}; proceeding without the unit check",
@@ -2650,7 +2699,7 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
     queue_defer_began: float | None = None
     # #1489 observe: one would-have-deferred check before the grant, then
     # the queue proceeds without ever waiting on deferral.
-    if defer.mode == "observe" and _defer_applies(defer, priority):
+    if fresh_defer().mode == "observe" and _defer_applies(defer, priority):
         observed, observe_problem = record_observe(defer, run_id, defer_now())
         if observe_problem is not None:
             print(f"gate: warning: {observe_problem}; proceeding without the unit check",
@@ -2667,7 +2716,7 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
         # start — the grant is the start. Deferral time never counts
         # against --wait-timeout (owner rule 346), so this check runs, and
         # can wait, before the timeout check below.
-        if defer.mode != "observe" and _defer_applies(defer, priority):
+        if fresh_defer().mode != "observe" and _defer_applies(defer, priority):
             blockers, problem = defer_blockers(defer, defer_now())
             if problem is not None and problem != defer_problem:
                 print(f"gate: warning: {problem}; proceeding without the unit check",
