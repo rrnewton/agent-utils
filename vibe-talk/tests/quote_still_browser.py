@@ -127,6 +127,13 @@ class StillApi(FakeApi):
                          "updated_at": messages[20]["timestamp"]}]
 
 
+def num(frame: dict[str, object], key: str) -> float:
+    """One measured number from a captured frame."""
+    value = frame[key]
+    assert isinstance(value, (int, float))
+    return float(value)
+
+
 def wait_for(page: Page, condition: str, why: str, seconds: float = 15) -> None:
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline and not page.evaluate(condition):
@@ -273,9 +280,9 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             open_frame = frames[opened_at] if opened_at < len(frames) else frames[-1]
             low = place >= 0.7
             if low:
-                check(float(open_frame["mountHeight"]) > 80
-                      and float(open_frame["mountBottom"]) <= float(open_frame["bandBottom"]) + 2
-                      and float(open_frame["mountTop"]) >= float(open_frame["bandTop"]) - 2,
+                check(num(open_frame, "mountHeight") > 80
+                      and num(open_frame, "mountBottom") <= num(open_frame, "bandBottom") + 2
+                      and num(open_frame, "mountTop") >= num(open_frame, "bandTop") - 2,
                       f"{label}: low on screen the box is not visible in the column: {open_frame}")
             return (f"{label}: quoted post still at {baseline:.1f}px over {len(frames)} frames "
                     f"(worst {worst:.1f}px, windowed={'on' if windowed else 'off'}"
