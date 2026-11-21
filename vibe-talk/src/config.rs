@@ -740,7 +740,7 @@ fn yes() -> bool {
 ///
 /// Each `channels` entry is a channel id or a name pattern matched
 /// case-insensitively against the channel id and its configured label; `*`
-/// matches any run of characters, so `*hermit*` names every channel whose id
+/// matches any run of characters, so `*kernel*` names every channel whose id
 /// or label contains that word. A channel matching several rules gets every
 /// matching rule's `files`, in configuration order, after the default
 /// `catchup_warmup_files`.

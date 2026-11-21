@@ -1635,20 +1635,20 @@ mod tests {
         };
         // No rules: exactly the default list, as before this feature.
         assert_eq!(
-            select_warmup_files(&summaries(vec![]), "C1", "hermit chat"),
+            select_warmup_files(&summaries(vec![]), "C1", "kernel team chat"),
             vec!["shared.md".to_owned()]
         );
         let configured = summaries(vec![
-            rule(&["*hermit*"], &["hermit.md", "shared.md"]),
+            rule(&["*kernel*"], &["kernel-team.md", "shared.md"]),
             rule(&["C9"], &["by-id.md"]),
             rule(&["*other*"], &["other.md"]),
         ]);
         // Label pattern and id both match; defaults first, config order, deduped.
         assert_eq!(
-            select_warmup_files(&configured, "C9", "Hermit Chat"),
+            select_warmup_files(&configured, "C9", "Kernel Team Chat"),
             vec![
                 "shared.md".to_owned(),
-                "hermit.md".to_owned(),
+                "kernel-team.md".to_owned(),
                 "by-id.md".to_owned()
             ]
         );
@@ -1660,8 +1660,8 @@ mod tests {
         // Glob edges: bare `*`, exact id is case-insensitive, no partial match.
         assert!(channel_pattern_matches("*", "anything"));
         assert!(channel_pattern_matches("c9", "C9"));
-        assert!(!channel_pattern_matches("hermit", "hermit chat"));
-        assert!(channel_pattern_matches("*hermit*", "a Hermit chat"));
+        assert!(!channel_pattern_matches("kernel", "kernel team chat"));
+        assert!(channel_pattern_matches("*kernel*", "a Kernel Team chat"));
     }
 
     #[test]

@@ -114,7 +114,7 @@ fn per_channel_glossaries_parse_and_an_empty_rule_is_refused() {
     // `vibe-talk-discuss-glossary-per-channel` (#2069).
     let cfg = load(
         "catchup_warmup_files = [\"shared.md\"]\n\
-         [[summaries.catchup_glossaries]]\nchannels = [\"*hermit*\"]\nfiles = [\"hermit.md\"]\n",
+         [[summaries.catchup_glossaries]]\nchannels = [\"*kernel*\"]\nfiles = [\"kernel-team.md\"]\n",
     )
     .expect("valid");
     assert_eq!(
@@ -124,8 +124,8 @@ fn per_channel_glossaries_parse_and_an_empty_rule_is_refused() {
     assert_eq!(
         cfg.summaries.catchup_glossaries,
         vec![ChannelGlossary {
-            channels: vec!["*hermit*".to_owned()],
-            files: vec!["hermit.md".to_owned()],
+            channels: vec!["*kernel*".to_owned()],
+            files: vec!["kernel-team.md".to_owned()],
         }]
     );
     // Absent rules keep today's behaviour: no per-channel files at all.
@@ -135,7 +135,7 @@ fn per_channel_glossaries_parse_and_an_empty_rule_is_refused() {
         .catchup_glossaries
         .is_empty());
     let field = invalid_field(load(
-        "[[summaries.catchup_glossaries]]\nchannels = []\nfiles = [\"hermit.md\"]\n",
+        "[[summaries.catchup_glossaries]]\nchannels = []\nfiles = [\"kernel-team.md\"]\n",
     ));
     assert_eq!(field, "summaries.catchup_glossaries[0]");
 }
