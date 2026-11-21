@@ -46,6 +46,8 @@ CONSTANTS RegA,            \* "none" | "own" | "foreign" (slot A git lock)
           Fixes,           \* subset of FixNames
           RefsLarge,       \* finish inventories exceed the inline limit
           NormalizeCompare,\* compare journals after expansion (#2041 fix)
+          WindowWriteHypothesis, \* suspected bug: a disjoint create/adopt
+                            \* commits during the out-of-lock finish window
           Disable          \* subset of {"rm", "cr", "vb"}
 
 FixNames == {"pre-delete-classify", "rebase-on-advance",
@@ -349,9 +351,14 @@ CrJournal ==
   /\ ~("cr" \in Disable) /\ Me(2).pc = 0 /\ ok = 1
   /\ logPres[B] = 0 /\ storage[B] = "absent" /\ jrnl[B] = "none"
   /\ lockHolder = -1 /\ seal = "none"
+  \* A commit first meets _assert_no_journal: a live finish journal
+  \* on any slot raises _JournalBusy and nothing is written (#1367).
+  \* WindowWriteHypothesis removes that gate (the suspected bug).
+  /\ (WindowWriteHypothesis \/ ~(jrnl[A] \in FinishKinds /\ jlive[A] = 1))
   /\ lockHolder' = 2 /\ jrnl' = [jrnl EXCEPT ![B] = "create0"]
   /\ jlive' = [jlive EXCEPT ![B] = 1] /\ version' = version + 1
-  /\ actors' = [actors EXCEPT ![2] = [Me(2) EXCEPT !.pc = 1]]
+  /\ actors' = [actors EXCEPT ![2] = [Me(2) EXCEPT !.pc = 1,
+        !.q = IF Me(0).pc \in {11, 12} /\ jlive[A] = 1 THEN 1 ELSE Me(2).q]]
   /\ UNCHANGED <<tip, ok, forkTip, logHb, logPres, snapRev, snapHb,
     snapPres, hbExp, truth, proof, hold, handoff, jform, delDone, seal,
     sealTgt, storage, reg, arch, partial, cfgTtl, hbn, holdn, viol,
@@ -389,7 +396,7 @@ CrClearJournal ==
   /\ Me(2).pc = 3
   /\ jrnl' = [jrnl EXCEPT ![B] = "none"] /\ jlive' = [jlive EXCEPT ![B] = 0]
   /\ lockHolder' = -1 /\ version' = version + 1
-  /\ actors' = [actors EXCEPT ![2] = [Me(2) EXCEPT !.pc = DONE]]
+  /\ actors' = [actors EXCEPT ![2] = [Me(2) EXCEPT !.pc = DONE, !.q = 0]]
   /\ UNCHANGED <<tip, ok, forkTip, logHb, logPres, snapRev, snapHb,
     snapPres, hbExp, truth, proof, hold, handoff, jform, delDone, seal,
     sealTgt, storage, reg, arch, partial, cfgTtl, hbn, holdn, viol,
@@ -506,21 +513,24 @@ VbArchive ==
 (* prepare lock-free, commit only if identity still matches; 5 rounds.     *)
 (***************************************************************************)
 AdPrepareFree ==
-  /\ Contention /\ Me(4).pc = 0 /\ ok = 1 /\ logPres[B] = 1
+  /\ BUnbound /\ Me(4).pc = 0 /\ ok = 1 /\ logPres[B] = 1
   /\ proof[B] = "unbound" /\ jrnl[A] = "none" /\ jrnl[B] = "none"
   /\ actors' = [actors EXCEPT ![4] = [pc |-> 1, p |-> version,
                                       q |-> Me(4).q, r |-> 0, s |-> 0]]
   /\ LockFree /\ UNCHANGED <<version, lockHolder>>
 
 AdLock ==
-  /\ Contention /\ Me(4).pc = 1 /\ lockHolder = -1
+  /\ BUnbound /\ Me(4).pc = 1 /\ lockHolder = -1
   /\ lockHolder' = 4
   /\ actors' = [actors EXCEPT ![4] = [Me(4) EXCEPT !.pc = 2]]
   /\ LockFree /\ UNCHANGED version
 
 AdCommit ==
-  /\ Contention /\ Me(4).pc = 2 /\ ok = 1 /\ partial = 0
+  /\ BUnbound /\ Me(4).pc = 2 /\ ok = 1 /\ partial = 0
   /\ version = Me(4).p
+  \* Same _assert_no_journal gate as create (adopt commit, prepared
+  \* is None exactly when a journal was outstanding at prepare).
+  /\ (WindowWriteHypothesis \/ ~(jrnl[A] \in FinishKinds /\ jlive[A] = 1))
   /\ LET a == AppendRec(tip, B, "") IN
      /\ tip' = a.tip /\ ok' = a.ok /\ forkTip' = a.forkTip
      /\ viol' = a.viol /\ logHb' = a.logHb /\ logPres' = a.logPres
@@ -528,18 +538,43 @@ AdCommit ==
      /\ proof' = [proof EXCEPT ![B] = "live"]
      /\ hbExp' = [hbExp EXCEPT ![B] = 0]
      /\ lockHolder' = -1 /\ version' = version + 1
-     /\ actors' = [actors EXCEPT ![4] = [Me(4) EXCEPT !.pc = DONE]]
+     /\ actors' = [actors EXCEPT ![4] = [Me(4) EXCEPT !.pc = DONE,
+           !.s = IF Me(0).pc \in {11, 12} /\ jlive[A] = 1 THEN 1 ELSE Me(4).s]]
   /\ UNCHANGED <<truth, hold, handoff, jrnl, jlive, jform, delDone, seal,
     sealTgt, storage, reg, arch, partial, cfgTtl, hbn, holdn, formStuck>>
 
 AdRetry ==
-  /\ Contention /\ Me(4).pc = 2 /\ (ok = 0 \/ partial = 1 \/ version /= Me(4).p)
+  /\ BUnbound /\ Me(4).pc = 2 /\ (ok = 0 \/ partial = 1 \/ version /= Me(4).p)
   /\ lockHolder' = -1
   /\ IF ok = 0 \/ partial = 1
      THEN actors' = [actors EXCEPT ![4] = [Me(4) EXCEPT !.pc = DONE]]
      ELSE IF Me(4).q + 1 >= 5
           THEN actors' = [actors EXCEPT ![4] = [Me(4) EXCEPT !.pc = BUSY, !.q = Me(4).q + 1]]
           ELSE actors' = [actors EXCEPT ![4] = [Me(4) EXCEPT !.pc = 0, !.q = Me(4).q + 1]]
+  /\ UNCHANGED <<tip, ok, forkTip, logHb, logPres, snapRev, snapHb,
+    snapPres, hbExp, truth, proof, hold, handoff, jrnl, jlive, jform,
+    delDone, seal, sealTgt, storage, reg, arch, partial, cfgTtl, version,
+    hbn, holdn, viol, formStuck>>
+
+(***************************************************************************)
+(* Disjoint create/adopt meeting the out-of-lock finish window: the        *)
+(* prevalidated rounds take the locks, _assert_no_journal sees the live    *)
+(* finish journal, waits bounded, and refuses busy with nothing written    *)
+(* (#1367).  These are the refusal edges; the commit edges above carry     *)
+(* the same gate, and WindowWriteHypothesis is the control that removes    *)
+(* it (actor locals q / s record a commit taken inside the window).        *)
+(***************************************************************************)
+GjCreateBusy ==
+  /\ ~WindowWriteHypothesis /\ Me(2).pc = 0 /\ Me(0).pc \in {11, 12}
+  /\ jlive[A] = 1 /\ lockHolder = -1
+  /\ actors' = [actors EXCEPT ![2] = [Me(2) EXCEPT !.pc = BUSY]]
+  /\ LockFree /\ UNCHANGED <<version, lockHolder>>
+
+GjAdoptBusy ==
+  /\ ~WindowWriteHypothesis /\ BUnbound /\ Me(4).pc = 2
+  /\ lockHolder = 4 /\ jrnl[A] \in FinishKinds /\ jlive[A] = 1
+  /\ lockHolder' = -1
+  /\ actors' = [actors EXCEPT ![4] = [Me(4) EXCEPT !.pc = BUSY]]
   /\ UNCHANGED <<tip, ok, forkTip, logHb, logPres, snapRev, snapHb,
     snapPres, hbExp, truth, proof, hold, handoff, jrnl, jlive, jform,
     delDone, seal, sealTgt, storage, reg, arch, partial, cfgTtl, version,
@@ -763,6 +798,7 @@ Next ==
   \/ VbSeal \/ VbFinishPrepared \/ VbFence \/ VbClassify
   \/ VbDeleteSubvolume \/ VbPrune \/ VbArchive
   \/ AdPrepareFree \/ AdLock \/ AdCommit \/ AdRetry
+  \/ GjCreateBusy \/ GjAdoptBusy
   \/ RecShardSync \/ RecDiscardPartial \/ RecTailTruncate
   \/ RecFinishArchive(A) \/ RecFinishArchive(B)
   \/ RecCreate(A) \/ RecCreate(B) \/ RecSealRetire
@@ -828,6 +864,13 @@ NotTipForkDeadSeal ==
   ~(ok = 0 /\ forkTip = 1 /\ jrnl = [s \in Slots |-> "none"] /\ seal = "dead")
 
 NoAdoptBusy == Me(4).pc /= BUSY
+
+\* Disjoint-commit-in-window ghosts: q / s are set only by a create /
+\* adopt commit taken inside the live out-of-lock finish window.
+NoWindowJournal == Me(2).q = 0
+NoWindowAdopt == Me(4).s = 0
+NoCreateBusyInWindow == ~(Me(0).pc \in {11, 12} /\ Me(2).pc = BUSY)
+NoAdoptBusyWithFinish == ~(jrnl[A] \in FinishKinds /\ Me(4).pc = BUSY)
 
 \* Every interrupted state is completed by one recover (liveness form).
 Interrupted == \E i \in Slots: jrnl[i] /= "none" /\ jlive[i] = 0

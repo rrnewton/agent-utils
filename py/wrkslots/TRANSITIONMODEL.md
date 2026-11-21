@@ -187,17 +187,22 @@ counterexample doing its job):
 
 | Config | Result | Distinct states (depth) |
 |---|---|---|
-| `current` (current main, small refs) | all invariants pass | 123,204 (29) |
+| `current` (current main, small refs) | all invariants pass | 133,044 (30) |
 | `fork` (`NoViol`, current main) | FAIL: `forked-chain`, `ok=0` — RmLoadFree → RmSalvage → HbAppend → RmCaptureIdentity → RmAssert → RmAppendBasis (#1807) | 5,369 (10) |
 | `pre1766` (no fixes, foreign lock) | FAIL: `deleted-while-locked`, journal `vfence` left (#1766) | 765 (6) |
-| `allfix` | pass, incl. `NoViol` | 117,384 (29) |
-| `shapes` / `shapes2` (C1 shapes) | FAIL: buried fork + finish journal; fork at tip + dead seal (#1830) | 15,328 / 15,728 (12) |
+| `allfix` | pass, incl. `NoViol` | 126,660 (30) |
+| `shapes` / `shapes2` (C1 shapes) | FAIL: buried fork + finish journal; fork at tip + dead seal (#1830) | 15,329 / 15,729 (12) |
 | `sidecar` (`RefsLarge`, raw compare) | FAIL: `ReloadEqualsMemory` at the fence step (#2041 class) | 73 (4) |
-| `sidecar-form` | FAIL: `NoFormStuck` — deletion done, completion refused, journal `ffence` left (RECOVERY REQUIRED) | 22,114 (13) |
-| `sidecar-fixed` (`NormalizeCompare`) | pass | 123,204 (29) |
+| `sidecar-form` | FAIL: `NoFormStuck` — deletion done, completion refused, journal `ffence` left (RECOVERY REQUIRED) | 22,115 (13) |
+| `sidecar-fixed` (`NormalizeCompare`) | pass | 133,044 |
 | `contention` | FAIL: `NoAdoptBusy` witness reachable; `contention-safety` (`NoViol` alone) passes | 402,732 (39) |
-| `liveness` (current main) | FAIL: `OneRecoverCompletes` — C1 interrupted states no fair recover completes | — |
-| `liveness-fixed` (all fixes) | pass under recover + hand-exit + actor-exit fairness | 117,384 |
+| `liveness` (current main) | FAIL: `OneRecoverCompletes` — C1 interrupted states no fair recover completes | 133,044 |
+| `liveness-fixed` (all fixes) | pass under recover + hand-exit + actor-exit fairness | 126,660 |
+| `globaljournal` (disjoint create, absent B) | pass: no create commit inside the live finish window | 247,990 (32) |
+| `globaljournal-witness` | FAIL: `NoCreateBusyInWindow` — the busy refusal is reachable in the window | 6,704 (12) |
+| `globaljournal-control` (hypothesis toggle) | FAIL: `NoWindowJournal` — with the gate removed the window commit appears | 6,705 (12) |
+| `globaljournal-adopt` | pass: no adopt commit inside the live finish window | 1,245,746 (45) |
+| `globaljournal-adopt-witness` | FAIL: `NoAdoptBusyWithFinish` — busy refusal reachable beside a live finish journal | 33,840 (13) |
 
 The two explorers agree on every known result: the #1807
 fork (same interleaving order), #1766, the C1/#1830 wedge
@@ -205,3 +210,30 @@ shapes, the contention witness, and — new in the TLA+ model —
 the #2041 sidecar class, which appears exactly when
 `RefsLarge` holds and the completion compares raw forms,
 and closes when the comparison expands both sides first.
+
+The global-journal hypothesis first suspected for #2041 —
+a create or adopt on a disjoint slot committing during the
+out-of-lock finish window — is refuted in the model as it
+was at the test seam: a commit first meets
+`_assert_no_journal`, a live finish journal raises
+`_JournalBusy`, and the command refuses busy with nothing
+written. TLC confirms the refusal edge is reachable in the
+window (the two witness configs) and that no window commit
+exists over the full spaces; removing the gate
+(`WindowWriteHypothesis`, the control config) makes the
+window commit appear, so the check has teeth. Adopt is
+additionally blocked by identity staleness: a capture taken
+before the window no longer matches inside it.
+
+The older `spec/WrkslotsLifecycle.tla` (#1568) was also
+checked with this toolchain. No record of a prior TLC run
+exists — the docs present it as a mirror whose gated checker
+is the Python explorer — and as shipped it does not complete
+one: TLC's deadlock check stops at depth 2 (5 states) on the
+stray-storage start state, which has no successor and is not
+terminal. With deadlock checking off it explores 11,795
+distinct states: `Safety` holds in the baseline config and
+`Liveness` fails, as its config comment expects (no finisher
+in the baseline). The deadlock finding is a spec-completeness
+note, not a product issue; the Python explorer treats the
+same state as an ordinary leaf.

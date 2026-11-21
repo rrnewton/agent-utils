@@ -23,6 +23,13 @@
 #                 interrupted states no fair recover path completes)
 #   liveness-fixed PASS (all fixes; completion may use the two
 #                 documented hand exits, config revert / hand unlock)
+#   globaljournal PASS: no disjoint create/adopt commits inside
+#                 the live out-of-lock finish window (#1367 gate)
+#   globaljournal-witness FAIL NoCreateBusyInWindow: the busy
+#                 refusal itself is reachable in the window
+#   globaljournal-control FAIL (WindowWriteHypothesis): with the
+#                 gate removed the window commit appears, proving
+#                 the check has teeth
 set -eu
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 jar=${TLA2TOOLS_JAR:?set TLA2TOOLS_JAR to a downloaded tla2tools.jar}
