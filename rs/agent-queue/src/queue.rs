@@ -1152,14 +1152,20 @@ pub fn cancel(root: &Path, message_id: &str, reason: &str) -> Result<CancelOutco
 }
 
 /// Why the item `message_id`, whose document is `document`, must not be typed at `now_millis`:
-/// `("cancelled", reason)` when a tombstone names it, `("expired", detail)` when its `not_after`
-/// has passed, or `None`. Drainers ask this just before typing.
+/// `("cancelled", reason)` when a tombstone names it or a copy already sits in `cancelled/`
+/// (a prompt retired by hand, with no tombstone written: #2022
+/// agentctl-cancel-resurrection), `("expired", detail)` when its `not_after` has passed, or
+/// `None`. Drainers ask this just before typing, and every writer of an inbox entry asks it
+/// before writing one back, so a retired prompt is never resurrected as pending.
 pub fn set_aside_reason(
     directories: &QueueDirectories,
     message_id: &str,
     document: &Map<String, Value>,
     now_millis: u64,
 ) -> Option<(&'static str, String)> {
+    if fs::symlink_metadata(&directories.cancelled.join(format!("{message_id}.json"))).is_ok() {
+        return Some(("cancelled", "already retired".to_owned()));
+    }
     let tombstone = directories.cancel.join(format!("{message_id}.json"));
     if fs::symlink_metadata(&tombstone).is_ok() {
         let reason = read_json(&tombstone)
@@ -1213,7 +1219,20 @@ pub fn set_aside(
     document.insert("cancel_detail".to_owned(), json!(detail));
     document.insert("cancelled_at".to_owned(), json!(unix_seconds()));
     atomic_json(path, &Value::Object(document))?;
-    transition(path, &directories.cancelled.join(filename))?;
+    let destination = directories.cancelled.join(filename);
+    if fs::symlink_metadata(&destination).is_ok() {
+        // A copy of this item already sits in cancelled/ (it was retired,
+        // and this pending copy is a resurrection or a leftover duplicate):
+        // the cancelled copy is authoritative, so this copy is removed
+        // rather than replacing it (#2022 agentctl-cancel-resurrection).
+        fs::remove_file(path)
+            .map_err(|error| io_error("remove resurrected queue item", path, error))?;
+        if let Some(parent) = path.parent() {
+            sync_directory(parent)?;
+        }
+    } else {
+        transition(path, &destination)?;
+    }
     remove_claim_lock(directories, filename);
     let identifier = message_id_from_path(path)?;
     // The tombstone has done its work: the item it named can never be typed now.
@@ -1627,6 +1646,17 @@ mod tests {
         assert_eq!(
             cancel(root, "kept", "x").unwrap(),
             CancelOutcome::AlreadyCancelled
+        );
+        // A copy already in cancelled/ (retired by hand, no tombstone:
+        // #2022) sets a same-id pending item aside too.
+        assert_eq!(
+            set_aside_reason(
+                &directories,
+                "kept",
+                &item("kept", &directories.cancelled),
+                0
+            ),
+            Some(("cancelled", "already retired".to_owned()))
         );
         assert_eq!(
             put(root, "kept", true).unwrap_err().kind(),

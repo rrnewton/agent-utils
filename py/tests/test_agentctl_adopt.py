@@ -2402,3 +2402,32 @@ def test_suggestion4_older_cli_retirement_and_stop_only_boundary_use_real_privat
     assert result["retired_dead_adoption"] is True and result["record_sha256"] == digest
     assert (Path(result["archive"]) / "agent.json").read_bytes() == raw
     assert not (Path(result["archive"]) / "queue").exists()
+
+
+def test_retired_queue_item_is_set_aside_without_replacing_the_cancelled_copy(
+    tmp_path: Path,
+) -> None:
+    # #2022 agentctl-cancel-resurrection: a tombstone, or a copy already
+    # in cancelled/ (a hand retirement writes no tombstone), retires an
+    # id; setting a same-id pending copy aside keeps the cancelled copy.
+    root = tmp_path / "queue"
+    (root / "inbox").mkdir(parents=True)
+    os.chmod(root / "inbox", 0o700)
+    source = root / "inbox" / "dup-1.json"
+    document = {"id": "dup-1", "text": "already delivered by hand", "queued_at": 1.0}
+    source.write_text(json.dumps(document), encoding="utf-8")
+    assert not agent._retired(str(root), "dup-1.json")
+    (root / "cancel").mkdir()
+    os.chmod(root / "cancel", 0o700)
+    (root / "cancel" / "dup-1.json").write_text("{}", encoding="utf-8")
+    assert agent._retired(str(root), "dup-1.json")
+    agent._set_aside_retired(str(root), str(source), dict(document))
+    assert not source.exists()
+    moved = json.loads((root / "cancelled" / "dup-1.json").read_text(encoding="utf-8"))
+    assert moved["delivery_state"] == "cancelled"
+    # A second copy (a resurrection) is removed, never replacing the first.
+    source.write_text(json.dumps(document), encoding="utf-8")
+    agent._set_aside_retired(str(root), str(source), dict(document))
+    assert not source.exists()
+    kept = json.loads((root / "cancelled" / "dup-1.json").read_text(encoding="utf-8"))
+    assert kept["delivery_state"] == "cancelled"

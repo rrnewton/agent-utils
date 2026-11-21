@@ -2061,6 +2061,37 @@ def _transition(source: str, destination: str, *, max_artifact_bytes: int | None
         _fsync_dir(source_parent)
 
 
+def _retired(root: str, basename: str) -> bool:
+    """Whether queue item `basename` is retired: a tombstone in ``cancel/``
+    or a copy already in ``cancelled/`` (a hand retirement writes no
+    tombstone: #2022 agentctl-cancel-resurrection)."""
+    return (os.path.lexists(os.path.join(root, "cancel", basename))
+            or os.path.lexists(os.path.join(root, "cancelled", basename)))
+
+
+def _set_aside_retired(root: str, source: str, document: dict, *,
+                       max_artifact_bytes: int | None = None) -> None:
+    """Move the untyped item at `source` to ``cancelled/`` as retired, or
+    remove it when the authoritative cancelled copy already exists (#2022)."""
+    for field in ("possibly_submitted", "inflight_at", "paste_tracking",
+                  "inflight_from", "paste_started_at", "delivery_claimed_at"):
+        document.pop(field, None)
+    document["delivery_state"] = "cancelled"
+    document["cancel_reason"] = "cancelled"
+    document["cancel_detail"] = "already retired"
+    document["cancelled_at"] = time.time()
+    _atomic_json(source, document, max_artifact_bytes=max_artifact_bytes)
+    cancelled = os.path.join(root, "cancelled")
+    os.makedirs(cancelled, mode=0o700, exist_ok=True)
+    _validate_private_directory(cancelled, "queue state directory", tighten=True)
+    destination = os.path.join(cancelled, os.path.basename(source))
+    if os.path.lexists(destination):
+        os.remove(source)
+        _fsync_dir(os.path.dirname(source))
+    else:
+        _transition(source, destination, max_artifact_bytes=max_artifact_bytes)
+
+
 def _failure_document(
     failed_path: str, *, outcome: str, error: str, max_artifact_bytes: int | None,
 ) -> dict[str, object]:
@@ -2477,6 +2508,11 @@ def _drain(
             if isinstance(recorded_error, str):
                 document["delivery_error"] = _bounded_error(recorded_error, max_artifact_bytes)
             identifier = str(document.get("id", os.path.basename(path)[:-5]))
+            # A retired prompt (tombstone, or a copy already in cancelled/)
+            # is set aside untyped, never typed or written back (#2022).
+            if _retired(root, os.path.basename(path)):
+                _set_aside_retired(root, path, document, max_artifact_bytes=max_artifact_bytes)
+                continue
             if attempts >= max_attempts:
                 blocked = _bounded_error(
                     f"message {identifier} reached the maximum delivery-attempt count "
@@ -2571,7 +2607,12 @@ def _drain(
                 # (#1480). Another live holder means it owns the item.
                 claim_descriptor = _take_claim_lock(inflight, os.path.basename(path))
                 if claim_descriptor is None:
-                    _transition(inflight_path, path, max_artifact_bytes=max_artifact_bytes)
+                    # A retirement that landed while claimed wins over
+                    # the return to inbox (#2022).
+                    if _retired(root, os.path.basename(path)):
+                        _set_aside_retired(root, inflight_path, document, max_artifact_bytes=max_artifact_bytes)
+                    else:
+                        _transition(inflight_path, path, max_artifact_bytes=max_artifact_bytes)
                     break
                 try:
                     # Typing runs without the queue lock (#1480); the item is
@@ -2605,8 +2646,14 @@ def _drain(
                         document["delivery_error"] = blocked
                         document["delivery_blocked_at"] = time.time()
                         _atomic_json(inflight_path, document, max_artifact_bytes=max_artifact_bytes)
-                        _transition(inflight_path, path, max_artifact_bytes=max_artifact_bytes)
-                        retained_path = path
+                        # A retirement that landed while typing wins over
+                        # the return to inbox (#2022).
+                        if _retired(root, os.path.basename(path)):
+                            _set_aside_retired(root, inflight_path, document, max_artifact_bytes=max_artifact_bytes)
+                            retained_path = os.path.join(root, "cancelled", os.path.basename(path))
+                        else:
+                            _transition(inflight_path, path, max_artifact_bytes=max_artifact_bytes)
+                            retained_path = path
                         break
                     elif isinstance(delivery_error, _Misrouted):
                         misroute_error = delivery_error
@@ -2643,6 +2690,12 @@ def _drain(
                         document["delivery_state"] = "pending"
                         document["delivery_error"] = _bounded_error(str(misroute_error), max_artifact_bytes)
                         _atomic_json(inflight_path, document, max_artifact_bytes=max_artifact_bytes)
+                        # A retirement that landed while typing wins over
+                        # the return to inbox (#2022).
+                        if _retired(root, os.path.basename(path)):
+                            _set_aside_retired(root, inflight_path, document, max_artifact_bytes=max_artifact_bytes)
+                            retained_path = os.path.join(root, "cancelled", os.path.basename(path))
+                            break
                         _transition(inflight_path, path, max_artifact_bytes=max_artifact_bytes)
                         retained_path = path
                         # The retry does not consume an attempt: the misroute count bounds it.

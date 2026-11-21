@@ -2224,6 +2224,26 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                 continue 'message;
             }
             if attempts >= options.max_attempts {
+                // A retirement that landed while this item was read (a hand
+                // move writes no tombstone) wins over the blocked write-back:
+                // writing pending here would resurrect it (#2022).
+                if let Some((reason, detail)) =
+                    set_aside_reason(&directories, &filename_id, &document, now_millis())
+                {
+                    if path.exists() {
+                        cancelled.push(set_aside(
+                            root,
+                            &directories,
+                            &path,
+                            document,
+                            reason,
+                            &detail,
+                        )?);
+                    } else {
+                        cancelled.push(identifier.clone());
+                    }
+                    continue 'message;
+                }
                 let detail = format!(
                 "message {identifier} reached the maximum delivery-attempt count ({attempts} >= {}); retained pending",
                 options.max_attempts
@@ -2242,6 +2262,25 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
             // muse-send-staged-unsubmitted). An urgent or owner prompt waits too.
             if !document.contains_key("stranded_at") {
                 if let Some((other, why)) = input_stalled_by(&directories, &identifier) {
+                    // As at the attempt bound: a retirement that landed
+                    // while this item was read wins over the write-back (#2022).
+                    if let Some((reason, detail)) =
+                        set_aside_reason(&directories, &filename_id, &document, now_millis())
+                    {
+                        if path.exists() {
+                            cancelled.push(set_aside(
+                                root,
+                                &directories,
+                                &path,
+                                document,
+                                reason,
+                                &detail,
+                            )?);
+                        } else {
+                            cancelled.push(identifier.clone());
+                        }
+                        continue 'message;
+                    }
                     let detail = format!(
                         "{}: pane input stalled: queued behind message {other}, whose paste the \
                          pane has not drawn; this prompt was not typed and waits until the pane \
@@ -2551,6 +2590,26 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                             let _ = delivered;
                             for (index, (member, inflight)) in active.iter().enumerate() {
                                 let document = &mut documents[index];
+                                // A member retired while the batch typed is
+                                // set aside from inflight, never returned to
+                                // its inbox lane as pending (#2022).
+                                if let Some((reason, aside_detail)) = set_aside_reason(
+                                    &directories,
+                                    &member.4,
+                                    document,
+                                    now_millis(),
+                                ) {
+                                    let document = document.clone();
+                                    set_aside(
+                                        root,
+                                        &directories,
+                                        inflight,
+                                        document,
+                                        reason,
+                                        &aside_detail,
+                                    )?;
+                                    continue;
+                                }
                                 document.remove("possibly_submitted");
                                 if !document.contains_key("stranded_at") {
                                     document.remove("typed_as");
@@ -2727,6 +2786,25 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                                         )?;
                                         quarantined.push(member.3.clone());
                                         batched.insert(member.0.clone());
+                                    } else if let Some((reason, aside_detail)) =
+                                        // A member retired while the batch typed
+                                        // is set aside, never returned pending (#2022).
+                                        set_aside_reason(
+                                                &directories,
+                                                &member.4,
+                                                document,
+                                                now_millis(),
+                                            )
+                                    {
+                                        set_aside(
+                                            root,
+                                            &directories,
+                                            inflight,
+                                            document.clone(),
+                                            reason,
+                                            &aside_detail,
+                                        )?;
+                                        cancelled.push(member.3.clone());
                                     } else {
                                         document.remove("possibly_submitted");
                                         document.remove("typed_as");
@@ -3027,6 +3105,21 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                         quarantined.push(identifier.clone());
                         break 'retry;
                     }
+                    // A retirement that landed while this prompt typed is
+                    // set aside from inflight, never returned pending (#2022).
+                    if let Some((reason, aside_detail)) =
+                        set_aside_reason(&directories, &filename_id, &document, now_millis())
+                    {
+                        cancelled.push(set_aside(
+                            root,
+                            &directories,
+                            &inflight_path,
+                            document,
+                            reason,
+                            &aside_detail,
+                        )?);
+                        break 'retry;
+                    }
                     document.remove("inflight_at");
                     document.remove("paste_tracking");
                     document.remove("inflight_from");
@@ -3098,6 +3191,21 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                         transition(&inflight_path, &failed_path)?;
                         failed_metadata(&failed_path, "possibly_submitted", &detail)?;
                         quarantined.push(identifier);
+                        break 'retry;
+                    }
+                    // A retirement that landed while this prompt typed is
+                    // set aside from inflight, never returned pending (#2022).
+                    if let Some((reason, aside_detail)) =
+                        set_aside_reason(&directories, &filename_id, &document, now_millis())
+                    {
+                        cancelled.push(set_aside(
+                            root,
+                            &directories,
+                            &inflight_path,
+                            document,
+                            reason,
+                            &aside_detail,
+                        )?);
                         break 'retry;
                     }
                     document.remove("possibly_submitted");
@@ -5364,6 +5472,9 @@ mod tests {
         /// Cancel this queue item (root, message ID, done flag) on the second
         /// pane check, while a drain waits on readiness (#1775 (c) test).
         cancel_on_check: Option<(PathBuf, String, Arc<AtomicBool>)>,
+        /// Move this queue item from inbox/ to cancelled/ by hand (no
+        /// tombstone) on the second pane check (#2022 test).
+        hand_move_on_check: Option<(PathBuf, String, Arc<AtomicBool>)>,
         pane_checks: usize,
         fail_wait: bool,
         unwrapped_empty: bool,
@@ -5558,6 +5669,37 @@ mod tests {
             };
             if let Some((root, message_id, done)) = scripted {
                 let _ = cancel(&root, &message_id, "no longer wanted");
+                done.store(true, AtomicOrdering::SeqCst);
+            }
+            let hand_moved = {
+                let mut state = self.state.lock().expect("fake state");
+                if state.pane_checks == 2 {
+                    state.hand_move_on_check.take()
+                } else {
+                    None
+                }
+            };
+            if let Some((root, message_id, done)) = hand_moved {
+                // A hand retirement (#2022): the file moves to cancelled/
+                // with its state stamped, and no tombstone is written.
+                let source = root.join("inbox").join(format!("{message_id}.json"));
+                if let Ok(mut document) = load_message(&source) {
+                    document.insert("delivery_state".to_owned(), json!("cancelled"));
+                    document.insert("cancel_reason".to_owned(), json!("cancelled"));
+                    document.insert("cancelled_at".to_owned(), json!(unix_seconds()));
+                    let _ = atomic_json(&source, &Value::Object(document));
+                }
+                let cancelled = root.join("cancelled");
+                let _ = std::fs::create_dir_all(&cancelled);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    let _ = std::fs::set_permissions(
+                        &cancelled,
+                        std::fs::Permissions::from_mode(0o700),
+                    );
+                }
+                let _ = std::fs::rename(source, cancelled.join(format!("{message_id}.json")));
                 done.store(true, AtomicOrdering::SeqCst);
             }
             let mut state = self.state.lock().expect("fake state");
@@ -8613,6 +8755,89 @@ mod tests {
             message_state(&root, "cancel-race-1").unwrap(),
             Some(QueueMessageState::Cancelled),
             "the prompt stays cancelled, in exactly one phase"
+        );
+    }
+
+    #[test]
+    fn hand_moved_during_a_readiness_wait_stays_cancelled_and_is_not_written_back() {
+        // #2022 agentctl-cancel-resurrection: as the #1775 (c) test, but
+        // the prompt is retired by hand (moved to cancelled/, no
+        // tombstone), as an operator's flush script moves it. The blocked
+        // drain waking afterwards must not recreate it in inbox/.
+        let directory = TestDirectory::new("hand-move-during-readiness");
+        let root = directory.path().to_path_buf();
+        enqueue(
+            &root,
+            "delivered by hand while waiting",
+            Some("hand-move-1"),
+        )
+        .unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let fake = FakeAgent::with_pane(&["working"], "w1:p-hand-move");
+        fake.state.lock().unwrap().hand_move_on_check = Some((
+            root.clone(),
+            "hand-move-1".to_owned(),
+            Arc::clone(&cancelled),
+        ));
+        let result = drain_with_runtime(
+            &fake,
+            &target_for("w1:p-hand-move"),
+            &root,
+            DrainOptions {
+                ready_timeout: Duration::from_secs(60),
+                ..DrainOptions::default()
+            },
+            &CancellationFlagRuntime { cancelled },
+        )
+        .expect("the drain completes");
+        assert!(
+            json_paths(&root.join("inbox")).unwrap().is_empty(),
+            "the hand-moved prompt is not written back into inbox/: {result:?}"
+        );
+        assert_eq!(
+            message_state(&root, "hand-move-1").unwrap(),
+            Some(QueueMessageState::Cancelled)
+        );
+        assert!(fake.runs().is_empty(), "nothing was typed");
+    }
+
+    #[test]
+    fn a_pending_copy_of_a_cancelled_prompt_is_set_aside_untyped() {
+        // #2022: a prompt delivered by hand and moved to cancelled/ left
+        // a copy in inbox/ (or a blocked writer recreated one). A drain
+        // must set that copy aside, never type it as a duplicate.
+        let directory = TestDirectory::new("cancelled-duplicate");
+        let root = directory.path().to_path_buf();
+        enqueue(&root, "already delivered by hand", Some("dup-1")).unwrap();
+        let source = root.join("inbox/dup-1.json");
+        let mut document = load_message(&source).unwrap();
+        document.insert("delivery_state".to_owned(), json!("cancelled"));
+        document.insert("cancel_reason".to_owned(), json!("cancelled"));
+        atomic_json(&source, &Value::Object(document)).unwrap();
+        let cancelled_dir = root.join("cancelled");
+        std::fs::create_dir_all(&cancelled_dir).unwrap();
+        std::fs::copy(&source, cancelled_dir.join("dup-1.json")).unwrap();
+        // The pending copy again, as a resurrection would leave it.
+        let mut pending = load_message(&source).unwrap();
+        pending.insert("delivery_state".to_owned(), json!("pending"));
+        atomic_json(&source, &Value::Object(pending)).unwrap();
+        let fake = FakeAgent::new(&["idle"]);
+        let result = drain_with_runtime(
+            &fake,
+            &target_for("w1:p1"),
+            &root,
+            DrainOptions::default(),
+            &FakeRuntime::default(),
+        )
+        .expect("the drain completes");
+        assert!(
+            fake.runs().is_empty(),
+            "the duplicate was not typed: {result:?}"
+        );
+        assert!(json_paths(&root.join("inbox")).unwrap().is_empty());
+        assert_eq!(
+            message_state(&root, "dup-1").unwrap(),
+            Some(QueueMessageState::Cancelled)
         );
     }
 
