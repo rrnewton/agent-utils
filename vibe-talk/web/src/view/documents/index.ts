@@ -425,7 +425,7 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     if (deps.reactPolicy() === "discussion") {
       const root = await findDiscussionRoot(mention.channel_id);
       if (root === null) {
-        deps.onStatus?.("No discussion yet — Jump to last mention takes you to where it was last mentioned.");
+        deps.onStatus?.("No discussion yet. Use Last mention to reply there.");
         return;
       }
       deps.onJumpToMention?.({
@@ -482,8 +482,7 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     reader.close();
     currentRow = null;
     try {
-      deps.byId("doc-jump-mention").hidden = true;
-      deps.byId("doc-jump-discussion").hidden = true;
+      deps.byId("doc-jumps").hidden = true;
     } catch {
       // A host without the jump buttons keeps the list as it was.
     }
@@ -572,8 +571,7 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     deps.byId("docs-reader").hidden = false;
     // The reader's jumps stand with it (`#2006`).
     try {
-      deps.byId("doc-jump-mention").hidden = false;
-      deps.byId("doc-jump-discussion").hidden = false;
+      deps.byId("doc-jumps").hidden = false;
     } catch {
       // A host without the jump buttons keeps the reader as it was.
     }

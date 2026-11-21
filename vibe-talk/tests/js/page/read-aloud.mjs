@@ -5673,8 +5673,7 @@ test("`#2006 vibe-talk-documents-react`: React in the reader quotes the lit bloc
   assert.ok(card, "fixture: no document card was drawn");
   await card.click();
   await page.settle();
-  assert.equal(page.el("doc-jump-mention").hidden, false, "Jump to last mention does not stand in the reader's toolbar");
-  assert.equal(page.el("doc-jump-discussion").hidden, false, "Jump to discussion does not stand in the reader's toolbar");
+  assert.equal(page.el("doc-jumps").hidden, false, "the jump buttons do not stand in the reader's toolbar");
   await page.el("read-aloud").click();
   await page.settle();
   assert.equal(playingId(page), "doc:field-notes", "the premise: the document is not playing");

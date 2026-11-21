@@ -214,6 +214,39 @@
   grid-row: 2;
 }
 
+/* `#2006 vibe-talk-documents-react`. The Documents reader's two jumps: their own row
+   under the pane's, each half of it, labels on one line. The short words stand on a
+   phone; the owner's full words where the room is (and always to a screen reader). */
+#control-pane #doc-jumps {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 0.4rem;
+}
+
+#control-pane #doc-jumps[hidden] {
+  display: none;
+}
+
+#control-pane #doc-jumps .control {
+  flex: 1 1 0;
+  min-height: 2.4rem;
+  white-space: nowrap;
+}
+
+#control-pane #doc-jumps .label-short {
+  display: none;
+}
+
+@media (max-width: 700px) {
+  #control-pane #doc-jumps .label-full {
+    display: none;
+  }
+
+  #control-pane #doc-jumps .label-short {
+    display: inline;
+  }
+}
+
 /* Only while the reader row is the pane's content: with a call up, Sound and
    Clear hold that column, and the toggle waits in its hidden state. */
 #control-pane:has(#read-aloud[hidden]) #audio-source {

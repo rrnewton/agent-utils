@@ -606,6 +606,7 @@ export interface ElementById {
   "settings-agent-audio": HTMLOptionElement;
   "settings-audio-source": HTMLSelectElement;
   "documents-react-policy": HTMLSelectElement;
+  "doc-jumps": HTMLDivElement;
   "doc-jump-mention": HTMLButtonElement;
   "doc-jump-discussion": HTMLButtonElement;
   "settings-chain-order": HTMLParagraphElement;

@@ -4883,14 +4883,20 @@ writable = true</pre>
 
         <!-- `#2006 vibe-talk-documents-react`. The Documents reader's jumps, in
              its bottom toolbar: shown only while a document is open. -->
-        <button id="doc-jump-mention" class="control control-read" type="button" hidden
-                title="Go to the message that mentioned this document last">
-          <span class="control-label">Last mention</span>
-        </button>
-        <button id="doc-jump-discussion" class="control control-read" type="button" hidden
-                title="Go to this document's discussion">
-          <span class="control-label">Discussion</span>
-        </button>
+        <div id="doc-jumps" hidden>
+          <button id="doc-jump-mention" class="control control-read" type="button"
+                  aria-label="Jump to last mention"
+                  title="Jump to last mention: go to the message that mentioned this document last">
+            <span class="control-label label-full">Jump to last mention</span>
+            <span class="control-label label-short">Last mention</span>
+          </button>
+          <button id="doc-jump-discussion" class="control control-read" type="button"
+                  aria-label="Jump to discussion"
+                  title="Jump to discussion: go to this document's discussion">
+            <span class="control-label label-full">Jump to discussion</span>
+            <span class="control-label label-short">Discussion</span>
+          </button>
+        </div>
 
         <!--
           Reading pace, beside the control it acts on. A popover rather than a fourth control in
