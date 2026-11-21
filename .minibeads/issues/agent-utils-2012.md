@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-offline-cache-phone-360-arrow-head: coalesce walk hit-tests a head settled below the scrollport'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -8,7 +8,7 @@ labels:
 - ui
 - browser
 created_at: 2026-11-20T18:00:00-05:00
-updated_at: 2026-11-20T18:00:00-05:00
+updated_at: 2026-11-20T22:00:00-05:00
 ---
 
 # Description
@@ -30,3 +30,7 @@ updated_at: 2026-11-20T18:00:00-05:00
 # Notes
 
 [watermelon-full-preview] mu-discussfix, after #2010 vibe-talk-discuss-browser-red-on-main (b908f455). Number 2012 pre-assigned by coordb. Evidence: failing run arrow (13.0, 675.2) 44x44, row 216 top 674.2, `#scroll-area` 360x651.1 `scrollTop` 1269, `#dock` top 651.1, `elementFromPoint` at (55.1, 652.2) and (51.8, 652.2) returns `div.solo` (`#control-pane.solo`); passing run `scrollTop` 1651, row at y 292.2, hit is the arrow itself.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as 1744b2ab: offline-cache-phone-360 green in the gate on b70c2584 (replayed as 1744b2ab); coalesce 12/12 locally.

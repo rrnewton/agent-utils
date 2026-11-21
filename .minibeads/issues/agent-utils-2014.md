@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-screenshots-desks-scene-59-scroll: scene 59 strict scroll equality races late re-anchoring on a hot host'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -8,7 +8,7 @@ labels:
 - ui
 - browser
 created_at: 2026-11-20T18:00:00-05:00
-updated_at: 2026-11-20T18:00:00-05:00
+updated_at: 2026-11-20T22:00:00-05:00
 ---
 
 # Description
@@ -31,3 +31,7 @@ updated_at: 2026-11-20T18:00:00-05:00
 # Notes
 
 [watermelon-full-preview] mu-discussfix, after #2012. Number 2014 pre-assigned by coordb. Evidence: #2010 gate (head b908f455) screenshots-desks exit 31 at scene 59 after scene 58 passed on laptop-1280; solo `--only 59-all-thread-selected` 4/4 ok; full desks about 10/11 pass locally including parallel dagrun sets. Validation deferred during the coordinator's measurement window on the lane host; code written first, browser proof to follow when the window lifts.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as 9b3384de: screenshots-desks green in the gate on 048304d0 (stack replayed to 9b3384de); desks matrix 3/3 locally.

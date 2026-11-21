@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-documents-backfilter-head-total: the Back walk reads the head before the grown-set refresh lands'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -8,7 +8,7 @@ labels:
 - documents
 - browser
 created_at: 2026-11-20T18:00:00-05:00
-updated_at: 2026-11-20T18:00:00-05:00
+updated_at: 2026-11-20T22:00:00-05:00
 ---
 
 # Description
@@ -27,3 +27,7 @@ updated_at: 2026-11-20T18:00:00-05:00
 # Notes
 
 [watermelon-full-preview] mu-discussfix, stacked after #2020/#2021. Number 2023 pre-assigned by coordb.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as fd9feb35: clean full gate pass on 860f962d (replayed as fd9feb35).

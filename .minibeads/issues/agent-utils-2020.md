@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-read-pause-reply-hold-clock: the held-read snapshot compares a free-running audio clock exactly'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -8,7 +8,7 @@ labels:
 - voice
 - browser
 created_at: 2026-11-20T18:00:00-05:00
-updated_at: 2026-11-20T18:00:00-05:00
+updated_at: 2026-11-20T22:00:00-05:00
 ---
 
 # Description
@@ -28,3 +28,7 @@ updated_at: 2026-11-20T18:00:00-05:00
 # Notes
 
 [watermelon-full-preview] mu-discussfix. Number 2020 pre-assigned by coordb. Sibling: #2021 vibe-talk-scroll-stability-arrival-offer.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as 5d37a560: clean full gate pass on 0f5363dd (stack replayed to 5d37a560).

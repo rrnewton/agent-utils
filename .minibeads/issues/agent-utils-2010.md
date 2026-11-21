@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-discuss-browser-red-on-main: three discuss browser checks fail on the collapse bar'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -9,7 +9,7 @@ labels:
 - ui
 - browser
 created_at: 2026-11-20T18:00:00-05:00
-updated_at: 2026-11-20T18:00:00-05:00
+updated_at: 2026-11-20T22:00:00-05:00
 ---
 
 # Description
@@ -34,3 +34,7 @@ updated_at: 2026-11-20T18:00:00-05:00
 # Notes
 
 [watermelon-full-preview] mu-discussfix, owner-priority gate. Number 2010 pre-assigned by coordb. Related: `#1960 vibe-talk-discuss-header-toggle-colours` (the toggle that replaced the chip pair), `#1961 vibe-talk-colour-themes`, `#1985 vibe-talk-windowed-all-view-fixes`, `#1986`, `#1984`.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as 28cc9860: discuss-browser, discuss-dock-browser and discuss-strike-live-browser green in the gate on b908f455 (replayed as 28cc9860).

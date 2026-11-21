@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-server-hits-typing-debounce: the while-typing silence assertion races the search debounce on a hot host'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -8,7 +8,7 @@ labels:
 - search
 - browser
 created_at: 2026-11-20T18:00:00-05:00
-updated_at: 2026-11-20T18:00:00-05:00
+updated_at: 2026-11-20T22:00:00-05:00
 ---
 
 # Description
@@ -28,3 +28,7 @@ updated_at: 2026-11-20T18:00:00-05:00
 # Notes
 
 [watermelon-full-preview] mu-discussfix, after #2014. Number 2019 pre-assigned by coordb. Fix option (1) chosen by the coordinator: fill/single input event, one ask for the full word after a condition-based settle, plus the 50-card stand.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as 9b3384de: server-hits-browser green in the same gate on 048304d0 (stack replayed to 9b3384de) and solo.
