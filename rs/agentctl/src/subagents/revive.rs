@@ -2943,7 +2943,13 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             effectives.insert(0, refreshed);
         }
         for effective in effectives {
-            let expected_arguments = expected_arguments(effective)?;
+            // An unrebuildable recorded generation is no match, not
+            // an error: the refusal stays the ordinary one (#1992).
+            let expected_arguments = match expected_arguments(effective) {
+                Ok(arguments) => arguments,
+                Err(error) if std::ptr::eq(effective, old) => return Ok(false),
+                Err(error) => return Err(error),
+            };
             if record.name == old.name
                 && record.token != old.token
                 && record.harness == old.harness
