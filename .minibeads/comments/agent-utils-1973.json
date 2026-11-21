@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-1973-cf763d9d916",
+    "issue_id": "agent-utils-1973",
+    "author": "host-a",
+    "body": "[watermelon-full-preview] Cold-review notes recorded. Accepted nits: a console that keeps dying still churns once per 5 min at the viewer backoff cap; two registries sharing a workspace label can race a viewer create; an owner renaming a live console tab gets a duplicate on the next ensure. Label-sync caveat for #1971 agentctl-tabs-scheduled-hygiene (mu-tabhygiene owns tabs.rs): hygiene label sync renames a recorded viewer tab to the agent name, which would fool a label-only ownership proof, so ensure now also requires a tail tab's pane to be an idle shell or provably run agentctl tail NAME (pane_foreground_argv) before closing it. Ideally label sync also should not rename a tab whose pane runs an unrelated live program; that half lives in tabs.rs and is mu-tabhygiene's call.",
+    "created_at": "2026-11-20T19:01:43.158635877Z",
+    "updated_at": "2026-11-20T19:01:43.158635877Z"
+  }
+]
