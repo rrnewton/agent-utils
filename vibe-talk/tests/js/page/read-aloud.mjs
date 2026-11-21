@@ -4513,21 +4513,23 @@ async function heldThreadPreparations() {
   return { page, data, releases };
 }
 
-test("THE THREADS ON SCREEN ARE PREPARED ONE AFTER ANOTHER, never all at once", async () => {
-  // The owner's lag on 2026-10-19: ten preparations for one channel in flight together, each 46 to
-  // 53 s, because one upstream slot served them in turn. One at a time, each is answered as fast as
-  // that slot allows, and the first rows are ready while the last are still being asked for.
+test("THE THREADS ON SCREEN ARE PREPARED A FEW AT A TIME, never one serial round-trip each", async () => {
+  // `#2066 vibe-talk-page-freeze` (the #2059 note's S1), superseding #375's one-after-another:
+  // that order was for a server whose every preparation fetched upstream in turn. Preparations
+  // now mostly answer from the server's cache in milliseconds and the rest are bounded there,
+  // so serial is a round-trip per thread on screen — bursts of about fifty in the owner's log.
+  // A few at a time (PREPARE_GROUPS_AT_ONCE), started most-wanted first, each kept as it lands;
+  // never the whole screen at once, which is the burst #375 measured at 46 to 53 s each.
   const { page, data, releases } = await heldThreadPreparations();
-  assert.equal(page.prepareCalls.length, 1, "the threads were not prepared one at a time");
-  assert.equal(page.maxPreparesInFlight, 1);
-  for (let answered = 1; answered < 3; answered += 1) {
-    releases[answered - 1]();
-    await page.settle();
-    assert.equal(page.prepareCalls.length, answered + 1, `thread ${answered + 1} was never asked for`);
-    assert.equal(page.maxPreparesInFlight, 1, "two preparations were in flight at once");
-  }
-  releases[2]();
+  assert.ok(page.prepareCalls.length >= 2, "the thread groups were asked for one after another");
+  assert.ok(page.maxPreparesInFlight >= 2, "no two groups overlapped");
+  assert.ok(page.maxPreparesInFlight <= 4, "more than the bound were in flight at once");
+  // Answering those in flight asks for the rest: every group is asked for, none twice.
+  for (const release of releases.splice(0)) release();
   await page.settle();
+  for (const release of releases.splice(0)) release();
+  await page.settle();
+  assert.equal(page.prepareCalls.length, 3, "a thread group was never asked for, or was asked twice");
   assert.deepEqual(page.prepareCalls.map((call) => [call.thread_id || null, call.ids]).sort(), [
     [null, ["200"]], [data.threads[0].id, ["201", "202"]], [data.threads[1].id, ["203", "204"]],
   ].sort());
@@ -4535,7 +4537,8 @@ test("THE THREADS ON SCREEN ARE PREPARED ONE AFTER ANOTHER, never all at once", 
 
 test("a tap that needs preparing CANCELS the batch in flight, reads at once, and the batch resumes", async () => {
   const { page, data, releases } = await heldThreadPreparations();
-  assert.equal(page.prepareCalls.length, 1);
+  // The batch's groups are in flight together now (`#2066`): asked together, before any lands.
+  assert.ok(page.prepareCalls.length >= 2, "the batch was not in flight together");
   const batchSignal = page.prepareSignals[0];
   assert.ok(batchSignal, "the batch cannot be cancelled");
   // The tap's own preparation is answered at once; only the batch is held.
@@ -4552,10 +4555,11 @@ test("a tap that needs preparing CANCELS the batch in flight, reads at once, and
   assert.match(page.players[0].url, /ticket-for-203\?selection=tap-/);
   // ...and the batch starts again behind the read, without the row the tap prepared.
   const after = page.prepareCalls.slice(page.prepareCalls.indexOf(tapCall) + 1);
-  assert.equal(after.length, 1, "the batch did not resume, or resumed more than once");
-  assert.ok(after[0].ids.length > 0 && !after[0].ids.includes("203"),
-    `the resumed batch asked again for the row the tap prepared: ${JSON.stringify(after[0])}`);
-  assert.ok(page.maxPreparesInFlight <= 2, "more than the tap's and one batch request were in flight");
+  assert.ok(after.length >= 1, "the batch did not resume");
+  assert.ok(after.every((call) => call.ids.length > 0 && !call.ids.includes("203")),
+    `the resumed batch asked again for the row the tap prepared: ${JSON.stringify(after)}`);
+  // The batch's bound plus the tap's own, at the transient worst (`#2066`).
+  assert.ok(page.maxPreparesInFlight <= 5, "more than the bound and the tap's were in flight");
 });
 
 test("a batch cancelled while it was being answered keeps nothing it was answered with", async () => {
@@ -4563,14 +4567,15 @@ test("a batch cancelled while it was being answered keeps nothing it was answere
   // them back.
   const { page, releases } = await heldThreadPreparations();
   const first = page.prepareSignals[0];
+  const atOldPace = page.prepareCalls.length;
   page.prepareHold = null;
   page.el("read-speed-box").value = "150";
   await page.el("read-speed-box").dispatch("change");
   await page.settle();
   assert.equal(first.aborted, true, "the batch at the old pace was left running");
-  releases[0]();
+  for (const release of releases.splice(0)) release();
   await page.settle();
-  const speeds = page.prepareCalls.slice(1).map((call) => call.speed);
+  const speeds = page.prepareCalls.slice(atOldPace).map((call) => call.speed);
   assert.ok(speeds.length > 0 && speeds.every((speed) => speed === 1.5), `re-prepared at ${speeds}`);
 });
 

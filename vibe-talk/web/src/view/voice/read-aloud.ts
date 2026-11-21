@@ -220,6 +220,15 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
    * presses of + restart the sentence or block once, not three times.
    */
   const READ_SPEED_SETTLE_MS = 600;
+  /**
+   * How many thread groups one preparation asks for at once (`#2066
+   * vibe-talk-page-freeze`, the #2059 note's S1): as many as the server fetches
+   * thread messages at once for one preparation. One at a time (#375) made a
+   * screen of threads a serial round-trip per thread — bursts of about fifty —
+   * each now usually a cache answer of a few milliseconds on the server, whose
+   * own fetch is bounded besides; all at once would stack the bursts back up.
+   */
+  const PREPARE_GROUPS_AT_ONCE = 4;
   let readSpeed: number | null = null;
   /**
    * `#2053 vibe-talk-pace-has-no-effect`. Whether the voice that will read can
@@ -1054,13 +1063,17 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   /**
    * Prepare exactly these messages, one request per thread they belong to, and keep their tickets.
    *
-   * The requests go ONE AFTER ANOTHER, in the order their threads first appear in `ids`, and each
-   * thread's tickets are kept as soon as they arrive. `#375 read-aloud-latency`: sent all at once
-   * they queued behind each other upstream anyway, and every one waited for the slowest.
+   * The requests go up to [`PREPARE_GROUPS_AT_ONCE`] at a time, started in the order their
+   * threads first appear in `ids`, and each thread's tickets are kept as soon as they arrive.
+   * `#375 read-aloud-latency` had them one after another, because sent all at once they queued
+   * behind each other upstream anyway; since the server answers most preparations from its
+   * cache in milliseconds and bounds the rest (`#2066`), one at a time is a serial round-trip
+   * per thread on screen for no upstream saving. The bound keeps a screenful of threads from
+   * stacking up as one burst again.
    *
    * @param {string} channel the channel the ids are in.
    * @param {Array<string>} ids message ids, most wanted first.
-   * @param {AbortSignal | null} [signal] stops it between requests, and closes the one in flight.
+   * @param {AbortSignal | null} [signal] stops it between requests, and closes those in flight.
    */
   async function requestPreparedSpeech(channel: string, ids: string[], signal: AbortSignal | null = null) {
     const groups = new Map<string | null, string[]>();
@@ -1069,12 +1082,12 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
       if (!groups.has(threadId)) groups.set(threadId, []);
       groups.get(threadId)!.push(id);
     }
-    for (const [threadId, messageIds] of groups) {
-      if (signal && signal.aborted) return;
+    const queue = [...groups];
+    const askGroup = async ([threadId, messageIds]: readonly [string | null, string[]]): Promise<void> => {
       // Before the request goes: the tickets may be minted the moment it arrives, and counting from
       // the answer would let a URL outlive its ticket by however long the answer took. `#290`.
       const requestedAt = speechDeadlineNow();
-      const batch = await deps.api(
+      const batch: PrepareReply = await deps.api(
         `/api/v1/channels/${encodeURIComponent(channel)}/speech/prepare`,
         { method: "POST", body: { ids: messageIds, speed: readSpeed === null ? null : readSpeed / 100,
           ...(readAudioSource === "wit" && witVoice ? { voice: witVoice } : {}),
@@ -1089,7 +1102,19 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
         const blocks = Array.isArray(entry.blocks) && entry.blocks.length > 1 ? entry.blocks : null;
         preparedSpeech.keep(String(entry.message_id), { url: entry.url, until, blocks });
       }
+    };
+    const workers: Promise<void>[] = [];
+    for (let at = 0; at < Math.min(PREPARE_GROUPS_AT_ONCE, queue.length); at += 1) {
+      workers.push((async () => {
+        for (;;) {
+          if (signal && signal.aborted) return;
+          const next = queue.shift();
+          if (!next) return;
+          await askGroup(next);
+        }
+      })());
     }
+    await Promise.all(workers);
   }
 
   /**

@@ -5285,6 +5285,9 @@ const TUNING_BANDS = {
   FREEZE_MAX_EVENTS: [40, 40, "events in the freeze ring and one report: the server's exact cap"],
   SCRIPT_CHARS: [256, 256, "chars of one long frame's invoker kept: the server's exact cap"],
   FLUSH_QUIET_MS: [1000, 60000, "the least while between the freeze watch's unforced postings"],
+  // `#2066 vibe-talk-page-freeze` (the #2059 note's S1). Preparations in flight together:
+  // one is a serial round-trip per thread on screen; unbounded restacks the burst upstream.
+  PREPARE_GROUPS_AT_ONCE: [2, 8, "thread groups one speech preparation asks for at once"],
   // `#1224 mention-jump-in-view`. How often a landed row is checked while it can still be lost:
   // under four a second checks chase every resize of a page still settling; far slower than
   // frames a reader sees misses the loss until whatever pushed it has itself gone.
