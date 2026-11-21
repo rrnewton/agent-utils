@@ -803,6 +803,9 @@ export function createReplySession(deps: ReplySessionDependencies): ReplySession
       return;
     }
     deps.setHiddenIfChanged(deps.el("reply-discard"), false);
+    // Stood at the foot again in this same call (`#2063`): the question grows the box,
+    // and its buttons are pressed where they are drawn, not a watcher later.
+    if (footDock) footDock.place();
     // Into view as it takes the focus: under the box, it may open below the list's foot.
     deps.el("reply-discard-no").focus();
   }
@@ -1087,6 +1090,9 @@ export function createReplySession(deps: ReplySessionDependencies): ReplySession
     if (replyState.anchor === null || !replyState.list) return;
     const room = `${Math.ceil(replyMountFor(replyState.list).getBoundingClientRect().height || 0)}px`;
     if (replyState.anchor.style.getPropertyValue("--inline-reply-room") !== room) replyState.anchor.style.setProperty("--inline-reply-room", room);
+    // A box stood at the foot is stood again with its new height in the same pass
+    // (`#2063`), not a watcher later: its buttons never stand a frame from drawn.
+    if (footDock) footDock.place();
   }
 
   /**
@@ -1134,17 +1140,30 @@ export function createReplySession(deps: ReplySessionDependencies): ReplySession
   let footDock: { mount: HTMLElement; scroller: HTMLElement; release: () => void; place: () => void; watcher?: ResizeObserver | null; onScroll?: () => void } | null = null;
 
   /** Stand `mount` at the foot of `pane`, over the rows, their place untouched (`#2063`). The
-   * box keeps its anchored place in the layout (the room under its row is already kept for it)
-   * and is painted at the foot by a shift of its own: no row, spacer or scroll position moves. */
-  function dockReplyAtFoot(mount: HTMLElement, pane: { scroller(): HTMLElement; foot(): number }): void {
+   * box keeps the room kept for it under its row and is stood at the foot by its own `top`
+   * (out of flow, so no row, spacer or scroll position moves, and presses land on it as
+   * drawn), until the box under its row would stand inside the foot itself. */
+  function dockReplyAtFoot(mount: HTMLElement, pane: { scroller(): HTMLElement; head(): number; foot(): number }): void {
     releaseFootDock();
     const scroller = pane.scroller();
-    let shift = 0;
+    /** How far the box stands above its anchored place, in px (never positive). */
+    let lift = 0;
     const place = (): void => {
       if (!footDock) return;
       const rect = mount.getBoundingClientRect();
-      shift += pane.foot() - rect.bottom;
-      mount.style.transform = shift !== 0 ? `translateY(${Math.round(shift)}px)` : "";
+      const anchoredTop = rect.top - lift;
+      let next = lift + pane.foot() - rect.bottom;
+      // Never stood above the pane's head either: in a band too short for the box
+      // (a docked panel, a keyboard up) its head stays clear of what floats there,
+      // and its foot is the reader's scroll to reach, as before.
+      if (anchoredTop + next < pane.head()) next = pane.head() - anchoredTop;
+      // A sub-pixel settling of the rows around it is not a move: standing the box
+      // again for one would put its buttons a frame away from where they were drawn.
+      if (Math.abs(next - lift) < 1) return;
+      const resolved = Number.parseFloat(getComputedStyle(mount).top);
+      const base = Number.isFinite(resolved) ? resolved : mount.offsetTop;
+      mount.style.top = `${Math.round(base + next - lift)}px`;
+      lift = next;
     };
     const release = (): void => releaseFootDock();
     // A scroll the reader makes by hand is followed (the box stays at the foot) until the
@@ -1152,7 +1171,7 @@ export function createReplySession(deps: ReplySessionDependencies): ReplySession
     // scroll of the page's own (a keeper following the foot) never undocks it unseen.
     const onScroll = (): void => {
       if (!footDock) return;
-      const naturalBottom = mount.getBoundingClientRect().bottom - shift;
+      const naturalBottom = mount.getBoundingClientRect().bottom - lift;
       if (naturalBottom <= pane.foot() + 1) releaseFootDock();
       else place();
     };
@@ -1180,7 +1199,7 @@ export function createReplySession(deps: ReplySessionDependencies): ReplySession
     window.removeEventListener("resize", place);
     if (window.visualViewport) window.visualViewport.removeEventListener("resize", place);
     mount.removeAttribute("data-foot-docked");
-    mount.style.removeProperty("transform");
+    mount.style.removeProperty("top");
   }
 
   /** Scroll `pane` so that the row of `list` holding message `id` has its top at `top` again, where both are known. */

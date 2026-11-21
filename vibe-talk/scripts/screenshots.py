@@ -5702,7 +5702,7 @@ SCENES: tuple[Scene, ...] = (
     ),
     Scene(
         name="19-reply-view-long-target",
-        what="a target longer than the frame — the list moves to show the box, which stays reachable",
+        what="a target longer than the frame — the box stands at the foot, reachable, the message unmoved",
         act=_act_reply_long_target,
         # PHONES ONLY, and this is a scoping decision rather than an oversight. The property is
         # that a message longer than the frame does not push the reply control off the bottom -- and
@@ -5714,18 +5714,21 @@ SCENES: tuple[Scene, ...] = (
         expect=(
             ("the reply is open in the list", "window.__visible('column-reply')"),
             # The whole content of this picture: a message a good part of the frame tall, with the box
-            # under it still on screen, the list having moved only as far as shows it whole, so the
-            # thing you type into is there (`#410 inline-reply-editor`).
+            # still on screen and the message unmoved, so the thing you type into is there (`#410
+            # inline-reply-editor`, `#2063 vibe-talk-quote-reply-view-stability`): directly under
+            # it where that stands inside the frame, else docked at the foot over its tail.
             (
                 "the message being answered is a long one, over a third of the frame",
                 "(() => { const t = document.getElementById('reply-probe').getBoundingClientRect(); "
                 "return t.height > window.innerHeight / 3; })()",
             ),
             (
-                "the box is directly under it",
+                "the box is directly under it, or docked at the foot over its tail",
                 "(() => { const t = document.getElementById('reply-probe').getBoundingClientRect(); "
-                "const b = document.getElementById('column-reply').getBoundingClientRect(); "
-                "return b.top - t.bottom >= -1 && b.top - t.bottom <= 9; })()",
+                "const m = document.getElementById('column-reply'); "
+                "const b = m.getBoundingClientRect(); "
+                "return (b.top - t.bottom >= -1 && b.top - t.bottom <= 9) "
+                "|| (m.hasAttribute('data-foot-docked') && b.bottom <= window.innerHeight + 1); })()",
             ),
             (
                 "the reply box and its Send control are still on screen, above the frame's foot",
