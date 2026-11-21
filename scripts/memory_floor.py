@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -121,10 +122,13 @@ def load_config(explicit: str | None = None) -> FloorConfig:
 
     def _num(key: str, default: float) -> float:
         value = raw.get(key, default)
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        # Non-finite values refuse: nan compares false against every
+        # floor and would silently weaken it, inf would block forever.
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or value < 0):
             raise MemoryFloorError(
-                f"memory floor config {path}: {key} must be a non-negative number, "
-                f"not {value!r}")
+                f"memory floor config {path}: {key} must be a finite, "
+                f"non-negative number, not {value!r}")
         return float(value)
 
     return FloorConfig(
@@ -143,9 +147,12 @@ def parse_meminfo(text: str) -> tuple[float, float]:
         parts = line.split()
         if len(parts) >= 2 and parts[0] in ("MemTotal:", "MemAvailable:"):
             try:
-                found[parts[0]] = float(parts[1]) / (1024.0 * 1024.0)  # kB -> GiB
+                kib = float(parts[1])
             except ValueError:
                 continue
+            if not math.isfinite(kib) or kib < 0:
+                raise MemoryFloorError(f"meminfo {parts[0]} is not finite: {parts[1]!r}")
+            found[parts[0]] = kib / (1024.0 * 1024.0)  # kB -> GiB
     if "MemTotal:" not in found or "MemAvailable:" not in found:
         raise MemoryFloorError("meminfo lacks MemTotal or MemAvailable")
     return found["MemAvailable:"], found["MemTotal:"]
@@ -168,8 +175,8 @@ def check(cls: str, need_gib: float, config: FloorConfig | None = None,
     """One admission verdict; `config=None` loads the host file."""
     if cls not in _CLASSES:
         raise MemoryFloorError(f"unknown memory class {cls!r} (heavy or light)")
-    if need_gib < 0:
-        raise MemoryFloorError(f"need must be non-negative, not {need_gib}")
+    if not math.isfinite(need_gib) or need_gib < 0:
+        raise MemoryFloorError(f"need must be a finite, non-negative number, not {need_gib}")
     cfg = load_config() if config is None else config
     available, total = read_meminfo(meminfo)
     floor = cfg.floor_gib(cls, total)

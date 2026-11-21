@@ -2632,3 +2632,12 @@ def test_gate_log_retention_is_bounded(tmp_path: Path) -> None:
     removed = gate.prune_gate_logs(keep=3)
     assert removed == 4
     assert sorted(d.name for d in root.iterdir()) == ["run-4", "run-5", "run-6"]
+@pytest.mark.parametrize("raw", ["nan", "inf", "-inf", "-2", "lots"])
+def test_gate_memory_need_refuses_non_finite(tmp_path: Path, raw: str) -> None:
+    """#2062 follow-up: GATE_MEMORY_NEED_GIB / MemoryMax / --memory-need-gib
+    values that are not finite numbers refuse instead of weakening
+    the floor (nan) or blocking forever (inf)."""
+    gate = _gate_module()
+    args = type("A", (), {"memory_need_gib": raw, "ledger": None})()
+    with pytest.raises(ValueError):
+        gate.memory_need_gib(args, "heavy")

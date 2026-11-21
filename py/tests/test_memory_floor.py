@@ -107,3 +107,31 @@ def test_cli_check_exit_codes_and_json(tmp_path: Path) -> None:
     bad = _cli(tmp_path, "check", "--class", "heavy", "--need-gib", "1",
                "--config", str(_config(tmp_path, "nope = [\n")), "--meminfo", str(info))
     assert bad.returncode == 2
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "-1"])
+def test_config_non_finite_or_negative_refuses(tmp_path: Path, value: str) -> None:
+    """A consumer's review: nan compares false against every floor and
+    would silently weaken it; inf would block forever. Both refuse."""
+    with pytest.raises(mf.MemoryFloorError):
+        mf.load_config(str(_config(tmp_path, f"heavy_min_gib = {value}\n")))
+    with pytest.raises(mf.MemoryFloorError):
+        mf.load_config(str(_config(tmp_path, f"light_floor_gib = {value}\n")))
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "-5"])
+def test_meminfo_and_need_non_finite_refuse(tmp_path: Path, value: str) -> None:
+    cfg = mf.load_config(str(_config(tmp_path, "")))
+    bad = tmp_path / "meminfo-bad"
+    bad.write_text(f"MemTotal:       {value} kB\nMemAvailable:   1024 kB\n")
+    with pytest.raises(mf.MemoryFloorError):
+        mf.check("heavy", 1.0, cfg, str(bad))
+    with pytest.raises(mf.MemoryFloorError):
+        mf.check("heavy", float(value), cfg, str(_meminfo(tmp_path, 200.0, 100.0)))
+
+
+def test_cli_nan_need_exits_2(tmp_path: Path) -> None:
+    result = _cli(tmp_path, "check", "--class", "heavy", "--need-gib", "nan",
+                  "--config", str(_config(tmp_path, "")),
+                  "--meminfo", str(_meminfo(tmp_path, 200.0, 100.0)))
+    assert result.returncode == 2, result.stdout + result.stderr

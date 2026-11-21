@@ -347,6 +347,7 @@ import datetime as dt
 import fcntl
 import fnmatch
 import json
+import math
 import os
 import re
 import shlex
@@ -1458,6 +1459,19 @@ def memory_class(args: argparse.Namespace, command: list[str], rerun: bool) -> s
     return "light" if selected else "heavy"
 
 
+def _finite_need(raw: object, source: str) -> float:
+    """A caller-passed need as a float, refusing non-finite values
+    (#2062 follow-up): nan would silently weaken the floor, because
+    every comparison against it is false."""
+    try:
+        value = float(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{source}={raw!r} is not a number") from exc
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{source} must be a finite, non-negative number, not {raw!r}")
+    return value
+
+
 def memory_need_gib(args: argparse.Namespace, cls: str) -> tuple[float, str]:
     """This job's need (#2062): --memory-need-gib/$GATE_MEMORY_NEED_GIB,
     then a launcher-passed MemoryMax ($GATE_MEMORY_MAX_GIB), then the
@@ -1466,10 +1480,10 @@ def memory_need_gib(args: argparse.Namespace, cls: str) -> tuple[float, str]:
     if raw is None:
         raw = os.environ.get("GATE_MEMORY_NEED_GIB")
     if raw not in (None, ""):
-        return float(raw), "explicit need"
+        return _finite_need(raw, "--memory-need-gib/$GATE_MEMORY_NEED_GIB"), "explicit need"
     raw_max = os.environ.get("GATE_MEMORY_MAX_GIB")
     if raw_max:
-        return float(raw_max), "MemoryMax"
+        return _finite_need(raw_max, "$GATE_MEMORY_MAX_GIB"), "MemoryMax"
     try:
         peaks = []
         for line in ledger_path(getattr(args, "ledger", None)).read_text().splitlines():
@@ -1478,7 +1492,8 @@ def memory_need_gib(args: argparse.Namespace, cls: str) -> tuple[float, str]:
                 peak = row.get("memory_peak_gib", row.get("memory_need_gib"))
             except json.JSONDecodeError:
                 continue
-            if isinstance(peak, (int, float)) and not isinstance(peak, bool):
+            if (isinstance(peak, (int, float)) and not isinstance(peak, bool)
+                    and math.isfinite(peak)):
                 peaks.append(float(peak))
         if peaks:
             return max(peaks), "measured peak (ledger)"
