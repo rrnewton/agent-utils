@@ -1,6 +1,6 @@
 ---
 title: 'agentctl-revive-journal-launch-spec: finish an in-flight revive against its recorded launch spec and pin-abandon a vanished pane'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -63,3 +63,16 @@ consumer's registry.
 [watermelon-full-preview] Lane mu-restorefix/1992, after #1934
 agentctl-restore-muse-sessions-and-timeout landed (c8591bd3),
 coordinated by coordb. Related: #1934, #1928.
+
+## Resolution
+
+[watermelon-full-preview] Landed as 52cb6240 on main. Candidate
+verification in both editions accepts the recorded generation
+beside the refreshed profile when finishing an in-flight journal;
+only a new revive re-reads the profile. The stuck consumer journal
+would have finished under this fix: its candidate was alive on the
+recorded session, the only failing check was the drifted profile
+policy, and the vanished old pane is handled by the missing-pane
+proof (or the #1934 candidate pin). The pinned-token abandon for a
+dead candidate in a vanished pane already worked and is now
+test-covered.
