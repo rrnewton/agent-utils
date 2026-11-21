@@ -88,3 +88,81 @@ def test_repair_refuses_live_pinned_worktree(tmp_path: Path) -> None:
     vcs = wrkslots_cli._GitVcs()
     with pytest.raises(wrkslots_cli.Refusal, match="refusing to move it"):
         vcs.repair_nested_repository(nested_leaf)
+
+
+def test_salvage_index_trees_survive_fence_with_nested_worktree(tmp_path: Path) -> None:
+    """Salvage index trees after a fence rename with a nested worktree (#2026).
+
+    The nested worktree holds a submodule whose admin ``core.worktree``
+    is a relative path naming the slot's unfenced location; Git cannot
+    chdir into it after the fence. Salvage must still read the nested
+    worktree's staged and worktree trees, per-invocation, without
+    rewriting any Git file.
+    """
+
+    import dataclasses
+    import subprocess
+
+    from wrkslots.tests.test_lifecycle import checkout, create, make_project
+
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    target = checkout(project)
+
+    def run(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            list(args), cwd=cwd, check=False, capture_output=True, text=True, timeout=120
+        )
+
+    nested = target / "ignored" / "nested" / "agent-utils"
+    added = run(
+        target, "git", "worktree", "add", "--relative-paths", "-b", "nested-branch",
+        str(nested),
+    )
+    assert added.returncode == 0, added.stderr
+    leaf_src = tmp_path / "leaf-src"
+    _repo(leaf_src)
+    sub = run(
+        nested, "git", "-c", "protocol.file.allow=always",
+        "submodule", "add", "-q", str(leaf_src), "leafmod",
+    )
+    assert sub.returncode == 0, sub.stderr
+    init = run(
+        nested, "git", "-c", "protocol.file.allow=always",
+        "submodule", "update", "--init",
+    )
+    assert init.returncode == 0, init.stderr
+    for args in (
+        ["config", "user.email", "t@example.invalid"],
+        ["config", "user.name", "T"],
+        ["add", "-A"],
+        ["commit", "-q", "-m", "nested setup"],
+    ):
+        committed = run(nested, "git", *args)
+        assert committed.returncode == 0, committed.stderr
+
+    slot_dir = target.parent
+    fenced = slot_dir.with_name(".slot01.fenced.test")
+    os.rename(slot_dir, fenced)
+    moved_nested = fenced / target.name / "ignored" / "nested" / "agent-utils"
+
+    config = wrkslots_cli._load_config(str(project), "testhost")
+    record = wrkslots_cli._find_record(wrkslots_cli._load_active(config), "slot01")
+    nested_checkout = dataclasses.replace(
+        record.checkouts[0], name="product/ignored/nested/agent-utils"
+    )
+    vcs = wrkslots_cli._GitVcs()
+    trees = wrkslots_cli._index_state_trees(vcs, config, nested_checkout, moved_nested)
+    assert trees
+    assert all(len(tree) == 40 for tree in trees)
+    # The worktree tree still carries the submodule's gitlink, at the
+    # submodule's current HEAD, exactly as a healthy `git add` would.
+    gitdir = wrkslots_cli._worktree_gitdir(moved_nested / "leafmod")
+    assert gitdir is not None
+    head = vcs._run(
+        moved_nested,
+        [f"--git-dir={gitdir}", "rev-parse", "--verify", "HEAD^{commit}"],
+    ).stdout.strip()
+    listing = run(moved_nested, "git", "ls-tree", trees[-1], "leafmod").stdout
+    assert listing.startswith(f"160000 commit {head}\t")

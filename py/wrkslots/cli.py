@@ -36494,18 +36494,77 @@ def _index_state_trees(
         tracks_files = bool(
             vcs._run(path, ["ls-files", "-z"], env_overrides=env).stdout.strip()
         )
+        stale_gitlinks: list[tuple[str, str]] = []
         if tracks_files:
-            vcs._run(
-                path,
-                ["add", "-u", "--", *pathspecs],
-                env_overrides=env,
-                config=_FAITHFUL_ADD_CONFIG,
-            )
+            try:
+                vcs._run(
+                    path,
+                    ["add", "-u", "--", *pathspecs],
+                    env_overrides=env,
+                    config=_FAITHFUL_ADD_CONFIG,
+                )
+            except Refusal as exc:
+                if "cannot chdir to" not in str(exc) and "failed in submodule" not in str(exc):
+                    raise
+                # A fence rename leaves a submodule's recorded
+                # core.worktree naming the unfenced slot path, so Git
+                # cannot chdir into it from here (#2026, as #1483 for
+                # status). The gitlink is all salvage needs from such a
+                # submodule, and its HEAD reads straight from its
+                # gitdir, with no worktree at all. Take every populated
+                # gitlink out of the copied index, add the rest of the
+                # worktree, then put each gitlink back at its current
+                # HEAD. Only the copied index is written: no Git file
+                # changes, so a refused or rolled-back removal leaves
+                # the repository metadata exactly as it was.
+                for relative in vcs._indexed_gitlink_paths(path):
+                    submodule = path / relative
+                    if not _submodule_worktree_populated(submodule):
+                        continue
+                    gitdir = _worktree_gitdir(submodule)
+                    if gitdir is None:
+                        continue
+                    head = vcs._run(
+                        path,
+                        [f"--git-dir={gitdir}", "rev-parse", "--verify", "HEAD^{commit}"],
+                        check=False,
+                    ).stdout.strip()
+                    if SHA_RE.fullmatch(head):
+                        stale_gitlinks.append((relative, head))
+                if not stale_gitlinks:
+                    raise
+                shutil.copyfile(index, worktree_copy, follow_symlinks=False)
+                for relative, _head in stale_gitlinks:
+                    vcs._run(
+                        path,
+                        ["update-index", "--force-remove", relative],
+                        env_overrides=env,
+                    )
+                vcs._run(
+                    path,
+                    ["add", "-u", "--", *pathspecs],
+                    env_overrides=env,
+                    config=_FAITHFUL_ADD_CONFIG,
+                )
         untracked = vcs._run(
             path,
             ["ls-files", "--others", "--exclude-standard", "-z", "--", *pathspecs],
             env_overrides=env,
         ).stdout
+        if untracked and stale_gitlinks:
+            # With a gitlink out of the copied index its directory
+            # would list as untracked; salvage never stages a
+            # submodule's own files under its superproject.
+            kept = [
+                entry
+                for entry in untracked.split("\x00")
+                if entry
+                and not any(
+                    entry == relative or entry.startswith(relative + "/")
+                    for relative, _head in stale_gitlinks
+                )
+            ]
+            untracked = "\x00".join(kept) + ("\x00" if kept else "")
         if untracked:
             vcs._run(
                 path,
@@ -36522,6 +36581,12 @@ def _index_state_trees(
                 ["add", "--renormalize", "--", *pathspecs],
                 env_overrides=env,
                 config=_FAITHFUL_ADD_CONFIG,
+            )
+        for relative, head in stale_gitlinks:
+            vcs._run(
+                path,
+                ["update-index", "--add", "--cacheinfo", f"160000,{head},{relative}"],
+                env_overrides=env,
             )
         worktree_tree = vcs._run(path, ["write-tree"], env_overrides=env).stdout.strip()
     for tree in (staged_tree, worktree_tree):
