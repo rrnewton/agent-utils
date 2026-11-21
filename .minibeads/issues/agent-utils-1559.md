@@ -6,7 +6,7 @@ issue_type: feature
 labels:
 - agentctl
 created_at: 2026-11-20T22:08:11+00:00
-updated_at: 2026-11-21T10:04:11+00:00
+updated_at: 2026-11-21T13:12:57+00:00
 ---
 
 # Description
@@ -34,4 +34,6 @@ Landing 1 (manifest + record-gap reporting) landed 2026-11-21 as `437a5262`: rea
 
 Landing 1b (structured session candidates) landed 2026-11-21 as `5dd8708b` (verified tree `f10d1489`): session-less interactive records list report-only candidates from bounded newest-first store scans, matched by structured canonical cwd with sanitized bounded first prompts; revive walks whole stores head-only and its structured-cwd binds were verified as corrections against real stores (prefix collisions, mentions, parent dirs, Codex root-over-subdir). Gate red only on the upstream #1934 issue-parse heading (fixed on main in `080df8bf`, present in the combined tree) and the #2027 pidfd pair; landed under coordb's waiver after re-review GO and combined-tree verification. Still no persisted data and no record rewrites.
 
-Remaining for this issue: `team act` (landing 2) — its DriverRecord `manifest`/`actions[]` persisted-data report goes to coordb with the design check before code — then the wrapper, shepherd loop/unit, and deployment landings. Python revive still single-picks a Muse discovery and has no Claude/Codex discovery; whether that parity folds into a later landing is coordb's call at the landing-2 design check (restorefix owns #1934/#1992/#1993). Landing 2's per-request files under the team state directory's `actions/` accumulate without bound; pruning them is deliberately deferred to a later cleanup landing.
+Landing 2 (`team act`) landed 2026-11-21 as `9f6fa482` (verified combined tree `d6de9d60` over `cadb5b08`): the driver-owned durable request queue with request-id idempotence and running markers, DriverRecord `manifest`/`actions[]` plus per-request ledger files (cleared with the pinned reader's owner; request files accumulate unbounded, pruning deferred), model `ActRequested` self-loops that never move a deadline, the allowlist verbs, and the `agentctl team act` CLI. Its gate was red only on the #2037 five-cycles host-process case (passes in isolation) and landed under coordb's waiver after cold review, a NO-GO fix round, and a same-reviewer GO. Bridge gap actions were deferred to a follow-up (2b) at design check.
+
+Remaining for this issue: the `run-agent-prompt` wrapper (landing 3, design check first), then the shepherd loop/unit and deployment landings. Python revive still single-picks a Muse discovery and has no Claude/Codex discovery; whether that parity folds into a later landing is coordb's call at the landing-2 design check (restorefix owns #1934/#1992/#1993). Landing 2's per-request files under the team state directory's `actions/` accumulate without bound; pruning them is deliberately deferred to a later cleanup landing.
