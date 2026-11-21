@@ -1,12 +1,13 @@
 ---
 title: 'wrkslots-deferred-finish-journal-race: a sidecarred finish journal refuses its own out-of-lock reload'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-11-21T07:00:00-05:00
-updated_at: 2026-11-21T07:00:00-05:00
+updated_at: 2026-11-21T08:28:43-05:00
+closed_at: 2026-11-21T08:28:43-05:00
 ---
 
 # Description
@@ -29,3 +30,7 @@ Cause: `_finish_journal_payload` sidecars `containing_remote_refs` in the *in-me
 # Notes
 
 Related: #1757 (finish-journal sidecars), #1735 wrkslots-remove-holds-state-lock-through-salvage (the out-of-lock compares), #2026 wrkslots-fence-breaks-nested-submodule-gitdir (the stale-`core.worktree` sibling).
+
+## Resolution
+
+[watermelon-full-preview] Landed as d236117e on github/main. The four out-of-lock identity compares now canonicalise both journals (expand #1757 sidecars on copies) before the whole-JSON comparison, so a sidecarred finish journal reloads as itself; every other check is unchanged, a substituted journal still refuses, and a missing sidecar file fails closed. Regression tests: a deferred remove and the private reload, each with a salvage inventory over the 64-ref inline limit and failing first with the exact field refusals, plus the substituted-journal negative control and the missing-sidecar fail-closed test. Gate on 51e6f1c5 was red only on the #1957 census-churn test (passes alone on the tree and on main; solo rerun green).
