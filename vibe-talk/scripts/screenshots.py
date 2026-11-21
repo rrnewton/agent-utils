@@ -4528,19 +4528,59 @@ def _wait_scroll_stable(driver: Driver) -> None:
     )
 
 
+def _wait_scroll_stable_at(driver: Driver, top: float) -> None:
+    """Wait until #scroll-area stands at `top` and has not moved for 300 ms.
+
+    # `#2014`: stability alone is not the claim — a late re-anchor can
+    # settle the list at a different offset than the one recorded before
+    # the click, and capture's strict equality then polls a stale value
+    # for its whole window. The condition is equality plus stability
+    # (patience-stretched by the page's waits); a timeout reads the live
+    # offset back, so a real scroll on select reports its delta.
+    """
+    driver.page.evaluate(
+        "() => { window.__stableTop = undefined; window.__stableFrames = 0; "
+        "window.__stableTopAt = 0; }"
+    )
+    try:
+        driver.page.wait_for_function(
+            "(top) => { const a = document.getElementById('scroll-area'); "
+            "const now = performance.now(); "
+            "if (a.scrollTop !== top) { "
+            "window.__stableTop = a.scrollTop; window.__stableTopAt = now; "
+            "window.__stableFrames = 0; return false; } "
+            "if (window.__stableTop !== a.scrollTop) { "
+            "window.__stableTop = a.scrollTop; window.__stableTopAt = now; "
+            "window.__stableFrames = 0; return false; } "
+            "window.__stableFrames = (window.__stableFrames || 0) + 1; "
+            "return window.__stableFrames >= 3 && now - (window.__stableTopAt || now) >= 300; }",
+            arg=top,
+            timeout=15_000,
+        )
+    except Exception:
+        now_top = driver.page.evaluate(
+            "() => document.getElementById('scroll-area').scrollTop"
+        )
+        raise AssertionError(
+            f"selecting the thread scrolled #scroll-area from {top} to {now_top} "
+            f"(delta {now_top - top})"
+        ) from None
+
+
 def _act_all_thread_selected(driver: Driver) -> None:
     """`#299 all-thread-strip`: the summarised thread selected by a click on a reply's strip, in All: the
     rest dimmed and drained, nothing scrolled."""
     page = driver.page
     _open_threaded_all(driver)
     _wait_scroll_stable(driver)
-    page.evaluate("() => { window.__beforeTop = document.getElementById('scroll-area').scrollTop; }")
+    before_top = float(page.evaluate("() => document.getElementById('scroll-area').scrollTop"))
+    page.evaluate(f"() => {{ window.__beforeTop = {before_top}; }}")
     page.click(f"#discord-log > li[data-id='{THREADED_STRIP_ROW}'] > .thread-strip")
     page.wait_for_function(
         f"() => document.getElementById('discord-log').getAttribute('data-focus-thread') === '{THREADED_RUNNER}'",
         timeout=10_000,
     )
-    _wait_scroll_stable(driver)
+    _wait_scroll_stable_at(driver, before_top)
 
 
 def _act_settings_voice_agent(driver: Driver) -> None:
