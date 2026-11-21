@@ -2069,7 +2069,7 @@ def _retired(root: str, basename: str) -> bool:
             or os.path.lexists(os.path.join(root, "cancelled", basename)))
 
 
-def _set_aside_retired(root: str, source: str, document: dict, *,
+def _set_aside_retired(root: str, source: str, document: dict[str, object], *,
                        max_artifact_bytes: int | None = None) -> None:
     """Move the untyped item at `source` to ``cancelled/`` as retired, or
     remove it when the authoritative cancelled copy already exists (#2022)."""

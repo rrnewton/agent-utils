@@ -1197,7 +1197,7 @@ pub fn set_aside_reason(
     document: &Map<String, Value>,
     now_millis: u64,
 ) -> Option<(&'static str, String)> {
-    if fs::symlink_metadata(&directories.cancelled.join(format!("{message_id}.json"))).is_ok() {
+    if fs::symlink_metadata(directories.cancelled.join(format!("{message_id}.json"))).is_ok() {
         return Some(("cancelled", "already retired".to_owned()));
     }
     let tombstone = directories.cancel.join(format!("{message_id}.json"));
