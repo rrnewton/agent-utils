@@ -149,6 +149,7 @@ export interface ElementById {
   "discuss-mark-read": HTMLButtonElement;
   "discuss-mark-unread": HTMLButtonElement;
   "discuss-menu-open": HTMLButtonElement;
+  "discuss-new-summary": HTMLButtonElement;
   "discuss-open": HTMLButtonElement;
   "discuss-panel": HTMLDivElement;
   "discuss-resize": HTMLDivElement;
@@ -172,7 +173,6 @@ export interface ElementById {
   "discuss-uncovered-go": HTMLButtonElement;
   "discuss-uncovered-text": HTMLSpanElement;
   "discuss-unmarkable": HTMLParagraphElement;
-  "discuss-new-summary": HTMLButtonElement;
   "discuss-update": HTMLButtonElement;
   "dismiss-banner": HTMLButtonElement;
   "dismiss-error": HTMLButtonElement;

@@ -32,7 +32,7 @@ STAMP = {"context_ms": 10, "model_ms": 20, "first_token_ms": None,
          "total_ms": 30, "input_tokens": None, "output_tokens": None,
          "input_chars": 100, "output_chars": 20, "unknown_term_count": 0}
 
-OLD_SUMMARY = {
+OLD_SUMMARY: dict[str, object] = {
     "backend": "fake", "model": "fake-model", "view": "flat",
     "since_ms": None, "created_ms": 1760000000000,
     "window": {"count": 2, "unread_count": 2, "read_count": 0,
@@ -48,7 +48,7 @@ OLD_SUMMARY = {
     "text_html": "<h2>Progress</h2><p>Ada shipped the fix. Ben is reviewing it.</p>",
     "unknown_terms": [], "stamp": STAMP,
 }
-FRESH_SUMMARY = {
+FRESH_SUMMARY: dict[str, object] = {
     **OLD_SUMMARY,
     "created_ms": 1760000060000,
     "window": {"count": 1, "unread_count": 1, "read_count": 0,
@@ -66,7 +66,7 @@ ANSWER_BASE = {
 }
 
 
-def as_answer(summary: dict) -> dict:
+def as_answer(summary: dict[str, object]) -> dict[str, object]:
     return {
         **ANSWER_BASE,
         "window": summary["window"],
@@ -92,7 +92,7 @@ def free_port() -> int:
 
 
 def call(base: str, method: str, path: str, token: str,
-         body: dict | None = None) -> dict:
+         body: dict[str, object] | None = None) -> dict[str, object]:
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(base + path, data=data, method=method)
     req.add_header("Authorization", f"Bearer {token}")
@@ -107,11 +107,14 @@ def call(base: str, method: str, path: str, token: str,
 def walk(page: Page, base: str, width: int) -> None:
     state = {"fresh": False, "stale_again": False, "updated": False,
              "new_calls": 0, "update_calls": 0}
-    merged_summary = {**FRESH_SUMMARY,
-                      "text": FRESH_SUMMARY["text"] + "\n\n## Later\nDi confirmed it.",
-                      "text_html": FRESH_SUMMARY["text_html"] + "<h2>Later</h2><p>Di confirmed it.</p>"}
+    merged_summary: dict[str, object] = {
+        **FRESH_SUMMARY,
+        "text": str(FRESH_SUMMARY["text"]) + "\n\n## Later\nDi confirmed it.",
+        "text_html": str(FRESH_SUMMARY["text_html"]) + "<h2>Later</h2><p>Di confirmed it.</p>",
+    }
 
     def record(route: Route) -> None:
+        body: dict[str, object]
         if not state["fresh"]:
             body = {"exists": True, "thread_id": None,
                     "current_summary": OLD_SUMMARY, "timeline": [],

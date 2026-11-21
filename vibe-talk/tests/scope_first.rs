@@ -310,6 +310,13 @@ fn inventory() -> Vec<Route> {
             Write,
             Json(r#"{}"#),
         ),
+        // `#2073 vibe-talk-new-summary-button`: a fresh New summary spends a model call, so write scope.
+        route(
+            "POST",
+            "/api/v1/channels/{channel_id}/catchup/new-summary",
+            Write,
+            Json(r#"{}"#),
+        ),
         // `#1840`: synced drafts are the owner's unsent words, so write scope,
         // reads included.
         route(
