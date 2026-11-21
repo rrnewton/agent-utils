@@ -7165,6 +7165,9 @@ fn append_maintains_the_scoped_status_index() {
     assert_eq!(index["schema"], json!(1));
     assert_eq!(index["machine"], json!("node-a"));
     assert_eq!(index["active_revision"], json!(1));
+    // The slot's latest active-state-recorded sequence lets a scoped
+    // read prove snapshot identity against the authoritative record.
+    assert_eq!(index["slots"]["slot-a"]["active_state"], json!(2));
     assert_eq!(index["slots"]["slot-a"]["held"], index["tip"]["sequence"]);
     assert_eq!(
         index["tip"]["sequence"].as_i64(),

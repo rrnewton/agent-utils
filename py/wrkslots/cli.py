@@ -10708,6 +10708,12 @@ def _index_observe(index: dict[str, object], event: Mapping[str, object]) -> Non
     if kind == "active-state-recorded":
         revision = payload.get("revision")
         index["active_revision"] = revision if isinstance(revision, int) else None
+        # The active-state-recorded sequence per slot lets a scoped read
+        # prove its snapshot row equals the authoritative event's record
+        # without replaying the log (#2039).
+        slot_seq = payload.get("slot")
+        if isinstance(slot_seq, str):
+            entry(slot_seq)["active_state"] = sequence
     elif kind == "state-imported":
         active = payload.get("active")
         revision = active.get("revision") if isinstance(active, Mapping) else None
@@ -63640,8 +63646,11 @@ def _scoped_status_state(
 
     Proven only when the event index tip is exactly the chain tip (file
     count and last file's digest) and the snapshot revision is the
-    index's recorded active revision.  Anything else returns None and
-    the caller takes the ordinary full replay.
+    index's recorded active revision.  Any single row is served only
+    when the scoped caller additionally proves it against its
+    active-state-recorded event (see `_scoped_slot_record_agrees`).
+    Anything else returns None and the caller takes the ordinary full
+    replay.
     """
 
     directory = _event_directory(config, machine)
@@ -63664,6 +63673,65 @@ def _scoped_status_state(
     if snapshot.revision != index.get("active_revision"):
         return None
     return snapshot, index
+
+
+def _scoped_slot_record_agrees(
+    config: Config,
+    machine: str,
+    snapshot: ActiveState,
+    index: Mapping[str, object],
+    slot: str,
+) -> bool:
+    """Whether the snapshot's row equals the authoritative record (#2039).
+
+    The scoped read serves the snapshot row for one slot; the event log
+    is authoritative and the ACTIVE file only a cache, so the row is
+    proven only when it decodes identically to the `record` of the
+    slot's latest active-state-recorded event (its sequence comes from
+    the index). The full replay derives the row from that event, so
+    agreement proves the row exactly as a replay would produce it;
+    anything else falls back to the replay. Compares only the one
+    sequence-addressed event (plus its chain predecessor).
+    """
+
+    slots_obj = index.get("slots")
+    entry = slots_obj.get(slot, {}) if isinstance(slots_obj, dict) else {}
+    if not isinstance(entry, dict):
+        return False
+    sequence = entry.get("active_state")
+    if not isinstance(sequence, int):
+        return False
+    directory = _event_directory(config, machine)
+    previous = "0" * 64
+    if sequence > 1:
+        try:
+            prior = _read_json(
+                directory / f"{sequence - 1:020d}.json", "append-only event"
+            )
+        except (OSError, Refusal, StateError, ValueError):
+            return False
+        previous = _as_str(
+            _as_mapping(prior, "append-only event")["sha256"],
+            "append-only event.sha256",
+        )
+    try:
+        event = _event_from_path(
+            directory / f"{sequence:020d}.json", machine, sequence, previous
+        )
+    except (OSError, Refusal, StateError, ValueError):
+        return False
+    if event.get("kind") != "active-state-recorded":
+        return False
+    payload = _as_mapping(event["payload"], "append-only event.payload")
+    if payload.get("slot") != slot:
+        return False
+    recorded = payload.get("record")
+    row = next((r for r in snapshot.slots if r.slot == slot), None)
+    if recorded is None:
+        return row is None
+    if row is None:
+        return False
+    return _json_equal(recorded, _record_to_obj(row))
 
 
 def _scoped_slot_hold(
@@ -63791,6 +63859,18 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
                     else {}
                 )
                 if not isinstance(entry, dict) or "released" in entry:
+                    proven = False
+                elif not _scoped_slot_record_agrees(
+                    config,
+                    config.machine,
+                    next(
+                        state
+                        for state in scoped_states
+                        if state.machine == config.machine
+                    ),
+                    scoped_index,
+                    scoped_slot,
+                ):
                     proven = False
                 else:
                     try:

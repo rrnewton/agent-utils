@@ -3,9 +3,12 @@
 Scoped status must not parse the whole event log: the writer keeps a
 per-machine index of the latest event sequence per slot and kind, and
 the reader trusts it only when its tip is exactly the chain tip and
-the ACTIVE snapshot revision matches.  Anything else falls back to
-today's full replay.  No elapsed-time budget decides any of this;
-bounded reads are proven by making the full parse fail loudly.
+the ACTIVE snapshot revision matches.  The served row must also equal
+the record of the slot's latest active-state-recorded event, because
+the snapshot file is a cache and only the event log is authoritative.
+Anything else falls back to today's full replay.  No elapsed-time
+budget decides any of this; bounded reads are proven by making the
+full parse fail loudly.
 """
 
 from __future__ import annotations
@@ -92,10 +95,40 @@ def test_scoped_status_matches_full_without_parsing_log(
     monkeypatch.setattr(wrkslots, "_load_events", _no_parse)
     scoped_rc, scoped = _status_json(project, "--slot", "slot01", capsys=capsys)
     monkeypatch.undo()
-    full_rc, full = _status_json(project, "--slot", "slot01", capsys=capsys)
+    # The reference is the real unscoped status, filtered to the slot, so
+    # it takes the full replay path and can catch a corrupted scoped row.
+    full_rc, full = _status_json(project, capsys=capsys)
     assert scoped_rc == 0 and full_rc == 0
-    assert _active(scoped) == _active(full)
+    full_rows = [row for row in _active(full) if row["slot"] == "slot01"]
+    assert _active(scoped) == full_rows
     assert _active(scoped)[0]["held"] is True
+
+
+def test_scoped_status_ignores_a_tampered_snapshot_row(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An out-of-band ACTIVE edit does not surface in scoped status (#2039).
+
+    The snapshot file is a cache of the event log: rewriting its row
+    without an event (revision unchanged, index still fresh) must make
+    the scoped read fall back to the authoritative replay rather than
+    report the edited row, exactly as unscoped status would.
+    """
+
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    config = wrkslots._load_config(str(project), "testhost")
+    path = wrkslots._active_path(config, "testhost")
+    document = json.loads(path.read_text())
+    document["slots"][0]["task"] = "EDITED-IN-SNAPSHOT"
+    wrkslots._atomic_write_json(path, document)
+
+    scoped_rc, scoped = _status_json(project, "--slot", "slot01", capsys=capsys)
+    full_rc, full = _status_json(project, capsys=capsys)
+    assert scoped_rc == 0 and full_rc == 0
+    full_rows = [row for row in _active(full) if row["slot"] == "slot01"]
+    assert _active(scoped) == full_rows
+    assert _active(scoped)[0]["task"] == "task-slot01"
 
 
 def test_old_build_append_then_new_append_rebuilds_index(

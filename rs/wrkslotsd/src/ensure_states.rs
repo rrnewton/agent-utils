@@ -589,6 +589,20 @@ fn index_observe(index: &mut Map<String, Value>, event: &Value) {
                 "active_revision".to_string(),
                 payload.get("revision").cloned().unwrap_or(Value::Null),
             );
+            if let (Some(slot), Some(slots)) = (
+                payload.get("slot").and_then(Value::as_str),
+                index
+                    .entry("slots".to_string())
+                    .or_insert_with(|| Value::Object(Map::new()))
+                    .as_object_mut(),
+            ) {
+                slots
+                    .entry(slot)
+                    .or_insert_with(|| Value::Object(Map::new()))
+                    .as_object_mut()
+                    .expect("slot entry is an object")
+                    .insert("active_state".to_string(), sequence.clone());
+            }
         }
         "state-imported" => {
             index.insert(
