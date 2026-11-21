@@ -1154,7 +1154,7 @@ pub fn cancel(root: &Path, message_id: &str, reason: &str) -> Result<CancelOutco
 /// Why the item `message_id`, whose document is `document`, must not be typed at `now_millis`:
 /// `("cancelled", reason)` when a tombstone names it or a copy already sits in `cancelled/`
 /// (a prompt retired by hand, with no tombstone written: #2022
-/// agentctl-cancel-resurrection), `("expired", detail)` when its `not_after` has passed, or
+/// cancel-resurrection), `("expired", detail)` when its `not_after` has passed, or
 /// `None`. Drainers ask this just before typing, and every writer of an inbox entry asks it
 /// before writing one back, so a retired prompt is never resurrected as pending.
 pub fn set_aside_reason(
@@ -1224,7 +1224,7 @@ pub fn set_aside(
         // A copy of this item already sits in cancelled/ (it was retired,
         // and this pending copy is a resurrection or a leftover duplicate):
         // the cancelled copy is authoritative, so this copy is removed
-        // rather than replacing it (#2022 agentctl-cancel-resurrection).
+        // rather than replacing it (#2022 cancel-resurrection).
         fs::remove_file(path)
             .map_err(|error| io_error("remove resurrected queue item", path, error))?;
         if let Some(parent) = path.parent() {
