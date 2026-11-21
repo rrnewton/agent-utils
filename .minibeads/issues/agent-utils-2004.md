@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-read-highlight-missing: no reading highlight or navigator while a document read plays'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -39,3 +39,7 @@ Liaison hypothesis to verify first (coordb, 2026-11-20): a read started from the
 # Notes
 
 [watermelon-full-preview] mu-readstart. Owner-priority. Related: #2003 vibe-talk-read-starts-on-screen (the first-visible start rule and the upper-right button's removal, which follows naturally once the bottom-bar Read is the document's read), #1541 documents-nav-outline-tree, #1330 doc-read-highlight, #1543, #1505 documents-read-controls-highlight-tap, #1961 vibe-talk-colour-themes, #1959 vibe-talk-reader-one-click-jump, #1967 vibe-talk-reader-pause-on-any-composer. Test instances only; never the live instance (127.0.0.1:18090 or 8422).
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as 47454e8a (replay of 154c6ed3 over f65e8a9a, verified tree e6e6fc14). Verdict: the liaison hypothesis held, and the second suspect was real too. The bottom-bar Read only armed channel reading mode and never started the open document's read, so the reader's `readingActive` stayed false — no navigator, no highlight, taps gated, Stop without Pause. Now the bar's Read is the document's read through the reader's one start path. A cloud read whose server cut disagrees with the caller's block model (an issue's front matter) reported a false stop on every block; it now reports the server's drawn block, and issue speech is cut server-side from the body the reader draws. Page tests pin both start paths and the disagreeing-cuts report (failing on the base, passing on the fix); browser walks on a Chromium host show the lit block in Documents and channels, light and dark, every colour preset, with the navigator standing and Pause beside Stop.

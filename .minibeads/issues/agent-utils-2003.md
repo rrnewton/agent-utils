@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-read-starts-on-screen: Read starts at the first thing on screen in both views'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
@@ -41,3 +41,7 @@ Folded reports: owner 273 (no reading highlight at all) and owner 274 (no two-le
 [watermelon-full-preview] mu-readstart. Owner-priority (owner UI fast-track). Related: #2004 vibe-talk-read-highlight-missing (verify first; this issue builds on a working highlight), #1959 vibe-talk-reader-one-click-jump, #1541, #1330, #1543, #1505. Test instances only; never the live instance (127.0.0.1:18090 or 8422).
 
 Earlier decision replaced (tracker search, 2026-11-20): the standing start-point rule is "reading mode waits for a tap" — entering the mode only arms it and prepares speech, with the status "tap a message to hear it" (`view/voice/readingacts.ts`, `setReadingMode`), and a row tap then starts the read. This issue replaces that wait with an immediate start at the first visible item in both views. Kept, not replaced: #434 (Read is the playing read's Pause/Resume, one state path), #442 (Stop stands beside Pause while a read plays), #1543 (a text tap never starts cold, only jumps an active read), and #1959/owner 228 (one click on a message link while the reader is on lands expanded and reads it).
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as 47454e8a (replay of 154c6ed3 over f65e8a9a, verified tree e6e6fc14). Pressing the bottom-bar Read now starts immediately at the first meaningful visible item (40px, or half of a short item) with no scroll change, in both views; the header Read button is gone; with Discuss open the press arms only and the panel starts the summary. Cold taps still start nothing (#1543). The gate on the squashed tip had only load/timing reds (read-aloud-blocks and backfilter green solo; read-pause #2020; picker and screenshots fixed on main), waived by the coordinator; the combined tree over #1997 was verified (Rust documents/http tests, clippy, fmt, typecheck, documents JS, and the documents/views/GitHub-helper browser checks) before landing.
