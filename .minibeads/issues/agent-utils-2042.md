@@ -30,3 +30,7 @@ updated_at: 2026-11-21T09:00:00-05:00
 # Notes
 
 Owner-priority, fast-track. Standing lane mu-clientperf under coordb; one fix per issue, one commit per fix. Follow-up candidate (b), containing style recalc scope (content-visibility/containment on rows, the :has()-heavy CSS), stays parked for coordb's separate go.
+
+## Resolution
+
+Measured modest. Recounts per PageDown screenful fall from 10 to 6 on the tracer probe; over six screenfuls at 4x CPU, FireAnimationFrame 1,576 -> 945 ms and UpdateLayoutTree 1,530 -> 1,166 ms; layout reads unchanged (already #2034's win); the 4x long tasks are still present (11, max 160 ms) — this fix cuts the script and style mass inside frames, it does not remove throttled frame rendering. Landed with the contract step's heap said out loud (`NODE_OPTIONS=--max-old-space-size=1536` in the Makefile typecheck target and a 2 GiB rss baseline on the step): under the gate's memory box, Node sized its old-space from the cgroup limit (~327 MB) and starved the typecheck on every later tree carrying this folding shape.
