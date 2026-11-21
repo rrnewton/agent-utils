@@ -20,8 +20,11 @@
 //! does. Status rows and unit outcomes come from the verify snapshot;
 //! the raw-record facts behind `record_gaps` are a second read taken
 //! immediately after it, so on a live registry they can describe the
-//! instant just after the agents[] rows they sit beside. Persisting the
-//! manifest rides with `team act`.
+//! instant just after the agents[] rows they sit beside. A session-less
+//! interactive record also gets a read-only store scan for report-only
+//! `session_candidates` (newest 16, first prompts bounded); enumeration
+//! never binds or picks one. Persisting the manifest rides with
+//! `team act`.
 
 use std::path::Path;
 
@@ -29,7 +32,9 @@ use serde_json::{json, Value};
 
 use crate::agent::AgentError;
 use crate::restore::{CommandOutcome, Host, RestoreConfig};
-use crate::subagents::{ManagedAgents, ManagedApi, ManifestProfileState, ManifestRecordFacts};
+use crate::subagents::{
+    ManagedAgents, ManagedApi, ManifestProfileState, ManifestRecordFacts, SessionCandidate,
+};
 use crate::team_verify::{unit_row, verify_ok, verify_team_with_snapshot, VerifyOptions};
 
 /// Schema of a manifest document.
@@ -84,7 +89,7 @@ pub fn manifest_team<A: ManagedApi + ?Sized>(
     if snapshot.pins.is_err() {
         errors.push("turnover pin unreadable".to_owned());
     }
-    let facts: Vec<(String, Option<ManifestRecordFacts>)> = snapshot
+    let mut facts: Vec<(String, Option<ManifestRecordFacts>)> = snapshot
         .desired
         .names
         .iter()
@@ -100,6 +105,24 @@ pub fn manifest_team<A: ManagedApi + ?Sized>(
             .any(|(known, found)| known == name && found.is_ok());
         if status_ok && facts.is_none() {
             errors.push(format!("{name}: record facts unavailable"));
+        }
+    }
+    // Candidate stores are scanned once for this whole build, never once
+    // per session-less record.
+    let session_less: Vec<String> = facts
+        .iter()
+        .filter(|(_, fact)| {
+            fact.as_ref()
+                .is_some_and(|fact| !fact.native_session_present)
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    if !session_less.is_empty() {
+        let mut candidates = manager.manifest_session_candidate_index(&session_less);
+        for (name, fact) in &mut facts {
+            if let (Some(fact), Some(found)) = (fact, candidates.remove(name)) {
+                fact.session_candidates = found;
+            }
         }
     }
     let queued: Vec<(String, Value)> = snapshot
@@ -316,6 +339,15 @@ fn project_agent(
         if let ManifestProfileState::Drifted(fields) = &fact.profile_state {
             row["profile_drift_fields"] = json!(fields);
         }
+        let (candidates, _ids, total) = if fact.native_session_present {
+            (Vec::new(), Vec::new(), 0)
+        } else {
+            candidate_rows(fact)
+        };
+        if total > 0 {
+            row["session_candidates"] = json!(candidates);
+            row["session_candidate_count"] = json!(total);
+        }
     }
     if status["probe_error"]
         .as_str()
@@ -324,6 +356,48 @@ fn project_agent(
         row["probe_error"] = json!("probe unavailable");
     }
     row
+}
+
+/// At most this many session candidates ride one agent's manifest row:
+/// the newest matches, then id order for a stable document.
+const MAX_SESSION_CANDIDATES: usize = 16;
+
+/// Project internal candidates to their manifest rows, returning the
+/// rows, their ids in row order, and the total discovered before capping.
+/// Selection is newest first; it is a display bound, never a pick.
+fn candidate_rows(fact: &ManifestRecordFacts) -> (Vec<Value>, Vec<String>, usize) {
+    let total = fact.session_candidates.len();
+    let mut ranked: Vec<&SessionCandidate> = fact.session_candidates.iter().collect();
+    ranked.sort_by(|a, b| {
+        b.last_activity
+            .cmp(&a.last_activity)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    ranked.truncate(MAX_SESSION_CANDIDATES);
+    ranked.sort_by(|a, b| a.id.cmp(&b.id));
+    let ids: Vec<String> = ranked
+        .iter()
+        .map(|candidate| candidate.id.clone())
+        .collect();
+    let rows: Vec<Value> = ranked
+        .into_iter()
+        .map(|candidate| {
+            json!({
+                "id": candidate.id,
+                "cwd": candidate.cwd,
+                "first_prompt": candidate
+                    .first_prompt
+                    .as_deref()
+                    .filter(|text| !text.trim().is_empty())
+                    .map(|text| bounded_line(text, 120)),
+                "last_activity": candidate
+                    .last_activity
+                    .and_then(|activity| activity.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_secs()),
+            })
+        })
+        .collect();
+    (rows, ids, total)
 }
 
 fn profile_state_name(state: &ManifestProfileState) -> &'static str {
@@ -441,7 +515,12 @@ fn record_gaps(name: &str, status: &Value, fact: &ManifestRecordFacts) -> Option
     }
     if !fact.native_session_present {
         missing.push("session");
-        details.push("no recorded native session (candidates are report-only)".to_owned());
+        let total = fact.session_candidates.len();
+        details.push(if total == 0 {
+            "no recorded native session; no report-only candidates".to_owned()
+        } else {
+            format!("no recorded native session; {total} report-only candidate(s) listed")
+        });
     }
     let _ = status;
     if missing.is_empty() {
@@ -454,6 +533,14 @@ fn record_gaps(name: &str, status: &Value, fact: &ManifestRecordFacts) -> Option
     });
     if let ManifestProfileState::Drifted(fields) = &fact.profile_state {
         row["profile_drift_fields"] = json!(fields);
+    }
+    if !fact.native_session_present {
+        let (_rows, ids, total) = candidate_rows(fact);
+        row["candidate_count"] = json!(total);
+        row["candidate_ids"] = json!(ids);
+        if total > ids.len() {
+            row["candidates_truncated"] = json!(true);
+        }
     }
     Some(row)
 }
@@ -596,8 +683,16 @@ fn bounded_evidence(name: &str, status: &str, subject: Option<&str>, evidence: &
 }
 
 /// One line, bounded in characters, for generated (non-free-text) lines.
+/// Control and bidi override/isolate marks never ride a brief.
 fn bounded_line(text: &str, max_chars: usize) -> String {
-    let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let cleaned: String = text
+        .chars()
+        .filter(|ch| {
+            !matches!(ch, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+                && (ch.is_whitespace() || !ch.is_control())
+        })
+        .collect();
+    let joined = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
     if joined.chars().count() > max_chars {
         format!("{}...", joined.chars().take(max_chars).collect::<String>())
     } else if joined.is_empty() {
@@ -644,6 +739,7 @@ mod tests {
             native_session_present: true,
             missing_bypass_flag: None,
             adopted_without_launch_spec: false,
+            session_candidates: Vec::new(),
         }
     }
 
@@ -683,6 +779,7 @@ mod tests {
                 "--dangerously-skip-permissions (or --permission-mode bypassPermissions)",
             ),
             adopted_without_launch_spec: false,
+            session_candidates: Vec::new(),
         };
         let gaps = record_gaps("lane", &status_row(json!({})), &facts).expect("gaps");
         assert_eq!(
@@ -711,6 +808,59 @@ mod tests {
         facts.profile_state = ManifestProfileState::Absent;
         let gaps = record_gaps("lane", &row, &facts).expect("profile gap only");
         assert_eq!(gaps["missing"], json!(["profile"]));
+    }
+
+    #[test]
+    fn session_candidates_are_bounded_and_only_for_session_less_records() {
+        let mut facts = complete_facts();
+        facts.native_session_present = false;
+        facts.session_candidates = (0..20)
+            .map(|index| SessionCandidate {
+                id: format!("candidate-{index:02}"),
+                cwd: "/tmp/proj".to_owned(),
+                last_activity: Some(
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(100 + index),
+                ),
+                first_prompt: Some(format!(
+                    "\u{202e}\u{0007}{} SECRET-TAIL",
+                    "word ".repeat(40)
+                )),
+            })
+            .collect();
+        let row = project_agent(
+            "lane",
+            &status_row(json!({"native_session_missing": true})),
+            json!({}),
+            Some(&facts),
+        );
+        assert_eq!(row["session_candidate_count"], 20);
+        let listed = row["session_candidates"].as_array().unwrap();
+        assert_eq!(listed.len(), 16);
+        assert_eq!(listed[0]["id"], "candidate-04");
+        assert_eq!(listed[15]["id"], "candidate-19");
+        assert_eq!(listed[0]["last_activity"], 104);
+        let prompt = listed[0]["first_prompt"].as_str().unwrap();
+        assert!(prompt.chars().count() <= 123, "{prompt}");
+        assert!(
+            prompt
+                .chars()
+                .all(|ch| !ch.is_control()
+                    && !matches!(ch, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')),
+            "{prompt:?}"
+        );
+        assert!(!prompt.contains('\n'));
+        assert!(!prompt.contains("SECRET-TAIL"), "{prompt}");
+
+        let gaps = record_gaps("lane", &status_row(json!({})), &facts).expect("session gap");
+        assert_eq!(gaps["missing"], json!(["session"]));
+        assert_eq!(gaps["candidate_count"], 20);
+        assert_eq!(gaps["candidate_ids"].as_array().unwrap().len(), 16);
+        assert_eq!(gaps["candidates_truncated"], true);
+        assert!(!gaps["evidence"].as_str().unwrap().contains("SECRET-TAIL"));
+
+        facts.native_session_present = true;
+        let row = project_agent("lane", &status_row(json!({})), json!({}), Some(&facts));
+        assert!(row.get("session_candidates").is_none(), "{row}");
     }
 
     #[test]

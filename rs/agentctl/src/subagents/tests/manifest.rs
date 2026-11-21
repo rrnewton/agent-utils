@@ -261,3 +261,81 @@ fn manifest_facts_read_cloud_declared_effort_the_status_row_omits() {
     assert_eq!(facts.missing_bypass_flag, None);
     assert!(!facts.native_session_present);
 }
+
+#[test]
+fn manifest_candidate_index_enumerates_muse_for_a_session_less_record() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    manager
+        .start(
+            "worker",
+            &fixture.root,
+            StartOptions {
+                harness: "muse".to_owned(),
+                harness_args: strings(&["--approval-mode", "never"]),
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    let mut record = manager.load("worker").unwrap();
+    record.native_session = None;
+    record.launch_spec = None;
+    record.session_agent = None;
+    record.session_value = None;
+    record.resume = None;
+    manager.save(&record).unwrap();
+
+    let store = fixture.root.join("muse-store");
+    for (id, prompt) in [
+        ("11111111-1111-1111-1111-111111111111", "recover lane A"),
+        ("22222222-2222-2222-2222-222222222222", "recover lane B"),
+    ] {
+        let dir = store.join("sessions/2026/11/06").join(id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("session.jsonl"),
+            format!(
+                "{}\n",
+                json!({
+                    "cwd": fixture.root.display().to_string(),
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": prompt}],
+                    },
+                })
+            ),
+        )
+        .unwrap();
+    }
+    crate::subagents::revive::MUSE_STORE_ROOT.with(|cell| *cell.borrow_mut() = Some(store));
+    let facts = manager.manifest_record_facts("worker").unwrap();
+    let index = manager.manifest_session_candidate_index(&["worker".to_owned()]);
+    crate::subagents::revive::MUSE_STORE_ROOT.with(|cell| *cell.borrow_mut() = None);
+
+    assert!(!facts.native_session_present, "{facts:?}");
+    assert!(facts.session_candidates.is_empty(), "{facts:?}");
+    let candidates = &index["worker"];
+    let mut ids: Vec<&str> = candidates
+        .iter()
+        .map(|candidate| candidate.id.as_str())
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        [
+            "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222"
+        ]
+    );
+    assert_eq!(
+        candidates
+            .iter()
+            .find(|candidate| candidate.id == "11111111-1111-1111-1111-111111111111")
+            .unwrap()
+            .first_prompt
+            .as_deref(),
+        Some("recover lane A")
+    );
+    // Enumeration is report-only: the record still names no session.
+    assert!(manager.load("worker").unwrap().native_session.is_none());
+}

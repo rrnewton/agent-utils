@@ -1407,7 +1407,17 @@ a native session is recorded, queued pending/inflight/archived-undelivered
 counts) — record tokens and launch arguments never appear. `record_gaps`
 names every record missing a profile, a permission-bypass flag, a declared
 effort, or a recorded session; the report is the fix list, because recovery
-reports such records and never rewrites them. It also carries unit
+reports such records and never rewrites them. A session-less interactive
+record also gets report-only `session_candidates` from its harness store
+(the newest 16 matches for its cwd within a bounded newest-first scan,
+each with `id`, the store's own `cwd`, a bounded one-line
+`first_prompt`, and `last_activity` in Unix seconds) plus
+`session_candidate_count` for every match that scan found; the session
+gap row mirrors `candidate_count`/`candidate_ids`. A Codex
+`first_prompt` is often null, because wrapped instruction/context
+messages are skipped and can fill the bounded head. Candidates are
+evidence for a human or lead to disambiguate after handoff — listing
+them never binds, picks, or revives one. It also carries unit
 active/held booleans, `lost` in-session work no restore can bring back, one
 `errors` line per failed fact, and a bounded projection of the verify
 report embedded (closed fields and evidence classes, alarm

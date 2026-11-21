@@ -382,9 +382,188 @@ pub(super) fn claude_transcript_verdict(
     looked.then_some(false)
 }
 
+/// At most this many newest store files one *manifest* candidate scan
+/// reads. The stores hold every session the host has ever run, so an
+/// unbounded evidence scan is minutes of I/O for the newest few. Revive
+/// discovery is never capped this way: it walks the whole store (heads
+/// only) until its first match — or second, to prove ambiguity.
+const MAX_MANIFEST_CANDIDATE_FILES_SCANNED: usize = 512;
+
+/// The most store-head bytes candidate evidence reads from one file.
+const SESSION_HEAD_BYTES: u64 = 64 * 1024;
+
+/// Read only the bounded head of a regular file. A FIFO or other special
+/// file named like a session journal is refused without opening it, so a
+/// candidate scan can never block on one.
+fn read_head(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let metadata = fs::symlink_metadata(path).ok()?;
+    let regular = if metadata.file_type().is_symlink() {
+        fs::metadata(path).is_ok_and(|target| target.is_file())
+    } else {
+        metadata.is_file()
+    };
+    if !regular {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .ok()?
+        .take(SESSION_HEAD_BYTES)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// The comparison key for a working directory: canonical when it exists,
+/// lexical without a trailing slash when it does not (a slot can be
+/// unmounted at manifest time).
+fn cwd_key(cwd: &str) -> String {
+    if let Ok(canonical) = fs::canonicalize(cwd) {
+        return canonical.display().to_string();
+    }
+    let trimmed = cwd.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+/// The first structured cwd a journal head names (`cwd` or
+/// `workspace_root`, nested `record_json` frames included).
+fn first_cwd(head: &str) -> Option<String> {
+    fn search(value: &Value) -> Option<String> {
+        match value {
+            Value::Object(map) => {
+                for key in ["cwd", "workspace_root"] {
+                    if let Some(found) = map
+                        .get(key)
+                        .and_then(Value::as_str)
+                        .filter(|text| !text.is_empty())
+                    {
+                        return Some(found.to_owned());
+                    }
+                }
+                for (key, item) in map {
+                    if key == "record_json" {
+                        if let Some(found) = item
+                            .as_str()
+                            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                            .and_then(|inner| search(&inner))
+                        {
+                            return Some(found);
+                        }
+                    }
+                    if let Some(found) = search(item) {
+                        return Some(found);
+                    }
+                }
+                None
+            }
+            Value::Array(items) => items.iter().find_map(search),
+            _ => None,
+        }
+    }
+    head.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find_map(|value| search(&value))
+}
+
+/// Prompt evidence safe to print: controls and bidi override/isolate
+/// marks stripped, whitespace flattened, at most 120 chars.
+fn sanitized_prompt(text: &str) -> Option<String> {
+    let cleaned: String = text
+        .chars()
+        .filter(|ch| {
+            !matches!(ch, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+                && (ch.is_whitespace() || !ch.is_control())
+        })
+        .collect();
+    let flat: String = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!flat.is_empty()).then(|| flat.chars().take(120).collect())
+}
+
+/// The first real user prompt in a Claude transcript head: only
+/// `type == "user"` records with a user message count, meta records and
+/// tag-wrapped system/command content never do.
+fn claude_first_prompt(head: &str) -> Option<String> {
+    fn prompt_text(text: &str) -> Option<String> {
+        if text.trim_start().starts_with('<') {
+            return None;
+        }
+        sanitized_prompt(text)
+    }
+    for line in head.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value["type"] != "user" || value["isMeta"] == json!(true) {
+            continue;
+        }
+        let message = &value["message"];
+        if message["role"] != "user" {
+            continue;
+        }
+        match &message["content"] {
+            Value::String(text) => {
+                if let Some(found) = prompt_text(text) {
+                    return Some(found);
+                }
+            }
+            Value::Array(blocks) => {
+                for block in blocks {
+                    if block["type"] != "text" {
+                        continue;
+                    }
+                    if let Some(found) = block["text"].as_str().and_then(prompt_text) {
+                        return Some(found);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// One Claude transcript as a candidate when its structured cwd names
+/// the record's cwd (canonicalized); a substring mention anywhere in the
+/// head is never a match.
+fn claude_candidate(
+    transcript: crate::harness::claude::ProjectTranscript,
+    record_key: &str,
+) -> Option<SessionCandidate> {
+    let head = read_head(&transcript.path)?;
+    let cwd = first_cwd(&head)?;
+    (cwd_key(&cwd) == record_key).then(|| SessionCandidate {
+        id: transcript.session,
+        cwd,
+        last_activity: Some(transcript.modified),
+        first_prompt: claude_first_prompt(&head),
+    })
+}
+
+/// The Claude sessions under `roots` naming the record's cwd, newest
+/// first, scanning at most [`MAX_MANIFEST_CANDIDATE_FILES_SCANNED`] transcripts:
+/// the report-only enumeration behind the manifest's candidates.
+fn claude_candidates_in(roots: &[PathBuf], record: &AgentRecord) -> Vec<SessionCandidate> {
+    if record.harness != "claude" {
+        return Vec::new();
+    }
+    let record_key = cwd_key(&record.cwd);
+    crate::harness::claude::project_transcripts(roots, Path::new(&record.cwd), &valid_metadata_text)
+        .into_iter()
+        .take(MAX_MANIFEST_CANDIDATE_FILES_SCANNED)
+        .filter_map(|transcript| claude_candidate(transcript, &record_key))
+        .collect()
+}
+
 /// Discover a Claude session for `record` from transcripts on disk (#741 restore-native-sessions):
 /// the newest `<session>.jsonl` in the encoded project directory for the record's cwd whose
-/// head mentions that cwd. Returns `None` when nothing confirms, so the caller keeps refusing.
+/// structured cwd matches. Stops at the first match after walking the
+/// whole store (heads only, never the manifest file cap), and returns
+/// `None` when nothing confirms, so the caller keeps refusing.
 pub(super) fn discover_claude_session(
     roots: &[PathBuf],
     record: &AgentRecord,
@@ -392,14 +571,11 @@ pub(super) fn discover_claude_session(
     if record.harness != "claude" {
         return None;
     }
+    let record_key = cwd_key(&record.cwd);
     crate::harness::claude::project_transcripts(roots, Path::new(&record.cwd), &valid_metadata_text)
         .into_iter()
-        .find(|transcript| {
-            fs::read(&transcript.path).is_ok_and(|bytes| {
-                String::from_utf8_lossy(&bytes[..bytes.len().min(65536)]).contains(&record.cwd)
-            })
-        })
-        .map(|transcript| NativeSession::new("claude", &transcript.session, "observed"))
+        .find_map(|transcript| claude_candidate(transcript, &record_key))
+        .map(|candidate| NativeSession::new("claude", &candidate.id, "observed"))
 }
 
 /// Discover a Codex session for `record` (#741): newest `rollout-*-<thread>.jsonl` under
@@ -422,20 +598,11 @@ pub(super) fn discover_codex_session(record: &AgentRecord) -> Option<NativeSessi
     }
 }
 
-/// One store session that names a record's cwd, with the evidence an
-/// operator needs to tell it apart from the others (#948).
-pub(super) struct MuseCandidate {
-    id: String,
-    cwd: String,
-    last_activity: std::time::SystemTime,
-    first_prompt: Option<String>,
-}
-
-impl MuseCandidate {
+impl SessionCandidate {
     fn describe(&self) -> String {
         let activity = self
             .last_activity
-            .duration_since(std::time::UNIX_EPOCH)
+            .and_then(|activity| activity.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs())
             .unwrap_or_default();
         let prompt = self
@@ -457,7 +624,7 @@ pub(super) enum MuseDiscovery {
     /// Exactly one does; revive may record and resume it.
     One(NativeSession),
     /// Several do; revive must not guess, and the caller names them.
-    Many(Vec<MuseCandidate>),
+    Many(Vec<SessionCandidate>),
 }
 
 /// The first prompt-like text in a session journal's head, if cheap to find:
@@ -469,12 +636,8 @@ fn first_prompt_line(head: &str) -> Option<String> {
             Value::Object(map) => {
                 for (key, item) in map {
                     if matches!(key.as_str(), "text" | "prompt") {
-                        if let Some(text) = item.as_str() {
-                            let flat: String =
-                                text.split_whitespace().collect::<Vec<_>>().join(" ");
-                            if !flat.is_empty() {
-                                return Some(flat.chars().take(120).collect());
-                            }
+                        if let Some(found) = item.as_str().and_then(sanitized_prompt) {
+                            return Some(found);
                         }
                     }
                     if key == "record_json" {
@@ -516,39 +679,9 @@ pub(super) fn discover_muse_session(record: &AgentRecord) -> MuseDiscovery {
 }
 
 fn discover_muse_in(sessions: &Path, record: &AgentRecord) -> MuseDiscovery {
-    let mut candidates: Vec<MuseCandidate> = Vec::new();
-    if let Ok(years) = fs::read_dir(sessions) {
-        for year in years.flatten() {
-            for month in fs::read_dir(year.path()).into_iter().flatten().flatten() {
-                for day in fs::read_dir(month.path()).into_iter().flatten().flatten() {
-                    for session in fs::read_dir(day.path()).into_iter().flatten().flatten() {
-                        let journal = session.path().join("session.jsonl");
-                        let Ok(bytes) = fs::read(&journal) else {
-                            continue;
-                        };
-                        let head = String::from_utf8_lossy(&bytes[..bytes.len().min(65536)]);
-                        if !head.contains(&record.cwd) {
-                            continue;
-                        }
-                        if let Some(id) = session.file_name().to_str() {
-                            if valid_metadata_text(id)
-                                && !candidates.iter().any(|seen| seen.id == id)
-                            {
-                                candidates.push(MuseCandidate {
-                                    id: id.to_owned(),
-                                    cwd: record.cwd.clone(),
-                                    last_activity: fs::metadata(&journal)
-                                        .and_then(|meta| meta.modified())
-                                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
-                                    first_prompt: first_prompt_line(&head),
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // Two matches already prove Many; revive walks the whole store
+    // (heads only) until then, never the manifest file cap.
+    let mut candidates = muse_candidates_limited(sessions, record, usize::MAX, 2);
     candidates.sort_by(|a, b| a.id.cmp(&b.id));
     match candidates.as_slice() {
         [] => MuseDiscovery::None,
@@ -557,18 +690,144 @@ fn discover_muse_in(sessions: &Path, record: &AgentRecord) -> MuseDiscovery {
     }
 }
 
-#[cfg(not(test))]
-fn discover_codex_in(sessions: &Path, record: &AgentRecord) -> Option<NativeSession> {
-    let mut best: Option<(std::time::SystemTime, String)> = None;
+/// Muse journal files under a dated store, newest first, gathered from
+/// directory metadata only — no journal is read to build this list.
+fn muse_journal_paths(sessions: &Path) -> Vec<(std::time::SystemTime, String, PathBuf)> {
+    let mut journals = Vec::new();
+    if let Ok(years) = fs::read_dir(sessions) {
+        for year in years.flatten() {
+            for month in fs::read_dir(year.path()).into_iter().flatten().flatten() {
+                for day in fs::read_dir(month.path()).into_iter().flatten().flatten() {
+                    for session in fs::read_dir(day.path()).into_iter().flatten().flatten() {
+                        let Some(id) = session.file_name().to_str().map(str::to_owned) else {
+                            continue;
+                        };
+                        if !valid_metadata_text(&id) {
+                            continue;
+                        }
+                        let journal = session.path().join("session.jsonl");
+                        let Ok(activity) =
+                            fs::symlink_metadata(&journal).and_then(|meta| meta.modified())
+                        else {
+                            continue;
+                        };
+                        journals.push((activity, id, journal));
+                    }
+                }
+            }
+        }
+    }
+    journals.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    journals
+}
+
+/// One Muse journal as a candidate carrying the store's own structured
+/// cwd; `None` when the head names none.
+fn muse_candidate_from_journal(
+    id: String,
+    journal: &Path,
+    activity: std::time::SystemTime,
+) -> Option<SessionCandidate> {
+    let head = read_head(journal)?;
+    let cwd = first_cwd(&head)?;
+    Some(SessionCandidate {
+        id,
+        cwd,
+        last_activity: Some(activity),
+        first_prompt: first_prompt_line(&head),
+    })
+}
+
+fn muse_candidates_limited(
+    sessions: &Path,
+    record: &AgentRecord,
+    max_files: usize,
+    max_matches: usize,
+) -> Vec<SessionCandidate> {
+    let record_key = cwd_key(&record.cwd);
+    let mut candidates: Vec<SessionCandidate> = Vec::new();
+    for (activity, id, journal) in muse_journal_paths(sessions).into_iter().take(max_files) {
+        if candidates.iter().any(|seen| seen.id == id) {
+            continue;
+        }
+        let Some(candidate) = muse_candidate_from_journal(id, &journal, activity) else {
+            continue;
+        };
+        if cwd_key(&candidate.cwd) != record_key {
+            continue;
+        }
+        candidates.push(candidate);
+        if candidates.len() >= max_matches {
+            break;
+        }
+    }
+    candidates
+}
+
+/// The first user prompt in a Codex rollout head: the first user
+/// `response_item` message's text, flattened and truncated. Session-meta
+/// instructions and wrapped instruction/context messages are never a
+/// prompt, so this is `None` when those fill the bounded head.
+fn codex_first_prompt(head: &str) -> Option<String> {
+    for line in head.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value["type"] != "response_item" {
+            continue;
+        }
+        let payload = &value["payload"];
+        if payload["type"] != "message" || payload["role"] != "user" {
+            continue;
+        }
+        let Some(blocks) = payload["content"].as_array() else {
+            continue;
+        };
+        for block in blocks {
+            if !matches!(block["type"].as_str(), Some("input_text" | "text")) {
+                continue;
+            }
+            let Some(text) = block["text"].as_str() else {
+                continue;
+            };
+            // Wrapped instructions/context arrive as user messages too:
+            // a tag-led or AGENTS.md-led block is never the typed prompt.
+            if text.trim_start().starts_with('<')
+                || text.trim_start().starts_with("# AGENTS.md instructions")
+            {
+                continue;
+            }
+            if let Some(found) = sanitized_prompt(text) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// Codex rollout files under `sessions`, newest first, gathered from
+/// directory metadata only. Symlinks are never followed, so a linked
+/// cycle cannot make the walk loop.
+fn codex_rollout_paths(sessions: &Path) -> Vec<(std::time::SystemTime, PathBuf)> {
+    let mut rollouts = Vec::new();
     let mut stack = vec![sessions.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = fs::read_dir(&dir) else {
             continue;
         };
         for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_symlink() {
+                continue;
+            }
             let path = entry.path();
-            if path.is_dir() {
+            if kind.is_dir() {
                 stack.push(path);
+                continue;
+            }
+            if !kind.is_file() {
                 continue;
             }
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -577,33 +836,144 @@ fn discover_codex_in(sessions: &Path, record: &AgentRecord) -> Option<NativeSess
             if !(name.starts_with("rollout-") && name.ends_with(".jsonl")) {
                 continue;
             }
-            let Ok(bytes) = fs::read(&path) else { continue };
-            let head = String::from_utf8_lossy(&bytes[..bytes.len().min(65536)]);
-            if !head.contains(&record.cwd) {
-                continue;
-            }
-            let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
+            let Ok(activity) = fs::symlink_metadata(&path).and_then(|meta| meta.modified()) else {
                 continue;
             };
-            // The session id comes from the first entry's session_meta; no id, no bind.
-            let Some(value) = head
-                .lines()
-                .next()
-                .and_then(|line| serde_json::from_str::<Value>(line).ok())
-                .and_then(|v| {
-                    v.pointer("/payload/id")
-                        .or_else(|| v.pointer("/id"))
-                        .and_then(|i| i.as_str().map(str::to_owned))
-                })
-            else {
-                continue;
-            };
-            if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
-                best = Some((mtime, value));
-            }
+            rollouts.push((activity, path));
         }
     }
-    best.map(|(_, value)| NativeSession::new("codex", &value, "observed"))
+    rollouts.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    rollouts
+}
+
+/// One Codex rollout as a candidate carrying the cwd its session meta
+/// names; `None` when the head names no session id or cwd.
+fn codex_candidate_from_rollout(
+    path: &Path,
+    activity: std::time::SystemTime,
+) -> Option<SessionCandidate> {
+    let head = read_head(path)?;
+    // The session id comes from the first entry's session_meta; no id, no bind.
+    let meta = head
+        .lines()
+        .next()
+        .and_then(|line| serde_json::from_str::<Value>(line).ok())?;
+    let id = meta
+        .pointer("/payload/id")
+        .or_else(|| meta.pointer("/id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())?;
+    let cwd = meta
+        .pointer("/payload/cwd")
+        .and_then(Value::as_str)
+        .filter(|cwd| !cwd.is_empty())
+        .map(str::to_owned)
+        .or_else(|| first_cwd(&head))?;
+    Some(SessionCandidate {
+        id: id.to_owned(),
+        cwd,
+        last_activity: Some(activity),
+        first_prompt: codex_first_prompt(&head),
+    })
+}
+
+fn codex_candidates_limited(
+    sessions: &Path,
+    record: &AgentRecord,
+    max_files: usize,
+    max_matches: usize,
+) -> Vec<SessionCandidate> {
+    let record_key = cwd_key(&record.cwd);
+    let mut candidates: Vec<SessionCandidate> = Vec::new();
+    for (activity, path) in codex_rollout_paths(sessions).into_iter().take(max_files) {
+        let Some(candidate) = codex_candidate_from_rollout(&path, activity) else {
+            continue;
+        };
+        if cwd_key(&candidate.cwd) != record_key
+            || candidates.iter().any(|seen| seen.id == candidate.id)
+        {
+            continue;
+        }
+        candidates.push(candidate);
+        if candidates.len() >= max_matches {
+            break;
+        }
+    }
+    candidates
+}
+
+/// Every Codex rollout naming the record's cwd within the scan cap,
+/// newest first: the report-only enumeration behind
+/// [`discover_codex_in`]'s pick and the manifest's candidates.
+#[cfg(test)]
+fn codex_candidates_in(sessions: &Path, record: &AgentRecord) -> Vec<SessionCandidate> {
+    codex_candidates_limited(
+        sessions,
+        record,
+        MAX_MANIFEST_CANDIDATE_FILES_SCANNED,
+        usize::MAX,
+    )
+}
+
+fn discover_codex_in(sessions: &Path, record: &AgentRecord) -> Option<NativeSession> {
+    codex_candidates_limited(sessions, record, usize::MAX, 1)
+        .into_iter()
+        .next()
+        .map(|candidate| NativeSession::new("codex", &candidate.id, "observed"))
+}
+
+/// Muse candidates for several cwds from one newest-first store pass,
+/// bucketed by canonical cwd key.
+fn muse_candidate_index(
+    sessions: &Path,
+    wanted: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeMap<String, Vec<SessionCandidate>> {
+    let mut by_key: std::collections::BTreeMap<String, Vec<SessionCandidate>> =
+        std::collections::BTreeMap::new();
+    for (activity, id, journal) in muse_journal_paths(sessions)
+        .into_iter()
+        .take(MAX_MANIFEST_CANDIDATE_FILES_SCANNED)
+    {
+        let Some(candidate) = muse_candidate_from_journal(id, &journal, activity) else {
+            continue;
+        };
+        let key = cwd_key(&candidate.cwd);
+        if !wanted.contains(&key) {
+            continue;
+        }
+        let bucket = by_key.entry(key).or_default();
+        if !bucket.iter().any(|seen| seen.id == candidate.id) {
+            bucket.push(candidate);
+        }
+    }
+    by_key
+}
+
+/// Codex candidates for several cwds from one newest-first store pass,
+/// bucketed by canonical cwd key.
+fn codex_candidate_index(
+    sessions: &Path,
+    wanted: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeMap<String, Vec<SessionCandidate>> {
+    let mut by_key: std::collections::BTreeMap<String, Vec<SessionCandidate>> =
+        std::collections::BTreeMap::new();
+    for (activity, path) in codex_rollout_paths(sessions)
+        .into_iter()
+        .take(MAX_MANIFEST_CANDIDATE_FILES_SCANNED)
+    {
+        let Some(candidate) = codex_candidate_from_rollout(&path, activity) else {
+            continue;
+        };
+        let key = cwd_key(&candidate.cwd);
+        if !wanted.contains(&key) {
+            continue;
+        }
+        let bucket = by_key.entry(key).or_default();
+        if !bucket.iter().any(|seen| seen.id == candidate.id) {
+            bucket.push(candidate);
+        }
+    }
+    by_key
 }
 
 /// Newest `archive/<name>-<token>` directory for `name`, by modification time (#741).
@@ -1287,7 +1657,7 @@ fn conversation(record: &AgentRecord) -> Result<NativeSession> {
             "recorded native conversation provider is incomplete or conflicts with the harness",
         ));
     }
-    let mut muse_many: Vec<MuseCandidate> = Vec::new();
+    let mut muse_many: Vec<SessionCandidate> = Vec::new();
     let native = record
         .native_session
         .clone()
@@ -1321,7 +1691,7 @@ fn conversation(record: &AgentRecord) -> Result<NativeSession> {
             if !muse_many.is_empty() {
                 let described = muse_many
                     .iter()
-                    .map(MuseCandidate::describe)
+                    .map(SessionCandidate::describe)
                     .collect::<Vec<_>>()
                     .join("; ");
                 return fail(format!(
@@ -5538,12 +5908,104 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
     /// The recovery-completeness facts for one registered agent, judged
     /// from its raw record (`#1559`): the profile current at this moment,
     /// the argv a revive would replay, and the recorded native session.
-    /// This never returns an argv, token, or session value, and writes
+    /// This never returns an argv, token, or the recorded session value
+    /// (candidate ids for a session-less record are the report), and writes
     /// nothing; profile reading may run git, exactly as `profile_drift`
     /// already does for status.
     pub(crate) fn manifest_record_facts(&self, agent_name: &str) -> Result<ManifestRecordFacts> {
         let record = self.load(agent_name)?;
         Ok(self.manifest_facts(&record))
+    }
+
+    /// Report-only session candidates for the named session-less
+    /// interactive records, scanning each harness store once: Muse and
+    /// Codex in a single newest-first pass per build, Claude once per
+    /// distinct encoded project directory. Records are only loaded;
+    /// nothing is locked, saved, bound, or launched.
+    pub(crate) fn manifest_session_candidate_index(
+        &self,
+        agent_names: &[String],
+    ) -> std::collections::BTreeMap<String, Vec<SessionCandidate>> {
+        let mut muse_groups: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        let mut codex_groups: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        let mut claude_groups: Vec<(String, AgentRecord, Vec<String>)> = Vec::new();
+        for name in agent_names {
+            let Ok(record) = self.load(name) else {
+                continue;
+            };
+            if record.is_cloud()
+                || record.is_headless()
+                || record.effective_native_session().is_some()
+            {
+                continue;
+            }
+            let key = cwd_key(&record.cwd);
+            match record.harness.as_str() {
+                "muse" => muse_groups.entry(key).or_default().push(name.clone()),
+                "codex" => codex_groups.entry(key).or_default().push(name.clone()),
+                "claude" => {
+                    if let Some((_, _, names)) =
+                        claude_groups.iter_mut().find(|(known, _, _)| *known == key)
+                    {
+                        names.push(name.clone());
+                    } else {
+                        claude_groups.push((key, record, vec![name.clone()]));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out: std::collections::BTreeMap<String, Vec<SessionCandidate>> =
+            std::collections::BTreeMap::new();
+        if !muse_groups.is_empty() {
+            if let Some(root) = muse_store_root() {
+                let wanted: std::collections::BTreeSet<String> =
+                    muse_groups.keys().cloned().collect();
+                let index = muse_candidate_index(&root.join("sessions"), &wanted);
+                for (key, names) in &muse_groups {
+                    if let Some(candidates) = index.get(key) {
+                        for name in names {
+                            out.insert(name.clone(), candidates.clone());
+                        }
+                    }
+                }
+            }
+        }
+        if !claude_groups.is_empty() {
+            let roots = claude_config_roots();
+            for (_, record, names) in &claude_groups {
+                let candidates = claude_candidates_in(&roots, record);
+                if candidates.is_empty() {
+                    continue;
+                }
+                for name in names {
+                    out.insert(name.clone(), candidates.clone());
+                }
+            }
+        }
+        #[cfg(not(test))]
+        if !codex_groups.is_empty() {
+            if let Some(home) = std::env::var_os("CODEX_HOME")
+                .map(PathBuf::from)
+                .or_else(|| crate::harness::home().map(|h| h.join(".codex")))
+            {
+                let wanted: std::collections::BTreeSet<String> =
+                    codex_groups.keys().cloned().collect();
+                let index = codex_candidate_index(&home.join("sessions"), &wanted);
+                for (key, names) in &codex_groups {
+                    if let Some(candidates) = index.get(key) {
+                        for name in names {
+                            out.insert(name.clone(), candidates.clone());
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(test)]
+        let _ = &codex_groups;
+        out
     }
 
     fn manifest_facts(&self, record: &AgentRecord) -> ManifestRecordFacts {
@@ -5564,6 +6026,10 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             record.effective_native_session().is_some()
         };
         let adopted_without_launch_spec = record.is_foreign() && record.launch_spec.is_none();
+        // Candidates are filled by manifest_session_candidate_index, which
+        // scans each store once per manifest build instead of once here
+        // per record.
+        let session_candidates = Vec::new();
         let (profile_state, missing_bypass_flag) = if record.is_cloud() {
             (
                 if record.profile.is_some() {
@@ -5620,6 +6086,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             native_session_present,
             missing_bypass_flag,
             adopted_without_launch_spec,
+            session_candidates,
         }
     }
 
@@ -6014,6 +6481,275 @@ mod discovery_tests {
         );
         let _ = fs::remove_dir_all(&root);
     }
+    #[test]
+    fn claude_candidates_list_every_confirmed_transcript() {
+        let root =
+            std::env::temp_dir().join(format!("disc-claude-candidates-{}", std::process::id()));
+        let dir = root.join("projects").join("-tmp-proj");
+        fs::create_dir_all(&dir).unwrap();
+        for (id, cwd, prompt) in [
+            (
+                "11111111-1111-1111-1111-111111111111",
+                "/tmp/proj",
+                "first A",
+            ),
+            (
+                "22222222-2222-2222-2222-222222222222",
+                "/tmp/proj",
+                "first B",
+            ),
+            ("33333333-3333-3333-3333-333333333333", "/other", "other"),
+        ] {
+            // Real transcript heads open with non-prompt records: an
+            // attachment naming the model, meta/system-reminder user
+            // lines, and command tags all precede the typed prompt.
+            let body = match prompt {
+                "first A" => format!(
+                    "{{\"type\":\"attachment\",\"cwd\":\"{cwd}\",\"attachment\":{{\"text\":\"You are powered by the model named Fixture\"}}}}\n{{\"type\":\"user\",\"isMeta\":true,\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"<system-reminder>meta</system-reminder>\"}}]}}}}\n{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"<command-name>/clear</command-name>\"}}}}\n{{\"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"assistant first\"}}]}}}}\n{{\"type\":\"user\",\"cwd\":\"{cwd}\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"{prompt}\"}}]}}}}\n"
+                ),
+                "first B" => format!(
+                    "{{\"type\":\"user\",\"cwd\":\"{cwd}\",\"message\":{{\"role\":\"user\",\"content\":\"{prompt}\"}}}}\n"
+                ),
+                _ => format!(
+                    "{{\"type\":\"user\",\"cwd\":\"{cwd}\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"{prompt}\"}}]}}}}\n"
+                ),
+            };
+            fs::write(dir.join(format!("{id}.jsonl")), body).unwrap();
+        }
+        let candidates = claude_candidates_in(std::slice::from_ref(&root), &rec("/tmp/proj"));
+        let by_id: std::collections::BTreeMap<_, _> = candidates
+            .iter()
+            .map(|candidate| (candidate.id.as_str(), candidate))
+            .collect();
+        assert_eq!(by_id.len(), 2, "{candidates:?}");
+        assert_eq!(
+            by_id["11111111-1111-1111-1111-111111111111"]
+                .first_prompt
+                .as_deref(),
+            Some("first A")
+        );
+        assert_eq!(
+            by_id["22222222-2222-2222-2222-222222222222"]
+                .first_prompt
+                .as_deref(),
+            Some("first B")
+        );
+        assert!(by_id.values().all(|candidate| candidate.cwd == "/tmp/proj"));
+        assert!(by_id
+            .values()
+            .all(|candidate| candidate.last_activity.is_some()));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn codex_candidates_list_every_rollout_without_meta_instructions_as_prompt() {
+        let root = std::env::temp_dir().join(format!("codex-candidates-{}", std::process::id()));
+        let dir = root.join("sessions/2026/11/06");
+        fs::create_dir_all(&dir).unwrap();
+        for (id, cwd, prompt) in [
+            (
+                "11111111-1111-1111-1111-111111111111",
+                "/tmp/proj",
+                "codex A",
+            ),
+            (
+                "22222222-2222-2222-2222-222222222222",
+                "/tmp/proj",
+                "codex B",
+            ),
+            ("33333333-3333-3333-3333-333333333333", "/other", "other"),
+        ] {
+            fs::write(
+                dir.join(format!("rollout-2026-11-06T00-00-00-{id}.jsonl")),
+                format!(
+                    "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"{cwd}\",\"base_instructions\":{{\"text\":\"META-SECRET\"}}}}}}\n{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{prompt}\"}}]}}}}\n"
+                ),
+            )
+            .unwrap();
+        }
+        let mut record = rec("/tmp/proj");
+        record.harness = "codex".into();
+        let candidates = codex_candidates_in(&root.join("sessions"), &record);
+        let by_id: std::collections::BTreeMap<_, _> = candidates
+            .iter()
+            .map(|candidate| (candidate.id.as_str(), candidate))
+            .collect();
+        assert_eq!(by_id.len(), 2, "{candidates:?}");
+        assert_eq!(
+            by_id["11111111-1111-1111-1111-111111111111"]
+                .first_prompt
+                .as_deref(),
+            Some("codex A")
+        );
+        assert_eq!(
+            by_id["22222222-2222-2222-2222-222222222222"]
+                .first_prompt
+                .as_deref(),
+            Some("codex B")
+        );
+        let index = codex_candidate_index(
+            &root.join("sessions"),
+            &std::collections::BTreeSet::from([cwd_key("/tmp/proj"), cwd_key("/other")]),
+        );
+        assert_eq!(index[&cwd_key("/tmp/proj")].len(), 2, "{index:?}");
+        assert_eq!(index[&cwd_key("/other")].len(), 1, "{index:?}");
+        // Codex newest-wins is pinned by file mtime: make the second
+        // rollout unambiguously newest and require the pick to follow it.
+        let newest =
+            dir.join("rollout-2026-11-06T00-00-00-22222222-2222-2222-2222-222222222222.jsonl");
+        fs::File::options()
+            .write(true)
+            .open(&newest)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3600))
+            .unwrap();
+        let discovered = discover_codex_in(&root.join("sessions"), &record).unwrap();
+        assert_eq!(discovered.value, "22222222-2222-2222-2222-222222222222");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn muse_prefix_collision_is_one_not_many() {
+        // Structured cwd equality: /tmp/proj2 must never make a lane in
+        // /tmp/proj ambiguous, the prefix collision substring matching
+        // produced on real stores.
+        let root = std::env::temp_dir().join(format!("muse-prefix-{}", std::process::id()));
+        muse_store(
+            &root,
+            &[],
+            &[
+                ("11111111-1111-1111-1111-111111111111", 4242, "/tmp/proj"),
+                ("22222222-2222-2222-2222-222222222222", 777, "/tmp/proj2"),
+            ],
+        );
+        let mut record = rec("/tmp/proj");
+        record.harness = "muse".into();
+        match discover_muse_in(&root.join("sessions"), &record) {
+            MuseDiscovery::One(native) => {
+                assert_eq!(native.value, "11111111-1111-1111-1111-111111111111")
+            }
+            MuseDiscovery::Many(candidates) => {
+                panic!("prefix collision refused as Many: {candidates:?}")
+            }
+            MuseDiscovery::None => panic!("expected the exact-cwd match"),
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn codex_root_cwd_picks_the_root_session_over_a_newer_subdir_one() {
+        let root = std::env::temp_dir().join(format!("codex-root-subdir-{}", std::process::id()));
+        let dir = root.join("sessions/2026/11/06");
+        fs::create_dir_all(&dir).unwrap();
+        for (id, cwd, prompt, newest) in [
+            (
+                "11111111-1111-1111-1111-111111111111",
+                "/tmp/proj",
+                "root prompt",
+                false,
+            ),
+            (
+                "22222222-2222-2222-2222-222222222222",
+                "/tmp/proj/sub",
+                "subdir prompt",
+                true,
+            ),
+        ] {
+            let path = dir.join(format!("rollout-2026-11-06T00-00-00-{id}.jsonl"));
+            fs::write(
+                &path,
+                format!(
+                    "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"{cwd}\"}}}}\n{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{prompt}\"}}]}}}}\n"
+                ),
+            )
+            .unwrap();
+            if newest {
+                fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_modified(
+                        std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+                    )
+                    .unwrap();
+            }
+        }
+        let mut record = rec("/tmp/proj");
+        record.harness = "codex".into();
+        let candidates = codex_candidates_in(&root.join("sessions"), &record);
+        assert_eq!(candidates.len(), 1, "{candidates:?}");
+        assert_eq!(candidates[0].id, "11111111-1111-1111-1111-111111111111");
+        let discovered = discover_codex_in(&root.join("sessions"), &record).unwrap();
+        assert_eq!(discovered.value, "11111111-1111-1111-1111-111111111111");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn muse_revive_discovery_walks_past_the_manifest_file_cap_to_refuse_many() {
+        // #1559 re-review: the manifest cap must never turn Many into One
+        // for revive. The second match is the oldest of 514 journals, so
+        // only an uncapped walk can see it and refuse.
+        let root = std::env::temp_dir().join(format!("muse-many-cap-{}", std::process::id()));
+        let sessions = root.join("sessions/2026/11/06");
+        let now = std::time::SystemTime::now();
+        for index in 0..514_u64 {
+            let id = format!("{index:08x}-0000-0000-0000-000000000000");
+            let dir = sessions.join(&id);
+            fs::create_dir_all(&dir).unwrap();
+            let cwd = if index == 0 || index == 513 {
+                "/tmp/proj"
+            } else {
+                "/other"
+            };
+            let journal = dir.join("session.jsonl");
+            fs::write(&journal, format!("{{\"cwd\":\"{cwd}\"}}\n")).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&journal)
+                .unwrap()
+                .set_modified(now - std::time::Duration::from_secs(index))
+                .unwrap();
+        }
+        let mut record = rec("/tmp/proj");
+        record.harness = "muse".into();
+        match discover_muse_in(&root.join("sessions"), &record) {
+            MuseDiscovery::Many(candidates) => {
+                let ids: Vec<&str> = candidates.iter().map(|c| c.id.as_str()).collect();
+                assert_eq!(
+                    ids,
+                    [
+                        "00000000-0000-0000-0000-000000000000",
+                        "00000201-0000-0000-0000-000000000000"
+                    ]
+                );
+            }
+            MuseDiscovery::One(native) => {
+                panic!("capped walk bound {} instead of refusing", native.value)
+            }
+            MuseDiscovery::None => panic!("expected two matches"),
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn codex_first_prompt_skips_agents_and_wrapped_context_blocks() {
+        for wrapped in [
+            "# AGENTS.md instructions for /tmp/proj\nDo setup first",
+            "<codex_internal_context>internal</codex_internal_context>",
+        ] {
+            let head = [
+                json!({"type":"session_meta","payload":{"id":"t1","cwd":"/tmp/proj","base_instructions":{"text":"META"}}}).to_string(),
+                json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":wrapped}]}}).to_string(),
+                json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"the typed prompt"}]}}).to_string(),
+            ]
+            .join("\n");
+            assert_eq!(
+                codex_first_prompt(&head).as_deref(),
+                Some("the typed prompt")
+            );
+        }
+    }
+
     #[test]
     fn muse_fresh_selector_adds_no_resume() {
         let args = fresh_selector("muse", vec!["--model".into(), "m".into()], "sess-1").unwrap();

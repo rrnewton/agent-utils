@@ -26,8 +26,14 @@ struct Scratch {
 
 impl Scratch {
     fn new() -> Self {
-        let root =
-            std::env::temp_dir().join(format!("agentctl-team-manifest-cli-{}", std::process::id()));
+        Self::named("recorded")
+    }
+
+    fn named(label: &str) -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "agentctl-team-manifest-cli-{label}-{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&root);
         for directory in ["registry/agents/lane", "home", "state"] {
             fs::create_dir_all(root.join(directory)).expect("create scratch directory");
@@ -154,6 +160,37 @@ impl Scratch {
     }
 }
 
+impl Scratch {
+    fn run_manifest(&self) -> Value {
+        let home = self.root.join("home");
+        let output = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+            .current_dir(&self.root)
+            .env("HOME", &home)
+            .env("AGENTCTL_HOME", home.join(".agentctl"))
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_CACHE_HOME", home.join(".cache"))
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_STATE_HOME", home.join(".local/state"))
+            .env_remove("HERDR_SOCKET_PATH")
+            .env_remove("HERDR_PANE_ID")
+            .env_remove("AGENTCTL_AGENT")
+            .env_remove("AGENTCLOUD_SESSION_ID")
+            .arg("--registry")
+            .arg(self.root.join("registry"))
+            .arg("--herdr-bin")
+            .arg(self.root.join("herdr"))
+            .args(["team", "manifest", "--state-dir"])
+            .arg(self.root.join("state"))
+            .stdin(Stdio::null())
+            .output()
+            .expect("run agentctl team manifest");
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let text = String::from_utf8(output.stdout).expect("manifest is UTF-8");
+        assert!(!text.contains(TOKEN), "record token leaked: {text}");
+        serde_json::from_str(&text).expect("manifest JSON")
+    }
+}
+
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
@@ -201,6 +238,84 @@ fn team_manifest_embeds_verify_without_registry_writes() {
     // even though `arguments` is empty and status redacts the pair form.
     assert_eq!(document["record_gaps"][0]["name"], "lane");
     assert_eq!(document["record_gaps"][0]["missing"], json!(["profile"]));
+    assert_eq!(scratch.snapshot(), before, "manifest changed the registry");
+    assert_eq!(
+        scratch.state_snapshot(),
+        state_before,
+        "manifest changed its --state-dir"
+    );
+}
+
+#[test]
+fn team_manifest_lists_report_only_candidates_for_a_session_less_record() {
+    let scratch = Scratch::named("sessionless");
+    let record_path = scratch.root.join("registry/agents/lane/agent.json");
+    let mut record: Value =
+        serde_json::from_slice(&fs::read(&record_path).expect("read scratch record"))
+            .expect("scratch record JSON");
+    record
+        .as_object_mut()
+        .expect("record object")
+        .remove("launch_spec");
+    fs::write(&record_path, record.to_string()).expect("remove recorded session");
+    fs::set_permissions(&record_path, fs::Permissions::from_mode(0o600)).expect("record mode");
+    for (id, prompt) in [
+        ("11111111-1111-1111-1111-111111111111", "recover lane A"),
+        ("22222222-2222-2222-2222-222222222222", "recover lane B"),
+    ] {
+        let dir = scratch
+            .root
+            .join("home/.local/share/muse/sessions/2026/11/06")
+            .join(id);
+        fs::create_dir_all(&dir).expect("create Muse session dir");
+        fs::write(
+            dir.join("session.jsonl"),
+            format!(
+                "{}\n",
+                json!({
+                    "cwd": scratch.root.display().to_string(),
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": prompt}],
+                    },
+                })
+            ),
+        )
+        .expect("write Muse session journal");
+    }
+    let before = scratch.snapshot();
+    let state_before = scratch.state_snapshot();
+
+    let document = scratch.run_manifest();
+
+    let candidates = document["agents"][0]["session_candidates"]
+        .as_array()
+        .expect("structured candidates");
+    let ids: Vec<&str> = candidates
+        .iter()
+        .map(|candidate| candidate["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222"
+        ]
+    );
+    assert_eq!(document["agents"][0]["session_candidate_count"], 2);
+    assert_eq!(candidates[0]["first_prompt"], "recover lane A");
+    let gaps = document["record_gaps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "lane")
+        .expect("lane gap row");
+    assert!(gaps["missing"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("session")));
+    assert_eq!(gaps["candidate_count"], 2);
+    assert_eq!(gaps["candidate_ids"], json!(ids));
     assert_eq!(scratch.snapshot(), before, "manifest changed the registry");
     assert_eq!(
         scratch.state_snapshot(),

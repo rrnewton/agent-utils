@@ -2756,10 +2756,23 @@ pub(crate) enum ManifestProfileState {
     NotApplicable,
 }
 
+/// One native session a store names for a record's cwd, as report-only
+/// recovery evidence (`#1559` landing 1b). A candidate is never a bind:
+/// several (or one) may be listed while revive keeps its own recorded-
+/// session rules.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SessionCandidate {
+    pub id: String,
+    pub cwd: String,
+    pub last_activity: Option<SystemTime>,
+    pub first_prompt: Option<String>,
+}
+
 /// The recovery-completeness facts `team manifest` may judge from one raw
-/// record. This deliberately carries only names, booleans, and the static
-/// bypass-flag text: no argv, token, or native-session value crosses into
-/// the manifest module.
+/// record. This deliberately carries only names, booleans, the static
+/// bypass-flag text, and report-only session candidates for a record
+/// with no recorded session: no argv, token, or recorded native-session
+/// value crosses into the manifest module.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ManifestRecordFacts {
     pub profile: Option<String>,
@@ -2768,6 +2781,7 @@ pub(crate) struct ManifestRecordFacts {
     pub native_session_present: bool,
     pub missing_bypass_flag: Option<&'static str>,
     pub adopted_without_launch_spec: bool,
+    pub session_candidates: Vec<SessionCandidate>,
 }
 
 fn goal_replacement_selected(screen: &str, objective: &str) -> bool {
