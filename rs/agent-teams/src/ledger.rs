@@ -759,42 +759,57 @@ fn queue_candidates(recorded: &Path) -> Vec<PathBuf> {
         }
     };
     push(agent_queue::registry::relocated(recorded));
-    // Derive (registry, agent) from .../<agent>/queue or
-    // .../agents/<agent>/queue or .../archive/<agent>-<token>/queue.
-    let agent_dir = recorded.parent();
-    let (registry, agent) = match (agent_dir, recorded) {
-        (Some(dir), _) => {
-            let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            let parent = dir.parent();
-            match parent.and_then(|p| p.file_name()).and_then(|n| n.to_str()) {
-                Some("agents") => (
-                    parent.and_then(|p| p.parent()).map(Path::to_path_buf),
-                    Some(name.to_string()),
-                ),
-                Some("archive") => {
-                    // Entry is <agent>-<digits>-<digits>[/-adopt-failed].
-                    let agent = name
-                        .rsplit_once('-')
-                        .map(|(head, _)| head)
-                        .and_then(|head| head.rsplit_once('-').map(|(a, _)| a.to_string()))
-                        .unwrap_or_else(|| name.to_string());
-                    (
-                        parent.and_then(|p| p.parent()).map(Path::to_path_buf),
-                        Some(agent),
-                    )
-                }
-                _ => (parent.map(Path::to_path_buf), Some(name.to_string())),
+    // Derive (registry, agent) only from a recognised layout:
+    // .../agents/<agent>/queue, .../archive/<entry>/queue, or a legacy
+    // .../<agent>/queue whose parent is a real registry (it holds
+    // coordinator.json or agents/). Anything else (a scratch queue
+    // root in a temp dir) has no registry to scan.
+    let Some(agent_dir) = recorded.parent() else { return out };
+    let name = agent_dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let parent = agent_dir.parent();
+    let (registry, agent) = match parent.and_then(|p| p.file_name()).and_then(|n| n.to_str()) {
+        Some("agents") => (
+            parent.and_then(|p| p.parent()).map(Path::to_path_buf),
+            Some(name.to_string()),
+        ),
+        Some("archive") => {
+            let recorded_name = fs::read_to_string(agent_dir.join("agent.json"))
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                .and_then(|value| {
+                    value.get("name").and_then(Value::as_str).map(str::to_owned)
+                });
+            (
+                parent.and_then(|p| p.parent()).map(Path::to_path_buf),
+                recorded_name,
+            )
+        }
+        _ => {
+            let is_registry = parent.is_some_and(|p| {
+                p.join("coordinator.json").exists() || p.join("agents").is_dir()
+            });
+            if is_registry && agent_queue::registry::is_agent_name(name) {
+                (parent.map(Path::to_path_buf), Some(name.to_string()))
+            } else {
+                (None, None)
             }
         }
-        _ => (None, None),
     };
     if let (Some(registry), Some(agent)) = (registry, agent) {
-        if let Ok(entries) = fs::read_dir(registry.join("archive")) {
-            let prefix = format!("{agent}-");
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name.starts_with(&prefix) {
-                    push(entry.path().join("queue"));
+        // Archived generations of exactly this agent: the entry's own
+        // record names it, never a file-name prefix.
+        if agent_queue::registry::archived(&registry, &agent).unwrap_or(false) {
+            if let Ok(entries) = fs::read_dir(registry.join("archive")) {
+                for entry in entries.flatten() {
+                    let record = fs::read_to_string(entry.path().join("agent.json"))
+                        .ok()
+                        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                        .and_then(|value| {
+                            value.get("name").and_then(Value::as_str).map(str::to_owned)
+                        });
+                    if record.as_deref() == Some(agent.as_str()) {
+                        push(entry.path().join("queue"));
+                    }
                 }
             }
         }
@@ -807,24 +822,6 @@ fn queue_candidates(recorded: &Path) -> Vec<PathBuf> {
         if let Some(designated) = designated {
             if designated != agent {
                 if let Ok(dir) = agent_queue::registry::directory(&registry, &designated) {
-                    push(dir.join("queue"));
-                }
-            }
-        }
-        // Re-designation fallback: every live agent queue in the same
-        // registry, so a successor is found even when the designation
-        // reader cannot answer in this process.
-        if let Ok(entries) = fs::read_dir(registry.join("agents")) {
-            for entry in entries.flatten() {
-                let queue = entry.path().join("queue");
-                if queue.is_dir() {
-                    push(queue);
-                }
-            }
-        }
-        if let Ok(names) = agent_queue::registry::names(&registry) {
-            for name in names {
-                if let Ok(dir) = agent_queue::registry::directory(&registry, &name) {
                     push(dir.join("queue"));
                 }
             }
@@ -946,7 +943,7 @@ pub fn reconcile_queue_delivery(state: &Path, team: &str, id: &str) -> Option<St
                     "expired",
                     "set aside untyped at drain: past not_after".to_string(),
                 )
-            } else if reason.starts_with("retargeted") || reason.starts_with("stranded") {
+            } else if reason.starts_with("stranded") {
                 ("stranded", format!("set aside untyped: {reason}"))
             } else {
                 (
@@ -974,6 +971,11 @@ pub fn reconcile_queue_delivery(state: &Path, team: &str, id: &str) -> Option<St
                 ),
             }
         }
+        Some((queue_dir, MessageState::Pending)) if in_archive(&queue_dir) => (
+            "stranded",
+            "stranded: item left pending in an archived coordinator queue; never typed"
+                .to_string(),
+        ),
         Some((queue_dir, MessageState::Inflight)) if in_archive(&queue_dir) => (
             "stranded",
             "stranded: item left inflight in an archived coordinator queue; never confirmed typed"
