@@ -1774,6 +1774,14 @@ fn cmd_send(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         flag_value(args, "--in-reply-to").as_deref(),
         &body,
     );
+    // #2035: a service sender's replies route to the team it is
+    // declared for (its own svc.* name has no inbox); provenance
+    // stays in `from`.
+    let declared = sender
+        .starts_with("service:")
+        .then_some(own.team.as_str());
+    envelope["reply_to"]["team"] =
+        json!(crate::envelope::reply_team(&from_team, declared));
     // Signed identity is the default once this team@host has a key
     // (created by `relay keygen` or `relay announce`): envelopes then
     // carry its signature, and the seed never leaves this host's state.
@@ -3756,6 +3764,28 @@ mod tests {
             service_team(&entry, &args, &declarations).as_deref(),
             Some("team-b")
         );
+    }
+
+    #[test]
+    #[test]
+    fn service_reply_to_routes_to_the_declared_team() {
+        // #2035: from stays the service; reply_to is the declared team.
+        assert_eq!(
+            crate::envelope::reply_team("svc.nightly", Some("tools")),
+            "tools"
+        );
+        assert_eq!(crate::envelope::reply_team("svc.nightly", None), "svc.nightly");
+        assert_eq!(crate::envelope::reply_team("tools", Some("other")), "tools");
+        let envelope = crate::envelope::build_envelope(
+            "tm-svc-1", "k", "svc.nightly", "host-a", 1, "service-unit",
+            "ops", "host-a", "info", None, &[], false, 0, 7_200_000, None, "alert",
+        );
+        let mut envelope = envelope;
+        envelope["reply_to"]["team"] =
+            serde_json::json!(crate::envelope::reply_team("svc.nightly", Some("tools")));
+        assert_eq!(envelope["from"]["team"], "svc.nightly");
+        assert_eq!(envelope["reply_to"]["team"], "tools");
+        assert_eq!(envelope["reply_to"]["host"], "host-a");
     }
 
     #[test]

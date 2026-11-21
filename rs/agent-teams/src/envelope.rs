@@ -89,6 +89,20 @@ pub fn build_envelope(
     })
 }
 
+/// The team replies to a sender are routed to (#2035): a service
+/// sender (`svc.NAME` in `from.team`) has no inbox, so replies go to
+/// the team the service is declared for; every other sender replies
+/// to itself. Provenance stays in `from`, never in `reply_to`.
+#[must_use]
+pub fn reply_team(from_team: &str, declared_team: Option<&str>) -> String {
+    if from_team.starts_with("svc.") {
+        if let Some(team) = declared_team.filter(|team| !team.is_empty()) {
+            return team.to_string();
+        }
+    }
+    from_team.to_string()
+}
+
 /// Sender name as used for policy: the team, or `service:NAME`.
 pub fn envelope_sender(envelope: &Value) -> String {
     let team = envelope
