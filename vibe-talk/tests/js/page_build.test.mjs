@@ -36,6 +36,7 @@ import {
 } from "../../web/build.mjs";
 import { ASSEMBLED, SHELL, WEB, moduleSources, partsOf, readWeb, shellScripts, shellStyles } from "../../web/page_sources.mjs";
 import { PACKAGES, checkArchitecture } from "../../web/architecture.mjs";
+import { buildGraph, packageOf, specifiersOf, summarize } from "../../web/import_graph.mjs";
 
 const scratch = mkdtempSync(join(tmpdir(), "vibe-talk-page-build-"));
 process.on("exit", () => rmSync(scratch, { recursive: true, force: true }));
@@ -588,5 +589,24 @@ test("`#624 voice-page-modularity`: the import checker fails closed on every wro
     'import { glyphEm } from "./index.ts";\nexport const again = glyphEm;\n');
   assert.ok(checkArchitecture(copy).some((problem) => /a cycle between files: .*foundation\/text\.ts/.test(problem)),
     "a cycle through foundation/index.ts was not refused");
+  rmSync(copy, { recursive: true, force: true });
+});
+
+test("`#2059 vibe-talk-ui-latency-architecture-review`: the kept import graph maps packages, keeps JSDoc type refs out of the edges, and refuses a wrong edge", () => {
+  assert.deepStrictEqual(packageOf("view/channel/rows.ts"), "view/channel");
+  assert.deepStrictEqual(packageOf("core/sync/poll.ts"), "core/sync");
+  const found = specifiersOf('import { x } from "./a.ts";\n/** @type {import("./b.ts").T} */\nexport const y = x;\n');
+  assert.deepStrictEqual(found.edges, ["./a.ts"], "a JSDoc type ref became an import edge");
+  assert.deepStrictEqual(found.jsdoc, ["./b.ts"], "a JSDoc type ref was not counted separately");
+  const copy = mkdtempSync(join(scratch, "import-graph-"));
+  cpSync(join(WEB, "src"), copy, { recursive: true });
+  const clean = summarize(buildGraph(copy));
+  assert.deepStrictEqual(clean.violations, [], "the clean tree gained a violation in the kept graph");
+  assert.deepStrictEqual(clean.cycles, [], "the clean tree gained a cycle in the kept graph");
+  writeFileSync(join(copy, "core", "api", "bad.ts"),
+    'import { createWebPorts } from "../../platform/web/index.ts";\nexport const x = createWebPorts;\n');
+  const dirty = summarize(buildGraph(copy));
+  assert.ok(dirty.violations.some((v) => /core\/api may not import platform\/web/.test(v)),
+    `a wrong-direction import was not refused: ${JSON.stringify(dirty.violations)}`);
   rmSync(copy, { recursive: true, force: true });
 });
