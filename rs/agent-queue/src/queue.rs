@@ -1112,13 +1112,26 @@ fn settled_state(root: &Path, message_id: &str) -> Result<Option<MessageState>> 
 pub fn cancel(root: &Path, message_id: &str, reason: &str) -> Result<CancelOutcome> {
     validate_message_id(message_id)?;
     let directories = prepare(root)?;
-    match settled_state(root, message_id)? {
-        Some(MessageState::Cancelled) => return Ok(CancelOutcome::AlreadyCancelled),
-        Some(MessageState::Processed | MessageState::Failed) => return Ok(CancelOutcome::TooLate),
-        _ => {}
+    let filename = format!("{message_id}.json");
+    let present = |directories: &QueueDirectories| -> Vec<MessageState> {
+        directories
+            .states()
+            .iter()
+            .filter(|(directory, _)| fs::symlink_metadata(directory.join(&filename)).is_ok())
+            .map(|(_, state)| *state)
+            .collect()
+    };
+    match settled_state(root, message_id) {
+        Ok(Some(MessageState::Cancelled)) => return Ok(CancelOutcome::AlreadyCancelled),
+        Ok(Some(MessageState::Processed | MessageState::Failed)) => {
+            return Ok(CancelOutcome::TooLate);
+        }
+        Ok(_) => {}
+        Err(_) if present(&directories).len() > 1 => {}
+        Err(error) => return Err(error),
     }
     prepare_lane(root, &directories.cancel)?;
-    let path = directories.cancel.join(format!("{message_id}.json"));
+    let path = directories.cancel.join(&filename);
     let tombstone = serde_json::to_value(crate::schema::Tombstone {
         id: message_id.to_owned(),
         reason: reason.to_owned(),
@@ -1132,15 +1145,36 @@ pub fn cancel(root: &Path, message_id: &str, reason: &str) -> Result<CancelOutco
     }
     // With the delivery lock free, no drain is between its last check and its paste, so the item
     // can be set aside now, out of reach of every drainer.
+    let had_cancelled = present(&directories).contains(&MessageState::Cancelled);
+    let mut set_aside_pending = false;
     if let Ok(_lock) = lock_delivery(root, directory_identity(root)?, &NoWait) {
         for inbox in [&directories.inbox, &directories.inbox_v2] {
-            let item = inbox.join(format!("{message_id}.json"));
+            let item = inbox.join(&filename);
             if fs::symlink_metadata(&item).is_ok() {
                 let document = load_message(&item)?;
                 set_aside(root, &directories, &item, document, "cancelled", reason)?;
-                return Ok(CancelOutcome::SetAside);
+                set_aside_pending = true;
             }
         }
+        if set_aside_pending && !had_cancelled && present(&directories).len() <= 1 {
+            return Ok(CancelOutcome::SetAside);
+        }
+    }
+    // An id in several phases (#2022 cancel-resurrection): the terminal
+    // record wins, a pending copy was retired above (or the tombstone
+    // retires it at the drain holding the queue), and the ambiguity is
+    // resolved instead of refused.
+    let states = present(&directories);
+    if states.len() > 1 {
+        return Ok(if had_cancelled {
+            CancelOutcome::AlreadyCancelled
+        } else if set_aside_pending {
+            CancelOutcome::SetAside
+        } else if states.contains(&MessageState::Pending) {
+            CancelOutcome::Pending
+        } else {
+            CancelOutcome::TooLate
+        });
     }
     Ok(match settled_state(root, message_id)? {
         Some(MessageState::Pending) => CancelOutcome::Pending,
@@ -1551,6 +1585,50 @@ mod tests {
         assert_eq!(order, ["new", "old"], "merged by queued_at across lanes");
         assert!(withdraw(root, "new", &Blocking).unwrap());
         assert_eq!(message_state(root, "new").unwrap(), None);
+    }
+
+    #[test]
+    fn a_named_id_in_a_terminal_phase_is_never_reenqueued_and_cancel_resolves_phases() {
+        // #2022 cancel-resurrection, named-id form: a re-send with an
+        // explicit id whose record is already cancelled is refused, and
+        // cancel on an id in several phases retires the pending copy
+        // instead of refusing on the ambiguity.
+        let queue = TestQueue::new();
+        let root = &queue.0;
+        let directories = prepare(root).unwrap();
+        put(root, "named-1", true).unwrap();
+        assert_eq!(
+            cancel(root, "named-1", "delivered by hand").unwrap(),
+            CancelOutcome::SetAside
+        );
+        assert_eq!(
+            put(root, "named-1", true).unwrap_err().kind(),
+            ErrorKind::Duplicate,
+            "a cancelled named id is never re-enqueued"
+        );
+        // A resurrected pending copy beside the cancelled record: cancel
+        // resolves it, keeping the terminal record.
+        let pending = directories.inbox.join("named-1.json");
+        fs::copy(directories.cancelled.join("named-1.json"), &pending).unwrap();
+        assert_eq!(
+            cancel(root, "named-1", "again").unwrap(),
+            CancelOutcome::AlreadyCancelled
+        );
+        assert!(!pending.exists(), "the pending copy was retired");
+        assert!(directories.cancelled.join("named-1.json").exists());
+        // Cancelled (via set_aside, tombstone consumed) plus a revived
+        // pending copy: cancel keeps the terminal record and retires it.
+        put(root, "named-2", true).unwrap();
+        let claimed = directories.inbox.join("named-2.json");
+        let document = load_message(&claimed).unwrap();
+        set_aside(root, &directories, &claimed, document, "cancelled", "x").unwrap();
+        let revived = directories.inbox.join("named-2.json");
+        fs::copy(directories.cancelled.join("named-2.json"), &revived).unwrap();
+        assert_eq!(
+            cancel(root, "named-2", "again").unwrap(),
+            CancelOutcome::AlreadyCancelled
+        );
+        assert!(!revived.exists());
     }
 
     #[test]

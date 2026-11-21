@@ -45,6 +45,11 @@ the retirement.
   `cancelled/` sets it aside and delivers nothing for it.
 - Retire and cancel keep their current behaviour; the focused
   queue and drain suites pass in both editions where they apply.
+- (Fold-in) A send whose explicit id already exists in a terminal
+  phase is refused as a duplicate, never re-enqueued (pinned for a
+  cancelled named id); `cancel` on an id in several phases keeps
+  the terminal record and retires the pending copy instead of
+  refusing with "exists in multiple queue phases".
 
 # Notes
 
