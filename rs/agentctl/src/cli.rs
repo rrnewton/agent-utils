@@ -6952,8 +6952,8 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
                                 && value.target.bridge.is_none();
                             match crate::chat_runtime::BridgeState::inspect(&state) {
                                 Ok(bridge) => {
-                                    // A headless agent replies only by the command, as its
-                                    // prompts say; `chat run` learns that from the registry too.
+                                    // The target's kind, as `chat run` learns it from the
+                                    // registry: the fallback when no prompt is recorded.
                                     let agent = bridge.config().agent_name.clone();
                                     // An unknown harness has no transcript followed (#896).
                                     let (headless, unknown) = bridge_registry
@@ -6969,9 +6969,21 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
                                             ))
                                         })
                                         .unwrap_or((false, false));
+                                    // Follow the request's recorded reply mode (#1974):
+                                    // its prompt may have given marker lines (a headless
+                                    // agent whose event log is followed) even though the
+                                    // agent is headless, or only the command. Only when
+                                    // no prompt is recorded yet does the harness decide.
+                                    let bridge = bridge.with_headless_target(headless);
+                                    let bridge = match bridge.recorded_reply_mode(&key) {
+                                        Some(command_only) => bridge
+                                            .with_command_only_replies(command_only)
+                                            .with_transcriptless_target(false),
+                                        None => bridge
+                                            .with_command_only_replies(headless)
+                                            .with_transcriptless_target(unknown),
+                                    };
                                     bridge
-                                        .with_command_only_replies(headless)
-                                        .with_transcriptless_target(unknown)
                                         .with_prompt_commands(crate::chat_runtime::PromptCommands {
                                             bare: found_by_lookup,
                                             discoverable: found_by_lookup,

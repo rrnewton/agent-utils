@@ -2094,8 +2094,11 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
         None => state,
     };
     // A headless coordinator has no screen to read or composer to type into: its requests go to
-    // its queue, which its wrapper drains, and it replies only through `chat reply` (#594
-    // headless-slack-trial).
+    // its queue, which its wrapper drains. Its replies are read from its event log when one is
+    // followed, exactly as a TUI target's are read from its transcript, and only then fall back
+    // to `chat reply` alone (#594 headless-slack-trial, #1974
+    // agentctl-headless-chat-transcript-parity: the mode is decided per prompt, so this start
+    // never pins it).
     let headless = manager.is_headless(&state.config().agent_name)?;
     // A cloud target is not command-only (its markers are read from its
     // session output), but its prompt is journaled at submission, which is
@@ -2115,19 +2118,18 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
         .with_ignored_text_prefixes(settings.ignored_text_prefixes)?
         .with_prompt_commands(prompt_commands)
         .with_reply_command_offered(offer_reply_command)
-        .with_command_only_replies(headless)
+        .with_headless_target(headless)
         .with_transcriptless_target(unknown)
         .with_receipt_when_started(headless || cloud)
         .with_latency_profile(Some(manager.registry().to_path_buf()), headless);
     // A coordinator's reply text comes from its transcript where that holds it (#710
-    // chat-transcript-extraction). A headless coordinator's screen is never read, so it needs no
-    // clean text for screen blocks: the reader rests for one, and starts following once a repoint
-    // serves an agent with a screen (#852 unknown-tui-bridge). AGENTCTL_CHAT_REPLY_TEXT=screen
-    // keeps the screen's text.
+    // chat-transcript-extraction): a headless coordinator's event log is that transcript
+    // (#1974), and a repoint retargets the reader to the new agent's source (#852
+    // unknown-tui-bridge). AGENTCTL_CHAT_REPLY_TEXT=screen keeps the screen's text.
     let state = if std::env::var("AGENTCTL_CHAT_REPLY_TEXT").is_ok_and(|value| value == "screen") {
         state
     } else {
-        let agent = (!headless).then(|| state.config().agent_name.clone());
+        let agent = Some(state.config().agent_name.clone());
         let records = state.clone();
         let source = crate::chat_transcript::SharedReplySource::default();
         let marks = crate::chat_transcript::SharedTurnMarks::default();
@@ -2181,8 +2183,9 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
     if headless {
         service_log(format!(
             "agentctl: {} is headless: requests go to its queue, each earns its receipt when \
-             the model starts it, replies only through `agentctl chat reply`; reply reminders \
-             and the stale composer guard are off",
+             the model starts it, replies are read from its event log when one is followed \
+             (else only through `agentctl chat reply`); reply reminders and the stale composer \
+             guard are off",
             state.config().agent_name
         ));
     }
@@ -6105,8 +6108,9 @@ fn run_owner_loop_with_health<A: ManagedApi + ?Sized>(
         let state = &mut state;
         let started = Instant::now();
         health.pass_started(started);
-        // A headless coordinator has no pane for the pane loop to read. The prompts' reply
-        // instructions are chosen at startup and at a repoint, so a coordinator restarted in the
+        // A headless coordinator has no pane for the pane loop to read. Its reply mode is
+        // decided per prompt from its followed event log (#1974), but the other per-target
+        // settings are chosen at startup and at a repoint, so a coordinator restarted in the
         // other mode under the same name needs `chat run` restarted too.
         let pass = match manager.is_headless(&state.config().agent_name) {
             Err(error) => Err(error.into()),
@@ -7820,12 +7824,104 @@ fn outbound(
         .map(|transport| transport as &mut dyn RootMessageTransport)
 }
 
+/// How often the headless loop captures reply blocks from the event log it follows (#1974).
+const HEADLESS_CAPTURE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Capture the reply blocks the headless target's event log gained, exactly as a pane capture
+/// does for a TUI target (#1974): an empty screen, because no screen is read and every block
+/// comes from the transcript source. Captured replies are then sent by `process_keys`, as in
+/// the pane loop. The poll that capture performs also refreshes where replies are read from,
+/// so the next prompt's reply mode follows the log's presence.
+fn capture_headless_replies<A: ManagedApi + ?Sized>(
+    state: &BridgeState,
+    manager: &ManagedAgents<'_, A>,
+    delivery: crate::agent::DrainOptions,
+    routes: &mut RouteCache,
+    notes: &mut NoteLog,
+    control: &mut PassControl<'_>,
+) -> Result<(), ChatServiceError> {
+    let gate = prompt_gate(state, manager, None, control.stop)?;
+    let capture = state.capture_snapshot_with_gate("", &gate)?;
+    for refusal in &capture.refused {
+        service_log(format_args!("agentctl: headless reply refused: {refusal}"));
+    }
+    if capture.replies.is_empty() {
+        return Ok(());
+    }
+    let keys: Vec<String> = capture.replies.iter().map(|(key, _)| key.clone()).collect();
+    log_captured(
+        control,
+        routes,
+        &capture.replies,
+        &capture.transcript_replies,
+    );
+    let report = process_keys(state, manager, delivery, &keys, control)?;
+    notes.log(&report);
+    for key in &report.processed_keys {
+        routes.replace(key, state.next_reply_route(key)?);
+    }
+    Ok(())
+}
+
+/// When the headless loop next runs [`capture_headless_replies`]: not on every tick, only
+/// when the reader holds new blocks, when the set of delivered-and-unanswered requests
+/// changed (a block already in the log can become answerable when its request is marked
+/// delivered moments later, with no new block written), or when forced at a reconciliation
+/// (#1974 re-review).
+#[derive(Default)]
+struct HeadlessCaptureWatch {
+    last_blocks: Vec<chat_runtime::TranscriptBlock>,
+    last_unanswered: std::collections::BTreeSet<String>,
+    forced: bool,
+}
+
+impl HeadlessCaptureWatch {
+    /// Force the next tick to scan (a reconciliation).
+    fn force(&mut self) {
+        self.forced = true;
+    }
+
+    /// One capture tick: poll the reader (cheap, and it keeps the reply source fresh for
+    /// the next prompt), then scan only when due. Gives whether a scan ran; the remembered
+    /// state advances only after a successful scan.
+    fn tick<A: ManagedApi + ?Sized>(
+        &mut self,
+        state: &BridgeState,
+        manager: &ManagedAgents<'_, A>,
+        delivery: crate::agent::DrainOptions,
+        routes: &mut RouteCache,
+        notes: &mut NoteLog,
+        control: &mut PassControl<'_>,
+    ) -> Result<bool, ChatServiceError> {
+        let blocks = state.transcript_blocks();
+        let unanswered: std::collections::BTreeSet<String> = state
+            .reply_reminder_candidates()
+            .map(|found| {
+                found
+                    .candidates
+                    .into_iter()
+                    .map(|candidate| candidate.key)
+                    .collect()
+            })
+            .unwrap_or_else(|_| self.last_unanswered.clone());
+        let forced = std::mem::take(&mut self.forced);
+        if !forced && blocks == self.last_blocks && unanswered == self.last_unanswered {
+            return Ok(false);
+        }
+        capture_headless_replies(state, manager, delivery, routes, notes, control)?;
+        self.last_blocks = blocks;
+        self.last_unanswered = unanswered;
+        Ok(true)
+    }
+}
+
 /// One run of the owner loop for a headless coordinator (#594 headless-slack-trial, the minimal
 /// form of the design note's `HeadlessDelivery`). Its wrapper is the only drainer of its queue,
 /// so a pass enqueues each admitted request (urgent and delivered mid-turn with
-/// `--deliver-while-working`) and wakes the wrapper; there is no pane to read, no turn to watch
-/// and no reply block to capture, because a headless coordinator replies only through
-/// `agentctl chat reply`, whose wake brings the send forward. Delivery state comes from the
+/// `--deliver-while-working`) and wakes the wrapper; there is no pane to read. Reply blocks are
+/// captured from the wrapper's event log, which the transcript reader follows as the agent's
+/// transcript (#1974); `agentctl chat reply` remains a fallback whose wake brings the send
+/// forward. Delivery state comes from the
 /// queue alone: a request is delivered, and earns its ✅ receipt, when the queue shows that the
 /// model started its prompt, which [`StartWatch`] looks for (#601 headless-second-reaction).
 /// Rescans retry the requests still pending, and each reconciliation runs a recovery pass, as
@@ -7854,6 +7950,10 @@ fn headless_owner_loop_pass<A: ManagedApi + ?Sized>(
     let mut starts = StartWatch::default();
     let receipts = stop.ack_queue.as_ref();
     let mut approvals = ApprovalRelay::new(state, manager, outbound(control.transport));
+    let mut reply_watch = reply_source::ReplySourceWatch::default();
+    // Poll the event log before any prompt of this pass is composed, so its reply mode
+    // reflects whether the log is followed now (#1974, per-prompt with no restart).
+    let _ = state.transcript_blocks();
     let recovery = recover_pass(state, manager, options.delivery, &mut routes, &mut control)?;
     enqueue_report_backlog(&mut direct_keys, &recovery, overflowed);
     starts.note(&recovery);
@@ -7873,6 +7973,8 @@ fn headless_owner_loop_pass<A: ManagedApi + ?Sized>(
         &mut notes,
     );
     let mut next_reconciliation = Instant::now() + options.reconciliation_interval;
+    let mut next_capture = Instant::now() + HEADLESS_CAPTURE_INTERVAL;
+    let mut capture_watch = HeadlessCaptureWatch::default();
     while !stop.is_stopped() {
         // A waiting repoint ends the pass here, between two rounds, when no prompt is being
         // typed; `run_owner_loop` applies it and starts the next pass on the new target. Queued
@@ -7885,6 +7987,23 @@ fn headless_owner_loop_pass<A: ManagedApi + ?Sized>(
         }
         health.tick(state);
         approvals.relay(state, outbound(control.transport));
+        if Instant::now() >= next_capture {
+            next_capture = Instant::now() + HEADLESS_CAPTURE_INTERVAL;
+            // A failed capture is logged and retried at a later tick, never fatal.
+            if let Err(error) = capture_watch.tick(
+                state,
+                manager,
+                options.delivery,
+                &mut routes,
+                &mut notes,
+                &mut control,
+            ) {
+                service_log(format_args!(
+                    "agentctl: headless reply capture failed (a later tick tries again): \
+                     {error}"
+                ));
+            }
+        }
         take_provider_notices(notices, stop, &mut direct_keys, overflowed)?;
         take_reply_wakes(state, reply_wakes, &mut direct_keys, overflowed);
         let recover = direct_keys.is_empty() && overflowed.swap(false, Ordering::SeqCst);
@@ -7969,6 +8088,29 @@ fn headless_owner_loop_pass<A: ManagedApi + ?Sized>(
             );
         }
         if Instant::now() >= next_reconciliation {
+            // A forced capture scan before the capture-miss check, so a block that became
+            // answerable since the last scan is captured, not warned about (#1974).
+            capture_watch.force();
+            if let Err(error) = capture_watch.tick(
+                state,
+                manager,
+                options.delivery,
+                &mut routes,
+                &mut notes,
+                &mut control,
+            ) {
+                service_log(format_args!(
+                    "agentctl: headless reply capture failed (a later tick tries again): \
+                     {error}"
+                ));
+            }
+            reply_watch.step(
+                state,
+                manager,
+                stop,
+                options.delivery,
+                outbound(control.transport),
+            );
             let report = recover_pass(state, manager, options.delivery, &mut routes, &mut control)?;
             enqueue_report_backlog(&mut direct_keys, &report, overflowed);
             starts.note(&report);
@@ -17136,6 +17278,25 @@ esac
         .with_receipt_when_started(true)
     }
 
+    /// A bridge state for the fixture's headless agent `worker`, wired as `chat run` wires it
+    /// since #1974: no pinned reply mode, its event log followed as its transcript.
+    fn headless_worker_state_with_log(fixture: &crate::subagents::tests::Fixture) -> BridgeState {
+        let source = crate::chat_transcript::SharedReplySource::default();
+        headless_worker_state(fixture)
+            .with_command_only_replies(false)
+            .with_headless_target(true)
+            .with_transcript_replies(Box::new(
+                crate::chat_transcript::CoordinatorTranscript::for_agent(
+                    fixture.manager().registry().to_path_buf(),
+                    Some("worker".to_owned()),
+                    Box::new(service_log),
+                    Box::new(Vec::new),
+                    source.clone(),
+                ),
+            ))
+            .with_reply_source(source)
+    }
+
     /// Whether request `key` has a ✅ receipt waiting to be added.
     fn receipt_saved(state: &BridgeState, key: &str) -> bool {
         state
@@ -17526,6 +17687,7 @@ esac
             discovered: false,
             unbound_session: None,
             session_history: false,
+            headless_log: false,
         });
         let state = state
             .with_transcript_replies(Box::new(FollowedEmpty))
@@ -17586,6 +17748,7 @@ esac
             discovered: true,
             unbound_session: None,
             session_history: false,
+            headless_log: false,
         });
         let state = state
             .with_transcript_replies(Box::new(HeldBlocks(vec![chat_runtime::TranscriptBlock {
@@ -18169,6 +18332,305 @@ esac
                 "spaces/example/messages/one".to_owned(),
                 "\u{2705}".to_owned()
             )
+        );
+    }
+
+    #[test]
+    fn a_headless_event_log_reply_is_captured_once_whichever_way_it_arrives_first() {
+        // #1974 on a scratch bridge/agent (never the live bridge): the headless target gets
+        // the marker prompt, a CHAT_REPLY block in its event log is captured exactly as a TUI
+        // transcript block is, and the same text arriving by `chat reply --file` afterwards is
+        // already stored; the reverse order (file first, then the block) also stores once.
+        let fixture = crate::subagents::tests::Fixture::new();
+        let state = headless_worker_state_with_log(&fixture);
+        let manager = fixture.manager();
+        let keys = [
+            admitted_worker_message(&state, 1, "one"),
+            admitted_worker_message(&state, 2, "two"),
+        ];
+        for key in &keys {
+            state
+                .put_delivery_phase(key, chat_runtime::RequestPhase::Delivered, None)
+                .expect("deliver");
+        }
+        // The log exists before the prompts are composed, so both get marker lines.
+        let events = crate::headless::events::directory(&manager.agent_directory("worker"));
+        let mut writer =
+            crate::headless::events::EventWriter::open(&events, "worker").expect("event log");
+        writer
+            .append("turn.started", None, json!({"cause": "input"}))
+            .expect("append");
+        let prompt = state.prompt(&keys[0], "").expect("prompt one");
+        assert!(prompt.contains("<CHAT_REPLY_001>"), "{prompt}");
+        assert!(!prompt.contains("Nothing you print"), "{prompt}");
+        let prompt = state.prompt(&keys[1], "").expect("prompt two");
+        assert!(prompt.contains("<CHAT_REPLY_002>"), "{prompt}");
+
+        let mut routes = RouteCache::from_entries(state.reply_route_entries().expect("routes"));
+        let mut notes = NoteLog::default();
+        let mut transport = None;
+        let mut control = PassControl {
+            transport: &mut transport,
+            stop: None,
+        };
+        let capture = |state: &BridgeState,
+                       routes: &mut RouteCache,
+                       notes: &mut NoteLog,
+                       control: &mut PassControl<'_>| {
+            capture_headless_replies(
+                state,
+                &manager,
+                DrainOptions::default(),
+                routes,
+                notes,
+                control,
+            )
+            .expect("capture headless replies");
+        };
+        let reply_count = |state: &BridgeState, key: &str| {
+            state.inspect_request(key).expect("inspect")["replies"]
+                .as_array()
+                .expect("replies")
+                .len()
+        };
+
+        // File first for the second request, then its block in the log.
+        let chat_runtime::ReplyStoreOutcome::Stored(stored) = state
+            .submit_reply(&keys[1], "002", "file answer")
+            .expect("file reply")
+        else {
+            panic!("file reply not stored");
+        };
+        assert!(!stored.already_stored);
+        writer
+            .append(
+                "assistant.text",
+                None,
+                json!({"text": "note\n<CHAT_REPLY_002>\nfile answer\n</CHAT_REPLY_002>"}),
+            )
+            .expect("append");
+        capture(&state, &mut routes, &mut notes, &mut control);
+        assert_eq!(reply_count(&state, &keys[1]), 1);
+
+        // Block first for the first request, then the same text by file.
+        writer
+            .append(
+                "assistant.text",
+                None,
+                json!({"text": "<CHAT_REPLY_001>\nlog answer\n</CHAT_REPLY_001>"}),
+            )
+            .expect("append");
+        capture(&state, &mut routes, &mut notes, &mut control);
+        assert_eq!(reply_count(&state, &keys[0]), 1);
+        let chat_runtime::ReplyStoreOutcome::Stored(stored) = state
+            .submit_reply(&keys[0], "001", "log answer")
+            .expect("same text by file")
+        else {
+            panic!("same text not stored");
+        };
+        assert!(stored.already_stored, "{stored:?}");
+        assert_eq!(reply_count(&state, &keys[0]), 1);
+        // A different text by file is a second reply, as on a TUI target.
+        let chat_runtime::ReplyStoreOutcome::Stored(stored) = state
+            .submit_reply(&keys[0], "001", "second answer")
+            .expect("second reply")
+        else {
+            panic!("second reply not stored");
+        };
+        assert_eq!(stored.ordinal, 2);
+        assert_eq!(reply_count(&state, &keys[0]), 2);
+    }
+
+    #[test]
+    fn a_headless_block_already_in_the_log_is_captured_once_its_request_is_delivered() {
+        // #1974 re-review: a fast reply lands in the log before its request is marked
+        // delivered. A capture scan weighs it then (nothing stored), and with no new block
+        // written afterwards the set of delivered-and-unanswered requests changing must run
+        // the scan again, so the reply is captured and the capture-miss watch warns nobody.
+        let fixture = crate::subagents::tests::Fixture::new();
+        let state = headless_worker_state_with_log(&fixture);
+        let manager = fixture.manager();
+        let key = admitted_worker_message(&state, 1, "one");
+        let events = crate::headless::events::directory(&manager.agent_directory("worker"));
+        let mut writer =
+            crate::headless::events::EventWriter::open(&events, "worker").expect("event log");
+        // The block is in the log before the prompt's alias exists or anything is delivered.
+        writer
+            .append(
+                "assistant.text",
+                None,
+                json!({"text": "<CHAT_REPLY_001>\nearly answer\n</CHAT_REPLY_001>"}),
+            )
+            .expect("append");
+        let block_at = crate::headless::events::read_all(&events)
+            .expect("read log")
+            .last()
+            .expect("block event")
+            .ts;
+        let mut routes = RouteCache::from_entries(state.reply_route_entries().expect("routes"));
+        let mut notes = NoteLog::default();
+        let mut transport = None;
+        let mut control = PassControl {
+            transport: &mut transport,
+            stop: None,
+        };
+        let mut watch = HeadlessCaptureWatch::default();
+        let reply_count = |state: &BridgeState| {
+            state.inspect_request(&key).expect("inspect")["replies"]
+                .as_array()
+                .expect("replies")
+                .len()
+        };
+        // First scan: the block is weighed, its request not yet answerable, nothing stored.
+        assert!(
+            watch
+                .tick(
+                    &state,
+                    &manager,
+                    DrainOptions::default(),
+                    &mut routes,
+                    &mut notes,
+                    &mut control,
+                )
+                .expect("first tick"),
+            "first tick should scan"
+        );
+        assert_eq!(reply_count(&state), 0);
+        // No change: no scan.
+        assert!(
+            !watch
+                .tick(
+                    &state,
+                    &manager,
+                    DrainOptions::default(),
+                    &mut routes,
+                    &mut notes,
+                    &mut control,
+                )
+                .expect("second tick"),
+            "an unchanged tick should skip the scan"
+        );
+        // The prompt is composed (its alias now names the block) and the request is marked
+        // delivered, stamped when the model started it (the block's own instant).
+        let prompt = state.prompt(&key, "").expect("prompt");
+        assert!(prompt.contains("<CHAT_REPLY_001>"), "{prompt}");
+        let request_path = state
+            .state_root()
+            .join("requests")
+            .join(format!("{key}.json"));
+        let mut record: Value =
+            serde_json::from_slice(&fs::read(&request_path).expect("request file"))
+                .expect("request JSON");
+        record["phase"] = json!("delivered");
+        record["delivery_started_at_millis"] = json!(block_at);
+        record["delivered_at_millis"] = json!(block_at);
+        fs::write(
+            &request_path,
+            serde_json::to_vec(&record).expect("request bytes"),
+        )
+        .expect("mark delivered");
+        // Blocks unchanged, but the delivered-and-unanswered set changed: scan again.
+        assert!(
+            watch
+                .tick(
+                    &state,
+                    &manager,
+                    DrainOptions::default(),
+                    &mut routes,
+                    &mut notes,
+                    &mut control,
+                )
+                .expect("third tick"),
+            "becoming delivered should rerun the scan"
+        );
+        assert_eq!(reply_count(&state), 1);
+        // Captured, so the capture-miss watch has nothing to warn the owner about.
+        let stop = StopState::default();
+        let mut reply_watch = reply_source::ReplySourceWatch::default();
+        let mut roots = RecordingRoots::default();
+        reply_watch.step(
+            &state,
+            &manager,
+            &stop,
+            DrainOptions::default(),
+            Some(&mut roots),
+        );
+        assert!(roots.posts.is_empty(), "warned: {:?}", roots.posts);
+        let record = state.reply_source_record().expect("reply source record");
+        assert_eq!(record["capture_misses"], json!([]), "{record}");
+    }
+
+    #[test]
+    fn a_headless_reply_block_is_captured_by_the_owner_loop_from_its_event_log() {
+        // #1974 e2e on the test bridge (scratch registry, fake Herdr, fixture channel): a
+        // dummy chat request is queued to the scratch headless agent with the marker prompt,
+        // the fake wrapper starts it (earning its receipt as before, #896), the agent's
+        // event log gains a CHAT_REPLY block, and the headless owner loop captures and holds
+        // that reply without any screen read.
+        let fixture = crate::subagents::tests::Fixture::new();
+        let state = headless_worker_state_with_log(&fixture);
+        let wrapper = FakeWrapper::serve(&fixture, "worker");
+        wrapper.start_on_wake.store(true, AtomicOrdering::SeqCst);
+        let events =
+            crate::headless::events::directory(&fixture.manager().agent_directory("worker"));
+        let writer = Arc::new(Mutex::new(
+            crate::headless::events::EventWriter::open(&events, "worker").expect("event log"),
+        ));
+        writer
+            .lock()
+            .expect("writer")
+            .append("turn.started", None, json!({"cause": "input"}))
+            .expect("append");
+        let mut key: Option<String> = None;
+        let mut appended = false;
+        let mut failure = None;
+        run_headless_loop(&fixture, &state, DrainOptions::default(), |notify, _| {
+            let Some(current) = &key else {
+                let admitted = admitted_worker_message(&state, 1, "one");
+                notify(ProviderNotice::Batch(vec![admitted.clone()]));
+                key = Some(admitted);
+                return false;
+            };
+            if !appended {
+                if !receipt_saved(&state, current) {
+                    return false;
+                }
+                let text = wrapper.item(current)["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                if !text.contains("<CHAT_REPLY_001>") || text.contains("Nothing you print") {
+                    failure = Some(format!("prompt was not the marker prompt: {text}"));
+                    return true;
+                }
+                writer
+                        .lock()
+                        .expect("writer")
+                        .append(
+                            "assistant.text",
+                            None,
+                            json!({"text": "outside\n<CHAT_REPLY_001>\nloop answer\n</CHAT_REPLY_001>"}),
+                        )
+                        .expect("append reply block");
+                appended = true;
+                return false;
+            }
+            state.inspect_request(current).expect("inspect")["replies"]
+                .as_array()
+                .is_some_and(|replies| !replies.is_empty())
+        });
+        assert_eq!(failure, None);
+        let key = key.expect("a request was admitted");
+        assert!(
+            receipt_saved(&state, &key),
+            "the started prompt earned no receipt"
+        );
+        assert_eq!(
+            state.inspect_request(&key).expect("inspect")["replies"]
+                .as_array()
+                .expect("replies")
+                .len(),
+            1
         );
     }
 

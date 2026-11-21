@@ -392,9 +392,13 @@ impl MuseHarness {
                 }]
             }
             ("item/completed", "agentMessage") => {
-                let phase = text_of(item, "messagePhase");
+                // Every completed message is committed prose, whatever its phase
+                // (`commentary`, `finalAnswer`, ...): a CHAT_REPLY block in a non-final
+                // message must reach the event log or the chat bridge cannot capture it
+                // (#1974). Only the harness's final text was logged before, which silently
+                // dropped such blocks.
                 let text = text_of(item, "text");
-                if text.is_empty() || (!phase.is_empty() && phase != "finalAnswer") {
+                if text.is_empty() {
                     Vec::new()
                 } else {
                     vec![Signal::Text(text)]
@@ -1088,6 +1092,37 @@ mod tests {
         assert_eq!(parsed["params"]["commandId"], "u1");
         assert_eq!(parsed["params"]["reasoningEffort"], "max");
         assert_eq!(parsed["params"]["input"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn a_completed_agent_message_is_text_whatever_its_phase() {
+        // #1974: a CHAT_REPLY block in a non-final (e.g. commentary) completed message must
+        // become assistant text in the event log, or the chat bridge cannot capture it.
+        let h = harness();
+        for phase in ["commentary", "finalAnswer", ""] {
+            let message: Value = serde_json::json!({
+                "method": "item/completed",
+                "params": {"item": {
+                    "itemId": "m1", "kind": "agentMessage", "messagePhase": phase,
+                    "text": "<CHAT_REPLY_001>\nhi\n</CHAT_REPLY_001>", "turnId": "u1",
+                }, "sessionId": "s1"},
+            });
+            assert_eq!(
+                h.parse(&message),
+                vec![Signal::Text(
+                    "<CHAT_REPLY_001>\nhi\n</CHAT_REPLY_001>".into()
+                )],
+                "phase {phase:?}"
+            );
+        }
+        let empty: Value = serde_json::json!({
+            "method": "item/completed",
+            "params": {"item": {
+                "itemId": "m2", "kind": "agentMessage", "messagePhase": "commentary",
+                "text": "", "turnId": "u1",
+            }, "sessionId": "s1"},
+        });
+        assert!(h.parse(&empty).is_empty());
     }
 
     #[test]

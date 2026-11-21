@@ -332,13 +332,12 @@ impl BridgeState {
 
     /// This state, serving `agent_name`, which is `headless`, an agentcloud session (`cloud`),
     /// or neither, and driven by the generic rules (`unknown`) or not, after a repoint: every
-    /// process-local setting that depends on the kind of target follows it (prompts that give
-    /// only the `chat reply` command, for a headless agent or one whose replies the bridge cannot
-    /// capture reliably, an unknown harness (#896);
-    /// the receipt given when its prompt is started or journaled, for a headless or cloud agent;
-    /// the latency profile), and the shared transcript reader follows the new agent's
-    /// transcript, or rests for a headless one (#852 unknown-tui-bridge). Nothing keeps reading
-    /// the previous agent.
+    /// process-local setting that depends on the kind of target follows it (an unknown harness
+    /// gets command-only prompts (#896); a headless target's reply mode is decided per prompt
+    /// from whether its event log is followed (#1974); the receipt given when its prompt is
+    /// started or journaled, for a headless or cloud agent; the latency profile), and the
+    /// shared transcript reader follows the new agent's transcript or event log
+    /// (#852 unknown-tui-bridge). Nothing keeps reading the previous agent.
     #[must_use]
     pub(crate) fn serving(
         &self,
@@ -349,7 +348,8 @@ impl BridgeState {
     ) -> Self {
         let mut state = self
             .retargeted(agent_name)
-            .with_command_only_replies(headless)
+            .with_command_only_replies(false)
+            .with_headless_target(headless)
             .with_transcriptless_target(unknown)
             .with_receipt_when_started(headless || cloud);
         state.latency_headless = headless;
@@ -357,7 +357,7 @@ impl BridgeState {
             source
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .retarget((!headless).then_some(agent_name));
+                .retarget(Some(agent_name));
         }
         state
     }
@@ -792,7 +792,9 @@ mod tests {
     fn serving_a_new_agent_moves_receipts_and_reply_capture_to_it() {
         // #852 unknown-tui-bridge: after a repoint, receipts are read from the new agent's queue
         // (a headless agent's when its model starts the prompt), and the transcript reader follows
-        // the new agent, resting for a headless one, never the previous agent.
+        // the new agent, never the previous agent. Since #1974 a headless agent is followed
+        // through its event log, so serving one no longer pins command-only replies: that mode
+        // is decided per prompt from whether the log is followed.
         let fixture = fixture("serving");
         let followed = std::sync::Arc::new(Mutex::new(Vec::new()));
         let state = fixture
@@ -803,9 +805,13 @@ mod tests {
 
         let liaison = state.serving("liaison", true, false, false);
         assert_eq!(liaison.config().agent_name, "liaison");
-        assert!(liaison.command_only_replies && liaison.receipt_when_started);
+        assert!(!liaison.command_only_replies && liaison.receipt_when_started);
+        assert!(liaison.headless_target);
         assert!(liaison.latency_headless);
-        assert_eq!(*followed.lock().expect("lock"), [None]);
+        assert_eq!(
+            *followed.lock().expect("lock"),
+            [Some("liaison".to_owned())]
+        );
         let key = admit(&liaison, 1);
         liaison
             .set_delivery_phase(&key, RequestPhase::Submitting, None)
@@ -830,10 +836,11 @@ mod tests {
         let back = liaison.serving("coordb", false, false, false);
         assert_eq!(back.config().agent_name, "coordb");
         assert!(!back.command_only_replies && !back.receipt_when_started);
+        assert!(!back.headless_target);
         assert!(!back.latency_headless);
         assert_eq!(
             *followed.lock().expect("lock"),
-            [None, Some("coordb".to_owned())]
+            [Some("liaison".to_owned()), Some("coordb".to_owned())]
         );
         let key = admit(&back, 2);
         back.set_delivery_phase(&key, RequestPhase::Submitting, None)

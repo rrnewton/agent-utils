@@ -19,10 +19,12 @@
 //! A repoint changes the agent followed ([`TranscriptReplies::retarget`], #852
 //! unknown-tui-bridge): the reader drops what it read of the previous agent and looks for the new
 //! agent's transcript at once. It never goes on reading the previous agent's file, whose
-//! following would hold the new agent's screen replies back as unpaired. A headless target has
-//! no transcript the bridge reads (it replies only through `agentctl chat reply`), so for one the
-//! reader rests, and a target whose harness writes no transcript agentctl reads (`--harness
-//! unknown`) is reported as replying through its screen and `agentctl chat reply`.
+//! following would hold the new agent's screen replies back as unpaired. A headless target's
+//! transcript is its wrapper's typed event log (#1974):
+//! the reader follows that log's `assistant.text` events exactly as it follows a harness
+//! transcript's text, and only while no log is followed does a headless target reply solely
+//! through `agentctl chat reply`. A target whose harness writes no transcript agentctl reads
+//! (`--harness unknown`) is reported as replying through its screen and `agentctl chat reply`.
 //!
 //! A record can name no conversation and no process that names one, as an adopted coordinator's
 //! can. Its transcript is then discovered (#783 chat-reply-capture-miss): first from the harness
@@ -69,6 +71,8 @@ const DISCOVER_TAIL_BYTES: u64 = 8 * 1024 * 1024;
 pub(crate) type Resolve = Box<dyn Fn() -> Option<(String, Hints)> + Send>;
 /// What finds the coordinator's transcript when [`Resolve`] does not: see [`discover`].
 pub(crate) type Discover = Box<dyn Fn() -> Option<Discovered> + Send>;
+/// The event log directory of the current target when it is a headless agent, else `None`.
+pub(crate) type HeadlessDir = Box<dyn Fn() -> Option<PathBuf> + Send>;
 /// The reply IDs of the requests delivered to the coordinator and not answered yet.
 pub(crate) type Expected = Box<dyn Fn() -> Vec<String> + Send>;
 /// Where log lines go.
@@ -103,6 +107,10 @@ pub(crate) struct ReplySource {
     /// session's own history (`agentcloudctl history`) rather than from a screen.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) session_history: bool,
+    /// Whether `path` is a headless target's event log directory, whose `assistant.text`
+    /// events the bridge reads as its transcript (#1974).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) headless_log: bool,
 }
 
 /// The [`ReplySource`] the transcript reader shares with the owner loop: `None` until the first
@@ -155,7 +163,7 @@ impl TurnMarks {
 pub(crate) type SharedTurnMarks = Arc<Mutex<TurnMarks>>;
 
 /// The agent a reader made by [`CoordinatorTranscript::for_agent`] follows: `None` while the
-/// bridge serves a headless agent, whose transcript it does not read.
+/// bridge serves no target agent, so the reader rests.
 type SharedTarget = Arc<Mutex<Option<String>>>;
 
 /// The evidence recorded for an agentcloud target, whose replies come from its session history.
@@ -164,14 +172,84 @@ pub(crate) const CLOUD_EVIDENCE: &str =
      replies from the session's own history (`agentcloudctl history`), and through `agentctl chat \
      reply`";
 
-/// The evidence recorded while the reader rests for a headless target.
-pub(crate) const HEADLESS_EVIDENCE: &str = "the target is headless: the bridge reads no screen or \
-     transcript of it, and its replies come only through `agentctl chat reply`";
+/// The evidence recorded while a headless target's event log is followed.
+pub(crate) const HEADLESS_EVIDENCE: &str = "the target is headless: the bridge reads its replies \
+     from its event log's assistant text, and through `agentctl chat reply`";
+
+/// The evidence recorded while a headless target has no event log the bridge follows yet.
+pub(crate) const HEADLESS_NO_LOG_EVIDENCE: &str = "the target is headless but no event log of it \
+     is followed yet: its replies come only through `agentctl chat reply`";
+
+/// The evidence recorded while the reader follows no target agent.
+pub(crate) const RESTING_EVIDENCE: &str =
+    "the bridge serves no target agent: no transcript is read";
+
+/// Identity of the record/log a headless follower reads, by token and directory identity
+/// rather than segment numbers (as `headless/tail.rs` checks, #1221): a replaced record under
+/// the same name gets a new token and usually a fresh events directory, even when its new
+/// generation numbers are lower than the old cursor (#1974 review).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HeadlessIdentity {
+    token: Option<String>,
+    agent_dir: Option<(u64, u64)>,
+    events_dir: Option<(u64, u64)>,
+}
+
+impl HeadlessIdentity {
+    fn of(dir: &Path) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        let identity = |path: &Path| {
+            std::fs::metadata(path)
+                .ok()
+                .map(|meta| (meta.dev(), meta.ino()))
+        };
+        let agent_dir_path = dir.parent();
+        let token = agent_dir_path.and_then(|parent| {
+            let text = std::fs::read_to_string(parent.join("agent.json")).ok()?;
+            let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+            value
+                .get("token")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+        Self {
+            token,
+            agent_dir: agent_dir_path.and_then(identity),
+            events_dir: identity(dir),
+        }
+    }
+
+    /// Whether `now` is a different record/log than this one.
+    fn replaced(&self, now: &Self) -> bool {
+        let changed = |before: &Option<String>, after: &Option<String>| matches!((before, after), (Some(a), Some(b)) if a != b);
+        let dir_changed = |before: &Option<(u64, u64)>, after: &Option<(u64, u64)>| matches!((before, after), (Some(a), Some(b)) if a != b);
+        changed(&self.token, &now.token)
+            || dir_changed(&self.events_dir, &now.events_dir)
+            || dir_changed(&self.agent_dir, &now.agent_dir)
+    }
+}
+
+/// A headless target's event log being followed as its transcript (#1974).
+struct HeadlessFollow {
+    dir: PathBuf,
+    follower: crate::headless::events::Follower,
+    identity: HeadlessIdentity,
+    /// Raw log events read from the log's bounded tail at open, converted at first poll.
+    initial: Vec<crate::headless::events::Event>,
+}
 
 /// The coordinator's transcript, followed for its reply blocks.
 pub(crate) struct CoordinatorTranscript {
     resolve: Resolve,
     discover: Option<Discover>,
+    headless_dir: Option<HeadlessDir>,
+    headless: Option<HeadlessFollow>,
+    /// The event log directory of a headless target whose log has no segment yet, cached so
+    /// its appearance is checked on every poll without reparsing its record.
+    headless_pending_dir: Option<PathBuf>,
+    /// Queued prompts' excerpts by queue id, until their `input.started` emits the prompt
+    /// mark at the time the model actually started it.
+    headless_prompts: VecDeque<(String, String)>,
     source: Option<SharedReplySource>,
     log: Log,
     follower: Option<Follower>,
@@ -207,6 +285,10 @@ impl CoordinatorTranscript {
         Self {
             resolve,
             discover: None,
+            headless_dir: None,
+            headless: None,
+            headless_pending_dir: None,
+            headless_prompts: VecDeque::new(),
             source: None,
             log,
             follower: None,
@@ -233,12 +315,17 @@ impl CoordinatorTranscript {
 
     /// Tell the shared marks whether a transcript is followed now, forgetting what was read when
     /// `clear`.
+    /// Whether any transcript is followed now: a harness file or a headless event log.
+    fn following_any(&self) -> bool {
+        self.follower.is_some() || self.headless.is_some()
+    }
+
     fn share_following(&self, clear: bool) {
         if let Some(marks) = &self.marks {
             let mut marks = marks
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            marks.following = self.follower.is_some();
+            marks.following = self.following_any();
             if clear {
                 marks.prompts.clear();
                 marks.tools.clear();
@@ -246,10 +333,11 @@ impl CoordinatorTranscript {
         }
     }
 
-    /// Follow the transcript of agent `name` in `registry` (`None`: a headless agent, whose
-    /// transcript is not read), as its record describes it, or as [`discover`] finds it,
+    /// Follow the transcript of agent `name` in `registry` (`None`: no target, so the reader
+    /// rests), as its record describes it, or as [`discover`] finds it,
     /// confirmed by content against the reply IDs `expected` gives; sharing where the text comes
-    /// from through `source`. [`TranscriptReplies::retarget`] changes the agent.
+    /// from through `source`. A headless agent's transcript is its event log (#1974).
+    /// [`TranscriptReplies::retarget`] changes the agent.
     pub(crate) fn for_agent(
         registry: PathBuf,
         name: Option<String>,
@@ -268,6 +356,10 @@ impl CoordinatorTranscript {
             let (registry, target) = (registry.clone(), Arc::clone(&target));
             Box::new(move || record_hints(&registry, &current(&target)?)) as Resolve
         };
+        let headless_dir = {
+            let (registry, target) = (registry.clone(), Arc::clone(&target));
+            Box::new(move || headless_events_dir(&registry, &current(&target)?)) as HeadlessDir
+        };
         let mut transcript = Self::new(resolve, log);
         transcript.discover = Some({
             let target = Arc::clone(&target);
@@ -281,12 +373,13 @@ impl CoordinatorTranscript {
                 )
             })
         });
+        transcript.headless_dir = Some(headless_dir);
         transcript.source = Some(source);
         transcript.target = Some(target);
         transcript
     }
 
-    /// Whether this reader rests because the bridge serves a headless agent.
+    /// Whether this reader rests because the bridge serves no target agent.
     fn resting(&self) -> bool {
         self.target.as_ref().is_some_and(|target| {
             target
@@ -315,7 +408,15 @@ impl CoordinatorTranscript {
     /// Follow a transcript for the trace (#714): collect every event, and
     /// start at the end of the file so old text is never replayed.
     pub(crate) fn for_agent_trace(registry: PathBuf, name: String, log: Log) -> Self {
-        let mut source = Self::new(Box::new(move || record_hints(&registry, &name)), log);
+        let mut source = Self::new(
+            Box::new({
+                let registry = registry.clone();
+                let name = name.clone();
+                move || record_hints(&registry, &name)
+            }),
+            log,
+        );
+        source.headless_dir = Some(Box::new(move || headless_events_dir(&registry, &name)));
         source.collect_events = true;
         source.trace = true;
         source
@@ -328,9 +429,112 @@ impl CoordinatorTranscript {
         }
     }
 
+    /// Follow `dir` as a headless target's transcript, or report that no log is followed yet.
+    /// Whether the target is headless at all is re-resolved only on the harness relocate
+    /// cadence (its record is not reparsed on every poll); once its directory is known, the
+    /// log's appearance is checked on every poll from the cached path, so a wrapper that
+    /// starts after the bridge switches the next prompt to marker replies with no bridge
+    /// restart (#1974, owner 241).
+    fn relocate_headless(&mut self, dir: PathBuf) {
+        if self.headless.as_ref().is_some_and(|held| held.dir == dir) {
+            return;
+        }
+        // A different log under a familiar path (a record replaced, #1221): nothing read of
+        // the previous incarnation stays.
+        if self.headless.is_some() {
+            self.blocks.clear();
+            self.bytes = 0;
+            self.waited.clear();
+            self.headless_prompts.clear();
+        }
+        self.follower = None;
+        self.headless = None;
+        match headless_start(&dir, self.trace, self.ever_opened) {
+            Some(follow) => {
+                self.ever_opened = true;
+                self.headless_pending_dir = None;
+                self.headless = Some(follow);
+                self.share(ReplySource {
+                    path: Some(dir.clone()),
+                    evidence: HEADLESS_EVIDENCE.to_owned(),
+                    headless_log: true,
+                    ..ReplySource::default()
+                });
+                self.report(format!(
+                    "agentctl: reply text comes from the headless agent's event log {}",
+                    dir.display()
+                ));
+            }
+            None => {
+                self.headless_pending_dir = Some(dir);
+                self.share(ReplySource {
+                    evidence: HEADLESS_NO_LOG_EVIDENCE.to_owned(),
+                    ..ReplySource::default()
+                });
+                self.report(
+                    "agentctl: the bridge serves a headless agent whose event log is not \
+                     followed yet; replies come only through `agentctl chat reply`"
+                        .to_owned(),
+                );
+            }
+        }
+    }
+
+    /// Whether the followed headless log's record/log was replaced since it was opened, or
+    /// its generations regressed below the follower's cursor (a fresh log under the same
+    /// name, #1221): the follower's byte offset must not be carried into the new log.
+    fn headless_replaced(&self) -> bool {
+        let Some(held) = &self.headless else {
+            return false;
+        };
+        if held.identity.replaced(&HeadlessIdentity::of(&held.dir)) {
+            return true;
+        }
+        let cursor = held.follower.cursor_generation();
+        if cursor == 0 {
+            return false;
+        }
+        let segments = crate::headless::events::segments(&held.dir).unwrap_or_default();
+        !segments.is_empty()
+            && segments
+                .iter()
+                .all(|segment| segment.key() < (cursor, u64::MAX))
+            && segments.iter().map(|s| s.generation).max().unwrap_or(0) < cursor
+    }
+
     /// Look for the transcript again when it is due, switching to another file if it moved.
     fn relocate(&mut self) {
-        // Looking reads the process table, so it is done at most once per period, found or not.
+        // Following a headless log: its identity is re-checked only on the relocate cadence;
+        // the follower itself follows new segments on every poll.
+        if self.headless.is_some() {
+            if self
+                .located_at
+                .is_some_and(|at| at.elapsed() < RELOCATE_EVERY)
+            {
+                return;
+            }
+            self.located_at = Some(Instant::now());
+            if !self.headless_replaced() {
+                return;
+            }
+            let dir = self.headless.as_ref().expect("held log").dir.clone();
+            self.headless = None;
+            // Nothing read of the replaced incarnation stays.
+            self.blocks.clear();
+            self.bytes = 0;
+            self.waited.clear();
+            self.headless_prompts.clear();
+            self.relocate_headless(dir);
+            return;
+        }
+        // A headless target whose log has not appeared: look for its first segment on every
+        // poll, from the cached directory (no record reparse).
+        if let Some(dir) = self.headless_pending_dir.clone() {
+            self.relocate_headless(dir);
+            return;
+        }
+        // Looking reads the process table and the record, so it is done at most once per
+        // period, found or not.
         if self
             .located_at
             .is_some_and(|at| at.elapsed() < RELOCATE_EVERY)
@@ -338,17 +542,23 @@ impl CoordinatorTranscript {
             return;
         }
         self.located_at = Some(Instant::now());
+        if let Some(dir) = self.headless_dir.as_ref().and_then(|resolve| resolve()) {
+            self.relocate_headless(dir);
+            return;
+        }
         if self.resting() {
             self.follower = None;
+            self.headless = None;
             self.share(ReplySource {
-                evidence: HEADLESS_EVIDENCE.to_owned(),
+                evidence: RESTING_EVIDENCE.to_owned(),
                 ..ReplySource::default()
             });
             self.report(
-                "agentctl: the bridge serves a headless agent; no transcript is read".to_owned(),
+                "agentctl: the bridge serves no target agent; no transcript is read".to_owned(),
             );
             return;
         }
+        self.headless = None;
         let resolved = (self.resolve)();
         // A harness agentctl reads no transcript of, such as one driven by the generic screen
         // rules (`--harness unknown`): its reply text can only come from its screen.
@@ -420,6 +630,7 @@ impl CoordinatorTranscript {
             discovered,
             unbound_session: bind,
             session_history: false,
+            headless_log: false,
         });
         if self
             .follower
@@ -451,29 +662,106 @@ impl CoordinatorTranscript {
         ));
     }
 
+    /// Headless log events as harness-neutral events, in order. An `input.queued` only
+    /// remembers its prompt's excerpt; the prompt mark is emitted at its `input.started`,
+    /// when the model actually started it, with that excerpt as its text.
+    fn convert_headless(&mut self, raw: &[crate::headless::events::Event]) -> Vec<Event> {
+        let mut events = Vec::new();
+        for event in raw {
+            match event.kind.as_str() {
+                "input.queued" => {
+                    let queue = event.data["queue_id"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .or_else(|| event.causation.clone());
+                    let excerpt = event.data["excerpt"].as_str().unwrap_or_default();
+                    if let (Some(queue), false) = (queue, excerpt.is_empty()) {
+                        self.headless_prompts.push_back((queue, excerpt.to_owned()));
+                        while self.headless_prompts.len() > 64 {
+                            self.headless_prompts.pop_front();
+                        }
+                    }
+                }
+                "input.started" => {
+                    let queue = event.data["queue_id"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .or_else(|| event.causation.clone());
+                    let text = queue
+                        .and_then(|queue| {
+                            self.headless_prompts
+                                .iter()
+                                .position(|(held, _)| *held == queue)
+                                .map(|at| self.headless_prompts.remove(at).expect("held").1)
+                        })
+                        .unwrap_or_default();
+                    events.push(Event::Prompt {
+                        at: Some(event.ts as f64 / 1000.0),
+                        text,
+                        via: agent_harness::Via::Typed,
+                    });
+                }
+                _ => {
+                    if let Some(event) = headless_event(event) {
+                        events.push(event);
+                    }
+                }
+            }
+        }
+        events
+    }
+
     /// Read what the transcript gained, keeping its complete reply blocks.
     fn poll(&mut self) {
         self.relocate();
         self.share_following(false);
-        let Some(follower) = self.follower.as_mut() else {
-            return;
-        };
-        let events = match follower.poll() {
-            Ok(events) => events,
-            Err(error) => {
-                let path = follower.path().display().to_string();
-                self.follower = None;
-                self.share_following(false);
-                self.report(format!(
-                    "agentctl: the coordinator's transcript {path} cannot be read ({error}); {}",
-                    if self.trace {
-                        "the trace is idle"
-                    } else {
-                        "replies keep the text read from its screen"
+        let events = if self.headless.is_some() {
+            let (initial, polled) = {
+                let held = self.headless.as_mut().expect("held log");
+                let initial = std::mem::take(&mut held.initial);
+                match held.follower.poll() {
+                    Ok(raw) => (initial, raw),
+                    Err(error) => {
+                        let dir = held.dir.clone();
+                        self.headless = None;
+                        self.headless_pending_dir = Some(dir.clone());
+                        self.share_following(false);
+                        self.share(ReplySource {
+                            evidence: HEADLESS_NO_LOG_EVIDENCE.to_owned(),
+                            ..ReplySource::default()
+                        });
+                        self.report(format!(
+                            "agentctl: the headless agent's event log {} cannot be read \
+                             ({error}); replies come only through `agentctl chat reply`",
+                            dir.display()
+                        ));
+                        return;
                     }
-                ));
-                return;
+                }
+            };
+            let mut events = self.convert_headless(&initial);
+            events.extend(self.convert_headless(&polled));
+            events
+        } else if let Some(follower) = self.follower.as_mut() {
+            match follower.poll() {
+                Ok(events) => events,
+                Err(error) => {
+                    let path = follower.path().display().to_string();
+                    self.follower = None;
+                    self.share_following(false);
+                    self.report(format!(
+                        "agentctl: the coordinator's transcript {path} cannot be read ({error}); {}",
+                        if self.trace {
+                            "the trace is idle"
+                        } else {
+                            "replies keep the text read from its screen"
+                        }
+                    ));
+                    return;
+                }
             }
+        } else {
+            return;
         };
         if let Some(marks) = &self.marks {
             let mut marks = marks
@@ -545,7 +833,7 @@ impl TranscriptReplies for CoordinatorTranscript {
         let deadline = Instant::now() + SETTLE_FOR;
         loop {
             self.poll();
-            if self.follower.is_none()
+            if !self.following_any()
                 || pending.iter().all(|identifier| self.holds(identifier))
                 || Instant::now() >= deadline
             {
@@ -562,7 +850,7 @@ impl TranscriptReplies for CoordinatorTranscript {
     }
 
     fn following(&self) -> bool {
-        self.follower.is_some()
+        self.following_any()
     }
 
     fn retarget(&mut self, agent: Option<&str>) {
@@ -581,6 +869,9 @@ impl TranscriptReplies for CoordinatorTranscript {
         // Nothing read of the previous agent stays: its blocks are not this agent's replies, and
         // a file still followed would hold this agent's screen replies back as unpaired.
         self.follower = None;
+        self.headless = None;
+        self.headless_pending_dir = None;
+        self.headless_prompts.clear();
         self.blocks.clear();
         self.bytes = 0;
         self.waited.clear();
@@ -589,9 +880,73 @@ impl TranscriptReplies for CoordinatorTranscript {
         self.share_following(true);
         (self.log)(format!(
             "agentctl: the bridge now serves {}; its reply text is looked for again",
-            agent.unwrap_or("a headless agent")
+            agent.unwrap_or("no target agent")
         ));
         self.relocate();
+    }
+}
+
+/// The event log directory of agent `name` in `registry` when its record says it is a
+/// headless agent, else `None` (#1974).
+fn headless_events_dir(registry: &Path, name: &str) -> Option<PathBuf> {
+    let directory = agent_queue::registry::directory(registry, name).ok()?;
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.join("agent.json")).ok()?).ok()?;
+    let headless = record["adapter"].as_str() == Some(crate::headless::ADAPTER)
+        || record["mode"].as_str() == Some(crate::headless::MODE);
+    headless.then(|| crate::headless::events::directory(&directory))
+}
+
+/// Open a follower of the headless log in `dir`, bounded so a first open never reads a whole
+/// segment history on the caller's thread: for the trace's first open it starts at the end
+/// (old text is never replayed); otherwise the last [`FIRST_READ_BYTES`] are read once with
+/// `events::read_recent` as the initial events and the follower starts at the end, so replies
+/// written while the bridge was down are found. Events in both are deduplicated downstream
+/// by block identity. `None` when the log has no segment yet or cannot be listed.
+fn headless_start(dir: &Path, trace: bool, ever_opened: bool) -> Option<HeadlessFollow> {
+    let segments = crate::headless::events::segments(dir).ok()?;
+    if segments.is_empty() {
+        return None;
+    }
+    let identity = HeadlessIdentity::of(dir);
+    let (follower, initial) = if trace && !ever_opened {
+        (
+            crate::headless::events::Follower::at_end(dir).ok()?,
+            Vec::new(),
+        )
+    } else {
+        let follower = crate::headless::events::Follower::at_end(dir).ok()?;
+        let initial =
+            crate::headless::events::read_recent(dir, FIRST_READ_BYTES).unwrap_or_default();
+        (follower, initial)
+    };
+    Some(HeadlessFollow {
+        dir: dir.to_path_buf(),
+        follower,
+        identity,
+        initial,
+    })
+}
+
+/// One headless log event as the harness-neutral event the reply and trace paths read:
+/// assistant text, tool call and turn end carry over (#1974); prompts are converted by the
+/// reader from their `input.started` (see `convert_headless`). Assistant text is
+/// verbatim, so reply blocks sliced from it need no screen rendering.
+fn headless_event(event: &crate::headless::events::Event) -> Option<Event> {
+    let at = Some(event.ts as f64 / 1000.0);
+    let text = |key: &str| event.data[key].as_str().unwrap_or_default().to_owned();
+    match event.kind.as_str() {
+        "assistant.text" => Some(Event::Text {
+            at,
+            text: text("text"),
+        }),
+        "tool.started" => Some(Event::ToolCall {
+            at,
+            id: text("tool_use_id"),
+            name: text("tool"),
+        }),
+        "turn.completed" => Some(Event::TurnEnd { at }),
+        _ => None,
     }
 }
 
@@ -863,7 +1218,7 @@ mod tests {
     #[test]
     fn a_repoint_follows_the_new_agent_and_drops_what_was_read_of_the_previous() {
         // #852 unknown-tui-bridge: the reader follows the agent the bridge serves now; nothing
-        // read of the previous agent stays, and a headless agent's transcript is not read.
+        // read of the previous agent stays, and with no target agent the reader rests.
         let root = scratch("retarget");
         for (name, identifier) in [("coordb", "007"), ("liaison", "008")] {
             let project = root.join(format!("{name}/.claude/projects/-work"));
@@ -915,7 +1270,7 @@ mod tests {
         assert!(identifiers(&mut reader).is_empty());
         let rested = source.lock().unwrap().clone().unwrap();
         assert_eq!(rested.path, None);
-        assert_eq!(rested.evidence, HEADLESS_EVIDENCE);
+        assert_eq!(rested.evidence, RESTING_EVIDENCE);
         fs::remove_dir_all(root).ok();
     }
 
@@ -992,6 +1347,216 @@ mod tests {
             "{}",
             found.evidence
         );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_headless_targets_event_log_is_followed_as_its_transcript() {
+        // #1974: a headless agent has no harness transcript the bridge reads; its wrapper's
+        // event log is the transcript. Before any event, no log is followed (command-only
+        // prompts); once `assistant.text` events appear, their complete reply blocks are kept
+        // verbatim, and the same events feed the trace as prompt/text/tool/turn-end.
+        let root = scratch("headless-log");
+        let registry = registry_with(
+            &root,
+            &serde_json::json!({"harness": "claude", "adapter": "harness-wrapper", "mode": "headless", "cwd": "/work"}),
+        );
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let source = SharedReplySource::default();
+        let mut reader = CoordinatorTranscript::for_agent(
+            registry.clone(),
+            Some("coord".to_owned()),
+            Box::new({
+                let logs = Arc::clone(&logs);
+                move |line| logs.lock().unwrap().push(line)
+            }),
+            Box::new(Vec::new),
+            Arc::clone(&source),
+        );
+        assert!(reader.blocks().is_empty());
+        assert!(!reader.following());
+        let found = source.lock().unwrap().clone().unwrap();
+        assert_eq!(found.path, None);
+        assert_eq!(found.evidence, HEADLESS_NO_LOG_EVIDENCE);
+        assert!(!found.headless_log);
+
+        let events_dir = crate::headless::events::directory(&registry.join("agents/coord"));
+        let mut writer = crate::headless::events::EventWriter::open(&events_dir, "coord").unwrap();
+        writer
+            .append(
+                "input.queued",
+                Some("q1"),
+                serde_json::json!({"excerpt": "[from Owner via slack #test · reply: <CHAT_REPLY_001>]"}),
+            )
+            .unwrap();
+        writer
+            .append(
+                "input.started",
+                Some("q1"),
+                serde_json::json!({"queue_id": "q1", "harness_input_id": "u1", "mid_turn": false}),
+            )
+            .unwrap();
+        writer
+            .append(
+                "assistant.text",
+                Some("q1"),
+                serde_json::json!({"text": "Working note.\n<CHAT_REPLY_001>\n**Done.**\n</CHAT_REPLY_001>\nTrail."}),
+            )
+            .unwrap();
+        writer
+            .append(
+                "tool.started",
+                Some("q1"),
+                serde_json::json!({"tool": "Bash", "tool_use_id": "t1"}),
+            )
+            .unwrap();
+        writer
+            .append("turn.completed", Some("q1"), serde_json::json!({}))
+            .unwrap();
+
+        reader.collect_events = true;
+        let events = reader.events();
+        assert_eq!(events.len(), 4, "{events:?}");
+        assert!(matches!(&events[0], Event::Prompt { .. }));
+        assert!(matches!(&events[1], Event::Text { .. }));
+        assert!(matches!(&events[2], Event::ToolCall { .. }));
+        assert!(matches!(&events[3], Event::TurnEnd { .. }));
+        // The trace harvest (#1608 via #714) gets only the outside-marker text.
+        let mut collector = crate::chat_trace::Collector::new(Duration::from_secs(45));
+        let mut posts = Vec::new();
+        for event in &events {
+            posts.extend(collector.feed(event));
+        }
+        let traced: Vec<&str> = posts.iter().map(|post| post.text.as_str()).collect();
+        assert!(
+            traced.iter().any(|text| text.contains("Working note.")),
+            "{traced:?}"
+        );
+        assert!(
+            !traced.iter().any(|text| text.contains("**Done.**")),
+            "{traced:?}"
+        );
+        assert!(reader.following());
+        let blocks = reader.blocks();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].identifier, "001");
+        assert_eq!(blocks[0].body, "**Done.**");
+        assert!(blocks[0].at_millis.is_some_and(|at| at > 0));
+        let found = source.lock().unwrap().clone().unwrap();
+        assert_eq!(found.path, Some(events_dir.clone()));
+        assert!(found.headless_log);
+        assert_eq!(found.evidence, HEADLESS_EVIDENCE);
+
+        writer
+            .append(
+                "assistant.text",
+                None,
+                serde_json::json!({"text": "<CHAT_REPLY_002>\nMore\n</CHAT_REPLY_002>"}),
+            )
+            .unwrap();
+        assert_eq!(reader.blocks().len(), 2);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_replaced_headless_log_under_the_same_name_is_read_from_its_start() {
+        // #1974 review (as #1221): a record replaced under the same name gets a new token
+        // and a fresh log at generation 1; the old follower's byte offset must not silently
+        // skip the new log's early assistant text.
+        let root = scratch("headless-replaced");
+        let registry = registry_with(
+            &root,
+            &serde_json::json!({"harness": "claude", "adapter": "harness-wrapper", "mode": "headless", "cwd": "/work", "token": "t1"}),
+        );
+        let source = SharedReplySource::default();
+        let mut reader = CoordinatorTranscript::for_agent(
+            registry.clone(),
+            Some("coord".to_owned()),
+            Box::new(|_| {}),
+            Box::new(Vec::new),
+            Arc::clone(&source),
+        );
+        let events_dir = crate::headless::events::directory(&registry.join("agents/coord"));
+        let mut writer = crate::headless::events::EventWriter::open(&events_dir, "coord").unwrap();
+        writer
+            .append(
+                "assistant.text",
+                None,
+                serde_json::json!({"text": "<CHAT_REPLY_001>\nold\n</CHAT_REPLY_001>"}),
+            )
+            .unwrap();
+        assert_eq!(reader.blocks().len(), 1);
+        drop(writer);
+
+        // Replace the record (new token) and its log under the same name and path.
+        fs::write(
+            registry.join("agents/coord/agent.json"),
+            serde_json::json!({"harness": "claude", "adapter": "harness-wrapper", "mode": "headless", "cwd": "/work", "token": "t2"})
+                .to_string(),
+        )
+        .unwrap();
+        fs::remove_dir_all(&events_dir).unwrap();
+        let mut writer = crate::headless::events::EventWriter::open(&events_dir, "coord").unwrap();
+        writer
+            .append(
+                "assistant.text",
+                None,
+                serde_json::json!({"text": "<CHAT_REPLY_009>\nnew\n</CHAT_REPLY_009>"}),
+            )
+            .unwrap();
+        // Force the relocate-cadence identity re-check.
+        reader.located_at = Some(Instant::now() - RELOCATE_EVERY - Duration::from_secs(1));
+        let blocks = reader.blocks();
+        assert_eq!(
+            blocks
+                .iter()
+                .map(|block| block.identifier.as_str())
+                .collect::<Vec<_>>(),
+            ["009"],
+            "{blocks:?}"
+        );
+        assert!(reader.following());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_headless_trace_reads_only_new_event_log_text() {
+        // #1974 trace side: the trace reader for a headless agent follows the same event
+        // log, starting at its end so old text is never replayed to the trace thread.
+        let root = scratch("headless-trace");
+        let registry = registry_with(
+            &root,
+            &serde_json::json!({"harness": "claude", "adapter": "harness-wrapper", "mode": "headless", "cwd": "/work"}),
+        );
+        let events_dir = crate::headless::events::directory(&registry.join("agents/coord"));
+        let mut writer = crate::headless::events::EventWriter::open(&events_dir, "coord").unwrap();
+        writer
+            .append(
+                "assistant.text",
+                None,
+                serde_json::json!({"text": "old text"}),
+            )
+            .unwrap();
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let mut reader = CoordinatorTranscript::for_agent_trace(
+            registry.clone(),
+            "coord".to_owned(),
+            Box::new({
+                let logs = Arc::clone(&logs);
+                move |line| logs.lock().unwrap().push(line)
+            }),
+        );
+        assert!(reader.events().is_empty(), "old text replayed");
+        writer
+            .append(
+                "assistant.text",
+                None,
+                serde_json::json!({"text": "new text"}),
+            )
+            .unwrap();
+        let events = reader.events();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(matches!(&events[0], Event::Text { text, .. } if text == "new text"));
         fs::remove_dir_all(root).ok();
     }
 
@@ -1284,6 +1849,7 @@ mod tests {
                 discovered: true,
                 unbound_session: Some("s-live".to_owned()),
                 session_history: false,
+                headless_log: false,
             })
         );
         assert!(logs.lock().unwrap()[0].contains("discovered"));

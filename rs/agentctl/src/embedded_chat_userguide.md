@@ -904,7 +904,8 @@ second, once per reply ID, for the transcript to hold a block whose closing
 marker the screen already shows on a row of its own. The service log names the
 transcript it reads, says when none is found or one cannot be read, and says
 `captured with its text from the coordinator's transcript` for each reply
-stored with transcript text. With no transcript, for a headless coordinator, or
+stored with transcript text. With no transcript (for a headless coordinator,
+no event log followed yet), or
 with `AGENTCTL_CHAT_REPLY_TEXT=screen` in the service's environment, every reply
 keeps the text read from the screen, and replies are told apart as they always
 are. Screen reads decide everything else: delivery, readiness, forms and
@@ -939,8 +940,10 @@ state directory.
 
 The transcript followed is always the current target's (#852
 unknown-tui-bridge). A `chat repoint` drops everything read of the previous
-agent and looks for the new agent's transcript at once; while a headless agent
-is the target nothing is read, since it replies only through `chat reply`. A
+agent and looks for the new agent's transcript at once; for a headless agent
+that transcript is its wrapper's event log, whose `assistant.text` events are
+read exactly as a harness transcript's text (#1974), and only while no such
+log is followed does a headless target reply solely through `chat reply`. A
 target whose harness writes no transcript agentctl reads, such as one adopted
 with `--harness unknown`, replies through its screen: `chat health` says
 `reply text: the screen only: the target's harness (unknown) writes no
@@ -1968,10 +1971,11 @@ effect at the next prompt (#896 chat-receipt-needs-evidence):
 
 - **Marker lines** (plus the `chat reply` command where it is offered), where
   the bridge follows a transcript (Claude Code, Codex or Muse with the
-  transcript found) or an agentcloud session's history, and, before the
+  transcript found), a headless agent's event log (#1974), or an agentcloud
+  session's history, and, before the
   transcript reader's first look, for a harness agentctl reads.
 - **The `chat reply` command only**, with no marker lines, where it follows
-  none: a headless agent, a target adopted with `--harness unknown` (such as an
+  none: a headless agent whose event log is not followed yet, a target adopted with `--harness unknown` (such as an
   agentterm pane), or one whose transcript was looked for and not found,
   including one lost mid-session. The footer reads `Nothing you print reaches
   the chat: send each reply by writing it to a file and running this, once per
@@ -2140,14 +2144,18 @@ meanwhile. A prompt the wrapper hands back before the model starts it, as when
 the turn is interrupted, waits in the queue again and earns its receipt only
 when the model does start it. A prompt the queue sets aside untyped, because
 it was cancelled or expired, earns none: the request is `delivery_uncertain`
-and `chat status` gives its stage as `cancelled`. The bridge never reads a screen, so the prompt gives
-no marker lines. It names the `chat reply` command as the only way to reply,
-whether or not `--offer-reply-command` is given, and the same command and
-reply ID send every reply. Reply reminders and `--stale-composer-clear-after`
+and `chat status` gives its stage as `cancelled`. The bridge never reads a screen; it follows the
+wrapper's event log as the agent's transcript (#1974), so while that log is
+followed the prompt gives the marker lines as a TUI target's prompt does, and
+the `chat reply` command remains as the fallback (named where
+`--offer-reply-command` offers it). Only while no log is followed does the
+prompt name the `chat reply` command as the only way to reply. The mode is
+decided when each prompt is composed, so a wrapper that starts after the
+bridge switches the next prompt with no `chat run` restart. Reply reminders and `--stale-composer-clear-after`
 are off for a headless agent. Give the agent permission to run the printed
 `chat reply` command and to write its reply files. Restart `chat run` when
-the agent is restarted in the other mode, since the prompts' reply
-instructions are chosen at startup and at each `chat repoint`.
+the agent is restarted in the other mode under the same name, since the
+other per-target settings are chosen at startup and at each `chat repoint`.
 
 ### Clearing a draft left in the composer
 

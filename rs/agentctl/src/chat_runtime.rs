@@ -5853,8 +5853,8 @@ pub(crate) trait TranscriptReplies: Send + fmt::Debug {
         false
     }
 
-    /// Follow `agent`'s transcript from now on (`None`: a headless agent, whose transcript is not
-    /// read), dropping what was read of the agent followed before: a repoint changed the bridge's
+    /// Follow `agent`'s transcript from now on (`None`: no target agent), dropping what was
+    /// read of the agent followed before: a repoint changed the bridge's
     /// target (#852 unknown-tui-bridge).
     fn retarget(&mut self, _agent: Option<&str>) {}
 }
@@ -6443,6 +6443,10 @@ pub struct BridgeState {
     /// the generic rules: its prompts give only the `chat reply` command, though blocks seen on
     /// its screen are still captured (#896 chat-receipt-needs-evidence).
     transcriptless_target: bool,
+    /// The target is a headless agent (#1974): it has no composer, so a `/goal` message is
+    /// never typed raw, while its replies are read from its event log when one is followed
+    /// (see [`Self::reply_mode`], which decides per prompt).
+    headless_target: bool,
     // Whether a request earns its ✅ receipt when the coordinator's queue shows that the model
     // started its prompt, as a headless agent's does, rather than when a drain verifies the
     // prompt in a pane; also process-local.
@@ -6603,6 +6607,7 @@ impl BridgeState {
             prompt_commands: PromptCommands::default(),
             command_only_replies: false,
             transcriptless_target: false,
+            headless_target: false,
             receipt_when_started: false,
             typed_retirements: Arc::default(),
             transcript_replies: None,
@@ -6716,6 +6721,7 @@ impl BridgeState {
             prompt_commands: PromptCommands::default(),
             command_only_replies: false,
             transcriptless_target: false,
+            headless_target: false,
             receipt_when_started: false,
             typed_retirements: Arc::default(),
             transcript_replies: None,
@@ -6801,6 +6807,15 @@ impl BridgeState {
     #[must_use]
     pub fn with_transcriptless_target(mut self, transcriptless: bool) -> Self {
         self.transcriptless_target = transcriptless;
+        self
+    }
+
+    /// Set whether the target is a headless agent (#1974): no composer takes a raw `/goal`
+    /// command from it. Its reply mode is decided per prompt by [`Self::reply_mode`] from
+    /// whether its event log is followed, never from this flag alone.
+    #[must_use]
+    pub fn with_headless_target(mut self, headless: bool) -> Self {
+        self.headless_target = headless;
         self
     }
 
@@ -10896,7 +10911,7 @@ impl BridgeState {
     /// for any other message, and for a headless coordinator, which has no composer to take a
     /// harness command. The sender was authorized at admission like any other.
     fn goal_command(&self, record: &RequestRecord) -> Option<String> {
-        (!self.command_only_replies)
+        (!(self.command_only_replies || self.headless_target))
             .then(|| crate::goal_command::argument(&record.message.text))
             .flatten()
             .map(|_| record.message.text.trim().to_owned())
@@ -11071,15 +11086,19 @@ and running this, once per reply: {command}{sent}"
     }
 
     /// Whether this bridge's prompts give only the `chat reply` command, and why (#896
-    /// chat-receipt-needs-evidence): yes for a headless target, a target driven by the generic
-    /// rules, or one whose transcript the reader looked for and did not find; no where the bridge
-    /// follows a transcript or an agentcloud session's history, whose reply blocks it captures.
-    /// Before the reader's first look, a target with a harness agentctl reads gets blocks.
+    /// chat-receipt-needs-evidence), decided for each prompt as it is composed, from the
+    /// target served then and what the reader follows now (#1974, owner 241): yes for a target
+    /// driven by the generic rules, a headless target whose event log is not followed yet, or
+    /// one whose transcript the reader looked for and did not find; no where the bridge follows
+    /// a transcript, a headless event log, or an agentcloud session's history, whose reply
+    /// blocks it captures. Before the reader's first look, a target with a harness agentctl
+    /// reads gets blocks. No bridge restart is needed for the mode to switch: the reader
+    /// re-looks on every poll, and this is read again for every prompt.
     pub(crate) fn reply_mode(&self) -> (bool, &'static str) {
         if self.command_only_replies {
             return (
                 true,
-                "the target is headless: its screen and transcript are not read",
+                "replies are commanded only: the bridge does not read this target's replies",
             );
         }
         if self.transcriptless_target {
@@ -11089,8 +11108,19 @@ and running this, once per reply: {command}{sent}"
             );
         }
         match self.reply_source() {
+            Some(source) if source.headless_log => (
+                false,
+                "replies are read from the target's headless event log",
+            ),
             Some(source) if source.path.is_none() && !source.session_history => {
-                (true, "no transcript of the target was found")
+                if source.evidence == crate::chat_transcript::HEADLESS_NO_LOG_EVIDENCE {
+                    (
+                        true,
+                        "the target is headless and its event log is not followed yet",
+                    )
+                } else {
+                    (true, "no transcript of the target was found")
+                }
             }
             Some(source) if source.session_history => (
                 false,
@@ -11102,6 +11132,17 @@ and running this, once per reply: {command}{sent}"
             }
             None => (false, "replies are read from the target's screen"),
         }
+    }
+
+    /// The reply mode the prompt of request `key` recorded when its delivery was submitted
+    /// (`true`: it asked only for the `chat reply` command; `false`: it gave the marker
+    /// lines), or `None` when no prompt of that request has been recorded. `chat help`
+    /// follows this, so its instructions match the prompt the agent actually got (#1974).
+    pub fn recorded_reply_mode(&self, key: &str) -> Option<bool> {
+        self.read_request(key)
+            .ok()?
+            .reply_mode
+            .map(|mode| mode == "command")
     }
 
     /// Save the reply path of the prompt being composed as `reply-path.json`, for `chat status`.
@@ -44353,6 +44394,7 @@ agentctl chat sent 001\nIf you have trouble, run: agentctl chat help 001"
             discovered: false,
             unbound_session: None,
             session_history,
+            headless_log: false,
         });
     }
 
@@ -44443,6 +44485,104 @@ agentctl chat sent 001\nIf you have trouble, run: agentctl chat help 001"
         assert_eq!(
             state.read_request(&keys[1]).unwrap().reply_mode.as_deref(),
             Some("command")
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    fn set_headless_source(source: &crate::chat_transcript::SharedReplySource, followed: bool) {
+        *source.lock().expect("reply source") = Some(crate::chat_transcript::ReplySource {
+            path: followed.then(|| PathBuf::from("/r/agents/coord/events")),
+            evidence: if followed {
+                crate::chat_transcript::HEADLESS_EVIDENCE.into()
+            } else {
+                crate::chat_transcript::HEADLESS_NO_LOG_EVIDENCE.into()
+            },
+            discovered: false,
+            unbound_session: None,
+            session_history: false,
+            headless_log: followed,
+        });
+    }
+
+    #[test]
+    fn a_headless_targets_prompt_switches_per_prompt_with_its_event_log() {
+        // #1974 (owner 241): a headless target's reply mode is decided when each prompt is
+        // composed, with no bridge restart: no event log followed yet asks only for
+        // `chat reply`; once the log is followed the marker prompt returns; losing it switches
+        // back. Each request keeps the mode its own prompt had.
+        let root = temporary("headless-per-prompt-mode");
+        let source = crate::chat_transcript::SharedReplySource::default();
+        set_headless_source(&source, false);
+        let state = BridgeState::initialize(&root, config())
+            .expect("initialize state")
+            .with_headless_target(true)
+            .with_reply_source(source.clone());
+        let keys = admitted(&state, 3);
+        let prompt = prompted(&state, &keys[0]);
+        let (command_only, mode, status) = reply_mode_of(&state, &keys[0], &prompt);
+        assert!(command_only, "{prompt}");
+        assert_eq!(mode, "command");
+        assert!(
+            status["reason"]
+                .as_str()
+                .unwrap()
+                .contains("event log is not followed"),
+            "{status}"
+        );
+        set_headless_source(&source, true);
+        let prompt = prompted(&state, &keys[1]);
+        let (command_only, mode, status) = reply_mode_of(&state, &keys[1], &prompt);
+        assert!(!command_only, "{prompt}");
+        assert_eq!(mode, "blocks");
+        assert!(
+            status["reason"]
+                .as_str()
+                .unwrap()
+                .contains("headless event log"),
+            "{status}"
+        );
+        set_headless_source(&source, false);
+        let prompt = prompted(&state, &keys[2]);
+        assert!(reply_mode_of(&state, &keys[2], &prompt).0, "{prompt}");
+        assert_eq!(
+            state.read_request(&keys[1]).unwrap().reply_mode.as_deref(),
+            Some("blocks")
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_request_records_the_reply_mode_its_prompt_used_for_chat_help() {
+        // #1974: `chat help` follows the request's recorded mode, not the target's kind:
+        // a headless target whose log is followed records `blocks`, one without records
+        // `command`, and a request never submitted records none.
+        let root = temporary("headless-recorded-mode");
+        let source = crate::chat_transcript::SharedReplySource::default();
+        set_headless_source(&source, true);
+        let state = BridgeState::initialize(&root, config())
+            .expect("initialize state")
+            .with_headless_target(true)
+            .with_reply_source(source.clone());
+        let keys = admitted(&state, 2);
+        assert_eq!(state.recorded_reply_mode(&keys[0]), None);
+        let _ = prompted(&state, &keys[0]);
+        assert_eq!(state.recorded_reply_mode(&keys[0]), Some(false));
+        // The help page a `chat help` that follows the recorded mode builds names markers.
+        let page = state
+            .clone()
+            .with_command_only_replies(state.recorded_reply_mode(&keys[0]).expect("mode"))
+            .help_page("001", &keys[0]);
+        assert!(page.contains("The normal way to reply"), "{page}");
+        set_headless_source(&source, false);
+        let _ = prompted(&state, &keys[1]);
+        assert_eq!(state.recorded_reply_mode(&keys[1]), Some(true));
+        let page = state
+            .clone()
+            .with_command_only_replies(state.recorded_reply_mode(&keys[1]).expect("mode"))
+            .help_page("002", &keys[1]);
+        assert!(
+            page.contains("nothing you print reaches the chat"),
+            "{page}"
         );
         fs::remove_dir_all(root).expect("cleanup");
     }

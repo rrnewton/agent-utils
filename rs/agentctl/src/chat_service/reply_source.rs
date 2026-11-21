@@ -174,13 +174,15 @@ impl ReplySourceWatch {
         transport: Option<&mut dyn RootMessageTransport>,
     ) {
         let Some(source) = state.reply_source() else {
-            // No transcript reader: a headless coordinator, or screen text by request.
+            // No transcript reader, or screen text by request.
             return;
         };
         let now = chat_runtime::unix_millis();
-        if source.evidence == crate::chat_transcript::HEADLESS_EVIDENCE {
-            // The reader rests while the bridge serves a headless agent: there is no transcript
-            // to miss captures in, and the agent is told of nothing through its screen.
+        if source.evidence == crate::chat_transcript::HEADLESS_NO_LOG_EVIDENCE
+            || source.evidence == crate::chat_transcript::RESTING_EVIDENCE
+        {
+            // No transcript is followed (a headless agent whose event log has not appeared, or
+            // no target agent): there is nothing to miss captures in.
             self.record(state, &source, now);
             return;
         }
