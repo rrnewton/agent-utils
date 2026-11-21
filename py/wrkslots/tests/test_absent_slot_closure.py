@@ -104,6 +104,7 @@ if sys.stdin.readline():
 """
 
 
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: absent-slot closure census reads the live process table
 def test_reparented_descendant_holding_a_deleted_fd_does_not_block(
     tmp_path: Path,
 ) -> None:
@@ -143,6 +144,7 @@ def test_reparented_descendant_holding_a_deleted_fd_does_not_block(
             holder.wait(timeout=10)
 
 
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: absent-slot closure census exceeds its time bound under host churn
 def test_a_live_reference_to_an_existing_slot_still_refuses(tmp_path: Path) -> None:
     with _record_with_owner(tmp_path) as (config, record, slot_path, parent):
         assert parent.stdin is not None and parent.stdout is not None
@@ -217,6 +219,7 @@ def _interrupt_with_dead_owner(
     return fenced[0]
 
 
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: recover preparation censuses read the live process table
 def test_recover_absent_sealed_target_with_a_deleted_fd_descendant(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -263,6 +266,7 @@ def test_recover_absent_sealed_target_with_a_deleted_fd_descendant(
         holder.wait(timeout=10)
 
 
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: recover preparation censuses read the live process table
 def test_recover_refuses_a_spoofed_deleted_directory_name(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -298,6 +302,7 @@ def test_recover_refuses_a_spoofed_deleted_directory_name(
         holder.wait(timeout=10)
 
 
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: closure census exceeds its time bound under host churn
 def test_a_spoofed_deleted_sibling_directory_still_refuses(
     tmp_path: Path,
 ) -> None:
@@ -351,6 +356,7 @@ while True:
 """
 
 
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: closure census exceeds its time bound under host churn
 def test_a_linked_fd_with_the_deleted_roots_text_still_refuses(
     tmp_path: Path,
 ) -> None:

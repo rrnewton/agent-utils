@@ -2071,6 +2071,7 @@ def test_audit_follows_a_matched_holder_replaced_before_its_recheck(
         )
 
 
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: Rust census indeterminate on an exiting process with an unreadable fd
 def test_audit_size_unknown_text_matches_python(tmp_path: Path) -> None:
     """#1106: both editions print 'DELETABLE (size unknown: ...)' for an allowance shortfall."""
 

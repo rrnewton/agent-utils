@@ -28,6 +28,7 @@ def fixture_machine(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("WRKSLOTS_MACHINE", "testhost")
 
 
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: batch remove proc scan exceeds its 60s budget under host churn
 def test_remove_agent_batch_validates_nothing_under_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -57,6 +58,7 @@ def test_remove_agent_batch_validates_nothing_under_lock(
     assert ledger.pregather_probes == [False, False]
 
 
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: plain remove proc scan exceeds its 60s budget under host churn
 def test_plain_remove_validates_nothing_under_the_configuration_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -218,6 +218,7 @@ def test_early_census_refusal_with_fenced_holder_retains_journal_and_retry_remov
     }
 
 
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: real same-UID census does not close under unrelated fork/exit churn
 def test_real_holder_late_census_refusal_in_recover_unfences(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

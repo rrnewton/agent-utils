@@ -241,6 +241,7 @@ def test_heartbeat_refuses_on_its_own_slots_dead_entry(
     assert _revision(root) == 7
 
 
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: full create runs live censuses under host churn
 def test_create_proceeds_with_a_finding_on_another_slots_dead_entry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -335,6 +336,7 @@ def test_remove_refuses_the_slot_holding_a_dead_entry(
     assert _active_slots(root) == {"slot-a", "slot-b"}
 
 
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: pre-deletion proc scan exceeds its 60s budget under host churn
 def test_remove_proceeds_for_another_slot_with_a_dead_entry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

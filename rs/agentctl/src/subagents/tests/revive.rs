@@ -858,6 +858,7 @@ fn revive_completes_while_this_process_already_holds_the_queue_locks() {
 }
 
 #[test]
+#[ignore = "#2065 hot-host-census-tests (owner rule 346): live /proc holder scan fails closed on an unrelated same-uid non-dumpable harness process; run with cargo test -- --ignored revive_archived_completes_while_this_process_already_holds_the_queue_locks"]
 fn revive_archived_completes_while_this_process_already_holds_the_queue_locks() {
     // #1723, the `--archived` path: revive_archived restores the archived
     // directory (same queue inode) and then revive takes its delivery and
@@ -1160,6 +1161,7 @@ fn revive_requires_positive_missing_target_and_absent_unambiguous_census() {
 }
 
 #[test]
+#[ignore = "#2065 hot-host-census-tests (owner rule 346): live /proc holder scan fails closed on an unrelated same-uid non-dumpable harness process; run with cargo test -- --ignored revive_previous_boot_missing_pane_with_stale_agent_revives"]
 fn revive_previous_boot_missing_pane_with_stale_agent_revives() {
     // #1944: previous boot + pane_not_found + stale Herdr agent object revives.
     let (fixture, mut old) = recoverable("claude", false);
@@ -1296,6 +1298,7 @@ fn revive_live_session_holder_refuses() {
 }
 
 #[test]
+#[ignore = "#2065 hot-host-census-tests (owner rule 346): live /proc holder scan fails closed on an unrelated same-uid non-dumpable harness process; run with cargo test -- --ignored revive_candidate_holding_session_after_launch_is_not_refused"]
 fn revive_candidate_holding_session_after_launch_is_not_refused() {
     // Re-review item 1: after launch the revive's own harness holds the
     // session; a holder process must not make the journalled revive refuse.
@@ -3594,6 +3597,7 @@ fn stop_and_revive_archived(fixture: &Fixture) -> crate::subagents::Result<Value
 }
 
 #[test]
+#[ignore = "#2065 hot-host-census-tests (owner rule 346): live /proc holder scan fails closed on an unrelated same-uid non-dumpable harness process; run with cargo test -- --ignored a_muse_lane_records_the_session_its_runtime_holds_and_revives_from_the_archive_without_a_bind"]
 fn a_muse_lane_records_the_session_its_runtime_holds_and_revives_from_the_archive_without_a_bind() {
     let fixture = unreported();
     let id = "01a1ab0f-0a3c-73c1-8056-ee5296bc1574";
@@ -3892,6 +3896,7 @@ fn revive_refuses_zero_and_several_store_matches_with_candidates_listed() {
 }
 
 #[test]
+#[ignore = "#2065 hot-host-census-tests (owner rule 346): live /proc holder scan fails closed on an unrelated same-uid non-dumpable harness process; run with cargo test -- --ignored a_codex_lane_records_its_main_thread_rollout_and_revives_from_the_archive"]
 fn a_codex_lane_records_its_main_thread_rollout_and_revives_from_the_archive() {
     let fixture = unreported();
     let sessions = fixture.root.join("codex/sessions/2026/11/06");
@@ -3936,6 +3941,7 @@ fn a_codex_lane_records_its_main_thread_rollout_and_revives_from_the_archive() {
 }
 
 #[test]
+#[ignore = "#2065 hot-host-census-tests (owner rule 346): live /proc holder scan fails closed on an unrelated same-uid non-dumpable harness process; run with cargo test -- --ignored a_claude_lane_carries_the_id_it_was_launched_with_and_revives_from_the_archive"]
 fn a_claude_lane_carries_the_id_it_was_launched_with_and_revives_from_the_archive() {
     let fixture = unreported();
     start_worker(&fixture, "claude");

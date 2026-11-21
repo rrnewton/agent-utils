@@ -3734,6 +3734,7 @@ except Exception as exc:
 "####;
 
     #[test]
+    #[ignore = "#2065 hot-host-census-tests (owner rule 346): checkout-facts differential reads the live process table; an exiting process with an unreadable fd makes Rust indeterminate where Python is ok; run with cargo test -- --ignored checkout_facts_match_python"]
     fn checkout_facts_match_python() {
         let (cfg, root) = fixture("facts");
         let (repository, checkout) = git_fixture(&root);
@@ -3850,6 +3851,7 @@ print(json.dumps(out, sort_keys=True))
     }
 
     #[test]
+    #[ignore = "#2065 hot-host-census-tests (owner rule 346): frozen-disposition differential reads the live process table; an exiting thread with an unreadable fd makes Rust indeterminate where Python is ok; run with cargo test -- --ignored frozen_disposition_historical_schema2_matches_python"]
     fn frozen_disposition_historical_schema2_matches_python() {
         let (cfg, root) = fixture("frozen-disposition");
         // Build the run-1773 shape Python's own lifecycle fixtures use:

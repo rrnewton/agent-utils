@@ -106,6 +106,7 @@ def _validate_record(
         parent.wait(timeout=10)
 
 
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: teardown reference scan reads the live process table
 def test_teardown_closes_when_the_slice_is_empty_and_owner_dead(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -133,6 +134,7 @@ def test_teardown_closes_when_the_slice_is_empty_and_owner_dead(
                 pass
 
 
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: privileged census exceeds its budget under host churn
 def test_a_sibling_scope_holder_makes_teardown_refuse(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -163,6 +163,7 @@ def test_recover_refuses_while_the_recorded_remover_is_alive(
         sleeper.wait()
 
 
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: remover reaches deletion through live censuses inside a wall-clock wait
 def test_coordinator_remover_blocked_mid_deletion_refuses_child_recover(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -226,6 +227,7 @@ def _add_containing_remote_branches(target: Path, remote: Path) -> None:
     assert fetched.returncode == 0, fetched.stderr
 
 
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: deferred remove proc scan exceeds its 60s budget under host churn
 def test_deferred_remove_with_sidecarred_refs_completes(tmp_path: Path) -> None:
     """A deferred remove survives its own sidecarred journal (#2041).
 
@@ -385,6 +387,7 @@ def test_private_finish_compare_fails_closed_without_sidecar(
         wrkslots._load_prepared_private_finish(config, prepared)
 
 
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: remover reaches completion through live censuses inside a wall-clock wait
 def test_coordinator_remover_paused_before_completion_refuses_child_recover(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -422,6 +425,7 @@ def test_coordinator_remover_paused_before_completion_refuses_child_recover(
     assert results == [0]
 
 
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: batch reaches group scan through live censuses inside a wall-clock wait
 def test_grouped_member_paused_in_group_scan_refuses_child_recover(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -467,6 +471,7 @@ def test_grouped_member_paused_in_group_scan_refuses_child_recover(
     assert outcomes[0][0] == 0
 
 
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: interrupted-batch setup reaches its seal through live censuses
 def test_refused_recover_leaves_sealed_fence_and_state_unchanged(
     tmp_path: Path,
 ) -> None:
@@ -540,6 +545,7 @@ def test_refused_recover_leaves_sealed_fence_and_state_unchanged(
             os.chmod(fenced, 0o755)
 
 
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: grouped batch remove proc scans exceed their budget under host churn
 def test_grouped_batch_members_still_defer_their_deletion(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

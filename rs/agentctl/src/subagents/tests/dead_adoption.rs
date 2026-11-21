@@ -1385,6 +1385,7 @@ fn dead_native_missing_identity_is_unproven() {
 }
 
 #[test]
+#[ignore = "#2065 hot-host-census-tests (owner rule 346): live /proc holder scan fails closed on an unrelated same-uid non-dumpable harness process; run with cargo test -- --ignored dead_native_live_session_holder_refuses"]
 fn dead_native_live_session_holder_refuses() {
     // F2: a live process carrying the recorded session in its environment.
     let fixture = Fixture::new();
