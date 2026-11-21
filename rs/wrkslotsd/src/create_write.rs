@@ -1053,6 +1053,12 @@ fn create_slot_inner(
             ),
         });
     }
+    // Global lock order (#2000): the configuration locks first, then
+    // the ACTIVE registry locks, as the Python edition's mutation
+    // locks take them. This create used to take the ACTIVE locks
+    // first, which inverted against every Python mutation and could
+    // deadlock cross-edition until a wait timed out.
+    let _config_lock = crate::hold_write::acquire_config_lock(&cfg)?;
     let _global = acquire_lock(
         &cfg.control.join("ACTIVE.global.lock"),
         &cfg.control.join("ACTIVE"),
@@ -1061,7 +1067,6 @@ fn create_slot_inner(
         &cfg.control.join(format!("ACTIVE.{selected}.json.lock")),
         &cfg.control.join(format!("ACTIVE.{selected}.json")),
     )?;
-    let _config_lock = crate::hold_write::acquire_config_lock(&cfg)?;
     refuse_partial_state_allow_seals(&cfg.control)?;
     if !crate::heartbeat_write::seal_paths(&cfg).is_empty() {
         return Err(
