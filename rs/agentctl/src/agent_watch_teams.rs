@@ -206,6 +206,60 @@ pub(super) fn report_team_notices(
     rows
 }
 
+/// Raise this registry's stranded coordinator notices (#2028): while
+/// `.stranded-notices/` is non-empty, one coalesced expiring notice
+/// goes to the designated coordinator (the same supersede key, so a
+/// blocked coordinator gets one copy, refreshed per interval). The
+/// files stay until a human re-sends and removes them.
+pub(super) fn report_stranded_notices(
+    probe: &mut dyn Probe,
+    notifier: &mut dyn Notifier,
+    now: f64,
+    options: &WatchAgentsOptions,
+) -> Value {
+    let files = probe.stranded_notice_files();
+    if files.is_empty() {
+        return json!({"count": 0, "reported": true});
+    }
+    let names: Vec<String> = files
+        .iter()
+        .map(|path| path.file_name().unwrap_or_default().to_string_lossy().into_owned())
+        .collect();
+    let mut row = json!({"count": files.len(), "files": names, "reported": false});
+    if options.check_only {
+        row["due"] = json!(true);
+        return row;
+    }
+    let text = format!(
+        "[agentctl watch-agents] {} stranded notice(s) in this registry's .stranded-notices/ ({}): each names items set aside undelivered when their coordinator was archived. Read each, re-send its items, then remove the notice file.",
+        files.len(),
+        names.join(", ")
+    );
+    let recipient = team_recipient(probe, options);
+    let message_id = format!(
+        "agent-watch-stranded-notices-{:016x}-{}",
+        stable_hash(&names.join(",")),
+        now as u64
+    );
+    match notifier.notify_expiring(
+        &recipient,
+        &text,
+        &message_id,
+        Some(super::NOTICE_TTL),
+        Some("stranded-notices"),
+    ) {
+        Ok(outcome) => {
+            row["reported"] = json!(true);
+            row["recipient"] = json!(recipient);
+            row["outcome"] = json!(outcome);
+        }
+        Err(error) => {
+            row["error"] = json!(error.to_string());
+        }
+    }
+    row
+}
+
 /// Start `agent-teams pump --deferred` at most every [`TEAM_PUMP_INTERVAL_SECONDS`] while this
 /// host's outbox holds deferred messages (the pass does not wait for it), so a message refused as undeliverable is retried once its
 /// target is fixed without anyone remembering to pump. `null` when nothing waits.

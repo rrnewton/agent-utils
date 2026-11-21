@@ -94,7 +94,6 @@ pub const RESERVED_NAMES: [&str; 8] = [
     "turnover-pins",
     "restore",
     "restore-reports",
-    "restore-reports",
 ];
 /// The registry-wide lock files, `REGISTRY/.<stem>.lock`, that are fixed items, not agents'
 /// layout-1 locks. Layout 1 shared `.coordinator.lock` between the designation and an agent

@@ -1378,6 +1378,13 @@ pub trait Probe {
     fn team_undeliverable_notices(&mut self) -> Vec<(PathBuf, Value)> {
         Vec::new()
     }
+    /// Stranded coordinator notices filed in this registry's
+    /// `.stranded-notices/` collection (#2028): one file per
+    /// coordinator archived while designated, each an undelivered
+    /// raise until re-sent. The default sees none.
+    fn stranded_notice_files(&mut self) -> Vec<PathBuf> {
+        Vec::new()
+    }
     /// How many messages in this host's agent-teams outbox wait for a retry (#721). The
     /// default sees none.
     fn team_outbox_waiting(&mut self) -> usize {
@@ -4008,6 +4015,7 @@ fn watch_agents_once(
         (Vec::new(), Value::Null)
     };
     let team_notices = teams::report_team_notices(probe, notifier, now, options);
+    let stranded_notices = teams::report_stranded_notices(probe, notifier, now, options);
     let team_pump = teams::drive_team_pump(probe, notifier, state, now, options);
     let child_done = flush_child_done(state, notifier, now, options);
     let notice = flush_notices(state, notifier, now, options);
@@ -4085,6 +4093,7 @@ fn watch_agents_once(
         "team_declarations": team_flags,
         "team_declarations_notice": team_flags_notice,
         "team_notices": team_notices,
+        "stranded_notices": stranded_notices,
         "team_pump": team_pump,
         "auto_interrupts": auto_interrupts,
         "hooks_trust": hooks_trust,
@@ -6563,6 +6572,20 @@ impl<A: ManagedApi + ?Sized> Probe for ManagedProbe<'_, A> {
 
     fn team_undeliverable_notices(&mut self) -> Vec<(PathBuf, Value)> {
         crate::subagents::team_undeliverable_notices(&self.registry, &self.teams_state)
+    }
+
+    fn stranded_notice_files(&mut self) -> Vec<PathBuf> {
+        let dir = self.registry.join(".stranded-notices");
+        let Ok(entries) = fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        let mut files: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+            .collect();
+        files.sort();
+        files
     }
 
     /// Outbox entries `agent-teams pump --deferred` retries: `deferred`, and `undeliverable` as
