@@ -63961,7 +63961,9 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
                     "journals": journals,
                     "interrupted_journals": journal_reports,
                     "registry_storage_state": (
-                        "inconsistent" if storage_inconsistencies else "consistent"
+                        "unknown"
+                        if partial_detail is not None
+                        else "inconsistent" if storage_inconsistencies else "consistent"
                     ),
                     "registry_storage_inconsistencies": [
                         item.to_obj() for item in storage_inconsistencies
@@ -63991,13 +63993,18 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
         if scoped_event_count
         else sum(len(_load_events(config, state.machine)) for state in states)
     )
+    if partial_detail is not None:
+        registry_state, registry_count = "UNKNOWN", "UNKNOWN"
+    else:
+        registry_state = "INCONSISTENT" if storage_inconsistencies else "CONSISTENT"
+        registry_count = str(len(storage_inconsistencies))
     print(
         f"project={config.root} worktrees={config.worktrees} control={config.control} "
         f"layout={config.layout} "
         f"active={len(records)} journals={len(journals)} "
         f"events={events_total} "
-        f"registry_storage={'INCONSISTENT' if storage_inconsistencies else 'CONSISTENT'} "
-        f"inconsistencies={len(storage_inconsistencies)}"
+        f"registry_storage={registry_state} "
+        f"inconsistencies={registry_count}"
     )
     if eden_section is not None:
         if eden_section.get("error") is not None:

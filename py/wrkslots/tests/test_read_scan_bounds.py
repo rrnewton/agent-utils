@@ -208,6 +208,38 @@ def test_status_past_scan_timeout_reports_partial_and_exits_nonzero(
     assert len(payload["active"]) == 2
 
 
+def test_partial_status_never_claims_registry_consistent(
+    tmp_path: Path,
+) -> None:
+    """A partial status prints UNKNOWN, never CONSISTENT (#2040).
+
+    The storage scan never finished, so an empty measured set does not
+    read as consistency: the text header says UNKNOWN for both the
+    storage verdict and the inconsistency count, and the JSON state
+    is "unknown".
+    """
+
+    root = _registry(tmp_path / "case", 2)
+    stream = io.StringIO()
+    with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(io.StringIO()):
+        rc = wrkslots_cli._cmd_status(_status_args(root, scan_timeout=1e-9))
+    assert rc == 2
+    payload = json.loads(stream.getvalue())
+    assert payload["registry_storage_state"] == "unknown"
+
+    stream = io.StringIO()
+    with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(io.StringIO()):
+        rc = wrkslots_cli._cmd_status(
+            _status_args(root, scan_timeout=1e-9, format="text")
+        )
+    assert rc == 2
+    head = stream.getvalue()
+    assert "PARTIAL:" in head
+    assert "registry_storage=UNKNOWN" in head
+    assert "inconsistencies=UNKNOWN" in head
+    assert "registry_storage=CONSISTENT" not in head
+
+
 def test_storage_scan_git_calls_grow_per_checkout_not_per_finding(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
