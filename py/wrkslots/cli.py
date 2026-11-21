@@ -99667,6 +99667,59 @@ def _cmd_recover_with_policy(
         _PRIVATE_HISTORY_SCAN_POLICY.reset(token)
 
 
+def _cmd_recover_abort_own(args: argparse.Namespace, config: Config) -> int:
+    """Abort a caller's own half-made create without a coordinator pid (#2017).
+
+    Recover ordinarily needs the coordinator in the caller's ancestry.
+    A lane aborting its own half-made create has no coordinator to name:
+    its authority is that the caller descends from the recorded create
+    journal's owner (the same process lineage that ran the `create`),
+    which `_assert_caller_process` proves with process identity, so a
+    sibling lane cannot pass. Anything else takes the coordinator route.
+    """
+
+    slot = getattr(args, "slot", None)
+    if slot is None:
+        raise Refusal(
+            "recover --abort-create without --coordinator-pid needs --slot SLOT"
+        )
+    with _mutation_locks(config, args.wait_lock):
+        _refuse_partial_state(config, allow_validate_batch_seals=True)
+        path, raw = _load_journal(config, selected_path=_journal_path_for_slot(config, slot))
+        kind = raw.get("kind")
+        if kind not in {"create", _CREATE_EDEN_KIND}:
+            raise Refusal(
+                "--abort-create without --coordinator-pid applies only to create "
+                f"journals; the recorded journal is {kind!r}"
+            )
+        owner = _identity_from_obj(raw["owner"], "create journal.owner")
+        if owner is None:
+            raise Refusal(
+                "this create journal records no owner to authorise against; "
+                "run 'wrkslots recover --coordinator-pid PID --abort-create' instead"
+            )
+        _assert_caller_process(owner, "create journal owner")
+        caller = _read_process_identity(os.getpid())
+        _validate_global_state(config)
+        if kind == _CREATE_EDEN_KIND:
+            state = _load_active(config, require_repository=False)
+            _recover_eden_create(
+                config, path, raw, state, caller, abort_create=True
+            )
+        else:
+            state = _load_active(config, require_repository=True)
+            _recover_create(
+                config,
+                path,
+                raw,
+                state,
+                caller,
+                retry_running_hook=False,
+                abort_create=True,
+            )
+        return 0
+
+
 def _cmd_recover(
     args: argparse.Namespace,
     *,
@@ -99676,6 +99729,17 @@ def _cmd_recover(
     _reset_dead_mount_findings()
     seal_override: dict[str, object] | None = None
     config = _load_config(args.project_root, args.machine)
+    if (
+        getattr(args, "abort_create", False)
+        and getattr(args, "coordinator_pid", None) is None
+        and getattr(args, "slot", None) is not None
+    ):
+        return _cmd_recover_abort_own(args, config)
+    if getattr(args, "coordinator_pid", None) is None:
+        raise Refusal(
+            "recover requires --coordinator-pid PID "
+            "(omittable only with --abort-create --slot SLOT)"
+        )
     coordinator, runner, handoff_writer, proof_fd = _capture_remove_processes(
         args.coordinator_pid
     )
@@ -104364,7 +104428,7 @@ usage or audit gate unknown, 3 fail-closed refusal.
         ),
         formatter_class=_HelpFormatter,
     )
-    recover.add_argument("--coordinator-pid", type=int, required=True, metavar="PID", help="live current coordinator PID recorded with recovery")
+    recover.add_argument("--coordinator-pid", type=int, metavar="PID", help="live current coordinator PID recorded with recovery; may be omitted only with --abort-create --slot SLOT (the caller then proves itself against the recorded create journal's owner)")
     recover.add_argument(
         "--slot",
         metavar="SLOT",
