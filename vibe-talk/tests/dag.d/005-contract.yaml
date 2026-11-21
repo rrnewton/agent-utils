@@ -11,7 +11,7 @@ steps:
     hint:
       est_duration_s: 8
       classification: light
-      rss_baseline_bytes: 536870912
+      rss_baseline_bytes: 2147483648
 
   # The physical Android run is opt-in. Its evaluator is not: silence and wrong-language speech
   # are negative controls here, requiring no phone, browser, capture device or STT service.

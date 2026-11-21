@@ -70,11 +70,17 @@ contract-check:
 # not compile (tsconfig.types.json, tests/types). The page build compiles them; see web/build.mjs.
 # Then the import directions between them and what each may say (web/architecture.mjs), which the
 # page-build suite also holds.
+# `#2042`: under the gate's memory box Node sizes its old-space from the cgroup limit
+# (~327 MB where tsc needs more), which starves the checker into a GC death spiral;
+# the check's heap is therefore said out loud. Keep it under the step's
+# rss_baseline_bytes in tests/dag.d/005-contract.yaml.
+TSC_NODE_OPTIONS := --max-old-space-size=1536
+
 typecheck:
-	contract/node_modules/.bin/tsc -p tsconfig.json
-	contract/node_modules/.bin/tsc -p tsconfig.core.json
-	contract/node_modules/.bin/tsc -p tsconfig.web.json
-	contract/node_modules/.bin/tsc -p tsconfig.types.json
+	NODE_OPTIONS="$(TSC_NODE_OPTIONS)" contract/node_modules/.bin/tsc -p tsconfig.json
+	NODE_OPTIONS="$(TSC_NODE_OPTIONS)" contract/node_modules/.bin/tsc -p tsconfig.core.json
+	NODE_OPTIONS="$(TSC_NODE_OPTIONS)" contract/node_modules/.bin/tsc -p tsconfig.web.json
+	NODE_OPTIONS="$(TSC_NODE_OPTIONS)" contract/node_modules/.bin/tsc -p tsconfig.types.json
 	node web/architecture.mjs
 
 # `cargo test` runs the page's suites through `node --test` as well as the Rust tests, so this is
