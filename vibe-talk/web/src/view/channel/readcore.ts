@@ -2304,9 +2304,19 @@ function settleAfterRead(messages: readonly Message[], how: { area: HTMLElement;
       const at = messages.findIndex((message) => String(message.id) === previous);
       setJumpNewest(true, "discord", at >= 0 ? messages.length - 1 - at : null);
     }
-  } else {
+  } else if (!how.keepPosition || previous === null || how.heldPlaceAt !== undefined ||
+      (moved && !(newest !== null && ownPostStands(newest)))) {
     scrollToNewest();
     setJumpNewest(false, "discord");
+  } else {
+    // `#1983 vibe-talk-all-view-send-flash`. A keeping read that brought nothing new
+    // does not take the reader to the foot: after their own send the new row already
+    // stands at the foot, and following it here would move every row on screen by
+    // its height for the rest of the read, then put them back as the receipt goes.
+    // The reader stays where they are; the jump is decided where they stand. A read
+    // behind held rows (`heldPlaceAt`) still lands as it always did: the foot it
+    // follows is the true foot of a list that was only partly drawn.
+    renderJumpNewest();
   }
 }
 

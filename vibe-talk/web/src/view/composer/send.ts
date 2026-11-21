@@ -33,8 +33,13 @@ export interface ChannelSendDependencies {
   onDraftCleared?(): void;
   noteDraft(kind: string, key: string, channel: string, held: boolean): void;
   fitBox(box: HTMLElement): void;
-  draftRefusedWords: string;
+  /** The writing in the box that held the view (`#1839`) is over, until more is typed. */
+  releaseComposerHold(): void;
+  /** Whether a composer in this list stands fitted to the on-screen keyboard (`#610`). */
+  keyboardFitted(): boolean;
+  /** Take this list to its newest line (only for the fitted regime above). */
   scrollToNewest(): void;
+  draftRefusedWords: string;
   renderChannelNavigation(): void;
   renderDraftChip(): void;
 }
@@ -60,7 +65,6 @@ export function createChannelSend(deps: ChannelSendDependencies): ChannelSend {
   const queueOutgoingMessage = deps.queueOutgoingMessage;
   const channelDrafts = deps.channelDrafts;
   const noteDraft = deps.noteDraft;
-  const scrollToNewest = deps.scrollToNewest;
   const renderChannelNavigation = deps.renderChannelNavigation;
   const renderDraftChip = deps.renderDraftChip;
   const composerState = deps.composerState;
@@ -81,6 +85,15 @@ async function sendChannelMessage() {
     return;
   }
   if (!text.trim() || !channel) return;
+  // `#1983 vibe-talk-all-view-send-flash`. From the moment Send is pressed, not
+  // after the clear: the first redraw the send brings (the outgoing row's) is
+  // already one the holders would otherwise keep the box through, by the hold
+  // the typing left, and move the reader's rows for it.
+  deps.releaseComposerHold();
+  // Fitted to the keyboard (`#610`), the reader's place is the box on the keys and
+  // the list's foot under it: a send there still goes to the newest, as the fitted
+  // regime has always stood. Anywhere else a send scrolls nothing (`#1983`).
+  const fitted = deps.keyboardFitted();
   rememberChannelDraft();
   // `#1135 raw-message-page`. Ticked for this send alone, the words go exactly as typed; the choice
   // is taken here, with the text, and is never kept for the next message.
@@ -101,7 +114,12 @@ async function sendChannelMessage() {
   el("channel-raw").checked = false;
   fitGrowingBox(el("channel-compose-text"));
   el("channel-compose-state").textContent = "";
-  scrollToNewest();
+  // `#1983 vibe-talk-all-view-send-flash`. No scroll on Send, fitted regime aside:
+  // taking the reader to the foot here moved every row on screen by the outgoing
+  // row's height while the post was on its way, and the answer's follow moved them
+  // again by the new row's. The reader stays on the messages they were looking at;
+  // the sent row lands at the foot and the newest-line jump is offered for it.
+  if (fitted) deps.scrollToNewest();
   await completion;
 }
 

@@ -145,6 +145,8 @@ export interface OutboxDispatchDependencies {
   selectedChannel(): string;
   inDiscord(): boolean;
   followsNewest(side: boolean): boolean;
+  /** Whether a composer in that side's list stands fitted to the on-screen keyboard (`#610`). */
+  keyboardFitted?(side: boolean): boolean;
   noteSelfAuthor(authorId: unknown): void;
   noteStartsRead(parts: readonly OutgoingPart[]): void;
   appendPart(part: OutgoingPart): void;
@@ -758,16 +760,26 @@ export function createOutboxDispatch(deps: OutboxDispatchDependencies): OutboxDi
       // `#500 sent-receipts-pile-up`. From now its receipt is shown for a while, then goes.
       entry.sentAt = now();
       deps.armSentReceipt(entry);
-      // Whether the reader follows is decided BEFORE anything this answer changes is drawn. The first
-      // message sent can tell the page who "me" is, and then every row of mine is drawn again as mine
-      // (`noteSelfAuthor`), narrower, where a line may wrap onto one more: a reader on the newest line
-      // was left that much above it, and the message they had just sent arrived below them, unseen.
-      // Not while a filter change holds a message in place (`#243 filter-keeps-selection`), which the
-      // page's follow answers for.
+      // `#1983 vibe-talk-all-view-send-flash`. The reader does NOT follow their own
+      // send to the foot: the follow moved every row on screen by the new row's
+      // height (and, at the tap, by the outgoing row's), showed different messages
+      // in their place while the post was on its way, and put them back as the
+      // receipt went. The row is added at the foot where the reader stands; the
+      // newest-line jump is offered for it, as for anything that lands below a
+      // reader who is not on the newest line. (Before this, whether the reader
+      // followed was decided BEFORE anything this answer changes is drawn,
+      // because the first message sent can tell the page who "me" is, and then
+      // every row of mine is drawn again as mine (`noteSelfAuthor`), narrower,
+      // where a line may wrap onto one more.)
       const here = entry.channel === deps.selectedChannel();
-      const pinned = here && deps.inDiscord() && deps.followsNewest(false);
-      // `#229 desktop-two-column`. The right column's reader on its newest line follows it too.
-      const sidePinned = here && deps.followsNewest(true);
+      // Fitted to the keyboard (`#610`), the reader's place is the fitted box and
+      // the list's foot under it, and a confirmed send is still followed there, as
+      // that regime has always stood; the follow is decided before the row is
+      // drawn, as it was. Everywhere else the row stands at the foot unfollowed.
+      const pinned = here && deps.inDiscord() && deps.followsNewest(false) &&
+        deps.keyboardFitted?.(false) === true;
+      const sidePinned = here && deps.followsNewest(true) &&
+        deps.keyboardFitted?.(true) === true;
       deps.noteSelfAuthor(entry.parts[0]!.author_id);
       // `#549 own-read-stored`. What he just said starts read, as the server recorded it before answering.
       deps.noteStartsRead(entry.parts);

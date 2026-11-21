@@ -2383,17 +2383,27 @@ const { answeredRow, doneWhereNotDrawn, answeredDone, doneHeldHere, markAnswered
 const COMPOSER_HOLD_MS = 5000;
 let heldComposerField = null;
 let heldComposerInputAt = -Infinity;
+// `#1983 vibe-talk-all-view-send-flash`. The field whose writing a send from it ended:
+// it holds the view no more until more is typed in it (`releaseComposerHold`).
+let releasedComposerField = null;
 document.addEventListener("input", (event) => {
   if (isComposer(event.target)) {
     heldComposerField = event.target;
     heldComposerInputAt = Date.now();
+    releasedComposerField = null;
   }
 }, true);
+/** A send from the held box is done writing: the view is the reader's again (`#1983`). */
+function releaseComposerHold() {
+  releasedComposerField = isComposer(document.activeElement) ? document.activeElement : heldComposerField;
+  heldComposerInputAt = -Infinity;
+}
 function heldComposer() {
   const field = isComposer(document.activeElement) ? document.activeElement
     : heldComposerField && Date.now() - heldComposerInputAt < COMPOSER_HOLD_MS ? heldComposerField
     : null;
   if (!field) return null;
+  if (releasedComposerField !== null && field === releasedComposerField) return null;
   // The whole composer, not the field alone: its container carries the Send row under
   // the box, and keeping only the field in view left that row under the bottom bar
   // (`#1839`). A field with no container around it is its own box.
@@ -7857,6 +7867,9 @@ const outboxDispatch = createOutboxDispatch({
   followsNewest: (side) => side
     ? sideShowing() && inColumn(columns.side, () => followsNewest(el("scroll-area")))
     : followsNewest(el("scroll-area")),
+  keyboardFitted: (side) => (screenKeyboardRoom
+    ? (side ? inColumn(columns.side, () => screenKeyboardRoom.roomIn(el("scroll-area")))
+      : screenKeyboardRoom.roomIn(el("scroll-area"))) > 0 : false),
   noteSelfAuthor, noteStartsRead: (parts) => noteStartsRead(/** @type {any} */ (parts)), appendPart: (part) => appendToColumns(/** @type {any} */ (part)),
   scrollToNewest: (side) => { if (side) inColumn(columns.side, scrollToNewest); else scrollToNewest(); },
   markSentRead: (entry) => guardQuietly(/** @type {any} */ (markSentRead))(entry),
@@ -7952,7 +7965,10 @@ const channelSend = createChannelSend({
     void draftSync.clear(mainDraftKey());
   },
   storageOkay: () => outbox.storageOkay(), noteDraft, fitBox: (box) => fitGrowingBox(box),
-  draftRefusedWords: CHANNEL_DRAFT_REFUSED, scrollToNewest, renderChannelNavigation, renderDraftChip,
+  draftRefusedWords: CHANNEL_DRAFT_REFUSED, renderChannelNavigation, renderDraftChip,
+  releaseComposerHold: () => releaseComposerHold(),
+  keyboardFitted: () => (screenKeyboardRoom ? screenKeyboardRoom.roomIn(el("scroll-area")) > 0 : false),
+  scrollToNewest,
 });
 const { sendChannelMessage, cancelChannelMessage, answerChannelDiscard, rememberChannelDraft, restoreChannelComposer, saveChannelDrafts, channelComposerKey, onComposerKey } = channelSend;
 // `#1840`: the Save draft buttons, the continue offers, and the setting.
