@@ -1,6 +1,6 @@
 ---
 title: 'agentctl-adopt-attach-profile: attach a launch profile at adopt or by pinned verb so restore and revive use it'
-status: open
+status: closed
 priority: 2
 issue_type: task
 labels:
@@ -55,3 +55,16 @@ starting).
 
 [watermelon-full-preview] Lane mu-restorefix/1993, after #1992,
 coordinated by coordb. Related: #1934, #1928, owner rule 257.
+
+## Resolution
+
+[watermelon-full-preview] Landed as c18e80b6 on main. `adopt
+--profile P` and `bind-profile NAME --profile P --expected-token T`
+attach a launch profile in both editions: the profile must exist
+and name the record's harness kind and mode, the bind is pinned to
+the record's exact token, and no new record field was written (the
+existing `profile` field is set). Afterwards revive and restore
+rebuild the launch from the profile and status shows it. Verified
+on the landing tree: fmt and clippy clean, Rust
+adopt/bind/revive/restore suites 304 passed, Python
+herdr/identity/lifecycle/restore-drill suites 415 passed.
