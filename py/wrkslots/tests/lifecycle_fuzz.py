@@ -363,6 +363,9 @@ def _exit_sweep() -> None:
 
 
 def _on_signal(signum: int, _frame: object) -> None:
+    trees = _ACTIVE.get("trees")
+    if isinstance(trees, dict):
+        _stop_trees(trees)
     # Stop the in-flight CLI child first: it may hold the slot
     # whose images the sweep must unmount. Children are read
     # from /proc, never matched by name or pattern.
@@ -404,21 +407,60 @@ def _assert_mounts_allowed() -> None:
         )
 
 
+def _stop_trees(trees: dict[str, e2e.AgentTree]) -> None:
+    for tree in trees.values():
+        try:
+            tree.stop()
+        except Exception:
+            tree.terminate_tree()
+    trees.clear()
+
+
+def _heal_if_journaled(project: e2e.TestProject, trace: e2e.Trace) -> None:
+    """One recover before a create when a journal is outstanding.
+
+    A crashed create that reached ACTIVE publication leaves a
+    completed-create journal; classification then refuses new
+    creates registry-wide until recover clears it — exactly the
+    model's one-recover completion, so the generator heals first
+    instead of treating the refusal as a divergence.
+    """
+    state = _decode(project)
+    if state.get("journals"):
+        _cli(project, "recover", "--coordinator-pid", str(os.getpid()),
+                 expected=(0, 3), trace=trace)
+
+
+def _land_and_finish(project: e2e.TestProject, tree: e2e.AgentTree) -> None:
+    """Publish the slot's work and finish it (the fence lands inside)."""
+    e2e._do_and_land_work(project, tree, tree.trace)
+    e2e._finish(tree)
+
+
 def _run_seed(
     seed: int, steps: int, base: Path, *, keep: bool, faults: bool = False
 ) -> None:
     _assert_mounts_allowed()
     trace = e2e.Trace(base / "trace.jsonl", seed=seed)
     project = e2e._make_project(base, trace, ttl_seconds=2)
-    _ACTIVE.update(project=project, trace=trace)
-    atexit.register(_exit_sweep)
-    _record_attached(project)
     rng = random.Random(seed)
     live: set[str] = set()
     archived: set[str] = set()
+    trees: dict[str, e2e.AgentTree] = {}
+    runner_owned: set[str] = set()
+    landed: set[str] = set()
+    # A failure mid-sequence must not orphan mock-agent trees.
+    atexit.register(_stop_trees, trees)
+    _ACTIVE.update(project=project, trace=trace, trees=trees)
+    atexit.register(_exit_sweep)
+    _record_attached(project)
+    _ACTIVE.update(project=project, trace=trace, trees=trees)
+    atexit.register(_exit_sweep)
+    _record_attached(project)
     for index in range(steps):
         slot = rng.choice(SLOTS)
-        choices = ["create", "hold", "unhold", "remove", "recover", "status"]
+        choices = ["create", "hold", "unhold", "remove", "recover", "status",
+                   "adopt", "heartbeat", "finish", "fence", "transfer"]
         if faults:
             choices.append("fault-create")
         op = rng.choice(choices)
@@ -450,7 +492,66 @@ def _run_seed(
                           rc=done.returncode, after=fault_after)
                 if verdict.startswith("FINDING"):
                     raise FuzzFailure(f"{label}: {verdict}")
+            elif op == "adopt" and slot not in live and slot not in archived:
+                _heal_if_journaled(project, trace)
+                _create_unbound(project_crash, slot, f"fz-{slot}", trace)
+                tree = e2e.AgentTree(project, slot, f"fz-{slot}", trace)
+                trees[slot] = tree
+                e2e._adopt(tree)
+                live.add(slot)
+            elif op == "heartbeat" and slot in trees:
+                trees[slot].wrkslots(
+                    "heartbeat", slot, "--agent", f"fz-{slot}",
+                    "--owner-pid", str(trees[slot].info["engine_pid"]),
+                    "--expected-generation", "1", expected=(0, 3))
+            elif op == "heartbeat" and slot in runner_owned:
+                _cli(project_crash, "heartbeat", slot, "--agent",
+                         f"fz-new-{slot}", "--owner-pid", str(os.getpid()),
+                         "--expected-generation", "1",
+                         expected=(0, 3), trace=trace)
+            elif op == "finish" and slot in trees:
+                tree = trees.pop(slot)
+                if slot in landed:
+                    e2e._finish(tree)
+                else:
+                    _land_and_finish(project, tree)
+                landed.discard(slot)
+                tree.stop()
+                live.discard(slot)
+            elif op == "fence" and slot in trees:
+                # Publish, then interrupt finish at its fence seam:
+                # the fenced finish journal is what recover meets.
+                if slot not in landed:
+                    e2e._do_and_land_work(project, trees[slot], trace)
+                    landed.add(slot)
+                fence_env = dict(project.environment)
+                fence_env["WRKSLOTS_TEST_INTERRUPT"] = rng.choice(
+                    ("after-path-fence", "after-finish-journal"))
+                fenced = dataclasses.replace(project, environment=fence_env)
+                _cli(fenced, "finish", slot, "--agent", f"fz-{slot}",
+                         "--owner-pid", str(trees[slot].info["engine_pid"]),
+                         "--expected-generation", "1",
+                         "--validation", "wrkslots fuzz: pass",
+                         expected=(0, 3, 86), trace=trace)
+            elif op == "transfer" and slot in trees:
+                tree = trees.pop(slot)
+                tree.kill_engine()
+                tree.terminate_tree()
+                deadline = time.monotonic() + 20
+                moved = False
+                while time.monotonic() < deadline and not moved:
+                    done = _cli(
+                        project, "transfer-owner", slot, "--agent",
+                        f"fz-new-{slot}", "--owner-pid", str(os.getpid()),
+                        "--expected-generation", "1",
+                        expected=(0, 3), trace=trace)
+                    moved = done.returncode == 0
+                    if not moved:
+                        time.sleep(0.2)
+                if moved:
+                    runner_owned.add(slot)
             elif op == "create" and slot not in live and slot not in archived:
+                _heal_if_journaled(project, trace)
                 _create_unbound(project_crash, slot, f"fz-{slot}", trace)
                 live.add(slot)
             elif op == "hold" and slot in live:
@@ -496,19 +597,17 @@ def _run_seed(
                 if p not in problems
             ]
         _record_attached(project)
+        _record_attached(project)
         trace.add("step", label=label, chain_loads=state.get("chain_loads"),
                   classification=_classify_state(state),
                   journals=state.get("journals"))
         if problems:
             raise FuzzFailure("; ".join(problems))
+    _stop_trees(trees)
     final = _wait_chain_loads(project)
     problems = _oracle(final, step=f"seed={seed} final")
     if problems:
         raise FuzzFailure("; ".join(problems))
-    # Detach images through wrkslots before the scratch rmtree,
-    # so a plain-directory host never notices and an image host
-    # leaves no loop mount behind (#2048).
-    e2e._detach_project_images(project.root, trace)
     print(f"lifecycle fuzz passed; seed={seed} steps={steps}")
 
 
@@ -520,6 +619,9 @@ def _run_ops_file(ops_path: Path, root: Path) -> None:
         remote=root.parent / "product.git", environment=e2e._environment(),
     )
     trace = e2e.Trace(ops_path.with_suffix(".trace.jsonl"), seed=int(spec["seed"]))
+    trees: dict[str, e2e.AgentTree] = {}
+    atexit.register(_stop_trees, trees)
+    owned: set[str] = set()
     for item in spec["ops"]:
         op, slot = item["op"], item["slot"]
         label = f"worker step op={op} slot={slot}"
@@ -538,7 +640,34 @@ def _run_ops_file(ops_path: Path, root: Path) -> None:
             continue
         if op in ("hold", "unhold", "remove") and slot not in known:
             continue
-        if op == "create":
+        if op == "adopt" and slot not in known and slot not in gone:
+            _heal_if_journaled(project, trace)
+            _create_unbound(project, slot, f"fz-{slot}", trace)
+            tree = e2e.AgentTree(project, slot, f"fz-{slot}", trace)
+            trees[slot] = tree
+            e2e._adopt(tree)
+        elif op == "heartbeat" and slot in trees:
+            trees[slot].wrkslots(
+                "heartbeat", slot, "--agent", f"fz-{slot}",
+                "--owner-pid", str(trees[slot].info["engine_pid"]),
+                "--expected-generation", "1", expected=(0, 3))
+        elif op == "heartbeat" and slot in owned:
+            _cli(project, "heartbeat", slot, "--agent", f"fz-new-{slot}",
+                     "--owner-pid", str(os.getpid()),
+                     "--expected-generation", "1",
+                     expected=(0, 3), trace=trace)
+        elif op == "transfer" and slot in trees:
+            tree = trees.pop(slot)
+            tree.kill_engine()
+            tree.terminate_tree()
+            done = _cli(project, "transfer-owner", slot, "--agent",
+                            f"fz-new-{slot}", "--owner-pid", str(os.getpid()),
+                            "--expected-generation", "1",
+                            expected=(0, 3), trace=trace)
+            if done.returncode == 0:
+                owned.add(slot)
+        elif op == "create":
+            _heal_if_journaled(project, trace)
             _create_unbound(project, slot, f"fz-{slot}", trace)
         elif op == "hold":
             _cli(project, "hold", slot, "--reason", "fuzz",
@@ -554,6 +683,11 @@ def _run_ops_file(ops_path: Path, root: Path) -> None:
         problems = _oracle(state, step=label)
         if problems:
             raise FuzzFailure("; ".join(problems))
+    for tree in trees.values():
+        try:
+            tree.stop()
+        except Exception:
+            tree.terminate_tree()
     print(f"worker done seed={spec['seed']}")
 
 
@@ -567,7 +701,8 @@ def _run_concurrent(seed: int, base: Path) -> None:
     for worker, slot in enumerate(SLOTS):
         ops = []
         for _ in range(10):
-            op = rng.choice(("create", "hold", "unhold", "remove", "recover"))
+            op = rng.choice(("create", "hold", "unhold", "remove", "recover",
+                             "adopt", "heartbeat", "transfer"))
             ops.append({"op": op, "slot": slot})
         spec_path = base / f"ops-{worker}.json"
         spec_path.write_text(

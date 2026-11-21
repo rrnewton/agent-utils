@@ -58,6 +58,13 @@ are the old Python model's, so counterexamples read the same.
 
 ## Seeded fuzz
 
-`tests/lifecycle_fuzz.py` checks the same invariants against
-the real code (see FUZZ_INVARIANTS.md for the shared
-predicates and decode contract).
+`tests/lifecycle_fuzz.py` generates seeded random command
+sequences over two slots in a scratch registry — create,
+adopt, heartbeat, hold/unhold, finish (with its fence seam
+interrupted), transfer-owner, remove, recover — injects
+crashes at the CLI test seams, decodes the real state after
+every step, and judges it against the invariants above; a
+concurrent mode runs two worker processes on disjoint slots.
+`tests/test_lifecycle_fuzz.py` gates a fast subset; the long
+soak is opt-in by hand. `tests/test_fault_fsync.py` pins the
+directory-fsync-after-rename family.
