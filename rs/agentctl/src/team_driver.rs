@@ -1957,21 +1957,175 @@ impl<A: crate::subagents::ManagedApi + ?Sized> DriverEffects for ProductionEffec
 
     fn act(
         &mut self,
-        _record: &DriverRecord,
+        record: &DriverRecord,
         action: &TeamAction,
-        _manifest: &Value,
+        manifest: &Value,
     ) -> Result<ActionOutcome> {
-        // Stage 1 wires the queue and receipts; concrete verbs land in
-        // the next internal commit and replace these refusals.
-        Ok(ActionOutcome {
+        let refused = |detail: &str| ActionOutcome {
             status: "refused".to_owned(),
-            detail: match action {
-                TeamAction::Facts => return Ok(done_outcome("facts recorded")),
-                TeamAction::DeclareDone => return Ok(done_outcome("verify requested")),
-                _ => "action effects are not wired yet".to_owned(),
-            },
+            detail: detail.to_owned(),
             escalation: None,
-        })
+        };
+        match action {
+            TeamAction::Facts => Ok(done_outcome("facts recorded")),
+            TeamAction::DeclareDone => Ok(done_outcome("verify requested")),
+            TeamAction::Revive { agent } => {
+                let manager = self.manager()?;
+                match manager.revive(agent, false, None, self.startup_timeout) {
+                    Ok(_) => Ok(done_outcome("revive completed")),
+                    Err(_) => Ok(refused("revive refused")),
+                }
+            }
+            TeamAction::StartUnit { unit } | TeamAction::ResetUnit { unit } => {
+                let reset = matches!(action, TeamAction::ResetUnit { .. });
+                if !self.config.units.iter().any(|found| found == unit) {
+                    return Ok(refused("unit is not configured for this team"));
+                }
+                let pins = match crate::team_verify::read_pins(
+                    &self.registry,
+                    &self.config.units,
+                    self.verify_options.state_dir.as_deref(),
+                ) {
+                    Ok(pins) => pins,
+                    Err(_) => return Ok(refused("turnover pin unreadable")),
+                };
+                if pins.reason_for(unit).is_some() {
+                    return Ok(refused("unit held by turnover pin"));
+                }
+                if unit.starts_with("agentctl-bridge-") {
+                    let coordinator = manifest["coordinator"].as_str().unwrap_or_default();
+                    let live = !coordinator.is_empty()
+                        && manifest["verify"]["checks"].as_array().is_some_and(|checks| {
+                            checks.iter().any(|row| {
+                                row["name"] == "desired-live"
+                                    && row["subject"] == coordinator
+                                    && row["status"] == "pass"
+                            })
+                        });
+                    if !live {
+                        return Ok(refused("bridge target not live"));
+                    }
+                }
+                if reset {
+                    let outcome = self.host.run(
+                        &[
+                            "systemctl".to_owned(),
+                            "--user".to_owned(),
+                            "reset-failed".to_owned(),
+                            unit.clone(),
+                        ],
+                        None,
+                        Duration::from_secs(30),
+                    );
+                    if outcome.status != Some(0) {
+                        return Ok(ActionOutcome {
+                            status: "failed".to_owned(),
+                            detail: "unit reset-failed failed".to_owned(),
+                            escalation: None,
+                        });
+                    }
+                }
+                let outcome = self.host.run(
+                    &[
+                        "systemctl".to_owned(),
+                        "--user".to_owned(),
+                        "start".to_owned(),
+                        unit.clone(),
+                    ],
+                    None,
+                    Duration::from_secs(120),
+                );
+                if outcome.status == Some(0) {
+                    Ok(done_outcome(if reset {
+                        "unit reset and started"
+                    } else {
+                        "unit started"
+                    }))
+                } else {
+                    Ok(ActionOutcome {
+                        status: "failed".to_owned(),
+                        detail: "unit start failed".to_owned(),
+                        escalation: None,
+                    })
+                }
+            }
+            TeamAction::Drain { agent } => {
+                let manager = self.manager()?;
+                let options = crate::agent::DrainOptions {
+                    ready_timeout: Duration::from_secs(30),
+                    deadline: Some(Duration::from_secs(60)),
+                    lock_timeout: Some(Duration::from_secs(10)),
+                    max_attempts: 1,
+                    ..crate::agent::DrainOptions::default()
+                };
+                match manager.drain(agent, options) {
+                    Ok(result) => Ok(match result.outcome {
+                        crate::agent::QueueOutcome::Delivered => {
+                            done_outcome("queue drained")
+                        }
+                        crate::agent::QueueOutcome::Pending => ActionOutcome {
+                            status: "failed".to_owned(),
+                            detail: "drain pending".to_owned(),
+                            escalation: None,
+                        },
+                        crate::agent::QueueOutcome::PossiblySubmitted => ActionOutcome {
+                            status: "unknown".to_owned(),
+                            detail: "drain quarantined".to_owned(),
+                            escalation: None,
+                        },
+                    }),
+                    Err(_) => Ok(refused("drain refused")),
+                }
+            }
+            TeamAction::KillPid {
+                pid,
+                expect_cmdline,
+                expect_start,
+                signal,
+                ..
+            } => {
+                let Ok(expect_start) = expect_start.parse::<u64>() else {
+                    return Ok(refused("invalid expect_start"));
+                };
+                let signal = signal.as_deref().unwrap_or("TERM");
+                if !crate::kill_pid::SIGNALS
+                    .iter()
+                    .any(|(name, _)| *name == signal)
+                {
+                    return Ok(refused("invalid signal"));
+                }
+                match crate::kill_pid::run_kill_pid(
+                    u64::from(*pid),
+                    expect_cmdline,
+                    expect_start,
+                    signal,
+                    &self.registry,
+                ) {
+                    Ok(_) => Ok(done_outcome("process signalled")),
+                    Err(refusal) => Ok(ActionOutcome {
+                        status: "refused".to_owned(),
+                        detail: format!("kill refused ({})", refusal.reason),
+                        escalation: None,
+                    }),
+                }
+            }
+            TeamAction::Escalate { text } => {
+                if record.escalation.delivered_at.is_some() {
+                    return Ok(done_outcome("escalation already delivered"));
+                }
+                let outcome = self.escalate(record, text, false)?;
+                let (status, detail) = match &outcome {
+                    EscalationOutcome::Delivered => ("done", "escalation delivered"),
+                    EscalationOutcome::Failed(_) => ("failed", "escalation failed"),
+                    EscalationOutcome::Unconfigured => ("failed", "escalation unconfigured"),
+                };
+                Ok(ActionOutcome {
+                    status: status.to_owned(),
+                    detail: detail.to_owned(),
+                    escalation: Some(outcome),
+                })
+            }
+        }
     }
 }
 
