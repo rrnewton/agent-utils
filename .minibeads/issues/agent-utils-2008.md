@@ -24,6 +24,7 @@ updated_at: 2026-11-20T17:40:00-05:00
 # Acceptance Criteria
 
 - The windowed phone send case in the send-flash walk shows zero missing-row frames and an anchor move within the invariant, on the landed combined tree.
+- Un-mark the two send-flash expected-fails for this issue (remove `expected_fail_2008` in tests/send_flash_browser.py once phone-412-dark-plainwindowed and phone-412-dark-late-readwindowed pass on the combined tree; they were marked at 565e459f by the #1983 lane with coordinator approval, still run and record, and an XPASS under the mark means un-mark).
 - Dynamic evidence from a local test instance (walk output and screenshots), focused suites and an owner-priority gate before landing.
 
 # Notes
