@@ -50,7 +50,9 @@ For the compiled bridge, use the installed command as the authority:
 
 ## When the prompt gives only the command
 
-When the bridge follows no transcript of yours (a headless agent, an unknown
+When the bridge follows no transcript of yours (a headless agent whose
+event log it does not follow yet — a headless agent whose log it follows
+gets the marker lines as a TUI agent does — an unknown
 harness such as an agentterm pane, or a transcript it could not find), the
 prompt gives no marker lines. Its footer says `Nothing you print reaches the
 chat` and names the `chat reply` command: write each reply to a file, run that

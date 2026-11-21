@@ -432,7 +432,13 @@ last event, model output, open request, and tool call in flight
 - **Unknown TUI**: none — no transcript is known or read; the watcher
   sees only the screen and the process tree.
 - **Headless**: supported — the typed event log replaces the transcript
-  (`rs/agentctl/src/headless/events.rs`, `tail.rs`).
+  (`rs/agentctl/src/headless/events.rs`, `tail.rs`). The chat bridge also
+  follows that log as the agent's transcript for reply capture and trace
+  harvesting (#1974 agentctl-headless-chat-transcript-parity,
+  `rs/agentctl/src/chat_transcript.rs`): while a log is followed its
+  prompts get the `CHAT_REPLY` marker lines as a TUI target's do, decided
+  per prompt; only with no log followed do they ask solely for
+  `agentctl chat reply --file`, which stays as the fallback either way.
 
 ### `--trace-thread` harvesting
 
