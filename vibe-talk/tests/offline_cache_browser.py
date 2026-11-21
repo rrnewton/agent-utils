@@ -274,6 +274,13 @@ def thread_of(row: Json) -> Json:
     return thread if isinstance(thread, dict) else {}
 
 
+# A channel read, matched by route shape: `GET /api/v1/channels/<id>/timeline?...` or
+# `GET /api/v1/channels/<id>/page` with its query. Substring matching ("/page" anywhere in the
+# recorded request) misclassified any later route whose path happens to contain that text, and
+# splitting the request on "/" then indexed a segment such a route need not have.
+_CHANNEL_READ = re.compile(r"^GET /api/v1/channels/([^/]+)/(?:timeline\?.*|page(?:\?.*)?)$")
+
+
 class FakeApi:
     """The routes the page reads, answering from one mutable little store."""
 
@@ -334,7 +341,7 @@ class FakeApi:
 
     def reads(self) -> list[str]:
         with self.lock:
-            return [r for r in self.requests if "/timeline?" in r or "/page" in r]
+            return [r for r in self.requests if _CHANNEL_READ.match(r)]
 
     def post(self, path: str, body: Json) -> tuple[int, Json]:
         """A POST to `path` with its JSON body, as status and answer. Almost none is served here; a
@@ -5091,7 +5098,7 @@ def windows_walk(chromium: BrowserType, args: argparse.Namespace) -> None:
                 page.wait_for_timeout(200)
                 reads = api.reads()
                 check(bool(reads), f"windows: {why}: no channel was read")
-                read = sorted({r.split("/")[4] for r in reads})
+                read = sorted({m.group(1) for r in reads if (m := _CHANNEL_READ.match(r)) is not None})
                 check(read == [expected], f"windows: {why}: read {read}, expected {expected}")
                 check(channel(page) == expected, f"windows: {why}: the picker is on {channel(page)}, not {expected}")
 
