@@ -578,7 +578,14 @@ export function createTimelineView(deps: TimelineViewDependencies): TimelineView
     // reader a spacer's error above the bottom, and the re-slice after it
     // moved the foot again, so END and Newest visibly did nothing stable.
     const atFoot = winHoldFoot || (area.scrollHeight > 0 && area.clientHeight > 0 &&
-      area.scrollTop + area.clientHeight >= area.scrollHeight - 2);
+      area.scrollTop + area.clientHeight >= area.scrollHeight - 2) ||
+      // `#2008`: also at the foot in the window's own priced space. Prices
+      // can run short of the real layout, leaving the reader's px position
+      // past the priced end of the list while the measured foot still looks
+      // a row away: sliceFor then parks on the last group alone and the
+      // rows above it vanish for that render (the send-flash A -> B -> A).
+      (area.clientHeight > 0 && groups.length > 0 &&
+        area.scrollTop + area.clientHeight >= (offsets[offsets.length - 1] as number) - 2);
     if (atFoot && groups.length > 0) {
       // The last cap of groups, never the whole list: forcing only the end
       // of a top slice would mount everything it was priced from.
