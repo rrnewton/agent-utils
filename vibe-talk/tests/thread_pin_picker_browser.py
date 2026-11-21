@@ -445,6 +445,18 @@ def picker_walk(desk: Desk, api: PinApi) -> None:
         widths = [r["width"] for r in rects]
         desk.check(max(widths) - min(widths) <= 2, f"desk fixed cells are not equal width: {rects}")
         desk.notes.append("desk: fixed views are one equal row")
+    # The THREADS heading stands whole inside its pane at open, not half
+    # scrolled away under the header (the pane opens at its bottom).
+    head = page.evaluate("""() => { const g = document.querySelector('.thread-picker-group');
+        const p = document.querySelector('.thread-picker-threads');
+        const gr = g.getBoundingClientRect(), pr = p.getBoundingClientRect();
+        return {top: gr.top, bottom: gr.bottom, height: gr.height,
+                paneTop: pr.top, paneBottom: pr.bottom}; }""")
+    desk.check(float(str(head["height"])) > 0
+               and float(str(head["top"])) >= float(str(head["paneTop"])) - 1
+               and float(str(head["bottom"])) <= float(str(head["paneBottom"])) + 1,
+               f"the THREADS heading is clipped inside its pane: {head}")
+    desk.notes.append("the THREADS heading stands whole in its pane at open")
     # Toggle: a second tap on the toolbar button closes, and stays closed.
     page.click("#thread-select")
     desk.wait_for("() => document.querySelector('.thread-picker-popup').hidden",

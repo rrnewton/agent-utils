@@ -388,6 +388,12 @@
   padding: 0.4rem;
 }
 .thread-picker-group {
+  /* `#2071`: the pane opens at its bottom; the heading sticks so it is
+     never half-scrolled out of sight under the popup's header. */
+  position: sticky;
+  top: -0.4rem;
+  z-index: 1;
+  background: var(--panel, Canvas);
   padding: 0.3rem 0.4rem;
   color: var(--muted, CanvasText);
   font-size: 0.78rem;
