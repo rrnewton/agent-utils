@@ -269,8 +269,6 @@ def walk(desk: Desk, api: VoicesApi, voice: str, args: argparse.Namespace) -> No
     held_k, held_n = held_block if held_block is not None else (0, 0)
     steps_at_pause = int(page.evaluate("() => window.steerSteps.length")) if voice == "agent" else 0
     held_lit = page.evaluate(LIT_JS) if voice == "agent" else None
-    clock_at_pause = (page.evaluate("() => readAloudOwner().readAloudContext.currentTime")
-                      if voice == "agent" else None)
     if voice == "agent":
         desk.check(held_block is not None and 2 <= held_k <= held_n,
                    f"agent: the read was paused at {held_count!r}, not in its second or a later block")
@@ -291,8 +289,8 @@ def walk(desk: Desk, api: VoicesApi, voice: str, args: argparse.Namespace) -> No
     desk.check(len(posted) == 1 and posted[0].get("reply_to") == MESSAGE, f"{voice}: what was posted was {posted}")
     desk.settled()
     # Still held, proven by the snapshot, not by dwelling: a read that carried on by itself while the
-    # reply was made and sent would have started an utterance (device), moved the held audio clock,
-    # the steer count or the lit sentence (agent), or stopped saying Resume. The agent's source count
+    # reply was made and sent would have started an utterance (device), moved the steer count
+    # or the lit sentence (agent), or stopped saying Resume. The agent's source count
     # is not such a sign: later blocks are fetched and buffered ahead while the read is held.
     desk.check(label(page) == "Resume", f"{voice}: after the reply was sent Read says {label(page)!r}, not Resume")
     if voice == "device":
@@ -301,11 +299,9 @@ def walk(desk: Desk, api: VoicesApi, voice: str, args: argparse.Namespace) -> No
         desk.check(len(started_now) == held_started,
                    f"device: utterances started while the read was held: {started_now[held_started:]!r}")
     else:
-        clock_now = page.evaluate("() => readAloudOwner().readAloudContext.currentTime")
         count_now = str(page.evaluate("() => document.getElementById('read-steer-count').textContent"))
-        desk.check(clock_now == clock_at_pause and count_now == held_count,
-                   f"agent: the read moved while held: audio clock {clock_at_pause} -> {clock_now}, "
-                   f"count {held_count!r} -> {count_now!r}")
+        desk.check(count_now == held_count,
+                   f"agent: the read moved while held: count {held_count!r} -> {count_now!r}")
         if held_lit is not None:
             desk.check(page.evaluate(LIT_JS) == held_lit,
                        f"agent: the lit sentence moved while held: {held_lit!r} -> {page.evaluate(LIT_JS)!r}")
@@ -433,8 +429,16 @@ def held_snapshot(desk: Desk, voice: str) -> Json:
     page = desk.page
     if voice == "device":
         return {"started": sum(1 for one in page.evaluate(SPOKEN_JS) if one["started"] is not None)}
+    # `#2020`: events, not the audio clock. AudioContext.currentTime is a
+    # free-running wall clock (it advances while the context runs, held
+    # read or not, and its suspension lands async), so exact equality
+    # across a settle window fails on a hot host while the read stands
+    # still (gate sample: count "2 of 3" unmoved, clock +0.45s). The
+    # strip count, the lit sentence and the steer-step count are the
+    # read's own events: a chunk started during the hold moves one.
     return {"count": str(page.evaluate("() => document.getElementById('read-steer-count').textContent")),
-            "clock": page.evaluate("() => readAloudOwner().readAloudContext.currentTime")}
+            "lit": page.evaluate(LIT_JS),
+            "steps": int(page.evaluate("() => window.steerSteps.length"))}
 
 
 def check_held_still(desk: Desk, voice: str, where: str, held: Json) -> None:
