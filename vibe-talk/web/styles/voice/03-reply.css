@@ -216,6 +216,14 @@
     right: anchor(--inline-reply-list right);
     margin: 0;
   }
+
+  /* `#2063 vibe-talk-quote-reply-view-stability`: the box docked to its column's foot rather
+     than scrolled to (painted there by the reply session's own shift of the box, over the
+     rows, whose place never moves to show it). */
+  #column-reply[data-foot-docked],
+  #side-reply[data-foot-docked] {
+    z-index: 3;
+  }
 }
 
 /* Sized like `.fold` beside it: a quiet control on the metadata row, not a second action

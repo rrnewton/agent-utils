@@ -1116,14 +1116,71 @@ export function createReplySession(deps: ReplySessionDependencies): ReplySession
     // `#304 back-gesture-in-app`. A reply open in the stream is a level of its own.
     deps.scheduleBackSync();
     placeInlineReply();
-    // Where the box is under the foot of the column: up by as little as shows the whole box, the box
-    // being what the reader is about to write in. A message, or its replies, taller than the column leaves
-    // above it is the one case where the row's top goes up under the head, a scroll up to read. Only for a
-    // box drawn under its row: one at the list's foot is not a reason to take the reader there.
+    // `#2063 vibe-talk-quote-reply-view-stability`. The post being answered stays pixel-still:
+    // opening the box never scrolls the list. Where the box drawn under its row would sit below
+    // the foot of the column, it is docked to that foot instead (an overlay at the foot, the
+    // rows exactly where they were) until the reader scrolls, which hands the box back to its
+    // row. Only for a box drawn under its row: one at the list's foot needs no dock.
     if (!anchorsSupported() || replyState.anchor === null) return;
     const pane = replyPane();
-    const over = mount.getBoundingClientRect().bottom - pane.foot();
-    if (over > 0) deps.nudge(pane.scroller(), over);
+    if (mount.getBoundingClientRect().bottom > pane.foot()) dockReplyAtFoot(mount, pane);
+  }
+
+  /**
+   * The reply's box held at the foot of its column (`dockReply`, `#2063`): the mount it stands
+   * in, the scroller whose next scroll releases it, and the listeners that keep its place.
+   * Null while the box stands under its row as usual.
+   */
+  let footDock: { mount: HTMLElement; scroller: HTMLElement; release: () => void; place: () => void; watcher?: ResizeObserver | null; onScroll?: () => void } | null = null;
+
+  /** Stand `mount` at the foot of `pane`, over the rows, their place untouched (`#2063`). The
+   * box keeps its anchored place in the layout (the room under its row is already kept for it)
+   * and is painted at the foot by a shift of its own: no row, spacer or scroll position moves. */
+  function dockReplyAtFoot(mount: HTMLElement, pane: { scroller(): HTMLElement; foot(): number }): void {
+    releaseFootDock();
+    const scroller = pane.scroller();
+    let shift = 0;
+    const place = (): void => {
+      if (!footDock) return;
+      const rect = mount.getBoundingClientRect();
+      shift += pane.foot() - rect.bottom;
+      mount.style.transform = shift !== 0 ? `translateY(${Math.round(shift)}px)` : "";
+    };
+    const release = (): void => releaseFootDock();
+    // A scroll the reader makes by hand is followed (the box stays at the foot) until the
+    // box drawn under its row would stand inside the foot itself, which hands it back; a
+    // scroll of the page's own (a keeper following the foot) never undocks it unseen.
+    const onScroll = (): void => {
+      if (!footDock) return;
+      const naturalBottom = mount.getBoundingClientRect().bottom - shift;
+      if (naturalBottom <= pane.foot() + 1) releaseFootDock();
+      else place();
+    };
+    const watcher = typeof ResizeObserver === "function" ? new ResizeObserver(() => place()) : null;
+    footDock = { mount, scroller, release, place };
+    mount.setAttribute("data-foot-docked", "");
+    place();
+    if (watcher) watcher.observe(mount);
+    scroller.addEventListener("scroll", onScroll, { passive: true });
+    footDock.onScroll = onScroll;
+    window.addEventListener("resize", place);
+    if (window.visualViewport) window.visualViewport.addEventListener("resize", place);
+    footDock.watcher = watcher;
+  }
+
+  /** Hand a foot-docked box back to its row: its overlay place and listeners go (`#2063`). */
+  function releaseFootDock(): void {
+    if (!footDock) return;
+    const { mount, scroller, place } = footDock;
+    const watcher = footDock.watcher;
+    const onScroll = footDock.onScroll;
+    footDock = null;
+    if (watcher) watcher.disconnect();
+    if (onScroll) scroller.removeEventListener("scroll", onScroll);
+    window.removeEventListener("resize", place);
+    if (window.visualViewport) window.visualViewport.removeEventListener("resize", place);
+    mount.removeAttribute("data-foot-docked");
+    mount.style.removeProperty("transform");
   }
 
   /** Scroll `pane` so that the row of `list` holding message `id` has its top at `top` again, where both are known. */
@@ -1138,6 +1195,7 @@ export function createReplySession(deps: ReplySessionDependencies): ReplySession
    */
   function undockReply(): void {
     if (!replyState.docked) return;
+    releaseFootDock();
     // Not open in the stream from here on, before the box moves: Chromium takes the focus off a box as it
     // leaves the column, and that is not the column going (`noteReplyFocusLeaving`).
     replyState.docked = false;

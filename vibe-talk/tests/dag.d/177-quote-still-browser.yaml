@@ -1,0 +1,20 @@
+steps:
+  # `#2063 vibe-talk-quote-reply-view-stability` in the browser engine: quote-replying
+  # a long message in a thread (two columns at 1280x800, one column at 412x915,
+  # windowed on and off, the post mid-column and low on screen) leaves the quoted
+  # post's top at 0 px in every animation frame through opening and Cancel, and
+  # low on screen the box stays visible docked at the column's foot.
+  - group: check
+    job: quote-still-browser
+    desc: quote-reply in a thread never moves the quoted post (0px every frame) and keeps the box visible at the foot, in current Chromium at 412x915 and 1280x800, windowed on and off
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/quote_still_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 600
+    cpu_timeout: 90
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 60
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824

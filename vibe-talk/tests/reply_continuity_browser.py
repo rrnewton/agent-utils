@@ -17,10 +17,10 @@ title bar will be, half under the list's top edge, low on the screen, and taller
 
   scroll the row there and measure it -> press its Reply -> still the main screen, the channel's own
   box hidden, the reply's box open on its tint directly under the row, as wide as the list; the row
-  not moved by a pixel, the row above it neither; low on the screen the list moves up only as far as
-  shows the whole box, and a row taller than the screen goes up as far as shows the box -> Cancel,
-  and nothing moves but the box, which goes: the row where it is, the list where it was before Reply
-  wherever Reply did not move it, the channel's box back.
+  not moved by a pixel, the row above it neither; low on the screen, and for a row taller than the
+  screen, the box is docked at the foot of the list instead of moving it (`#2063
+  vibe-talk-quote-reply-view-stability`) -> Cancel, and nothing moves but the box, which goes: the
+  row where it is, the list where it was before Reply, the channel's box back.
 
 Then, at 100%: Reply open while the phone is turned and turned back, or the desk window is made
 shorter, taller, narrower and as it was, and after each the box is still directly under its row ->
@@ -312,6 +312,7 @@ MEASURE_JS = """(id) => {
   const page = getComputedStyle(document.body).backgroundColor;
   return {
     open: !mount.hidden && mount.getClientRects().length > 0,
+    docked: mount.hasAttribute('data-foot-docked'),
     main: !document.getElementById('screen-main').hidden,
     composer: !document.getElementById('channel-composer').hidden,
     row: box(row), rowSize: size(row), rowWords: box(words(row)),
@@ -508,10 +509,15 @@ class Walk:
 
 
 def check_under(walk: Walk, measured: Measured, case: str) -> None:
-    """The reply's box is open directly under the row, as wide as the list's rows, the channel's box hidden."""
+    """The reply's box is open directly under the row, as wide as the list's rows, the channel's box hidden.
+    Docked at the foot instead (`#2063`), where under its row would sit below the foot."""
     row, mount = measured.box("row"), measured.box("mount")
-    gap = mount["top"] - row["bottom"]
-    walk.check(UNDER_PX[0] - 1 <= gap <= UNDER_PX[1] + 1, f"{case}: the box is {gap:.1f}px under its row, not directly under it")
+    if measured.found["docked"] is True:
+        walk.check(abs(mount["bottom"] - measured.number("foot")) <= 2,
+                   f"{case}: the docked box is not at the foot of the list: {mount} foot {measured.number('foot')}")
+    else:
+        gap = mount["top"] - row["bottom"]
+        walk.check(UNDER_PX[0] - 1 <= gap <= UNDER_PX[1] + 1, f"{case}: the box is {gap:.1f}px under its row, not directly under it")
     walk.check(measured.found["composer"] is False, f"{case}: the channel's box is drawn beside the reply's")
     walk.check(measured.text("tint") != measured.text("page") and measured.text("tint") not in ("", "rgba(0, 0, 0, 0)"),
                f"{case}: the reply's box is not tinted: {measured.text('tint')} on {measured.text('page')}")
@@ -549,18 +555,12 @@ def reply_case(walk: Walk, index: int, y: float, case: str, scale: int) -> None:
     log = after.box("log")
     walk.check(abs(mount["left"] - log["left"]) <= 1 and abs(mount["right"] - log["right"]) <= 1,
                f"{case}: the box is not as wide as the list its row is in: {mount} {log}")
-    if case == "low":
-        # Moved up only as far as shows the whole box over the chips at the foot.
-        walk.check(moved_row["top"] < row["top"], f"{case}: the list did not move up, so this asks nothing: {moved_row}")
-        walk.check(abs(mount["bottom"] - after.number("foot")) <= 2,
-                   f"{case}: the list did not move up just as far as shows the box: {mount} foot {after.number('foot')}")
-    elif abs(moved_row["top"] - row["top"]) <= 1:
-        walk.check(mount["bottom"] <= after.number("foot") + 1, f"{case}: the box is under the foot of the list: {mount}")
-    else:
-        # A row whose box would be under the foot (a tall one, open): up just as far as shows the box.
-        walk.check(moved_row["top"] < row["top"], f"{case}: the row moved down: {row} -> {moved_row}")
-        walk.check(abs(mount["bottom"] - after.number("foot")) <= 2,
-                   f"{case}: the row moved from {row['top']:.1f} to {moved_row['top']:.1f}, more than shows the box")
+    # `#2063 vibe-talk-quote-reply-view-stability`: the row never moves to show the box. Where
+    # the box drawn under it would sit below the foot (low on screen, a tall row), it stands
+    # docked at the foot instead, over the rows where they were.
+    walk.check(abs(moved_row["top"] - row["top"]) <= 1,
+               f"{case}: the row moved from {row['top']:.1f} to {moved_row['top']:.1f} to show the box")
+    walk.check(mount["bottom"] <= after.number("foot") + 1, f"{case}: the box is under the foot of the list: {mount}")
     if case == "middle":
         above, now_above = before.box("above"), after.box("above")
         walk.check(abs(now_above["top"] - above["top"]) <= 1, f"{case}: the row above moved from {above} to {now_above}")
@@ -575,8 +575,7 @@ def reply_case(walk: Walk, index: int, y: float, case: str, scale: int) -> None:
     back = walk.measure(index)
     walk.check(abs(back.box("row")["top"] - moved_row["top"]) <= 1,
                f"{case}: Cancel moved the row from {moved_row['top']:.1f} to {back.box('row')['top']:.1f}")
-    if case not in ("low", "tall"):
-        walk.check(abs(back.number("listTop") - list_top) <= 1, f"{case}: Cancel came back to {back.number('listTop')}, not {list_top}")
+    walk.check(abs(back.number("listTop") - list_top) <= 1, f"{case}: Cancel came back to {back.number('listTop')}, not {list_top}")
     walk.check(back.found["composer"] is True, f"{case}: Cancel did not bring the channel's box back")
     walk.notes.append(f"{scale}% {case}: the box {mount['top'] - moved_row['bottom']:.1f}px under the row, the row "
                       f"{row['top']:.1f} -> {moved_row['top']:.1f} ({moved:+.1f})")

@@ -185,6 +185,7 @@ MEASURE_JS = """([list, id]) => {
     const scroller = document.getElementById(list === 'discord-log' ? 'scroll-area' : 'side-scroll');
     return {
         main: !document.getElementById('screen-main').hidden,
+        docked: mount ? mount.hasAttribute('data-foot-docked') : false,
         columns: document.getElementById('screen-main').getAttribute('data-columns'),
         row: box(row), anchor: box(anchor), anchorId: anchor ? anchor.getAttribute('data-id') : null,
         after: box(after), afterId: after ? after.getAttribute('data-id') : null,
@@ -463,7 +464,10 @@ def two_columns(desk: Desk) -> None:
 
 
 def place(desk: Desk, list_id: str, message_id: str, fraction: float) -> Json:
-    """Scroll `list_id`'s row for `message_id` to `fraction` of its scroller's height; then measure."""
+    """Scroll `list_id`'s row for `message_id` to `fraction` of its scroller's height; then measure.
+    The reader arrives by the wheel (down and back by the same turn), as a reader does:
+    a bare script scroll leaves the page believing the reader still follows the foot,
+    and its foot keeper then takes the list there on the next resize (`#2063`)."""
     desk.page.evaluate("""([list, id, fraction]) => {
         const area = document.getElementById(list === 'discord-log' ? 'scroll-area' : 'side-scroll');
         const row = [...document.querySelectorAll(`#${list} > li[data-id]`)].find((li) => li.dataset.id === id);
@@ -471,6 +475,14 @@ def place(desk: Desk, list_id: str, message_id: str, fraction: float) -> Json:
         area.scrollTop += row.getBoundingClientRect().top - top;
     }""", [list_id, message_id, fraction])
     desk.settled()
+    area_box = desk.page.locator(
+        "#scroll-area" if list_id == "discord-log" else "#side-scroll").bounding_box()
+    if area_box is not None:
+        desk.page.mouse.move(area_box["x"] + area_box["width"] / 2, area_box["y"] + area_box["height"] / 2)
+        desk.page.mouse.wheel(0, -120)
+        desk.settled()
+        desk.page.mouse.wheel(0, 120)
+        desk.settled()
     return measure(desk, list_id, message_id)
 
 
@@ -495,11 +507,16 @@ def check_open(desk: Desk, found: Json, where: str, list_id: str, anchor_id: str
     desk.check(found["main"] is True, f"{where}: Reply left the main screen")
     desk.check(found["anchorId"] == anchor_id, f"{where}: the box is under {found['anchorId']}, not {anchor_id}")
     anchor, mount, log = rect(found, "anchor"), rect(found, "mount"), rect(found, "log")
-    gap = mount["top"] - anchor["bottom"]
-    desk.check(UNDER_PX[0] - 1 <= gap <= UNDER_PX[1] + 1, f"{where}: the box is {gap:.1f}px under its row, not directly under it")
+    if found["docked"] is True:
+        # `#2063`: under its row would sit below the foot, so it stands docked at the foot.
+        desk.check(abs(mount["bottom"] - number(found, "foot")) <= 2,
+                   f"{where}: the docked box is not at the foot of the list: {mount} foot {number(found, 'foot'):.1f}")
+    else:
+        gap = mount["top"] - anchor["bottom"]
+        desk.check(UNDER_PX[0] - 1 <= gap <= UNDER_PX[1] + 1, f"{where}: the box is {gap:.1f}px under its row, not directly under it")
     desk.check(abs(mount["left"] - log["left"]) <= 1 and abs(mount["right"] - log["right"]) <= 1,
                f"{where}: the box is not as wide as the list: {mount} {log}")
-    if found["after"] is not None:
+    if found["after"] is not None and found["docked"] is not True:
         after = rect(found, "after")
         desk.check(after["top"] >= mount["bottom"] - 0.5,
                    f"{where}: the row after it ({found['afterId']}) is at {after['top']:.1f}, under the box ending at {mount['bottom']:.1f}")
@@ -509,9 +526,14 @@ def check_open(desk: Desk, found: Json, where: str, list_id: str, anchor_id: str
 
 
 def check_held(desk: Desk, before: Json, found: Json, where: str) -> None:
-    """The row answered not moved, or moved up just as far as shows the whole box under it."""
+    """The row answered not moved, or moved up just as far as shows the whole box under it.
+    Still, its box is visible in the list (`#2063 vibe-talk-quote-reply-view-stability`):
+    where under its row would sit below the foot it stands docked at the foot instead."""
     was, now = rect(before, "row")["top"], rect(found, "row")["top"]
     if abs(now - was) <= 1:
+        desk.check(rect(found, "mount")["bottom"] <= number(found, "foot") + 2,
+                   f"{where}: the box is under the foot of the list: "
+                   f"{rect(found, 'mount')} foot {number(found, 'foot'):.1f}")
         return
     desk.check(now < was, f"{where}: the row moved down, from {was:.1f} to {now:.1f}")
     desk.check(abs(rect(found, "mount")["bottom"] - number(found, "foot")) <= 2,
