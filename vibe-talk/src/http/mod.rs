@@ -286,6 +286,13 @@ fn routes(state: AppState) -> Router {
             post(api::scroll_trace)
                 .layer(DefaultBodyLimit::max(crate::scroll_trace::MAX_BODY_BYTES)),
         )
+        // `#2066 vibe-talk-page-freeze`. The page's stalls — long tasks, heartbeat freezes,
+        // hides and shows — one header line with the day's totals and one line per event.
+        // WRITE scope, like the voice records.
+        .route(
+            "/api/v1/freeze-report",
+            post(api::page_freeze).layer(DefaultBodyLimit::max(crate::page_freeze::MAX_BODY_BYTES)),
+        )
         // `#511 voice-explicit-send-only`. What the page heard the user say, as each turn grows, so
         // the voice agent's ask to send can be checked against the user's own words. WRITE scope;
         // held in memory for minutes, never logged or stored.

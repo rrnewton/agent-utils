@@ -394,6 +394,8 @@ fn state_pieces_with(
         voice_health_budget: Arc::new(crate::voice_health::LogBudget::new()),
         voice_end_budget: Arc::new(crate::voice_health::LogBudget::new()),
         scroll_trace_budget: Arc::new(crate::voice_health::LogBudget::new()),
+        page_freeze_budget: Arc::new(crate::voice_health::LogBudget::new()),
+        page_freeze_days: Arc::new(crate::page_freeze::DayCounts::new()),
         pairing: Arc::new(crate::pairing::Pairing::new()),
         documents,
         headings: Arc::new(crate::heading::HeadingTags::new()),

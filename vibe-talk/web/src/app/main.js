@@ -77,7 +77,7 @@ import {childByClass,
   setHiddenIfChanged,
   setTextIfChanged,
   shownNode,} from "../view/dom/index.ts";
-import {SCREEN_TITLES, WELCOME_DISMISSED_KEY, createActionMenu, createChannelDirectoryView, createDeploymentWords, createChannelSelection, createChipsOverComposer, createControlBar, createPromptsTray, createReaderRow, createReplySight, createPageNavigation, createScreens, createScreenShowing, createShellNotices, createPageVisibility, createUndoOffer, createUndoStamps, createWelcome, modHeld, mountDocumentListeners, mountKeyListeners, mountMenuOpeners, mountPageListeners, pageStep, swallow} from "../view/shell/index.ts";
+import {SCREEN_TITLES, WELCOME_DISMISSED_KEY, createActionMenu, createChannelDirectoryView, createDeploymentWords, createChannelSelection, createChipsOverComposer, createControlBar, createFreezeWatch, createPromptsTray, createReaderRow, createReplySight, createPageNavigation, createScreens, createScreenShowing, createShellNotices, createPageVisibility, createUndoOffer, createUndoStamps, createWelcome, modHeld, mountDocumentListeners, mountKeyListeners, mountMenuOpeners, mountPageListeners, pageStep, swallow} from "../view/shell/index.ts";
 import {KEYBOARD_SEND_PARTS,
   NEWLINE_KEYS,
   createComposerBoxes,
@@ -9526,6 +9526,86 @@ el("scroll-trace-send").addEventListener("click", () => {
 });
 // As stored, so a reload with the trace on loses none of the minute it is on for.
 applyScrollTrace(storedScrollTrace());
+
+// --- the page stopped answering, kept for the log -------------------------------------------------------------------
+//
+// `#2066 vibe-talk-page-freeze`. The page locks up on the phone — swipes and presses do nothing for a
+// while, then it answers again, laggy at first — while the server stays healthy. The freeze watch
+// (web/src/view/shell/freezewatch.ts) is always on and draws nothing: a heartbeat whose in-sight
+// lateness is a freeze, long tasks and long animation frames where the browser offers them, and
+// every hide and show with the backlog measured at the show. What it keeps rides to the server's log
+// (`POST /api/v1/freeze-report`) on a freeze's recovery, on a show, and on the next load. A press
+// waiting on speech preparing reads as `pending` here, told apart from a busy main thread; presses
+// during a pending prepare coalesce latest-only through the reader's ticket (`#2058`), so a show
+// never fires a queue of them — the watch counts acts heard while hidden, not a press backlog.
+
+/** What read-aloud is doing, in the freeze watch's words. */
+function freezeReadingWord() {
+  const owner = readAloudOwner();
+  if (owner.pendingRead !== null || owner.readState === "working") return "pending";
+  if (owner.nowPlaying) return owner.nowPlaying.paused === true ? "paused" : "playing";
+  return "idle";
+}
+
+const freezeWatch = createFreezeWatch({
+  now: () => performance.now(),
+  clock: browserPorts().clock,
+  // The heartbeat, as the transcripts view's `every` is given: a shell with no interval
+  // timer gets no watch at all (`freezewatch.ts` says why).
+  every: typeof setInterval === "function" && typeof clearInterval === "function"
+    ? (ms, run) => {
+      const timer = setInterval(run, ms);
+      return () => clearInterval(timer);
+    }
+    : undefined,
+  storage: deviceStorageOnUse(),
+  documentTarget: () => document,
+  hidden: () => document.hidden,
+  requestFrame: typeof requestAnimationFrame === "function"
+    ? (run) => { requestAnimationFrame(() => run()); }
+    : undefined,
+  observe: (type, note) => {
+    const Observer = /** @type {any} */ (globalThis).PerformanceObserver;
+    if (typeof Observer !== "function") return null;
+    try {
+      const observer = new Observer((/** @type {any} */ list) => note(list.getEntries()));
+      observer.observe({ type, buffered: true });
+      return () => observer.disconnect();
+    } catch (_error) {
+      return null;
+    }
+  },
+  state: () => {
+    try {
+      return {
+        view: screens.view(),
+        screen: screens.screen(),
+        channelView: selection().view || "",
+        twoColumns: sideColumnUp(),
+        reading: freezeReadingWord(),
+        windowed: windowedConfig(deviceSettings(), document.documentElement.clientWidth < 900).windowed,
+      };
+    } catch (_error) {
+      // Watching never breaks the page it watches: an unreadable state says so as "other".
+      return { view: "", screen: "", channelView: "", twoColumns: false, reading: "", windowed: false };
+    }
+  },
+  replaysWaiting: () => replayLedger.waiting(),
+  send: async (text) => {
+    try {
+      await api("/api/v1/freeze-report", { method: "POST", body: JSON.parse(text) });
+      return true;
+    } catch (_error) {
+      return false;
+    }
+  },
+  // Never a request to make offline, in the background, or to be refused: the route is
+  // WRITE scope, as the draft sync's gate reads the same facts (`#2066`; the offline
+  // walks count a refused request against the page).
+  canPost: () => serverFacts.configApplied() && serverFacts.tokenScope() === "write"
+    && !document.hidden && navigator.onLine !== false,
+});
+freezeWatch.start();
 
 // Drawing the readout and its switch, and keeping it redrawn while it is drawn, are the keyboard owner's
 // (`showKeyboardDebug`, `renderKeyboardDebug`, above).

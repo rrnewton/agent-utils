@@ -87,6 +87,7 @@ pub mod noise;
 pub mod ops;
 pub mod own_read;
 pub mod owner;
+pub mod page_freeze;
 pub mod pair_link;
 pub mod pairing;
 pub mod post_gate;

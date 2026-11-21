@@ -220,6 +220,13 @@ fn inventory() -> Vec<Route> {
             Write,
             Bytes("{}", vibe_talk::scroll_trace::MAX_BODY_BYTES),
         ),
+        // `#2066 vibe-talk-page-freeze`.
+        route(
+            "POST",
+            "/api/v1/freeze-report",
+            Write,
+            Bytes("{}", vibe_talk::page_freeze::MAX_BODY_BYTES),
+        ),
         // `#511 voice-explicit-send-only`.
         route(
             "POST",

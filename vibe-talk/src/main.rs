@@ -899,6 +899,8 @@ async fn main() -> anyhow::Result<()> {
         voice_health_budget: Arc::new(vibe_talk::voice_health::LogBudget::new()),
         voice_end_budget: Arc::new(vibe_talk::voice_health::LogBudget::new()),
         scroll_trace_budget: Arc::new(vibe_talk::voice_health::LogBudget::new()),
+        page_freeze_budget: Arc::new(vibe_talk::voice_health::LogBudget::new()),
+        page_freeze_days: Arc::new(vibe_talk::page_freeze::DayCounts::new()),
         pairing: Arc::new(vibe_talk::pairing::Pairing::new()),
         documents,
         headings: Arc::new(vibe_talk::heading::HeadingTags::new()),

@@ -2142,6 +2142,56 @@ pub async fn scroll_trace(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+/// `POST /api/v1/freeze-report` — the page's record of its own stalls: long tasks, heartbeat
+/// freezes, and hides/shows with the backlog at the show. `#2066 vibe-talk-page-freeze`.
+///
+/// Closed like the voice records (see [`crate::page_freeze::FreezeReport`]), logged and not
+/// stored: one `page_freeze_report` line carrying the day's running totals, then one
+/// `page_freeze` line per event. Bounded by its own [`crate::voice_health::LogBudget`],
+/// spent once per report however many lines its events make, so a freeze flood cannot
+/// silence the voice records. The day totals count only reports the budget let through:
+/// what was throttled away is not in the log and must not be in its totals either.
+/// WRITE scope, like the voice records.
+pub async fn page_freeze(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    body: axum::body::Bytes,
+) -> Result<Response, ApiError> {
+    let report: crate::page_freeze::FreezeReport = serde_json::from_slice(&body).map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_page_freeze",
+            "expected a page freeze report with only the documented fields and values",
+        )
+    })?;
+    report
+        .validate()
+        .map_err(|detail| ApiError::new(StatusCode::BAD_REQUEST, "invalid_page_freeze", detail))?;
+    let spend = state.page_freeze_budget.spend();
+    if spend == crate::voice_health::Spend::FirstRefusal {
+        tracing::warn!(
+            "page_freeze_throttled max_lines={} window_s={}",
+            crate::voice_health::MAX_LINES_PER_WINDOW,
+            crate::voice_health::BUDGET_WINDOW.as_secs()
+        );
+    }
+    if !spend.allowed() {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "page_freeze_throttled",
+            "too many page freeze reports this minute; this one was not logged",
+        ));
+    }
+    let today = crate::clock::iso_from_ms(crate::store::now_ms());
+    let day = today.get(..10).unwrap_or("");
+    let totals = state.page_freeze_days.note(day, &report);
+    tracing::warn!("page_freeze_report {}", report.header_fields(day, &totals));
+    for (at, event) in report.events.iter().enumerate() {
+        tracing::warn!("page_freeze {}", event.log_fields(at));
+    }
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
 /// `POST /api/v1/channels/{channel_id}/messages/{message_id}/speak`
 ///
 /// Read a message aloud, and hand back the AUDIO rather than a URL to it.

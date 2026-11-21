@@ -5275,6 +5275,16 @@ const TUNING_BANDS = {
   STACK_CHARS: [128, 4096, "chars of one write's stack kept in one trace entry"],
   SCROLL_TRACE_AUTO_SEND_MS: [10000, 300000, "the least while between the trace posting itself"],
   SCROLL_TRACE_INPUT_QUIET_MS: [100, 2000, "how long after the reader's last input a move is still theirs"],
+  // `#2066 vibe-talk-page-freeze`. The freeze watch's heartbeat, thresholds and ring: the
+  // heartbeat must be cheap enough to leave the thread it watches alone and fine enough to
+  // date a freeze; the gap must clear ordinary jank (a slow frame is not a lockup) yet catch
+  // what a finger feels; the ring matches the server's per-report cap exactly.
+  FREEZE_HEARTBEAT_MS: [50, 2000, "how often the freeze watch's heartbeat timer is due, in ms"],
+  FREEZE_GAP_MS: [250, 10000, "an in-sight heartbeat silence at or over this is a freeze, in ms"],
+  FREEZE_LONG_TASK_MS: [50, 2000, "a long task or long frame at or over this is kept, in ms"],
+  FREEZE_MAX_EVENTS: [40, 40, "events in the freeze ring and one report: the server's exact cap"],
+  SCRIPT_CHARS: [256, 256, "chars of one long frame's invoker kept: the server's exact cap"],
+  FLUSH_QUIET_MS: [1000, 60000, "the least while between the freeze watch's unforced postings"],
   // `#1224 mention-jump-in-view`. How often a landed row is checked while it can still be lost:
   // under four a second checks chase every resize of a page still settling; far slower than
   // frames a reader sees misses the loss until whatever pushed it has itself gone.

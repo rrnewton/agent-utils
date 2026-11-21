@@ -592,6 +592,103 @@ async fn a_voice_health_record_is_one_line_of_names_and_numbers_and_a_refused_on
     assert!(recoveries[0].contains("INFO") && recoveries[0].contains("cause=recovered"));
 }
 
+/// `#2066 vibe-talk-page-freeze`. A page freeze report is a header line with the day's
+/// running totals and one line per event, enums and numbers only; a refused report — a
+/// smuggled id or the words on screen — is no line at all and does not move the totals.
+#[tokio::test]
+async fn a_page_freeze_report_is_counted_by_day_and_a_refused_one_is_none() {
+    let capture = LogCapture::info_only();
+    let harness = harness();
+    let report = json!({
+        "v": 1,
+        "startedAt": 10000.0,
+        "events": [{
+            "t": 12345.5, "kind": "freeze", "dur_ms": 4200,
+            "view": "discord", "screen": "main", "channel_view": "thread",
+            "layout": "two_column", "reading": "pending", "windowed": true,
+            "visibility": "visible", "action": "pointer", "action_age_ms": 300
+        }],
+    });
+    let mut smuggled = report.clone();
+    smuggled["events"][0]["channel_id"] = json!("the words on screen");
+    assert_eq!(
+        call(
+            &harness,
+            "POST",
+            "/api/v1/freeze-report",
+            Some(WRITE_TOKEN),
+            Some(smuggled)
+        )
+        .await,
+        StatusCode::BAD_REQUEST
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            call(
+                &harness,
+                "POST",
+                "/api/v1/freeze-report",
+                Some(WRITE_TOKEN),
+                Some(report.clone())
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+    }
+    let text = capture.text();
+    assert!(
+        !text.contains("words on screen"),
+        "refused free text reached the log: {text}"
+    );
+    let headers: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("page_freeze_report "))
+        .collect();
+    assert_eq!(headers.len(), 2, "{headers:?}");
+    let totals = |line: &str| -> (String, u64, u64) {
+        let fields = line.split("page_freeze_report ").nth(1).expect("fields");
+        let value = |name: &str| {
+            fields
+                .split_whitespace()
+                .find_map(|pair| pair.strip_prefix(name))
+                .unwrap_or_else(|| panic!("no {name} in {fields}"))
+                .to_owned()
+        };
+        (
+            value("day="),
+            value("day_reports=").parse().expect("a count"),
+            value("day_freezes=").parse().expect("a count"),
+        )
+    };
+    let (day_one, reports_one, freezes_one) = totals(headers[0]);
+    let (day_two, reports_two, freezes_two) = totals(headers[1]);
+    // Two reports on one day count up together; across a UTC midnight the second day
+    // starts over. Either way the refused report counted for nothing.
+    if day_one == day_two {
+        assert_eq!((reports_one, freezes_one), (1, 1));
+        assert_eq!((reports_two, freezes_two), (2, 2));
+    } else {
+        assert_eq!((reports_two, freezes_two), (1, 1));
+    }
+    let events: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("page_freeze i="))
+        .collect();
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert!(events[0].contains("WARN"), "{}", events[0]);
+    let fields = events[0]
+        .split("page_freeze ")
+        .nth(1)
+        .expect("fields follow the name");
+    assert_eq!(
+        fields,
+        "i=0 t=12345.5 kind=freeze dur_ms=4200 view=discord screen=main \
+         channel_view=thread layout=two_column reading=pending windowed=true \
+         visibility=visible action=pointer action_age_ms=300 resume_age_ms=- \
+         replays_waiting=- inputs_hidden=- timer_delay_ms=- raf_delay_ms=- script=\"\""
+    );
+}
+
 /// `#268 voice-call-drops`. How a call ended is one line of names and numbers: a hang-up at info,
 /// anything that ended the call for the reader at warn, and a refused record is no line at all.
 #[tokio::test]

@@ -79,6 +79,8 @@ export { READER_NAME, READER_WORDS, createReaderRow } from "./readerrow.ts";
 export type { ReaderRow, ReaderRowDependencies } from "./readerrow.ts";
 export { createPageVisibility } from "./visibility.ts";
 export type { PageVisibility, PageVisibilityDependencies } from "./visibility.ts";
+export { FREEZE_GAP_MS, FREEZE_HEARTBEAT_MS, FREEZE_LONG_TASK_MS, FREEZE_MAX_EVENTS, FREEZE_STORAGE_KEY, createFreezeWatch } from "./freezewatch.ts";
+export type { FreezeWatch, FreezeWatchDependencies, FreezeWatchState } from "./freezewatch.ts";
 export { createChannelSelection } from "./channelselection.ts";
 export type { ChannelSelection, ChannelSelectionDependencies, NavigationLike } from "./channelselection.ts";
 export { createDeploymentWords } from "./deployment.ts";

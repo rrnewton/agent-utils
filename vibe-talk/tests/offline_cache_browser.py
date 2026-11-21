@@ -337,8 +337,13 @@ class FakeApi:
             return [r for r in self.requests if "/timeline?" in r or "/page" in r]
 
     def post(self, path: str, body: Json) -> tuple[int, Json]:
-        """A POST to `path` with its JSON body, as status and answer. None is served here; a walk that
-        writes (`tests/inline_reply_browser.py`, its replies and Done) answers its own."""
+        """A POST to `path` with its JSON body, as status and answer. Almost none is served here; a
+        walk that writes (`tests/inline_reply_browser.py`, its replies and Done) answers its own.
+        The freeze watch's report (`#2066`) is taken and forgotten: under load the page really
+        does post one (a detected long task), and refusing it would count the page refused for
+        keeping its own telemetry."""
+        if path == "/api/v1/freeze-report":
+            return 200, {}
         return 404, {"error": "not_found", "detail": "not served by this check"}
 
     def summary(self, message_id: str) -> tuple[int, Json]:

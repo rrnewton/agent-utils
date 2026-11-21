@@ -179,6 +179,12 @@ pub struct AppState {
     /// The same cap for `POST /api/v1/scroll-trace`, one spend per report however many lines its
     /// entries make. `#1144 scrollback-typing-jump`; see [`crate::scroll_trace`].
     pub scroll_trace_budget: Arc<crate::voice_health::LogBudget>,
+    /// The same cap for `POST /api/v1/freeze-report`, one spend per report however many lines its
+    /// events make. `#2066 vibe-talk-page-freeze`; see [`crate::page_freeze`].
+    pub page_freeze_budget: Arc<crate::voice_health::LogBudget>,
+    /// Per-day freeze totals for the `page_freeze` header lines. `#2066
+    /// vibe-talk-page-freeze`; see [`crate::page_freeze::DayCounts`]. In memory.
+    pub page_freeze_days: Arc<crate::page_freeze::DayCounts>,
     /// The paren tags each author has started messages with, per channel: what confirms a
     /// `(tag)` heading. `#242 rich-headers`; see [`crate::heading::HeadingTags`]. In memory and
     /// bounded, shared by every read and the live stream.
