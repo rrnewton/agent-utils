@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""Compare one served wrkslots reader result with its Rust shadow.
+
+Used by common/bin/wrkslots-soak in shadow mode (#562 rust-primary-wrkslots):
+the served edition stays Python while a sampled reader also runs in Rust, and
+this helper records whether the two agreed. It never fails the served call:
+every outcome, including its own errors, is one JSONL line and exit 0.
+
+Modes:
+    wrkslots-shadow fingerprint [--project-root DIR]
+        Print an O(1)-ish registry fingerprint (ACTIVE and EVENT-INDEX file
+        digests plus EVENTS tip names), or "none" when no registry is found.
+        Two runs are comparable only when their fingerprints agree.
+    wrkslots-shadow compare --cmd CMD --argv-sha HEX --py-rc N --rs-rc N
+        --py-out F --rs-out F --py-err F --rs-err F
+        --fp-before H --fp-after H --py-ms N --rs-ms N --log F
+        Append one divergence-log line: agree, diverge (first field), or
+        skipped with a reason. A skip is never an agreement.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
+DROP_KEYS = frozenset({"heartbeat_age_seconds", "held_at", "recorded_at"})
+RS_REFUSAL_MARKERS = ("stays with the Python edition", "fixture-only")
+
+
+def _config_value(text: str, key: str) -> str | None:
+    for line in text.splitlines():
+        stripped = line.strip().lstrip('"').lstrip("'")
+        if stripped.startswith(f"{key}:") or stripped.startswith(f"{key} :"):
+            value = stripped.split(":", 1)[1].strip().strip(",}")
+            return value.strip('"').strip("'") or None
+    return None
+
+
+def find_project_root(explicit: str | None) -> Path | None:
+    if explicit:
+        candidate = Path(explicit)
+        return candidate if candidate.is_dir() else None
+    current = Path.cwd().resolve()
+    for candidate in (current, *current.parents):
+        if (candidate / ".wrkslots.yml").exists():
+            return candidate
+    return None
+
+
+def control_dir(root: Path) -> Path | None:
+    config = root / ".wrkslots.yml"
+    try:
+        text = config.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    worktrees = _config_value(text, "worktrees_dir") or "worktrees"
+    layout = _config_value(text, "layout") or "nested"
+    if Path(worktrees).is_absolute() or ".." in Path(worktrees).parts:
+        return None
+    control = root / worktrees
+    if layout == "flat":
+        control = control.parent
+    return control if control.is_dir() else None
+
+
+def fingerprint(project_root: str | None) -> str:
+    root = find_project_root(project_root)
+    if root is None:
+        return "none"
+    control = control_dir(root)
+    if control is None:
+        return "none"
+    digest = hashlib.sha256()
+    names = sorted(control.glob("ACTIVE.*.json")) + sorted(
+        control.glob("EVENT-INDEX.*.json")
+    )
+    for path in names:
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return "none"
+        digest.update(path.name.encode())
+        digest.update(hashlib.sha256(data).hexdigest().encode())
+    for events in sorted(control.glob("EVENTS.*")):
+        if not events.is_dir():
+            continue
+        try:
+            entries = sorted(entry.name for entry in events.iterdir())
+        except OSError:
+            return "none"
+        digest.update(events.name.encode())
+        digest.update((entries[-1] if entries else "").encode())
+    return digest.hexdigest()
+
+
+def scrub(value: Any) -> Any:
+    """Drop volatile leaves the fixture differentials also drop (ages, stamps)."""
+    if isinstance(value, dict):
+        return {
+            key: scrub(item)
+            for key, item in value.items()
+            if key not in DROP_KEYS and not key.endswith("_age_seconds")
+        }
+    if isinstance(value, list):
+        return [scrub(item) for item in value]
+    return value
+
+
+def first_divergence(py: Any, rs: Any, path: str = "") -> tuple[str, Any, Any] | None:
+    if type(py) is not type(rs) and not (
+        isinstance(py, (int, float)) and isinstance(rs, (int, float))
+    ):
+        return (path or "<root>", py, rs)
+    if isinstance(py, dict):
+        for key in sorted(set(py) | set(rs)):
+            child = f"{path}.{key}" if path else key
+            if key not in py or key not in rs:
+                return (child, py.get(key, "<absent>"), rs.get(key, "<absent>"))
+            found = first_divergence(py[key], rs[key], child)
+            if found:
+                return found
+        return None
+    if isinstance(py, list):
+        if len(py) != len(rs):
+            return (path or "<root>", f"<{len(py)} items>", f"<{len(rs)} items>")
+        for index, (left, right) in enumerate(zip(py, rs, strict=True)):
+            found = first_divergence(left, right, f"{path}[{index}]")
+            if found:
+                return found
+        return None
+    if py != rs:
+        return (path or "<root>", py, rs)
+    return None
+
+
+_AGE_TEXT = re.compile(r"\b\d+(?:\.\d+)?s ago\b|heartbeat_age_seconds[=: ]+[0-9.]+")
+
+
+def _short(value: Any) -> str:
+    text = value if isinstance(value, str) else json.dumps(value, sort_keys=True)
+    return text[:200]
+
+
+def compare(
+    *,
+    py_rc: int,
+    rs_rc: int,
+    py_out: str,
+    rs_out: str,
+    rs_err: str,
+    fp_before: str,
+    fp_after: str,
+) -> dict[str, Any]:
+    if rs_rc == 124:
+        return {"result": "skipped", "reason": "timeout"}
+    if fp_before == "none" or fp_after == "none":
+        return {"result": "skipped", "reason": "no-fingerprint"}
+    if fp_before != fp_after:
+        return {"result": "skipped", "reason": "registry-changed"}
+    if any(marker in rs_err for marker in RS_REFUSAL_MARKERS):
+        return {"result": "diverge", "reason": "rs-refused", "field": "<refusal>"}
+    if py_rc != rs_rc:
+        return {
+            "result": "diverge",
+            "reason": "rc",
+            "field": "<rc>",
+            "py": str(py_rc),
+            "rs": str(rs_rc),
+        }
+    try:
+        py_json = json.loads(py_out)
+        rs_json = json.loads(rs_out)
+    except (json.JSONDecodeError, ValueError):
+        py_text = _AGE_TEXT.sub("<age>", py_out)
+        rs_text = _AGE_TEXT.sub("<age>", rs_out)
+        if py_text == rs_text:
+            return {"result": "agree"}
+        return {
+            "result": "diverge",
+            "reason": "text",
+            "field": "<text>",
+            "py": _short(py_text),
+            "rs": _short(rs_text),
+        }
+    found = first_divergence(scrub(py_json), scrub(rs_json))
+    if found is None:
+        return {"result": "agree"}
+    field, left, right = found
+    return {
+        "result": "diverge",
+        "reason": "field",
+        "field": field,
+        "py": _short(left),
+        "rs": _short(right),
+    }
+
+
+def _read(path: str) -> str:
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _now_iso() -> str:
+    from datetime import datetime
+
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="mode", required=True)
+    fp_parser = sub.add_parser("fingerprint")
+    fp_parser.add_argument("--project-root", default=None)
+    cmp_parser = sub.add_parser("compare")
+    cmp_parser.add_argument("--cmd", required=True)
+    cmp_parser.add_argument("--argv-sha", required=True)
+    cmp_parser.add_argument("--py-rc", required=True, type=int)
+    cmp_parser.add_argument("--rs-rc", required=True, type=int)
+    cmp_parser.add_argument("--py-out", required=True)
+    cmp_parser.add_argument("--rs-out", required=True)
+    cmp_parser.add_argument("--py-err", required=True)
+    cmp_parser.add_argument("--rs-err", required=True)
+    cmp_parser.add_argument("--fp-before", required=True)
+    cmp_parser.add_argument("--fp-after", required=True)
+    cmp_parser.add_argument("--py-ms", required=True, type=int)
+    cmp_parser.add_argument("--rs-ms", required=True, type=int)
+    cmp_parser.add_argument("--log", required=True)
+    args = parser.parse_args(argv)
+
+    if args.mode == "fingerprint":
+        print(fingerprint(args.project_root))
+        return 0
+
+    record: dict[str, Any] = {
+        "ts": _now_iso(),
+        "cmd": args.cmd,
+        "argv_sha256": args.argv_sha,
+        "served": "python",
+        "py_rc": args.py_rc,
+        "rs_rc": args.rs_rc,
+        "py_ms": args.py_ms,
+        "rs_ms": args.rs_ms,
+    }
+    try:
+        record.update(
+            compare(
+                py_rc=args.py_rc,
+                rs_rc=args.rs_rc,
+                py_out=_read(args.py_out),
+                rs_out=_read(args.rs_out),
+                rs_err=_read(args.rs_err),
+                fp_before=args.fp_before,
+                fp_after=args.fp_after,
+            )
+        )
+    except Exception as error:  # the helper must never fail the served call
+        record.update(
+            {"result": "skipped", "reason": f"compare-error: {type(error).__name__}"}
+        )
+    try:
+        log = Path(os.path.expanduser(args.log))
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+    except OSError:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -228,6 +228,75 @@ if [[ -n "$MACHINE" && "$CMD" != "quickstart" ]]; then
     fi
 fi
 
+# Shadow mode (readers only): serve Python, run the same reader in Rust, and
+# record agreement in the divergence log (common/bin/wrkslots-shadow). This is
+# the production evidence a per-command flip rests on; writers never shadow
+# (double-apply on a live registry). WRKSLOTS_SHADOW=sampled compares a
+# deterministic 1-in-WRKSLOTS_SHADOW_N (default 20) of invocations by argv
+# hash; =all compares every covered reader; =off (default) is inert.
+# unpushed is excluded: it fetches, so a pair is order-sensitive.
+SHADOW=""
+case "${WRKSLOTS_SHADOW:-off}" in
+    sampled|all)
+        if [[ "${WRKSLOTS_SOAK_READERS_ONLY:-}" == "1" && "$CMD" != "unpushed" ]]; then
+            SHADOW="${WRKSLOTS_SHADOW}"
+        fi
+        ;;
+    off|"") ;;
+    *) echo "[wrkslots] WRKSLOTS_SHADOW='${WRKSLOTS_SHADOW}' is invalid (sampled, all, or off); shadow off" >&2 ;;
+esac
+ARGV_SHA=""
+if [[ -n "$SHADOW" ]]; then
+    ARGV_SHA="$(printf '%s\0' "$CMD" "${ORIGINAL[@]}" | sha256sum | cut -d' ' -f1)"
+    if [[ "$SHADOW" == "sampled" ]]; then
+        SHADOW_N="${WRKSLOTS_SHADOW_N:-20}"
+        [[ "$SHADOW_N" =~ ^[0-9]+$ && "$SHADOW_N" -gt 0 ]] || SHADOW_N=20
+        (( 16#${ARGV_SHA:0:8} % SHADOW_N == 0 )) || SHADOW=""
+    fi
+fi
+if [[ -n "$SHADOW" ]]; then
+    SHADOW_DIR="$(mktemp -d 2>/dev/null)" || SHADOW_DIR=""
+    SHADOW_HELPER="$ROOT/common/bin/wrkslots-shadow"
+    if [[ -n "$SHADOW_DIR" && -f "$SHADOW_HELPER" ]]; then
+        SHADOW_PY="${CI_HUB_PYTHON:-python3}"
+        DIVERGENCE_LOG="${WRKSLOTS_DIVERGENCE_LOG:-$HOME/.local/state/wrkslots-soak/divergence.jsonl}"
+        FP_ARGS=()
+        [[ -n "$PROJECT_ROOT" ]] && FP_ARGS+=(--project-root "$PROJECT_ROOT")
+        FP_BEFORE="$("$SHADOW_PY" "$SHADOW_HELPER" fingerprint "${FP_ARGS[@]}" 2>/dev/null)" || FP_BEFORE="none"
+        echo "[wrkslots] $CMD: python (shadow-sampled; Rust compared, not served)" >&2
+        START=$SECONDS
+        "$SHADOW_PY" "$ROOT/py/bin/wrkslots" "${ORIGINAL[@]}" >"$SHADOW_DIR/py.out" 2>"$SHADOW_DIR/py.err"
+        PY_RC=$?
+        PY_MS=$(( (SECONDS - START) * 1000 ))
+        cat "$SHADOW_DIR/py.out"
+        cat "$SHADOW_DIR/py.err" >&2
+        if [[ -n "$WAIT_LOCK" ]]; then
+            export WRKSLOTS_WAIT_LOCK="$WAIT_LOCK"
+        fi
+        START=$SECONDS
+        if command -v timeout >/dev/null 2>&1; then
+            timeout "${WRKSLOTS_SHADOW_TIMEOUT_S:-30}" "$ROOT/rs/bin/wrkslotsd" "$RUST_CMD" "${REST[@]}" >"$SHADOW_DIR/rs.out" 2>"$SHADOW_DIR/rs.err"
+        else
+            "$ROOT/rs/bin/wrkslotsd" "$RUST_CMD" "${REST[@]}" >"$SHADOW_DIR/rs.out" 2>"$SHADOW_DIR/rs.err"
+        fi
+        RS_RC=$?
+        RS_MS=$(( (SECONDS - START) * 1000 ))
+        FP_AFTER="$("$SHADOW_PY" "$SHADOW_HELPER" fingerprint "${FP_ARGS[@]}" 2>/dev/null)" || FP_AFTER="none"
+        "$SHADOW_PY" "$SHADOW_HELPER" compare \
+            --cmd "$CMD" --argv-sha "$ARGV_SHA" \
+            --py-rc "$PY_RC" --rs-rc "$RS_RC" \
+            --py-out "$SHADOW_DIR/py.out" --rs-out "$SHADOW_DIR/rs.out" \
+            --py-err "$SHADOW_DIR/py.err" --rs-err "$SHADOW_DIR/rs.err" \
+            --fp-before "$FP_BEFORE" --fp-after "$FP_AFTER" \
+            --py-ms "$PY_MS" --rs-ms "$RS_MS" \
+            --log "$DIVERGENCE_LOG" >/dev/null 2>&1 || true
+        log_invocation "$CMD" python "$PY_RC" "$((PY_MS / 1000))"
+        rm -rf "$SHADOW_DIR"
+        exit "$PY_RC"
+    fi
+    echo "[wrkslots] $CMD: shadow requested but unavailable (no temp dir or helper); running Rust" >&2
+fi
+
 echo "[wrkslots] $CMD: rust (soak)" >&2
 if [[ -n "$WAIT_LOCK" ]]; then
     export WRKSLOTS_WAIT_LOCK="$WAIT_LOCK"

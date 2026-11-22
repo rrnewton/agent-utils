@@ -19,6 +19,7 @@ from pathlib import Path
 AU_ROOT = Path(__file__).resolve().parents[2]
 RESOLVER = AU_ROOT / "common" / "bin" / "engine-resolver"
 SOAK = AU_ROOT / "common" / "bin" / "wrkslots-soak"
+SHADOW = AU_ROOT / "common" / "bin" / "wrkslots-shadow"
 
 STUB_RUST = """#!/bin/sh
 if [ "$AGENT_UTILS_RS_PROBE_ONLY" = "1" ]; then
@@ -107,8 +108,10 @@ def _sandbox(tmp_path: Path) -> tuple[Path, Path]:
         directory.mkdir(parents=True)
     shutil.copy2(RESOLVER, root / "common" / "bin" / "engine-resolver")
     shutil.copy2(SOAK, root / "common" / "bin" / "wrkslots-soak")
+    shutil.copy2(SHADOW, root / "common" / "bin" / "wrkslots-shadow")
     _chmod_x(root / "common" / "bin" / "engine-resolver")
     _chmod_x(root / "common" / "bin" / "wrkslots-soak")
+    _chmod_x(root / "common" / "bin" / "wrkslots-shadow")
     (root / "common" / "bin" / "wrkslots").symlink_to("engine-resolver")
     python_stub = root / "py" / "bin" / "wrkslots"
     python_stub.write_text("import sys\nprint('PY wrkslots ' + ' '.join(sys.argv[1:]))\n")
@@ -142,6 +145,10 @@ def _run(
             "AGENT_UTILS_RS_PROBE_ONLY",
             "AGENT_UTILS_RS_ENSURE_ONLY",
             "WRKSLOTS_RUST_DISABLE",
+            "WRKSLOTS_SHADOW",
+            "WRKSLOTS_SHADOW_N",
+            "WRKSLOTS_SHADOW_TIMEOUT_S",
+            "WRKSLOTS_DIVERGENCE_LOG",
         )
     }
     env["WRKSLOTS_ENGINE"] = "rust-soak"
@@ -564,3 +571,96 @@ def test_rust_disable_family_action_and_unrelated_names(tmp_path: Path) -> None:
         extra_env={"WRKSLOTS_RUST_DISABLE": "image"},
     )
     assert bare.stdout.startswith("PY wrkslots image status")
+
+
+def _shadow_sandbox(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+    """Sandbox whose Python and Rust status outputs agree after age scrubbing."""
+    root, log = _sandbox(tmp_path)
+    (root / "py" / "bin" / "wrkslots").write_text(
+        "print('{\"active\": [], \"heartbeat_age_seconds\": 3}')\n"
+    )
+    _chmod_x(root / "py" / "bin" / "wrkslots")
+    project = tmp_path / "proj"
+    control = project / "worktrees"
+    control.mkdir(parents=True)
+    (project / ".wrkslots.yml").write_text("schema: 2\nworktrees_dir: worktrees\n")
+    (control / "ACTIVE.node-a.json").write_text("{}\n")
+    rust_stub = root / "rs" / "bin" / "wrkslotsd"
+    rust_stub.write_text(
+        "#!/bin/sh\n"
+        'if [ "$AGENT_UTILS_RS_PROBE_ONLY" = "1" ]; then echo stub-snapshot; exit 0; fi\n'
+        'case "$1" in\n'
+        '  status-text)\n'
+        '    if [ "$2" = "--help" ]; then echo "Usage: --root --machine --format"; exit 0; fi\n'
+        f"    [ -f ./rs-mutate ] && printf 'x' >>\"{control}/ACTIVE.node-a.json\"\n"
+        "    if [ -f ./rs-diverge ]; then echo '{\"active\": [{\"x\": 1}]}';\n"
+        "    else echo '{\"active\": [], \"heartbeat_age_seconds\": 7}'; fi ;;\n"
+        '  *) echo "RS $@" ;;\n'
+        "esac\n"
+    )
+    _chmod_x(rust_stub)
+    return root, log, project, tmp_path / "divergence.jsonl"
+
+
+def _shadow_run(root, log, project, divergence, **env):
+    return _run(
+        root,
+        log,
+        "--project-root",
+        str(project),
+        "status",
+        "--format",
+        "json",
+        readers_only=True,
+        extra_env={"WRKSLOTS_DIVERGENCE_LOG": str(divergence), **env},
+    )
+
+
+def test_shadow_all_serves_python_and_logs_agreement(tmp_path: Path) -> None:
+    root, log, project, divergence = _shadow_sandbox(tmp_path)
+    result = _shadow_run(root, log, project, divergence, WRKSLOTS_SHADOW="all")
+    assert result.returncode == 0, result.stderr
+    # Served bytes are the Python edition's (age 3, not the Rust stub's 7).
+    assert '"heartbeat_age_seconds": 3' in result.stdout
+    assert "shadow-sampled" in result.stderr
+    assert "cmd=status edition=python" in log.read_text()
+    lines = divergence.read_text().splitlines()
+    assert len(lines) == 1
+    assert '"result": "agree"' in lines[0]
+
+
+def test_shadow_logs_first_divergent_field(tmp_path: Path) -> None:
+    root, log, project, divergence = _shadow_sandbox(tmp_path)
+    (root / "rs-diverge").write_text("x\n")
+    result = _shadow_run(root, log, project, divergence, WRKSLOTS_SHADOW="all")
+    assert result.returncode == 0, result.stderr
+    record = divergence.read_text()
+    assert '"result": "diverge"' in record
+    assert '"field": "active"' in record
+
+
+def test_shadow_registry_change_is_skipped(tmp_path: Path) -> None:
+    root, log, project, divergence = _shadow_sandbox(tmp_path)
+    (root / "rs-mutate").write_text("x\n")
+    result = _shadow_run(root, log, project, divergence, WRKSLOTS_SHADOW="all")
+    assert result.returncode == 0, result.stderr
+    assert '"reason": "registry-changed"' in divergence.read_text()
+
+
+def test_shadow_sampled_n1_and_determinism(tmp_path: Path) -> None:
+    root, log, project, divergence = _shadow_sandbox(tmp_path)
+    first = _shadow_run(
+        root, log, project, divergence,
+        WRKSLOTS_SHADOW="sampled", WRKSLOTS_SHADOW_N="1",
+    )
+    assert "shadow-sampled" in first.stderr
+    # Same argv, same sampling decision both times (whatever N=2 decides).
+    one = _shadow_run(
+        root, log, project, divergence,
+        WRKSLOTS_SHADOW="sampled", WRKSLOTS_SHADOW_N="2",
+    )
+    two = _shadow_run(
+        root, log, project, divergence,
+        WRKSLOTS_SHADOW="sampled", WRKSLOTS_SHADOW_N="2",
+    )
+    assert ("shadow-sampled" in one.stderr) == ("shadow-sampled" in two.stderr)
