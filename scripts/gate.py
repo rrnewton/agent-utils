@@ -23,6 +23,15 @@ repository (default /tmp/dev-agent-utils-gate-admission, override with
 $GATE_ADMISSION_DIR); tickets and runs are files, reaped when their pid dies,
 so a killed lane never holds a slot forever.
 
+Known-red verdict (#2114 gate-known-red-aware-verdict): the versioned
+list validation/known-red.toml names steps that fail on unrelated
+trees and clean main, each with its tracking issue and an expiry.
+The ledger row records known_red_steps and only_known_red (every
+failed step listed and unexpired), the gate prints that verdict, and
+`gate stats` counts such rows, so the coordinator can waive at once.
+An unlisted or expired failure is never labelled known-red; expired
+matches are named in the log for renewal or removal.
+
 Step logs (#2078 gate-step-logs-kept): every admitted gate gets a log
 directory outside the worktree (~/.local/state/agent-utils/gate-logs/
 <run-id>, override $GATE_LOG_ROOT), passed to its command as
@@ -1041,6 +1050,81 @@ def prune_gate_logs(keep: int | None = None) -> int:
         shutil.rmtree(stale, ignore_errors=True)
         removed += 1
     return removed
+
+
+#: The known-red list (#2114): in-repo, versioned, every entry with
+#: its tracking issue and an expiry. $GATE_KNOWN_RED overrides (tests).
+DEFAULT_KNOWN_RED = Path(__file__).resolve().parent.parent / "validation" / "known-red.toml"
+
+
+def known_red_path() -> Path:
+    return Path(os.environ.get("GATE_KNOWN_RED") or DEFAULT_KNOWN_RED).expanduser()
+
+
+def _known_red_today() -> dt.date:
+    raw = os.environ.get("GATE_KNOWN_RED_TODAY")
+    if raw:
+        try:
+            return dt.date.fromisoformat(raw)
+        except ValueError:
+            pass
+    return dt.datetime.now(dt.timezone.utc).date()
+
+
+def known_red_entries() -> tuple[list[dict[str, object]], str | None]:
+    """(entries, problem): the versioned known-red list. A missing
+    file means no known-red steps; a malformed one labels NOTHING
+    (an unknown red must never become known-red by accident) and
+    reports the problem for the gate log."""
+    path = known_red_path()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return [], None
+    except OSError as exc:
+        return [], f"known-red list {path} is unreadable: {exc}"
+    try:
+        raw = tomllib.loads(text)
+        entries = raw.get("known-red")
+        if not isinstance(entries, list):
+            raise ValueError("top-level [[known-red]] entries are required")
+        out: list[dict[str, object]] = []
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get("step"), str) \
+                    or not isinstance(entry.get("issue"), str) \
+                    or not isinstance(entry.get("expires"), str):
+                raise ValueError("each entry needs step, issue and expires")
+            dt.date.fromisoformat(str(entry["expires"]))
+            out.append(entry)
+        return out, None
+    except Exception as exc:
+        return [], f"known-red list {path} is malformed: {exc}"
+
+
+def known_red_split(
+    failed: set[str], today: dt.date | None = None,
+) -> tuple[list[str], list[str], list[str]]:
+    """(known, unknown, expired) for a gate's failed steps (#2114).
+
+    A step is known only when an unexpired entry matches it exactly
+    or by fnmatch glob. A step matched only by expired entries is
+    unknown, and the expired entry is named so it gets renewed or
+    removed instead of silently living forever."""
+    entries, _problem = known_red_entries()
+    day = today or _known_red_today()
+    known: list[str] = []
+    expired: list[str] = []
+    for step in sorted(failed):
+        live = any(fnmatch.fnmatchcase(step, str(e["step"]))
+                   and dt.date.fromisoformat(str(e["expires"])) >= day for e in entries)
+        stale = any(fnmatch.fnmatchcase(step, str(e["step"]))
+                    and dt.date.fromisoformat(str(e["expires"])) < day for e in entries)
+        if live:
+            known.append(step)
+        elif stale:
+            expired.append(step)
+    unknown = sorted(set(failed) - set(known))
+    return known, unknown, expired
 
 
 def _utc(unix: float) -> str:
@@ -3117,6 +3201,17 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
                        memory_class=mem_cls, memory_need_gib=mem_need,
                        log_path=str(log_dir),
                        memory_peak_gib=mem_peak_gib, memory_peak_source=mem_peak_source)
+        # #2114: say at once when nothing red is news, so the
+        # coordinator can waive without a solo rerun; name expired
+        # entries that matched, so they get renewed or removed.
+        _known, _unknown, _expired = known_red_split(failed_steps)
+        if failed_steps and not _unknown:
+            print(f"gate: ONLY known-red steps failed ({', '.join(_known)}); "
+                  "this row is labelled only-known-red in the ledger (#2114)", flush=True)
+        if _expired:
+            print(f"gate: warning: known-red entries for {', '.join(_expired)} have EXPIRED; "
+                  "they no longer label a failure known-red — renew or remove them "
+                  "in validation/known-red.toml (#2114)", flush=True)
     return rc
 
 
@@ -3215,6 +3310,7 @@ def _record_ledger(
     line, which stats counts apart from gates."""
 
     try:
+        _known_red = known_red_split(set(failed_steps))
         base: str | None = None
         if "--base" in command:
             base = command[command.index("--base") + 1]
@@ -3236,6 +3332,8 @@ def _record_ledger(
             "kind": kind,
             "steps": len(passed_steps) + len(failed_steps),
             "failed_steps": sorted(failed_steps),
+            "known_red_steps": _known_red[0],
+            "only_known_red": bool(failed_steps) and not _known_red[1],
             "rerun_passed": (rc == 0) if kind == "exclusive-rerun" else None,
             "verdict": verdict,
             "exit_code": rc,
@@ -3635,6 +3733,10 @@ def show_stats(args: argparse.Namespace) -> int:
         print(f"gate stats: queue wait over {len(waits)} run(s): median "
               f"{waits[len(waits) // 2] / 60:.1f} min, max {waits[-1] / 60:.1f} min, "
               f"total {sum(waits) / 3600:.1f} h")
+    only_known = [row for row in gates if row.get("only_known_red")]
+    if only_known:
+        print(f"gate stats: {len(only_known)} gate(s) failed ONLY on known-red steps "
+              "(#2114; waivable at once, no solo rerun)")
     for step, count in failures.most_common(10):
         print(f"gate stats: failing step {step}: {count}")
     return 0

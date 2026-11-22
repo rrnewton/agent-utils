@@ -38,6 +38,7 @@ def _hermetic_gate_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setenv("MEMORY_FLOOR_CONFIG", str(tmp_path / "hostless-memory-floor.toml"))
     monkeypatch.setenv("GATE_RERUN_PROMOTE_CONFIG", str(tmp_path / "hostless-rerun-promote.toml"))
     monkeypatch.setenv("GATE_LOG_ROOT", str(tmp_path / "gate-logs"))
+    monkeypatch.setenv("GATE_KNOWN_RED", str(tmp_path / "hostless-known-red.toml"))
     monkeypatch.delenv("GATE_RERUN_PROMOTE_MIN", raising=False)
     # #2062: a missing floor file means defaults, so tests fake a roomy
     # meminfo (200 GiB total, 190 available) rather than depend on the host.
@@ -86,6 +87,7 @@ def _env(tmp_path: Path) -> dict[str, str]:
             "MEMORY_FLOOR_CONFIG": str(tmp_path / "memory-floor.toml"),
             "GATE_RERUN_PROMOTE_CONFIG": str(tmp_path / "rerun-promote.toml"),
             "GATE_LOG_ROOT": str(tmp_path / "gate-logs"),
+            "GATE_KNOWN_RED": str(tmp_path / "known-red.toml"),
             "MEMORY_FLOOR_MEMINFO": str(tmp_path / "meminfo"),
             "GATE_DEFER_SHARED_HOLDS_DIR": str(tmp_path / "no-shared-holds"),
             "GATE_DEFER_HOLD_REPORT_STATE": str(tmp_path / "hold-reports.json"),
@@ -2689,3 +2691,61 @@ def test_a_need_that_can_never_fit_admits_with_a_warning(
     waited, ever = gate._wait_memory_floor("heavy", 500.0, "test", 0.05)
     assert waited < 5 and ever is False
     assert "can never be admitted; starting anyway" in capsys.readouterr().out
+
+
+def _known_red_file(tmp_path: Path, body: str) -> Path:
+    path = tmp_path / "known-red.toml"
+    path.write_text(body)
+    return path
+
+
+def test_known_red_split_labels_only_listed_unexpired(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#2114: exact and glob matches label; an unknown red never does;
+    an expired entry does not label and is named expired."""
+    gate = _gate_module()
+    monkeypatch.setenv("GATE_KNOWN_RED", str(_known_red_file(tmp_path, """
+[[known-red]]
+step = "a.b-red"
+issue = "#1"
+expires = "2999-01-01"
+[[known-red]]
+step = "c.*"
+issue = "#2"
+expires = "2999-01-01"
+[[known-red]]
+step = "d.old"
+issue = "#3"
+expires = "2000-01-01"
+""")))
+    known, unknown, expired = gate.known_red_split({"a.b-red", "c.x", "d.old", "e.new"})
+    assert known == ["a.b-red", "c.x"]
+    assert unknown == ["d.old", "e.new"]
+    assert expired == ["d.old"]
+
+
+def test_only_known_red_gate_row_is_labelled(tmp_path: Path) -> None:
+    """#2114 end to end: a gate whose only failures are listed is
+    labelled only-known-red in the ledger and in its own output."""
+    _known_red_file(tmp_path, """
+[[known-red]]
+step = "a.step"
+issue = "#1"
+expires = "2999-01-01"
+""")
+    ledger = tmp_path / "ledger.jsonl"
+    env = {**_env(tmp_path), "GATE_LEDGER": str(ledger)}
+    bad = subprocess.run(
+        [PY, str(GATE), "--", PY, "-c",
+         "print('[a.step] ✗ FAIL y'); print('validate: FAILED'); raise SystemExit(3)"],
+        env=env, capture_output=True, text=True)
+    assert bad.returncode == 3, bad.stdout
+    assert "ONLY known-red steps failed" in bad.stdout
+    row = [json.loads(line) for line in ledger.read_text().splitlines()][-1]
+    assert row["known_red_steps"] == ["a.step"] and row["only_known_red"] is True
+    worse = subprocess.run(
+        [PY, str(GATE), "--", PY, "-c",
+         "print('[z.step] ✗ FAIL y'); print('validate: FAILED'); raise SystemExit(3)"],
+        env=env, capture_output=True, text=True)
+    row = [json.loads(line) for line in ledger.read_text().splitlines()][-1]
+    assert row["known_red_steps"] == [] and row["only_known_red"] is False

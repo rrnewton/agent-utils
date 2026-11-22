@@ -1,0 +1,63 @@
+# Known-red gate steps (#2114 gate-known-red-aware-verdict).
+#
+# Steps that fail on unrelated trees and on clean main, each with its
+# tracking issue as its mark. gate.py reads this file: a gate whose
+# ONLY failed steps are listed here (unexpired) is labelled
+# only-known-red in its ledger row, so the coordinator can waive it
+# at once instead of paying for solo reruns. An unlisted failure is
+# never labelled known-red.
+#
+# Every entry expires: `expires` is an ISO date, and an entry stops
+# matching the day after it. Renew an entry only by naming the issue
+# that still tracks the failure; an expired entry that still matches
+# is named in the gate log so it cannot silently live forever.
+# `step` is an exact step name or an fnmatch glob.
+version = 1
+
+[[known-red]]
+step = "vibe-talk.check.offline-cache-phone-360-browser"
+issue = "#2101"
+expires = "2026-12-22"
+note = "offline-cache phone snapshot failures on unrelated trees"
+
+[[known-red]]
+step = "vibe-talk.check.read-aloud-blocks-browser"
+issue = "#2077"
+expires = "2026-12-22"
+note = "read-aloud load family (CPU timeouts under load)"
+
+[[known-red]]
+step = "vibe-talk.check.send-flash-browser"
+issue = "#2077"
+expires = "2026-12-22"
+note = "quarantined from gating; if it still appears red, it is known-red"
+
+[[known-red]]
+step = "vibe-talk.check.quote-dismiss-browser"
+issue = "#2117"
+expires = "2026-12-22"
+note = "shared page-build output race (target/web replaced mid-step)"
+
+[[known-red]]
+step = "vibe-talk.check.done-feedback-browser"
+issue = "#2077"
+expires = "2026-12-22"
+note = "flash/ring timing under load"
+
+[[known-red]]
+step = "python.wrkslots.shard-*"
+issue = "#2065"
+expires = "2026-12-22"
+note = "census/remove timing under load, already seen on unrelated trees"
+
+[[known-red]]
+step = "rust.*.test"
+issue = "#2065"
+expires = "2026-12-22"
+note = "CPU timeouts with no named assertion failure"
+
+[[known-red]]
+step = "repository.check.wrkslots-debug-test"
+issue = "#2065"
+expires = "2026-12-22"
+note = "wrkslots debug-profile CPU timeouts under load"
