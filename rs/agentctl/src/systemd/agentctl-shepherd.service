@@ -5,7 +5,8 @@
 # it. It judges `team manifest` facts with stateless one-shot calls
 # and effects only through `team act`, one incident per restore
 # epoch, bounded rounds. Installing writes this file only; the
-# operator enables it deliberately.
+# operator enables it deliberately. The unit is only a caller of
+# the one trigger-neutral entry point; recovery does not depend on it.
 [Unit]
 Description=Shepherd one agentctl team back after boot (judgement loop; never blocks restore)
 StartLimitIntervalSec=1800
@@ -13,11 +14,12 @@ StartLimitBurst=3
 
 [Service]
 Type=oneshot
-ExecStart=@AGENTCTL@ --registry @REGISTRY@ --herdr-bin @HERDR@ team shepherd@TEAMS_CONFIG_ARG@
+ExecStart=@AGENTCTL@ --registry @REGISTRY@ --herdr-bin @HERDR@ start-recovery@TEAMS_CONFIG_ARG@
 # Covers the incident bound (120 minutes of rounds) plus one final
 # escalation attempt; the loop gives up and stamps on its own bounds
 # long before systemd needs this watchdog.
 TimeoutStartSec=7800
+KillMode=process
 SuccessExitStatus=75
 StandardOutput=journal
 StandardError=journal

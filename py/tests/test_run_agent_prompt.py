@@ -434,3 +434,58 @@ def test_model_and_effort_translation_per_harness(
     for harness, cwd in cwds.items():
         assert Path(cwd).parent.name == harness
         assert Path(cwd).name == "workspace"
+
+
+def write_profiles(tmp_path: Path, body: str) -> Path:
+    path = tmp_path / "recovery-profiles.toml"
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def test_profile_file_order_is_authoritative(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    claude = write_fake(tmp_path, "claude", "fail")
+    codex = write_fake(tmp_path, "codex", "ok", "codex profile answer")
+    profiles = write_profiles(
+        tmp_path,
+        'schema = "agentctl-recovery-profiles/v1"\n'
+        f'[[profile]]\nname = "first"\nharness = "claude"\ncommand = "{claude}"\n'
+        f'[[profile]]\nname = "second"\nharness = "codex"\ncommand = "{codex}"\n',
+    )
+    (tmp_path / "prompt.txt").write_text(PROMPT, encoding="utf-8")
+    assert main(["--timeout", "5", "--profile-file", str(profiles),
+                 "--prompt-file", str(tmp_path / "prompt.txt")]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "codex profile answer\n"
+    assert "profile=first harness=claude" in captured.err
+    assert "profile=second harness=codex status=answered" in captured.err
+    # No built-in first harness ran: the file order is the whole order.
+    assert invocations(tmp_path, "muse") == []
+
+
+def test_profile_selection_and_validation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    claude = write_fake(tmp_path, "claude", "ok", "claude answer")
+    profiles = write_profiles(
+        tmp_path,
+        'schema = "agentctl-recovery-profiles/v1"\n'
+        f'[[profile]]\nname = "only-me"\nharness = "claude"\ncommand = "{claude}"\n',
+    )
+    (tmp_path / "prompt.txt").write_text(PROMPT, encoding="utf-8")
+    assert main(["--profile-file", str(profiles), "--profile", "only-me",
+                 "--prompt-file", str(tmp_path / "prompt.txt")]) == 0
+    assert capsys.readouterr().out == "claude answer\n"
+    with pytest.raises(SystemExit) as raised:
+        main(["--profile-file", str(profiles), "--profile", "nope",
+              "--prompt-file", str(tmp_path / "prompt.txt")])
+    assert raised.value.code == 2
+    bad = write_profiles(
+        tmp_path,
+        'schema = "agentctl-recovery-profiles/v1"\n'
+        '[[profile]]\nname = "x"\nharness = "claude"\ncommand = "relative/path"\n',
+    )
+    with pytest.raises(SystemExit) as raised:
+        main(["--profile-file", str(bad), "--prompt-file", str(tmp_path / "prompt.txt")])
+    assert raised.value.code == 2

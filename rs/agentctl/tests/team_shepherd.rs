@@ -71,15 +71,25 @@ impl Scratch {
         install_executable(
             &bin.join("claude"),
             &format!(
-                "#!/bin/sh\necho claude >> {}\ncat > /dev/null\nprintf '%s\\n' \
-                 '{{\"type\": \"result\", \"subtype\": \"success\", \"is_error\": false, \
-                 \"result\": \"down\\n{{\\\"action\\\": \\\"facts\\\"}}\"}}'\n",
-                log.display()
+                "#!/usr/bin/env python3\nimport json, sys\n\
+                 open({log:?}, 'a').write('claude\\n')\n\
+                 prompt = sys.stdin.read()\n\
+                 result = '{{\"marker\": \"agentctl-recovery-smoke\"}}' if 'agentctl-recovery-smoke' in prompt else 'down\\n{{\"action\": \"facts\"}}'\n\
+                 print(json.dumps({{'type': 'result', 'subtype': 'success', 'is_error': False, 'result': result}}))\n",
+                log = log.display().to_string()
             ),
         );
         install_executable(
             &bin.join("codex"),
-            &format!("#!/bin/sh\necho codex >> {}\n", log.display()),
+            &format!(
+                "#!/usr/bin/env python3\nimport json, sys\n\
+                 open({log:?}, 'a').write('codex\\n')\n\
+                 args = sys.argv[1:]\n\
+                 out = args[args.index('--output-last-message') + 1]\n\
+                 open(out, 'w').write('{{\"marker\": \"agentctl-recovery-smoke\"}}\\n')\n\
+                 print(json.dumps({{'type': 'turn.completed'}}))\n",
+                log = log.display().to_string()
+            ),
         );
         let teams = json!({
             "schema": "agentctl-restore-teams/v1",
@@ -345,7 +355,7 @@ fn install_units_shepherd_writes_only_the_boot_unit() {
         .expect("run install-units --shepherd");
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let unit = fs::read_to_string(dest.join("agentctl-shepherd.service")).expect("unit");
-    assert!(unit.contains("team shepherd"), "{unit}");
+    assert!(unit.contains("start-recovery"), "{unit}");
     assert!(
         !unit.contains("After="),
         "must not order on restore: {unit}"
@@ -368,4 +378,140 @@ fn install_units_shepherd_writes_only_the_boot_unit() {
         .map(|entry| entry.expect("entry").file_name())
         .collect();
     assert_eq!(written.len(), 1, "only the shepherd unit: {written:?}");
+}
+
+impl Scratch {
+    fn run_agentctl(&self, args: &[String]) -> (i32, Value) {
+        let home = self.root.join("home");
+        fs::create_dir_all(&home).expect("home");
+        let path = format!(
+            "{}:{}",
+            self.root.join("fakebin").display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let output = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+            .current_dir(&self.root)
+            .env("HOME", &home)
+            .env("AGENTCTL_HOME", home.join(".agentctl"))
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_CACHE_HOME", home.join(".cache"))
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_STATE_HOME", home.join(".local/state"))
+            .env("PATH", path)
+            .env_remove("HERDR_SOCKET_PATH")
+            .env_remove("HERDR_PANE_ID")
+            .env_remove("AGENTCTL_AGENT")
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run agentctl");
+        let code = output.status.code().unwrap_or(-1);
+        let text = String::from_utf8(output.stdout).expect("report is UTF-8");
+        let report: Value = serde_json::from_str(&text)
+            .unwrap_or_else(|_| panic!("report not JSON (exit {code}): {text}"));
+        (code, report)
+    }
+
+    fn base_args(&self) -> Vec<String> {
+        vec![
+            "--registry".to_owned(),
+            self.root.join("own").display().to_string(),
+            "--herdr-bin".to_owned(),
+            self.root.join("herdr").display().to_string(),
+        ]
+    }
+}
+
+#[test]
+fn recovery_smoke_records_profiles_and_start_recovery_claims_once() {
+    let scratch = Scratch::new("smoke");
+    let state = scratch.root.join("state");
+    // Ordered profiles at the team level: Claude first, then Codex —
+    // no built-in first harness is consulted.
+    let profiles = format!(
+        "schema = \"agentctl-recovery-profiles/v1\"\n\
+         [[profile]]\nname = \"local-claude\"\nharness = \"claude\"\ncommand = \"{}\"\n\
+         [[profile]]\nname = \"local-codex\"\nharness = \"codex\"\ncommand = \"{}\"\n",
+        scratch.root.join("fakebin/claude").display(),
+        scratch.root.join("fakebin/codex").display(),
+    );
+    write_private(&scratch.root.join("own/recovery-profiles.toml"), &profiles);
+
+    let mut args = scratch.base_args();
+    args.extend([
+        "recovery".to_owned(),
+        "smoke".to_owned(),
+        "--state-dir".to_owned(),
+        state.display().to_string(),
+        "--run-agent-prompt".to_owned(),
+        wrapper().display().to_string(),
+    ]);
+    let (code, report) = scratch.run_agentctl(&args);
+    assert_eq!(code, 0, "{report}");
+    assert_eq!(report["chain"]["judge"], "local-claude", "{report}");
+    let rows = report["profiles"].as_array().expect("profile rows");
+    assert_eq!(rows.len(), 2, "{report}");
+    assert!(rows.iter().all(|row| row["status"] == "pass"), "{report}");
+
+    // A claim from a previous boot never blocks a new start.
+    let recovery = state
+        .join("recovery")
+        .join(crate_team_key(&scratch.root.join("own")));
+    fs::create_dir_all(&recovery).expect("recovery dir");
+    write_private(
+        &recovery.join("claim.json"),
+        "{\"schema\": \"agentctl-recovery-claim/v1\", \"boot_id\": \"previous-boot\", \
+         \"pid\": 999999, \"heartbeat_at\": 1.0}",
+    );
+    let mut args = scratch.base_args();
+    args.extend([
+        "start-recovery".to_owned(),
+        "--state-dir".to_owned(),
+        state.display().to_string(),
+        "--run-agent-prompt".to_owned(),
+        wrapper().display().to_string(),
+    ]);
+    let (code, report) = scratch.run_agentctl(&args);
+    assert_eq!(code, 0, "{report}");
+    assert_eq!(report["status"], "started", "{report}");
+    let supervisor_pid = report["supervisor_pid"].as_u64().expect("supervisor pid");
+    // A second call while the supervisor lives joins, never restarts.
+    let (code, report) = scratch.run_agentctl(&args);
+    assert_eq!(code, 75, "{report}");
+    assert_eq!(report["status"], "already-running", "{report}");
+    // The test owns this child; stop it by its literal pid.
+    let _ = Command::new("kill")
+        .arg(supervisor_pid.to_string())
+        .status();
+    if let Some(restore_pid) = report["restore_pid"].as_u64() {
+        let _ = restore_pid;
+    }
+    let status_args = {
+        let mut args = scratch.base_args();
+        args.extend([
+            "recovery".to_owned(),
+            "status".to_owned(),
+            "--state-dir".to_owned(),
+            state.display().to_string(),
+        ]);
+        args
+    };
+    let (code, report) = scratch.run_agentctl(&status_args);
+    assert_eq!(code, 0, "{report}");
+    assert_eq!(
+        report["claim"]["boot_id"]
+            .as_str()
+            .map(|b| b != "previous-boot"),
+        Some(true)
+    );
+}
+
+fn crate_team_key(registry: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let canonical = fs::canonicalize(registry).unwrap_or_else(|_| registry.to_path_buf());
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(canonical.to_string_lossy().as_bytes())
+    );
+    digest[..16].to_owned()
 }

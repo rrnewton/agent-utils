@@ -171,6 +171,18 @@ none; each can be added later by asking):
 - `vibe-talk`: a deployable voice and phone front end for chat-bridged sessions (a service with
   its own deployment; see `agent-utils/vibe-talk/README.md`).
 - `pr-landing-planner`: an advisory plan for landing a queue of pull requests (experimental).
+- **Recovery agent** (recommended after a reboot-prone setup): the always-on recovery supervisor
+  that brings the team back when nobody is there to run the team-restore protocol by hand. Ask for
+  an ordered list of harness/model profiles for it (for example one local Claude profile, then a
+  Codex fallback; only the harnesses actually installed), write them as the team-level ordered list
+  in `REGISTRY/recovery-profiles.toml` (schema `agentctl-recovery-profiles/v1`; never store
+  secrets there), then run `agentctl --registry R recovery install` — it validates the file,
+  optionally renders the `start-recovery` boot unit without enabling it, and smoke-tests every
+  profile with a real tiny structured round trip. Report the recorded smoke result
+  (`install-smoke.json`); recovery is not installed until every enabled profile passed. The one
+  entry point afterwards is `agentctl --registry R start-recovery`, callable by hand, from a
+  script, in a container foreground (`--foreground`), or from the optional boot unit; the operator
+  enables that unit deliberately, never setup.
 
 ## Phase 4: Confirm the plan
 

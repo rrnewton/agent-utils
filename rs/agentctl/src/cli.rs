@@ -169,6 +169,16 @@ enum Commands {
         after_help = "Examples:\n  agentctl --registry ~/project/.agentctl team verify\n  agentctl --registry ~/project/.agentctl team verify --check-only\n\n`team verify` is standalone and read-only apart from dismissing an allowlisted dialog: any human or agent can run it after an outage to learn, with evidence, whether the team is really back (checks desired-live, units-bridges, queued-not-archived, watcher-dead-agents, pane-at-prompt, coordinator-ack). It prints schema agentctl-team-verify/v1 as JSON and exits 0 only when no check failed, 1 otherwise."
     )]
     Team(Team),
+    /// Install, smoke-test, and report this registry's recovery configuration: ordered harness/model profiles (REGISTRY/recovery-profiles.toml), the install-time real smoke round trips they must pass, and the trigger that starts recovery
+    #[command(
+        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl recovery install --write-unit --unit-dest ~/.config/systemd/user\n  agentctl --registry ~/project/.agentctl recovery smoke\n  agentctl --registry ~/project/.agentctl recovery status\n\nEvery subcommand prints a versioned JSON report. install validates (and, with --profiles PATH, copies) the ordered profile file, renders the optional start-recovery unit without enabling it, and runs a full smoke; it reports done only when every enabled profile passed. smoke runs one real tiny structured round trip per enabled profile plus one whole-chain run and records install-smoke.json (no prompt, answer, or secret is recorded). status reads the incident claim and stamp and changes nothing."
+    )]
+    Recovery(Recovery),
+    /// Start recovery for this registry NOW: claim the incident and launch deterministic restore and the recovery-agent supervisor together. The one trigger-neutral entry point for a service unit, a startup script, a container foreground process, or a human
+    #[command(
+        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl start-recovery\n  agentctl --registry ~/project/.agentctl start-recovery --foreground\n\nOne incident per registry per restore epoch: a second live call returns already-running (exit 75) and starts nothing; a claim from a previous boot never blocks. Default returns once restore and the supervisor are launched; --foreground waits with the supervisor (for containers and manual runs). No service manager is assumed. Prints schema agentctl-start-recovery/v1."
+    )]
+    StartRecovery(StartRecovery),
     /// Write the user units that restore the team at boot: a persistent herdr-server.service, the agent-restore.service boot hook, agent-watch.service, and a drop-in that orders the chat bridge after Herdr and restarts it on failure (start limits stay with the bridge's own policy). With --bridge NAME, write only that bridge's persistent unit (agentctl-bridge-NAME.service) instead of a transient. With --scheduled, write only the persistent timer/service pairs the team spec names. With --teams-config PATH, write only agent-restore-teams.service, the boot unit that restores every team that teams file names. Never enables, starts, or reloads anything
     #[command(
         after_help = "Examples:\n  agentctl --registry ~/project/.agentctl --herdr-bin ~/bin/herdr install-units --dest ~/.config/systemd/user --bridge-unit chat-bridge.service --dry-run\n  agentctl --registry ~/project/.agentctl install-units --dest ~/.config/systemd/user --bridge coordinator\n  agentctl --registry ~/project/.agentctl install-units --dest ~/.config/systemd/user --scheduled\n  agentctl install-units --dest ~/.config/systemd/user --teams-config ~/.config/agentctl/teams.json\n\nWith --teams-config PATH, only agent-restore-teams.service is written: a oneshot after\nherdr-server.service that runs `restore-teams --config PATH --boot`, treats exit 74 as\nsuccess, and retries only temporary failures, bounded. With --scheduled, every `scheduled` entry in REGISTRY/restore.json ({name, on_calendar,\ncommand}, command an argv whose first element is an absolute path; on_calendar may name a timezone such as *-*-* 05:30:00 America/New_York, and an entry may also declare timeout_start_seconds, environment, after and success_exit_status, rendered into the service) renders as\nagentctl-scheduled-NAME.service plus agentctl-scheduled-NAME.timer under --dest, each with\nConditionHost set to this host and the timer Persistent=true, so the pair replaces a\nsystemd-run transient and survives reboots. Paths are rendered absolute: --agentctl\n(default: this executable), --herdr-bin (looked up on PATH when it is a bare name), and\n--registry. A file that exists with different contents is refused unless --force. The\noutput lists the files and the systemctl commands an operator runs next."
@@ -803,9 +813,86 @@ struct TeamShepherd {
     /// The run-agent-prompt executable (default: run-agent-prompt on PATH)
     #[arg(long, value_name = "PATH")]
     run_agent_prompt: Option<PathBuf>,
+    /// Ordered recovery profiles TOML (default: REGISTRY/recovery-profiles.toml when present); judgement runs only on a current all-pass recovery smoke record for the file
+    #[arg(long, value_name = "PATH")]
+    profile_file: Option<PathBuf>,
     /// Seconds a team act execution may wait for its receipt, from 0 to 3600 (default: 60)
     #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(0..=3600), value_name = "SECONDS")]
     act_wait_seconds: u64,
+}
+
+#[derive(Args)]
+struct Recovery {
+    #[command(subcommand)]
+    command: RecoveryCommand,
+}
+
+#[derive(Subcommand)]
+enum RecoveryCommand {
+    /// Validate the ordered profile file, optionally render the start-recovery unit (never enable it), then smoke-test every profile and record the result
+    Install(RecoveryInstall),
+    /// Run one real tiny structured round trip per enabled profile plus one whole-chain run, and record install-smoke.json
+    Smoke(RecoverySmoke),
+    /// Print the current incident claim and terminal stamp; changes nothing
+    Status(RecoveryStatus),
+}
+
+#[derive(Args)]
+struct RecoveryInstall {
+    /// Ordered profiles TOML to copy into REGISTRY/recovery-profiles.toml (default: the file already there)
+    #[arg(long, value_name = "PATH")]
+    profiles: Option<PathBuf>,
+    /// Also render agentctl-shepherd.service into --unit-dest (writes only; never enables)
+    #[arg(long)]
+    write_unit: bool,
+    /// Directory --write-unit renders into (default: $XDG_CONFIG_HOME/systemd/user, else ~/.config/systemd/user)
+    #[arg(long, value_name = "DIR")]
+    unit_dest: Option<PathBuf>,
+    /// The run-agent-prompt executable (default: run-agent-prompt on PATH)
+    #[arg(long, value_name = "PATH")]
+    run_agent_prompt: Option<PathBuf>,
+    /// Agentctl state root holding recovery/ (default: $XDG_STATE_HOME/agentctl, else ~/.local/state/agentctl)
+    #[arg(long, value_name = "DIR")]
+    state_dir: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct RecoverySmoke {
+    /// Smoke only this profile name (default: every enabled profile, plus the chain)
+    #[arg(long, value_name = "NAME")]
+    profile: Option<String>,
+    /// Profiles TOML (default: REGISTRY/recovery-profiles.toml)
+    #[arg(long, value_name = "PATH")]
+    profiles: Option<PathBuf>,
+    /// The run-agent-prompt executable (default: run-agent-prompt on PATH)
+    #[arg(long, value_name = "PATH")]
+    run_agent_prompt: Option<PathBuf>,
+    /// Agentctl state root holding recovery/ (default: $XDG_STATE_HOME/agentctl, else ~/.local/state/agentctl)
+    #[arg(long, value_name = "DIR")]
+    state_dir: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct RecoveryStatus {
+    /// Agentctl state root holding recovery/ (default: $XDG_STATE_HOME/agentctl, else ~/.local/state/agentctl)
+    #[arg(long, value_name = "DIR")]
+    state_dir: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct StartRecovery {
+    /// Stay in the foreground with the supervisor (containers, manual runs, process supervisors)
+    #[arg(long)]
+    foreground: bool,
+    /// Seconds before a same-boot claim with no heartbeat counts as stale, from 10 to 86400 (default: 180)
+    #[arg(long, default_value_t = 180.0, value_name = "SECONDS")]
+    stale_seconds: f64,
+    /// The run-agent-prompt executable the supervisor uses (default: run-agent-prompt on PATH)
+    #[arg(long, value_name = "PATH")]
+    run_agent_prompt: Option<PathBuf>,
+    /// Agentctl state root holding recovery/ (default: $XDG_STATE_HOME/agentctl, else ~/.local/state/agentctl)
+    #[arg(long, value_name = "DIR")]
+    state_dir: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -4928,6 +5015,12 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                             .run_agent_prompt
                             .clone()
                             .unwrap_or_else(|| PathBuf::from("run-agent-prompt")),
+                        profile_file: shepherd.profile_file.clone().or_else(|| {
+                            let file = args.registry.join("recovery-profiles.toml");
+                            file.is_file().then_some(file)
+                        }),
+                        claim_file: std::env::var_os("AGENTCTL_RECOVERY_CLAIM_FILE")
+                            .map(PathBuf::from),
                         act_wait_seconds: shepherd.act_wait_seconds,
                     },
                 )?;
@@ -5239,6 +5332,141 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             };
             write_json(&queue).map_err(Failure::Output)?;
             return Ok(i32::from(!found));
+        }
+        Commands::Recovery(value) => {
+            let wrapper = value_run_agent_prompt(&value);
+            let result: Result<(serde_json::Value, i32), Failure> = (|| match &value.command {
+                RecoveryCommand::Smoke(smoke) => {
+                    let file = smoke
+                        .profiles
+                        .clone()
+                        .unwrap_or_else(|| args.registry.join("recovery-profiles.toml"));
+                    Ok(crate::team_shepherd::smoke_profiles(
+                        &args.registry,
+                        &file,
+                        &wrapper,
+                        smoke.profile.as_deref(),
+                        smoke.state_dir.as_deref(),
+                    )?)
+                }
+                RecoveryCommand::Install(install) => {
+                    let target = args.registry.join("recovery-profiles.toml");
+                    if let Some(source) = &install.profiles {
+                        if source != &target {
+                            let bytes = std::fs::read(source).map_err(|error| {
+                                Failure::Usage(format!("cannot read {}: {error}", source.display()))
+                            })?;
+                            crate::team_shepherd::parse_profiles(&String::from_utf8_lossy(&bytes))?;
+                            std::fs::write(&target, &bytes)
+                                .map_err(|error| Failure::Usage(error.to_string()))?;
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                let _ = std::fs::set_permissions(
+                                    &target,
+                                    std::fs::Permissions::from_mode(0o600),
+                                );
+                            }
+                        }
+                    }
+                    let mut report = json!({
+                        "schema": "agentctl-recovery-install/v1",
+                        "profiles": target,
+                        "unit": Value::Null,
+                    });
+                    if install.write_unit {
+                        let dest = install.unit_dest.clone().unwrap_or_else(|| {
+                            std::env::var_os("XDG_CONFIG_HOME")
+                                .map(PathBuf::from)
+                                .or_else(|| {
+                                    std::env::var_os("HOME")
+                                        .map(|home| PathBuf::from(home).join(".config"))
+                                })
+                                .unwrap_or_default()
+                                .join("systemd/user")
+                        });
+                        let herdr_bin = resolve_herdr_bin(&args.registry, &args.herdr_bin);
+                        let agentctl = std::env::current_exe()
+                            .map_err(|error| Failure::Usage(error.to_string()))?;
+                        report["unit"] = crate::units::install_shepherd(
+                            &crate::units::InstallOptions {
+                                dest,
+                                agentctl,
+                                herdr: herdr_bin,
+                                registry: std::path::absolute(&args.registry)
+                                    .map_err(|error| Failure::Usage(error.to_string()))?,
+                                bridge_unit: None,
+                                dry_run: false,
+                                force: false,
+                            },
+                            Some(&target),
+                        )?;
+                    }
+                    let (smoke, code) = crate::team_shepherd::smoke_profiles(
+                        &args.registry,
+                        &target,
+                        &wrapper,
+                        None,
+                        install.state_dir.as_deref(),
+                    )?;
+                    report["smoke"] = smoke;
+                    report["exit_code"] = json!(code);
+                    Ok((report, code))
+                }
+                RecoveryCommand::Status(status) => {
+                    let dir = crate::team_shepherd::recovery_dir(
+                        status.state_dir.as_deref(),
+                        &args.registry,
+                    )
+                    .ok_or_else(|| {
+                        Failure::Usage("cannot determine the agentctl state directory".to_owned())
+                    })?;
+                    let claim: Value = std::fs::read_to_string(dir.join("claim.json"))
+                        .ok()
+                        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                        .unwrap_or(Value::Null);
+                    let stamp = claim["boot_id"].as_str().and_then(|boot| {
+                        crate::team_shepherd::shepherd_dir(status.state_dir.as_deref(), boot)
+                            .and_then(|boot_dir| {
+                                std::fs::read_to_string(boot_dir.join("stamp.json")).ok()
+                            })
+                            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                    });
+                    Ok((
+                        json!({"schema": "agentctl-recovery-status/v1",
+                                "claim": claim, "stamp": stamp, "exit_code": 0}),
+                        0,
+                    ))
+                }
+            })();
+            let (report, code) = result?;
+            write_json(&report).map_err(Failure::Output)?;
+            return Ok(code);
+        }
+        Commands::StartRecovery(value) => {
+            let herdr_bin = resolve_herdr_bin(&args.registry, &args.herdr_bin);
+            let agentctl =
+                std::env::current_exe().map_err(|error| Failure::Usage(error.to_string()))?;
+            let report = crate::team_shepherd::start_recovery(
+                &args.registry,
+                &crate::restore::SystemHost,
+                &crate::team_shepherd::ShepherdInputs {
+                    agentctl,
+                    herdr_bin,
+                },
+                value.state_dir.as_deref(),
+                &crate::team_shepherd::StartOptions {
+                    foreground: value.foreground,
+                    stale_seconds: value.stale_seconds,
+                    run_agent_prompt: value
+                        .run_agent_prompt
+                        .clone()
+                        .unwrap_or_else(|| PathBuf::from("run-agent-prompt")),
+                },
+            )?;
+            let code = report["exit_code"].as_i64().unwrap_or(1) as i32;
+            write_json(&report).map_err(Failure::Output)?;
+            return Ok(code);
         }
         Commands::Services(value) => return run_services(&args.registry, value),
         Commands::InstallUnits(value) => {
@@ -6759,6 +6987,8 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         | Commands::Hold(_)
         | Commands::Tail(_)
         | Commands::History(_)
+        | Commands::Recovery(_)
+        | Commands::StartRecovery(_)
         | Commands::Requests(_) => {
             unreachable!()
         }
@@ -7021,6 +7251,17 @@ fn to_team_action(action: &TeamActAction) -> crate::team_driver::TeamAction {
             crate::team_driver::TeamAction::Escalate { text: text.clone() }
         }
     }
+}
+
+fn value_run_agent_prompt(value: &Recovery) -> PathBuf {
+    let named = match &value.command {
+        RecoveryCommand::Install(install) => install.run_agent_prompt.as_ref(),
+        RecoveryCommand::Smoke(smoke) => smoke.run_agent_prompt.as_ref(),
+        RecoveryCommand::Status(_) => None,
+    };
+    named
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from("run-agent-prompt"))
 }
 
 fn team_driver_prep(

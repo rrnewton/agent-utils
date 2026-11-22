@@ -74,6 +74,11 @@ pub struct ShepherdOptions {
     pub no_progress_rounds: u32,
     /// The `run-agent-prompt` executable.
     pub run_agent_prompt: PathBuf,
+    /// Ordered recovery profiles file, when the team configured one.
+    pub profile_file: Option<PathBuf>,
+    /// Incident claim file to heartbeat while running, when launched
+    /// through `start-recovery`.
+    pub claim_file: Option<PathBuf>,
     /// Seconds a `team act` execution may wait for its receipt.
     pub act_wait_seconds: u64,
 }
@@ -88,6 +93,8 @@ impl Default for ShepherdOptions {
             round_delay_seconds: 30,
             no_progress_rounds: 2,
             run_agent_prompt: PathBuf::from("run-agent-prompt"),
+            profile_file: None,
+            claim_file: None,
             act_wait_seconds: 60,
         }
     }
@@ -238,16 +245,20 @@ fn run_bounded(
     ))
 }
 
-/// Which harness answered, from the wrapper's stderr attempt lines
-/// (`run-agent-prompt: harness=muse status=answered ...`).
+/// Which profile answered, from the wrapper's stderr attempt lines
+/// (`run-agent-prompt: profile=NAME harness=muse status=answered ...`).
+/// Without profiles, the harness name is the judge identity.
 pub fn judge_of(stderr: &str) -> Option<String> {
     stderr.lines().find_map(|line| {
         if !line.contains("status=answered") {
             return None;
         }
-        line.split_whitespace()
-            .find_map(|word| word.strip_prefix("harness="))
-            .map(str::to_owned)
+        let word = |prefix: &str| {
+            line.split_whitespace()
+                .find_map(|word| word.strip_prefix(prefix))
+                .map(str::to_owned)
+        };
+        word("profile=").or_else(|| word("harness="))
     })
 }
 
@@ -491,20 +502,45 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
             save_state(&dir, &state)?;
         }
         // One judgement call per round; at most one own-team act.
+        // With a profile file, judgement runs only on a current
+        // all-pass smoke record; deterministic recovery never waits
+        // on it.
+        let judgement = match &options.profile_file {
+            Some(file) => {
+                if judgement_allowed(options.state_dir.as_deref(), own, file) {
+                    Some(file.clone())
+                } else {
+                    append_log(
+                        &dir,
+                        &format!("round {round}: judgement unavailable (smoke)"),
+                    );
+                    None
+                }
+            }
+            None => None,
+        };
         let prompt = brief(own_round, judged_rounds, round);
         let prompt_path = dir.join(format!("prompt-{round}.txt"));
         std::fs::write(&prompt_path, &prompt)
             .map_err(|error| fail(format!("cannot write the round brief: {error}")))?;
-        let answer = run_bounded(
-            &options.run_agent_prompt,
-            &[
-                "--prompt-file".to_owned(),
-                prompt_path.display().to_string(),
-                "--timeout".to_owned(),
-                options.call_timeout_seconds.to_string(),
-            ],
-            Duration::from_secs(options.call_timeout_seconds * 3 + 60),
-        );
+        let mut wrapper_args = vec![
+            "--prompt-file".to_owned(),
+            prompt_path.display().to_string(),
+            "--timeout".to_owned(),
+            options.call_timeout_seconds.to_string(),
+        ];
+        if let Some(file) = &judgement {
+            wrapper_args.extend(["--profile-file".to_owned(), file.display().to_string()]);
+        }
+        let answer = if options.profile_file.is_some() && judgement.is_none() {
+            Err(fail("judgement unavailable"))
+        } else {
+            run_bounded(
+                &options.run_agent_prompt,
+                &wrapper_args,
+                Duration::from_secs(options.call_timeout_seconds * 3 + 60),
+            )
+        };
         let mut proposal: Option<Value> = None;
         if let Ok((0, text, log)) = &answer {
             if !text.trim().is_empty() {
@@ -559,6 +595,9 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
         }
         state.round = round;
         save_state(&dir, &state)?;
+        if let Some(claim) = &options.claim_file {
+            heartbeat_claim(claim, &incident, &boot_id);
+        }
         let elapsed = started.elapsed() >= Duration::from_secs(options.max_minutes * 60);
         if elapsed || state.no_progress >= options.no_progress_rounds {
             break;
@@ -652,5 +691,613 @@ mod tests {
         let two = json!({"a": 2});
         assert_eq!(manifest_hash(&one), manifest_hash(&one));
         assert_ne!(manifest_hash(&one), manifest_hash(&two));
+    }
+}
+
+/// Schema of a recovery profile file.
+pub const PROFILES_SCHEMA: &str = "agentctl-recovery-profiles/v1";
+/// Schema of the recorded install-smoke results.
+pub const SMOKE_SCHEMA: &str = "agentctl-recovery-smoke/v1";
+/// Schema of a recovery incident claim.
+pub const CLAIM_SCHEMA: &str = "agentctl-recovery-claim/v1";
+
+/// One ordered harness/model profile (`[[profile]]` in the file).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct RecoveryProfile {
+    /// Unique profile name; stamps and smoke records use it.
+    pub name: String,
+    /// `muse`, `claude`, or `codex`.
+    pub harness: String,
+    /// Requested model, when pinned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Requested effort, when pinned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Per-attempt seconds budget for this profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<f64>,
+    /// Absolute harness executable, when not resolved by name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Explicitly out of the chain (install records the reason in prose).
+    #[serde(default)]
+    pub disabled: bool,
+}
+
+/// Parse the strict v1 profile-file subset: a top-level `schema`
+/// string plus ordered `[[profile]]` tables whose only keys are the
+/// [`RecoveryProfile`] fields with string, number, or boolean values.
+/// This is the whole v1 schema, so the subset loses nothing; anything
+/// outside it is refused rather than guessed at.
+pub fn parse_profiles(text: &str) -> Result<Vec<RecoveryProfile>> {
+    let mut schema: Option<String> = None;
+    let mut profiles: Vec<RecoveryProfile> = Vec::new();
+    let mut current: Option<RecoveryProfile> = None;
+    let mut in_profile = false;
+    let unquote = |value: &str| -> Result<String> {
+        let value = value.trim();
+        value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .map(str::to_owned)
+            .ok_or_else(|| fail(format!("profile value must be a quoted string: {value}")))
+    };
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line == "[[profile]]" {
+            if let Some(done) = current.take() {
+                profiles.push(done);
+            }
+            current = Some(RecoveryProfile::default());
+            in_profile = true;
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(fail(format!("invalid profile line: {line}")));
+        };
+        let (key, value) = (key.trim(), value.trim());
+        if !in_profile {
+            if key != "schema" {
+                return Err(fail(format!("unknown top-level profile key {key}")));
+            }
+            schema = Some(unquote(value)?);
+            continue;
+        }
+        let profile = current.as_mut().expect("profile table open");
+        match key {
+            "name" => profile.name = unquote(value)?,
+            "harness" => profile.harness = unquote(value)?,
+            "model" => profile.model = Some(unquote(value)?),
+            "effort" => profile.effort = Some(unquote(value)?),
+            "command" => profile.command = Some(unquote(value)?),
+            "timeout_seconds" => {
+                profile.timeout_seconds = Some(
+                    value
+                        .parse::<f64>()
+                        .map_err(|_| fail("profile timeout_seconds must be a number"))?,
+                );
+            }
+            "disabled" => {
+                profile.disabled = match value {
+                    "true" => true,
+                    "false" => false,
+                    _ => return Err(fail("profile disabled must be true or false")),
+                };
+            }
+            other => return Err(fail(format!("unknown profile key {other}"))),
+        }
+    }
+    if let Some(done) = current.take() {
+        profiles.push(done);
+    }
+    if schema.as_deref() != Some(PROFILES_SCHEMA) {
+        return Err(fail(format!("profile schema must be {PROFILES_SCHEMA}")));
+    }
+    if profiles.is_empty() {
+        return Err(fail("at least one [[profile]] is required"));
+    }
+    let mut names = std::collections::BTreeSet::new();
+    for profile in &profiles {
+        if profile.name.is_empty() || profile.harness.is_empty() {
+            return Err(fail("each profile needs name and harness"));
+        }
+        if !names.insert(profile.name.clone()) {
+            return Err(fail(format!("duplicate profile name {}", profile.name)));
+        }
+        if !matches!(profile.harness.as_str(), "muse" | "claude" | "codex") {
+            return Err(fail(format!("unknown harness {}", profile.harness)));
+        }
+        if let Some(command) = &profile.command {
+            if !Path::new(command).is_absolute() {
+                return Err(fail(format!(
+                    "profile {} command must be absolute",
+                    profile.name
+                )));
+            }
+        }
+        if profile
+            .timeout_seconds
+            .is_some_and(|timeout| timeout <= 0.0)
+        {
+            return Err(fail(format!(
+                "profile {} timeout_seconds must be positive",
+                profile.name
+            )));
+        }
+    }
+    Ok(profiles)
+}
+
+/// Load and validate the profile file at `path`.
+pub fn load_profiles(path: &Path) -> Result<Vec<RecoveryProfile>> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| fail(format!("cannot read {}: {error}", path.display())))?;
+    parse_profiles(&text)
+}
+
+/// SHA-256 of a profile file's bytes; smoke records bind to it.
+pub fn profiles_hash(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// The team recovery state directory: `<state root>/recovery/<key>/`.
+pub fn recovery_dir(state_dir: Option<&Path>, registry: &Path) -> Option<PathBuf> {
+    Some(
+        state_root(state_dir)?
+            .join("recovery")
+            .join(crate::restore::team_key(registry)),
+    )
+}
+
+/// Whether judgement is currently trusted for this profile file: a
+/// smoke record exists, binds to the file's current hash, and every
+/// enabled profile passed. Anything else leaves judgement unavailable.
+pub fn judgement_allowed(state_dir: Option<&Path>, registry: &Path, profile_file: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(profile_file) else {
+        return false;
+    };
+    let Ok(profiles) = parse_profiles(&String::from_utf8_lossy(&bytes)) else {
+        return false;
+    };
+    let Some(dir) = recovery_dir(state_dir, registry) else {
+        return false;
+    };
+    let Ok(text) = std::fs::read_to_string(dir.join("install-smoke.json")) else {
+        return false;
+    };
+    let Ok(record) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    if record["schema"] != SMOKE_SCHEMA || record["config_hash"] != profiles_hash(&bytes) {
+        return false;
+    }
+    profiles
+        .iter()
+        .filter(|profile| !profile.disabled)
+        .all(|profile| {
+            record["profiles"].as_array().is_some_and(|rows| {
+                rows.iter()
+                    .any(|row| row["name"] == profile.name && row["status"] == "pass")
+            })
+        })
+}
+
+/// What claiming an incident should do, decided purely.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ClaimDecision {
+    /// No live claimant: take the incident.
+    Take,
+    /// A previous-boot claim: it never blocks a new boot.
+    TakeOverPreviousBoot,
+    /// A dead or stale claimant in this boot: take over, recorded.
+    TakeOverStale,
+    /// A live claimant in this boot owns the incident.
+    AlreadyRunning,
+}
+
+/// Decide from a claim record. A claim from a different boot is stale
+/// by definition, whatever its heartbeat says (the reboot rule).
+pub fn claim_decision(
+    claim: Option<&Value>,
+    boot_id: &str,
+    now: f64,
+    stale_seconds: f64,
+    pid_alive: bool,
+) -> ClaimDecision {
+    let Some(claim) = claim else {
+        return ClaimDecision::Take;
+    };
+    if claim["boot_id"].as_str() != Some(boot_id) {
+        return ClaimDecision::TakeOverPreviousBoot;
+    }
+    let heartbeat = claim["heartbeat_at"].as_f64().unwrap_or(0.0);
+    if pid_alive && now - heartbeat < stale_seconds {
+        ClaimDecision::AlreadyRunning
+    } else {
+        ClaimDecision::TakeOverStale
+    }
+}
+
+/// Refresh a claim's heartbeat under its short flock: constant-time
+/// file work only, never across a round's long operations.
+pub fn heartbeat_claim(path: &Path, incident: &str, boot_id: &str) {
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_extension("lock"))
+    else {
+        return;
+    };
+    if file.lock_exclusive().is_err() {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d: Duration| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let mut record: Value = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_else(
+            || json!({"schema": CLAIM_SCHEMA, "incident": incident, "boot_id": boot_id}),
+        );
+    record["heartbeat_at"] = json!(now);
+    // The claim's pid names the incident owner (the supervisor), set
+    // by whoever claimed it; a heartbeat refresh never replaces it.
+    if record["pid"].is_null() {
+        record["pid"] = json!(std::process::id());
+    }
+    let _ = crate::agent::atomic_json(path, &record);
+}
+
+/// The fixed harmless smoke prompt: an exact final JSON marker, so a
+/// pass proves executable resolution, credentials, model/effort
+/// selection, timeout handling, and the structured reply shape.
+pub const SMOKE_PROMPT: &str = "You are smoke-testing a recovery profile. \
+Reply with exactly one final line and nothing after it:\n\
+{\"marker\": \"agentctl-recovery-smoke\"}";
+
+/// Whether an answer passes smoke: its last JSON line is the marker.
+pub fn smoke_passed(answer: &str) -> bool {
+    answer.lines().rev().find_map(|line| {
+        let value: Value = serde_json::from_str(line.trim()).ok()?;
+        Some(value["marker"] == "agentctl-recovery-smoke")
+    }) == Some(true)
+}
+
+/// Run `recovery smoke`: every enabled profile (or one named profile)
+/// plus one whole-chain run, recording `install-smoke.json`.
+pub fn smoke_profiles(
+    registry: &Path,
+    profile_file: &Path,
+    wrapper: &Path,
+    only: Option<&str>,
+    state_dir: Option<&Path>,
+) -> Result<(Value, i32)> {
+    let profiles = load_profiles(profile_file)?;
+    let bytes = std::fs::read(profile_file)
+        .map_err(|error| fail(format!("cannot read {}: {error}", profile_file.display())))?;
+    let dir = recovery_dir(state_dir, registry)
+        .ok_or_else(|| fail("cannot determine the agentctl state directory"))?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| fail(format!("cannot create {}: {error}", dir.display())))?;
+    let prompt_path = dir.join("smoke-prompt.txt");
+    std::fs::write(&prompt_path, SMOKE_PROMPT)
+        .map_err(|error| fail(format!("cannot write the smoke prompt: {error}")))?;
+    let mut rows: Vec<Value> = Vec::new();
+    let mut all_pass = true;
+    for profile in profiles.iter().filter(|profile| !profile.disabled) {
+        if let Some(name) = only {
+            if profile.name != name {
+                continue;
+            }
+        }
+        let started = Instant::now();
+        let timeout = profile.timeout_seconds.unwrap_or(120.0);
+        let result = run_bounded(
+            wrapper,
+            &[
+                "--profile-file".to_owned(),
+                profile_file.display().to_string(),
+                "--profile".to_owned(),
+                profile.name.clone(),
+                "--prompt-file".to_owned(),
+                prompt_path.display().to_string(),
+                "--timeout".to_owned(),
+                timeout.to_string(),
+            ],
+            Duration::from_secs_f64(timeout * 3.0 + 30.0),
+        );
+        let (status, detail) = match result {
+            Ok((0, answer, _)) if smoke_passed(&answer) => {
+                ("pass", "answered with the smoke marker")
+            }
+            Ok((0, _, _)) => ("fail", "answered without the smoke marker"),
+            Ok((69, _, _)) => ("fail", "every harness failed"),
+            Ok((code, _, _)) => {
+                all_pass = false;
+                rows.push(json!({"name": profile.name, "harness": profile.harness,
+                    "model": profile.model, "effort": profile.effort,
+                    "status": "fail", "detail": format!("wrapper exit {code}"),
+                    "duration_s": started.elapsed().as_secs_f64()}));
+                continue;
+            }
+            Err(_error) => ("fail", "wrapper could not run"),
+        };
+        if status != "pass" {
+            all_pass = false;
+        }
+        let _ = detail;
+        rows.push(json!({"name": profile.name, "harness": profile.harness,
+            "model": profile.model, "effort": profile.effort,
+            "status": status,
+            "duration_s": started.elapsed().as_secs_f64()}));
+    }
+    // One whole-chain run proves fall-through order end to end.
+    let chain_started = Instant::now();
+    let chain = run_bounded(
+        wrapper,
+        &[
+            "--profile-file".to_owned(),
+            profile_file.display().to_string(),
+            "--prompt-file".to_owned(),
+            prompt_path.display().to_string(),
+            "--timeout".to_owned(),
+            "120".to_owned(),
+        ],
+        Duration::from_secs(390),
+    );
+    let (chain_status, judge) = match &chain {
+        Ok((0, answer, log)) if smoke_passed(answer) => {
+            ("pass", judge_of(log).unwrap_or_else(|| "none".to_owned()))
+        }
+        _ => ("fail", "none".to_owned()),
+    };
+    if chain_status != "pass" {
+        all_pass = false;
+    }
+    let record = json!({
+        "schema": SMOKE_SCHEMA,
+        "at": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d: Duration| d.as_secs_f64())
+            .unwrap_or(0.0),
+        "config_hash": profiles_hash(&bytes),
+        "profiles": rows,
+        "chain": {"status": chain_status, "judge": judge,
+                  "duration_s": chain_started.elapsed().as_secs_f64()},
+    });
+    crate::agent::atomic_json(&dir.join("install-smoke.json"), &record)
+        .map_err(|error| fail(error.to_string()))?;
+    Ok((record, if all_pass { 0 } else { 75 }))
+}
+
+/// Options for the one `start-recovery` entry point.
+#[derive(Clone, Debug)]
+pub struct StartOptions {
+    /// Keep the supervisor in the foreground (container/manual use).
+    pub foreground: bool,
+    /// Seconds before a same-boot claim with no heartbeat is stale.
+    pub stale_seconds: f64,
+    /// The `run-agent-prompt` executable for the supervisor child.
+    pub run_agent_prompt: PathBuf,
+}
+
+/// Claim or join the incident, then launch restore and the recovery
+/// supervisor concurrently. This is the single trigger-neutral entry
+/// point: a service unit, a script, a remote shell, and a human all
+/// call it, and a second live call joins instead of starting a
+/// second restorer. The claim flock is held only for the claim
+/// read/write itself.
+pub fn start_recovery(
+    registry: &Path,
+    host: &dyn Host,
+    inputs: &ShepherdInputs,
+    state_dir: Option<&Path>,
+    options: &StartOptions,
+) -> Result<Value> {
+    crate::team_driver::require_host_namespace(host)?;
+    if !registry.is_dir() {
+        return Ok(json!({"schema": "agentctl-start-recovery/v1",
+            "status": "BLOCKED_PREREQUISITE",
+            "detail": format!("registry {} is not a directory", registry.display()),
+            "exit_code": 1}));
+    }
+    let boot_id = host.boot_id()?;
+    let epoch = RestoreEpoch {
+        boot_id: boot_id.clone(),
+        user_manager: host.user_manager_id(),
+    };
+    let incident = crate::team_driver::incident_id(registry, &epoch);
+    let dir = recovery_dir(state_dir, registry)
+        .ok_or_else(|| fail("cannot determine the agentctl state directory"))?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| fail(format!("cannot create {}: {error}", dir.display())))?;
+    let claim_path = dir.join("claim.json");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d: Duration| d.as_secs_f64())
+        .unwrap_or(0.0);
+    // Claim: short flock, constant-time file work only.
+    let decision = {
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join("claim.lock"))
+            .map_err(|error| fail(format!("cannot open the claim lock: {error}")))?;
+        lock.lock_exclusive()
+            .map_err(|error| fail(format!("cannot take the claim lock: {error}")))?;
+        let existing: Option<Value> = std::fs::read_to_string(&claim_path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok());
+        let pid_alive = existing
+            .as_ref()
+            .and_then(|claim| claim["pid"].as_u64())
+            .is_some_and(|pid| Path::new(&format!("/proc/{pid}")).exists());
+        let decision = claim_decision(
+            existing.as_ref(),
+            &boot_id,
+            now,
+            options.stale_seconds,
+            pid_alive,
+        );
+        if decision != ClaimDecision::AlreadyRunning {
+            let claim = json!({
+                "schema": CLAIM_SCHEMA,
+                "registry": registry,
+                "incident": incident,
+                "boot_id": boot_id,
+                "epoch": epoch.as_json(),
+                "pid": std::process::id(),
+                "heartbeat_at": now,
+                "started_at": now,
+                "takeover": format!("{decision:?}"),
+            });
+            crate::agent::atomic_json(&claim_path, &claim)
+                .map_err(|error| fail(error.to_string()))?;
+        }
+        decision
+    };
+    if decision == ClaimDecision::AlreadyRunning {
+        return Ok(json!({"schema": "agentctl-start-recovery/v1",
+            "status": "already-running", "incident": incident,
+            "claim": claim_path, "exit_code": 75}));
+    }
+    // Launch restore and the supervisor concurrently; neither waits
+    // for the other, and both are idempotent underneath (restore's
+    // replay guard, team act request ids).
+    let base = vec![
+        "--registry".to_owned(),
+        registry.display().to_string(),
+        "--herdr-bin".to_owned(),
+        inputs.herdr_bin.display().to_string(),
+    ];
+    let spawn_logged = |args: &[String], log_name: &str| -> Result<std::process::Child> {
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(log_name))
+            .map_err(|error| fail(format!("cannot open the recovery log: {error}")))?;
+        let err = log
+            .try_clone()
+            .map_err(|error| fail(format!("cannot clone the recovery log: {error}")))?;
+        Command::new(&inputs.agentctl)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(err))
+            .env("AGENTCTL_RECOVERY_CLAIM_FILE", &claim_path)
+            .spawn()
+            .map_err(|error| fail(format!("cannot launch a recovery child: {error}")))
+    };
+    let mut restore_args = base.clone();
+    restore_args.push("restore".to_owned());
+    let mut restore_child = spawn_logged(&restore_args, "restore.log")?;
+    let mut shepherd_args = base;
+    shepherd_args.extend([
+        "team".to_owned(),
+        "shepherd".to_owned(),
+        "--run-agent-prompt".to_owned(),
+        options.run_agent_prompt.display().to_string(),
+    ]);
+    if let Some(state) = state_dir {
+        shepherd_args.extend(["--state-dir".to_owned(), state.display().to_string()]);
+    }
+    let mut supervisor = spawn_logged(&shepherd_args, "supervisor.log")?;
+    // The claim belongs to the supervisor, not this short-lived
+    // starter: rewrite its pid under the short flock.
+    {
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join("claim.lock"))
+            .map_err(|error| fail(format!("cannot open the claim lock: {error}")))?;
+        lock.lock_exclusive()
+            .map_err(|error| fail(format!("cannot take the claim lock: {error}")))?;
+        if let Ok(text) = std::fs::read_to_string(&claim_path) {
+            if let Ok(mut claim) = serde_json::from_str::<Value>(&text) {
+                claim["pid"] = json!(supervisor.id());
+                let _ = crate::agent::atomic_json(&claim_path, &claim);
+            }
+        }
+    }
+    heartbeat_claim(&claim_path, &incident, &boot_id);
+    if options.foreground {
+        let status = supervisor
+            .wait()
+            .map_err(|error| fail(format!("cannot wait on the supervisor: {error}")))?;
+        let _ = restore_child.wait();
+        return Ok(json!({"schema": "agentctl-start-recovery/v1",
+            "status": "finished", "incident": incident, "claim": claim_path,
+            "exit_code": status.code().unwrap_or(1)}));
+    }
+    Ok(json!({"schema": "agentctl-start-recovery/v1",
+        "status": "started", "incident": incident, "claim": claim_path,
+        "restore_pid": restore_child.id(), "supervisor_pid": supervisor.id(),
+        "exit_code": 0}))
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    #[test]
+    fn profiles_parse_in_file_order_and_refuse_guesses() {
+        let text = "schema = \"agentctl-recovery-profiles/v1\"\n\
+                    [[profile]]\nname = \"local-claude\"\nharness = \"claude\"\n\
+                    [[profile]]\nname = \"local-codex\"\nharness = \"codex\"\nmodel = \"m\"\n";
+        let profiles = parse_profiles(text).expect("profiles");
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(profiles[0].name, "local-claude");
+        assert_eq!(profiles[1].model.as_deref(), Some("m"));
+        assert!(parse_profiles(
+            "schema = \"nope\"\n[[profile]]\nname = \"a\"\nharness = \"claude\"\n"
+        )
+        .is_err());
+        assert!(parse_profiles(
+            "schema = \"agentctl-recovery-profiles/v1\"\n[[profile]]\nname = \"a\"\nharness = \"claude\"\ncommand = \"relative\"\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn previous_boot_claim_never_blocks() {
+        let claim = json!({"boot_id": "old", "pid": 999999, "heartbeat_at": 10.0});
+        assert_eq!(
+            claim_decision(Some(&claim), "new", 20.0, 180.0, false),
+            ClaimDecision::TakeOverPreviousBoot
+        );
+        let live = json!({"boot_id": "new", "pid": 1, "heartbeat_at": 19.0});
+        assert_eq!(
+            claim_decision(Some(&live), "new", 20.0, 180.0, true),
+            ClaimDecision::AlreadyRunning
+        );
+        assert_eq!(
+            claim_decision(Some(&live), "new", 20.0, 180.0, false),
+            ClaimDecision::TakeOverStale
+        );
+        assert_eq!(
+            claim_decision(None, "new", 20.0, 180.0, false),
+            ClaimDecision::Take
+        );
+    }
+
+    #[test]
+    fn smoke_needs_the_exact_final_marker() {
+        assert!(smoke_passed(
+            "ok\n{\"marker\": \"agentctl-recovery-smoke\"}"
+        ));
+        assert!(!smoke_passed("{\"marker\": \"other\"}"));
+        assert!(!smoke_passed("no marker"));
     }
 }

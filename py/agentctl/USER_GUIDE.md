@@ -1495,6 +1495,45 @@ writes `alarm.json` beside the state and retries on backoff
 (60/300/900 seconds), reminders are at most hourly, and one resolved
 notice follows a delivered incident that later verifies healthy.
 
+Recovery after a boot is started with the one trigger-neutral entry
+point, callable by hand, from a script, in a container foreground, or
+from the optional boot unit — no service manager is assumed:
+
+```sh
+agentctl --registry ~/project/.agentctl start-recovery
+agentctl --registry ~/project/.agentctl start-recovery --foreground
+agentctl --registry ~/project/.agentctl recovery status
+```
+
+`start-recovery` claims one incident per restore epoch (a claim from
+a previous boot never blocks), launches deterministic restore and the
+recovery supervisor together, and joins instead of starting a second
+restorer when one is live (exit 75). The supervisor judges `team
+manifest` facts with stateless one-shot calls and effects only
+through `team act`, until the deterministic YES (lead running, bridge
+healthy, handoff acked) or bounded give-up escalates and stamps under
+`<state root>/shepherd/<boot-id>/`. Its judgement profiles are the
+team's ordered harness/model list in
+`REGISTRY/recovery-profiles.toml` (schema
+`agentctl-recovery-profiles/v1`: ordered `[[profile]]` entries with
+`name`, `harness`, and optional `model`, `effort`, `timeout_seconds`,
+absolute `command`, and `disabled`; the file order is the attempt
+order, and no secrets belong in it). Configure and smoke-test them at
+install time:
+
+```sh
+agentctl --registry ~/project/.agentctl recovery install --write-unit --unit-dest ~/.config/systemd/user
+agentctl --registry ~/project/.agentctl recovery smoke
+```
+
+`recovery install` validates the profile file, renders the optional
+`start-recovery` boot unit without enabling it (the operator enables
+it deliberately), and runs one real tiny structured round trip per
+enabled profile plus one whole-chain run, recorded in
+`<state root>/recovery/<key>/install-smoke.json` (no prompt, answer,
+or secret is recorded). Judgement runs only on a current all-pass
+smoke record for the file; deterministic recovery never waits on it.
+
 `agentctl watch` runs as a service and, every `--interval` seconds (default 60),
 checks and repairs:
 

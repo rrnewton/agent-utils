@@ -52,7 +52,16 @@ per attempt.
 ## Attempts and time limits
 
 Attempts run in Muse, Claude Code, Codex order unless `--only HARNESS`
-selects one. An attempt falls through to the next harness when the
+selects one, or `--profile-file PATH` names a recovery profile file
+(schema `agentctl-recovery-profiles/v1`): then its ordered
+`[[profile]]` entries are the attempt order, with no hidden built-in
+order. Each profile names a unique `name`, a `harness`, and optional
+`model`, `effort`, `timeout_seconds`, an absolute `command`, and
+`disabled`. `--profile NAME` (repeatable) restricts a profile file to
+the named enabled profiles. Attempt log lines then carry
+`profile=NAME`, and the winning profile is the one whose attempt
+answered. A recovery installation writes this file per team and
+smoke-tests every profile before trusting judgement. An attempt falls through to the next harness when the
 executable cannot start, the effort is unsupported, the child times
 out, the child exits nonzero, or its final answer is empty.
 

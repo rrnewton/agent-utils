@@ -25,7 +25,7 @@ from run_agent_prompt.attempts import (
     attempt_muse,
     child_env,
 )
-from run_agent_prompt.config import Config, load_config
+from run_agent_prompt.config import Config, Profile, load_config, load_profiles
 from run_agent_prompt.process import (
     BackendProcesses,
     TerminationSignal,
@@ -127,6 +127,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="also append one JSONL record per attempt to PATH",
     )
     parser.add_argument(
+        "--profile-file",
+        type=Path,
+        metavar="PATH",
+        help="ordered recovery profiles TOML (schema agentctl-recovery-profiles/v1); "
+        "its [[profile]] order is the attempt order, replacing the built-in order",
+    )
+    parser.add_argument(
+        "--profile",
+        action="append",
+        metavar="NAME",
+        help="with --profile-file, try only the named profile (repeatable); "
+        "an unknown or disabled name is a usage error",
+    )
+    parser.add_argument(
         "--only",
         choices=ALL_HARNESSES,
         metavar="HARNESS",
@@ -169,8 +183,12 @@ def _log_attempt(
     result: AttemptResult,
     effort: str,
     log_file: Path | None,
+    profile: str | None = None,
 ) -> None:
-    print(_attempt_line(result, effort), file=sys.stderr, flush=True)
+    line = _attempt_line(result, effort)
+    if profile is not None:
+        line = line.replace("run-agent-prompt: ", f"run-agent-prompt: profile={profile} ", 1)
+    print(line, file=sys.stderr, flush=True)
     if log_file is not None:
         record = {
             "event": "attempt",
@@ -180,6 +198,7 @@ def _log_attempt(
             "duration_s": round(result.duration_s, 3),
             "model": result.model,
             "effort": effort,
+            "profile": profile,
         }
         log_file.parent.mkdir(parents=True, exist_ok=True)
         with log_file.open("a", encoding="utf-8") as handle:
@@ -225,6 +244,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         config = load_config(args.config)
     except ValueError as error:
         parser.error(str(error))
+    profiles: list[Profile] | None = None
+    if args.profile_file is not None:
+        try:
+            profiles = load_profiles(args.profile_file)
+        except ValueError as error:
+            parser.error(str(error))
+        if args.profile:
+            known = {profile.name: profile for profile in profiles}
+            selected: list[Profile] = []
+            for name in args.profile:
+                profile = known.get(name)
+                if profile is None or profile.disabled:
+                    parser.error(f"profile {name} is unknown or disabled")
+                selected.append(profile)
+            profiles = selected
+        else:
+            profiles = [profile for profile in profiles if not profile.disabled]
+            if not profiles:
+                parser.error("profile file enables no profile")
     if args.prompt_file is not None:
         try:
             prompt = args.prompt_file.read_text(encoding="utf-8")
@@ -237,7 +275,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.cwd is not None and not args.cwd.is_dir():
         parser.error(f"--cwd is not a directory: {args.cwd}")
 
-    harnesses = [args.only] if args.only else list(ALL_HARNESSES)
+    if profiles is not None:
+        plans: list[tuple[str, Profile | None]] = [(p.harness, p) for p in profiles]
+    elif args.only:
+        plans = [(args.only, None)]
+    else:
+        plans = [(harness, None) for harness in ALL_HARNESSES]
     env = child_env()
     deadline = time.monotonic() + args.total_timeout
     processes = BackendProcesses()
@@ -264,19 +307,37 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if previous_mask is not None:
                     signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
             scratch = Path(temporary.name)
-            for harness in harnesses:
+            for harness, profile in plans:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     result = AttemptResult(harness, "total-timeout", None, 0.0)
-                    _log_attempt(result, _resolve(harness, args, config)[1], args.log_file)
+                    _log_attempt(result, _resolve(harness, args, config)[1], args.log_file, profile.name if profile else None)
                     continue
                 model, effort = _resolve(harness, args, config)
-                command = _command(getattr(args, f"{harness}_command"), harness)
+                if profile is not None:
+                    if getattr(args, f"{harness}_model") is None and profile.model:
+                        model = profile.model
+                    if (
+                        getattr(args, f"{harness}_effort") is None
+                        and args.effort is None
+                        and profile.effort
+                    ):
+                        effort = profile.effort
+                attempt_timeout = (
+                    profile.timeout_seconds
+                    if profile is not None and profile.timeout_seconds
+                    else args.timeout
+                )
+                command = (
+                    [profile.command]
+                    if profile is not None and profile.command
+                    else _command(getattr(args, f"{harness}_command"), harness)
+                )
                 if effort not in EFFORT_LEVELS[harness]:
                     result = AttemptResult(
                         harness, "invalid-effort", None, 0.0, model=model
                     )
-                    _log_attempt(result, effort, args.log_file)
+                    _log_attempt(result, effort, args.log_file, profile.name if profile else None)
                     continue
                 if shutil.which(command[0], path=env.get("PATH")) is None and not Path(
                     command[0]
@@ -284,9 +345,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     result = AttemptResult(
                         harness, "spawn-error", None, 0.0, model=model
                     )
-                    _log_attempt(result, effort, args.log_file)
+                    _log_attempt(result, effort, args.log_file, profile.name if profile else None)
                     continue
-                timeout = min(args.timeout, remaining)
+                timeout = min(attempt_timeout, remaining)
                 attempt_scratch = scratch / harness
                 workspace = args.cwd or attempt_scratch / "workspace"
                 attempt_scratch.mkdir(parents=True, exist_ok=True)
@@ -307,9 +368,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         result = AttemptResult(harness, "total-timeout", None, 0.0)
-                        _log_attempt(result, effort, args.log_file)
+                        _log_attempt(
+                            result, effort, args.log_file, profile.name if profile else None
+                        )
                         continue
-                    timeout = min(args.timeout, remaining)
+                    timeout = min(attempt_timeout, remaining)
                 if harness == "muse":
                     result = attempt_muse(
                         processes,
@@ -345,7 +408,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         timeout_seconds=timeout,
                         env=env,
                     )
-                _log_attempt(result, effort, args.log_file)
+                _log_attempt(result, effort, args.log_file, profile.name if profile else None)
                 if result.status == "answered" and result.answer is not None:
                     sys.stdout.write(result.answer)
                     if not result.answer.endswith("\n"):

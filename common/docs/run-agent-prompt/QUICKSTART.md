@@ -11,6 +11,7 @@ Install it with `python3 -m pip install run-agent-prompt`. Python
 run-agent-prompt --prompt-file prompt.txt
 cat prompt.txt | run-agent-prompt --timeout 120
 run-agent-prompt --only claude --prompt-file prompt.txt
+run-agent-prompt --profile-file recovery-profiles.toml --prompt-file prompt.txt
 ```
 
 The prompt is read from `--prompt-file PATH` or stdin and never
