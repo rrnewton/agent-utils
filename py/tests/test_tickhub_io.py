@@ -189,3 +189,39 @@ def test_strict_parse_errors() -> None:
         except TickConfigError:
             raised = True
         assert raised, f"expected TickConfigError for: {doc!r}"
+
+
+def test_deadline_and_after_keys_load_and_round_trip() -> None:
+    from tick_hub.model import AfterEdge
+    text = (
+        '{"deadline_secs": 30, "reminders": ['
+        '{"name": "foundation", "max_duration_secs": 10, "emit": {"skill": "s"}},'
+        '{"name": "dependent", "after": [{"name": "foundation", "require_success": true}], "emit": {"skill": "s"}}'
+        ']}'
+    )
+    cfg = config_from_json(text)
+    assert cfg.deadline_secs == 30
+    assert cfg.reminders[0].max_duration_secs == 10
+    assert cfg.reminders[1].after == (AfterEdge("foundation", require_success=True),)
+    assert config_from_json(config_to_json(cfg)) == cfg
+
+
+def test_after_cycle_and_invalid_new_keys_are_refused_at_load() -> None:
+    bad_docs = [
+        '{"reminders": [{"name": "a", "after": [{"name": "b"}], "emit": {"skill": "s"}}, {"name": "b", "after": [{"name": "a"}], "emit": {"skill": "s"}}]}',
+        '{"reminders": [{"name": "a", "after": [{"name": "missing"}], "emit": {"skill": "s"}}]}',
+        '{"reminders": [{"name": "a", "after": [{"name": "a"}], "emit": {"skill": "s"}}]}',
+        '{"reminders": [{"name": "a", "after": [{"name": "b"}, {"name": "b"}], "emit": {"skill": "s"}}, {"name": "b", "emit": {"skill": "s"}}]}',
+        '{"reminders": [{"name": "a", "after": [{"name": "b", "unknown": 1}], "emit": {"skill": "s"}}, {"name": "b", "emit": {"skill": "s"}}]}',
+        '{"reminders": [{"name": "a", "max_duration_secs": 0, "emit": {"skill": "s"}}]}',
+        '{"deadline_secs": 0, "reminders": []}',
+        '{"deadline_secs": -5, "reminders": []}',
+        '{"reminders": [{"name": "a", "after": ["b"], "emit": {"skill": "s"}}]}',
+    ]
+    for doc in bad_docs:
+        raised = False
+        try:
+            config_from_json(doc)
+        except TickConfigError:
+            raised = True
+        assert raised, f"expected TickConfigError for: {doc!r}"

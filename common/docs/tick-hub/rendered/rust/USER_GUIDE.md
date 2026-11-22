@@ -82,6 +82,38 @@ verbatim; dependency metadata never suppresses a finding. Empty output or an
 intentional zero selection does not imply `NO_RESULT`: only exit 75 carries
 that meaning.
 
+A tick may declare a whole-tick budget with the top-level `deadline_secs`,
+accounted in declared bounds rather than measured wall time. Each reminder
+declares its worst case with `max_duration_secs`. In execution order, a
+reminder starts only when its bound fits the budget that remains; otherwise
+it emits a `SKIPPED:` record naming it and keeps its cadence, so the next
+tick offers it again. A reminder with no declared bound charges nothing
+against the budget. Gates that set `parallel: true` run serially in a tick
+whose configuration declares a deadline or ordering edges, because each
+start decision needs the remaining budget and the prerequisite outcomes
+first.
+
+`after` declares typed same-tick ordering edges:
+
+```yaml
+  - name: publish_report
+    after:
+      - name: refresh_cache
+        require_success: true
+```
+
+The engine runs prerequisites first and breaks ties by configuration order.
+Unknown, duplicate, self-referential, or cyclic edges are errors. An edge
+whose prerequisite is absent this tick (not due, or flag-suppressed)
+imposes nothing. A skipped prerequisite skips every reminder that runs
+after it, transitively, and each skip names the dependent and the
+prerequisite. With `require_success: true`, the prerequisite must also have
+determined a verdict in this tick without an execution error and without
+`NO_RESULT`, or the dependent is skipped the same way; an ordering-only
+edge runs after its prerequisite whatever verdict it reached. `after` is
+distinct from `depends_on`: `depends_on` never changes whether or when a
+gate runs, while `after` orders execution and can skip a dependent.
+
 An action emit requires a non-empty `skill`; its `fields` values are strings.
 A note emit uses `title` as its text.
 
@@ -143,6 +175,9 @@ NOTE: emitted 1 instruction(s) this tick
 - `NO_RESULT:` means a gate could not determine its condition, or a quiet
   dependent is unevaluable because such a gate is its declared dependency. It
   is neither a pass nor a failure and does not consume cadence.
+- `SKIPPED:` means a due reminder did not run this tick: its declared bound
+  exceeded the remaining tick budget, a prerequisite was skipped, or a
+  prerequisite it required to succeed did not. It does not consume cadence.
 
 If a fired reminder cannot render because a `{placeholder}` is unresolved,
 tick-hub emits an `ERROR:` and a counted `NO-SIGNAL` action and retries the

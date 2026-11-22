@@ -134,6 +134,39 @@ impl Emit {
     }
 }
 
+/// One typed same-tick ordering edge: this reminder runs after `name`.
+///
+/// `require_success` additionally demands that the prerequisite completed its
+/// check successfully this tick (a determined fire or quiet verdict, with no
+/// execution error and no no-result); an ordering-only edge constrains
+/// sequence alone. Either way, a prerequisite that was skipped this tick skips
+/// this reminder too.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AfterEdge {
+    /// Prerequisite reminder name.
+    pub name: String,
+    /// Whether the prerequisite must have succeeded this tick.
+    pub require_success: bool,
+}
+
+impl AfterEdge {
+    /// Construct an ordering-only edge.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            require_success: false,
+        }
+    }
+
+    /// Construct an edge that also requires the prerequisite to succeed.
+    pub fn requiring_success(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            require_success: true,
+        }
+    }
+}
+
 /// One recurring responsibility.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Reminder {
@@ -159,6 +192,14 @@ pub struct Reminder {
     /// that did not complete is offered on every later tick, including the other phase's --
     /// the pile-up phasing exists to prevent. It never marks a missed reminder done.
     pub cadence_window_secs: Option<i64>,
+    /// Declared worst-case seconds this reminder's check may occupy. Only
+    /// consulted when the config sets a tick `deadline_secs`: the reminder
+    /// starts only if this bound fits the remaining tick budget. `None`
+    /// declares no bound and charges nothing against the budget.
+    pub max_duration_secs: Option<i64>,
+    /// Typed same-tick ordering edges. Empty keeps plain config-order
+    /// execution, exactly as before.
+    pub after: Vec<AfterEdge>,
 }
 
 impl Reminder {
@@ -173,6 +214,8 @@ impl Reminder {
             depends_on: Vec::new(),
             cadence_offset_secs: None,
             cadence_window_secs: None,
+            max_duration_secs: None,
+            after: Vec::new(),
         }
     }
 }
@@ -211,6 +254,10 @@ pub struct TickConfig {
     pub health_checks: Vec<HealthCheck>,
     /// Free-form documentation that does not affect behavior.
     pub description: String,
+    /// Optional whole-tick budget in seconds, accounted in each reminder's
+    /// declared `max_duration_secs` bound. `None` (the default) imposes no
+    /// deadline and preserves the previous behaviour exactly.
+    pub deadline_secs: Option<i64>,
 }
 
 impl TickConfig {

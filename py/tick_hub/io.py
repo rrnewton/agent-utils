@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 
 from tick_hub.cadence import INTERNAL_STATE_PREFIX
 from tick_hub.model import (
+    AfterEdge,
     Emit,
     EmitKind,
     Gate,
@@ -222,6 +223,25 @@ def _emit_from(value: object, where: str) -> Emit:
     return emit
 
 
+def _after_from(value: object, where: str) -> tuple[AfterEdge, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise TickConfigError(f"{where}: field 'after' must be a list of edge objects")
+    out: list[AfterEdge] = []
+    for index, entry in enumerate(value):
+        edge_where = f"{where}.after[{index}]"
+        obj = _as_obj(entry, edge_where)
+        _reject_unknown(obj, frozenset({"name", "require_success"}), edge_where)
+        out.append(
+            AfterEdge(
+                name=_require_reminder_name(_req_str(obj, "name", edge_where), edge_where),
+                require_success=_opt_bool(obj, "require_success", False, edge_where),
+            )
+        )
+    return tuple(out)
+
+
 def _reminder_from(value: object, where: str) -> Reminder:
     obj = _as_obj(value, where)
     _reject_unknown(
@@ -236,6 +256,8 @@ def _reminder_from(value: object, where: str) -> Reminder:
                 "requires_flags",
                 "depends_on",
                 "gate",
+                "max_duration_secs",
+                "after",
             }
         ),
         where,
@@ -279,6 +301,9 @@ def _reminder_from(value: object, where: str) -> Reminder:
                 f"{where}: 'cadence_window_secs' ({cadence_window_secs}) must be greater "
                 f"than 0 and at most 'cadence_secs' ({cadence_secs})"
             )
+    max_duration_secs: int | None = None
+    if obj.get("max_duration_secs") is not None:
+        max_duration_secs = _opt_positive_int_or_none(obj, "max_duration_secs", where)
     return Reminder(
         name=_require_reminder_name(_req_str(obj, "name", where), where),
         emit=_emit_from(emit_raw, f"{where}.emit"),
@@ -288,6 +313,8 @@ def _reminder_from(value: object, where: str) -> Reminder:
         requires_flags=_opt_str_list(obj, "requires_flags", where),
         depends_on=depends_on,
         gate=_gate_from(obj.get("gate"), f"{where}.gate"),
+        max_duration_secs=max_duration_secs,
+        after=_after_from(obj.get("after"), where),
     )
 
 
@@ -326,6 +353,46 @@ def _validate_dependencies(reminders: Sequence[Reminder]) -> None:
 
     for reminder in reminders:
         visit(reminder.name, ())
+
+    for reminder in reminders:
+        edge_names = [edge.name for edge in reminder.after]
+        if len(set(edge_names)) != len(edge_names):
+            raise TickConfigError(
+                f"<root>: reminder {reminder.name!r} has duplicate after entries"
+            )
+        for edge in reminder.after:
+            if edge.name == reminder.name:
+                raise TickConfigError(
+                    f"<root>: reminder {reminder.name!r} cannot run after itself"
+                )
+            if edge.name not in by_name:
+                raise TickConfigError(
+                    f"<root>: reminder {reminder.name!r} runs after unknown reminder "
+                    f"{edge.name!r}"
+                )
+            if not isinstance(edge.require_success, bool):
+                raise TickConfigError(
+                    f"<root>: reminder {reminder.name!r} after entry for "
+                    f"{edge.name!r} must declare require_success as a boolean"
+                )
+
+    after_visiting: set[str] = set()
+    after_visited: set[str] = set()
+
+    def visit_after(name: str, path: tuple[str, ...]) -> None:
+        if name in after_visited:
+            return
+        if name in after_visiting:
+            cycle = " -> ".join((*path, name))
+            raise TickConfigError(f"<root>: reminder after cycle: {cycle}")
+        after_visiting.add(name)
+        for edge in by_name[name].after:
+            visit_after(edge.name, (*path, name))
+        after_visiting.remove(name)
+        after_visited.add(name)
+
+    for reminder in reminders:
+        visit_after(reminder.name, ())
 
 
 def _health_from(value: object, where: str) -> HealthCheck:
@@ -390,7 +457,9 @@ def config_from_yaml(text: str) -> TickConfig:
 
 def _config_from_obj(raw: object) -> TickConfig:
     doc = _as_obj(raw, "<root>")
-    _reject_unknown(doc, frozenset({"reminders", "health_checks", "description"}), "<root>")
+    _reject_unknown(
+        doc, frozenset({"reminders", "health_checks", "description", "deadline_secs"}), "<root>"
+    )
     reminders: list[Reminder] = []
     if "reminders" in doc:
         reminders_raw = doc["reminders"]
@@ -412,10 +481,14 @@ def _config_from_obj(raw: object) -> TickConfig:
     health_names = [check.name for check in health]
     if len(set(health_names)) != len(health_names):
         raise TickConfigError("<root>: health check names must be unique")
+    deadline_secs: int | None = None
+    if doc.get("deadline_secs") is not None:
+        deadline_secs = _opt_positive_int_or_none(doc, "deadline_secs", "<root>")
     return TickConfig(
         reminders=tuple(reminders),
         health_checks=tuple(health),
         description=_opt_str(doc, "description", "", "<root>"),
+        deadline_secs=deadline_secs,
     )
 
 
@@ -468,6 +541,12 @@ def _reminder_to_obj(rem: Reminder) -> dict[str, object]:
     }
     if rem.depends_on:
         obj["depends_on"] = list(rem.depends_on)
+    if rem.max_duration_secs is not None:
+        obj["max_duration_secs"] = rem.max_duration_secs
+    if rem.after:
+        obj["after"] = [
+            {"name": edge.name, "require_success": edge.require_success} for edge in rem.after
+        ]
     return obj
 
 
@@ -486,6 +565,8 @@ def _config_to_obj(cfg: TickConfig) -> dict[str, object]:
         "health_checks": [_health_to_obj(h) for h in cfg.health_checks],
         "reminders": [_reminder_to_obj(r) for r in cfg.reminders],
     }
+    if cfg.deadline_secs is not None:
+        obj["deadline_secs"] = cfg.deadline_secs
     # Public dataclasses are directly constructible. Validate them through the same strict
     # narrowing path before serializing so every emitted document is guaranteed loadable.
     _config_from_obj(obj)

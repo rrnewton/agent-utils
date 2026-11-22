@@ -10,7 +10,7 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 
 use crate::cadence::INTERNAL_STATE_PREFIX;
-use crate::model::{Emit, EmitKind, Gate, GateWhen, HealthCheck, Reminder, TickConfig};
+use crate::model::{AfterEdge, Emit, EmitKind, Gate, GateWhen, HealthCheck, Reminder, TickConfig};
 use crate::text::{is_whitespace, string_repr, trim};
 
 /// Configuration parse or serialization failure.
@@ -423,6 +423,60 @@ fn emit_from(value: &Value, where_: &str) -> Result<Emit, TickConfigError> {
     Ok(emit)
 }
 
+fn opt_positive_or_none(
+    object: &Map<String, Value>,
+    key: &str,
+    where_: &str,
+) -> Result<Option<i64>, TickConfigError> {
+    match object.get(key) {
+        Some(value) if !value.is_null() => {
+            let parsed = opt_int(object, key, 0, where_)?;
+            if parsed <= 0 {
+                return Err(TickConfigError(format!(
+                    "{where_}: field '{key}' must be positive"
+                )));
+            }
+            Ok(Some(parsed))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn after_from(value: Option<&Value>, where_: &str) -> Result<Vec<AfterEdge>, TickConfigError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    let Some(items) = value.as_array() else {
+        return Err(TickConfigError(format!(
+            "{where_}: field 'after' must be a list of edge objects"
+        )));
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for (index, entry) in items.iter().enumerate() {
+        let edge_where = format!("{where_}.after[{index}]");
+        let object = as_obj(entry, &edge_where)?;
+        reject_unknown(object, &["name", "require_success"], &edge_where)?;
+        let name = req_str(object, "name", &edge_where)?;
+        if trim(&name).is_empty()
+            || name.contains('=')
+            || name.chars().any(is_whitespace)
+            || name.starts_with(INTERNAL_STATE_PREFIX)
+        {
+            return Err(TickConfigError(format!(
+                "{edge_where}: field 'name' must not contain whitespace or '=' (it is a fired-state key)"
+            )));
+        }
+        out.push(AfterEdge {
+            name,
+            require_success: opt_bool(object, "require_success", false, &edge_where)?,
+        });
+    }
+    Ok(out)
+}
+
 fn reminder_from(value: &Value, where_: &str) -> Result<Reminder, TickConfigError> {
     let object = as_obj(value, where_)?;
     reject_unknown(
@@ -436,6 +490,8 @@ fn reminder_from(value: &Value, where_: &str) -> Result<Reminder, TickConfigErro
             "requires_flags",
             "depends_on",
             "gate",
+            "max_duration_secs",
+            "after",
         ],
         where_,
     )?;
@@ -510,6 +566,8 @@ fn reminder_from(value: &Value, where_: &str) -> Result<Reminder, TickConfigErro
         depends_on: opt_str_list(object, "depends_on", where_)?,
         cadence_offset_secs,
         cadence_window_secs,
+        max_duration_secs: opt_positive_or_none(object, "max_duration_secs", where_)?,
+        after: after_from(object.get("after"), where_)?,
     })
 }
 
@@ -589,6 +647,69 @@ fn validate_dependencies(reminders: &[Reminder]) -> Result<(), TickConfigError> 
             &mut Vec::new(),
         )?;
     }
+
+    for reminder in reminders {
+        let mut unique = BTreeSet::new();
+        for edge in &reminder.after {
+            if !unique.insert(edge.name.as_str()) {
+                return Err(TickConfigError(format!(
+                    "<root>: reminder {:?} has duplicate after entries",
+                    reminder.name
+                )));
+            }
+            if edge.name == reminder.name {
+                return Err(TickConfigError(format!(
+                    "<root>: reminder {:?} cannot run after itself",
+                    reminder.name
+                )));
+            }
+            if !by_name.contains_key(edge.name.as_str()) {
+                return Err(TickConfigError(format!(
+                    "<root>: reminder {:?} runs after unknown reminder {:?}",
+                    reminder.name, edge.name
+                )));
+            }
+        }
+    }
+
+    fn visit_after<'a>(
+        name: &'a str,
+        by_name: &BTreeMap<&'a str, &'a Reminder>,
+        visiting: &mut BTreeSet<&'a str>,
+        visited: &mut BTreeSet<&'a str>,
+        path: &mut Vec<&'a str>,
+    ) -> Result<(), TickConfigError> {
+        if visited.contains(name) {
+            return Ok(());
+        }
+        if !visiting.insert(name) {
+            path.push(name);
+            return Err(TickConfigError(format!(
+                "<root>: reminder after cycle: {}",
+                path.join(" -> ")
+            )));
+        }
+        path.push(name);
+        for edge in &by_name[name].after {
+            visit_after(&edge.name, by_name, visiting, visited, path)?;
+        }
+        path.pop();
+        visiting.remove(name);
+        visited.insert(name);
+        Ok(())
+    }
+
+    let mut visiting = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    for reminder in reminders {
+        visit_after(
+            &reminder.name,
+            &by_name,
+            &mut visiting,
+            &mut visited,
+            &mut Vec::new(),
+        )?;
+    }
     Ok(())
 }
 
@@ -623,7 +744,7 @@ fn config_from_value(raw: &Value) -> Result<TickConfig, TickConfigError> {
     let object = as_obj(raw, "<root>")?;
     reject_unknown(
         object,
-        &["reminders", "health_checks", "description"],
+        &["reminders", "health_checks", "description", "deadline_secs"],
         "<root>",
     )?;
     let reminders = match object.get("reminders") {
@@ -673,6 +794,7 @@ fn config_from_value(raw: &Value) -> Result<TickConfig, TickConfigError> {
         reminders,
         health_checks,
         description: opt_str(object, "description", "", "<root>")?,
+        deadline_secs: opt_positive_or_none(object, "deadline_secs", "<root>")?,
     })
 }
 
@@ -797,14 +919,39 @@ fn config_to_value(config: &TickConfig) -> Value {
             }
             object.insert("gate".into(), gate_to_value(reminder.gate.as_ref()));
             object.insert("emit".into(), emit_to_value(&reminder.emit));
+            if let Some(bound) = reminder.max_duration_secs {
+                object.insert("max_duration_secs".into(), Value::Number(bound.into()));
+            }
+            if !reminder.after.is_empty() {
+                let edges = reminder
+                    .after
+                    .iter()
+                    .map(|edge| {
+                        let mut edge_object = Map::new();
+                        edge_object.insert("name".into(), Value::String(edge.name.clone()));
+                        edge_object
+                            .insert("require_success".into(), Value::Bool(edge.require_success));
+                        Value::Object(edge_object)
+                    })
+                    .collect();
+                object.insert("after".into(), Value::Array(edges));
+            }
             Value::Object(object)
         })
         .collect();
     root.insert("reminders".into(), Value::Array(reminders));
+    if let Some(deadline) = config.deadline_secs {
+        root.insert("deadline_secs".into(), Value::Number(deadline.into()));
+    }
     Value::Object(root)
 }
 
 fn validate_serializable(config: &TickConfig) -> Result<(), TickConfigError> {
+    if config.deadline_secs.is_some_and(|deadline| deadline <= 0) {
+        return Err(TickConfigError(
+            "tick deadline_secs must be positive".to_string(),
+        ));
+    }
     let mut reminder_names = BTreeSet::new();
     for reminder in &config.reminders {
         if trim(&reminder.name).is_empty()
@@ -825,6 +972,11 @@ fn validate_serializable(config: &TickConfig) -> Result<(), TickConfigError> {
         if reminder.cadence_secs < 0 {
             return Err(TickConfigError(
                 "reminder cadence_secs must be non-negative".to_string(),
+            ));
+        }
+        if reminder.max_duration_secs.is_some_and(|bound| bound <= 0) {
+            return Err(TickConfigError(
+                "reminder max_duration_secs must be positive".to_string(),
             ));
         }
         if reminder.emit.kind == EmitKind::Action && trim(&reminder.emit.skill).is_empty() {
@@ -1099,6 +1251,7 @@ mod tests {
             description: "-0xF0".into(),
             reminders: vec![Reminder::new("r", Emit::note("+0o7"))],
             health_checks: Vec::new(),
+            deadline_secs: None,
         };
         let yaml = config_to_yaml(&config).unwrap();
         let round_trip = config_from_yaml(&yaml).unwrap();
@@ -1197,5 +1350,44 @@ mod tests {
             ..TickConfig::default()
         };
         assert!(config_to_json(&invalid_model).is_err());
+    }
+
+    #[test]
+    fn deadline_and_after_keys_load_and_round_trip() {
+        let text = r#"{"deadline_secs": 30, "reminders": [
+          {"name": "foundation", "max_duration_secs": 10, "emit": {"skill": "s"}},
+          {"name": "dependent", "after": [{"name": "foundation", "require_success": true}], "emit": {"skill": "s"}}
+        ]}"#;
+        let config = config_from_json(text).unwrap();
+        assert_eq!(config.deadline_secs, Some(30));
+        assert_eq!(config.reminders[0].max_duration_secs, Some(10));
+        assert_eq!(
+            config.reminders[1].after,
+            vec![AfterEdge {
+                name: "foundation".into(),
+                require_success: true
+            }]
+        );
+        assert_eq!(
+            config_from_json(&config_to_json(&config).unwrap()).unwrap(),
+            config
+        );
+    }
+
+    #[test]
+    fn after_cycle_and_invalid_new_keys_are_refused_at_load() {
+        for doc in [
+            r#"{"reminders": [{"name": "a", "after": [{"name": "b"}], "emit": {"skill": "s"}}, {"name": "b", "after": [{"name": "a"}], "emit": {"skill": "s"}}]}"#,
+            r#"{"reminders": [{"name": "a", "after": [{"name": "missing"}], "emit": {"skill": "s"}}]}"#,
+            r#"{"reminders": [{"name": "a", "after": [{"name": "a"}], "emit": {"skill": "s"}}]}"#,
+            r#"{"reminders": [{"name": "a", "max_duration_secs": 0, "emit": {"skill": "s"}}]}"#,
+            r#"{"deadline_secs": 0, "reminders": []}"#,
+            r#"{"reminders": [{"name": "a", "after": ["b"], "emit": {"skill": "s"}}]}"#,
+        ] {
+            assert!(
+                config_from_json(doc).is_err(),
+                "expected refusal for: {doc}"
+            );
+        }
     }
 }

@@ -115,6 +115,15 @@ pub fn format_clean(name: &str) -> String {
     format!("CLEAN: {name} ran and found nothing to report")
 }
 
+/// Format a due reminder that did not run this tick (deadline or dependency skip).
+///
+/// Always emitted, never only in a pending report: a silently skipped check is
+/// indistinguishable from a completed one. The reminder keeps its cadence, so
+/// it is offered again next tick.
+pub fn format_skipped(name: &str, detail: &str) -> String {
+    format!("SKIPPED: {name} did not run; {detail}")
+}
+
 /// Format a reminder not evaluated because one or more required flags are off.
 pub fn format_suppressed(name: &str, missing_flags: &[String]) -> String {
     let flags = if missing_flags.is_empty() {

@@ -67,6 +67,21 @@ class Gate:
 
 
 @dataclass(frozen=True)
+class AfterEdge:
+    """One typed same-tick ordering edge: this reminder runs after ``name``.
+
+    ``require_success`` additionally demands that the prerequisite completed
+    its check successfully this tick (a determined FIRE or QUIET verdict, with
+    no execution error and no ``NO_RESULT``); an ordering-only edge
+    (``require_success=False``) constrains sequence alone. Either way, a
+    prerequisite that was SKIPPED this tick skips this reminder too.
+    """
+
+    name: str
+    require_success: bool = False
+
+
+@dataclass(frozen=True)
 class Emit:
     """What a fired reminder emits.
 
@@ -121,6 +136,14 @@ class Reminder:
     # New fields on a public dataclass go last.
     cadence_offset_secs: int | None = None
     cadence_window_secs: int | None = None
+    #: Declared worst-case seconds this reminder's check may occupy. Only
+    #: consulted when the config sets a tick ``deadline_secs``: the reminder
+    #: starts only if this bound fits the remaining tick budget. ``None``
+    #: declares no bound and charges nothing against the budget.
+    max_duration_secs: int | None = None
+    #: Typed same-tick ordering edges (see :class:`AfterEdge`). Empty keeps
+    #: plain config-order execution, exactly as before.
+    after: Sequence[AfterEdge] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -147,6 +170,12 @@ class TickConfig:
     health_checks: tuple[HealthCheck, ...] = ()
     #: Optional long-form documentation for the whole config (never affects behavior).
     description: str = ""
+    #: Optional whole-tick budget in seconds, accounted in each reminder's
+    #: declared ``max_duration_secs`` bound. ``None`` (the default) imposes no
+    #: deadline and preserves the previous behaviour exactly.
+    # ⚠️ APPENDED, NOT INSERTED: existing positional callers pass
+    # (reminders, health_checks, description) and must not be rebound.
+    deadline_secs: int | None = None
 
     def by_name(self) -> dict[str, Reminder]:
         """Index reminders by their configured names."""

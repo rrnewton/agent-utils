@@ -118,6 +118,16 @@ def format_suppressed(name: str, missing_flags: Sequence[str]) -> str:
     return f"SUPPRESSED: {name} did not run; required flag(s) not set: {flags}"
 
 
+def format_skipped(name: str, detail: str) -> str:
+    """Format a due reminder that did not run this tick (deadline or dependency skip).
+
+    Always emitted, never only in a pending report: a silently skipped check is
+    indistinguishable from a completed one, which is the failure the deadline
+    and dependency-edge features exist to remove. The reminder keeps its
+    cadence, so it is offered again next tick."""
+    return f"SKIPPED: {name} did not run; {detail}"
+
+
 def format_error(text: str) -> str:
     """Format an operational ``ERROR`` record."""
     return f"ERROR: {text}"

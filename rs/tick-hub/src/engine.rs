@@ -14,7 +14,7 @@ use crate::cadence::{
 };
 use crate::emit::{
     format_action, format_clean, format_error, format_health, format_no_result, format_note,
-    format_schedule, format_suppressed, format_tick_header, format_unevaluable,
+    format_schedule, format_skipped, format_suppressed, format_tick_header, format_unevaluable,
     HEALTH_STATUS_MISSING, HEALTH_STATUS_OK, HEALTH_STATUS_STALE,
 };
 use crate::model::{Emit, EmitKind, Gate, GateWhen, HealthCheck, Reminder, TickConfig};
@@ -126,6 +126,9 @@ enum PlannedReminder<'a> {
 enum ReminderReport<'a> {
     Evaluated(ReminderEvaluation<'a>),
     Suppressed(SuppressedLines),
+    /// A due reminder that did not run: its header, then `SKIPPED:`. Carries no
+    /// cadence stamp, so the reminder is offered again next tick.
+    Skipped(SuppressedLines),
 }
 
 type EmitLine<'a> = Option<&'a mut dyn FnMut(&str) -> io::Result<()>>;
@@ -384,6 +387,55 @@ fn prune_removed_render_failure_state(
     });
 }
 
+/// Topologically order planned runnable indices by `after` edges (stable).
+///
+/// Only edges between two planned runnable reminders constrain order; an edge
+/// naming a reminder that is not planned this tick is vacuous. Ties keep
+/// config order, so a config without `after` edges yields config order
+/// exactly. A cycle (refused at load; reachable only by direct construction)
+/// falls back to config order for the remaining reminders rather than hanging.
+fn execution_order(planned: &[PlannedReminder<'_>]) -> Vec<usize> {
+    let mut index_of = BTreeMap::new();
+    for (index, entry) in planned.iter().enumerate() {
+        if let PlannedReminder::Runnable(reminder) = entry {
+            index_of.insert(reminder.name.clone(), index);
+        }
+    }
+    let mut placed: Vec<usize> = Vec::new();
+    let mut placed_set = BTreeSet::new();
+    let mut remaining: BTreeSet<usize> = index_of.values().copied().collect();
+    while !remaining.is_empty() {
+        let mut chosen = None;
+        for &index in &remaining {
+            let PlannedReminder::Runnable(reminder) = &planned[index] else {
+                continue;
+            };
+            if reminder
+                .after
+                .iter()
+                .filter(|edge| index_of.contains_key(&edge.name))
+                .all(|edge| placed_set.contains(&index_of[&edge.name]))
+            {
+                chosen = Some(index);
+                break;
+            }
+        }
+        let Some(index) = chosen else {
+            placed.extend(remaining.iter().copied());
+            break;
+        };
+        placed.push(index);
+        placed_set.insert(index);
+        remaining.remove(&index);
+    }
+    placed
+}
+
+fn succeeded(evaluation: &ReminderEvaluation<'_>) -> bool {
+    evaluation.error.is_none()
+        && matches!(evaluation.outcome, GateOutcome::Fire | GateOutcome::Quiet)
+}
+
 fn record_line(lines: &mut Vec<String>, emit: &mut EmitLine<'_>, line: String) -> io::Result<()> {
     lines.push(line);
     if let Some(callback) = emit.as_deref_mut() {
@@ -574,7 +626,7 @@ fn render_after_dependency_pass(
     let mut actions = 0;
     for report in &reports[render_from..] {
         match report {
-            ReminderReport::Suppressed(suppressed) => {
+            ReminderReport::Suppressed(suppressed) | ReminderReport::Skipped(suppressed) => {
                 for line in suppressed {
                     record_line(lines, emit, line.clone())?;
                 }
@@ -716,7 +768,16 @@ fn run_tick_inner(
             planned.push(PlannedReminder::Runnable(reminder));
         }
 
-        let stream_prefix_len = if emit.is_some() {
+        // Deadline and after-edge configs evaluate serially in execution
+        // (topological) order and render afterwards: a gate may only start
+        // once its prerequisites and the remaining budget are known, so no
+        // prefix verdict is final early. Configs using neither feature keep
+        // the streaming path below exactly.
+        let ordered_mode = config.deadline_secs.is_some()
+            || planned.iter().any(|entry| {
+                matches!(entry, PlannedReminder::Runnable(reminder) if !reminder.after.is_empty())
+            });
+        let stream_prefix_len = if emit.is_some() && !ordered_mode {
             planned
                 .iter()
                 .position(|entry| {
@@ -728,18 +789,122 @@ fn run_tick_inner(
         };
         let no_dependencies = BTreeSet::new();
         let mut reports = Vec::new();
-        let parallel_indexes = planned
-            .iter()
-            .enumerate()
-            .filter_map(|(index, entry)| match entry {
-                PlannedReminder::Runnable(reminder)
-                    if reminder.gate.as_ref().is_some_and(|gate| gate.parallel) =>
-                {
-                    Some(index)
+        let mut precomputed: BTreeMap<usize, ReminderReport<'_>> = BTreeMap::new();
+        if ordered_mode {
+            let planned_names: BTreeSet<&str> = planned
+                .iter()
+                .filter_map(|entry| match entry {
+                    PlannedReminder::Runnable(reminder) => Some(reminder.name.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let mut succeeded_by_name: BTreeMap<String, bool> = BTreeMap::new();
+            let mut skipped_names: BTreeSet<String> = BTreeSet::new();
+            let mut remaining_budget = config.deadline_secs;
+            for index in execution_order(&planned) {
+                let PlannedReminder::Runnable(reminder) = &planned[index] else {
+                    continue;
+                };
+                let reminder = *reminder;
+                let skipped_prereqs: Vec<&str> = reminder
+                    .after
+                    .iter()
+                    .filter(|edge| skipped_names.contains(&edge.name))
+                    .map(|edge| edge.name.as_str())
+                    .collect();
+                if !skipped_prereqs.is_empty() {
+                    precomputed.insert(
+                        index,
+                        ReminderReport::Skipped([
+                            reminder_header(reminder),
+                            format_skipped(
+                                &reminder.name,
+                                &format!("prerequisite {} was skipped", skipped_prereqs.join(",")),
+                            ),
+                        ]),
+                    );
+                    skipped_names.insert(reminder.name.clone());
+                    continue;
                 }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+                let failed_prereqs: Vec<&str> = reminder
+                    .after
+                    .iter()
+                    .filter(|edge| {
+                        edge.require_success
+                            && planned_names.contains(edge.name.as_str())
+                            && succeeded_by_name.get(&edge.name).is_some_and(|ok| !ok)
+                    })
+                    .map(|edge| edge.name.as_str())
+                    .collect();
+                if !failed_prereqs.is_empty() {
+                    precomputed.insert(
+                        index,
+                        ReminderReport::Skipped([
+                            reminder_header(reminder),
+                            format_skipped(
+                                &reminder.name,
+                                &format!(
+                                    "prerequisite {} did not succeed",
+                                    failed_prereqs.join(",")
+                                ),
+                            ),
+                        ]),
+                    );
+                    skipped_names.insert(reminder.name.clone());
+                    continue;
+                }
+                let bound = reminder.max_duration_secs.unwrap_or(0);
+                if let Some(remaining) = remaining_budget {
+                    if bound > remaining {
+                        precomputed.insert(
+                            index,
+                            ReminderReport::Skipped([
+                                reminder_header(reminder),
+                                format_skipped(
+                                    &reminder.name,
+                                    &format!(
+                                        "declared bound {bound}s exceeds remaining tick budget {remaining}s (tick deadline {}s)",
+                                        config.deadline_secs.unwrap_or(0)
+                                    ),
+                                ),
+                            ]),
+                        );
+                        skipped_names.insert(reminder.name.clone());
+                        continue;
+                    }
+                    remaining_budget = Some(remaining - bound);
+                }
+                let evaluated = eval_gate(reminder.gate.as_ref(), gate_runner);
+                let (outcome, captured, error) = match evaluated {
+                    Ok((outcome, captured)) => (outcome, captured, None),
+                    Err(error) => (GateOutcome::Quiet, IndexMap::new(), Some(error)),
+                };
+                let evaluation = ReminderEvaluation {
+                    reminder,
+                    outcome,
+                    captured,
+                    error,
+                };
+                succeeded_by_name.insert(reminder.name.clone(), succeeded(&evaluation));
+                precomputed.insert(index, ReminderReport::Evaluated(evaluation));
+            }
+        }
+        let parallel_indexes = if ordered_mode {
+            Vec::new()
+        } else {
+            planned
+                .iter()
+                .enumerate()
+                .filter_map(|(index, entry)| match entry {
+                    PlannedReminder::Runnable(reminder)
+                        if reminder.gate.as_ref().is_some_and(|gate| gate.parallel) =>
+                    {
+                        Some(index)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
         thread::scope(|scope| -> io::Result<()> {
             let mut parallel = BTreeMap::new();
             if parallel_indexes.len() >= 2 {
@@ -756,49 +921,58 @@ fn run_tick_inner(
             }
             let mut next_parallel = MAX_PARALLEL_GATES;
             for (index, entry) in planned.iter().enumerate() {
-                let report = match entry {
-                    PlannedReminder::Suppressed(lines) => ReminderReport::Suppressed(lines.clone()),
-                    PlannedReminder::Runnable(reminder) => {
-                        let evaluated = match parallel.remove(&index) {
-                            Some(handle) => {
-                                let result = handle.join().unwrap_or_else(|_| {
-                                    Err("parallel gate worker panicked".into())
-                                });
-                                if let Some(next_index) = parallel_indexes.get(next_parallel) {
-                                    let PlannedReminder::Runnable(next_reminder) =
-                                        &planned[*next_index]
-                                    else {
-                                        unreachable!("parallel indexes contain runnable reminders")
-                                    };
-                                    let next_reminder = *next_reminder;
-                                    parallel.insert(
-                                        *next_index,
-                                        scope.spawn(move || {
-                                            eval_gate(next_reminder.gate.as_ref(), gate_runner)
-                                        }),
-                                    );
-                                    next_parallel += 1;
+                let report = if let Some(report) = precomputed.remove(&index) {
+                    report
+                } else {
+                    match entry {
+                        PlannedReminder::Suppressed(lines) => {
+                            ReminderReport::Suppressed(lines.clone())
+                        }
+                        PlannedReminder::Runnable(reminder) => {
+                            let evaluated = match parallel.remove(&index) {
+                                Some(handle) => {
+                                    let result = handle.join().unwrap_or_else(|_| {
+                                        Err("parallel gate worker panicked".into())
+                                    });
+                                    if let Some(next_index) = parallel_indexes.get(next_parallel) {
+                                        let PlannedReminder::Runnable(next_reminder) =
+                                            &planned[*next_index]
+                                        else {
+                                            unreachable!(
+                                                "parallel indexes contain runnable reminders"
+                                            )
+                                        };
+                                        let next_reminder = *next_reminder;
+                                        parallel.insert(
+                                            *next_index,
+                                            scope.spawn(move || {
+                                                eval_gate(next_reminder.gate.as_ref(), gate_runner)
+                                            }),
+                                        );
+                                        next_parallel += 1;
+                                    }
+                                    result
                                 }
-                                result
-                            }
-                            None => eval_gate(reminder.gate.as_ref(), gate_runner),
-                        };
-                        let (outcome, captured, error) = match evaluated {
-                            Ok((outcome, captured)) => (outcome, captured, None),
-                            Err(error) => (GateOutcome::Quiet, IndexMap::new(), Some(error)),
-                        };
-                        ReminderReport::Evaluated(ReminderEvaluation {
-                            reminder,
-                            outcome,
-                            captured,
-                            error,
-                        })
+                                None => eval_gate(reminder.gate.as_ref(), gate_runner),
+                            };
+                            let (outcome, captured, error) = match evaluated {
+                                Ok((outcome, captured)) => (outcome, captured, None),
+                                Err(error) => (GateOutcome::Quiet, IndexMap::new(), Some(error)),
+                            };
+                            ReminderReport::Evaluated(ReminderEvaluation {
+                                reminder,
+                                outcome,
+                                captured,
+                                error,
+                            })
+                        }
                     }
                 };
                 reports.push(report);
                 if index < stream_prefix_len {
                     match reports.last().expect("report was just appended") {
-                        ReminderReport::Suppressed(suppressed) => {
+                        ReminderReport::Suppressed(suppressed)
+                        | ReminderReport::Skipped(suppressed) => {
                             for line in suppressed {
                                 record_line(&mut lines, &mut emit, line.clone())?;
                             }
@@ -846,7 +1020,7 @@ fn run_tick_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Emit, Gate, HealthCheck, Reminder};
+    use crate::model::{AfterEdge, Emit, Gate, HealthCheck, Reminder};
     use crate::protocols::GateResult;
     use crate::state::FlagValue;
     use std::sync::{Arc, Mutex};
@@ -1936,5 +2110,149 @@ mod tests {
             gate.calls.lock().unwrap().is_empty(),
             "evaluation must stop at the failed write"
         );
+    }
+
+    fn bounded(name: &str, bound: Option<i64>, after: Vec<AfterEdge>) -> Reminder {
+        let mut reminder = Reminder::new(
+            name,
+            Emit::action(format!("run-{name}"), format!("do {name}")),
+        );
+        let mut gate = Gate::new(name);
+        gate.when = GateWhen::Failure;
+        reminder.gate = Some(gate);
+        reminder.max_duration_secs = bound;
+        reminder.after = after;
+        reminder
+    }
+
+    fn gate_with(outcomes: &[(&str, i32)]) -> FakeGate {
+        FakeGate {
+            outcomes: outcomes
+                .iter()
+                .map(|(cmd, code)| (cmd.to_string(), GateResult::completed(*code, "")))
+                .collect(),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn deadline_skips_gates_that_do_not_fit_and_keeps_their_cadence() {
+        let config = TickConfig {
+            reminders: vec![
+                bounded("a", Some(6), vec![]),
+                bounded("b", Some(6), vec![]),
+                bounded("c", Some(4), vec![]),
+            ],
+            deadline_secs: Some(10),
+            ..TickConfig::default()
+        };
+        let gate = gate_with(&[("a", 1), ("b", 1), ("c", 1)]);
+        let result = run_tick(
+            &config,
+            &OpsState::default(),
+            5,
+            &BTreeMap::new(),
+            &gate,
+            &FakeProbe(BTreeMap::new()),
+            None,
+        );
+        assert_eq!(*gate.calls.lock().unwrap(), vec!["a", "c"]);
+        assert!(result.lines.contains(&"SKIPPED: b did not run; declared bound 6s exceeds remaining tick budget 4s (tick deadline 10s)".to_string()));
+        assert_eq!(
+            result.fired,
+            BTreeMap::from([("a".into(), 5), ("c".into(), 5)])
+        );
+        assert_eq!(result.actions_emitted, 2);
+    }
+
+    #[test]
+    fn after_edge_orders_execution_against_config_order() {
+        let config = TickConfig {
+            reminders: vec![
+                bounded("dependent", None, vec![AfterEdge::new("foundation")]),
+                bounded("foundation", None, vec![]),
+            ],
+            ..TickConfig::default()
+        };
+        let gate = gate_with(&[("foundation", 1), ("dependent", 1)]);
+        let result = run_tick(
+            &config,
+            &OpsState::default(),
+            5,
+            &BTreeMap::new(),
+            &gate,
+            &FakeProbe(BTreeMap::new()),
+            None,
+        );
+        assert_eq!(*gate.calls.lock().unwrap(), vec!["foundation", "dependent"]);
+        assert_eq!(result.fired.len(), 2);
+    }
+
+    #[test]
+    fn skipped_prerequisite_skips_dependants_transitively_by_name() {
+        let config = TickConfig {
+            reminders: vec![
+                bounded("foundation", Some(10), vec![]),
+                bounded("dependent", None, vec![AfterEdge::new("foundation")]),
+                bounded("leaf", None, vec![AfterEdge::new("dependent")]),
+                bounded("independent", None, vec![]),
+            ],
+            deadline_secs: Some(5),
+            ..TickConfig::default()
+        };
+        let gate = gate_with(&[("independent", 1)]);
+        let result = run_tick(
+            &config,
+            &OpsState::default(),
+            5,
+            &BTreeMap::new(),
+            &gate,
+            &FakeProbe(BTreeMap::new()),
+            None,
+        );
+        assert_eq!(*gate.calls.lock().unwrap(), vec!["independent"]);
+        let skipped: Vec<&String> = result
+            .lines
+            .iter()
+            .filter(|line| line.starts_with("SKIPPED: "))
+            .collect();
+        assert_eq!(skipped, vec![
+            &"SKIPPED: foundation did not run; declared bound 10s exceeds remaining tick budget 5s (tick deadline 5s)".to_string(),
+            &"SKIPPED: dependent did not run; prerequisite foundation was skipped".to_string(),
+            &"SKIPPED: leaf did not run; prerequisite dependent was skipped".to_string(),
+        ]);
+        assert_eq!(result.fired, BTreeMap::from([("independent".into(), 5)]));
+    }
+
+    #[test]
+    fn require_success_skips_after_no_result_but_order_only_still_runs() {
+        let config = TickConfig {
+            reminders: vec![
+                bounded(
+                    "strict",
+                    None,
+                    vec![AfterEdge::requiring_success("foundation")],
+                ),
+                bounded("loose", None, vec![AfterEdge::new("foundation")]),
+                bounded("foundation", None, vec![]),
+            ],
+            ..TickConfig::default()
+        };
+        let gate = gate_with(&[("foundation", NO_RESULT_EXIT), ("loose", 1)]);
+        let result = run_tick(
+            &config,
+            &OpsState::default(),
+            5,
+            &BTreeMap::new(),
+            &gate,
+            &FakeProbe(BTreeMap::new()),
+            None,
+        );
+        assert_eq!(*gate.calls.lock().unwrap(), vec!["foundation", "loose"]);
+        assert!(result.lines.contains(
+            &"SKIPPED: strict did not run; prerequisite foundation did not succeed".to_string()
+        ));
+        assert!(!result.fired.contains_key("strict"));
+        assert_eq!(result.fired.get("loose"), Some(&5));
     }
 }

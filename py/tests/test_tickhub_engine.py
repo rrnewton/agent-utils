@@ -1019,3 +1019,121 @@ def test_a_pending_reports_suppressed_and_clean_lines_open_with_their_tick_heade
         "[tick-hub: quiet · every tick]",
         "CLEAN: quiet ran and found nothing to report",
     ], result.lines
+
+
+# --- TICK DEADLINE AND SAME-TICK ORDERING EDGES (#2130) -----------------------
+
+from tick_hub.model import AfterEdge
+
+
+def _bounded(name: str, bound: int | None, *, after: tuple[AfterEdge, ...] = ()) -> Reminder:
+    return Reminder(
+        name,
+        Emit(EmitKind.ACTION, title=f"do {name}", skill=f"run-{name}"),
+        gate=Gate(cmd=name, when=GateWhen.FAILURE),
+        max_duration_secs=bound,
+        after=after,
+    )
+
+
+def test_deadline_skips_gates_that_do_not_fit_and_keeps_their_cadence() -> None:
+    cfg = TickConfig(
+        deadline_secs=10,
+        reminders=(_bounded("a", 6), _bounded("b", 6), _bounded("c", 4)),
+    )
+    runner = FakeGate({
+        "a": GateResult(1, "", True),
+        "b": GateResult(1, "", True),
+        "c": GateResult(1, "", True),
+    })
+    result = run_tick(cfg, OpsState.default(), now=5, fired={},
+                      gate_runner=runner, age_probe=FakeProbe({}))
+    # a starts (10-6=4 left), b no longer fits, c fits exactly.
+    assert [cmd for cmd, _ in runner.calls] == ["a", "c"], runner.calls
+    skipped = [ln for ln in result.lines if ln.startswith("SKIPPED: ")]
+    assert skipped == [
+        "SKIPPED: b did not run; declared bound 6s exceeds remaining tick budget 4s (tick deadline 10s)"
+    ], result.lines
+    assert result.fired == {"a": 5, "c": 5}, "a skipped gate keeps its cadence and runs next tick"
+    assert result.actions_emitted == 2
+    # Next tick the same budget is available again, so b is offered once more.
+    runner2 = FakeGate({"b": GateResult(1, "", True)})
+    cfg2 = TickConfig(deadline_secs=10, reminders=(_bounded("b", 6),))
+    second = run_tick(cfg2, OpsState.default(), now=6, fired=result.fired,
+                      gate_runner=runner2, age_probe=FakeProbe({}))
+    assert [cmd for cmd, _ in runner2.calls] == ["b"]
+    assert second.fired["b"] == 6
+
+
+def test_gate_without_declared_bound_charges_nothing_against_the_deadline() -> None:
+    cfg = TickConfig(deadline_secs=1, reminders=(_bounded("free", None), _bounded("a", 1)))
+    runner = FakeGate({"free": GateResult(1, "", True), "a": GateResult(1, "", True)})
+    result = run_tick(cfg, OpsState.default(), now=5, fired={},
+                      gate_runner=runner, age_probe=FakeProbe({}))
+    assert [cmd for cmd, _ in runner.calls] == ["free", "a"]
+    assert not any(ln.startswith("SKIPPED: ") for ln in result.lines)
+
+
+def test_after_edge_orders_execution_against_config_order() -> None:
+    cfg = TickConfig(reminders=(
+        _bounded("dependent", None, after=(AfterEdge("foundation"),)),
+        _bounded("foundation", None),
+    ))
+    runner = FakeGate({"foundation": GateResult(1, "", True), "dependent": GateResult(1, "", True)})
+    result = run_tick(cfg, OpsState.default(), now=5, fired={},
+                      gate_runner=runner, age_probe=FakeProbe({}))
+    assert [cmd for cmd, _ in runner.calls] == ["foundation", "dependent"], runner.calls
+    assert result.fired == {"dependent": 5, "foundation": 5}
+
+
+def test_skipped_prerequisite_skips_dependants_transitively_by_name() -> None:
+    cfg = TickConfig(
+        deadline_secs=5,
+        reminders=(
+            _bounded("foundation", 10),
+            _bounded("dependent", None, after=(AfterEdge("foundation"),)),
+            _bounded("leaf", None, after=(AfterEdge("dependent"),)),
+            _bounded("independent", None),
+        ),
+    )
+    runner = FakeGate({"independent": GateResult(1, "", True)})
+    result = run_tick(cfg, OpsState.default(), now=5, fired={},
+                      gate_runner=runner, age_probe=FakeProbe({}))
+    assert [cmd for cmd, _ in runner.calls] == ["independent"], runner.calls
+    skipped = [ln for ln in result.lines if ln.startswith("SKIPPED: ")]
+    assert skipped == [
+        "SKIPPED: foundation did not run; declared bound 10s exceeds remaining tick budget 5s (tick deadline 5s)",
+        "SKIPPED: dependent did not run; prerequisite foundation was skipped",
+        "SKIPPED: leaf did not run; prerequisite dependent was skipped",
+    ], result.lines
+    assert result.fired == {"independent": 5}
+
+
+def test_require_success_skips_after_no_result_but_order_only_still_runs() -> None:
+    cfg = TickConfig(reminders=(
+        _bounded("strict", None, after=(AfterEdge("foundation", require_success=True),)),
+        _bounded("loose", None, after=(AfterEdge("foundation"),)),
+        _bounded("foundation", None),
+    ))
+    runner = FakeGate({
+        "foundation": GateResult(NO_RESULT_EXIT, "", True),
+        "loose": GateResult(1, "", True),
+    })
+    result = run_tick(cfg, OpsState.default(), now=5, fired={},
+                      gate_runner=runner, age_probe=FakeProbe({}))
+    assert [cmd for cmd, _ in runner.calls] == ["foundation", "loose"], runner.calls
+    assert "SKIPPED: strict did not run; prerequisite foundation did not succeed" in result.lines
+    assert "strict" not in result.fired
+    assert result.fired["loose"] == 5
+
+
+def test_require_success_runs_after_a_determined_prerequisite() -> None:
+    cfg = TickConfig(reminders=(
+        _bounded("dependent", None, after=(AfterEdge("foundation", require_success=True),)),
+        _bounded("foundation", None),
+    ))
+    runner = FakeGate({"foundation": GateResult(0, "", True), "dependent": GateResult(1, "", True)})
+    result = run_tick(cfg, OpsState.default(), now=5, fired={},
+                      gate_runner=runner, age_probe=FakeProbe({}))
+    assert [cmd for cmd, _ in runner.calls] == ["foundation", "dependent"]
+    assert not any(ln.startswith("SKIPPED: ") for ln in result.lines)

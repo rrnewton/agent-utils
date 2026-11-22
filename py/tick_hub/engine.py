@@ -41,6 +41,7 @@ from tick_hub.emit import (
     format_health,
     format_note,
     format_schedule,
+    format_skipped,
     format_suppressed,
     format_tick_header,
     format_unevaluable,
@@ -132,6 +133,15 @@ class GateOutcome(Enum):
 @dataclass(frozen=True)
 class _Suppressed:
     """A flag-suppressed reminder's records in a pending report: its header, then SUPPRESSED."""
+
+    lines: tuple[str, str]
+
+
+@dataclass(frozen=True)
+class _Skipped:
+    """A due reminder that did not run this tick: its header, then SKIPPED.
+
+    Carries no cadence stamp, so the reminder is offered again next tick."""
 
     lines: tuple[str, str]
 
@@ -338,6 +348,51 @@ def _prune_removed_render_failure_state(
             state.pop(key, None)
 
 
+def _execution_order(planned: Sequence[Reminder | _Suppressed]) -> list[int]:
+    """Topologically order planned indices by ``after`` edges (stable).
+
+    Only edges between two planned runnable reminders constrain order; an edge
+    naming a reminder that is not planned this tick is vacuous. Ties keep
+    config order, so a config without ``after`` edges yields config order
+    exactly. A cycle (refused at load; reachable only by direct construction)
+    falls back to config order for the remaining reminders rather than hanging.
+    """
+    reminders = [entry for entry in planned if isinstance(entry, Reminder)]
+    index_of = {entry.name: index for index, entry in enumerate(planned) if isinstance(entry, Reminder)}
+    placed: list[int] = []
+    placed_set: set[int] = set()
+    remaining = set(index_of.values())
+    while remaining:
+        ready: list[int] = []
+        for reminder in reminders:
+            index = index_of[reminder.name]
+            if index not in remaining:
+                continue
+            if all(
+                index_of[edge.name] in placed_set
+                for edge in reminder.after
+                if edge.name in index_of
+            ):
+                ready.append(index)
+        ready.sort()
+        if not ready:
+            placed.extend(sorted(remaining))
+            break
+        chosen = ready[0]
+        placed.append(chosen)
+        placed_set.add(chosen)
+        remaining.remove(chosen)
+    return placed
+
+
+def _succeeded(evaluation: _ReminderEvaluation) -> bool:
+    """True iff a gate evaluation determined a verdict without error."""
+    return evaluation.error is None and evaluation.outcome in (
+        GateOutcome.FIRE,
+        GateOutcome.QUIET,
+    )
+
+
 def _flags_satisfied(required: Sequence[str], flags: Mapping[str, object]) -> bool:
     typed_flags = {k: v for k, v in flags.items() if isinstance(v, (bool, int, str))}
     return all(flag_truthy(typed_flags, name) for name in required)
@@ -425,8 +480,16 @@ def run_tick(
         # reminder around it would change config order. This lets mixed configs
         # report the maximal safe prefix without publishing a verdict that may
         # subsequently change.
+        # Deadline and after-edge configs evaluate serially in execution
+        # (topological) order and render afterwards: a gate may only start
+        # once its prerequisites and the remaining budget are known, so no
+        # prefix verdict is final early. Configs using neither feature keep
+        # the streaming path below exactly.
+        ordered_mode = config.deadline_secs is not None or any(
+            isinstance(entry, Reminder) and entry.after for entry in planned
+        )
         stream_prefix_len = 0
-        if emit is not None:
+        if emit is not None and not ordered_mode:
             stream_prefix_len = next(
                 (
                     index
@@ -437,24 +500,94 @@ def run_tick(
             )
 
         no_dependencies: set[str] = set()
-        reports: list[_ReminderEvaluation | _Suppressed] = []
+        reports: list[_ReminderEvaluation | _Suppressed | _Skipped] = []
 
         def evaluate(reminder: Reminder) -> _ReminderEvaluation:
             outcome, captured, error = _eval_gate(reminder.gate, gate_runner)
             return _ReminderEvaluation(reminder, outcome, captured, error)
 
+        precomputed: dict[int, _ReminderEvaluation | _Skipped] = {}
+        if ordered_mode:
+            planned_names = {
+                entry.name for entry in planned if isinstance(entry, Reminder)
+            }
+            evaluations_by_name: dict[str, _ReminderEvaluation] = {}
+            skipped_names: set[str] = set()
+            remaining_budget = config.deadline_secs
+            for index in _execution_order(planned):
+                entry = planned[index]
+                if not isinstance(entry, Reminder):
+                    continue
+                rem = entry
+                skipped_prereqs = tuple(
+                    edge.name for edge in rem.after if edge.name in skipped_names
+                )
+                if skipped_prereqs:
+                    precomputed[index] = _Skipped(
+                        (
+                            _reminder_header(rem),
+                            format_skipped(
+                                rem.name,
+                                f"prerequisite {','.join(skipped_prereqs)} was skipped",
+                            ),
+                        )
+                    )
+                    skipped_names.add(rem.name)
+                    continue
+                failed_prereqs = tuple(
+                    edge.name
+                    for edge in rem.after
+                    if edge.require_success
+                    and edge.name in planned_names
+                    and edge.name in evaluations_by_name
+                    and not _succeeded(evaluations_by_name[edge.name])
+                )
+                if failed_prereqs:
+                    precomputed[index] = _Skipped(
+                        (
+                            _reminder_header(rem),
+                            format_skipped(
+                                rem.name,
+                                f"prerequisite {','.join(failed_prereqs)} did not succeed",
+                            ),
+                        )
+                    )
+                    skipped_names.add(rem.name)
+                    continue
+                bound = rem.max_duration_secs if rem.max_duration_secs is not None else 0
+                if remaining_budget is not None and bound > remaining_budget:
+                    precomputed[index] = _Skipped(
+                        (
+                            _reminder_header(rem),
+                            format_skipped(
+                                rem.name,
+                                f"declared bound {bound}s exceeds remaining tick budget "
+                                f"{remaining_budget}s (tick deadline {config.deadline_secs}s)",
+                            ),
+                        )
+                    )
+                    skipped_names.add(rem.name)
+                    continue
+                if remaining_budget is not None:
+                    remaining_budget -= bound
+                evaluation = evaluate(rem)
+                evaluations_by_name[rem.name] = evaluation
+                precomputed[index] = evaluation
+
         def collect(futures: Mapping[int, Future[_ReminderEvaluation]]) -> None:
             nonlocal actions
             for index, entry in enumerate(planned):
                 if isinstance(entry, _Suppressed):
-                    report: _ReminderEvaluation | _Suppressed = entry
+                    report: _ReminderEvaluation | _Suppressed | _Skipped = entry
+                elif index in precomputed:
+                    report = precomputed[index]
                 elif index in futures:
                     report = futures[index].result()
                 else:
                     report = evaluate(entry)
                 reports.append(report)
                 if index < stream_prefix_len:
-                    if isinstance(report, _Suppressed):
+                    if isinstance(report, (_Suppressed, _Skipped)):
                         for line in report.lines:
                             record(line)
                     else:
@@ -474,7 +607,11 @@ def run_tick(
             and entry.gate is not None
             and entry.gate.parallel
         )
-        if len(parallel_indices) >= 2 and isinstance(gate_runner, ParallelGateRunner):
+        if (
+            not ordered_mode
+            and len(parallel_indices) >= 2
+            and isinstance(gate_runner, ParallelGateRunner)
+        ):
             # The executor owns the shared cancellation scope. A failed output
             # write therefore exits the scope and kills outstanding gates
             # before the executor waits for its worker threads.
@@ -510,7 +647,7 @@ def run_tick(
 
 
 def _render_after_dependency_pass(
-    reports: Sequence[_ReminderEvaluation | _Suppressed],
+    reports: Sequence[_ReminderEvaluation | _Suppressed | _Skipped],
     new_fired: dict[str, int],
     now: int,
     record: Callable[[str], None],
@@ -519,7 +656,9 @@ def _render_after_dependency_pass(
     render_from: int = 0,
 ) -> int:
     """Interpret dependency edges over completed evaluations, then render in config order."""
-    evaluations = tuple(report for report in reports if not isinstance(report, _Suppressed))
+    evaluations = tuple(
+        report for report in reports if isinstance(report, _ReminderEvaluation)
+    )
     # Evaluate every due gate before interpreting dependency edges. A
     # dependency never decides whether another gate runs, and config order
     # therefore cannot turn a forward reference into a false clean.
@@ -545,7 +684,7 @@ def _render_after_dependency_pass(
 
     actions = 0
     for report in reports[render_from:]:
-        if isinstance(report, _Suppressed):
+        if isinstance(report, (_Suppressed, _Skipped)):
             for line in report.lines:
                 record(line)
         else:
