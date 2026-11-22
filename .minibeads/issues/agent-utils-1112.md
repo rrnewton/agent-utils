@@ -47,3 +47,14 @@ only when the show succeeded. A failed set refuses (exit 3).
 Part of #562 rust-primary-wrkslots P9. Following handlers in the
 lane's list: image mount family, worktrees-image, migrate/convert,
 run/box.
+
+[watermelon-full-preview] 2026-11-22 housekeeping (mu-rustwrk, verified
+at dd3e1fc0): the 2026-11-22 rust-primary status report listed this
+among landed-and-wired issues, but only `limits show` is wired
+(048c94e2). `limits apply`/`clear` have a complete oracle-tested
+handler (`sandbox_exec::limits`) with no CLI variant; Python compat
+refuses both by name (cli.rs:2047-2066). Remaining: LimitsApply/
+LimitsClear variants + dispatch through SubprocessRunner + compat
+branch. This writer mutates the host user slice via sudo, not a
+registry, so it needs the writers-phase live decision, not
+require_fixture. Stays open for apply/clear.

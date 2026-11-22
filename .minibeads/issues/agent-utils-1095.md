@@ -1,10 +1,11 @@
 ---
 title: 'wrkslots-image-status-handler: dispatch-shaped Rust handler for image status'
-status: open
+status: closed
 priority: 2
 issue_type: task
-created_at: 2026-11-08T22:55:45.000000000+00:00
-updated_at: 2026-11-08T22:55:45.000000000+00:00
+created_at: 2026-11-08T22:55:45+00:00
+updated_at: 2026-11-22T20:59:17.106306172+00:00
+closed_at: 2026-11-22T20:59:17.106305822+00:00
 ---
 
 # Description

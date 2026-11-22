@@ -1,10 +1,11 @@
 ---
 title: 'rust-wrkviz-agent-scope-port: port --agent-scope coordinator and summarize-project to Rust before the A3 flip'
-status: open
+status: closed
 priority: 1
 issue_type: task
 created_at: 2026-11-08T17:18:34.764426174+00:00
-updated_at: 2026-11-08T17:18:34.764426174+00:00
+updated_at: 2026-11-22T20:59:17.150682526+00:00
+closed_at: 2026-11-22T20:59:17.150682175+00:00
 ---
 
 # Description

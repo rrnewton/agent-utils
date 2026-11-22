@@ -1,10 +1,11 @@
 ---
 title: 'wrkslots-sandbox-show-config-handler: dispatch-shaped Rust handler for sandbox show-config'
-status: open
+status: closed
 priority: 2
 issue_type: task
-created_at: 2026-11-08T23:57:40.000000000+00:00
-updated_at: 2026-11-08T23:57:40.000000000+00:00
+created_at: 2026-11-08T23:57:40+00:00
+updated_at: 2026-11-22T20:59:17.119658220+00:00
+closed_at: 2026-11-22T20:59:17.119658090+00:00
 ---
 
 # Description

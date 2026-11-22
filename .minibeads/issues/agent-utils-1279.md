@@ -1,10 +1,11 @@
 ---
 title: 'wrkslots-image-status-worktrees-field: conditional worktrees image in image status'
-status: open
+status: closed
 priority: 2
 issue_type: task
-created_at: 2026-11-11T10:00:00.000000000+00:00
-updated_at: 2026-11-11T10:00:00.000000000+00:00
+created_at: 2026-11-11T10:00:00+00:00
+updated_at: 2026-11-22T20:59:17.155594575+00:00
+closed_at: 2026-11-22T20:59:17.155594434+00:00
 ---
 
 # Description

@@ -47,3 +47,13 @@ original on failure.
 # Notes
 
 Part of #562 rust-primary-wrkslots P8. Run/box handlers follow.
+
+[watermelon-full-preview] 2026-11-22 housekeeping (mu-rustwrk, verified
+at dd3e1fc0): worktrees-image migrate is landed and wired (4d2294be,
+binds layout; direct layout refuses by name). `image convert` is
+wired only for registry checks and the already-at-target no-op;
+the conversion itself refuses ("slot-image provisioning is not
+wired in Rust yet", image_dispatch.rs) and --keep-original is
+ignored. Remaining: wire slot-image provisioning into
+image_convert_cli, honour --keep-original, success-path CLI
+differentials both directions. Stays open for convert.

@@ -1,10 +1,11 @@
 ---
 title: 'wrkslots-image-mount-family-handlers: dispatch-shaped Rust handlers for image mount set'
-status: open
+status: closed
 priority: 2
 issue_type: task
-created_at: 2026-11-09T04:17:31.000000000+00:00
-updated_at: 2026-11-09T04:17:31.000000000+00:00
+created_at: 2026-11-09T04:17:31+00:00
+updated_at: 2026-11-22T20:59:17.124458552+00:00
+closed_at: 2026-11-22T20:59:17.124458431+00:00
 ---
 
 # Description

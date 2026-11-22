@@ -1,10 +1,11 @@
 ---
 title: 'wrkslots-worktrees-image-handlers: dispatch-shaped Rust handlers for worktrees-image'
-status: open
+status: closed
 priority: 2
 issue_type: task
-created_at: 2026-11-09T15:42:10.000000000+00:00
-updated_at: 2026-11-09T15:42:10.000000000+00:00
+created_at: 2026-11-09T15:42:10+00:00
+updated_at: 2026-11-22T20:59:17.138907097+00:00
+closed_at: 2026-11-22T20:59:17.138906806+00:00
 ---
 
 # Description

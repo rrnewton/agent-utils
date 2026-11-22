@@ -45,3 +45,13 @@ handlers:
 # Notes
 
 Part of #562 rust-primary-wrkslots P8. Follows #1279.
+
+[watermelon-full-preview] 2026-11-22 housekeeping (mu-rustwrk, verified
+at dd3e1fc0): proof-carrying signatures and the migrate reclaim order
+are landed AND wired (ed316445 handler; 4d2294be wiring via
+wt_migrate_cli). Only `unbind_slot` (worktrees_image.rs:1895) remains
+unwired: referenced solely by its unit tests; remove_write and the
+compat translator never call it. Remaining: call unbind_slot from the
+Rust remove path for image-bound slots (unmount first, drop the bind
+record under the records flock only on success), and/or add a
+worktrees-image unbind compat action. Stays open for unbind only.
