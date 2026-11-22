@@ -326,7 +326,9 @@ class Walk:
         if not condition:
             raise AssertionError(f"{self.size}: {why}")
 
-    def wait_for(self, condition: str, why: str, arg: object = None, seconds: float = 30) -> None:
+    def wait_for(self, condition: str, why: str, arg: object = None,
+                 seconds: float = browser_waits.HANG_BACKSTOP_MS / 1000) -> None:
+        # The bound is the hang backstop (#2077), as in the other walks' shared waits.
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline and not self.page.evaluate(condition, arg):
             self.page.wait_for_timeout(25)

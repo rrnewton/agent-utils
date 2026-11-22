@@ -138,9 +138,18 @@ def walk(page: Page, base: str, label: str) -> None:
     # The anchor row itself, at the place the reload kept: measured from the
     # list's own top on both sides, since the bar over it is closed again
     # after the reload and its foot is not the edge either measure wants.
+    # Restoring the anchor follows the rows' own mounting, which on a hot host can still be
+    # settling when the tenth row lands (#2077): poll for the kept place itself, then let the
+    # checks below judge the sampled state as before.
+    deadline = time.monotonic() + browser_waits.HANG_BACKSTOP_MS / 1000
     after_top = page.evaluate(
         "(id) => { const row = document.querySelector(`#discord-log > li[data-id=\"${id}\"]`);"
         " return row ? row.getBoundingClientRect().top : null; }", before["id"])
+    while (after_top is None or abs(after_top - before["top"]) > 2) and time.monotonic() < deadline:
+        page.wait_for_timeout(50)
+        after_top = page.evaluate(
+            "(id) => { const row = document.querySelector(`#discord-log > li[data-id=\"${id}\"]`);"
+            " return row ? row.getBoundingClientRect().top : null; }", before["id"])
     check(after_top is not None,
           f"{label}: the reload lost the scroll anchor {before['id']}: {before} -> {after}")
     check(abs(after_top - before["top"]) <= 2,
