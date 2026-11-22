@@ -108,6 +108,7 @@ def test_sigterm_mid_session_removes_the_sentinel_directory(
         stdout=subprocess.PIPE,
         text=True,
     )
+    assert proc.stdout is not None
     try:
         directory = Path(proc.stdout.readline().strip())
         assert directory.name.startswith("agent-utils-gitconfig-global-")
