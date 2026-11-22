@@ -5,7 +5,7 @@
 // Construction is inert: no element is looked up, no listener is added and nothing is
 // fetched until the controls are mounted and the panel opened.
 
-export { DISCUSS_DOCUMENTS_HINT, DISCUSS_UNAVAILABLE_HINT, HOUR_MS, asCatchupAnswer, asCatchupPreview, asCatchupRecord, boundForCount, boundForHours, countForHours, countSince, createDiscussPanel, uncoveredInScope, discussReadKey, discussTitle, formatHoursFloor1, formatStampLine, hhmm, hoursFloor1, hoursSinceStart, isDiscussUnavailable, summaryTimeLabel, withoutTimestampCitations } from "./panel.ts";
+export { DISCUSS_DOCUMENTS_HINT, DISCUSS_UNAVAILABLE_HINT, HOUR_MS, asCatchupAnswer, asCatchupPreview, asCatchupRecord, boundForCount, boundForHours, countForHours, countSince, createDiscussPanel, uncoveredInScope, discussReadKey, discussTitle, formatHoursFloor1, formatStampLine, hhmm, hoursFloor1, hoursSinceStart, isDiscussUnavailable, summarySearchHits, summarySearchMatches, summarySearchRows, summarySearchWords, summaryTimeLabel, withoutTimestampCitations } from "./panel.ts";
 export { FRESH_CLASS, STRUCK_BULLET_CLASS, STRUCK_SECTION_CLASS, applyStrikes, citationIdsOf, hasWord } from "./strikes.ts";
 export type { StrikeElement } from "./strikes.ts";
 export type {
@@ -24,6 +24,8 @@ export type {
   DiscussPanel,
   DiscussPanelDependencies,
   DiscussScope,
+  SummarySearchHit,
+  SummarySearchRow,
 } from "./panel.ts";
 
 import { createListening } from "../dom/index.ts";

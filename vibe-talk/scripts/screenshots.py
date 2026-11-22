@@ -5126,6 +5126,25 @@ def _act_discuss_terms(driver: Driver) -> None:
     driver.settle(200)
 
 
+def _act_discuss_search(driver: Driver) -> None:
+    """`#2136`: two real summaries (current + earlier via the timeline walk),
+    then the header search opened and a query typed, so the shot shows flat
+    hits labelled by summary and topic."""
+    _act_discuss_timeline_layout(driver)
+    driver.click("discuss-search-toggle")
+    driver.page.wait_for_function(
+        "() => !document.getElementById('discuss-search').hidden",
+        timeout=15_000,
+    )
+    driver.page.fill("#discuss-search-input", "Model stub")
+    driver.page.wait_for_function(
+        "() => document.querySelectorAll('#discuss-search-results .discuss-search-hit').length >= 2 "
+        "&& document.getElementById('discuss-search-results').textContent.includes('Current summary') "
+        "&& document.getElementById('discuss-search-results').textContent.includes('Earlier summary')",
+        timeout=15_000,
+    )
+
+
 def _after_discuss_summary(driver: Driver) -> None:
     """Put the summarized messages back to unread, so the next profile's preview is real too."""
     if bool(driver.js("window.__visible('discuss-mark-unread')")):
@@ -8307,6 +8326,28 @@ SCENES: tuple[Scene, ...] = (
                 "[...document.querySelectorAll('.thread-picker-fixed')].every((row) => getComputedStyle(row).textAlign === 'center')",
             ),
             ("no fixture refusal is showing for the picker", "!document.querySelector('.thread-picker-popup').textContent.includes('not served by this check')"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="89-discuss-search",
+        what="Discuss summary search: hits from the current and an earlier summary, labelled by topic",
+        act=_act_discuss_search,
+        after=_after_discuss_summary,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("the Discuss panel is open", "window.__visible('discuss-panel')"),
+            (
+                "hits stand from both the current and an earlier summary",
+                "document.querySelectorAll('#discuss-search-results .discuss-search-hit').length >= 2 "
+                "&& document.getElementById('discuss-search-results').textContent.includes('Current summary') "
+                "&& document.getElementById('discuss-search-results').textContent.includes('Earlier summary')",
+            ),
+            (
+                "no fixture refusal is showing for Discuss",
+                "!document.getElementById('discuss-panel').textContent.includes('not served by this check') "
+                "&& !document.getElementById('discuss-panel').textContent.includes('not_found')",
+            ),
             ("no error banner is up", "!window.__visible('error-wrap')"),
         ),
     ),

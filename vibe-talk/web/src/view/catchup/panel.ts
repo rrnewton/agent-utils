@@ -594,6 +594,93 @@ export function summaryTimeLabel(createdMs: number, nowMs: number): string {
   return `${SUMMARY_MONTHS[at.getMonth()]} ${at.getDate()}${year}, ${time}`;
 }
 
+/** `#2136 vibe-talk-discuss-summary-search`. The words of a summary search: whitespace split, folded lower. */
+export function summarySearchWords(query: string): string[] {
+  return query.toLowerCase().split(/\s+/).map((word) => word.trim()).filter((word) => word !== "");
+}
+
+/** `#2136`. Whether `text` holds every word (case-insensitive substring, the unified read rule). */
+export function summarySearchMatches(text: string, words: readonly string[]): boolean {
+  if (words.length === 0) return false;
+  const folded = text.toLowerCase();
+  return words.every((word) => folded.includes(word));
+}
+
+/** One summary row for search: its topic heading and its rendered row. */
+export interface SummarySearchRow {
+  heading: string;
+  /** The row's sanitized HTML (its citation anchors intact); empty draws `text`. */
+  html: string;
+  text: string;
+}
+
+/**
+ * `#2136`. The rows of one summary: every bullet (`li`) and stray paragraph,
+ * each under the nearest heading before it. Headings themselves are not rows.
+ */
+export function summarySearchRows(answer: CatchupAnswer): SummarySearchRow[] {
+  const rows: SummarySearchRow[] = [];
+  if (answer.text_html !== "") {
+    const host = document.createElement("div");
+    insertSanitizedHtml(host as HTMLElement, answer.text_html);
+    let heading = "";
+    const walk = (node: HTMLElement): void => {
+      for (const kid of Array.from(node.children ?? [])) {
+        const el = kid as HTMLElement;
+        const tag = String(el.tagName ?? "").toLowerCase();
+        if (/^h[1-6]$/.test(tag)) {
+          heading = String(el.textContent ?? "").replace(/\s+/g, " ").trim();
+          continue;
+        }
+        if (tag === "li" || tag === "p") {
+          rows.push({ heading, html: String((el as { outerHTML?: string }).outerHTML ?? ""), text: String(el.textContent ?? "") });
+          continue;
+        }
+        walk(el);
+      }
+    };
+    walk(host as HTMLElement);
+    return rows;
+  }
+  let heading = "";
+  for (const line of answer.text.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed === "") continue;
+    const head = /^#{1,6}\s+(.*)$/.exec(trimmed);
+    if (head !== null) {
+      heading = (head[1] ?? "").trim();
+      continue;
+    }
+    const text = trimmed.replace(/^[-*]\s+/, "");
+    rows.push({ heading, html: "", text });
+  }
+  return rows;
+}
+
+/** One hit of a summary search: which summary, which topic, and the row itself. */
+export interface SummarySearchHit extends SummarySearchRow {
+  place: string;
+}
+
+/**
+ * `#2136`. Every row of `sources` (current first, then earlier summaries)
+ * holding all the query's words, as one flat list.
+ */
+export function summarySearchHits(
+  sources: readonly { place: string; answer: CatchupAnswer }[],
+  query: string,
+): SummarySearchHit[] {
+  const words = summarySearchWords(query);
+  if (words.length === 0) return [];
+  const hits: SummarySearchHit[] = [];
+  for (const source of sources) {
+    for (const row of summarySearchRows(source.answer)) {
+      if (summarySearchMatches(row.text, words)) hits.push({ ...row, place: source.place });
+    }
+  }
+  return hits;
+}
+
 /**
  * The bound for "last `n` unread": how many, and the instant the POST bounds at
  * (the Nth-newest unread's own time, so the server covers exactly those N).
@@ -712,6 +799,9 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
   // thread (main is its own scope), so switching scope restores that
   // scope's own summary and never another scope's.
   const scopeAnswers = new Map<string, { scope: DiscussScope; answer: CatchupAnswer; readCreatedMs: number }>();
+  // `#2136`: the timeline last drawn, kept as data so summary search can
+  // filter earlier summaries without re-reading the record.
+  let searchTimeline: DiscussEntryShape[] = [];
 
   function scopeKeyOf(scope: DiscussScope): string {
     return `${scope.channelId}\0${scope.threadId ?? ""}`;
@@ -1489,6 +1579,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     // `#1388` landing 1: the strike stands from this draw (a plain draw has
     // no citation links to map, so nothing is struck there).
     restrike();
+    drawSearchHits();
   }
 
   /**
@@ -1631,6 +1722,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
    * small expand-all to the right of its header for the second step.
    */
   function drawTimeline(entries: DiscussEntryShape[], scope: DiscussScope): void {
+    searchTimeline = entries;
     const box = deps.byId("discuss-timeline");
     box.replaceChildren();
     // `#2134 vibe-talk-discuss-timeline-expand-inline`: the toggle stands
@@ -1768,7 +1860,66 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     }
     timelineToggle.refresh();
     keepCitationsInApp(box);
+    drawSearchHits();
     void scope;
+  }
+
+  /** `#2136`. The summaries search filters: the current one, then every earlier one. */
+  function searchSources(): { place: string; answer: CatchupAnswer }[] {
+    const sources: { place: string; answer: CatchupAnswer }[] = [];
+    if (lastAnswer !== null) sources.push({ place: "Current summary", answer: lastAnswer });
+    for (const entry of searchTimeline) {
+      if (entry.kind !== "summary") continue;
+      const when = entry.created_ms > 0 ? summaryTimeLabel(entry.created_ms, nowMs()) : "—";
+      sources.push({ place: `Earlier summary · ${when}`, answer: entry.answer });
+    }
+    return sources;
+  }
+
+  /** `#2136`. Draw the flat hit list for the typed query; nothing typed, no list. */
+  function drawSearchHits(): void {
+    const box = maybe("discuss-search");
+    const input = maybe("discuss-search-input") as HTMLInputElement | null;
+    const list = maybe("discuss-search-results");
+    const status = maybe("discuss-search-status");
+    if (box === null || input === null || list === null || box.hidden) return;
+    const query = String(input.value ?? "");
+    list.replaceChildren();
+    if (summarySearchWords(query).length === 0) {
+      if (status !== null) status.textContent = searchSources().length === 0 ? "No summary yet to search." : "";
+      return;
+    }
+    const hits = summarySearchHits(searchSources(), query);
+    if (status !== null) status.textContent = hits.length === 0 ? "No summary rows match." : `${hits.length} matching row${hits.length === 1 ? "" : "s"}`;
+    for (const hit of hits) {
+      const item = document.createElement("li");
+      item.className = "discuss-search-hit";
+      const place = document.createElement("span");
+      place.className = "discuss-search-place";
+      place.textContent = hit.heading !== "" ? `${hit.place} — ${hit.heading}` : hit.place;
+      item.appendChild(place);
+      const body = document.createElement("div");
+      body.className = "discuss-search-body";
+      if (hit.html !== "") insertSanitizedHtml(body, hit.html);
+      else body.textContent = hit.text;
+      item.appendChild(body);
+      list.appendChild(item);
+    }
+    keepCitationsInApp(list as HTMLElement);
+  }
+
+  /** `#2136`. Open or close the summary search; opening focuses its field. */
+  function toggleSearch(): void {
+    const box = maybe("discuss-search");
+    const toggle = maybe("discuss-search-toggle");
+    if (box === null) return;
+    box.hidden = !box.hidden;
+    if (toggle !== null) toggle.setAttribute("aria-expanded", box.hidden ? "false" : "true");
+    if (!box.hidden) {
+      drawSearchHits();
+      const input = maybe("discuss-search-input") as HTMLInputElement | null;
+      if (input !== null && typeof input.focus === "function") input.focus();
+    }
   }
 
   /**
@@ -2338,6 +2489,20 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
           if (pending) setPending(false);
           setOpen(false);
         });
+        // `#2136`: the Discuss bar's summary search — a square icon in the
+        // header row, a field under it, and hits that jump like citations.
+        const searchToggle = maybe("discuss-search-toggle");
+        if (searchToggle !== null) {
+          listening.listen(searchToggle, "click", () => toggleSearch());
+        }
+        const searchInput = maybe("discuss-search-input");
+        if (searchInput !== null) {
+          listening.listen(searchInput, "input", () => drawSearchHits());
+        }
+        const searchResults = maybe("discuss-search-results");
+        if (searchResults !== null) {
+          listening.listen(searchResults, "click", (event) => answerTap(event, searchResults));
+        }
         // `#1531 discuss-top-bar-slim-fixed`. No Read in the top bar: the
         // bottom toolbar's Read (`#read-aloud`) reads the summary on
         // screen whole when Discuss stands open with one; its own

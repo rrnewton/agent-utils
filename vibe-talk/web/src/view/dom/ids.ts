@@ -157,6 +157,11 @@ export interface ElementById {
   "discuss-retry": HTMLButtonElement;
   "discuss-save-draft": HTMLButtonElement;
   "discuss-scope": HTMLParagraphElement;
+  "discuss-search": HTMLDivElement;
+  "discuss-search-input": HTMLInputElement;
+  "discuss-search-results": HTMLUListElement;
+  "discuss-search-status": HTMLParagraphElement;
+  "discuss-search-toggle": HTMLButtonElement;
   "discuss-send": HTMLButtonElement;
   "discuss-since": HTMLInputElement;
   "discuss-stale": HTMLParagraphElement;

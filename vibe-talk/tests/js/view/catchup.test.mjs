@@ -23,6 +23,7 @@ const {
   linkDecision, normalizeDiscussScope, viewChangeDecision,
   applyStrikes, citationIdsOf, hasWord, STRUCK_BULLET_CLASS, STRUCK_SECTION_CLASS, FRESH_CLASS,
   hoursSinceStart, countForHours, boundForHours, hoursFloor1, formatHoursFloor1, summaryTimeLabel, withoutTimestampCitations, uncoveredInScope,
+  summarySearchWords, summarySearchMatches, summarySearchRows, summarySearchHits,
 } = VIEW;
 
 // ---- fakes -----------------------------------------------------------------------------------
@@ -107,6 +108,7 @@ const IDS = [
   "discuss-stale", "discuss-stale-text", "discuss-update", "discuss-new-summary", "discuss-timeline", "discuss-timeline-head", "discuss-current-covers", "discuss-current-head", "discuss-current-section",
   "discuss-followup", "discuss-send", "discuss-uncovered", "discuss-uncovered-go", "discuss-uncovered-text",
   "discuss-actions", "discuss-resize", "discuss-head", "discuss-title",
+  "discuss-search", "discuss-search-toggle", "discuss-search-input", "discuss-search-results", "discuss-search-status",
   "discuss-dock-toggle", "discuss-full-toggle", "screen-main",
   "discuss-summarize", "discuss-count", "discuss-since", "discuss-hours",
   // `#1531 discuss-top-bar-slim-fixed`: no #discuss-read in the top bar; the
@@ -2815,6 +2817,67 @@ test("catchup: a failed follow-up stands as an error, and the next line clears i
     assert.equal(line.textContent, "Answered below.");
     assert.equal(line.className, "", "the error styling outlived the failure");
     assert.equal(line.getAttribute("role"), "status");
+  } finally { fx.restore(); }
+});
+
+// ---- summary search (#2136) ---------------------------------------------------------------------
+
+test("search: words fold case and every word must match", () => {
+  assert.deepEqual(summarySearchWords("  Deploy  FAILED "), ["deploy", "failed"]);
+  assert.deepEqual(summarySearchWords("   "), []);
+  assert.equal(summarySearchMatches("The Deploy failed twice", ["deploy", "failed"]), true);
+  assert.equal(summarySearchMatches("The deploy passed", ["deploy", "failed"]), false);
+  assert.equal(summarySearchMatches("anything", []), false);
+});
+
+test("search: rows keep their topic heading; hits span current and earlier summaries", () => {
+  const current = { text: "## Deploys\n- Deploy freeze lifted\n- Docs updated", text_html: "" };
+  const earlier = { text: "## Rollback\n- Deploy rollback rehearsed", text_html: "" };
+  assert.deepEqual(summarySearchRows(current).map((row) => [row.heading, row.text]), [
+    ["Deploys", "Deploy freeze lifted"],
+    ["Deploys", "Docs updated"],
+  ]);
+  const hits = summarySearchHits([
+    { place: "Current summary", answer: current },
+    { place: "Earlier summary · 09:51", answer: earlier },
+  ], "DEPLOY");
+  assert.deepEqual(hits.map((hit) => [hit.place, hit.heading, hit.text]), [
+    ["Current summary", "Deploys", "Deploy freeze lifted"],
+    ["Earlier summary · 09:51", "Rollback", "Deploy rollback rehearsed"],
+  ]);
+  assert.deepEqual(summarySearchHits([{ place: "Current summary", answer: current }], "deploy docs"), []);
+});
+
+test("search: typing in the Discuss search lists labelled hits from current and earlier summaries", async () => {
+  const fx = fixture();
+  const record = savedRecord();
+  record.current_summary.text = "## Deploys\n- Deploy freeze lifted";
+  record.timeline[0].summary.text = "## Rollback\n- Deploy rollback rehearsed";
+  fx.deps.catchupRecord = (channelId, scope) => {
+    fx.calls.records.push({ channelId, scope });
+    return Promise.resolve(record);
+  };
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    view.open();
+    await flush();
+    fx.els["discuss-search"].hidden = true;
+    click(fx.els["discuss-search-toggle"]);
+    assert.equal(fx.els["discuss-search"].hidden, false, "the search icon did not open the search");
+    fx.els["discuss-search-input"].value = "deploy";
+    fireInput(fx.els["discuss-search-input"]);
+    const hits = fx.els["discuss-search-results"].children;
+    assert.equal(hits.length, 2, "hits from both summaries were not listed");
+    assert.match(hits[0].textContent, /Current summary — Deploys/);
+    assert.match(hits[0].textContent, /Deploy freeze lifted/);
+    assert.match(hits[1].textContent, /Earlier summary · .* — Rollback/);
+    assert.match(hits[1].textContent, /Deploy rollback rehearsed/);
+    assert.match(fx.els["discuss-search-status"].textContent, /2 matching rows/);
+    fx.els["discuss-search-input"].value = "deploy missingword";
+    fireInput(fx.els["discuss-search-input"]);
+    assert.equal(fx.els["discuss-search-results"].children.length, 0, "an AND miss still listed rows");
+    assert.match(fx.els["discuss-search-status"].textContent, /No summary rows match/);
   } finally { fx.restore(); }
 });
 

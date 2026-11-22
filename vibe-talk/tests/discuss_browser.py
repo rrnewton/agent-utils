@@ -209,7 +209,21 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
                     "<a href=\"?c=100000000000000001&v=all&m=discord:100000000000000001:100000000000000102\">(09:52 ↩)</a></li></ul>") if updated else ""),
                 "unknown_terms": [], "stamp": CATCHUP_ANSWER["stamp"],
             },
-            "timeline": [],
+            "timeline": [{
+                "kind": "summary",
+                "summary": {
+                    "backend": "fake", "model": "fake-model", "view": "flat",
+                    "since_ms": None, "created_ms": 1760000000000,
+                    "window": CATCHUP_ANSWER["window"],
+                    "covered_ids": MARKABLE, "markable_ids": MARKABLE,
+                    "cited_ids": [], "fresh_ids": [],
+                    "footer_links": CATCHUP_ANSWER["footer_links"],
+                    "text": "## Rollback\nDeploy rollback rehearsed the fix.",
+                    "text_html": "<h2>Rollback</h2><ul><li>Deploy rollback rehearsed the fix "
+                                 "<a href=\"?c=100000000000000001&v=all&m=discord:100000000000000001:100000000000000101\">(09:51 ↩)</a></li></ul>",
+                    "unknown_terms": [], "stamp": CATCHUP_ANSWER["stamp"],
+                },
+            }],
             "staleness": {"new_unread": 1, "marked_read": 0} if not updated else None,
         }))
 
@@ -1017,6 +1031,30 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
     page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
     check((page.locator("#discuss-scope").text_content() or "") == scope_open,
           "the reopened scope differs after the second reload")
+    # `#2136 vibe-talk-discuss-summary-search`: last, because a hit's jump
+    # moves the list — the header search icon opens a field; typing lists
+    # labelled hits from the current and an earlier summary.
+    page.click("#discuss-search-toggle")
+    page.wait_for_selector("#discuss-search-input", state="visible", timeout=20_000)
+    page.fill("#discuss-search-input", "FIX")
+    page.wait_for_function(
+        "() => document.querySelectorAll('#discuss-search-results .discuss-search-hit').length === 2",
+        timeout=20_000)
+    hit_text = page.locator("#discuss-search-results").text_content() or ""
+    check("Current summary" in hit_text and "Progress" in hit_text,
+          f"the current hit is not labelled with its topic: {hit_text!r}")
+    check("Earlier summary" in hit_text and "Rollback" in hit_text,
+          f"the earlier hit is not labelled with its topic: {hit_text!r}")
+    page.fill("#discuss-search-input", "fix missingword")
+    page.wait_for_function(
+        "() => document.querySelectorAll('#discuss-search-results .discuss-search-hit').length === 0",
+        timeout=20_000)
+    page.fill("#discuss-search-input", "fix")
+    page.wait_for_function(
+        "() => document.querySelectorAll('#discuss-search-results .discuss-search-hit').length === 2",
+        timeout=20_000)
+    page.locator("#discuss-search-results .discuss-search-hit a").first.click()
+    page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
     page.click("#discuss-close")
     page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
 

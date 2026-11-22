@@ -210,6 +210,51 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   color: var(--accent);
 }
 
+/* `#2136 vibe-talk-discuss-summary-search`: the search field and its flat hits. */
+#discuss-search {
+  padding: 6px 0 2px;
+}
+
+#discuss-search-input {
+  box-sizing: border-box;
+  width: 100%;
+  padding: 6px 8px;
+  background: var(--row-hover);
+  color: var(--ink);
+  border: 1px solid var(--edge);
+  border-radius: 6px;
+  font: inherit;
+}
+
+#discuss-search-status {
+  margin: 4px 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+#discuss-search-results {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.discuss-search-hit {
+  padding: 6px 0;
+  border-top: 1px solid var(--edge);
+}
+
+.discuss-search-place {
+  display: block;
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.discuss-search-body p,
+.discuss-search-body ul {
+  margin: 2px 0;
+}
+
 /* The dock toggle is a desk layout; a phone's sheet has no column to dock into. */
 @media not ((min-width: 900px) and (pointer: fine)) {
   #discuss-dock-toggle {
