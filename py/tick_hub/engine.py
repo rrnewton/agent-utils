@@ -349,10 +349,10 @@ def _prune_removed_render_failure_state(
 
 
 def _execution_order(planned: Sequence[Reminder | _Suppressed]) -> list[int]:
-    """Topologically order planned indices by ``after`` edges (stable).
+    """Topologically order runnable indices by ``after`` edges (stable).
 
-    Only edges between two planned runnable reminders constrain order; an edge
-    naming a reminder that is not planned this tick is vacuous. Ties keep
+    Only edges between two runnable reminders in this tick's set constrain
+    order; an edge naming a reminder absent this tick is vacuous. Ties keep
     config order, so a config without ``after`` edges yields config order
     exactly. A cycle (refused at load; reachable only by direct construction)
     falls back to config order for the remaining reminders rather than hanging.
