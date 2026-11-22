@@ -6455,6 +6455,11 @@ pub struct BridgeState {
     // typed, oldest retirement first, until `take_typed_retirements` takes them. A retired
     // request's record is gone and its tombstone keeps no delivery time.
     typed_retirements: Arc<std::sync::Mutex<VecDeque<(String, u64)>>>,
+    // Whether `short-refs.json` is behind the retained records because an alias was
+    // assigned since it was last rewritten; also process-local. The file is derived
+    // from the request and alias records, so a crash leaves it stale until the next
+    // rewrite, and no reader treats it as authority.
+    short_refs_pending: Arc<AtomicBool>,
     // The coordinator's transcript, read for the clean text of its replies; also process-local.
     transcript_replies: Option<Arc<std::sync::Mutex<Box<dyn TranscriptReplies>>>>,
     // Where that transcript reader last found the text, shared with it; also process-local.
@@ -6610,6 +6615,7 @@ impl BridgeState {
             headless_target: false,
             receipt_when_started: false,
             typed_retirements: Arc::default(),
+            short_refs_pending: Arc::default(),
             transcript_replies: None,
             reply_source: None,
             screen_held: Arc::default(),
@@ -6724,6 +6730,7 @@ impl BridgeState {
             headless_target: false,
             receipt_when_started: false,
             typed_retirements: Arc::default(),
+            short_refs_pending: Arc::default(),
             transcript_replies: None,
             reply_source: None,
             screen_held: Arc::default(),
@@ -12751,9 +12758,28 @@ stay held until an operator repairs or deletes it, and deleting it forgets which
     /// Best-effort beside admission and alias assignment: a failed write
     /// leaves the previous file, never blocks a delivery.
     pub(crate) fn write_short_refs(&self) {
+        self.short_refs_pending.store(false, Ordering::SeqCst);
         let document = self.short_refs_document();
         if let Err(error) = write_document(&self.root.join(SHORT_REFS_FILE), &document) {
             eprintln!("agentctl: short references not written: {error}");
+        }
+    }
+
+    /// Note that `short-refs.json` is behind the retained records, without
+    /// rewriting it: the service rewrites it once per owner-loop pass through
+    /// [`Self::flush_short_refs`], so a burst of admissions or alias
+    /// assignments costs one whole-file write per pass, not one per event
+    /// (#2098 agentctl-chat-bridge-write-burst).
+    pub(crate) fn note_short_refs_changed(&self) {
+        self.short_refs_pending.store(true, Ordering::SeqCst);
+    }
+
+    /// Rewrite `short-refs.json` if [`Self::note_short_refs_changed`] marked
+    /// it behind; a no-op otherwise, and free when the document it would
+    /// write is already the file's content (see `write_document`).
+    pub(crate) fn flush_short_refs(&self) {
+        if self.short_refs_pending.swap(false, Ordering::SeqCst) {
+            self.write_short_refs();
         }
     }
 
@@ -13064,8 +13090,9 @@ still skipped, but a block under an old number that is out of view then could re
             .retain(|withheld| !forgotten.contains(&withheld.alias));
         record.validate()?;
         write_document(&self.reply_alias_path(), &record)?;
-        // A new alias is a new short thread reference for vibe-talk (#658).
-        self.write_short_refs();
+        // A new alias is a new short thread reference for vibe-talk (#658);
+        // the file itself is rewritten once per pass, not once per alias.
+        self.note_short_refs_changed();
         Ok(alias)
     }
 
@@ -17953,6 +17980,9 @@ fn consume_one_scoped(
             let admission = state.admit_batch_scoped(&batch, senders)?;
             subscription.commit_durable(&batch)?;
             state.confirm_batch_commit(&admission)?;
+            if !admission.new_request_keys.is_empty() {
+                state.note_short_refs_changed();
+            }
             Ok(ConsumedItem::Batch(admission))
         }
     }
@@ -21484,8 +21514,25 @@ fn open_existing_private_state_lock(path: &Path) -> Result<File> {
     Ok(file)
 }
 
+/// Write `value` as the JSON document at `path`, skipping the write entirely
+/// when the file already holds exactly the encoded document: several bridge
+/// stores are rewritten from loops and passes that often change nothing, and
+/// each skipped write also skips its temporary file, fsyncs and rename
+/// (#2098 agentctl-chat-bridge-write-burst). The encoding compared is the
+/// one `agent::atomic_json` writes (pretty JSON plus a final newline).
 fn write_document<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    agent::atomic_json(path, &serde_json::to_value(value)?)?;
+    let value = serde_json::to_value(value)?;
+    let mut encoded = serde_json::to_vec_pretty(&value)?;
+    encoded.push(b'\n');
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.is_file()
+            && metadata.len() == u64::try_from(encoded.len()).unwrap_or(u64::MAX)
+            && fs::read(path).is_ok_and(|current| current == encoded)
+        {
+            return Ok(());
+        }
+    }
+    agent::atomic_json(path, &value)?;
     Ok(())
 }
 
@@ -22175,7 +22222,9 @@ pub(crate) mod tests {
         );
         assert!(posted.contains("and :thread:999;"), "{posted}");
         assert!(posted.contains("plain 060 and #658 stay."), "{posted}");
-        // The short-reference file names the thread and the message.
+        // The short-reference file names the thread and the message, once
+        // the pass-end flush has rewritten it (#2098).
+        state.flush_short_refs();
         let short_refs: Value =
             serde_json::from_str(&fs::read_to_string(root.join("short-refs.json")).expect("file"))
                 .expect("short refs JSON");
@@ -22696,7 +22745,9 @@ pub(crate) mod tests {
             ),
             "{posted}"
         );
-        // `short-refs.json` carries bare `ts` values, never qualified ids.
+        // `short-refs.json` carries bare `ts` values, never qualified ids,
+        // once the pass-end flush has rewritten it (#2098).
+        state.flush_short_refs();
         let short_refs: Value =
             serde_json::from_str(&fs::read_to_string(root.join("short-refs.json")).expect("file"))
                 .expect("short refs JSON");
@@ -23618,6 +23669,133 @@ pub(crate) mod tests {
         assert!(!status.contains(&inherited_home));
         assert!(!status.contains("subscription_environment"));
         fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    /// Snapshot of every file under `root`: path to (length, modified time).
+    fn store_snapshot(root: &Path) -> BTreeMap<PathBuf, (u64, std::time::SystemTime)> {
+        let mut files = BTreeMap::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(&directory).expect("read store directory") {
+                let entry = entry.expect("store entry");
+                let path = entry.path();
+                let metadata = entry.metadata().expect("store metadata");
+                if metadata.is_dir() {
+                    pending.push(path);
+                } else if metadata.is_file() {
+                    files.insert(
+                        path,
+                        (metadata.len(), metadata.modified().expect("modified time")),
+                    );
+                }
+            }
+        }
+        files
+    }
+
+    /// Bytes written under `root` since `before` was taken: the current
+    /// length of each file that appeared or changed, as the store layer
+    /// wrote it. No wall-clock budget is involved.
+    fn store_bytes_since(
+        root: &Path,
+        before: &BTreeMap<PathBuf, (u64, std::time::SystemTime)>,
+    ) -> u64 {
+        store_snapshot(root)
+            .into_iter()
+            .filter(|(path, current)| before.get(path) != Some(current))
+            .map(|(_, (length, _))| length)
+            .sum()
+    }
+
+    /// #2098 agentctl-chat-bridge-write-burst: the bytes the store layer
+    /// writes grow with the change, not with the store size. A rescan or
+    /// pass that changes nothing writes nothing; alias assignments cost
+    /// nothing until one flush rewrites the short-refs snapshot once; one
+    /// new message costs its own records, never a snapshot rewrite. The
+    /// same change beside an eight-times-larger store costs the same.
+    #[test]
+    fn store_writes_scale_with_the_change_not_the_store_size() {
+        let mut admitted_bytes = Vec::new();
+        for (name, prefill) in [
+            ("write-scale-small", 32_u64),
+            ("write-scale-large", 256_u64),
+        ] {
+            let root = temporary(name);
+            let state = BridgeState::initialize(&root, config_without_reaction())
+                .expect("initialize state");
+            for index in 1..=prefill {
+                let key = state
+                    .admit_batch(&indexed_delivery(index, index))
+                    .expect("prefill admission")
+                    .new_request_keys
+                    .into_iter()
+                    .next()
+                    .expect("prefill key");
+                state.prompt(&key, "").expect("prefill prompt");
+            }
+            state.write_short_refs();
+            let short_refs_size = fs::metadata(root.join(SHORT_REFS_FILE))
+                .expect("short refs metadata")
+                .len();
+            assert!(
+                short_refs_size > 4_096,
+                "prefill {prefill} left a {short_refs_size}-byte short-refs file"
+            );
+            // A rescan that changes nothing writes nothing.
+            let before = store_snapshot(&root);
+            state.write_short_refs();
+            state.flush_short_refs();
+            assert_eq!(store_bytes_since(&root, &before), 0);
+            // Notes without a change behind them still cost nothing.
+            let before = store_snapshot(&root);
+            for _ in 0..4 {
+                state.note_short_refs_changed();
+            }
+            assert_eq!(store_bytes_since(&root, &before), 0);
+            state.flush_short_refs();
+            assert_eq!(store_bytes_since(&root, &before), 0);
+            // One new message costs its own records, not a snapshot rewrite.
+            let before = store_snapshot(&root);
+            let next = prefill + 1;
+            let new_key = state
+                .admit_batch_scoped(&indexed_delivery(next, next), None)
+                .expect("scoped admission")
+                .new_request_keys
+                .into_iter()
+                .next()
+                .expect("scoped key");
+            let bytes = store_bytes_since(&root, &before);
+            assert!(
+                bytes < short_refs_size,
+                "one message wrote {bytes} bytes beside a {short_refs_size}-byte \
+                 short-refs file"
+            );
+            admitted_bytes.push(bytes);
+            // Its alias assignment is noted at prompt time; the flush then
+            // rewrites the snapshot exactly once, however often it is noted.
+            state.prompt(&new_key, "").expect("new prompt");
+            let before = store_snapshot(&root);
+            let grown_size = fs::metadata(root.join(SHORT_REFS_FILE))
+                .expect("short refs metadata")
+                .len();
+            for _ in 0..4 {
+                state.note_short_refs_changed();
+            }
+            state.flush_short_refs();
+            let flushed = store_bytes_since(&root, &before);
+            let final_size = fs::metadata(root.join(SHORT_REFS_FILE))
+                .expect("short refs metadata")
+                .len();
+            assert!(final_size > grown_size, "alias never reached short-refs");
+            assert_eq!(flushed, final_size);
+            state.flush_short_refs();
+            assert_eq!(store_bytes_since(&root, &before), final_size);
+            fs::remove_dir_all(&root).expect("remove fixture");
+        }
+        assert!(
+            admitted_bytes[1] <= admitted_bytes[0] + 2_048,
+            "per-message bytes grew with the store: {admitted_bytes:?}"
+        );
     }
 
     fn state_with_old_request(

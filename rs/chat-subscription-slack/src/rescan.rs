@@ -390,6 +390,11 @@ impl Ledger {
             "cursor": self.cursor,
         });
         let bytes = serde_json::to_vec_pretty(&record).map_err(std::io::Error::other)?;
+        // An unchanged ledger is not rewritten: batch acknowledgements save
+        // after every batch, and most change nothing (#2098).
+        if fs::read(&self.path).is_ok_and(|current| current == bytes) {
+            return Ok(());
+        }
         let mut temporary = self.path.clone().into_os_string();
         temporary.push(".tmp");
         let temporary = PathBuf::from(temporary);

@@ -6145,6 +6145,9 @@ fn run_owner_loop_with_health<A: ManagedApi + ?Sized>(
                 &mut health,
             ),
         };
+        // One short-refs rewrite per pass, however many aliases the pass
+        // assigned (#2098 agentctl-chat-bridge-write-burst).
+        state.flush_short_refs();
         let result = owner_loop_end(stop, pass);
         let error = match result {
             // The pass ended for a repoint request: the next round applies it and starts the
@@ -6198,6 +6201,7 @@ fn run_owner_loop_with_health<A: ManagedApi + ?Sized>(
     if result.is_ok() {
         health.clear(&state);
     }
+    state.flush_short_refs();
     result
 }
 
