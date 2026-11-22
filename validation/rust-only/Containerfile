@@ -7,7 +7,8 @@
 # POSIX shell only. The build stage needs the Rust toolchain; neither stage
 # installs Python, and the smoke entrypoint fails if an interpreter is
 # present on PATH. This is the hermetic version of
-# scripts/check_rust_only.py (#542 rust-primary-rust-only-check).
+# scripts/check_rust_only.py (#542 rust-primary-rust-only-check), extended
+# by #2131 rust-only-functional-check from --help probes to real flows.
 
 FROM docker.io/library/rust:1-slim-bookworm AS build
 WORKDIR /src
@@ -19,6 +20,9 @@ COPY --from=build /src/rs/target/release/agentctl /src/rs/target/release/herdr-a
 COPY --from=build /src/rs/target/release/dagrun /src/rs/target/release/cpuset-alloc /usr/local/bin/
 COPY --from=build /src/rs/target/release/tick-hub /src/rs/target/release/herdr-run /usr/local/bin/
 COPY --from=build /src/rs/target/release/pr-landing-planner /usr/local/bin/
+COPY --from=build /src/rs/target/release/wrkslotsd /src/rs/target/release/wrkvizd /usr/local/bin/
+COPY --from=build /src/rs/target/release/agent-teams /src/rs/target/release/agent-usage /src/rs/target/release/gh-paced /usr/local/bin/
+COPY validation/rust-only/fixtures /usr/local/share/agent-utils-rust-only/fixtures
 COPY validation/rust-only/smoke.sh /usr/local/bin/agent-utils-rust-only-smoke
 RUN chmod +x /usr/local/bin/agent-utils-rust-only-smoke
 ENTRYPOINT ["/usr/local/bin/agent-utils-rust-only-smoke"]

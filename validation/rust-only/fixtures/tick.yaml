@@ -1,0 +1,9 @@
+reminders:
+  - name: backlog
+    cadence_secs: 0
+    gate: {cmd: "echo count=42", when: always, capture: true}
+    emit:
+      kind: action
+      skill: backlog-triage
+      fields: {threshold: "20"}
+      title: "backlog has {{count}} ready items (threshold {{threshold}})"

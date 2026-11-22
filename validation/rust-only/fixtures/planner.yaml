@@ -1,0 +1,30 @@
+repo: OWNER/NAME
+base: main
+prs:
+  - number: 1043
+    title: fast, fresh, all green
+    head_ref: feat-a
+    additions: 10
+    labels: [validated-locally]
+    changed_files: [src/a.rs]
+    checks:
+      - {name: CI, status: COMPLETED, conclusion: SUCCESS}
+      - {name: merge-gate, status: COMPLETED, conclusion: SUCCESS}
+  - number: 987
+    title: green but 6 behind base
+    head_ref: feat-b
+    additions: 40
+    commits_behind: 6
+    changed_files: [src/b.rs]
+    checks:
+      - {name: CI, status: COMPLETED, conclusion: SUCCESS}
+      - {name: merge-gate, status: COMPLETED, conclusion: SUCCESS}
+  - number: 942
+    title: CI green, required gate stale
+    head_ref: feat-c
+    changed_files: [src/c.rs]
+    checks:
+      - {name: CI, status: COMPLETED, conclusion: SUCCESS}
+      - {name: merge-gate, status: COMPLETED, conclusion: FAILURE, text: stale result}
+conflicts:
+  - {a: 987, b: 942, paths: [src/shared.rs]}

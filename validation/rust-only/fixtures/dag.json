@@ -1,0 +1,5 @@
+{"description":"rust-only smoke: three-node chain","steps":[
+ {"group":"build","job":"one","cmd":"mkdir -p out && printf 'one\n' > out/one.txt"},
+ {"group":"build","job":"two","cmd":"mkdir -p out && cat out/one.txt > out/two.txt && printf 'two\n' >> out/two.txt","deps":["build.one"]},
+ {"group":"build","job":"three","cmd":"mkdir -p out && cat out/two.txt > out/three.txt && printf 'three\n' >> out/three.txt","deps":["build.two"]}
+]}

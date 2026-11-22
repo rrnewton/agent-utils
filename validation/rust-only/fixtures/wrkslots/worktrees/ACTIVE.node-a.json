@@ -1,0 +1,51 @@
+{
+ "schema": 2,
+ "machine": "node-a",
+ "revision": 7,
+ "slots": [
+  {
+   "slot": "slot-a",
+   "agent": "agent-a",
+   "task": "do work",
+   "purpose": "testing",
+   "machine": "node-a",
+   "generation": 1,
+   "created_at": "2026-10-26T00:00:00Z",
+   "heartbeat_at": "2026-10-26T01:00:00Z",
+   "heartbeat_ttl_seconds": 60,
+   "owner": {
+    "pid": 123,
+    "start_ticks": 1123,
+    "boot_id": "boot-1",
+    "host_id": "host-1",
+    "cgroup_path": "/user.slice/session.scope"
+   },
+   "coordinator_lease": {
+    "pid": 456,
+    "start_ticks": 1456,
+    "boot_id": "boot-1",
+    "host_id": "host-1",
+    "cgroup_path": "/user.slice/session.scope"
+   },
+   "coordinator_recovery_note": null,
+   "handoff": null,
+   "checkouts": [
+    {
+     "name": "repo",
+     "path": "worktrees/slot-a/repo",
+     "repository": "../upstream-repo",
+     "branch": "suite/work",
+     "start_point": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "remote": "origin",
+     "remote_url_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+     "landed_ref": "refs/remotes/origin/main",
+     "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "containing_remote_refs": [
+      "refs/remotes/origin/main"
+     ],
+     "vcs": "git"
+    }
+   ]
+  }
+ ]
+}

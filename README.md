@@ -142,7 +142,11 @@ parity check that enforces it. The dispatcher reads the generated
 explicitly for a paused, archived, or absent mirror refuses and names its
 state. `python3 scripts/check_editions.py` proves the file still matches the
 tracked entrypoints and the Rust editions' refusal lists, and runs as a
-validation hygiene check on every change.
+validation hygiene check on every change. The Rust-primary tools pass the
+functional no-Python smoke in `validation/rust-only/` (a real basic flow per
+tool with no interpreter present; cpuset-alloc's reserve/release is blocked
+only where `systemd-run --user` scopes are unavailable), while the
+Python-primary tools below remain not-yet.
 
 The same file inventories every on-disk and wire format (queue items,
 registry records, coordinator and landing-queue files, wrkslots state,

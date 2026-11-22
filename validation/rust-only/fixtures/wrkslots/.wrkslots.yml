@@ -1,0 +1,7 @@
+schema: 2
+machine: node-a
+worktrees_dir: worktrees
+default_remote: origin
+default_landed_ref: refs/remotes/origin/main
+heartbeat_ttl_seconds: 60
+liveness_command: live.py
