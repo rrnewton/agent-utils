@@ -334,9 +334,13 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   white-space: pre-wrap;
 }
 
+/* `#2135 vibe-talk-discuss-header-sizes`: two-level hierarchy — top
+ * section titles (`.discuss-section-title`) at 1.25rem, in-summary
+ * collapsible headings (this rule and the summary rules below) at
+ * 1.1rem, clearly one level below. */
 #discuss-answer h2,
 #discuss-answer h3 {
-  font-size: 0.95rem;
+  font-size: 1.1rem;
   margin: 10px 0 4px;
 }
 
@@ -400,6 +404,8 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   padding: 0.4rem 0;
   cursor: pointer;
   list-style: none;
+  /* `#2135`: second level — a collapsible inside Current summary. */
+  font-size: 1.1rem;
   font-weight: 600;
   touch-action: manipulation;
   -webkit-tap-highlight-color: transparent;
@@ -510,8 +516,10 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
 }
 
 .discuss-section-title {
-  font-size: 1rem;
+  /* `#2135`: first level — a little bigger than the old 1rem. */
+  font-size: 1.25rem;
   font-weight: 700;
+  line-height: 1.2;
   margin: 4px 0 0;
 }
 
@@ -565,7 +573,8 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   padding: 0.55rem 0;
   cursor: pointer;
   list-style: none;
-  font-size: 0.95rem;
+  /* `#2135`: second level — bigger than the old 0.95rem, below 1.25rem. */
+  font-size: 1.1rem;
   font-weight: 700;
   color: var(--ink);
   touch-action: manipulation;
@@ -615,7 +624,8 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
 
 .discuss-old-body h2,
 .discuss-old-body h3 {
-  font-size: 0.95rem;
+  /* `#2135`: second level, same as the other in-summary headings. */
+  font-size: 1.1rem;
   margin: 10px 0 4px;
 }
 
@@ -628,6 +638,8 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   padding: 0.55rem 0;
   cursor: pointer;
   list-style: none;
+  /* `#2135`: second level (was inherited 0.9rem from `.discuss-old`). */
+  font-size: 1.1rem;
   font-weight: 700;
   color: var(--ink);
 }
@@ -1101,6 +1113,8 @@ stay its owner's (#1524). The pane itself already ends above the
   padding: 0.55rem 0;
   cursor: pointer;
   list-style: none;
+  /* `#2135`: second level; the folded `h2`/`h3` inside carries it too. */
+  font-size: 1.1rem;
   touch-action: manipulation;
   -webkit-tap-highlight-color: transparent;
 }
