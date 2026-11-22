@@ -2643,7 +2643,7 @@ def test_gate_memory_need_refuses_non_finite(tmp_path: Path, raw: str) -> None:
         gate.memory_need_gib(args, "heavy")
 
 
-def _peaks_ledger(tmp_path: Path, rows: list[dict[str, object]]) -> Path:
+def _peaks_ledger(tmp_path: Path, rows: list[dict[str, float | None]]) -> Path:
     ledger = tmp_path / "peaks-ledger.jsonl"
     ledger.write_text("".join(json.dumps(row) + "\n" for row in rows))
     return ledger
@@ -2653,12 +2653,14 @@ def test_measured_need_decays_and_never_reads_recorded_needs(tmp_path: Path) -> 
     """#2062 decay: needs gate.py recorded are never read back; only
     measured peaks, in a bounded recent window, feed the estimate."""
     gate = _gate_module()
-    giant_need = [{"memory_need_gib": 900.0, "memory_peak_gib": None}]
+    giant_need: list[dict[str, float | None]] = [{"memory_need_gib": 900.0, "memory_peak_gib": None}]
     args = type("A", (), {"memory_need_gib": None,
                           "ledger": str(_peaks_ledger(tmp_path, giant_need))})()
     need, source = gate.memory_need_gib(args, "light")
     assert need == 8.0 and "cold-start" in source  # the 900 GiB need is ignored
-    rows = [{"memory_peak_gib": 100.0}] + [{"memory_peak_gib": 10.0}] * 60
+    ten: float | None = 10.0
+    rows: list[dict[str, float | None]] = [{"memory_peak_gib": 100.0}]
+    rows += [{"memory_peak_gib": ten} for _ in range(60)]
     args = type("A", (), {"memory_need_gib": None,
                           "ledger": str(_peaks_ledger(tmp_path, rows))})()
     need, source = gate.memory_need_gib(args, "heavy")
@@ -2668,7 +2670,8 @@ def test_measured_need_decays_and_never_reads_recorded_needs(tmp_path: Path) -> 
 
 def test_measured_need_capped_at_half_of_memtotal(tmp_path: Path) -> None:
     gate = _gate_module()
-    rows = [{"memory_peak_gib": 500.0}] * 5
+    five_hundred: float | None = 500.0
+    rows: list[dict[str, float | None]] = [{"memory_peak_gib": five_hundred} for _ in range(5)]
     args = type("A", (), {"memory_need_gib": None,
                           "ledger": str(_peaks_ledger(tmp_path, rows))})()
     need, _source = gate.memory_need_gib(args, "heavy")
