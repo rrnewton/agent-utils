@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 import search_dates_browser as week
 from bookmark_browser import TOKEN, check, serve
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserContext, Page, Playwright
@@ -174,15 +175,19 @@ def walk(page: Page, label: str, touch: bool, shots: Path | None, width: int = 1
 def launch(playwright: Playwright, browser: str | None, profile: str, width: int, height: int,
            touch: bool) -> BrowserContext:
     if touch:
-        return playwright.chromium.launch_persistent_context(
+        _bw_ctx = playwright.chromium.launch_persistent_context(
             profile, headless=True, executable_path=browser, timezone_id=week.ZONE,
             viewport={"width": width, "height": height}, color_scheme="dark",
             device_scale_factor=2.625, is_mobile=True, has_touch=True,
         )
-    return playwright.chromium.launch_persistent_context(
+        browser_waits.hot_host_timeouts(_bw_ctx)
+        return _bw_ctx
+    _bw_ctx = playwright.chromium.launch_persistent_context(
         profile, headless=True, executable_path=browser, timezone_id=week.ZONE,
         viewport={"width": width, "height": height}, color_scheme="dark",
     )
+    browser_waits.hot_host_timeouts(_bw_ctx)
+    return _bw_ctx
 
 
 def main() -> int:

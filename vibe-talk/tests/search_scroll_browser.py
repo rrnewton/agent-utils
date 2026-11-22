@@ -28,6 +28,7 @@ from zoneinfo import ZoneInfo
 import bookmark_browser as fixture
 from bookmark_browser import AGENT, CHANNEL, TOKEN, FakeApi, Json, check, serve
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserContext, Page, Playwright
@@ -209,6 +210,7 @@ def launch(playwright: Playwright, args: argparse.Namespace, profile: str, width
         viewport={"width": width, "height": height}, color_scheme=scheme,  # type: ignore[arg-type]
         device_scale_factor=2.625 if touch else 1, is_mobile=touch, has_touch=touch,
     )
+    browser_waits.hot_host_timeouts(context)
     context.add_init_script(IOS_VIEWPORT_JS)
     return context
 

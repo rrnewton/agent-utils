@@ -89,6 +89,7 @@ from offline_cache_browser import TOKEN
 from thread_card_focus_browser import COLOURED, COLOURED_PIXEL, PIXELS_JS, chroma, open_two_columns
 from two_column_browser import FILLER, REPLICA, RUNNER, THREAD_ROWS, ColumnsApi, Desk
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType
@@ -305,6 +306,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                     viewport={"width": width, "height": height}, color_scheme="light" if scheme == "light" else "dark",
                     device_scale_factor=2.625, is_mobile=True, has_touch=True,
                 )
+                browser_waits.hot_host_timeouts(context)
             else:
                 context = chromium.launch_persistent_context(
                     profile, headless=True, executable_path=args.browser_executable,
@@ -312,6 +314,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                     color_scheme="light" if scheme == "light" else "dark",
                     reduced_motion="reduce" if kind == "reduced" else "no-preference",
                 )
+                browser_waits.hot_host_timeouts(context)
             version = context.browser.version if context.browser else "Chromium"
             page = context.pages[0]
             errors: list[str] = []

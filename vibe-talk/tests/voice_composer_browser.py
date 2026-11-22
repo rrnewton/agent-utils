@@ -46,6 +46,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import unquote, urlsplit
 
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType, Page, WebSocketRoute
@@ -319,6 +320,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi
             has_touch=mobile,
             device_scale_factor=2.625 if mobile else 1,
         )
+        browser_waits.hot_host_timeouts(context)
         try:
             origin = url.removesuffix("/")
             context.grant_permissions(["microphone"], origin=origin)

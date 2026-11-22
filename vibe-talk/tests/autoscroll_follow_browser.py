@@ -34,6 +34,7 @@ from urllib.parse import unquote, urlsplit
 
 from browser_audio import CHROMIUM_AUDIO_ARGS
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import Page
@@ -244,6 +245,7 @@ def main() -> int:
                         profile, args=CHROMIUM_AUDIO_ARGS, headless=True,
                         executable_path=os.environ.get("VIBE_TALK_CHROMIUM"),
                         viewport={"width": width, "height": height}, is_mobile=mobile, has_touch=mobile)
+                    browser_waits.hot_host_timeouts(context)
                     page = context.pages[0]
                     errors: list[str] = []
                     page.on("pageerror", lambda e: errors.append(str(e)))

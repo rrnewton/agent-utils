@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING
 import offline_cache_browser as fixture
 import page_sources
 from offline_cache_browser import TOKEN, Json, check, handler_for, said
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import Page
@@ -257,6 +258,7 @@ def run(chromium: object, args: argparse.Namespace, label: str, width: int, heig
                 profile, headless=True, executable_path=args.browser_executable,
                 viewport={"width": width, "height": height}, color_scheme="dark",
                 device_scale_factor=2.625 if touch else 1, is_mobile=touch, has_touch=touch)
+            browser_waits.hot_host_timeouts(context)
             page = context.pages[0]
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))

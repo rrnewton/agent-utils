@@ -65,6 +65,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 import keyboard_browser as kb
 from keyboard_browser import TOKEN, Json, check
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import Browser, BrowserContext, CDPSession, Page
@@ -644,8 +645,10 @@ def short_window(desk: Desk) -> None:
 
 def desk_walk(browser: Browser, url: str, args: argparse.Namespace, posts: list[Json], errors: list[str]) -> list[str]:
     context = browser.new_context(viewport={"width": 1280, "height": 800}, color_scheme="dark")
+    browser_waits.hot_host_timeouts(context)
     context.grant_permissions(["clipboard-read", "clipboard-write"], origin=url.rstrip("/"))
     page = context.new_page()
+    browser_waits.hot_host_timeouts(page)
     page.on("pageerror", lambda error: errors.append(str(error)))
     desk = Desk(page, context.new_cdp_session(page), args.screenshots, "1280x800")
     sign_in(page, url)
@@ -677,9 +680,11 @@ def desk_walk(browser: Browser, url: str, args: argparse.Namespace, posts: list[
 
 def fallback_walk(browser: Browser, url: str, args: argparse.Namespace, posts: list[Json], errors: list[str]) -> list[str]:
     context = browser.new_context(viewport={"width": 1280, "height": 800}, color_scheme="dark")
+    browser_waits.hot_host_timeouts(context)
     context.grant_permissions(["clipboard-read", "clipboard-write"], origin=url.rstrip("/"))
     context.add_init_script(NO_FIELD_SIZING_JS)
     page = context.new_page()
+    browser_waits.hot_host_timeouts(page)
     page.on("pageerror", lambda error: errors.append(str(error)))
     desk = Desk(page, context.new_cdp_session(page), args.screenshots, "1280x800-no-field-sizing")
     sign_in(page, url)
@@ -715,8 +720,10 @@ def phone_walk(browser: Browser, url: str, args: argparse.Namespace, errors: lis
     for stored in ("1", "0"):
         context: BrowserContext = browser.new_context(viewport={"width": 393, "height": 852}, color_scheme="dark",
                                                       device_scale_factor=2.75, is_mobile=True, has_touch=True)
+        browser_waits.hot_host_timeouts(context)
         context.add_init_script(f"localStorage.setItem('{GROW_KEY}', '{stored}');")
         page = context.new_page()
+        browser_waits.hot_host_timeouts(page)
         page.on("pageerror", lambda error: errors.append(str(error)))
         desk = Desk(page, context.new_cdp_session(page), args.screenshots, f"393x852-stored-{stored}")
         sign_in(page, url)

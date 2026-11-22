@@ -43,6 +43,7 @@ from offline_cache_browser import check, handler_for
 from threads_polish_browser import PolishApi, to_threads, unpack_to
 from two_column_browser import REPLICA, RUNNER, Desk
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType
@@ -132,6 +133,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 viewport={"width": width, "height": height}, color_scheme="dark",
                 has_touch=touch, is_mobile=touch,
                 reduced_motion="reduce" if reduced else "no-preference")
+            browser_waits.hot_host_timeouts(context)
             version = context.browser.version if context.browser else "Chromium"
             page = context.pages[0]
             errors: list[str] = []

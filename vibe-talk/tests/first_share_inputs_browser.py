@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Literal
 import offline_cache_browser as fixture
 from offline_cache_browser import TOKEN, FakeApi, handler_for
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType, Page
@@ -74,6 +75,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 profile, headless=True, executable_path=args.browser_executable,
                 viewport={"width": width, "height": height}, color_scheme=scheme,
                 has_touch=mobile, is_mobile=mobile)
+            browser_waits.hot_host_timeouts(context)
             page = context.pages[0]
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))

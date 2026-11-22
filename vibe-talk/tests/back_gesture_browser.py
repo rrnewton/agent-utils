@@ -66,6 +66,7 @@ import offline_cache_browser as fixture
 from offline_cache_browser import TOKEN, Json, check, handler_for
 from two_column_browser import REPLICA, RUNNER, THREAD_ROWS, ColumnsApi, Desk
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserContext, BrowserType, Page
@@ -168,16 +169,19 @@ def phone_context(chromium: BrowserType, args: argparse.Namespace, profile: str)
         viewport={"width": WIDTH, "height": HEIGHT}, color_scheme="dark",
         device_scale_factor=2.625, is_mobile=True, has_touch=True, user_agent=ANDROID_CHROME,
     )
+    browser_waits.hot_host_timeouts(context)
     context.add_init_script(STANDALONE_JS)
     return context
 
 
 def desk_context(chromium: BrowserType, args: argparse.Namespace, profile: str) -> BrowserContext:
     """A desk's Chrome at 1440x900, with a mouse: wide enough for two columns."""
-    return chromium.launch_persistent_context(
+    _bw_ctx = chromium.launch_persistent_context(
         profile, headless=True, executable_path=args.browser_executable,
         viewport={"width": DESK_WIDTH, "height": DESK_HEIGHT}, color_scheme="dark",
     )
+    browser_waits.hot_host_timeouts(_bw_ctx)
+    return _bw_ctx
 
 
 def walk(chromium: BrowserType, args: argparse.Namespace, label: str, steps: Callable[[Desk], None],

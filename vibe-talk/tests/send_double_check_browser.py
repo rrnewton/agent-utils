@@ -18,6 +18,7 @@ from inline_reply_browser import ReplyColumnsApi, sign_in
 from offline_cache_browser import check, handler_for, said
 from two_column_browser import Desk
 import page_sources
+import browser_waits
 
 WIDTH, HEIGHT = 393, 852
 
@@ -63,6 +64,7 @@ def main() -> int:
             context = playwright.chromium.launch_persistent_context(
                 profile, headless=True, executable_path=args.browser_executable,
                 viewport={"width": WIDTH, "height": HEIGHT}, is_mobile=True, has_touch=True)
+            browser_waits.hot_host_timeouts(context)
             page = context.pages[0]
             errors: list[str] = []
             page.on("pageerror", lambda e: errors.append(str(e)))

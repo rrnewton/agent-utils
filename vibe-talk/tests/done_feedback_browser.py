@@ -51,6 +51,7 @@ import json
 import mimetypes
 import os
 import re
+import time
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -58,6 +59,7 @@ from typing import TYPE_CHECKING, Literal
 from urllib.parse import unquote, urlsplit
 
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import Browser, Page, Route
@@ -358,9 +360,11 @@ def open_channel(browser: Browser, api: FakeApi, *, reduced: bool = False, schem
                                   reduced_motion="reduce" if reduced else "no-preference",
                                   is_mobile=touch, has_touch=touch,
                                   device_scale_factor=2.625 if touch else 1)
+    browser_waits.hot_host_timeouts(context)
     errors: list[str] = []
     context.route("**/*", api.route)
     page = context.new_page()
+    browser_waits.hot_host_timeouts(page)
     page.on("pageerror", lambda error: errors.append(str(error)))
     page.goto(f"{ORIGIN}/", wait_until="load")
     page.fill("#api-token", TOKEN)
@@ -405,7 +409,15 @@ def walk_motion(walk: Walk, scheme: Scheme) -> list[str]:
     page = walk.page
     notes: list[str] = []
     marked = marking(walk)
+    # The mark lands through a server round-trip and a frame, and the animation itself runs
+    # 0.25 s: on a hot host one sample taken at once reads [] either side of it (#2077). Poll
+    # for the marking state with the animation running; the checks below still pass or fail on
+    # the sampled state, named as before.
+    deadline = time.monotonic() + browser_waits.HANG_BACKSTOP_MS / 1000
     now = walk.row(marked)
+    while now["animations"] != ["done-marking"] and time.monotonic() < deadline:
+        page.wait_for_timeout(25)
+        now = walk.row(marked)
     check(walk.selected() != marked, "e did not move the selection on to the next unread message")
     check(now["archived"] == "true", f"e did not mark {marked} Done: {now}")
     check(now["flash"] == "marking", f"the row e marked carries nothing of the moment: {now}")

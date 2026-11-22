@@ -37,6 +37,7 @@ import offline_cache_browser as fixture
 from keyboard_hides_bar_browser import IOS_VIEWPORT_JS, KEYBOARD_PX
 from offline_cache_browser import CHANNEL, TOKEN, FakeApi, Json, check, handler_for, message
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import Page, Playwright
@@ -303,7 +304,9 @@ class Walk:
     def settled(self) -> None:
         self.page.evaluate("() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))")
 
-    def until(self, script: str, why: str, seconds: float = 10) -> None:
+    def until(self, script: str, why: str, seconds: float = browser_waits.HANG_BACKSTOP_MS / 1000) -> None:
+        # The bound is the hang backstop (#2077): on a hot host a condition can take far longer
+        # than 10 s of wall time to come true without anything being wrong.
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline and not self.page.evaluate(script):
             self.page.wait_for_timeout(25)
@@ -574,6 +577,7 @@ def main() -> None:
                             has_touch=touch, is_mobile=touch,
                             color_scheme=theme,
                         )
+                        browser_waits.hot_host_timeouts(context)
                         page = context.pages[0] if context.pages else context.new_page()
                         page.add_init_script(IOS_VIEWPORT_JS)
                         page.goto(origin)

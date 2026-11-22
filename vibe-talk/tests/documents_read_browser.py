@@ -46,6 +46,7 @@ from typing import Literal, cast
 from playwright.sync_api import Browser, BrowserContext, Page, sync_playwright
 
 from browser_audio import CHROMIUM_AUDIO_ARGS
+import browser_waits
 
 ROOT = Path(__file__).resolve().parent.parent
 CHANNEL = "100000000000000001"
@@ -714,6 +715,7 @@ def screenshot_matrix(browser: Browser, base: str, out: Path) -> None:
 
     def new_page(ctx: BrowserContext) -> Page:
         page = ctx.new_page()
+        browser_waits.hot_host_timeouts(page)
         page.add_init_script(
             f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")
         page.add_init_script(DEVICE_VOICE)
@@ -763,6 +765,7 @@ def screenshot_matrix(browser: Browser, base: str, out: Path) -> None:
             ctx = browser.new_context(
                 viewport={"width": width, "height": height},
                 has_touch=touch, is_mobile=touch, color_scheme=scheme)
+            browser_waits.hot_host_timeouts(ctx)
             page = new_page(ctx)
             docs = stamp("documents")
             open_document(page)
@@ -872,6 +875,7 @@ def screenshot_matrix(browser: Browser, base: str, out: Path) -> None:
         ctx = browser.new_context(
             viewport={"width": 412, "height": 915}, has_touch=True, is_mobile=True,
             color_scheme=scheme)
+        browser_waits.hot_host_timeouts(ctx)
         page = new_page(ctx)
         docs = stamp("documents")
         open_document(page)
@@ -925,6 +929,7 @@ def screenshot_matrix(browser: Browser, base: str, out: Path) -> None:
         ctx = browser.new_context(
             viewport={"width": 412, "height": 915}, has_touch=True, is_mobile=True,
             color_scheme=scheme)
+        browser_waits.hot_host_timeouts(ctx)
         page = new_page(ctx)
         open_document(page)
         for preset in ("blue", "blue-hc", "teal", "plum", "amber"):
@@ -1032,7 +1037,9 @@ def main() -> int:
                     forget_synced_source(base)
                     ctx = browser.new_context(
                         viewport={"width": width, "height": height}, has_touch=touch, is_mobile=touch)
+                    browser_waits.hot_host_timeouts(ctx)
                     page = ctx.new_page()
+                    browser_waits.hot_host_timeouts(page)
                     page.add_init_script(
                         f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")
                     page.add_init_script(DEVICE_VOICE)
@@ -1044,7 +1051,9 @@ def main() -> int:
                 forget_synced_source(base)
                 ctx = browser.new_context(
                     viewport={"width": 393, "height": 852}, has_touch=True, is_mobile=True)
+                browser_waits.hot_host_timeouts(ctx)
                 page = ctx.new_page()
+                browser_waits.hot_host_timeouts(page)
                 page.add_init_script(
                     f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")
                 page.add_init_script(DEVICE_VOICE)

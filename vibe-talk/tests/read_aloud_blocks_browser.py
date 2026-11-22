@@ -84,6 +84,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from browser_audio import CHROMIUM_AUDIO_ARGS
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserContext, Page
@@ -831,6 +832,7 @@ def main() -> int:
                     is_mobile=mobile,
                     has_touch=mobile,
                 )
+                browser_waits.hot_host_timeouts(context)
                 context.add_init_script("localStorage.setItem('vibe-talk.voice.read-audio-source', 'agent');")
                 context.add_init_script(SOURCE_PROBE)
                 context.add_init_script(CONTEXT_STATE_PROBE)

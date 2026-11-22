@@ -83,6 +83,7 @@ from offline_cache_browser import TOKEN, check, said
 from scroll_stability_browser import SUMMARY, Reader, StabilityApi, handler, thread_record, view_key
 from two_column_browser import UNSPLIT_CARDS_JS
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType
@@ -382,6 +383,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 profile, headless=True, executable_path=args.browser_executable,
                 viewport={"width": width, "height": height}, color_scheme="dark",
             )
+            browser_waits.hot_host_timeouts(context)
             try:
                 version = context.browser.version if context.browser else "Chromium"
                 page = context.pages[0]

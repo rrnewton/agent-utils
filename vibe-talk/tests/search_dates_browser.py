@@ -46,6 +46,7 @@ from zoneinfo import ZoneInfo
 import bookmark_browser as fixture
 from bookmark_browser import AGENT, CHANNEL, TOKEN, FakeApi, Json, check, serve
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserContext, Page, Playwright
@@ -553,15 +554,19 @@ def walk_through(walk: Walk) -> None:
 def launch(playwright: Playwright, args: argparse.Namespace, profile: str, width: int, height: int,
            touch: bool) -> BrowserContext:
     if touch:
-        return playwright.chromium.launch_persistent_context(
+        _bw_ctx = playwright.chromium.launch_persistent_context(
             profile, headless=True, executable_path=args.browser_executable, timezone_id=ZONE,
             viewport={"width": width, "height": height}, color_scheme="dark",
             device_scale_factor=2.625, is_mobile=True, has_touch=True,
         )
-    return playwright.chromium.launch_persistent_context(
+        browser_waits.hot_host_timeouts(_bw_ctx)
+        return _bw_ctx
+    _bw_ctx = playwright.chromium.launch_persistent_context(
         profile, headless=True, executable_path=args.browser_executable, timezone_id=ZONE,
         viewport={"width": width, "height": height}, color_scheme="dark",
     )
+    browser_waits.hot_host_timeouts(_bw_ctx)
+    return _bw_ctx
 
 
 def main() -> int:

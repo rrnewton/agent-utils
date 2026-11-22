@@ -42,3 +42,11 @@ Gate ledger rows a4100efa, e1ecd02f, bf300e59, 3d872668, d2d5db8f share no singl
 - A (scheduling + build): cap `browser: 8` to `4` in both fragments (sole-holder demands follow), `preferred_inner_jobs: 4` on every browser step (browser lane ceiling 16 of the gate's 48 CPUs), the missing hint on `keyboard-browser`, and one `build.page` step per gate serving all fake-server walks through `VIBE_TALK_WEB_ROOT` (134 page builds to 1; a stale build refuses by recorded input digests).
 - B (waits): shared `browser_waits` helper (hang backstop defaults + condition waits) applied suite-wide.
 - C (proof): the browser group repeatedly above 75% host CPU; quarantine only what still fails, as `disabled-optin` with a pointer here.
+
+## Progress
+
+[watermelon-full-preview] A landed on main as a3caaea0 (gate e91e0755 red only in the #2065 families and 4 load-timing browser checks, coordinator waiver). The exact route-shape classification for the offline-cache fixture's channel reads is its own commit on this branch.
+
+B adds `vibe-talk/tests/browser_waits.py` (`HANG_BACKSTOP_MS`, `hot_host_timeouts`, `wait_until`, `click_when_clear`) and applies the backstop at all 304 context/page creations in 160 files (AST-guided; mypy strict clean). Hand conversions at Gate A's four failure spots: the kinds walk reaches the call view by keyboard (at 150% root the Documents view lays out 518px wide on the 360px screen, putting `#view-switch` past the visual viewport once that frame commits — a coordinate click only lands by racing the frame; the placement assertions are unchanged), the done-marking animation is polled for instead of sampled once, the one-page picker read waits on its condition, and the shared `Walk.until` bound becomes the hang backstop. New walks should use `browser_waits` (one sibling lane's in-flight walk adopts it after this lands).
+
+Follow-up worth its own look (not fixed here): the Documents view overflowing to a 518px layout at 150% root type on a 360px phone, and a host-wide browser cap across concurrent gates (the per-gate cap is process-local; three gates can still run 12 Chromiums — halved from 24 by A, and each now has a four-core box).

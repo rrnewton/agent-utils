@@ -55,6 +55,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import unquote, urlsplit
 
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import Page, WebSocketRoute
@@ -599,6 +600,7 @@ def main() -> int:
                 is_mobile=True,
                 has_touch=True,
             )
+            browser_waits.hot_host_timeouts(context)
             voice = FakeVoice()
             try:
                 context.grant_permissions(["microphone"], origin=origin)

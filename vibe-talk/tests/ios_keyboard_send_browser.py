@@ -45,6 +45,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import page_sources
+import browser_waits
 
 TOKEN = "write-token-browser-ios-keyboard-send-check"
 CHANNEL = {"id": "1110000000000000001", "label": "lead team", "writable": True, "alias": None,
@@ -228,7 +229,9 @@ def main() -> int:
             else:
                 browser = playwright.chromium.launch(headless=True)
             context = browser.new_context(**iphone)
+            browser_waits.hot_host_timeouts(context)
             page = context.new_page()
+            browser_waits.hot_host_timeouts(page)
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))
             page.goto(url, wait_until="load")

@@ -33,6 +33,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import page_sources
+import browser_waits
 
 TOKEN = "write-token-browser-pairing-link-check"
 CODE = "Pq3x_Zr-7AbCdEfGhIjKlMnOpQrStUvWxYz01234567"
@@ -223,6 +224,7 @@ def main() -> int:
                         is_mobile=True,
                         has_touch=True,
                     )
+                    browser_waits.hot_host_timeouts(context)
                     browser_version = context.browser.version if context.browser else browser_version
                     page = context.pages[0]
                     errors: list[str] = []

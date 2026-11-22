@@ -30,6 +30,7 @@ from playwright.sync_api import Locator, Page, sync_playwright
 
 from browser_audio import CHROMIUM_AUDIO_ARGS
 import documents_read_browser as harness
+import browser_waits
 
 ROOT = harness.ROOT
 CHANNEL = harness.CHANNEL
@@ -325,7 +326,9 @@ def main() -> int:
                 for width, height, touch, name in ((393, 852, True, "phone-doc"), (1280, 800, False, "desk-doc")):
                     ctx = browser.new_context(
                         viewport={"width": width, "height": height}, has_touch=touch, is_mobile=touch)
+                    browser_waits.hot_host_timeouts(ctx)
                     page = ctx.new_page()
+                    browser_waits.hot_host_timeouts(page)
                     page.add_init_script(
                         f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")
                     page.add_init_script(harness.DEVICE_VOICE)
@@ -336,7 +339,9 @@ def main() -> int:
                     ctx.close()
                 ctx = browser.new_context(
                     viewport={"width": 393, "height": 852}, has_touch=True, is_mobile=True)
+                browser_waits.hot_host_timeouts(ctx)
                 page = ctx.new_page()
+                browser_waits.hot_host_timeouts(page)
                 page.add_init_script(
                     f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")
                 page.add_init_script(harness.DEVICE_VOICE)
@@ -347,7 +352,9 @@ def main() -> int:
                 ctx.close()
                 ctx = browser.new_context(
                     viewport={"width": 393, "height": 852}, has_touch=True, is_mobile=True)
+                browser_waits.hot_host_timeouts(ctx)
                 page = ctx.new_page()
+                browser_waits.hot_host_timeouts(page)
                 page.add_init_script(
                     f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")
                 page.add_init_script(harness.DEVICE_VOICE)

@@ -49,6 +49,7 @@ from urllib.parse import parse_qs, urlsplit
 import offline_cache_browser as fixture
 from offline_cache_browser import CACHE_KEY, TOKEN, FakeApi, Json, check, handler_for, said, thread_of
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType, Route
@@ -233,6 +234,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 viewport={"width": width, "height": height}, device_scale_factor=2.625,
                 is_mobile=True, has_touch=True,
             )
+            browser_waits.hot_host_timeouts(context)
             version = context.browser.version if context.browser else "Chromium"
             page = context.pages[0]
             errors: list[str] = []

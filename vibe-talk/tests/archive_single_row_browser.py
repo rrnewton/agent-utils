@@ -28,6 +28,7 @@ import offline_cache_browser as fixture
 from offline_cache_browser import TOKEN, check
 import page_sources
 import search_typing_fast_browser as typing_fast
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import Page, Playwright
@@ -200,6 +201,7 @@ def main() -> int:
                         timezone_id="America/New_York",
                         viewport={"width": width, "height": height}, color_scheme=scheme,  # type: ignore[arg-type]
                         device_scale_factor=2.625 if width < 600 else 1, is_mobile=width < 600, has_touch=width < 600)
+                    browser_waits.hot_host_timeouts(context)
                     page = context.pages[0]
                     if windowed:
                         page.add_init_script(

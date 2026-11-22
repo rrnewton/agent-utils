@@ -58,6 +58,7 @@ from reply_marks_read_browser import MarkerApi, drawn_read
 from two_column_browser import CANARY, RUNNER, THREAD_ROWS, Desk
 from view_switch_browser import PHONE, SwitchApi
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType, Route
@@ -240,6 +241,7 @@ def views_walk(chromium: BrowserType, args: argparse.Namespace) -> str:
                 viewport={"width": width, "height": height}, device_scale_factor=2.625,
                 is_mobile=True, has_touch=True,
             )
+            browser_waits.hot_host_timeouts(context)
             version = context.browser.version if context.browser else "Chromium"
             page = context.pages[0]
             errors: list[str] = []
@@ -368,6 +370,7 @@ def sends_walk(chromium: BrowserType, args: argparse.Namespace) -> str:
                 profile, headless=True, executable_path=args.browser_executable,
                 viewport={"width": WIDTH, "height": HEIGHT}, color_scheme="dark",
             )
+            browser_waits.hot_host_timeouts(context)
             version = context.browser.version if context.browser else "Chromium"
             page = context.pages[0]
             errors: list[str] = []

@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserContext
@@ -275,6 +276,7 @@ def main() -> int:
                 context = playwright.chromium.launch_persistent_context(
                     profile, headless=True, executable_path=args.browser_executable,
                     viewport={"width": 1280, "height": 800})
+                browser_waits.hot_host_timeouts(context)
                 page = context.pages[0]
                 errors: list[str] = []
                 page.on("pageerror", lambda error: errors.append(str(error)))

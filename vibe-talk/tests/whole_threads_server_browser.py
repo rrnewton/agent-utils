@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from playwright.sync_api import sync_playwright
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import Page
@@ -181,7 +182,9 @@ def main() -> None:
                     context = browser.new_context(
                         viewport={"width": width, "height": height}, device_scale_factor=scale,
                         color_scheme=theme, has_touch=width < 600, is_mobile=width < 600)
+                    browser_waits.hot_host_timeouts(context)
                     page = context.new_page()
+                    browser_waits.hot_host_timeouts(page)
                     page.add_init_script(
                         f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE)}); "
                         "localStorage.setItem('vibe-talk.welcome.dismissed','1'); } catch(e) {}")

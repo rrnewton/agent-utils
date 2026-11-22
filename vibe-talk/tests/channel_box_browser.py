@@ -39,6 +39,7 @@ from urllib.parse import unquote, urlsplit
 import keyboard_browser as kb
 from keyboard_browser import CHANNEL, SECOND, TOKEN, Json, check
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -301,6 +302,7 @@ def browse(playwright: Playwright, args: argparse.Namespace, url: str, width: in
             viewport={"width": width, "height": height}, is_mobile=mobile, has_touch=mobile,
             device_scale_factor=3 if mobile else 1,
         )
+        browser_waits.hot_host_timeouts(context)
         errors: list[str] = []
         context.pages[0].on("pageerror", lambda error: errors.append(str(error)))
         note = walk(context, url, args.screenshots, f"{width}x{height}")

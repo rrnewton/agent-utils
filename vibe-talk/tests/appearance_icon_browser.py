@@ -21,6 +21,7 @@ from pathlib import Path
 
 import offline_cache_browser as fixture
 from offline_cache_browser import TOKEN, FakeApi, check, handler_for
+import browser_waits
 
 STATE_MS = 30_000
 # (device scheme, stored Appearance, expected effective theme)
@@ -68,6 +69,7 @@ def main() -> int:
                         viewport={"width": 412, "height": 915}, color_scheme="light" if device == "light" else "dark",
                         device_scale_factor=2.6, is_mobile=True, has_touch=True,
                     )
+                    browser_waits.hot_host_timeouts(context)
                     page = context.pages[0]
                     page.add_init_script(
                         f"try {{ localStorage.setItem('vibe-talk.voice.appearance', '{stored}'); }} catch (e) {{}}"

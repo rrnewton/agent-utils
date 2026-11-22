@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING
 import offline_cache_browser as fixture
 from keyboard_hides_bar_browser import IOS_VIEWPORT_JS, KEYBOARD_PX
 from offline_cache_browser import TOKEN, FakeApi, Json, check, handler_for, message
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import Page
@@ -236,6 +237,7 @@ def main() -> None:
                             viewport={"width": width, "height": height},
                             device_scale_factor=2.6 if touch else 1,
                             has_touch=touch, is_mobile=touch, color_scheme=theme)
+                        browser_waits.hot_host_timeouts(context)
                         page = context.pages[0] if context.pages else context.new_page()
                         page.route("**/catchup/preview*", lambda route: route.fulfill(
                             status=200, content_type="application/json",

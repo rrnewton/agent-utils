@@ -45,6 +45,7 @@ from all_thread_strip_browser import StripApi, handler
 from offline_cache_browser import Json, check
 import page_sources
 from two_column_browser import Desk
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType
@@ -209,6 +210,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str) -> Seen:
                 profile, headless=True, executable_path=args.browser_executable,
                 viewport={"width": 1280, "height": 800}, color_scheme="dark",
             )
+            browser_waits.hot_host_timeouts(context)
             version = context.browser.version if context.browser else "Chromium"
             page = context.pages[0]
             errors: list[str] = []

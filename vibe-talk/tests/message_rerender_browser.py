@@ -19,6 +19,7 @@ from pathlib import Path
 import offline_cache_browser as fixture
 from offline_cache_browser import TOKEN, FakeApi, check, handler_for, message
 from typing import TYPE_CHECKING
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import Playwright
@@ -70,6 +71,7 @@ def walk(playwright: Playwright, web_root: Path, shots: Path, width: int, height
                 executable_path=os.environ.get("VIBE_TALK_CHROMIUM"),
                 viewport={"width": width, "height": height},
                 is_mobile=mobile, has_touch=mobile)
+            browser_waits.hot_host_timeouts(context)
             page = context.pages[0]
             errors: list[str] = []
             page.on("pageerror", lambda e: errors.append(str(e)))

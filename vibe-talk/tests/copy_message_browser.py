@@ -54,6 +54,7 @@ import offline_cache_browser as fixture
 from offline_cache_browser import TOKEN, Json, check, handler_for
 from two_column_browser import LONG_FIRST, REPLICA, ColumnsApi, Desk
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserContext, BrowserType, CDPSession, Page
@@ -174,11 +175,13 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                     viewport={"width": width, "height": height}, color_scheme="dark",
                     device_scale_factor=2.625, is_mobile=True, has_touch=True,
                 )
+                browser_waits.hot_host_timeouts(context)
             else:
                 context = chromium.launch_persistent_context(
                     profile, headless=True, executable_path=args.browser_executable,
                     viewport={"width": width, "height": height}, color_scheme="dark",
                 )
+                browser_waits.hot_host_timeouts(context)
             # Reading the clipboard back is what this check is for; writing the sentinel needs the other.
             context.grant_permissions(["clipboard-read", "clipboard-write"], origin=origin)
             version = context.browser.version if context.browser else "Chromium"
@@ -415,6 +418,7 @@ def desk_walk(reader: Reader) -> None:
 def mac_walk(reader: Reader, context: BrowserContext, origin: str, errors: list[str]) -> None:
     """A second tab of the signed-in profile, its platform a Mac's: Cmd+C with the Edit menu's copy and without it."""
     mac = context.new_page()
+    browser_waits.hot_host_timeouts(mac)
     mac.on("pageerror", lambda error: errors.append(str(error)))
     cdp = context.new_cdp_session(mac)
     agent = str(reader.page.evaluate("() => navigator.userAgent"))

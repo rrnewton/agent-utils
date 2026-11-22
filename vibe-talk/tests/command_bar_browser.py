@@ -53,6 +53,7 @@ from typing import TYPE_CHECKING
 import keyboard_browser as kb
 from keyboard_browser import TOKEN, Json, check
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import Browser, Page
@@ -156,7 +157,9 @@ def shot(page: Page, shots: Path | None, name: str) -> None:
 
 def open_page(browser: Browser, url: str, width: int, height: int, mobile: bool = False) -> Page:
     context = browser.new_context(viewport={"width": width, "height": height}, is_mobile=mobile, has_touch=mobile)
+    browser_waits.hot_host_timeouts(context)
     page = context.new_page()
+    browser_waits.hot_host_timeouts(page)
     page.goto(url, wait_until="load")
     page.fill("#api-token", TOKEN)
     page.click("#save-token")

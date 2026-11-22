@@ -202,6 +202,7 @@ from typing import TYPE_CHECKING, TypedDict, cast
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -2532,6 +2533,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 is_mobile=mobile,
                 has_touch=mobile,
             )
+            browser_waits.hot_host_timeouts(context)
             page = context.pages[0]
             # Time flows as normal; `#32`'s in-place step jumps it past the channel's poll.
             page.clock.install()
@@ -3250,6 +3252,7 @@ def reply_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
                 is_mobile=mobile,
                 has_touch=mobile,
             )
+            browser_waits.hot_host_timeouts(context)
             page = context.pages[0]
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))
@@ -3422,6 +3425,7 @@ def tile_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
                 viewport={"width": width, "height": height}, device_scale_factor=2.625 if mobile else 1,
                 is_mobile=mobile, has_touch=mobile, color_scheme="dark",
             )
+            browser_waits.hot_host_timeouts(context)
             page = context.pages[0]
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))
@@ -3555,6 +3559,7 @@ def dock_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
                 viewport={"width": width, "height": height}, device_scale_factor=2.625 if mobile else 1,
                 is_mobile=mobile, has_touch=mobile, color_scheme="dark",
             )
+            browser_waits.hot_host_timeouts(context)
             page = context.pages[0]
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))
@@ -3656,8 +3661,8 @@ def dock_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
             page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
             # `#1781`: sign-in lands on the Channel; the dock this walk measures is the call
             # view's, two presses away through Documents.
-            page.click("#view-switch")
-            page.click("#view-switch")
+            browser_waits.click_when_clear(page, "#view-switch")
+            browser_waits.click_when_clear(page, "#view-switch")
             until("() => !document.getElementById('pane-voice').hidden", "the call view did not appear")
             until("() => !document.getElementById('control-pane').hidden", "the call view's pane did not appear")
 
@@ -3713,7 +3718,7 @@ def dock_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
                 if desk:
                     page.mouse.click(spot_x, spot_y)
                 else:
-                    page.click("#view-switch")
+                    browser_waits.click_when_clear(page, "#view-switch")
                 until("() => document.getElementById('view-switch').getAttribute('aria-pressed') === "
                       f"{json.dumps(checked)}", why)
 
@@ -3848,6 +3853,7 @@ def coalesce_walk(chromium: BrowserType, args: argparse.Namespace, label: str, w
                 has_touch=mobile,
                 color_scheme="dark",
             )
+            browser_waits.hot_host_timeouts(context)
             page = context.pages[0]
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))
@@ -4146,6 +4152,7 @@ def menu_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
                     viewport={"width": width, "height": height}, device_scale_factor=2.625,
                     is_mobile=True, has_touch=True, color_scheme="dark",
                 )
+                browser_waits.hot_host_timeouts(context)
                 page = context.pages[0]
                 larger_root_font(page, root_percent)
                 errors: list[str] = []
@@ -4243,6 +4250,7 @@ def pin_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width:
                 viewport={"width": width, "height": height}, device_scale_factor=2.625 if mobile else 1,
                 is_mobile=mobile, has_touch=mobile, color_scheme="dark",
             )
+            browser_waits.hot_host_timeouts(context)
             page = context.pages[0]
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))
@@ -4379,6 +4387,7 @@ def links_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
                 viewport={"width": width, "height": height}, device_scale_factor=2.625 if mobile else 1,
                 is_mobile=mobile, has_touch=mobile, color_scheme="dark",
             )
+            browser_waits.hot_host_timeouts(context)
             opened: list[str] = []
 
             def answer(route: Route) -> None:
@@ -4501,8 +4510,8 @@ def links_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
 
             # Over the call view there are no pins: Links stands beside the glass on its own.
             # `documents-view-client`: Channel -> Documents -> Voice takes two presses.
-            page.click("#view-switch")
-            page.click("#view-switch")
+            browser_waits.click_when_clear(page, "#view-switch")
+            browser_waits.click_when_clear(page, "#view-switch")
             page.wait_for_selector("#pane-voice", state="visible", timeout=5_000)
             tap("#search-toggle")
             until("() => !document.getElementById('links-filter').hidden", "the call view's bar has no Links filter")
@@ -4544,6 +4553,7 @@ def links_bar_walk(chromium: BrowserType, args: argparse.Namespace, label: str, 
                 viewport={"width": width, "height": height}, device_scale_factor=2.625,
                 is_mobile=True, has_touch=True, color_scheme="dark",
             )
+            browser_waits.hot_host_timeouts(context)
             page = context.pages[0]
             larger_root_font(page, root_percent)
             errors: list[str] = []
@@ -4636,6 +4646,7 @@ def kinds_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
                 viewport={"width": width, "height": height}, device_scale_factor=2.625 if mobile else 1,
                 is_mobile=mobile, has_touch=mobile, color_scheme="dark",
             )
+            browser_waits.hot_host_timeouts(context)
             page = context.pages[0]
             larger_root_font(page, root_percent)
             errors: list[str] = []
@@ -4800,9 +4811,18 @@ def kinds_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
                   "folding the bar left the kinds up")
 
             # Over the call view Links stands beside the glass: right-aligned under the bar's end.
-            page.click("#view-switch")
-            page.click("#view-switch")
-            page.wait_for_selector("#pane-voice", state="visible", timeout=5_000)
+            # There by keyboard, not by tap (#2077): at 150% root the Documents view lays out
+            # 518px wide on a 360px screen, so once that frame commits the switch stands past
+            # the visual viewport's edge — a hand can pan to it, but no coordinate click can be
+            # aimed at it, and on a fast host the tap only lands by racing the frame. What this
+            # walk proves is where the kinds stand over the call, reached either way.
+            page.focus("#view-switch")
+            page.keyboard.press("Enter")
+            until("() => document.getElementById('view-switch').title.includes('Showing Documents')",
+                  "a press on the switch did not show Documents")
+            page.focus("#view-switch")
+            page.keyboard.press("Enter")
+            page.wait_for_selector("#pane-voice", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
             links_on()
             call = page.evaluate(KINDS_JS, {"pinned": False})
             shot("4-call-view")
@@ -4844,6 +4864,7 @@ def crowded_kinds_walk(chromium: BrowserType, args: argparse.Namespace, label: s
                 viewport={"width": width, "height": height}, device_scale_factor=2.625,
                 is_mobile=True, has_touch=True, color_scheme="dark",
             )
+            browser_waits.hot_host_timeouts(context)
             page = context.pages[0]
             larger_root_font(page, root_percent)
             errors: list[str] = []
@@ -4954,6 +4975,7 @@ def empty_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
                 viewport={"width": width, "height": height}, device_scale_factor=2.625,
                 is_mobile=True, has_touch=True, color_scheme="dark",
             )
+            browser_waits.hot_host_timeouts(context)
             page = context.pages[0]
             larger_root_font(page, root_percent)
             errors: list[str] = []
@@ -5079,6 +5101,7 @@ def windows_walk(chromium: BrowserType, args: argparse.Namespace) -> None:
                 profile, headless=True, executable_path=args.browser_executable,
                 viewport={"width": 1280, "height": 800},
             )
+            browser_waits.hot_host_timeouts(context)
             errors: list[str] = []
 
             def channel(page: Page) -> str:
@@ -5104,6 +5127,7 @@ def windows_walk(chromium: BrowserType, args: argparse.Namespace) -> None:
 
             def opened() -> Page:
                 page = context.new_page()
+                browser_waits.hot_host_timeouts(page)
                 page.on("pageerror", lambda error: errors.append(str(error)))
                 return page
 

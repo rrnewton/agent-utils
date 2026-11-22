@@ -183,6 +183,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType, Page, WebSocketRoute
@@ -1299,6 +1300,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi
                 "(KHTML, like Gecko) Chrome/151.0.0.0 Mobile Safari/537.36"
             ),
         )
+        browser_waits.hot_host_timeouts(context)
         try:
             context.route_web_socket(re.compile(r"/ws\?mode=voice$"), voice.accept)
             context.route_web_socket(re.compile(r"/ws\?mode=hosted$"), hosted.accept)
@@ -1357,6 +1359,7 @@ def walk_short(chromium: BrowserType, args: argparse.Namespace, url: str, api: F
             viewport={"width": width, "height": height}, is_mobile=True, has_touch=True,
             device_scale_factor=2.75,
         )
+        browser_waits.hot_host_timeouts(context)
         try:
             context.route_web_socket(re.compile(r"/ws\?mode=voice$"), voice.accept)
             page = context.pages[0]
@@ -2947,6 +2950,7 @@ def walk_desk(chromium: BrowserType, args: argparse.Namespace, url: str, api: Fa
             directory, headless=True, executable_path=args.browser_executable,
             viewport={"width": width, "height": height},
         )
+        browser_waits.hot_host_timeouts(context)
         try:
             context.route_web_socket(re.compile(r"/ws\?mode=voice$"), voice.accept)
             page = context.pages[0]

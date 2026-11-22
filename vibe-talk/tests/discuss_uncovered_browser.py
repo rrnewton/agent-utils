@@ -32,6 +32,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from playwright.sync_api import Page, sync_playwright
+import browser_waits
 
 ROOT = Path(__file__).resolve().parent.parent
 CHANNEL = "100000000000000001"
@@ -379,6 +380,7 @@ def main() -> int:
             context = browser.new_context(
                 viewport={"width": width, "height": height}, device_scale_factor=scale,
                 has_touch=touch, is_mobile=touch, color_scheme="dark" if scheme == "dark" else "light")
+            browser_waits.hot_host_timeouts(context)
             walk(context.new_page(), args.screenshots, tag)
             context.close()
         browser.close()

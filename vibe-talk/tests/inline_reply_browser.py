@@ -74,6 +74,7 @@ import offline_cache_browser as fixture
 from offline_cache_browser import TOKEN, Json, check, handler_for, said, thread_of
 from two_column_browser import RUNNER, THREAD_ROWS, ColumnsApi, Desk
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -390,6 +391,7 @@ def run(chromium: BrowserType, args: argparse.Namespace, label: str, size: tuple
                 profile, headless=True, executable_path=args.browser_executable,
                 viewport={"width": width, "height": height}, color_scheme="dark",
                 has_touch=touch, is_mobile=touch)
+            browser_waits.hot_host_timeouts(context)
             version = context.browser.version if context.browser else "Chromium"
             page = context.pages[0]
             errors: list[str] = []

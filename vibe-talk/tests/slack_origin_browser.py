@@ -19,6 +19,7 @@ import urllib.request
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
+import browser_waits
 
 ROOT = Path(__file__).resolve().parent.parent
 CHANNEL = "100000000000000001"
@@ -83,7 +84,9 @@ def main() -> int:
             with sync_playwright() as pw:
                 browser = pw.chromium.launch()
                 context = browser.new_context(viewport={"width": 412, "height": 915})
+                browser_waits.hot_host_timeouts(context)
                 page = context.new_page()
+                browser_waits.hot_host_timeouts(page)
                 seen: list[str] = []
                 page.on("request", lambda request: seen.append(request.url))
                 errors: list[str] = []

@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 import keyboard_browser as kb
 from keyboard_browser import TOKEN, check
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import Page
@@ -114,7 +115,9 @@ def main() -> int:
             context = browser.new_context(
                 viewport={"width": 412, "height": 915}, device_scale_factor=2.6,
                 is_mobile=True, has_touch=True)
+            browser_waits.hot_host_timeouts(context)
             page: Page = context.new_page()
+            browser_waits.hot_host_timeouts(page)
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))
             page.goto(url, wait_until="load")

@@ -45,6 +45,7 @@ import urllib.request
 from pathlib import Path
 
 from playwright.sync_api import Page, Route, sync_playwright
+import browser_waits
 
 ROOT = Path(__file__).resolve().parent.parent
 CHANNEL = "100000000000000001"
@@ -291,12 +292,15 @@ def main() -> int:
                 browser = pw.chromium.launch()
                 desk = browser.new_context(viewport={"width": 1280, "height": 800},
                                             color_scheme="dark")
+                browser_waits.hot_host_timeouts(desk)
                 desk_page = desk.new_page()
+                browser_waits.hot_host_timeouts(desk_page)
                 wire(desk_page, base)
                 walk(desk_page, base, "Control", "Meta", "desk (Ctrl+D)", args.screenshots, "desk")
                 # The same on a Mac, emulated as keyboard_browser.py emulates it:
                 # plain Cmd+D acts, plain Ctrl+D in the box is the box's.
                 mac_page = desk.new_page()
+                browser_waits.hot_host_timeouts(mac_page)
                 mac_cdp = desk.new_cdp_session(mac_page)
                 agent = str(desk_page.evaluate("() => navigator.userAgent"))
                 mac_cdp.send("Emulation.setUserAgentOverride",
@@ -307,7 +311,9 @@ def main() -> int:
                 desk.close()
                 phone = browser.new_context(viewport={"width": 412, "height": 915},
                                              has_touch=True, is_mobile=True, color_scheme="light")
+                browser_waits.hot_host_timeouts(phone)
                 phone_page = phone.new_page()
+                browser_waits.hot_host_timeouts(phone_page)
                 wire(phone_page, base)
                 walk(phone_page, base, "Control", "Meta", "phone (Ctrl+D)", args.screenshots, "phone")
                 phone.close()

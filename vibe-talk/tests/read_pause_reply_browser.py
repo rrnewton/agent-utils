@@ -84,6 +84,7 @@ from two_column_browser import Desk
 
 from browser_audio import CHROMIUM_AUDIO_ARGS
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import Browser, BrowserContext, Page
@@ -220,6 +221,7 @@ def open_page(browser: Browser, width: int, height: int, touch: bool) -> tuple[B
     """
     context = browser.new_context(viewport={"width": width, "height": height}, color_scheme="dark",
                                     has_touch=touch, is_mobile=touch)
+    browser_waits.hot_host_timeouts(context)
     return context, context.new_page(), browser.version
 
 

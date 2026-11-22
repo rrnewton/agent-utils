@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import unquote, urlsplit
 
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType
@@ -447,6 +448,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, url: str, label: str, 
             viewport={"width": width, "height": height}, device_scale_factor=2.625 if mobile else 1,
             is_mobile=mobile, has_touch=mobile, color_scheme="dark",
         )
+        browser_waits.hot_host_timeouts(context)
         page = context.pages[0]
         errors: list[str] = []
         page.on("pageerror", lambda error: errors.append(str(error)))

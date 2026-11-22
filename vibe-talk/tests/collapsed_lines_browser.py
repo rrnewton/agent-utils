@@ -50,6 +50,7 @@ from typing import TYPE_CHECKING, TypedDict
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import CDPSession, Page, Route
@@ -722,11 +723,13 @@ def main() -> int:
                                     "(KHTML, like Gecko) Chrome/151.0.0.0 Mobile Safari/537.36"),
                         device_scale_factor=2.75, is_mobile=True, has_touch=True,
                     )
+                    browser_waits.hot_host_timeouts(context)
                 else:
                     context = playwright.chromium.launch_persistent_context(
                         profile, headless=True, executable_path=args.browser_executable,
                         viewport={"width": width, "height": height}, color_scheme="dark",
                     )
+                    browser_waits.hot_host_timeouts(context)
                 try:
                     context.route("**/*", api.route)
                     page = context.pages[0]

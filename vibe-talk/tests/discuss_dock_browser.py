@@ -41,6 +41,7 @@ import urllib.request
 from pathlib import Path
 
 from playwright.sync_api import Page, Route, sync_playwright
+import browser_waits
 
 ROOT = Path(__file__).resolve().parent.parent
 CHANNEL = "100000000000000001"
@@ -583,8 +584,10 @@ def main() -> int:
                 browser = pw.chromium.launch()
                 phone = browser.new_context(
                     viewport={"width": 390, "height": 844}, has_touch=True, is_mobile=True)
+                browser_waits.hot_host_timeouts(phone)
                 walk_phone(phone.new_page(), base, 390, 844)
                 desk = browser.new_context(viewport={"width": 1280, "height": 800})
+                browser_waits.hot_host_timeouts(desk)
                 walk_desk(desk.new_page(), base, 1280, 800)
                 browser.close()
             print("discuss dock browser: phone docked and desk overlay walks passed")

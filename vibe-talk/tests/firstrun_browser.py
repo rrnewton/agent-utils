@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING
 import keyboard_browser as kb
 from keyboard_browser import CHANNEL, TOKEN, Json, check
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserContext, Page, Playwright
@@ -330,6 +331,7 @@ def browse(playwright: Playwright, args: argparse.Namespace, web_root: Path) -> 
             is_mobile=mobile, has_touch=mobile,
             device_scale_factor=2.6 if mobile else 1,
             color_scheme="dark" if scheme == "dark" else "light")
+        browser_waits.hot_host_timeouts(context)
         context.pages[0].on("pageerror", lambda error: page_errors.append(str(error)))
         return context
 

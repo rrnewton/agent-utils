@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType, Page, Route
@@ -305,10 +306,12 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 profile, headless=True, executable_path=args.browser_executable,
                 viewport={"width": width, "height": height}, color_scheme="dark",
                 device_scale_factor=2.625, is_mobile=True, has_touch=True)
+            browser_waits.hot_host_timeouts(context)
         else:
             context = chromium.launch_persistent_context(
                 profile, headless=True, executable_path=args.browser_executable,
                 viewport={"width": width, "height": height}, color_scheme="dark")
+            browser_waits.hot_host_timeouts(context)
         page = context.pages[0]
         errors: list[str] = []
         page.on("pageerror", lambda error: errors.append(str(error)))
@@ -416,10 +419,12 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                     profile2, headless=True, executable_path=args.browser_executable,
                     viewport={"width": width, "height": height}, color_scheme="dark",
                     device_scale_factor=2.625, is_mobile=True, has_touch=True)
+                browser_waits.hot_host_timeouts(context2)
             else:
                 context2 = chromium.launch_persistent_context(
                     profile2, headless=True, executable_path=args.browser_executable,
                     viewport={"width": width, "height": height}, color_scheme="dark")
+                browser_waits.hot_host_timeouts(context2)
             page2 = context2.pages[0]
             errors2: list[str] = []
             page2.on("pageerror", lambda error: errors2.append(str(error)))

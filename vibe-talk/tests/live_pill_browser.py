@@ -45,6 +45,7 @@ import offline_cache_browser as fixture
 from offline_cache_browser import TOKEN, Json, check, handler_for
 from two_column_browser import REPLICA, THREAD_ROWS, ColumnsApi, Desk
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType
@@ -158,6 +159,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 color_scheme="light" if scheme == "light" else "dark",
                 device_scale_factor=2.625, is_mobile=True, has_touch=True,
             )
+            browser_waits.hot_host_timeouts(context)
             version = context.browser.version if context.browser else "Chromium"
             page = context.pages[0]
             errors: list[str] = []

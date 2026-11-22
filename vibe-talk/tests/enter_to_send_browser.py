@@ -39,6 +39,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import page_sources
+import browser_waits
 
 TOKEN = "write-token-browser-enter-to-send-check"
 CHANNEL = {"id": "1110000000000000001", "label": "lead team", "writable": True, "alias": None,
@@ -249,6 +250,7 @@ def main() -> int:
                 executable_path=args.browser_executable,
                 viewport={"width": 1280, "height": 800},
             )
+            browser_waits.hot_host_timeouts(context)
             page = context.pages[0]
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))
@@ -328,6 +330,7 @@ def main() -> int:
                 profile, headless=True, executable_path=args.browser_executable,
                 viewport={"width": 393, "height": 852}, is_mobile=True, has_touch=True,
                 permissions=["clipboard-read", "clipboard-write"])
+            browser_waits.hot_host_timeouts(context)
             page = context.pages[0]
             errors = []
             page.on("pageerror", lambda error: errors.append(str(error)))

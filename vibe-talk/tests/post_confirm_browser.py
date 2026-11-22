@@ -34,6 +34,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import page_sources
+import browser_waits
 
 TOKEN = "write-token-browser-post-confirm-check"
 CHANNEL = {"id": "1110000000000000001", "label": "lead team", "writable": True, "alias": None,
@@ -242,6 +243,7 @@ def main() -> int:
                 is_mobile=True,
                 has_touch=True,
             )
+            browser_waits.hot_host_timeouts(context)
             # Never connected onward: the socket opens in the browser and stays quiet, which is all
             # a typed call needs to start watching for proposals.
             context.route_web_socket("**/voice-socket", lambda _socket: None)

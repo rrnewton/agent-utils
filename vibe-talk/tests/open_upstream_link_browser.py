@@ -50,6 +50,7 @@ import offline_cache_browser as fixture
 from offline_cache_browser import TOKEN, Json, check, handler_for
 from two_column_browser import ColumnsApi, Desk
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType, CDPSession, Page, Route
@@ -157,11 +158,13 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                     viewport={"width": width, "height": height}, color_scheme="dark",
                     device_scale_factor=2.625, is_mobile=True, has_touch=True,
                 )
+                browser_waits.hot_host_timeouts(context)
             else:
                 context = chromium.launch_persistent_context(
                     profile, headless=True, executable_path=args.browser_executable,
                     viewport={"width": width, "height": height}, color_scheme="dark",
                 )
+                browser_waits.hot_host_timeouts(context)
             # The Slack address is answered here, so the new page's address and what it can see
             # of this one are read without reaching Slack. Registered before the page opens, so
             # it holds for the popup the link opens too.
@@ -450,11 +453,13 @@ def deep_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
                     viewport={"width": width, "height": height}, color_scheme="dark",
                     device_scale_factor=2.625, is_mobile=True, has_touch=True,
                 )
+                browser_waits.hot_host_timeouts(context)
             else:
                 context = chromium.launch_persistent_context(
                     profile, headless=True, executable_path=args.browser_executable,
                     viewport={"width": width, "height": height}, color_scheme="dark",
                 )
+                browser_waits.hot_host_timeouts(context)
             version = context.browser.version if context.browser else "Chromium"
             page = context.pages[0]
             errors: list[str] = []
@@ -509,6 +514,7 @@ def deep_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
             # Durability: the same query against a fresh server instance lands on the same reply.
             other = serve()
             page2 = context.new_page()
+            browser_waits.hot_host_timeouts(page2)
             page2.on("pageerror", lambda error: errors.append(str(error)))
             page2.goto(f"{other}/?{DEEP_QUERY}", wait_until="load")
             if page2.locator("#api-token").is_visible():

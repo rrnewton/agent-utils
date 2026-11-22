@@ -44,6 +44,7 @@ from offline_cache_browser import CHANNEL, Json, check, handler_for, thread_of
 from inline_reply_browser import ReplyColumnsApi, open_columns, place_row, reply_button
 from two_column_browser import RUNNER, Desk
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType
@@ -181,6 +182,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace) -> str:
                 profile, headless=True, executable_path=args.browser_executable,
                 viewport={"width": WIDTH, "height": HEIGHT}, color_scheme="dark",
             )
+            browser_waits.hot_host_timeouts(context)
             version = context.browser.version if context.browser else "Chromium"
             page = context.pages[0]
             errors: list[str] = []

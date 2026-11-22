@@ -35,6 +35,7 @@ import offline_cache_browser as fixture
 from offline_cache_browser import CHANNEL, TOKEN, FakeApi, Json, check, handler_for, message
 import page_sources
 import search_unmatched_browser as unmatched
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import Page, Playwright
@@ -274,6 +275,7 @@ def main() -> int:
                         timezone_id="America/New_York",
                         viewport={"width": width, "height": height}, color_scheme=scheme,  # type: ignore[arg-type]
                         device_scale_factor=2.625 if touch else 1, is_mobile=touch, has_touch=touch)
+                    browser_waits.hot_host_timeouts(context)
                     context.add_init_script(IOS_VIEWPORT_JS)
                     page = context.pages[0]
                     errors: list[str] = []

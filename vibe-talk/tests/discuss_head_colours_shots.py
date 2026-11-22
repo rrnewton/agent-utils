@@ -16,6 +16,7 @@ document to be complete, never for a wall-clock duration.
 import argparse
 import pathlib
 import sys
+import browser_waits
 
 HERE = pathlib.Path(__file__).resolve().parent
 MOCK = HERE / "discuss_head_colours_mock.html"
@@ -36,6 +37,7 @@ def main() -> int:
         with sync_playwright() as pw:
             browser = pw.chromium.launch()
             page = browser.new_page(viewport={"width": 1820, "height": 1100})
+            browser_waits.hot_host_timeouts(page)
             page.goto(MOCK.as_uri())
             page.wait_for_function("() => document.readyState === 'complete'")
             for theme in ("dark", "light"):

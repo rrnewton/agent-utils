@@ -20,6 +20,7 @@ import tempfile
 import time
 import urllib.request
 from pathlib import Path
+import browser_waits
 
 ROOT = Path(__file__).resolve().parent.parent
 CHANNEL = "100000000000000001"
@@ -92,7 +93,9 @@ def main() -> int:
                     ctx = browser.new_context(
                         viewport={"width": width, "height": height},
                         color_scheme="dark", has_touch=width < 600, is_mobile=width < 600)
+                    browser_waits.hot_host_timeouts(ctx)
                     page = ctx.new_page()
+                    browser_waits.hot_host_timeouts(page)
                     page.add_init_script(
                         f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE)}); }} catch(e) {{}}")
                     page.goto(base + "/", wait_until="load")
@@ -137,7 +140,9 @@ def main() -> int:
                 ctx = browser.new_context(
                     viewport={"width": 412, "height": 915},
                     color_scheme="dark", has_touch=True, is_mobile=True)
+                browser_waits.hot_host_timeouts(ctx)
                 page = ctx.new_page()
+                browser_waits.hot_host_timeouts(page)
                 page.add_init_script(
                     f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE)}); }} catch(e) {{}}")
                 page.goto(base + "/", wait_until="load")

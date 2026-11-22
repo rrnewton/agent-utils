@@ -52,6 +52,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import unquote, urlsplit
 
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import Browser, Page, Route
@@ -263,11 +264,13 @@ def open_layout(browser: Browser, api: FakeApi, width: int, height: int, touch: 
                 storage: dict[str, str]) -> tuple[Page, list[str]]:
     context = browser.new_context(viewport={"width": width, "height": height}, color_scheme="dark",
                                   is_mobile=touch, has_touch=touch, device_scale_factor=2.625 if touch else 1)
+    browser_waits.hot_host_timeouts(context)
     context.add_init_script("".join(f"localStorage.setItem({json.dumps(k)}, {json.dumps(v)});"
                                     for k, v in storage.items()))
     errors: list[str] = []
     context.route("**/*", api.route)
     page = context.new_page()
+    browser_waits.hot_host_timeouts(page)
     page.on("pageerror", lambda error: errors.append(str(error)))
     page.goto(f"{ORIGIN}/", wait_until="load")
     page.fill("#api-token", TOKEN)

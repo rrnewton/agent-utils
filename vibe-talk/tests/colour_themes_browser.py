@@ -24,6 +24,7 @@ from pathlib import Path
 
 import offline_cache_browser as fixture
 from offline_cache_browser import TOKEN, FakeApi, check, handler_for
+import browser_waits
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -74,6 +75,7 @@ def main() -> int:
                         viewport={"width": 412, "height": 915}, color_scheme=scheme,
                         device_scale_factor=2.6, is_mobile=True, has_touch=True,
                     )
+                    browser_waits.hot_host_timeouts(context)
                     page = context.pages[0]
                     page.goto(url, wait_until="load")
                     page.fill("#api-token", TOKEN)

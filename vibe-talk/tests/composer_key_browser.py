@@ -39,6 +39,7 @@ from pathlib import Path
 import keyboard_browser as kb
 from keyboard_browser import TOKEN, Json, Walk, check
 import page_sources
+import browser_waits
 
 FIRST_ROW = "#discord-log > li[data-id]"
 CARD = "#side-cards > li[data-id] .side-card"
@@ -223,6 +224,7 @@ def main() -> int:
                 profile, headless=True, executable_path=args.browser_executable,
                 viewport={"width": 1280, "height": 800},
             )
+            browser_waits.hot_host_timeouts(context)
             page = context.pages[0]
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))

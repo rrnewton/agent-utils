@@ -38,6 +38,7 @@ import urllib.request
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urljoin, urlsplit
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserContext, CDPSession, Page
@@ -268,6 +269,7 @@ def main() -> int:
                     is_mobile=True,
                     has_touch=True,
                 )
+                browser_waits.hot_host_timeouts(context)
                 try:
                     verified = inspect(context, origin)
                     version = context.new_cdp_session(context.pages[0]).send("Browser.getVersion")["product"]

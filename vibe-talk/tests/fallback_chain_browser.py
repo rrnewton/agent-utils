@@ -44,6 +44,7 @@ from urllib.parse import unquote, urlsplit
 
 from browser_audio import CHROMIUM_AUDIO_ARGS
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -363,6 +364,7 @@ def main() -> int:
                         is_mobile=mobile,
                         has_touch=mobile,
                     )
+                    browser_waits.hot_host_timeouts(context)
                     page = context.pages[0]
                     errors: list[str] = []
                     page.on("pageerror", lambda error: errors.append(str(error)))

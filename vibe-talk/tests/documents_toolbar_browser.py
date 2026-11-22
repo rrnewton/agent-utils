@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Literal, cast
 
 from playwright.sync_api import Page, ViewportSize, sync_playwright
+import browser_waits
 
 ROOT = Path(__file__).resolve().parent.parent
 CHANNEL = "100000000000000001"
@@ -314,7 +315,9 @@ def main() -> int:
                     ctx = browser.new_context(
                         viewport=viewport, has_touch=touch,
                         is_mobile=touch, color_scheme=scheme)
+                    browser_waits.hot_host_timeouts(ctx)
                     page = ctx.new_page()
+                    browser_waits.hot_host_timeouts(page)
                     page.add_init_script(
                         f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")
                     label = f"{scheme} {folder_name}"

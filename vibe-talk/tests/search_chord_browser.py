@@ -56,6 +56,7 @@ from typing import TYPE_CHECKING
 import keyboard_browser as kb
 from keyboard_browser import CHANNEL, TOKEN, Json, Walk, check
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import CDPSession, Page
@@ -465,6 +466,7 @@ def main() -> int:
                 profile, headless=True, executable_path=args.browser_executable,
                 viewport={"width": 1280, "height": 800},
             )
+            browser_waits.hot_host_timeouts(context)
             page = context.pages[0]
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))
@@ -500,6 +502,7 @@ def main() -> int:
 
             # A Mac, as `navigator.platform` reports it there: a second tab of the signed-in profile.
             mac_page = context.new_page()
+            browser_waits.hot_host_timeouts(mac_page)
             mac_page.on("pageerror", lambda error: errors.append(str(error)))
             mac_cdp = context.new_cdp_session(mac_page)
             agent = str(page.evaluate("() => navigator.userAgent"))

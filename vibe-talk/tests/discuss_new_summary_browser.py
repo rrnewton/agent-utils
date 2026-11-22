@@ -21,6 +21,7 @@ import urllib.request
 from pathlib import Path
 
 from playwright.sync_api import Page, Route, sync_playwright
+import browser_waits
 
 ROOT = Path(__file__).resolve().parent.parent
 CHANNEL = "100000000000000001"
@@ -269,9 +270,11 @@ def main() -> int:
                 phone = browser.new_context(
                     viewport={"width": 412, "height": 915}, has_touch=True,
                     is_mobile=True, color_scheme="dark")
+                browser_waits.hot_host_timeouts(phone)
                 walk(phone.new_page(), base, 412)
                 desk = browser.new_context(
                     viewport={"width": 1280, "height": 800}, color_scheme="light")
+                browser_waits.hot_host_timeouts(desk)
                 walk(desk.new_page(), base, 1280)
                 browser.close()
             print("new-summary browser: phone 412 and desk 1280 walks passed")

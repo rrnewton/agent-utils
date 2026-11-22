@@ -68,6 +68,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import Browser, Page, Route
@@ -540,11 +541,13 @@ class Desk:
 
 def open_desk(browser: Browser, api: FakeApi, storage: dict[str, str]) -> tuple[Page, list[str]]:
     context = browser.new_context(viewport={"width": 1280, "height": 800}, color_scheme="dark")
+    browser_waits.hot_host_timeouts(context)
     context.add_init_script("".join(f"localStorage.setItem({json.dumps(k)}, {json.dumps(v)});"
                                     for k, v in storage.items()))
     errors: list[str] = []
     context.route("**/*", api.route)
     page = context.new_page()
+    browser_waits.hot_host_timeouts(page)
     page.on("pageerror", lambda error: errors.append(str(error)))
     page.goto(f"{ORIGIN}/", wait_until="load")
     page.fill("#api-token", TOKEN)

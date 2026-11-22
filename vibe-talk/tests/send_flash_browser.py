@@ -49,6 +49,7 @@ from all_thread_strip_browser import StripApi, handler
 from offline_cache_browser import SPEAKERS, Json, check, said, thread_of
 import page_sources
 from two_column_browser import Desk
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType, Page
@@ -448,6 +449,7 @@ def main() -> int:
                             profile, headless=True, executable_path=args.browser_executable,
                             viewport={"width": width, "height": height}, color_scheme=scheme,  # type: ignore[arg-type]
                         )
+                        browser_waits.hot_host_timeouts(context)
                         page = context.pages[0]
                         context.add_init_script(
                             "try { localStorage.setItem('vibe-talk.voice.scroll-trace', '1'); } catch (e) {}")

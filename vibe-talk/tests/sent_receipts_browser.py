@@ -39,6 +39,7 @@ from inline_reply_browser import ReplyColumnsApi, sign_in
 from offline_cache_browser import CHANNEL, check, handler_for, said, thread_of
 import page_sources
 from two_column_browser import CANARY, REPLICA, Desk
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType
@@ -114,6 +115,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace) -> str:
             context = chromium.launch_persistent_context(
                 profile, headless=True, executable_path=args.browser_executable,
                 viewport={"width": WIDTH, "height": HEIGHT}, color_scheme="dark")
+            browser_waits.hot_host_timeouts(context)
             version = context.browser.version if context.browser else "Chromium"
             page = context.pages[0]
             errors: list[str] = []

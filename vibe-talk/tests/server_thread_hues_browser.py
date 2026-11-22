@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING
 import offline_cache_browser as fixture
 from offline_cache_browser import CHANNEL, TOKEN, FakeApi, Json, check, handler_for, message
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserContext, BrowserType
@@ -133,6 +134,7 @@ def open_device(chromium: BrowserType, args: argparse.Namespace, origin: str, me
         profile, headless=True, executable_path=args.browser_executable,
         viewport={"width": WIDTH, "height": HEIGHT}, color_scheme="dark",
     )
+    browser_waits.hot_host_timeouts(context)
     version = context.browser.version if context.browser else "Chromium"
     context.add_init_script(
         f"if (!localStorage.getItem({json.dumps(HUES_KEY)})) "

@@ -42,6 +42,7 @@ import wave
 from pathlib import Path
 
 from playwright.sync_api import Page, Route, sync_playwright
+import browser_waits
 
 ROOT = Path(__file__).resolve().parent.parent
 CHANNEL = "100000000000000001"
@@ -1051,16 +1052,20 @@ def main() -> int:
                 phone = browser.new_context(
                     viewport={"width": 393, "height": 852}, has_touch=True, is_mobile=True,
                     color_scheme="dark")
+                browser_waits.hot_host_timeouts(phone)
                 walk(phone.new_page(), base, 393, 852, "dark")
                 phone_small = browser.new_context(
                     viewport={"width": 390, "height": 844}, has_touch=True, is_mobile=True,
                     color_scheme="light")
+                browser_waits.hot_host_timeouts(phone_small)
                 walk(phone_small.new_page(), base, 390, 844, "light")
                 desk = browser.new_context(viewport={"width": 1280, "height": 800},
                                             color_scheme="dark")
+                browser_waits.hot_host_timeouts(desk)
                 walk(desk.new_page(), base, 1280, 800, "dark")
                 desk_light = browser.new_context(viewport={"width": 1280, "height": 800},
                                                  color_scheme="light")
+                browser_waits.hot_host_timeouts(desk_light)
                 walk(desk_light.new_page(), base, 1280, 800, "light")
                 browser.close()
             print("discuss browser: phone (393x852 dark, 390x844 light) and desk "

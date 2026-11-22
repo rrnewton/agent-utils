@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from playwright.sync_api import sync_playwright
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import Browser, Page
@@ -165,8 +166,10 @@ def run_context(
     ctx = browser.new_context(
         viewport={"width": width, "height": height}, has_touch=touch,
         is_mobile=touch, color_scheme=scheme)
+    browser_waits.hot_host_timeouts(ctx)
     ctx.set_default_timeout(HANG_BACKSTOP_MS)
     page = ctx.new_page()
+    browser_waits.hot_host_timeouts(page)
     exercise(page, base, shots, label, scheme)
     ctx.close()
 

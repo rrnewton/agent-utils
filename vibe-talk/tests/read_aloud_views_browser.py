@@ -69,6 +69,7 @@ from two_column_browser import CANARY, REPLICA, RUNNER, Desk
 
 from browser_audio import CHROMIUM_AUDIO_ARGS
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType
@@ -566,6 +567,7 @@ def run(chromium: BrowserType, args: argparse.Namespace, voice: str) -> str:
                 profile, headless=True, executable_path=args.browser_executable,
                 args=CHROMIUM_AUDIO_ARGS,
                 viewport={"width": WIDTH, "height": HEIGHT}, color_scheme="dark")
+            browser_waits.hot_host_timeouts(context)
             version = context.browser.version if context.browser else "Chromium"
             page = context.pages[0]
             errors: list[str] = []

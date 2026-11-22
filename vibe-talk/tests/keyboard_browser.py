@@ -90,6 +90,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import CDPSession, Page
@@ -1774,6 +1775,7 @@ def main() -> int:
                 profile, headless=True, executable_path=args.browser_executable,
                 viewport={"width": 1280, "height": 800},
             )
+            browser_waits.hot_host_timeouts(context)
             page = context.pages[0]
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))
@@ -1835,6 +1837,7 @@ def main() -> int:
             # The same on a Mac, as `navigator.platform` reports it there: the page says Cmd, and Cmd
             # (Meta) is the chord. A second tab of the signed-in profile, its platform emulated.
             mac = context.new_page()
+            browser_waits.hot_host_timeouts(mac)
             mac.on("pageerror", lambda error: errors.append(str(error)))
             mac_cdp = context.new_cdp_session(mac)
             agent = str(page.evaluate("() => navigator.userAgent"))

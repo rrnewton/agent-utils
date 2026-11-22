@@ -63,6 +63,7 @@ from pathlib import Path
 from typing import cast
 
 from playwright.sync_api import Locator, Page, Route, sync_playwright
+import browser_waits
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -420,7 +421,9 @@ def capture_failure_screenshots(browser: object, base: str, out_dir: Path) -> No
             ctx = browser.new_context(  # type: ignore[attr-defined]
                 viewport={"width": width, "height": height},
                 has_touch=mobile, is_mobile=mobile, color_scheme=theme)
+            browser_waits.hot_host_timeouts(ctx)
             page = ctx.new_page()
+            browser_waits.hot_host_timeouts(page)
             ctx.set_default_timeout(HANG_BACKSTOP_MS)
             page.add_init_script(
                 f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")
@@ -552,7 +555,9 @@ def main() -> int:
             with sync_playwright() as pw:
                 browser = pw.chromium.launch()
                 ctx = browser.new_context(viewport={"width": 393, "height": 852}, has_touch=True, is_mobile=True)
+                browser_waits.hot_host_timeouts(ctx)
                 page = ctx.new_page()
+                browser_waits.hot_host_timeouts(page)
                 ctx.set_default_timeout(HANG_BACKSTOP_MS)
                 page.add_init_script(
                     f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")
@@ -877,7 +882,9 @@ def main() -> int:
                 # The same outline flow at desktop size with a mouse: open, jump,
                 # HERE, and Escape from the keyboard inside the panel.
                 dctx = browser.new_context(viewport={"width": 1280, "height": 800})
+                browser_waits.hot_host_timeouts(dctx)
                 dpage = dctx.new_page()
+                browser_waits.hot_host_timeouts(dpage)
                 dctx.set_default_timeout(HANG_BACKSTOP_MS)
                 dpage.add_init_script(
                     f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")
@@ -966,7 +973,9 @@ def main() -> int:
                 # with a real touch swipe, and again on the desktop.
                 sctx = browser.new_context(
                     viewport={"width": 393, "height": 852}, has_touch=True, is_mobile=True)
+                browser_waits.hot_host_timeouts(sctx)
                 spage = sctx.new_page()
+                browser_waits.hot_host_timeouts(spage)
                 sctx.set_default_timeout(HANG_BACKSTOP_MS)
                 spage.add_init_script(
                     f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")
@@ -1129,7 +1138,9 @@ def main() -> int:
                 # A fresh device (empty storage) converges from the server:
                 # the paste is starred, and nothing is hidden any more.
                 fctx = browser.new_context(viewport={"width": 393, "height": 852})
+                browser_waits.hot_host_timeouts(fctx)
                 fpage = fctx.new_page()
+                browser_waits.hot_host_timeouts(fpage)
                 fctx.set_default_timeout(HANG_BACKSTOP_MS)
                 fpage.add_init_script(
                     f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")
@@ -1143,7 +1154,9 @@ def main() -> int:
 
                 # Desktop: the Hide button hides, Show hidden and Unhide undo it.
                 hctx = browser.new_context(viewport={"width": 1280, "height": 800})
+                browser_waits.hot_host_timeouts(hctx)
                 hpage = hctx.new_page()
+                browser_waits.hot_host_timeouts(hpage)
                 hctx.set_default_timeout(HANG_BACKSTOP_MS)
                 hpage.add_init_script(
                     f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")

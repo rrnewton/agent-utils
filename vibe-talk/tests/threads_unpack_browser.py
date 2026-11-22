@@ -53,6 +53,7 @@ from offline_cache_browser import Json, handler_for, said
 from thread_card_header_browser import phone_thread_list
 from two_column_browser import CANARY, FILLER, REPLICA, RUNNER, ColumnsApi, Desk, thread_record
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType, Page
@@ -213,6 +214,7 @@ def open_page(chromium: BrowserType, args: argparse.Namespace, label: str, width
         profile.name, headless=True, executable_path=args.browser_executable,
         viewport={"width": width, "height": height}, color_scheme=scheme,  # type: ignore[arg-type]
         has_touch=touch, is_mobile=touch)
+    browser_waits.hot_host_timeouts(context)
     page = context.pages[0] if context.pages else context.new_page()
     desk = Desk(page, args.screenshots, label, width, height)
     errors: list[str] = []

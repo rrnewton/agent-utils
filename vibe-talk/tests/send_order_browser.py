@@ -52,6 +52,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
+import browser_waits
 
 CHANNEL_ID = "1110000000000000277"
 CHANNEL_LABEL = "lead team"
@@ -391,6 +392,7 @@ def main() -> int:
                     executable_path=args.browser_executable,
                     viewport={"width": 412, "height": 915},
                 )
+                browser_waits.hot_host_timeouts(context)
                 page = context.pages[0]
                 errors: list[str] = []
                 page.on("pageerror", lambda error: errors.append(str(error)))

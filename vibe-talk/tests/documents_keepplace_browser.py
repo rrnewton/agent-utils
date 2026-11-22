@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import cast
 
 from playwright.sync_api import Page, sync_playwright
+import browser_waits
 
 ROOT = Path(__file__).resolve().parent.parent
 CHANNEL = "100000000000000001"
@@ -339,14 +340,18 @@ def main() -> int:
                     phone = browser.new_context(
                         viewport={"width": 412, "height": 915}, has_touch=True, is_mobile=True,
                         color_scheme=scheme)
+                    browser_waits.hot_host_timeouts(phone)
                     phone_page = phone.new_page()
+                    browser_waits.hot_host_timeouts(phone_page)
                     phone_page.add_init_script(
                         f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")
                     walk(phone_page, base, True, f"phone412-{scheme}", args.screenshots)
                     phone.close()
 
                     desk = browser.new_context(viewport={"width": 1280, "height": 800}, color_scheme=scheme)
+                    browser_waits.hot_host_timeouts(desk)
                     desk_page = desk.new_page()
+                    browser_waits.hot_host_timeouts(desk_page)
                     desk_page.add_init_script(
                         f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")
                     walk(desk_page, base, False, f"desktop1280-{scheme}", args.screenshots)

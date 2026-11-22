@@ -54,6 +54,7 @@ import offline_cache_browser as fixture
 from offline_cache_browser import CHANNEL, SCOPES, TOKEN, Json, check, handler_for
 from two_column_browser import RUNNER, ColumnsApi, Desk
 import page_sources
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType, Page, Route
@@ -357,11 +358,13 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                     viewport={"width": width, "height": height}, color_scheme="dark",
                     device_scale_factor=2.625, is_mobile=True, has_touch=True,
                 )
+                browser_waits.hot_host_timeouts(context)
             else:
                 context = chromium.launch_persistent_context(
                     profile, headless=True, executable_path=args.browser_executable,
                     viewport={"width": width, "height": height}, color_scheme="dark",
                 )
+                browser_waits.hot_host_timeouts(context)
             # Nothing may leave for the service: a request there is a jump that did not stay.
             left: list[str] = []
             def leaving(route: Route) -> None:

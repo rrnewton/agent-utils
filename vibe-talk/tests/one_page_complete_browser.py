@@ -30,6 +30,7 @@ import offline_cache_browser as fixture
 from keyboard_hides_bar_browser import IOS_VIEWPORT_JS
 from labels_browser import LabelsApi, Walk, labels_handler
 from offline_cache_browser import CHANNEL, TOKEN, check, message
+import browser_waits
 
 if TYPE_CHECKING:
     from playwright.sync_api import Page
@@ -153,7 +154,7 @@ def walk_through(walk: Walk, api: OnePageApi) -> None:
     walk.until("""() => document.body.textContent.includes('last by grace')
       && document.body.textContent.includes('grace, ada')""",
                "the thread card does not say its last reply or participants")
-    walk.check(page.evaluate("() => document.querySelector('#thread-select')?.textContent.includes('7 unread') || document.body.textContent.includes('Thread list (7 unread)')"),
+    walk.until("() => document.querySelector('#thread-select')?.textContent.includes('7 unread') || document.body.textContent.includes('Thread list (7 unread)')",
                "the picker does not carry the channel summary's unread")
     reads = api.reads()
     walk.check(not any("before=" in read for read in reads),
@@ -188,6 +189,7 @@ def main() -> None:
                         viewport={"width": width, "height": height},
                         device_scale_factor=2.6 if touch else 1,
                         has_touch=touch, is_mobile=touch, color_scheme="dark")
+                    browser_waits.hot_host_timeouts(context)
                     page = context.pages[0] if context.pages else context.new_page()
                     page.add_init_script(IOS_VIEWPORT_JS)
                     page.goto(origin)
