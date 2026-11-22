@@ -169,23 +169,25 @@ SPOKEN_JS = "() => window.deviceSpeech.map(({text, started, ended, silenced}) =>
 
 
 class PauseDesk(Desk):
-    """A Desk whose state waits use STATE_S unless a longer bound is named.
+    """A Desk whose state waits use the hang backstop unless a longer bound is named.
 
     Desk's own default is 10s, which a CPU-quota-saturated proof scope can outrun while the page
-    behaves (run 17 of the first 20-run pause proof died in a React pause wait). Every wait in this
-    file polls a page state and judges no elapsed time, so widening only bounds failures. The poll
-    itself runs at POLL_MS, not Desk's 25 ms (see POLL_MS).
+    behaves (run 17 of the first 20-run pause proof died in a React pause wait); STATE_S (30s)
+    proved no safer on a hot host (#2077: a re-gate died reaching the second block). Every wait
+    in this file polls a page state and judges no elapsed time, so widening only bounds
+    failures. The poll itself runs at POLL_MS, not Desk's 25 ms (see POLL_MS).
     """
 
     def wait_for(self, condition: str, why: str, seconds: float = STATE_S) -> None:
-        deadline = time.monotonic() + max(seconds, STATE_S)
+        deadline = time.monotonic() + max(seconds, browser_waits.HANG_BACKSTOP_MS / 1000)
         while time.monotonic() < deadline and not self.page.evaluate(condition):
             self.page.wait_for_timeout(POLL_MS)
         check(bool(self.page.evaluate(condition)), f"{self.label}: {why}")
 
 
-def wait_until(page: Page, condition: str, why: str, seconds: float = STATE_S) -> None:
-    deadline = time.monotonic() + seconds
+def wait_until(page: Page, condition: str, why: str,
+               seconds: float = browser_waits.HANG_BACKSTOP_MS / 1000) -> None:
+    deadline = time.monotonic() + max(seconds, browser_waits.HANG_BACKSTOP_MS / 1000)
     while time.monotonic() < deadline and not page.evaluate(condition):
         page.wait_for_timeout(POLL_MS)
     check(bool(page.evaluate(condition)), why)
@@ -285,7 +287,7 @@ def walk(desk: Desk, api: VoicesApi, voice: str, args: argparse.Namespace) -> No
     tap(page, "#reply-send")
     desk.wait_for("() => document.getElementById('column-reply').hidden",
                   f"{voice}: Send did not put the box away", STATE_S)
-    deadline = time.monotonic() + STATE_S
+    deadline = time.monotonic() + browser_waits.HANG_BACKSTOP_MS / 1000
     while time.monotonic() < deadline and len(api.posted()) <= sent:
         page.wait_for_timeout(POLL_MS)
     posted = api.posted()[sent:]
@@ -618,7 +620,7 @@ def composer_pause_walk(desk: Desk, api: VoicesApi, voice: str, touch: bool) -> 
     press(page, "#reply-send", touch)
     desk.wait_for("() => document.getElementById('column-reply').hidden",
                   "composer-pause: Send did not put the docked reply away", STATE_S)
-    deadline = time.monotonic() + STATE_S
+    deadline = time.monotonic() + browser_waits.HANG_BACKSTOP_MS / 1000
     while time.monotonic() < deadline and len(api.posted()) <= sent:
         page.wait_for_timeout(POLL_MS)
     posted = api.posted()[sent:]
