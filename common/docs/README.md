@@ -36,6 +36,8 @@ python3 scripts/embed_userguides.py --check
 [agentctl/services.md](agentctl/services.md) is the guide to building compiled snapshots and
 refreshing a team's long-running agentctl services onto them; the Rust edition embeds it as
 `agentctl services userguide`.
+[agentctl/recovery.md](agentctl/recovery.md) is the guide to bringing an agent team back after
+an outage (reboot, user-manager restart, Herdr or bridge failure).
 The documentation link check also covers those package-owned assets, without
 creating another rendered operator manual here.
 

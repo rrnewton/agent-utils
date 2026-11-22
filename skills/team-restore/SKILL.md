@@ -10,8 +10,10 @@ profiles and `restore.json`. The team is the unit of restore. Its **lead** is it
 Its **units** are its systemd user services (chat bridge, watcher), started after the agents. Restore
 brings back every agent whose record says it was running at shutdown, then the units.
 
-The installed command is the authority for flags and exit codes: `agentctl restore --help`.
-This skill is the protocol around it.
+The installed command is the authority for flags and exit codes: `agentctl restore --help`,
+`agentctl team --help`. This skill is the protocol around it. The same protocol, written for a
+person on an outside team, is the recovery guide
+[`common/docs/agentctl/recovery.md`](../../common/docs/agentctl/recovery.md).
 
 ## 0. One restorer per team
 
@@ -35,6 +37,11 @@ Before you touch anything, find out whether someone is already restoring the tea
 - The boot restore unit's result and exit code (0 done, 74 done with refused lanes, 75 incomplete). A run
   that exited quickly having revived nothing usually replayed an older report.
 - Bridges: `agentctl chat health --bridge-state <dir>` and the tail of the bridge log.
+- The whole picture in one read-only document: `agentctl --registry R team manifest`
+  (schema `agentctl-team-manifest/v1`): the desired set, per-agent liveness, profile and effort,
+  `record_gaps` (records missing a profile, bypass flag, declared effort or recorded session, with
+  report-only session candidates), queued prompts, unit state, `lost[]` and an embedded verify. It
+  never contains record tokens or launch arguments, so it is the thing to share or hand to a judge.
 
 ## 2. Dry run
 
@@ -48,8 +55,10 @@ Read the report before running anything:
   `agents` key that overrides the records and will park everything else. Back the file up, remove the key,
   and dry-run again. Lanes that should deliberately stay down go in `exclude`.
 - If `action` is `already-restored` / `replayed: true` but agents are visibly down, the guard thinks this
-  boot was already restored. That's what happens after a user-manager restart, which keeps the boot id.
-  Add `--force`. It only bypasses the replay; it never overrides a refusal.
+  epoch was already restored. Since #1405 the epoch is the boot plus the user manager's identity, so a
+  user-manager restart (which keeps the boot id) is a new epoch and restores for real; an older build,
+  or a host where the manager's identity can't be read, replays instead. Add `--force`. It only bypasses
+  the replay; it never overrides a refusal.
 - A report with `complete: false` and `in_progress: true` is a killed attempt's partial report, not a
   completed restore: it names the lanes that attempt already revived under `agents`. A rerun in the same
   boot resumes from it — those lanes are carried forward (`resumed: true`, listed in `resumed_lanes`)
@@ -81,8 +90,41 @@ persisted state (schema `agentctl-team-driver/v1`, under
 with a wake armed, not failed. Kick only from the host PID namespace:
 inside a team namespace it refuses rather than half-restoring. The
 manual steps below remain the fallback and the meaning of its checks.
+Never run a manual `restore` while the driver works: that is two restorers.
+
+### Fixing what is left: `team act`
+
+`agentctl --registry R team act --incident I --request-id ID <action>` queues one allowlisted
+action for the driver: `facts`, `revive NAME`, `start-unit UNIT`, `reset-unit UNIT`,
+`drain NAME`, `kill-pid PID --expect-cmdline T --expect-start TICKS --boot-id B`, `declare-done`,
+`escalate TEXT`. The driver validates it against a fresh manifest, runs it, persists a receipt and
+verifies again; it never rewrites a record or binds a session. The incident (12 hex) is
+`.state.incident` in the `team kick` report.
+
+- `--request-id` is the idempotence key: the same id with the same fields replays the receipt; the
+  same id with different fields (`--dry-run` included) is refused. Use a new id per action.
+- `stale incident` means the epoch moved on: kick again for the current incident.
+- `revive` runs only with a recorded native session. A session gap's candidates are report-only:
+  if you know the right one, `agentctl stop NAME` and `agentctl start NAME --profile P --resume ID`.
+- `declare-done` succeeds only on the full verify's explicit YES.
+- Exit 0 done and verified, 75 queued/running or still pending, 1 refused or failed.
+
+### Asking for a judgement: `run-agent-prompt`
+
+When no agent of the team is up to decide the next step, `run-agent-prompt` sends one prompt (from
+`--prompt-file` or stdin) to the first harness that answers — Muse, then Claude, then Codex — with
+no tools, and prints only the answer (exit 69 when every harness failed). Feed it the manifest,
+never raw records, ask for one `team act` proposal, and run that action yourself:
+
+```sh
+{ echo "Given this recovery manifest, which single team act action should run next?"; \
+  agentctl --registry R team manifest; } | run-agent-prompt --timeout 120
+```
 
 ## 4. Verify: a restore isn't done until all of these hold
+
+`agentctl --registry R team verify` checks most of this list with evidence and exits 0 only
+when no check failed; a held or skipped check is not a pass.
 
 1. Every desired agent is live in Herdr, with the right profile, effort and launch environment. Look at the
    status bar of anything that should run at a raised effort level.

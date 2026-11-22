@@ -201,6 +201,20 @@ Start new integrations with `agentctl`.
 See [public related work](common/docs/agentctl/RELATED_WORK.md) for comparisons
 with other session-control and chat approaches.
 
+### When a team goes down
+
+A reboot, a restart of the systemd user manager, or a Herdr or chat-bridge
+failure can take a whole team down. The
+[recovery guide](common/docs/agentctl/recovery.md) says what to run, in order
+(`agentctl restore`, the `team` driver, `team manifest`, `team act`), how to
+check the team really came back, what not to do, and what to collect when it
+fails. Agents follow the same protocol in the
+[`team-restore` skill](skills/team-restore/SKILL.md).
+
+## Changes
+
+[CHANGELOG.md](CHANGELOG.md) lists user-visible changes, newest first, by week.
+
 ## Repository layout
 
 ```text

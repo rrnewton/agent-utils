@@ -28,7 +28,9 @@ copying its manual.
   record handoff, and remove source only after verified owner absence.
 - `team-restore` — bring an agent team back after an outage with `agentctl restore`: one restorer
   per team, a dry run that checks the desired-state source, health checks that include chat-bridge
-  targets, known failures and their fixes, and who to tell. Harnesses extend it with their own facts.
+  targets, the `team` driver, manifest and `team act`, known failures and their fixes, and who to
+  tell. Harnesses extend it with their own facts. The person-facing version is
+  [`common/docs/agentctl/recovery.md`](../common/docs/agentctl/recovery.md).
 - `agent-teams` — message another team's designated coordinator across hosts, exactly once:
   who may send (coordinators and registered services, never workers), the team tag grammar,
   reply/receipt verbs, and when the (currently off) chat route would be used sparingly.
