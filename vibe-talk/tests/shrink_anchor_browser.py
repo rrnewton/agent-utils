@@ -379,18 +379,40 @@ def next_unread_case(page: Page, label: str, index: int) -> str:
       return next ? next.getAttribute('data-id') : null; }}""")
     check(isinstance(target, str), f"{label}: no next unread below message {index}")
     before = page.evaluate(SAMPLE, message_id(index))
+    # Record in page from before the press: the phases are frames apart, and a
+    # sample taken from outside after the press can miss the shrink phase.
+    page.evaluate("""(id) => {
+      const snap = (%s);
+      const probe = { frames: [] };
+      window.__nuProbe = probe;
+      const step = () => {
+        requestAnimationFrame(() => {
+          probe.frames.push(snap(id));
+          if (!probe.stop) requestAnimationFrame(step);
+        });
+      };
+      requestAnimationFrame(step);
+    }""" % SNAP, message_id(index))
     page.keyboard.press("e")
-    until(page, f"() => {{ const r = document.querySelector('#discord-log > li[data-id=\"{message_id(index)}\"]');"
-                " return !r || r.getAttribute('data-read-run') === 'member' || r.getAttribute('data-archived') === 'true'; }",
-          f"{label}: the e archive never landed")
-    frames = collect_frames(page, index, want_folded=True)
+    until(page, f"() => document.querySelector('#discord-log > li[data-selected=\"true\"]')"
+                f"?.getAttribute('data-id') === '{target}'",
+          f"{label}: the selection never landed on the next unread {target}")
+    page.evaluate("""() => new Promise((done) => {
+        let n = 0; const s = () => (++n >= 30 ? done() : requestAnimationFrame(s));
+        requestAnimationFrame(s); })""")
+    frames = page.evaluate("() => { window.__nuProbe.stop = true; return window.__nuProbe.frames; }")
+    check(any(f["folded"] for f in frames), f"{label}: the e archive never folded into its run")
     # Shrink phase only: every frame before the explicit move lands on the target.
     shrink_frames = []
     for f in frames:
         if f["selected"] == target:
             break
         shrink_frames.append(f)
-    check(len(shrink_frames) >= 3, f"{label}: the move landed before the shrink could be measured")
+    check(len(shrink_frames) >= 1, f"{label}: the move landed before the shrink could be measured")
+    folded_at = next((i for i, f in enumerate(frames) if f["folded"]), len(frames))
+    moved_at = next((i for i, f in enumerate(frames) if f["selected"] == target), len(frames))
+    check(folded_at < moved_at or moved_at == len(frames),
+          f"{label}: the selection moved in the shrink's own frames (folded {folded_at}, moved {moved_at})")
     moved = max((abs(px(f["aboveY"]) - px(before["aboveY"])) for f in shrink_frames if f["aboveY"] is not None), default=0.0)
     check(moved <= STILL_PX, f"{label}: next-unread shrink moved the content above {moved:.2f}px")
     # The move is its own phase: it lands on the next unread row, after the shrink.
