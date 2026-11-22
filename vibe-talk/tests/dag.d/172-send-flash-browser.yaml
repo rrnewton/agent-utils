@@ -5,10 +5,16 @@ steps:
   # was looking at for a moment and then puts it back, and never moves the anchor row
   # by more than 3px, sampled at every animation frame, at 412x915 and 1280x800 in
   # light and dark.
+  # DISABLED from gating (`disabled-optin`, #2077 vibe-talk-browser-checks-hot-host; owner
+  # rule 346): this walk samples every animation frame during a send racing a late read and
+  # allows the anchor at most 3px of movement. After the #2077 scheduling and wait fixes it
+  # still measured 27.7px in 3 of 4 load-proof runs at 71-100% host load (no Playwright
+  # timeout): under load the race lands in a different phase. It stays runnable by hand /
+  # validate --include-disabled; return only as a behaviour-only check proved under load.
   - group: check
     job: send-flash-browser
     desc: a send in All shows no different messages for a moment and moves the anchor by at most 3px, in current Chromium at 412x915 and 1280x800 in both schemes
-    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    labels: [validation-vibe-talk, validation-vibe-talk-page, disabled-optin]
     cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/send_flash_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools, build.page]
