@@ -1138,7 +1138,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 "attach-self takes no environment entries; the viewer tab needs none",
             ));
         }
-        if let Some(owner) = self.identity_owner(CLOUD_HARNESS, &session, None)? {
+        if let Some(owner) = self.identity_owner(CLOUD_HARNESS, &session, Some(agent_name))? {
             return Err(fail(format!(
                 "this session is already registered as {:?}; inspect it with `{}`, or retire that record with `{}` first",
                 owner.name,

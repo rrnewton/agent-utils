@@ -3304,7 +3304,7 @@ closed it; doctor reports it and goes on to the other records), `harness-exited`
 (Rust distribution: an agentcloud tab's agentterm re-executed itself, as an
 in-place upgrade does, so it runs another executable than the one recorded; the
 row's `detail` names the recorded and current device and inode and the new
-path); per workspace `label-collision` and the informational `unmanaged-tab`. It exits 0 when clean and 1 with findings, and
+path); per workspace `label-collision` and the informational `unmanaged-tab`. The Rust distribution's report also lists under `native_session_duplicates` every native session id recorded under more than one distinct name, live or archived, with each binding's name, `recorded_at` (the record's `created_at`), source (`observed` or `asserted`), archived flag, lifecycle and cwd; a non-empty list is a finding, because two names on one native session are not independent seats. It exits 0 when clean and 1 with findings, and
 changes nothing unless `--repair-labels`, which restores the label and Herdr
 name of an owned agent only when every other check still passes. agentctl does
 not schedule doctor; run it by hand, from cron, or from a coordinator's health
@@ -3337,6 +3337,16 @@ such sessions, agentctl does not choose: the record keeps no ID, says why
 under `native_session_unknown`, `start` and `adopt` print a warning and add a
 `native_session_warning` to their output, and `revive` refuses with that
 reason until `bind-session` names the right one.
+
+In the Rust distribution, no path that binds a name to a native session (`start`, `adopt`, `revive`,
+`restore`, `bind-session`, or pane recovery) binds a session already
+recorded for a different name, live or archived: it refuses naming both
+names, or, for a session captured from a live pane, records the lane's
+session as unknown instead. A session revive only finds on disk (the
+record names none) is likewise never inferred from the newest session in
+its working directory when another seat, live or archived, shares that
+directory, and several sessions naming one directory are never guessed
+between; `bind-session` names the right one.
 
 `goal`, `bind-session`, and `drain` apply to the native interactive adapter.
 Headless turn runners expose their supported operations in `agentctl status`;

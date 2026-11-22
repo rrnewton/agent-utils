@@ -10662,7 +10662,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 }));
             }
         }
-        let clean = registry_findings.is_empty()
+        // #2124: a native session recorded under two names broke review
+        // independence; name every such id, live or archived, with each
+        // binding's time (`created_at`) and source.
+        let native_session_duplicates = self.native_session_duplicates(&records);
+        let clean = native_session_duplicates.is_empty()
+            && registry_findings.is_empty()
             && rows.iter().all(|row| {
                 // A re-executed viewer is reported, not a fault: `stop` still closes its pane.
                 // A terminal shared across registries is likewise reported, not a fault:
@@ -10681,6 +10686,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             "clean": clean,
             "records": rows,
             "registry": registry_findings,
+            "native_session_duplicates": native_session_duplicates,
             "shared_terminals": shared_terminals,
             "workspace": workspace_findings,
             "journals": journals
@@ -10905,12 +10911,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let owner = self
             .identity_owner(&native.agent, &native.value, Some(&record.name))
             .ok()??;
-        if owner.lifecycle != "running" {
-            return None;
-        }
+        // #2124: an archived or stopped owner binds just as much as a live
+        // one; leaving the duplicate recorded is how a revive of a lane
+        // with no session silently became another seat's session.
         record.native_session = None;
         let reason = format!(
-            "the {} session it holds ({}) is already bound to live record {:?}",
+            "the {} session it holds ({}) is already bound to record {:?}",
             native.agent, native.value, owner.name
         );
         record.extra.insert(
@@ -10963,7 +10969,180 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 return Ok(Some(other));
             }
         }
+        // #2124: archived generations bind too. A seat stopped and archived
+        // still owns its native session; a revive that cannot see the
+        // archive asserts that session under a second name.
+        for other in self.archived_records() {
+            if Some(other.name.as_str()) == exclude {
+                continue;
+            }
+            if (other.session_agent.as_deref().unwrap_or(&other.harness) == session_agent
+                && (other.session_value.as_deref() == Some(session_value)
+                    || other.goal_session_id.as_deref() == Some(session_value)
+                    || other.resume.as_deref() == Some(session_value)))
+                || other.native_session.as_ref().is_some_and(|native| {
+                    native.agent == session_agent && native.value == session_value
+                })
+            {
+                return Ok(Some(other));
+            }
+        }
         Ok(None)
+    }
+
+    /// Every archived generation's record, decoded tolerantly: a row this
+    /// build cannot decode owns nothing it can name and is skipped, never
+    /// a failure of the scan (#2124).
+    fn archived_records(&self) -> Vec<AgentRecord> {
+        let archive = self.registry.join("archive");
+        let Ok(entries) = fs::read_dir(&archive) else {
+            return Vec::new();
+        };
+        let mut paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path().join("agent.json"))
+            .collect();
+        paths.sort();
+        let mut records = Vec::new();
+        for path in paths {
+            let Ok(bytes) = fs::read(&path) else {
+                continue;
+            };
+            let record = match nested::decode_bytes(&bytes, &path) {
+                Some(Ok(record)) => record,
+                Some(Err(_)) => continue,
+                None => match serde_json::from_slice::<AgentRecord>(&bytes) {
+                    Ok(record) => record,
+                    Err(_) => continue,
+                },
+            };
+            records.push(record);
+        }
+        records
+    }
+
+    /// Names other than `record`'s own, live or archived, whose record
+    /// names the same working directory (#2124): a discovered session in
+    /// a shared cwd cannot be told apart from a neighbour's.
+    fn cwd_sharers(&self, record: &AgentRecord) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        let mut push = |name: &str| {
+            if name != record.name && !names.iter().any(|seen| seen == name) {
+                names.push(name.to_owned());
+            }
+        };
+        if let Ok(live) = self.registered_names() {
+            for name in live {
+                if let Ok(Some(other)) = self.read_record_for_scan(&name) {
+                    if same_directory(&other.cwd, &record.cwd) {
+                        push(&other.name);
+                    }
+                }
+            }
+        }
+        for other in self.archived_records() {
+            if same_directory(&other.cwd, &record.cwd) {
+                push(&other.name);
+            }
+        }
+        names.sort();
+        names
+    }
+
+    /// Every native session binding one record carries, in the record's
+    /// own forms (#2124): the `native_session` object first (its stored
+    /// source wins), then the flat observed/asserted forms, deduplicated
+    /// by session id. `recorded_at` is the generation's `created_at`:
+    /// no new persisted field records a binding time.
+    fn session_bindings(record: &AgentRecord, archived: bool) -> Vec<Value> {
+        let mut bindings: Vec<Value> = Vec::new();
+        let mut push = |agent: &str, value: &str, source: &str| {
+            if valid_metadata_text(value)
+                && !bindings
+                    .iter()
+                    .any(|seen| seen["session"] == value && seen["agent"] == agent)
+            {
+                bindings.push(json!({
+                    "name": record.name,
+                    "agent": agent,
+                    "session": value,
+                    "source": source,
+                    "recorded_at": record.created_at,
+                    "archived": archived,
+                    "lifecycle": record.lifecycle,
+                    "cwd": record.cwd,
+                }));
+            }
+        };
+        if let Some(native) = &record.native_session {
+            push(&native.agent, &native.value, &native.source);
+        }
+        if let Some(value) = &record.session_value {
+            let agent = record
+                .session_agent
+                .as_deref()
+                .unwrap_or(&record.harness)
+                .to_owned();
+            push(&agent, value, "observed");
+        }
+        if let Some(value) = &record.goal_session_id {
+            push(&record.harness.clone(), value, "asserted");
+        }
+        if let Some(value) = &record.resume {
+            push(&record.harness.clone(), value, "asserted");
+        }
+        if let Some(spec) = &record.launch_spec {
+            if let Some(value) = spec["native_session"]["value"].as_str() {
+                let source = spec["native_session"]["source"]
+                    .as_str()
+                    .unwrap_or("asserted")
+                    .to_owned();
+                push(&record.harness.clone(), value, &source);
+            }
+        }
+        bindings
+    }
+
+    /// Native session ids recorded under more than one distinct name,
+    /// live or archived (#2124): past cross-bindings an operator must
+    /// find. Same-name generations of one seat are one binding.
+    fn native_session_duplicates(&self, records: &[AgentRecord]) -> Vec<Value> {
+        let mut bindings: Vec<Value> = Vec::new();
+        for record in records {
+            bindings.extend(Self::session_bindings(record, false));
+        }
+        for record in self.archived_records() {
+            bindings.extend(Self::session_bindings(&record, true));
+        }
+        let mut by_session: BTreeMap<(String, String), Vec<Value>> = BTreeMap::new();
+        for binding in bindings {
+            let key = (
+                binding["agent"].as_str().unwrap_or_default().to_owned(),
+                binding["session"].as_str().unwrap_or_default().to_owned(),
+            );
+            by_session.entry(key).or_default().push(binding);
+        }
+        let mut duplicates = Vec::new();
+        for ((agent, session), mut rows) in by_session {
+            let names: BTreeSet<&str> =
+                rows.iter().filter_map(|row| row["name"].as_str()).collect();
+            if names.len() < 2 {
+                continue;
+            }
+            rows.sort_by(|a, b| {
+                a["recorded_at"]
+                    .as_f64()
+                    .unwrap_or_default()
+                    .total_cmp(&b["recorded_at"].as_f64().unwrap_or_default())
+                    .then_with(|| a["name"].as_str().cmp(&b["name"].as_str()))
+            });
+            duplicates.push(json!({
+                "agent": agent,
+                "session": session,
+                "bindings": rows,
+            }));
+        }
+        duplicates
     }
 
     /// Start one fresh tab and retain failed launch artifacts for diagnosis.
@@ -11912,7 +12091,10 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             )));
         }
         if let (Some(kind), Some(value)) = (&info.session_agent, &info.session_value) {
-            if let Some(owner) = self.identity_owner(kind, value, None)? {
+            // #2124: excluding this name lets a name re-register its own
+            // archived generation's session; a different name's archived
+            // generation still refuses.
+            if let Some(owner) = self.identity_owner(kind, value, Some(agent_name))? {
                 return Err(fail(format!(
                     "native session is already registered as {:?}",
                     owner.name

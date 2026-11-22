@@ -3895,6 +3895,200 @@ fn revive_refuses_zero_and_several_store_matches_with_candidates_listed() {
     );
 }
 
+/// Plant `record` as an archived generation, as `stop` leaves it (#2124).
+fn plant_archived(fixture: &Fixture, record: &AgentRecord) {
+    let archive = fixture.root.join("registry/archive");
+    agent::create_private_directory(&archive, "test agent archive", false, false).unwrap();
+    let dir = archive.join(format!("{}-{}", record.name, record.token));
+    agent::create_private_directory(&dir, "test archived agent", false, false).unwrap();
+    agent::atomic_json(&dir.join("agent.json"), &json!(record)).unwrap();
+}
+
+#[test]
+fn revive_discovered_session_refuses_when_an_archived_peer_shares_the_cwd() {
+    // #2124: the record names no session and the store holds exactly one
+    // for its cwd, but an archived seat shares that cwd, so the one found
+    // cannot be told apart from the peer's. Revive refuses, naming both.
+    let fixture = unreported();
+    let (store, _store_guard) = pretend_muse_store(&fixture);
+    let id = "44444444-4444-4444-4444-444444444444";
+    fake_muse_journal(&store, id, &fixture.root);
+    let _held = pretend_held(Vec::new());
+    start_worker(&fixture, "muse");
+    let mut peer = fixture.manager().load("worker").unwrap();
+    peer.name = "peer-seat".to_owned();
+    peer.token = "peer-token".to_owned();
+    peer.lifecycle = "stopped".to_owned();
+    plant_archived(&fixture, &peer);
+
+    let refused = stop_and_revive_archived(&fixture).unwrap_err().to_string();
+    assert!(refused.contains("\"peer-seat\""), "{refused}");
+    assert!(refused.contains("\"worker\""), "{refused}");
+    assert!(refused.contains("bind-session worker"), "{refused}");
+    assert!(
+        fixture.manager().load("worker").is_err()
+            || fixture
+                .manager()
+                .load("worker")
+                .unwrap()
+                .native_session
+                .is_none(),
+        "the discovered session was bound despite the refusal"
+    );
+}
+
+#[test]
+fn revive_refuses_a_session_recorded_for_an_archived_codex_peer() {
+    // #2124, the consumer case in miniature: two Codex seats, one cwd.
+    // The peer is archived holding its session observed; this seat's
+    // record was made to name that session, and revive must refuse it
+    // naming both seats instead of binding it a second time.
+    let (fixture, mut old) = recoverable("codex", true);
+    let mut peer = old.clone();
+    peer.name = "peer-seat".to_owned();
+    peer.token = "peer-token".to_owned();
+    peer.lifecycle = "stopped".to_owned();
+    peer.native_session = Some(NativeSession::new("codex", "peer-thread", "observed"));
+    peer.session_agent = Some("codex".to_owned());
+    peer.session_value = Some("peer-thread".to_owned());
+    plant_archived(&fixture, &peer);
+
+    old.native_session = None;
+    old.launch_spec = None;
+    old.session_agent = Some("codex".to_owned());
+    old.session_value = Some("peer-thread".to_owned());
+    fixture.manager().save(&old).unwrap();
+    let refused = fixture
+        .manager()
+        .revive("worker", false, Some(&old.token), TIMEOUT)
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("\"peer-seat\""), "{refused}");
+    assert!(refused.contains("\"worker\""), "{refused}");
+}
+
+#[test]
+fn adopt_refuses_a_session_whose_owner_is_archived() {
+    // #2124: adoption is a binding too; an archived seat still owns its
+    // session, so a second name cannot adopt the pane reporting it.
+    let fixture = Fixture::new();
+    fixture.adopt();
+    fixture.manager().stop("foreign").unwrap();
+    let mut options = fixture.adopt_options();
+    options.pane_id = "owned".to_owned();
+    let refused = fixture
+        .manager()
+        .adopt("second", options)
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("already registered as"), "{refused}");
+    assert!(refused.contains("\"foreign\""), "{refused}");
+    assert!(fixture.manager().load("second").is_err());
+}
+
+#[test]
+fn bind_session_refuses_an_archived_owner() {
+    // #2124: bind-session names both seats when the session already
+    // belongs to an archived record.
+    let fixture = Fixture::new();
+    fixture.adopt();
+    fixture.manager().stop("foreign").unwrap();
+    fixture
+        .client
+        .report_session
+        .store(false, Ordering::Relaxed);
+    let mut second = Fake::pane("second");
+    second.tab_id = "second-tab".to_owned();
+    fixture.client.panes.lock().unwrap().push(second);
+    let mut options = fixture.adopt_options();
+    options.pane_id = "second".to_owned();
+    fixture.manager().adopt("second", options).unwrap();
+    let refused = fixture
+        .manager()
+        .bind_session("second", "thread", None)
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("already registered as"), "{refused}");
+    assert!(refused.contains("\"foreign\""), "{refused}");
+}
+
+#[test]
+fn a_lane_holding_an_archived_peers_session_is_recorded_as_unknown() {
+    // #2124 pane recovery: the first seat is archived holding its
+    // session; a second seat whose processes hold the same session file
+    // is recorded unknown, never given the archived seat's session.
+    let fixture = unreported();
+    let id = "33333333-3333-3333-3333-333333333333";
+    let lock = fake_muse_session(&fixture, id);
+    let held = pretend_held(vec![lock.clone()]);
+    start_worker(&fixture, "muse");
+    let first = fixture.manager().load("worker").unwrap();
+    assert_eq!(first.native_session.as_ref().unwrap().value, id);
+    fixture.manager().stop("worker").unwrap();
+    drop(held);
+
+    let _held = pretend_held(vec![lock]);
+    fixture
+        .manager()
+        .start(
+            "other",
+            &fixture.root,
+            StartOptions {
+                harness: "muse".to_owned(),
+                harness_args: vec!["--approval-mode=never".to_owned()],
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    let record = fixture.manager().load("other").unwrap();
+    assert!(
+        record.native_session.is_none(),
+        "archived peer's session was recorded for the second seat"
+    );
+}
+
+#[test]
+fn doctor_lists_a_native_session_recorded_under_two_names() {
+    // #2124 registry check: a planted duplicate is listed with each
+    // binding's time and source; same-name generations are not a
+    // duplicate.
+    let fixture = Fixture::new();
+    fixture.adopt();
+    let report = fixture.manager().doctor(false).unwrap();
+    assert_eq!(report["native_session_duplicates"], json!([]), "{report}");
+    let mut peer = fixture.manager().load("foreign").unwrap();
+    peer.name = "peer-seat".to_owned();
+    peer.token = "peer-token".to_owned();
+    peer.lifecycle = "stopped".to_owned();
+    peer.created_at = 1_700_000_000.0;
+    plant_archived(&fixture, &peer);
+    // An archived generation of the same name and session is one seat.
+    let mut own_archive = fixture.manager().load("foreign").unwrap();
+    own_archive.token = "older-token".to_owned();
+    own_archive.lifecycle = "stopped".to_owned();
+    plant_archived(&fixture, &own_archive);
+
+    let report = fixture.manager().doctor(false).unwrap();
+    let duplicates = report["native_session_duplicates"].as_array().unwrap();
+    assert_eq!(duplicates.len(), 1, "{report}");
+    assert_eq!(duplicates[0]["session"], "thread");
+    let bindings = duplicates[0]["bindings"].as_array().unwrap();
+    let names: Vec<&str> = bindings
+        .iter()
+        .map(|binding| binding["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"foreign"), "{bindings:?}");
+    assert!(names.contains(&"peer-seat"), "{bindings:?}");
+    let peer_binding = bindings
+        .iter()
+        .find(|binding| binding["name"] == "peer-seat")
+        .unwrap();
+    assert_eq!(peer_binding["archived"], json!(true));
+    assert_eq!(peer_binding["source"], "observed");
+    assert_eq!(peer_binding["recorded_at"], json!(1_700_000_000.0));
+    assert_eq!(report["clean"], json!(false), "{report}");
+}
+
 #[test]
 #[ignore = "#2065 hot-host-census-tests (owner rule 346): live /proc holder scan fails closed on an unrelated same-uid non-dumpable harness process; run with cargo test -- --ignored a_codex_lane_records_its_main_thread_rollout_and_revives_from_the_archive"]
 fn a_codex_lane_records_its_main_thread_rollout_and_revives_from_the_archive() {

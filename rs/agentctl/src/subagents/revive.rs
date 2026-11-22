@@ -678,40 +678,59 @@ fn claude_candidates_in(roots: &[PathBuf], record: &AgentRecord) -> Vec<SessionC
 }
 
 /// Discover a Claude session for `record` from transcripts on disk (#741 restore-native-sessions):
-/// the newest `<session>.jsonl` in the encoded project directory for the record's cwd whose
-/// structured cwd matches. Stops at the first match after walking the
-/// whole store (heads only, never the manifest file cap), and returns
-/// `None` when nothing confirms, so the caller keeps refusing.
-pub(super) fn discover_claude_session(
-    roots: &[PathBuf],
-    record: &AgentRecord,
-) -> Option<NativeSession> {
+/// `<session>.jsonl` files in the encoded project directory for the record's cwd whose
+/// structured cwd matches. Exactly one match is a discovery; several are
+/// `Many` and never guessed between (#2124: the newest transcript in a
+/// shared cwd is as likely a neighbour seat's as this record's).
+pub(super) fn discover_claude_session(roots: &[PathBuf], record: &AgentRecord) -> SessionDiscovery {
     if record.harness != "claude" {
-        return None;
+        return SessionDiscovery::None;
     }
     let record_key = cwd_key(&record.cwd);
-    crate::harness::claude::project_transcripts(roots, Path::new(&record.cwd), &valid_metadata_text)
-        .into_iter()
-        .find_map(|transcript| claude_candidate(transcript, &record_key))
-        .map(|candidate| NativeSession::new("claude", &candidate.id, "observed"))
+    let mut candidates: Vec<SessionCandidate> = Vec::new();
+    for transcript in crate::harness::claude::project_transcripts(
+        roots,
+        Path::new(&record.cwd),
+        &valid_metadata_text,
+    ) {
+        let Some(candidate) = claude_candidate(transcript, &record_key) else {
+            continue;
+        };
+        if candidates.iter().any(|seen| seen.id == candidate.id) {
+            continue;
+        }
+        candidates.push(candidate);
+        if candidates.len() >= 2 {
+            break;
+        }
+    }
+    match candidates.as_slice() {
+        [] => SessionDiscovery::None,
+        [only] => SessionDiscovery::One(NativeSession::new("claude", &only.id, "observed")),
+        _ => SessionDiscovery::Many(candidates),
+    }
 }
 
-/// Discover a Codex session for `record` (#741): newest `rollout-*-<thread>.jsonl` under
-/// `$CODEX_HOME/sessions` (default `~/.codex/sessions`) whose head mentions the record's cwd.
-pub(super) fn discover_codex_session(record: &AgentRecord) -> Option<NativeSession> {
+/// Discover a Codex session for `record` (#741): `rollout-*-<thread>.jsonl` under
+/// `$CODEX_HOME/sessions` (default `~/.codex/sessions`) whose head names the record's cwd.
+/// Several matches are `Many`, never the newest (#2124).
+pub(super) fn discover_codex_session(record: &AgentRecord) -> SessionDiscovery {
     if record.harness != "codex" {
-        return None;
+        return SessionDiscovery::None;
     }
     // Tests never scan the host's own Codex home.
     #[cfg(test)]
     {
-        None
+        SessionDiscovery::None
     }
     #[cfg(not(test))]
     {
-        let home = std::env::var_os("CODEX_HOME")
+        let Some(home) = std::env::var_os("CODEX_HOME")
             .map(PathBuf::from)
-            .or_else(|| crate::harness::home().map(|h| h.join(".codex")))?;
+            .or_else(|| crate::harness::home().map(|h| h.join(".codex")))
+        else {
+            return SessionDiscovery::None;
+        };
         discover_codex_in(&home.join("sessions"), record)
     }
 }
@@ -735,15 +754,18 @@ impl SessionCandidate {
     }
 }
 
-/// What the Muse session store says about a record that names no session (#948).
-pub(super) enum MuseDiscovery {
-    /// No session journal under the store names the record's cwd.
+/// What a session store says about a record that names no session (#948, #2124).
+pub(super) enum SessionDiscovery {
+    /// No session file under the store names the record's cwd.
     None,
     /// Exactly one does; revive may record and resume it.
     One(NativeSession),
     /// Several do; revive must not guess, and the caller names them.
     Many(Vec<SessionCandidate>),
 }
+
+/// The Muse spelling of [`SessionDiscovery`].
+pub(super) type MuseDiscovery = SessionDiscovery;
 
 /// The first prompt-like text in a session journal's head, if cheap to find:
 /// the first nonempty `text` or `prompt` string in its JSON records (nested
@@ -784,7 +806,7 @@ fn first_prompt_line(head: &str) -> Option<String> {
 
 /// Discover a Muse session for `record` from the session store: dated session
 /// journals whose head mentions the record's cwd, exactly as the Claude and
-/// Codex discoveries confirm theirs. Unlike them this reports several matches,
+/// Codex discoveries confirm theirs. Like them this reports several matches,
 /// because a shared cwd is exactly how a wrong session gets bound.
 pub(super) fn discover_muse_session(record: &AgentRecord) -> MuseDiscovery {
     if record.harness != "muse" {
@@ -1021,8 +1043,8 @@ fn codex_candidates_limited(
 }
 
 /// Every Codex rollout naming the record's cwd within the scan cap,
-/// newest first: the report-only enumeration behind
-/// [`discover_codex_in`]'s pick and the manifest's candidates.
+/// newest first: the report-only enumeration behind the manifest's
+/// candidates.
 #[cfg(test)]
 fn codex_candidates_in(sessions: &Path, record: &AgentRecord) -> Vec<SessionCandidate> {
     codex_candidates_limited(
@@ -1033,11 +1055,16 @@ fn codex_candidates_in(sessions: &Path, record: &AgentRecord) -> Vec<SessionCand
     )
 }
 
-fn discover_codex_in(sessions: &Path, record: &AgentRecord) -> Option<NativeSession> {
-    codex_candidates_limited(sessions, record, usize::MAX, 1)
-        .into_iter()
-        .next()
-        .map(|candidate| NativeSession::new("codex", &candidate.id, "observed"))
+fn discover_codex_in(sessions: &Path, record: &AgentRecord) -> SessionDiscovery {
+    // Two matches already prove Many; walk the whole store (heads only)
+    // until then, never the manifest file cap, and never pick the newest
+    // of several (#2124).
+    let candidates = codex_candidates_limited(sessions, record, usize::MAX, 2);
+    match candidates.as_slice() {
+        [] => SessionDiscovery::None,
+        [only] => SessionDiscovery::One(NativeSession::new("codex", &only.id, "observed")),
+        _ => SessionDiscovery::Many(candidates),
+    }
 }
 
 /// Muse candidates for several cwds from one newest-first store pass,
@@ -1775,7 +1802,19 @@ fn conversation(record: &AgentRecord) -> Result<NativeSession> {
             "recorded native conversation provider is incomplete or conflicts with the harness",
         ));
     }
-    let mut muse_many: Vec<SessionCandidate> = Vec::new();
+    // #2124: discovery on disk is the last resort, and several sessions
+    // naming this cwd are never guessed between, for every harness: the
+    // newest Codex rollout or Claude transcript in a shared cwd is as
+    // likely another seat's as this record's.
+    let mut many: Vec<SessionCandidate> = Vec::new();
+    let mut discovered = |found: SessionDiscovery| match found {
+        SessionDiscovery::One(native) => Some(native),
+        SessionDiscovery::Many(candidates) => {
+            many = candidates;
+            None
+        }
+        SessionDiscovery::None => None,
+    };
     let native = record
         .native_session
         .clone()
@@ -1795,26 +1834,20 @@ fn conversation(record: &AgentRecord) -> Result<NativeSession> {
             })
         })
         .or_else(|| record.effective_native_session())
-        .or_else(|| discover_claude_session(&claude_config_roots(), record))
-        .or_else(|| discover_codex_session(record))
-        .or_else(|| match discover_muse_session(record) {
-            MuseDiscovery::One(native) => Some(native),
-            MuseDiscovery::Many(candidates) => {
-                muse_many = candidates;
-                None
-            }
-            MuseDiscovery::None => None,
-        })
+        .or_else(|| discovered(discover_claude_session(&claude_config_roots(), record)))
+        .or_else(|| discovered(discover_codex_session(record)))
+        .or_else(|| discovered(discover_muse_session(record)))
         .ok_or_else(|| {
-            if !muse_many.is_empty() {
-                let described = muse_many
+            if !many.is_empty() {
+                let described = many
                     .iter()
                     .map(SessionCandidate::describe)
                     .collect::<Vec<_>>()
                     .join("; ");
                 return fail(format!(
-                    "record has no native conversation ID: {} muse sessions in the session store name its cwd, and agentctl does not guess which one is its own: {described}; name yours with `agentctl bind-session {} <id>` or `agentctl anchor {} --replace --session-id <id>`",
-                    muse_many.len(),
+                    "record has no native conversation ID: {} {} sessions name its cwd, and agentctl does not guess which one is its own: {described}; name yours with `agentctl bind-session {} <id>` or `agentctl anchor {} --replace --session-id <id>`",
+                    many.len(),
+                    record.harness,
                     record.name,
                     record.name
                 ));
@@ -2681,6 +2714,42 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         }
         options.slot = slot;
         let project_workspace = self.start_workspace_policy(&options)?;
+        // #2124: a session revive only discovered on disk (the record
+        // itself names none, in any form) is never bound when another
+        // seat, live or archived, shares this cwd: the one session found
+        // there cannot be told apart from that seat's.
+        let recorded = record
+            .native_session
+            .as_ref()
+            .is_some_and(|session| session.value == native.value)
+            || record.resume.as_deref() == Some(native.value.as_str())
+            || record.session_value.as_deref() == Some(native.value.as_str())
+            || record.goal_session_id.as_deref() == Some(native.value.as_str())
+            || record
+                .launch_spec
+                .as_ref()
+                .and_then(|spec| spec["native_session"]["value"].as_str())
+                == Some(native.value.as_str())
+            || fresh_revive(record).is_some_and(|(session, _)| session == native.value);
+        if !recorded {
+            let sharers = self.cwd_sharers(record);
+            if !sharers.is_empty() {
+                return Err(fail(format!(
+                    "refusing to bind discovered {} session {} to {:?}: seat(s) {} share its cwd {:?}, so the session found there may be theirs, not {:?}'s (#2124). Name this record's own session with `agentctl bind-session {} <id>` and revive again",
+                    native.agent,
+                    native.value,
+                    record.name,
+                    sharers
+                        .iter()
+                        .map(|name| format!("{name:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    record.cwd,
+                    record.name,
+                    record.name
+                )));
+            }
+        }
         if let Some(owner) =
             self.identity_owner(&native.agent, &native.value, Some(&record.name))?
         {
@@ -6758,10 +6827,25 @@ mod discovery_tests {
         )
         .unwrap();
         let got = discover_claude_session(std::slice::from_ref(&root), &rec("/tmp/proj"));
-        assert_eq!(
-            got.map(|s| s.value).as_deref(),
-            Some("11111111-1111-1111-1111-111111111111")
-        );
+        match got {
+            SessionDiscovery::One(native) => {
+                assert_eq!(native.value, "11111111-1111-1111-1111-111111111111")
+            }
+            _ => panic!("expected the one confirmed Claude session"),
+        }
+        // #2124: a second transcript naming the same cwd makes the
+        // discovery Many, never the first or newest found.
+        fs::write(
+            dir.join("22222222-2222-2222-2222-222222222222.jsonl"),
+            "{\"cwd\":\"/tmp/proj\"}\n",
+        )
+        .unwrap();
+        match discover_claude_session(std::slice::from_ref(&root), &rec("/tmp/proj")) {
+            SessionDiscovery::Many(candidates) => {
+                assert_eq!(candidates.len(), 2, "{candidates:?}")
+            }
+            _ => panic!("expected two same-cwd Claude transcripts to refuse as Many"),
+        }
         let _ = fs::remove_dir_all(&root);
     }
     #[test]
@@ -6876,8 +6960,8 @@ mod discovery_tests {
         );
         assert_eq!(index[&cwd_key("/tmp/proj")].len(), 2, "{index:?}");
         assert_eq!(index[&cwd_key("/other")].len(), 1, "{index:?}");
-        // Codex newest-wins is pinned by file mtime: make the second
-        // rollout unambiguously newest and require the pick to follow it.
+        // #2124: two rollouts naming this cwd are never resolved by
+        // newest-wins, however unambiguous the mtimes are.
         let newest =
             dir.join("rollout-2026-11-06T00-00-00-22222222-2222-2222-2222-222222222222.jsonl");
         fs::File::options()
@@ -6886,8 +6970,12 @@ mod discovery_tests {
             .unwrap()
             .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3600))
             .unwrap();
-        let discovered = discover_codex_in(&root.join("sessions"), &record).unwrap();
-        assert_eq!(discovered.value, "22222222-2222-2222-2222-222222222222");
+        match discover_codex_in(&root.join("sessions"), &record) {
+            SessionDiscovery::Many(candidates) => {
+                assert_eq!(candidates.len(), 2, "{candidates:?}");
+            }
+            _ => panic!("expected two same-cwd Codex rollouts to refuse as Many"),
+        }
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -6962,8 +7050,12 @@ mod discovery_tests {
         let candidates = codex_candidates_in(&root.join("sessions"), &record);
         assert_eq!(candidates.len(), 1, "{candidates:?}");
         assert_eq!(candidates[0].id, "11111111-1111-1111-1111-111111111111");
-        let discovered = discover_codex_in(&root.join("sessions"), &record).unwrap();
-        assert_eq!(discovered.value, "11111111-1111-1111-1111-111111111111");
+        match discover_codex_in(&root.join("sessions"), &record) {
+            SessionDiscovery::One(native) => {
+                assert_eq!(native.value, "11111111-1111-1111-1111-111111111111")
+            }
+            _ => panic!("expected the root-cwd Codex session"),
+        }
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -7298,7 +7390,10 @@ mod discovery_tests {
             "{\"cwd\":\"/other\"}\n",
         )
         .unwrap();
-        assert!(discover_claude_session(std::slice::from_ref(&root), &rec("/tmp/proj")).is_none());
+        assert!(matches!(
+            discover_claude_session(std::slice::from_ref(&root), &rec("/tmp/proj")),
+            SessionDiscovery::None
+        ));
         let _ = fs::remove_dir_all(&root);
     }
 }
