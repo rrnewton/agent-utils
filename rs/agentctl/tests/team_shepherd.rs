@@ -35,12 +35,95 @@ fn write_private(path: &Path, body: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("private mode");
 }
 
+/// A spawned child's process group. The drill's binaries spawn
+/// children of their own (restore, team act, the supervisor), and a
+/// test that leaks them piles processes onto the host: the group is
+/// killed when the guard drops, whatever the test outcome was.
+struct GroupGuard(u32);
+
+impl GroupGuard {
+    fn kill_group(&self) {
+        let _ = Command::new("kill")
+            .args(["-KILL", &format!("-{}", self.0)])
+            .status();
+    }
+}
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        self.kill_group();
+    }
+}
+
+/// Spawn in a fresh process group, reap the whole group on drop of
+/// the returned guard, and wait for the direct child.
+fn spawn_grouped(command: &mut Command) -> (std::process::Output, GroupGuard) {
+    use std::os::unix::process::CommandExt;
+    command
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn grouped child");
+    let guard = GroupGuard(child.id());
+    let output = child.wait_with_output().expect("wait for grouped child");
+    (output, guard)
+}
+
+/// Processes whose cmdline names this scratch tree (excluding us).
+fn scratch_processes(root: &Path) -> Vec<u32> {
+    let needle = root.display().to_string();
+    let mut found = Vec::new();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Ok(pid) = name.to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        if pid == std::process::id() {
+            continue;
+        }
+        if let Ok(cmdline) = fs::read(entry.path().join("cmdline")) {
+            if String::from_utf8_lossy(&cmdline).contains(&needle) {
+                found.push(pid);
+            }
+        }
+    }
+    found
+}
+
 struct Scratch {
     root: PathBuf,
+    groups: std::cell::RefCell<Vec<GroupGuard>>,
+}
+
+impl Scratch {
+    /// Kill every spawned group, then prove nothing survived.
+    fn reap(&self) {
+        for guard in self.groups.borrow().iter() {
+            guard.kill_group();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let survivors = scratch_processes(&self.root);
+            if survivors.is_empty() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "drill leaked processes: {survivors:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
 }
 
 impl Drop for Scratch {
     fn drop(&mut self) {
+        for guard in self.groups.borrow().iter() {
+            guard.kill_group();
+        }
         let _ = fs::remove_dir_all(&self.root);
     }
 }
@@ -52,7 +135,10 @@ impl Scratch {
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&root);
-        let scratch = Self { root };
+        let scratch = Self {
+            root,
+            groups: std::cell::RefCell::new(Vec::new()),
+        };
         scratch.register("own");
         scratch.register("judged");
         // Fake Herdr and fake one-shot harnesses: muse hangs past the
@@ -103,6 +189,12 @@ impl Scratch {
             &serde_json::to_string(&teams).expect("teams json"),
         );
         scratch
+    }
+
+    fn spawn_grouped(&self, command: &mut Command) -> std::process::Output {
+        let (output, guard) = spawn_grouped(command);
+        self.groups.borrow_mut().push(guard);
+        output
     }
 
     fn register(&self, team: &str) {
@@ -193,7 +285,8 @@ impl Scratch {
             self.root.join("fakebin").display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        let output = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agentctl"));
+        command
             .current_dir(&self.root)
             .env("HOME", &home)
             .env("AGENTCTL_HOME", home.join(".agentctl"))
@@ -228,9 +321,8 @@ impl Scratch {
                 "--run-agent-prompt",
             ])
             .arg(wrapper)
-            .stdin(Stdio::null())
-            .output()
-            .expect("run agentctl team shepherd");
+            .stdin(Stdio::null());
+        let output = self.spawn_grouped(&mut command);
         let code = output.status.code().unwrap_or(-1);
         let text = String::from_utf8(output.stdout).expect("report is UTF-8");
         let report: Value = serde_json::from_str(&text)
@@ -316,6 +408,7 @@ fn shepherd_drill_gives_up_bounded_and_judges_cross_team_read_only() {
         before,
         "rerun repeated a one-shot call"
     );
+    scratch.reap();
 }
 
 #[test]
@@ -329,6 +422,7 @@ fn shepherd_drill_judge_none_when_every_harness_is_down() {
     let stamp = scratch.stamp(&state);
     assert_eq!(stamp["judge"], "none", "{stamp}");
     assert_eq!(stamp["verdict"], "GAVE-UP");
+    scratch.reap();
 }
 
 #[test]
@@ -337,7 +431,8 @@ fn install_units_shepherd_writes_only_the_boot_unit() {
     let home = scratch.root.join("home");
     fs::create_dir_all(&home).expect("home");
     let dest = scratch.root.join("units");
-    let output = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agentctl"));
+    command
         .current_dir(&scratch.root)
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
@@ -350,9 +445,8 @@ fn install_units_shepherd_writes_only_the_boot_unit() {
         .args(["install-units", "--dest"])
         .arg(&dest)
         .arg("--shepherd")
-        .stdin(Stdio::null())
-        .output()
-        .expect("run install-units --shepherd");
+        .stdin(Stdio::null());
+    let output = scratch.spawn_grouped(&mut command);
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let unit = fs::read_to_string(dest.join("agentctl-shepherd.service")).expect("unit");
     assert!(unit.contains("start-recovery"), "{unit}");
@@ -378,6 +472,7 @@ fn install_units_shepherd_writes_only_the_boot_unit() {
         .map(|entry| entry.expect("entry").file_name())
         .collect();
     assert_eq!(written.len(), 1, "only the shepherd unit: {written:?}");
+    scratch.reap();
 }
 
 impl Scratch {
@@ -389,7 +484,8 @@ impl Scratch {
             self.root.join("fakebin").display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        let output = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agentctl"));
+        command
             .current_dir(&self.root)
             .env("HOME", &home)
             .env("AGENTCTL_HOME", home.join(".agentctl"))
@@ -402,9 +498,8 @@ impl Scratch {
             .env_remove("HERDR_PANE_ID")
             .env_remove("AGENTCTL_AGENT")
             .args(args)
-            .stdin(Stdio::null())
-            .output()
-            .expect("run agentctl");
+            .stdin(Stdio::null());
+        let output = self.spawn_grouped(&mut command);
         let code = output.status.code().unwrap_or(-1);
         let text = String::from_utf8(output.stdout).expect("report is UTF-8");
         let report: Value = serde_json::from_str(&text)
