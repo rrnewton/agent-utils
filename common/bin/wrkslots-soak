@@ -15,6 +15,12 @@
 # here: readers-only mode serves Python with a note, full soak refuses.
 set -u
 
+# Probe/ensure are per-call launcher queries, never dispatch input: an
+# ambient request must not turn this soak's wrkslotsd calls (help probes,
+# dispatch, shadow) into a probe (serving a snapshot path as output) or a
+# prebuild. The no-build gate below sets PROBE_ONLY per command, unaffected.
+unset AGENT_UTILS_RS_PROBE_ONLY AGENT_UTILS_RS_ENSURE_ONLY
+
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
 SOAK_LOG="${WRKSLOTS_SOAK_LOG:-$HOME/.local/state/wrkslots-soak/soak.log}"
@@ -232,9 +238,14 @@ fi
 # record agreement in the divergence log (common/bin/wrkslots-shadow). This is
 # the production evidence a per-command flip rests on; writers never shadow
 # (double-apply on a live registry). WRKSLOTS_SHADOW=sampled compares a
-# deterministic 1-in-WRKSLOTS_SHADOW_N (default 20) of invocations by argv
-# hash; =all compares every covered reader; =off (default) is inert.
+# deterministic 1-in-WRKSLOTS_SHADOW_N (default 20) by exact-argv hash (the
+# same argv always makes the same decision; distinct argvs sample at 1-in-N);
+# =all compares every covered reader; =off (default) is inert.
 # unpushed is excluded: it fetches, so a pair is order-sensitive.
+# Served-stream scope: Python stdout/stderr BYTES and its exit code are
+# preserved, but output is captured to files and replayed (all stdout, then
+# all stderr) - not streamed, not a tty - and the caller additionally waits
+# for the Rust run before this process exits.
 SHADOW=""
 case "${WRKSLOTS_SHADOW:-off}" in
     sampled|all)
@@ -250,7 +261,14 @@ if [[ -n "$SHADOW" ]]; then
     ARGV_SHA="$(printf '%s\0' "$CMD" "${ORIGINAL[@]}" | sha256sum | cut -d' ' -f1)"
     if [[ "$SHADOW" == "sampled" ]]; then
         SHADOW_N="${WRKSLOTS_SHADOW_N:-20}"
-        [[ "$SHADOW_N" =~ ^[0-9]+$ && "$SHADOW_N" -gt 0 ]] || SHADOW_N=20
+        # Decimal only: a leading zero would otherwise read as octal (08/09
+        # kill sampling with an arithmetic error); absurd N falls back too.
+        if [[ "$SHADOW_N" =~ ^[0-9]+$ ]]; then
+            SHADOW_N=$((10#$SHADOW_N))
+            [[ "$SHADOW_N" -ge 1 && "$SHADOW_N" -le 100000 ]] || SHADOW_N=20
+        else
+            SHADOW_N=20
+        fi
         (( 16#${ARGV_SHA:0:8} % SHADOW_N == 0 )) || SHADOW=""
     fi
 fi
@@ -258,12 +276,21 @@ if [[ -n "$SHADOW" ]]; then
     SHADOW_DIR="$(mktemp -d 2>/dev/null)" || SHADOW_DIR=""
     SHADOW_HELPER="$ROOT/common/bin/wrkslots-shadow"
     if [[ -n "$SHADOW_DIR" && -f "$SHADOW_HELPER" ]]; then
+        trap 'rm -rf "$SHADOW_DIR"' EXIT
         SHADOW_PY="${CI_HUB_PYTHON:-python3}"
         DIVERGENCE_LOG="${WRKSLOTS_DIVERGENCE_LOG:-$HOME/.local/state/wrkslots-soak/divergence.jsonl}"
+        SHADOW_TIMEOUT_S="${WRKSLOTS_SHADOW_TIMEOUT_S:-30}"
+        if [[ "$SHADOW_TIMEOUT_S" =~ ^[0-9]+$ ]]; then
+            SHADOW_TIMEOUT_S=$((10#$SHADOW_TIMEOUT_S))
+            [[ "$SHADOW_TIMEOUT_S" -ge 1 && "$SHADOW_TIMEOUT_S" -le 3600 ]] || SHADOW_TIMEOUT_S=30
+        else
+            SHADOW_TIMEOUT_S=30
+        fi
         FP_ARGS=()
         [[ -n "$PROJECT_ROOT" ]] && FP_ARGS+=(--project-root "$PROJECT_ROOT")
         FP_BEFORE="$("$SHADOW_PY" "$SHADOW_HELPER" fingerprint "${FP_ARGS[@]}" 2>/dev/null)" || FP_BEFORE="none"
-        echo "[wrkslots] $CMD: python (shadow-sampled; Rust compared, not served)" >&2
+        [[ -n "$FP_BEFORE" ]] || FP_BEFORE="none"
+        echo "[wrkslots] $CMD: python (shadow; Rust compared, not served)" >&2
         START=$SECONDS
         "$SHADOW_PY" "$ROOT/py/bin/wrkslots" "${ORIGINAL[@]}" >"$SHADOW_DIR/py.out" 2>"$SHADOW_DIR/py.err"
         PY_RC=$?
@@ -273,18 +300,31 @@ if [[ -n "$SHADOW" ]]; then
         if [[ -n "$WAIT_LOCK" ]]; then
             export WRKSLOTS_WAIT_LOCK="$WAIT_LOCK"
         fi
-        START=$SECONDS
-        if command -v timeout >/dev/null 2>&1; then
-            timeout "${WRKSLOTS_SHADOW_TIMEOUT_S:-30}" "$ROOT/rs/bin/wrkslotsd" "$RUST_CMD" "${REST[@]}" >"$SHADOW_DIR/rs.out" 2>"$SHADOW_DIR/rs.err"
+        RS_TIMED_OUT=0
+        if [[ "$PY_RC" -le 128 ]]; then
+            START=$SECONDS
+            if command -v timeout >/dev/null 2>&1; then
+                timeout "$SHADOW_TIMEOUT_S" "$ROOT/rs/bin/wrkslotsd" "$RUST_CMD" "${REST[@]}" >"$SHADOW_DIR/rs.out" 2>"$SHADOW_DIR/rs.err"
+                RS_RC=$?
+                # Distinguish timeout's 124 from a tool's own 124 by elapsed time.
+                [[ "$RS_RC" == "124" && $((SECONDS - START)) -ge $((SHADOW_TIMEOUT_S - 1)) ]] && RS_TIMED_OUT=1
+            else
+                "$ROOT/rs/bin/wrkslotsd" "$RUST_CMD" "${REST[@]}" >"$SHADOW_DIR/rs.out" 2>"$SHADOW_DIR/rs.err"
+                RS_RC=$?
+            fi
+            RS_MS=$(( (SECONDS - START) * 1000 ))
         else
-            "$ROOT/rs/bin/wrkslotsd" "$RUST_CMD" "${REST[@]}" >"$SHADOW_DIR/rs.out" 2>"$SHADOW_DIR/rs.err"
+            # Served process died on a signal; there is nothing to compare.
+            RS_RC=0
+            RS_MS=0
+            : >"$SHADOW_DIR/rs.out"
+            : >"$SHADOW_DIR/rs.err"
         fi
-        RS_RC=$?
-        RS_MS=$(( (SECONDS - START) * 1000 ))
         FP_AFTER="$("$SHADOW_PY" "$SHADOW_HELPER" fingerprint "${FP_ARGS[@]}" 2>/dev/null)" || FP_AFTER="none"
+        [[ -n "$FP_AFTER" ]] || FP_AFTER="none"
         "$SHADOW_PY" "$SHADOW_HELPER" compare \
             --cmd "$CMD" --argv-sha "$ARGV_SHA" \
-            --py-rc "$PY_RC" --rs-rc "$RS_RC" \
+            --py-rc "$PY_RC" --rs-rc "$RS_RC" --rs-timed-out "$RS_TIMED_OUT" \
             --py-out "$SHADOW_DIR/py.out" --rs-out "$SHADOW_DIR/rs.out" \
             --py-err "$SHADOW_DIR/py.err" --rs-err "$SHADOW_DIR/rs.err" \
             --fp-before "$FP_BEFORE" --fp-after "$FP_AFTER" \
@@ -294,7 +334,10 @@ if [[ -n "$SHADOW" ]]; then
         rm -rf "$SHADOW_DIR"
         exit "$PY_RC"
     fi
-    echo "[wrkslots] $CMD: shadow requested but unavailable (no temp dir or helper); running Rust" >&2
+    # Shadow was requested (serve Python); never flip the served edition
+    # to the unproven one because the comparison machinery is unavailable.
+    PYTHON_NOTE="shadow unavailable (no temp dir or helper)"
+    run_python "$CMD" "${ORIGINAL[@]}"
 fi
 
 echo "[wrkslots] $CMD: rust (soak)" >&2

@@ -34,6 +34,7 @@ def _compare(**overrides):
     base = dict(
         py_rc=0,
         rs_rc=0,
+        rs_timed_out=False,
         py_out='{"active": [], "heartbeat_age_seconds": 3}',
         rs_out='{"heartbeat_age_seconds": 9, "active": []}',
         rs_err="",
@@ -73,7 +74,10 @@ def test_registry_change_is_a_skip_not_agreement() -> None:
 
 
 def test_timeout_and_rs_refusal_classes() -> None:
-    assert _compare(rs_rc=124)["reason"] == "timeout"
+    assert _compare(rs_rc=124, rs_timed_out=True)["reason"] == "timeout"
+    # A tool's own 124 without the timeout flag is an ordinary rc divergence.
+    assert _compare(rs_rc=124)["result"] == "diverge"
+    assert _compare(py_rc=130)["reason"] == "served-signal"
     refused = _compare(rs_err="'status' stays with the Python edition in this slice")
     assert refused["result"] == "diverge"
     assert refused["reason"] == "rs-refused"
@@ -88,6 +92,59 @@ def test_rc_mismatch_diverges() -> None:
 def test_text_compare_scrubs_ages() -> None:
     result = _compare(py_out="slot-a heartbeat 3s ago\n", rs_out="slot-a heartbeat 8s ago\n")
     assert result == {"result": "agree"}
+    # The real human spellings readers emit.
+    assert _compare(
+        py_out="slot-a heartbeat_age=5s\n", rs_out="slot-a heartbeat_age=6s\n"
+    ) == {"result": "agree"}
+    assert _compare(
+        py_out="journal age=10s\n", rs_out="journal age=11s\n"
+    ) == {"result": "agree"}
+
+
+def test_scrub_is_an_explicit_set_not_a_suffix() -> None:
+    # Bare age_seconds (interrupted_journals) is volatile and scrubbed...
+    assert _compare(
+        py_out='{"interrupted_journals": [{"age_seconds": 10}]}',
+        rs_out='{"interrupted_journals": [{"age_seconds": 11}]}',
+    ) == {"result": "agree"}
+    # ...but a non-volatile *_age_seconds threshold is real signal.
+    assert _compare(
+        py_out='{"evidence_max_age_seconds": 100}',
+        rs_out='{"evidence_max_age_seconds": 999}',
+    )["result"] == "diverge"
+    # bool is not a number for divergence purposes.
+    assert _compare(py_out='{"a": true}', rs_out='{"a": 1}')["result"] == "diverge"
+
+
+def _project(tmp_path: Path, config: str, control_rel: str) -> Path:
+    project = tmp_path / "proj"
+    control = project / control_rel
+    control.mkdir(parents=True)
+    (project / ".wrkslots.yml").write_text(config)
+    (control / "ACTIVE.node-a.json").write_text("{}\n")
+    return project
+
+
+def test_fingerprint_layouts_and_config_shapes(tmp_path: Path) -> None:
+    cases = [
+        # nested + worktrees/slots: control is the PARENT (slots special case)
+        ("worktrees_dir: worktrees/slots\n", "worktrees"),
+        # flat + worktrees: control is the project root
+        ("worktrees_dir: worktrees\nlayout: flat\n", "."),
+        # JSON document, non-default values
+        ('{"worktrees_dir": "wt", "layout": "nested"}', "wt"),
+        # quoted YAML scalar with a trailing comment
+        ('worktrees_dir: "worktrees" # control lives here\n', "worktrees"),
+    ]
+    for index, (config, control_rel) in enumerate(cases):
+        root = tmp_path / f"case-{index}"
+        root.mkdir()
+        project = _project(root, config, control_rel)
+        first = HELPER.fingerprint(str(project))
+        assert first != "none", config
+        active = next((project / control_rel).glob("ACTIVE.*.json"))
+        active.write_text('{"revision": 2}\n')
+        assert HELPER.fingerprint(str(project)) != first, config
 
 
 def test_fingerprint_reads_registry(tmp_path: Path) -> None:

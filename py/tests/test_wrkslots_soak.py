@@ -622,7 +622,7 @@ def test_shadow_all_serves_python_and_logs_agreement(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     # Served bytes are the Python edition's (age 3, not the Rust stub's 7).
     assert '"heartbeat_age_seconds": 3' in result.stdout
-    assert "shadow-sampled" in result.stderr
+    assert "(shadow;" in result.stderr
     assert "cmd=status edition=python" in log.read_text()
     lines = divergence.read_text().splitlines()
     assert len(lines) == 1
@@ -647,13 +647,64 @@ def test_shadow_registry_change_is_skipped(tmp_path: Path) -> None:
     assert '"reason": "registry-changed"' in divergence.read_text()
 
 
+def test_ambient_probe_request_never_replaces_soak_dispatch(tmp_path: Path) -> None:
+    """A leaked AGENT_UTILS_RS_PROBE_ONLY must not make soak serve a snapshot path."""
+    root, log = _sandbox(tmp_path)
+    result = _run(
+        root,
+        log,
+        "status",
+        readers_only=True,
+        extra_env={"AGENT_UTILS_RS_PROBE_ONLY": "1"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("RS status-text status-text")
+    assert "stub-snapshot" not in result.stdout
+
+
+def test_shadow_unavailable_serves_python(tmp_path: Path) -> None:
+    root, log, project, divergence = _shadow_sandbox(tmp_path)
+    (root / "common" / "bin" / "wrkslots-shadow").unlink()
+    result = _shadow_run(root, log, project, divergence, WRKSLOTS_SHADOW="all")
+    assert result.returncode == 0, result.stderr
+    assert '"heartbeat_age_seconds": 3' in result.stdout
+    assert "shadow unavailable" in result.stderr
+
+
+def test_shadow_sampling_and_timeout_value_validation(tmp_path: Path) -> None:
+    root, log, project, divergence = _shadow_sandbox(tmp_path)
+    # Leading-zero N is decimal, not an octal error that kills sampling.
+    result = _shadow_run(
+        root, log, project, divergence,
+        WRKSLOTS_SHADOW="sampled", WRKSLOTS_SHADOW_N="01",
+        WRKSLOTS_SHADOW_TIMEOUT_S="abc",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "shadow;" in result.stderr or "(shadow;" in result.stderr
+    assert '"result": "agree"' in divergence.read_text()
+
+
+def test_shadow_passes_served_stderr_through(tmp_path: Path) -> None:
+    root, log, project, divergence = _shadow_sandbox(tmp_path)
+    (root / "py" / "bin" / "wrkslots").write_text(
+        "import sys\n"
+        "sys.stderr.write('served warning line\\n')\n"
+        "print('{\"active\": [], \"heartbeat_age_seconds\": 3}')\n"
+    )
+    _chmod_x(root / "py" / "bin" / "wrkslots")
+    result = _shadow_run(root, log, project, divergence, WRKSLOTS_SHADOW="all")
+    assert result.returncode == 0, result.stderr
+    assert "served warning line" in result.stderr
+    assert '"heartbeat_age_seconds": 3' in result.stdout
+
+
 def test_shadow_sampled_n1_and_determinism(tmp_path: Path) -> None:
     root, log, project, divergence = _shadow_sandbox(tmp_path)
     first = _shadow_run(
         root, log, project, divergence,
         WRKSLOTS_SHADOW="sampled", WRKSLOTS_SHADOW_N="1",
     )
-    assert "shadow-sampled" in first.stderr
+    assert "(shadow;" in first.stderr
     # Same argv, same sampling decision both times (whatever N=2 decides).
     one = _shadow_run(
         root, log, project, divergence,
@@ -663,4 +714,4 @@ def test_shadow_sampled_n1_and_determinism(tmp_path: Path) -> None:
         root, log, project, divergence,
         WRKSLOTS_SHADOW="sampled", WRKSLOTS_SHADOW_N="2",
     )
-    assert ("shadow-sampled" in one.stderr) == ("shadow-sampled" in two.stderr)
+    assert ("(shadow;" in one.stderr) == ("(shadow;" in two.stderr)

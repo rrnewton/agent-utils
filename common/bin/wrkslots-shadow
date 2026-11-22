@@ -29,16 +29,45 @@ import sys
 from pathlib import Path
 from typing import Any
 
-DROP_KEYS = frozenset({"heartbeat_age_seconds", "held_at", "recorded_at"})
+# Volatile leaves only: ages that tick between the two runs, and the stamp
+# keys the fixture differentials pop from records and events before
+# comparing. An explicit set, never a suffix rule - *_age_seconds also
+# names non-volatile thresholds a real divergence could hide behind.
+DROP_KEYS = frozenset({"heartbeat_age_seconds", "age_seconds", "held_at", "recorded_at"})
 RS_REFUSAL_MARKERS = ("stays with the Python edition", "fixture-only")
 
 
+def _scalar(raw: str) -> str | None:
+    value = raw.strip().rstrip(",}")
+    if value.startswith(('"', "'")):
+        quote = value[0]
+        end = value.find(quote, 1)
+        return value[1:end] if end > 0 else None
+    if " #" in value:
+        value = value.split(" #", 1)[0].rstrip()
+    return value or None
+
+
 def _config_value(text: str, key: str) -> str | None:
+    """The two scalar keys the fingerprint needs, from a YAML or JSON document.
+
+    Mirrors the document shapes py/wrkslots/yamlconfig.load_document accepts
+    for these keys: JSON objects, and top-level YAML scalars (quoted or bare,
+    trailing comments allowed).
+    """
+    try:
+        document = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        document = None
+    if isinstance(document, dict):
+        value = document.get(key)
+        return value if isinstance(value, str) and value else None
     for line in text.splitlines():
-        stripped = line.strip().lstrip('"').lstrip("'")
-        if stripped.startswith(f"{key}:") or stripped.startswith(f"{key} :"):
-            value = stripped.split(":", 1)[1].strip().strip(",}")
-            return value.strip('"').strip("'") or None
+        if not line or line[0] in " \t#":
+            continue
+        name, separator, rest = line.partition(":")
+        if separator and name.strip().strip('"').strip("'") == key:
+            return _scalar(rest)
     return None
 
 
@@ -63,9 +92,14 @@ def control_dir(root: Path) -> Path | None:
     layout = _config_value(text, "layout") or "nested"
     if Path(worktrees).is_absolute() or ".." in Path(worktrees).parts:
         return None
-    control = root / worktrees
-    if layout == "flat":
-        control = control.parent
+    # Mirror py/wrkslots/cli.py _control_directory_for exactly.
+    resolved = root / worktrees
+    if Path(worktrees).name == "slots":
+        control = resolved.parent
+    elif layout == "nested":
+        control = resolved
+    else:
+        control = resolved.parent
     return control if control.is_dir() else None
 
 
@@ -77,8 +111,11 @@ def fingerprint(project_root: str | None) -> str:
     if control is None:
         return "none"
     digest = hashlib.sha256()
-    names = sorted(control.glob("ACTIVE.*.json")) + sorted(
-        control.glob("EVENT-INDEX.*.json")
+    index_files = sorted(control.glob("EVENT-INDEX.*.json"))
+    names = (
+        sorted(control.glob("ACTIVE.*.json"))
+        + sorted(control.glob("ARCHIVED.*.json"))
+        + index_files
     )
     for path in names:
         try:
@@ -87,15 +124,22 @@ def fingerprint(project_root: str | None) -> str:
             return "none"
         digest.update(path.name.encode())
         digest.update(hashlib.sha256(data).hexdigest().encode())
-    for events in sorted(control.glob("EVENTS.*")):
-        if not events.is_dir():
-            continue
-        try:
-            entries = sorted(entry.name for entry in events.iterdir())
-        except OSError:
-            return "none"
-        digest.update(events.name.encode())
-        digest.update((entries[-1] if entries else "").encode())
+    # Journal existence is reader-visible state; events are immutable once
+    # appended, so only each chain's tip matters. The index already carries
+    # the tip (sequence + digest); only list EVENTS when no index exists,
+    # and then take the max name in one pass instead of sorting the chain.
+    for journal in sorted(control.glob("*.journal")):
+        digest.update(journal.name.encode())
+    if not index_files:
+        for events in sorted(control.glob("EVENTS.*")):
+            if not events.is_dir():
+                continue
+            try:
+                tip = max((entry.name for entry in events.iterdir()), default="")
+            except OSError:
+                return "none"
+            digest.update(events.name.encode())
+            digest.update(tip.encode())
     return digest.hexdigest()
 
 
@@ -103,19 +147,19 @@ def scrub(value: Any) -> Any:
     """Drop volatile leaves the fixture differentials also drop (ages, stamps)."""
     if isinstance(value, dict):
         return {
-            key: scrub(item)
-            for key, item in value.items()
-            if key not in DROP_KEYS and not key.endswith("_age_seconds")
+            key: scrub(item) for key, item in value.items() if key not in DROP_KEYS
         }
     if isinstance(value, list):
         return [scrub(item) for item in value]
     return value
 
 
+def _numeric(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def first_divergence(py: Any, rs: Any, path: str = "") -> tuple[str, Any, Any] | None:
-    if type(py) is not type(rs) and not (
-        isinstance(py, (int, float)) and isinstance(rs, (int, float))
-    ):
+    if type(py) is not type(rs) and not (_numeric(py) and _numeric(rs)):
         return (path or "<root>", py, rs)
     if isinstance(py, dict):
         for key in sorted(set(py) | set(rs)):
@@ -139,7 +183,12 @@ def first_divergence(py: Any, rs: Any, path: str = "") -> tuple[str, Any, Any] |
     return None
 
 
-_AGE_TEXT = re.compile(r"\b\d+(?:\.\d+)?s ago\b|heartbeat_age_seconds[=: ]+[0-9.]+")
+_AGE_TEXT = re.compile(
+    r"\b\d+(?:\.\d+)?s ago\b"
+    r"|heartbeat_age(?:_seconds)?[=: ]+\S+"
+    r"|\bage=\S+"
+    r"|heartbeat_age_seconds[=: ]+[0-9.]+"
+)
 
 
 def _short(value: Any) -> str:
@@ -151,13 +200,16 @@ def compare(
     *,
     py_rc: int,
     rs_rc: int,
+    rs_timed_out: bool,
     py_out: str,
     rs_out: str,
     rs_err: str,
     fp_before: str,
     fp_after: str,
 ) -> dict[str, Any]:
-    if rs_rc == 124:
+    if py_rc > 128:
+        return {"result": "skipped", "reason": "served-signal"}
+    if rs_timed_out:
         return {"result": "skipped", "reason": "timeout"}
     if fp_before == "none" or fp_after == "none":
         return {"result": "skipped", "reason": "no-fingerprint"}
@@ -224,6 +276,7 @@ def main(argv: list[str] | None = None) -> int:
     cmp_parser.add_argument("--argv-sha", required=True)
     cmp_parser.add_argument("--py-rc", required=True, type=int)
     cmp_parser.add_argument("--rs-rc", required=True, type=int)
+    cmp_parser.add_argument("--rs-timed-out", choices=("0", "1"), default="0")
     cmp_parser.add_argument("--py-out", required=True)
     cmp_parser.add_argument("--rs-out", required=True)
     cmp_parser.add_argument("--py-err", required=True)
@@ -254,6 +307,7 @@ def main(argv: list[str] | None = None) -> int:
             compare(
                 py_rc=args.py_rc,
                 rs_rc=args.rs_rc,
+                rs_timed_out=args.rs_timed_out == "1",
                 py_out=_read(args.py_out),
                 rs_out=_read(args.rs_out),
                 rs_err=_read(args.rs_err),
@@ -268,7 +322,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         log = Path(os.path.expanduser(args.log))
         log.parent.mkdir(parents=True, exist_ok=True)
-        with log.open("a", encoding="utf-8") as handle:
+        # 0600: excerpts can carry task/agent/path strings. Concurrent
+        # appends are single sub-KB O_APPEND writes; no lock is taken.
+        handle = os.fdopen(
+            os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600),
+            "a",
+            encoding="utf-8",
+        )
+        with handle:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
     except OSError:
         pass
