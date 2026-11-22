@@ -640,6 +640,11 @@ enum TeamCommand {
         after_help = "Examples:\n  agentctl --registry ~/project/.agentctl team kick\n  agentctl team kick --all --config ~/.config/agentctl/teams.json\n\nWith --all, --config names a teams file (schema agentctl-restore-teams/v1) and every registry it lists is kicked in order; the report wraps one kick object per registry under kicks and the exit is 1 when any registry refused, else 75 when any is pending, else 0. A kick to a running driver changes nothing and reports its state."
     )]
     Kick(TeamKick),
+    /// Shepherd this registry's team back after a boot: judge team manifest facts with stateless run-agent-prompt one-shots (muse, then claude, then codex) and effect only through team act, one incident per restore epoch, until a deterministic YES (lead running, bridge healthy, handoff acked) or bounded give-up escalates and stamps. A live lead means judge-only. Prints schema agentctl-team-shepherd/v1; exit 0 every judged team YES, 75 gave up, 1 refused
+    #[command(
+        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl team shepherd\n  agentctl --registry ~/project/.agentctl team shepherd --config ~/.config/agentctl/teams.json --max-rounds 5\n\nOne incident per restore epoch (kernel boot plus user-manager identity): a rerun in the same epoch reports the existing stamp and repeats no effect. Inside the incident the loop gathers team manifest facts each round, runs restore --dry-run then restore for its own team only while its lead is down (--force only when the dry run replayed a completed report yet agents are down), and accepts at most one own-team team act proposal per round from the one-shot's final JSON line. Teams named by --config are judged read-only, as is its own team while its lead is live (team-restore step 0). Bounds: --max-rounds/--max-minutes per incident, --call-timeout-seconds per one-shot chain, early give-up after --no-progress-rounds identical manifests. The per-boot stamp and state live under <state root>/shepherd/<boot-id>/ (stamp.json schema agentctl-team-shepherd-stamp/v1). Install the boot unit with install-units --shepherd; installing never enables it."
+    )]
+    Shepherd(TeamShepherd),
 }
 
 #[derive(Args)]
@@ -770,6 +775,37 @@ struct TeamKick {
     /// Teams file for --all (JSON schema agentctl-restore-teams/v1, absolute registry paths)
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct TeamShepherd {
+    /// Teams file (JSON schema agentctl-restore-teams/v1) whose registries are judged read-only; only this command's --registry team is ever acted on
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+    /// Agentctl state root holding shepherd/ (default: $XDG_STATE_HOME/agentctl, else ~/.local/state/agentctl)
+    #[arg(long, value_name = "DIR")]
+    state_dir: Option<PathBuf>,
+    /// Maximum judgement rounds in one incident, from 1 to 100 (default: 20)
+    #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=100), value_name = "ROUNDS")]
+    max_rounds: u32,
+    /// Maximum wall minutes in one incident, from 1 to 1440 (default: 120)
+    #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..=1440), value_name = "MINUTES")]
+    max_minutes: u64,
+    /// Hard seconds budget for one run-agent-prompt chain, from 1 to 3600 (default: 300)
+    #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..=3600), value_name = "SECONDS")]
+    call_timeout_seconds: u64,
+    /// Seconds between rounds, from 0 to 3600 (default: 30)
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(0..=3600), value_name = "SECONDS")]
+    round_delay_seconds: u64,
+    /// Consecutive identical-manifest rounds that escalate early, from 1 to 100 (default: 2)
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..=100), value_name = "ROUNDS")]
+    no_progress_rounds: u32,
+    /// The run-agent-prompt executable (default: run-agent-prompt on PATH)
+    #[arg(long, value_name = "PATH")]
+    run_agent_prompt: Option<PathBuf>,
+    /// Seconds a team act execution may wait for its receipt, from 0 to 3600 (default: 60)
+    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(0..=3600), value_name = "SECONDS")]
+    act_wait_seconds: u64,
 }
 
 #[derive(Args)]
@@ -1012,6 +1048,9 @@ struct InstallUnits {
     /// Example: agentctl --registry ~/project/.agentctl install-units --dest ~/.config/systemd/user --tab-hygiene
     #[arg(long, conflicts_with_all = ["bridge_unit", "bridge", "headless", "scheduled", "teams_config"])]
     tab_hygiene: bool,
+    /// Write only agentctl-shepherd.service, the always-on boot unit that runs `agentctl team shepherd` for this registry (#1559), instead of the restore units; with --teams-config PATH the unit also judges those teams read-only. Writes the file only and never enables, starts, or reloads anything: the operator enables it deliberately. Example: agentctl --registry ~/project/.agentctl install-units --dest ~/.config/systemd/user --shepherd
+    #[arg(long, conflicts_with_all = ["bridge_unit", "bridge", "headless", "scheduled"])]
+    shepherd: bool,
 }
 
 #[derive(Args)]
@@ -4853,6 +4892,49 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 .map_err(Failure::Output)?;
                 return Ok(aggregate);
             }
+            TeamCommand::Shepherd(shepherd) => {
+                let herdr_bin = resolve_herdr_bin(&args.registry, &args.herdr_bin);
+                let client =
+                    HerdrClient::with_executable("direct", &herdr_bin).map_err(AgentError::from)?;
+                let judged = match &shepherd.config {
+                    Some(path) => crate::restore_teams::TeamsConfig::load(path)
+                        .map_err(|error| Failure::Usage(error.to_string()))?
+                        .entries
+                        .iter()
+                        .map(|entry| entry.registry.clone())
+                        .filter(|registry| registry != &args.registry)
+                        .collect::<Vec<_>>(),
+                    None => Vec::new(),
+                };
+                let agentctl =
+                    std::env::current_exe().map_err(|error| Failure::Usage(error.to_string()))?;
+                let report = crate::team_shepherd::run_shepherd(
+                    &client,
+                    &args.registry,
+                    &judged,
+                    &crate::restore::SystemHost,
+                    &crate::team_shepherd::ShepherdInputs {
+                        agentctl,
+                        herdr_bin: herdr_bin.clone(),
+                    },
+                    &crate::team_shepherd::ShepherdOptions {
+                        state_dir: shepherd.state_dir.clone(),
+                        max_rounds: shepherd.max_rounds,
+                        max_minutes: shepherd.max_minutes,
+                        call_timeout_seconds: shepherd.call_timeout_seconds,
+                        round_delay_seconds: shepherd.round_delay_seconds,
+                        no_progress_rounds: shepherd.no_progress_rounds,
+                        run_agent_prompt: shepherd
+                            .run_agent_prompt
+                            .clone()
+                            .unwrap_or_else(|| PathBuf::from("run-agent-prompt")),
+                        act_wait_seconds: shepherd.act_wait_seconds,
+                    },
+                )?;
+                let code = report["exit_code"].as_i64().unwrap_or(1) as i32;
+                write_json(&report).map_err(Failure::Output)?;
+                return Ok(code);
+            }
         },
         Commands::Watch(value) => {
             // Heartbeat from daemon start (#1914): written before the client, the
@@ -5220,6 +5302,27 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     },
                     &name,
                     &unit,
+                )?)
+                .map_err(Failure::Output)?;
+                return Ok(0);
+            }
+            if value.shepherd {
+                write_json(&crate::units::install_shepherd(
+                    &crate::units::InstallOptions {
+                        dest: value.dest,
+                        agentctl,
+                        herdr,
+                        registry: absolute(&args.registry)?,
+                        bridge_unit: None,
+                        dry_run: value.dry_run,
+                        force: value.force,
+                    },
+                    value
+                        .teams_config
+                        .as_deref()
+                        .map(absolute)
+                        .transpose()?
+                        .as_deref(),
                 )?)
                 .map_err(Failure::Output)?;
                 return Ok(0);

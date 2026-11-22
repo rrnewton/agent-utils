@@ -121,6 +121,37 @@ never raw records, ask for one `team act` proposal, and run that action yourself
   agentctl --registry R team manifest; } | run-agent-prompt --timeout 120
 ```
 
+## The shepherd: the automated form of this protocol
+
+`agentctl --registry R team shepherd` runs this protocol after a boot so an outside team's agents
+do not stay dead when nobody is there to drive sections 1–3 by hand. It starts unconditionally from
+its own boot unit in parallel with deterministic restore (no ordering on restore or Herdr; restore
+never waits for it) and runs one incident per restore epoch — the kernel boot plus the user-manager
+identity, the same epoch the restore replay guard uses. A rerun in the same epoch reports the
+existing stamp and repeats no effect; a mid-session death is not its job (watch, `team kick` and the
+driver own that).
+
+Inside the incident, each round:
+
+1. probes step 0: a team whose lead is live is judged read-only and never acted on, and only the
+   shepherd's own team (its `--registry` registry) is ever acted on — teams named with `--config`
+   are judged read-only in the same stamp;
+2. gathers `team manifest` facts (never raw records), and, for its own team while its lead is down,
+   runs `restore --dry-run`, reads the report, then the real `restore` — with `--force` only in the
+   replayed-but-visibly-down case after a user-manager restart;
+3. asks one stateless one-shot (`run-agent-prompt`: muse, then claude, then codex) to judge the
+   manifest, and accepts at most one own-team `team act` proposal from its final JSON line — every
+   effect goes through `team act`, so the driver validates, persists and re-verifies it.
+
+It finishes only on the deterministic YES of section 4 (lead running, bridge healthy, handoff acked,
+each an explicit pass; held/skipped never count), or on bounded give-up (20 rounds / 120 min by
+default, early after two identical manifests) with escalation and a stamp under
+`<state root>/shepherd/<boot-id>/`. If every harness is down while the checks pass, the stamp still
+says YES with `judge=none`. Install its unit with
+`agentctl --registry R install-units --dest ~/.config/systemd/user --shepherd`: installing writes
+`agentctl-shepherd.service` only and never enables it — the operator reviews and enables it
+deliberately.
+
 ## 4. Verify: a restore isn't done until all of these hold
 
 `agentctl --registry R team verify` checks most of this list with evidence and exits 0 only

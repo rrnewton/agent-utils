@@ -22,6 +22,7 @@ const BRIDGE: &str = include_str!("systemd/agentctl-bridge.service");
 const SCHEDULED_SERVICE: &str = include_str!("systemd/agentctl-scheduled.service");
 const SCHEDULED_TIMER: &str = include_str!("systemd/agentctl-scheduled.timer");
 const AGENT_RESTORE_TEAMS: &str = include_str!("systemd/agent-restore-teams.service");
+const SHEPHERD: &str = include_str!("systemd/agentctl-shepherd.service");
 const TAB_HYGIENE_SERVICE: &str = include_str!("systemd/agentctl-tab-hygiene.service");
 const TAB_HYGIENE_TIMER: &str = include_str!("systemd/agentctl-tab-hygiene.timer");
 
@@ -421,6 +422,53 @@ pub fn rendered_restore_teams(
 /// different existing file without `force`. Enables and starts nothing.
 pub fn install_restore_teams(options: &InstallOptions, teams_config: &Path) -> Result<Value> {
     let file = rendered_restore_teams(options, teams_config)?;
+    let unit = file.0.display().to_string();
+    let (written, unchanged) = write_files(options, &[file])?;
+    Ok(json!({
+        "dry_run": options.dry_run,
+        "written": written,
+        "unchanged": unchanged,
+        "next_steps": [
+            "review the file",
+            "systemctl --user daemon-reload",
+            format!("systemctl --user enable {unit}"),
+            "loginctl enable-linger \"$USER\"   # once, so the units start at boot without a login",
+        ],
+    }))
+}
+
+/// The boot unit of the recovery shepherd for this registry (#1559
+/// Phase 2), rendered, as `(file name, contents)`. It runs
+/// `agentctl team shepherd` for the install registry, with
+/// `--config PATH` (judged read-only teams) when a teams file is
+/// given. The unit deliberately has no ordering on restore or Herdr:
+/// it starts in parallel and monitors them.
+pub fn rendered_shepherd(
+    options: &InstallOptions,
+    teams_config: Option<&Path>,
+) -> Result<(PathBuf, String)> {
+    let agentctl = unit_path("agentctl", &options.agentctl)?;
+    let registry = unit_path("registry", &options.registry)?;
+    let herdr = unit_path("herdr", &options.herdr)?;
+    let config_arg = match teams_config {
+        Some(path) => format!(" --config {}", unit_path("teams config", path)?),
+        None => String::new(),
+    };
+    Ok((
+        PathBuf::from("agentctl-shepherd.service"),
+        SHEPHERD
+            .replace("@AGENTCTL@", &agentctl)
+            .replace("@REGISTRY@", &registry)
+            .replace("@HERDR@", &herdr)
+            .replace("@TEAMS_CONFIG_ARG@", &config_arg),
+    ))
+}
+
+/// Write only `agentctl-shepherd.service`; refuse to replace a
+/// different existing file without `force`. Enables and starts
+/// nothing: the operator enables the shepherd deliberately.
+pub fn install_shepherd(options: &InstallOptions, teams_config: Option<&Path>) -> Result<Value> {
+    let file = rendered_shepherd(options, teams_config)?;
     let unit = file.0.display().to_string();
     let (written, unchanged) = write_files(options, &[file])?;
     Ok(json!({

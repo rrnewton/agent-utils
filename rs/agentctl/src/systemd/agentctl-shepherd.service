@@ -1,0 +1,26 @@
+# Installed by `agentctl install-units --shepherd`. The always-on
+# one-shot recovery shepherd for one team (#1559): it starts
+# unconditionally at boot, in parallel with deterministic restore,
+# with no ordering on restore or Herdr, and restore never waits for
+# it. It judges `team manifest` facts with stateless one-shot calls
+# and effects only through `team act`, one incident per restore
+# epoch, bounded rounds. Installing writes this file only; the
+# operator enables it deliberately.
+[Unit]
+Description=Shepherd one agentctl team back after boot (judgement loop; never blocks restore)
+StartLimitIntervalSec=1800
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+ExecStart=@AGENTCTL@ --registry @REGISTRY@ --herdr-bin @HERDR@ team shepherd@TEAMS_CONFIG_ARG@
+# Covers the incident bound (120 minutes of rounds) plus one final
+# escalation attempt; the loop gives up and stamps on its own bounds
+# long before systemd needs this watchdog.
+TimeoutStartSec=7800
+SuccessExitStatus=75
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

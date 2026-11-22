@@ -67,6 +67,7 @@ pub mod team_driver;
 pub mod team_escalate;
 pub mod team_manifest;
 pub mod team_model;
+pub mod team_shepherd;
 pub mod team_verify;
 pub mod term;
 pub mod tui_prompts;
