@@ -167,6 +167,7 @@ export interface ElementById {
   "discuss-terms-list": HTMLUListElement;
   "discuss-terms-summary": HTMLElement;
   "discuss-timeline": HTMLDivElement;
+  "discuss-timeline-head": HTMLDivElement;
   "discuss-timeline-heading": HTMLHeadingElement;
   "discuss-title": HTMLSpanElement;
   "discuss-uncovered": HTMLParagraphElement;

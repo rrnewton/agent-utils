@@ -546,7 +546,12 @@
             </section>
             <section class="discuss-section discuss-timeline-section" aria-labelledby="discuss-timeline-heading">
               <hr class="discuss-sep">
-              <h2 id="discuss-timeline-heading" class="discuss-section-title">Timeline</h2>
+              <!-- `#2134 vibe-talk-discuss-timeline-expand-inline`: the
+                   Timeline Expand/Collapse toggle stands on this header row,
+                   straight right of the label, with no row of its own. -->
+              <div id="discuss-timeline-head" class="discuss-section-head discuss-timeline-head">
+                <h2 id="discuss-timeline-heading" class="discuss-section-title">Timeline</h2>
+              </div>
               <div id="discuss-timeline"></div>
             </section>
             <div id="discuss-draft-offer" class="draft-sync-offer" role="group" aria-labelledby="discuss-draft-offer-text" hidden>

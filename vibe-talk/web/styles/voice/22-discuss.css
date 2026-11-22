@@ -559,6 +559,17 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   margin: 4px 0 8px;
 }
 
+/* `#2134 vibe-talk-discuss-timeline-expand-inline`: the Timeline toggle
+ * shares its header row, straight right of the label, so the header block
+ * is one row tall on phone and desktop alike, with no extra row. */
+.discuss-timeline-head {
+  flex-wrap: nowrap;
+}
+
+.discuss-timeline-head .discuss-toggle {
+  margin-left: auto;
+}
+
 .discuss-collapsible {
   margin-top: 10px;
 }

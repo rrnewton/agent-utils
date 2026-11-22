@@ -1633,12 +1633,27 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
   function drawTimeline(entries: DiscussEntryShape[], scope: DiscussScope): void {
     const box = deps.byId("discuss-timeline");
     box.replaceChildren();
+    // `#2134 vibe-talk-discuss-timeline-expand-inline`: the toggle stands
+    // on the Timeline header row, straight right of the label, with no row
+    // of its own; a host without that head keeps it atop the timeline.
+    const head = maybe("discuss-timeline-head");
+    if (head !== null) {
+      for (const kid of Array.from(head.children as unknown as ArrayLike<HTMLElement>)) {
+        if (String((kid as HTMLElement).className ?? "").includes("discuss-toggle")) {
+          head.removeChild(kid as never);
+        }
+      }
+    }
     if (entries.length === 0) return;
     const timelineToggle = makeDiscussToggle("timeline", () => box as unknown as HTMLElement, (open) => setDetailsDeep(box as unknown as HTMLElement, open));
-    const bar = document.createElement("div");
-    bar.className = "discuss-toggle-bar discuss-toggle-bar--timeline";
-    bar.appendChild(timelineToggle.button);
-    box.appendChild(bar);
+    if (head !== null) {
+      head.appendChild(timelineToggle.button as never);
+    } else {
+      const bar = document.createElement("div");
+      bar.className = "discuss-toggle-bar discuss-toggle-bar--timeline";
+      bar.appendChild(timelineToggle.button);
+      box.appendChild(bar);
+    }
     let at = 0;
     while (at < entries.length) {
       const entry = entries[at];

@@ -8155,14 +8155,23 @@ SCENES: tuple[Scene, ...] = (
             ),
             (
                 "the one toggle stands for the current summary and the timeline",
-                "!!document.querySelector('#discuss-current-head .discuss-toggle') && !!document.querySelector('.discuss-toggle-bar--timeline .discuss-toggle')",
+                "!!document.querySelector('#discuss-current-head .discuss-toggle') && !!document.querySelector('#discuss-timeline-head .discuss-toggle')",
+            ),
+            (
+                # `#2134`: the Timeline toggle shares the heading's row,
+                # straight right of the label, with no row of its own.
+                "the timeline toggle shares the Timeline header row",
+                "(() => { const t = document.querySelector('#discuss-timeline-head .discuss-toggle'); "
+                "const h = document.getElementById('discuss-timeline-heading'); "
+                "if (!t || !h) return false; const tr = t.getBoundingClientRect(); const hr = h.getBoundingClientRect(); "
+                "return tr.left >= hr.right - 1 && tr.top < hr.bottom && hr.top < tr.bottom; })()",
             ),
             (
                 # `#1960`: every header toggle shares the one bigger size.
                 "every header toggle shares the one toggle size",
                 "(() => { const fs = (el) => (el ? parseFloat(getComputedStyle(el).fontSize) : -1); "
                 "const cur = fs(document.querySelector('#discuss-current-head .discuss-toggle')); "
-                "const tl = fs(document.querySelector('.discuss-toggle-bar--timeline .discuss-toggle')); "
+                "const tl = fs(document.querySelector('#discuss-timeline-head .discuss-toggle')); "
                 "const old = fs(document.querySelector('.discuss-old-toggle')); "
                 "return cur > 0 && Math.abs(cur - tl) < 0.6 && Math.abs(cur - old) < 0.6; })()",
             ),

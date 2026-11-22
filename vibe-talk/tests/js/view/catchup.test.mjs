@@ -104,7 +104,7 @@ const IDS = [
   "discuss-answer", "discuss-footer", "discuss-covers", "discuss-links",
   "discuss-mark-read", "discuss-mark-unread", "discuss-unmarkable",
   "discuss-stamp", "discuss-retry", "discuss-terms", "discuss-terms-summary", "discuss-terms-list",
-  "discuss-stale", "discuss-stale-text", "discuss-update", "discuss-new-summary", "discuss-timeline", "discuss-current-covers", "discuss-current-head", "discuss-current-section",
+  "discuss-stale", "discuss-stale-text", "discuss-update", "discuss-new-summary", "discuss-timeline", "discuss-timeline-head", "discuss-current-covers", "discuss-current-head", "discuss-current-section",
   "discuss-followup", "discuss-send", "discuss-uncovered", "discuss-uncovered-go", "discuss-uncovered-text",
   "discuss-actions", "discuss-resize", "discuss-head", "discuss-title",
   "discuss-dock-toggle", "discuss-full-toggle", "screen-main",
@@ -1272,9 +1272,9 @@ test("catchup: reopening draws the saved record and asks nothing", async () => {
     assert.equal(fx.els["discuss-stale"].hidden, false, "the staleness banner did not show");
     assert.equal(fx.els["discuss-stale-text"].textContent, "3 new unread · 1 marked read since summary");
     const timeline = fx.els["discuss-timeline"].children;
-    assert.equal(timeline.length, 3, "the timeline did not draw its chip bar, old summary and Q/A pair");
-    assert.match(timeline[2].children[0].textContent, /Follow-up question/, "the turn did not draw as a collapsible pair");
-    assert.equal(timeline[2].children[1].textContent, "and the deploy?");
+    assert.equal(timeline.length, 2, "the timeline did not draw its old summary and Q/A pair");
+    assert.match(timeline[1].children[0].textContent, /Follow-up question/, "the turn did not draw as a collapsible pair");
+    assert.equal(timeline[1].children[1].textContent, "and the deploy?");
     assert.equal(fx.els["discuss-current-covers"].textContent, "Covers 2 messages");
     // [Update] is the incremental delta (`#1388` landing 2): one update
     // call, no full re-summarize POST.
@@ -1341,7 +1341,7 @@ test("catchup: timeline and saved labels date a previous day's summary (#1787)",
     await flush();
     assert.match(fx.els["discuss-status"].textContent, /Saved summary · Sun \d{1,2}:\d{2}\s?(AM|PM)/);
     const timeline = fx.els["discuss-timeline"].children;
-    assert.match(timeline[1].children[0].textContent, /Earlier summary · Sun \d{1,2}:\d{2}\s?(AM|PM) · 1 unread/);
+    assert.match(timeline[0].children[0].textContent, /Earlier summary · Sun \d{1,2}:\d{2}\s?(AM|PM) · 1 unread/);
   } finally { fx.restore(); }
 });
 
@@ -1403,13 +1403,14 @@ test("catchup: timeline pairs follow-ups, earlier summaries open headings-first,
     await flush();
     assert.equal(els["discuss-current-covers"].textContent, "Covers 2 messages");
     const timeline = els["discuss-timeline"].children;
-    // Toggle bar, then the earlier summary, then ONE collapsible Q/A pair.
-    assert.equal(timeline.length, 3);
-    assert.ok(String(timeline[0].className).includes("discuss-toggle-bar--timeline"), "timeline toggle bar missing");
-    const timelineToggle = timeline[0].children[0];
+    // The earlier summary, then ONE collapsible Q/A pair; the toggle stands
+    // on the Timeline header row (`#2134`), not in a bar of its own.
+    assert.equal(timeline.length, 2);
+    const timelineToggle = els["discuss-timeline-head"].children.find((kid) => String(kid.className).includes("discuss-toggle"));
+    assert.ok(timelineToggle, "timeline toggle missing from the header row");
     assert.equal(timelineToggle.textContent, "Expand", "timeline toggle did not start at Expand");
     assert.equal(els["discuss-timeline"].textContent.includes("Expand all"), false, "an Expand all label remains");
-    const old = timeline[1];
+    const old = timeline[0];
     assert.match(old.children[0].children[0].textContent, /Earlier summary/);
     const oldBody = old.children[1];
     const oldFolds = () => oldBody.children.filter((kid) => kid.tagName === "DETAILS");
@@ -1426,7 +1427,7 @@ test("catchup: timeline pairs follow-ups, earlier summaries open headings-first,
     assert.deepEqual(oldFolds().map((fold) => fold.open), [false, false], "Collapse did not close the earlier summary folds");
     assert.equal(old.open, true, "Collapse closed the earlier summary row itself");
     assert.equal(oldToggle.textContent, "Expand", "closed folds did not read Expand again");
-    const pair = timeline[2];
+    const pair = timeline[1];
     assert.match(pair.children[0].textContent, /Follow-up question/);
     assert.equal(pair.children[1].children.length, 2, "question and answer do not collapse together");
     assert.equal(pair.children[1].children[0].textContent, "and the deploy?");
@@ -1464,6 +1465,19 @@ test("catchup header: dense lines, toggle to the right, one colour variable (#19
   assert.equal(panel.includes("Expand all"), false, "an Expand all label remains in the panel");
   assert.equal(panel.includes("Collapse all"), false, "a Collapse all label remains in the panel");
   assert.equal(panel.includes("expand all"), false, "a lowercase expand all label remains in the panel");
+});
+
+test("catchup timeline header: the toggle shares the Timeline row (#2134)", () => {
+  const read = (path) => readFileSync(new URL(path, import.meta.url), "utf8");
+  const html = read("../../../web/voice.html");
+  const headAt = html.indexOf('id="discuss-timeline-head"');
+  const labelAt = html.indexOf('id="discuss-timeline-heading"', headAt);
+  const bodyAt = html.indexOf('id="discuss-timeline"', labelAt);
+  assert.ok(headAt >= 0 && labelAt > headAt && bodyAt > labelAt, "Timeline label does not stand in its header row above the timeline body");
+  const css = read("../../../web/styles/voice/22-discuss.css");
+  assert.match(css, /\.discuss-timeline-head \{[^}]*flex-wrap: nowrap;/, "the Timeline header row can wrap onto a second row");
+  const panel = read("../../../web/src/view/catchup/panel.ts");
+  assert.ok(panel.includes('maybe("discuss-timeline-head")'), "the Timeline toggle is not placed in the header row");
 });
 
 test("catchup header: Terms counts toward Collapse, and the toggle opens it too (#1960)", async () => {
@@ -2511,9 +2525,9 @@ test("catchup new summary: New summary adds a fresh card and keeps the first in 
     assert.equal(fx.els["discuss-status"].textContent, "New summary.");
     assert.equal(fx.els["discuss-answer"].textContent, "fresh point", "the fresh summary did not stand on top");
     const timeline = fx.els["discuss-timeline"].children;
-    assert.equal(timeline.length, 2, "the timeline did not keep the first summary under the fresh one");
-    assert.match(timeline[1].children[0].textContent, /Earlier summary/, "the first summary is not labelled earlier");
-    assert.match(timeline[1].children[0].textContent, /covers 09:51–09:52/, "the earlier summary does not name the range it covers");
+    assert.equal(timeline.length, 1, "the timeline did not keep the first summary under the fresh one");
+    assert.match(timeline[0].children[0].textContent, /Earlier summary/, "the first summary is not labelled earlier");
+    assert.match(timeline[0].children[0].textContent, /covers 09:51–09:52/, "the earlier summary does not name the range it covers");
   } finally { fx.restore(); }
 });
 
