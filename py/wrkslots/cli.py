@@ -98932,6 +98932,28 @@ def _emit_absent_validate_outcomes(
         )
 
 
+def _absent_validate_snapshot_rows(
+    config: Config, requested: Sequence[AbsentValidateRow]
+) -> dict[str, ActiveRecord] | None:
+    """The requested rows from an index-proven ACTIVE snapshot (#2088).
+
+    Returns None when the event index cannot prove the snapshot is
+    the current state; the caller then takes the ordinary full path.
+    """
+
+    proven = _scoped_status_state(config, config.machine)
+    if proven is None:
+        return None
+    snapshot, _index = proven
+    return {
+        record.slot: record
+        for item in requested
+        if item.machine == config.machine
+        for record in snapshot.slots
+        if record.slot == item.slot and record.generation == item.generation
+    }
+
+
 def _cmd_recover_absent_validate_rows(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
     input_sha256, requested = _read_absent_validate_rows_input(config, args.input)
@@ -98950,6 +98972,33 @@ def _cmd_recover_absent_validate_rows(args: argparse.Namespace) -> int:
             coordinator = _capture_caller_process(args.coordinator_pid, "coordinator")
         else:
             coordinator = None
+        # Cheap refusal pre-check (#2088): the cheap validation refusal
+        # checks run BEFORE the registry locks, from the event-index
+        # snapshot (proven current; the locked path re-runs every check
+        # against the full replay anyway). A row the plan is guaranteed
+        # to refuse — a wrong record identity, a checksum mismatch, or
+        # Git still registering the checkout — refuses here, before any
+        # lock is taken, instead of after minutes parsing the history
+        # under the locks. Anything unproven falls back: no refusal is
+        # weakened, and the pre-check is exact whenever the index is.
+        if args.apply:
+            try:
+                snapshot_rows = _absent_validate_snapshot_rows(config, requested)
+            except (OSError, Refusal, StateError, ValueError):
+                snapshot_rows = None
+            if snapshot_rows is not None:
+                item_identities = {
+                    item.slot: item
+                    for item in requested
+                    if item.machine == config.machine
+                }
+                for wanted_slot, record in list(snapshot_rows.items()):
+                    item = item_identities[wanted_slot]
+                    _validate_absent_validate_row(record, item)
+                    _assert_absent_validate_row_is_local(record)
+                _assert_absent_validate_rows_storage(
+                    config, tuple(snapshot_rows.values())
+                )
         # The privileged process census also runs before the lock (#1194):
         # processes never take this lock, so holding it during the census
         # never protected against a process starting in a row later; the

@@ -21,6 +21,19 @@ Run the cheap refusal checks (Git registration, and any other precondition that 
 
 - A refusable row refuses without taking the state-root flock; an accepted row still re-validates under the lock; the lock hold time no longer scales with the full event history; deterministic tests.
 
+## Implementation notes
+
+The cheap validation refusal checks now run before the registry
+locks. A pre-check reads the requested rows through the event index
+(`_scoped_status_state` proves the ACTIVE snapshot is current); the
+locked path still re-runs every check against the full replay, so no
+refusal is weakened. A row the plan is guaranteed to refuse — wrong
+identity, checksum mismatch, or Git still registering the checkout
+— refuses before any registry lock is taken instead of after minutes
+of history parsing under them. Rows absent from the snapshot, stale
+indexes, and any other unproven case fall back unchanged. Covered by
+`py/wrkslots/tests/test_recover_absent_precheck.py`.
+
 # Notes
 
 Filed by the coordinator from a consumer report; the owning lane refines this file as it works.
