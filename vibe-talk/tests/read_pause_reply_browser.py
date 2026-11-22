@@ -68,6 +68,7 @@ scroll-tools chips by design, so it is pressed from the held read and must open 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import threading
 import time
@@ -305,8 +306,11 @@ def walk(desk: Desk, api: VoicesApi, voice: str, args: argparse.Namespace) -> No
         desk.check(count_now == held_count,
                    f"agent: the read moved while held: count {held_count!r} -> {count_now!r}")
         if held_lit is not None:
-            desk.check(page.evaluate(LIT_JS) == held_lit,
-                       f"agent: the lit sentence moved while held: {held_lit!r} -> {page.evaluate(LIT_JS)!r}")
+            # The highlight can read empty for a frame while the send settles (#2077); wait for
+            # the held sentence itself, as settled()'s own contract requires. Movement through
+            # the hold is still proven by the steer count and hold steps checked either side.
+            desk.wait_for(f"() => ({LIT_JS})() === {json.dumps(held_lit)}",
+                          f"agent: the lit sentence moved while held (held {held_lit!r})", STATE_S)
         hold_steps = page.evaluate(f"() => window.steerSteps.slice({steps_at_pause})")
         desk.check(all(str(one["count"]) in (held_count, "") for one in hold_steps),
                    f"agent: the steer count moved while held: {hold_steps}")
