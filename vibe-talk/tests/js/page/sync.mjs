@@ -2625,7 +2625,14 @@ test("THE SCROLLER IS SIZED BY ITS CELL ALONE, so a change beside it does not la
   // #discuss-panel's own scroller (the panel stands outside #scroll-area),
   // so it escapes nothing here either. Exactly that selector, nothing broader.
   const withoutComposer = withoutLabelsFilter.replace(/#discuss-panel \.discuss-compose\s*\{[^}]*position:\s*sticky[^}]*\}/, " ");
-  assert.doesNotMatch(withoutComposer, /position:\s*(fixed|sticky)/, "something now escapes the scroller's containment");
+  // The thread picker's exception (`#2071 vibe-talk-thread-picker-grid-toggle`):
+  // `.thread-picker-group` sticks inside `.thread-picker-threads`, the picker's
+  // own `overflow-y: auto` pane; the popup hangs off the document root, outside
+  // #scroll-area, so the heading sticks within that pane and hangs off the list
+  // no more than Discuss's bars do.
+  assert.match(cssBlock(".thread-picker-group"), /position:\s*sticky/, "the THREADS heading does not stick in its pane");
+  const withoutPickerGroup = withoutComposer.replace(/\.thread-picker-group\s*\{[^}]*\}/, " ");
+  assert.doesNotMatch(withoutPickerGroup, /position:\s*(fixed|sticky)/, "something now escapes the scroller's containment");
 });
 
 test("A HIDDEN PAGE POLLS NOTHING: the poll waits for it to come back, and one that came due meanwhile runs then", async () => {

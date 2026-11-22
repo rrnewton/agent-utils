@@ -28,3 +28,5 @@ Responsiveness, measured at 6x CPU throttle at 412px before the fix: the popup p
 # Notes
 
 Owner requests 301 and 302 (2026-11-21 1:49 and 1:51 PM ET), fast-track UI. Perf findings for the broader freeze go to #2066 vibe-talk-page-freeze.
+
+Resolution: landed and deployed; the `.thread-picker-group` sticky heading it added is a named exception in the `#226` containment scan (the picker pane is its own scroller outside `#scroll-area`, like Discuss and Labels), keeping the heading whole at open.
