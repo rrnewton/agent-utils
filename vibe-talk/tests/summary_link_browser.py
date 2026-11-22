@@ -244,11 +244,12 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
         page.screenshot(path=str(shots / f"{label}-summary-open.png"))
 
     def panel_scroll() -> int:
-        return page.evaluate("""() => {
+        value: object = page.evaluate("""() => {
           const panel = document.getElementById('discuss-panel');
           const answer = document.getElementById('discuss-answer');
           return Math.round((answer && answer.scrollHeight > answer.clientHeight ? answer.scrollTop : panel.scrollTop) || 0);
         }""")
+        return int(value) if isinstance(value, (int, float)) else 0
 
     def assert_stayed(what: str) -> None:
         state = page.evaluate("""() => ({

@@ -242,6 +242,7 @@ export interface ElementById {
   "enter-sends": HTMLInputElement;
   "enter-sends-hint": HTMLParagraphElement;
   "error": HTMLSpanElement;
+  "error-action": HTMLButtonElement;
   "error-wrap": HTMLDivElement;
   "expand-all": HTMLButtonElement;
   "expand-all-label": HTMLSpanElement;
