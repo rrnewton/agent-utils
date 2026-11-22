@@ -538,6 +538,12 @@ def test_source_change_during_snapshot_retries_before_execution(tmp_path: Path) 
     root = _build_sandbox(tmp_path)
     ensured = _run_launcher(root, ensure_only=True)
     assert ensured.returncode == 0, ensured.stderr
+    # The ensure prebuild publishes the snapshot too; remove it so the launched
+    # run below is the publisher whose copy races the source edit.
+    for snapshot in (root / "rs" / ".agent-utils-snapshots" / "tick-hub").glob(
+        "*/tick-hub"
+    ):
+        snapshot.unlink()
 
     real_cp = shutil.which("cp")
     assert real_cp is not None
@@ -788,3 +794,83 @@ def test_cargo_clean_failure_prints_cargo_reason(tmp_path: Path) -> None:
     assert "error: synthetic clean refusal" in failed.stderr
     assert "Cargo clean failed; no cached Rust artifact was executed" in failed.stderr
     assert "--quiet" not in clean_args.read_text()
+
+
+def _run_direct(
+    root: Path, extra_env: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    """Invoke the tracked Cargo launcher directly (no resolver)."""
+    env = {**os.environ, "CARGO_NET_OFFLINE": "true", **extra_env}
+    return subprocess.run(
+        [str(root / "rs" / "bin" / "tick-hub")],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+        timeout=120,
+    )
+
+
+def test_probe_and_no_build_cold_cache_never_build(tmp_path: Path) -> None:
+    """Cold cache: probe reports cold (75) and no-build refuses (127) without building.
+
+    This is the install contract for callers that hold their own locks: the first
+    call must never pay a lazy build under the checkout cache lock.
+    """
+    root = _build_sandbox(tmp_path)
+
+    probe = _run_direct(root, {"AGENT_UTILS_RS_PROBE_ONLY": "1"})
+    assert probe.returncode == 75, probe.stderr
+    assert probe.stdout == ""
+    assert "cache=cold" in probe.stderr
+
+    refused = _run_launcher(root, extra_env={"AGENT_UTILS_RS_NO_BUILD": "1"})
+    assert refused.returncode == 127, refused.stderr
+    assert refused.stdout == ""
+    assert "AGENT_UTILS_RS_NO_BUILD=1" in refused.stderr
+    assert "AGENT_UTILS_RS_ENSURE_ONLY=1 rs/bin/tick-hub" in refused.stderr
+
+    # Nothing was built or published by either refused path.
+    assert not list((root / "rs" / "target").glob("*/release/tick-hub"))
+    assert not (root / "rs" / ".agent-utils-snapshots").exists()
+
+
+def test_ensure_prebuild_publishes_snapshot_for_no_build(tmp_path: Path) -> None:
+    """The ensure prebuild alone leaves a no-build caller able to exec the fast path."""
+    root = _build_sandbox(tmp_path)
+    assert _run_launcher(root).stdout == "v1\n"
+    _git_commit(root, "pin v1")
+    # The first committed call restamps through the slow verified path.
+    assert _run_launcher(root).stdout == "v1\n"
+
+    # Remove every published snapshot; only the ensure prebuild may republish.
+    snapshots = root / "rs" / ".agent-utils-snapshots"
+    shutil.rmtree(snapshots)
+    ensured = _run_launcher(root, ensure_only=True)
+    assert ensured.returncode == 0, ensured.stderr
+    target = Path(ensured.stdout.strip())
+    # The ensure stdout contract is unchanged: the Cargo target path.
+    assert target.name == "tick-hub" and "release" in target.parts
+    published = list((snapshots / "tick-hub").glob("*/tick-hub"))
+    assert len(published) == 1
+
+    probe = _run_direct(root, {"AGENT_UTILS_RS_PROBE_ONLY": "1"})
+    assert probe.returncode == 0, probe.stderr
+    # The probe reports the snapshot; it does not execute the tool.
+    assert Path(probe.stdout.strip()) == published[0]
+
+    warm = _run_launcher(root, extra_env={"AGENT_UTILS_RS_NO_BUILD": "1"})
+    assert warm.returncode == 0, warm.stderr
+    assert warm.stdout == "v1\n"
+    assert "cache=verified" in warm.stderr
+
+
+def test_no_build_does_not_block_the_ensure_prebuild(tmp_path: Path) -> None:
+    """An environment carrying NO_BUILD permanently can still run its pin-bump prebuild."""
+    root = _build_sandbox(tmp_path)
+    ensured = _run_launcher(
+        root, ensure_only=True, extra_env={"AGENT_UTILS_RS_NO_BUILD": "1"}
+    )
+    assert ensured.returncode == 0, ensured.stderr
+    assert Path(ensured.stdout.strip()).is_file()

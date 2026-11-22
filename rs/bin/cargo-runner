@@ -20,6 +20,13 @@
 # fsmonitor, and untracked caches are trusted exactly as `git status` trusts them. The slow path
 # also skips Cargo entirely when that fingerprint, the target hash, and the toolchain token
 # already match the stamp.
+#
+# Caller modes (environment): AGENT_UTILS_RS_ENSURE_ONLY=1 is the install/pin-bump prebuild: it
+# takes the slow path, publishes the verified snapshot, prints the Cargo target path, and exits
+# without executing the tool. AGENT_UTILS_RS_NO_BUILD=1 refuses (127) rather than take the slow
+# path, for installs whose callers must never pay a lazy first-call build inside their own locks;
+# the message names the ensure prebuild. AGENT_UTILS_RS_PROBE_ONLY=1 prints the verified snapshot
+# path and exits 0 when warm, exits 75 when cold, and never locks, builds, or executes the tool.
 set -euo pipefail
 
 CALLER_CWD="$PWD"
@@ -343,14 +350,35 @@ if [[ "${AGENT_UTILS_RS_ENSURE_ONLY:-}" != "1" ]]; then
         FAST_SNAPSHOT_SHA="$(sha256sum -- "$FAST_SNAPSHOT" 2>/dev/null || true)"
         if [[ "${FAST_SNAPSHOT_SHA%% *}" == "$ST_BINARY" ]] &&
           fast_git_state && [[ "$FAST_HEAD_NOW" == "$ST_HEAD" ]]; then
+          if [[ "${AGENT_UTILS_RS_PROBE_ONLY:-}" == "1" ]]; then
+            # Probe: report the verified snapshot without executing the tool.
+            printf '%s\n' "$FAST_SNAPSHOT"
+            exit 0
+          fi
           echo "[$TOOL] rust cache=verified source=${ST_SOURCE:0:12} binary=${ST_BINARY:0:12}" >&2
           cd "$CALLER_CWD"
-          unset AGENT_UTILS_RS_ENSURE_ONLY
+          unset AGENT_UTILS_RS_ENSURE_ONLY AGENT_UTILS_RS_NO_BUILD AGENT_UTILS_RS_PROBE_ONLY
           exec "$FAST_SNAPSHOT" "$@"
         fi
       fi
     fi
   fi
+fi
+
+# Probe-only callers learn warm/cold here without the lock, Cargo, or a build: reaching this
+# point means the fast warm path missed. Exit 75 (tempfail) distinguishes "cold" from refusals.
+if [[ "${AGENT_UTILS_RS_PROBE_ONLY:-}" == "1" ]]; then
+  echo "[$TOOL] rust cache=cold (no verified snapshot for the current source)" >&2
+  exit 75
+fi
+
+# No-build callers refuse here instead of taking the cache lock: installs that prebuild at
+# pin-bump time must never pay a lazy first-call build inside a caller's own lock (a wrkslots
+# caller's registry/validation lock included). Ensure-only IS the prebuild, so it is exempt.
+if [[ "${AGENT_UTILS_RS_NO_BUILD:-}" == "1" && "${AGENT_UTILS_RS_ENSURE_ONLY:-}" != "1" ]]; then
+  echo "[$TOOL] AGENT_UTILS_RS_NO_BUILD=1 and no verified Rust snapshot is published for the current source" >&2
+  echo "[$TOOL] prebuild outside any lock with: AGENT_UTILS_RS_ENSURE_ONLY=1 rs/bin/$TOOL (or ./setup rs)" >&2
+  exit 127
 fi
 
 # Slow path only from here: it needs the full toolchain, so pay for its discovery now.
@@ -628,47 +656,47 @@ while ((attempt <= 3)); do
     continue
   fi
 
-  if [[ "${AGENT_UTILS_RS_ENSURE_ONLY:-}" != "1" ]]; then
-    # Publish a named, content-addressed copy outside the deletable Cargo target. The stable name is
-    # required because dagrun and cpuset-alloc use current_exe() for containment re-exec.
-    # Existing snapshots are rehashed and never overwritten when valid.
-    SNAPSHOT_DIR="$ROOT/rs/.agent-utils-snapshots/$TOOL/$binary_sha"
-    SNAPSHOT="$SNAPSHOT_DIR/$TOOL"
-    mkdir -p "$SNAPSHOT_DIR"
-    snapshot_ok=0
-    if [[ -f "$SNAPSHOT" && -x "$SNAPSHOT" ]]; then
-      snapshot_sha="$(sha256sum -- "$SNAPSHOT" | cut -d' ' -f1)"
-      if [[ "$snapshot_sha" == "$binary_sha" ]]; then
-        snapshot_ok=1
-      fi
+  # Publish a named, content-addressed copy outside the deletable Cargo target. The stable name is
+  # required because dagrun and cpuset-alloc use current_exe() for containment re-exec.
+  # Existing snapshots are rehashed and never overwritten when valid. Ensure-only callers
+  # publish too: an install/pin-bump prebuild must leave the fast warm path ready to exec,
+  # or the first real call pays the slow path (lock, fingerprint, publish) lazily.
+  SNAPSHOT_DIR="$ROOT/rs/.agent-utils-snapshots/$TOOL/$binary_sha"
+  SNAPSHOT="$SNAPSHOT_DIR/$TOOL"
+  mkdir -p "$SNAPSHOT_DIR"
+  snapshot_ok=0
+  if [[ -f "$SNAPSHOT" && -x "$SNAPSHOT" ]]; then
+    snapshot_sha="$(sha256sum -- "$SNAPSHOT" | cut -d' ' -f1)"
+    if [[ "$snapshot_sha" == "$binary_sha" ]]; then
+      snapshot_ok=1
     fi
-    if [[ "$snapshot_ok" == "0" ]]; then
-      launch_tmp="$(mktemp "$SNAPSHOT_DIR/.${TOOL}.XXXXXX")"
-      if ! cp --reflink=auto --preserve=mode -- "$TARGET" "$launch_tmp"; then
-        rm -f -- "$launch_tmp"
-        echo "[$TOOL] could not snapshot the verified Rust artifact" >&2
-        exit 3
-      fi
-      launch_sha="$(sha256sum -- "$launch_tmp" | cut -d' ' -f1)"
-      if [[ "$launch_sha" != "$binary_sha" || ! -x "$launch_tmp" ]]; then
-        rm -f -- "$launch_tmp"
-        echo "[$TOOL] verified Rust artifact changed while preparing execution" >&2
-        exit 3
-      fi
-      mv -f -- "$launch_tmp" "$SNAPSHOT"
-    fi
-    if [[ ! -x "$SNAPSHOT" ]]; then
-      echo "[$TOOL] verified Rust snapshot is not executable: $SNAPSHOT" >&2
+  fi
+  if [[ "$snapshot_ok" == "0" ]]; then
+    launch_tmp="$(mktemp "$SNAPSHOT_DIR/.${TOOL}.XXXXXX")"
+    if ! cp --reflink=auto --preserve=mode -- "$TARGET" "$launch_tmp"; then
+      rm -f -- "$launch_tmp"
+      echo "[$TOOL] could not snapshot the verified Rust artifact" >&2
       exit 3
     fi
-
-    # Snapshotting may take long enough for an editor to advance source after the earlier check.
-    if [[ "$("$FINGERPRINT")" != "$source_after" ]]; then
-      refresh_package
-      echo "[$TOOL] Rust source changed while snapshotting; retrying ($attempt/3)" >&2
-      attempt=$((attempt + 1))
-      continue
+    launch_sha="$(sha256sum -- "$launch_tmp" | cut -d' ' -f1)"
+    if [[ "$launch_sha" != "$binary_sha" || ! -x "$launch_tmp" ]]; then
+      rm -f -- "$launch_tmp"
+      echo "[$TOOL] verified Rust artifact changed while preparing execution" >&2
+      exit 3
     fi
+    mv -f -- "$launch_tmp" "$SNAPSHOT"
+  fi
+  if [[ ! -x "$SNAPSHOT" ]]; then
+    echo "[$TOOL] verified Rust snapshot is not executable: $SNAPSHOT" >&2
+    exit 3
+  fi
+
+  # Snapshotting may take long enough for an editor to advance source after the earlier check.
+  if [[ "$("$FINGERPRINT")" != "$source_after" ]]; then
+    refresh_package
+    echo "[$TOOL] Rust source changed while snapshotting; retrying ($attempt/3)" >&2
+    attempt=$((attempt + 1))
+    continue
   fi
 
   if [[ "$cache_state" == "verified" && "$before_binary" == "$binary_sha" ]]; then
@@ -695,5 +723,5 @@ fi
 flock -u 9
 exec 9>&-
 cd "$CALLER_CWD"
-unset AGENT_UTILS_RS_ENSURE_ONLY
+unset AGENT_UTILS_RS_ENSURE_ONLY AGENT_UTILS_RS_NO_BUILD AGENT_UTILS_RS_PROBE_ONLY
 exec "$SNAPSHOT" "$@"

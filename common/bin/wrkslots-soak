@@ -10,7 +10,9 @@
 # WRKSLOTSD_FIXTURE_WRITER=1 is set for the soak; a Rust refusal is
 # final (logged edition=rust), never a silent Python rerun. The one
 # pre-dispatch exception is image-mode create: it is not a covered Rust
-# command yet, so it is handed to Python before Rust runs.
+# command yet, so it is handed to Python before Rust runs. With
+# AGENT_UTILS_RS_NO_BUILD=1 a cold Rust snapshot likewise never builds
+# here: readers-only mode serves Python with a note, full soak refuses.
 set -u
 
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -114,6 +116,24 @@ case "$CMD" in
         RUST_CMD="$CMD" ;;
     *) run_python "$CMD" "${ORIGINAL[@]}" ;;
 esac
+
+# Cold-cache gate for no-build installs: the first Rust touch of a cold
+# checkout would otherwise be the validate-config/--help probes below,
+# paying a lazy build (under the checkout cache lock) inside this call.
+# Probe instead (never locks, builds, or executes the tool). Cold in
+# readers-only mode serves Python with this note, loudly, never silently;
+# cold in full soak refuses, since the operator asked for Rust by name.
+if [[ "${AGENT_UTILS_RS_NO_BUILD:-}" == "1" ]]; then
+    if ! AGENT_UTILS_RS_PROBE_ONLY=1 "$ROOT/rs/bin/wrkslotsd" >/dev/null 2>&1; then
+        if [[ "${WRKSLOTS_SOAK_READERS_ONLY:-}" == "1" ]]; then
+            PYTHON_NOTE="rust snapshot not prebuilt (AGENT_UTILS_RS_NO_BUILD)"
+            run_python "$CMD" "${ORIGINAL[@]}"
+        fi
+        echo "[wrkslots] $CMD: rust snapshot not prebuilt and AGENT_UTILS_RS_NO_BUILD=1; refusing (prebuild outside any lock with AGENT_UTILS_RS_ENSURE_ONLY=1 rs/bin/wrkslotsd)" >&2
+        log_invocation "$CMD" rust 127 0
+        exit 127
+    fi
+fi
 
 # Image-backed create is not a covered Rust command. Resolve its
 # representation before dispatch, using Rust's own normalized config for

@@ -21,6 +21,10 @@ RESOLVER = AU_ROOT / "common" / "bin" / "engine-resolver"
 SOAK = AU_ROOT / "common" / "bin" / "wrkslots-soak"
 
 STUB_RUST = """#!/bin/sh
+if [ "$AGENT_UTILS_RS_PROBE_ONLY" = "1" ]; then
+  if [ -f ./rust-cold ]; then echo "stub cache=cold" >&2; exit 75; fi
+  echo "stub-snapshot-path"; exit 0;
+fi
 case "$1" in
   --help) echo "wrkslotsd stub" ;;
   parse-status)
@@ -118,7 +122,11 @@ def _sandbox(tmp_path: Path) -> tuple[Path, Path]:
 
 
 def _run(
-    root: Path, log: Path, *args: str, readers_only: bool = False
+    root: Path,
+    log: Path,
+    *args: str,
+    readers_only: bool = False,
+    extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = {
         key: value
@@ -130,11 +138,16 @@ def _run(
             "WRKSLOTS_ENGINE",
             "WRKSLOTS_SOAK_READERS_ONLY",
             "CI_HUB_PYTHON",
+            "AGENT_UTILS_RS_NO_BUILD",
+            "AGENT_UTILS_RS_PROBE_ONLY",
+            "AGENT_UTILS_RS_ENSURE_ONLY",
         )
     }
     env["WRKSLOTS_ENGINE"] = "rust-soak"
     if readers_only:
         env["WRKSLOTS_SOAK_READERS_ONLY"] = "1"
+    if extra_env:
+        env.update(extra_env)
     env["WRKSLOTS_SOAK_LOG"] = str(log)
     return subprocess.run(
         [str(root / "common" / "bin" / "wrkslots"), *args],
@@ -446,3 +459,56 @@ def test_every_route_keeps_the_callers_directory_through_a_symlinked_launcher(
         assert len(lines) == 1, (route, result.stdout)
         assert f" cwd={slot.resolve()} " in lines[0], (route, lines[0])
         assert "--root" not in lines[0], (route, lines[0])
+
+
+def test_no_build_cold_readers_serves_python(tmp_path: Path) -> None:
+    """A no-build install never pays a lazy build for a reader: cold serves Python."""
+    root, log = _sandbox(tmp_path)
+    (root / "rust-cold").write_text("cold\n")
+    result = _run(
+        root,
+        log,
+        "status",
+        readers_only=True,
+        extra_env={"AGENT_UTILS_RS_NO_BUILD": "1"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("PY wrkslots status")
+    assert "rust snapshot not prebuilt" in result.stderr
+    assert "cmd=status edition=python" in log.read_text()
+
+
+def test_no_build_warm_readers_runs_rust(tmp_path: Path) -> None:
+    root, log = _sandbox(tmp_path)
+    result = _run(
+        root,
+        log,
+        "status",
+        readers_only=True,
+        extra_env={"AGENT_UTILS_RS_NO_BUILD": "1"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("RS status-text status-text")
+    assert "cmd=status edition=rust rc=0" in log.read_text()
+
+
+def test_no_build_cold_full_soak_refuses(tmp_path: Path) -> None:
+    """Full soak asked for Rust by name: a cold no-build refusal is final, not a fallback."""
+    root, log = _sandbox(tmp_path)
+    (root / "rust-cold").write_text("cold\n")
+    result = _run(
+        root, log, "status", extra_env={"AGENT_UTILS_RS_NO_BUILD": "1"}
+    )
+    assert result.returncode == 127
+    assert result.stdout == ""
+    assert "refusing" in result.stderr
+    assert "cmd=status edition=rust rc=127" in log.read_text()
+
+
+def test_cold_without_no_build_still_dispatches_rust(tmp_path: Path) -> None:
+    """Without the no-build contract the probe gate is inert (development checkouts build)."""
+    root, log = _sandbox(tmp_path)
+    (root / "rust-cold").write_text("cold\n")
+    result = _run(root, log, "status", readers_only=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("RS status-text status-text")
