@@ -530,6 +530,7 @@
         "py/wrkslots/tests/test_record_holds_rust.py",
         "py/wrkslots/tests/test_recover_abort_own.py",
         "py/wrkslots/tests/test_recover_absent_bounded.py",
+        "py/wrkslots/tests/test_recover_absent_outside_lock.py",
         "py/wrkslots/tests/test_recover_absent_precheck.py",
         "py/wrkslots/tests/test_recover_absent_write_rust.py",
         "py/wrkslots/tests/test_recover_batch_text_rust.py",

@@ -286,110 +286,88 @@ fn refusal_payload(
     Some(json!({"schema": 1, "rows": out}))
 }
 
-/// Recover absent validation rows named by the input file. On
-/// refusal, also returns the outcome payload Python prints first.
-pub(crate) fn recover_absent_validate_rows_wrapped(
+/// Bounded re-reads before the locked fallback (#2125), as in
+/// the Python edition's `_HISTORY_RECHECK_ATTEMPTS`.
+const HISTORY_RECHECK_ATTEMPTS: usize = 3;
+
+/// The cheap proof a prove-then-recheck mutation compares (#2125):
+/// per machine, the event log's file count and last file's digest
+/// plus both snapshot revisions, and the on-disk journal names.
+/// Reading it never folds a chain, so comparing it under the
+/// mutation locks costs milliseconds on a long history. `None`
+/// when any piece cannot be read; the caller then takes the
+/// ordinary locked path, exactly as before #2125. Mirrors the
+/// Python edition's `_history_tip_proof` (which additionally
+/// proves each ACTIVE snapshot against its event index).
+fn history_proof(
     root: Option<&Path>,
-    machine_override: Option<&str>,
-    input: &Path,
-    apply: bool,
-    coordinator_authorized: bool,
-    coordinator_pid: Option<i64>,
-) -> (Option<Value>, Result<Value>) {
-    match recover_absent_validate_rows(
-        root,
-        machine_override,
-        input,
-        apply,
-        coordinator_authorized,
-        coordinator_pid,
-    ) {
-        Ok(value) => (None, Ok(value)),
-        Err(message) => (
-            refusal_payload(root, machine_override, input, &message),
-            Err(message),
-        ),
+    cfg: &Cfg,
+) -> Option<(Vec<(String, u64, String, i64, i64)>, Vec<String>)> {
+    let machines = crate::global_state::discover_machines(&cfg.control).ok()?;
+    let mut proof = Vec::new();
+    for machine in &machines {
+        let directory = cfg.control.join(format!("EVENTS.{machine}"));
+        let mut names: Vec<String> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&directory) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.ends_with(".json") {
+                    names.push(name);
+                }
+            }
+        }
+        names.sort();
+        let (count, tip) = match names.last() {
+            Some(last) => {
+                let text = std::fs::read_to_string(directory.join(last)).ok()?;
+                let raw: Value = serde_json::from_str(&text).ok()?;
+                (
+                    names.len() as u64,
+                    raw.get("sha256").and_then(Value::as_str)?.to_string(),
+                )
+            }
+            None => (0, String::new()),
+        };
+        let (active, _order) =
+            crate::active_state::parse_state_ordered(root, Some(machine)).ok()?;
+        let active_revision = active.get("revision").and_then(Value::as_i64)?;
+        let archive = crate::archive_state::parse_archive(root, Some(machine)).ok()?;
+        let archive_revision = archive.get("revision").and_then(Value::as_i64).unwrap_or(0);
+        proof.push((
+            machine.clone(),
+            count,
+            tip,
+            active_revision,
+            archive_revision,
+        ));
+    }
+    let mut journals: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(&cfg.control).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".journal") || name.contains(".journal.tmp.") {
+            journals.push(name);
+        }
+    }
+    journals.sort();
+    Some((proof, journals))
+}
+
+/// Whether no interrupted-mutation journal is outstanding, judged
+/// without the locks; the locked path re-judges journals itself.
+fn journals_absent(root: Option<&Path>) -> bool {
+    match crate::journals_state::parse_journals(root) {
+        Ok(enumerated) => enumerated
+            .get("journals")
+            .and_then(Value::as_array)
+            .is_some_and(|names| names.is_empty()),
+        Err(_) => false,
     }
 }
 
-/// Recover absent validation rows named by the input file.
-pub(crate) fn recover_absent_validate_rows(
-    root: Option<&Path>,
-    machine_override: Option<&str>,
-    input: &Path,
-    apply: bool,
-    coordinator_authorized: bool,
-    coordinator_pid: Option<i64>,
-) -> Result<Value> {
-    require_fixture()?;
-    let (cfg, selected) = load_cfg(root, machine_override)?;
-    validate_name(&selected, "machine")?;
-    let (input_sha256, rows) = read_input(&cfg, input)?;
-    let local = short_hostname()?;
-    if selected != local {
-        return Err(format!(
-            "absent validation rows belong to {selected}, but liveness evidence is local to {local}; run this command on {selected}"
-        ));
-    }
-    if apply {
-        if !coordinator_authorized {
-            return Err(
-                "absent validation row recovery requires --coordinator-authorized with --apply"
-                    .to_string(),
-            );
-        }
-        let pid = coordinator_pid.ok_or("--apply requires --coordinator-pid")?;
-        read_process_identity(pid)?;
-    }
-    let _locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
-    refuse_partial_state(&cfg.control)?;
-    // Interrupted-batch journal outcomes.
-    {
-        let enumerated = crate::journals_state::parse_journals(root)?;
-        let names = enumerated
-            .get("journals")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        if names.len() > 1 {
-            return Err("multiple interrupted mutations require inspection".to_string());
-        }
-        if let Some(name) = names.first().and_then(Value::as_str) {
-            let path: PathBuf = cfg.control.join(name);
-            let text = match std::fs::read_to_string(&path) {
-                Ok(text) => text,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    // An event-pending journal with no file on disk:
-                    // Python falls back to the pending mapping; the
-                    // kind/input judgement cannot be made here.
-                    return Err(format!(
-                        "another interrupted mutation is recorded in {}; run wrkslots recover",
-                        path.display()
-                    ));
-                }
-                Err(error) => {
-                    return Err(format!("cannot read recovery journal: {error}"));
-                }
-            };
-            let raw: Value = serde_json::from_str(&text)
-                .map_err(|error| format!("cannot read recovery journal: {error}"))?;
-            if raw.get("kind").and_then(Value::as_str) != Some("recover-absent-validate-rows") {
-                return Err(format!(
-                    "another interrupted mutation is recorded in {}; run wrkslots recover",
-                    path.display()
-                ));
-            }
-            if raw.get("input_sha256").and_then(Value::as_str) != Some(input_sha256.as_str()) {
-                return Err(
-                    "absent-validation-row input differs from the interrupted batch".to_string(),
-                );
-            }
-            return Err(
-                "resuming an interrupted absent-validation-row batch stays with the Python edition for now"
-                    .to_string(),
-            );
-        }
-    }
+/// The history-folding outcome computation, shared by the
+/// prove-then-recheck rounds (no locks held) and the ordinary
+/// locked path (#2125).
+fn recover_outcomes(root: Option<&Path>, cfg: &Cfg, selected: &str, rows: &[Row]) -> Result<Value> {
     validate_global(root, &cfg)?;
     let active = active_document(root, &cfg, &selected)?;
     let archives = crate::recover_absent_write::archives_document(&cfg, &selected)?;
@@ -403,7 +381,7 @@ pub(crate) fn recover_absent_validate_rows(
         .cloned()
         .unwrap_or_default();
     let mut outcomes: Vec<Value> = Vec::new();
-    for row in &rows {
+    for row in rows {
         if row.machine != selected {
             return Err(format!(
                 "every input row must name selected machine {selected}; use --machine for another shard"
@@ -484,7 +462,7 @@ pub(crate) fn recover_absent_validate_rows(
             .filter(|item| item.get("slot").and_then(Value::as_str) == Some(row.slot.as_str()))
             .collect();
         let exact = matching.len() == 1
-            && matching[0].get("machine").and_then(Value::as_str) == Some(selected.as_str())
+            && matching[0].get("machine").and_then(Value::as_str) == Some(selected)
             && matching[0].get("generation").and_then(Value::as_i64) == Some(row.generation)
             && matching[0].get("slot_type").and_then(Value::as_str) == Some("validate")
             && matching[0].get("physical_storage").and_then(Value::as_str) == Some("removed")
@@ -504,6 +482,141 @@ pub(crate) fn recover_absent_validate_rows(
         }));
     }
     Ok(json!({"schema": 1, "rows": outcomes}))
+}
+
+/// Recover absent validation rows named by the input file. On
+/// refusal, also returns the outcome payload Python prints first.
+pub(crate) fn recover_absent_validate_rows_wrapped(
+    root: Option<&Path>,
+    machine_override: Option<&str>,
+    input: &Path,
+    apply: bool,
+    coordinator_authorized: bool,
+    coordinator_pid: Option<i64>,
+) -> (Option<Value>, Result<Value>) {
+    match recover_absent_validate_rows(
+        root,
+        machine_override,
+        input,
+        apply,
+        coordinator_authorized,
+        coordinator_pid,
+    ) {
+        Ok(value) => (None, Ok(value)),
+        Err(message) => (
+            refusal_payload(root, machine_override, input, &message),
+            Err(message),
+        ),
+    }
+}
+
+/// Recover absent validation rows named by the input file.
+pub(crate) fn recover_absent_validate_rows(
+    root: Option<&Path>,
+    machine_override: Option<&str>,
+    input: &Path,
+    apply: bool,
+    coordinator_authorized: bool,
+    coordinator_pid: Option<i64>,
+) -> Result<Value> {
+    require_fixture()?;
+    let (cfg, selected) = load_cfg(root, machine_override)?;
+    validate_name(&selected, "machine")?;
+    let (input_sha256, rows) = read_input(&cfg, input)?;
+    let local = short_hostname()?;
+    if selected != local {
+        return Err(format!(
+            "absent validation rows belong to {selected}, but liveness evidence is local to {local}; run this command on {selected}"
+        ));
+    }
+    if apply {
+        if !coordinator_authorized {
+            return Err(
+                "absent validation row recovery requires --coordinator-authorized with --apply"
+                    .to_string(),
+            );
+        }
+        let pid = coordinator_pid.ok_or("--apply requires --coordinator-pid")?;
+        read_process_identity(pid)?;
+    }
+    // Prove-then-recheck (#2125): fold the history and judge every
+    // row WITHOUT the mutation locks, then take them and return the
+    // prepared outcome only when the cheap proof shows the history
+    // has not moved since the fold. A moved history is re-read
+    // (bounded rounds); an unprovable one, an outstanding journal
+    // (the locked path below judges journals, as before), or
+    // exhausted rounds take the ordinary locked path unchanged.
+    for _round in 0..HISTORY_RECHECK_ATTEMPTS {
+        let Some(proof) = history_proof(root, &cfg) else {
+            break;
+        };
+        if !journals_absent(root) {
+            break;
+        }
+        let prepared = recover_outcomes(root, &cfg, &selected, &rows);
+        if let Err(message) = &prepared {
+            if history_proof(root, &cfg).as_ref() == Some(&proof) {
+                return Err(message.clone());
+            }
+            continue;
+        }
+        let _locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
+        if history_proof(root, &cfg).as_ref() != Some(&proof) {
+            continue;
+        }
+        refuse_partial_state(&cfg.control)?;
+        return prepared;
+    }
+    let _locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
+    refuse_partial_state(&cfg.control)?;
+    // Interrupted-batch journal outcomes.
+    {
+        let enumerated = crate::journals_state::parse_journals(root)?;
+        let names = enumerated
+            .get("journals")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if names.len() > 1 {
+            return Err("multiple interrupted mutations require inspection".to_string());
+        }
+        if let Some(name) = names.first().and_then(Value::as_str) {
+            let path: PathBuf = cfg.control.join(name);
+            let text = match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // An event-pending journal with no file on disk:
+                    // Python falls back to the pending mapping; the
+                    // kind/input judgement cannot be made here.
+                    return Err(format!(
+                        "another interrupted mutation is recorded in {}; run wrkslots recover",
+                        path.display()
+                    ));
+                }
+                Err(error) => {
+                    return Err(format!("cannot read recovery journal: {error}"));
+                }
+            };
+            let raw: Value = serde_json::from_str(&text)
+                .map_err(|error| format!("cannot read recovery journal: {error}"))?;
+            if raw.get("kind").and_then(Value::as_str) != Some("recover-absent-validate-rows") {
+                return Err(format!(
+                    "another interrupted mutation is recorded in {}; run wrkslots recover",
+                    path.display()
+                ));
+            }
+            if raw.get("input_sha256").and_then(Value::as_str) != Some(input_sha256.as_str()) {
+                return Err(
+                    "absent-validation-row input differs from the interrupted batch".to_string(),
+                );
+            }
+            return Err(
+                "resuming an interrupted absent-validation-row batch stays with the Python edition for now"
+                    .to_string(),
+            );
+        }
+    }
+    recover_outcomes(root, &cfg, &selected, &rows)
 }
 
 #[cfg(test)]

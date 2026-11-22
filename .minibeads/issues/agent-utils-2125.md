@@ -24,3 +24,37 @@ Prove-then-recheck: read and replay the history outside the lock, take the locks
 # Notes
 
 Follow-up to #2088; event-store compaction stays in #1123. Filed by the coordinator.
+
+## Refinement (mu-lockread, 2026-11-22)
+
+Implemented prove-then-recheck for `recover-absent-validate-rows`
+(Python and Rust editions) and for the slot move
+`relocate-repository` (Python-only command):
+
+- `_history_tip_proof` captures, per machine, the event index tip
+  (sequence + digest, proven against the chain tip and the ACTIVE
+  snapshot revision via `_scoped_status_state`), the ARCHIVED
+  revision, and the on-disk journal names. No new persisted fields.
+- The history replay and plan run with no lock held; the locks are
+  taken only when the proof is unchanged, and the mutation then
+  skips its replays (prepared states thread through
+  `_plan_absent_validate_rows` / `_recover_absent_validate_rows`;
+  the batch-removal change guard and the hold check use the proven
+  state and the scoped index instead of folding the log).
+- A moved history is re-read for up to 3 rounds, then the command
+  falls back to the previous locked path unchanged. An outstanding
+  journal (the resume path) always takes the locked path.
+- The Rust edition mirrors this: the fold runs before
+  `acquire_mutation_locks`, gated by the same tip/revision proof,
+  with the locked path as fallback.
+
+Lock hold on a synthetic 20,000-event history (same fixture, base
+vs this change): 35.8 s under the locks before, 0.8-3.0 s after
+across runs (total command 35.8 s -> 14-22 s). At the reported
+95,000-event scale the before number extrapolates to the observed
+~2.3 minutes.
+
+Tests: `py/wrkslots/tests/test_recover_absent_outside_lock.py` -- a
+concurrent write between read and lock is detected and the read is
+redone (recover and relocate); a passing row on a padded history
+performs no history replay while the locks are held.

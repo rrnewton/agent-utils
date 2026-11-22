@@ -6696,6 +6696,41 @@ def _assert_not_held(config: Config, record: ActiveRecord) -> None:
 
 def _assert_absent_validate_rows_not_held(config: Config, records: Sequence[ActiveRecord]) -> None:
     slots = {record.slot for record in records}
+    # Scoped (#2125, after #2039): when the event index proves the
+    # ACTIVE snapshot current, each named slot's hold comes from its
+    # few sequence-addressed events instead of a fold of the whole
+    # log -- under the registry locks that fold outlasted every other
+    # step of a passing recovery. Anything unprovable (no usable
+    # index, an unreadable addressed event) takes the streamed path
+    # below, unchanged.
+    proven = _scoped_status_state(config, config.machine)
+    if proven is not None:
+        _snapshot, index = proven
+        slots_index = index.get("slots")
+        if isinstance(slots_index, dict):
+            scoped_holds: dict[str, Mapping[str, object] | None] = {}
+            scoped_complete = True
+            try:
+                for record in records:
+                    entry = slots_index.get(record.slot)
+                    scoped_holds[record.slot] = _scoped_slot_hold(
+                        config,
+                        config.machine,
+                        record.slot,
+                        entry if isinstance(entry, dict) else {},
+                    )
+            except (OSError, Refusal, StateError, ValueError):
+                scoped_complete = False
+            if scoped_complete:
+                for record in records:
+                    selected_hold = scoped_holds.get(record.slot)
+                    if selected_hold is not None:
+                        raise Refusal(
+                            f"slot {record.slot} is held: "
+                            f"{_as_str(selected_hold.get('reason'), 'slot hold.reason')}; run 'wrkslots "
+                            f"unhold {record.slot}' only when the hold is no longer needed"
+                        )
+                return
     # Streamed (#1931): only the named slots' hold state is derived, one
     # verified event at a time; the empty-log snapshot branch is unchanged.
     events: Iterable[Mapping[str, object]] = _iter_events(config, config.machine)
@@ -12028,6 +12063,7 @@ def _write_active_rows_removed(
     *,
     evidence_by_slot: Mapping[str, Mapping[str, object]] | None = None,
     event_writer: _EventWriter | None = None,
+    previous_verified: bool = False,
 ) -> ActiveState:
     names = tuple(_validate_name(slot, "slot") for slot in slots)
     if not names or len(names) != len(set(names)):
@@ -12037,9 +12073,16 @@ def _write_active_rows_removed(
     if missing:
         raise StateError(f"cannot batch-remove missing slot {missing[0]}")
     _ensure_event_log(config, state.machine)
-    previous = _load_active(config, state.machine, stream_events=True)
-    if previous != state:
-        raise StateError("active state changed before batch removal")
+    if previous_verified:
+        # Prove-then-recheck (#2125): the caller proved the history
+        # unchanged under the registry locks, so the state it hands
+        # over is the log's end; the change guard below would only
+        # re-fold the whole log to learn that.
+        previous = state
+    else:
+        previous = _load_active(config, state.machine, stream_events=True)
+        if previous != state:
+            raise StateError("active state changed before batch removal")
     revision = state.revision
     payloads: list[dict[str, object]] = []
     for slot in names:
@@ -50883,9 +50926,23 @@ def _cmd_relocate_repository(args: argparse.Namespace) -> int:
             raise Refusal("--apply requires --coordinator-pid")
         coordinator = _capture_caller_process(args.coordinator_pid, "coordinator")
     vcs = _GitVcs()
-    with _mutation_locks(config, args.wait_lock):
-        _refuse_partial_state(config)
-        _assert_no_journal(config)
+
+    def prepare() -> tuple[
+        list[ActiveState],
+        list[ArchiveState],
+        dict[tuple[str, str, str], object],
+        ActiveState,
+        list[tuple[ActiveRecord, Checkout, bool, bool]],
+        list[str],
+        object,
+    ]:
+        """Replay the history and judge every Git witness (#2125).
+
+        Runs with no registry lock held; the caller either proves
+        the history unchanged under the locks before committing
+        this plan, or runs it there directly, as before #2125.
+        """
+
         states, archives = _validate_global_state(config, require_repository=False)
         before = _global_rows(states, archives)
         state = _load_active(config, require_repository=False)
@@ -50978,6 +51035,22 @@ def _cmd_relocate_repository(args: argparse.Namespace) -> int:
                 f"no checkout recorded under {source!r} is present, so nothing proves that "
                 f"{target!r} is the same repository. {tail}"
             )
+        return states, archives, before, state, planned, witnesses, common
+
+    def commit(
+        prepared: tuple[
+            list[ActiveState],
+            list[ArchiveState],
+            dict[tuple[str, str, str], object],
+            ActiveState,
+            list[tuple[ActiveRecord, Checkout, bool, bool]],
+            list[str],
+            object,
+        ],
+        *,
+        proven: bool,
+    ) -> int:
+        states, archives, before, state, planned, witnesses, common = prepared
         print(
             f"REPOSITORY machine={config.machine} from={source} to={target} "
             f"common_directory={common} witnesses={','.join(witnesses)}"
@@ -51049,14 +51122,61 @@ def _cmd_relocate_repository(args: argparse.Namespace) -> int:
         expected = dict(before)
         for slot in {record.slot for record, _checkout, _present, _branch in planned}:
             expected[("active", config.machine, slot)] = _record_to_obj(relocated[slot])
-        after_states, after_archives = _validate_global_state(
-            config, require_repository=False
-        )
+        if proven:
+            # Prove-then-recheck (#2125): the proof held when the locks
+            # were taken and this relocation's writes are the only
+            # changes since, so prove they landed by reading the ACTIVE
+            # snapshot back instead of replaying the whole history.
+            readback = _load_active_snapshot(
+                config, config.machine, require_repository=False
+            )
+            after_states = [
+                readback if item.machine == config.machine else item
+                for item in states
+            ]
+            readback_archive = _load_archive_snapshot(config, config.machine)
+            after_archives = [
+                readback_archive if item.machine == config.machine else item
+                for item in archives
+            ]
+        else:
+            after_states, after_archives = _validate_global_state(
+                config, require_repository=False
+            )
         if _global_rows(after_states, after_archives) != expected:
             raise StateError("repository relocation changed an unrelated registry row")
-    return 0
+        return 0
 
-
+    # Prove-then-recheck (#2125): replay the history and judge the
+    # Git witnesses WITHOUT the registry locks, then take them and
+    # move the rows only when the event-index proof shows the
+    # history has not moved since the replay. A moved history is
+    # re-read (bounded rounds); an unprovable one, an outstanding
+    # journal (the locked path below judges journals, as before),
+    # or exhausted rounds take the ordinary locked path unchanged.
+    # A passing move's lock hold drops from the replay's minutes
+    # to the proof comparison's milliseconds.
+    for _round in range(_HISTORY_RECHECK_ATTEMPTS):
+        proof = _history_tip_proof(config)
+        if proof is None:
+            break
+        try:
+            if _outstanding_journals(config):
+                break
+            prepared = prepare()
+        except Refusal:
+            if _history_tip_proof(config) == proof:
+                raise
+            continue
+        with _mutation_locks(config, args.wait_lock):
+            if _history_tip_proof(config) != proof:
+                continue
+            _refuse_partial_state(config)
+            return commit(prepared, proven=True)
+    with _mutation_locks(config, args.wait_lock):
+        _refuse_partial_state(config)
+        _assert_no_journal(config)
+        return commit(prepare(), proven=False)
 @dataclasses.dataclass(frozen=True)
 class _TransferPrevalidated:
     """What a transfer-owner lock-free validation established (#1975).
@@ -64149,6 +64269,70 @@ def _scoped_status_state(
     if snapshot.revision != index.get("active_revision"):
         return None
     return snapshot, index
+
+
+#: Bounded re-reads of the event history before a prove-then-recheck
+#: mutation falls back to holding the registry locks across the replay
+#: (#2125), as `_run_prevalidated_mutation` bounds its rounds (#1276).
+_HISTORY_RECHECK_ATTEMPTS = 3
+
+
+def _history_tip_proof(
+    config: Config,
+) -> tuple[tuple[tuple[str, int | None, str | None, int, int], ...], tuple[str, ...]] | None:
+    """The cheap proof a prove-then-recheck mutation compares (#2125).
+
+    One entry per machine: the event index's tip (sequence and digest,
+    proven against the chain tip and the ACTIVE snapshot revision by
+    `_scoped_status_state`), the ARCHIVED snapshot revision, and the
+    on-disk journal file names. Reading it lists each event directory
+    and reads each log's last file and both snapshot files -- never a
+    replay -- so comparing it under the locks costs milliseconds even
+    on a 95,000-event history. Returns None when any machine's index
+    cannot prove its snapshot current; the caller then takes the
+    ordinary locked path, exactly as before #2125.
+    """
+
+    try:
+        machines = _state_machines(config)
+    except (OSError, StateError):
+        return None
+    proof: list[tuple[str, int | None, str | None, int, int]] = []
+    for machine in machines:
+        proven = _scoped_status_state(config, machine)
+        if proven is None:
+            return None
+        snapshot, index = proven
+        tip = index.get("tip")
+        if not isinstance(tip, dict):
+            return None
+        sequence = tip.get("sequence")
+        digest = tip.get("sha256")
+        try:
+            archive = _load_archive_snapshot(config, machine)
+        except (OSError, Refusal, StateError, ValueError):
+            return None
+        proof.append(
+            (
+                machine,
+                sequence if isinstance(sequence, int) else None,
+                digest if isinstance(digest, str) else None,
+                snapshot.revision,
+                archive.revision,
+            )
+        )
+    try:
+        journals = tuple(
+            sorted(
+                path.name
+                for path in config.control.iterdir()
+                if _registry_journal_name(path.name)
+                and (path.is_file() or path.is_symlink())
+            )
+        )
+    except OSError:
+        return None
+    return tuple(proof), journals
 
 
 def _scoped_slot_record_agrees(
@@ -98853,15 +99037,38 @@ def _absent_validate_rows_state(
 def _plan_absent_validate_rows(
     config: Config,
     items: Sequence[AbsentValidateRow],
+    *,
+    prepared: tuple[Sequence[ActiveState], Sequence[ArchiveState]] | None = None,
 ) -> tuple[tuple[AbsentValidateRow, ActiveRecord, dict[str, object]], ...]:
     if any(item.machine != config.machine for item in items):
         raise Refusal(
             f"every input row must name selected machine {config.machine}; use --machine "
             "for another shard"
         )
-    states, archives = _absent_validate_rows_state(
-        config, items, allow_exact_overlap=False, stream_events=True
-    )
+    if prepared is not None:
+        # Prove-then-recheck (#2125): the caller replayed the history
+        # outside the registry locks and proved it unchanged under
+        # them, so planning judges exactly that replay, not a second
+        # one. The overlap refusal the streamed loader raises is
+        # re-judged here from the prepared rows.
+        states, archives = list(prepared[0]), list(prepared[1])
+        active = {
+            record.slot: (state.machine, record)
+            for state in states
+            for record in state.slots
+        }
+        for archive in archives:
+            for archived in archive.records:
+                slot = _as_str(archived.get("slot"), "archive slot")
+                if slot in active:
+                    raise StateError(
+                        f"slot {slot!r} is active on {active[slot][0]} and archived on "
+                        f"{archive.machine}"
+                    )
+    else:
+        states, archives = _absent_validate_rows_state(
+            config, items, allow_exact_overlap=False, stream_events=True
+        )
     active_by_identity = {
         (state.machine, record.slot): record for state in states for record in state.slots
     }
@@ -99029,6 +99236,7 @@ def _recover_absent_validate_rows(
     safety_prechecked: bool = False,
     census_prechecked: bool = False,
     processes: _RecoveryProcesses | None = None,
+    prepared: tuple[Sequence[ActiveState], Sequence[ArchiveState]] | None = None,
 ) -> tuple[AbsentValidateRow, ...]:
     if path != _journal_path(config):
         raise StateError("absent-validation-row journal filename is invalid")
@@ -99050,12 +99258,20 @@ def _recover_absent_validate_rows(
     _assert_recovery_processes(coordinator, processes)
     cursor, items = _absent_validate_batch_items(config, raw)
     journal = dict(raw)
-    states, archives = _absent_validate_rows_state(
-        config,
-        tuple(item for item, _record, _entry in items),
-        allow_exact_overlap=True,
-        stream_events=True,
-    )
+    if prepared is not None:
+        # Prove-then-recheck (#2125): the caller replayed the history
+        # outside the registry locks and proved the event tips and
+        # snapshot revisions unchanged under them, so this replay of
+        # exactly that history is skipped. Every check below still
+        # runs against the prepared rows.
+        states, archives = list(prepared[0]), list(prepared[1])
+    else:
+        states, archives = _absent_validate_rows_state(
+            config,
+            tuple(item for item, _record, _entry in items),
+            allow_exact_overlap=True,
+            stream_events=True,
+        )
     active_state = next(state for state in states if state.machine == config.machine)
     archive_state = next(state for state in archives if state.machine == config.machine)
     active_by_slot = {record.slot: record for record in active_state.slots}
@@ -99160,6 +99376,7 @@ def _recover_absent_validate_rows(
                 for item, _record, entry in items
             },
             event_writer=writer,
+            previous_verified=prepared is not None,
         )
         _interrupt_for_test("after-absent-validate-active-delete")
     # EVENTS is authoritative.  A crash can occur after either append-only
@@ -99172,7 +99389,35 @@ def _recover_absent_validate_rows(
     # only in the fold, not in the snapshot files, so a snapshot
     # readback cannot prove it (#1701; the streamed fold of #1794
     # is the path to cheapen this load, not a snapshot shortcut).
-    states, archives = _validate_global_state_streamed(config)
+    if prepared is not None:
+        # Prove-then-recheck (#2125): the proof held when the locks
+        # were taken and this recovery's writes are the only changes
+        # since, so the fold's verdict is the prepared history plus
+        # exactly those writes. Prove the writes landed by reading
+        # both snapshot files back, then judge the same rows the
+        # fold would have produced.
+        readback_active = _load_active_snapshot(
+            config, config.machine, require_repository=False
+        )
+        readback_archive = _load_archive_snapshot(config, config.machine)
+        if _active_to_obj(readback_active) != _active_to_obj(active_state):
+            raise StateError(
+                "absent-validation-row recovery ACTIVE readback differs from its write"
+            )
+        if _archive_to_obj(readback_archive) != _archive_to_obj(archive_state):
+            raise StateError(
+                "absent-validation-row recovery ARCHIVED readback differs from its write"
+            )
+        states = [
+            active_state if state.machine == config.machine else state
+            for state in states
+        ]
+        archives = [
+            archive_state if archive.machine == config.machine else archive
+            for archive in archives
+        ]
+    else:
+        states, archives = _validate_global_state_streamed(config)
     active_by_identity = {
         (state.machine, record.slot): record for state in states for record in state.slots
     }
@@ -99367,6 +99612,121 @@ def _cmd_recover_absent_validate_rows(args: argparse.Namespace) -> int:
             except Exception:
                 pass
         census_prechecked = False
+        # Prove-then-recheck (#2125): replay the event history and plan
+        # WITHOUT the registry locks, then take them and mutate only
+        # when the event-index proof shows the history has not moved
+        # since the replay. A moved history is re-read (bounded
+        # rounds); an unprovable one, an outstanding journal (the
+        # resume path below judges journals under the locks, as
+        # before), or exhausted rounds take the ordinary locked path
+        # unchanged. A passing row's lock hold drops from the replay's
+        # minutes to the proof comparison's milliseconds, so slot
+        # heartbeats stop starving behind this command.
+        for _round in range(_HISTORY_RECHECK_ATTEMPTS):
+            proof = _history_tip_proof(config)
+            if proof is None:
+                break
+            try:
+                if _outstanding_journals(config, stream_events=True):
+                    break
+                prepared_states, prepared_archives = _validate_global_state_streamed(
+                    config
+                )
+                already_recovered_keys = _already_recovered_absent_validate_keys(
+                    prepared_archives, requested
+                )
+                planned = _plan_absent_validate_rows(
+                    config,
+                    requested,
+                    prepared=(prepared_states, prepared_archives),
+                )
+            except Refusal:
+                if _history_tip_proof(config) == proof:
+                    raise
+                continue
+            before = _global_rows(prepared_states, prepared_archives)
+            planned_keys = {
+                (item.machine, item.slot, item.generation)
+                for item, _record, _entry in planned
+            }
+            lock_started = time.monotonic()
+            with _mutation_locks(config, args.wait_lock):
+                if _history_tip_proof(config) != proof:
+                    continue
+                _refuse_partial_state(config)
+                if not args.apply:
+                    _emit_absent_validate_outcomes(
+                        [
+                            (
+                                item,
+                                (
+                                    "planned"
+                                    if (item.machine, item.slot, item.generation)
+                                    in planned_keys
+                                    else "already-recovered"
+                                ),
+                                (
+                                    f"read-only plan input_sha256={input_sha256}"
+                                    if (item.machine, item.slot, item.generation)
+                                    in planned_keys
+                                    else "exact archive already exists"
+                                ),
+                            )
+                            for item in requested
+                        ],
+                        args.format,
+                    )
+                    return 0
+                assert coordinator is not None
+                if planned:
+                    journal = _absent_validate_batch_journal(
+                        config, input_sha256, planned, coordinator
+                    )
+                    _write_journal(config, journal)
+                    _interrupt_for_test("after-absent-validate-batch-journal")
+                    try:
+                        _recover_absent_validate_rows(
+                            config,
+                            _journal_path(config),
+                            journal,
+                            coordinator,
+                            safety_prechecked=True,
+                            census_prechecked=census_prechecked,
+                            prepared=(prepared_states, prepared_archives),
+                        )
+                    except Refusal:
+                        # Same journal-release rule as the locked path
+                        # (#1554): release it only when every registry
+                        # row is unchanged.
+                        after_states, after_archives = (
+                            _validate_global_state_streamed(config)
+                        )
+                        if _global_rows(after_states, after_archives) == before:
+                            _clear_journal(config, journal)
+                        raise
+                _emit_absent_validate_outcomes(
+                    [
+                        (
+                            item,
+                            (
+                                "recovered"
+                                if (item.machine, item.slot, item.generation)
+                                in planned_keys
+                                else "already-recovered"
+                            ),
+                            (
+                                "archived with validation outcome unknown"
+                                if (item.machine, item.slot, item.generation)
+                                in planned_keys
+                                else "exact archive already existed"
+                            ),
+                        )
+                        for item in requested
+                    ],
+                    args.format,
+                    lock_seconds=time.monotonic() - lock_started,
+                )
+                return 0
         lock_started = time.monotonic()
         with _mutation_locks(config, args.wait_lock):
             _refuse_partial_state(config)
