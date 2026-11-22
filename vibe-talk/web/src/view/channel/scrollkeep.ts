@@ -897,7 +897,7 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     // then the redraw that folds the run once the write answers, then the
     // re-read landing that follows it — each held by the same three cases.
     // The loop ends when the anchor and the list's height have stood still
-    // for 45 frames after the act settles (frame-based, never a clock), when
+    // for 6 frames after the act settles (frame-based, never a clock), when
     // the reader wheels or touches, or when another owner writes the place
     // after the act settles (a keyboard scroll, a deliberate move): that
     // write owns the place now. The next-unread move waits for this settle
@@ -930,7 +930,7 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
         const height = area.scrollHeight;
         still = settled && off <= 0.5 && height === lastHeight ? still + 1 : 0;
         lastHeight = height;
-        if (still < 45) requestAnimationFrame(step);
+        if (still < 6) requestAnimationFrame(step);
         else shrinkActive = false;
       };
       requestAnimationFrame(step);

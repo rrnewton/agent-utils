@@ -63,6 +63,11 @@ STATE_S = 30.0
 STILL_PX = 0.5
 
 
+def px(value: object) -> float:
+    """A measured pixel value from a page answer, as a float."""
+    return float(value) if isinstance(value, (int, float)) else 0.0
+
+
 def message_id(index: int) -> str:
     return str(200 + index)
 
@@ -95,11 +100,13 @@ class ShrinkApi(fixture.FakeApi):
 
     def post(self, path: str, body: Json) -> tuple[int, Json]:
         if path.endswith("/dismiss"):
-            ids = [str(one) for one in (body.get("messages") or [])]
+            raw = body.get("messages")
+            ids = [str(one) for one in raw] if isinstance(raw, list) else []
             self.dismissed.update(ids)
             return 200, {"dismissed": ids}
         if path.endswith("/restore"):
-            ids = [str(one) for one in (body.get("messages") or [])]
+            raw = body.get("messages")
+            ids = [str(one) for one in raw] if isinstance(raw, list) else []
             self.dismissed.difference_update(ids)
             return 200, {"dismissed": []}
         return super().post(path, body)
@@ -259,9 +266,9 @@ SAMPLE = """(id) => new Promise((resolve) => {
 })""" % SNAP
 
 
-def collect_frames(page: Page, index: int, want_folded: bool) -> list[dict]:
+def collect_frames(page: Page, index: int, want_folded: bool) -> list[Json]:
     """Sample after the page's own frame work, until landed and still, then 30 more."""
-    frames: list[dict] = []
+    frames: list[Json] = []
     deadline = time.monotonic() + STATE_S
     while time.monotonic() < deadline and len(frames) < 240:
         frames.append(page.evaluate(SAMPLE, message_id(index)))
@@ -344,16 +351,16 @@ def archive_case(page: Page, label: str, index: int, offset: float, case: int) -
     frames = collect_frames(page, index, want_folded=True)
     check(len(frames) >= 6, f"{label}: case {case} sampled only {len(frames)} frames")
     if case == 1:
-        moved = max(abs(f["aboveY"] - before["aboveY"]) for f in frames if f["aboveY"] is not None)
+        moved = max(abs(px(f["aboveY"]) - px(before["aboveY"])) for f in frames if f["aboveY"] is not None)
         check(moved <= STILL_PX, f"{label}: case 1 content above moved {moved:.2f}px over {len(frames)} frames")
         return f"case1 above held {moved:.2f}px/{len(frames)}f"
     if case == 2:
-        moved = max(abs(f["belowY"] - before["belowY"]) for f in frames if f["belowY"] is not None)
+        moved = max(abs(px(f["belowY"]) - px(before["belowY"])) for f in frames if f["belowY"] is not None)
         check(moved <= STILL_PX, f"{label}: case 2 content below moved {moved:.2f}px over {len(frames)} frames")
         return f"case2 below held {moved:.2f}px/{len(frames)}f"
     landed = [f for f in frames if f["folded"] and f["seamY"] is not None]
     check(len(landed) > 0, f"{label}: case 3 never folded into its run")
-    off = max(abs(f["seamY"] - f["centre"]) for f in landed)
+    off = max(abs(px(f["seamY"]) - px(f["centre"])) for f in landed)
     check(off <= STILL_PX, f"{label}: case 3 seam sat {off:.2f}px off centre over {len(landed)} frames")
     return f"case3 seam {off:.2f}px off centre/{len(landed)}f"
 
@@ -384,7 +391,7 @@ def next_unread_case(page: Page, label: str, index: int) -> str:
             break
         shrink_frames.append(f)
     check(len(shrink_frames) >= 3, f"{label}: the move landed before the shrink could be measured")
-    moved = max((abs(f["aboveY"] - before["aboveY"]) for f in shrink_frames if f["aboveY"] is not None), default=0.0)
+    moved = max((abs(px(f["aboveY"]) - px(before["aboveY"])) for f in shrink_frames if f["aboveY"] is not None), default=0.0)
     check(moved <= STILL_PX, f"{label}: next-unread shrink moved the content above {moved:.2f}px")
     # The move is its own phase: it lands on the next unread row, after the shrink.
     until(page, f"() => document.querySelector('#discord-log > li[data-selected=\"true\"]')"
@@ -476,7 +483,7 @@ def fuzz(page: Page, api: ShrinkApi, seed: int, steps: int, label: str) -> str:
             settled(page)
             after = page.evaluate(SNAP, acted)
             if before and after and before["rowTop"] is not None and after["rowTop"] is not None:
-                delta = abs(after["rowTop"] - before["rowTop"])
+                delta = abs(px(after["rowTop"]) - px(before["rowTop"]))
                 check(delta <= STILL_PX,
                       f"fuzz seed={seed} step={step} {act} {acted}: touched top moved {delta:.2f}px")
             continue
@@ -504,15 +511,15 @@ def fuzz(page: Page, api: ShrinkApi, seed: int, steps: int, label: str) -> str:
         if after["folded"] and before["rowTop"] is not None:
             # Where it stood decides the case, as the page's rule reads it.
             if before["rowTop"] >= before["head"] - 1:
-                delta = abs(after["pageAboveY"] - before["pageAboveY"])
+                delta = abs(px(after["pageAboveY"]) - px(before["pageAboveY"]))
                 check(delta <= STILL_PX,
                       f"fuzz seed={seed} step={step} archive {acted} case1: above moved {delta:.2f}px")
             elif before["rowBottom"] <= before["foot"] + 1:
-                delta = abs(after["belowY"] - before["belowY"])
+                delta = abs(px(after["belowY"]) - px(before["belowY"]))
                 check(delta <= STILL_PX,
                       f"fuzz seed={seed} step={step} archive {acted} case2: below moved {delta:.2f}px")
             else:
-                off = abs(after["seamY"] - after["centre"])
+                off = abs(px(after["seamY"]) - px(after["centre"]))
                 check(off <= STILL_PX,
                       f"fuzz seed={seed} step={step} archive {acted} case3: seam {off:.2f}px off centre")
     return f"fuzz seed={seed}: {steps} steps held"

@@ -2308,11 +2308,11 @@ const doneAct = createDoneAct({
   // `#2091 vibe-talk-shrink-anchor-policy`: one row's Done in the channel list is
   // anchored by the scroll owner; a row of another list runs unheld, as before.
   preservingShrink: (row, act) => {
-    if (row.closest && row.closest("#discord-log")) preservingShrink(el("scroll-area"), row, channelPane.head(), channelPane.foot(), act);
+    if (row.closest && row.closest("#discord-log")) preservingShrink(el("scroll-area"), /** @type {any} */ (row), channelPane.head(), channelPane.foot(), act);
     else act();
   },
   preservingShrinkAsync: async (row, act) => {
-    if (row.closest && row.closest("#discord-log")) await preservingShrinkAsync(el("scroll-area"), row, channelPane.head(), channelPane.foot(), act);
+    if (row.closest && row.closest("#discord-log")) await preservingShrinkAsync(el("scroll-area"), /** @type {any} */ (row), channelPane.head(), channelPane.foot(), act);
     else await act();
   },
   idsOf: (row) => idsOf(/** @type {any} */ (row)), inColumn: (column, act) => inColumn(/** @type {any} */ (column), act), inOtherColumn: (act) => inOtherColumn(act),
