@@ -334,6 +334,9 @@ mod voice_prompt;
 #[path = "voice_relay.rs"]
 mod voice_relay;
 
+#[path = "voice_tool_boundary.rs"]
+mod voice_tool_boundary;
+
 #[path = "wit_tts.rs"]
 mod wit_tts;
 
