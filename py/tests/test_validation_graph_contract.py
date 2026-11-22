@@ -1504,3 +1504,49 @@ def test_per_component_selection_is_narrow() -> None:
     page = _selected_tags_for_paths(["vibe-talk/web/index.html"])
     assert any(tag.startswith("vibe-talk.") for tag in page)
     assert "timeline.browser.functional" not in page
+
+
+def _build_out_dirs(cmd: str) -> list[str]:
+    """Output directories a step's command builds a page into."""
+    tokens = shlex.split(cmd)
+    return [tokens[i + 1] for i, token in enumerate(tokens[:-1])
+            if token == "--out" and "build.mjs" in " ".join(tokens[max(0, i - 3):i + 1])]
+
+
+def test_no_two_concurrent_steps_write_the_same_output_directory() -> None:
+    """#2117: build.mjs replaces its whole output directory, so two
+    steps that can run at the same time must never write the same
+    one (a reader of the shared target/web died ENOENT mid-rebuild).
+    Writers of one directory must be ordered by dependency."""
+    config = dag_from_path(REPO_ROOT / "validation.dag.yaml")
+    by_tag = {step.tag: step for step in config.steps}
+
+    def ordered_before(a: str, b: str) -> bool:
+        seen: set[str] = set()
+        stack = list(by_tag[a].deps)
+        while stack:
+            dep = stack.pop()
+            if dep == b:
+                return True
+            if dep not in seen and dep in by_tag:
+                seen.add(dep)
+                stack.extend(by_tag[dep].deps)
+        return False
+
+    writers: dict[str, list[str]] = {}
+    for step in config.steps:
+        for out in _build_out_dirs(step.cmd):
+            writers.setdefault(out, []).append(step.tag)
+    for out, tags in writers.items():
+        for i, a in enumerate(tags):
+            for b in tags[i + 1:]:
+                assert ordered_before(a, b) or ordered_before(b, a), (
+                    f"{a} and {b} both write {out} and neither depends on the other")
+
+
+def test_quote_dismiss_serves_its_own_page_build() -> None:
+    """#2117: quote-dismiss no longer reads the shared target/web."""
+    config = dag_from_path(REPO_ROOT / "validation.dag.yaml")
+    step = next(s for s in config.steps if s.tag == "vibe-talk.check.quote-dismiss-browser")
+    assert "target/web-quote-dismiss" in step.cmd
+    assert "VIBE_TALK_WEB_ROOT=$PWD/target/web " not in step.cmd

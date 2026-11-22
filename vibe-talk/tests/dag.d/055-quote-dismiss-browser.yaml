@@ -3,9 +3,12 @@ steps:
     job: quote-dismiss-browser
     desc: The X beside the Quoted reply chip clears the selection and hides both, the card still expanded and the scroll unmoved, in current Chromium at 412x915
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/quote_dismiss_browser.py
+    # #2117: this step builds its OWN page copy (target/web-quote-dismiss) instead of
+    # serving the shared target/web: build.mjs replaces its output directory, so a
+    # reader of the shared build dies ENOENT whenever a rebuild lands mid-walk.
+    cmd: cd vibe-talk && ../scripts/with-node22 node web/build.mjs --out target/web-quote-dismiss && VIBE_TALK_WEB_ROOT=$PWD/target/web-quote-dismiss python3 tests/quote_dismiss_browser.py
     jobs_flag: ""
-    deps: [setup.contract-tools, build.page]
+    deps: [setup.contract-tools, setup.node22]
     timeout: 360
     cpu_timeout: 45
     hint:
