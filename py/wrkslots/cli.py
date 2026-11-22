@@ -51660,7 +51660,7 @@ def _refuse_absent_slot_without_sidecar(
 
 
 def _cmd_adopt_checkout(args: argparse.Namespace) -> int:
-    """Declare a nested linked worktree of another repository (#1400)."""
+    """Declare a nested linked worktree into a slot record (#1400, #2122)."""
 
     _reset_dead_mount_findings()
     config = _load_config(args.project_root, args.machine)
@@ -51698,6 +51698,26 @@ def _cmd_adopt_checkout(args: argparse.Namespace) -> int:
             raise Refusal(
                 f"adopt-checkout path must lie inside slot {record.slot}: {relative}"
             )
+        # #2122: a checkout row's path is always its slot's top-level
+        # directory named by the checkout (the loader invariant every
+        # reader enforces), so a worktree nested deeper -- inside
+        # another checkout, or under a subdirectory such as
+        # .muse/worktrees -- cannot be declared in place. Refuse here
+        # with the remedy instead of failing in the event-append check.
+        expected = _checkout_destination(
+            slot_directory, _record_layout(config, record), name
+        )
+        if path != expected:
+            raise Refusal(
+                "adopt-checkout can only declare "
+                f"{expected.relative_to(config.root).as_posix()}: a checkout "
+                "row's path is its slot's top-level directory named by the "
+                f"checkout, so the nested worktree at {relative} cannot be "
+                "declared in place. remedy: move it with 'git worktree move' "
+                "to that directory and rerun, or leave it undeclared -- "
+                "hold, heartbeat and transfer-owner tolerate a present "
+                "undeclared nested worktree with a warning"
+            )
         vcs = _GitVcs()
         if path.is_symlink() or not path.is_dir():
             raise Refusal(f"adopt-checkout path is not a real directory: {relative}")
@@ -51705,7 +51725,7 @@ def _cmd_adopt_checkout(args: argparse.Namespace) -> int:
         if not git_marker.exists() and not git_marker.is_symlink():
             raise Refusal(
                 f"{relative} is not a linked worktree: it has no .git marker; "
-                "declare only a linked worktree of another repository"
+                "declare only a linked worktree"
             )
         git_dir = Path(
             vcs._run(path, ["rev-parse", "--absolute-git-dir"]).stdout.strip()
@@ -102314,10 +102334,11 @@ usage or audit gate unknown, 3 fail-closed refusal.
 
     adopt_checkout = subparsers.add_parser(
         "adopt-checkout",
-        help="declare a nested linked worktree of another repository into a slot record",
+        help="declare a nested linked worktree into a slot record",
         description=(
-            "Declare an undeclared linked worktree of another repository that sits "
-            "inside an agent slot's directory, so removal salvages and archives it "
+            "Declare an undeclared linked worktree (of any repository, including "
+            "the slot's own) that sits at an agent slot's top-level checkout "
+            "directory, so removal salvages and archives it "
             "like any declared checkout. Verifies that the path is a clean linked "
             "worktree of a known repository (it registers the path, has the "
             "configured default remote with a URL, and its HEAD is on a branch). "

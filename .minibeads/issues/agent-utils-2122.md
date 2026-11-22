@@ -24,3 +24,30 @@ hold records the hold even when such registration drift exists, and reports the 
 # Notes
 
 Reported by a consumer's lead; filed by the coordinator.
+
+## Resolution notes (mu-holddrift)
+
+Hold: fixed. `hold` (Python `_cmd_hold`, Rust `hold_slot`) now tolerates a
+target slot's `git-registration-without-row` finding when the registered
+path is present, recording the hold and printing a warning that names the
+path, mirroring heartbeat (#1492) and transfer-owner. A registration whose
+path was deleted still refuses, as do all other storage findings. No new
+persisted field or event: the `slot-held` payload and HOLD record are
+unchanged, so older readers are unaffected. Differential-tested
+(`test_hold_write_rust.py`) plus lifecycle tests including that removal
+never proceeds on the held, drifted slot.
+
+Adopt-checkout: a same-repository nested worktree CAN be declared, but
+only at the slot's top-level checkout directory (`<slot>/<name>`). That is
+the only path a checkout row can name: the registry loader enforces
+`checkout.path == slot/<name>` for every reader, so a worktree nested
+deeper (inside another checkout, or under a subdirectory) cannot be
+represented without changing the persisted row shape and every reader
+that relies on the invariant. `adopt-checkout` now refuses such a path up
+front with the remedy (`git worktree move` to `<slot>/<name>`, then rerun;
+or leave it undeclared, since hold/heartbeat/transfer-owner now tolerate
+it with a warning) instead of failing in the event-append check. Covered
+by `test_adopt_checkout_declares_same_repository_nested_worktree` and
+`test_adopt_checkout_refuses_deeply_nested_worktree_with_remedy`.
+`adopt-checkout` remains Python-edition only in Rust (`wrkslotsd` stubs
+it), so no Rust change was needed for this part.

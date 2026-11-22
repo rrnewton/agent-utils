@@ -58320,6 +58320,89 @@ def test_hold_tolerates_present_nested_same_repository_worktree(
     assert checkout(project, "slot01").is_dir()
 
 
+def test_adopt_checkout_declares_same_repository_nested_worktree(
+    tmp_path: Path,
+) -> None:
+    """#2122: adopt-checkout declares a same-repository nested worktree.
+
+    The nested worktree sits at the slot's top-level checkout directory
+    (the only path a checkout row can name), on a branch of the same
+    repository as the slot's declared checkout.
+    """
+    project, repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    nested = checkout(project, "slot01").parent / "candnested"
+    git(
+        repository,
+        "worktree",
+        "add",
+        "-b",
+        "codex/nested-adopt",
+        str(nested),
+        "origin/main",
+    )
+
+    adopted = command(
+        project,
+        "adopt-checkout",
+        "slot01",
+        "--repo",
+        f"candnested={nested.relative_to(project).as_posix()}",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+
+    assert adopted.returncode == 0, adopted.stderr
+    assert "adopted checkout candnested" in adopted.stdout
+    config = wrkslots._load_config(str(project), "testhost")
+    record = wrkslots._find_record(wrkslots._load_active(config), "slot01")
+    assert [item.name for item in record.checkouts] == ["product", "candnested"]
+    assert record.checkouts[1].repository == record.checkouts[0].repository
+
+
+def test_adopt_checkout_refuses_deeply_nested_worktree_with_remedy(
+    tmp_path: Path,
+) -> None:
+    """#2122: a worktree nested deeper than slot/<name> cannot be declared.
+
+    A checkout row's path is always its slot's top-level directory named
+    by the checkout, so a worktree inside another checkout is refused
+    up front with the 'git worktree move' remedy, and no row is added.
+    """
+    project, repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    nested = checkout(project, "slot01") / "cand-nested"
+    git(
+        repository,
+        "worktree",
+        "add",
+        "-b",
+        "codex/nested-deep",
+        str(nested),
+        "origin/main",
+    )
+
+    refused = command(
+        project,
+        "adopt-checkout",
+        "slot01",
+        "--repo",
+        f"candnested={nested.relative_to(project).as_posix()}",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+
+    assert refused.returncode == 3, refused.stdout
+    assert "git worktree move" in refused.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    record = wrkslots._find_record(wrkslots._load_active(config), "slot01")
+    assert [item.name for item in record.checkouts] == ["product"]
+
+
 def test_registry_storage_guard_still_refuses_when_no_slot_is_named(
     tmp_path: Path,
 ) -> None:
