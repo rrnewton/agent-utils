@@ -176,8 +176,11 @@ export interface ScrollKeeping {
    * redraw's hold.
    */
   preservingShrinkAsync(area: HTMLElement, row: HTMLElement, head: number, foot: number, mutate: () => Promise<void>): Promise<void>;
-  /** Whether a shrink's settle loop still stands (`#2091`): the next-unread move waits for it. */
+  /** Whether a shrink's settle loop still stands (`#2091`). */
   shrinkSettling(): boolean;
+  /** Whether the latest shrink's act has settled (`#2091`): the next-unread
+   * move waits for the act, not for the loop's whole guard window. */
+  shrinkActSettled(): boolean;
   /**
    * Whether a user-caused height change is settling (`#2076`): the reader's own act
    * opened a hold (a fold, a click in the list within the act window), and until it
@@ -264,6 +267,7 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
    * a new shrink supersedes an older loop, which must never fight it. */
   let shrinkActive = false;
   let shrinkGen = 0;
+  let shrinkActDoneGen = 0;
   /** Whether a user-caused height change's hold stands (`#2076`), and which opening it is. */
   let userHold = false;
   let holdGen = 0;
@@ -728,10 +732,9 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     // else, and what is below it moves — the composer lifting off the bottom
     // included. Following the foot is the arrival path's (`followIfPinned`).
     const box = row.getBoundingClientRect();
-    const kind = shrinkCase(box, head, foot);
-    if (kind === "above") {
+    if (box.top >= head - 1) {
       preservingScrollAt(area, row, box.top, mutate);
-    } else if (kind === "below") {
+    } else if (box.bottom <= foot + 1) {
       const next = nextDrawnRow(row);
       if (next) preservingScrollAt(area, next, next.getBoundingClientRect().top, mutate);
       else preservingScrollAt(area, row, box.top, mutate);
@@ -941,6 +944,7 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
       await mutate();
     } finally {
       settled = true;
+      shrinkActDoneGen = gen;
       settledWriteCount = ownWriteCount;
       session.apply();
       loopWriteCount = ownWriteCount - settledWriteCount;
@@ -1084,5 +1088,5 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     return onScreen;
   }
 
-  return { visibleList, shownChannelList, scrollAnchor, preservingScroll, preservingCollapse, preservingShrink, preservingShrinkAsync, shrinkSettling: () => shrinkActive, holdingRows, toFoot, nudge, toPosition, wheelBy, glideTo, intoView, holdingReader, captureScroll, restoreScroll, followIfPinned, rowsOnScreen, userMovedSince, inputStamp: () => userInputAt, userChangeActive, beginUserChange: openUserHold, footRoom };
+  return { visibleList, shownChannelList, scrollAnchor, preservingScroll, preservingCollapse, preservingShrink, preservingShrinkAsync, shrinkSettling: () => shrinkActive, shrinkActSettled: () => shrinkActDoneGen === shrinkGen, holdingRows, toFoot, nudge, toPosition, wheelBy, glideTo, intoView, holdingReader, captureScroll, restoreScroll, followIfPinned, rowsOnScreen, userMovedSince, inputStamp: () => userInputAt, userChangeActive, beginUserChange: openUserHold, footRoom };
 }

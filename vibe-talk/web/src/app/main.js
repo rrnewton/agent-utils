@@ -3662,7 +3662,7 @@ const keyboard = createKeyboardComposition({
   afterShrinkSettles: (act) => {
     if (typeof requestAnimationFrame !== "function") { act(); return; }
     const step = () => {
-      if (scrollKeeping.userChangeActive() || scrollKeeping.shrinkSettling()) requestAnimationFrame(step);
+      if (scrollKeeping.userChangeActive() || !scrollKeeping.shrinkActSettled()) requestAnimationFrame(step);
       else act();
     };
     step();

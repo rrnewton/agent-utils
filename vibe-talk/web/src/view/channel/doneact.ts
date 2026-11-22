@@ -379,11 +379,12 @@ export function createDoneAct(deps: DoneActDependencies): DoneAct {
     // grow held by the same owner's top rule) is anchored by the scroll owner,
     // not by the generic redraw's first-row hold. The dismissal's redraw is
     // synchronous inside the act; its write settles behind the hold.
-    if (row && deps.preservingShrinkAsync && !marking) {
+    const shrinkHeld = row && (deps.readModes().mode() === "fold" || deps.readModes().hiding());
+    if (shrinkHeld && deps.preservingShrinkAsync && !marking) {
       await deps.preservingShrinkAsync(row, () => restoreMessages(all));
       return;
     }
-    if (row && deps.preservingShrink && !marking) {
+    if (shrinkHeld && deps.preservingShrink && !marking) {
       let act: Promise<void> | undefined;
       deps.preservingShrink(row, () => {
         act = restoreMessages(all);
@@ -411,10 +412,15 @@ export function createDoneAct(deps: DoneActDependencies): DoneAct {
     flashDone(row);
     try {
       // `#2091 vibe-talk-shrink-anchor-policy`: the dismissal's redraw runs
-      // under the scroll owner's shrink anchor where the page provides one.
-      if (row && deps.preservingShrinkAsync) {
+      // under the scroll owner's shrink anchor where the page provides one —
+      // in Fold read (or Hide read, where the row leaves), where marking Done
+      // shrinks the row into its run's line. In Show read the row only greys:
+      // no height changes, no shrink to anchor, and the act's own move after
+      // it (the next unread) keeps its immediate landing.
+      const shrinkHeld = row && (deps.readModes().mode() === "fold" || deps.readModes().hiding());
+      if (shrinkHeld && deps.preservingShrinkAsync) {
         await deps.preservingShrinkAsync(row, () => dismissMessages({ messages: ids }));
-      } else if (row && deps.preservingShrink) {
+      } else if (shrinkHeld && deps.preservingShrink) {
         let act: Promise<void> | undefined;
         deps.preservingShrink(row, () => {
           act = dismissMessages({ messages: ids });
