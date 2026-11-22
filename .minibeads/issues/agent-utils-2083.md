@@ -1,5 +1,5 @@
 ---
-title: 'wrkslots-owner-retires-absent-row: a slot's live owner can retire its own absent-directory row'
+title: 'wrkslots-owner-retires-absent-row: a slot''s live owner can retire its own absent-directory row'
 status: open
 priority: 2
 issue_type: bug
