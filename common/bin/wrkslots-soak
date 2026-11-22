@@ -91,6 +91,27 @@ case "$CMD" in
     limits) [[ "${REST[0]:-}" == "show" ]] || run_python "$CMD" "${ORIGINAL[@]}" ;;
 esac
 
+# Per-command kill switch: WRKSLOTS_RUST_DISABLE=<cmd>[,<cmd>...] pulls the
+# named commands back to Python in every soak mode (the finest-grained
+# rollback; WRKSLOTS_ENGINE=python is the whole-tool one). Entries are a
+# command word (`status`) or a family action (`image:status`,
+# `sandbox:show-config`, `limits:show`); a bare family word disables its
+# wired action too. Read fresh on every invocation; empty disables nothing.
+if [[ -n "${WRKSLOTS_RUST_DISABLE:-}" ]]; then
+    DISABLE_ACTION=""
+    case "$CMD" in
+        image|sandbox|limits) DISABLE_ACTION="$CMD:${REST[0]:-}" ;;
+    esac
+    DISABLE_LIST="${WRKSLOTS_RUST_DISABLE//[[:space:]]/}"
+    IFS=',' read -ra DISABLE_ENTRIES <<<"$DISABLE_LIST"
+    for DISABLE_ENTRY in "${DISABLE_ENTRIES[@]}"; do
+        if [[ "$DISABLE_ENTRY" == "$CMD" || ( -n "$DISABLE_ACTION" && "$DISABLE_ENTRY" == "$DISABLE_ACTION" ) ]]; then
+            PYTHON_NOTE="disabled by WRKSLOTS_RUST_DISABLE"
+            run_python "$CMD" "${ORIGINAL[@]}"
+        fi
+    done
+fi
+
 # Python command -> wrkslotsd command. Anything unlisted stays Python.
 RUST_CMD=""
 case "$CMD" in

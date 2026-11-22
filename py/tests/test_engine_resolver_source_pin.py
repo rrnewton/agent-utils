@@ -820,18 +820,42 @@ def test_probe_and_no_build_cold_cache_never_build(tmp_path: Path) -> None:
     """
     root = _build_sandbox(tmp_path)
 
-    probe = _run_direct(root, {"AGENT_UTILS_RS_PROBE_ONLY": "1"})
+    # A logging cargo wrapper proves neither refused path ever ran Cargo.
+    real_cargo = shutil.which("cargo")
+    assert real_cargo is not None
+    wrapper_dir = tmp_path / "cargo-log"
+    wrapper_dir.mkdir()
+    cargo_log = tmp_path / "cargo-calls.log"
+    cargo_wrapper = wrapper_dir / "cargo"
+    cargo_wrapper.write_text(
+        "#!/bin/sh\n"
+        'printf "%s\\n" "$*" >>"$AGENT_UTILS_TEST_CARGO_LOG"\n'
+        'exec "$AGENT_UTILS_TEST_REAL_CARGO" "$@"\n'
+    )
+    _chmod_x(cargo_wrapper)
+    logged_env = {
+        "PATH": str(wrapper_dir) + os.pathsep + os.environ["PATH"],
+        "AGENT_UTILS_TEST_REAL_CARGO": real_cargo,
+        "AGENT_UTILS_TEST_CARGO_LOG": str(cargo_log),
+    }
+
+    probe = _run_direct(
+        root, {"AGENT_UTILS_RS_PROBE_ONLY": "1", **logged_env}
+    )
     assert probe.returncode == 75, probe.stderr
     assert probe.stdout == ""
     assert "cache=cold" in probe.stderr
 
-    refused = _run_launcher(root, extra_env={"AGENT_UTILS_RS_NO_BUILD": "1"})
+    refused = _run_launcher(
+        root, extra_env={"AGENT_UTILS_RS_NO_BUILD": "1", **logged_env}
+    )
     assert refused.returncode == 127, refused.stderr
     assert refused.stdout == ""
     assert "AGENT_UTILS_RS_NO_BUILD=1" in refused.stderr
     assert "AGENT_UTILS_RS_ENSURE_ONLY=1 rs/bin/tick-hub" in refused.stderr
 
-    # Nothing was built or published by either refused path.
+    # Nothing was built or published by either refused path, and Cargo never ran.
+    assert not cargo_log.exists()
     assert not list((root / "rs" / "target").glob("*/release/tick-hub"))
     assert not (root / "rs" / ".agent-utils-snapshots").exists()
 
@@ -874,3 +898,18 @@ def test_no_build_does_not_block_the_ensure_prebuild(tmp_path: Path) -> None:
     )
     assert ensured.returncode == 0, ensured.stderr
     assert Path(ensured.stdout.strip()).is_file()
+    # The combined mode publishes the snapshot too, like a plain ensure run.
+    published = list(
+        (root / "rs" / ".agent-utils-snapshots" / "tick-hub").glob("*/tick-hub")
+    )
+    assert len(published) == 1
+
+
+def test_ambient_probe_only_through_resolver_still_runs_the_tool(
+    tmp_path: Path,
+) -> None:
+    """A leaked AGENT_UTILS_RS_PROBE_ONLY must not turn a dispatch into a probe."""
+    root = _build_sandbox(tmp_path)
+    result = _run_launcher(root, extra_env={"AGENT_UTILS_RS_PROBE_ONLY": "1"})
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "v1\n"

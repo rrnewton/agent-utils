@@ -140,6 +140,10 @@ fi
 # nothing changes. WRKSLOTS_ENGINE=python (or WRKSLOTS_RUST_READERS=0)
 # opts back out. Routed calls are logged by the soak launcher
 # (WRKSLOTS_SOAK_LOG, default ~/.local/state/wrkslots-soak/soak.log).
+# The soak launcher's readers-only filter decides which commands actually
+# run in Rust (status, doctor, unpushed, shell-command, quickstart, image
+# status, sandbox show-config, limits show); WRKSLOTS_RUST_DISABLE=<cmd,...>
+# pulls named commands back to Python per process (see wrkslots-soak).
 _wrkslots_readers_config_value() {
     local file="$1" key="$2" line value
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -244,7 +248,7 @@ if [[ "$TOOL" == "wrkslots" && -z "${WRKSLOTS_ENGINE:-}" && -z "$ENGINE_VAR" ]];
                 done
                 READERS_COMMAND="${READERS_ARGS[READERS_INDEX]:-}"
                 case "$READERS_COMMAND" in
-                    status|doctor|unpushed|shell-command|quickstart)
+                    status|doctor|unpushed|shell-command|quickstart|image|sandbox|limits)
                         READERS_PROJECT_ROOT="$(_wrkslots_readers_project_root "$READERS_EXPLICIT_ROOT")"
                         READERS_LISTED=""
                         if [[ -n "$READERS_PROJECT_ROOT" ]]; then
@@ -459,7 +463,10 @@ case "$ENGINE" in
             exit 127
         fi
         echo "[$TOOL] engine=rust (tracked Cargo launcher: ${TARGET#"$ROOT"/})" >&2
-        unset AGENT_UTILS_RS_ENSURE_ONLY
+        # Probe is a per-call query, never dispatch input: an ambient
+        # AGENT_UTILS_RS_PROBE_ONLY must not turn this dispatch into a probe.
+        # AGENT_UTILS_RS_NO_BUILD stays exported; the launcher decides on it.
+        unset AGENT_UTILS_RS_ENSURE_ONLY AGENT_UTILS_RS_PROBE_ONLY
         if [[ "$TOOL" == "wrkslots" ]]; then
             # Routed as the wrkslots Rust edition: wrkslotsd translates
             # exact Python spellings in this mode (#562 P10).

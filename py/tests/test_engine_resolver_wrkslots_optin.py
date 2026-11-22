@@ -165,6 +165,31 @@ def test_readers_host_file_optin_dispatches_to_soak(tmp_path: Path) -> None:
     assert result.stdout == f"SOAK readers=1 args=--project-root {project} doctor\n"
 
 
+def test_readers_host_file_routes_family_readers_to_soak(tmp_path: Path) -> None:
+    """image/sandbox/limits reach the soak via the host file; soak filters actions."""
+    root = _build_sandbox(tmp_path)
+    project = tmp_path / "listed-project"
+    project.mkdir()
+    host_file = tmp_path / "wrkslots-rust-readers"
+    host_file.write_text(f"readers = scoped\nproject = {project}\n")
+    for args in (
+        ("image", "status"),
+        ("sandbox", "show-config"),
+        ("limits", "show"),
+    ):
+        result = _run(
+            root,
+            {"WRKSLOTS_RUST_READERS_FILE": str(host_file)},
+            "--project-root",
+            str(project),
+            *args,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == (
+            f"SOAK readers=1 args=--project-root {project} {' '.join(args)}\n"
+        )
+
+
 def test_readers_scoped_discovered_project_dispatches_to_soak(tmp_path: Path) -> None:
     root = _build_sandbox(tmp_path)
     project = tmp_path / "listed-project"

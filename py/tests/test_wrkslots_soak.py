@@ -141,6 +141,7 @@ def _run(
             "AGENT_UTILS_RS_NO_BUILD",
             "AGENT_UTILS_RS_PROBE_ONLY",
             "AGENT_UTILS_RS_ENSURE_ONLY",
+            "WRKSLOTS_RUST_DISABLE",
         )
     }
     env["WRKSLOTS_ENGINE"] = "rust-soak"
@@ -512,3 +513,54 @@ def test_cold_without_no_build_still_dispatches_rust(tmp_path: Path) -> None:
     result = _run(root, log, "status", readers_only=True)
     assert result.returncode == 0, result.stderr
     assert result.stdout.startswith("RS status-text status-text")
+
+
+def test_rust_disable_pulls_named_reader_back_to_python(tmp_path: Path) -> None:
+    """WRKSLOTS_RUST_DISABLE is the per-command rollback, in readers and full soak."""
+    root, log = _sandbox(tmp_path)
+    readers = _run(
+        root,
+        log,
+        "status",
+        readers_only=True,
+        extra_env={"WRKSLOTS_RUST_DISABLE": "status"},
+    )
+    assert readers.returncode == 0, readers.stderr
+    assert readers.stdout.startswith("PY wrkslots status")
+    assert "disabled by WRKSLOTS_RUST_DISABLE" in readers.stderr
+    full = _run(root, log, "status", extra_env={"WRKSLOTS_RUST_DISABLE": "status"})
+    assert full.stdout.startswith("PY wrkslots status")
+    assert "cmd=status edition=python" in log.read_text()
+
+
+def test_rust_disable_family_action_and_unrelated_names(tmp_path: Path) -> None:
+    root, log = _sandbox(tmp_path)
+    # image:status disabled; sandbox show-config (spaced list) untouched.
+    image = _run(
+        root,
+        log,
+        "image",
+        "status",
+        readers_only=True,
+        extra_env={"WRKSLOTS_RUST_DISABLE": "doctor, image:status"},
+    )
+    assert image.stdout.startswith("PY wrkslots image status")
+    sandbox = _run(
+        root,
+        log,
+        "sandbox",
+        "show-config",
+        readers_only=True,
+        extra_env={"WRKSLOTS_RUST_DISABLE": "doctor, image:status"},
+    )
+    assert sandbox.stdout.startswith("RS sandbox-show-config")
+    # A bare family word disables its wired action too.
+    bare = _run(
+        root,
+        log,
+        "image",
+        "status",
+        readers_only=True,
+        extra_env={"WRKSLOTS_RUST_DISABLE": "image"},
+    )
+    assert bare.stdout.startswith("PY wrkslots image status")
