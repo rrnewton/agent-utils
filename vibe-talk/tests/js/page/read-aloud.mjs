@@ -3139,6 +3139,10 @@ test("`#2053 vibe-talk-pace-has-no-effect`: a voice that cannot be paced greys P
   assert.equal(page.el("read-pace-help").text(), "Pace isn't available with this voice.");
   assert.equal(page.el("read-speed").title, "Pace isn't available with this voice");
   assert.equal(page.el("read-speed").getAttribute("aria-label"), "Pace. Pace isn't available with this voice.");
+  // The tile itself is muted on the closed bar, and stays tappable: its tap
+  // is what opens the reason above, so it is `aria-disabled`, never `disabled`.
+  assert.equal(page.el("read-speed").getAttribute("aria-disabled"), "true", "the Pace tile is not muted");
+  assert.equal(page.el("read-speed").disabled, false, "the Pace tile was disabled outright; it must still open its popover");
   assert.equal(page.el("read-speed-box").getAttribute("aria-label"), "reading pace. Pace isn't available with this voice");
   // Nothing has been stored: the pace was never the reader's to choose here.
   assert.equal(page.storage.has("vibe-talk.voice.read-speed"), false, "opening Pace stored a pace");
@@ -3154,6 +3158,7 @@ test("`#2053 vibe-talk-pace-has-no-effect`: a capable voice keeps Pace live, and
   assert.equal(page.el("read-speed-box").disabled, false, "a capable voice greys its pace box");
   assert.equal(page.el("read-speed").title, "");
   assert.equal(page.el("read-speed").getAttribute("aria-label"), null);
+  assert.equal(page.el("read-speed").getAttribute("aria-disabled"), null, "a capable voice mutes its Pace tile");
   // Switching to the device voice keeps it live: a rate is its own to set.
   page.el("audio-source").click();
   await page.settle();

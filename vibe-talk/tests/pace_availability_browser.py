@@ -75,7 +75,34 @@ def walk(desk: Desk, touch: bool, pace_supported: bool) -> None:
     sign_in(desk)
     press(page, "#read-aloud", touch)
     desk.settled()
-    press(page, "#read-speed", touch)
+    # The CLOSED bar first: the tile itself is muted for a voice that cannot
+    # be paced (aria-disabled at the bar's 0.45 fade), with the reason on its
+    # title, and still tappable — its tap opens the popover below.
+    tile = page.evaluate("() => { const tile = document.getElementById('read-speed'); "
+                         "return {disabled: tile.getAttribute('aria-disabled'), "
+                         "title: tile.title, opacity: getComputedStyle(tile).opacity}; }")
+    if pace_supported:
+        desk.check(tile["disabled"] is None and tile["opacity"] == "1",
+                   f"a capable voice's Pace tile is muted: {tile}")
+        desk.check(tile["title"] == "", f"a capable voice's Pace tile is titled: {tile}")
+        desk.notes.append("Pace tile live on the closed bar")
+    else:
+        desk.check(tile["disabled"] == "true" and tile["opacity"] == "0.45",
+                   f"an incapable voice's Pace tile is not muted: {tile}")
+        desk.check(tile["title"] == REASON, f"the Pace tile's title is {tile['title']!r}")
+        desk.notes.append("Pace tile muted on the closed bar, reason on its title")
+    desk.shot("toolbar")
+    # A coordinate tap, not Playwright's click: its actionability check reads
+    # `aria-disabled` as a dead button, but a real tap lands — the tile is
+    # muted, never disabled, precisely so this tap opens the reason.
+    tile_box = page.locator("#read-speed").bounding_box()
+    check(tile_box is not None, "#read-speed is not drawn")
+    assert tile_box is not None
+    centre_x, centre_y = tile_box["x"] + tile_box["width"] / 2, tile_box["y"] + tile_box["height"] / 2
+    if touch:
+        page.touchscreen.tap(centre_x, centre_y)
+    else:
+        page.mouse.click(centre_x, centre_y)
     desk.wait_for("() => !document.getElementById('speed-popover').hidden",
                   "Pace did not open its popover", STATE_S)
     state = "() => ({box: document.getElementById('read-speed-box').disabled, " \

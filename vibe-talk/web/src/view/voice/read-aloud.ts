@@ -244,8 +244,17 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     deps.el("read-speed-up").disabled = !paceSupported || shown >= MAX_READ_SPEED;
     deps.el("read-speed-box").disabled = !paceSupported;
     deps.el("read-speed").title = paceSupported ? "" : PACE_UNAVAILABLE;
-    if (paceSupported) deps.el("read-speed").removeAttribute("aria-label");
-    else deps.el("read-speed").setAttribute("aria-label", `Pace. ${PACE_UNAVAILABLE}.`);
+    if (paceSupported) {
+      deps.el("read-speed").removeAttribute("aria-label");
+      deps.el("read-speed").removeAttribute("aria-disabled");
+    } else {
+      deps.el("read-speed").setAttribute("aria-label", `Pace. ${PACE_UNAVAILABLE}.`);
+      // The BUTTON is muted too, not only the stepper inside its popover: a
+      // live-looking tile hid the fact until it was opened. `aria-disabled`,
+      // not `disabled` (the bar's standing rule, 18-control-bar.css): the
+      // tile stays tappable, because its tap is what opens the reason.
+      deps.el("read-speed").setAttribute("aria-disabled", "true");
+    }
     // A button disabled under the focus would drop it to the page: it goes to the box instead.
     const focused = document.activeElement;
     if ((focused === deps.el("read-speed-down") && deps.el("read-speed-down").disabled) ||

@@ -180,6 +180,17 @@
   grid-row: 1 / span 2;
 }
 
+/*
+ * A voice that cannot be paced (`#2053 vibe-talk-pace-has-no-effect`): the tile
+ * itself is muted, not only the stepper inside its popover, so the fact is on
+ * the closed bar. The `.bar-button[aria-disabled="true"]` fade (0.45) borrowed
+ * whole, and nothing else of that rule: no `cursor: not-allowed`, because this
+ * tile still acts — its tap opens the popover that says why.
+ */
+#control-pane #read-speed[aria-disabled="true"] {
+  opacity: 0.45;
+}
+
 /* `#442 read-strip-order`. While a read plays, Read is its Pause and Stop stands beside it, both
    under the thumb: the tile takes a fourth column for the time Stop is shown, and gives it back.
    Stop takes the new column on Read's LEFT, so Read keeps the edge a thumb reaches for without

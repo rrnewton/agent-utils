@@ -36,3 +36,9 @@ Approved by coordb as (a)+(b), 2026-11-21:
 - The conversation backend's description serializes `"pace_supported": false`; capable backends omit the field.
 - Page shards: with `pace_supported: false` the stepper and box are disabled and the reason shows in help, title and aria; with a capable voice, and on the device voice, Pace stays live.
 - A Chromium walk (fixture server only) at 412 by touch and 1280, light and dark: Pace greyed with its reason for the incapable voice, live for the capable one, with screenshots of all eight popovers.
+
+## Resolution
+
+Landed on main as da38989d (replay of gated 9b30c346, verified tree 12e1a9e8), 2026-11-22: (a) and (b) as designed above. Gate 216 steps: 215 pass, the one red step (windowed-refresh-browser, untouched scroll code under host loadavg 281) passed on its solo rerun; ledger head_sha verified.
+
+Follow-up, the same day (owner 281, fast-track): the Pace TOOLBAR BUTTON still looked live on the closed bar — only the popover's controls were greyed. The tile now carries `aria-disabled` at the bar's 0.45 fade (never `disabled`, so its tap still opens the popover with the reason), its title and aria saying "Pace isn't available with this voice", on phone and desktop toolbars alike; covered by the page shard, the availability walk's closed-bar assertions, and closed-toolbar screenshots.
