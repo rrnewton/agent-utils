@@ -87,6 +87,8 @@ export { OVERSCROLL_IDLE_MS, OVERSCROLL_REST_MS, createFootRooms } from "./footr
 export type { FootRooms, FootRoomsDependencies } from "./footroom.ts";
 export { createPackSlides, screenMotionMs } from "./packslide.ts";
 export type { PackSlides, PackSlidesDependencies } from "./packslide.ts";
+export { ANCHOR_TOLERANCE_PX, anchorDeltaPx, anchorInvariantHolds, shrinkCase } from "./anchorpolicy.ts";
+export type { AnchorCheck, AnchorKind, ShrinkCase } from "./anchorpolicy.ts";
 export { createScrollKeeping, rowsBelowReadingPosition } from "./scrollkeep.ts";
 export type { ScrollKeeping, ScrollKeepingDependencies, ScrollMark } from "./scrollkeep.ts";
 export { createCardFlight } from "./cardflight.ts";

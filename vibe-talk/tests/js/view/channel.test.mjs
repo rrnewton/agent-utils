@@ -799,6 +799,64 @@ test("`#1251 scroll-single-owner` + `#1215 collapse-anchor-below`: a collapse ho
   assert.equal(keep.userChangeActive(), true, "a fold opened no user-caused hold");
 });
 
+test("`#2091 vibe-talk-shrink-anchor-policy`: the anchor invariant is one numeric function", () => {
+  const { shrinkCase, anchorInvariantHolds, anchorDeltaPx, ANCHOR_TOLERANCE_PX } = CHANNEL_VIEW;
+  assert.equal(ANCHOR_TOLERANCE_PX, 0.5, "the tolerance is not owner 308's half pixel");
+  assert.equal(shrinkCase({ top: 40, bottom: 120 }, 0, 200), "above", "a top on screen is not the above case");
+  assert.equal(shrinkCase({ top: -80, bottom: 40 }, 0, 200), "below", "a top off-screen with its bottom on screen is not the below case");
+  assert.equal(shrinkCase({ top: -80, bottom: 500 }, 0, 200), "seam", "a row spanning both edges is not the seam case");
+  assert.equal(anchorInvariantHolds({ kind: "above", beforeY: 100, afterY: 100.5 }), true, "a half-pixel move broke the invariant");
+  assert.equal(anchorInvariantHolds({ kind: "below", beforeY: 100, afterY: 101 }), false, "a one-pixel move held the invariant");
+  assert.equal(anchorInvariantHolds({ kind: "seam", beforeY: 0, afterY: 0, seamY: 100.4, centreY: 100 }), true, "a seam 0.4px off centre broke the invariant");
+  assert.equal(anchorInvariantHolds({ kind: "seam", beforeY: 0, afterY: 0, seamY: 101, centreY: 100 }), false, "a seam 1px off centre held the invariant");
+  assert.equal(anchorInvariantHolds({ kind: "grow", beforeY: 100, afterY: 100.2 }), true, "a grown row's held top broke the invariant");
+  assert.equal(anchorInvariantHolds({ kind: "arrival-bottom", beforeY: 0, afterY: 900 }), true,
+    "an arrival followed at the bottom is not the documented exception");
+  assert.equal(anchorDeltaPx({ kind: "seam", beforeY: 0, afterY: 0, seamY: 97, centreY: 100 }), 3, "the seam delta is not its distance from centre");
+});
+
+test("`#2091 vibe-talk-shrink-anchor-policy`: a shrink holds above, below, or the seam at centre", () => {
+  const { createScrollKeeping } = CHANNEL_VIEW;
+  const tops = new Map();
+  const mk = (id) => ({
+    id, parentNode: null, nextElementSibling: null,
+    getAttribute: (name) => (name === "data-id" ? id : null),
+    getBoundingClientRect: () => ({ top: tops.get(id)[0], bottom: tops.get(id)[1] }),
+  });
+  const a = mk("a");
+  const b = mk("b");
+  const c = mk("c");
+  a.nextElementSibling = b;
+  b.nextElementSibling = c;
+  const list = { id: "discord-log", children: [a, b, c] };
+  for (const one of [a, b, c]) one.parentNode = list;
+  const area = { scrollTop: 300, scrollHeight: 900, clientHeight: 200, getBoundingClientRect: () => ({ top: 0 }) };
+  const els = { "discord-log": list, "pinned-log": { id: "pinned-log", children: [] }, "scroll-area": area, "load-older": { hidden: true, getBoundingClientRect: () => ({ top: 0 }) }, transcript: { children: [] } };
+  const keep = createScrollKeeping({
+    el: (id) => els[id], onMain: () => true, currentView: () => "discord", channelView: () => "main", pinnedOnly: () => false,
+    heldFilterRow: () => null, searchWalk: () => null, atBottom: () => false,
+    scrollToNewest: () => {}, renderJumpNewest: () => {}, setJumpNewest: () => {},
+  });
+  // Case 1, top on screen: the standing row's top is held across the shrink.
+  tops.set("a", [-40, 40]);
+  tops.set("b", [40, 120]);
+  tops.set("c", [120, 200]);
+  keep.preservingShrink(area, b, 0, 200, () => { tops.set("b", [10, 50]); tops.set("c", [50, 130]); });
+  assert.equal(area.scrollTop, 270, "a shrink with its top on screen did not hold the content above");
+  assert.equal(keep.userChangeActive(), true, "a shrink opened no user-caused hold");
+  // Case 2, top off-screen above, bottom on screen: the next drawn row is held.
+  area.scrollTop = 300;
+  tops.set("b", [-80, 40]);
+  tops.set("c", [40, 120]);
+  keep.preservingShrink(area, b, 0, 200, () => { tops.set("b", [-80, -20]); tops.set("c", [-20, 60]); });
+  assert.equal(area.scrollTop, 240, "a shrink with its top off screen did not hold the content below");
+  // Case 3, spanning both edges: the seam (the shrunken row's centre) lands at the centre.
+  area.scrollTop = 300;
+  tops.set("b", [-80, 500]);
+  keep.preservingShrink(area, b, 0, 200, () => tops.set("b", [-80, 60]));
+  assert.equal(area.scrollTop, 190, "a spanning shrink did not land its seam at the centre");
+});
+
 test("`#2076 vibe-talk-top-anchor-policy`: a user-caused change at the foot holds the anchor's top; an arrival during it is chipped, not followed", () => {
   const { createScrollKeeping } = CHANNEL_VIEW;
   const handlers = {};

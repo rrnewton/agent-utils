@@ -46,6 +46,13 @@ export interface DoneKeysDependencies<Pane> {
   toggleDone(ids: string[], row: HTMLElement): void;
   /** `#1321 after-done-setting`. What e does after marking Done, as kept in Settings. */
   afterDone(): AfterDone;
+  /**
+   * Run `act` once the archive's anchored shrink has settled (`#2091
+   * vibe-talk-shrink-anchor-policy`): the next-unread move is its own explicit,
+   * reader-intended move made after the settle, never part of the shrink frame.
+   * Optional: without it the move lands at once, as before.
+   */
+  afterShrinkSettles?(act: () => void): void;
 }
 
 /** The keys. Each returns whether it did anything, as a binding of the keymap does. */
@@ -146,7 +153,10 @@ export function createDoneKeys<Pane>(deps: DoneKeysDependencies<Pane>): DoneKeys
         : choice === "next" ? (rows[at + 1] || null)
         : unreadAfter(rows, at);
       deps.toggleDone(ids, row);
-      landAfterDone(pane, next, ids[0] as string, at, stay);
+      // `#2091`: where the page sequences it, the move to the next unread waits
+      // for the archive's shrink to settle and lands as its own move.
+      if (deps.afterShrinkSettles) deps.afterShrinkSettles(() => landAfterDone(pane, next, ids[0] as string, at, stay));
+      else landAfterDone(pane, next, ids[0] as string, at, stay);
       return true;
     },
   };

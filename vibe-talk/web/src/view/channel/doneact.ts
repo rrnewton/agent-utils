@@ -57,6 +57,15 @@ export interface DoneActDependencies {
   heldDonePart(held: unknown, ids: string[]): unknown;
   hidingRead(): boolean;
   holdingMessage(act: () => void): void;
+  /**
+   * Run one row's Done (or put-back) redraw under the scroll owner's shrink
+   * anchor (`#2091 vibe-talk-shrink-anchor-policy`): the act runs inside, and
+   * the list is held by the three shrink cases while it settles. Optional: a
+   * host with no scroll owner omits it and the act runs unheld, as before.
+   */
+  preservingShrink?(row: Row, act: () => void): void;
+  /** `preservingShrink` for the dismissal's async completion (`#2091`). */
+  preservingShrinkAsync?(row: Row, act: () => Promise<void>): Promise<void>;
   holdingReplyArrows(act: () => void): void;
   idsOf(row: unknown): string[];
   inColumn(column: unknown, act: () => void): void;
@@ -365,7 +374,24 @@ export function createDoneAct(deps: DoneActDependencies): DoneAct {
     // The row's own reading of itself, and it has to be the SAME `every` the row is drawn with:
     // a half-archived row shows as unread, so the act it offers is Done, and Done must archive the
     // part that is still outstanding rather than putting the whole row back.
-    if (all.length > 0 && all.every((id: string) => doneState().archived.has(id))) {
+    const marking = !(all.length > 0 && all.every((id: string) => doneState().archived.has(id)));
+    // `#2091 vibe-talk-shrink-anchor-policy`: one row's archive (or put-back, a
+    // grow held by the same owner's top rule) is anchored by the scroll owner,
+    // not by the generic redraw's first-row hold. The dismissal's redraw is
+    // synchronous inside the act; its write settles behind the hold.
+    if (row && deps.preservingShrinkAsync && !marking) {
+      await deps.preservingShrinkAsync(row, () => restoreMessages(all));
+      return;
+    }
+    if (row && deps.preservingShrink && !marking) {
+      let act: Promise<void> | undefined;
+      deps.preservingShrink(row, () => {
+        act = restoreMessages(all);
+      });
+      await act;
+      return;
+    }
+    if (!marking) {
       await restoreMessages(all);
     } else {
       await markRowDone(all, row);
@@ -384,7 +410,19 @@ export function createDoneAct(deps: DoneActDependencies): DoneAct {
     // browser can animate rather than a jump; taken back if the Done did not take.
     flashDone(row);
     try {
-      await dismissMessages({ messages: ids });
+      // `#2091 vibe-talk-shrink-anchor-policy`: the dismissal's redraw runs
+      // under the scroll owner's shrink anchor where the page provides one.
+      if (row && deps.preservingShrinkAsync) {
+        await deps.preservingShrinkAsync(row, () => dismissMessages({ messages: ids }));
+      } else if (row && deps.preservingShrink) {
+        let act: Promise<void> | undefined;
+        deps.preservingShrink(row, () => {
+          act = dismissMessages({ messages: ids });
+        });
+        await act;
+      } else {
+        await dismissMessages({ messages: ids });
+      }
     } catch (error) {
       unflashDone(row);
       throw error;

@@ -172,6 +172,8 @@ export interface KeyboardCompositionDependencies<
   atBottom(area: HTMLElement): boolean;
   preservingScroll(act: () => void): void;
   preservingCollapse(area: HTMLElement, row: HTMLElement, head: number, foot: number, act: () => void): void;
+  /** Run `act` once a user-caused shrink's hold has settled (`#2091`): frame-based, no clock. */
+  afterShrinkSettles?(act: () => void): void;
   renderScrollTools(): void;
   rowMessages(row: HTMLElement): Message[];
   isOpenThreadRoot(row: HTMLElement): boolean;
@@ -568,6 +570,7 @@ export function createKeyboardComposition<
     isDone: (id) => deps.isDone(id),
     toggleDone: (ids, row) => deps.guardQuietly(() => deps.toggleArchived(ids, row))(),
     afterDone: () => deps.afterDone(),
+    afterShrinkSettles: deps.afterShrinkSettles ? (act) => deps.afterShrinkSettles!(act) : undefined,
   });
   const { nextUnreadFromKeyboard, stepUnreadFromKeyboard, doneFromKeyboard } = doneKeys;
 

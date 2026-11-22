@@ -1,0 +1,15 @@
+steps:
+  - group: check
+    job: shrink-anchor-browser
+    desc: archiving (Done) in Fold read holds the content above (case 1), the content below (case 2), or lands the seam at the band centre (case 3), within 0.5px on every frame at 412x915 and 1280x800, windowed on and off; the next-unread move lands only after the shrink settles; a few fixed fuzz seeds assert the same invariant after random acts
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/shrink_anchor_browser.py && python3 tests/shrink_anchor_browser.py --fuzz-seeds 1,2,3 --fuzz-steps 14
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 900
+    cpu_timeout: 180
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 240
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824

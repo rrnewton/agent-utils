@@ -2305,6 +2305,16 @@ const doneAct = createDoneAct({
   followDoneEverywhere: (ids, column) => followDoneEverywhere(/** @type {any} */ (ids), /** @type {any} */ (column)),
   guardQuietly: (fn) => guardQuietly(fn), heldDonePart: (held, ids) => heldDonePart(/** @type {any} */ (held), /** @type {any} */ (ids)),
   hidingRead: () => hidingRead(), holdingMessage: (act) => holdingMessage(act), holdingReplyArrows: (act) => holdingReplyArrows(act),
+  // `#2091 vibe-talk-shrink-anchor-policy`: one row's Done in the channel list is
+  // anchored by the scroll owner; a row of another list runs unheld, as before.
+  preservingShrink: (row, act) => {
+    if (row.closest && row.closest("#discord-log")) preservingShrink(el("scroll-area"), row, channelPane.head(), channelPane.foot(), act);
+    else act();
+  },
+  preservingShrinkAsync: async (row, act) => {
+    if (row.closest && row.closest("#discord-log")) await preservingShrinkAsync(el("scroll-area"), row, channelPane.head(), channelPane.foot(), act);
+    else await act();
+  },
   idsOf: (row) => idsOf(/** @type {any} */ (row)), inColumn: (column, act) => inColumn(/** @type {any} */ (column), act), inOtherColumn: (act) => inOtherColumn(act),
   listState: () => listState(), listedMessages: () => listedMessages(),
   markHeldDone: (ids, done, settles) => markHeldDone(/** @type {any} */ (ids), done, /** @type {any} */ (settles)), messageText: (m) => messageText(/** @type {any} */ (m)),
@@ -2708,7 +2718,7 @@ const scrollKeeping = createScrollKeeping({
   readFollowing: () => readAloudOwner().readFollowing(),
 });
 const {
-  visibleList, shownChannelList, scrollAnchor, preservingScroll, preservingCollapse, holdingReader, captureScroll, restoreScroll, followIfPinned,
+  visibleList, shownChannelList, scrollAnchor, preservingScroll, preservingCollapse, preservingShrink, preservingShrinkAsync, holdingReader, captureScroll, restoreScroll, followIfPinned,
 } = scrollKeeping;
 // The dom layer's focus reveal is the owner's write too, handed in now the owner stands (`#1251`).
 setFocusReveal((element, block, inline) => scrollKeeping.intoView(element, block, inline));
@@ -3609,6 +3619,17 @@ const keyboard = createKeyboardComposition({
   atBottom: (area) => atBottom(area),
   preservingScroll: (act) => preservingScroll(act),
   preservingCollapse: (area, row, head, foot, act) => preservingCollapse(area, row, head, foot, act),
+  // `#2091 vibe-talk-shrink-anchor-policy`: the next-unread move after a Done
+  // waits, frame by frame, until the shrink's user-caused hold clears, then
+  // lands as its own explicit move — never inside the shrink frame.
+  afterShrinkSettles: (act) => {
+    if (typeof requestAnimationFrame !== "function") { act(); return; }
+    const step = () => {
+      if (scrollKeeping.userChangeActive() || scrollKeeping.shrinkSettling()) requestAnimationFrame(step);
+      else act();
+    };
+    step();
+  },
   renderScrollTools: () => renderScrollTools(),
   rowMessages: (row) => rowMessages(/** @type {any} */ (row)),
   isOpenThreadRoot: (row) => isOpenThreadRoot(row, openThreadRootId()),

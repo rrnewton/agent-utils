@@ -6,6 +6,7 @@
 // Explicit, rather than the browser's scroll anchoring, which a change above the viewport defeats. The
 // filters' held row, the search walk's control, and the jump to the newest are the page's.
 
+import { shrinkCase } from "./anchorpolicy.ts";
 import { shownRowFor } from "./rows.ts";
 
 /** Where the reader is: on the newest line, or which element their eye is on and how far down it sits. */
@@ -150,6 +151,27 @@ export interface ScrollKeeping {
    */
   preservingCollapse(area: HTMLElement, row: HTMLElement, head: number, foot: number, mutate: () => void): void;
   /**
+   * Shrink `row` in `area` — an archive (Done) in fold-read mode, or any collapse
+   * of a message to a fold line where the row itself may leave the screen
+   * (`#2091 vibe-talk-shrink-anchor-policy`): the three shrink cases of
+   * `anchorpolicy` — the content above holds (top on screen), the content just
+   * below holds (top off-screen above, bottom on screen), or the seam lands at
+   * the viewport's centre (spanning both edges). Opens the user-caused hold
+   * (`#2076`) like the collapse act, so the foot keepers and the next-unread
+   * scroll cannot override the anchored shrink while it settles.
+   */
+  preservingShrink(area: HTMLElement, row: HTMLElement, head: number, foot: number, mutate: () => void): void;
+  /**
+   * `preservingShrink` for an act that completes across awaits (`#2091`): the
+   * anchor is re-asserted every frame until the act has settled and the anchor
+   * has stood still for three frames, so a redraw that folds the run once the
+   * act's write answers is held by the same three cases, never by the generic
+   * redraw's hold.
+   */
+  preservingShrinkAsync(area: HTMLElement, row: HTMLElement, head: number, foot: number, mutate: () => Promise<void>): Promise<void>;
+  /** Whether a shrink's settle loop still stands (`#2091`): the next-unread move waits for it. */
+  shrinkSettling(): boolean;
+  /**
    * Whether a user-caused height change is settling (`#2076`): the reader's own act
    * opened a hold (a fold, a click in the list within the act window), and until it
    * clears the foot keepers write nothing and an arrival is counted on the jump
@@ -228,6 +250,13 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
 
   /** When the reader last scrolled or touched in the view, in `Date.now` terms. */
   let userInputAt = Number.NEGATIVE_INFINITY;
+  /** When the reader last wheeled or touched (`#2091`): unambiguous reader input,
+   * never a scroll event the shrink's own height change caused. */
+  let readerInputAt = Number.NEGATIVE_INFINITY;
+  /** Whether a shrink's settle loop still stands (`#2091`), and its generation:
+   * a new shrink supersedes an older loop, which must never fight it. */
+  let shrinkActive = false;
+  let shrinkGen = 0;
   /** Whether a user-caused height change's hold stands (`#2076`), and which opening it is. */
   let userHold = false;
   let holdGen = 0;
@@ -330,8 +359,8 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
   function watchInput(area: HTMLElement): void {
     if (inputPort === area || typeof area.addEventListener !== "function") return;
     inputPort = area;
-    area.addEventListener("wheel", () => { userInputAt = Date.now(); }, { passive: true });
-    area.addEventListener("touchstart", () => { userInputAt = Date.now(); }, { passive: true });
+    area.addEventListener("wheel", () => { userInputAt = Date.now(); readerInputAt = userInputAt; }, { passive: true });
+    area.addEventListener("touchstart", () => { userInputAt = Date.now(); readerInputAt = userInputAt; }, { passive: true });
     area.addEventListener("scroll", () => {
       // The reader's own scroll (not this owner's write) reclaims the held room
       // past the foot (`#2076`): the place is theirs again, room included.
@@ -688,14 +717,204 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     // else, and what is below it moves — the composer lifting off the bottom
     // included. Following the foot is the arrival path's (`followIfPinned`).
     const box = row.getBoundingClientRect();
-    if (box.top >= head - 1) {
+    const kind = shrinkCase(box, head, foot);
+    if (kind === "above") {
       preservingScrollAt(area, row, box.top, mutate);
-    } else if (box.bottom <= foot + 1) {
+    } else if (kind === "below") {
       const next = nextDrawnRow(row);
       if (next) preservingScrollAt(area, next, next.getBoundingClientRect().top, mutate);
       else preservingScrollAt(area, row, box.top, mutate);
     } else {
       preservingScrollCentered(area, row, head, foot, mutate);
+    }
+  }
+
+  /** The last drawn row above `row` in its list: the nearest sibling with a box of its own. */
+  function prevDrawnRow(row: Element): Element | null {
+    const parent = row.parentNode;
+    if (!parent) return null;
+    const kids = [...parent.children];
+    for (let at = kids.indexOf(row) - 1; at >= 0; at -= 1) {
+      const prev = kids[at] as Element;
+      if (prev.getAttribute("data-read-run") === "member") continue;
+      const box = prev.getBoundingClientRect();
+      if (box.bottom > box.top) return prev;
+    }
+    return null;
+  }
+
+  /**
+   * Open a shrink session on `row` (`#2091`): the case, the anchor that holds,
+   * and `apply`, which writes the list back to it. Null where another hold owns
+   * the reader's place (a filter hold, a search walk, a landed jump), where the
+   * caller falls back to `preservingScroll`.
+   */
+  function shrinkSession(area: HTMLElement, row: HTMLElement, head: number, foot: number): { apply(): number | null; inputAtStart: number } | null {
+    const jump = deps.jumpAnchorRow ? deps.jumpAnchorRow() : null;
+    if (deps.heldFilterRow() || (deps.searchWalk && deps.searchWalk()) || (jump && jump !== row)) return null;
+    if (!row.parentNode) return null;
+    const box = row.getBoundingClientRect();
+    const kind = shrinkCase(box, head, foot);
+    const prev = prevDrawnRow(row);
+    const next = nextDrawnRow(row);
+    // What holds, by case: above it the row's own top (the fold line stands
+    // where the row stood); below it the next drawn row's top; spanning, the
+    // seam — where the rows before and after meet, at the fold line.
+    const prevBottom = prev ? prev.getBoundingClientRect().bottom : box.top;
+    const belowY = next ? next.getBoundingClientRect().top : box.bottom;
+    const inputAtStart = readerInputAt;
+    // Where the content above the shrink will stand: the row itself, or — where
+    // it folds into a run of read rows above it — that run's head, whose top is
+    // the first thing above the shrink that must hold. Read rows above that
+    // will join the run are walked over by their archived dress.
+    let headTop = box.top;
+    let headEl: Element = row;
+    {
+      let el: Element = row;
+      for (;;) {
+        const above = prevDrawnRow(el);
+        if (!above || above.getAttribute("data-archived") !== "true") break;
+        el = above;
+      }
+      headEl = el;
+      headTop = el.getBoundingClientRect().top;
+    }
+    const headId = headEl.getAttribute("data-id");
+    // The row as drawn now: a redraw may replace its element, so it is re-found
+    // by its message id at each measure, as `restoreScroll` re-finds its anchor.
+    const rowId = row.getAttribute("data-id");
+    const currentRow = (): Element | null => {
+      if (row.parentNode) return row;
+      if (!rowId) return null;
+      const found = [...visibleList().children].find((one) => one.getAttribute("data-id") === rowId);
+      return found ? found as Element : null;
+    };
+    // Where the anchor stands now, and the element to hold room for it: by case,
+    // the row's own top (the fold line stands where the row stood), the next
+    // drawn row's top, or the seam — where the rows before and after meet, at
+    // the fold/run line standing for the row.
+    const measure = (): { el: Element; y: number; target: number } | null => {
+      const cur = currentRow();
+      if (kind === "above") {
+        // The captured head, re-found by id: the standing element must not
+        // change identity mid-shrink (the row, then its run's head), or the
+        // loop chases two tops at once.
+        let standing: Element | null = headEl.parentNode ? headEl : null;
+        if (!standing && headId) {
+          const found = [...visibleList().children].find((one) => one.getAttribute("data-id") === headId);
+          standing = found ? found as Element : null;
+        }
+        if (!standing && cur) standing = shownRowFor(cur) as Element;
+        if (standing && standing.parentNode) {
+          const rect = standing.getBoundingClientRect();
+          if (rect.bottom > rect.top) return { el: standing, y: rect.top, target: headTop };
+        }
+        if (prev && prev.parentNode) return { el: prev, y: prev.getBoundingClientRect().bottom, target: prevBottom };
+        return null;
+      }
+      if (kind === "below") {
+        // The first row still drawn below the shrink: the next row may itself
+        // fold into the run (archived into it), so this is found again at each
+        // measure, not held from before the shrink.
+        if (cur && cur.parentNode) {
+          const kids = [...cur.parentNode.children];
+          for (let at = kids.indexOf(cur) + 1; at < kids.length; at += 1) {
+            const one = kids[at] as Element;
+            if (one.getAttribute("data-read-run") === "member") continue;
+            const rect = one.getBoundingClientRect();
+            if (rect.bottom > rect.top) return { el: one, y: rect.top, target: belowY };
+          }
+        }
+        if (prev && prev.parentNode) return { el: prev, y: prev.getBoundingClientRect().bottom, target: prevBottom };
+        return null;
+      }
+      const shown = cur ? shownRowFor(cur) : null;
+      if (shown && shown.parentNode) {
+        const rect = (shown as Element).getBoundingClientRect();
+        if (rect.bottom > rect.top) return { el: shown as Element, y: (rect.top + rect.bottom) / 2, target: (head + foot) / 2 };
+      }
+      if (prev && prev.parentNode && next && next.parentNode) {
+        return { el: prev, y: (prev.getBoundingClientRect().bottom + next.getBoundingClientRect().top) / 2, target: (head + foot) / 2 };
+      }
+      return null;
+    };
+    const apply = (): number | null => {
+      const now = measure();
+      if (!now) return null;
+      const delta = now.y - now.target;
+      if (Math.abs(delta) > 0.5) writeHold(area, now.el, delta);
+      return Math.abs(delta);
+    };
+    return { apply, inputAtStart };
+  }
+
+  function preservingShrink(area: HTMLElement, row: HTMLElement, head: number, foot: number, mutate: () => void): void {
+    // The reader's own act, as the collapse act's (`#2076`): its hold stands over
+    // the keeper pass that follows, so nothing takes the list to its foot — and
+    // no next-unread scroll lands — while the shrink settles. That scroll is a
+    // separate, reader-intended move made after the settle (donekeys).
+    if (deps.currentView() === "discord") openUserHold();
+    const session = shrinkSession(area, row, head, foot);
+    if (!session) {
+      preservingScroll(mutate);
+      return;
+    }
+    const selection = deps.selectionIn ? deps.selectionIn(area) : null;
+    mutate();
+    session.apply();
+    deps.renderJumpNewest();
+    if (selection && deps.restoreSelectionIn) deps.restoreSelectionIn(area, selection);
+  }
+
+  async function preservingShrinkAsync(area: HTMLElement, row: HTMLElement, head: number, foot: number, mutate: () => Promise<void>): Promise<void> {
+    if (deps.currentView() === "discord") openUserHold();
+    const session = shrinkSession(area, row, head, foot);
+    if (!session) {
+      await mutate();
+      return;
+    }
+    const selection = deps.selectionIn ? deps.selectionIn(area) : null;
+    // Re-assert the anchor every frame while the act completes: the dress,
+    // then the redraw that folds the run once the write answers, then the
+    // re-read landing that follows it — each held by the same three cases.
+    // The loop ends when the anchor and the list's height have stood still
+    // for 45 frames after the act settles (frame-based, never a clock), or
+    // when the reader wheels or touches. The next-unread move waits for this
+    // settle (donekeys, via `shrinkSettling`), so it never fights the loop.
+    let settled = false;
+    shrinkActive = true;
+    const gen = ++shrinkGen;
+    if (typeof requestAnimationFrame === "function") {
+      let still = 0;
+      let writes = 0;
+      let lastHeight = area.scrollHeight;
+      const step = (): void => {
+        if (gen !== shrinkGen) return;
+        if (readerInputAt > session.inputAtStart) { shrinkActive = false; return; }
+        const off = session.apply();
+        if (off === null) { shrinkActive = false; return; }
+        // A holder that will not hold after 24 corrected frames is owned by
+        // another keeper (a landing's, a walk's): fighting it frame after
+        // frame would keep the list moving, which is the defect itself.
+        writes = off > 0.5 ? writes + 1 : 0;
+        if (writes >= 24) { shrinkActive = false; return; }
+        const height = area.scrollHeight;
+        still = settled && off <= 0.5 && height === lastHeight ? still + 1 : 0;
+        lastHeight = height;
+        if (still < 45) requestAnimationFrame(step);
+        else shrinkActive = false;
+      };
+      requestAnimationFrame(step);
+    } else {
+      shrinkActive = false;
+    }
+    try {
+      await mutate();
+    } finally {
+      settled = true;
+      session.apply();
+      deps.renderJumpNewest();
+      if (selection && deps.restoreSelectionIn) deps.restoreSelectionIn(area, selection);
     }
   }
 
@@ -830,5 +1049,5 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     return onScreen;
   }
 
-  return { visibleList, shownChannelList, scrollAnchor, preservingScroll, preservingCollapse, holdingRows, toFoot, nudge, toPosition, wheelBy, glideTo, intoView, holdingReader, captureScroll, restoreScroll, followIfPinned, rowsOnScreen, userMovedSince, inputStamp: () => userInputAt, userChangeActive, beginUserChange: openUserHold, footRoom };
+  return { visibleList, shownChannelList, scrollAnchor, preservingScroll, preservingCollapse, preservingShrink, preservingShrinkAsync, shrinkSettling: () => shrinkActive, holdingRows, toFoot, nudge, toPosition, wheelBy, glideTo, intoView, holdingReader, captureScroll, restoreScroll, followIfPinned, rowsOnScreen, userMovedSince, inputStamp: () => userInputAt, userChangeActive, beginUserChange: openUserHold, footRoom };
 }
