@@ -316,13 +316,6 @@ def serve_matrix(port: int, write_token: str, channel: str,
     return matrix
 
 
-class ProbeResult(TypedDict, total=False):
-    status: int
-    bytes: int
-    tickets: int
-    error: str
-
-
 def probe(port: int, write_token: str, channel: str,
           thread: str | None, message_id: str) -> ProbeResult:
     """Ask the clone to prepare speech for one message. Shape only."""
