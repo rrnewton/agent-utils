@@ -237,6 +237,17 @@ owner work keeps arriving; that is the stated policy, and every use is
 visible in `gate status`/`gate queue` and recorded in history and the
 ledger with its reason.
 
+Rerun fair lane (#2085 gate-rerun-fair-lane): a --rerun ticket (a few
+steps, minutes long) otherwise queues in grant order behind full
+gates for hours. After a promotion age (default 30 minutes;
+$GATE_RERUN_PROMOTE_MIN minutes, or `after_minutes = N` in
+~/.local/etc/agent-utils/gate-rerun-promote.toml), the single oldest
+aged rerun is marked `rerun_promoted` in memory by tickets() — one
+promotion per slot-free cycle — and grant_blockers lets it take a
+slot that is actually free ahead of ordinary tickets, never ahead of
+the owner tier, never preempting a running gate. Full gates keep
+FIFO among themselves, so they cannot starve.
+
 Admission fairness (#1219 gate-admission-fairness, interleave):
 admission stays tier-first (owner, then rerun-marked, then ordinary,
 FIFO inside each tier) with one added rule: after N consecutive
@@ -1064,6 +1075,48 @@ def interleave_after() -> tuple[int, str]:
             or not isinstance(value, int) or value < 1:
         return INTERLEAVE_DEFAULT, f"host file {path} must hold only `after_owners = N` (N >= 1); default 2"
     return value, f"host file {path}"
+
+
+#: How long a queued rerun waits before promotion (#2085), in minutes.
+RERUN_PROMOTE_DEFAULT_MIN = 30.0
+DEFAULT_RERUN_PROMOTE_CONFIG = Path("~/.local/etc/agent-utils/gate-rerun-promote.toml")
+
+
+def rerun_promote_after_s() -> tuple[float, str]:
+    """Seconds a rerun must queue before the fair lane promotes it
+    (#2085 gate-rerun-fair-lane), and what decided it.
+    $GATE_RERUN_PROMOTE_MIN (minutes; the test and override hook) wins,
+    then `after_minutes = N` in $GATE_RERUN_PROMOTE_CONFIG or
+    ~/.local/etc/agent-utils/gate-rerun-promote.toml (its own file, so
+    an older gate.py reading the interleave file is undisturbed); no
+    valid setting means 30 minutes. An unusable value never changes
+    it, matching interleave_after."""
+    raw = os.environ.get("GATE_RERUN_PROMOTE_MIN")
+    if raw is not None:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = 0.0
+        if value > 0:
+            return value * 60.0, f"env GATE_RERUN_PROMOTE_MIN={raw}"
+        return (RERUN_PROMOTE_DEFAULT_MIN * 60.0,
+                f"env GATE_RERUN_PROMOTE_MIN={raw!r} is not a positive number of minutes; default 30")
+    path = Path(os.environ.get("GATE_RERUN_PROMOTE_CONFIG")
+                or DEFAULT_RERUN_PROMOTE_CONFIG).expanduser()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return RERUN_PROMOTE_DEFAULT_MIN * 60.0, "default 30 minutes"
+    try:
+        parsed = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return RERUN_PROMOTE_DEFAULT_MIN * 60.0, f"host file {path} is not TOML; default 30 minutes"
+    value = parsed.get("after_minutes")
+    if (set(parsed) != {"after_minutes"} or isinstance(value, bool)
+            or not isinstance(value, (int, float)) or value <= 0):
+        return (RERUN_PROMOTE_DEFAULT_MIN * 60.0,
+                f"host file {path} must hold only `after_minutes = N` (N > 0); default 30 minutes")
+    return float(value) * 60.0, f"host file {path}"
 
 
 def _is_interleave_marked(data: dict[str, object]) -> bool:
@@ -1987,6 +2040,20 @@ class Admission:
             oldest = min(non_owners, key=lambda item: (
                 _float_or(item[1].get("queued_at"), 0.0), item[0].name))
             oldest[1]["interleave_selected"] = True
+        # #2085 fair lane: the single oldest rerun queued past the
+        # promotion age is marked (in memory only, like the interleave
+        # mark); grant_blockers lets it take a free slot ahead of the
+        # ordinary tickets queued before it. One mark per tickets()
+        # call means one promotion per slot-free cycle.
+        promote_s, _promote_source = rerun_promote_after_s()
+        now = time.time()
+        aged = [item for item in out
+                if item[1].get("rerun") and not _is_owner_ticket(item[1])
+                and now - _float_or(item[1].get("queued_at"), now) >= promote_s]
+        if aged:
+            oldest_rerun = min(aged, key=lambda item: (
+                _float_or(item[1].get("queued_at"), 0.0), item[0].name))
+            oldest_rerun[1]["rerun_promoted"] = True
         out.sort(key=lambda item: _tier(item[1]))
         return out
 
@@ -2139,12 +2206,21 @@ class Admission:
         ]
         blockers += [("run", run, "running") for run in runs if run.get("class") == "exclusive"]
         if not blockers:
-            ahead_shared = [data for _, data in ahead if data.get("class") != "exclusive"]
-            if len(runs) + len(ahead_shared) >= self.effective_slots():
-                if ahead_shared:
-                    blockers += [("ticket", data, "ahead") for data in ahead_shared]
-                else:
+            if tickets[index][1].get("rerun_promoted"):
+                # #2085: an aged rerun takes a slot that is actually
+                # free; the ordinary tickets ahead of it do not consume
+                # the slot against it. Owner-tier and exclusive
+                # blockers above still apply, and running gates are
+                # never preempted.
+                if len(runs) >= self.effective_slots():
                     blockers += [("run", run, "slots-full") for run in runs]
+            else:
+                ahead_shared = [data for _, data in ahead if data.get("class") != "exclusive"]
+                if len(runs) + len(ahead_shared) >= self.effective_slots():
+                    if ahead_shared:
+                        blockers += [("ticket", data, "ahead") for data in ahead_shared]
+                    else:
+                        blockers += [("run", run, "slots-full") for run in runs]
         return blockers
 
     def try_grant(self, run_id: str, cls: str) -> bool:
@@ -3210,6 +3286,8 @@ def _ticket_label(data: dict[str, object]) -> str:
         if data.get("rerun"):
             return f"nested exclusive phase (rerun-tier mark on, {data.get('phase_priority')})"
         return "nested exclusive phase (unmarked)"
+    if data.get("rerun_promoted"):
+        return "--rerun ticket (promoted by the fair lane after its wait, #2085)"
     if data.get("rerun"):
         return "--rerun ticket"
     if _is_inferred_phase(data):

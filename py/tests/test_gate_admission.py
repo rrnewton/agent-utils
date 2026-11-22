@@ -36,6 +36,8 @@ def _hermetic_gate_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setenv("GATE_BLACKOUT_CONFIG", str(tmp_path / "hostless-gate.toml"))
     monkeypatch.setenv("GATE_DEFER_CONFIG", str(tmp_path / "hostless-gate-defer.toml"))
     monkeypatch.setenv("MEMORY_FLOOR_CONFIG", str(tmp_path / "hostless-memory-floor.toml"))
+    monkeypatch.setenv("GATE_RERUN_PROMOTE_CONFIG", str(tmp_path / "hostless-rerun-promote.toml"))
+    monkeypatch.delenv("GATE_RERUN_PROMOTE_MIN", raising=False)
     # #2062: a missing floor file means defaults, so tests fake a roomy
     # meminfo (200 GiB total, 190 available) rather than depend on the host.
     (tmp_path / "meminfo").write_text(
@@ -81,6 +83,7 @@ def _env(tmp_path: Path) -> dict[str, str]:
             "GATE_BLACKOUT_CONFIG": str(tmp_path / "gate.toml"),
             "GATE_DEFER_CONFIG": str(tmp_path / "gate-defer.toml"),
             "MEMORY_FLOOR_CONFIG": str(tmp_path / "memory-floor.toml"),
+            "GATE_RERUN_PROMOTE_CONFIG": str(tmp_path / "rerun-promote.toml"),
             "MEMORY_FLOOR_MEMINFO": str(tmp_path / "meminfo"),
             "GATE_DEFER_SHARED_HOLDS_DIR": str(tmp_path / "no-shared-holds"),
             "GATE_DEFER_HOLD_REPORT_STATE": str(tmp_path / "hold-reports.json"),
@@ -2507,3 +2510,91 @@ def test_a_queued_gate_sees_a_signal_removed_from_the_host_file(tmp_path: Path) 
     assert gate.returncode == 0, out
     assert marker.exists()  # started while the unit is still active
     assert "deferral cleared" in out
+
+
+def _ticket(root: Path, run_id: str, queued_at: float, **kw: object) -> None:
+    _write_ticket(root, "queue", run_id, {
+        "id": run_id, "pid": os.getpid(), "class": "shared",
+        "queued_at": queued_at, "command": [], "rerun": False, **kw})
+
+
+def test_an_aged_rerun_is_promoted_ahead_of_full_gates(tmp_path: Path) -> None:
+    """#2085: one slot, two full gates ahead; a rerun queued past the
+    promotion age (queued_at 0) takes the free slot, while a young
+    rerun (queued now) would still wait behind them."""
+    gate = _gate_module()
+    root = tmp_path / "admission"
+    adm = gate.Admission(root, 1)
+    now = time.time()
+    _ticket(root, "100-full", now - 7200)
+    _ticket(root, "200-full", now - 7000)
+    _ticket(root, "300-rerun", 0, rerun=True)
+    tickets = adm.tickets()
+    by_id = {str(d["id"]): d for _, d in tickets}
+    assert by_id["300-rerun"].get("rerun_promoted") is True
+    assert adm.grant_blockers("300-rerun", "shared", tickets, []) == []
+    assert adm.try_grant("300-rerun", "shared")
+
+
+def test_a_young_rerun_is_not_promoted(tmp_path: Path) -> None:
+    gate = _gate_module()
+    root = tmp_path / "admission"
+    adm = gate.Admission(root, 1)
+    now = time.time()
+    _ticket(root, "100-full", now - 7200)
+    _ticket(root, "300-rerun", now, rerun=True)
+    tickets = adm.tickets()
+    by_id = {str(d["id"]): d for _, d in tickets}
+    assert "rerun_promoted" not in by_id["300-rerun"]
+
+
+def test_promotion_never_passes_the_owner_tier(tmp_path: Path) -> None:
+    gate = _gate_module()
+    root = tmp_path / "admission"
+    adm = gate.Admission(root, 1)
+    now = time.time()
+    _ticket(root, "100-owner", now - 7200, priority="owner", priority_reason="test")
+    _ticket(root, "300-rerun", 0, rerun=True)
+    tickets = adm.tickets()
+    assert adm.grant_blockers("300-rerun", "shared", tickets, []) != []
+
+
+def test_full_gates_progress_after_the_promoted_rerun(tmp_path: Path) -> None:
+    """One promotion per cycle: after the promoted rerun is granted,
+    the next tickets() call may promote the next aged rerun, but an
+    ordinary ticket is granted as soon as a slot is actually free."""
+    gate = _gate_module()
+    root = tmp_path / "admission"
+    adm = gate.Admission(root, 1)
+    now = time.time()
+    _ticket(root, "100-full", now - 7200)
+    _ticket(root, "300-rerun", 0, rerun=True)
+    tickets = adm.tickets()
+    assert adm.try_grant("300-rerun", "shared")
+    tickets = adm.tickets()
+    assert adm.grant_blockers("100-full", "shared", tickets, adm.runs()) != []
+    adm.finish("300-rerun")
+    tickets = adm.tickets()
+    assert adm.try_grant("100-full", "shared")
+
+
+def test_promotion_bypasses_the_ahead_shared_slot_count(tmp_path: Path) -> None:
+    """#2085, the bypass itself: in grant order as a legacy client
+    would list them (ordinary tickets first), a promoted rerun is
+    blocked only by actually-running work, not by the queued tickets
+    ahead of it; unpromoted, the same list blocks it."""
+    gate = _gate_module()
+    root = tmp_path / "admission"
+    adm = gate.Admission(root, 1)
+    now = time.time()
+    _ticket(root, "100-full", now - 7200)
+    _ticket(root, "200-full", now - 7000)
+    _ticket(root, "300-rerun", 0, rerun=True)
+    tickets = adm.tickets()
+    rerun_data = {str(d["id"]): d for _, d in tickets}["300-rerun"]
+    assert rerun_data.get("rerun_promoted") is True
+    legacy_order = [(p, d) for p, d in tickets if str(d["id"]) != "300-rerun"]
+    legacy_order.append(next((p, d) for p, d in tickets if str(d["id"]) == "300-rerun"))
+    assert adm.grant_blockers("300-rerun", "shared", legacy_order, []) == []
+    rerun_data.pop("rerun_promoted")
+    assert adm.grant_blockers("300-rerun", "shared", legacy_order, []) != []
