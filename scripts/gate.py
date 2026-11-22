@@ -23,6 +23,14 @@ repository (default /tmp/dev-agent-utils-gate-admission, override with
 $GATE_ADMISSION_DIR); tickets and runs are files, reaped when their pid dies,
 so a killed lane never holds a slot forever.
 
+Step logs (#2078 gate-step-logs-kept): every admitted gate gets a log
+directory outside the worktree (~/.local/state/agent-utils/gate-logs/
+<run-id>, override $GATE_LOG_ROOT), passed to its command as
+$DAGRUN_LOG_DIR (dagrun's per-step evidence is opt-in on that
+variable), printed at admission, and recorded as the ledger row's
+log_path. Retention is bounded: the newest $GATE_LOG_KEEP (default
+20) directories stay, older ones are pruned when a gate finishes.
+
 When a run finishes and has released its slot, it prunes this checkout's cargo
 target dirs of builds nothing can reuse, under cargo's own locks, and reports
 the bytes before and after, both under the target dirs and allocated on the
@@ -987,6 +995,50 @@ def run_hold(argv: list[str]) -> int:
 
 def ledger_path(explicit: str | None = None) -> Path:
     return Path(explicit or os.environ.get("GATE_LEDGER") or DEFAULT_LEDGER).expanduser()
+
+
+#: Per-gate step-log directories (#2078 gate-step-logs-kept): outside
+#: every worktree, one directory per gate run, bounded retention.
+DEFAULT_GATE_LOG_ROOT = Path("~/.local/state/agent-utils/gate-logs")
+GATE_LOG_KEEP = 20
+
+
+def gate_log_root() -> Path:
+    return Path(os.environ.get("GATE_LOG_ROOT") or DEFAULT_GATE_LOG_ROOT).expanduser()
+
+
+def gate_log_dir(run_id: str) -> Path:
+    """This gate's step-log directory: created before the command
+    starts, passed to dagrun as $DAGRUN_LOG_DIR (its evidence is
+    opt-in on exactly that variable), and recorded as the ledger
+    row's log_path so a red gate can be diagnosed after the fact."""
+    path = gate_log_root() / run_id
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def prune_gate_logs(keep: int | None = None) -> int:
+    """Bounded retention (#2078): keep the newest `keep` gate log
+    directories (by modification time), remove the rest. $GATE_LOG_KEEP
+    overrides; an unusable value keeps the default. Best effort: a
+    prune failure never changes a gate's result."""
+    if keep is None:
+        raw = os.environ.get("GATE_LOG_KEEP")
+        try:
+            keep = int(raw) if raw else GATE_LOG_KEEP
+        except ValueError:
+            keep = GATE_LOG_KEEP
+    root = gate_log_root()
+    try:
+        dirs = sorted((d for d in root.iterdir() if d.is_dir()),
+                      key=lambda d: d.stat().st_mtime, reverse=True)
+    except OSError:
+        return 0
+    removed = 0
+    for stale in dirs[max(keep, 0):]:
+        shutil.rmtree(stale, ignore_errors=True)
+        removed += 1
+    return removed
 
 
 def _utc(unix: float) -> str:
@@ -2883,12 +2935,16 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
     aborted: str | None = None
     previous = {sig: signal.getsignal(sig) for sig in _ABORT_SIGNALS}
     proc: subprocess.Popen[str] | None = None
+    # #2078: this gate's durable step-log directory, outside the worktree.
+    log_dir = gate_log_dir(run_id)
+    print(f"gate: step logs kept in {log_dir} (recorded in the ledger, #2078)", flush=True)
     try:
         for sig in _ABORT_SIGNALS:
             signal.signal(sig, _raise_aborted)
         proc = subprocess.Popen(
             run_command,
-            env=_child_environment(GATE_ADMISSION_RUN_ID=run_id, **_capped_environment(quota_cpus)),
+            env=_child_environment(GATE_ADMISSION_RUN_ID=run_id, DAGRUN_LOG_DIR=str(log_dir),
+                                   **_capped_environment(quota_cpus)),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -2932,9 +2988,11 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
                     "priority": priority, "priority_reason": priority_reason,
                     "defer_waiting": defer_ever, "defer_wait_s": round(defer_wait_s, 2),
                     "memory_waiting": memory_ever, "memory_wait_s": round(memory_wait_s, 2),
-                    "memory_class": mem_cls, "memory_need_gib": mem_need})
+                    "memory_class": mem_cls, "memory_need_gib": mem_need,
+                    "log_path": str(log_dir)})
         # After the slot is released, so no other gate waits on it (#940). A
         # nested gate leaves it to its parent, which is still building.
+        prune_gate_logs()
         pruned = None if nested or getattr(args, "no_prune", False) else _prune_after_gate()
         if pruned is not None and last_line:
             # The run's verdict stays the log's last line (`tail -1 LOG`).
@@ -2947,7 +3005,8 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
                        priority=priority, priority_reason=priority_reason,
                        defer_waiting=defer_ever, defer_wait_s=defer_wait_s,
                        memory_waiting=memory_ever, memory_wait_s=memory_wait_s,
-                       memory_class=mem_cls, memory_need_gib=mem_need)
+                       memory_class=mem_cls, memory_need_gib=mem_need,
+                       log_path=str(log_dir))
     return rc
 
 
@@ -3034,6 +3093,7 @@ def _record_ledger(
     memory_wait_s: float = 0.0,
     memory_class: str | None = None,
     memory_need_gib: float | None = None,
+    log_path: str | None = None,
 ) -> None:
     """Append one durable ledger line for the finished run (#827). Best effort:
     a ledger failure must never change the gate's own result. `queued_utc` and
@@ -3082,7 +3142,7 @@ def _record_ledger(
             "memory_wait_s": round(memory_wait_s, 2),
             "memory_class": memory_class,
             "memory_need_gib": memory_need_gib,
-            "log_path": None,
+            "log_path": log_path,
             "target_bytes_before": (pruned or {}).get("target_bytes_before"),
             "target_bytes_after": (pruned or {}).get("target_bytes_after"),
             "host_bytes_before": (pruned or {}).get("host_bytes_before"),

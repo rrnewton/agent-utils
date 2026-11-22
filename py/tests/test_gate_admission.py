@@ -37,6 +37,7 @@ def _hermetic_gate_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setenv("GATE_DEFER_CONFIG", str(tmp_path / "hostless-gate-defer.toml"))
     monkeypatch.setenv("MEMORY_FLOOR_CONFIG", str(tmp_path / "hostless-memory-floor.toml"))
     monkeypatch.setenv("GATE_RERUN_PROMOTE_CONFIG", str(tmp_path / "hostless-rerun-promote.toml"))
+    monkeypatch.setenv("GATE_LOG_ROOT", str(tmp_path / "gate-logs"))
     monkeypatch.delenv("GATE_RERUN_PROMOTE_MIN", raising=False)
     # #2062: a missing floor file means defaults, so tests fake a roomy
     # meminfo (200 GiB total, 190 available) rather than depend on the host.
@@ -84,6 +85,7 @@ def _env(tmp_path: Path) -> dict[str, str]:
             "GATE_DEFER_CONFIG": str(tmp_path / "gate-defer.toml"),
             "MEMORY_FLOOR_CONFIG": str(tmp_path / "memory-floor.toml"),
             "GATE_RERUN_PROMOTE_CONFIG": str(tmp_path / "rerun-promote.toml"),
+            "GATE_LOG_ROOT": str(tmp_path / "gate-logs"),
             "MEMORY_FLOOR_MEMINFO": str(tmp_path / "meminfo"),
             "GATE_DEFER_SHARED_HOLDS_DIR": str(tmp_path / "no-shared-holds"),
             "GATE_DEFER_HOLD_REPORT_STATE": str(tmp_path / "hold-reports.json"),
@@ -1277,7 +1279,7 @@ def test_a_passing_preflight_prints_one_line_and_is_recorded(tmp_path: Path) -> 
     done = subprocess.run([PY, str(GATE), "--", PY, "-c", "print('validate: OK')"],
                           env=_env(tmp_path), capture_output=True, text=True, timeout=30)
     assert done.returncode == 0, done.stdout
-    [line] = [line for line in done.stdout.splitlines() if "preflight" in line]
+    [line] = [line for line in done.stdout.splitlines() if line.startswith("gate: preflight")]
     assert line.startswith("gate: preflight passed in "), done.stdout
     [row] = _ledger_rows(tmp_path)
     assert row["kind"] == "gate" and row["preflight"] == "passed"
@@ -1288,7 +1290,7 @@ def test_skip_preflight_queues_anyway_and_is_recorded(tmp_path: Path) -> None:
     done = subprocess.run([PY, str(GATE), "--skip-preflight", "--", PY, "-c", "pass"],
                           env=env, capture_output=True, text=True, timeout=30)
     assert done.returncode == 0, done.stdout
-    assert "preflight" not in done.stdout
+    assert "gate: preflight" not in done.stdout
     [row] = _ledger_rows(tmp_path)
     assert row["preflight"] == "skipped: --skip-preflight"
     stats = subprocess.run([PY, str(GATE), "stats"], env=env, capture_output=True, text=True)
@@ -2598,3 +2600,35 @@ def test_promotion_bypasses_the_ahead_shared_slot_count(tmp_path: Path) -> None:
     assert adm.grant_blockers("300-rerun", "shared", legacy_order, []) == []
     rerun_data.pop("rerun_promoted")
     assert adm.grant_blockers("300-rerun", "shared", legacy_order, []) != []
+
+
+def test_gate_logs_are_kept_outside_the_worktree_and_recorded(tmp_path: Path) -> None:
+    """#2078: the admitted command sees $DAGRUN_LOG_DIR pointing at a
+    per-gate directory outside the worktree, and the ledger row's
+    log_path names that same directory."""
+    ledger = tmp_path / "ledger.jsonl"
+    env = {**_env(tmp_path), "GATE_LEDGER": str(ledger)}
+    result = subprocess.run(
+        [PY, str(GATE), "--", PY, "-c",
+         "import os; print('logdir=' + os.environ.get('DAGRUN_LOG_DIR', ''))"],
+        env=env, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout
+    shown = next(line.split("=", 1)[1] for line in result.stdout.splitlines()
+                 if line.startswith("logdir="))
+    rows = [json.loads(line) for line in ledger.read_text().splitlines()]
+    assert rows[-1]["log_path"] == shown
+    assert Path(shown).is_dir() and str(tmp_path) in shown
+
+
+def test_gate_log_retention_is_bounded(tmp_path: Path) -> None:
+    """#2078: only the newest GATE_LOG_KEEP directories stay."""
+    gate = _gate_module()
+    root = tmp_path / "gate-logs"
+    for i in range(7):
+        d = root / f"run-{i}"
+        d.mkdir(parents=True)
+        (d / "step.log").write_text("x")
+        os.utime(d, (1000 + i, 1000 + i))
+    removed = gate.prune_gate_logs(keep=3)
+    assert removed == 4
+    assert sorted(d.name for d in root.iterdir()) == ["run-4", "run-5", "run-6"]
