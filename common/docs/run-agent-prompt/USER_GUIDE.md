@@ -53,7 +53,7 @@ per attempt.
 
 Attempts run in Muse, Claude Code, Codex order unless `--only HARNESS`
 selects one, or `--profile-file PATH` names a recovery profile file
-(schema `agentctl-recovery-profiles/v1`): then its ordered
+(schema version 1, as the recovery guide describes): then its ordered
 `[[profile]]` entries are the attempt order, with no hidden built-in
 order. Each profile names a unique `name`, a `harness`, and optional
 `model`, `effort`, `timeout_seconds`, an absolute `command`, and
