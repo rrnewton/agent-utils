@@ -456,37 +456,17 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
       linkThread: ref.thread,
       outOfScope,
     });
-    if (decision.action === "jump-in-place" || (decision.action === "return-to-bound" && boundRaw !== null)) {
+    if (decision.action === "jump-in-place") {
       // `#1586`: out of full screen first, so the jump lands visibly.
       // `#2080`: in place — the current view (All included) shows the message
-      // where it can, Discuss stays open. Owner 311: the summary itself stays
-      // absolutely stable — its scroll is pinned across the jump and put
-      // back as the landing settles (frames, not clocks), because scroll
-      // anchoring over the strike settling otherwise walks it.
-      const unpin = panel.pinScroll();
+      // where it can, Discuss stays open and its scroll is untouched.
       panel.dropToPartialForLink();
-      const jumped = decision.action === "jump-in-place"
-        ? (deps.onJumpInPlace ? deps.onJumpInPlace(ref) : deps.onJump(ref))
-        : (deps.navigateToBound ? deps.navigateToBound(boundRaw!, ref) : deps.onJump(ref));
-      // Pin on every frame until the jump settles, and for six frames
-      // after: the scroll walk happens in the landing's own frames, and a
-      // one-off put-back loses to the last of them. Six, not thirty: past
-      // the landing the panel's scroll is the reader's again, and a pin
-      // that outlives the jump would fight their next scroll.
-      unpin();
-      let settleFrames = -1;
-      void Promise.resolve(jumped).then(
-        () => { settleFrames = 0; },
-        () => { settleFrames = 0; },
-      );
-      if (typeof requestAnimationFrame === "function") {
-        const pin = (): void => {
-          unpin();
-          if (settleFrames >= 0) settleFrames += 1;
-          if (settleFrames < 6) requestAnimationFrame(pin);
-        };
-        requestAnimationFrame(pin);
-      }
+      if (deps.onJumpInPlace) deps.onJumpInPlace(ref);
+      else deps.onJump(ref);
+    } else if (decision.action === "return-to-bound" && boundRaw !== null) {
+      panel.dropToPartialForLink();
+      if (deps.navigateToBound) deps.navigateToBound(boundRaw, ref);
+      else deps.onJump(ref);
     } else {
       pushRestoreState();
       panel.close();
