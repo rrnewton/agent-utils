@@ -384,7 +384,8 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   color: var(--warn);
 }
 
-#discuss-terms {
+#discuss-terms,
+#discuss-processed {
   margin-top: 10px;
   color: var(--muted);
   font-size: 0.85rem;
@@ -395,7 +396,9 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
 /* `#1924` (b)+(c): Terms folds with the same readable triangle as the
  * summary sections, on a row at least 32px tall, and its list stands
  * clear of the fold line. */
-#discuss-terms summary {
+#discuss-terms summary,
+#discuss-processed summary,
+.discuss-old-processed summary {
   display: flex;
   align-items: flex-start;
   gap: 0.45rem;
@@ -411,11 +414,15 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   -webkit-tap-highlight-color: transparent;
 }
 
-#discuss-terms summary::-webkit-details-marker {
+#discuss-terms summary::-webkit-details-marker,
+#discuss-processed summary::-webkit-details-marker,
+.discuss-old-processed summary::-webkit-details-marker {
   display: none;
 }
 
-#discuss-terms summary::before {
+#discuss-terms summary::before,
+#discuss-processed summary::before,
+.discuss-old-processed summary::before {
   content: "▸";
   flex: 0 0 auto;
   display: flex;
@@ -428,7 +435,9 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   line-height: 1;
 }
 
-#discuss-terms[open] summary::before {
+#discuss-terms[open] summary::before,
+#discuss-processed[open] summary::before,
+.discuss-old-processed[open] summary::before {
   content: "▾";
 }
 
@@ -744,20 +753,34 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   margin-top: 12px;
 }
 
-#discuss-covers {
-  display: inline;
-  margin: 0 0.25em 0 0;
-  font-size: 0.9rem;
+.discuss-old-processed {
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 0.85rem;
 }
 
-#discuss-links {
+.discuss-old-processed summary {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.45rem;
+  box-sizing: border-box;
+  min-height: 2rem;
+  padding: 0.4rem 0;
+  cursor: pointer;
+  list-style: none;
+  font-weight: 600;
+}
+
+#discuss-links,
+.discuss-processed-list {
   display: inline;
   list-style: none;
   margin: 0;
   padding: 0;
 }
 
-#discuss-links li {
+#discuss-links li,
+.discuss-processed-list li {
   display: inline;
 }
 

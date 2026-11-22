@@ -412,6 +412,8 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
     assert_landed(ids["old_msg"], "not-yet-loaded citation")
 
     # Footer time link (the reply), also in place.
+    page.locator("#discuss-processed summary").click()
+    page.wait_for_function("() => document.getElementById('discuss-processed').open", timeout=20_000)
     footer_link = page.locator("#discuss-links .discuss-link").first
     footer_link.scroll_into_view_if_needed()
     footer_link.click()

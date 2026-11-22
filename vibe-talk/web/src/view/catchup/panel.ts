@@ -1725,6 +1725,20 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         } else {
           body.textContent = entry.answer.text;
         }
+        // `#2133`: an earlier summary shows its own processed list where
+        // its stored record keeps the links, as a collapsible suffix.
+        {
+          const citedOld = new Set(entry.answer.cited_ids);
+          if (entry.answer.footer_links.some((link) => !citedOld.has(link.id))) {
+            const proc = document.createElement("details");
+            proc.className = "discuss-old-processed";
+            const head = document.createElement("summary");
+            head.textContent = "Other messages processed:";
+            proc.appendChild(head);
+            proc.appendChild(buildProcessedList(entry.answer, scope));
+            body.appendChild(proc);
+          }
+        }
         // `#1960`: the same single toggle as the other headers. It lives
         // in this summary, so its tap never folds this row: opening opens
         // this row and every fold in its body; collapsing closes only
@@ -1933,19 +1947,11 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     );
   }
 
-  /** Draw the footer's covered list and its mark buttons from one answer. */
-  function drawFooter(answer: CatchupAnswer, scope: DiscussScope): void {
-    const covered = answer.unread_ids.length;
-    const footer = deps.byId("discuss-footer");
-    footer.hidden = covered === 0;
-    if (covered === 0) return;
-    deps.byId("discuss-covers").textContent = "Other messages processed:";
+  /** One summary's uncited covered links as a dense jump list (`#1540`). */
+  function buildProcessedList(answer: CatchupAnswer, scope: DiscussScope): HTMLUListElement {
     const cited = new Set(answer.cited_ids);
-    const list = deps.byId("discuss-links");
-    list.replaceChildren();
-    // `#1540 discuss-footer-inline-links`: the uncited remainder reads as
-    // one dense comma-separated line that wraps like text, each time
-    // still its own jump button — not one full-width button per time.
+    const list = document.createElement("ul");
+    list.className = "discuss-processed-list";
     const visible = answer.footer_links.filter((link) => !cited.has(link.id));
     visible.forEach((link, index) => {
       const item = document.createElement("li");
@@ -1972,6 +1978,26 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       if (index < visible.length - 1) item.appendChild(document.createTextNode(", "));
       list.appendChild(item);
     });
+    return list;
+  }
+
+  /** Draw the summary's processed section and the footer's mark buttons. */
+  function drawFooter(answer: CatchupAnswer, scope: DiscussScope): void {
+    const covered = answer.unread_ids.length;
+    const footer = deps.byId("discuss-footer");
+    footer.hidden = covered === 0;
+    // `#2133`: the processed list is a collapsible suffix of the summary
+    // itself, just before Terms — shown only where the record keeps links.
+    const processed = deps.byId("discuss-processed") as HTMLDetailsElement;
+    const citedNow = new Set(answer.cited_ids);
+    const hasProcessed = answer.footer_links.some((link) => !citedNow.has(link.id));
+    processed.hidden = !hasProcessed;
+    if (hasProcessed) {
+      deps.byId("discuss-covers").textContent = "Other messages processed:";
+      const list = deps.byId("discuss-links");
+      list.replaceChildren(...Array.from(buildProcessedList(answer, scope).children));
+    }
+    if (covered === 0) return;
     const unmarkable = deps.byId("discuss-unmarkable");
     if (answer.unread_ids.length !== answer.markable_ids.length) {
       unmarkable.hidden = false;

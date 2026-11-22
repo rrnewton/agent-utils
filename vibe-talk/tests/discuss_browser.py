@@ -531,7 +531,11 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
     status = page.locator("#discuss-status").text_content() or ""
     check(status == "Read 2 unread of 12", f"the status says {status!r}")
     covers = page.locator("#discuss-covers").text_content() or ""
-    check(covers == "Other messages processed:", f"the footer says {covers!r}")
+    check(covers == "Other messages processed:", f"the summary suffix says {covers!r}")
+    # `#2133`: the processed list is a collapsible suffix of the summary,
+    # just before Terms — open it before measuring its links.
+    page.locator("#discuss-processed summary").click()
+    page.wait_for_function("() => document.getElementById('discuss-processed').open", timeout=20_000)
     check(page.locator("#discuss-links .discuss-link").count() == 10, "the footer links are missing")
     check(page.locator("#discuss-links .discuss-link").first.text_content() == "09:51", "the footer links are not dense HH:MM")
     # `#1540 discuss-footer-inline-links`: the times read as one dense,
@@ -553,7 +557,7 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
         shortest: Math.min(...rects.map((r) => r.height)),
         coversWithFirst: Math.abs(covers.top - first.top) <= 4
           || Math.abs(covers.bottom - first.bottom) <= 24,
-        text: document.getElementById('discuss-footer').textContent,
+        text: document.getElementById('discuss-processed').textContent,
       };
     }""")
     check(footer_geo["count"] == 10 and footer_geo["lines"] <= 3,
@@ -566,8 +570,8 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
           f"a footer time tap target is too short: {footer_geo}")
     check("09:51, 09:52" in footer_geo["text"],
           f"the footer times are not comma-separated: {footer_geo['text']!r}")
-    check(footer_geo["coversWithFirst"],
-          f"the footer label does not share the times' line: {footer_geo}")
+    check(page.locator("#discuss-processed").bounding_box()["y"] < page.locator("#discuss-terms").bounding_box()["y"] if page.locator("#discuss-terms").is_visible() else True,
+          "the processed section does not stand before Terms")
     check(page.locator("#discuss-answer .discuss-struck").count() == 0,
           "a bullet stood struck before anything was read")
     stamp = page.locator("#discuss-stamp").text_content() or ""
@@ -947,6 +951,8 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
         timeout=20_000)
 
     # A footer jump stays in its scope: the panel stays open (`#1395`).
+    page.evaluate("() => { const d = document.getElementById('discuss-processed'); if (d && !d.open) d.querySelector('summary').click(); }")
+    page.wait_for_function("() => document.getElementById('discuss-processed').open", timeout=20_000)
     page.click("#discuss-links .discuss-link >> nth=0")
     # The jump keeps the panel open (it overlays the list it jumped).
     page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
