@@ -7,6 +7,7 @@
 // filters' held row, the search walk's control, and the jump to the newest are the page's.
 
 import { shrinkCase } from "./anchorpolicy.ts";
+import type { AnchorCheck } from "./anchorpolicy.ts";
 import { shownRowFor } from "./rows.ts";
 
 /** Where the reader is: on the newest line, or which element their eye is on and how far down it sits. */
@@ -93,6 +94,12 @@ export interface ScrollKeepingDependencies {
    * one scroll owner, beside the composer's (`#1839`). Absent: never following.
    */
   readFollowing?(): boolean;
+  /**
+   * The live anchor debug mode's ear (`#2091`, owner 308 (c)): where it stands,
+   * the owner hands it each settled reader-caused change to judge by the one
+   * invariant (`anchorpolicy`). Absent, or the mode off: nothing is judged.
+   */
+  anchorDebug?(check: AnchorCheck & { action: string }): void;
 }
 
 /**
@@ -749,7 +756,7 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
    * the reader's place (a filter hold, a search walk, a landed jump), where the
    * caller falls back to `preservingScroll`.
    */
-  function shrinkSession(area: HTMLElement, row: HTMLElement, head: number, foot: number): { apply(): number | null; inputAtStart: number } | null {
+  function shrinkSession(area: HTMLElement, row: HTMLElement, head: number, foot: number): { apply(): number | null; judge(): AnchorCheck | null; inputAtStart: number } | null {
     const jump = deps.jumpAnchorRow ? deps.jumpAnchorRow() : null;
     if (deps.heldFilterRow() || (deps.searchWalk && deps.searchWalk()) || (jump && jump !== row)) return null;
     if (!row.parentNode) return null;
@@ -845,7 +852,15 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
       if (Math.abs(delta) > 0.5) writeHold(area, now.el, delta);
       return Math.abs(delta);
     };
-    return { apply, inputAtStart };
+    // The settled change as the one invariant judges it (`#2091` (a)): the
+    // anchor's target and where it stands, the seam against the centre.
+    const judge = (): AnchorCheck | null => {
+      const now = measure();
+      if (!now) return null;
+      if (kind === "seam") return { kind, beforeY: now.target, afterY: now.y, seamY: now.y, centreY: now.target };
+      return { kind, beforeY: now.target, afterY: now.y };
+    };
+    return { apply, judge, inputAtStart };
   }
 
   function preservingShrink(area: HTMLElement, row: HTMLElement, head: number, foot: number, mutate: () => void): void {
@@ -913,6 +928,10 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     } finally {
       settled = true;
       session.apply();
+      if (deps.anchorDebug) {
+        const judged = session.judge();
+        if (judged) deps.anchorDebug({ ...judged, action: "archive-shrink" });
+      }
       deps.renderJumpNewest();
       if (selection && deps.restoreSelectionIn) deps.restoreSelectionIn(area, selection);
     }
