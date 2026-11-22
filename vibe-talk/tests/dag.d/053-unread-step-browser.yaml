@@ -14,11 +14,6 @@ steps:
       classification: latency-bound
       preferred_inner_jobs: 4
       rss_baseline_bytes: 1073741824
-    hint:
-      resources: {browser: 1}
-      est_duration_s: 27
-      classification: latency-bound
-      rss_baseline_bytes: 1073741824
 
   # `#1710 vibe-talk-readerbar-sound-overlap` in the browser engine: Sound and the cloud/device
   # selector stacked in the phone reader bar's left column, at 412x915 (device scale 2.6) and

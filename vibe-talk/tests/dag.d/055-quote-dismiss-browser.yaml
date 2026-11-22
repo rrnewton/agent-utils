@@ -14,15 +14,6 @@ steps:
       classification: latency-bound
       preferred_inner_jobs: 4
       rss_baseline_bytes: 1073741824
-    jobs_flag: ""
-    deps: [setup.contract-tools]
-    timeout: 360
-    cpu_timeout: 45
-    hint:
-      resources: {browser: 1}
-      est_duration_s: 27
-      classification: latency-bound
-      rss_baseline_bytes: 1073741824
 
   # `#344 search-shortcut` in the browser engine, the keys pressed through CDP Input.dispatchKeyEvent at
   # 1280x800: Ctrl+/ opens the search with its field focused and its default refused from the channel's
