@@ -99,6 +99,7 @@ pub mod probe;
 pub mod prompts;
 pub mod providers;
 pub mod read_ahead;
+pub mod read_cli;
 pub mod read_reason;
 pub mod recap;
 pub mod recent;

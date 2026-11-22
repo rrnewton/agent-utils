@@ -154,6 +154,8 @@ fn config_candidates() -> Vec<PathBuf> {
 /// makes no provider calls, so provider credentials are never required or checked.
 #[derive(Clone, Debug, Default)]
 pub struct PromptsConfig {
+    /// `[render] short_refs_files`, for the read CLI's `:thread:` ids.
+    pub short_refs_files: Vec<PathBuf>,
     /// The owner's user ids.
     pub owner_ids: Vec<String>,
     /// The configured channels (id + label).
@@ -178,6 +180,14 @@ struct LenientFile {
     storage: LenientStorage,
     #[serde(default)]
     message_cache: LenientCache,
+    #[serde(default)]
+    render: LenientRender,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct LenientRender {
+    #[serde(default)]
+    short_refs_files: Vec<PathBuf>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -250,6 +260,7 @@ pub fn parse_lenient(text: &str) -> anyhow::Result<PromptsConfig> {
         })
         .collect();
     Ok(PromptsConfig {
+        short_refs_files: file.render.short_refs_files,
         owner_ids,
         channels,
         storage_path: file.storage.path,
@@ -447,6 +458,16 @@ pub fn parse_since(raw: &str) -> anyhow::Result<i64> {
 
 /// The cache file `prompts` reads: `--cache`, else the configuration's cache path,
 /// else the default beside the store.
+/// The cache file for a loaded config and options: [`cache_path`], for the
+/// unified read CLI (`#2106`), which discovers config exactly as `prompts`.
+///
+/// # Errors
+///
+/// As [`cache_path`].
+pub fn cache_file(config: &PromptsConfig, options: &Options) -> anyhow::Result<PathBuf> {
+    cache_path(config, options)
+}
+
 fn cache_path(config: &PromptsConfig, options: &Options) -> anyhow::Result<PathBuf> {
     if let Some(path) = &options.cache {
         return Ok(path.clone());

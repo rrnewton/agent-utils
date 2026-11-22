@@ -181,6 +181,9 @@ mod recap;
 #[path = "read_ahead.rs"]
 mod read_ahead;
 
+#[path = "read_cli.rs"]
+mod read_cli;
+
 #[path = "read_aloud.rs"]
 mod read_aloud;
 

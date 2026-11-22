@@ -41,7 +41,13 @@ USAGE:
     vibe-talk pair-link [--config PATH] [--config-overlay PATH]... [--base-url URL] [--ttl SECONDS]
     vibe-talk recap [--config PATH] [--hours N | --since WHEN] [--channel NAME] [--json]
     vibe-talk prompts [--hours N | --since WHEN] [--channel NAME] [--json]
-    vibe-talk search \"<query>\" [--channel NAME] [--since DATE] [--limit N] [--json]
+    vibe-talk search [TERM...] [--any] [--mine] [--brief] [--channel NAME]
+                     [--hours N | --since WHEN | --until WHEN | --range FROM..TO]
+                     [--limit N] [--json] [--cache PATH]
+    vibe-talk threads [--channel NAME] [--hours N | --since WHEN | --until WHEN
+                     | --range FROM..TO] [--limit N] [--json] [--cache PATH]
+    vibe-talk thread <long-id|slug|:thread:N> [TERM...] [--any] [--mine]
+                     [--brief] [--channel NAME] [--json] [--cache PATH]
     vibe-talk <tool> [--json] [--yes]     one subcommand per MCP tool, generated from the
                                           tool manifest (recent-activity, list-channels,
                                           read-page, post-reply, ...); `vibe-talk <tool>
@@ -66,10 +72,21 @@ COMMANDS:
     prompts               print ONLY the owner's messages over a window, oldest first,
                           from the local message cache (no server, no provider calls).
                           See `vibe-talk prompts --help`
-    search \"<query>\"      search the chat history the running server holds and print one line
-                          per hit (ET time, author, snippet, permalink, vibe-talk deep link),
-                          newest first, with a line per channel saying how far back it was
-                          searched. Uses the READ token. See `vibe-talk search --help`
+    search [TERM...]      search the local message cache only (no server, no token):
+                          whole-message hits holding every term (AND; --any for OR,
+                          quoted phrases contiguous), newest first, with channel,
+                          thread long id + slug + :thread: short id and ET time;
+                          --mine is `prompts` with no terms, --brief one line a hit.
+                          See `vibe-talk search --help`
+    threads               list threads active in a window from the local cache only
+                          (long id, slug, short id, count, last activity in ET).
+                          See `vibe-talk threads --help`
+    thread <ref>          list or search one thread's messages from the local cache
+                          only, by Slack long id, slug, or :thread: short id.
+                          See `vibe-talk thread --help`
+    search-server \"<q>\"   search through the running server (READ token), as before;
+                          kept beside the cache-only `search`. See
+                          `vibe-talk search-server --help`
     unknown-terms-report  list the most frequent Discuss unknown terms over the last N days
                           (default 7) from the debug log at PATH (the .jsonl file, its
                           directory, or the state directory). See
@@ -386,7 +403,10 @@ async fn main() -> anyhow::Result<()> {
         Some("pair-link") => return pair_link(argv).await,
         Some("recap") => return recap(argv).await,
         Some("prompts") => return prompts(argv),
-        Some("search") => return search(argv).await,
+        Some("search") => return search_cache(argv),
+        Some("threads") => return threads(argv),
+        Some("thread") => return thread(argv),
+        Some("search-server") => return search(argv).await,
         // `#1338 vibe-talk-search-cli` slice 2: one generated subcommand per MCP tool,
         // built from the same manifest as `tools/list`; any other first word is the
         // server's own arguments, exactly as before.
@@ -1478,7 +1498,34 @@ fn prompts(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `vibe-talk search`. `#1338 vibe-talk-search-cli`.
+/// `vibe-talk search`: cache-only. `#2106 vibe-talk-unified-cache-read-cli`.
+fn search_cache(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
+    let Some(options) = vibe_talk::read_cli::parse_search(args)? else {
+        return Ok(());
+    };
+    println!("{}", vibe_talk::read_cli::search(options)?);
+    Ok(())
+}
+
+/// `vibe-talk threads`: cache-only. `#2106`.
+fn threads(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
+    let Some(options) = vibe_talk::read_cli::parse_threads(args)? else {
+        return Ok(());
+    };
+    println!("{}", vibe_talk::read_cli::threads(options)?);
+    Ok(())
+}
+
+/// `vibe-talk thread`: cache-only. `#2106`.
+fn thread(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
+    let Some(options) = vibe_talk::read_cli::parse_thread(args)? else {
+        return Ok(());
+    };
+    println!("{}", vibe_talk::read_cli::thread(options)?);
+    Ok(())
+}
+
+/// `vibe-talk search-server` (formerly `search`). `#1338 vibe-talk-search-cli`.
 ///
 /// Standard output carries the hits and nothing else; diagnostics go to standard error.
 async fn search(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
