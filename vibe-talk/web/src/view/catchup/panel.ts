@@ -317,6 +317,15 @@ export interface DiscussPanel {
    * full again. A no-op at partial or closed.
    */
   dropToPartialForLink(): void;
+  /**
+   * `#2080` (owner 311): pin the summary's own scroll across a link jump.
+   * Captures the panel and answer scrollers' positions; the returned
+   * function puts them back (a no-op while the panel is closed). The jump
+   * itself never redraws the answer, but scroll anchoring over the strike
+   * and layout settling as the target lands otherwise walks the panel's
+   * scroll away from the reader's place in the summary.
+   */
+  pinScroll(): () => void;
   /** `#1388` landing 1. Restate the strike from the read set now (a mark landed elsewhere). */
   refreshStrikes(): void;
   /**
@@ -2651,6 +2660,25 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       applyMode(mode, true);
     },
     dropToPartialForLink,
+    pinScroll() {
+      let tops: readonly [HTMLElement, number][] = [];
+      try {
+        tops = [panel(), deps.byId("discuss-answer")]
+          .map((el) => [el, el.scrollTop] as [HTMLElement, number]);
+      } catch {
+        tops = [];
+      }
+      return () => {
+        if (!isOpen()) return;
+        for (const [el, top] of tops) {
+          try {
+            el.scrollTop = top;
+          } catch {
+            // A scroller taken away with its panel: nothing to put back.
+          }
+        }
+      };
+    },
     refreshStrikes() {
       restrike();
     },

@@ -1333,12 +1333,8 @@ const discussView = createDiscussView({
   },
   // `#2080 vibe-talk-summary-link-stays-in-view`: a citation tap stays in the
   // view on screen (All included); a return-to-bound tap lands in the bound view.
-  onJumpInPlace: (ref) => {
-    void shellNavigation.jumpToMessageInPlace(ref);
-  },
-  navigateToBound: (scope, ref) => {
-    void shellNavigation.jumpToMessageInView(ref, scope.view);
-  },
+  onJumpInPlace: (ref) => shellNavigation.jumpToMessageInPlace(ref),
+  navigateToBound: (scope, ref) => shellNavigation.jumpToMessageInView(ref, scope.view),
   dismissMessages: (body) => dismissMessages(body),
   restoreMessages: (ids) => restoreMessages(ids),
   onFollowupTyped: (text, scope) => {

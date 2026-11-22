@@ -90,14 +90,21 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
     ids: dict[str, str] = {}
 
     def summary_answer() -> dict[str, object]:
+        filler = "".join(
+            f"<li>Filler point {n} with enough words to make the summary long</li>"
+            for n in range(8))
+        more_filler = "".join(
+            f"<li>Later filler point {n} with enough words to make the summary long</li>"
+            for n in range(16))
         html = (
             "<h2>Progress</h2><ul>"
+            f"{filler}"
             f"<li>Main point {cite(ids['main_msg'], '09:10')}</li>"
             f"<li>Reply point {cite(ids['reply_msg'], '09:11', THREAD)}</li>"
             f"<li>Older point {cite(ids['old_msg'], '09:12')}</li>"
             f"<li>Missing point {cite('999999999999999999', '09:13')}</li>"
             f"<li>Future point {cite(ids['main_msg'], '09:14', THREAD, ':extra')}</li>"
-            "</ul>"
+            f"{more_filler}</ul>"
         )
         return {
             "backend": "fake", "model": "fake-model", "view": "flat", "since_ms": None,
@@ -301,19 +308,93 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
     citations = page.locator("#discuss-answer a")
     check(citations.count() == 5, f"{label}: summary citations missing: {citations.count()}")
 
-    # (a) a main-channel message, in place.
+    # `#2080` stability probe (owner 311): the summary panel must not
+    # re-render across a link click — same bullets list, same first bullet,
+    # same Collapse/Expand toggle node, same toggle words, same scroll.
+    def stash_stable() -> None:
+        page.evaluate("""() => {
+          const answer = document.getElementById('discuss-answer');
+          const panel = document.getElementById('discuss-panel');
+          const toggle = document.querySelector('.discuss-toggle--current');
+          window.__stableProbe = {
+            list: answer.querySelector('ul'),
+            firstBullet: answer.querySelector('li'),
+            toggle,
+            toggleText: toggle ? toggle.textContent : null,
+            scroll: Math.round((answer.scrollHeight > answer.clientHeight ? answer.scrollTop : panel.scrollTop) || 0),
+          };
+          window.__scrollLog = [];
+          let frames = 0;
+          const step = () => {
+            window.__scrollLog.push([panel.scrollTop, panel.clientHeight, panel.scrollHeight,
+              document.activeElement ? (document.activeElement.id || document.activeElement.className || document.activeElement.tagName) : '',
+              answer.querySelectorAll('[class*=struck]').length]);
+            if (++frames < 900) requestAnimationFrame(step);
+          };
+          requestAnimationFrame(step);
+        }""")
+
+    # A big summary, read part-way down (owner 311's shape): park the
+    # panel's own scroll mid-summary before any click is probed.
+    page.evaluate("""() => {
+      const answer = document.getElementById('discuss-answer');
+      const panel = document.getElementById('discuss-panel');
+      const scroller = answer.scrollHeight > answer.clientHeight ? answer : panel;
+      scroller.scrollTop = 240;
+    }""")
+    stash_stable()
+
+    def check_stable(what: str) -> None:
+        stable = page.evaluate("""() => {
+          const probe = window.__stableProbe;
+          const answer = document.getElementById('discuss-answer');
+          const panel = document.getElementById('discuss-panel');
+          const toggle = document.querySelector('.discuss-toggle--current');
+          return {
+            listSame: probe.list === answer.querySelector('ul'),
+            bulletSame: probe.firstBullet === answer.querySelector('li'),
+            toggleSame: probe.toggle === toggle,
+            toggleText: toggle ? toggle.textContent : null,
+            scroll: Math.round((answer.scrollHeight > answer.clientHeight ? answer.scrollTop : panel.scrollTop) || 0),
+            wantScroll: probe.scroll,
+            wantText: probe.toggleText,
+          };
+        }""")
+        if not (stable["listSame"] and stable["bulletSame"] and stable["toggleSame"]
+                and stable["toggleText"] == stable["wantText"] and stable["scroll"] == stable["wantScroll"]):
+            log = page.evaluate("() => (window.__scrollLog || []).filter((v, i, a) => i === 0 || JSON.stringify(v) !== JSON.stringify(a[i-1]))")
+            log.append(page.evaluate("""() => [...document.querySelectorAll('#discuss-answer a')].map(a => a.offsetTop)"""))
+            raise AssertionError(f"{label}: the summary re-rendered on {what}: {stable} scroll log: {log}")
+
+    def tap_visible(locator: object, what: str) -> None:
+        # A tap on the anchor itself, with no scroll-into-view: whatever the
+        # panel's scroll does next is the app's doing, not the driver's.
+        check(locator.count() > 0, f"{label}: {what} is not drawn to tap")
+        locator.evaluate("el => el.click()")
+
+    # (a) a main-channel message, in place. Tapped at its on-screen point,
+    # as a finger taps: no scroll-into-view may move the summary for it.
     scroll_before = panel_scroll()
-    citations.nth(0).click()
+    tap_visible(citations.nth(0), "main citation")
     assert_landed(ids["main_msg"], "main citation")
-    check(panel_scroll() == scroll_before, f"{label}: the summary scroll moved on a jump")
+    if panel_scroll() != scroll_before:
+        both = page.evaluate("""() => ({
+          answer: document.getElementById('discuss-answer').scrollTop,
+          panel: document.getElementById('discuss-panel').scrollTop,
+          body: document.getElementById('discuss-body')?.scrollTop,
+        })""")
+        raise AssertionError(f"{label}: the summary scroll moved on a jump: {scroll_before} -> {panel_scroll()} {both}")
+    check_stable("main citation")
 
     # (b) a thread reply, in place in All — never the Thread view.
     anchor_top = page.evaluate(
         "() => [...document.querySelectorAll('#discord-log li')]"
         f".find(r => (r.getAttribute('data-ids') || '').split(' ').includes('{ids['main_msg']}'))"
         ".getBoundingClientRect().top")
-    citations.nth(1).click()
+    page.evaluate("() => { window.__scrollLog = []; }")
+    tap_visible(citations.nth(1), "reply citation")
     assert_landed(ids["reply_msg"], "reply citation")
+    check_stable("reply citation")
     if shots is not None:
         page.screenshot(path=str(shots / f"{label}-reply-landed.png"))
     # Back returns to the previous position in the same view: the row the
@@ -335,6 +416,21 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
     footer_link.scroll_into_view_if_needed()
     footer_link.click()
     assert_landed(ids["reply_msg"], "footer time")
+
+    # Owner 311, full-screen Discuss: stand the panel full, then a footer
+    # jump must still leave the summary's nodes and scroll untouched (the
+    # mode may drop so the message can land; the summary may not redraw).
+    page.click("#discuss-full-toggle")
+    page.wait_for_function(
+        "() => document.getElementById('discuss-panel').getAttribute('data-mode') === 'maximized'"
+        " || document.getElementById('discuss-panel').getAttribute('data-sheet') === 'full'",
+        timeout=20_000)
+    stash_stable()
+    footer_link = page.locator("#discuss-links .discuss-link").first
+    footer_link.scroll_into_view_if_needed()
+    footer_link.click()
+    assert_landed(ids["reply_msg"], "footer time from full Discuss")
+    check_stable("footer time from full Discuss")
 
     # Not found: a persistent reason, no silent no-op.
     citations.nth(3).click()
