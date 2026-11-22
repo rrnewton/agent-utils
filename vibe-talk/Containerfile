@@ -40,6 +40,7 @@ RUN mkdir -p src/bin \
     && printf '//! placeholder\nfn main() {}\n' > src/main.rs \
     && printf '//! placeholder for dependency caching\n' > src/lib.rs \
     && printf '//! placeholder\nfn main() {}\n' > src/bin/mock_elevenlabs.rs \
+    && printf '//! placeholder\nfn main() {}\n' > src/bin/thread_replay.rs \
     && cargo build --release --locked \
     && rm -rf src
 

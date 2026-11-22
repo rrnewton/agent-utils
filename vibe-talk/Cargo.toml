@@ -36,6 +36,13 @@ path = "src/main.rs"
 name = "vibe-talk-mock-elevenlabs"
 path = "src/bin/mock_elevenlabs.rs"
 
+# The clone harness's cache reader (`scripts/local_clone.py`): prints one
+# thread from a cache copy in the provider's answer shape. A dev helper,
+# never part of the server; the Containerfile needs its placeholder too.
+[[bin]]
+name = "vibe-talk-thread-replay"
+path = "src/bin/thread_replay.rs"
+
 [[test]]
 name = "integration"
 path = "tests/integration.rs"

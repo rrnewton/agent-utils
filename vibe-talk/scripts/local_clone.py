@@ -51,6 +51,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import TypedDict
@@ -115,6 +116,8 @@ def copy_cache(source: Path, dest: Path) -> None:
 
 ACCOUNT_ID = ""
 TEAM_ID = ""
+REPLAY_BIN: Path | None = None
+REPLAY_CACHE: Path | None = None
 
 
 class StubHandler(http.server.BaseHTTPRequestHandler):
@@ -127,8 +130,54 @@ class StubHandler(http.server.BaseHTTPRequestHandler):
     public user id, supplied with --account-id) and nothing else.
     """
 
+    def _replay(self, method: str) -> tuple[int, bytes] | None:
+        """Answer one provider read from the copied cache, or None.
+
+        The helper's output carries message text: it goes only to the
+        clone server on loopback, exactly as a provider answer would,
+        and is never logged here.
+        """
+        if REPLAY_BIN is None or REPLAY_CACHE is None:
+            return None
+        length = int(self.headers.get("Content-Length") or 0)
+        form = urllib.parse.parse_qs(self.rfile.read(length).decode())
+        channel = form.get("channel", [""])[0]
+        if not channel:
+            return None
+        if method == "conversations.replies":
+            thread = form.get("ts", [""])[0]
+            if not thread:
+                return None
+            argv = [str(REPLAY_BIN), "--cache", str(REPLAY_CACHE),
+                    "--channel", channel, "--thread", thread]
+        elif method == "conversations.history":
+            limit = form.get("limit", ["100"])[0]
+            argv = [str(REPLAY_BIN), "--cache", str(REPLAY_CACHE),
+                    "--channel", channel, "--history", "--limit", limit]
+        else:
+            return None
+        ran = subprocess.run(argv, capture_output=True, timeout=30)
+        if ran.returncode == 0:
+            return 200, ran.stdout
+        return 404, ran.stdout
+
     def _refuse(self) -> None:
-        if ACCOUNT_ID and self.path.rstrip("/").endswith("auth.test"):
+        path = self.path.rstrip("/")
+        for method in ("conversations.replies", "conversations.history"):
+            if path.endswith(method):
+                replayed = self._replay(method)
+                if replayed is not None:
+                    status, body = replayed
+                    self.send_response(status)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    try:
+                        self.wfile.write(body)
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+                    return
+        if ACCOUNT_ID and path.endswith("auth.test"):
             body = json.dumps({
                 "ok": True, "user_id": ACCOUNT_ID, "user": "local-clone",
                 **({"team_id": TEAM_ID} if TEAM_ID else {}),
@@ -267,6 +316,13 @@ def serve_matrix(port: int, write_token: str, channel: str,
     return matrix
 
 
+class ProbeResult(TypedDict, total=False):
+    status: int
+    bytes: int
+    tickets: int
+    error: str
+
+
 def probe(port: int, write_token: str, channel: str,
           thread: str | None, message_id: str) -> ProbeResult:
     """Ask the clone to prepare speech for one message. Shape only."""
@@ -322,11 +378,24 @@ def main() -> int:
                         help="exit 3 when any probed surface is not "
                              "cache-served (default: print the matrix "
                              "loudly and keep running)")
+    parser.add_argument("--replay-bin", default="",
+                        help="vibe-talk-thread-replay binary (default: "
+                             "target/release beside this repo, if built); "
+                             "with it, the stub replays thread and "
+                             "history reads from the copied cache")
+    parser.add_argument("--allow-stub-replay", action="store_true",
+                        help="with --strict: accept stub-replay surfaces "
+                             "as served")
     args = parser.parse_args()
 
-    global ACCOUNT_ID, TEAM_ID
+    global ACCOUNT_ID, TEAM_ID, REPLAY_BIN, REPLAY_CACHE
     ACCOUNT_ID = args.account_id
     TEAM_ID = args.team_id
+    if args.replay_bin:
+        REPLAY_BIN = Path(args.replay_bin).expanduser().resolve()
+    else:
+        candidate = REPO / "target" / "release" / "vibe-talk-thread-replay"
+        REPLAY_BIN = candidate if candidate.exists() else None
     binary = find_binary(args.sha, args.binary).resolve()
     source = find_cache(args.cache)
     work = Path(tempfile.mkdtemp(prefix="vibe-talk-local-clone-"))
@@ -339,6 +408,7 @@ def main() -> int:
     proc: subprocess.Popen[bytes] | None = None
     try:
         copy_cache(source, work / "message-cache.sqlite3")
+        REPLAY_CACHE = work / "message-cache.sqlite3"
         test_token = (
             "local-clone-test-" + secrets.token_hex(12) if args.test_token else None
         )
@@ -371,14 +441,44 @@ def main() -> int:
                               args.thread, args.message_id)
         for surface, status in matrix.items():
             print(f"served[{status}]: {surface}", flush=True)
-        if args.strict and any(status != 200 for status in matrix.values()):
+        if REPLAY_BIN is not None and args.thread:
             print(
-                "local_clone: --strict: a probed surface is not "
-                "cache-served (see served[...] lines above); stopping. "
-                "Thread-view timelines are not cache-served on any "
-                "current build; main timeline and speech prepare are.",
+                "local_clone: NOTE: replayed threads render unnamed and "
+                "unsummarised (the summary lives in the state store, "
+                "which the clone never copies).",
+                file=sys.stderr, flush=True)
+
+        def acceptable(surface: str, status: int) -> bool:
+            if status != 200:
+                return False
+            # A thread view can only ever answer through the stub
+            # replay (no build cache-serves it), so under --strict it
+            # counts only when the flag accepts stub-replay.
+            if "thread" in surface and REPLAY_BIN is not None:
+                return bool(args.allow_stub_replay)
+            return True
+
+        failed = [
+            surface for surface, status in matrix.items()
+            if not acceptable(surface, status)
+        ]
+        if args.strict and failed:
+            print(
+                "local_clone: --strict: a probed surface is not served "
+                f"({', '.join(failed)}; see served[...] lines above); "
+                "stopping. With --replay-bin the thread view answers "
+                "from the copied cache through the stub (served "
+                "marked stub-replay below), accepted under --strict "
+                "only with --allow-stub-replay.",
                 file=sys.stderr)
             return 3
+        if REPLAY_BIN is not None:
+            thread_status = matrix.get("timeline (thread view, write token)")
+            if args.thread and thread_status == 200:
+                print("served[stub-replay]: timeline (thread view, "
+                      "via the stub's cache replay)", flush=True)
+            print(f"served[stub-replay]: stub backend "
+                  f"({REPLAY_BIN.name})", flush=True)
         if test_token:
             print(f"test token (fake, local only): {test_token}", flush=True)
         if args.probe:
