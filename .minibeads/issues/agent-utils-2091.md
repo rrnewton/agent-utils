@@ -37,3 +37,11 @@ Landing split: (a) and (b) land with the 307 fix; (c) lands as the next commit.
 # Notes
 
 Filed by the coordinator; the owning lane refines this file as it works.
+
+## Resolution in progress (mu-shrinkanchor, 2026-11-22)
+
+Cause: archive (Done) in Fold read never went through `preservingCollapse`/`beginUserChange` — the #2076 hold in `createScrollKeeping` (`scrollkeep.ts`). It redrew under the generic `holdingMessage` first-row hold (`doneact.ts` → `refreshAfterInboxChange`/`renderDoneChange`), with later same-press writers free to move it (bookmark hold, deferred reply-arrow measure, cross-column redraw, windowed re-slice, foot keepers, and `donekeys`' immediate next-unread `bringIntoView`). Before, frame-measured in Fold read (Done button, rAF to settle+30): content above moved 79.0px (412) / 79.3px (1280), content below 42.9 / 43.4px, spanning item never centred; windowed on = same.
+
+Fix (f3f1e215): one row's Done/put-back routes through `preservingShrink`/`preservingShrinkAsync` in the same scroll owner, composed with #2076: three cases from `anchorpolicy.shrinkCase`, anchor re-asserted every frame until the act and its landing renders settle (45 still frames, corrections capped), opening the user-caused hold; the next-unread move waits for `shrinkSettling` and lands as its own explicit move. (a) `anchorInvariantHolds` (≤0.5px; seam within 0.5px of centre; arrivals idle at the bottom exempt) is the one function tests and debug call. (b) Seeded fuzz in `tests/shrink_anchor_browser.py` (gated seeds 1,2,3 × 14 steps, windowed on/off, phone and desktop; long opt-in `--fuzz-steps 200`). After: cases 0.00–0.28px every frame, seam 0.11px off centre, next-unread shrink held then landed.
+
+Debug mode (850ab307, own commit): opt-in `?anchordebug=1` or held `vibe-talk.voice.anchor-debug`, default off, page-only, read-only; settled shrinks judged by the same invariant, violations to console and the #2066 freeze-report route (timings only).
