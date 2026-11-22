@@ -38,3 +38,11 @@ not-closed text matches. No persisted fields, no new flags.
 # Notes
 
 Filed by the coordinator from a consumer report; the owning lane refines this file as it works.
+
+R3 (consumer proposal): the same-UID "did not close" refusals no
+longer claim the 8 rounds were consecutive ("each of 8"); they report
+the followed/relevant round counts out of all inventories and the
+followed-generation total. Counter semantics unchanged. The
+consumer's scripted short-lived-churn controls are vendored as
+py/wrkslots/tests/test_census_short_lived_churn.py. The holder-found
+naming and distinct exit status follow in a separate slice.

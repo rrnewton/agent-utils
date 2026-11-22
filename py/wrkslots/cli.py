@@ -93883,7 +93883,10 @@ def _capture_same_uid_process_path_census_following(
     relevant_rounds = 0
     followed_rounds = 0
     proven_rounds = 0
+    inventories = 0
+    followed_total = 0
     while True:
+        inventories += 1
         budget.remaining_seconds()
         try:
             inventory = _same_uid_process_observations(budget)
@@ -93899,6 +93902,7 @@ def _capture_same_uid_process_path_census_following(
             scanned_round, relevant, followed = _scan_same_uid_generations(
                 unscanned, targets, budget, found
             )
+            followed_total += followed
             scanned.extend(scanned_round)
         except _ProcessEvidenceChanged:
             discarded += 1
@@ -93948,10 +93952,13 @@ def _capture_same_uid_process_path_census_following(
             followed_rounds += 1
             if followed_rounds >= _SAME_UID_CENSUS_INVENTORIES:
                 raise _CensusDidNotClose(
-                    f"same-UID process census did not close: each of "
-                    f"{_SAME_UID_CENSUS_INVENTORIES} process inventories "
-                    "found generations that forked or exited before their "
-                    "scan completed; retry when fewer processes are starting",
+                    "same-UID process census did not close: "
+                    f"{followed_rounds} rounds (not necessarily consecutive) "
+                    f"of {inventories} inventories found generations that "
+                    "forked or exited before their scan completed "
+                    f"({followed_total} generations in all, {followed} in "
+                    "the last such round); retry when fewer processes are "
+                    "starting",
                     tuple(found),
                 )
             continue
@@ -93960,8 +93967,9 @@ def _capture_same_uid_process_path_census_following(
         if relevant_rounds >= _SAME_UID_CENSUS_INVENTORIES:
             sample = ", ".join(str(process.pid) for process in relevant[:5])
             raise _CensusDidNotClose(
-                f"same-UID process census did not close: each of "
-                f"{_SAME_UID_CENSUS_INVENTORIES} process inventories found "
+                "same-UID process census did not close: "
+                f"{relevant_rounds} rounds (not necessarily consecutive) "
+                f"of {inventories} inventories found "
                 "live generations that may still use the target and no "
                 f"earlier scan had covered (most recently {len(relevant)}, "
                 f"PIDs {sample}); retry when fewer processes are starting",
