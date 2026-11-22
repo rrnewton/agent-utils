@@ -105,6 +105,9 @@ struct Fake {
     calls: RefCell<Vec<String>>,
     /// Turnover notify invocations: (program, TURNOVER_* environment).
     notify_calls: RefCell<Vec<NotifyCall>>,
+    /// #2120 test hook: a pin file written on the first unit stop, as a
+    /// consumer would write it while the turnover waits on a unit.
+    pin_to_write: RefCell<Option<(PathBuf, String)>>,
 }
 
 const UNIT_KEYS: [&str; 6] = [
@@ -144,6 +147,7 @@ impl Fake {
             died: Cell::new(false),
             calls: RefCell::default(),
             notify_calls: RefCell::default(),
+            pin_to_write: RefCell::new(None),
         }
     }
 
@@ -307,6 +311,10 @@ impl Host for Fake {
     }
 
     fn stop(&self, unit: &str) -> Result<(), String> {
+        if let Some((path, reason)) = self.pin_to_write.borrow_mut().take() {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, format!("{reason}\n")).unwrap();
+        }
         self.calls.borrow_mut().push(format!("stop {unit}"));
         self.clock.set(self.clock.get() + self.stop_delay.get());
         let mut units = self.units.borrow_mut();
@@ -787,6 +795,7 @@ fn options(world: &World) -> RefreshOptions {
         refreshes_dir: world.root.join("refreshes"),
         drop_in_dir: world.fake.drop_in_dir.clone(),
         interrupted: None,
+        pin_check: None,
     }
 }
 
@@ -815,7 +824,10 @@ fn snapshot_is_complete_private_and_selected_as_newest() {
         NEW
     );
     assert!(snapshot::select(&world.root, Some("2222")).is_err());
-    // Staging leftovers never count, and a second install of the same commit is refused.
+    // Staging leftovers never count; a second install of the same
+    // complete snapshot succeeds against it (#2110).
+    let again = make_snapshot(&world.fake, &world.root, &world._temporary.0);
+    assert_eq!(again.path, snapshot.path);
     let leftovers: Vec<String> = fs::read_dir(snapshot::snapshots_dir(&world.root))
         .unwrap()
         .flatten()
@@ -853,6 +865,173 @@ fn a_snapshot_whose_binary_reports_another_commit_is_not_installed() {
         .unwrap()
         .count();
     assert_eq!(entries, 0, "the staging directory is removed");
+}
+
+/// Fake release outputs for a direct snapshot install.
+fn fake_release(work: &Path) -> PathBuf {
+    let release = work.join("release");
+    fs::create_dir_all(&release).unwrap();
+    for name in [
+        "agentctl",
+        "agentctl-slack-outbound",
+        "agentctl-slack-plugin",
+    ] {
+        fs::write(release.join(name), format!("#!/bin/sh\necho {name}\n")).unwrap();
+    }
+    release
+}
+
+fn slack_manifest() -> Vec<u8> {
+    fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../chat-subscription-slack/manifest.json"))
+        .unwrap()
+}
+
+#[test]
+fn an_incomplete_snapshot_leftover_is_moved_aside_and_does_not_block() {
+    // #2110: a dead builder left the snapshot directory half-built;
+    // the next builder moves it aside and lands a complete snapshot.
+    let temporary = temporary("incomplete-leftover");
+    let fake = Fake::new(temporary.0.join("drop-ins"));
+    let root = temporary.0.join("root");
+    let destination = snapshot::snapshots_dir(&root).join(&NEW[..12]);
+    fs::create_dir_all(destination.join("bin")).unwrap();
+    fs::write(destination.join("bin/agentctl"), "half-built\n").unwrap();
+    let release = fake_release(&temporary.0);
+    let installed = snapshot::install_snapshot(
+        &fake,
+        &root,
+        NEW,
+        &release,
+        &slack_manifest(),
+        &json!({"test": true}),
+    )
+    .expect("incomplete leftover must not block the build");
+    assert_eq!(installed.commit, NEW);
+    assert!(destination.join("snapshot.json").is_file());
+    let asides: Vec<PathBuf> = fs::read_dir(snapshot::snapshots_dir(&root))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".incomplete-"))
+        })
+        .collect();
+    assert_eq!(asides.len(), 1, "the leftover was moved aside: {asides:?}");
+    assert_eq!(
+        fs::read_to_string(asides[0].join("bin/agentctl")).unwrap(),
+        "half-built\n"
+    );
+    assert_eq!(snapshot::list(&root).len(), 1);
+}
+
+/// A `Host` safe to share between builder threads (#2110): snapshot
+/// installation only needs commit reporting, hashes, files and time.
+struct ConcurrentHost;
+
+impl Host for ConcurrentHost {
+    fn service_units(&self) -> Result<Vec<String>, String> {
+        Err("unused".to_owned())
+    }
+    fn show(&self, _units: &[String]) -> Result<Vec<super::host::UnitState>, String> {
+        Ok(Vec::new())
+    }
+    fn cat(&self, _unit: &str) -> Result<String, String> {
+        Err("unused".to_owned())
+    }
+    fn stop(&self, _unit: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn reset_failed(&self, _unit: &str) {}
+    fn restart(&self, _unit: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn start(&self, _unit: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn daemon_reload(&self) -> Result<(), String> {
+        Ok(())
+    }
+    fn systemd_run(&self, _args: &[String]) -> Result<(), String> {
+        Ok(())
+    }
+    fn binary_commit(&self, binary: &Path) -> Option<String> {
+        binary
+            .to_string_lossy()
+            .contains("/snapshots/")
+            .then(|| NEW.to_owned())
+    }
+    fn file_sha256(&self, path: &Path) -> Option<String> {
+        fs::read(path)
+            .ok()
+            .map(|bytes| format!("fake-{}", bytes.len()))
+    }
+    fn read_file(&self, path: &Path) -> Option<Vec<u8>> {
+        fs::read(path).ok()
+    }
+    fn process_exe(&self, _pid: u32) -> Option<PathBuf> {
+        None
+    }
+    fn process_children(&self, _pid: u32) -> Vec<u32> {
+        Vec::new()
+    }
+    fn process_environ(&self, _pid: u32) -> Option<Vec<(String, String)>> {
+        None
+    }
+    fn run(
+        &self,
+        _program: &Path,
+        _args: &[String],
+        _environment: &[(String, String)],
+    ) -> Result<(i32, String), String> {
+        Ok((0, String::new()))
+    }
+    fn headless_status(&self, _socket: &Path) -> Result<Value, String> {
+        Ok(json!({"ok": true}))
+    }
+    fn now(&self) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(1_800_000_000)
+    }
+    fn sleep(&self, _duration: Duration) {}
+}
+
+#[test]
+fn two_concurrent_builders_share_one_complete_snapshot() {
+    // #2110: two builders of the same commit at once (a turnover and a
+    // host-wide build on the same timer) both succeed, against the one
+    // complete snapshot the lock serialised them into.
+    let temporary = temporary("concurrent-builders");
+    let root = temporary.0.join("root");
+    let release = fake_release(&temporary.0);
+    let host = std::sync::Arc::new(ConcurrentHost);
+    let handles: Vec<_> = (0..2)
+        .map(|_| {
+            let host = host.clone();
+            let root = root.clone();
+            let release = release.clone();
+            std::thread::spawn(move || {
+                snapshot::install_snapshot(
+                    &*host,
+                    &root,
+                    NEW,
+                    &release,
+                    &slack_manifest(),
+                    &json!({"test": true}),
+                )
+            })
+        })
+        .collect();
+    for handle in handles {
+        let installed = handle.join().unwrap().expect("every builder succeeds");
+        assert_eq!(installed.commit, NEW);
+    }
+    let snapshots = snapshot::list(&root);
+    assert_eq!(snapshots.len(), 1, "one complete snapshot: {snapshots:?}");
+    assert!(snapshots[0].path.join("snapshot.json").is_file());
+    assert_eq!(
+        snapshot::select(&root, Some(&NEW[..9])).unwrap().commit,
+        NEW
+    );
 }
 
 #[test]
@@ -1063,6 +1242,41 @@ fn an_explicit_per_unit_health_timeout_wins_over_the_scaled_window() {
         report.text
     );
     assert_eq!(report.exit_code, 4, "{}", report.text);
+}
+
+#[test]
+fn refresh_skips_a_service_pinned_at_its_turn() {
+    // #2120 at the refresh layer: the pin check runs immediately
+    // before each service, so the bridge is skipped untouched while
+    // the watcher ahead of it refreshes.
+    let world = world();
+    let bridge_before = world.fake.service_text("bridge.service");
+    let mut refresh_options = options(&world);
+    refresh_options.pin_check = Some(std::sync::Arc::new(|_, service| {
+        Ok((service.unit == "bridge.service").then(|| "held at its turn".to_owned()))
+    }));
+    let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
+    let report = refresh(&world.fake, &services, &refresh_options).unwrap();
+    assert_eq!(report.exit_code, 0, "{}", report.text);
+    let rows = report.document["services"].as_array().unwrap();
+    let bridge = rows
+        .iter()
+        .find(|row| row["unit"] == "bridge.service")
+        .unwrap();
+    assert_eq!(bridge["action"], "skipped");
+    assert!(
+        bridge["reason"]
+            .as_str()
+            .unwrap()
+            .contains("held at its turn"),
+        "{bridge:?}"
+    );
+    assert_eq!(world.fake.service_text("bridge.service"), bridge_before);
+    assert!(
+        rows.iter()
+            .any(|row| row["unit"] == "watch.service" && row["action"] == "refreshed"),
+        "{rows:?}"
+    );
 }
 
 #[test]
@@ -2192,6 +2406,120 @@ fn moving_a_symlinked_global_binary_names_its_previous_target() {
     );
     assert!(!detail.contains("backup"), "{detail}");
     assert_eq!(fs::read_link(&global).unwrap(), snapshot.agentctl());
+}
+
+/// Fabricate a complete snapshot of the candidate commit `new`, so a
+/// turnover's build step reuses it instead of running cargo.
+fn fabricate_candidate_snapshot(world: &World, new: &str) -> PathBuf {
+    let destination = world.root.join("snapshots").join(&new[..12]);
+    fs::create_dir_all(destination.join("bin")).unwrap();
+    fs::create_dir_all(destination.join("home/plugins/slack")).unwrap();
+    for relative in [
+        snapshot::AGENTCTL,
+        snapshot::OUTBOUND,
+        snapshot::PLUGIN,
+        snapshot::MANIFEST,
+    ] {
+        fs::copy(
+            world.snapshot.path.join(relative),
+            destination.join(relative),
+        )
+        .unwrap();
+    }
+    let files: serde_json::Map<String, Value> = [
+        snapshot::AGENTCTL,
+        snapshot::OUTBOUND,
+        snapshot::PLUGIN,
+        snapshot::MANIFEST,
+    ]
+    .into_iter()
+    .map(|relative| {
+        (
+            relative.to_owned(),
+            json!({"sha256": world.fake.file_sha256(&destination.join(relative)), "bytes": 1}),
+        )
+    })
+    .collect();
+    fs::write(
+        destination.join("snapshot.json"),
+        json!({
+            "schema": snapshot::SNAPSHOT_SCHEMA,
+            "commit": new,
+            "built_at": 1_800_000_000_u64,
+            "source": {"test": true},
+            "files": files,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    world
+        .fake
+        .commits
+        .borrow_mut()
+        .insert(destination.join(snapshot::AGENTCTL), new.to_owned());
+    destination
+}
+
+#[test]
+fn turnover_skips_a_unit_pinned_after_planning() {
+    // #2120: the pin is written after planning, while the turnover is
+    // waiting on the watcher (the fake writes it on the first unit
+    // stop); when the bridge's turn comes it is re-read, the bridge is
+    // left untouched, and the skip is reported.
+    let world = world();
+    let (checkout, old, new) = turnover_checkout(&world._temporary.0);
+    let destination = fabricate_candidate_snapshot(&world, &new);
+    world
+        .fake
+        .commits
+        .borrow_mut()
+        .insert(PathBuf::from("/state/bin/agentctl-old"), old.clone());
+    let bridge_before = world.fake.service_text("bridge.service");
+    *world.fake.pin_to_write.borrow_mut() = Some((
+        world.registry.join("turnover-pins/bridge.service.pin"),
+        "held while the turnover waited".to_owned(),
+    ));
+    let calls_before = world.fake.calls().len();
+    let mut options = turnover_options(&world, checkout);
+    options.report_only = false;
+    let report = turnover(&world.fake, &Tables, &options).unwrap();
+    assert_eq!(report.exit_code, 0, "{}", report.text);
+    let rows = report.document["services"].as_array().unwrap();
+    let bridge = rows
+        .iter()
+        .find(|row| row["unit"] == "bridge.service")
+        .expect("bridge row");
+    assert_eq!(bridge["decision"], "pinned", "{}", report.text);
+    assert!(
+        bridge["detail"]
+            .as_str()
+            .unwrap()
+            .contains("held while the turnover waited"),
+        "{}",
+        report.text
+    );
+    assert!(
+        report.text.contains("pinned at its turn"),
+        "the skip is in the run's notices: {}",
+        report.text
+    );
+    // The pinned unit was never touched; the watcher still refreshed.
+    assert_eq!(world.fake.service_text("bridge.service"), bridge_before);
+    assert!(
+        world.fake.calls()[calls_before..]
+            .iter()
+            .all(|call| !call.contains("bridge.service")),
+        "no action on the pinned unit: {:?}",
+        &world.fake.calls()[calls_before..]
+    );
+    let candidate_agentctl = destination.join(snapshot::AGENTCTL);
+    assert!(
+        world
+            .fake
+            .service_text("watch.service")
+            .contains(&candidate_agentctl.to_string_lossy().into_owned()),
+        "watcher moved to the candidate snapshot"
+    );
 }
 
 #[test]

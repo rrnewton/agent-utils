@@ -46,8 +46,16 @@ const DEPENDENCY_KEYS: [&str; 15] = [
     "PropagatesStopTo",
 ];
 
+/// A fresh pin check for one service (#2120): `Ok(Some(reason))` when a
+/// pin written since planning now covers the service, `Ok(None)` when it
+/// may still be touched. Called immediately before any action on the
+/// service, so a pin that lands while earlier services are being
+/// refreshed still skips this one untouched.
+pub type PinCheck =
+    std::sync::Arc<dyn Fn(&dyn Host, &Service) -> Result<Option<String>, String> + Send + Sync>;
+
 /// What `services refresh` was asked to do.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RefreshOptions {
     /// The snapshot to move onto.
     pub snapshot: Snapshot,
@@ -73,6 +81,9 @@ pub struct RefreshOptions {
     pub drop_in_dir: PathBuf,
     /// Set by a signal handler: finish the service in hand, then stop.
     pub interrupted: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Fresh pin check run immediately before any action on each service
+    /// (#2120); `None` for a plain `services refresh`, which has no pins.
+    pub pin_check: Option<PinCheck>,
 }
 
 /// How long a restarted service must stay up and healthy before it counts as refreshed.
@@ -1116,6 +1127,19 @@ pub fn refresh(
             stopped = true;
             rows.push(entry);
             continue;
+        }
+        // #2120: re-read the pin files immediately before any action on
+        // this service (drop-in rewrite, start, restart). A pin written
+        // after planning — while an earlier service was refreshing —
+        // skips this service untouched.
+        if let Some(pin_check) = &options.pin_check {
+            if let Some(reason) = pin_check(host, service)? {
+                entry["action"] = json!("skipped");
+                entry["reason"] = json!(format!("pinned: {reason}"));
+                text.push_str(&format!("{label}: skipped, pinned: {reason}\n"));
+                rows.push(entry);
+                continue;
+            }
         }
         // An inactive restore oneshot is still moved: its binary is updated
         // for the next boot without starting it (#1179 turnover).

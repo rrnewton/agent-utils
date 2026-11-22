@@ -12,6 +12,15 @@
 //! A snapshot is written once, under a staging name, and renamed into place only after its
 //! binary reports the commit it was built from and its plugin home passes plugin discovery. It is
 //! never changed afterwards, so a running service's binary is never replaced under it.
+//!
+//! Creation is exclusive per snapshot (#2110): the builder holds
+//! `ROOT/snapshot-COMMIT12.lock` from its first completeness check until
+//! the rename into place, so two builders of the same commit (for
+//! example a turnover and a host-wide build on the same timer) cannot
+//! interleave. Under that lock a complete snapshot of the same commit
+//! is success, not an error, and an incomplete directory left by a dead
+//! builder is moved aside under a dot name instead of blocking every
+//! later build.
 
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, Write};
@@ -21,6 +30,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use fs2::FileExt;
 use serde_json::{json, Value};
 
 use super::host::Host;
@@ -197,6 +207,36 @@ fn private_dir(path: &Path) -> io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
+/// A suffix no other live builder of this process is using, so staging
+/// and moved-aside names never collide (#2110).
+fn unique_suffix() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{nanos}", std::process::id())
+}
+
+/// Take the per-snapshot lock (#2110): held from the completeness check
+/// until the snapshot is renamed into place, it proves that any
+/// incomplete directory found at the destination was left by a dead
+/// builder. The returned file keeps the lock; dropping it releases it.
+fn snapshot_lock(root: &Path, commit: &str) -> Result<fs::File, String> {
+    let snapshots = snapshots_dir(root);
+    private_dir(&snapshots).map_err(|error| format!("{}: {error}", snapshots.display()))?;
+    let path = root.join(format!("snapshot-{}.lock", &commit[..12]));
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    file.lock_exclusive()
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    Ok(file)
+}
+
 /// Run git in a checkout (shared with turnover's changed-paths test).
 pub(crate) fn git_in(checkout: &Path, args: &[&str]) -> Result<String, String> {
     git(checkout, args)
@@ -296,29 +336,68 @@ pub fn install_snapshot(
     manifest: &[u8],
     source: &Value,
 ) -> Result<Snapshot, String> {
+    let _lock = snapshot_lock(root, commit)?;
+    install_snapshot_locked(host, root, commit, release, manifest, source)
+}
+
+/// [`install_snapshot`] with the per-snapshot lock already held.
+fn install_snapshot_locked(
+    host: &dyn Host,
+    root: &Path,
+    commit: &str,
+    release: &Path,
+    manifest: &[u8],
+    source: &Value,
+) -> Result<Snapshot, String> {
     let snapshots = snapshots_dir(root);
     private_dir(&snapshots).map_err(|error| format!("{}: {error}", snapshots.display()))?;
     let destination = snapshots.join(&commit[..12]);
-    if destination.exists() {
+    // #2110: under the lock, a complete snapshot of this commit is
+    // success (the other builder finished first), and an incomplete
+    // leftover is a dead builder's, moved aside rather than blocking.
+    if let Some(existing) = read(&destination) {
+        if existing.commit == commit {
+            return Ok(existing);
+        }
         return Err(format!(
-            "{} already exists and is not a complete snapshot; remove it and build again",
+            "{} already holds a complete snapshot of a different commit",
             destination.display()
         ));
     }
-    let staging = snapshots.join(format!(".staging-{}-{}", &commit[..12], std::process::id()));
-    let result = stage(host, &staging, commit, release, manifest, source).and_then(|()| {
-        fs::rename(&staging, &destination).map_err(|error| {
+    if destination.exists() {
+        let aside = snapshots.join(format!(".incomplete-{}-{}", &commit[..12], unique_suffix()));
+        fs::rename(&destination, &aside).map_err(|error| {
             format!(
-                "cannot rename {} to {}: {error}",
-                staging.display(),
-                destination.display()
+                "cannot move the incomplete snapshot {} aside to {}: {error}",
+                destination.display(),
+                aside.display()
             )
-        })
+        })?;
+    }
+    let staging = snapshots.join(format!(".staging-{}-{}", &commit[..12], unique_suffix()));
+    let result = stage(host, &staging, commit, release, manifest, source).and_then(|()| {
+        match fs::rename(&staging, &destination) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // A builder that ignores the lock landed first: its
+                // complete snapshot is still success.
+                if read(&destination).is_some_and(|snapshot| snapshot.commit == commit) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "cannot rename {} to {}: {error}",
+                        staging.display(),
+                        destination.display()
+                    ))
+                }
+            }
+        }
     });
     if result.is_err() {
         let _ = fs::remove_dir_all(&staging);
     }
     result?;
+    let _ = fs::remove_dir_all(&staging);
     read(&destination).ok_or_else(|| format!("{} is unreadable", destination.display()))
 }
 
@@ -397,13 +476,18 @@ fn stage(
 /// snapshot of the same commit is reused).
 pub fn build(host: &dyn Host, options: &BuildOptions) -> Result<(Snapshot, bool), String> {
     let commit = resolve_commit(&options.checkout, &options.revision)?;
+    // #2110: one builder per snapshot at a time, from the completeness
+    // check until the rename into place.
+    let _lock = snapshot_lock(&options.root, &commit)?;
     if let Some(existing) = read(&snapshots_dir(&options.root).join(&commit[..12])) {
-        return Ok((existing, false));
+        if existing.commit == commit {
+            return Ok((existing, false));
+        }
     }
     let work = options.work_dir.join(format!(
         "agentctl-services-build-{}-{}",
         &commit[..12],
-        std::process::id()
+        unique_suffix()
     ));
     DirBuilder::new()
         .mode(0o700)
@@ -466,7 +550,7 @@ fn build_in(
         "cargo": cargo_version,
         "command": "cargo build --release --locked -p agentctl -p chat-subscription-slack --bins",
     });
-    install_snapshot(
+    install_snapshot_locked(
         host,
         &options.root,
         commit,

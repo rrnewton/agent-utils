@@ -6,7 +6,9 @@
 //! their binary (reported; the snapshot carries no binary for them).
 //! Scope is opt-out: only a documented pin skips a unit or a registry
 //! (`REGISTRY/turnover.pin`, `REGISTRY/turnover-pins/<unit>.pin`, reason =
-//! file contents). Refresh of agentctl units reuses `services refresh`
+//! file contents). Pins are re-read immediately before any action on a
+//! unit (#2120), so a pin written after planning still skips it.
+//! Refresh of agentctl units reuses `services refresh`
 //! per registry, bridges last within a registry, and the global agentctl
 //! binary moves last of all under the same changed-paths test.
 
@@ -341,6 +343,17 @@ fn pin_reason(host: &dyn Host, path: &Path) -> Result<Option<String>, String> {
         ));
     }
     Ok(Some(reason))
+}
+
+/// #2120: the pin reason for one unit, read fresh at call time rather
+/// than from the planning snapshot.
+fn fresh_pin_reason(
+    host: &dyn Host,
+    registry: &Path,
+    unit: &str,
+) -> Result<Option<String>, String> {
+    let pins = read_pins(host, registry, &[unit])?;
+    Ok(pins.reason_for(unit).map(str::to_owned))
 }
 
 fn read_pins(host: &dyn Host, registry: &Path, units: &[&str]) -> Result<Pins, String> {
@@ -882,10 +895,26 @@ pub fn turnover(
         .collect();
     // #1493 (coordinator-amended): an unknown unit is skipped, never touched,
     // and named with its remedy; every other unit proceeds as usual.
-    let skipped_unknown: Vec<&Row> = rows
+    // Owned, not row references: rows stay mutable so a pin found at a
+    // unit's turn can update its row (#2120).
+    struct SkippedUnknown {
+        unit: String,
+        detail: String,
+        pin_checked: Vec<PathBuf>,
+        registry: Option<PathBuf>,
+        running: Option<String>,
+    }
+    let skipped_unknown: Vec<SkippedUnknown> = rows
         .iter()
         .chain(global_row.iter())
         .filter(|row| row.decision == Decision::Unknown)
+        .map(|row| SkippedUnknown {
+            unit: row.unit.clone(),
+            detail: row.detail.clone(),
+            pin_checked: row.pin_checked.clone(),
+            registry: row.registry.clone(),
+            running: row.running.clone(),
+        })
         .collect();
     for row in &skipped_unknown {
         let why = if row.detail.is_empty() {
@@ -999,18 +1028,20 @@ pub fn turnover(
             if stopped {
                 break;
             }
-            let mine: Vec<&Row> = rows
+            let mine: Vec<usize> = rows
                 .iter()
-                .filter(|row| {
+                .enumerate()
+                .filter(|(_, row)| {
                     row.registry.as_deref() == Some(registry.as_path())
                         && row.decision == Decision::Refresh
                 })
+                .map(|(index, _)| index)
                 .collect();
             if mine.is_empty() {
                 continue;
             }
             let command = notify_command(host, registry, options.notify.as_deref());
-            let first = mine[0];
+            let first = &rows[mine[0]];
             notify(
                 host,
                 command.as_deref(),
@@ -1023,24 +1054,66 @@ pub fn turnover(
                 &mut notes,
             );
             // Bridges last within the registry: two refresh calls.
-            let (bridges, rest): (Vec<&Row>, Vec<&Row>) = mine
-                .iter()
-                .partition(|row| row.service.as_ref().map(|s| s.kind) == Some(Kind::Bridge));
+            let (bridges, rest): (Vec<usize>, Vec<usize>) =
+                mine.clone().into_iter().partition(|index| {
+                    rows[*index].service.as_ref().map(|s| s.kind) == Some(Kind::Bridge)
+                });
             let mut verdicts: BTreeMap<String, (String, Option<String>)> = BTreeMap::new();
             for group in [&rest, &bridges] {
                 if group.is_empty() || stopped {
                     continue;
                 }
+                // #2120: re-read this group's pins immediately before
+                // its turn. A pin written after planning (while the
+                // turnover waited on another unit) skips its unit
+                // untouched; refresh re-checks again per service right
+                // before acting, for pins landing inside the group.
+                let group_units: Vec<&str> = group
+                    .iter()
+                    .map(|index| rows[*index].unit.as_str())
+                    .collect();
+                let fresh = read_pins(host, registry, &group_units)?;
+                let mut live: Vec<usize> = Vec::new();
+                for index in group.iter() {
+                    let index = *index;
+                    if let Some(reason) = fresh.reason_for(&rows[index].unit).map(str::to_owned) {
+                        let (checked, found) = fresh.lookup(&rows[index].unit);
+                        rows[index].decision = Decision::Pinned;
+                        rows[index].detail = format!("pinned: {reason}");
+                        rows[index].pin_checked = checked;
+                        rows[index].pin_path = found;
+                        notes.push(format!(
+                            "{} pinned at its turn (pinned: {reason}); skipped untouched",
+                            rows[index].unit
+                        ));
+                        verdicts.insert(
+                            rows[index].unit.clone(),
+                            ("pinned".to_owned(), rows[index].running.clone()),
+                        );
+                    } else {
+                        live.push(index);
+                    }
+                }
+                if live.is_empty() {
+                    continue;
+                }
                 // Warn agents behind bridges before their bridge goes
                 // down (#1220, see warn_agent_behind_bridge).
-                for row in group.iter() {
+                for index in live.iter() {
+                    let row = &rows[*index];
                     if row.service.as_ref().map(|s| s.kind) == Some(Kind::Bridge) {
                         if let Some(service) = &row.service {
                             warn_agent_behind_bridge(host, service, &candidate, &mut notes);
                         }
                     }
                 }
-                let only: Vec<String> = group.iter().map(|row| row.unit.clone()).collect();
+                let only: Vec<String> =
+                    live.iter().map(|index| rows[*index].unit.clone()).collect();
+                let checked_registry = registry.clone();
+                let pin_check: super::refresh::PinCheck =
+                    std::sync::Arc::new(move |host, service| {
+                        fresh_pin_reason(host, &checked_registry, &service.unit)
+                    });
                 let refresh_options = RefreshOptions {
                     snapshot: snapshot.clone(),
                     only,
@@ -1053,6 +1126,7 @@ pub fn turnover(
                     refreshes_dir: options.root.join("refreshes"),
                     drop_in_dir: options.drop_in_dir.clone(),
                     interrupted: options.interrupted.clone(),
+                    pin_check: Some(pin_check),
                 };
                 let report =
                     super::refresh(host, tables, registry, &options.root, &refresh_options)?;
@@ -1090,6 +1164,36 @@ pub fn turnover(
                 if hard_failure {
                     stopped = true;
                 }
+                // #2120: a pin refresh found right before a unit inside
+                // this group (after the group re-check above) is
+                // reflected in the turnover row and the run's notices.
+                for entry in report.document["services"].as_array().into_iter().flatten() {
+                    let pinned = entry["action"] == "skipped"
+                        && entry["reason"]
+                            .as_str()
+                            .is_some_and(|reason| reason.starts_with("pinned"));
+                    if !pinned {
+                        continue;
+                    }
+                    let Some(unit) = entry["unit"].as_str() else {
+                        continue;
+                    };
+                    let Some(index) = live.iter().find(|index| rows[**index].unit == unit) else {
+                        continue;
+                    };
+                    let index = *index;
+                    let detail = entry["reason"].as_str().unwrap_or("pinned").to_owned();
+                    rows[index].decision = Decision::Pinned;
+                    rows[index].detail = detail.clone();
+                    if let Ok(fresh) = read_pins(host, registry, &[unit]) {
+                        let (checked, found) = fresh.lookup(unit);
+                        rows[index].pin_checked = checked;
+                        rows[index].pin_path = found;
+                    }
+                    notes.push(format!(
+                        "{unit} pinned at its turn ({detail}); skipped untouched"
+                    ));
+                }
                 for entry in report.document["services"].as_array().into_iter().flatten() {
                     if let Some(unit) = entry["unit"].as_str() {
                         verdicts.insert(
@@ -1103,7 +1207,8 @@ pub fn turnover(
                 }
                 refresh_documents.push(report.document);
             }
-            for row in ordered(&mine) {
+            for index in ordered_indices(&mine, &rows) {
+                let row = &rows[index];
                 let (verdict, old) = verdicts
                     .get(&row.unit)
                     .cloned()
@@ -1123,13 +1228,23 @@ pub fn turnover(
         }
         // The global binary moves last of all, and only if nothing failed.
         if !stopped && exit_code == 0 {
-            if let Some(row) = &global_row {
+            if let Some(row) = &mut global_row {
                 if row.decision == Decision::Refresh {
-                    match move_global_binary(host, options, &snapshot, &candidate) {
-                        Ok(detail) => notes.push(format!("global binary: {detail}")),
-                        Err(error) => {
-                            notes.push(format!("global binary: {error}"));
-                            exit_code = exit_code.max(1);
+                    // #2120: re-read the global pin right before moving it.
+                    if let Some(reason) = pin_reason(host, &options.root.join("global.pin"))? {
+                        row.decision = Decision::Pinned;
+                        row.detail = format!("pinned: {reason}");
+                        row.pin_path = Some(options.root.join("global.pin"));
+                        notes.push(format!(
+                            "global binary pinned at its turn (pinned: {reason}); skipped untouched"
+                        ));
+                    } else {
+                        match move_global_binary(host, options, &snapshot, &candidate) {
+                            Ok(detail) => notes.push(format!("global binary: {detail}")),
+                            Err(error) => {
+                                notes.push(format!("global binary: {error}"));
+                                exit_code = exit_code.max(1);
+                            }
                         }
                     }
                 }
@@ -1224,6 +1339,19 @@ pub fn turnover(
         options,
         exit_code,
     ))
+}
+
+/// [`ordered`] over row indices (#2120: rows must stay mutable so a
+/// pin found at a unit's turn can update its row).
+fn ordered_indices(indices: &[usize], rows: &[Row]) -> Vec<usize> {
+    let mut ordered: Vec<usize> = indices.to_vec();
+    ordered.sort_by_key(
+        |index| match rows[*index].service.as_ref().map(|service| service.kind) {
+            Some(Kind::Bridge) => 1,
+            _ => 0,
+        },
+    );
+    ordered
 }
 
 /// Refresh order inside one registry: restore, watchers and headless

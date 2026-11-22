@@ -3893,6 +3893,7 @@ fn run_services(registry: &Path, value: Services) -> Result<i32, Failure> {
                 refreshes_dir: root.join("refreshes"),
                 drop_in_dir,
                 interrupted: None,
+                pin_check: None,
             };
             // From here an interrupt, a hangup or a termination request no longer kills the
             // command between stopping a service and starting or restoring it: the service in
