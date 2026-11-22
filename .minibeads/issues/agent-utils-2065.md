@@ -8,7 +8,7 @@ labels:
 - agentctl
 - testing
 created_at: 2026-11-21T12:45:00-05:00
-updated_at: 2026-11-21T18:14:40-05:00
+updated_at: 2026-11-22T09:17:46-05:00
 ---
 
 # Description
@@ -44,3 +44,5 @@ Filed by the coordinator so the issue link resolves on main; the owning lane ref
 Shard CPU timeouts (family (d)): the sixteen wrkslots shards are already balanced by recorded solo durations (about 114 s each of about 1825 s over 814 weighted families), yet a shard burned past its 2400 CPU-second cap at about three quarters through 147 cases. That is per-case census CPU on a large, churning process table (each differential scans in both editions and churn multiplies inventories), not an unbalanced split, so raising `cpu_timeout` would only license more live-table scanning. No shard or budget change in step 1: step 2 cuts the CPU by removing the live scans, then re-measure and only consider a finer split (with regenerated weights) if a shard still sits near the cap.
 
 Step 2 then drives each census from a controlled inventory (fake proc root or injected inventory, whichever each edition already half-supports), covering census-not-closed, exiting-process-with-unreadable-fd, and unrelated non-dumpable same-UID process deterministically in both editions, and removes each quarantine mark as its case passes under gate load. What the fail-closed holder rule should be for a process that provably is not a holder is decided and documented in step 2; any production behaviour change there is a separate, cold-reviewed commit.
+
+[watermelon-full-preview] Step 1 landed as 3d26c0aa on the default branch (verified-overlap landing under a coordinator waiver: fresh gate 107 of 111 steps passed, none of the 31 quarantined cases ran, remaining reds were rotating census victims in untouched differentials). Step 2 (fresh lane) is the hermetic return: drive every quarantined case above from a controlled inventory — scripted process snapshots in Python, the test-only fake process table for the holder scan in Rust, snapshot/injected evidence for the Rust differentials — covering census-not-closed, exiting process or thread with an unreadable fd directory, and unrelated non-dumpable same-UID process deterministically, and remove each mark as its family passes under gate load. Step 2 scope also covers the wider differential surface the step-1 gates exposed as rotating victims of the same cause (remove and audit Rust differentials whose verdicts read the live table, for example the ignored-file and unrelated-pane remove differentials and audit planning exhaustion): inventory that surface first, hermetically cover or quarantine each case found, and do not chase victims one gate at a time. The fail-closed rule for a process that provably is not a holder is decided and documented in step 2; any production census-behaviour change is a separate cold-reviewed commit. Timing-budget cases are tracked separately under #2031, and CPU-cap sizing under #2084.
