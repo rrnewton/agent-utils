@@ -109,6 +109,54 @@ class FuzzFailure(RuntimeError):
     """One decoded state diverged from the model oracle."""
 
 
+_CLI_TIMEOUT = 600.0
+
+
+def _cli(
+    project: e2e.TestProject,
+    *args: str,
+    expected: int | tuple[int, ...] = 0,
+    trace: e2e.Trace | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """wrkslots CLI with a hot-host bound (owner testing rule).
+
+    Every wait in this harness is condition-based (decode
+    polling); the only fixed bounds are process ceilings, and
+    those must survive a saturated gate host where one census
+    can take minutes — 600s, not e2e's interactive 120s.
+    """
+    return e2e._run(
+        [sys.executable, "-m", "wrkslots", "--project-root",
+         str(project.root), "--machine", e2e.MACHINE,
+         "--wait-lock", "30", *args],
+        cwd=project.root, env=project.environment,
+        expected=expected, timeout=_CLI_TIMEOUT, trace=trace,
+    )
+
+
+def _remove(
+    project: e2e.TestProject, slot: str, trace: e2e.Trace,
+    *, expected: tuple[int, ...] = (0, 3, 86),
+) -> subprocess.CompletedProcess[str]:
+    return _cli(
+        project, "remove", slot, "--coordinator-pid", str(os.getpid()),
+        "--expected-generation", "1", expected=expected, trace=trace,
+    )
+
+
+def _create_unbound(
+    project: e2e.TestProject, slot: str, agent: str, trace: e2e.Trace
+) -> None:
+    _cli(
+        project, "create", slot, "--slot-type", "agent",
+        "--coordinator-authorized", "--agent", agent,
+        "--task", f"task-{slot}", "--purpose", f"e2e scenario {slot}",
+        "--coordinator-pid", str(os.getpid()),
+        "--repo", "product=product", "--branch", f"product=e2e/{slot}",
+        trace=trace,
+    )
+
+
 _FAULT_PROGRAM = """
 import os, runpy, stat, sys
 real_fsync = os.fsync
@@ -149,7 +197,7 @@ def _cli_fault(
          str(project.root), "--machine", e2e.MACHINE, "--wait-lock", "10",
          *args],
         cwd=project.root, env=env, text=True, capture_output=True,
-        timeout=120, check=False,
+        timeout=_CLI_TIMEOUT, check=False,
     )
 
 
@@ -177,7 +225,7 @@ def _decode(project: e2e.TestProject) -> dict[str, object]:
     done = subprocess.run(
         [sys.executable, "-c", _DECODE_PROGRAM, str(project.root), e2e.MACHINE],
         cwd=project.root, env=project.environment,
-        text=True, capture_output=True, timeout=120, check=False,
+        text=True, capture_output=True, timeout=_CLI_TIMEOUT, check=False,
     )
     if done.returncode != 0:
         raise FuzzFailure(f"decode crashed: {done.stderr.strip()}")
@@ -365,27 +413,27 @@ def _run_seed(
                 if verdict.startswith("FINDING"):
                     raise FuzzFailure(f"{label}: {verdict}")
             elif op == "create" and slot not in live and slot not in archived:
-                e2e._create_unbound(project_crash, slot, f"fz-{slot}", trace)
+                _create_unbound(project_crash, slot, f"fz-{slot}", trace)
                 live.add(slot)
             elif op == "hold" and slot in live:
-                e2e._cli(project_crash, "hold", slot, "--reason", "fuzz",
+                _cli(project_crash, "hold", slot, "--reason", "fuzz",
                          expected=(0, 3), trace=trace)
             elif op == "unhold" and slot in live:
-                e2e._cli(project_crash, "unhold", slot,
+                _cli(project_crash, "unhold", slot,
                          expected=(0, 3), trace=trace)
             elif op == "remove" and slot in live:
                 _wait_chain_loads(project)
-                done = e2e._remove(
+                done = _remove(
                     project_crash, slot, trace, expected=(0, 3, 86)
                 )
                 if done.returncode == 0:
                     live.discard(slot)
             elif op == "recover":
-                e2e._cli(project_crash, "recover", "--coordinator-pid",
+                _cli(project_crash, "recover", "--coordinator-pid",
                          str(os.getpid()),
                          expected=(0, 3, 86), trace=trace)
             else:
-                e2e._cli(project_crash, "status", expected=(0, 3), trace=trace)
+                _cli(project_crash, "status", expected=(0, 3), trace=trace)
         except Exception:
             if not crash:
                 raise

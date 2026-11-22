@@ -28,7 +28,7 @@ def test_lifecycle_fuzz_fast_seeds(tmp_path: Path) -> None:
         done = subprocess.run(
             [sys.executable, str(runner), "--seed", str(seed), "--steps", "16"],
             text=True, capture_output=True, check=False,
-            timeout=600, preexec_fn=_limits, cwd=tmp_path,
+            timeout=1800, preexec_fn=_limits, cwd=tmp_path,
         )
         assert done.returncode == 0, (
             f"seed {seed}:\n{done.stdout}\n{done.stderr}"
