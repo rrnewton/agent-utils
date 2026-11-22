@@ -241,7 +241,7 @@ def get_status(port: int, token: str, path: str) -> int:
     try:
         with urllib.request.urlopen(request, timeout=15) as reply:
             reply.read()
-            return reply.status
+            return int(reply.status)
     except urllib.error.HTTPError as error:
         return error.code
     except Exception:
