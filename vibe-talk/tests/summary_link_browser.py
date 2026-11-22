@@ -40,7 +40,7 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from playwright.sync_api import Page, Route, sync_playwright
+from playwright.sync_api import Locator, Page, Route, sync_playwright
 
 ROOT = Path(__file__).resolve().parent.parent
 CHANNEL = "100000000000000001"
@@ -366,7 +366,7 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
             log.append(page.evaluate("""() => [...document.querySelectorAll('#discuss-answer a')].map(a => a.offsetTop)"""))
             raise AssertionError(f"{label}: the summary re-rendered on {what}: {stable} scroll log: {log}")
 
-    def tap_visible(locator: object, what: str) -> None:
+    def tap_visible(locator: Locator, what: str) -> None:
         # A tap on the anchor itself, with no scroll-into-view: whatever the
         # panel's scroll does next is the app's doing, not the driver's.
         check(locator.count() > 0, f"{label}: {what} is not drawn to tap")

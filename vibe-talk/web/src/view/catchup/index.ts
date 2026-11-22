@@ -468,9 +468,11 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
       const jumped = decision.action === "jump-in-place"
         ? (deps.onJumpInPlace ? deps.onJumpInPlace(ref) : deps.onJump(ref))
         : (deps.navigateToBound ? deps.navigateToBound(boundRaw!, ref) : deps.onJump(ref));
-      // Pin on every frame until the jump settles, and for thirty frames
+      // Pin on every frame until the jump settles, and for six frames
       // after: the scroll walk happens in the landing's own frames, and a
-      // one-off put-back loses to the last of them.
+      // one-off put-back loses to the last of them. Six, not thirty: past
+      // the landing the panel's scroll is the reader's again, and a pin
+      // that outlives the jump would fight their next scroll.
       unpin();
       let settleFrames = -1;
       void Promise.resolve(jumped).then(
@@ -481,7 +483,7 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
         const pin = (): void => {
           unpin();
           if (settleFrames >= 0) settleFrames += 1;
-          if (settleFrames < 30) requestAnimationFrame(pin);
+          if (settleFrames < 6) requestAnimationFrame(pin);
         };
         requestAnimationFrame(pin);
       }
