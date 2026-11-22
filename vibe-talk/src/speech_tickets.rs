@@ -52,9 +52,16 @@ pub const TICKET_TTL: Duration = Duration::from_secs(600);
 /// The most tickets held at once, across every reader.
 ///
 /// A ceiling rather than a target. Turning the mode on mints one per visible row, and scrolling
-/// mints more; without a cap a page left open all day is an unbounded map. Evicting the oldest is
-/// safe because the page re-mints anything it still needs.
-pub const MAX_TICKETS: usize = 512;
+/// mints more; without a cap a page left open all day is an unbounded map. At the cap the
+/// least recently claimed go first — never a ticket a read is playing from while an
+/// unclaimed one can go (`#2066 vibe-talk-page-freeze`: evicting by mint order killed a
+/// live read mid-message once fast held preparations minted bursts of hundreds).
+pub const MAX_TICKETS: usize = 2048;
+
+/// How many gone tickets (expired or evicted) keep only their observation, so a failure
+/// report arriving after its ticket went is still recorded instead of refused
+/// (`#2066`): the correlation key, never the text. Bounded like the store it shadows.
+pub const MAX_GONE_TICKETS: usize = 128;
 
 /// One message, resolved and ready to be spoken.
 #[derive(Clone, Debug, PartialEq)]
@@ -107,6 +114,9 @@ pub struct ServerTiming {
 struct Entry {
     prepared: Prepared,
     minted: Instant,
+    /// When this ticket was last claimed (played from), or never yet: a claimed ticket
+    /// is a read in progress and is evicted last (`#2066`).
+    last_claimed: Option<Instant>,
     /// Per block read (`None` for the whole message), because each is its own request.
     server_timing: HashMap<Option<usize>, ServerTiming>,
     /// `#548 cloud-read-failures`. Why a read's audio stream ended in an error, per block: the error's
@@ -267,6 +277,10 @@ impl ReadAloudCounters {
 #[derive(Debug)]
 pub struct SpeechTickets {
     held: Mutex<HashMap<String, Entry>>,
+    /// Observations of tickets already gone (expired or evicted), newest last, so a
+    /// failure report arriving after its ticket went is still recorded under its
+    /// observation instead of refused (`#2066`). Keys and correlation keys only.
+    gone: Mutex<std::collections::VecDeque<(String, String, Instant)>>,
     /// The last failed read, and how many have failed since the server started.
     failures: Mutex<(u64, Option<ReadFailure>)>,
 }
@@ -283,6 +297,7 @@ impl SpeechTickets {
     pub fn new() -> Self {
         Self {
             held: Mutex::new(HashMap::new()),
+            gone: Mutex::new(std::collections::VecDeque::new()),
             failures: Mutex::new((0, None)),
         }
     }
@@ -294,30 +309,82 @@ impl SpeechTickets {
         let ticket = fresh_ticket();
         if let Ok(mut held) = self.held.lock() {
             let now = Instant::now();
+            // Gone tickets keep their observation for a late failure report (`#2066`).
+            let expired: Vec<(String, String)> = held
+                .iter()
+                .filter(|(_, entry)| now.duration_since(entry.minted) >= TICKET_TTL)
+                .map(|(key, entry)| (key.clone(), entry.prepared.observation.clone()))
+                .collect();
             held.retain(|_, entry| now.duration_since(entry.minted) < TICKET_TTL);
             // Only after expiry has been applied, so a store full of dead tickets evicts those
-            // rather than a live one somebody is about to tap.
+            // rather than a live one somebody is about to tap. Eviction then takes the
+            // least recently claimed — unclaimed first, oldest minted among them — so a
+            // read in progress keeps its ticket however fast new ones are minted.
+            let mut evicted: Vec<(String, String)> = Vec::new();
             while held.len() >= MAX_TICKETS {
                 let Some(oldest) = held
                     .iter()
-                    .min_by_key(|(_, entry)| entry.minted)
+                    .min_by_key(|(_, entry)| {
+                        (
+                            entry.last_claimed.is_some(),
+                            entry.last_claimed.unwrap_or(entry.minted),
+                        )
+                    })
                     .map(|(key, _)| key.clone())
                 else {
                     break;
                 };
-                held.remove(&oldest);
+                if let Some(entry) = held.remove(&oldest) {
+                    evicted.push((oldest, entry.prepared.observation));
+                }
+            }
+            if !evicted.is_empty() {
+                tracing::warn!(
+                    evicted = evicted.len(),
+                    held = held.len(),
+                    cap = MAX_TICKETS,
+                    "speech ticket store at its cap: evicted the least recently claimed"
+                );
+            }
+            if let Ok(mut gone) = self.gone.lock() {
+                for (key, observation) in expired.into_iter().chain(evicted) {
+                    gone.push_back((key, observation, now));
+                }
+                while gone.len() > MAX_GONE_TICKETS {
+                    gone.pop_front();
+                }
             }
             held.insert(
                 ticket.clone(),
                 Entry {
                     prepared,
                     minted: now,
+                    last_claimed: None,
                     server_timing: HashMap::new(),
                     stream_failures: HashMap::new(),
                 },
             );
         }
         ticket
+    }
+
+    /// The observation a failure report for `ticket` records under: the live ticket's,
+    /// or a gone one's kept for [`MAX_GONE_TICKETS`] departures, or `None` for a ticket
+    /// this store never held (or held too long ago). A failure report is diagnostics
+    /// the page volunteers after a read died; refusing it because its ticket expired
+    /// or was evicted in the meantime loses exactly the reports that matter (`#2066`).
+    #[must_use]
+    pub fn failure_observation(&self, ticket: &str) -> Option<String> {
+        if let Ok(held) = self.held.lock() {
+            if let Some(entry) = held.get(ticket) {
+                return Some(entry.prepared.observation.clone());
+            }
+        }
+        let gone = self.gone.lock().ok()?;
+        gone.iter()
+            .rev()
+            .find(|(key, _, _)| key == ticket)
+            .map(|(_, observation, _)| observation.clone())
     }
 
     /// What this ticket names, or `None` when it is unknown or has expired.
@@ -327,14 +394,27 @@ impl SpeechTickets {
     #[must_use]
     pub fn claim(&self, ticket: &str) -> Option<Prepared> {
         let mut held = self.held.lock().ok()?;
-        let entry = held.get(ticket)?;
+        let entry = held.get_mut(ticket)?;
         if Instant::now().duration_since(entry.minted) >= TICKET_TTL {
-            held.remove(ticket);
+            let gone = held.remove(ticket);
+            drop(held);
+            if let (Some(entry), Ok(mut gone_kept)) = (gone, self.gone.lock()) {
+                gone_kept.push_back((
+                    ticket.to_owned(),
+                    entry.prepared.observation,
+                    Instant::now(),
+                ));
+                while gone_kept.len() > MAX_GONE_TICKETS {
+                    gone_kept.pop_front();
+                }
+            }
             return None;
         }
         // NOT removed on a successful claim. An `<audio>` element may open the URL more than once
         // — a retry, a re-read, a media session restoring itself — and a single-use ticket turns
-        // the second of those into a failure the reader cannot explain or act on.
+        // the second of those into a failure the reader cannot explain or act on. The claim
+        // itself is noted: it is what keeps a playing read's ticket from eviction (`#2066`).
+        entry.last_claimed = Some(Instant::now());
         Some(entry.prepared.clone())
     }
 
@@ -558,6 +638,35 @@ mod tests {
         assert_eq!(shown.abandoned, 1);
         assert_eq!(shown.superseded, 2);
         assert_eq!(shown.day.len(), 10, "not a day: {}", shown.day);
+    }
+
+    #[test]
+    fn a_claimed_ticket_survives_a_mint_flood_and_a_gone_one_still_answers_for_its_failure() {
+        // `#2066 vibe-talk-page-freeze`: evicting by mint order killed a live read
+        // mid-message once fast held preparations minted bursts of hundreds. A ticket
+        // being played from (claimed) outlasts unclaimed ones however old it is, and
+        // an evicted ticket still names its observation for a late failure report.
+        let tickets = SpeechTickets::new();
+        let playing = tickets.mint(prepared("playing"));
+        let queued = tickets.mint(prepared("queued"));
+        assert!(tickets.claim(&playing).is_some(), "the play did not claim");
+        for n in 0..MAX_TICKETS + 10 {
+            let _ = tickets.mint(prepared(&format!("flood-{n}")));
+        }
+        assert!(
+            tickets.claim(&playing).is_some(),
+            "a ticket being played from was evicted by newer mints"
+        );
+        assert_eq!(
+            tickets.claim(&queued),
+            None,
+            "the unclaimed oldest was not the one evicted"
+        );
+        assert!(
+            tickets.failure_observation(&queued).is_some(),
+            "an evicted ticket's failure report would be refused"
+        );
+        assert_eq!(tickets.failure_observation("never-minted"), None);
     }
 
     #[test]

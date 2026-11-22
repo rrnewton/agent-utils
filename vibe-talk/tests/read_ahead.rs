@@ -498,6 +498,78 @@ async fn a_stalled_fetch_answers_with_the_held_tickets_and_lands_behind() {
     );
 }
 
+/// `#2066 vibe-talk-page-freeze`: a read in progress keeps its tickets through a burst
+/// of held preparations minting far past the old cap — every block still plays, and a
+/// failure report for the read's ticket is recorded, not refused. This is the live
+/// React death: mint-order eviction killed the playing read's ticket mid-message.
+#[tokio::test(start_paused = true)]
+async fn a_read_plays_through_a_burst_of_held_preparations() {
+    let (app, state, _chat) = harness(Arc::new(TimedSpeech::new(Duration::ZERO)));
+    let (status, _) = call(
+        &app,
+        "GET",
+        &format!("/api/v1/channels/{READ_CHANNEL}/page?limit=20"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = call(
+        &app,
+        "POST",
+        &prepare_path(),
+        Some(json!({"ids": ["101", "102", "103"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(prepared_ids(&body), ["101", "102", "103"]);
+    let ticket_of = |at: usize| -> String {
+        body["prepared"][at]["url"]
+            .as_str()
+            .expect("ticket url")
+            .trim_start_matches("/api/v1/speech/")
+            .split('?')
+            .next()
+            .expect("ticket")
+            .to_owned()
+    };
+    // The read starts; then a burst of held preparations elsewhere mints far past
+    // the old 512 cap while it is playing.
+    let first = json!({"prepared": [body["prepared"][0].clone()]});
+    assert_eq!(play(&app, &first).await, "words of message 101");
+    for n in 0..600 {
+        state
+            .speech_tickets
+            .mint(vibe_talk::speech_tickets::Prepared {
+                channel: READ_CHANNEL.to_owned(),
+                message: format!("burst-{n}"),
+                said: format!("burst {n}"),
+                blocks: Vec::new(),
+                speed: None,
+                voice: None,
+                observation: vibe_talk::speech_tickets::fresh_observation(),
+                preparation_ms: 0,
+            });
+    }
+    // The read goes on: its remaining tickets still play, in sequence.
+    for (at, id) in [(1, "102"), (2, "103")] {
+        let one = json!({"prepared": [body["prepared"][at].clone()]});
+        assert_eq!(
+            play(&app, &one).await,
+            format!("words of message {id}"),
+            "the read died at {id} in the burst"
+        );
+    }
+    // And its failure report (had it failed) would still be recorded, not refused.
+    let (status, _) = call(
+        &app,
+        "POST",
+        &format!("/api/v1/speech/{}/failure", ticket_of(0)),
+        Some(json!({"reason": "no_audio", "detail": "probe"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_thread_view_the_page_fetched_answers_only_for_that_thread() {
     let (app, _state, chat) = harness(Arc::new(TimedSpeech::new(Duration::ZERO)));

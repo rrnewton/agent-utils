@@ -316,6 +316,38 @@ impl axum::extract::FromRequestParts<AppState> for SpeechTicket {
     }
 }
 
+/// The ticket in a failure report's path, with the observation it records under, checked
+/// before anything else in the request is read — the [`SpeechTicket`] shape, widened by
+/// `#2066` to a ticket already gone (expired or evicted) whose observation the store
+/// still keeps: a report arriving after its ticket went is recorded, not refused, while
+/// a ticket never held (or undecodable) gets the same 404 whatever query or body came.
+pub struct FailureTicket {
+    /// The observation the report records under.
+    pub observation: String,
+}
+
+impl axum::extract::FromRequestParts<AppState> for FailureTicket {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let Ok(Path(ticket)) =
+            <Path<String> as axum::extract::FromRequestParts<AppState>>::from_request_parts(
+                parts, state,
+            )
+            .await
+        else {
+            return Err(unknown_speech_ticket());
+        };
+        let Some(observation) = state.speech_tickets.failure_observation(&ticket) else {
+            return Err(unknown_speech_ticket());
+        };
+        Ok(Self { observation })
+    }
+}
+
 /// The SAME answer for expired and never-existed. Distinguishing them would let a caller probe for
 /// the difference, and neither is something the reader can act on differently.
 fn unknown_speech_ticket() -> ApiError {
@@ -8658,7 +8690,10 @@ pub struct SpeechPlaybackFailure {
 /// report carries a slug and a short sentence, never text to speak.
 pub async fn speech_playback_failure(
     State(state): State<AppState>,
-    SpeechTicket(ticket): SpeechTicket,
+    // Checked first like the SpeechTicket it widens (`#42`, `#2066`): a report
+    // arriving after its ticket expired or was evicted is still recorded, under
+    // the observation kept for it; one never held gets the same 404 as ever.
+    ticket: FailureTicket,
     Query(read): Query<TimingQuery>,
     Json(failure): Json<SpeechPlaybackFailure>,
 ) -> Result<StatusCode, ApiError> {
@@ -8692,13 +8727,11 @@ pub async fn speech_playback_failure(
             ));
         }
     };
-    let Some(prepared) = state.speech_tickets.claim(&ticket) else {
-        return Err(unknown_speech_ticket());
-    };
+    let observation = ticket.observation;
     // `#2056`: one structured line per page-reported failure, with the
     // page's own judgement of it, and the day's counters kept beside it.
     tracing::warn!(
-        observation = prepared.observation,
+        observation,
         block = read.block,
         reason,
         recoverable = failure.recoverable,
