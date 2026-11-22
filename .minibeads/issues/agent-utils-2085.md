@@ -25,3 +25,5 @@ Extend the owner-tier interleave: after N minutes (host-configurable, default 30
 # Notes
 
 Filed by the coordinator; the owning lane refines this file as it works.
+
+Note (landing, 2026-11-22): test_interleaved_admission_order_end_to_end is timing/order-sensitive under load (it failed once in the #2085 gate with O5 admitted before N2, then passed locally and on a solo rerun) and should become condition-based (owner rule 346).
