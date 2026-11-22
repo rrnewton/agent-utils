@@ -278,12 +278,16 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
   let roomPadding = "";
   /** When this owner last wrote the list's place, in `Date.now` terms. */
   let ownWriteAt = Number.NEGATIVE_INFINITY;
+  /** How many times this owner has written the place (`#2091`): a settle loop
+   * tells its own writes from another owner's by the count. */
+  let ownWriteCount = 0;
   /** The port the input watch stands on; re-armed when the column swaps its area. */
   let inputPort: HTMLElement | null = null;
 
   /** This owner is about to write the list's place: the scroll it causes is not the reader's. */
   function noteOwnWrite(): void {
     ownWriteAt = Date.now();
+    ownWriteCount += 1;
   }
 
   /**
@@ -893,10 +897,14 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     // then the redraw that folds the run once the write answers, then the
     // re-read landing that follows it — each held by the same three cases.
     // The loop ends when the anchor and the list's height have stood still
-    // for 45 frames after the act settles (frame-based, never a clock), or
-    // when the reader wheels or touches. The next-unread move waits for this
-    // settle (donekeys, via `shrinkSettling`), so it never fights the loop.
+    // for 45 frames after the act settles (frame-based, never a clock), when
+    // the reader wheels or touches, or when another owner writes the place
+    // after the act settles (a keyboard scroll, a deliberate move): that
+    // write owns the place now. The next-unread move waits for this settle
+    // (donekeys, via `shrinkSettling`), so it never fights the loop.
     let settled = false;
+    let settledWriteCount = -1;
+    let loopWriteCount = 0;
     shrinkActive = true;
     const gen = ++shrinkGen;
     if (typeof requestAnimationFrame === "function") {
@@ -906,7 +914,13 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
       const step = (): void => {
         if (gen !== shrinkGen) return;
         if (readerInputAt > session.inputAtStart) { shrinkActive = false; return; }
+        if (settled && settledWriteCount >= 0 && ownWriteCount - settledWriteCount > loopWriteCount) {
+          shrinkActive = false;
+          return;
+        }
+        const beforeWrites = ownWriteCount;
         const off = session.apply();
+        loopWriteCount += ownWriteCount - beforeWrites;
         if (off === null) { shrinkActive = false; return; }
         // A holder that will not hold after 24 corrected frames is owned by
         // another keeper (a landing's, a walk's): fighting it frame after
@@ -927,7 +941,9 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
       await mutate();
     } finally {
       settled = true;
+      settledWriteCount = ownWriteCount;
       session.apply();
+      loopWriteCount = ownWriteCount - settledWriteCount;
       if (deps.anchorDebug) {
         const judged = session.judge();
         if (judged) deps.anchorDebug({ ...judged, action: "archive-shrink" });
