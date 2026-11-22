@@ -223,10 +223,7 @@ fn main() {
     match run(&args) {
         Ok(answer) => println!("{answer}"),
         Err(error) => {
-            println!(
-                "{}",
-                serde_json::json!({"ok": false, "error": error}).to_string()
-            );
+            println!("{}", serde_json::json!({"ok": false, "error": error}));
             std::process::exit(2);
         }
     }
