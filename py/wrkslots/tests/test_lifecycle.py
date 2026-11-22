@@ -58278,6 +58278,48 @@ def test_hold_still_refuses_a_stranded_git_registration_for_its_own_slot(
     assert "slot02" in refused.stderr
 
 
+def test_hold_tolerates_present_nested_same_repository_worktree(
+    tmp_path: Path,
+) -> None:
+    """#2122: hold succeeds despite an undeclared nested worktree.
+
+    The nested worktree is present (unlike the stranded registration
+    above, whose deleted path still refuses): a hold is the protective
+    direction, so it records and warns naming the path instead of
+    leaving live work unprotected. The held slot is then protected
+    from removal like any other hold.
+    """
+    project, repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    nested = checkout(project, "slot01") / "cand-nested"
+    git(
+        repository,
+        "worktree",
+        "add",
+        "-b",
+        "codex/nested-hold",
+        str(nested),
+        "origin/main",
+    )
+    assert nested.is_dir()
+
+    held = command(project, "hold", "slot01", "--reason", "protect live work")
+
+    assert held.returncode == 0, held.stderr
+    assert "held slot=slot01" in held.stdout
+    assert "WARNING" in held.stderr
+    assert str(nested) in held.stderr
+    assert "no active checkout row" in held.stderr
+
+    # Removal never proceeds: it refuses (the nested drift alone
+    # refuses removal, and the hold protects the slot independently),
+    # and both the slot and the nested worktree survive untouched.
+    removed = remove(project, "slot01")
+    assert removed.returncode == 3, removed.stdout
+    assert nested.is_dir()
+    assert checkout(project, "slot01").is_dir()
+
+
 def test_registry_storage_guard_still_refuses_when_no_slot_is_named(
     tmp_path: Path,
 ) -> None:

@@ -51449,7 +51449,36 @@ def _cmd_hold(args: argparse.Namespace) -> int:
         _refuse_partial_state(config)
         _assert_no_journal(config, target_slot=args.slot)
         states, _archives = _validate_global_state(config)
-        _assert_command_registry_storage(config, states, args)
+        # #2122: a hold is the protective direction, so a nested worktree
+        # Git registers inside this slot without a checkout row must not
+        # refuse it -- refusing would leave live work unprotected over an
+        # unrelated registration inconsistency. Tolerate the target's
+        # git-registration-without-row findings and warn naming the path,
+        # as heartbeat (#1492) and transfer-owner already do. Only a
+        # PRESENT nested worktree is tolerated: a registration whose path
+        # was deleted is stale bookkeeping and still refuses. Every other
+        # storage refusal is unchanged.
+        findings = _assert_command_registry_storage(
+            config, states, args, tolerate_target_git_registrations=True
+        )
+        for detail in findings.target_git_registrations:
+            marker = " registers "
+            start = detail.find(marker)
+            end = detail.find(" inside", start) if start >= 0 else -1
+            registered = (
+                Path(detail[start + len(marker):end])
+                if start >= 0 and end > start
+                else None
+            )
+            if registered is not None and not registered.exists():
+                raise Refusal(detail)
+            print(
+                f"WARNING: slot {args.slot} has a nested worktree Git "
+                f"registers without a checkout row: {detail}. "
+                "state: hold recorded anyway; the nested worktree is "
+                "retained and not inspected",
+                file=sys.stderr,
+            )
         record = _find_record(_load_active(config), args.slot)
         _report_dead_for_record(config, states, record)
         path = _hold_path(config, record.slot, record.machine)

@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -196,6 +197,52 @@ def test_hold_matches_python(tmp_path: Path) -> None:
     assert (rust_root / "worktrees" / "ACTIVE.node-a.json").read_bytes() == (
         oracle_root / "worktrees" / "ACTIVE.node-a.json"
     ).read_bytes()
+
+
+def _add_nested(root: Path) -> Path:
+    nested = root / "worktrees" / "slot-a" / "repo" / "cand-nested"
+    _git(
+        root.parent / "upstream-repo", "worktree", "add", "-q", "-b",
+        "suite/nested", str(nested), "HEAD",
+    )
+    return nested
+
+
+def test_hold_tolerates_present_nested_worktree_matches_python(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#2122: an undeclared nested same-repository worktree warns, not refuses."""
+    rust_root, oracle_root = _pair(tmp_path)
+    oracle_nested = _add_nested(oracle_root)
+    rust_nested = _add_nested(rust_root)
+    assert _python(oracle_root, "slot-a", "keep it") == 0
+    python_stderr = capsys.readouterr().err
+    assert "WARNING" in python_stderr
+    assert str(oracle_nested) in python_stderr
+    result = _rust(rust_root, "slot-a", "keep it")
+    assert result.returncode == 0, result.stderr
+    assert "WARNING" in result.stderr
+    assert str(rust_nested) in result.stderr
+    assert json.loads(result.stdout)["already_held"] is False
+    assert _hold_record(rust_root) == _hold_record(oracle_root)
+    assert _events(rust_root) == _events(oracle_root)
+
+
+def test_hold_refuses_stranded_nested_registration_matches_python(
+    tmp_path: Path,
+) -> None:
+    """A nested registration whose path was deleted still refuses (#2122)."""
+    rust_root, oracle_root = _pair(tmp_path)
+    for root in (rust_root, oracle_root):
+        shutil.rmtree(_add_nested(root))
+    with pytest.raises(Exception) as caught:
+        _python(oracle_root, "slot-a", "keep it")
+    assert "no active checkout row" in str(caught.value)
+    result = _rust(rust_root, "slot-a", "keep it")
+    assert result.returncode == 1
+    assert "no active checkout row" in result.stderr
+    assert _hold_record(rust_root) is None
+    assert _hold_record(oracle_root) is None
 
 
 def test_hold_already_held_same_reason_matches_python(tmp_path: Path) -> None:

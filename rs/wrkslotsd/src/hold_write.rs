@@ -379,7 +379,8 @@ pub(crate) fn refuse_target_storage_tolerating_foreign(
 
 /// Like `refuse_target_storage`, but `git-registration-without-row`
 /// findings for the target slot are collected as warnings instead of
-/// refusing: transfer-owner tolerates unregistered nested worktrees.
+/// refusing: transfer-owner, heartbeat and hold (#2122) tolerate
+/// unregistered nested worktrees.
 pub(crate) fn refuse_target_storage_except_nested(
     root: Option<&Path>,
     slot: &str,
@@ -728,7 +729,26 @@ pub(crate) fn hold_slot(
         }
     }
     validate_global(root, &cfg)?;
-    refuse_target_storage(root, slot)?;
+    // #2122: a hold is the protective direction, so a nested worktree
+    // Git registers inside this slot without a checkout row warns
+    // instead of refusing, as heartbeat (#1492) and transfer-owner
+    // already do. Only a PRESENT nested worktree is tolerated; a
+    // deleted path is stale bookkeeping and still refuses.
+    let nested_warnings = refuse_target_storage_except_nested(root, slot)?;
+    for detail in &nested_warnings {
+        if let Some(start) = detail.find(" registers ") {
+            let rest = &detail[start + " registers ".len()..];
+            if let Some(end) = rest.find(" inside") {
+                let registered = &rest[..end];
+                if !Path::new(registered).exists() {
+                    return Err(detail.clone());
+                }
+            }
+        }
+        eprintln!(
+            "WARNING: slot {slot} has a nested worktree Git registers without a checkout row: {detail}. state: hold recorded anyway; the nested worktree is retained and not inspected"
+        );
+    }
     report_dead_findings(root, slot)?;
     let active = active_document(root, &cfg, &selected)?;
     let record = active
