@@ -52,6 +52,71 @@ fn a_managed_muse_lane_at_the_dialog_is_answered_per_policy() {
 }
 
 #[test]
+fn a_missing_hooks_record_is_silent_in_either_layout() {
+    // #2121: a `hooks/` directory holding only a hook script, in layout 1
+    // or under `agents/` in layout 2, is no hooks to trust: no error, and
+    // the name is not listed as an agent at all.
+    for current in [false, true] {
+        let fixture = Fixture::new();
+        let registry = fixture.root.join("registry");
+        let hooks = if current {
+            registry.join("agents/hooks")
+        } else {
+            registry.join("hooks")
+        };
+        fs::create_dir_all(&hooks).unwrap();
+        fs::write(hooks.join("permission.sh"), "#!/bin/sh\n").unwrap();
+        let manager = fixture.manager();
+        assert_eq!(manager.answer_hooks_trust_if_dialog("hooks").unwrap(), None);
+        assert!(
+            !agent_queue::registry::names(&registry)
+                .unwrap()
+                .iter()
+                .any(|name| name == "hooks"),
+            "hooks must not list as an agent (current={current})"
+        );
+        assert!(fixture.client.hooks_answers.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn a_malformed_hooks_record_still_reports_a_problem() {
+    // #2121: only a missing file is silent; an existing malformed record
+    // is a problem in either layout.
+    for current in [false, true] {
+        let fixture = Fixture::new();
+        let registry = fixture.root.join("registry");
+        let hooks = if current {
+            registry.join("agents/hooks")
+        } else {
+            registry.join("hooks")
+        };
+        fs::create_dir_all(&hooks).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&registry, fs::Permissions::from_mode(0o700)).unwrap();
+            if current {
+                fs::set_permissions(registry.join("agents"), fs::Permissions::from_mode(0o700))
+                    .unwrap();
+            }
+            fs::set_permissions(&hooks, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        fs::write(hooks.join("agent.json"), "not json").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(hooks.join("agent.json"), fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+        let manager = fixture.manager();
+        let error = manager.answer_hooks_trust_if_dialog("hooks").unwrap_err();
+        assert!(
+            error.to_string().contains("agent.json"),
+            "{error} (current={current})"
+        );
+    }
+}
+
+#[test]
 fn a_near_miss_and_another_harness_are_never_answered() {
     let fixture = Fixture::new();
     let manager = start_muse(&fixture);

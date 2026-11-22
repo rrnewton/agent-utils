@@ -352,18 +352,57 @@ pub fn relocated(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-/// Every agent name with an entry in either layout, sorted and without repeats. A name in both
-/// appears once; [`locate`] reports the conflict when it is used.
+/// Whether either layout's directory for `name` holds an `agent.json`
+/// entry (#2121): a directory without one — `hooks/` holding only a hook
+/// script, in either layout — is not an agent at all. Any existing entry
+/// counts, readable or not, so a malformed record still surfaces as an
+/// agent whose record fails to load.
+fn has_record_entry(registry: &Path, name: &str) -> Result<bool> {
+    for directory in [
+        current_directory(registry, name),
+        legacy_directory(registry, name),
+    ] {
+        match fs::symlink_metadata(directory.join("agent.json")) {
+            Ok(_) => return Ok(true),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) => {}
+            Err(error) => {
+                return Err(io_error(
+                    "inspect agent directory",
+                    &directory.join("agent.json"),
+                    error,
+                ))
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Every agent name with a record in either layout, sorted and without
+/// repeats (#2121: a directory holding no `agent.json` in either layout,
+/// such as a `hooks/` script directory, is not listed as an agent). A name
+/// in both appears once; [`locate`] reports the conflict when it is used.
+/// Callers that must see recordless directories (a doctor reporting an
+/// orphan queue) list [`legacy_names`] and [`current_names`] themselves.
 ///
 /// # Errors
 ///
-/// A directory that exists but cannot be listed.
+/// A directory that exists but cannot be listed or inspected.
 pub fn names(registry: &Path) -> Result<Vec<String>> {
     let mut names = legacy_names(registry)?;
     names.extend(current_names(registry)?);
     names.sort();
     names.dedup();
-    Ok(names)
+    let mut recorded = Vec::new();
+    for name in names {
+        if has_record_entry(registry, &name)? {
+            recorded.push(name);
+        }
+    }
+    Ok(recorded)
 }
 
 /// Whether `REGISTRY/archive/` holds a retired generation of agent `name`.
@@ -613,10 +652,32 @@ mod tests {
         assert!(error.message().contains("both registry layouts"), "{error}");
         assert!(stray_names(&registry).unwrap().is_empty());
         assert_eq!(record_directories(&registry, "twice").unwrap().len(), 1);
-        assert_eq!(names(&registry).unwrap(), ["new", "old", "twice"]);
+        // #2121: only a directory holding a record is listed as an agent;
+        // `new` and `old` hold no agent.json, so they are not agents.
+        assert_eq!(names(&registry).unwrap(), ["twice"]);
         assert!(locate(&registry, "agents").is_err());
         assert!(locate(&registry, "bridges").is_err());
         assert!(!is_agent_name("bridges"));
+        fs::remove_dir_all(registry).unwrap();
+    }
+
+    #[test]
+    fn a_hooks_directory_without_a_record_is_not_an_agent_in_either_layout() {
+        // #2121: a registry `hooks/` directory holding only a hook script
+        // (and the same under `agents/`) is not an agent; a malformed
+        // existing record still lists, so its load error can surface.
+        let registry = scratch("hooks-not-agent");
+        prepare(&registry).unwrap();
+        let legacy_hooks = registry.join("hooks");
+        fs::create_dir(&legacy_hooks).unwrap();
+        fs::write(legacy_hooks.join("permission.sh"), "#!/bin/sh\n").unwrap();
+        assert_eq!(names(&registry).unwrap(), Vec::<String>::new());
+        let current_hooks = registry.join("agents/hooks");
+        fs::create_dir(&current_hooks).unwrap();
+        fs::write(current_hooks.join("permission.sh"), "#!/bin/sh\n").unwrap();
+        assert_eq!(names(&registry).unwrap(), Vec::<String>::new());
+        fs::write(current_hooks.join("agent.json"), "not json").unwrap();
+        assert_eq!(names(&registry).unwrap(), ["hooks"]);
         fs::remove_dir_all(registry).unwrap();
     }
 

@@ -94,7 +94,15 @@ pub enum Presence {
 /// entry's recorded name, never a file-name prefix, and it decides for a
 /// directory that holds no record.
 pub fn presence(registry: &Path, agent: &str) -> Presence {
-    let listed = match agent_queue::registry::names(registry) {
+    // A queue directory created by path ahead of registration counts as
+    // present here, so this lists both layouts raw: `registry::names`
+    // lists only directories holding a record (#2121).
+    let listed = match agent_queue::registry::legacy_names(registry).and_then(|mut names| {
+        agent_queue::registry::current_names(registry).map(|current| {
+            names.extend(current);
+            names
+        })
+    }) {
         Ok(names) => names.iter().any(|name| name == agent),
         Err(error) => return Presence::Unknown(error.to_string()),
     };

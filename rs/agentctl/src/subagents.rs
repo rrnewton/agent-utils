@@ -10486,8 +10486,17 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             .collect();
         let mut records = Vec::new();
         if self.registry.exists() {
-            let names = agent_queue::registry::names(&self.registry)
+            // Doctor must also see recordless directories (an orphan queue
+            // is its finding), so it lists both layouts raw: `names` itself
+            // now lists only directories holding a record (#2121).
+            let mut names = agent_queue::registry::legacy_names(&self.registry)
                 .map_err(|error| fail(error.to_string()))?;
+            names.extend(
+                agent_queue::registry::current_names(&self.registry)
+                    .map_err(|error| fail(error.to_string()))?,
+            );
+            names.sort();
+            names.dedup();
             for agent_name in names {
                 match self.read_record_for_scan(&agent_name) {
                     Ok(Some(record)) => records.push(record),
@@ -14398,6 +14407,16 @@ its drain would also type, so it was not queued",
     /// [`Self::answer_hooks_trust`], or `Ok(None)` when this agent is not
     /// a Muse lane parked at the exact dialog: the watch sweep's form.
     pub fn answer_hooks_trust_if_dialog(&self, agent_name: &str) -> Result<Option<String>> {
+        // #2121: no record in either layout means no hooks to trust, not
+        // an error (a `hooks/` directory holding only a hook script is
+        // not an agent; `registry::names` no longer lists it, and this
+        // guard keeps a direct call silent too). An existing record that
+        // is unreadable or malformed still fails in `load` below.
+        match agent_queue::registry::record_directories(&self.registry, agent_name) {
+            Ok(directories) if directories.is_empty() => return Ok(None),
+            Ok(_) => {}
+            Err(error) => return Err(fail(error.to_string())),
+        }
         // The watch sweep calls this for every registered name: only a
         // Muse lane can show the dialog, so the lifecycle lock is taken
         // only once the record proves this one is Muse.

@@ -1613,7 +1613,9 @@ pub fn completed_boot_report(
 ) -> Option<(PathBuf, Value)> {
     match boot_report_state(registry, config, epoch, manager_started) {
         BootReportState::Completed(found) => Some(found),
-        BootReportState::PredatesKeying(_) | BootReportState::Missing => None,
+        BootReportState::Incomplete(_)
+        | BootReportState::PredatesKeying(_)
+        | BootReportState::Missing => None,
     }
 }
 
@@ -1625,10 +1627,39 @@ pub enum BootReportState {
     /// A completed report proven to belong to this epoch, manager-start proof
     /// by manager start included.
     Completed((PathBuf, Value)),
+    /// A report for this boot exists but did not complete (#2018): it is
+    /// evidence a restore ran, never the same finding as no report at all.
+    Incomplete((PathBuf, Value)),
     /// Only a pre-epoch completed report, which nothing can prove.
     PredatesKeying(PathBuf),
-    /// No completed report for this epoch at any candidate location.
+    /// No report file for this boot exists at any candidate location.
     Missing,
+}
+
+/// Why an incomplete report did not complete, in the report's own terms
+/// (#2018): its recorded error, else its coordinator refusal, else its
+/// refused lanes, else the bare fact.
+fn incomplete_reason(report: &Value) -> String {
+    if let Some(error) = report["error"].as_str().filter(|error| !error.is_empty()) {
+        return error.to_owned();
+    }
+    let coordinator = &report["coordinator"];
+    if coordinator["action"] == "refused" {
+        if let Some(reason) = coordinator["reason"].as_str().filter(|r| !r.is_empty()) {
+            return format!("coordinator refused: {reason}");
+        }
+        return "coordinator refused".to_owned();
+    }
+    if let Some(lanes) = report["refused_lanes"]
+        .as_array()
+        .filter(|lanes| !lanes.is_empty())
+    {
+        let names: Vec<&str> = lanes.iter().filter_map(Value::as_str).collect();
+        if !names.is_empty() {
+            return format!("refused lanes: {}", names.join(", "));
+        }
+    }
+    "restore did not complete".to_owned()
 }
 
 /// [`BootReportState`] for this boot, scanning candidates in read order.
@@ -1639,11 +1670,25 @@ pub fn boot_report_state(
     manager_started: Option<f64>,
 ) -> BootReportState {
     let mut predating: Option<PathBuf> = None;
+    let mut incomplete: Option<(PathBuf, Value)> = None;
+    let mut incomplete_predating: Option<(PathBuf, Value)> = None;
     for path in candidate_report_paths(registry, config, &epoch.boot_id) {
         let Some(report) = read_report(&path) else {
             continue;
         };
         if report["complete"] != true {
+            // #2018: an existing incomplete report is not "no report": keep
+            // the first one proven for this epoch, and an unprovable one
+            // only when nothing better is found.
+            match epoch.legacy_match(&report, manager_started) {
+                LegacyMatch::Matches => {
+                    incomplete.get_or_insert((path, report));
+                }
+                LegacyMatch::PredatesKeying => {
+                    incomplete_predating.get_or_insert((path, report));
+                }
+                LegacyMatch::Miss => {}
+            };
             continue;
         }
         match epoch.legacy_match(&report, manager_started) {
@@ -1652,9 +1697,15 @@ pub fn boot_report_state(
             LegacyMatch::Miss => continue,
         };
     }
+    if let Some(found) = incomplete {
+        return BootReportState::Incomplete(found);
+    }
     match predating {
         Some(path) => BootReportState::PredatesKeying(path),
-        None => BootReportState::Missing,
+        None => match incomplete_predating {
+            Some(found) => BootReportState::Incomplete(found),
+            None => BootReportState::Missing,
+        },
     }
 }
 
@@ -4800,24 +4851,43 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
             // An unprovable pre-epoch report is said distinctly and never
             // alarmed: alarming every pass until someone forces a restore
             // (and its notices) helps nobody (#1426).
-            let (ok, detail): (bool, String) = match &report_state {
-                BootReportState::Completed(_) => (true, "this boot's restore completed".to_owned()),
+            let (ok, detail, missing): (bool, String, bool) = match &report_state {
+                BootReportState::Completed(_) => {
+                    (true, "this boot's restore completed".to_owned(), false)
+                }
+                BootReportState::Incomplete((path, report)) => (
+                    false,
+                    format!(
+                        "restore report for this boot is incomplete ({}): {}",
+                        path.display(),
+                        incomplete_reason(report)
+                    ),
+                    false,
+                ),
                 BootReportState::PredatesKeying(path) => (
                     true,
                     format!(
                         "report predates epoch keying ({}); cannot prove it for this epoch",
                         path.display()
                     ),
+                    false,
                 ),
-                BootReportState::Missing if early => {
-                    (true, "boot is recent; restore may still run".to_owned())
-                }
+                BootReportState::Missing if early => (
+                    true,
+                    "boot is recent; restore may still run".to_owned(),
+                    false,
+                ),
                 BootReportState::Missing => (
                     false,
                     "no completed restore report for this boot".to_owned(),
+                    true,
                 ),
             };
-            findings.push(finding("restore", &boot_id, ok, &detail, Value::Null));
+            let mut row = finding("restore", &boot_id, ok, &detail, Value::Null);
+            if missing {
+                row["missing_restore_report"] = json!(true);
+            }
+            findings.push(row);
         }
     }
     // Queued prompts must not sit parked (#804 agentctl-queue-only-drain): a
@@ -4957,6 +5027,30 @@ fn health_path(options: &WatchOptions) -> Option<PathBuf> {
             default_report_dir().and_then(|dir| dir.parent().map(|parent| parent.join("watch")))
         })
         .map(|dir| dir.join("health.json"))
+}
+
+/// Report a missing restore report once per boot in this watch process
+/// (#2018): the first failing row for a boot stays failing, later rows for
+/// the same boot become a suppressed non-alerting row. In memory only, so
+/// a watch restart may report it once more.
+fn apply_restore_missing_once(
+    findings: &mut [Value],
+    noted: &mut std::collections::BTreeSet<String>,
+) {
+    for row in findings.iter_mut() {
+        if row["check"] != "restore" || row["missing_restore_report"] != true {
+            continue;
+        }
+        let boot = row["subject"].as_str().unwrap_or("").to_owned();
+        if noted.insert(boot) {
+            continue;
+        }
+        row["ok"] = Value::Null;
+        row["detail"] =
+            json!("no completed restore report for this boot (already reported for this boot)");
+        row["suppressed"] = json!("reported-once-this-boot");
+        row["skipped"] = json!("already-reported-this-boot");
+    }
 }
 
 /// Tell the coordinator about failing findings, each at most once an hour, when it can hear.
@@ -5854,6 +5948,9 @@ pub fn watch<A: ManagedApi + ?Sized>(
     // Units whose cooldown finding has already gone to stderr this episode (#961): a
     // cooldown is logged once when it starts, not on every pass it spans.
     let mut cooldown_noted: std::collections::BTreeSet<String> = Default::default();
+    // #2018: boots whose missing restore report this process already
+    // reported; in memory only, never persisted to health.json.
+    let mut restore_missing_noted: std::collections::BTreeSet<String> = Default::default();
     let mut closed_bare_shells: Vec<Value> = Vec::new();
     let mut pass: u64 = 0;
     loop {
@@ -5874,6 +5971,7 @@ pub fn watch<A: ManagedApi + ?Sized>(
             &mut timer_repaired_at,
             &mut timer_stopped_noted,
         );
+        apply_restore_missing_once(&mut findings, &mut restore_missing_noted);
         // Workspace hygiene and canonical tab order:
         // close unclaimed bare shells idle past the grace period, and keep
         // managed workspaces' tabs in canonical order. Best-effort; a
@@ -6456,6 +6554,97 @@ mod tests {
         let (path, _) = completed_boot_report(&registry, &config, &epoch, None).unwrap();
         assert_eq!(path, middle.join(&file));
         fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn an_incomplete_report_is_not_missing_in_either_layout() {
+        // #2018: a report that exists but did not complete (the drill's
+        // coordinator-refused boot) must not collapse into Missing.
+        let directory =
+            std::env::temp_dir().join(format!("restore-incomplete-{}", std::process::id()));
+        let registry = directory.join("registry");
+        fs::create_dir_all(&registry).unwrap();
+        let mut config = RestoreConfig::load(&registry).unwrap();
+        let boot = "11111111-2222-3333-4444-555555555555";
+        let epoch = RestoreEpoch {
+            boot_id: boot.to_owned(),
+            user_manager: Some("invocation:m1".to_owned()),
+        };
+        let incomplete = format!(
+            "{{\"boot_id\": \"{boot}\", \"epoch\": {}, \"complete\": false, \
+             \"coordinator\": {{\"action\": \"refused\", \"reason\": \"no pane\"}}}}",
+            epoch.as_json()
+        );
+        let file = format!("{boot}.json");
+        assert_eq!(
+            boot_report_state(&registry, &config, &epoch, None),
+            BootReportState::Missing
+        );
+        // At the current location.
+        let primary = reports_directory(&registry);
+        fs::create_dir_all(&primary).unwrap();
+        fs::write(primary.join(&file), &incomplete).unwrap();
+        match boot_report_state(&registry, &config, &epoch, None) {
+            BootReportState::Incomplete((path, report)) => {
+                assert_eq!(path, primary.join(&file));
+                assert_eq!(incomplete_reason(&report), "coordinator refused: no pane");
+            }
+            other => panic!("expected Incomplete, got {other:?}"),
+        }
+        assert!(completed_boot_report(&registry, &config, &epoch, None).is_none());
+        // Only at the legacy agents/ location: still Incomplete, same path.
+        fs::remove_file(primary.join(&file)).unwrap();
+        let agents = registry.join("agents/restore-reports");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(agents.join(&file), &incomplete).unwrap();
+        match boot_report_state(&registry, &config, &epoch, None) {
+            BootReportState::Incomplete((path, _)) => assert_eq!(path, agents.join(&file)),
+            other => panic!("expected Incomplete, got {other:?}"),
+        }
+        // An explicit report_dir is the one location: no fallback reads.
+        let explicit = directory.join("explicit");
+        fs::create_dir_all(&explicit).unwrap();
+        config.report_dir = Some(explicit.clone());
+        assert_eq!(
+            boot_report_state(&registry, &config, &epoch, None),
+            BootReportState::Missing
+        );
+        fs::write(explicit.join(&file), &incomplete).unwrap();
+        match boot_report_state(&registry, &config, &epoch, None) {
+            BootReportState::Incomplete((path, _)) => assert_eq!(path, explicit.join(&file)),
+            other => panic!("expected Incomplete, got {other:?}"),
+        }
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn a_missing_restore_report_is_reported_once_per_boot() {
+        // #2018: first pass for a boot stays failing; later passes in the
+        // same watch process are suppressed and never alert.
+        let row = || {
+            json!({"check": "restore", "subject": "boot-a", "ok": false,
+                   "detail": "no completed restore report for this boot",
+                   "missing_restore_report": true, "repair": Value::Null})
+        };
+        let mut noted = std::collections::BTreeSet::new();
+        let mut first = vec![row()];
+        apply_restore_missing_once(&mut first, &mut noted);
+        assert_eq!(first[0]["ok"], json!(false));
+        let mut second = vec![row()];
+        apply_restore_missing_once(&mut second, &mut noted);
+        assert_eq!(second[0]["ok"], Value::Null);
+        assert_eq!(second[0]["suppressed"], "reported-once-this-boot");
+        // A different boot reports again.
+        let mut other = vec![json!({"check": "restore", "subject": "boot-b", "ok": false,
+                   "detail": "no completed restore report for this boot",
+                   "missing_restore_report": true, "repair": Value::Null})];
+        apply_restore_missing_once(&mut other, &mut noted);
+        assert_eq!(other[0]["ok"], json!(false));
+        // Incomplete rows are never suppressed by this rule.
+        let mut incomplete = vec![json!({"check": "restore", "subject": "boot-a", "ok": false,
+                   "detail": "restore report for this boot is incomplete", "repair": Value::Null})];
+        apply_restore_missing_once(&mut incomplete, &mut noted);
+        assert_eq!(incomplete[0]["ok"], json!(false));
     }
 
     #[test]
