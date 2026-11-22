@@ -4578,7 +4578,9 @@ pub async fn catchup_followup(
     prompt.push_str(&format!(
         "\n\nFor tool calls, this channel's channel_id is {channel_id}."
     ));
-    let system = crate::catchup::effective_system_prompt(None);
+    // `#2137 vibe-talk-discuss-followup-prompt-and-labels`: a follow-up is not
+    // a briefing, so it gets its own system prompt — never the summary's.
+    let system = crate::catchup::FOLLOWUP_SYSTEM_PROMPT.to_owned();
     let channels = ops::channels(&state).await;
     let tools = crate::summarize::discuss::discuss_tool_specs(&channels);
     let executor = DiscussTools {

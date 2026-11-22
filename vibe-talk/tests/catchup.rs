@@ -852,6 +852,57 @@ async fn a_followup_appends_both_turns_and_carries_the_transcript() {
 }
 
 #[tokio::test]
+async fn a_followup_uses_the_followup_prompt_not_the_briefing_prompt() {
+    // `#2137 vibe-talk-discuss-followup-prompt-and-labels`: through the real
+    // router (only the model upstream is the fake), the first summary uses
+    // the briefing prompt and the follow-up uses the follow-up prompt.
+    let messages: Vec<Message> = (0..5).map(|seq| message(seq, None, false)).collect();
+    let backend = backend_with(messages);
+    let (state, _store, summarizer, _dir) =
+        cached_state(&testing::config_toml(), backend.clone()).await;
+    fill(&state, TimelineView::Flat, None).await;
+    let mut state = state;
+    state.catchup_summarizer = Some(summarizer.clone());
+    state.catchup_model = Some(Arc::from("fake-model"));
+    let app = vibe_talk::http::router(state);
+    let channel_path = format!("/api/v1/channels/{WRITE_CHANNEL}/catchup");
+
+    summarizer.answer_with("first point");
+    let (status, _body) = post(&app, &channel_path, Some(WRITE_TOKEN), &json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    summarizer.answer_with("it shipped at noon");
+    let (status, body) = post(
+        &app,
+        &format!("{channel_path}/messages"),
+        Some(WRITE_TOKEN),
+        &json!({"text": "and the deploy?"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let calls = summarizer.prompt_calls();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].0, vibe_talk::catchup::DEFAULT_SYSTEM_PROMPT);
+    assert_eq!(calls[1].0, vibe_talk::catchup::FOLLOWUP_SYSTEM_PROMPT);
+    assert_ne!(calls[1].0, vibe_talk::catchup::DEFAULT_SYSTEM_PROMPT);
+    assert!(
+        calls[1].0.contains("never restate the question"),
+        "the follow-up prompt must forbid restating the question: {}",
+        calls[1].0
+    );
+    assert!(
+        calls[1].0.contains("no '## <workstream>' headings"),
+        "the follow-up prompt must forbid workstream sections: {}",
+        calls[1].0
+    );
+    assert!(
+        calls[1].0.contains("[m:<full-id>]"),
+        "the follow-up prompt must keep the citation rule: {}",
+        calls[1].0
+    );
+}
+
+#[tokio::test]
 async fn on_an_elevenlabs_only_deployment_discuss_refuses_by_backend_name() {
     // The test configuration names an [elevenlabs] agent and no [summaries.llm]: summaries
     // are fully configured (through the agent), so Discuss must refuse saying it is not

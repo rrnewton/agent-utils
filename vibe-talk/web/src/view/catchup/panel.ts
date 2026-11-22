@@ -1675,7 +1675,11 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         summary.className = "discuss-collapsible-head";
         const label = document.createElement("span");
         label.className = "discuss-collapsible-label";
-        label.textContent = `Follow-up question ${when > 0 ? summaryTimeLabel(when, nowMs()) : "—"}`;
+        // `#2137`: the folded header carries the verbatim question, so the
+        // pair can be told apart from a summary without opening it.
+        label.textContent = entry.speaker === "you" && entry.text !== ""
+          ? `Follow-up question ${when > 0 ? summaryTimeLabel(when, nowMs()) : "—"} — ${entry.text}`
+          : `Follow-up question ${when > 0 ? summaryTimeLabel(when, nowMs()) : "—"}`;
         summary.appendChild(label);
         details.appendChild(summary);
         const body = document.createElement("div");
@@ -1684,8 +1688,14 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
           if (entry.kind !== "turn") continue;
           const line = document.createElement("p");
           line.className = entry.speaker === "you" ? "discuss-turn discuss-you" : "discuss-turn discuss-agent";
+          // `#2137`: label each paragraph so model text can never sit in
+          // the question's place.
+          const turnLabel = document.createElement("span");
+          turnLabel.className = "discuss-turn-label";
+          turnLabel.textContent = entry.speaker === "you" ? "You" : "Discuss";
+          line.appendChild(turnLabel);
           if (entry.text_html !== "") insertSanitizedHtml(line, entry.text_html);
-          else line.textContent = entry.text;
+          else line.appendChild(document.createTextNode(entry.text));
           body.appendChild(line);
         }
         details.appendChild(body);

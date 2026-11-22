@@ -488,6 +488,12 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   font-weight: 600;
 }
 
+/* `#2137`: the You / Discuss label on each follow-up paragraph. */
+.discuss-turn-label {
+  font-weight: 700;
+  margin-right: 6px;
+}
+
 /* `#1912 vibe-talk-discuss-summary-timeline-layout`: headed sections with
  * separators, one shared collapsible style, and low-key centred chips. */
 .discuss-sep {

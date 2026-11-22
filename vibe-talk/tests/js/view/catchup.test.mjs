@@ -1274,7 +1274,8 @@ test("catchup: reopening draws the saved record and asks nothing", async () => {
     const timeline = fx.els["discuss-timeline"].children;
     assert.equal(timeline.length, 2, "the timeline did not draw its old summary and Q/A pair");
     assert.match(timeline[1].children[0].textContent, /Follow-up question/, "the turn did not draw as a collapsible pair");
-    assert.equal(timeline[1].children[1].textContent, "and the deploy?");
+    assert.ok(timeline[1].children[0].textContent.includes("and the deploy?"), "the folded header does not carry the verbatim question");
+    assert.match(timeline[1].children[1].textContent, /You\s*and the deploy\?/, "the question paragraph is not labelled You");
     assert.equal(fx.els["discuss-current-covers"].textContent, "Covers 2 messages");
     // [Update] is the incremental delta (`#1388` landing 2): one update
     // call, no full re-summarize POST.
@@ -1430,8 +1431,9 @@ test("catchup: timeline pairs follow-ups, earlier summaries open headings-first,
     const pair = timeline[1];
     assert.match(pair.children[0].textContent, /Follow-up question/);
     assert.equal(pair.children[1].children.length, 2, "question and answer do not collapse together");
-    assert.equal(pair.children[1].children[0].textContent, "and the deploy?");
-    assert.equal(pair.children[1].children[1].textContent, "It shipped.");
+    assert.ok(pair.children[0].textContent.includes("and the deploy?"), "the folded header does not carry the verbatim question");
+    assert.match(pair.children[1].children[0].textContent, /You\s*and the deploy\?/, "the question paragraph is not labelled You");
+    assert.match(pair.children[1].children[1].textContent, /Discuss\s*It shipped\./, "the answer paragraph is not labelled Discuss");
     // The timeline toggle opens and closes every timeline collapsible at once.
     click(timelineToggle);
     assert.equal(pair.open, true, "timeline Expand did not open the pair");

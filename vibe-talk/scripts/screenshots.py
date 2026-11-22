@@ -5083,6 +5083,13 @@ def _act_discuss_timeline_layout(driver: Driver) -> None:
         "&& document.getElementById('discuss-answer').textContent.includes('Model stub summary')",
         timeout=30_000,
     )
+    # `#2137`: open the follow-up pair, so its You / Discuss labels show.
+    driver.page.locator(".discuss-qa > summary").first.click()
+    driver.page.wait_for_function(
+        "() => document.querySelector('.discuss-qa').open "
+        "&& [...document.querySelectorAll('.discuss-qa .discuss-turn-label')].length >= 2",
+        timeout=5_000,
+    )
     # Open the earlier summary headings-first; its sections stay folded.
     driver.page.locator(".discuss-old > summary").first.click()
     driver.page.wait_for_function(
@@ -8146,6 +8153,17 @@ SCENES: tuple[Scene, ...] = (
             (
                 "the timeline holds a Follow-up question pair",
                 "[...document.querySelectorAll('.discuss-qa > summary')].some((s) => s.textContent.includes('Follow-up question'))",
+            ),
+            (
+                # `#2137`: the folded header carries the verbatim question.
+                "the folded follow-up header carries the verbatim question",
+                "[...document.querySelectorAll('.discuss-qa > summary')].some((s) => s.textContent.includes('What is the next step?'))",
+            ),
+            (
+                # `#2137`: each follow-up paragraph is labelled You / Discuss.
+                "the follow-up paragraphs are labelled You and Discuss",
+                "(() => { const labels = [...document.querySelectorAll('.discuss-qa .discuss-turn-label')].map((s) => s.textContent.trim()); "
+                "return labels.includes('You') && labels.includes('Discuss'); })()",
             ),
             (
                 "the earlier summary is open headings-first with its toggle reading Expand",
