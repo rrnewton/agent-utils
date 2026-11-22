@@ -142,11 +142,15 @@ parity check that enforces it. The dispatcher reads the generated
 explicitly for a paused, archived, or absent mirror refuses and names its
 state. `python3 scripts/check_editions.py` proves the file still matches the
 tracked entrypoints and the Rust editions' refusal lists, and runs as a
-validation hygiene check on every change. The Rust-primary tools pass the
-functional no-Python smoke in `validation/rust-only/` (a real basic flow per
-tool with no interpreter present; cpuset-alloc's reserve/release is blocked
-only where `systemd-run --user` scopes are unavailable), while the
-Python-primary tools below remain not-yet.
+validation hygiene check on every change. Does everything work with only
+cargo/rustc and no python3? Not yet: the functional smoke in
+`validation/rust-only/` runs a real basic flow per Rust-primary tool with no
+interpreter present and currently reports them working (cpuset-alloc's
+reserve/release blocked only where `systemd-run --user` scopes are
+unavailable), verified host-side with Python scrubbed from PATH; the
+hermetic in-container run is pending because base-image pulls are blocked
+for agents on the development host, and the Python-primary tools below
+remain not-yet (#2131).
 
 The same file inventories every on-disk and wire format (queue items,
 registry records, coordinator and landing-queue files, wrkslots state,

@@ -24,3 +24,19 @@ Extend the hermetic rust-only container check into a functional smoke: in an ima
 # Notes
 
 Owner request; filed by the coordinator. Owned by the Rust-primary campaign lane.
+
+[watermelon-full-preview] v1 implemented 2026-11-22 (mu-rustwrk, commit
+41ac3fdb on mu-rustwrk/2131-rust-only-smoke, gating next): Containerfile
+ships wrkslotsd/wrkvizd/agent-teams/agent-usage/gh-paced + fixtures;
+smoke.sh runs real flows (dagrun DAG, tick-hub gated tick, planner fixture
+plan, agentctl registry/inbox round-trip, herdr-run local contract,
+wrkslotsd status/doctor over a planted registry, wrkvizd inspect) with
+per-tool PASS/FAIL/BLOCKED and one verdict line. Host-verified with Python
+scrubbed from PATH: 12 passed, 0 failed, 1 blocked (cpuset-alloc needs
+systemd-run --user, absent in slim environments; passes on the bare host).
+The hermetic in-container run is PENDING: base-image pulls are blocked for
+agents on this host (fwdproxy allows registry-1.docker.io but denies the
+production.cloudfront.docker.com blob CDN for the agent identity); no
+allowlist change will be requested by the lane (owner's call, via coordb).
+Rerun where images are reachable:
+podman build -t agent-utils-rust-only -f validation/rust-only/Containerfile . && podman run --rm agent-utils-rust-only
