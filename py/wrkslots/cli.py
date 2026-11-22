@@ -1450,6 +1450,23 @@ class _RetirementDeferred(Refusal):
     """A queue candidate changed before its exact guarded attempt began."""
 
 
+class _CensusDidNotClose(Refusal):
+    """A same-UID census could not close under churn (#2128).
+
+    ``found`` carries the path matches accumulated before the bound
+    was reached. Seal recovery may substitute its scoped cgroup
+    decision only for this refusal and only when ``found`` is empty;
+    every other census refusal (including one carrying matches)
+    still refuses.
+    """
+
+    def __init__(
+        self, message: str, found: tuple[tuple[int, str, str, str], ...] = ()
+    ) -> None:
+        super().__init__(message)
+        self.found = found
+
+
 class _ProcessEvidenceChanged(Refusal):
     """A relevant PID generation changed while one liveness census ran.
 
@@ -67715,14 +67732,81 @@ def _finish_remove_paths(
         census_captured_here = fresh_census is None
         try:
             if census_captured_here:
-                # Interrupted-operation recovery still establishes this snapshot
-                # while holding the recovery lock. Ordinary removal supplies the
-                # post-fence census captured outside mutation locks.
-                finish.private_cleanup.same_uid_census_performed = True
-                fresh_census = _capture_same_uid_process_path_census(
-                    (fenced_slot,),
-                    budget=finish.private_cleanup.census_budget,
-                )
+                # Seal recovery (#2128): the batch's own owner cgroup
+                # decides its batch scope. A validate slot whose
+                # recorded owner is proven dead and whose owner cgroup
+                # is empty (or gone) has no holder in its batch scope;
+                # a populated cgroup (often a shared session scope)
+                # refuses only when a member actually uses the slot,
+                # and otherwise the census decides as before; a
+                # present but unreadable cgroup refuses fail-closed.
+                # When the cgroup reads empty the same-UID census
+                # still runs once as a reference scan: a completed
+                # scan's matches refuse exactly as before, but a
+                # census that cannot close under host churn no longer
+                # blocks recovery — the scoped decision stands.
+                # Accepted residual: processes the unclosed census
+                # never finished scanning may have forked unscanned
+                # children; only the owner-cgroup decision and the
+                # all-process census recover ran earlier cover that
+                # window. Only a slot this decision cannot apply to
+                # (not validate, or owner not proven dead) keeps the
+                # census as its decision.
+                scoped_empty = False
+                if (
+                    record.slot_type == "validate"
+                    and record.owner is not None
+                    and _process_state(record.owner)[0] == "dead"
+                ):
+                    scoped_state, _scoped_holder, scoped_detail = (
+                        _scoped_validation_run_cgroup_state(record)
+                    )
+                    if scoped_state == "nonempty":
+                        # A populated owner cgroup is often a shared
+                        # scope (a session or service), not the batch:
+                        # only a member actually using the slot refuses
+                        # here; otherwise the census decides as before.
+                        users = _scoped_cgroup_slot_users(
+                            fenced_slot, record
+                        )
+                        # An indeterminate member check (cap hit or
+                        # an unreadable member) does not refuse: the
+                        # census decides, exactly as at base.
+                        if users:
+                            user_pid, user_kind, user_detail = users[0]
+                            raise Refusal(
+                                f"live process {user_pid} remains in "
+                                f"the recorded owner cgroup and uses "
+                                f"slot {record.slot}: "
+                                f"{user_kind}={user_detail}; refusing "
+                                "seal recovery"
+                            )
+                    elif scoped_state == "unknown":
+                        raise Refusal(
+                            f"{scoped_detail}; refusing seal recovery "
+                            f"for slot {record.slot} (fail closed)"
+                        )
+                    else:
+                        scoped_empty = True
+                # Interrupted-operation recovery still establishes
+                # this snapshot while holding the recovery lock.
+                # Ordinary removal supplies the post-fence census
+                # captured outside mutation locks. Only a census that
+                # could not close under churn, and found nothing, is
+                # substituted by the scoped decision; every other
+                # refusal — including one carrying matches — refuses.
+                try:
+                    fresh_census = _capture_same_uid_process_path_census(
+                        (fenced_slot,),
+                        budget=finish.private_cleanup.census_budget,
+                    )
+                    finish.private_cleanup.same_uid_census_performed = True
+                except _CensusDidNotClose as exc:
+                    if not scoped_empty or exc.found:
+                        raise
+                    fresh_census = _ProcessPathCensus(
+                        (), (), owner_cgroup_complete=False
+                    )
             assert fresh_census is not None
             fresh_census.assert_slot_unused(
                 fenced_slot,
@@ -93426,23 +93510,25 @@ def _capture_same_uid_process_path_census_following(
             # rounds have their own bound.
             followed_rounds += 1
             if followed_rounds >= _SAME_UID_CENSUS_INVENTORIES:
-                raise Refusal(
+                raise _CensusDidNotClose(
                     f"same-UID process census did not close: each of "
                     f"{_SAME_UID_CENSUS_INVENTORIES} process inventories "
                     "found generations that forked or exited before their "
-                    "scan completed; retry when fewer processes are starting"
+                    "scan completed; retry when fewer processes are starting",
+                    tuple(found),
                 )
             continue
         followed_rounds = 0
         relevant_rounds += 1
         if relevant_rounds >= _SAME_UID_CENSUS_INVENTORIES:
             sample = ", ".join(str(process.pid) for process in relevant[:5])
-            raise Refusal(
+            raise _CensusDidNotClose(
                 f"same-UID process census did not close: each of "
                 f"{_SAME_UID_CENSUS_INVENTORIES} process inventories found "
                 "live generations that may still use the target and no "
                 f"earlier scan had covered (most recently {len(relevant)}, "
-                f"PIDs {sample}); retry when fewer processes are starting"
+                f"PIDs {sample}); retry when fewer processes are starting",
+                tuple(found),
             )
 
 
@@ -93629,7 +93715,13 @@ def _slice_subtree_state(
         except OSError:
             return "unknown"
         populated = next(
-            (line.split()[1] for line in events.splitlines() if line.startswith("populated ")),
+            (
+                fields[1]
+                for line in events.splitlines()
+                if (fields := line.split())
+                and fields[0] == "populated"
+                and len(fields) > 1
+            ),
             None,
         )
         if populated is None:
@@ -93637,6 +93729,107 @@ def _slice_subtree_state(
         if populated != "0":
             return "nonempty"
     return "empty"
+
+
+def _cgroup_events_state(
+    cgroup_dir: Path, *, cgroup_root: Path = Path("/sys/fs/cgroup")
+) -> str:
+    """``"empty"``/``"nonempty"``/``"unknown"`` from one cgroup.events.
+
+    An absent directory is ``"empty"`` only on a unified cgroup2
+    hierarchy: no process can be a member of a cgroup that does not
+    exist there, and the service manager removes a dead owner's scope
+    once its last member exits. On a non-unified (hybrid) root an
+    absent lookup proves nothing and is ``"unknown"``, as is a
+    directory that exists but whose events cannot be read or parsed.
+    """
+
+    try:
+        mode = os.stat(cgroup_dir).st_mode
+    except FileNotFoundError:
+        mode = None
+    except OSError:
+        return "unknown"
+    if mode is not None and not stat.S_ISDIR(mode):
+        return "unknown"
+    if mode is None:
+        if cgroup_root == Path("/sys/fs/cgroup") and not (
+            cgroup_root / "cgroup.controllers"
+        ).is_file():
+            return "unknown"
+        return "empty"
+    try:
+        events = (cgroup_dir / "cgroup.events").read_text(encoding="ascii")
+    except (OSError, UnicodeError):
+        return "unknown"
+    populated = next(
+        (
+            fields[1]
+            for line in events.splitlines()
+            if (fields := line.split()) and fields[0] == "populated" and len(fields) > 1
+        ),
+        None,
+    )
+    if populated is None:
+        return "unknown"
+    return "empty" if populated == "0" else "nonempty"
+
+
+def _scoped_validation_run_cgroup_state(
+    record: ActiveRecord, *, cgroup_root: Path = Path("/sys/fs/cgroup")
+) -> tuple[str, int | None, str]:
+    """Scoped no-holder decision for one validation slot (#2128).
+
+    Returns ``("empty", None, detail)``, ``("nonempty", holder_pid,
+    detail)`` or ``("unknown", None, detail)`` from the batch's own
+    scope only: the recorded owner cgroup (already recorded, so no
+    new persisted field). The kernel's recursive ``cgroup.events``
+    ``populated`` answer decides the batch scope; a member listing
+    (the scope subtree's ``cgroup.procs``, walked only on refusal)
+    only names a holder. Holders outside the owner cgroup — a dagrun
+    step in its own scope, a shell in the checkout — are NOT decided
+    here; the caller's reference census remains their decision. An
+    absent owner directory is empty only on a unified cgroup2
+    hierarchy (the service manager removes a dead owner's scope); a
+    present but unreadable one is ``"unknown"`` and callers refuse
+    fail-closed. Bounded: a constant number of file reads at one
+    direct path, regardless of host load or process churn. Callers
+    first prove the recorded owner generation dead, so a live member
+    of the owner cgroup is a holder of the batch's scope, not the
+    owner itself.
+    """
+
+    if record.owner is None:
+        return (
+            "unknown",
+            None,
+            f"validation slot {record.slot} has no recorded owner cgroup, "
+            "so no scoped no-holder decision is possible",
+        )
+    owner_dir = cgroup_root / record.owner.cgroup_path.lstrip("/")
+    owner_state = _cgroup_events_state(owner_dir, cgroup_root=cgroup_root)
+    if owner_state == "unknown":
+        return (
+            "unknown",
+            None,
+            f"recorded owner cgroup {record.owner.cgroup_path} cannot be "
+            "read, so no scoped no-holder decision is possible",
+        )
+    if owner_state == "nonempty":
+        members = _cgroup_member_pids(
+            record.owner.cgroup_path, cgroup_root=cgroup_root
+        )
+        return (
+            "nonempty",
+            members[0] if members else None,
+            f"recorded owner cgroup {record.owner.cgroup_path} still "
+            "has living members",
+        )
+    return (
+        "empty",
+        None,
+        f"recorded owner cgroup {record.owner.cgroup_path} is empty",
+    )
 
 
 def _assert_validate_teardown_unused(

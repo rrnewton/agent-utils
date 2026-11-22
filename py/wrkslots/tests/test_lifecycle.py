@@ -987,6 +987,9 @@ cli._assert_slot_unused = test_slot_unused
 cli._capture_process_path_census = test_census
 cli._capture_lsof_process_path_census = test_census
 cli._capture_same_uid_process_path_census = test_same_uid_census
+cli._scoped_validation_run_cgroup_state = lambda _record: (
+    "empty", None, "stubbed empty owner cgroup"
+)
 cli._production_frozen_validation_authority_commit = cli._frozen_validation_authority_commit
 cli._frozen_validation_authority_commit = test_frozen_authority
 cli._OWNERLESS_VALIDATION_EXCLUSION_ROOTS = (Path('/tmp'),)
@@ -2301,6 +2304,13 @@ def stub_validate_batch_censuses(
     monkeypatch.setattr(wrkslots, "_capture_process_path_census", shared)
     monkeypatch.setattr(wrkslots, "_capture_lsof_process_path_census", shared)
     monkeypatch.setattr(wrkslots, "_capture_same_uid_process_path_census", fresh)
+    # Seal recovery decides from the batch's own owner cgroup (#2128);
+    # the stubbed-empty censuses above stand for an empty cgroup too.
+    monkeypatch.setattr(
+        wrkslots,
+        "_scoped_validation_run_cgroup_state",
+        lambda _record: ("empty", None, "stubbed empty owner cgroup"),
+    )
 
 
 def validation_exclusion_guard(project: Path) -> Path:
@@ -20712,6 +20722,11 @@ def test_grouped_batch_later_census_failure_reports_and_continues(
         wrkslots,
         "_capture_same_uid_process_path_census",
         lambda _paths, **_kwargs: wrkslots._ProcessPathCensus((), ()),
+    )
+    monkeypatch.setattr(
+        wrkslots,
+        "_scoped_validation_run_cgroup_state",
+        lambda _record: ("empty", None, "stubbed empty owner cgroup"),
     )
     assert (
         wrkslots.main(

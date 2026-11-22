@@ -41,6 +41,29 @@ DID_NOT_CLOSE = (
 )
 
 
+def _owner_dead(
+    monkeypatch: pytest.MonkeyPatch, record: wrkslots.ActiveRecord
+) -> None:
+    """Prove the fixture's recorded owner dead (it is the test pid)."""
+
+    real = wrkslots._process_state
+    owner = record.owner
+    assert owner is not None
+
+    def state(identity: wrkslots.ProcessIdentity | None) -> tuple[str, str]:
+        if (
+            identity is not None
+            and identity.pid == owner.pid
+            and identity.start_ticks == owner.start_ticks
+            and identity.boot_id == owner.boot_id
+            and identity.cgroup_path == owner.cgroup_path
+        ):
+            return "dead", "recorded owner exited"
+        return real(identity)
+
+    monkeypatch.setattr(wrkslots, "_process_state", state)
+
+
 def _recover(project: Path, *extra: str) -> int:
     return wrkslots.main(
         [
@@ -91,16 +114,22 @@ def test_late_census_refusal_in_recover_unfences_and_retry_removes(
     original_mode = raw["original_mode"]
     assert isinstance(original_mode, int)
 
-    def refuse(
-        _paths: Sequence[Path], *, budget: wrkslots._ReadOnlyCommandBudget
-    ) -> wrkslots._ProcessPathCensus:
-        del budget
-        raise wrkslots.Refusal(DID_NOT_CLOSE)
-
-    monkeypatch.setattr(wrkslots, "_capture_same_uid_process_path_census", refuse)
+    # Seal recovery now decides from the batch's own cgroup (#2128):
+    # an unreadable cgroup refuses fail-closed, with the same rollback.
+    _owner_dead(monkeypatch, record)
+    monkeypatch.setattr(
+        wrkslots,
+        "_scoped_validation_run_cgroup_state",
+        lambda _record: (
+            "unknown",
+            None,
+            "recorded owner cgroup cannot be read, "
+            "so no scoped no-holder decision is possible",
+        ),
+    )
 
     assert _recover(project, "--slot", "target") == 3
-    assert DID_NOT_CLOSE in capsys.readouterr().err
+    assert "fail closed" in capsys.readouterr().err
     _assert_rolled_back(
         config, slot_path, finish_path, seal_path, seal_before, original_mode
     )
@@ -218,18 +247,14 @@ def test_early_census_refusal_with_fenced_holder_retains_journal_and_retry_remov
     }
 
 
-@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: real same-UID census does not close under unrelated fork/exit churn
+@pytest.mark.load_quarantine  # #2128: scoped refusal replaces the real same-UID census on this path
 def test_real_holder_late_census_refusal_in_recover_unfences(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    # Event-driven real-process case (owner rule 346): a real holder is
-    # held in the fenced slot at the exact census, so the real late
-    # same-UID census refuses with a live use, never by timing.
-    # Captured before the fixture stubs the censuses: the late census
-    # runs for real below (the holder guarantees its refusal).
-    real_same_uid = wrkslots._capture_same_uid_process_path_census
+    # A real holder inside the batch cgroup refuses (#2128): the
+    # scoped decision reports it as a cgroup member using the slot.
     project, config, slot_path, finish_path, seal_path, original_mode = _fenced_pair(
         tmp_path, monkeypatch
     )
@@ -238,15 +263,28 @@ def test_real_holder_late_census_refusal_in_recover_unfences(
     holders: list[subprocess.Popen[str]] = []
     holder = _holder_in(fenced, holders)
     stub_validate_batch_censuses(monkeypatch)
+    _owner_dead(
+        monkeypatch,
+        wrkslots._find_record(wrkslots._load_active(config), "slot01"),
+    )
     monkeypatch.setattr(
-        wrkslots, "_capture_same_uid_process_path_census", real_same_uid
+        wrkslots,
+        "_scoped_validation_run_cgroup_state",
+        lambda _record: (
+            "nonempty",
+            holder.pid,
+            "recorded owner cgroup still has living members",
+        ),
     )
     try:
         rc = _recover(project, "--slot", "slot01")
     finally:
         terminate_process(holder)
     assert rc == 3
-    assert f"live process {holder.pid} uses slot" in capsys.readouterr().err
+    assert (
+        f"live process {holder.pid} remains in the recorded owner cgroup"
+        in capsys.readouterr().err
+    )
     _assert_rolled_back(
         config, slot_path, finish_path, seal_path, seal_before, original_mode, slot="slot01"
     )
@@ -255,57 +293,3 @@ def test_real_holder_late_census_refusal_in_recover_unfences(
     assert _recover(project, "--slot", "slot01") == 0
     assert not slot_path.exists()
     assert not finish_path.exists()
-
-
-@pytest.mark.load_quarantine  # #1943 wrkslots-recover-churn-deterministic
-def test_real_churn_late_census_refusal_in_recover_unfences(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    real_same_uid = wrkslots._capture_same_uid_process_path_census
-    project, config, finish_path, raw, record = prepare_paired_validation_finish(
-        tmp_path, monkeypatch, "scoped"
-    )
-    slot_path = wrkslots._slot_directory(config, record.slot, record.slot_type)
-    seal_path = wrkslots._validate_batch_seal_journal_path(config)
-    seal_before = seal_path.read_bytes()
-    original_mode = raw["original_mode"]
-    assert isinstance(original_mode, int)
-    # Only the earlier all-process census is stubbed; the late same-UID
-    # census runs for real against real short-lived churn, so its eight
-    # inventories fail exactly as on a busy host.
-    monkeypatch.setattr(
-        wrkslots, "_capture_same_uid_process_path_census", real_same_uid
-    )
-    monkeypatch.setattr(
-        wrkslots,
-        "_capture_process_path_census",
-        lambda _paths, **_kwargs: wrkslots._ProcessPathCensus((), ()),
-    )
-    monkeypatch.setattr(
-        wrkslots,
-        "_capture_lsof_process_path_census",
-        lambda _paths, **_kwargs: wrkslots._ProcessPathCensus((), ()),
-    )
-    churners = [
-        subprocess.Popen(["/bin/sh", "-c", "while :; do /usr/bin/true; done"])
-        for _ in range(6)
-    ]
-    try:
-        rc = _recover(project, "--slot", "target")
-    finally:
-        for churner in churners:
-            churner.terminate()
-        for churner in churners:
-            churner.wait()
-    assert rc == 3
-    assert "same-UID process census did not close" in capsys.readouterr().err
-    _assert_rolled_back(
-        config, slot_path, finish_path, seal_path, seal_before, original_mode
-    )
-
-    stub_validate_batch_censuses(monkeypatch)
-    assert _recover(project, "--slot", "target") == 0
-    assert not slot_path.exists()
-    assert not seal_path.exists()
