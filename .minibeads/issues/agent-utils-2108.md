@@ -11,7 +11,7 @@ updated_at: 2026-11-22T10:10:00-05:00
 
 # Description
 
-The owner wants a subteam run by Orc (its own tmux, coordinator in the first tab, minimal TUI preferred) to compare against agent-utils coordination over time. First candidate: the lightly used agent-utils team on one host; later, with the hermit lead team, a hermit team on another host. Fresh, globally numbered task databases from here on.
+The owner wants a subteam run by Orc (its own tmux, coordinator in the first tab, minimal TUI preferred) to compare against agent-utils coordination over time. First candidate: the lightly used agent-utils team on one host; later, with another consumer team, that team on another host. Fresh, globally numbered task databases from here on.
 
 # Design
 
