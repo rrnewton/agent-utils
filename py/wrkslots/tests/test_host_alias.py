@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import datetime as dt
 import json
 import os
 import stat
@@ -314,16 +315,261 @@ def test_host_alias_add_refuses_live_coordinator_under_previous_identity(
     assert not alias_path.exists()
 
 
-def test_host_alias_add_allows_empty_boot_evidence(
+BOOT_START = dt.datetime(2026, 11, 20, 9, 0, tzinfo=dt.timezone.utc)
+OLD_HEARTBEAT = "2026-11-19T00:00:00+00:00"
+
+
+def _validate_record(
+    owner: cli.ProcessIdentity | None, lease: cli.ProcessIdentity, *, heartbeat: str = OLD_HEARTBEAT
+) -> cli.ActiveRecord:
+    return dataclasses.replace(
+        _record(owner, lease), slot_type="validate", heartbeat_at=heartbeat
+    )
+
+
+def _host_at_b_with_boot_start(monkeypatch: pytest.MonkeyPatch, alias_path: Path) -> None:
+    _host_at_b(monkeypatch, alias_path)
+    monkeypatch.setattr(cli, "_boot_started_at", lambda: BOOT_START)
+
+
+def test_aliased_validate_row_is_local_and_recoverable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     alias_path = tmp_path / "host-aliases.json"
+    _host_at_b_with_boot_start(monkeypatch, alias_path)
+    _write_aliases(alias_path, [_entry(MACHINE_A, MACHINE_B, previous_boots=[BOOT_A])])
+    record = _validate_record(_identity(MACHINE_A, BOOT_A), _identity(MACHINE_A, BOOT_A, pid=4194301))
+
+    cli._assert_absent_validate_row_is_local(record)
+    assert (
+        cli._absent_validate_owner_refusal(
+            record, current_host=MACHINE_B, current_boot=BOOT_B
+        )
+        is None
+    )
+
+    foreign = _validate_record(
+        _identity(MACHINE_C, BOOT_A), _identity(MACHINE_C, BOOT_A, pid=4194301)
+    )
+    with pytest.raises(cli.Refusal, match="belongs to stable host"):
+        cli._assert_absent_validate_row_is_local(foreign)
+    assert cli._absent_validate_owner_refusal(
+        foreign, current_host=MACHINE_B, current_boot=BOOT_B
+    )
+
+
+def test_aliased_absent_agent_row_passes_locality_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Absent agent rows share the validate locality gate (#2100)."""
+
+    alias_path = tmp_path / "host-aliases.json"
+    _host_at_b_with_boot_start(monkeypatch, alias_path)
+    _write_aliases(alias_path, [_entry(MACHINE_A, MACHINE_B, previous_boots=[BOOT_A])])
+    record = _record(_identity(MACHINE_A, BOOT_A), _identity(MACHINE_A, BOOT_A, pid=4194301))
+    assert record.slot_type == "agent"
+
+    cli._assert_absent_validate_row_is_local(record)
+
+    foreign = _record(_identity(MACHINE_C, BOOT_A), _identity(MACHINE_C, BOOT_A, pid=4194301))
+    with pytest.raises(cli.Refusal, match="host-alias add --previous-host-id"):
+        cli._assert_absent_validate_row_is_local(foreign)
+
+
+def test_aliased_row_passes_pre_lock_and_locked_locality_checks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both recover checks pass for a re-homed row (#2100, #2088).
+
+    The #2088 pre-lock pre-check and the locked recovery path call
+    the same `_assert_absent_validate_row_is_local` on the snapshot
+    record and on the locked reload; an aliased row passes both, a
+    foreign row fails both with the host-alias remedy.
+    """
+
+    alias_path = tmp_path / "host-aliases.json"
+    _host_at_b_with_boot_start(monkeypatch, alias_path)
+    _write_aliases(alias_path, [_entry(MACHINE_A, MACHINE_B, previous_boots=[BOOT_A])])
+    snapshot = _validate_record(
+        _identity(MACHINE_A, BOOT_A), _identity(MACHINE_A, BOOT_A, pid=4194301)
+    )
+    locked_reload = dataclasses.replace(snapshot)
+
+    cli._assert_absent_validate_row_is_local(snapshot)
+    cli._assert_absent_validate_row_is_local(locked_reload)
+
+    foreign = _validate_record(
+        _identity(MACHINE_C, BOOT_A), _identity(MACHINE_C, BOOT_A, pid=4194301)
+    )
+    with pytest.raises(cli.Refusal, match="host-alias add"):
+        cli._assert_absent_validate_row_is_local(foreign)
+    with pytest.raises(cli.Refusal, match="host-alias add"):
+        cli._assert_absent_validate_row_is_local(dataclasses.replace(foreign))
+
+
+def test_aliased_validate_row_seen_live_after_boot_stays_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    alias_path = tmp_path / "host-aliases.json"
+    _host_at_b_with_boot_start(monkeypatch, alias_path)
+    _write_aliases(alias_path, [_entry(MACHINE_A, MACHINE_B, previous_boots=[BOOT_A])])
+    live_heartbeat = (BOOT_START + dt.timedelta(seconds=60)).isoformat()
+    record = _validate_record(
+        _identity(MACHINE_A, BOOT_A),
+        _identity(MACHINE_A, BOOT_A, pid=4194301),
+        heartbeat=live_heartbeat,
+    )
+
+    with pytest.raises(cli.Refusal, match="belongs to stable host"):
+        cli._assert_absent_validate_row_is_local(record)
+
+    current_boot_owner = _validate_record(
+        _identity(MACHINE_A, BOOT_B), _identity(MACHINE_A, BOOT_A, pid=4194301)
+    )
+    with pytest.raises(cli.Refusal, match="belongs to stable host"):
+        cli._assert_absent_validate_row_is_local(current_boot_owner)
+
+
+def test_heartbeat_margin_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    alias_path = tmp_path / "host-aliases.json"
+    _host_at_b_with_boot_start(monkeypatch, alias_path)
+    _write_aliases(alias_path, [_entry(MACHINE_A, MACHINE_B, previous_boots=[BOOT_A])])
+    at_margin = _validate_record(
+        _identity(MACHINE_A, BOOT_A),
+        _identity(MACHINE_A, BOOT_A, pid=4194301),
+        heartbeat=(BOOT_START - dt.timedelta(seconds=5)).isoformat(),
+    )
+    cli._assert_absent_validate_row_is_local(at_margin)
+
+    inside_margin = _validate_record(
+        _identity(MACHINE_A, BOOT_A),
+        _identity(MACHINE_A, BOOT_A, pid=4194301),
+        heartbeat=(BOOT_START - dt.timedelta(seconds=2)).isoformat(),
+    )
+    with pytest.raises(cli.Refusal, match="belongs to stable host"):
+        cli._assert_absent_validate_row_is_local(inside_margin)
+
+
+def test_host_alias_add_refuses_heartbeat_after_boot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    alias_path = tmp_path / "host-aliases.json"
+    _host_at_b_with_boot_start(monkeypatch, alias_path)
+    record = _validate_record(
+        _identity(MACHINE_A, BOOT_A),
+        _identity(MACHINE_A, BOOT_A, pid=4194301),
+        heartbeat=(BOOT_START + dt.timedelta(seconds=60)).isoformat(),
+    )
+    _verb_host(monkeypatch, alias_path, [record])
+
+    with pytest.raises(cli.Refusal, match="may have been seen live since the boot"):
+        cli._cmd_host_alias_add(_verb_args(MACHINE_A))
+    assert not alias_path.exists()
+
+
+def test_host_alias_add_refuses_differing_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    alias_path = tmp_path / "host-aliases.json"
+    _host_at_b_with_boot_start(monkeypatch, alias_path)
+    base = _validate_record(_identity(MACHINE_A, BOOT_A), _identity(MACHINE_A, BOOT_A, pid=4194301))
+    checkout = cli.Checkout(
+        name="main",
+        path="elsewhere/not-the-slot-path",
+        repository="repo",
+        branch="main",
+        start_point="HEAD",
+        remote="origin",
+        remote_url_sha256="0" * 64,
+        landed_ref="refs/remotes/origin/main",
+        head="abc123",
+    )
+    record = dataclasses.replace(base, checkouts=(checkout,))
+    _verb_host(monkeypatch, alias_path, [record])
+
+    with pytest.raises(cli.Refusal, match="names paths that differ"):
+        cli._cmd_host_alias_add(_verb_args(MACHINE_A))
+    assert not alias_path.exists()
+
+
+def test_host_alias_add_refuses_empty_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Zero-evidence aliases refuse (#2100 cold review).
+
+    This replaces #1933's `test_host_alias_add_allows_empty_boot_evidence`:
+    with no row in this shard under the previous id, the proofs loop
+    over nothing and any id would be recorded.
+    """
+
+    alias_path = tmp_path / "host-aliases.json"
     _verb_host(monkeypatch, alias_path, [])
 
-    assert cli._cmd_host_alias_add(_verb_args(MACHINE_A)) == 0
-    payload = json.loads(alias_path.read_text(encoding="utf-8"))
-    assert payload["aliases"][0]["previous_boot_ids"] == []
-    assert cli._process_state(_identity(MACHINE_A, BOOT_A)) == (
-        "dead",
-        "the recorded machine boot ended",
+    with pytest.raises(cli.Refusal, match="no row in shard"):
+        cli._cmd_host_alias_add(_verb_args(MACHINE_A))
+    assert not alias_path.exists()
+
+
+def test_judge_refuses_when_boot_start_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    alias_path = tmp_path / "host-aliases.json"
+    _host_at_b_with_boot_start(monkeypatch, alias_path)
+    monkeypatch.setattr(cli, "_boot_started_at", lambda: None)
+    _write_aliases(alias_path, [_entry(MACHINE_A, MACHINE_B, previous_boots=[BOOT_A])])
+    record = _validate_record(
+        _identity(MACHINE_A, BOOT_A), _identity(MACHINE_A, BOOT_A, pid=4194301)
     )
+
+    with pytest.raises(cli.Refusal, match="belongs to stable host"):
+        cli._assert_absent_validate_row_is_local(record)
+
+
+def test_ownerless_row_with_current_boot_lease_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    alias_path = tmp_path / "host-aliases.json"
+    _host_at_b_with_boot_start(monkeypatch, alias_path)
+    _write_aliases(alias_path, [_entry(MACHINE_A, MACHINE_B, previous_boots=[BOOT_A])])
+    record = _validate_record(None, _identity(MACHINE_A, BOOT_B, pid=4194301))
+
+    with pytest.raises(cli.Refusal, match="belongs to stable host"):
+        cli._assert_absent_validate_row_is_local(record)
+
+
+def test_journal_host_aliased_accepted_foreign_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    alias_path = tmp_path / "host-aliases.json"
+    _host_at_b_with_boot_start(monkeypatch, alias_path)
+    _write_aliases(alias_path, [_entry(MACHINE_A, MACHINE_B, previous_boots=[BOOT_A])])
+
+    assert cli._journal_host_is_local(MACHINE_A)
+    assert cli._journal_host_is_local(MACHINE_B)
+    assert not cli._journal_host_is_local(MACHINE_C)
+
+
+def test_wrongly_recorded_alias_still_refuses_live_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An alias recorded for a foreign id does not free its live rows."""
+
+    alias_path = tmp_path / "host-aliases.json"
+    _host_at_b_with_boot_start(monkeypatch, alias_path)
+    _write_aliases(alias_path, [_entry(MACHINE_C, MACHINE_B, previous_boots=[BOOT_A])])
+
+    current_boot = _validate_record(
+        _identity(MACHINE_C, BOOT_B), _identity(MACHINE_C, BOOT_A, pid=4194301)
+    )
+    with pytest.raises(cli.Refusal, match="belongs to stable host"):
+        cli._assert_absent_validate_row_is_local(current_boot)
+
+    after_boot = _validate_record(
+        _identity(MACHINE_C, BOOT_A),
+        _identity(MACHINE_C, BOOT_A, pid=4194301),
+        heartbeat=(BOOT_START + dt.timedelta(seconds=60)).isoformat(),
+    )
+    with pytest.raises(cli.Refusal, match="belongs to stable host"):
+        cli._assert_absent_validate_row_is_local(after_boot)

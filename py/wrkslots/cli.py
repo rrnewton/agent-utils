@@ -26425,6 +26425,39 @@ def _boot_id(proc_root: Path) -> str:
     return value
 
 
+#: Clock-skew margin for comparing a recorded heartbeat against the
+#: current boot's start (#2100). A heartbeat inside the margin after
+#: boot start is ambiguous -- it may predate the boot on a skewed
+#: clock -- so it proves nothing and every judge refuses on it.
+_HOST_ALIAS_SKEW_MARGIN_SECONDS = 5.0
+_boot_started_at_cache: dt.datetime | None = None
+_boot_started_at_read: bool = False
+
+
+def _boot_started_at() -> dt.datetime | None:
+    """The current boot's start instant from ``/proc/stat`` ``btime``.
+
+    Read once per run and cached; ``None`` when the boot start cannot
+    be established, which every caller treats as ambiguous evidence.
+    """
+
+    global _boot_started_at_cache, _boot_started_at_read
+    if _boot_started_at_read:
+        return _boot_started_at_cache
+    _boot_started_at_read = True
+    try:
+        for line in Path("/proc/stat").read_text(encoding="ascii").splitlines():
+            if line.startswith("btime "):
+                seconds = int(line.split()[1])
+                _boot_started_at_cache = dt.datetime.fromtimestamp(
+                    seconds, tz=dt.timezone.utc
+                )
+                break
+    except (OSError, ValueError, IndexError, OverflowError):
+        _boot_started_at_cache = None
+    return _boot_started_at_cache
+
+
 def _host_id() -> str:
     candidates = (Path("/etc/machine-id"), Path("/var/lib/dbus/machine-id"))
     failures: list[str] = []
@@ -26635,6 +26668,87 @@ def _host_alias_counts(
             return False
         frontier = following
     return False
+
+
+def _heartbeat_predates_boot(record: ActiveRecord) -> bool:
+    """Whether the row's heartbeat is unambiguously from before this boot.
+
+    The heartbeat must precede the boot start by more than the skew
+    margin; a heartbeat inside the margin, after the boot, or with an
+    unparseable stamp or unknown boot start proves nothing (#2100).
+    """
+
+    boot_start = _boot_started_at()
+    if boot_start is None:
+        return False
+    try:
+        heartbeat = _parse_timestamp(record.heartbeat_at, "heartbeat")
+    except StateError:
+        return False
+    margin = dt.timedelta(seconds=_HOST_ALIAS_SKEW_MARGIN_SECONDS)
+    return heartbeat <= boot_start - margin
+
+
+def _recorded_host_is_local(record: ActiveRecord, recorded_host_id: str) -> bool:
+    """Whether ``recorded_host_id`` on ``record`` counts as this host (#2100).
+
+    The current identity always counts. A previous identity counts
+    only through a recorded host alias (see ``_host_alias_counts``)
+    whose per-row guards also hold: neither the owner nor the
+    coordinator lease was recorded in the current boot, and the row's
+    heartbeat unambiguously predates this boot, so no live sighting
+    of the old identity exists since the boot. Recorded paths are
+    proved at alias-record time by ``host-alias add``; the alias file
+    is trusted host-local evidence exactly as in #1933.
+    """
+
+    current_host = _host_id()
+    if recorded_host_id == current_host:
+        return True
+    try:
+        current_boot = _boot_id(Path("/proc"))
+        hostname = _short_hostname()
+    except Refusal:
+        return False
+    if record.coordinator_lease.boot_id == current_boot:
+        return False
+    if record.owner is not None and record.owner.boot_id == current_boot:
+        return False
+    if not _heartbeat_predates_boot(record):
+        return False
+    return _host_alias_counts(
+        recorded_host_id,
+        current_host_id=current_host,
+        hostname=hostname,
+        current_boot_id=current_boot,
+        aliases=_load_host_aliases(),
+    )
+
+
+def _journal_host_is_local(journal_host_id: str) -> bool:
+    """Whether a journal recorded under ``journal_host_id`` is this host's.
+
+    Journal resume after a reprovision (#2100): the journal's own host
+    counts when it is current or an aliased previous identity of this
+    host. A journal carries no heartbeat or paths, so the alias chain
+    and its boot exclusion are the whole proof.
+    """
+
+    current_host = _host_id()
+    if journal_host_id == current_host:
+        return True
+    try:
+        current_boot = _boot_id(Path("/proc"))
+        hostname = _short_hostname()
+    except Refusal:
+        return False
+    return _host_alias_counts(
+        journal_host_id,
+        current_host_id=current_host,
+        hostname=hostname,
+        current_boot_id=current_boot,
+        aliases=_load_host_aliases(),
+    )
 
 
 # The machine's own PID 1 and PID 2, recognised by cgroup rather than by number.
@@ -49686,9 +49800,14 @@ def _cmd_host_alias_add(args: argparse.Namespace) -> int:
     coordinator, the previous identity differs from the current one,
     this host's short name is the shard, the current boot is none of
     the boots recorded under the previous identity, and no coordinator
-    recorded under that identity is live now. Only then does the judge
-    treat the old identity as this host, where the ordinary boot check
-    proves its owners dead.
+    recorded under that identity is live now. Re-home proofs (#2100)
+    also run before the write: every row recorded under the previous
+    identity names this host's recorded paths for it, and no such row
+    shows a heartbeat at or after the current boot's start (beyond a
+    small clock-skew margin). Only then do the judges treat the old
+    identity as this host, where the ordinary boot check proves its
+    owners dead and the ordinary retire, remove and recover paths
+    apply to its agent and validation rows alike.
     """
 
     _require_coordinator_authorized(args, "host-alias recording")
@@ -49751,6 +49870,51 @@ def _cmd_host_alias_add(args: argparse.Namespace) -> int:
             f"host id {previous!r}; an alias whose boot is still running "
             "proves nothing. state: REFUSED -- no alias was recorded"
         )
+    # Re-home proofs (#2100): an alias with no evidence proves
+    # nothing. At least one row in this shard must be recorded under
+    # the previous identity; without one, the proofs below loop over
+    # nothing and any id would be written (cold review of #2100).
+    if not previous_boots:
+        raise Refusal(
+            f"no row in shard {config.machine!r} is recorded under the "
+            f"previous host id {previous!r}; an alias records a previous "
+            "identity of this host only on the evidence of its own rows. "
+            "state: REFUSED -- no alias was recorded"
+        )
+    # Every row recorded under the previous identity must name this
+    # host's own paths, and none may show a live sighting of that
+    # identity since this boot started. Lock files carry no host
+    # identity, so they cannot be attributed and are not sightings.
+    boot_start = _boot_started_at()
+    if boot_start is None:
+        raise Refusal(
+            "cannot establish the current boot start from /proc/stat; "
+            "whether the previous identity was seen live since the boot "
+            "is ambiguous. state: REFUSED -- no alias was recorded"
+        )
+    for record in state.slots:
+        recorded_hosts = {record.coordinator_lease.host_id}
+        if record.owner is not None:
+            recorded_hosts.add(record.owner.host_id)
+        if previous not in recorded_hosts:
+            continue
+        try:
+            _assert_record_paths(config, record, require_repository=False)
+        except (Refusal, StateError) as exc:
+            raise Refusal(
+                f"slot {record.slot} recorded under the previous host id "
+                f"{previous!r} names paths that differ from this host's "
+                f"recorded paths for it: {exc}. state: REFUSED -- no "
+                "alias was recorded"
+            ) from exc
+        if boot_start is not None and not _heartbeat_predates_boot(record):
+            raise Refusal(
+                f"slot {record.slot} heartbeat {record.heartbeat_at} does "
+                f"not unambiguously predate the current boot start "
+                f"{boot_start.isoformat()}; the previous host id "
+                f"{previous!r} may have been seen live since the boot. "
+                "state: REFUSED -- no alias was recorded"
+            )
     path = _host_alias_path()
     entry: dict[str, object] = {
         "previous_host_id": previous,
@@ -89308,7 +89472,8 @@ def _recover_absent_agent_row(
 ) -> None:
     if path != _journal_path(config):
         raise StateError("absent-agent-row journal filename is invalid")
-    if raw.get("host_id") != _host_id():
+    journal_host = raw.get("host_id")
+    if not isinstance(journal_host, str) or not _journal_host_is_local(journal_host):
         raise Refusal("absent-agent-row journal belongs to another host identity")
     _assert_recovery_processes(coordinator, processes)
     item, recorded, branch_witnesses, planned, archive_entry = (
@@ -97743,7 +97908,9 @@ def _absent_validate_owner_refusal(
                 "missing generation proves nothing"
             )
         return None
-    if owner.host_id != current_host:
+    if owner.host_id != current_host and not _recorded_host_is_local(
+        record, owner.host_id
+    ):
         return f"recorded owner host is indeterminate for validation row {record.slot}"
     if owner.boot_id != current_boot:
         return None
@@ -97961,10 +98128,25 @@ def _assert_absent_validate_row_is_local(record: ActiveRecord) -> None:
         )
     expected = next(iter(recorded))
     current = _host_id()
-    if expected != current:
+    if expected != current and not _recorded_host_is_local(record, expected):
+        # Name the re-home command only for a row in this host's own
+        # shard; a foreign shard's row must never hand the operator a
+        # ready-made alias command for its id (cold review of #2100).
+        remedy = ""
+        try:
+            own_shard = record.machine == _short_hostname()
+        except Refusal:
+            own_shard = False
+        if own_shard:
+            remedy = (
+                f"; remedy: if {expected} is a previous identity of this "
+                "host, record it with 'wrkslots host-alias add "
+                f"--previous-host-id {expected} --coordinator-authorized "
+                "--coordinator-pid <coordinator-pid>', then retry"
+            )
         raise Refusal(
             f"validation row {record.machine}/{record.slot} belongs to stable host "
-            f"{expected}, not current host {current}"
+            f"{expected}, not current host {current}{remedy}"
         )
 
 
@@ -98199,8 +98381,7 @@ def _recover_absent_validate_rows(
             f"is local to {local_machine}; run this command on {config.machine}"
         )
     journal_host = _as_str(raw.get("host_id"), "absent-validation-row journal.host_id")
-    current_host = _host_id()
-    if journal_host != current_host:
+    if not _journal_host_is_local(journal_host):
         raise Refusal(
             "absent-validation-row journal belongs to another host identity; "
             "resume it on the host that created it"

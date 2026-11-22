@@ -1365,6 +1365,25 @@ an owner recorded in the current boot under the previous identity stays indeterm
 `transfer-owner`, `adopt`, and `recover` then work as usual for the old-boot owners. An identity
 that was never aliased still reads as a different machine.
 
+The same alias re-homes validation rows and absent rows (#2100). Recording it refuses with no
+evidence: at least one row in this shard must be recorded under the previous identity. Before
+anything is written, every such row's recorded paths are checked against this configuration's
+layout for the row, and no such row may show a heartbeat at or after the current boot's start
+(read from `/proc/stat`, allowing a few seconds of clock skew; a heartbeat inside that margin is
+ambiguous and refuses). Say exactly what those proofs establish. The path check proves only
+layout consistency: any well-formed row written under the same configuration passes it, including
+a row from another machine sharing the registry, and a row from an older layout can refuse
+spuriously (which fails closed). It does not tell machines apart. The heartbeat and boot checks
+are the separators, and heartbeats are explicit commands, not periodic: a live foreign owner that
+has not heartbeated since before this host's boot passes them, so the alias file's trusted,
+host-local provenance is part of the proof. A different hostname or a live sighting after the boot
+refuses the alias outright. Once the alias stands, the ordinary `retire-pending`, `remove`, and
+`recover-absent-agent-rows` / `recover-absent-validate-rows` paths apply to the re-homed rows
+unchanged, in both editions. If the alias was already recorded before this behaviour existed, it
+never ran the add-time proofs above; only the judge-time boot and heartbeat guards protect it.
+There is still nothing to redo: run a build that has it, and those paths accept the rows;
+`host-alias add` refuses to record the same previous identity twice, and that refusal is expected.
+
 ## Giving a slot back while the owner keeps running
 
 An agent that finishes with a slot often keeps running, for example to take its next task in a new

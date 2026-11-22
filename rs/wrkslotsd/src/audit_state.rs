@@ -5899,9 +5899,19 @@ pub(crate) fn validation_liveness(
         ))
     } else {
         let expected = recorded.iter().next().expect("one host identity");
-        if *expected != current_host {
+        if *expected != current_host
+            && !crate::status_state::recorded_host_is_local(record, expected)
+        {
+            // Name the re-home command only for this host's own shard.
+            let own_shard =
+                crate::config_validate::short_hostname().is_ok_and(|hostname| hostname == machine);
+            let remedy = if own_shard {
+                format!("; remedy: if {expected} is a previous identity of this host, record it with 'wrkslots host-alias add --previous-host-id {expected} --coordinator-authorized --coordinator-pid <coordinator-pid>', then retry")
+            } else {
+                String::new()
+            };
             Some(format!(
-                "validation row {machine}/{slot} belongs to stable host {expected}, not current host {current_host}"
+                "validation row {machine}/{slot} belongs to stable host {expected}, not current host {current_host}{remedy}"
             ))
         } else {
             None

@@ -119,11 +119,89 @@ pub(crate) fn host_id() -> std::result::Result<String, String> {
 const HOST_ALIAS_SCHEMA: i64 = 1;
 const HOST_ALIAS_MAX_CHAIN: usize = 8;
 
-struct HostAliasEntry {
-    previous_host_id: String,
-    current_host_id: String,
-    hostname: String,
-    previous_boot_ids: Vec<String>,
+pub(crate) struct HostAliasEntry {
+    pub(crate) previous_host_id: String,
+    pub(crate) current_host_id: String,
+    pub(crate) hostname: String,
+    pub(crate) previous_boot_ids: Vec<String>,
+}
+
+/// Clock-skew margin for heartbeat-versus-boot comparisons (#2100),
+/// mirroring `_HOST_ALIAS_SKEW_MARGIN_SECONDS`.
+pub(crate) const HOST_ALIAS_SKEW_MARGIN_SECONDS: i64 = 5;
+
+pub(crate) fn boot_started_at() -> Option<i64> {
+    static CACHE: std::sync::OnceLock<Option<i64>> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let text = std::fs::read_to_string("/proc/stat").ok()?;
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("btime ") {
+                return rest.trim().parse::<i64>().ok();
+            }
+        }
+        None
+    })
+}
+
+fn heartbeat_predates_boot(record: &Value) -> bool {
+    let Some(boot_start) = boot_started_at() else {
+        return false;
+    };
+    let Some(stamp) = record.get("heartbeat_at").and_then(Value::as_str) else {
+        return false;
+    };
+    let Ok(instant) = crate::schema::parse_timestamp_instant(stamp, "heartbeat_at") else {
+        return false;
+    };
+    // Sub-second compare (#2100 cold review): `timestamp()` floors,
+    // which disagreed with Python inside the last second of margin.
+    instant.timestamp_micros() <= (boot_start - HOST_ALIAS_SKEW_MARGIN_SECONDS) * 1_000_000
+}
+
+/// Whether ``recorded`` on ``record`` counts as this host (#2100),
+/// mirroring `_recorded_host_is_local`.
+pub(crate) fn recorded_host_is_local(record: &Value, recorded: &str) -> bool {
+    let Ok(current) = host_id() else {
+        return false;
+    };
+    if recorded == current {
+        return true;
+    }
+    let Ok(current_boot) = boot_id() else {
+        return false;
+    };
+    let Ok(hostname) = crate::config_validate::short_hostname() else {
+        return false;
+    };
+    // A missing boot id is unknown evidence, not "another boot".
+    let Some(lease_boot) = record
+        .get("coordinator_lease")
+        .and_then(|lease| lease.get("boot_id"))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    if lease_boot == current_boot {
+        return false;
+    }
+    if let Some(owner) = record.get("owner").filter(|owner| !owner.is_null()) {
+        let Some(owner_boot) = owner.get("boot_id").and_then(Value::as_str) else {
+            return false;
+        };
+        if owner_boot == current_boot {
+            return false;
+        }
+    }
+    if !heartbeat_predates_boot(record) {
+        return false;
+    }
+    host_alias_counts(
+        recorded,
+        &current,
+        &hostname,
+        &current_boot,
+        &load_host_aliases(),
+    )
 }
 
 fn host_alias_id_valid(value: &str) -> bool {
@@ -259,7 +337,7 @@ fn host_alias_location_trusted(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn load_host_aliases() -> Vec<HostAliasEntry> {
+pub(crate) fn load_host_aliases() -> Vec<HostAliasEntry> {
     let Some(path) = host_alias_path() else {
         return Vec::new();
     };
@@ -286,7 +364,7 @@ fn load_host_aliases() -> Vec<HostAliasEntry> {
     aliases.iter().filter_map(valid_host_alias_entry).collect()
 }
 
-fn host_alias_counts(
+pub(crate) fn host_alias_counts(
     recorded_host_id: &str,
     current_host_id: &str,
     hostname: &str,

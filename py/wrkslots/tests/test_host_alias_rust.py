@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import subprocess
@@ -129,3 +130,114 @@ def test_rust_status_uses_host_alias_like_python(
         assert by_slot[slot]["owner_detail"] == (
             "the recorded owner belongs to a previous machine identity in the current boot"
         )
+
+
+def test_rust_audit_treats_aliased_validate_row_as_local(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Differential (#2100): a re-homed validation row is local in both editions."""
+
+    root = _root(tmp_path)
+    upstream = tmp_path / "upstream-repo"
+    upstream.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(upstream)],
+        check=True,
+        capture_output=True,
+        timeout=60,
+    )
+    live = _live_identity()
+    old_owner = {
+        **live,
+        "pid": 4194300,
+        "start_ticks": 12345,
+        "boot_id": "old-boot",
+        "host_id": "machine-a",
+    }
+    foreign_owner = {**old_owner, "host_id": "machine-c"}
+
+    def validate_record(slot: str, agent: str, owner: dict[str, object]) -> dict[str, object]:
+        record = _record(slot, agent, owner)
+        record["slot_type"] = "validate"
+        record["heartbeat_at"] = "2026-11-19T00:00:00Z"
+        checkouts = cast(list[dict[str, object]], record["checkouts"])
+        checkouts[0]["path"] = f"worktrees/validate/{slot}/repo"
+        return record
+
+    boot_start = wrkslots_cli._boot_started_at()
+    assert boot_start is not None
+    current_boot_owner = {
+        **old_owner,
+        "boot_id": wrkslots_cli._boot_id(Path("/proc")),
+    }
+    boundary_record = validate_record("slot-boundary", "validate-e", old_owner)
+    boundary_record["heartbeat_at"] = (
+        boot_start - dt.timedelta(seconds=4.5)
+    ).isoformat()
+    records = [
+        validate_record("slot-old", "validate-a", old_owner),
+        validate_record("slot-foreign", "validate-b", foreign_owner),
+        validate_record("slot-curboot", "validate-c", current_boot_owner),
+        validate_record(
+            "slot-afterboot",
+            "validate-d",
+            old_owner,
+        ),
+        boundary_record,
+    ]
+    records[3]["heartbeat_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+    control = root / "worktrees"
+    (control / "ACTIVE.node-a.json").write_text(
+        json.dumps({"schema": 2, "machine": "node-a", "revision": 7, "slots": records})
+    )
+    (control / "ARCHIVED.node-a.json").write_text(
+        json.dumps({"schema": 2, "machine": "node-a", "revision": 3, "records": []})
+    )
+    alias_path = tmp_path / "host-aliases.json"
+    alias_path.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "aliases": [
+                    _alias_entry(
+                        "machine-a",
+                        wrkslots_cli._host_id(),
+                        wrkslots_cli._short_hostname(),
+                        wrkslots_cli._boot_id(Path("/proc")),
+                    )
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("WRKSLOTS_HOST_ALIAS_PATH", str(alias_path))
+    monkeypatch.setenv("WRKSLOTS_HOST_ALIAS_TEST", "1")
+
+    env = dict(os.environ)
+    env["WRKSLOTS_HOST_ALIAS_PATH"] = str(alias_path)
+    env["WRKSLOTS_HOST_ALIAS_TEST"] = "1"
+    result = subprocess.run(
+        [str(rust_wrkslotsd()), "parse-audit", "--root", str(root)],
+        cwd=AU_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=900,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    rows = cast(list[dict[str, object]], json.loads(result.stdout)["slots"])
+    by_slot = {str(row["slot"]): row for row in rows}
+    old_reasons = " ".join(
+        str(r) for r in cast(list[object], by_slot["slot-old"]["reasons"])
+    )
+    foreign_reasons = " ".join(
+        str(r) for r in cast(list[object], by_slot["slot-foreign"]["reasons"])
+    )
+    assert "belongs to stable host" not in old_reasons
+    assert "belongs to stable host machine-c" in foreign_reasons
+    for slot in ("slot-curboot", "slot-afterboot", "slot-boundary"):
+        reasons = " ".join(
+            str(r) for r in cast(list[object], by_slot[slot]["reasons"])
+        )
+        assert "belongs to stable host machine-a" in reasons, slot
