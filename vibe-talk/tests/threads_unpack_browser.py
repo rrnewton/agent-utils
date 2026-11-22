@@ -40,6 +40,7 @@ Pass --screenshots DIR to keep a PNG of each state; --web-root DIR for another c
 from __future__ import annotations
 
 import argparse
+import atexit
 import os
 import tempfile
 import threading
@@ -206,15 +207,43 @@ def serve(api: ColumnsApi) -> ThreadingHTTPServer:
     return server
 
 
+#: Chrome profiles of contexts still open; dropped on context close.
+_live_profiles: list[tempfile.TemporaryDirectory[str]] = []
+
+
+def _cleanup_live_profiles() -> None:
+    for profile in list(_live_profiles):
+        profile.cleanup()
+    _live_profiles.clear()
+
+
+atexit.register(_cleanup_live_profiles)
+
+
 def open_page(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int,
               scheme: str, touch: bool, api: ColumnsApi) -> tuple[Desk, list[str]]:
     server = serve(api)
     profile = tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-unpack-")
-    context = chromium.launch_persistent_context(
-        profile.name, headless=True, executable_path=args.browser_executable,
-        viewport={"width": width, "height": height}, color_scheme=scheme,  # type: ignore[arg-type]
-        has_touch=touch, is_mobile=touch)
+    _live_profiles.append(profile)
+    try:
+        context = chromium.launch_persistent_context(
+            profile.name, headless=True, executable_path=args.browser_executable,
+            viewport={"width": width, "height": height}, color_scheme=scheme,  # type: ignore[arg-type]
+            has_touch=touch, is_mobile=touch)
+    except Exception:
+        _live_profiles.remove(profile)
+        profile.cleanup()
+        raise
     browser_waits.hot_host_timeouts(context)
+    # The profile must outlive the context, not the open_page frame: clean
+    # it when the context closes, and at exit if a failure left it open, so
+    # no vibe-talk-chrome-unpack-* entry survives, pass or fail.
+    def _drop_profile() -> None:
+        if profile in _live_profiles:
+            _live_profiles.remove(profile)
+        profile.cleanup()
+
+    context.on("close", lambda _context: _drop_profile())
     page = context.pages[0] if context.pages else context.new_page()
     desk = Desk(page, args.screenshots, label, width, height)
     errors: list[str] = []

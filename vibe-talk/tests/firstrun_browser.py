@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import tempfile
 import threading
 from dataclasses import dataclass, field
@@ -323,17 +324,34 @@ def browse(playwright: Playwright, args: argparse.Namespace, web_root: Path) -> 
     page_errors: list[str] = []
     served = page_sources.served(web_root)
 
+    profiles: dict[int, str] = {}
+
     def fresh_context(viewport: dict[str, int], scheme: str, mobile: bool = False) -> BrowserContext:
         profile = tempfile.mkdtemp(prefix="vibe-talk-firstrun-")
-        context = playwright.chromium.launch_persistent_context(
-            profile, headless=True, executable_path=args.browser_executable,
-            viewport={"width": viewport["width"], "height": viewport["height"]},
-            is_mobile=mobile, has_touch=mobile,
-            device_scale_factor=2.6 if mobile else 1,
-            color_scheme="dark" if scheme == "dark" else "light")
+        try:
+            context = playwright.chromium.launch_persistent_context(
+                profile, headless=True, executable_path=args.browser_executable,
+                viewport={"width": viewport["width"], "height": viewport["height"]},
+                is_mobile=mobile, has_touch=mobile,
+                device_scale_factor=2.6 if mobile else 1,
+                color_scheme="dark" if scheme == "dark" else "light")
+        except Exception:
+            shutil.rmtree(profile, ignore_errors=True)
+            raise
+        profiles[id(context)] = profile
         browser_waits.hot_host_timeouts(context)
         context.pages[0].on("pageerror", lambda error: page_errors.append(str(error)))
         return context
+
+    def close_context(context: BrowserContext) -> None:
+        # Closing the context releases the profile; remove it as one unit
+        # so no vibe-talk-firstrun-* entry survives, pass or fail.
+        profile = profiles.pop(id(context), None)
+        try:
+            context.close()
+        finally:
+            if profile is not None:
+                shutil.rmtree(profile, ignore_errors=True)
 
     for scheme in ("light", "dark"):
         api = FirstRunApi(listed=[dict(CHANNEL)])
@@ -343,12 +361,12 @@ def browse(playwright: Playwright, args: argparse.Namespace, web_root: Path) -> 
             try:
                 walk_fresh(context, url, args.screenshots, "desk", scheme)
             finally:
-                context.close()
+                close_context(context)
             context = fresh_context(PHONE, scheme, mobile=True)
             try:
                 walk_phone(context, url, args.screenshots, scheme)
             finally:
-                context.close()
+                close_context(context)
         finally:
             api.stopping.set()
             server.shutdown()
@@ -363,7 +381,7 @@ def browse(playwright: Playwright, args: argparse.Namespace, web_root: Path) -> 
         try:
             walk_saved_voice(context, url, args.screenshots)
         finally:
-            context.close()
+            close_context(context)
         notes["saved-voice"] = "a saved Voice choice opens on Voice, the Welcome not shown"
     finally:
         api.stopping.set()
@@ -383,22 +401,22 @@ def browse(playwright: Playwright, args: argparse.Namespace, web_root: Path) -> 
             check(on(page, "welcome-guide"), "desk no-channel: the guided setup is not showing")
             shot(page, args.screenshots, "desk-no-channel-02-welcome-guide")
         finally:
-            context.close()
+            close_context(context)
         context = fresh_context(PHONE, "light", mobile=True)
         try:
             walk_no_channel(context, api, url, args.screenshots)
         finally:
-            context.close()
+            close_context(context)
         context = fresh_context(DESK, "light")
         try:
             walk_deep_link(context, url)
         finally:
-            context.close()
+            close_context(context)
         context = fresh_context(PHONE, "light", mobile=True)
         try:
             walk_pairing(context, url, args.screenshots)
         finally:
-            context.close()
+            close_context(context)
         notes["no-channel"] = "guided config steps shown; Check again lands on the channel once configured"
         notes["deep-link"] = "?v=docs opens Documents over the default, uncovered"
         notes["pairing"] = "a pairing link redeems into the Welcome, and dismissing lands on the Channel"

@@ -1330,6 +1330,10 @@ pub fn run_post_argv_with_timeout(
         .ok_or_else(|| "no post argv configured".to_string())?;
     let output = run_with_timeout(program, args, timeout_seconds);
     let _ = std::fs::remove_file(&text_file);
+    // The per-process relay dir is shared by concurrent posts; remove_dir
+    // only succeeds once the last file is gone, so the final finisher
+    // reclaims the `agent-teams-relay-<pid>` entry instead of leaking it.
+    let _ = std::fs::remove_dir(&dir);
     let output = output?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
@@ -1394,6 +1398,7 @@ fn run_with_timeout(
         Ok(file) => file,
         Err(error) => {
             let _ = std::fs::remove_file(&out_path);
+            let _ = std::fs::remove_dir(&dir);
             return Err(error);
         }
     };
@@ -1409,6 +1414,7 @@ fn run_with_timeout(
         Err(e) => {
             let _ = std::fs::remove_file(&out_path);
             let _ = std::fs::remove_file(&err_path);
+            let _ = std::fs::remove_dir(&dir);
             return Err(format!("post command failed to start: {e}"));
         }
     };
@@ -1436,6 +1442,7 @@ fn run_with_timeout(
     let stderr = std::fs::read(&err_path).unwrap_or_default();
     let _ = std::fs::remove_file(&out_path);
     let _ = std::fs::remove_file(&err_path);
+    let _ = std::fs::remove_dir(&dir);
     Ok(std::process::Output {
         status: status?,
         stdout,
@@ -3510,6 +3517,42 @@ pub fn known_teams(state: &Path, repo_filter: Option<&str>) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn post_argv_leaves_no_relay_temp_dir_on_success_or_failure() {
+        let dir =
+            std::env::temp_dir().join(format!("agent-teams-relay-{}", std::process::id()));
+        let ok = run_post_argv(
+            &["/bin/true".to_string()],
+            "chan",
+            "thread",
+            "msg",
+            "hello",
+        );
+        assert!(ok.is_ok(), "{ok:?}");
+        assert!(!dir.exists(), "relay temp dir leaked after success: {dir:?}");
+        let err = run_post_argv(
+            &["/bin/false".to_string()],
+            "chan",
+            "thread",
+            "msg",
+            "hello",
+        );
+        assert!(err.is_err());
+        assert!(!dir.exists(), "relay temp dir leaked after failure: {dir:?}");
+        let missing = run_post_argv(
+            &["/nonexistent-agent-teams-helper".to_string()],
+            "chan",
+            "thread",
+            "msg",
+            "hello",
+        );
+        assert!(missing.is_err());
+        assert!(
+            !dir.exists(),
+            "relay temp dir leaked after spawn failure: {dir:?}"
+        );
+    }
 
     #[test]
     fn post_round_trips_and_tag_is_checked() {

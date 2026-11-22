@@ -257,6 +257,15 @@ fn token_file(contents: &str) -> std::path::PathBuf {
 struct Harness {
     router: axum::Router,
     message: String,
+    // Kept alive for the harness lifetime; removed on drop so no
+    // `vibe-talk-wit-token-*` file survives the test, pass or fail.
+    token_path: std::path::PathBuf,
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.token_path);
+    }
 }
 
 fn harness(api_base: &str, token: &str) -> Harness {
@@ -274,6 +283,7 @@ fn harness(api_base: &str, token: &str) -> Harness {
     Harness {
         router: router(state),
         message,
+        token_path: file,
     }
 }
 
@@ -647,4 +657,17 @@ fn the_token_comes_from_the_file_and_wit_is_a_backend_choice() {
         "trimmed, from the file"
     );
     assert_eq!(config.wit.voice.as_deref(), Some("wit$Remi"));
+    let _ = std::fs::remove_file(&file);
+    assert!(!file.exists(), "wit token temp file leaked: {file:?}");
+}
+
+#[test]
+fn dropping_the_harness_removes_its_token_file() {
+    let path = {
+        let harness = harness("http://127.0.0.1:9", TOKEN);
+        let path = harness.token_path.clone();
+        assert!(path.exists());
+        path
+    };
+    assert!(!path.exists(), "wit token temp file leaked: {path:?}");
 }

@@ -3577,6 +3577,9 @@ print(json.dumps(out, sort_keys=True))
             .current_dir(&repo_root)
             .output()
             .expect("python oracle");
+        // Remove the per-run driver before asserting, so no
+        // wrkslotsd-validation-*-driver-*.py entry survives, pass or fail.
+        let _ = std::fs::remove_file(&driver);
         assert!(
             output.status.success(),
             "oracle failed: {}",
@@ -3770,6 +3773,9 @@ except Exception as exc:
             .current_dir(&repo_root)
             .output()
             .expect("python oracle");
+        // Remove the per-run driver before asserting, so no
+        // wrkslotsd-validation-*-driver-*.py entry survives, pass or fail.
+        let _ = std::fs::remove_file(&driver);
         assert!(
             output.status.success(),
             "oracle failed: {}",
@@ -3777,6 +3783,7 @@ except Exception as exc:
         );
         let expected: Value = serde_json::from_slice(&output.stdout).expect("oracle json");
         assert_eq!(mine, expected);
+        assert!(!driver.exists(), "validation driver leaked: {driver:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4009,6 +4016,9 @@ print(json.dumps(out, sort_keys=True))
             .current_dir(&repo_root)
             .output()
             .expect("python oracle");
+        // Remove the per-run driver before asserting, so no
+        // wrkslotsd-validation-*-driver-*.py entry survives, pass or fail.
+        let _ = std::fs::remove_file(&driver);
         assert!(
             output.status.success(),
             "oracle failed: {}",
@@ -4061,6 +4071,9 @@ print(json.dumps(out, sort_keys=True))
             .current_dir(&repo_root)
             .output()
             .expect("python oracle");
+        // Remove the per-run driver before asserting, so no
+        // wrkslotsd-validation-*-driver-*.py entry survives, pass or fail.
+        let _ = std::fs::remove_file(&driver);
         assert!(
             output.status.success(),
             "oracle failed: {}",
