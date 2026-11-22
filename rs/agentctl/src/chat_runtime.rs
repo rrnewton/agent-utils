@@ -6675,6 +6675,10 @@ impl BridgeState {
         state.recover_admission()?;
         state.complete_retirements()?;
         state.recover_population()?;
+        // `short-refs.json` is derived, so a stop between an admission or
+        // assignment and its rewrite leaves it behind; the first prompt or
+        // pass of this process rebuilds it (#2098).
+        state.note_short_refs_changed();
         Ok(state)
     }
 
@@ -10987,6 +10991,11 @@ adding one to the last number in both lines for each later reply.",
                 None,
             ),
         };
+        // The file must name this prompt's references before the prompt
+        // leaves the bridge: other processes (the reply and sent commands,
+        // the thread renderer) read only the files, seconds after delivery
+        // (#2098). A no-op unless an assignment above noted it behind.
+        self.flush_short_refs();
         // The thread's ready permalink beside its number (#658): the agent
         // copies the link, never a bare id the owner cannot open.
         if let (Some(alias), Some(link)) = (alias_number, self.message_thread_permalink(message)) {
@@ -23771,31 +23780,102 @@ pub(crate) mod tests {
                  short-refs file"
             );
             admitted_bytes.push(bytes);
-            // Its alias assignment is noted at prompt time; the flush then
-            // rewrites the snapshot exactly once, however often it is noted.
+            // Its alias assignment is flushed by the prompt itself, before
+            // the prompt leaves the bridge; later notes and flushes in the
+            // same pass then rewrite nothing more.
             state.prompt(&new_key, "").expect("new prompt");
-            let before = store_snapshot(&root);
             let grown_size = fs::metadata(root.join(SHORT_REFS_FILE))
                 .expect("short refs metadata")
                 .len();
+            assert!(
+                grown_size > short_refs_size,
+                "alias never reached short-refs"
+            );
+            let before = store_snapshot(&root);
             for _ in 0..4 {
                 state.note_short_refs_changed();
             }
             state.flush_short_refs();
-            let flushed = store_bytes_since(&root, &before);
-            let final_size = fs::metadata(root.join(SHORT_REFS_FILE))
-                .expect("short refs metadata")
-                .len();
-            assert!(final_size > grown_size, "alias never reached short-refs");
-            assert_eq!(flushed, final_size);
+            assert_eq!(store_bytes_since(&root, &before), 0);
             state.flush_short_refs();
-            assert_eq!(store_bytes_since(&root, &before), final_size);
+            assert_eq!(store_bytes_since(&root, &before), 0);
             fs::remove_dir_all(&root).expect("remove fixture");
         }
         assert!(
             admitted_bytes[1] <= admitted_bytes[0] + 2_048,
             "per-message bytes grew with the store: {admitted_bytes:?}"
         );
+    }
+
+    /// #2098: a delivered prompt's references are on disk before the prompt
+    /// can be answered. Another process reads only the files, so after the
+    /// prompt is built (what delivery types into the pane), and with no
+    /// pass-end flush, the alias record and `short-refs.json` already name
+    /// the new reference; and a short-refs file staled by a crash is
+    /// rebuilt by the first prompt after a reopen.
+    #[test]
+    fn a_delivered_prompts_references_are_on_disk_for_other_processes() {
+        let root = temporary("prompt-refs-on-disk");
+        let mut configuration = config_without_reaction();
+        configuration.channel_ids = vec!["C0123ABCD".to_owned()];
+        configuration.slack_workspace_url = Some("https://acme.slack.com".to_owned());
+        let state = BridgeState::initialize(&root, configuration).expect("initialize state");
+        let message = InboundMessage::new(
+            ChannelId::new("C0123ABCD").expect("channel"),
+            MessageId::new("1700000000.000100").expect("message"),
+            ThreadId::new("1700000000.000100").expect("thread"),
+            SenderId::new("users/owner").expect("sender"),
+            "please look",
+            "2026-09-21T12:00:00Z",
+            false,
+        )
+        .expect("normalized message");
+        let batch = DeliveryBatch::new(
+            EventSequence::new(1).expect("sequence"),
+            ProviderCursor::new("cursor-1").expect("cursor"),
+            DeliveryId::new("delivery-1").expect("delivery"),
+            vec![CommittableEvent::message_created(message)],
+        )
+        .expect("delivery");
+        let key = state
+            .admit_batch_scoped(&batch, None)
+            .expect("scoped admission")
+            .new_request_keys
+            .into_iter()
+            .next()
+            .expect("key");
+        let prompt = state.prompt(&key, "").expect("prompt");
+        assert!(prompt.contains(":thread:001"), "{prompt}");
+        // No flush call: the files alone, as another process reads them.
+        let aliases: Value = serde_json::from_str(
+            &fs::read_to_string(root.join("reply-aliases.json")).expect("file"),
+        )
+        .expect("alias JSON");
+        assert_eq!(aliases["aliases"][0]["alias"], json!(1));
+        assert_eq!(aliases["aliases"][0]["request_key"], json!(key));
+        let short_refs: Value =
+            serde_json::from_str(&fs::read_to_string(root.join("short-refs.json")).expect("file"))
+                .expect("short refs JSON");
+        assert_eq!(short_refs["threads"][0]["n"], json!(1));
+        assert_eq!(
+            short_refs["threads"][0]["root_ts"],
+            json!("1700000000.000100")
+        );
+        assert_eq!(short_refs["messages"][0]["n"], json!(1));
+        // A crash staled the derived file; the first prompt after a reopen
+        // rebuilds it before that prompt leaves the bridge.
+        fs::write(
+            root.join("short-refs.json"),
+            "{\"schema\":\"agentctl-short-refs/v1\",\"threads\":[],\"messages\":[]}",
+        )
+        .expect("stale short refs");
+        let reopened = BridgeState::open(&root).expect("reopen state");
+        reopened.prompt(&key, "").expect("prompt after reopen");
+        let short_refs: Value =
+            serde_json::from_str(&fs::read_to_string(root.join("short-refs.json")).expect("file"))
+                .expect("short refs JSON");
+        assert_eq!(short_refs["threads"][0]["n"], json!(1));
+        fs::remove_dir_all(&root).expect("remove fixture");
     }
 
     fn state_with_old_request(

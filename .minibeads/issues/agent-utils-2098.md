@@ -22,7 +22,7 @@ A consumer measured one chat bridge (agentctl chat run) as the host's top writer
 # Design
 
 - The store layer (`write_document`) skips a write whose encoded document is already the file's content, so no loop or pass rewrites state without a change.
-- `short-refs.json` is coalesced: alias assignments and admissions only note that it is behind, and the service rewrites it once per owner-loop pass (and on shutdown), so a burst costs one snapshot write per pass, not one per event. The file and its `agentctl-short-refs/v1` format are unchanged, and no persisted file or field is added, so older builds read the state as before.
+- `short-refs.json` is coalesced: alias assignments and admissions only note that it is behind, and the service rewrites it once per owner-loop pass (and on shutdown), so a burst costs one snapshot write per pass, not one per event. Ordering is preserved for other processes that read only the files: a prompt flushes the file (when behind) before the prompt carrying a new reference leaves the bridge, and opening the state notes the derived file behind so the first prompt or pass after a restart rebuilds it. The file and its `agentctl-short-refs/v1` format are unchanged, and no persisted file or field is added, so older builds read the state as before.
 - The reply-alias record stays a single durable file, written only on change (assignment, burn, withhold) as before: it must be durable before a prompt shows the alias, and assignments are request-paced, so it cannot multiply at machine rate. The Slack rescan ledger gets the same skip-if-unchanged guard.
 
 # Acceptance Criteria
