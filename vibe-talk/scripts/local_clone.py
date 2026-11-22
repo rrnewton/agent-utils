@@ -298,7 +298,8 @@ def get_status(port: int, token: str, path: str) -> int:
 
 
 def serve_matrix(port: int, write_token: str, channel: str,
-                 thread: str | None, message_id: str | None) -> dict[str, int]:
+                 thread: str | None, message_id: str | None,
+                 probe_speech: bool = False) -> dict[str, int]:
     """What this clone actually serves, by surface. Statuses only."""
     matrix = {
         "timeline (main, write token)": get_status(
@@ -310,7 +311,7 @@ def serve_matrix(port: int, write_token: str, channel: str,
             port, write_token,
             f"/api/v1/channels/{channel}/timeline?view=thread"
             f"&thread_id={thread}&limit=5")
-    if message_id:
+    if message_id and probe_speech:
         result = probe(port, write_token, channel, thread, message_id)
         matrix["speech prepare"] = result["status"]
     return matrix
@@ -412,10 +413,17 @@ def main() -> int:
                      test_token=test_token)
         threading.Thread(target=stub.serve_forever, daemon=True).start()
         log = open(work / "server.log", "wb")
+        # A cleaned environment: no VIBE_TALK_* variable of the
+        # operator's shell (above all no live token) reaches the clone.
+        clean_env = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("VIBE_TALK_")
+        }
         proc = subprocess.Popen(
             [str(binary), "--config", str(work / "vibe-talk.toml"),
              "--skip-startup-probe"],
-            stdout=log, stderr=subprocess.STDOUT, cwd=work,
+            stdout=log, stderr=subprocess.STDOUT, cwd=work, env=clean_env,
         )
         if not wait_up(port, proc):
             tail = (work / "server.log").read_text(errors="replace")[-2000:]
@@ -431,7 +439,8 @@ def main() -> int:
                 "recorded provider account to serve from the cache.",
                 file=sys.stderr, flush=True)
         matrix = serve_matrix(port, write_token, args.channel,
-                              args.thread, args.message_id)
+                              args.thread, args.message_id,
+                              probe_speech=args.probe)
         for surface, status in matrix.items():
             print(f"served[{status}]: {surface}", flush=True)
         if REPLAY_BIN is not None and args.thread:

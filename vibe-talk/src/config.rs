@@ -6666,7 +6666,63 @@ provider = "slack"
         assert!(cfg.speakable.enabled);
     }
 
+    fn toml_with(extra_auth: &str) -> String {
+        format!(
+            "[server]\nbind = \"127.0.0.1:9000\"\n\n[discord]\nbot_token = \"file-discord-token\"\n\n[auth]\nread_token = \"read-token-that-is-long-enough\"\nwrite_token = \"write-token-that-is-long-enough\"\n{extra_auth}\n[[channels]]\nid = \"111\"\nlabel = \"lead\"\nwritable = true\n"
+        )
+    }
+
     #[test]
+    fn a_test_token_equal_to_the_voice_token_is_refused() {
+        let text = toml_with(
+            "voice_token = \"test-token-that-is-long-enough\"\ntest_token = \"test-token-that-is-long-enough\"\n",
+        );
+        let error = Config::from_toml_and_env(&text, &env(&[]))
+            .expect_err("a test token equal to the voice token is refused");
+        assert!(
+            matches!(&error, ConfigError::Invalid { field, .. } if field == "auth.test_token"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_test_token_equal_to_the_ingest_token_is_refused() {
+        let text = format!(
+            "{}\n[ingest]\ntoken = \"test-token-that-is-long-enough\"\n",
+            toml_with("test_token = \"test-token-that-is-long-enough\"\n")
+        );
+        let error = Config::from_toml_and_env(&text, &env(&[]))
+            .expect_err("a test token equal to the ingest token is refused");
+        assert!(
+            matches!(&error, ConfigError::Invalid { field, .. } if field == "auth.test_token"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_kill_file_without_a_test_token_is_refused() {
+        let text = toml_with("test_token_kill_file = \"/tmp/vibe-talk-kill\"\n");
+        let error = Config::from_toml_and_env(&text, &env(&[]))
+            .expect_err("a kill file with no test token is refused");
+        assert!(
+            matches!(&error, ConfigError::Invalid { field, .. } if field == "auth.test_token_kill_file"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_kill_file_in_a_missing_directory_is_refused() {
+        let text = toml_with(
+            "test_token = \"test-token-that-is-long-enough\"\ntest_token_kill_file = \"/nonexistent-vibe-talk-dir/kill\"\n",
+        );
+        let error = Config::from_toml_and_env(&text, &env(&[]))
+            .expect_err("a kill file whose directory is missing is refused");
+        assert!(
+            matches!(&error, ConfigError::Invalid { field, .. } if field == "auth.test_token_kill_file"),
+            "{error}"
+        );
+    }
+
     fn internal_link_hosts_are_the_deployments_and_empty_by_default() {
         // `#2007 vibe-talk-speech-short-links`: no internal host is named in code.
         let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");

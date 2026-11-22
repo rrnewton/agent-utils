@@ -329,6 +329,43 @@ async fn a_served_page_for_the_test_credential_takes_no_claim_and_spawns_no_refr
     );
 }
 
+/// Third cold review, should-fix 2: with a counting provider behind
+/// the server, the allowlisted routes and every refusal together make
+/// ZERO provider calls of any method.
+#[tokio::test]
+async fn the_test_credential_makes_no_provider_call_of_any_method() {
+    use std::sync::Arc;
+    use vibe_talk::chat::ChatClient;
+    use vibe_talk::testing::CountingChat;
+
+    let toml = testing::config_toml().replace(
+        &format!("write_token = \"{WRITE_TOKEN}\""),
+        &format!("write_token = \"{WRITE_TOKEN}\"\ntest_token = \"{TEST_TOKEN}\""),
+    );
+    let (mut state, fake, _voice) = testing::state_from_toml(&toml);
+    let counting = Arc::new(CountingChat::new(fake.clone() as Arc<dyn ChatClient>));
+    state.replace_chat(counting.clone());
+    let (status, _answer) = call(&state, "GET", "/api/v1/client-config", TEST_TOKEN, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _answer) = call(
+        &state,
+        "GET",
+        &format!("/api/v1/channels/{READ_CHANNEL}/timeline"),
+        TEST_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    for (method, uri, body) in non_allowlisted() {
+        let _ = call(&state, method, &uri, TEST_TOKEN, body).await;
+    }
+    assert!(
+        counting.calls().is_empty(),
+        "the test credential reached the provider: {:?}",
+        counting.calls()
+    );
+}
+
 #[tokio::test]
 async fn the_read_token_keeps_its_routes() {
     let (state, _discord) = state();

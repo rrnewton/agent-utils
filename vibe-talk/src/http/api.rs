@@ -2373,7 +2373,6 @@ pub async fn speak(
     Path((channel_id, message_id)): Path<(String, String)>,
     Query(query): Query<SpeakQuery>,
 ) -> Result<Response, ApiError> {
-    let _ = caller;
     // TIMED IN THREE PARTS, because "reading a message aloud is slow" has three candidate causes
     // and they are fixed by completely different work. Looking up the message is a round trip to
     // DISCORD — this route asks for a whole window and finds one message in it. Generating the
@@ -2703,6 +2702,9 @@ async fn attach_transcript_classes(
     state: &AppState,
     channel: &crate::model::ChannelId,
     page: &mut crate::threads::TimelinePage,
+    // `#2060` follow-up: false for the test credential, whose reads
+    // record nothing in the store.
+    record: bool,
 ) -> std::collections::HashSet<String> {
     let mut seen: Vec<(String, crate::transcripts::ThreadClass)> = Vec::new();
     for summary in page.threads.iter().chain(page.thread.iter()) {
@@ -2717,11 +2719,13 @@ async fn attach_transcript_classes(
             }
         }
     }
-    for (thread_id, class) in &seen {
-        let _ = state
-            .store
-            .set_thread_class(channel, thread_id, class)
-            .await;
+    if record {
+        for (thread_id, class) in &seen {
+            let _ = state
+                .store
+                .set_thread_class(channel, thread_id, class)
+                .await;
+        }
     }
     let stored: std::collections::HashMap<String, crate::transcripts::ThreadClass> =
         match state.store.transcript_threads().await {
@@ -2936,7 +2940,7 @@ pub async fn transcript_thread(
     let (channel, mut page) = reason
         .scope(ops::timeline(&state, caller, &channel_id, &request))
         .await?;
-    attach_transcript_classes(&state, &channel.id, &mut page).await;
+    attach_transcript_classes(&state, &channel.id, &mut page, caller != Scope::TestRead).await;
     let is_transcript = class.is_some()
         || page
             .messages
@@ -3032,7 +3036,7 @@ pub async fn timeline(
     let (channel, mut page) = ops::timeline(&state, caller, &channel_id, &request).await?;
     // `#1608 agent-transcripts-timeline`: class what this page carries,
     // then keep transcripts out of every raw-feed view.
-    attach_transcript_classes(&state, &channel.id, &mut page).await;
+    attach_transcript_classes(&state, &channel.id, &mut page, caller != Scope::TestRead).await;
     exclude_transcripts(&mut page, request.view);
     // `#427 server-thread-hues`. Here beside the rendering, for its reason: this route's only
     // reader is the page. A write-scope read colours threads it is the first to meet; a
@@ -8677,7 +8681,6 @@ pub async fn prepare_speech(
     Path(channel_id): Path<String>,
     Json(request): Json<PrepareSpeechRequest>,
 ) -> Result<Json<PrepareSpeechResponse>, ApiError> {
-    let _ = caller;
     let preparation_began = std::time::Instant::now();
     if state.speech.describe().playback == crate::speech::Playback::Browser {
         return Err(SpeechError::BrowserPlaybackRequired.into());
@@ -10659,11 +10662,10 @@ async fn discuss_summary_text(
 /// `unknown_discuss_summary`, never `unknown_document`.
 pub async fn prepare_document_speech(
     State(state): State<AppState>,
-    SpeechScope(caller): SpeechScope,
+    SpeechScope(_caller): SpeechScope,
     Path(key): Path<String>,
     Json(request): Json<PrepareDocumentSpeechRequest>,
 ) -> Result<Json<PrepareSpeechResponse>, ApiError> {
-    let _ = caller;
     let preparation_began = std::time::Instant::now();
     if state.speech.describe().playback == crate::speech::Playback::Browser {
         return Err(SpeechError::BrowserPlaybackRequired.into());

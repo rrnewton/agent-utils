@@ -401,6 +401,11 @@ pub async fn settle(
     channel: &ChannelId,
     messages: &[Message],
 ) -> HashSet<MessageId> {
+    // `#2060` follow-up: a test read decides nothing (its reads also
+    // never reach here with a fill grant, but the skip is explicit).
+    if caller == crate::auth::Scope::TestRead {
+        return HashSet::new();
+    }
     decide_waiting(state).await;
     let sightings: Vec<Sighting> = messages
         .iter()

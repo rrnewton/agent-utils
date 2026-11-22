@@ -68,7 +68,11 @@ pub async fn log_requests(State(state): State<AppState>, request: Request, next:
     );
     // `#1848`: the per-route refusal watch counts the same answer, beside
     // its log line, for every `/api/` request (door refusals included).
-    if private_response {
+    // `#2060` follow-up: the test credential's refusals are expected, so
+    // they are kept out of the refusal watch -- they would raise false
+    // alerts and mask real ones. The access line above still carries
+    // credential=test-read for audit.
+    if private_response && credential != crate::access::Credential::TestRead {
         state.route_health.record(
             &method,
             &path,

@@ -257,3 +257,34 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod test_credential_tests {
+    use super::*;
+    use crate::config::{Secret, TestCredential};
+
+    fn config_with_kill(kill: std::path::PathBuf) -> AuthConfig {
+        AuthConfig {
+            read_token: Secret::new("read-token-that-is-long-enough"),
+            write_token: Secret::new("write-token-that-is-long-enough"),
+            voice_token: None,
+            test_token: Some(TestCredential {
+                token: Secret::new("test-token-that-is-long-enough"),
+                kill_file: Some(kill),
+            }),
+        }
+    }
+
+    #[test]
+    fn a_present_kill_file_disables_the_test_credential() {
+        let dir = std::env::temp_dir().join(format!("vibe-talk-kill-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let kill = dir.join("killed");
+        let config = config_with_kill(kill.clone());
+        let header = Some("Bearer test-token-that-is-long-enough");
+        assert_eq!(scope_of(header, &config), Some(Scope::TestRead));
+        std::fs::write(&kill, "").expect("kill file");
+        assert_eq!(scope_of(header, &config), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
