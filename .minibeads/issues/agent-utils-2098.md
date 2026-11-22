@@ -13,7 +13,7 @@ updated_at: 2026-11-22T06:30:00-05:00
 
 A consumer measured one chat bridge (agentctl chat run) as the host's top writer: about 6 GB/min of device writes over a 20 s sample. A later 10 s sample of the same unit showed almost nothing, so it comes in bursts. The bridge state holds several large whole-file JSON stores (short refs, reply aliases, request and reply directories) that may be rewritten whole on each message or pass.
 
-# Findings (owning lane, 2026-11-22)
+## Findings (owning lane, 2026-11-22)
 
 - Both bridges were idle when re-measured (about 5-10 KB/s over a 10 s per-process I/O sample), confirming a burst, not a steady rate. Persistent state was almost untouched inside the reported burst window (three small commit receipts at the ordinary provider-batch cadence, ordinary rescan passes), so the burst bytes are synced write-and-rename churn, not file growth: every store write is a temporary file plus fsync plus rename plus directory fsync.
 - The store layer rewrote whole files with no change check. `short-refs.json` (the largest snapshot; hundreds of KB on a busy bridge) is rebuilt from all retained request records and rewritten whole on every alias assignment and on every one-shot admission; rescan and replay passes, health records and the rescan ledger likewise saved even when their document had not changed. A burst of admissions, alias assignments or replayed batches therefore multiplies whole-store synced writes: at a few hundred such writes a second the arithmetic reaches the reported GB/min. Requests and replies are already per-entry files and were not the multiplier.
