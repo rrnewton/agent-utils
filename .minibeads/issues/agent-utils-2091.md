@@ -22,6 +22,18 @@ One shrink and remove anchor rule for archive (Done) in fold-read mode and for a
 
 - Measured anchor deltas of 0 px (cases 1 and 2) and the seam at the centre (case 3), windowed on and off, phone and desktop; deterministic frame-based browser checks through the real router; marked before and after shots of one action each.
 
+## Owner 308 addendum (2026-11-22 5:50 AM ET)
+
+The owner, verbatim: "This is the kind of thing that should be numerical in variance that we can fuss test or check live in a debug mode" (that is: numerical invariance we can fuzz test or check live in a debug mode).
+
+(a) One numeric invariant. State the anchor policy — the 307 three cases above plus #2076's top anchor for growth — as ONE numeric invariant: for every READER-caused height change, the chosen anchor's viewport Y moves at most 0.5 px (case 3: the seam within 0.5 px of centre). The documented exception: arrivals while idle at the bottom. Put it in one function the tests and the debug mode both call.
+
+(b) A seeded fuzz test, deterministic and hot-machine safe (event-driven, no wall-clock budgets): random action sequences (archive or Done in fold-read, fold, expand, select, quote, reply box, arrivals), windowed on and off, phone and desktop, asserting the invariant after each step and printing the seed and step on failure. Keep the gated run small (a few fixed seeds); allow a long opt-in run.
+
+(c) An opt-in live debug mode (a setting or URL flag, default off, page-only, read-only) that checks the invariant on every layout change and records violations (action, anchor, delta px, view, windowed state) to the console and to the freeze telemetry channel from #2066 (the freeze-report route; timings only, never content).
+
+Landing split: (a) and (b) land with the 307 fix; (c) lands as the next commit.
+
 # Notes
 
 Filed by the coordinator; the owning lane refines this file as it works.
