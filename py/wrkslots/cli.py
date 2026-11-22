@@ -70864,6 +70864,97 @@ def _reconcile_deleted_bind_validate_row(
     return True
 
 
+def _retire_absent_row(
+    config: Config, args: argparse.Namespace, record: ActiveRecord | None
+) -> int:
+    """Retire the row of a slot whose directory is absent, as its live owner (#2083).
+
+    The only retirement that runs no salvage, census, or Git work: the
+    storage is already gone. Every condition is rechecked under the
+    mutation locks before the row is deleted.
+    """
+
+    if record is None:
+        raise Refusal(f"slot {args.slot!r} is not active; no row to retire")
+    agent = getattr(args, "agent", None)
+    if agent is None:
+        raise Refusal("--retire-absent-row requires --agent naming the row's agent")
+    _validate_name(agent, "agent")
+    if agent != record.agent:
+        raise Refusal(
+            f"--agent {agent!r} does not name the agent recorded for slot "
+            f"{args.slot!r} ({record.agent!r}); only its own owner may retire "
+            "an absent-directory row"
+        )
+    if args.expected_generation != record.generation:
+        raise Refusal(
+            f"slot {args.slot!r} is at generation {record.generation}, not "
+            f"{args.expected_generation}"
+        )
+    with _mutation_locks(config, args.wait_lock):
+        state = _load_active(config, require_repository=False)
+        current = next(
+            (item for item in state.slots if item.slot == args.slot), None
+        )
+        if current is None or _record_to_obj(current) != _record_to_obj(record):
+            raise Refusal(f"slot {args.slot!r} changed before its row could retire")
+        slot_path = _slot_directory(config, args.slot, record.slot_type)
+        if slot_path.exists() or slot_path.is_symlink():
+            raise Refusal(
+                f"slot directory {slot_path} is present; use ordinary 'remove'"
+            )
+        if slotimage.load(config.control, record.slot_type, args.slot) is not None:
+            raise Refusal(
+                f"slot {args.slot!r} is image-backed; its directory is an "
+                "unmounted mount point, not absent storage: run "
+                "'wrkslots image mount' or ordinary 'remove'"
+            )
+        for path in _outstanding_journals(config):
+            try:
+                raw = _as_mapping(
+                    _read_json(path, "recovery journal"), "recovery journal"
+                )
+            except (Refusal, StateError) as exc:
+                raise Refusal(
+                    f"cannot verify mutation journals before retiring slot "
+                    f"{args.slot!r}: {exc}"
+                ) from exc
+            if raw.get("slot") == args.slot:
+                raise Refusal(
+                    f"a mutation journal for slot {args.slot!r} is outstanding "
+                    f"in {path}; resolve it with 'wrkslots recover' first"
+                )
+        if record.owner is None:
+            raise Refusal(
+                f"slot {args.slot!r} records no owner process; only a verified "
+                "live owner may retire an absent-directory row"
+            )
+        owner_state, owner_detail = _process_state(record.owner)
+        if owner_state != "live":
+            raise Refusal(
+                f"the recorded owner of slot {args.slot!r} is not live "
+                f"({owner_detail}); only its verified live owner may retire "
+                "an absent-directory row"
+            )
+        _write_active_state(
+            config,
+            _delete_record(state, args.slot),
+            action="slot-removed",
+            slot=args.slot,
+            evidence={
+                "basis": "owner-retired-absent-directory",
+                "agent": record.agent,
+                "generation": record.generation,
+            },
+            require_repository=False,
+        )
+    print(
+        f"retired the row of {record.slot_type}/{args.slot}; its directory "
+        "was already absent"
+    )
+    return 0
+
+
 def _cmd_remove_in_scope(
     args: argparse.Namespace,
     *,
@@ -70883,6 +70974,18 @@ def _cmd_remove_in_scope(
     )
     if _preflight_record is not None:
         _assert_record_actable(_preflight_record, "remove")
+    if bool(getattr(args, "retire_absent_row", False)):
+        if (
+            private_cleanup is not None
+            or agent_batch is not None
+            or validation_removal_proof is not None
+            or bool(getattr(args, "validate_complete", False))
+        ):
+            raise Refusal(
+                "--retire-absent-row retires one row as its live owner and "
+                "combines with no batch, validation, or cleanup mode"
+            )
+        return _retire_absent_row(config, args, _preflight_record)
     if agent_batch is not None and (
         private_cleanup is not None
         or validation_removal_proof is not None
@@ -103588,6 +103691,22 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--discard-ignored",
         action="store_true",
         help=_DISCARD_IGNORED_HELP,
+    )
+    remove.add_argument(
+        "--retire-absent-row",
+        action="store_true",
+        help=(
+            "retire only the registry row of a slot whose directory is wholly absent, "
+            "as its verified live owner: the recorded owner process must still be live "
+            "(pid, start time, and boot identity) and --agent must name the row's agent. "
+            "No salvage, census, or Git work runs; an image-backed row, a present "
+            "directory, and any outstanding mutation journal refuse"
+        ),
+    )
+    remove.add_argument(
+        "--agent",
+        metavar="AGENT",
+        help="the agent recorded on the slot row; required with --retire-absent-row",
     )
     remove.set_defaults(handler=_cmd_remove)
 

@@ -547,6 +547,7 @@
         "py/wrkslots/tests/test_remove_proof_batching.py",
         "py/wrkslots/tests/test_remove_stale_revision.py",
         "py/wrkslots/tests/test_remove_write_rust.py",
+        "py/wrkslots/tests/test_retire_absent_row.py",
         "py/wrkslots/tests/test_retire_freeze.py",
         "py/wrkslots/tests/test_retire_lock_scope.py",
         "py/wrkslots/tests/test_review1785_regressions.py",
