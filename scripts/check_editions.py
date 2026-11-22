@@ -18,6 +18,12 @@ loudly in CI; it proves, offline:
 * a `parity` mirror names a parity check that exists as a job in
   `validation/cross.dag.yaml`, and a paused mirror names a commit-shaped
   `paused_at`;
+* an `archived` mirror (a retired edition kept frozen in place, #2139
+  python-editions-archive-and-parity-retirement) names the full archive
+  metadata - `archived_at` and `equivalent_rust_commit` (commit-shaped),
+  `equivalent_rust_version`, `archive_tag`, and `tracking_issue`
+  (`#<number> <slug>`) - and no parity check; archive metadata on any other
+  mirror state is refused, so a half-finished archival cannot pass;
 * the generated `validation/editions.tsv` is byte-identical to what this
   file's tools generate (regenerate with `--write-tsv`);
 * the agentctl python-only subcommands in the file are exactly the lists the
@@ -51,6 +57,19 @@ EDITION_NAMES = ("rust", "python")
 MIRROR_STATES = ("parity", "paused", "archived", "absent")
 PATH_TOKEN = re.compile(r"(?:rs|py|vibe-talk|validation|cross|scripts)/[A-Za-z0-9_./-]+")
 COMMIT_SHAPE = re.compile(r"^[0-9a-f]{7,40}$")
+VERSION_SHAPE = re.compile(r"^\S+$")
+TAG_SHAPE = re.compile(r"^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._/-]*$")
+ISSUE_SHAPE = re.compile(r"^#\d+ [a-z0-9]+(?:-[a-z0-9]+)+$")
+# Archive metadata an `archived` mirror must carry (and no other state may):
+# the commit the tree was frozen at, the Rust commit/version this edition was
+# last equivalent to, the annotated tag naming the archive, and its issue.
+ARCHIVED_FIELDS = {
+    "archived_at": COMMIT_SHAPE,
+    "equivalent_rust_commit": COMMIT_SHAPE,
+    "equivalent_rust_version": VERSION_SHAPE,
+    "archive_tag": TAG_SHAPE,
+    "tracking_issue": ISSUE_SHAPE,
+}
 REQUIRED_FORMAT_TOPICS = (
     "queue",
     "registry",
@@ -154,6 +173,17 @@ def check_document(
             paused_at = mirror.get("paused_at")
             if not isinstance(paused_at, str) or not COMMIT_SHAPE.match(paused_at):
                 failures.append(f"{where}: a paused mirror names no commit-shaped paused_at")
+        if state == "archived":
+            for field, shape in ARCHIVED_FIELDS.items():
+                value = mirror.get(field)
+                if not isinstance(value, str) or not shape.match(value):
+                    failures.append(f"{where}: an archived mirror names no valid {field}")
+            if tool.get("parity_check") is not None:
+                failures.append(f"{where}: an archived mirror names a parity check; retired means none")
+        elif state in MIRROR_STATES:
+            for field in ARCHIVED_FIELDS:
+                if mirror.get(field) is not None:
+                    failures.append(f"{where}: archive field {field} on a {state} mirror; archive metadata belongs to archived only")
         entry_for = {
             "rust": tool.get("rust_entrypoint"),
             "python": tool.get("python_entrypoint"),
@@ -383,6 +413,22 @@ def _self_test() -> int:
     expect("missing entrypoint fails", doc(dict(tick_hub, rust_entrypoint="rs/bin/nope")), "does not exist")
     expect("swapped entrypoint fails", doc(dict(tick_hub, rust_entrypoint="py/bin/tick-hub")), "not on the rust side")
     expect("absent mirror naming an entrypoint fails", doc(dict(tick_hub, mirror={"edition": "python", "state": "absent"}, parity_check=None)), "state is not absent")
+    archived_mirror = {
+        "edition": "python",
+        "state": "archived",
+        "archived_at": "a36df6146ada2d4739cc71728dfc76b000692160",
+        "equivalent_rust_commit": "a36df6146ada2d4739cc71728dfc76b000692160",
+        "equivalent_rust_version": "0.1.0",
+        "archive_tag": "archive/py-tick-hub-2026-11-25",
+        "tracking_issue": "#2139 python-editions-archive-and-parity-retirement",
+    }
+    expect("archived mirror with full metadata passes", doc(dict(tick_hub, mirror=dict(archived_mirror), parity_check=None)), None)
+    incomplete = dict(archived_mirror)
+    del incomplete["archive_tag"]
+    expect("archived mirror missing metadata fails", doc(dict(tick_hub, mirror=incomplete, parity_check=None)), "no valid archive_tag")
+    expect("archived mirror with a bad issue shape fails", doc(dict(tick_hub, mirror=dict(archived_mirror, tracking_issue="2139"), parity_check=None)), "no valid tracking_issue")
+    expect("archived mirror naming a parity check fails", doc(dict(tick_hub, mirror=dict(archived_mirror))), "names a parity check")
+    expect("archive metadata on a parity mirror fails", doc(dict(tick_hub, mirror={"edition": "python", "state": "parity", "archived_at": "a36df6146ada2d4739cc71728dfc76b000692160"})), "archive metadata belongs to archived only")
     expect("stale tsv fails", doc(tick_hub), "stale", tsv="tick-hub\tpython\tparity\t\n")
 
     with tempfile.TemporaryDirectory() as directory:
@@ -415,7 +461,7 @@ def _self_test() -> int:
         print("\n".join(failures), file=sys.stderr)
         print(f"\n{len(failures)} self-test failure(s)", file=sys.stderr)
         return 1
-    print("check-editions --self-test: PASSED (10 controls)")
+    print("check-editions --self-test: PASSED (15 controls)")
     return 0
 
 
