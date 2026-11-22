@@ -1,13 +1,14 @@
 ---
 title: 'vibe-talk-discuss-header-sizes: bigger Discuss section headers with a clear two-level hierarchy'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - vibe-talk
 - owner-ui
 created_at: 2026-11-22T17:35:00-05:00
-updated_at: 2026-11-22T17:35:00-05:00
+updated_at: 2026-11-22T18:37:40-05:00
+closed_at: 2026-11-22T18:37:40-05:00
 ---
 
 # Description
