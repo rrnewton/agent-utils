@@ -177,13 +177,16 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     del exitstatus
     if _gitconfig_guard is None:
         return
-    status, message = _gitconfig_guard.check()
-    session.config._gitconfig_guard_result = (status, message)  # type: ignore[attr-defined]
-    session.config._gitconfig_guard_sentinel_note = (  # type: ignore[attr-defined]
-        _gitconfig_guard.sentinel_note()
-    )
-    if status == "fail":
-        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+    try:
+        status, message = _gitconfig_guard.check()
+        session.config._gitconfig_guard_result = (status, message)  # type: ignore[attr-defined]
+        session.config._gitconfig_guard_sentinel_note = (  # type: ignore[attr-defined]
+            _gitconfig_guard.sentinel_note()
+        )
+        if status == "fail":
+            session.exitstatus = pytest.ExitCode.TESTS_FAILED
+    finally:
+        _gitconfig_guard.cleanup()
 
 
 def pytest_terminal_summary(terminalreporter: pytest.TerminalReporter) -> None:

@@ -26,11 +26,16 @@ things:
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import os
+import shutil
+import signal
+import sys
 import tempfile
+import threading
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -78,6 +83,39 @@ _SEED = (
 _SEED_SHA256 = hashlib.sha256(_SEED).hexdigest()
 
 
+#: Guards not yet cleaned up in this process, for the signal handlers.
+_live_guards: list[GlobalGitConfigGuard] = []
+_signal_cleanup_installed = False
+
+
+def _install_signal_cleanup() -> None:
+    """Clean live guards up on SIGTERM/SIGINT, then re-raise the signal.
+
+    Installed once, main thread only (``signal.signal`` refuses other
+    threads; the conftest session guard starts on the main thread).
+    Mirrors the SIGTERM handling in ``scripts/validate.py``.
+    """
+
+    global _signal_cleanup_installed
+    if _signal_cleanup_installed:
+        return
+    if threading.current_thread() is not threading.main_thread():
+        return
+
+    def _on_signal(signum: int, _frame: object) -> None:
+        for guard in list(_live_guards):
+            guard.cleanup()
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    try:
+        signal.signal(signal.SIGTERM, _on_signal)
+        signal.signal(signal.SIGINT, _on_signal)
+    except (ValueError, OSError):
+        return
+    _signal_cleanup_installed = True
+
+
 @dataclass
 class GlobalGitConfigGuard:
     """One session's redirect of global git config plus its damage check."""
@@ -85,6 +123,7 @@ class GlobalGitConfigGuard:
     real_path: Path
     before: Fingerprint
     sentinel: Path
+    _cleaned: bool = field(default=False, repr=False)
 
     @classmethod
     def start(
@@ -93,9 +132,13 @@ class GlobalGitConfigGuard:
         """Fingerprint the real file and redirect global config to a sentinel.
 
         The sentinel is a fresh seeded file in a per-session temporary
-        directory. The directory is left in place (the OS reclaims temp
-        space); its path is printed in the session summary so a write that
-        landed there can be inspected.
+        directory. At session end :meth:`cleanup` removes the directory
+        when the sentinel still holds exactly the seed; when a write was
+        caught there it keeps the directory and prints its path, so the
+        writer can be found. The pytest conftests call it at session
+        finish, ``atexit`` covers interpreter exits (failures included),
+        and SIGTERM/SIGINT handlers cover a worker killed mid-session.
+        Only SIGKILL leaves an entry, for the stale-entry sweep.
         """
 
         env = os.environ if environ is None else environ
@@ -107,7 +150,41 @@ class GlobalGitConfigGuard:
         sentinel.chmod(0o600)
         env["GIT_CONFIG_GLOBAL"] = str(sentinel)
         env["GIT_CONFIG_NOSYSTEM"] = "1"
-        return cls(real_path=real, before=before, sentinel=sentinel)
+        guard = cls(real_path=real, before=before, sentinel=sentinel)
+        _live_guards.append(guard)
+        atexit.register(guard.cleanup)
+        _install_signal_cleanup()
+        return guard
+
+    def cleanup(self) -> None:
+        """Remove the sentinel directory unless a write was caught in it.
+
+        Safe to call twice. When the sentinel no longer holds exactly the
+        seed, a global write landed there: keep the directory for
+        inspection and print its path instead of deleting the evidence.
+        """
+
+        if self._cleaned:
+            return
+        self._cleaned = True
+        if self in _live_guards:
+            _live_guards.remove(self)
+        current = fingerprint(self.sentinel)
+        if current.exists and current.sha256 not in (None, _SEED_SHA256):
+            print(
+                f"global git config guard: kept session sentinel at "
+                f"{self.sentinel.parent} (a global write landed there; "
+                f"inspect {self.sentinel})",
+                file=sys.stderr,
+            )
+            return
+        shutil.rmtree(self.sentinel.parent, ignore_errors=True)
+
+    def __enter__(self) -> GlobalGitConfigGuard:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.cleanup()
 
     def check(self) -> tuple[str, str]:
         """Compare the real file against the session-start fingerprint.

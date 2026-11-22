@@ -55,6 +55,98 @@ def test_check_ok_warn_fail(tmp_path: Path) -> None:
     assert guard.check()[0] == "fail"
 
 
+def test_cleanup_removes_the_sentinel_directory(tmp_path: Path) -> None:
+    guard = GlobalGitConfigGuard.start(environ={"HOME": str(tmp_path)})
+    directory = guard.sentinel.parent
+    assert directory.name.startswith("agent-utils-gitconfig-global-")
+    assert guard.sentinel.is_file()
+    guard.cleanup()
+    assert not directory.exists()
+    guard.cleanup()  # idempotent: a second call at exit must not raise
+
+
+def test_context_manager_removes_the_sentinel_directory(tmp_path: Path) -> None:
+    with GlobalGitConfigGuard.start(environ={"HOME": str(tmp_path)}) as guard:
+        directory = guard.sentinel.parent
+        assert guard.sentinel.is_file()
+    assert not directory.exists()
+
+
+def test_cleanup_keeps_the_directory_when_a_write_landed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    guard = GlobalGitConfigGuard.start(environ={"HOME": str(tmp_path)})
+    guard.sentinel.write_bytes(b"[user]\n\temail = caught@example.invalid\n")
+    guard.cleanup()
+    assert guard.sentinel.is_file(), "cleanup deleted the caught write"
+    assert str(guard.sentinel.parent) in capsys.readouterr().err
+    guard.cleanup()  # still idempotent; the kept directory stays
+    import shutil
+
+    shutil.rmtree(guard.sentinel.parent)  # test hygiene: drop the kept evidence
+
+
+def test_sigterm_mid_session_removes_the_sentinel_directory(
+    tmp_path: Path,
+) -> None:
+    # A worker killed with SIGTERM mid-session runs the guard's signal
+    # handler: the seed-only directory is removed before the process dies.
+    import signal as signal_module
+
+    py_root = Path(__file__).resolve().parents[1]
+    script = (
+        "import sys, time\n"
+        f"sys.path.insert(0, {str(py_root)!r})\n"
+        "from gitconfig_guard import GlobalGitConfigGuard\n"
+        "guard = GlobalGitConfigGuard.start()\n"
+        "print(guard.sentinel.parent, flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", script],
+        env={**os.environ, "HOME": str(tmp_path)},
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        directory = Path(proc.stdout.readline().strip())
+        assert directory.name.startswith("agent-utils-gitconfig-global-")
+        proc.send_signal(signal_module.SIGTERM)
+        proc.wait(timeout=30)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=30)
+    assert not directory.exists()
+
+
+def test_atexit_removes_the_sentinel_directory_on_failure_exit(
+    tmp_path: Path,
+) -> None:
+    # A failing interpreter exit still runs atexit: start a guard in a
+    # subprocess, exit nonzero without cleanup, and assert no entry survives.
+    py_root = Path(__file__).resolve().parents[1]
+    script = (
+        "import sys\n"
+        f"sys.path.insert(0, {str(py_root)!r})\n"
+        "from gitconfig_guard import GlobalGitConfigGuard\n"
+        "guard = GlobalGitConfigGuard.start()\n"
+        "print(guard.sentinel.parent, flush=True)\n"
+        "sys.exit(3)\n"
+    )
+    run = subprocess.run(
+        [sys.executable, "-c", script],
+        env={**os.environ, "HOME": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert run.returncode == 3, run.stderr
+    directory = Path(run.stdout.strip().splitlines()[-1])
+    assert directory.name.startswith("agent-utils-gitconfig-global-")
+    assert not directory.exists(), run.stderr
+
+
 def test_session_fails_when_a_test_writes_the_real_file(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()
