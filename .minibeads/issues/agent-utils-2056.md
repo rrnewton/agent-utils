@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-reader-retry-and-error-telemetry: retry recoverable read-aloud failures and count them'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -8,7 +8,8 @@ labels:
 - voice
 - read-aloud
 created_at: 2026-11-21T10:46:00-05:00
-updated_at: 2026-11-21T10:46:00-05:00
+updated_at: 2026-11-22T05:31:00-05:00
+closed_at: 2026-11-22T05:31:00-05:00
 ---
 
 # Description
@@ -49,3 +50,7 @@ What the code and log together prove:
 Cause reported to the coordinator before any fix, per the lane brief; implementation waits for the go. Related: #487 read-aloud-recovery, #548 cloud-read-failures, #1872 vibe-talk-read-no-audio-retry, #2057 vibe-talk-slack-rate-limit-check (the same log, a separate question).
 
 [watermelon-full-preview] Coordinator GO (2026-11-21) on the scope as filed, with two additions: (1) server-side, distinguish the two interrupt causes in the log and in the counters (`abandoned` vs `superseded`); (2) page-side, every player stop path records why (user stop, arrow or jump, new selection, error, visibility or connection lost), non-user reasons are reported to the server, and the bounded same-block retry fires only for recoverable non-user reasons. Also checked against #2055 (a live server panic on the speech-text path, `speakable.rs` `internal_id()` splitting at byte 1 of a segment starting with `…`): the log holds 15 such panics on 2026-11-21 (12:23-12:46Z and 15:29-15:48Z clusters), and none falls within two minutes of any of the four 15:24-15:27Z deaths — the panic explains other failed speech work that day (a panicked prepare drops its request; the page sees a lost/refused read, never a supersede, and a block whose text panics never reaches a turn), while the 15:25Z deaths remain the separate page-consumer cause above. The panic fix itself is #2055, landed separately.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as f16d25254aae498b2367978e8538ba4f2d1a0dae (coordinator waiver over the gate below; coordinator deploys). The server names why it interrupted a turn (`interrupt=abandoned|superseded` in the turn-end log) and counts both; per-day read-aloud counters (failures/retried/recovered/gave_up by class, interrupted by cause) are on healthz as `read_aloud`; every stream failure is counted, and the page's failure report carries recoverable/retried/outcome (validated) into the same counters. The page retries one named recoverable set (lost/malformed/no_audio; a browser abort counts as lost), resumes at the same block on the existing bounded schedules, reports a retry recovered once when it plays and gave_up once at the end, records every stop's reason (user_stop/superseded/jump/error/connection_lost), and never retries or reports a deliberate stop or supersede. Gate d848409d: 210 passed, 5 browser failures all in the load family; solo rerun passed read-aloud-blocks, one-page-complete and done-feedback (offline-cache-phone-360 is #2012, red on main). Unverified: the give-up notice screenshot matrix and a full clone-page drive (the clone's timeline cannot serve rows while its cache cannot verify its account through the stub), and interrupts that end by acknowledgement timeout are not yet counted (the expire() path) — a follow-up, kept out of #2075 by agreement with its lane.
