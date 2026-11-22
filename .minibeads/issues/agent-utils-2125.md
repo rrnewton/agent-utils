@@ -17,6 +17,15 @@ Commands that replay the full event history (about 95,000 files on one consumer 
 
 Prove-then-recheck: read and replay the history outside the lock, take the locks, verify the snapshot revision and event-log tip are unchanged since the read (cheap), and only then mutate; if anything moved, redo the read (bounded retries) or fall back to the locked path. Apply it to recover-absent-validate-rows and to slot moves first, then to other long locked replays. Measure lock hold before and after.
 
+## Owner rule (binding on all registry-lock work)
+
+Only ever do quick, constant-time things while holding one of these
+locks. If there is a linear-time thing to do, do as much prep work
+ahead of time as possible: linear work happens outside the lock and
+is validated under it by an O(1) generation/tip check, redone if it
+changed. #2127 (per-slot locks) reuses the `_history_tip_proof`
+pattern introduced here instead of re-deriving it.
+
 # Acceptance Criteria
 
 - Lock hold for a passing recover-absent call and a slot move drops to seconds on a large history fixture; a concurrent mutation between read and lock is detected and handled; tests for both.

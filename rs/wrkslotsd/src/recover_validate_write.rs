@@ -290,15 +290,23 @@ fn refusal_payload(
 /// the Python edition's `_HISTORY_RECHECK_ATTEMPTS`.
 const HISTORY_RECHECK_ATTEMPTS: usize = 3;
 
-/// The cheap proof a prove-then-recheck mutation compares (#2125):
-/// per machine, the event log's file count and last file's digest
-/// plus both snapshot revisions, and the on-disk journal names.
-/// Reading it never folds a chain, so comparing it under the
-/// mutation locks costs milliseconds on a long history. `None`
-/// when any piece cannot be read; the caller then takes the
-/// ordinary locked path, exactly as before #2125. Mirrors the
-/// Python edition's `_history_tip_proof` (which additionally
-/// proves each ACTIVE snapshot against its event index).
+/// The cheap proof a prove-then-recheck mutation compares (#2125).
+///
+/// Owner rule: only constant-time work runs while holding one of
+/// the registry locks; anything linear in the history happens ahead
+/// of time, outside the locks, and is validated under them by an
+/// O(1) generation/tip check, redone if it changed. Later lock work
+/// (#2127 per-slot locks) must reuse this pattern, not re-derive it.
+///
+/// Per machine: the event index's tip (sequence and digest), both
+/// snapshot revisions, and the on-disk journal names. Reading it
+/// reads, per machine, the index file, the one sequence-addressed
+/// last event file, and both snapshot files -- never a listing of
+/// the log, never a fold -- so comparing it under the mutation
+/// locks is constant time on a long history. `None` when any piece
+/// cannot be read; the caller then takes the ordinary locked path,
+/// exactly as before #2125. Mirrors the Python edition's
+/// `_history_tip_proof`.
 fn history_proof(
     root: Option<&Path>,
     cfg: &Cfg,
@@ -307,30 +315,34 @@ fn history_proof(
     let mut proof = Vec::new();
     for machine in &machines {
         let directory = cfg.control.join(format!("EVENTS.{machine}"));
-        let mut names: Vec<String> = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&directory) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name.ends_with(".json") {
-                    names.push(name);
-                }
-            }
+        let index_text =
+            std::fs::read_to_string(cfg.control.join(format!("EVENT-INDEX.{machine}.json")))
+                .ok()?;
+        let index: Value = serde_json::from_str(&index_text).ok()?;
+        if index.get("schema").and_then(Value::as_i64) != Some(1)
+            || index.get("machine").and_then(Value::as_str) != Some(machine.as_str())
+        {
+            return None;
         }
-        names.sort();
-        let (count, tip) = match names.last() {
-            Some(last) => {
-                let text = std::fs::read_to_string(directory.join(last)).ok()?;
-                let raw: Value = serde_json::from_str(&text).ok()?;
-                (
-                    names.len() as u64,
-                    raw.get("sha256").and_then(Value::as_str)?.to_string(),
-                )
-            }
-            None => (0, String::new()),
-        };
+        let tip = index.get("tip")?;
+        let sequence = tip.get("sequence").and_then(Value::as_i64)?;
+        let digest = tip.get("sha256").and_then(Value::as_str)?;
+        if sequence < 1 {
+            return None;
+        }
+        let last_text =
+            std::fs::read_to_string(directory.join(format!("{sequence:020}.json"))).ok()?;
+        let last: Value = serde_json::from_str(&last_text).ok()?;
+        if last.get("sha256").and_then(Value::as_str) != Some(digest) {
+            return None;
+        }
+        let (count, tip) = (sequence as u64, digest.to_string());
         let (active, _order) =
             crate::active_state::parse_state_ordered(root, Some(machine)).ok()?;
         let active_revision = active.get("revision").and_then(Value::as_i64)?;
+        if index.get("active_revision").and_then(Value::as_i64) != Some(active_revision) {
+            return None;
+        }
         let archive = crate::archive_state::parse_archive(root, Some(machine)).ok()?;
         let archive_revision = archive.get("revision").and_then(Value::as_i64).unwrap_or(0);
         proof.push((

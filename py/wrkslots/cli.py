@@ -51150,7 +51150,10 @@ def _cmd_relocate_repository(args: argparse.Namespace) -> int:
     # Prove-then-recheck (#2125): replay the history and judge the
     # Git witnesses WITHOUT the registry locks, then take them and
     # move the rows only when the event-index proof shows the
-    # history has not moved since the replay. A moved history is
+    # history has not moved since the replay. Owner rule: only
+    # constant-time work runs under the locks; the linear replay
+    # stays outside and is validated under them by the O(1) tip
+    # check (`_history_tip_proof`), redone if it changed. A moved history is
     # re-read (bounded rounds); an unprovable one, an outstanding
     # journal (the locked path below judges journals, as before),
     # or exhausted rounds take the ordinary locked path unchanged.
@@ -64279,16 +64282,22 @@ _HISTORY_RECHECK_ATTEMPTS = 3
 
 def _history_tip_proof(
     config: Config,
-) -> tuple[tuple[tuple[str, int | None, str | None, int, int], ...], tuple[str, ...]] | None:
+) -> tuple[tuple[tuple[str, int, str, int, int], ...], tuple[str, ...]] | None:
     """The cheap proof a prove-then-recheck mutation compares (#2125).
 
-    One entry per machine: the event index's tip (sequence and digest,
-    proven against the chain tip and the ACTIVE snapshot revision by
-    `_scoped_status_state`), the ARCHIVED snapshot revision, and the
-    on-disk journal file names. Reading it lists each event directory
-    and reads each log's last file and both snapshot files -- never a
-    replay -- so comparing it under the locks costs milliseconds even
-    on a 95,000-event history. Returns None when any machine's index
+    Owner rule: only constant-time work runs while holding one of the
+    registry locks; anything linear in the history happens ahead of
+    time, outside the locks, and is validated under them by an O(1)
+    generation/tip check, redone if it changed. Later lock work
+    (#2127 per-slot locks) must reuse this pattern, not re-derive it.
+
+    One entry per machine: the event index's tip (sequence and
+    digest), the ACTIVE and ARCHIVED snapshot revisions, and the
+    on-disk journal file names. Reading it reads, per machine, the
+    index file, the one sequence-addressed last event file, and both
+    snapshot files -- never a listing of the log, never a replay --
+    so comparing it under the locks is constant time even on a
+    95,000-event history. Returns None when any machine's index
     cannot prove its snapshot current; the caller then takes the
     ordinary locked path, exactly as before #2125.
     """
@@ -64297,30 +64306,43 @@ def _history_tip_proof(
         machines = _state_machines(config)
     except (OSError, StateError):
         return None
-    proof: list[tuple[str, int | None, str | None, int, int]] = []
+    proof: list[tuple[str, int, str, int, int]] = []
     for machine in machines:
-        proven = _scoped_status_state(config, machine)
-        if proven is None:
+        directory = _event_directory(config, machine)
+        index = _load_event_index(directory, machine)
+        if index is None:
             return None
-        snapshot, index = proven
         tip = index.get("tip")
         if not isinstance(tip, dict):
             return None
         sequence = tip.get("sequence")
         digest = tip.get("sha256")
+        if not isinstance(sequence, int) or sequence < 1:
+            return None
+        if not isinstance(digest, str):
+            return None
         try:
+            last = _read_json(
+                directory / f"{sequence:020d}.json", "append-only event"
+            )
+            snapshot = _load_active_snapshot(
+                config, machine, require_repository=False
+            )
             archive = _load_archive_snapshot(config, machine)
         except (OSError, Refusal, StateError, ValueError):
             return None
-        proof.append(
-            (
-                machine,
-                sequence if isinstance(sequence, int) else None,
-                digest if isinstance(digest, str) else None,
-                snapshot.revision,
-                archive.revision,
+        try:
+            last_digest = _as_str(
+                _as_mapping(last, "append-only event")["sha256"],
+                "append-only event.sha256",
             )
-        )
+        except (StateError, KeyError):
+            return None
+        if last_digest != digest:
+            return None
+        if snapshot.revision != index.get("active_revision"):
+            return None
+        proof.append((machine, sequence, digest, snapshot.revision, archive.revision))
     try:
         journals = tuple(
             sorted(
@@ -99615,7 +99637,10 @@ def _cmd_recover_absent_validate_rows(args: argparse.Namespace) -> int:
         # Prove-then-recheck (#2125): replay the event history and plan
         # WITHOUT the registry locks, then take them and mutate only
         # when the event-index proof shows the history has not moved
-        # since the replay. A moved history is re-read (bounded
+        # since the replay. Owner rule: only constant-time work runs
+        # under the locks; the linear replay stays outside and is
+        # validated under them by the O(1) tip check (`_history_tip_proof`),
+        # redone if it changed. A moved history is re-read (bounded
         # rounds); an unprovable one, an outstanding journal (the
         # resume path below judges journals under the locks, as
         # before), or exhausted rounds take the ordinary locked path
