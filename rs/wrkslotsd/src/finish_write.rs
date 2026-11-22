@@ -352,13 +352,20 @@ pub(crate) fn stored_repository_path(cfg: &Cfg, raw: &str) -> Result<(String, Pa
         .components()
         .map(|part| part.as_os_str().to_string_lossy().into_owned())
         .collect();
+    let mut is_eden_backing = false;
     let (stored, unresolved, allowed_root) = if candidate.is_absolute() {
-        let normalized = parts.join("/");
-        let normalized = if normalized.is_empty() {
-            normalized
-        } else {
-            format!("/{normalized}")
-        };
+        // The root component renders as "/", so it is dropped before
+        // rejoining: the canonical spelling of an absolute path is the
+        // one Python's normpath comparison accepts (#2102).
+        let normalized = format!(
+            "/{}",
+            parts
+                .iter()
+                .filter(|part| part.as_str() != "/")
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("/")
+        );
         if raw != normalized {
             return Err(format!(
                 "stored absolute repository path is not canonical: {}",
@@ -367,7 +374,15 @@ pub(crate) fn stored_repository_path(cfg: &Cfg, raw: &str) -> Result<(String, Pa
         }
         let parent = cfg.root.parent().map(Path::to_path_buf).unwrap_or_default();
         let name = parts.last().cloned().unwrap_or_default();
-        if candidate == cfg.root
+        if let Some(backing_root) =
+            crate::active_state::configured_eden_backing_root(cfg, candidate)
+        {
+            // An in-image Eden backing (#2102), as in
+            // `stored_repository_parts`: the stored spelling stays
+            // absolute, as Eden rows record it.
+            is_eden_backing = true;
+            (raw.to_string(), candidate.to_path_buf(), backing_root)
+        } else if candidate == cfg.root
             || candidate == parent
             || name.is_empty()
             || candidate.parent() != Some(parent.as_path())
@@ -376,8 +391,9 @@ pub(crate) fn stored_repository_path(cfg: &Cfg, raw: &str) -> Result<(String, Pa
                 "stored absolute repository path must name one direct sibling of the project root, not the project root or another external path: {}",
                 py_repr(raw)
             ));
+        } else {
+            (format!("../{name}"), candidate.to_path_buf(), parent)
         }
-        (format!("../{name}"), candidate.to_path_buf(), parent)
     } else {
         let sibling = parts.len() >= 2
             && parts[0] == ".."
@@ -421,7 +437,7 @@ pub(crate) fn stored_repository_path(cfg: &Cfg, raw: &str) -> Result<(String, Pa
         }
     };
     ensure_no_symlink_components(&allowed_root, &unresolved, "repository")?;
-    if path_is_within(&unresolved, &managed_worktrees_root(cfg)) {
+    if !is_eden_backing && path_is_within(&unresolved, &managed_worktrees_root(cfg)) {
         return Err(format!(
             "source repository must be outside the managed worktrees directory: {}",
             unresolved.display()
@@ -440,7 +456,7 @@ pub(crate) fn stored_repository_path(cfg: &Cfg, raw: &str) -> Result<(String, Pa
             absolute.display()
         ));
     }
-    if path_is_within(&absolute, &managed_worktrees_root(cfg)) {
+    if !is_eden_backing && path_is_within(&absolute, &managed_worktrees_root(cfg)) {
         return Err(format!(
             "source repository must be outside the managed worktrees directory: {}",
             absolute.display()

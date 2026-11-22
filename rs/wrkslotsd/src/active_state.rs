@@ -46,6 +46,12 @@ pub(crate) struct Cfg {
     pub(crate) harness_repo: Option<String>,
     /// Configured Eden mount root (#1730); None derives the default.
     pub(crate) eden_mount_root: Option<PathBuf>,
+    /// In-image Eden backing root `<mount>/.eden-backing` (#2102), when
+    /// the worktrees-image configuration names backing repositories.
+    pub(crate) eden_backing_root: Option<PathBuf>,
+    /// The configured in-image Eden backing locations (#2102):
+    /// `eden_backing_root` joined with each configured suffix.
+    pub(crate) eden_backing_paths: Vec<PathBuf>,
     /// Extra validation exclusion guard parents, after the built-in root.
     pub(crate) validation_exclusion_roots: Vec<PathBuf>,
     /// Declared per-remote SSH settings (#1940), from the config payload.
@@ -1128,11 +1134,33 @@ fn path_is_within(candidate: &Path, parent: &Path) -> bool {
     candidate == parent || candidate.starts_with(parent)
 }
 
+/// The backing root holding `candidate`, when it is a configured
+/// in-image Eden backing location (#2102), mirroring Python
+/// `_configured_eden_backing_root`. A lexical match wins; a
+/// canonicalized match covers a stored spelling recorded through
+/// symlinked prefixes, as Python's resolved comparison does.
+pub(crate) fn configured_eden_backing_root(cfg: &Cfg, candidate: &Path) -> Option<PathBuf> {
+    let root = cfg.eden_backing_root.as_ref()?;
+    if cfg.eden_backing_paths.iter().any(|path| path == candidate) {
+        return Some(root.clone());
+    }
+    let canonical = candidate.canonicalize().ok()?;
+    if cfg.eden_backing_paths.iter().any(|path| {
+        path.canonicalize()
+            .map(|seen| seen == canonical)
+            .unwrap_or(false)
+    }) {
+        return root.canonicalize().ok().or_else(|| Some(root.clone()));
+    }
+    None
+}
+
 /// The normalized stored spelling, unresolved path, and allowed root
 /// for a stored repository reference, as the existing reference
 /// validation computes them.
 pub(crate) fn stored_repository_parts(cfg: &Cfg, raw: &str) -> Result<(String, PathBuf, PathBuf)> {
     let root_parent = cfg.root.parent().map(Path::to_path_buf).unwrap_or_default();
+    let mut is_eden_backing = false;
     let (stored, unresolved, allowed_root) = if raw.starts_with('/') {
         if raw != normpath_absolute(raw) {
             return Err(format!(
@@ -1140,7 +1168,14 @@ pub(crate) fn stored_repository_parts(cfg: &Cfg, raw: &str) -> Result<(String, P
             ));
         }
         let candidate = PathBuf::from(raw);
-        if candidate == cfg.root
+        if let Some(backing_root) = configured_eden_backing_root(cfg, &candidate) {
+            // An in-image Eden backing (#2102): the configuration names
+            // this exact location, so it stands alongside the direct
+            // siblings an absolute path may name. The stored spelling
+            // stays absolute, as Eden rows record it.
+            is_eden_backing = true;
+            (raw.to_string(), candidate, backing_root)
+        } else if candidate == cfg.root
             || candidate == root_parent
             || candidate.file_name().is_none()
             || candidate.parent() != Some(root_parent.as_path())
@@ -1148,15 +1183,16 @@ pub(crate) fn stored_repository_parts(cfg: &Cfg, raw: &str) -> Result<(String, P
             return Err(format!(
                 "stored absolute repository path must name one direct sibling of the project root, not the project root or another external path: {raw:?}"
             ));
+        } else {
+            let stored = format!(
+                "../{}",
+                candidate
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            );
+            (stored, candidate, root_parent.clone())
         }
-        let stored = format!(
-            "../{}",
-            candidate
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        );
-        (stored, candidate, root_parent.clone())
     } else {
         let parts: Vec<&str> = raw
             .split('/')
@@ -1198,7 +1234,7 @@ pub(crate) fn stored_repository_parts(cfg: &Cfg, raw: &str) -> Result<(String, P
         }
     };
     ensure_no_symlink_components(&allowed_root, &unresolved, "repository")?;
-    if path_is_within(&unresolved, &managed_worktrees_root(cfg)) {
+    if !is_eden_backing && path_is_within(&unresolved, &managed_worktrees_root(cfg)) {
         return Err(format!(
             "source repository must be outside the managed worktrees directory: {}",
             unresolved.display()
@@ -1481,6 +1517,45 @@ fn active_from_obj(
     ))
 }
 
+/// The configured in-image Eden backing root and locations (#2102),
+/// from the validated `worktrees_image` payload: the mount point the
+/// layout names, its `.eden-backing` root, and one location per
+/// configured `eden_backing_repo` suffix. Mirrors Python
+/// `WorktreesImageSettings.mount_point` plus `eden_backing_path`'s
+/// lexical form; no section, or no configured repos, names nothing.
+fn eden_backing_config(
+    config: &Value,
+    control: &Path,
+    worktrees: &Path,
+) -> (Option<PathBuf>, Vec<PathBuf>) {
+    let Some(section) = config
+        .get("worktrees_image")
+        .filter(|value| value.is_object())
+    else {
+        return (None, Vec::new());
+    };
+    let Some(repos) = section
+        .get("eden_backing_repo")
+        .and_then(Value::as_array)
+        .filter(|repos| !repos.is_empty())
+    else {
+        return (None, Vec::new());
+    };
+    let mount_point = if section.get("mount_at").and_then(Value::as_str) == Some("worktrees_dir") {
+        worktrees.to_path_buf()
+    } else {
+        crate::worktrees_image::image_mount_dir(control)
+    };
+    let root = mount_point.join(crate::worktrees_image::EDEN_BACKING_SUBDIR);
+    let paths = repos
+        .iter()
+        .filter_map(|pair| pair.as_array())
+        .filter_map(|pair| pair.get(1).and_then(Value::as_str))
+        .map(|suffix| root.join(suffix))
+        .collect();
+    (Some(root), paths)
+}
+
 pub(crate) fn load_cfg(
     root: Option<&Path>,
     machine_override: Option<&str>,
@@ -1494,10 +1569,14 @@ pub(crate) fn load_cfg(
             .ok_or_else(|| format!("validated configuration is missing {key}"))
     };
     let selected = text("machine")?;
+    let control_path = PathBuf::from(text("control")?);
+    let worktrees_path = PathBuf::from(text("worktrees")?);
+    let (eden_backing_root, eden_backing_paths) =
+        eden_backing_config(&config, &control_path, &worktrees_path);
     let cfg = Cfg {
         root: PathBuf::from(text("root")?),
-        worktrees: PathBuf::from(text("worktrees")?),
-        control: PathBuf::from(text("control")?),
+        worktrees: worktrees_path,
+        control: control_path,
         layout: text("layout")?,
         default_remote: text("default_remote")?,
         default_landed_ref: text("default_landed_ref")?,
@@ -1510,6 +1589,8 @@ pub(crate) fn load_cfg(
             .get("eden_mount_root")
             .and_then(Value::as_str)
             .map(PathBuf::from),
+        eden_backing_root,
+        eden_backing_paths,
         validation_exclusion_roots: config
             .get("validation_exclusion_roots")
             .and_then(Value::as_array)
@@ -1572,6 +1653,8 @@ mod eden_mount_tests {
             machine: "node-a".to_owned(),
             harness_repo: None,
             eden_mount_root: mount_root,
+            eden_backing_root: None,
+            eden_backing_paths: Vec::new(),
             validation_exclusion_roots: Vec::new(),
             remote_ssh_commands: Vec::new(),
             root,
@@ -1624,5 +1707,56 @@ mod eden_mount_tests {
             assert_record_paths(&config, &eden_record("/elsewhere/checkout".to_owned())).is_err()
         );
         assert!(stored_path_reference(&config, "/elsewhere/checkout", "checkout path").is_err());
+    }
+
+    /// #2102: the configured in-image backing stands alongside direct
+    /// siblings for a stored repository; every other external path is
+    /// still refused, in both stored-path spellings.
+    #[test]
+    fn configured_eden_backing_is_accepted_and_external_refused() {
+        let root = PathBuf::from("/tmp/wrkslots-test/project");
+        // Binds layout: control == worktrees here, so the mount is
+        // <control>/.slots-image and the backing root lives under it.
+        let backing_root = root
+            .join("worktrees")
+            .join(".slots-image")
+            .join(".eden-backing");
+        let backing = backing_root.join("source-repo");
+        let mut config = cfg(root.clone(), None);
+        config.eden_backing_root = Some(backing_root.clone());
+        config.eden_backing_paths = vec![backing.clone()];
+
+        let raw = backing.to_string_lossy().into_owned();
+        let (stored, unresolved, allowed_root) =
+            stored_repository_parts(&config, &raw).expect("configured backing");
+        assert_eq!(stored, raw);
+        assert_eq!(unresolved, backing);
+        assert_eq!(allowed_root, backing_root);
+        std::fs::create_dir_all(&backing).expect("seed backing directory");
+        let (stored, resolved) =
+            crate::finish_write::stored_repository_path(&config, &raw).expect("resolved backing");
+        assert_eq!(stored, raw);
+        assert_eq!(resolved, backing.canonicalize().expect("canonical backing"));
+        let _ = std::fs::remove_dir_all(root.join("worktrees").join(".slots-image"));
+
+        let unconfigured_raw = backing_root
+            .join("unconfigured")
+            .to_string_lossy()
+            .into_owned();
+        for refused in ["/elsewhere/repo", unconfigured_raw.as_str()] {
+            let error = stored_repository_parts(&config, refused)
+                .expect_err("non-configured external path");
+            assert!(
+                error.contains("must name one direct sibling"),
+                "unexpected refusal: {error}"
+            );
+            assert!(crate::finish_write::stored_repository_path(&config, refused).is_err());
+        }
+
+        // Without a configured backing, the same absolute path refuses.
+        let unconfigured = cfg(root, None);
+        let error = stored_repository_parts(&unconfigured, &raw)
+            .expect_err("backing path without configuration");
+        assert!(error.contains("must name one direct sibling"));
     }
 }

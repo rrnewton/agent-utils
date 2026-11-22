@@ -255,6 +255,61 @@ def test_parse_state_refusals_name_the_same_problem(
     assert fragment in result.stderr
 
 
+def _with_eden_backing_config(root: Path) -> Path:
+    """Name one in-image Eden backing in the fixture configuration (#2102)."""
+    config_path = root / ".wrkslots.yml"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + "worktrees_image:\n"
+        + "  path: wt.img\n"
+        + "  size_bytes: 1073741824\n"
+        + "  eden_backing_repo: source-repo\n",
+        encoding="utf-8",
+    )
+    # Nested layout: control is the worktrees directory itself, so the
+    # binds mount point is <worktrees>/.slots-image.
+    return root / "worktrees" / ".slots-image" / ".eden-backing" / "source-repo"
+
+
+def test_parse_state_configured_eden_backing_matches_python(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    backing = _with_eden_backing_config(root)
+    record = _record("slot-a", "agent-a")
+    checkouts = record["checkouts"]
+    assert isinstance(checkouts, list)
+    checkouts[0]["repository"] = str(backing)
+    _write_state(root, _state(record))
+    result = _rust(root)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == _expected(root)
+
+
+@pytest.mark.parametrize(
+    "repository_of",
+    [
+        lambda tmp_path, backing: str(tmp_path / "outside" / "external-repo"),
+        lambda tmp_path, backing: str(backing.parent / "unconfigured"),
+    ],
+)
+def test_parse_state_non_configured_external_repository_refusals_match(
+    tmp_path: Path, repository_of: Callable[[Path, Path], str]
+) -> None:
+    root = _root(tmp_path)
+    backing = _with_eden_backing_config(root)
+    record = _record("slot-a", "agent-a")
+    checkouts = record["checkouts"]
+    assert isinstance(checkouts, list)
+    checkouts[0]["repository"] = repository_of(tmp_path, backing)
+    _write_state(root, _state(record))
+    fragment = "must name one direct sibling"
+    with pytest.raises(Exception) as caught:
+        _expected(root)
+    assert fragment in str(caught.value)
+    result = _rust(root)
+    assert result.returncode == 1
+    assert fragment in result.stderr
+
+
 def test_parse_state_missing_shard(tmp_path: Path) -> None:
     root = _root(tmp_path)
     with pytest.raises(Exception) as caught:

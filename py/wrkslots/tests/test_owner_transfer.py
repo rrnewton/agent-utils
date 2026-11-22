@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -592,6 +593,67 @@ def test_released_generation_rebinds_only_with_coordinator_authorization(
     assert evidence["coordinator_authorized"] is True
     assert evidence["reason"] == "lane resumed after restart"
     assert evidence["previous_generation"] == 1
+
+
+@pytest.mark.ordinary_environment
+def test_rename_rebind_accepts_an_in_image_eden_backing(tmp_path: Path) -> None:
+    """#2102: the rename gate accepts the configured in-image backing.
+
+    A rename (``--to-agent``) runs the clean-tree rebind check, which
+    resolves every checkout's stored repository. An in-image Eden
+    slot's repository is the configured backing location, so the check
+    accepts it; any other external path is still refused, which is
+    what blocked every rename of such a slot.
+    """
+    from wrkslots import worktreesimage
+
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    loaded = cli._load_config(str(project), "testhost")
+    settings = worktreesimage.WorktreesImageSettings(
+        relative_path="worktrees.img",
+        size_bytes=1024**3,
+        eden_backing_repos=(
+            worktreesimage.EdenBacking("source-repo", "source-repo"),
+        ),
+    )
+    config = replace(
+        loaded,
+        worktrees_image=settings,
+        worktrees_image_state=worktreesimage.MOUNTED,
+    )
+    mount = settings.mount_point(config.control, config.worktrees)
+    backing = worktreesimage.eden_backing_path(
+        mount, (settings.eden_backing_repos or ())[0]
+    )
+    backing.mkdir(parents=True)
+    git(backing, "init", "--initial-branch=main")
+    git(backing, "config", "user.name", "Wrkslots Test")
+    git(backing, "config", "user.email", "wrkslots@example.invalid")
+    (backing / "seed.txt").write_text("seed\n", encoding="utf-8")
+    git(backing, "add", "seed.txt")
+    git(backing, "commit", "-m", "seed")
+    target = project / "worktrees" / "slot01" / "eden-wt"
+    git(backing, "worktree", "add", "-b", "eden/work", str(target), "main")
+
+    record = cli._load_active(config).slots[0]
+    eden_checkout = replace(
+        record.checkouts[0],
+        path="worktrees/slot01/eden-wt",
+        repository=str(backing),
+        branch="eden/work",
+        vcs="eden",
+    )
+    eden_record = replace(record, checkouts=(eden_checkout,))
+    assert cli._assert_clean_tree_for_rebind(config, eden_record) == ()
+
+    external = replace(
+        eden_checkout, repository=str(tmp_path / "outside" / "external-repo")
+    )
+    with pytest.raises(cli.Refusal, match="must name one direct sibling"):
+        cli._assert_clean_tree_for_rebind(
+            config, replace(record, checkouts=(external,))
+        )
 
 
 @pytest.mark.ordinary_environment

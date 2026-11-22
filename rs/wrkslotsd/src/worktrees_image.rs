@@ -17,6 +17,7 @@ use crate::image_mounts::MountEntry;
 pub(crate) const SCHEMA: &str = "wrkslots-worktrees-image/v1";
 pub(crate) const MIN_SIZE_BYTES: i64 = 1_073_741_824;
 pub(crate) const IMAGE_MOUNT_NAME: &str = ".slots-image";
+pub(crate) const EDEN_BACKING_SUBDIR: &str = ".eden-backing";
 pub(crate) const RECORD_NAME: &str = ".worktrees-image.json";
 
 pub(crate) const MOUNTED: &str = "mounted";
@@ -1398,7 +1399,7 @@ pub(crate) fn status_report_with_quota(
         let rendered: Vec<Value> = entries
             .iter()
             .map(|(name, suffix)| {
-                let backing_path = mount_dir.join(".eden-backing").join(suffix);
+                let backing_path = mount_dir.join(EDEN_BACKING_SUBDIR).join(suffix);
                 let repo_ok = state == MOUNTED
                     && backing_path.join(".hg/requires").is_file()
                     && backing_path.join(".hg/store").is_dir()

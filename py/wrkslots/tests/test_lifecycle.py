@@ -31116,6 +31116,65 @@ def test_absolute_non_sibling_stored_repository_refuses(
         wrkslots._assert_record_paths(config, invalid_record)
 
 
+def test_stored_repository_accepts_configured_in_image_eden_backing(
+    tmp_path: Path,
+) -> None:
+    """#2102: the configured in-image backing stands alongside siblings."""
+    from wrkslots import worktreesimage
+
+    project, _repository, _remote = make_project(tmp_path)
+    loaded = wrkslots._load_config(str(project), "testhost")
+    settings = worktreesimage.WorktreesImageSettings(
+        relative_path="worktrees.img",
+        size_bytes=1024**3,
+        eden_backing_repos=(
+            worktreesimage.EdenBacking("source-repo", "source-repo"),
+            worktreesimage.EdenBacking("beta", "team/beta"),
+        ),
+    )
+    config = replace(
+        loaded,
+        worktrees_image=settings,
+        worktrees_image_state=worktreesimage.MOUNTED,
+    )
+    mount = settings.mount_point(config.control, config.worktrees)
+    backing_root = worktreesimage.eden_backing_root(mount)
+    for backing in settings.eden_backing_repos or ():
+        raw = str(worktreesimage.eden_backing_path(mount, backing))
+        stored, unresolved, allowed_root = wrkslots._stored_repository_reference(
+            config, raw
+        )
+        assert stored == raw
+        assert unresolved == Path(raw)
+        assert allowed_root.resolve() == backing_root.resolve()
+        Path(raw).mkdir(parents=True)
+        assert wrkslots._stored_repository_path(config, raw) == (
+            raw,
+            Path(raw).resolve(),
+        )
+
+    # Everything else external is still refused: a path outside the
+    # backing root, an unconfigured name inside it, and the very same
+    # backing path when the configuration names no backing at all.
+    for raw in (
+        str(tmp_path / "outside" / "external-repository"),
+        str(backing_root / "unconfigured"),
+    ):
+        with pytest.raises(
+            wrkslots.Refusal,
+            match="stored absolute repository path must name one direct sibling",
+        ):
+            wrkslots._stored_repository_reference(config, raw)
+    configured = str(
+        worktreesimage.eden_backing_path(mount, (settings.eden_backing_repos or ())[0])
+    )
+    with pytest.raises(
+        wrkslots.Refusal,
+        match="stored absolute repository path must name one direct sibling",
+    ):
+        wrkslots._stored_repository_reference(loaded, configured)
+
+
 def test_recover_accepts_legacy_absolute_sibling_create_journal(
     tmp_path: Path,
 ) -> None:

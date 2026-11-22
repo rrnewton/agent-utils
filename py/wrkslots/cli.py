@@ -26225,18 +26225,58 @@ def _repository_path(
     )
 
 
+def _configured_eden_backing_root(config: Config, candidate: Path) -> Path | None:
+    """The backing root holding ``candidate``, when it is a configured backing.
+
+    A stored Eden repository names its backing repository, which for an
+    in-image slot is one of the locations the worktrees-image
+    configuration names: ``<mount>/.eden-backing/<suffix>`` for a
+    configured ``eden_backing_repo`` entry (#2102). Returns the backing
+    root (lexical or resolved, matching ``candidate``) so the caller can
+    hold the path to the symlink rule, or None when the configuration
+    names no such location.
+    """
+
+    settings = config.worktrees_image
+    if settings is None or not settings.eden_backing_repos:
+        return None
+    mount_point = settings.mount_point(config.control, config.worktrees)
+    lexical_root = worktreesimage.eden_backing_root(mount_point)
+    for backing in settings.eden_backing_repos:
+        if candidate == lexical_root / backing.path:
+            return lexical_root
+        try:
+            resolved = worktreesimage.eden_backing_path(mount_point, backing)
+        except worktreesimage.WorktreesImageError:
+            continue
+        if candidate == resolved:
+            return Path(os.path.realpath(lexical_root))
+    return None
+
+
 def _stored_repository_reference(
     config: Config, raw: str
 ) -> tuple[str, Path, Path]:
     """Validate a stored repository identity without requiring it to exist."""
 
     candidate = Path(raw)
+    is_eden_backing = False
     if candidate.is_absolute():
         if raw != os.path.normpath(raw):
             raise Refusal(
                 f"stored absolute repository path is not canonical: {raw!r}"
             )
-        if (
+        backing_root = _configured_eden_backing_root(config, candidate)
+        if backing_root is not None:
+            # An in-image Eden backing (#2102): the configuration names
+            # this exact location, so it stands alongside the direct
+            # siblings an absolute path may name. The stored spelling
+            # stays absolute, as Eden rows record it.
+            is_eden_backing = True
+            stored = candidate.as_posix()
+            unresolved = candidate
+            allowed_root = backing_root
+        elif (
             candidate in {config.root, config.root.parent}
             or not candidate.name
             or candidate.parent != config.root.parent
@@ -26245,9 +26285,10 @@ def _stored_repository_reference(
                 "stored absolute repository path must name one direct sibling of the project "
                 f"root, not the project root or another external path: {raw!r}"
             )
-        stored = (Path("..") / candidate.name).as_posix()
-        unresolved = candidate
-        allowed_root = config.root.parent
+        else:
+            stored = (Path("..") / candidate.name).as_posix()
+            unresolved = candidate
+            allowed_root = config.root.parent
     else:
         parts = candidate.parts
         sibling = _names_sibling_repository(parts)
@@ -26271,7 +26312,9 @@ def _stored_repository_reference(
             unresolved = config.root / normalized
             allowed_root = config.root
     _ensure_no_symlink_components(allowed_root, unresolved, "repository")
-    if _path_is_within(unresolved, _managed_worktrees_root(config)):
+    if not is_eden_backing and _path_is_within(
+        unresolved, _managed_worktrees_root(config)
+    ):
         raise Refusal(
             f"source repository must be outside the managed worktrees directory: {unresolved}"
         )
@@ -26281,7 +26324,11 @@ def _stored_repository_reference(
 def _stored_repository_path(config: Config, raw: str) -> tuple[str, Path]:
     stored, unresolved, allowed_root = _stored_repository_reference(config, raw)
     return _resolved_repository_path(
-        config, stored, unresolved, allowed_root
+        config,
+        stored,
+        unresolved,
+        allowed_root,
+        allow_managed=_configured_eden_backing_root(config, unresolved) is not None,
     )
 
 
