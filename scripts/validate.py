@@ -304,6 +304,7 @@ PREFIX_RULES: tuple[tuple[str, frozenset[str]], ...] = (
     ("Makefile", frozenset(GROUPS)),
     ("setup", frozenset(GROUPS)),
     ("README.md", frozenset()),
+    ("CHANGELOG.md", frozenset()),
     ("QUICKSTART.md", frozenset()),
     ("RELATED_WORK.md", frozenset()),
     ("scripts/README.md", frozenset()),
@@ -1816,7 +1817,7 @@ def self_test() -> int:
     )
     expect([".minibeads/issues/agent-utils-1.md"], set(), "issue metadata is not executable input")
     expect(
-        ["README.md", "RELATED_WORK.md", "common/README.md", "scripts/README.md"],
+        ["README.md", "CHANGELOG.md", "RELATED_WORK.md", "common/README.md", "scripts/README.md"],
         set(),
         "repository overview documents are not packaged inputs",
     )
