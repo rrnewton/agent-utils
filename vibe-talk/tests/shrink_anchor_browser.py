@@ -618,7 +618,7 @@ def shots(chromium: object, args: argparse.Namespace) -> list[str]:
     ]
     for label, width, height, touch in (("phone-412", 412, 915, True), ("desk-1280", 1280, 800, False)):
         for scheme in ("light", "dark"):
-            for case, index, offset in ((1, 5, 120.0), (2, 7, -90.0), (3, GIANT_INDEX, -600.0)):
+            for case, index, offset in ((1, 5, 220.0), (2, 7, -90.0), (3, GIANT_INDEX, -600.0)):
                 api = ShrinkApi()
                 server = ThreadingHTTPServer(("127.0.0.1", 0), handler(api))
                 server.daemon_threads = True
@@ -650,7 +650,8 @@ def shots(chromium: object, args: argparse.Namespace) -> list[str]:
                         page.evaluate(mark, [message_id(index), guide])
                         page.screenshot(path=str(out_dir / f"{stem}-before.png"))
                         press_done(page, index)
-                        settled(page)
+                        wait_settle_loop(page)
+                        wait_settle_loop(page)
                         after = page.evaluate(SNAP, message_id(index))
                         guide_after = after["centre"] if case == 3 else (after["aboveY"] if case == 1 else after["belowY"])
                         page.evaluate(mark, [message_id(index), guide_after])
