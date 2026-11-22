@@ -1,5 +1,5 @@
 ---
-title: 'agentctl-chat-bridge-write-burst: find and stop the chat bridge's multi-GB/min write bursts'
+title: 'agentctl-chat-bridge-write-burst: find and stop the chat bridge''s multi-GB/min write bursts'
 status: open
 priority: 1
 issue_type: bug

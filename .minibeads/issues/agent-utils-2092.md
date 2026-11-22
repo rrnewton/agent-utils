@@ -1,5 +1,5 @@
 ---
-title: 'wrkslots-cgroup-scoped-run-liveness: decide a run's liveness from its cgroup, not a host-wide process scan'
+title: 'wrkslots-cgroup-scoped-run-liveness: decide a run''s liveness from its cgroup, not a host-wide process scan'
 status: open
 priority: 1
 issue_type: feature

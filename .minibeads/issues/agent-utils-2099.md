@@ -1,5 +1,5 @@
 ---
-title: 'herdr-runtime-state-out-of-synced-config: keep herdr's session, log and socket files out of the synced config directory'
+title: 'herdr-runtime-state-out-of-synced-config: keep herdr''s session, log and socket files out of the synced config directory'
 status: open
 priority: 2
 issue_type: task
