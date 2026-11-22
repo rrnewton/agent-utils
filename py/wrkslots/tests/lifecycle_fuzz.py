@@ -250,6 +250,46 @@ def _wait_chain_loads(
 _ACTIVE: dict[str, object] = {}
 
 
+def _attached_loop_devices(root: Path) -> set[str]:
+    """Loop devices whose backing file lives under ``root``.
+
+    Recorded by device name at attach time (after project
+    creation and after every step). Teardown touches only
+    devices in this recorded set — never a pattern, never a
+    device another run attached.
+    """
+    devices: set[str] = set()
+    try:
+        done = subprocess.run(
+            ["losetup", "-l", "-O", "NAME,BACK-FILE"],
+            text=True, capture_output=True, timeout=30, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return devices
+    prefix = str(root) + "/"
+    for line in done.stdout.splitlines()[1:]:
+        fields = line.split()
+        if len(fields) >= 2 and fields[1].startswith(prefix):
+            devices.add(fields[0])
+    return devices
+
+
+def _record_attached(project: e2e.TestProject) -> None:
+    recorded = _ACTIVE.get("devices")
+    current = _attached_loop_devices(project.root)
+    if isinstance(recorded, set):
+        recorded |= current
+    else:
+        _ACTIVE["devices"] = set(current)
+
+
+def _residual_loop_devices(project: e2e.TestProject) -> set[str]:
+    recorded = _ACTIVE.get("devices")
+    if not isinstance(recorded, set):
+        return set()
+    return recorded & _attached_loop_devices(project.root)
+
+
 def _exit_sweep() -> None:
     """Detach this run's slot images through wrkslots (#2048).
 
@@ -264,6 +304,14 @@ def _exit_sweep() -> None:
             e2e._detach_project_images(project.root, trace)
         except Exception:
             pass
+        residual = _residual_loop_devices(project)
+        if residual:
+            # Unmount went through wrkslots; a recorded device
+            # still attached is reported by name, never detached
+            # by pattern or by hand here.
+            _ACTIVE["residual_loops"] = residual
+            print(f"residual loop devices for this run: "
+                  f"{sorted(str(d) for d in residual)}", file=sys.stderr)
 
 
 def _on_signal(signum: int, _frame: object) -> None:
@@ -278,6 +326,7 @@ def _run_seed(
     project = e2e._make_project(base, trace, ttl_seconds=2)
     _ACTIVE.update(project=project, trace=trace)
     atexit.register(_exit_sweep)
+    _record_attached(project)
     rng = random.Random(seed)
     live: set[str] = set()
     archived: set[str] = set()
@@ -360,6 +409,7 @@ def _run_seed(
                 p for p in _oracle(healed, step=label + " post-recover-wait")
                 if p not in problems
             ]
+        _record_attached(project)
         trace.add("step", label=label, chain_loads=state.get("chain_loads"),
                   classification=_classify_state(state),
                   journals=state.get("journals"))
@@ -403,6 +453,8 @@ def main() -> int:
                       file=sys.stderr)
             else:
                 shutil.rmtree(base, ignore_errors=True)
+    if _ACTIVE.get("residual_loops"):
+        return 1
     return 0
 
 

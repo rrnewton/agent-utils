@@ -14,6 +14,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 def _limits() -> None:
     resource.setrlimit(resource.RLIMIT_CPU, (600, 600))
@@ -32,6 +34,37 @@ def test_lifecycle_fuzz_fast_seeds(tmp_path: Path) -> None:
             f"seed {seed}:\n{done.stdout}\n{done.stderr}"
         )
         assert f"lifecycle fuzz passed; seed={seed}" in done.stdout
+
+
+def test_failing_run_leaves_no_loop_devices(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A scenario that fails mid-run still detaches its devices.
+
+    The fixture records loop devices by name at attach time;
+    the finally sweep unmounts through wrkslots, so zero of
+    this run's devices remain (other runs' devices, including
+    pre-existing orphans, are never touched or counted).
+    """
+    monkeypatch.setenv("WRKSLOTS_INIT_REPRESENTATION", "image")
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from wrkslots.tests import e2e_stress as e2e
+    from wrkslots.tests import lifecycle_fuzz as fuzz
+
+    trace = e2e.Trace(tmp_path / "trace.jsonl", seed=7)
+    project = e2e._make_project(tmp_path / "run", trace, ttl_seconds=2)
+    fuzz._ACTIVE.update(project=project, trace=trace)
+    fuzz._record_attached(project)
+    try:
+        e2e._create_unbound(project, "fz-a", "fz-fz-a", trace)
+        fuzz._record_attached(project)
+        raise RuntimeError("simulated scenario failure")
+    except RuntimeError:
+        pass
+    finally:
+        fuzz._exit_sweep()
+    assert fuzz._attached_loop_devices(project.root) == set()
+    assert not fuzz._ACTIVE.get("residual_loops")
 
 
 def test_sigterm_sweeps_run_images(tmp_path: Path) -> None:
