@@ -76,7 +76,12 @@ from types import FrameType
 from typing import NamedTuple
 
 import case_timings
-from run_component_tests import Manifest, components_for_paths, load_manifest
+from run_component_tests import (
+    Manifest,
+    components_for_paths,
+    load_manifest,
+    separate_suites_for_paths,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -393,6 +398,7 @@ def cross_filter_for_all(
         for path in paths
         if _longest_prefix_groups(path) is None
         and not components_for_paths([path], active_manifest)[0]
+        and not separate_suites_for_paths([path], active_manifest)
     ]
     if unclassified:
         shown = ", ".join(sorted(unclassified)[:3])
@@ -407,8 +413,10 @@ def selection_for(
 ) -> tuple[frozenset[str], dict[str, str], frozenset[str], dict[str, str]]:
     """Map changed paths onto validation groups and tool components.
 
-    A component match selects only that tool and its declared reverse dependencies. An
-    unrecognised path still selects every group and names itself as the reason.
+    A component match selects only that tool and its declared reverse dependencies. A
+    separate test file with no component lane (a frozen suite) is classified to its
+    named suite and selects no running group. An unrecognised path still selects
+    every group and names itself as the reason.
     """
     active_manifest = manifest if manifest is not None else load_manifest()
     components, component_because = components_for_paths(paths, active_manifest)
@@ -416,6 +424,7 @@ def selection_for(
     because: dict[str, str] = {group: "always" for group in ALWAYS}
     for path in sorted(paths):
         path_components, _ = components_for_paths([path], active_manifest)
+        path_separate = separate_suites_for_paths([path], active_manifest)
         best = _longest_prefix_groups(path)
         # Root `make mypy` scans the whole checkout, not only `py/`. A Python helper stored in an
         # otherwise prose-only directory is executable validation input and must not inherit the
@@ -446,6 +455,11 @@ def selection_for(
                 because.setdefault(DOCS, path)
         if best is None:
             if path_components:
+                continue
+            if path_separate:
+                # Classified to a separate suite with no component lane of its
+                # own (the frozen tick-hub Python edition): no DAG node runs
+                # it, so it owes only the always-on hygiene group.
                 continue
             # Fail safe. A path nobody has classified is a path nobody has reasoned about.
             for group in sorted(ALL_GROUPS):
@@ -1907,9 +1921,8 @@ def self_test() -> int:
     )
     expect(
         ["py/tests/test_tickhub_cli.py"],
-        {PYTHON},
-        "a test edit selects its owning component rather than every Python tool",
-        {"tick-hub"},
+        set(),
+        "a frozen separate test is classified to its frozen suite and selects no running lane",
     )
     expect(["scripts/something_new.py"], set(ALL_GROUPS), "an unclassified script must select EVERYTHING")
     expect(["brand_new_toplevel/x"], set(ALL_GROUPS), "an unclassified top level must select EVERYTHING")

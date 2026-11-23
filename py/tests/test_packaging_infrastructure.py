@@ -74,10 +74,12 @@ def _load_script(name: str) -> ModuleType:
 def test_python_package_selectors_accept_both_aliases_and_reject_duplicates() -> None:
     python_check = _load_script("check_python_packages")
 
-    selected = python_check._select_projects(["parallel_experiment_runner", "tick-hub"])
+    selected = python_check._select_projects(
+        ["parallel_experiment_runner", "pr-landing-planner"]
+    )
 
     assert [project.distribution for project in selected] == [
-        "tick-hub",
+        "pr-landing-planner",
         "parallel-experiment-runner",
     ]
     assert python_check._select_projects([]) == python_check.PROJECTS
@@ -99,7 +101,7 @@ def test_python_package_selector_list_and_help_are_discoverable(
 
     assert python_check.main(["--list-projects"]) == 0
     listed = capsys.readouterr().out
-    assert "tick-hub (directory alias: tick_hub)" in listed
+    assert "pr-landing-planner (directory alias: pr_landing_planner)" in listed
     assert "dagrun\n" in listed
     help_text = python_check._argument_parser().format_help()
     assert "--project NAME" in help_text
@@ -158,13 +160,13 @@ def test_python_package_main_only_builds_selected_projects(
         lambda project, *_args: observed.append(("smoke", project.distribution)),
     )
 
-    assert python_check.main(["--project", "tick_hub"]) == 0
+    assert python_check.main(["--project", "pr_landing_planner"]) == 0
     assert observed == [
         ("global", "topology"),
-        ("docstrings", "tick-hub"),
-        ("inspect", "tick-hub"),
-        ("inspect", "tick-hub"),
-        ("smoke", "tick-hub"),
+        ("docstrings", "pr-landing-planner"),
+        ("inspect", "pr-landing-planner"),
+        ("inspect", "pr-landing-planner"),
+        ("smoke", "pr-landing-planner"),
     ]
 
 
@@ -446,7 +448,7 @@ def test_artifact_doc_linters_reject_suite_language_sibling_and_template_leaks()
     rust_check = _load_script("check_rust_packages")
 
     python_errors = python_check._doc_violations(
-        python_check.PROJECTS[0], "agent-utils Rust tick-hub {{UNKNOWN}}"
+        python_check.PROJECTS[0], "agent-utils Rust pr-landing-planner {{UNKNOWN}}"
     )
     rust_errors = rust_check._doc_violations(
         rust_check.CRATES[0], "agent-utils Python tick-hub {{UNKNOWN}}"
@@ -684,8 +686,8 @@ def test_python_sibling_dependency_requires_a_project_local_exemption() -> None:
         parallel, dagrun_requirement
     )
     assert python_check._unexpected_sibling_requirements(
-        python_check.PROJECTS[0], {"tick-hub"}
-    ) == ["tick-hub"]
+        python_check.PROJECTS[0], {"wrkslots"}
+    ) == ["wrkslots"]
 
 
 def test_every_declared_markdown_resource_is_standalone() -> None:

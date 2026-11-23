@@ -11,6 +11,9 @@ The live tool is the Rust edition (`rs/tick-hub/`; `cargo install tick-hub`).
 Config and ops-state files written for this edition remain readable by the
 Rust edition; no persisted format changed at archival.
 
+The engine resolver refuses the Python edition, while invoking
+`py/bin/tick-hub` directly still executes this frozen edition.
+
 Known frozen divergence: this edition's `tick --dry-run` flag has no Rust
 counterpart (the Rust default already persists nothing without `--flush`).
 

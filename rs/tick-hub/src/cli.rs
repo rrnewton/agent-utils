@@ -839,8 +839,55 @@ mod tests {
         );
         let (code, json, _) = invoke(&["json", "--config", &pt]);
         assert_eq!(code, 0);
-        assert!(json.contains("\"cadence_offset_secs\": 0"));
-        assert!(json.contains("\"cadence_window_secs\": 1800"));
+        assert_eq!(
+            json,
+            r##"{
+  "description": "",
+  "health_checks": [],
+  "reminders": [
+    {
+      "name": "phase_a",
+      "cadence_secs": 3600,
+      "cadence_offset_secs": 0,
+      "cadence_window_secs": 1800,
+      "requires_flags": [],
+      "gate": null,
+      "emit": {
+        "kind": "note",
+        "title": "a",
+        "skill": "",
+        "fields": {}
+      }
+    },
+    {
+      "name": "phase_b",
+      "cadence_secs": 3600,
+      "cadence_offset_secs": 1800,
+      "requires_flags": [],
+      "gate": null,
+      "emit": {
+        "kind": "note",
+        "title": "b",
+        "skill": "",
+        "fields": {}
+      }
+    },
+    {
+      "name": "plain",
+      "cadence_secs": 3600,
+      "requires_flags": [],
+      "gate": null,
+      "emit": {
+        "kind": "note",
+        "title": "p",
+        "skill": "",
+        "fields": {}
+      }
+    }
+  ]
+}
+"##
+        );
         // G6d: yaml output fed back through json equals direct json.
         let (code, yaml, _) = invoke(&["yaml", "--config", &pt]);
         assert_eq!(code, 0);
@@ -898,6 +945,125 @@ mod tests {
             state_out,
             "NOTE: ops-state enabled=true tick_frequency_min=30 label=cross-host flags=count=2,ready=true\nACTION: actualize-tick-frequency desired=30 current=15 title=\"reschedule the tick to 30 min so it matches the intended cadence (currently 15 min)\"\n"
         );
+        // G6b/d: composite json/list exact (watched path normalized) + YAML round-trip.
+        let watched_plain = watched.to_string_lossy().into_owned();
+        let (code, composite_json, _) = invoke(&["json", "--config", &ct]);
+        assert_eq!(code, 0);
+        assert_eq!(
+            composite_json.replace(&watched_plain, "<WATCHED>"),
+            r##"{
+  "description": "cross-check unicode ☃",
+  "health_checks": [
+    {
+      "name": "snapshot",
+      "glob": "<WATCHED>",
+      "threshold_secs": 100,
+      "detail": "fixture age"
+    },
+    {
+      "name": "absent",
+      "glob": "<WATCHED>.missing-*",
+      "threshold_secs": 1,
+      "detail": ""
+    }
+  ],
+  "reminders": [
+    {
+      "name": "always",
+      "cadence_secs": 0,
+      "requires_flags": [],
+      "gate": null,
+      "emit": {
+        "kind": "action",
+        "title": "refresh {a} {z}",
+        "skill": "refresh-cache",
+        "fields": {
+          "a": "first",
+          "z": "last"
+        }
+      }
+    },
+    {
+      "name": "gated",
+      "cadence_secs": 60,
+      "requires_flags": [],
+      "gate": {
+        "cmd": "printf 'count=3\\n'",
+        "when": "nonempty",
+        "capture": true,
+        "parallel": true
+      },
+      "emit": {
+        "kind": "action",
+        "title": "triage {count}",
+        "skill": "triage",
+        "fields": {}
+      }
+    },
+    {
+      "name": "parallel_note",
+      "cadence_secs": 0,
+      "requires_flags": [],
+      "gate": {
+        "cmd": "true",
+        "when": "success",
+        "capture": false,
+        "parallel": true
+      },
+      "emit": {
+        "kind": "note",
+        "title": "parallel gate completed",
+        "skill": "",
+        "fields": {}
+      }
+    },
+    {
+      "name": "guarded",
+      "cadence_secs": 0,
+      "requires_flags": [
+        "ready"
+      ],
+      "gate": null,
+      "emit": {
+        "kind": "note",
+        "title": "guard is enabled",
+        "skill": "",
+        "fields": {}
+      }
+    },
+    {
+      "name": "not_due",
+      "cadence_secs": 500,
+      "requires_flags": [],
+      "gate": null,
+      "emit": {
+        "kind": "note",
+        "title": "must stay quiet",
+        "skill": "",
+        "fields": {}
+      }
+    }
+  ]
+}
+"##
+        );
+        let (code, composite_list, _) = invoke(&["list", "--config", &ct]);
+        assert_eq!(code, 0);
+        assert_eq!(
+            composite_list.replace(&watched_plain, "<WATCHED>"),
+            "reminders:\n  always         [action] every-tick refresh-cache\n  gated          [action] 60s triage gate[nonempty,capture]\n  parallel_note  [note] every-tick parallel gate completed gate[success]\n  guarded        [note] every-tick guard is enabled needs=ready\n  not_due        [note] 500s must stay quiet\nhealth checks:\n  snapshot  <WATCHED> threshold=100s\n  absent  <WATCHED>.missing-* threshold=1s\n"
+        );
+        let (code, composite_yaml, _) = invoke(&["yaml", "--config", &ct]);
+        assert_eq!(code, 0);
+        let composite_rt = temp_file("composite-roundtrip.yaml", &composite_yaml);
+        let composite_rt_t = composite_rt.to_string_lossy();
+        let (code, rt_json, _) = invoke(&["json", "--config", &composite_rt_t]);
+        assert_eq!(code, 0);
+        assert_eq!(rt_json, composite_json);
+        let (code, rt_list, _) = invoke(&["list", "--config", &composite_rt_t]);
+        assert_eq!(code, 0);
+        assert_eq!(rt_list, composite_list);
+        let _ = fs::remove_file(composite_rt);
         let _ = fs::remove_file(config);
         let _ = fs::remove_file(state);
         let _ = fs::remove_file(fired);
@@ -906,35 +1072,184 @@ mod tests {
 
     #[test]
     fn frozen_random_corpus_goldens() {
-        // G8: seed-1234 indices 0..4 frozen as literals; tick stdout is the golden.
-        let cases: &[(&str, &str, &str)] = &[
+        // G8: seed-1234 indices 0..4 frozen as literals; json+tick stdout are goldens.
+        let cases: &[(&str, &str, &str, &str)] = &[
             (
                 r#"{"description":"random fixture 0","reminders":[{"name":"r0","cadence_secs":0,"emit":{"kind":"action","title":"random 0:0 ☃","skill":"handler-0","fields":{"iteration":"0"}}},{"name":"r1","cadence_secs":0,"emit":{"kind":"action","title":"random 0:1 ☃","skill":"handler-1","fields":{"iteration":"0"}}},{"name":"r2","cadence_secs":0,"emit":{"kind":"action","title":"random 0:2 ☃","skill":"handler-2","fields":{"iteration":"0"}}},{"name":"r3","cadence_secs":30,"emit":{"kind":"action","title":"random 0:3 ☃","skill":"handler-3","fields":{"iteration":"0"}}},{"name":"r4","cadence_secs":0,"emit":{"kind":"action","title":"random 0:4 ☃","skill":"handler-4","fields":{"iteration":"0"}}},{"name":"r5","cadence_secs":0,"emit":{"kind":"note","title":"random 0:5 ☃"}}],"health_checks":[]}"#,
                 "0",
+                r##"{
+  "description": "random fixture 0",
+  "health_checks": [],
+  "reminders": [
+    {
+      "name": "r0",
+      "cadence_secs": 0,
+      "requires_flags": [],
+      "gate": null,
+      "emit": {
+        "kind": "action",
+        "title": "random 0:0 ☃",
+        "skill": "handler-0",
+        "fields": {
+          "iteration": "0"
+        }
+      }
+    },
+    {
+      "name": "r1",
+      "cadence_secs": 0,
+      "requires_flags": [],
+      "gate": null,
+      "emit": {
+        "kind": "action",
+        "title": "random 0:1 ☃",
+        "skill": "handler-1",
+        "fields": {
+          "iteration": "0"
+        }
+      }
+    },
+    {
+      "name": "r2",
+      "cadence_secs": 0,
+      "requires_flags": [],
+      "gate": null,
+      "emit": {
+        "kind": "action",
+        "title": "random 0:2 ☃",
+        "skill": "handler-2",
+        "fields": {
+          "iteration": "0"
+        }
+      }
+    },
+    {
+      "name": "r3",
+      "cadence_secs": 30,
+      "requires_flags": [],
+      "gate": null,
+      "emit": {
+        "kind": "action",
+        "title": "random 0:3 ☃",
+        "skill": "handler-3",
+        "fields": {
+          "iteration": "0"
+        }
+      }
+    },
+    {
+      "name": "r4",
+      "cadence_secs": 0,
+      "requires_flags": [],
+      "gate": null,
+      "emit": {
+        "kind": "action",
+        "title": "random 0:4 ☃",
+        "skill": "handler-4",
+        "fields": {
+          "iteration": "0"
+        }
+      }
+    },
+    {
+      "name": "r5",
+      "cadence_secs": 0,
+      "requires_flags": [],
+      "gate": null,
+      "emit": {
+        "kind": "note",
+        "title": "random 0:5 ☃",
+        "skill": "",
+        "fields": {}
+      }
+    }
+  ]
+}
+"##,
                 "NOTE: ops-state enabled=true tick_frequency_min=30\n[tick-hub: r0 · every tick]\nACTION: handler-0 iteration=0 title=\"random 0:0 ☃\"\n[tick-hub: r1 · every tick]\nACTION: handler-1 iteration=0 title=\"random 0:1 ☃\"\n[tick-hub: r2 · every tick]\nACTION: handler-2 iteration=0 title=\"random 0:2 ☃\"\n[tick-hub: r3 · every 30s]\nACTION: handler-3 iteration=0 title=\"random 0:3 ☃\"\n[tick-hub: r4 · every tick]\nACTION: handler-4 iteration=0 title=\"random 0:4 ☃\"\n[tick-hub: r5 · every tick]\nNOTE: random 0:5 ☃\nNOTE: emitted 5 instruction(s) this tick\n",
             ),
             (
                 r#"{"description":"random fixture 1","reminders":[{"name":"r0","cadence_secs":3600,"emit":{"kind":"action","title":"random 1:0 ☃","skill":"handler-0","fields":{"iteration":"1"}}},{"name":"r1","cadence_secs":1,"emit":{"kind":"action","title":"random 1:1 ☃","skill":"handler-1","fields":{"iteration":"1"}}}],"health_checks":[]}"#,
                 "1",
+                r##"{
+  "description": "random fixture 1",
+  "health_checks": [],
+  "reminders": [
+    {
+      "name": "r0",
+      "cadence_secs": 3600,
+      "requires_flags": [],
+      "gate": null,
+      "emit": {
+        "kind": "action",
+        "title": "random 1:0 ☃",
+        "skill": "handler-0",
+        "fields": {
+          "iteration": "1"
+        }
+      }
+    },
+    {
+      "name": "r1",
+      "cadence_secs": 1,
+      "requires_flags": [],
+      "gate": null,
+      "emit": {
+        "kind": "action",
+        "title": "random 1:1 ☃",
+        "skill": "handler-1",
+        "fields": {
+          "iteration": "1"
+        }
+      }
+    }
+  ]
+}
+"##,
                 "NOTE: ops-state enabled=true tick_frequency_min=30\n[tick-hub: r0 · every 3600s]\nACTION: handler-0 iteration=1 title=\"random 1:0 ☃\"\n[tick-hub: r1 · every 1s]\nACTION: handler-1 iteration=1 title=\"random 1:1 ☃\"\nNOTE: emitted 2 instruction(s) this tick\n",
             ),
             (
                 r#"{"description":"random fixture 2","reminders":[],"health_checks":[]}"#,
                 "2",
+                r##"{
+  "description": "random fixture 2",
+  "health_checks": [],
+  "reminders": []
+}
+"##,
                 "NOTE: ops-state enabled=true tick_frequency_min=30\nNOTE: emitted 0 instruction(s) this tick\n",
             ),
             (
                 r#"{"description":"random fixture 3","reminders":[{"name":"r0","cadence_secs":0,"emit":{"kind":"note","title":"random 3:0 ☃"}}],"health_checks":[]}"#,
                 "3",
+                r##"{
+  "description": "random fixture 3",
+  "health_checks": [],
+  "reminders": [
+    {
+      "name": "r0",
+      "cadence_secs": 0,
+      "requires_flags": [],
+      "gate": null,
+      "emit": {
+        "kind": "note",
+        "title": "random 3:0 ☃",
+        "skill": "",
+        "fields": {}
+      }
+    }
+  ]
+}
+"##,
                 "NOTE: ops-state enabled=true tick_frequency_min=30\n[tick-hub: r0 · every tick]\nNOTE: random 3:0 ☃\nNOTE: emitted 0 instruction(s) this tick\n",
             ),
         ];
-        for (fixture, now, golden) in cases {
+        for (fixture, now, json_golden, golden) in cases {
             let path = temp_file("random.json", fixture);
             let text = path.to_string_lossy();
             let (code, json, _) = invoke(&["json", "--config", &text]);
             assert_eq!(code, 0);
-            assert!(json.contains("random fixture"));
+            assert_eq!(json, *json_golden);
             let (code, tick, err) =
                 invoke(&["tick", "--config", &text, "--now", now, "--no-header"]);
             assert_eq!(code, 0, "{err}");

@@ -301,6 +301,25 @@ def _source_prefix_matches(path: str, prefix: str) -> bool:
     return path.startswith(prefix) if prefix.endswith("/") else path == prefix
 
 
+def separate_suites_for_paths(
+    paths: Sequence[str], manifest: Manifest
+) -> dict[str, str]:
+    """Return the separate validation suite each delegated test file belongs to.
+
+    Separate files are classified inventory, not component tests. A live suite
+    runs through its own DAG node, selected via the owning component's source
+    prefixes; a suite with no DAG node (the frozen tick-hub Python edition)
+    runs nowhere. Either way the file is classified, so the validation planner
+    must not treat it as an unknown path that selects everything.
+    """
+
+    return {
+        path: manifest.separate_test_files[path]
+        for path in paths
+        if path in manifest.separate_test_files
+    }
+
+
 def components_for_paths(
     paths: Sequence[str], manifest: Manifest
 ) -> tuple[frozenset[str], dict[str, str]]:
@@ -308,7 +327,10 @@ def components_for_paths(
 
     Paths outside this manifest's component boundary are deliberately absent from the result;
     the repository validation planner decides whether they are metadata, shared infrastructure,
-    or unknown and therefore require the complete contract.
+    or unknown and therefore require the complete contract. Separate test files
+    (see :func:`separate_suites_for_paths`) own no component through their test
+    listing; a live separate file may still match an owning component's source
+    prefix, while a frozen separate file matches neither and owns nothing.
     """
 
     selected: set[str] = set()
@@ -476,7 +498,10 @@ def _exercise_inventory_guards(manifest: Manifest, discovered: frozenset[str]) -
     for paths, expected in (
         (("py/dagrun/io.py",), {"dagrun", "experiment-runner"}),
         (("rs/dagrun/src/io.rs",), {"dagrun", "experiment-runner"}),
-        (("py/tests/test_tickhub_cli.py",), {"tick-hub"}),
+        # A frozen separate file owns no component: no DAG node runs it.
+        (("py/tests/test_tickhub_cli.py",), set()),
+        # A live separate file still routes to its DAG node's component.
+        (("py/tests/test_packaging_infrastructure.py",), {"repository-infrastructure"}),
         (("brand-new-tool/source.py",), set()),
     ):
         actual, _because = components_for_paths(paths, manifest)
@@ -485,6 +510,17 @@ def _exercise_inventory_guards(manifest: Manifest, discovered: frozenset[str]) -
                 f"component source routing mismatch for {paths}: "
                 f"expected {sorted(expected)}, got {sorted(actual)}"
             )
+
+    frozen = separate_suites_for_paths(("py/tests/test_tickhub_cli.py",), manifest)
+    if frozen != {"py/tests/test_tickhub_cli.py": "tick-hub-frozen-python-edition"}:
+        raise AssertionError(f"frozen separate-suite routing mismatch: {frozen}")
+    live = separate_suites_for_paths(
+        ("py/tests/test_packaging_infrastructure.py",), manifest
+    )
+    if live != {
+        "py/tests/test_packaging_infrastructure.py": "packaging-infrastructure"
+    }:
+        raise AssertionError(f"live separate-suite routing mismatch: {live}")
 
 
 def _parse_shard(value: str) -> str:
