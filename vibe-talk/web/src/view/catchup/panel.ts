@@ -1988,14 +1988,18 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     footer.hidden = covered === 0;
     // `#2133`: the processed list is a collapsible suffix of the summary
     // itself, just before Terms — shown only where the record keeps links.
-    const processed = deps.byId("discuss-processed") as HTMLDetailsElement;
-    const citedNow = new Set(answer.cited_ids);
-    const hasProcessed = answer.footer_links.some((link) => !citedNow.has(link.id));
-    processed.hidden = !hasProcessed;
-    if (hasProcessed) {
-      deps.byId("discuss-covers").textContent = "Other messages processed:";
-      const list = deps.byId("discuss-links");
-      list.replaceChildren(...Array.from(buildProcessedList(answer, scope).children));
+    // A host without the section keeps the old footer-only drawing.
+    const processed = maybe("discuss-processed") as HTMLDetailsElement | null;
+    if (processed !== null) {
+      const citedNow = new Set(answer.cited_ids);
+      const hasProcessed = answer.footer_links.some((link) => !citedNow.has(link.id));
+      processed.hidden = !hasProcessed;
+      if (hasProcessed) {
+        const covers = maybe("discuss-covers");
+        if (covers !== null) covers.textContent = "Other messages processed:";
+        const list = maybe("discuss-links");
+        if (list !== null) list.replaceChildren(...Array.from(buildProcessedList(answer, scope).children));
+      }
     }
     if (covered === 0) return;
     const unmarkable = deps.byId("discuss-unmarkable");

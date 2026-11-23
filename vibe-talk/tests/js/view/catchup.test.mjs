@@ -101,7 +101,7 @@ function deferred() {
 
 const IDS = [
   "discuss-open", "discuss-menu-open", "discuss-panel", "discuss-scope", "discuss-close", "discuss-status",
-  "discuss-answer", "discuss-footer", "discuss-covers", "discuss-links",
+  "discuss-answer", "discuss-footer", "discuss-covers", "discuss-links", "discuss-processed",
   "discuss-mark-read", "discuss-mark-unread", "discuss-unmarkable",
   "discuss-stamp", "discuss-retry", "discuss-terms", "discuss-terms-summary", "discuss-terms-list",
   "discuss-stale", "discuss-stale-text", "discuss-update", "discuss-new-summary", "discuss-timeline", "discuss-timeline-head", "discuss-current-covers", "discuss-current-head", "discuss-current-section",
