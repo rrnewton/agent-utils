@@ -5133,6 +5133,13 @@ def _act_glossary_wtf(driver: Driver) -> None:
     glossary link in the list."""
     driver.load(with_token=True)
     driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    # A kept Discuss panel from an earlier state would stand over the list
+    # (and the popover); this scene's subject is the channel list itself.
+    if bool(driver.js("window.__visible('discuss-panel')")):
+        driver.click("discuss-open")
+        driver.page.wait_for_function(
+            "() => !window.__visible('discuss-panel')", timeout=10_000
+        )
     _ensure_pane(driver, "pane-discord")
     driver.page.wait_for_function(
         "() => document.querySelectorAll('#discord-log > li').length > 0 "
