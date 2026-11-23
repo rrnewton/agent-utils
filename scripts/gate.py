@@ -1019,13 +1019,18 @@ def gate_log_root() -> Path:
 
 
 def gate_log_dir(run_id: str) -> Path:
-    """This gate's step-log directory: created before the command
-    starts, passed to dagrun as $DAGRUN_LOG_DIR (its evidence is
-    opt-in on exactly that variable), and recorded as the ledger
-    row's log_path so a red gate can be diagnosed after the fact."""
-    path = gate_log_root() / run_id
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+    """This gate's step-log directory, passed to dagrun as
+    $DAGRUN_LOG_DIR (its evidence is opt-in on exactly that variable)
+    and recorded as the ledger row's log_path so a red gate can be
+    diagnosed after the fact.
+
+    The directory is deliberately NOT created here: dagrun's
+    RunEvidence creates it itself (mode 0700) and refuses a
+    pre-existing caller directory, so a gate that mkdir'd it first
+    silently got no step logs at all (found 2026-11-23: every kept
+    directory since #2078 was empty). Only the root is ensured."""
+    gate_log_root().mkdir(parents=True, exist_ok=True)
+    return gate_log_root() / run_id
 
 
 def prune_gate_logs(keep: int | None = None) -> int:

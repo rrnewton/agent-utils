@@ -2619,7 +2619,10 @@ def test_gate_logs_are_kept_outside_the_worktree_and_recorded(tmp_path: Path) ->
                  if line.startswith("logdir="))
     rows = [json.loads(line) for line in ledger.read_text().splitlines()]
     assert rows[-1]["log_path"] == shown
-    assert Path(shown).is_dir() and str(tmp_path) in shown
+    assert str(tmp_path) in shown
+    # Not created by the gate itself: dagrun creates it (0700) or
+    # refuses a pre-existing one, so a non-dagrun command leaves it
+    # absent — the regression below proves dagrun fills it.
 
 
 def test_gate_log_retention_is_bounded(tmp_path: Path) -> None:
@@ -2749,3 +2752,22 @@ expires = "2999-01-01"
         env=env, capture_output=True, text=True)
     row = [json.loads(line) for line in ledger.read_text().splitlines()][-1]
     assert row["known_red_steps"] == [] and row["only_known_red"] is False
+
+
+def test_a_real_dagrun_step_fills_the_kept_log_directory(tmp_path: Path) -> None:
+    """#2078 regression (2026-11-23): the recorded log_path must
+    actually hold the step's log after a real dagrun run through a
+    gate — dagrun refuses a pre-created evidence directory, so the
+    gate must leave creation to it."""
+    ledger = tmp_path / "ledger.jsonl"
+    env = {**_env(tmp_path), "GATE_LEDGER": str(ledger)}
+    repo = Path(GATE).parents[1]
+    result = subprocess.run(
+        [PY, str(GATE), "--rerun", "--", str(repo / "common/bin/dagrun"), "run",
+         "--dag", "validation.dag.yaml", "--keep-going",
+         "--selected", "repository.hygiene.site"],
+        env=env, capture_output=True, text=True, timeout=300, cwd=repo)
+    assert result.returncode == 0, result.stdout[-2000:]
+    rows = [json.loads(line) for line in ledger.read_text().splitlines()]
+    log_dir = Path(rows[-1]["log_path"])
+    assert (log_dir / "repository.hygiene.site.log").is_file()
