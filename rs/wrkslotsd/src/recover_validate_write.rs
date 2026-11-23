@@ -307,10 +307,14 @@ const HISTORY_RECHECK_ATTEMPTS: usize = 3;
 /// cannot be read; the caller then takes the ordinary locked path,
 /// exactly as before #2125. Mirrors the Python edition's
 /// `_history_tip_proof`.
+/// One machine's (name, tip sequence, tip digest, ACTIVE revision,
+/// ARCHIVED revision) plus the on-disk journal names (#2125).
+type HistoryProof = (Vec<(String, u64, String, i64, i64)>, Vec<String>);
+
 fn history_proof(
     root: Option<&Path>,
     cfg: &Cfg,
-) -> Option<(Vec<(String, u64, String, i64, i64)>, Vec<String>)> {
+) -> Option<HistoryProof> {
     let machines = crate::global_state::discover_machines(&cfg.control).ok()?;
     let mut proof = Vec::new();
     for machine in &machines {
@@ -380,9 +384,9 @@ fn journals_absent(root: Option<&Path>) -> bool {
 /// prove-then-recheck rounds (no locks held) and the ordinary
 /// locked path (#2125).
 fn recover_outcomes(root: Option<&Path>, cfg: &Cfg, selected: &str, rows: &[Row]) -> Result<Value> {
-    validate_global(root, &cfg)?;
-    let active = active_document(root, &cfg, &selected)?;
-    let archives = crate::recover_absent_write::archives_document(&cfg, &selected)?;
+    validate_global(root, cfg)?;
+    let active = active_document(root, cfg, selected)?;
+    let archives = crate::recover_absent_write::archives_document(cfg, selected)?;
     let archives_revision = archives
         .get("revision")
         .and_then(Value::as_i64)
@@ -433,8 +437,8 @@ fn recover_outcomes(root: Option<&Path>, cfg: &Cfg, selected: &str, rows: &[Row]
                     row.machine, row.slot, row.record_sha256
                 ));
             }
-            assert_record_paths(&cfg, &record)?;
-            let slot_path = slot_directory(&cfg, &row.slot, slot_type)?;
+            assert_record_paths(cfg, &record)?;
+            let slot_path = slot_directory(cfg, &row.slot, slot_type)?;
             let mut paths: Vec<PathBuf> = vec![slot_path];
             for checkout in record
                 .get("checkouts")
@@ -478,7 +482,7 @@ fn recover_outcomes(root: Option<&Path>, cfg: &Cfg, selected: &str, rows: &[Row]
             && matching[0].get("generation").and_then(Value::as_i64) == Some(row.generation)
             && matching[0].get("slot_type").and_then(Value::as_str) == Some("validate")
             && matching[0].get("physical_storage").and_then(Value::as_str) == Some("removed")
-            && recovery_matches(&cfg, &selected, matching[0], archives_revision, row);
+            && recovery_matches(cfg, selected, matching[0], archives_revision, row);
         if !exact {
             return Err(format!(
                 "validation row {}/{} is neither active nor an exact prior absent-row recovery",
