@@ -4422,7 +4422,7 @@ test("thread views show roots in Main and the bar's selector offers Main, All, a
   assert.deepEqual(page.el("discord-log").children.map((row) => row.getAttribute("data-id")), ["200", "201", "203"]);
   assert.equal(threadButton(page.el("discord-log").children[1]).textContent, "1 reply");
   const rootRow = page.el("discord-log").children[1];
-  assert.ok(rootRow.children.indexOf(threadButton(rootRow)) > rootRow.children.findIndex((child) => child.className === "body"),
+  assert.ok(rootRow.children.findIndex((child) => child.className === "thread-reply-row") > rootRow.children.findIndex((child) => child.className === "body"),
     "the thread reply-count decorator must sit underneath the root message");
   assert.equal(threadButton(page.el("discord-log").children[2]).textContent, "about 1 reply");
   // Drawn from All, which holds every row of Main: no read. `#220 view-switch-instant`.
