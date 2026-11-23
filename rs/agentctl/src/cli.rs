@@ -796,19 +796,19 @@ struct TeamShepherd {
     #[arg(long, value_name = "DIR")]
     state_dir: Option<PathBuf>,
     /// Maximum judgement rounds in one incident, from 1 to 100 (default: 20)
-    #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=100), value_name = "ROUNDS")]
+    #[arg(long, default_value_t = 20, value_parser = bounded_u32::<1, 100>, value_name = "ROUNDS")]
     max_rounds: u32,
     /// Maximum wall minutes in one incident, from 1 to 1440 (default: 120)
-    #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..=1440), value_name = "MINUTES")]
+    #[arg(long, default_value_t = 120, value_parser = bounded_u64::<1, 1440>, value_name = "MINUTES")]
     max_minutes: u64,
     /// Hard seconds budget for one run-agent-prompt chain, from 1 to 3600 (default: 300)
-    #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..=3600), value_name = "SECONDS")]
+    #[arg(long, default_value_t = 300, value_parser = bounded_u64::<1, 3600>, value_name = "SECONDS")]
     call_timeout_seconds: u64,
     /// Seconds between rounds, from 0 to 3600 (default: 30)
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(0..=3600), value_name = "SECONDS")]
     round_delay_seconds: u64,
     /// Consecutive identical-manifest rounds that escalate early, from 1 to 100 (default: 2)
-    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..=100), value_name = "ROUNDS")]
+    #[arg(long, default_value_t = 2, value_parser = bounded_u32::<1, 100>, value_name = "ROUNDS")]
     no_progress_rounds: u32,
     /// The run-agent-prompt executable (default: run-agent-prompt on PATH)
     #[arg(long, value_name = "PATH")]
@@ -3297,6 +3297,22 @@ fn handoff_seconds(value: &str) -> Result<u64, String> {
     }
     Ok(value)
 }
+fn bounded_u32<const MIN: u32, const MAX: u32>(value: &str) -> Result<u32, String> {
+    let parsed: u32 = value.parse().map_err(|_| format!("not a count: {value}"))?;
+    if parsed < MIN || parsed > MAX {
+        return Err(format!("must be between {MIN} and {MAX}"));
+    }
+    Ok(parsed)
+}
+
+fn bounded_u64<const MIN: u64, const MAX: u64>(value: &str) -> Result<u64, String> {
+    let parsed: u64 = value.parse().map_err(|_| format!("not a count: {value}"))?;
+    if parsed < MIN || parsed > MAX {
+        return Err(format!("must be between {MIN} and {MAX}"));
+    }
+    Ok(parsed)
+}
+
 fn startup_seconds(value: &str) -> Result<f64, String> {
     let value = seconds(value)?;
     if value <= 0.0 || value > 300.0 {

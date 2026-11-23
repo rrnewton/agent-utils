@@ -63,7 +63,7 @@ fn spawn_grouped(command: &mut Command) -> (std::process::Output, GroupGuard) {
         .process_group(0)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.spawn().expect("spawn grouped child");
+    let child = command.spawn().expect("spawn grouped child");
     let guard = GroupGuard(child.id());
     let output = child.wait_with_output().expect("wait for grouped child");
     (output, guard)
