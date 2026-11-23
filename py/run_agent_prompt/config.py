@@ -176,7 +176,12 @@ def load_profiles(path: Path) -> list[Profile]:
             raise ValueError(f"profiles {path}: profile {name} command must be absolute")
         timeout = table.get("timeout_seconds")
         if timeout is not None and (
-            isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or timeout <= 0
+            or timeout != timeout
+            or timeout in (float("inf"), float("-inf"))
+            or timeout > 3600
         ):
             raise ValueError(f"profiles {path}: profile {name} timeout_seconds must be positive")
         disabled = table.get("disabled", False)

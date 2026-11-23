@@ -445,30 +445,39 @@ pub fn install_restore_teams(options: &InstallOptions, teams_config: &Path) -> R
 /// it starts in parallel and monitors them.
 pub fn rendered_shepherd(
     options: &InstallOptions,
-    teams_config: Option<&Path>,
+    wrapper: Option<&Path>,
 ) -> Result<(PathBuf, String)> {
     let agentctl = unit_path("agentctl", &options.agentctl)?;
     let registry = unit_path("registry", &options.registry)?;
     let herdr = unit_path("herdr", &options.herdr)?;
-    let config_arg = match teams_config {
-        Some(path) => format!(" --config {}", unit_path("teams config", path)?),
+    // Per-registry unit name (like the tab-hygiene pair), so two
+    // teams on one host never overwrite each other's unit.
+    let key = crate::restore::team_key(&options.registry);
+    let name = format!("agentctl-shepherd-{}.service", &key[..12]);
+    // The unit names the exact wrapper the install smoked, so boot
+    // judgement never silently uses a different one (S9).
+    let wrapper_arg = match wrapper {
+        Some(path) => format!(
+            " --run-agent-prompt {}",
+            unit_path("run-agent-prompt", path)?
+        ),
         None => String::new(),
     };
     Ok((
-        PathBuf::from("agentctl-shepherd.service"),
+        PathBuf::from(name),
         SHEPHERD
             .replace("@AGENTCTL@", &agentctl)
             .replace("@REGISTRY@", &registry)
             .replace("@HERDR@", &herdr)
-            .replace("@TEAMS_CONFIG_ARG@", &config_arg),
+            .replace("@WRAPPER_ARG@", &wrapper_arg),
     ))
 }
 
-/// Write only `agentctl-shepherd.service`; refuse to replace a
-/// different existing file without `force`. Enables and starts
-/// nothing: the operator enables the shepherd deliberately.
-pub fn install_shepherd(options: &InstallOptions, teams_config: Option<&Path>) -> Result<Value> {
-    let file = rendered_shepherd(options, teams_config)?;
+/// Write only this registry's `agentctl-shepherd-<key>.service`;
+/// refuse to replace a different existing file without `force`.
+/// Enables and starts nothing: the operator enables it deliberately.
+pub fn install_shepherd(options: &InstallOptions, wrapper: Option<&Path>) -> Result<Value> {
+    let file = rendered_shepherd(options, wrapper)?;
     let unit = file.0.display().to_string();
     let (written, unchanged) = write_files(options, &[file])?;
     Ok(json!({

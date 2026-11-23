@@ -125,7 +125,9 @@ never raw records, ask for one `team act` proposal, and run that action yourself
 
 `agentctl --registry R start-recovery` is the one entry point that runs this protocol when nobody
 is there to drive sections 1–3 by hand. A service unit, a startup script, a container foreground
-process, a remote shell, and a human all call the same command; no service manager is assumed. It
+process, a remote shell, and a human all call the same command; no service manager is assumed.
+It runs on the agents host in the host PID namespace (restore refuses descendant namespaces);
+`--foreground` is for a supervised process there, not for an isolated container. It
 claims one incident per restore epoch (the kernel boot plus the user-manager identity, the same
 epoch the restore replay guard uses — a claim from a previous boot never blocks), launches
 deterministic restore and the recovery supervisor together, and returns. A second live call joins

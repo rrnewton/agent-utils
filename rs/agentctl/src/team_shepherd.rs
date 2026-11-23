@@ -79,6 +79,11 @@ pub struct ShepherdOptions {
     /// Incident claim file to heartbeat while running, when launched
     /// through `start-recovery`.
     pub claim_file: Option<PathBuf>,
+    /// Seconds before a dead claim with no heartbeat counts as stale.
+    pub stale_seconds: f64,
+    /// A restore child was already launched by `start-recovery`:
+    /// supervise it, never start a second one.
+    pub restore_launched: bool,
     /// Seconds a `team act` execution may wait for its receipt.
     pub act_wait_seconds: u64,
 }
@@ -95,6 +100,8 @@ impl Default for ShepherdOptions {
             run_agent_prompt: PathBuf::from("run-agent-prompt"),
             profile_file: None,
             claim_file: None,
+            stale_seconds: 180.0,
+            restore_launched: false,
             act_wait_seconds: 60,
         }
     }
@@ -130,10 +137,29 @@ struct TeamRound {
     lead_live: bool,
 }
 
-/// The shepherd state directory for one boot:
-/// `<state root>/shepherd/<boot-id>/`.
-pub fn shepherd_dir(state_dir: Option<&Path>, boot_id: &str) -> Option<PathBuf> {
-    Some(state_root(state_dir)?.join("shepherd").join(boot_id))
+/// The shepherd state directory for one team's one incident:
+/// `<state root>/shepherd/<team-key>/<boot-id>-<epoch-tag>/` (B1: a
+/// host's teams never share a stamp or state file, and a user-manager
+/// restart begins a new epoch in the same boot).
+pub fn shepherd_dir(
+    state_dir: Option<&Path>,
+    registry: &Path,
+    epoch: &RestoreEpoch,
+) -> Option<PathBuf> {
+    let tag = epoch
+        .user_manager
+        .as_deref()
+        .map(|manager| {
+            let digest = format!("{:x}", Sha256::digest(manager.as_bytes()));
+            digest[..8].to_owned()
+        })
+        .unwrap_or_else(|| "nomgr".to_owned());
+    Some(
+        state_root(state_dir)?
+            .join("shepherd")
+            .join(crate::restore::team_key(registry))
+            .join(format!("{}-{tag}", epoch.boot_id)),
+    )
 }
 
 fn state_root(state_dir: Option<&Path>) -> Option<PathBuf> {
@@ -149,6 +175,31 @@ fn state_root(state_dir: Option<&Path>) -> Option<PathBuf> {
 pub fn manifest_hash(manifest: &Value) -> String {
     let text = serde_json::to_string(manifest).unwrap_or_default();
     format!("{:x}", Sha256::digest(text.as_bytes()))
+}
+
+/// The progress hash: the manifest with volatile fields (`checked_at`
+/// timestamps and other per-build clock readings) removed, so two
+/// rounds over unchanged facts hash identically (S2).
+pub fn progress_hash(manifest: &Value) -> String {
+    fn strip(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                map.retain(|key, _| key != "checked_at");
+                for inner in map.values_mut() {
+                    strip(inner);
+                }
+            }
+            Value::Array(items) => {
+                for inner in items {
+                    strip(inner);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut projected = manifest.clone();
+    strip(&mut projected);
+    manifest_hash(&projected)
 }
 
 /// The proposal a one-shot answer carries: its last JSON line with an
@@ -173,9 +224,9 @@ pub fn proposal_argv(proposal: &Value) -> std::result::Result<Vec<String>, Strin
     let field = |name: &str| -> std::result::Result<String, String> {
         proposal[name]
             .as_str()
-            .filter(|value| !value.is_empty())
+            .filter(|value| !value.is_empty() && !value.starts_with('-'))
             .map(str::to_owned)
-            .ok_or_else(|| format!("proposal {action} missing {name}"))
+            .ok_or_else(|| format!("proposal {action} missing or invalid {name}"))
     };
     let argv = match action {
         "facts" => vec!["facts".to_owned()],
@@ -185,11 +236,11 @@ pub fn proposal_argv(proposal: &Value) -> std::result::Result<Vec<String>, Strin
         "drain" => vec!["drain".to_owned(), field("agent")?],
         "declare-done" => vec!["declare-done".to_owned()],
         "escalate" => {
-            let mut argv = vec!["escalate".to_owned()];
-            if let Some(text) = proposal["text"].as_str().filter(|text| !text.is_empty()) {
-                argv.push(text.to_owned());
-            }
-            argv
+            let text = proposal["text"]
+                .as_str()
+                .filter(|text| !text.is_empty() && !text.starts_with('-'))
+                .unwrap_or("recovery needs a human decision");
+            vec!["escalate".to_owned(), text.to_owned()]
         }
         "kill-pid" => vec![
             "kill-pid".to_owned(),
@@ -214,6 +265,7 @@ fn run_bounded(
     args: &[String],
     timeout: Duration,
 ) -> Result<(i32, String, String)> {
+    use std::io::Read;
     let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
@@ -221,28 +273,56 @@ fn run_bounded(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| fail(format!("cannot run {}: {error}", program.display())))?;
+    // Drain both pipes while the child runs, so a large report can
+    // never block it on a full pipe.
+    let mut out_pipe = child.stdout.take().expect("piped stdout");
+    let out_thread = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = out_pipe.read_to_string(&mut text);
+        text
+    });
+    let mut err_pipe = child.stderr.take().expect("piped stderr");
+    let err_thread = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = err_pipe.read_to_string(&mut text);
+        text
+    });
     let started = Instant::now();
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) if started.elapsed() < timeout => {
                 std::thread::sleep(Duration::from_millis(50));
             }
             Ok(None) => {
-                let _ = child.kill();
-                break;
+                // SIGTERM first (the wrapper cleans up its own
+                // process group on TERM), grace, then SIGKILL.
+                let _ = Command::new("kill").arg(child.id().to_string()).status();
+                let grace = Instant::now();
+                let mut waited: Option<std::process::ExitStatus> = None;
+                while waited.is_none() {
+                    match child.try_wait() {
+                        Ok(Some(status)) => waited = Some(status),
+                        Ok(None) if grace.elapsed() < Duration::from_secs(2) => {
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
+                        Ok(None) => {
+                            let _ = child.kill();
+                            waited = child.wait().ok();
+                        }
+                        Err(error) => {
+                            return Err(fail(format!("cannot wait on a subprocess: {error}")))
+                        }
+                    }
+                }
+                break waited.expect("timeout arm produced a status");
             }
             Err(error) => return Err(fail(format!("cannot wait on a subprocess: {error}"))),
         }
-    }
-    let output = child
-        .wait_with_output()
-        .map_err(|error| fail(format!("cannot collect a subprocess: {error}")))?;
-    Ok((
-        output.status.code().unwrap_or(1),
-        String::from_utf8_lossy(&output.stdout).into_owned(),
-        String::from_utf8_lossy(&output.stderr).into_owned(),
-    ))
+    };
+    let stdout = out_thread.join().unwrap_or_default();
+    let stderr = err_thread.join().unwrap_or_default();
+    Ok((status.code().unwrap_or(1), stdout, stderr))
 }
 
 /// Which profile answered, from the wrapper's stderr attempt lines
@@ -386,10 +466,10 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
         boot_id: boot_id.clone(),
         user_manager: host.user_manager_id(),
     };
-    let dir = shepherd_dir(options.state_dir.as_deref(), &boot_id)
+    let dir = shepherd_dir(options.state_dir.as_deref(), own, &epoch)
         .ok_or_else(|| fail("cannot determine the agentctl state directory"))?;
-    std::fs::create_dir_all(&dir)
-        .map_err(|error| fail(format!("cannot create {}: {error}", dir.display())))?;
+    agent_queue::fsio::create_private_directory(&dir, "shepherd state directory", true, true)
+        .map_err(|error| fail(error.to_string()))?;
     if let Some(stamp) = load_stamp(&dir) {
         // A terminal stamp for this boot: resume means report, never
         // repeat effects.
@@ -413,6 +493,59 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
     let incident = crate::team_driver::incident_id(own, &epoch);
     state.incident = incident.clone();
     save_state(&dir, &state)?;
+    // Own the incident (B2): a manual `team shepherd` takes the claim
+    // itself; a start-recovery supervisor adopts its starter's
+    // pending claim. A live foreign claim means report, never act.
+    let claim_path = options.claim_file.clone().or_else(|| {
+        recovery_dir(options.state_dir.as_deref(), own).map(|dir| dir.join("claim.json"))
+    });
+    let Some(claim_path) = claim_path else {
+        return Err(fail("cannot determine the recovery claim path"));
+    };
+    match acquire_claim(
+        &claim_path,
+        own,
+        &incident,
+        &epoch,
+        options.stale_seconds,
+        false,
+    )? {
+        ClaimOutcome::Owned(_) => {}
+        ClaimOutcome::AlreadyRunning => {
+            return Ok(json!({
+                "schema": SHEPHERD_REPORT_SCHEMA,
+                "boot_id": boot_id,
+                "verdict": "already-running",
+                "incident": incident,
+                "claim": claim_path,
+                "exit_code": 75,
+            }));
+        }
+    }
+    // Heartbeat independently of rounds: rounds can legitimately
+    // outrun the stale interval, so a thread refreshes the claim and
+    // flags loss of ownership for the loop to stop on.
+    let claim_lost = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let heartbeat_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let heartbeat_thread = {
+        let claim_path = claim_path.clone();
+        let incident = incident.clone();
+        let lost = claim_lost.clone();
+        let stop = heartbeat_stop.clone();
+        let interval = Duration::from_secs_f64((options.stale_seconds / 4.0).clamp(5.0, 60.0));
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(interval);
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                if !heartbeat_claim(&claim_path, &incident) {
+                    lost.store(true, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
+            }
+        })
+    };
     let started = Instant::now();
     let mut verdict = "NO";
     let mut summaries: BTreeMap<String, Value> = BTreeMap::new();
@@ -421,25 +554,49 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
         round += 1;
         let mut rounds_teams: Vec<TeamRound> = Vec::new();
         for registry in std::iter::once(own).chain(judged.iter().map(PathBuf::as_path)) {
-            let config = RestoreConfig::load(registry)?;
-            let coordinator = config.coordinator.clone().unwrap_or_default();
-            let (manifest, verify) = manifest_team_with_verify(
-                client,
-                registry,
-                host,
-                &config,
-                &VerifyOptions {
-                    state_dir: options.state_dir.clone(),
-                    ack_timeout_seconds: 1800,
-                    dismiss_allowlisted: false,
-                },
-            )?;
-            rounds_teams.push(TeamRound {
-                registry: registry.to_path_buf(),
-                yes: explicit_yes(&verify, &coordinator),
-                lead_live: lead_live(&verify, &coordinator),
-                manifest,
+            // A team's facts error is a fact, never a supervisor
+            // abort (S3): a broken peer must not disable own-team
+            // recovery, and an own-team error counts toward give-up.
+            let gathered = RestoreConfig::load(registry).and_then(|config| {
+                let coordinator = config.coordinator.clone().unwrap_or_default();
+                manifest_team_with_verify(
+                    client,
+                    registry,
+                    host,
+                    &config,
+                    &VerifyOptions {
+                        state_dir: options.state_dir.clone(),
+                        ack_timeout_seconds: 1800,
+                        dismiss_allowlisted: false,
+                    },
+                )
+                .map(|(manifest, verify)| (manifest, verify, coordinator))
             });
+            match gathered {
+                Ok((manifest, verify, coordinator)) => {
+                    rounds_teams.push(TeamRound {
+                        registry: registry.to_path_buf(),
+                        yes: explicit_yes(&verify, &coordinator),
+                        lead_live: lead_live(&verify, &coordinator),
+                        manifest,
+                    });
+                }
+                Err(error) => {
+                    append_log(
+                        &dir,
+                        &format!(
+                            "round {round}: facts error for {}: {error}",
+                            registry.display()
+                        ),
+                    );
+                    rounds_teams.push(TeamRound {
+                        registry: registry.to_path_buf(),
+                        yes: false,
+                        lead_live: false,
+                        manifest: json!({"schema": crate::team_manifest::MANIFEST_SCHEMA, "error": error.to_string()}),
+                    });
+                }
+            }
         }
         let (own_round, judged_rounds) = rounds_teams.split_first().unwrap();
         for team in &rounds_teams {
@@ -462,12 +619,12 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
             save_state(&dir, &state)?;
             break;
         }
-        // Step 0 + the deterministic arm, own team only, and only while
-        // its lead is down: dry run first, then real; --force only when
-        // the dry run replayed a completed report yet agents are down
-        // (the user-manager-restart case in the skill).
+        // Step 0 + the deterministic arm, own team only, and only
+        // while its lead is down. When start-recovery launched the
+        // restore child, the supervisor only reads its reports as
+        // facts and never starts a second restore (S4).
         let own_actionable = !own_round.lead_live;
-        if own_actionable && !state.restore_done {
+        if own_actionable && !state.restore_done && !options.restore_launched {
             let base = vec![
                 "--registry".to_owned(),
                 own.display().to_string(),
@@ -476,53 +633,73 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
             ];
             let mut dry_args = base.clone();
             dry_args.extend(["restore".to_owned(), "--dry-run".to_owned()]);
-            let (_, dry_text, _) = run_bounded(
+            let _ = run_bounded(
                 &inputs.agentctl,
                 &dry_args,
                 Duration::from_secs(options.call_timeout_seconds.max(60)),
-            )?;
-            let dry: Value = serde_json::from_str(&dry_text).unwrap_or(Value::Null);
-            let replayed = dry["replayed"] == json!(true)
-                || dry["action"].as_str() == Some("already-restored");
+            );
+            // A dry run never replays (restore.rs), so there is no
+            // replayed-but-down signal to force from: the real run's
+            // own replay guard decides. The user-manager-restart
+            // --force case stays a manual team-restore step.
             let mut real_args = base;
             real_args.push("restore".to_owned());
-            if replayed {
-                real_args.push("--force".to_owned());
-            }
-            let (code, _, _) = run_bounded(
+            let code = match run_bounded(
                 &inputs.agentctl,
                 &real_args,
                 Duration::from_secs(options.max_minutes.max(1) * 60),
-            )?;
-            append_log(
-                &dir,
-                &format!("round {round}: restore replayed={replayed} exit={code}"),
-            );
+            ) {
+                Ok((code, _, _)) => code,
+                Err(error) => {
+                    append_log(
+                        &dir,
+                        &format!("round {round}: restore could not run: {error}"),
+                    );
+                    1
+                }
+            };
+            append_log(&dir, &format!("round {round}: restore exit={code}"));
             state.restore_done = true;
             save_state(&dir, &state)?;
         }
         // One judgement call per round; at most one own-team act.
-        // With a profile file, judgement runs only on a current
-        // all-pass smoke record; deterministic recovery never waits
-        // on it.
+        // Fail closed (S1): no profile file, or no current all-pass
+        // smoke record for it, means no model is consulted at all;
+        // deterministic recovery never waits on judgement.
         let judgement = match &options.profile_file {
-            Some(file) => {
-                if judgement_allowed(options.state_dir.as_deref(), own, file) {
-                    Some(file.clone())
-                } else {
-                    append_log(
-                        &dir,
-                        &format!("round {round}: judgement unavailable (smoke)"),
-                    );
-                    None
-                }
+            Some(file)
+                if judgement_allowed(
+                    options.state_dir.as_deref(),
+                    own,
+                    file,
+                    &options.run_agent_prompt,
+                ) =>
+            {
+                Some(file.clone())
             }
-            None => None,
+            _ => {
+                append_log(
+                    &dir,
+                    &format!("round {round}: judgement unavailable (smoke)"),
+                );
+                None
+            }
         };
         let prompt = brief(own_round, judged_rounds, round);
         let prompt_path = dir.join(format!("prompt-{round}.txt"));
-        std::fs::write(&prompt_path, &prompt)
-            .map_err(|error| fail(format!("cannot write the round brief: {error}")))?;
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&prompt_path)
+                .map_err(|error| fail(format!("cannot write the round brief: {error}")))?;
+            use std::io::Write;
+            file.write_all(prompt.as_bytes())
+                .map_err(|error| fail(format!("cannot write the round brief: {error}")))?;
+        }
         let mut wrapper_args = vec![
             "--prompt-file".to_owned(),
             prompt_path.display().to_string(),
@@ -532,7 +709,11 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
         if let Some(file) = &judgement {
             wrapper_args.extend(["--profile-file".to_owned(), file.display().to_string()]);
         }
-        let answer = if options.profile_file.is_some() && judgement.is_none() {
+        wrapper_args.extend([
+            "--total-timeout".to_owned(),
+            (options.call_timeout_seconds * 3).to_string(),
+        ]);
+        let answer = if judgement.is_none() {
             Err(fail("judgement unavailable"))
         } else {
             run_bounded(
@@ -561,19 +742,33 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
                             inputs.herdr_bin.display().to_string(),
                             "team".to_owned(),
                             "act".to_owned(),
+                        ];
+                        if let Some(state) = &options.state_dir {
+                            args.extend(["--state-dir".to_owned(), state.display().to_string()]);
+                        }
+                        args.extend([
                             "--incident".to_owned(),
                             incident.clone(),
                             "--request-id".to_owned(),
                             format!("shepherd-{incident}-r{round}"),
                             "--wait-seconds".to_owned(),
                             options.act_wait_seconds.to_string(),
-                        ];
+                        ]);
                         args.extend(action_argv);
-                        let (code, _, _) = run_bounded(
+                        let code = match run_bounded(
                             &inputs.agentctl,
                             &args,
                             Duration::from_secs(options.act_wait_seconds + 120),
-                        )?;
+                        ) {
+                            Ok((code, _, _)) => code,
+                            Err(error) => {
+                                append_log(
+                                    &dir,
+                                    &format!("round {round}: team act could not run: {error}"),
+                                );
+                                1
+                            }
+                        };
                         append_log(
                             &dir,
                             &format!("round {round}: team act {} exit={code}", proposal["action"]),
@@ -586,7 +781,7 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
             }
         }
         // No-progress bookkeeping on the owning team's manifest.
-        let hash = manifest_hash(&own_round.manifest);
+        let hash = progress_hash(&own_round.manifest);
         if hash == state.last_manifest_hash {
             state.no_progress += 1;
         } else {
@@ -595,8 +790,9 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
         }
         state.round = round;
         save_state(&dir, &state)?;
-        if let Some(claim) = &options.claim_file {
-            heartbeat_claim(claim, &incident, &boot_id);
+        if claim_lost.load(std::sync::atomic::Ordering::Relaxed) {
+            append_log(&dir, &format!("round {round}: claim lost; stopping"));
+            break;
         }
         let elapsed = started.elapsed() >= Duration::from_secs(options.max_minutes * 60);
         if elapsed || state.no_progress >= options.no_progress_rounds {
@@ -606,20 +802,30 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
             std::thread::sleep(Duration::from_secs(options.round_delay_seconds));
         }
     }
+    let claim_lost_now = claim_lost.load(std::sync::atomic::Ordering::Relaxed);
+    heartbeat_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = heartbeat_thread.join();
     if verdict != "YES" {
-        // Bounded give-up: escalate through the landed path (own team,
-        // lead down) and stamp. A live lead owns escalation instead.
-        let own_yes = summaries
-            .get(&own.display().to_string())
-            .is_some_and(|row| row["yes"] == json!(true));
-        if !own_yes {
-            let args = vec![
+        // Bounded give-up: escalate through the landed path only
+        // while the own lead is down (B4). A live lead owns recovery
+        // under step 0: the stamp records the outcome and no `team
+        // act` — which could kick the driver — is ever sent to it.
+        let own_row = summaries.get(&own.display().to_string());
+        let own_yes = own_row.is_some_and(|row| row["yes"] == json!(true));
+        let own_lead_live = own_row.is_some_and(|row| row["lead_live"] == json!(true));
+        if !own_yes && !own_lead_live && !claim_lost_now {
+            let mut args = vec![
                 "--registry".to_owned(),
                 own.display().to_string(),
                 "--herdr-bin".to_owned(),
                 inputs.herdr_bin.display().to_string(),
                 "team".to_owned(),
                 "act".to_owned(),
+            ];
+            if let Some(state) = &options.state_dir {
+                args.extend(["--state-dir".to_owned(), state.display().to_string()]);
+            }
+            args.extend([
                 "--incident".to_owned(),
                 incident.clone(),
                 "--request-id".to_owned(),
@@ -628,7 +834,7 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
                 options.act_wait_seconds.to_string(),
                 "escalate".to_owned(),
                 "shepherd gave up without a deterministic YES".to_owned(),
-            ];
+            ]);
             let _ = run_bounded(
                 &inputs.agentctl,
                 &args,
@@ -639,6 +845,7 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
     }
     let stamp = json!({
         "schema": SHEPHERD_STAMP_SCHEMA,
+        "reason": if claim_lost_now { "claim-lost" } else if verdict == "YES" { "verified" } else { "bounded-give-up" },
         "boot_id": boot_id,
         "epoch": epoch.as_json(),
         "incident": incident,
@@ -856,7 +1063,12 @@ pub fn recovery_dir(state_dir: Option<&Path>, registry: &Path) -> Option<PathBuf
 /// Whether judgement is currently trusted for this profile file: a
 /// smoke record exists, binds to the file's current hash, and every
 /// enabled profile passed. Anything else leaves judgement unavailable.
-pub fn judgement_allowed(state_dir: Option<&Path>, registry: &Path, profile_file: &Path) -> bool {
+pub fn judgement_allowed(
+    state_dir: Option<&Path>,
+    registry: &Path,
+    profile_file: &Path,
+    wrapper: &Path,
+) -> bool {
     let Ok(bytes) = std::fs::read(profile_file) else {
         return false;
     };
@@ -875,15 +1087,52 @@ pub fn judgement_allowed(state_dir: Option<&Path>, registry: &Path, profile_file
     if record["schema"] != SMOKE_SCHEMA || record["config_hash"] != profiles_hash(&bytes) {
         return false;
     }
-    profiles
+    if record["chain"]["status"] != "pass" {
+        return false;
+    }
+    // The record binds the wrapper it smoked; a different wrapper at
+    // runtime is a different, unsmoked judgement path.
+    let smoked_wrapper = record["wrapper"].as_str().unwrap_or_default();
+    let runtime_wrapper = std::fs::canonicalize(wrapper)
+        .unwrap_or_else(|_| wrapper.to_path_buf())
+        .display()
+        .to_string();
+    if smoked_wrapper != runtime_wrapper {
+        return false;
+    }
+    let enabled: Vec<&RecoveryProfile> = profiles
         .iter()
         .filter(|profile| !profile.disabled)
-        .all(|profile| {
-            record["profiles"].as_array().is_some_and(|rows| {
-                rows.iter()
-                    .any(|row| row["name"] == profile.name && row["status"] == "pass")
-            })
+        .collect();
+    if enabled.is_empty() {
+        return false;
+    }
+    enabled.iter().all(|profile| {
+        record["profiles"].as_array().is_some_and(|rows| {
+            rows.iter()
+                .any(|row| row["name"] == profile.name && row["status"] == "pass")
         })
+    })
+}
+
+/// The `/proc` start ticks (field 22) of a live pid, for verifying
+/// that a recorded pid is still the same process, not a recycled one.
+pub fn pid_start_ticks(pid: u64) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after = stat.rsplit_once(')')?.1;
+    after.split_whitespace().nth(19).map(str::to_owned)
+}
+
+/// Whether a claim's recorded owner is verifiably still that process:
+/// same pid, same start ticks.
+pub fn claim_owner_alive(claim: &Value) -> bool {
+    let Some(pid) = claim["pid"].as_u64() else {
+        return false;
+    };
+    match (claim["pid_start"].as_str(), pid_start_ticks(pid)) {
+        (Some(recorded), Some(current)) => recorded == current,
+        _ => Path::new(&format!("/proc/{pid}")).exists(),
+    }
 }
 
 /// What claiming an incident should do, decided purely.
@@ -900,13 +1149,16 @@ pub enum ClaimDecision {
 }
 
 /// Decide from a claim record. A claim from a different boot is stale
-/// by definition, whatever its heartbeat says (the reboot rule).
+/// by definition, whatever its heartbeat says (the reboot rule). A
+/// verifiably live owner is never taken over, however old its
+/// heartbeat is; a dead owner is superseded only once its heartbeat
+/// is also past the stale interval.
 pub fn claim_decision(
     claim: Option<&Value>,
     boot_id: &str,
     now: f64,
     stale_seconds: f64,
-    pid_alive: bool,
+    owner_alive: bool,
 ) -> ClaimDecision {
     let Some(claim) = claim else {
         return ClaimDecision::Take;
@@ -914,17 +1166,147 @@ pub fn claim_decision(
     if claim["boot_id"].as_str() != Some(boot_id) {
         return ClaimDecision::TakeOverPreviousBoot;
     }
+    if owner_alive {
+        return ClaimDecision::AlreadyRunning;
+    }
     let heartbeat = claim["heartbeat_at"].as_f64().unwrap_or(0.0);
-    if pid_alive && now - heartbeat < stale_seconds {
-        ClaimDecision::AlreadyRunning
-    } else {
+    if now - heartbeat >= stale_seconds {
         ClaimDecision::TakeOverStale
+    } else {
+        ClaimDecision::AlreadyRunning
     }
 }
 
+/// The outcome of trying to own an incident.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ClaimOutcome {
+    /// This process owns the incident (fresh, adopted, or taken over).
+    Owned(ClaimDecision),
+    /// A live supervisor already owns it; start nothing.
+    AlreadyRunning,
+}
+
+/// Claim (or adopt a starter's pending claim) under the short flock.
+/// The starter marks its claim `supervisor_pending`; the supervisor it
+/// launched adopts it by incident. Any other live claim refuses.
+pub fn acquire_claim(
+    claim_path: &Path,
+    registry: &Path,
+    incident: &str,
+    epoch: &RestoreEpoch,
+    stale_seconds: f64,
+    supervisor_pending: bool,
+) -> Result<ClaimOutcome> {
+    let lock_path = claim_path.with_extension("lock");
+    if let Some(parent) = claim_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| fail(format!("cannot create {}: {error}", parent.display())))?;
+    }
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| fail(format!("cannot open the claim lock: {error}")))?;
+    lock.lock_exclusive()
+        .map_err(|error| fail(format!("cannot take the claim lock: {error}")))?;
+    let existing: Option<Value> = std::fs::read_to_string(claim_path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d: Duration| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let me = std::process::id();
+    if let Some(claim) = &existing {
+        let same_incident = claim["incident"].as_str() == Some(incident);
+        if same_incident && claim["pid"].as_u64() == Some(u64::from(me)) {
+            return Ok(ClaimOutcome::Owned(ClaimDecision::Take));
+        }
+        // Adoption: the starter that claimed for us is our parent, or
+        // has exited leaving its pending claim to its supervisor.
+        if same_incident && claim["supervisor_pending"] == json!(true) {
+            let owner = claim["pid"].as_u64().unwrap_or(0);
+            let parent = std::fs::read_to_string("/proc/self/stat")
+                .ok()
+                .and_then(|stat| {
+                    stat.rsplit_once(')')?
+                        .1
+                        .split_whitespace()
+                        .nth(1)?
+                        .parse::<u64>()
+                        .ok()
+                })
+                .unwrap_or(0);
+            if owner == parent || !claim_owner_alive(claim) {
+                write_claim(
+                    claim_path,
+                    registry,
+                    incident,
+                    epoch,
+                    now,
+                    supervisor_pending,
+                    "adopted",
+                )?;
+                return Ok(ClaimOutcome::Owned(ClaimDecision::Take));
+            }
+        }
+    }
+    let owner_alive = existing.as_ref().is_some_and(claim_owner_alive);
+    let decision = claim_decision(
+        existing.as_ref(),
+        &epoch.boot_id,
+        now,
+        stale_seconds,
+        owner_alive,
+    );
+    if decision == ClaimDecision::AlreadyRunning {
+        return Ok(ClaimOutcome::AlreadyRunning);
+    }
+    write_claim(
+        claim_path,
+        registry,
+        incident,
+        epoch,
+        now,
+        supervisor_pending,
+        &format!("{decision:?}"),
+    )?;
+    Ok(ClaimOutcome::Owned(decision))
+}
+
+fn write_claim(
+    claim_path: &Path,
+    registry: &Path,
+    incident: &str,
+    epoch: &RestoreEpoch,
+    now: f64,
+    supervisor_pending: bool,
+    takeover: &str,
+) -> Result<()> {
+    let me = std::process::id();
+    let claim = json!({
+        "schema": CLAIM_SCHEMA,
+        "registry": registry,
+        "incident": incident,
+        "boot_id": epoch.boot_id,
+        "epoch": epoch.as_json(),
+        "pid": me,
+        "pid_start": pid_start_ticks(u64::from(me)),
+        "heartbeat_at": now,
+        "started_at": now,
+        "supervisor_pending": supervisor_pending,
+        "takeover": takeover,
+    });
+    crate::agent::atomic_json(claim_path, &claim).map_err(|error| fail(error.to_string()))
+}
+
 /// Refresh a claim's heartbeat under its short flock: constant-time
-/// file work only, never across a round's long operations.
-pub fn heartbeat_claim(path: &Path, incident: &str, boot_id: &str) {
+/// file work only, never across a round's long operations. Returns
+/// false when this process no longer owns the claim (another owner
+/// took it, or it vanished): the caller must stop acting.
+pub fn heartbeat_claim(path: &Path, incident: &str) -> bool {
     let Ok(file) = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -932,28 +1314,29 @@ pub fn heartbeat_claim(path: &Path, incident: &str, boot_id: &str) {
         .truncate(false)
         .open(path.with_extension("lock"))
     else {
-        return;
+        return false;
     };
     if file.lock_exclusive().is_err() {
-        return;
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(mut record) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    if record["incident"].as_str() != Some(incident)
+        || record["pid"].as_u64() != Some(u64::from(std::process::id()))
+    {
+        return false;
     }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d: Duration| d.as_secs_f64())
         .unwrap_or(0.0);
-    let mut record: Value = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_else(
-            || json!({"schema": CLAIM_SCHEMA, "incident": incident, "boot_id": boot_id}),
-        );
     record["heartbeat_at"] = json!(now);
-    // The claim's pid names the incident owner (the supervisor), set
-    // by whoever claimed it; a heartbeat refresh never replaces it.
-    if record["pid"].is_null() {
-        record["pid"] = json!(std::process::id());
-    }
-    let _ = crate::agent::atomic_json(path, &record);
+    record["supervisor_pending"] = json!(false);
+    crate::agent::atomic_json(path, &record).is_ok()
 }
 
 /// The fixed harmless smoke prompt: an exact final JSON marker, so a
@@ -985,8 +1368,8 @@ pub fn smoke_profiles(
         .map_err(|error| fail(format!("cannot read {}: {error}", profile_file.display())))?;
     let dir = recovery_dir(state_dir, registry)
         .ok_or_else(|| fail("cannot determine the agentctl state directory"))?;
-    std::fs::create_dir_all(&dir)
-        .map_err(|error| fail(format!("cannot create {}: {error}", dir.display())))?;
+    agent_queue::fsio::create_private_directory(&dir, "recovery state directory", true, true)
+        .map_err(|error| fail(error.to_string()))?;
     let prompt_path = dir.join("smoke-prompt.txt");
     std::fs::write(&prompt_path, SMOKE_PROMPT)
         .map_err(|error| fail(format!("cannot write the smoke prompt: {error}")))?;
@@ -1062,8 +1445,12 @@ pub fn smoke_profiles(
     if chain_status != "pass" {
         all_pass = false;
     }
-    let record = json!({
+    let mut record = json!({
         "schema": SMOKE_SCHEMA,
+        "wrapper": std::fs::canonicalize(wrapper)
+            .unwrap_or_else(|_| wrapper.to_path_buf())
+            .display()
+            .to_string(),
         "at": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d: Duration| d.as_secs_f64())
@@ -1073,6 +1460,27 @@ pub fn smoke_profiles(
         "chain": {"status": chain_status, "judge": judge,
                   "duration_s": chain_started.elapsed().as_secs_f64()},
     });
+    // A single-profile smoke refreshes that profile's row in the
+    // existing record instead of discarding the others (N8).
+    if only.is_some() {
+        if let Ok(text) = std::fs::read_to_string(dir.join("install-smoke.json")) {
+            if let Ok(mut existing) = serde_json::from_str::<Value>(&text) {
+                if existing["config_hash"] == record["config_hash"] {
+                    let mut merged: Vec<Value> = existing["profiles"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|row| !rows.iter().any(|new| new["name"] == row["name"]))
+                        .collect();
+                    merged.extend(rows.iter().cloned());
+                    existing["profiles"] = json!(merged);
+                    existing["at"] = record["at"].clone();
+                    record = existing;
+                }
+            }
+        }
+    }
     crate::agent::atomic_json(&dir.join("install-smoke.json"), &record)
         .map_err(|error| fail(error.to_string()))?;
     Ok((record, if all_pass { 0 } else { 75 }))
@@ -1117,59 +1525,25 @@ pub fn start_recovery(
     let incident = crate::team_driver::incident_id(registry, &epoch);
     let dir = recovery_dir(state_dir, registry)
         .ok_or_else(|| fail("cannot determine the agentctl state directory"))?;
-    std::fs::create_dir_all(&dir)
-        .map_err(|error| fail(format!("cannot create {}: {error}", dir.display())))?;
+    agent_queue::fsio::create_private_directory(&dir, "recovery state directory", true, true)
+        .map_err(|error| fail(error.to_string()))?;
     let claim_path = dir.join("claim.json");
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d: Duration| d.as_secs_f64())
-        .unwrap_or(0.0);
-    // Claim: short flock, constant-time file work only.
-    let decision = {
-        let lock = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(dir.join("claim.lock"))
-            .map_err(|error| fail(format!("cannot open the claim lock: {error}")))?;
-        lock.lock_exclusive()
-            .map_err(|error| fail(format!("cannot take the claim lock: {error}")))?;
-        let existing: Option<Value> = std::fs::read_to_string(&claim_path)
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok());
-        let pid_alive = existing
-            .as_ref()
-            .and_then(|claim| claim["pid"].as_u64())
-            .is_some_and(|pid| Path::new(&format!("/proc/{pid}")).exists());
-        let decision = claim_decision(
-            existing.as_ref(),
-            &boot_id,
-            now,
-            options.stale_seconds,
-            pid_alive,
-        );
-        if decision != ClaimDecision::AlreadyRunning {
-            let claim = json!({
-                "schema": CLAIM_SCHEMA,
-                "registry": registry,
-                "incident": incident,
-                "boot_id": boot_id,
-                "epoch": epoch.as_json(),
-                "pid": std::process::id(),
-                "heartbeat_at": now,
-                "started_at": now,
-                "takeover": format!("{decision:?}"),
-            });
-            crate::agent::atomic_json(&claim_path, &claim)
-                .map_err(|error| fail(error.to_string()))?;
+    // Claim for the supervisor we are about to launch (pending until
+    // it adopts by incident): short flock, constant-time work only.
+    match acquire_claim(
+        &claim_path,
+        registry,
+        &incident,
+        &epoch,
+        options.stale_seconds,
+        true,
+    )? {
+        ClaimOutcome::Owned(_) => {}
+        ClaimOutcome::AlreadyRunning => {
+            return Ok(json!({"schema": "agentctl-start-recovery/v1",
+                "status": "already-running", "incident": incident,
+                "claim": claim_path, "exit_code": 75}));
         }
-        decision
-    };
-    if decision == ClaimDecision::AlreadyRunning {
-        return Ok(json!({"schema": "agentctl-start-recovery/v1",
-            "status": "already-running", "incident": incident,
-            "claim": claim_path, "exit_code": 75}));
     }
     // Launch restore and the supervisor concurrently; neither waits
     // for the other, and both are idempotent underneath (restore's
@@ -1195,6 +1569,7 @@ pub fn start_recovery(
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(err))
             .env("AGENTCTL_RECOVERY_CLAIM_FILE", &claim_path)
+            .env("AGENTCTL_RECOVERY_RESTORE_LAUNCHED", "1")
             .spawn()
             .map_err(|error| fail(format!("cannot launch a recovery child: {error}")))
     };
@@ -1212,26 +1587,6 @@ pub fn start_recovery(
         shepherd_args.extend(["--state-dir".to_owned(), state.display().to_string()]);
     }
     let mut supervisor = spawn_logged(&shepherd_args, "supervisor.log")?;
-    // The claim belongs to the supervisor, not this short-lived
-    // starter: rewrite its pid under the short flock.
-    {
-        let lock = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(dir.join("claim.lock"))
-            .map_err(|error| fail(format!("cannot open the claim lock: {error}")))?;
-        lock.lock_exclusive()
-            .map_err(|error| fail(format!("cannot take the claim lock: {error}")))?;
-        if let Ok(text) = std::fs::read_to_string(&claim_path) {
-            if let Ok(mut claim) = serde_json::from_str::<Value>(&text) {
-                claim["pid"] = json!(supervisor.id());
-                let _ = crate::agent::atomic_json(&claim_path, &claim);
-            }
-        }
-    }
-    heartbeat_claim(&claim_path, &incident, &boot_id);
     if options.foreground {
         let status = supervisor
             .wait()
@@ -1278,18 +1633,34 @@ mod profile_tests {
             ClaimDecision::TakeOverPreviousBoot
         );
         let live = json!({"boot_id": "new", "pid": 1, "heartbeat_at": 19.0});
+        // A verifiably live owner is never taken over, however old
+        // its heartbeat; a dead owner with a fresh heartbeat is not
+        // stale yet either; only dead + past the interval is.
         assert_eq!(
             claim_decision(Some(&live), "new", 20.0, 180.0, true),
             ClaimDecision::AlreadyRunning
         );
         assert_eq!(
             claim_decision(Some(&live), "new", 20.0, 180.0, false),
+            ClaimDecision::AlreadyRunning
+        );
+        assert_eq!(
+            claim_decision(Some(&live), "new", 500.0, 180.0, false),
             ClaimDecision::TakeOverStale
         );
         assert_eq!(
             claim_decision(None, "new", 20.0, 180.0, false),
             ClaimDecision::Take
         );
+    }
+
+    #[test]
+    fn progress_hash_ignores_checked_at() {
+        let one = json!({"checked_at": 1.0, "checks": [{"checked_at": 2.0, "status": "fail"}]});
+        let two = json!({"checked_at": 9.0, "checks": [{"checked_at": 8.0, "status": "fail"}]});
+        assert_eq!(progress_hash(&one), progress_hash(&two));
+        let three = json!({"checked_at": 1.0, "checks": [{"checked_at": 2.0, "status": "pass"}]});
+        assert_ne!(progress_hash(&one), progress_hash(&three));
     }
 
     #[test]

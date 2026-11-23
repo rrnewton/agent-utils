@@ -39,13 +39,47 @@ fn write_private(path: &Path, body: &str) {
 /// children of their own (restore, team act, the supervisor), and a
 /// test that leaks them piles processes onto the host: the group is
 /// killed when the guard drops, whatever the test outcome was.
-struct GroupGuard(u32);
+struct GroupGuard {
+    pgid: u32,
+    armed: std::cell::Cell<bool>,
+}
+
+/// Whether any process still belongs to group `pgid` (identity check
+/// before ever signalling it: a bare recycled id is never killed).
+fn group_exists(pgid: u32) -> bool {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some(after) = stat.rsplit_once(')').map(|(_, rest)| rest) else {
+            continue;
+        };
+        let fields: Vec<&str> = after.split_whitespace().collect();
+        if fields.get(2).and_then(|field| field.parse::<u32>().ok()) == Some(pgid) {
+            return true;
+        }
+        let _ = pid;
+    }
+    false
+}
 
 impl GroupGuard {
+    /// Kill the group once, only while membership is verifiable.
     fn kill_group(&self) {
-        let _ = Command::new("kill")
-            .args(["-KILL", &format!("-{}", self.0)])
-            .status();
+        if !self.armed.replace(false) {
+            return;
+        }
+        if group_exists(self.pgid) {
+            let _ = Command::new("kill")
+                .args(["-KILL", &format!("-{}", self.pgid)])
+                .status();
+        }
     }
 }
 
@@ -64,7 +98,10 @@ fn spawn_grouped(command: &mut Command) -> (std::process::Output, GroupGuard) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let child = command.spawn().expect("spawn grouped child");
-    let guard = GroupGuard(child.id());
+    let guard = GroupGuard {
+        pgid: child.id(),
+        armed: std::cell::Cell::new(true),
+    };
     let output = child.wait_with_output().expect("wait for grouped child");
     (output, guard)
 }
@@ -152,7 +189,16 @@ impl Scratch {
         let log = scratch.root.join("harness.log");
         install_executable(
             &bin.join("muse"),
-            &format!("#!/bin/sh\necho muse >> {}\nsleep 10\n", log.display()),
+            &format!(
+                "#!/usr/bin/env python3\nimport json, sys, time\n\
+                 open({log:?}, 'a').write('muse\\n')\n\
+                 prompt = open(sys.argv[sys.argv.index('--prompt-file') + 1]).read()\n\
+                 if 'agentctl-recovery-smoke' not in prompt:\n\
+                 \ttime.sleep(3)\n\
+                 text = '{{\"marker\": \"agentctl-recovery-smoke\"}}' if 'agentctl-recovery-smoke' in prompt else 'slow'\n\
+                 print(json.dumps({{'payload': {{'kind': 'run_terminal', 'terminal': 'completed', 'reason': None, 'text': text}}}}))\n",
+                log = log.display().to_string()
+            ),
         );
         install_executable(
             &bin.join("claude"),
@@ -331,13 +377,46 @@ impl Scratch {
     }
 
     fn stamp(&self, state_dir: &Path) -> Value {
-        let boots = fs::read_dir(state_dir.join("shepherd"))
-            .expect("shepherd state")
-            .map(|entry| entry.expect("boot entry").path())
-            .collect::<Vec<_>>();
-        assert_eq!(boots.len(), 1, "one incident per boot: {boots:?}");
-        serde_json::from_str(&fs::read_to_string(boots[0].join("stamp.json")).expect("stamp"))
-            .expect("stamp JSON")
+        fn find(dir: &Path, found: &mut Vec<PathBuf>) {
+            for entry in fs::read_dir(dir).expect("read shepherd state") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    find(&path, found);
+                } else if path.file_name().is_some_and(|name| name == "stamp.json") {
+                    found.push(path);
+                }
+            }
+        }
+        let mut stamps = Vec::new();
+        find(&state_dir.join("shepherd"), &mut stamps);
+        assert_eq!(stamps.len(), 1, "one stamp per team incident: {stamps:?}");
+        serde_json::from_str(&fs::read_to_string(&stamps[0]).expect("stamp")).expect("stamp JSON")
+    }
+
+    /// Ordered profiles for the own team plus a passing smoke record,
+    /// so the supervisor may consult a model at all (fail closed).
+    fn install_profiles(&self, state_dir: &Path) {
+        let profiles = format!(
+            "schema = \"agentctl-recovery-profiles/v1\"\n\
+             [[profile]]\nname = \"slow-muse\"\nharness = \"muse\"\ntimeout_seconds = 2\ncommand = \"{}\"\n\
+             [[profile]]\nname = \"answering-claude\"\nharness = \"claude\"\ntimeout_seconds = 30\ncommand = \"{}\"\n",
+            self.root.join("fakebin/muse").display(),
+            self.root.join("fakebin/claude").display(),
+        );
+        write_private(&self.root.join("own/recovery-profiles.toml"), &profiles);
+        let mut args = self.base_args();
+        args.extend([
+            "recovery".to_owned(),
+            "smoke".to_owned(),
+            "--state-dir".to_owned(),
+            state_dir.display().to_string(),
+            "--run-agent-prompt".to_owned(),
+            wrapper().display().to_string(),
+        ]);
+        let (code, report) = self.run_agentctl(&args);
+        assert_eq!(code, 0, "smoke must pass before judgement: {report}");
+        // Judgement calls start from an empty harness log.
+        let _ = fs::remove_file(self.root.join("harness.log"));
     }
 }
 
@@ -350,6 +429,7 @@ fn shepherd_drill_gives_up_bounded_and_judges_cross_team_read_only() {
     let scratch = Scratch::new("drill");
     let judged_before = scratch.tree("judged");
     let state = scratch.root.join("state");
+    scratch.install_profiles(&state);
 
     let (code, report) = scratch.run_shepherd(&state, &wrapper());
     assert_eq!(code, 75, "{report}");
@@ -359,8 +439,9 @@ fn shepherd_drill_gives_up_bounded_and_judges_cross_team_read_only() {
     let stamp = scratch.stamp(&state);
     assert_eq!(stamp["schema"], "agentctl-team-shepherd-stamp/v1");
     assert_eq!(stamp["verdict"], "GAVE-UP");
-    // muse timed out, claude answered: fallback order with fall-through.
-    assert_eq!(stamp["judge"], "claude");
+    // muse timed out, the claude profile answered: ordered profiles
+    // with timeout fall-through, judged by profile name.
+    assert_eq!(stamp["judge"], "answering-claude");
     let calls = fs::read_to_string(scratch.root.join("harness.log")).expect("harness log");
     let calls: Vec<&str> = calls.lines().collect();
     assert_eq!(&calls[..2], ["muse", "claude"], "fallback order: {calls:?}");
@@ -374,13 +455,22 @@ fn shepherd_drill_gives_up_bounded_and_judges_cross_team_read_only() {
         "{stamp}"
     );
     assert_eq!(teams[&own_key]["yes"], false);
-    // The deterministic arm ran (dry run, then real) for its own team.
-    let boots = fs::read_dir(state.join("shepherd")).expect("boots");
-    let boot = boots
-        .map(|entry| entry.expect("boot").path())
-        .next()
-        .expect("one boot");
-    let log = fs::read_to_string(boot.join("shepherd.log")).expect("shepherd log");
+    // The deterministic arm ran for its own team.
+    fn find_log(dir: &Path) -> Option<PathBuf> {
+        for entry in fs::read_dir(dir).expect("read state") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                if let Some(found) = find_log(&path) {
+                    return Some(found);
+                }
+            } else if path.file_name().is_some_and(|name| name == "shepherd.log") {
+                return Some(path);
+            }
+        }
+        None
+    }
+    let log = fs::read_to_string(find_log(&state.join("shepherd")).expect("log path"))
+        .expect("shepherd log");
     assert!(log.contains("restore"), "{log}");
     // The judged team was never acted on: its records are untouched
     // and no restore ran there. (A manifest probe may create empty
@@ -448,7 +538,13 @@ fn install_units_shepherd_writes_only_the_boot_unit() {
         .stdin(Stdio::null());
     let output = scratch.spawn_grouped(&mut command);
     assert_eq!(output.status.code(), Some(0), "{output:?}");
-    let unit = fs::read_to_string(dest.join("agentctl-shepherd.service")).expect("unit");
+    let unit_path = fs::read_dir(&dest)
+        .expect("dest")
+        .next()
+        .expect("one unit")
+        .expect("unit entry")
+        .path();
+    let unit = fs::read_to_string(&unit_path).expect("unit");
     assert!(unit.contains("start-recovery"), "{unit}");
     assert!(
         !unit.contains("After="),
@@ -464,7 +560,7 @@ fn install_units_shepherd_writes_only_the_boot_unit() {
             .iter()
             .any(|step| step
                 .as_str()
-                .is_some_and(|step| step.contains("enable agentctl-shepherd.service"))),
+                .is_some_and(|step| step.contains("enable agentctl-shepherd-"))),
         "{report}"
     );
     let written: Vec<_> = fs::read_dir(&dest)
@@ -574,10 +670,14 @@ fn recovery_smoke_records_profiles_and_start_recovery_claims_once() {
     let (code, report) = scratch.run_agentctl(&args);
     assert_eq!(code, 75, "{report}");
     assert_eq!(report["status"], "already-running", "{report}");
-    // The test owns this child; stop it by its literal pid.
-    let _ = Command::new("kill")
-        .arg(supervisor_pid.to_string())
-        .status();
+    // The test owns this child; stop it only after verifying its
+    // cmdline still names this scratch tree.
+    let cmdline = fs::read_to_string(format!("/proc/{supervisor_pid}/cmdline")).unwrap_or_default();
+    if cmdline.contains(&scratch.root.display().to_string()) {
+        let _ = Command::new("kill")
+            .arg(supervisor_pid.to_string())
+            .status();
+    }
     if let Some(restore_pid) = report["restore_pid"].as_u64() {
         let _ = restore_pid;
     }
@@ -609,4 +709,111 @@ fn crate_team_key(registry: &Path) -> String {
         Sha256::digest(canonical.to_string_lossy().as_bytes())
     );
     digest[..16].to_owned()
+}
+
+#[test]
+fn two_registries_share_one_state_root_without_sharing_stamps() {
+    let scratch = Scratch::new("twoteams");
+    scratch.register("other");
+    let state = scratch.root.join("state");
+    let (code, report) = scratch.run_shepherd(&state, &wrapper());
+    assert_eq!(code, 75, "{report}");
+    // A second team under the same state root starts its own
+    // incident; it never resumes the first team's stamp (B1).
+    let home = scratch.root.join("home");
+    let mut args = vec![
+        "--registry".to_owned(),
+        scratch.root.join("other").display().to_string(),
+        "--herdr-bin".to_owned(),
+        scratch.root.join("herdr").display().to_string(),
+        "team".to_owned(),
+        "shepherd".to_owned(),
+        "--state-dir".to_owned(),
+        state.display().to_string(),
+        "--max-rounds".to_owned(),
+        "2".to_owned(),
+        "--round-delay-seconds".to_owned(),
+        "0".to_owned(),
+        "--run-agent-prompt".to_owned(),
+        wrapper().display().to_string(),
+    ];
+    args.push("--config".to_owned());
+    args.push(scratch.root.join("teams.json").display().to_string());
+    let (code, report) = scratch.run_agentctl(&args);
+    assert_eq!(code, 75, "{report}");
+    assert_eq!(report["resumed"], false, "second team resumed: {report}");
+    let _ = home;
+    scratch.reap();
+}
+
+#[test]
+fn shepherd_without_smoke_record_consults_no_model() {
+    let scratch = Scratch::new("gated");
+    // Profiles configured, but recovery smoke never ran: judgement
+    // must stay unavailable (fail closed, S1).
+    let profiles = format!(
+        "schema = \"agentctl-recovery-profiles/v1\"\n\
+         [[profile]]\nname = \"answering-claude\"\nharness = \"claude\"\ncommand = \"{}\"\n",
+        scratch.root.join("fakebin/claude").display(),
+    );
+    write_private(&scratch.root.join("own/recovery-profiles.toml"), &profiles);
+    let state = scratch.root.join("state");
+    let (code, report) = scratch.run_shepherd(&state, &wrapper());
+    assert_eq!(code, 75, "{report}");
+    assert!(
+        !scratch.root.join("harness.log").exists(),
+        "wrapper consulted without a smoke record"
+    );
+    let stamp = scratch.stamp(&state);
+    assert_eq!(stamp["judge"], "none", "{stamp}");
+    scratch.reap();
+}
+
+#[test]
+fn generated_unit_execstart_actually_starts_recovery() {
+    let scratch = Scratch::new("unitrun");
+    let state = scratch.root.join("state");
+    scratch.install_profiles(&state);
+    let dest = scratch.root.join("units");
+    let mut args = scratch.base_args();
+    args.extend([
+        "recovery".to_owned(),
+        "install".to_owned(),
+        "--write-unit".to_owned(),
+        "--unit-dest".to_owned(),
+        dest.display().to_string(),
+        "--state-dir".to_owned(),
+        state.display().to_string(),
+        "--run-agent-prompt".to_owned(),
+        wrapper().display().to_string(),
+    ]);
+    let (code, report) = scratch.run_agentctl(&args);
+    assert_eq!(code, 0, "{report}");
+    let units: Vec<PathBuf> = fs::read_dir(&dest)
+        .expect("unit dest")
+        .map(|entry| entry.expect("unit entry").path())
+        .collect();
+    assert_eq!(units.len(), 1, "one per-registry unit: {units:?}");
+    assert!(
+        units[0]
+            .file_name()
+            .expect("unit name")
+            .to_string_lossy()
+            .starts_with("agentctl-shepherd-"),
+        "{units:?}"
+    );
+    let unit = fs::read_to_string(&units[0]).expect("unit");
+    let exec = unit
+        .lines()
+        .find_map(|line| line.strip_prefix("ExecStart="))
+        .expect("ExecStart line")
+        .to_owned();
+    let mut tokens: Vec<String> = exec.split_whitespace().map(str::to_owned).collect();
+    tokens[0] = env!("CARGO_BIN_EXE_agentctl").to_owned();
+    // Run the generated line exactly as rendered (B3), in the
+    // scratch environment, and prove recovery starts.
+    let (code, report) = scratch.run_agentctl(&tokens[1..]);
+    assert_eq!(code, 0, "generated ExecStart failed: {report}");
+    assert_eq!(report["status"], "started", "{report}");
+    scratch.reap();
 }

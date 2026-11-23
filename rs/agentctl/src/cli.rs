@@ -176,7 +176,7 @@ enum Commands {
     Recovery(Recovery),
     /// Start recovery for this registry NOW: claim the incident and launch deterministic restore and the recovery-agent supervisor together. The one trigger-neutral entry point for a service unit, a startup script, a container foreground process, or a human
     #[command(
-        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl start-recovery\n  agentctl --registry ~/project/.agentctl start-recovery --foreground\n\nOne incident per registry per restore epoch: a second live call returns already-running (exit 75) and starts nothing; a claim from a previous boot never blocks. Default returns once restore and the supervisor are launched; --foreground waits with the supervisor (for containers and manual runs). No service manager is assumed. Prints schema agentctl-start-recovery/v1."
+        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl start-recovery\n  agentctl --registry ~/project/.agentctl start-recovery --foreground\n\nOne incident per registry per restore epoch: a second live call returns already-running (exit 75) and starts nothing; a claim from a previous boot never blocks. Default returns once restore and the supervisor are launched; --foreground waits with the supervisor (manual and supervised runs on the agents host; the host PID namespace is required, so a descendant container namespace is refused). No service manager is assumed. Prints schema agentctl-start-recovery/v1."
     )]
     StartRecovery(StartRecovery),
     /// Write the user units that restore the team at boot: a persistent herdr-server.service, the agent-restore.service boot hook, agent-watch.service, and a drop-in that orders the chat bridge after Herdr and restarts it on failure (start limits stay with the bridge's own policy). With --bridge NAME, write only that bridge's persistent unit (agentctl-bridge-NAME.service) instead of a transient. With --scheduled, write only the persistent timer/service pairs the team spec names. With --teams-config PATH, write only agent-restore-teams.service, the boot unit that restores every team that teams file names. Never enables, starts, or reloads anything
@@ -885,7 +885,7 @@ struct StartRecovery {
     #[arg(long)]
     foreground: bool,
     /// Seconds before a same-boot claim with no heartbeat counts as stale, from 10 to 86400 (default: 180)
-    #[arg(long, default_value_t = 180.0, value_name = "SECONDS")]
+    #[arg(long, default_value_t = 180.0, value_parser = stale_seconds, value_name = "SECONDS")]
     stale_seconds: f64,
     /// The run-agent-prompt executable the supervisor uses (default: run-agent-prompt on PATH)
     #[arg(long, value_name = "PATH")]
@@ -3297,6 +3297,14 @@ fn handoff_seconds(value: &str) -> Result<u64, String> {
     }
     Ok(value)
 }
+fn stale_seconds(value: &str) -> Result<f64, String> {
+    let parsed: f64 = value.parse().map_err(|_| format!("not seconds: {value}"))?;
+    if !parsed.is_finite() || !(10.0..=86400.0).contains(&parsed) {
+        return Err("stale seconds must be between 10 and 86400".to_owned());
+    }
+    Ok(parsed)
+}
+
 fn bounded_u32<const MIN: u32, const MAX: u32>(value: &str) -> Result<u32, String> {
     let parsed: u32 = value.parse().map_err(|_| format!("not a count: {value}"))?;
     if parsed < MIN || parsed > MAX {
@@ -5005,7 +5013,12 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                         .entries
                         .iter()
                         .map(|entry| entry.registry.clone())
-                        .filter(|registry| registry != &args.registry)
+                        .filter(|registry| {
+                            let canonical = |path: &PathBuf| {
+                                std::fs::canonicalize(path).unwrap_or_else(|_| path.clone())
+                            };
+                            canonical(registry) != canonical(&args.registry)
+                        })
                         .collect::<Vec<_>>(),
                     None => Vec::new(),
                 };
@@ -5037,6 +5050,9 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                         }),
                         claim_file: std::env::var_os("AGENTCTL_RECOVERY_CLAIM_FILE")
                             .map(PathBuf::from),
+                        stale_seconds: 180.0,
+                        restore_launched: std::env::var_os("AGENTCTL_RECOVERY_RESTORE_LAUNCHED")
+                            .is_some(),
                         act_wait_seconds: shepherd.act_wait_seconds,
                     },
                 )?;
@@ -5415,7 +5431,10 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                                 dry_run: false,
                                 force: false,
                             },
-                            Some(&target),
+                            Some(
+                                &std::path::absolute(&wrapper)
+                                    .map_err(|error| Failure::Usage(error.to_string()))?,
+                            ),
                         )?;
                     }
                     let (smoke, code) = crate::team_shepherd::smoke_profiles(
@@ -5442,11 +5461,21 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
                         .unwrap_or(Value::Null);
                     let stamp = claim["boot_id"].as_str().and_then(|boot| {
-                        crate::team_shepherd::shepherd_dir(status.state_dir.as_deref(), boot)
-                            .and_then(|boot_dir| {
-                                std::fs::read_to_string(boot_dir.join("stamp.json")).ok()
-                            })
-                            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                        let epoch = crate::restore::RestoreEpoch {
+                            boot_id: boot.to_owned(),
+                            user_manager: claim["epoch"]["user_manager"]
+                                .as_str()
+                                .map(str::to_owned),
+                        };
+                        crate::team_shepherd::shepherd_dir(
+                            status.state_dir.as_deref(),
+                            &args.registry,
+                            &epoch,
+                        )
+                        .and_then(|boot_dir| {
+                            std::fs::read_to_string(boot_dir.join("stamp.json")).ok()
+                        })
+                        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
                     });
                     Ok((
                         json!({"schema": "agentctl-recovery-status/v1",
@@ -5561,11 +5590,12 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                         dry_run: value.dry_run,
                         force: value.force,
                     },
-                    value
-                        .teams_config
-                        .as_deref()
-                        .map(absolute)
-                        .transpose()?
+                    std::env::var_os("PATH")
+                        .and_then(|path| {
+                            std::env::split_paths(&path)
+                                .map(|dir| dir.join("run-agent-prompt"))
+                                .find(|candidate| candidate.is_file())
+                        })
                         .as_deref(),
                 )?)
                 .map_err(Failure::Output)?;

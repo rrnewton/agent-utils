@@ -1496,8 +1496,9 @@ writes `alarm.json` beside the state and retries on backoff
 notice follows a delivered incident that later verifies healthy.
 
 Recovery after a boot is started with the one trigger-neutral entry
-point, callable by hand, from a script, in a container foreground, or
-from the optional boot unit — no service manager is assumed:
+point, callable by hand, from a script, as a supervised foreground
+process, or from the optional boot unit — no service manager is
+assumed, and the host PID namespace is required:
 
 ```sh
 agentctl --registry ~/project/.agentctl start-recovery
