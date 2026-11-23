@@ -1,6 +1,6 @@
 ---
 title: 'watch-restore-report-path: agentctl watch reports no restore report when one exists'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
@@ -8,7 +8,8 @@ labels:
 - restore
 - watch
 created_at: 2026-11-20T14:43:46-05:00
-updated_at: 2026-11-20T14:43:46-05:00
+updated_at: 2026-11-23T17:10:19-05:00
+closed_at: 2026-11-23T17:10:19-05:00
 ---
 
 # Description
@@ -36,3 +37,13 @@ Design note approved in shape by the lead coordinator (2026-11-21): acknowledgem
 # Notes
 
 Related: #1975 restore-boot-recovery ((2b) report-on-every-exit makes incomplete reports more common and more useful; this issue makes watch able to see them), #1359 (reports moved under `restore/reports/`), #1405/#1426 (epoch keying and the predates-keying watch wording). Number pre-assigned by the lead coordinator. Rides the Phase 2 stack unless the reproduction shows a one-line lookup fix that can land independently.
+
+## Resolution
+
+[watermelon-full-preview] Resolved on main by 183dbb46 (coordinator-scoped):
+BootReportState::Incomplete names the existing report path and its reason, and
+a truly missing report is reported once per boot per watch process (in-memory).
+candidate_report_paths already searched restore/reports first, then both legacy
+locations; the drill symptom was the incomplete collapse. The
+acknowledge-incomplete CLI from the Design was deferred by the coordinator and
+is not part of this closure; file a follow-up if it is still wanted.

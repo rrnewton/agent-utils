@@ -1,12 +1,13 @@
 ---
 title: 'agentctl-watch-hooks-trust-missing-file: a registry without hooks/agent.json means no hooks to trust, not an error'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - agentctl
 created_at: 2026-11-22T11:28:00-05:00
-updated_at: 2026-11-22T11:28:00-05:00
+updated_at: 2026-11-23T17:10:19-05:00
+closed_at: 2026-11-23T17:10:19-05:00
 ---
 
 # Description
@@ -24,3 +25,13 @@ A missing hooks agent file reads as "no hooks to trust" and raises nothing; only
 # Notes
 
 Reported by a consumer's lead; filed by the coordinator.
+
+## Resolution
+
+[watermelon-full-preview] Resolved by 183dbb46 on main: registry::names() lists only
+directories holding an agent.json in either layout, and
+answer_hooks_trust_if_dialog returns no-hooks-to-trust when no record exists in
+either layout; an existing malformed record still errors. Tests:
+a_missing_hooks_record_is_silent_in_either_layout and
+a_malformed_hooks_record_still_reports_a_problem. The acknowledge schema clause
+is moot: no operator-written hooks file exists in this design.
