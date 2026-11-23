@@ -45,12 +45,6 @@ expires = "2026-12-22"
 note = "census/remove timing under load, already seen on unrelated trees"
 
 [[known-red]]
-step = "rust.*.test"
-issue = "#2065"
-expires = "2026-12-22"
-note = "CPU timeouts with no named assertion failure"
-
-[[known-red]]
 step = "repository.check.wrkslots-debug-test"
 issue = "#2065"
 expires = "2026-12-22"
