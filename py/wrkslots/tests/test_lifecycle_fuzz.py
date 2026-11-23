@@ -22,6 +22,7 @@ def _limits() -> None:
     resource.setrlimit(resource.RLIMIT_AS, (4 * 1024**3, 4 * 1024**3))
 
 
+@pytest.mark.load_quarantine
 def test_lifecycle_fuzz_fast_seeds(tmp_path: Path) -> None:
     runner = Path(__file__).with_name("lifecycle_fuzz.py")
     for seed in (1, 2, 3, 4):
