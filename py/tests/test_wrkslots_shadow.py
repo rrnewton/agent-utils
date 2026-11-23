@@ -101,6 +101,23 @@ def test_text_compare_scrubs_ages() -> None:
     ) == {"result": "agree"}
 
 
+def test_compare_scrubs_doctor_age_in_both_formats() -> None:
+    # The verbatim doctor finding both editions emit for a quarantined journal.
+    finding = (
+        "quarantined journal {journal} retained for inspection (age {age}); "
+        "report-only in v1, hand restore is in the user guide"
+    )
+    py_finding = finding.format(journal="j1", age="10s")
+    rs_finding = finding.format(journal="j1", age="11s")
+    assert _compare(py_out=py_finding + "\n", rs_out=rs_finding + "\n") == {
+        "result": "agree"
+    }
+    assert _compare(
+        py_out=json.dumps({"findings": [{"detail": py_finding}]}),
+        rs_out=json.dumps({"findings": [{"detail": rs_finding}]}),
+    ) == {"result": "agree"}
+
+
 def test_scrub_is_an_explicit_set_not_a_suffix() -> None:
     # Bare age_seconds (interrupted_journals) is volatile and scrubbed...
     assert _compare(

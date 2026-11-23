@@ -143,14 +143,31 @@ def fingerprint(project_root: str | None) -> str:
     return digest.hexdigest()
 
 
+_AGE_TEXT = re.compile(
+    r"\b\d+(?:\.\d+)?s ago\b"
+    r"|heartbeat_age(?:_seconds)?[=: ]+\S+"
+    r"|\bage=\S+"
+    r"|\bage \d+(?:\.\d+)?s\b"
+    r"|heartbeat_age_seconds[=: ]+[0-9.]+"
+)
+
+
 def scrub(value: Any) -> Any:
-    """Drop volatile leaves the fixture differentials also drop (ages, stamps)."""
+    """Drop volatile leaves the fixture differentials also drop (ages, stamps).
+
+    String leaves get the same age scrub as plain text: doctor findings
+    embed ages in prose (for example a quarantined journal's "(age 10s)")
+    in both human and JSON output, so key-based dropping alone would
+    false-diverge whenever the second run crosses a one-second boundary.
+    """
     if isinstance(value, dict):
         return {
             key: scrub(item) for key, item in value.items() if key not in DROP_KEYS
         }
     if isinstance(value, list):
         return [scrub(item) for item in value]
+    if isinstance(value, str):
+        return _AGE_TEXT.sub("<age>", value)
     return value
 
 
@@ -181,14 +198,6 @@ def first_divergence(py: Any, rs: Any, path: str = "") -> tuple[str, Any, Any] |
     if py != rs:
         return (path or "<root>", py, rs)
     return None
-
-
-_AGE_TEXT = re.compile(
-    r"\b\d+(?:\.\d+)?s ago\b"
-    r"|heartbeat_age(?:_seconds)?[=: ]+\S+"
-    r"|\bage=\S+"
-    r"|heartbeat_age_seconds[=: ]+[0-9.]+"
-)
 
 
 def _short(value: Any) -> str:
