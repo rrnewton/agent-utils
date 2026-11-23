@@ -1339,11 +1339,29 @@ pub(crate) fn capture_process_snapshot_at(
     let mut unsettling = reads.unsettling;
     unsettling.sort_unstable();
     unsettling.dedup();
+    let (pid_clause, next_step) = if unsettling.is_empty() {
+        (
+            String::new(),
+            "retry the remove when fewer processes are starting",
+        )
+    } else {
+        (
+            format!(
+                " (most recently PIDs {})",
+                unsettling
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            "check whether the listed PIDs still use a target (they may have exited or been reused), then retry the remove",
+        )
+    };
     Err(format!(
-        "process use is indeterminate because the process snapshot did not close within {SNAPSHOT_LISTING_ROUNDS} listings of /proc (most recently PIDs {}); failure: census not closed; next step: stop the named processes if they hold the slot, or retry the remove",
-        unsettling
+        "process use is indeterminate because the process snapshot did not close within {SNAPSHOT_LISTING_ROUNDS} listings of /proc{pid_clause}; targets: {}; failure: census not closed; next step: {next_step}",
+        targets
             .iter()
-            .map(i64::to_string)
+            .map(|target| target.display().to_string())
             .collect::<Vec<_>>()
             .join(", ")
     ))

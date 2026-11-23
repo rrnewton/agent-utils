@@ -72668,10 +72668,11 @@ def _validate_remove_batch_census_stderr_bytes(
     4,400-5,500 processes: one privileged find up to 29 KiB, one census's
     attempts up to 56 KiB, a whole eight-slot batch up to 83 KiB -- about
     16 bytes per process at worst.  Each sealed slot therefore gets the
-    historical 64 KiB floor, scaled by 256 bytes per live process (16x
-    the measured worst case, the same allowance as the absent-slot
-    census) and capped at 1 MiB per slot; each further slot adds one
-    more per-slot allowance.
+    historical 64 KiB floor, scaled by 256 bytes per live process (the
+    same allowance as the absent-slot census) and capped at 1 MiB per
+    slot; the cap is reached at 4,096 processes, so at 6,500 processes
+    the allowance is about 10x the measured worst case. Each further
+    slot adds one more per-slot allowance.
     """
 
     if process_count is None:
@@ -92183,8 +92184,9 @@ class _ReadOnlyCommandBudget:
                 f"stderr over by {-self.stderr_remaining} bytes"
                 + self._failure_suffix(
                     "budget exceeded",
-                    "retry when fewer processes are churning, or narrow the "
-                    "batch and retry",
+                    "retry when fewer processes are churning (the census "
+                    "output grows with the host's process count, so a "
+                    "smaller batch does not help)",
                 )
             )
 
@@ -96843,13 +96845,22 @@ def _census_appearing_generations(
         proven_rounds += 1
         if proven_rounds >= 2:
             return tuple(observed), tuple(found)
+    if unsettling:
+        pid_clause = (
+            f" (most recently PIDs {', '.join(str(pid) for pid in unsettling[:16])})"
+        )
+        next_step = (
+            "check whether the listed PIDs still use a target (they may "
+            "have exited or been reused), then retry the remove"
+        )
+    else:
+        pid_clause = ""
+        next_step = "retry the remove when fewer processes are starting"
     raise Refusal(
         "process use is indeterminate because the process census did not close "
-        f"within {_CENSUS_LISTING_ROUNDS} listings of /proc (most recently PIDs "
-        f"{', '.join(str(pid) for pid in unsettling[:16])}); "
+        f"within {_CENSUS_LISTING_ROUNDS} listings of /proc{pid_clause}; "
         f"targets: {', '.join(str(path) for path in targets)}; "
-        "failure: census not closed; next step: stop the named processes if "
-        "they hold a target, or retry the remove"
+        f"failure: census not closed; next step: {next_step}"
     )
 
 

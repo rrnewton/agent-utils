@@ -62,5 +62,7 @@ def test_listed_then_gone_unrelated_churn_still_refuses(
     text = str(caught.value)
     assert "same-UID process census did not close" in text
     assert "(not necessarily consecutive)" in text
+    assert "8 rounds (not necessarily consecutive) of 9 inventories" in text
+    assert "(8 generations in all, 1 in the last such round)" in text
     assert len(host.inventories) == 1 + cli._SAME_UID_CENSUS_INVENTORIES
 

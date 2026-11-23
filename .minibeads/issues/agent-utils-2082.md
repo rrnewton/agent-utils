@@ -26,9 +26,10 @@ Document how the budget is derived; scale it with the process count up to a cap,
 The validate-remove stderr bound now scales with the live process
 count up to a cap (`_validate_remove_batch_census_stderr_bytes`): the
 historical 64 KiB per-slot floor, plus 256 bytes per process (the
-absent-slot census's allowance, 16x the measured worst case of about
-16 bytes per process at 4,400-5,500 processes), capped at 1 MiB per
-slot. The derivation is documented at the function and tested
+absent-slot census's allowance, against a measured worst case of
+about 16 bytes per process at 4,400-5,500 processes), capped at
+1 MiB per slot (the cap is reached at 4,096 processes, so the
+allowance is about 10x the measured worst case at 6,500 processes). The derivation is documented at the function and tested
 (floor/scale/cap). Census refusals name the slot and phase through
 `_ReadOnlyCommandBudget.census_context` (wired for validate-remove),
 the failure shape (time bound exceeded, budget exceeded, census not
