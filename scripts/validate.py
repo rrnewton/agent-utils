@@ -667,7 +667,7 @@ def announce_partial(verdict: str, lines: Sequence[str], environ: Mapping[str, s
 #: their own counts and emit no per-check record; expecting one would be a
 #: false inventory. Kept beside the selector so the boundary is explicit.
 TIMING_CROSS_TOOLS = frozenset(
-    {"dagrun", "cpuset-alloc", "tick-hub", "pr-landing-planner", "herdr-run"}
+    {"dagrun", "cpuset-alloc", "pr-landing-planner", "herdr-run"}
 )
 
 #: Command fragments that mark a gate as timing-capable. A selected gate

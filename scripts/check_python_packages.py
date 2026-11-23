@@ -78,21 +78,6 @@ PROJECTS: tuple[Project, ...] = (
         required_dependencies=("pyyaml",),
     ),
     Project(
-        directory="tick_hub",
-        distribution="tick-hub",
-        package="tick_hub",
-        commands=("tick-hub",),
-        resources=(
-            "README.md",
-            "USER_GUIDE.md",
-            "py.typed",
-            "examples/tick-hub-ops.json",
-            "examples/tick-hub-ops.yaml",
-            "examples/tick-hub-state.yaml",
-        ),
-        required_dependencies=("pyyaml",),
-    ),
-    Project(
         directory="pr_landing_planner",
         distribution="pr-landing-planner",
         package="pr_landing_planner",

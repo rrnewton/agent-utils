@@ -90,16 +90,6 @@ steps:
       preferred_inner_jobs: 4
       rss_baseline_bytes: 2147483648
 
-  - group: tick-hub
-    job: differential
-    desc: tick-hub Python and Rust commands agree
-    cmd: python3 cross/differential.py --tool tick-hub
-    jobs_flag: ""
-    labels: [validation-cross, component-tick-hub]
-    timeout: 9600
-    cpu_timeout: 1200
-    hint: *cross_hint
-
   - group: planner
     job: differential
     desc: pr-landing-planner Python and Rust commands agree

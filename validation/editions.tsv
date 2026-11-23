@@ -8,7 +8,7 @@ herdr-subagents	python	paused	456ed9ce4f2e93b7c6f201ea106d8b0d58aa910e
 parallel-experiment-runner	python	absent	
 pr-landing-planner	rust	parity	
 run-agent-prompt	python	absent	
-tick-hub	rust	parity	
+tick-hub	rust	archived	
 wrkslots	python	absent	
 wrkslotsd	rust	absent	
 wrkviz	python	absent	

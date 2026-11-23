@@ -1125,6 +1125,21 @@ mod tests {
     }
 
     #[test]
+    fn phased_refusals_are_rejected() {
+        // G4 (parser half): five refusal shapes from the retired differential.
+        let docs = [
+            r#"{"reminders":[{"name":"r","cadence_secs":3600,"cadence_offset_secs":3600,"emit":{"kind":"note","title":"t"}}]}"#,
+            r#"{"reminders":[{"name":"r","cadence_secs":0,"cadence_offset_secs":5,"emit":{"kind":"note","title":"t"}}]}"#,
+            r#"{"reminders":[{"name":"r","cadence_secs":3600,"cadence_window_secs":60,"emit":{"kind":"note","title":"t"}}]}"#,
+            r#"{"reminders":[{"name":"r","cadence_secs":3600,"cadence_offset_secs":0,"cadence_window_secs":3601,"emit":{"kind":"note","title":"t"}}]}"#,
+            r#"{"reminders":[{"name":"r","cadence_secs":3600,"gate":{"cmd":"true","timeout_secs":0},"emit":{"kind":"note","title":"t"}}]}"#,
+        ];
+        for doc in docs {
+            assert!(config_from_json(doc).is_err(), "must refuse: {doc}");
+        }
+    }
+
+    #[test]
     fn minimal_defaults_and_note_without_skill() {
         let config =
             config_from_json(r#"{"reminders":[{"name":"n","emit":{"kind":"note","title":"hi"}}]}"#)

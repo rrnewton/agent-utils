@@ -84,16 +84,6 @@ steps:
     hint: *python_package_hint
 
   - group: python
-    job: tick-hub
-    desc: build and smoke-install the tick-hub Python distribution
-    cmd: python3 scripts/check_python_packages.py --project tick-hub
-    jobs_flag: ""
-    labels: [validation-packages, validation-python-packages, component-tick-hub]
-    timeout: 960
-    cpu_timeout: 120
-    hint: *python_package_hint
-
-  - group: python
     job: wrkslots
     desc: build and smoke-install the wrkslots Python distribution
     cmd: python3 scripts/check_python_packages.py --project wrkslots
@@ -118,21 +108,6 @@ steps:
   # package steps above prove each artifact installs alone; these prove it also works alone.
   # The wrkslots lifecycle spends most of its time in removal's process census, which scales with
   # the host's process count: about 40 CPU-seconds on a busy shared workstation, a few on a runner.
-  - group: standalone
-    job: tick-hub
-    desc: install only tick-hub in a clean environment and run its quickstart ticks
-    cmd: python3 scripts/check_standalone.py --subset tick-hub
-    jobs_flag: ""
-    labels: [validation-packages, validation-python-packages, component-tick-hub]
-    timeout: 480
-    cpu_timeout: 60
-    hint:
-      resources: {python-package: 1}
-      est_duration_s: 3
-      classification: cpu-bound
-      preferred_inner_jobs: 1
-      rss_baseline_bytes: 536870912
-
   - group: standalone
     job: wrkslots
     desc: install only wrkslots in a clean environment and run a whole slot lifecycle

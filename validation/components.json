@@ -400,18 +400,7 @@
         "skills/tick-hub/"
       ],
       "reverse_dependencies": [],
-      "test_files": [
-        "py/tests/test_tickhub_cadence.py",
-        "py/tests/test_tickhub_cadence_offset.py",
-        "py/tests/test_tickhub_cli.py",
-        "py/tests/test_tickhub_emit.py",
-        "py/tests/test_tickhub_engine.py",
-        "py/tests/test_tickhub_example.py",
-        "py/tests/test_tickhub_io.py",
-        "py/tests/test_tickhub_probes.py",
-        "py/tests/test_tickhub_state.py",
-        "py/tests/test_tickhub_yaml.py"
-      ]
+      "test_files": []
     },
     "wrkslots": {
       "source_prefixes": [
@@ -707,6 +696,16 @@
     "py/tests/test_differential_tolerant_run.py": "differential-tolerant-run",
     "py/tests/test_packaging_infrastructure.py": "packaging-infrastructure",
     "py/tests/test_repo_dispatch_wiring.py": "repository-dispatch-wiring",
+    "py/tests/test_tickhub_cadence.py": "tick-hub-frozen-python-edition",
+    "py/tests/test_tickhub_cadence_offset.py": "tick-hub-frozen-python-edition",
+    "py/tests/test_tickhub_cli.py": "tick-hub-frozen-python-edition",
+    "py/tests/test_tickhub_emit.py": "tick-hub-frozen-python-edition",
+    "py/tests/test_tickhub_engine.py": "tick-hub-frozen-python-edition",
+    "py/tests/test_tickhub_example.py": "tick-hub-frozen-python-edition",
+    "py/tests/test_tickhub_io.py": "tick-hub-frozen-python-edition",
+    "py/tests/test_tickhub_probes.py": "tick-hub-frozen-python-edition",
+    "py/tests/test_tickhub_state.py": "tick-hub-frozen-python-edition",
+    "py/tests/test_tickhub_yaml.py": "tick-hub-frozen-python-edition",
     "py/tests/test_validation_graph_contract.py": "validation-graph-contract",
     "py/wrkslots/tests/test_lifecycle.py": "wrkslots-lifecycle"
   }

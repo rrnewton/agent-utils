@@ -92,7 +92,7 @@ EXPECTED_COMPONENTS = frozenset(
 )
 
 RUST_ONLY_COMPONENTS = frozenset(
-    {"agent-teams", "agent-usage", "change-classifier", "gh-paced", "merge-queue"}
+    {"agent-teams", "agent-usage", "change-classifier", "gh-paced", "merge-queue", "tick-hub"}
 )
 
 

@@ -359,33 +359,7 @@ steps:
       preferred_inner_jobs: 1
       rss_baseline_bytes: 671088640
 
-  - group: tick-hub
-    job: test
-    desc: tick-hub Python tests
-    cmd: python3 scripts/run_component_tests.py --component tick-hub -- -q
-    jobs_flag: ""
-    labels: [validation-workspace, validation-python-component-tests, component-tick-hub]
-    timeout: 7200
-    cpu_timeout: 900
-    hint: *python_test_hint
 
-  - group: tick-hub
-    job: cli-smoke
-    desc: tick-hub version and bundled dry-run example
-    cmd: >-
-      cd py &&
-      python3 -m tick_hub --version &&
-      python3 -m tick_hub tick --config tick_hub/examples/tick-hub-ops.yaml
-      --state tick_hub/examples/tick-hub-state.yaml --now 0 --no-header >/dev/null
-    jobs_flag: ""
-    labels: [validation-workspace, component-tick-hub]
-    timeout: 960
-    cpu_timeout: 120
-    hint:
-      est_duration_s: 3
-      classification: light
-      preferred_inner_jobs: 1
-      rss_baseline_bytes: 134217728
 
   # Sixteen shards (was eight), balanced by recorded family durations
   # (`scripts/pytest_shard_weights.json`, regenerated with `scripts/case_timings.py weights`):

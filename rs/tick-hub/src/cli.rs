@@ -681,8 +681,266 @@ mod tests {
     fn version_and_userguide_are_standalone() {
         let (_, version, _) = invoke(&["--version"]);
         assert_eq!(version, format!("tick-hub {VERSION}\n"));
+        // G2: literal golden so a version bump without a golden update fails.
+        assert_eq!(version, "tick-hub 0.2.0\n");
         let (_, guide, _) = invoke(&["--userguide"]);
         assert_eq!(guide, USER_GUIDE);
+        // G3: guide invariants (Rust half of compare_package_guides).
+        assert!(guide.len() > 500, "guide too short: {}", guide.len());
+        assert!(guide.to_lowercase().contains("tick-hub"));
+        for leak in ["pip install", "pypi", "python api", "py/"] {
+            assert!(
+                !guide.to_lowercase().contains(leak),
+                "rust guide leaks python-edition token {leak:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_schema_matches_differential_contract() {
+        // G1: replaces schema:* — every command/flag token must appear.
+        let (code, top, _) = invoke(&["--help"]);
+        assert_eq!(code, 0);
+        for token in [
+            "tick",
+            "state",
+            "list",
+            "json",
+            "yaml",
+            "quickstart",
+            "--userguide",
+        ] {
+            assert!(top.contains(token), "top --help missing {token}");
+        }
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "tick",
+                &[
+                    "--config",
+                    "--state",
+                    "--fired-state",
+                    "--now",
+                    "--current-tick-min",
+                    "--flush",
+                    "--report-pending",
+                    "--no-header",
+                ],
+            ),
+            ("state", &["--state", "--current-tick-min"]),
+            ("list", &["--config"]),
+            ("json", &["--config"]),
+            ("yaml", &["--config"]),
+        ];
+        for (cmd, flags) in cases {
+            let (code, help, _) = invoke(&[cmd, "--help"]);
+            assert_eq!(code, 0, "{cmd} --help exit");
+            for flag in *flags {
+                assert!(help.contains(flag), "{cmd} --help missing {flag}");
+            }
+        }
+    }
+
+    #[test]
+    fn config_refusal_exits_two_via_cli() {
+        // G4 (CLI half): one refusal shape pins parser -> exit 2 wiring.
+        let path = temp_file(
+            "refuse.json",
+            r#"{"reminders":[{"name":"r","cadence_secs":3600,"cadence_offset_secs":3600,"emit":{"kind":"note","title":"t"}}]}"#,
+        );
+        let text = path.to_string_lossy();
+        let (code, _, _) = invoke(&["list", "--config", &text]);
+        assert_eq!(code, 2);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn cli_numeric_hostility_is_usage_error() {
+        // G5: overflow, abbreviation, hostile integer syntax all exit 2.
+        let path = temp_file("hostile.json", r#"{"reminders":[]}"#);
+        let text = path.to_string_lossy();
+        for args in [
+            vec!["tick", "--config", &text, "--now", "9223372036854775808"],
+            vec!["tick", "--config", &text, "--now=-9223372036854775809"],
+            vec!["tick", "--conf", &text, "--now", "0"],
+            vec!["tick", "--config", &text, "--now=1_0"],
+            vec!["tick", "--config", &text, "--now= 10"],
+            vec!["tick", "--config", &text, "--now=١٠"],
+        ] {
+            let (code, _, _) = invoke(&args);
+            assert_eq!(code, 2, "args {args:?} must exit 2");
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn invalid_documents_exit_two_via_cli() {
+        // G7: reasons stay in io.rs; this pins document -> exit 2 wiring.
+        let docs: &[(&str, &str)] = &[
+            ("unknown.json", r#"{"unknown": true}"#),
+            ("null-list.json", r#"{"reminders": null}"#),
+            (
+                "duplicate-name.json",
+                r#"{"reminders":[{"name":"r","emit":{"skill":"s"}},{"name":"r","emit":{"skill":"s"}}]}"#,
+            ),
+            ("duplicate-key.json", r#"{"reminders":[],"reminders":[]}"#),
+            (
+                "reserved.json",
+                r#"{"reminders":[{"name":"r","emit":{"skill":"s","fields":{"<<":"x"}}}]}"#,
+            ),
+            (
+                "negative.json",
+                r#"{"reminders":[{"name":"r","cadence_secs":-1,"emit":{"skill":"s"}}]}"#,
+            ),
+            (
+                "overflow.json",
+                r#"{"reminders":[{"name":"r","cadence_secs":9223372036854775808,"emit":{"skill":"s"}}]}"#,
+            ),
+            (
+                "unknown-dependency.json",
+                r#"{"reminders":[{"name":"r","depends_on":["missing"],"emit":{"skill":"s"}}]}"#,
+            ),
+            (
+                "dependency-cycle.json",
+                r#"{"reminders":[{"name":"a","depends_on":["b"],"emit":{"skill":"s"}},{"name":"b","depends_on":["a"],"emit":{"skill":"s"}}]}"#,
+            ),
+            ("duplicate.yaml", "reminders: []\nreminders: []\n"),
+            ("non-string.yaml", "1: value\nreminders: []\n"),
+            (
+                "merge.yaml",
+                "base: &b {description: x}\n<<: *b\nreminders: []\n",
+            ),
+            (
+                "nonfinite.yaml",
+                "reminders:\n  - {name: r, gate: .nan, emit: {skill: s}}\n",
+            ),
+        ];
+        for (name, body) in docs {
+            let path = temp_file(name, body);
+            let text = path.to_string_lossy();
+            let (code, _, _) = invoke(&["json", "--config", &text]);
+            assert_eq!(code, 2, "{name} must exit 2");
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn cli_rendering_goldens_match_differential_fixtures() {
+        // G6a: phased config -> exact list/json bytes.
+        let phased = temp_file(
+            "phased.json",
+            r#"{"reminders":[{"name":"phase_a","cadence_secs":3600,"cadence_offset_secs":0,"cadence_window_secs":1800,"emit":{"kind":"note","title":"a"}},{"name":"phase_b","cadence_secs":3600,"cadence_offset_secs":1800,"emit":{"kind":"note","title":"b"}},{"name":"plain","cadence_secs":3600,"emit":{"kind":"note","title":"p"}}]}"#,
+        );
+        let pt = phased.to_string_lossy();
+        let (code, list, _) = invoke(&["list", "--config", &pt]);
+        assert_eq!(code, 0);
+        assert_eq!(
+            list,
+            "reminders:\n  phase_a  [note] 3600s a\n  phase_b  [note] 3600s b\n  plain    [note] 3600s p\n"
+        );
+        let (code, json, _) = invoke(&["json", "--config", &pt]);
+        assert_eq!(code, 0);
+        assert!(json.contains("\"cadence_offset_secs\": 0"));
+        assert!(json.contains("\"cadence_window_secs\": 1800"));
+        // G6d: yaml output fed back through json equals direct json.
+        let (code, yaml, _) = invoke(&["yaml", "--config", &pt]);
+        assert_eq!(code, 0);
+        let rt = temp_file("roundtrip.yaml", &yaml);
+        let rt_t = rt.to_string_lossy();
+        let (code, rt_json, _) = invoke(&["json", "--config", &rt_t]);
+        assert_eq!(code, 0);
+        assert_eq!(rt_json, json);
+        let _ = fs::remove_file(phased);
+        let _ = fs::remove_file(rt);
+    }
+
+    #[test]
+    fn representative_tick_and_state_goldens() {
+        // G6b/c: composite tick + ops-state exact stdout (differential fixtures).
+        let watched = temp_file("snapshot.dat", "snapshot\n");
+        let _ = std::process::Command::new("touch")
+            .args(["-d", "@800", &watched.to_string_lossy()])
+            .status();
+        let watched_t = watched.to_string_lossy().replace('\\', "\\\\");
+        let config_text = format!(
+            r#"{{"description":"cross-check unicode ☃","reminders":[{{"name":"always","cadence_secs":0,"emit":{{"kind":"action","skill":"refresh-cache","fields":{{"z":"last","a":"first"}},"title":"refresh {{a}} {{z}}"}} }},{{"name":"gated","cadence_secs":60,"gate":{{"cmd":"printf 'count=3\\n'","when":"nonempty","capture":true,"parallel":true}},"emit":{{"kind":"action","skill":"triage","title":"triage {{count}}"}} }},{{"name":"parallel_note","gate":{{"cmd":"true","when":"success","parallel":true}},"emit":{{"kind":"note","title":"parallel gate completed"}}}},{{"name":"guarded","requires_flags":["ready"],"emit":{{"kind":"note","title":"guard is enabled"}}}},{{"name":"not_due","cadence_secs":500,"emit":{{"kind":"note","title":"must stay quiet"}}}}],"health_checks":[{{"name":"snapshot","glob":"{watched_t}","threshold_secs":100,"detail":"fixture age"}},{{"name":"absent","glob":"{watched_t}.missing-*","threshold_secs":1}}]}}"#
+        );
+        let config = temp_file("composite.json", &config_text);
+        let state = temp_file(
+            "ops-state.yaml",
+            "enabled: true\ntick_frequency_min: 30\nlabel: cross-host\nflags: {ready: true, count: 2}\n_annotation: ignored\n",
+        );
+        let fired = temp_file("fired.state", "gated=900\nnot_due=900\n");
+        let (ct, st, ft) = (
+            config.to_string_lossy(),
+            state.to_string_lossy(),
+            fired.to_string_lossy(),
+        );
+        let (code, tick, err) = invoke(&[
+            "tick",
+            "--config",
+            &ct,
+            "--state",
+            &st,
+            "--fired-state",
+            &ft,
+            "--now",
+            "1000",
+            "--no-header",
+        ]);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(
+            tick,
+            "HEALTH: snapshot stale age_secs=200 threshold_secs=100 detail=\"fixture age\"\nHEALTH: absent missing age_secs=NA threshold_secs=1 detail=\"\"\nNOTE: ops-state enabled=true tick_frequency_min=30 label=cross-host flags=count=2,ready=true\n[tick-hub: always · every tick]\nACTION: refresh-cache z=last a=first title=\"refresh first last\"\n[tick-hub: gated · every 60s]\nACTION: triage count=3 title=\"triage 3\"\n[tick-hub: parallel_note · every tick]\nNOTE: parallel gate completed\n[tick-hub: guarded · every tick]\nNOTE: guard is enabled\nNOTE: emitted 2 instruction(s) this tick\n"
+        );
+        let (code, state_out, _) = invoke(&["state", "--state", &st, "--current-tick-min", "15"]);
+        assert_eq!(code, 0);
+        assert_eq!(
+            state_out,
+            "NOTE: ops-state enabled=true tick_frequency_min=30 label=cross-host flags=count=2,ready=true\nACTION: actualize-tick-frequency desired=30 current=15 title=\"reschedule the tick to 30 min so it matches the intended cadence (currently 15 min)\"\n"
+        );
+        let _ = fs::remove_file(config);
+        let _ = fs::remove_file(state);
+        let _ = fs::remove_file(fired);
+        let _ = fs::remove_file(watched);
+    }
+
+    #[test]
+    fn frozen_random_corpus_goldens() {
+        // G8: seed-1234 indices 0..4 frozen as literals; tick stdout is the golden.
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                r#"{"description":"random fixture 0","reminders":[{"name":"r0","cadence_secs":0,"emit":{"kind":"action","title":"random 0:0 ☃","skill":"handler-0","fields":{"iteration":"0"}}},{"name":"r1","cadence_secs":0,"emit":{"kind":"action","title":"random 0:1 ☃","skill":"handler-1","fields":{"iteration":"0"}}},{"name":"r2","cadence_secs":0,"emit":{"kind":"action","title":"random 0:2 ☃","skill":"handler-2","fields":{"iteration":"0"}}},{"name":"r3","cadence_secs":30,"emit":{"kind":"action","title":"random 0:3 ☃","skill":"handler-3","fields":{"iteration":"0"}}},{"name":"r4","cadence_secs":0,"emit":{"kind":"action","title":"random 0:4 ☃","skill":"handler-4","fields":{"iteration":"0"}}},{"name":"r5","cadence_secs":0,"emit":{"kind":"note","title":"random 0:5 ☃"}}],"health_checks":[]}"#,
+                "0",
+                "NOTE: ops-state enabled=true tick_frequency_min=30\n[tick-hub: r0 · every tick]\nACTION: handler-0 iteration=0 title=\"random 0:0 ☃\"\n[tick-hub: r1 · every tick]\nACTION: handler-1 iteration=0 title=\"random 0:1 ☃\"\n[tick-hub: r2 · every tick]\nACTION: handler-2 iteration=0 title=\"random 0:2 ☃\"\n[tick-hub: r3 · every 30s]\nACTION: handler-3 iteration=0 title=\"random 0:3 ☃\"\n[tick-hub: r4 · every tick]\nACTION: handler-4 iteration=0 title=\"random 0:4 ☃\"\n[tick-hub: r5 · every tick]\nNOTE: random 0:5 ☃\nNOTE: emitted 5 instruction(s) this tick\n",
+            ),
+            (
+                r#"{"description":"random fixture 1","reminders":[{"name":"r0","cadence_secs":3600,"emit":{"kind":"action","title":"random 1:0 ☃","skill":"handler-0","fields":{"iteration":"1"}}},{"name":"r1","cadence_secs":1,"emit":{"kind":"action","title":"random 1:1 ☃","skill":"handler-1","fields":{"iteration":"1"}}}],"health_checks":[]}"#,
+                "1",
+                "NOTE: ops-state enabled=true tick_frequency_min=30\n[tick-hub: r0 · every 3600s]\nACTION: handler-0 iteration=1 title=\"random 1:0 ☃\"\n[tick-hub: r1 · every 1s]\nACTION: handler-1 iteration=1 title=\"random 1:1 ☃\"\nNOTE: emitted 2 instruction(s) this tick\n",
+            ),
+            (
+                r#"{"description":"random fixture 2","reminders":[],"health_checks":[]}"#,
+                "2",
+                "NOTE: ops-state enabled=true tick_frequency_min=30\nNOTE: emitted 0 instruction(s) this tick\n",
+            ),
+            (
+                r#"{"description":"random fixture 3","reminders":[{"name":"r0","cadence_secs":0,"emit":{"kind":"note","title":"random 3:0 ☃"}}],"health_checks":[]}"#,
+                "3",
+                "NOTE: ops-state enabled=true tick_frequency_min=30\n[tick-hub: r0 · every tick]\nNOTE: random 3:0 ☃\nNOTE: emitted 0 instruction(s) this tick\n",
+            ),
+        ];
+        for (fixture, now, golden) in cases {
+            let path = temp_file("random.json", fixture);
+            let text = path.to_string_lossy();
+            let (code, json, _) = invoke(&["json", "--config", &text]);
+            assert_eq!(code, 0);
+            assert!(json.contains("random fixture"));
+            let (code, tick, err) =
+                invoke(&["tick", "--config", &text, "--now", now, "--no-header"]);
+            assert_eq!(code, 0, "{err}");
+            assert_eq!(&tick, golden);
+            let _ = fs::remove_file(path);
+        }
     }
 
     #[test]

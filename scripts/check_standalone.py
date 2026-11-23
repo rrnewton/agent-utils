@@ -18,7 +18,7 @@ the subsets and the ones still to add.
 
     python3 scripts/check_standalone.py --list
     python3 scripts/check_standalone.py --subset wrkslots
-    python3 scripts/check_standalone.py --subset tick-hub --keep
+    python3 scripts/check_standalone.py --subset wrkslots --keep
 """
 
 from __future__ import annotations
@@ -176,38 +176,6 @@ def _require(condition: bool, message: str) -> None:
 
 # ---- scenarios ------------------------------------------------------------------------------------
 
-_OPS_YAML = """\
-reminders:
-  - name: refresh_cache
-    cadence_secs: 3600
-    emit:
-      kind: action
-      skill: refresh-cache
-      title: refresh the shared cache
-health_checks:
-  - name: newest_snapshot
-    glob: {snapshots}/*.tar
-    threshold_secs: 86400
-"""
-
-
-def tick_hub_scenario(box: Sandbox) -> None:
-    """The README quick start: a due reminder fires once, and flushed state stops it repeating."""
-
-    (box.work / "ops.yaml").write_text(
-        _OPS_YAML.format(snapshots=box.work / "snapshots"), encoding="utf-8"
-    )
-    command = ["tick-hub", "tick", "--config", "ops.yaml", "--no-header"]
-    first = box.run(command)
-    _require("ACTION: refresh-cache" in first, f"first tick emitted no action:\n{first}")
-    _require("HEALTH: newest_snapshot missing" in first, f"no health line:\n{first}")
-    box.run([*command, "--flush"])
-    _require((box.work / ".tick-hub" / "state").exists(), "--flush wrote no state file")
-    again = box.run(command)
-    _require("ACTION:" not in again, f"a flushed reminder fired again:\n{again}")
-    _require("emitted 0 instruction(s)" in again, f"unexpected second tick:\n{again}")
-
-
 _AGENT_SCRIPT = """\
 set -eu
 wrkslots create s1 --slot-type agent --coordinator-authorized --agent worker-a --task t1 \\
@@ -300,14 +268,6 @@ def wrkslots_scenario(box: Sandbox) -> None:
 
 
 SUBSETS: tuple[Subset, ...] = (
-    Subset(
-        name="tick-hub",
-        summary="recurring duties evaluated by a timer, with no coordinator or agentctl",
-        projects=("tick_hub",),
-        dependencies=("PyYAML",),
-        commands=("tick-hub",),
-        scenario=tick_hub_scenario,
-    ),
     Subset(
         name="wrkslots",
         summary="worktree slots for any agents, with no agentctl, Herdr, systemd, or sudo",
