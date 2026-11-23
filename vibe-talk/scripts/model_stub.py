@@ -69,12 +69,25 @@ class Handler(BaseHTTPRequestHandler):
             return
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length else b""
-        text = body.decode("utf-8", "replace")
         answer = ANSWER
         # `#2156`: a WTF glossary lookup asks in its own shape; answer it as
         # the strict JSON the lookup route parses, citing the first evidence
-        # message the server fenced into the prompt.
-        if "You maintain a project glossary" in text:
+        # message the server fenced into the prompt. The prompt arrives
+        # JSON-wrapped, so decode before reading its lines.
+        try:
+            payload = json.loads(body.decode("utf-8", "replace"))
+            text = json.dumps(payload)
+            for message in payload.get("messages", []):
+                content = message.get("content", "")
+                if isinstance(content, str) and content:
+                    text = content
+                elif isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text = str(block.get("text", ""))
+        except ValueError:
+            text = body.decode("utf-8", "replace")
+        if "You maintain a project glossary" in text or "Selected words:" in text:
             import re
 
             selected = re.search(r"Selected words: (.+)", text)
