@@ -33,12 +33,6 @@ expires = "2026-12-22"
 note = "quarantined from gating; if it still appears red, it is known-red"
 
 [[known-red]]
-step = "vibe-talk.check.quote-dismiss-browser"
-issue = "#2117"
-expires = "2026-12-22"
-note = "shared page-build output race (target/web replaced mid-step)"
-
-[[known-red]]
 step = "vibe-talk.check.done-feedback-browser"
 issue = "#2077"
 expires = "2026-12-22"
