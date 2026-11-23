@@ -115,10 +115,18 @@ def test_sigterm_sweeps_run_images(tmp_path: Path) -> None:
     proc.send_signal(signal.SIGTERM)
     proc.wait(timeout=240)
     assert proc.returncode not in (0, None)
-    mounts = subprocess.run(
-        ["findmnt", "-rn", "-o", "TARGET"], text=True,
-        capture_output=True, check=False,
-    ).stdout
+    # Condition-based: the sweep unmounts after the in-flight
+    # child stops; poll until no mount names the run directory.
+    deadline = time.monotonic() + 240
+    mounts = ""
+    while time.monotonic() < deadline:
+        mounts = subprocess.run(
+            ["findmnt", "-rn", "-o", "TARGET"], text=True,
+            capture_output=True, check=False,
+        ).stdout
+        if str(run_dir) not in mounts:
+            break
+        time.sleep(0.2)
     assert str(run_dir) not in mounts, f"mounts remain under {run_dir}"
 
 

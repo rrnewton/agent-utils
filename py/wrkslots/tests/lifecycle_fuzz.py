@@ -363,6 +363,23 @@ def _exit_sweep() -> None:
 
 
 def _on_signal(signum: int, _frame: object) -> None:
+    # Stop the in-flight CLI child first: it may hold the slot
+    # whose images the sweep must unmount. Children are read
+    # from /proc, never matched by name or pattern.
+    try:
+        for task in Path(f"/proc/{os.getpid()}/task").iterdir():
+            try:
+                children = (task / "children").read_text(
+                    encoding="ascii").split()
+            except OSError:
+                continue
+            for raw in children:
+                try:
+                    os.kill(int(raw), signal.SIGTERM)
+                except (OSError, ValueError):
+                    pass
+    except OSError:
+        pass
     _exit_sweep()
     os._exit(128 + signum)
 
