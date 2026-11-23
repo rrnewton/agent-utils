@@ -13,6 +13,22 @@ import pytest
 from wrkslots import cli
 
 
+def test_stderr_budget_uses_live_host_count_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    floor = cli._VALIDATE_REMOVE_BATCH_CENSUS_STDERR_BYTES
+    cap = cli._VALIDATE_REMOVE_BATCH_CENSUS_STDERR_CAP_BYTES
+    per_process = cli._ABSENT_CENSUS_STDERR_PER_PROCESS_BYTES
+    for count, expected in (
+        (0, floor),
+        (256, max(floor, 256 * per_process)),
+        (6500, min(cap, 6500 * per_process)),
+        (10**9, cap),
+    ):
+        monkeypatch.setattr(cli, "_host_process_count", lambda count=count: count)
+        assert cli._validate_remove_batch_census_stderr_bytes(1) == expected
+
+
 def test_stderr_budget_floor_scale_and_cap() -> None:
     floor = cli._VALIDATE_REMOVE_BATCH_CENSUS_STDERR_BYTES
     cap = cli._VALIDATE_REMOVE_BATCH_CENSUS_STDERR_CAP_BYTES

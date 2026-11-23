@@ -20954,6 +20954,7 @@ def test_validate_batch_census_deadline_starts_after_seal_preflight(
         return wrkslots._ProcessPathCensus((), ())
 
     monkeypatch.setattr(time, "monotonic", monotonic)
+    monkeypatch.setattr(wrkslots, "_host_process_count", lambda: 0)
     monkeypatch.setattr(wrkslots, "_interrupt_for_test", advance_during_seal)
     monkeypatch.setattr(wrkslots, "_capture_process_path_census", shared)
     monkeypatch.setattr(
@@ -21039,6 +21040,7 @@ def test_validate_batch_census_deadline_restores_seals_before_outer_bound(
         raise AssertionError("unreachable")
 
     monkeypatch.setattr(time, "monotonic", monotonic)
+    monkeypatch.setattr(wrkslots, "_host_process_count", lambda: 0)
     monkeypatch.setattr(
         wrkslots, "_capture_process_path_census", exhaust_after_shared_census
     )
@@ -21094,10 +21096,14 @@ def test_validate_batch_census_deadline_restores_seals_before_outer_bound(
     ((0, 120.0), (1, 120.0), (2, 180.0), (wrkslots.VALIDATE_REMOVE_BATCH_LIMIT, 540.0)),
 )
 def test_validate_batch_census_bound_adds_one_allowance_per_further_slot(
-    sealed_slots: int, bound: float
+    sealed_slots: int, bound: float, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     assert wrkslots.VALIDATE_REMOVE_BATCH_LIMIT == 8
     assert wrkslots._validate_remove_batch_census_seconds(sealed_slots) == bound
+    # On a quiet host (process count pinned to 0) each sealed slot gets
+    # exactly the 64 KiB floor; scaling with the live process count is
+    # covered host-independently in test_census_diagnostics.py.
+    monkeypatch.setattr(wrkslots, "_host_process_count", lambda: 0)
     assert wrkslots._validate_remove_batch_census_stderr_bytes(sealed_slots) == (
         max(1, sealed_slots) * 64 * 1024
     )

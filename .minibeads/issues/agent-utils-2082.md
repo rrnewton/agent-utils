@@ -21,7 +21,7 @@ Document how the budget is derived; scale it with the process count up to a cap,
 
 - The budget and its derivation are documented and tested; timeout messages name the slot and failure shape.
 
-# Refinement (mu-census, 2026-11-21)
+## Refinement (mu-census, 2026-11-21)
 
 The validate-remove stderr bound now scales with the live process
 count up to a cap (`_validate_remove_batch_census_stderr_bytes`): the

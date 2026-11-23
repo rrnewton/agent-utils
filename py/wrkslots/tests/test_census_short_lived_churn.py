@@ -11,9 +11,9 @@ Two controls:
   listed-then-gone churn (convergence for validate remove comes from
   the lineage census in the #2081 stack, which replaces this census on
   that path; this census remains for the paths that still use it).
-- Holder naming: a holder found in round 1 is named (its PID) in the
-  refusal or matches, never reported only as "did not close". The
-  distinct holder-found shape and exit status are a separate slice.
+The companion control (a holder found in round 1 must be named, never
+reported only as "did not close") lands with the holder-found slice of
+#2082, which gives that naming its device-and-inode proof.
 """
 
 from __future__ import annotations
@@ -64,22 +64,3 @@ def test_listed_then_gone_unrelated_churn_still_refuses(
     assert "(not necessarily consecutive)" in text
     assert len(host.inventories) == 1 + cli._SAME_UID_CENSUS_INVENTORIES
 
-
-def test_a_found_holder_is_never_reported_as_census_did_not_close(
-    monkeypatch: pytest.MonkeyPatch, slot: Path,  # noqa: F811
-) -> None:
-    """A holder found in round 1, then short-lived unrelated churn: the
-    census reports the holder (in its matches, or a refusal naming its
-    PID), never a bare "did not close" with no PID. The distinct
-    holder-found shape and exit status are a separate #2082 slice."""
-
-    holder = (100, 7)
-    host = _Host(slot, holder, holders=[holder])
-    _listed_then_gone_churn(host, 40)
-    _scripted(monkeypatch, host)
-    try:
-        census = _census(host)
-    except cli.Refusal as exc:
-        assert str(holder[0]) in str(exc), f"holder {holder[0]} not named: {exc}"
-    else:
-        assert {pid for pid, *_ in census.matches} == {holder[0]}
