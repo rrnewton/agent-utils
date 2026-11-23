@@ -1244,6 +1244,19 @@ pub trait ManagedApi: AgentApi {
             "slot sandbox entry is unavailable",
         ))
     }
+    /// Replace a fresh pane's shell with a shell inside the mask
+    /// namespace (#2163) and prove every masked path is covered there.
+    /// The default cannot mask, so a masked launch refuses (fail closed).
+    fn enter_masked_namespace(
+        &self,
+        _pane: &str,
+        _masked_paths: &[String],
+        _timeout: Duration,
+    ) -> crate::error::Result<()> {
+        Err(crate::error::AdapterError::unavailable(
+            "masked-path namespace entry is unavailable on this terminal backend",
+        ))
+    }
     /// Type one environment line into a fresh pane's interactive shell before the harness
     /// starts (the registry's `launch_env`), and wait for the shell to take it.
     fn prepare_launch_shell(
@@ -1798,6 +1811,14 @@ impl ManagedApi for HerdrClient {
     ) -> crate::error::Result<()> {
         HerdrClient::prepare_launch_shell(self, pane, command_line, timeout)
     }
+    fn enter_masked_namespace(
+        &self,
+        pane: &str,
+        masked_paths: &[String],
+        timeout: Duration,
+    ) -> crate::error::Result<()> {
+        HerdrClient::enter_masked_namespace(self, pane, masked_paths, timeout)
+    }
     fn start_relay_agent(
         &self,
         kind: &str,
@@ -2252,6 +2273,14 @@ struct AgentRecord {
     /// Requested structured effort, separate from a harness's effective fallback.
     #[serde(default)]
     reasoning_effort: Option<String>,
+    /// Effective owner-declared off-limits paths at the last launch
+    /// (#2163); empty when the launch was unmasked.
+    #[serde(default)]
+    masked_paths: Vec<String>,
+    /// Per-agent masked-path override recorded at start: wins over the
+    /// launch profile's `masked_paths` on every relaunch (#2163).
+    #[serde(default)]
+    masked_paths_override: Option<Vec<String>>,
     /// Names only; literal environment values are not recovery metadata.
     #[serde(default)]
     environment_names: Vec<String>,
@@ -6818,6 +6847,9 @@ pub struct StartOptions {
     /// Record the agent as pinned, a persistent lane; `None` uses the profile's `pinned`
     /// (#917 chat-bang-commands).
     pub pinned: Option<bool>,
+    /// Per-agent masked-path override (#2163): recorded on the agent
+    /// record and winning over its launch profile on every launch.
+    pub masked_paths_override: Option<Vec<String>>,
 }
 
 /// The wrkslots slot an interactive agent is boxed to (`agentctl start --slot`).
@@ -7085,6 +7117,7 @@ impl Default for StartOptions {
             slot: None,
             record_edges: true,
             pinned: None,
+            masked_paths_override: None,
         }
     }
 }
@@ -11623,6 +11656,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 .map(|launch| launch.slot.clone()),
             slot_project,
             slot_isolation,
+            masked_paths: Vec::new(),
+            masked_paths_override: options.masked_paths_override.clone(),
             reasoning_effort: reasoning_effort.map(str::to_owned),
             environment_names: environment_names(&options.environment),
             agentcloud: None,
@@ -12275,6 +12310,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             slot: None,
             slot_project: None,
             slot_isolation: None,
+            masked_paths: Vec::new(),
+            masked_paths_override: None,
             reasoning_effort: None,
             environment_names: Vec::new(),
             agentcloud: None,
@@ -12458,6 +12495,34 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 options.startup_timeout.max(Duration::from_secs(300)),
             )?;
         }
+        // Masked paths (#2163): the pane shell enters the mask namespace
+        // before anything else runs in it, so the harness, its MCP server
+        // children and every tool it starts inherit the mask. Setup
+        // failure refuses the launch; nothing launches unmasked.
+        let masked = self.effective_masked_paths(record);
+        record.masked_paths = masked.clone();
+        if !masked.is_empty() {
+            if relay_command.is_some() {
+                return Err(fail(
+                    "masked_paths does not apply under root slot isolation (the relay runs outside the pane shell); use userns or cgroup isolation, or remove masked_paths",
+                ));
+            }
+            self.save(record)?;
+            self.client.enter_masked_namespace(
+                &pane_id,
+                &masked,
+                options.startup_timeout.max(Duration::from_secs(60)),
+            )?;
+        }
+        // Session environment (#2163): a profile may unset variables for
+        // the session (for example a root-naming variable), applied in
+        // the pane shell the harness will inherit.
+        let unset_env = self.profile_unset_env(record);
+        if !unset_env.is_empty() {
+            let line = format!("unset {}", unset_env.join(" "));
+            self.client
+                .prepare_launch_shell(&pane_id, &line, options.startup_timeout)?;
+        }
         if let Some(launch_env) = launch_env.as_ref() {
             // After the pane's (and any slot box's) interactive shell has run its startup
             // files, so the prefix stays first for the harness started next.
@@ -12555,8 +12620,11 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             let arguments = record.arguments.clone();
             // A userns slot box withholds the launcher's seteuid step (#1583):
             // run the adapter's boxed form (for Muse, its runtime directly).
-            let in_box =
-                slot_command.is_some() && record.slot_isolation.as_deref() == Some("userns");
+            // A mask namespace does the same (#2163): the masked pane is
+            // the sandbox, so Muse runs its runtime with its own sandbox off.
+            let in_box = (slot_command.is_some()
+                && record.slot_isolation.as_deref() == Some("userns"))
+                || !masked.is_empty();
             let mut persist = |identity: CustomProcessIdentity| {
                 record.custom_process_identity = Some(identity);
                 self.save(record).map_err(|error| {
@@ -13029,6 +13097,76 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             record_sha256: Some(format!("{:x}", Sha256::digest(&snapshot.content))),
             skip_cloud_halt: false,
         }))
+    }
+
+    /// The launch profile a record names, when it still loads (#2163).
+    fn profile_for_record(&self, record: &AgentRecord) -> Option<crate::profiles::LaunchProfile> {
+        let profile_name = record.profile.as_deref()?;
+        let root =
+            crate::profiles::configuration_root(Path::new(&record.cwd), &self.registry, false)
+                .ok()?;
+        let (_, profiles) = crate::profiles::load_profiles(&root, false).ok()?;
+        profiles.get(profile_name).cloned()
+    }
+
+    /// Declared masks: the profile's current `masked_paths` (#2163).
+    fn declared_masked_paths(&self, record: &AgentRecord) -> Vec<String> {
+        self.profile_for_record(record)
+            .map(|profile| profile.masked_paths)
+            .unwrap_or_else(|| record.masked_paths.clone())
+    }
+
+    /// Effective masks (#2163): the per-agent record override wins, then
+    /// the profile's current declared list, then the recorded effective
+    /// list (for a record whose profile is gone).
+    fn effective_masked_paths(&self, record: &AgentRecord) -> Vec<String> {
+        if let Some(override_paths) = record.masked_paths_override.as_deref() {
+            return override_paths.to_vec();
+        }
+        if record.profile.is_some() {
+            if let Some(profile) = self.profile_for_record(record) {
+                return profile.masked_paths;
+            }
+        }
+        record.masked_paths.clone()
+    }
+
+    /// Masked-session scope for the watch census (#2163): every live
+    /// record with effective masks, as (agent, masked paths, root PIDs).
+    /// File reads only, so a watch pass asks the terminal nothing new.
+    pub(crate) fn masked_scope(&self) -> Vec<(String, Vec<String>, Vec<u64>)> {
+        let Ok(names) = agent_queue::registry::names(&self.registry) else {
+            return Vec::new();
+        };
+        let mut scope = Vec::new();
+        for name in names {
+            let Ok(record) = self.load(&name) else {
+                continue;
+            };
+            if record.lifecycle != "running" {
+                continue;
+            }
+            let masked = self.effective_masked_paths(&record);
+            if masked.is_empty() {
+                continue;
+            }
+            let mut roots = Vec::new();
+            if let Some(identity) = record.harness_identity.as_ref() {
+                roots.push(u64::from(identity.pid));
+            }
+            if let Some(identity) = record.custom_process_identity.as_ref() {
+                roots.push(u64::from(identity.pid));
+            }
+            scope.push((name, masked, roots));
+        }
+        scope
+    }
+
+    /// Session variables the record's profile unsets at launch (#2163).
+    fn profile_unset_env(&self, record: &AgentRecord) -> Vec<String> {
+        self.profile_for_record(record)
+            .map(|profile| profile.unset_env)
+            .unwrap_or_default()
     }
 
     /// Names only, never values: the effective launch environment keys a relaunch of
@@ -13513,6 +13651,20 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             .or_else(|| record.declared_model()));
         result["model_source"] = json!(record.model_source());
         result["model_override"] = json!(record.model_override);
+        // Declared vs effective masks (#2163): the profile declares, the
+        // per-agent record override wins, the record keeps what ran.
+        result["declared_masked_paths"] = json!(self.declared_masked_paths(record));
+        result["effective_masked_paths"] = json!(self.effective_masked_paths(record));
+        result["masked_paths_source"] = json!(if record.masked_paths_override.is_some() {
+            "record"
+        } else if record.profile.is_some() {
+            "profile"
+        } else if record.masked_paths.is_empty() {
+            "none"
+        } else {
+            "record"
+        });
+        result["masked_paths_override"] = json!(record.masked_paths_override);
         result["queue"] = json!(self.queue(agent_name)?);
         result["output"] = json!(self.directory(agent_name)?.join("output.json"));
         result["goal_source"] = if record.goal.is_some() {
@@ -14577,6 +14729,20 @@ its drain would also type, so it was not queued",
                 _ => format!("agent {agent_name:?} launch"),
             };
             crate::profiles::require_permission_bypass(&label, &record.harness, &record.arguments)?;
+        }
+        // Masked paths (#2163): a same-pane relaunch inherits the pane
+        // shell's namespace, which is the mask only when this session was
+        // launched masked with exactly these paths. A mask that changed
+        // since launch cannot be applied here; refuse before anything is
+        // ended, naming the fresh-tab relaunch that does apply it.
+        {
+            let effective = self.effective_masked_paths(&record);
+            if effective != record.masked_paths {
+                return Err(fail(format!(
+                    "agent {agent_name} masked paths changed since launch (recorded {:?}, effective {:?}), which a same-pane restart cannot re-apply; use `agentctl restart {agent_name}` so it relaunches in a fresh tab inside the mask",
+                    record.masked_paths, effective
+                )));
+            }
         }
         // The whole tree, runtime first: a TERM to a wrapper alone (Muse's) orphans the
         // runtime, which then keeps the session while the relaunch resumes it (#920).
@@ -26102,6 +26268,8 @@ fi
     mod lock_rank;
     /// Recovery-manifest record facts judged from raw records (#1559).
     mod manifest;
+    /// Masked-path launches, record overrides and status (#2163).
+    mod masked;
     /// The harness-recorded model captured once at session capture (#1340).
     mod model;
     /// Follow-ups typed into a running Muse turn: steered, proved, withdrawn or held.

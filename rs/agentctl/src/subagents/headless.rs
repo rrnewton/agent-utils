@@ -110,6 +110,11 @@ pub struct HeadlessStart {
     pub detached: bool,
     /// Launch profile the start resolved, recorded on the agent record.
     pub profile: Option<String>,
+    /// Declared masked paths resolved from the launch profile (#2163).
+    pub masked_paths: Vec<String>,
+    /// Per-agent masked-path override from `--masked-paths` (#2163):
+    /// recorded and winning over the profile on every launch.
+    pub masked_paths_override: Option<Vec<String>>,
 }
 
 /// Why `harness` cannot run headless, naming the support-matrix row (#1879 E).
@@ -460,6 +465,11 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             slot: None,
             slot_project: None,
             slot_isolation: None,
+            masked_paths: crate::masked::effective_masked_paths(
+                &options.masked_paths,
+                options.masked_paths_override.as_deref(),
+            ),
+            masked_paths_override: options.masked_paths_override.clone(),
             reasoning_effort: options.reasoning_effort.clone(),
             environment_names: Vec::new(),
             agentcloud: None,
@@ -694,6 +704,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             agent_name,
             claude_bin,
             None,
+            None,
             tool_preview_lines,
             approvals,
             terminate,
@@ -709,6 +720,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         agent_name: &str,
         claude_bin: Option<&Path>,
         effort: Option<&str>,
+        masked_override: Option<Vec<String>>,
         tool_preview_lines: Option<usize>,
         approvals: Option<HeadlessApprovals>,
         terminate: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -726,6 +738,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             agent_name,
             claude_bin,
             effort,
+            masked_override,
             tool_preview_lines,
             approvals,
             terminate,
@@ -741,6 +754,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         agent_name: &str,
         claude_bin: Option<&Path>,
         effort: Option<&str>,
+        masked_override: Option<Vec<String>>,
         tool_preview_lines: Option<usize>,
         approvals: Option<HeadlessApprovals>,
         terminate: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -750,6 +764,14 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             crate::profiles::validate_effort(&record.harness, effort)?;
             if record.reasoning_effort.as_deref() != Some(effort) {
                 record.reasoning_effort = Some(effort.to_owned());
+                self.save(&record)?;
+            }
+        }
+        if let Some(masked) = masked_override {
+            let masked =
+                crate::masked::validate_masked_paths(&masked, "masked paths").map_err(fail)?;
+            if record.masked_paths_override.as_deref() != Some(masked.as_slice()) {
+                record.masked_paths_override = Some(masked);
                 self.save(&record)?;
             }
         }
@@ -838,6 +860,28 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             config.command = vec![launcher.display().to_string()];
         }
         config.arguments = declared_arguments(&record);
+        // Masked paths (#2163): wrap the harness command so the wrapper's
+        // harness, its MCP children and every restart spawn inside the
+        // mask namespace with the real uid/gid. An empty list leaves the
+        // command exactly as before.
+        let masked = self.effective_masked_paths(&record);
+        record.masked_paths = masked.clone();
+        if !masked.is_empty() {
+            // Muse's launcher dies setting its effective UID to root in a
+            // namespace with no inner root (#2163, as in a slot box): run
+            // its runtime directly; the mask is the sandbox.
+            if record.harness == "muse" {
+                if let Some(runtime) =
+                    crate::harness::muse::boxed_runtime(std::path::Path::new(&config.command[0]))
+                {
+                    config.command[0] = runtime.display().to_string();
+                    config.arguments =
+                        crate::harness::muse::boxed_arguments(config.arguments.clone());
+                }
+            }
+            config.command = crate::masked::wrap_command(&masked, config.command);
+        }
+        config.unset_env = self.profile_unset_env(&record);
         // #1822 (coordb): a wrapper (re)launch — run-headless, restart,
         // revive — refuses when the recorded harness args lack the bypass.
         if record.harness == "claude" {

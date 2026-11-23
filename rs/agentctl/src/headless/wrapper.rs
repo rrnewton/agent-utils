@@ -111,6 +111,9 @@ pub struct WrapperConfig {
     /// Launch environment entries (`KEY=VALUE`) the harness is spawned with, beyond
     /// `AGENTCTL_AGENT` (#1412 revive-profile-env); empty for most agents.
     pub environment: Vec<String>,
+    /// Environment variables removed from the harness at spawn (#2163
+    /// session environment); empty for most agents.
+    pub unset_env: Vec<String>,
     /// The harness adapter translating this harness's protocol
     /// (`#1232 headless-harness-adapters`); Claude unless set otherwise.
     pub adapter: std::sync::Arc<dyn HarnessAdapter>,
@@ -140,6 +143,7 @@ impl WrapperConfig {
             approval_timeout: approval::DEFAULT_TIMEOUT,
             approval_cgroup_check: true,
             environment: Vec::new(),
+            unset_env: Vec::new(),
             adapter,
         }
     }
@@ -511,6 +515,9 @@ impl Wrapper {
             if let Some((name, value)) = entry.split_once('=') {
                 command.env(name, value);
             }
+        }
+        for name in &self.config.unset_env {
+            command.env_remove(name);
         }
         let mut child = command
             .spawn()

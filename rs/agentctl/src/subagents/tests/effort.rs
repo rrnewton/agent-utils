@@ -153,7 +153,7 @@ fn run_headless_declared_refuses_an_agent_with_no_declared_effort() {
         .unwrap();
     let terminate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let error = manager
-        .run_headless_declared("lead", None, None, None, None, terminate)
+        .run_headless_declared("lead", None, None, None, None, None, terminate)
         .unwrap_err();
     assert!(
         error.to_string().contains("no reasoning effort declared"),
@@ -162,7 +162,7 @@ fn run_headless_declared_refuses_an_agent_with_no_declared_effort() {
     // Declaring one on the call satisfies the rule without touching the record first.
     let terminate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let error = manager
-        .run_headless_declared("lead", None, Some("ultra"), None, None, terminate)
+        .run_headless_declared("lead", None, Some("ultra"), None, None, None, terminate)
         .unwrap_err();
     assert!(error.to_string().contains("accepted levels"), "{error}");
 }

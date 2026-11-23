@@ -1291,6 +1291,8 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             slot: None,
             slot_project: None,
             slot_isolation: None,
+            masked_paths: Vec::new(),
+            masked_paths_override: None,
             reasoning_effort: reasoning_effort.map(str::to_owned),
             environment_names: environment_names(&options.environment),
             agentcloud: Some(cloud),

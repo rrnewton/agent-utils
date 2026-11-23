@@ -34,6 +34,8 @@ fn required_env_check_names_missing_variables_and_sources() {
         write_sandbox: false,
         slot_isolation: None,
         required_env: vec!["EXAMPLE_EXTRA".to_owned()],
+        masked_paths: Vec::new(),
+        unset_env: Vec::new(),
     };
     let empty: BTreeMap<String, String> = BTreeMap::new();
     let error =

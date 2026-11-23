@@ -175,6 +175,9 @@ def parser() -> argparse.ArgumentParser:
     start.add_argument("--model", metavar="MODEL", help="native model name; omission preserves the harness default")
     start.add_argument("--reasoning-effort", "--effort", dest="reasoning_effort", metavar="EFFORT",
         help="structured harness effort (alias: --effort); use the profile or this option, never a duplicate raw argument")
+    start.add_argument("--masked-paths", action="append", default=[], metavar="PATH",
+        help="owner-declared off-limits path to mask; repeatable. Only the Rust edition of agentctl "
+             "launches masked agents; this edition refuses rather than launching unmasked")
     start.add_argument("--resume", metavar="SESSION",
         help="resume an explicit native conversation for local interactive Claude/Codex/Muse, optionally using --profile")
     start.add_argument("--harness-arg", action="append", default=[], metavar="ARG",
@@ -703,6 +706,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"{selected} uses the agentcloud adapter, which only the Rust edition of "
                     "agentctl implements; start it with the Rust agentctl, or choose a Codex, "
                     f"Claude, or Muse profile from agentctl profiles --cwd {args.cwd}"
+                )
+            if getattr(args, "masked_paths", None):
+                raise ValueError(
+                    "--masked-paths is supported only by the Rust edition of agentctl; "
+                    "start the agent with the Rust agentctl rather than launching unmasked"
+                )
+            if profile is not None and profile.masked_paths:
+                raise ValueError(
+                    f"profile {profile.name!r} declares masked_paths, which only the Rust edition "
+                    "of agentctl implements; start the agent with the Rust agentctl rather than "
+                    "launching unmasked"
+                )
+            if profile is not None and profile.unset_env:
+                raise ValueError(
+                    f"profile {profile.name!r} declares unset_env, which only the Rust edition "
+                    "of agentctl implements; start the agent with the Rust agentctl"
                 )
             mode = profile.mode if profile else (args.mode or "interactive")
             model = profile.model if profile else args.model

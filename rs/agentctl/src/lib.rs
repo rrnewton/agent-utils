@@ -37,6 +37,7 @@ pub mod landing_queue;
 pub mod legacy_cli;
 pub mod lineage;
 pub mod lock_wait;
+pub(crate) mod masked;
 pub(crate) mod mcp;
 pub mod pane_admission;
 pub(crate) mod paste_backstop;

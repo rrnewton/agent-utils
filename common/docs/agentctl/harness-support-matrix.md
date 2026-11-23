@@ -86,6 +86,7 @@ Every cell names its code path. Paths are relative to this repository;
 | Goal commands | supported | supported | supported | none | partial |
 | Skill installation | supported | supported | supported | none | n/a |
 | Boxed launch (`--slot`, userns) | none | none | supported | none | n/a |
+| Masked paths (`masked_paths`, #2163) | partial | partial | supported | none | partial (Muse only) |
 | Transient-failure recovery | supported | supported | none | none | none |
 | Stalled-goal resume | none | supported | none | none | none |
 
@@ -830,6 +831,40 @@ harness without that step — the box is the sandbox.
   failing boxed command takes its exec'd pane with it; the relay
   launch now names that instead of a bare pane refusal.
 - **Unknown TUI**: none — no boxed form is declared.
+
+### Masked paths (`masked_paths`, #2163)
+
+Owner-declared off-limits paths (`masked_paths` in a launch profile,
+`--masked-paths` per agent; the whole harness process tree — MCP server
+children included — starts inside a nested user and mount namespace
+where each masked path reads as an empty read-only directory, with the
+harness running under its real uid and gid; namespace setup failure
+refuses the launch). Mask entry for panes and the headless wrap live in
+`rs/agentctl/src/masked.rs`, entry proof in
+`HerdrClient::enter_masked_namespace` (`rs/agentctl/src/client.rs`),
+launch wiring in `Subagents::launch` and the headless wrapper
+(`rs/agentctl/src/subagents.rs`, `rs/agentctl/src/subagents/headless.rs`);
+status shows declared and effective masks. The Python edition refuses
+the key explicitly rather than launching unmasked
+(`py/agentctl/profiles.py`, `py/agentctl/cli.py`). The key is opt-in
+per profile until every harness passes.
+
+Throwaway trials on one host (2026-11-23, temporary directory as the
+masked path):
+
+- **Muse**: supported — masked pane and headless launches run the
+  runtime beside the launcher with its shell sandbox disabled, as in a
+  slot box; the runtime works inside the namespace.
+- **Claude Code**: partial — `git`, `cargo`, shell children and an
+  MCP-like child process all work inside the namespace and see the
+  masked path as empty, but the Claude launcher itself dies setting
+  its effective UID to root (the same failure as the boxed-launch row
+  above), so a masked Claude launch fails closed until a runtime form
+  exists.
+- **Codex**: partial — same launcher failure as Claude Code.
+- **Headless**: partial — Muse headless works (runtime form, above);
+  Claude headless hits the same launcher failure.
+- **Unknown TUI**: none — no masked form is declared.
 
 ### Transient-failure recovery; stalled-goal resume
 

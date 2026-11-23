@@ -27,7 +27,7 @@ const SESSION_V2: &str = "agentctl-session/v2";
 const SESSION_V3: &str = "agentctl-session/v3";
 const LAUNCH_SCHEMAS: [&str; 2] = ["agentctl-launch/v1", "agentctl-launch/v2"];
 /// Keys every nested row carries.
-const COMMON_FIELDS: [&str; 19] = [
+const COMMON_FIELDS: [&str; 21] = [
     "schema",
     "name",
     "token",
@@ -41,6 +41,8 @@ const COMMON_FIELDS: [&str; 19] = [
     "effective_reasoning_effort",
     "resolved_model",
     "model_override",
+    "masked_paths",
+    "masked_paths_override",
     "error",
     "paused",
     "pane_reported_by_agentctl",
@@ -262,7 +264,12 @@ fn normalize(
     // required as before.
     if !expected
         .iter()
-        .filter(|key| !matches!(**key, "resolved_model" | "model_override"))
+        .filter(|key| {
+            !matches!(
+                **key,
+                "resolved_model" | "model_override" | "masked_paths" | "masked_paths_override"
+            )
+        })
         .all(|key| document.contains_key(*key))
         || document.keys().any(|key| second_authority(key))
     {
@@ -583,6 +590,12 @@ impl NestedRecord {
         }
         if let Some(overridden) = &record.model_override {
             fields.insert("model_override".to_owned(), json!(overridden));
+        }
+        if !record.masked_paths.is_empty() {
+            fields.insert("masked_paths".to_owned(), json!(record.masked_paths));
+        }
+        if let Some(overridden) = &record.masked_paths_override {
+            fields.insert("masked_paths_override".to_owned(), json!(overridden));
         }
         if self.schema == SESSION_V2 {
             for (key, value) in [

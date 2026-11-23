@@ -961,6 +961,10 @@ struct WatchState {
     /// reported, so one jam is reported once.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     jams_reported: BTreeMap<String, f64>,
+    /// Each masked-path process already reported, as `AGENT/PID/START`,
+    /// with when it was reported, so one process is told once (#2163).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    masked_reported: BTreeMap<String, f64>,
     /// For each agent whose owner requests wait undelivered and were reported, when they were
     /// last reported, so the notice repeats every `owner_stuck` until they are delivered.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -1288,6 +1292,22 @@ pub struct QuarantinedPrompt {
 /// watcher starts, is history rather than news.
 const QUARANTINE_LOOKBACK_SECONDS: f64 = 6.0 * 3600.0;
 
+/// One process in a managed session's scope whose working directory is
+/// under a masked path (#2163 interim watch guard).
+#[derive(Clone, Debug, PartialEq)]
+pub struct MaskedProcess {
+    /// Managed agent the process is attributed to.
+    pub agent: String,
+    /// Process ID.
+    pub pid: u64,
+    /// Process start time (kernel ticks), so a reused PID is a new process.
+    pub started: u64,
+    /// Working directory under the masked path.
+    pub cwd: String,
+    /// The masked path the working directory sits under.
+    pub masked_path: String,
+}
+
 /// Where observations come from; the production source reads the registry through Herdr.
 pub trait Probe {
     /// Observe every agent that should be watched this pass. An error means the team
@@ -1303,6 +1323,13 @@ pub trait Probe {
     /// For each registered agent that senders are waiting to deliver to, its name and the
     /// [`crate::lock_wait::contention`] report. The default sees no waits.
     fn delivery_waits(&mut self) -> Vec<(String, Value)> {
+        Vec::new()
+    }
+    /// Every process in a managed session's scope (cgroup or process
+    /// tree, MCP servers and build daemons included) whose working
+    /// directory is under one of that session's masked paths (#2163).
+    /// The default sees none.
+    fn masked_processes(&mut self) -> Vec<MaskedProcess> {
         Vec::new()
     }
     /// Drain every interactive agent's queued prompts once (#804), returning one
@@ -3924,6 +3951,11 @@ fn watch_agents_once(
     // First, as a priority sender: the other notices wait for the coordinator's lock like any
     // ordinary sender, so behind a jam on the coordinator they would hold this one up.
     let delivery_waits = report_delivery_jams(probe, notifier, state, now, options);
+    let masked_processes = if probe_error.is_null() {
+        report_masked_processes(probe, notifier, state, now, options)
+    } else {
+        Vec::new()
+    };
     // The coordinator's own blocked prompt, told past it at once (#1158): it is
     // exempt from episodes, so this dedicated check is its only alert.
     let coordinator_blocked = if probe_error.is_null() {
@@ -4080,6 +4112,7 @@ fn watch_agents_once(
         "child_done": child_done,
         "waiting": state.pending.len(),
         "delivery_waits": delivery_waits,
+        "masked_processes": masked_processes,
         "coordinator_blocked": coordinator_blocked,
         "hook_confirmations": hook_confirmations,
         "queue_drains": queue_drains,
@@ -4316,6 +4349,131 @@ fn report_delivery_jams(
         rows.push(row);
     }
     state.jams_reported = still_jammed;
+    rows
+}
+
+/// (pid, parent pid, start ticks) from `/proc/PID/stat`, parsed after
+/// the last `)` so a command name with spaces cannot shift the fields.
+fn proc_lineage(pid: &str) -> Option<(u64, u64, u64)> {
+    let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let pid_num: u64 = pid.parse().ok()?;
+    let after = text.rsplit(')').next()?;
+    let fields: Vec<&str> = after.split_whitespace().collect();
+    // fields[0] is state (stat field 3); ppid is field 4, starttime field 22.
+    let ppid: u64 = fields.get(1)?.parse().ok()?;
+    let started: u64 = fields.get(19)?.parse().ok()?;
+    Some((pid_num, ppid, started))
+}
+
+/// Every process in the session scope rooted at `roots` (the harness
+/// process and its whole descendant tree, MCP servers and build daemons
+/// included) whose working directory is under a masked path (#2163).
+fn session_masked_processes(agent: &str, roots: &[u64], masked: &[String]) -> Vec<MaskedProcess> {
+    if roots.is_empty() || masked.is_empty() {
+        return Vec::new();
+    }
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut lineage: Vec<(u64, u64, u64)> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str().and_then(proc_lineage))
+        .collect();
+    lineage.sort_unstable();
+    let mut children: std::collections::BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    let mut started: std::collections::BTreeMap<u64, u64> = BTreeMap::new();
+    for (pid, ppid, start) in &lineage {
+        children.entry(*ppid).or_default().push(*pid);
+        started.insert(*pid, *start);
+    }
+    let mut hits = Vec::new();
+    let mut stack: Vec<u64> = roots.to_vec();
+    let mut seen: BTreeSet<u64> = BTreeSet::new();
+    while let Some(pid) = stack.pop() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        if let Some(kids) = children.get(&pid) {
+            stack.extend(kids.iter().copied());
+        }
+        let Ok(cwd) = fs::read_link(format!("/proc/{pid}/cwd")) else {
+            continue;
+        };
+        if let Some(masked_path) = masked
+            .iter()
+            .find(|entry| crate::masked::path_is_masked(&cwd, std::slice::from_ref(*entry)))
+        {
+            hits.push(MaskedProcess {
+                agent: agent.to_owned(),
+                pid,
+                started: started.get(&pid).copied().unwrap_or_default(),
+                cwd: cwd.display().to_string(),
+                masked_path: masked_path.clone(),
+            });
+        }
+    }
+    hits
+}
+
+/// Report, once per process, each process in a managed session's scope
+/// whose working directory is under one of that session's masked paths
+/// (#2163 interim watch guard): MCP server children and build daemons
+/// count, not only the seat's own commands. The notice goes to the
+/// coordinator; a masked agent's own queue is no place for it (#844), so
+/// it is told about other agents, never routed into the masked session.
+fn report_masked_processes(
+    probe: &mut dyn Probe,
+    notifier: &mut dyn Notifier,
+    state: &mut WatchState,
+    now: f64,
+    options: &WatchAgentsOptions,
+) -> Vec<Value> {
+    let hits = probe.masked_processes();
+    let mut rows = Vec::new();
+    let mut still_present = BTreeMap::new();
+    for hit in &hits {
+        let key = format!("{}/{}/{}", hit.agent, hit.pid, hit.started);
+        let mut row = json!({
+            "agent": hit.agent, "pid": hit.pid, "started": hit.started,
+            "cwd": hit.cwd, "masked_path": hit.masked_path,
+        });
+        if let Some(reported_at) = state.masked_reported.get(&key).copied() {
+            still_present.insert(key, reported_at);
+            row["reported"] = json!(true);
+        } else if options.check_only {
+            row["due"] = json!(true);
+            still_present.insert(key, now);
+        } else {
+            let text = format!(
+                "[agentctl watch-agents] process {} of agent {} is working inside a masked path:                  its working directory {} is under {}. Masking is not enabled for this session yet,                  so this is the interim guard (#2163): stop that process or move the session's work                  out of the masked path.",
+                hit.pid, hit.agent, hit.cwd, hit.masked_path
+            );
+            let message_id = format!(
+                "agent-watch-masked-{}-{}-{}",
+                hit.agent, hit.pid, hit.started
+            );
+            let no_route: BTreeSet<String> = BTreeSet::new();
+            match tell_about_expiring(
+                notifier,
+                &hit.agent,
+                &no_route,
+                &text,
+                &message_id,
+                options,
+                Some(NOTICE_TTL),
+                None,
+            ) {
+                Ok(outcome) => {
+                    still_present.insert(key, now);
+                    row["reported"] = json!(true);
+                    row["outcome"] = outcome;
+                }
+                Err(error) => row["error"] = json!(error.to_string()),
+            }
+        }
+        rows.push(row);
+    }
+    state.masked_reported = still_present;
     rows
 }
 
@@ -6384,6 +6542,16 @@ fn message_excerpt(text: &str) -> String {
 }
 
 impl<A: ManagedApi + ?Sized> Probe for ManagedProbe<'_, A> {
+    fn masked_processes(&mut self) -> Vec<MaskedProcess> {
+        let Ok(manager) = ManagedAgents::new(self.client, &self.registry) else {
+            return Vec::new();
+        };
+        let mut hits = Vec::new();
+        for (agent, masked, roots) in manager.masked_scope() {
+            hits.extend(session_masked_processes(&agent, &roots, &masked));
+        }
+        hits
+    }
     fn registered_names(&mut self) -> Option<BTreeSet<String>> {
         agent_queue::registry::names(&self.registry)
             .ok()
@@ -7810,6 +7978,51 @@ mod tests {
         assert!(state.jams_reported.is_empty());
         pass(1_600.0, &mut state, &mut notifier);
         assert_eq!(notifier.sent.len(), 2, "a new jam is reported again");
+    }
+
+    struct MaskedProbe(Vec<MaskedProcess>);
+
+    impl Probe for MaskedProbe {
+        fn observe(&mut self) -> Result<Vec<Observation>> {
+            Ok(Vec::new())
+        }
+        fn masked_processes(&mut self) -> Vec<MaskedProcess> {
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn a_process_under_a_masked_path_is_reported_once_per_process() {
+        // #2163 interim guard: any process in the session scope counts,
+        // one notice per process (PID + start), attributed to its agent.
+        let options = options();
+        let mut state = WatchState::default();
+        let mut notifier = RecordingNotifier::default();
+        let hit = MaskedProcess {
+            agent: "worker".to_owned(),
+            pid: 4242,
+            started: 99,
+            cwd: "/off/limits/build".to_owned(),
+            masked_path: "/off/limits".to_owned(),
+        };
+        let mut probe = MaskedProbe(vec![hit.clone()]);
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 1_000.0, &options);
+        assert_eq!(report["masked_processes"][0]["reported"], true);
+        assert_eq!(notifier.sent.len(), 1);
+        let (_to, text, _id) = &notifier.sent[0];
+        assert!(text.contains("4242"), "{text}");
+        assert!(text.contains("/off/limits/build"), "{text}");
+        // The same process again: no second notice.
+        let mut probe = MaskedProbe(vec![hit.clone()]);
+        watch_agents_once(&mut probe, &mut notifier, &mut state, 1_060.0, &options);
+        assert_eq!(notifier.sent.len(), 1);
+        // A new process (new start time) under the mask: a new notice.
+        let mut probe = MaskedProbe(vec![MaskedProcess {
+            started: 100,
+            ..hit
+        }]);
+        watch_agents_once(&mut probe, &mut notifier, &mut state, 1_120.0, &options);
+        assert_eq!(notifier.sent.len(), 2);
     }
 
     /// A probe whose only findings are scripted owner requests waiting and quarantines.

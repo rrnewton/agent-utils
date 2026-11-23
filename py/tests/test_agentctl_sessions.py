@@ -1950,3 +1950,23 @@ def test_start_refuses_missing_required_env_and_launches_with_it(
     monkeypatch.setenv("EXAMPLE_GATEWAY", "https://example.invalid")
     result = sessions.start_session("worker", cwd=str(tmp_path), harness="codex")
     assert result["name"] == "worker"
+
+
+def test_masked_profile_is_refused_at_launch_by_the_python_edition(tmp_path: Path) -> None:
+    # #2163: the Python edition refuses masked_paths explicitly rather
+    # than launching unmasked; listing still shows the declared masks.
+    _write_profiles(tmp_path, {
+        "trial": {"harness": "codex", "mode": "interactive", "reasoning_effort": "high",
+                  "argv": ["--yolo"], "masked_paths": ["/off/limits"],
+                  "unset_env": ["EXAMPLE_ROOT"]},
+    })
+    _path, profiles = load_profiles(tmp_path)
+    assert profiles["trial"].masked_paths == ("/off/limits",)
+    assert profiles["trial"].public()["masked_paths"] == ["/off/limits"]
+    # cli.main reports a usage refusal as exit 2 with the reason on stderr.
+    import io, contextlib
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr):
+        code = cli.main(["start", "trial-agent", "--cwd", str(tmp_path), "--profile", "trial"])
+    assert code == 2
+    assert "only the Rust edition" in stderr.getvalue()

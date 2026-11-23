@@ -263,6 +263,22 @@ fn slot_boxed_shell(state: &PaneProcessState) -> bool {
             .is_ok_and(|cgroup| cgroup.contains("wrkslots"))
 }
 
+/// The shell PID's mount table covers every masked path (#2163): a mount
+/// point names the path exactly (mountinfo field 5, escaped spaces).
+fn masked_mounts_cover(shell_pid: u64, masked_paths: &[String]) -> bool {
+    let Ok(mounts) = fs::read_to_string(format!("/proc/{shell_pid}/mountinfo")) else {
+        return false;
+    };
+    masked_paths.iter().all(|path| {
+        let escaped = path.replace(' ', "\\040");
+        mounts.lines().any(|line| {
+            line.split(' ')
+                .nth(4)
+                .is_some_and(|mount_point| mount_point == escaped)
+        })
+    })
+}
+
 /// The pane's own shell is its only foreground process: it is back at its prompt.
 fn shell_alone_in_foreground(state: &PaneProcessState) -> bool {
     const SHELLS: [&str; 6] = ["bash", "zsh", "sh", "fish", "dash", "ksh"];
@@ -3098,6 +3114,57 @@ impl HerdrClient {
         }
         Err(AdapterError::unavailable(format!(
             "pane {pane_id} did not return to its shell prompt within {}s after the launch environment line; inspect the pane",
+            timeout.as_secs_f64()
+        )))
+    }
+
+    /// Replace a fresh pane's shell with a shell inside the mask
+    /// namespace (#2163) and prove it from the kernel: the shell is alone
+    /// in the foreground and its mount table covers every masked path.
+    /// Any failure refuses the launch; nothing runs unmasked.
+    pub fn enter_masked_namespace(
+        &self,
+        pane_id: &str,
+        masked_paths: &[String],
+        timeout: Duration,
+    ) -> Result<()> {
+        if timeout.is_zero() || timeout > Duration::from_secs(300) {
+            return Err(AdapterError::unavailable(
+                "masked namespace timeout must be between 0 and 300 seconds",
+            ));
+        }
+        if masked_paths.is_empty() {
+            return Err(AdapterError::unavailable(
+                "masked namespace entry needs at least one masked path",
+            ));
+        }
+        let (uid, gid) = crate::masked::real_ids();
+        let line = crate::masked::masked_shell_line(masked_paths, uid, gid);
+        self.call_ok(
+            &[
+                "pane".to_owned(),
+                "run".to_owned(),
+                pane_id.to_owned(),
+                line,
+            ],
+            &format!("pane run masked namespace {pane_id}"),
+        )?;
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if let Ok(state) = self.pane_process_state(pane_id, &|| false) {
+                if shell_alone_in_foreground(&state)
+                    && masked_mounts_cover(state.shell_pid, masked_paths)
+                {
+                    thread::sleep(Duration::from_millis(300));
+                    return Ok(());
+                }
+            }
+            thread::sleep(
+                Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+        Err(AdapterError::unavailable(format!(
+            "pane {pane_id} did not enter the masked namespace within {}s; refusing to launch unmasked (inspect the pane for the namespace error)",
             timeout.as_secs_f64()
         )))
     }

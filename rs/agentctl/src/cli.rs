@@ -1272,6 +1272,9 @@ struct RunHeadless {
     /// Reasoning effort for the headless harness (Claude Code levels: low, medium, high, xhigh, max); recorded in the agent record and overriding its profile, so later launches and latency stamps use it (default: the recorded effort, else the harness default)
     #[arg(long, alias = "reasoning-effort", value_name = "LEVEL")]
     effort: Option<String>,
+    /// Owner-declared off-limits path to mask for this agent; repeatable. Recorded on the agent record and winning over its launch profile's masked_paths on every launch; a wrapper launch whose mask cannot be set up is refused (default: the recorded or profile masks, else no masking)
+    #[arg(long = "masked-paths", value_name = "PATH")]
+    masked_paths: Vec<String>,
     /// Claude Code executable (default: claude on PATH)
     #[arg(long, value_name = "PATH")]
     claude_bin: Option<PathBuf>,
@@ -1839,6 +1842,9 @@ struct Start {
     /// Structured harness reasoning effort (alias: --effort); per-harness levels — Claude Code: low, medium, high, xhigh, max; Muse: none, minimal, low, medium, high, xhigh, max, ultra; Codex: minimal, low, medium, high, xhigh, max, ultra (default: the profile's reasoning_effort, else the harness default)
     #[arg(long, alias = "effort")]
     reasoning_effort: Option<String>,
+    /// Owner-declared off-limits path to mask for this agent; repeatable. Recorded on the agent record and winning over its launch profile's masked_paths on every launch; the harness and its whole process tree run inside a namespace where each path reads as an empty read-only directory, and a launch whose mask cannot be set up is refused (default: the profile's masked_paths, else no masking)
+    #[arg(long = "masked-paths", value_name = "PATH")]
+    masked_paths: Vec<String>,
     /// Existing native conversation ID for local interactive Claude, Codex, or Muse; can combine
     /// with --profile (example: --profile reviewer --resume CONVERSATION_ID)
     #[arg(long, value_name = "SESSION")]
@@ -5439,6 +5445,14 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             ));
         }
         Commands::Start(value) => {
+            let masked_override = if value.masked_paths.is_empty() {
+                None
+            } else {
+                Some(
+                    crate::masked::validate_masked_paths(&value.masked_paths, "launch")
+                        .map_err(Failure::Usage)?,
+                )
+            };
             let cloud_flags = [
                 (value.cloud_harness.is_some(), "--cloud-harness"),
                 (value.provision, "--provision"),
@@ -5465,6 +5479,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 profile_pinned,
                 profile_write_sandbox,
                 profile_slot_isolation,
+                profile_masked_paths,
             ) = if let Some(profile_name) = value.profile.as_deref() {
                 let mut overlaps = Vec::new();
                 if value.harness.is_some() {
@@ -5513,6 +5528,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     profile.pinned,
                     profile.write_sandbox,
                     profile.slot_isolation.clone(),
+                    profile.masked_paths.clone(),
                 )
             } else {
                 let harness = value.harness.unwrap_or_else(|| "codex".to_owned());
@@ -5559,6 +5575,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     None,
                     false,
                     None,
+                    Vec::new(),
                 )
             };
             // #1216 (owner reply 321): effort is always declared by the agentctl layer,
@@ -5624,6 +5641,8 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                         transport: value.transport.clone(),
                         detached: value.detached,
                         profile: value.profile.clone(),
+                        masked_paths: profile_masked_paths,
+                        masked_paths_override: masked_override,
                     },
                 )?
             } else if mode != "interactive" {
@@ -5711,6 +5730,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     cloud,
                     slot,
                     record_edges,
+                    masked_paths_override: masked_override,
                     pinned: if value.pinned {
                         Some(true)
                     } else {
@@ -6421,6 +6441,14 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 &value.agent.name,
                 value.claude_bin.as_deref(),
                 value.effort.as_deref(),
+                if value.masked_paths.is_empty() {
+                    None
+                } else {
+                    Some(
+                        crate::masked::validate_masked_paths(&value.masked_paths, "launch")
+                            .map_err(Failure::Usage)?,
+                    )
+                },
                 value.tool_preview_lines.map(|lines| lines as usize),
                 Some(crate::subagents::HeadlessApprovals {
                     enabled: !value.no_approvals,

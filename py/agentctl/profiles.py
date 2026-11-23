@@ -156,6 +156,11 @@ class LaunchProfile:
     required_env: tuple[str, ...] = ()
     #: Muse plugin-hooks trust answer (#1932): "decline" or "trust".
     muse_hooks_trust: str | None = None
+    #: Owner-declared off-limits paths (#2163); the Python edition refuses
+    #: to launch with any, explicitly, rather than launching unmasked.
+    masked_paths: tuple[str, ...] = ()
+    #: Session variables to unset (#2163); likewise refused at launch here.
+    unset_env: tuple[str, ...] = ()
 
     def public(self) -> dict[str, object]:
         """Return discovery metadata without argument or environment values."""
@@ -169,6 +174,10 @@ class LaunchProfile:
             "environment": [entry.partition("=")[0] for entry in self.environment],
             "required_env": list(self.required_env),
         }
+        if self.masked_paths:
+            result["masked_paths"] = list(self.masked_paths)
+        if self.unset_env:
+            result["unset_env"] = list(self.unset_env)
         if self.agentcloud is not None:
             result["agentcloud"] = dict(self.agentcloud)
             result["requires_edition"] = "rust"
@@ -669,13 +678,28 @@ def _profile(name: str, raw: object) -> LaunchProfile:
             raise AgentDeliveryError(f"profile {name!r} environment values must be NUL-free strings")
         environment.append(f"{key}={value}")
     required = _required_names(raw.get("required_env"), f"profile {name!r}")
+    masked = raw.get("masked_paths")
+    if masked is not None and (
+        not isinstance(masked, list)
+        or any(not isinstance(item, str) or not item.startswith("/") or "\0" in item for item in masked)
+    ):
+        raise AgentDeliveryError(f"profile {name!r} masked_paths must be an array of absolute paths")
+    unset = raw.get("unset_env")
+    if unset is not None and (
+        not isinstance(unset, list)
+        or any(not isinstance(item, str) or _ENVIRONMENT_NAME.fullmatch(item) is None for item in unset)
+    ):
+        raise AgentDeliveryError(f"profile {name!r} unset_env must be an array of environment variable names")
     hooks_trust = _hooks_trust_setting(raw.get("muse_hooks_trust"), f"profile {name!r}")
     # #1822: every interactive launch carries its harness's bypass flag.
     # Headless profiles are exempt at load: codex/agy headless argv is
     # empty by rule, and this edition runs no headless Claude.
     if mode == "interactive":
         require_permission_bypass(f'profile "{name}"', harness, argv)
-    return LaunchProfile(name, harness, mode, model, effort, argv, tuple(environment), agentcloud, required, hooks_trust)
+    return LaunchProfile(
+        name, harness, mode, model, effort, argv, tuple(environment), agentcloud,
+        required, hooks_trust, tuple(masked or ()), tuple(unset or ()),
+    )
 
 
 def _workspace(value: object) -> str | None:
@@ -869,7 +893,7 @@ def hooks_trust_policy(
 _KNOWN_TOP_LEVEL_KEYS = frozenset({"schema", "profiles", "workspace", "wrkslots", "term_backend", "launch_env", "required_env", "muse_hooks_trust"})
 _PROFILE_FIELDS = frozenset({
     "harness", "mode", "model", "reasoning_effort", "argv", "env", "agentcloud", "record_edges",
-    "role", "protocol", "required_env", "muse_hooks_trust",
+    "role", "protocol", "required_env", "muse_hooks_trust", "masked_paths", "unset_env",
 })
 _ROLES = ("coordinator", "liaison", "coordinator-hands", "worker")
 _PROTOCOLS = ("self-tooling", "hands-delegating")

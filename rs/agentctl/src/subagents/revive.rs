@@ -6778,6 +6778,8 @@ mod discovery_tests {
             slot: None,
             slot_project: None,
             slot_isolation: None,
+            masked_paths: Vec::new(),
+            masked_paths_override: None,
             reasoning_effort: None,
             environment_names: vec![],
             agentcloud: None,

@@ -50,6 +50,13 @@ pub(crate) struct LaunchProfile {
     pub(crate) slot_isolation: Option<String>,
     /// Variable names this profile additionally requires at launch (#1429 launch-required-env).
     pub(crate) required_env: Vec<String>,
+    /// Owner-declared off-limits paths masked at launch (#2163
+    /// agentctl-profile-masked-paths); empty means no masking, as before.
+    pub(crate) masked_paths: Vec<String>,
+    /// Environment variables removed from the session at launch (#2163):
+    /// a profile can unset a root-naming variable so plugins do not
+    /// default to an off-limits path.
+    pub(crate) unset_env: Vec<String>,
 }
 
 /// The roles a launch profile may give its agents (#897 chat-latency-stamps).
@@ -180,6 +187,10 @@ pub(crate) struct PublicProfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     permission_bypass_warning: Option<&'static str>,
     required_env: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    masked_paths: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unset_env: Vec<String>,
 }
 
 impl LaunchProfile {
@@ -202,6 +213,8 @@ impl LaunchProfile {
             blocking_question_warning: blocking_question_warning(&self.harness, &self.argv),
             permission_bypass_warning: permission_bypass_warning(&self.harness),
             required_env: self.required_env.clone(),
+            masked_paths: self.masked_paths.clone(),
+            unset_env: self.unset_env.clone(),
         }
     }
 }
@@ -350,6 +363,10 @@ struct RawProfile {
     slot_isolation: Option<String>,
     #[serde(default)]
     required_env: Option<Value>,
+    #[serde(default)]
+    masked_paths: Option<Value>,
+    #[serde(default)]
+    unset_env: Option<Value>,
     #[serde(default)]
     muse_hooks_trust: Option<Value>,
     /// The agent's role, one of [`ROLES`], and its protocol, one of [`PROTOCOLS`]: checked here,
@@ -1217,6 +1234,12 @@ fn validate(name: String, mut raw: RawProfile) -> Result<LaunchProfile, AgentErr
     if raw.mode == "interactive" {
         require_permission_bypass(&format!("profile {name:?}"), &raw.harness, &raw.argv)?;
     }
+    let masked_paths = crate::masked::masked_paths_from_value(
+        raw.masked_paths.as_ref(),
+        &format!("profile {name:?}"),
+    )
+    .map_err(fail)?;
+    let unset_env = unset_names(raw.unset_env.as_ref(), &format!("profile {name:?}"))?;
     Ok(LaunchProfile {
         name,
         harness: raw.harness,
@@ -1231,6 +1254,8 @@ fn validate(name: String, mut raw: RawProfile) -> Result<LaunchProfile, AgentErr
         write_sandbox: raw.write_sandbox.unwrap_or(false),
         slot_isolation: raw.slot_isolation,
         required_env,
+        masked_paths,
+        unset_env,
     })
 }
 
@@ -1726,6 +1751,31 @@ fn required_names(value: Option<&Value>, label: &str) -> Result<Vec<String>, Age
         }
         Some(_) => Err(fail(format!(
             "{label} required_env must be an array of environment variable names"
+        ))),
+    }
+}
+
+/// Validate one `unset_env` name list: unique, well-formed variable names (#2163).
+fn unset_names(value: Option<&Value>, label: &str) -> Result<Vec<String>, AgentError> {
+    match value {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => {
+            let mut names: Vec<String> = Vec::new();
+            for item in items {
+                let Some(name) = item.as_str().filter(|name| valid_env_name(name)) else {
+                    return Err(fail(format!(
+                        "{label} unset_env names must match [A-Za-z_][A-Za-z0-9_]*"
+                    )));
+                };
+                if names.iter().any(|seen| seen == name) {
+                    return Err(fail(format!("{label} unset_env names {name:?} twice")));
+                }
+                names.push(name.to_owned());
+            }
+            Ok(names)
+        }
+        Some(_) => Err(fail(format!(
+            "{label} unset_env must be an array of environment variable names"
         ))),
     }
 }
@@ -2713,6 +2763,39 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(message.contains("write_sandbox"), "{message}");
+    }
+
+    #[test]
+    fn masked_paths_and_unset_env_are_profile_keys() {
+        // #2163: declared masks and session unsets parse; bad shapes refuse.
+        let profile = parse(serde_json::json!({
+            "harness": "codex", "mode": "interactive", "argv": ["--yolo"],
+            "masked_paths": ["/off/limits", "/off/limits"], "unset_env": ["EXAMPLE_ROOT"]
+        }))
+        .expect("masked codex profile");
+        assert_eq!(profile.masked_paths, vec!["/off/limits".to_owned()]);
+        assert_eq!(profile.unset_env, vec!["EXAMPLE_ROOT".to_owned()]);
+        assert_eq!(profile.public().masked_paths, profile.masked_paths);
+        let plain = parse(serde_json::json!({
+            "harness": "codex", "mode": "interactive", "argv": ["--yolo"]
+        }))
+        .expect("plain codex profile");
+        assert!(plain.masked_paths.is_empty());
+        assert!(plain.unset_env.is_empty());
+        let message = parse(serde_json::json!({
+            "harness": "codex", "mode": "interactive", "argv": ["--yolo"],
+            "masked_paths": ["relative/path"]
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("absolute"), "{message}");
+        let message = parse(serde_json::json!({
+            "harness": "codex", "mode": "interactive", "argv": ["--yolo"],
+            "unset_env": ["not a name"]
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("unset_env"), "{message}");
     }
 
     #[test]
