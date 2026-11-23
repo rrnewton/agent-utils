@@ -67,11 +67,20 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
     const rect = chip.getBoundingClientRect();
     const size = button.getBoundingClientRect();
     const width = Number(size.width) || 64;
-    const viewWidth = (document.documentElement && document.documentElement.clientWidth) || 0;
+    const height = Number(size.height) || 40;
+    // Always LEFT of the chip (the owner's rule), never flipped right:
+    // clamp to the window's edge, and where even that cannot fit, stand
+    // above the chip's left end rather than on its right.
     let left = rect.left - 8 - width;
-    if (left < 8) left = Math.min(rect.right + 8, viewWidth - 8 - width);
+    let top = rect.top;
+    if (left < 8 && rect.left >= 8 + width + 2) {
+      left = 8;
+    } else if (left < 8) {
+      left = 8;
+      top = rect.top - height - 4;
+    }
     button.style.left = `${Math.round(Math.max(8, left))}px`;
-    button.style.top = `${Math.round(rect.top)}px`;
+    button.style.top = `${Math.round(Math.max(8, top))}px`;
   }
 
   function placePopover(): void {

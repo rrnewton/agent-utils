@@ -5126,6 +5126,60 @@ def _act_discuss_terms(driver: Driver) -> None:
     driver.settle(200)
 
 
+def _act_glossary_button(driver: Driver) -> None:
+    """`#2156` button frame: select a term and stop with the selection bar
+    standing (WTF? left of Quoted reply, X right), unpressed."""
+    driver.load(with_token=True)
+    driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    if bool(driver.js("window.__visible('discuss-panel')")):
+        driver.click("discuss-open")
+        driver.page.wait_for_function(
+            "() => !window.__visible('discuss-panel')", timeout=10_000
+        )
+    _ensure_pane(driver, "pane-discord")
+    driver.page.wait_for_function(
+        "() => document.querySelectorAll('#discord-log > li').length > 0 "
+        "&& !window.__visible('channel-loading')",
+        timeout=15_000,
+    )
+    rect = driver.js(
+        "(() => { const rows = [...document.querySelectorAll('#discord-log > li')]; "
+        "for (const row of rows) { "
+        "const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT); "
+        "for (let n = walker.nextNode(); n; n = walker.nextNode()) { "
+        "const at = n.textContent.indexOf('flaky ordering test'); "
+        "if (at < 0) continue; "
+        "const range = document.createRange(); "
+        "range.setStart(n, at); range.setEnd(n, at + 'flaky ordering test'.length); "
+        "if (n.parentElement) n.parentElement.scrollIntoView({block: 'center'}); "
+        "const r = range.getBoundingClientRect(); "
+        "return {x: r.left, y: r.top, width: r.width, height: r.height}; } } "
+        "return null; })()"
+    )
+    assert isinstance(rect, dict), "no selectable term text on screen"
+    driver.page.mouse.move(float(rect["x"]) + 1, float(rect["y"]) + float(rect["height"]) / 2)
+    driver.page.mouse.down()
+    driver.page.mouse.move(
+        float(rect["x"]) + float(rect["width"]) - 1,
+        float(rect["y"]) + float(rect["height"]) / 2,
+        steps=8,
+    )
+    driver.page.mouse.up()
+    driver.page.wait_for_function(
+        "() => window.__visible('selection-chip-wtf') && window.__visible('selection-chip')",
+        timeout=10_000,
+    )
+    # Both buttons place themselves over a frame or two; wait until WTF?
+    # stands left of the chip before the shutter, not just visible.
+    driver.page.wait_for_function(
+        "() => { const w = document.getElementById('selection-chip-wtf').getBoundingClientRect(); "
+        "const c = document.getElementById('selection-chip').getBoundingClientRect(); "
+        "return w.right <= c.left + 1; }",
+        timeout=10_000,
+    )
+    driver.settle(300)
+
+
 def _act_glossary_wtf(driver: Driver) -> None:
     """`#2156`: select an unfamiliar term in a message, press WTF?, and
     photograph the popover the real lookup route answers with (the loopback
@@ -8531,6 +8585,20 @@ SCENES: tuple[Scene, ...] = (
             ("no error banner is up", "!window.__visible('error-wrap')"),
         ),
     ),
+    Scene(
+        name="92-glossary-button",
+        what="the selection bar standing: WTF? left of Quoted reply, X on its right",
+        act=_act_glossary_button,
+        profiles=MATRIX_PROFILES,
+        keep_transient=True,
+        expect=(
+            ("the WTF? button reads WTF?", "document.getElementById('selection-chip-wtf').textContent.trim() === 'WTF?'"),
+            ("the WTF? button stands left of the Quote reply chip", "(() => { const w = document.getElementById('selection-chip-wtf').getBoundingClientRect(); const c = document.getElementById('selection-chip').getBoundingClientRect(); return w.right <= c.left + 1; })()"),
+            ("the dismiss X stands right of the chip", "(() => { const x = document.getElementById('selection-chip-dismiss').getBoundingClientRect(); const c = document.getElementById('selection-chip').getBoundingClientRect(); return x.left >= c.right - 1; })()"),
+            ("the selection still stands", "String(getSelection()).length > 0"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
     # LAST IN THE WALK, and not by accident: it empties the server's durable store on the way in,
     # so that the summary the state above cached is really regenerated and can really fail. Nothing
     # after it in this profile would miss what it deletes, and the next profile purges anyway.
@@ -8798,7 +8866,7 @@ def run_captures(
     # empty pane there is the failure the matrix exists to catch. A wider walk skips those
     # states BY NAME instead — its server is deliberately cacheless (the Settings and Help
     # states photograph exactly that), so Discuss has no window to show there.
-    discuss_scenes = [s for s in scenes if s.name.startswith(("73-", "74-", "75-", "76-", "78-", "84-", "85-", "89-", "90-", "91-"))]
+    discuss_scenes = [s for s in scenes if s.name.startswith(("73-", "74-", "75-", "76-", "78-", "84-", "85-", "89-", "90-", "91-", "92-"))]
     discuss_only = bool(wanted) and len(wanted) == len(discuss_scenes)
     if discuss_scenes and not seed_discuss_cache(60 if discuss_only else 10):
         if discuss_only:
