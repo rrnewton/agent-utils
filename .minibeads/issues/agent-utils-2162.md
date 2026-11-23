@@ -25,3 +25,7 @@ Make the tests hermetic: inject the process inventory (or point the census at a 
 # Notes
 
 Found while triaging gates; filed by the coordinator.
+
+## Resolution
+
+The holder scan (`live_session_holder_refusal`) already had a fake process table seam (#2037), but only when a test installed it; the named tests installed nothing, so test builds fell through to the real `/proc` census. Now test builds read the fake table by default (`Fixture` installs an empty one), a scan reached with neither a table nor the opt-in panics naming `pretend_real_processes()`, and `dead_native_live_session_holder_refuses` — which spawns a real holder process — is the one opt-in real-host variant, still outside the gating set. The six `#2065`-ignored revive tests are back in the gating set. Behaviour changed for: the two tests named in the Description, those six, the opt-in variant, and every other fixture test reaching the scan through the previous-boot revive proof. Production still scans `/proc`. Evidence: the named set passed 20/20 consecutive focused runs on the busy host (load 180–210); the scripted-holder refusal test in the same set still fails the revive, so the refusal itself is still exercised. The blanket `rust.*.test` known-red entry is removed in the same landing; `#2065` keeps its wrkslots entries.
