@@ -167,8 +167,20 @@ thread_local! {
     static LOCK_ORDER_STACK: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
 }
 
+/// The enable decision is read once per process: `env::var_os` scans
+/// the environment and allocates on every call, which made the
+/// recorder itself the dominant cost of the release test step in the
+/// suites that spawn this binary per case (#2000 measurement:
+/// ~270 CPU-seconds across one wrkslotsd test run).
+fn lock_order_check_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("WRKSLOTS_LOCK_ORDER_CHECK").is_some_and(|value| value == "1")
+    })
+}
+
 pub(crate) fn lock_order_acquire(name: &'static str) -> Result<()> {
-    if std::env::var_os("WRKSLOTS_LOCK_ORDER_CHECK").is_none_or(|value| value != "1") {
+    if !lock_order_check_enabled() {
         return Ok(());
     }
     let rank = lock_order_rank(name).unwrap_or(0);
@@ -189,7 +201,7 @@ pub(crate) fn lock_order_acquire(name: &'static str) -> Result<()> {
 }
 
 pub(crate) fn lock_order_release(name: &str) {
-    if std::env::var_os("WRKSLOTS_LOCK_ORDER_CHECK").is_none_or(|value| value != "1") {
+    if !lock_order_check_enabled() {
         return;
     }
     LOCK_ORDER_STACK.with(|stack| {

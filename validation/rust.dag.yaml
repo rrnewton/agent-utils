@@ -274,7 +274,12 @@ steps:
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-wrkslots]
     timeout: 9600
-    cpu_timeout: 1200
+    # 1800 (was 1200): measured on this host with /usr/bin/time -v,
+    # nice -n 10, one at a time (#2000): main 1065-1068 CPU-s for this
+    # command; with the lock-order recorder cached-enable fix the
+    # #2000 tree measures 1273 CPU-s, and the gate's parallel
+    # contention multiplies wall-clock CPU accounting past that.
+    cpu_timeout: 1800
     hint: *rust_test_hint
 
   - group: wrkviz
