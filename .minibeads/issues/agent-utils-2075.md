@@ -1,13 +1,13 @@
 ---
 title: 'read-aloud-interrupt-ack-window: a 3 s interrupt acknowledgement kills a live but slow provider session'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - vibe-talk
 - read-aloud
 created_at: 2026-11-21T14:16:00-05:00
-updated_at: 2026-11-21T14:16:00-05:00
+updated_at: 2026-11-23T12:00:00-05:00
 ---
 
 # Description
@@ -29,3 +29,7 @@ Refined by mu-s2s (2026-11-21): `SessionTask` records when the yield began. `int
 # Notes
 
 Filed by the coordinator from the investigating lane's evidence; the owning lane refines this file as it works.
+
+## Resolution
+
+Landed on main as 4850148f (#2075 read-aloud-interrupt-ack-window): while yielding, any inbound frame extends the interrupt deadline by the 3 s silence bound up to a 15 s hard cap; silent providers still die at 3 s and the retry-once fan-out is unchanged. Fake-provider tests cover slow-but-live, silent, and the cap. Coordb deploys with the next normal deploy.
