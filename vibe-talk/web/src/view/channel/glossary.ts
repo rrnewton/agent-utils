@@ -149,8 +149,13 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
     };
   }
 
+  // The last live selection, kept because a phone tap on the button can
+  // clear the browser selection before the press reads it (the same hold
+  // Quote reply keeps). A press with nothing live stands on this.
+  let lastSelection: { text: string; messageId: string; context: string } | null = null;
+
   async function pressWtf(): Promise<void> {
-    const info = selectionInfo();
+    const info = selectionInfo() ?? lastSelection;
     const channel = deps.selectedChannelId();
     if (!info || !channel) return;
     anchor = anchor ?? { top: 80, left: 16, bottom: 120 };
@@ -195,6 +200,12 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
 
   function linkTermsIn(root: ParentNode, force = false): void {
     if (!terms.length) return;
+    // While any selection stands, linking anywhere risks the list rebuild
+    // it triggers collapsing that selection; the press re-links on landing.
+    if (!force) {
+      const liveSel = typeof getSelection === "function" ? getSelection() : null;
+      if (liveSel && !liveSel.isCollapsed) return;
+    }
     // Never rewrite the row the reader is selecting in: replacing its text
     // nodes would collapse the selection the WTF? press stands on. `force`
     // is the press having landed: the popover stands on its own now.
@@ -289,6 +300,8 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
 
   listen<Event>(document, "selectionchange", () => {
     ensureTerms();
+    const current = selectionInfo();
+    if (current) lastSelection = current;
     // A collapsed selection frees the row it stood in for linking.
     const sel = typeof getSelection === "function" ? getSelection() : null;
     if (sel && sel.isCollapsed && terms.length) {

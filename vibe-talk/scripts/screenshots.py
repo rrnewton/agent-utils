@@ -5148,34 +5148,55 @@ def _act_glossary_wtf(driver: Driver) -> None:
     )
     # A real drag over the term (a scripted range is cleared by the list's
     # own selection keeping): "flaky ordering test" stands in the newest
-    # page's release message, so it is on screen at load.
-    rect = driver.js(
-        "(() => { const rows = [...document.querySelectorAll('#discord-log > li')]; "
-        "const row = rows.find((r) => r.textContent.includes('flaky ordering test')); "
-        "if (!row) return null; "
-        "const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT); "
-        "for (let n = walker.nextNode(); n; n = walker.nextNode()) { "
-        "const at = n.textContent.indexOf('flaky ordering test'); "
-        "if (at < 0) continue; "
-        "const range = document.createRange(); "
-        "range.setStart(n, at); range.setEnd(n, at + 'flaky ordering test'.length); "
-        "const r = range.getBoundingClientRect(); "
-        "return {x: r.left, y: r.top, width: r.width, height: r.height}; } "
-        "return null; })()"
-    )
-    assert isinstance(rect, dict), "no selectable term text on screen"
-    driver.page.mouse.move(float(rect["x"]) + 1, float(rect["y"]) + float(rect["height"]) / 2)
-    driver.page.mouse.down()
-    driver.page.mouse.move(
-        float(rect["x"]) + float(rect["width"]) - 1,
-        float(rect["y"]) + float(rect["height"]) / 2,
-        steps=8,
-    )
-    driver.page.mouse.up()
-    driver.page.wait_for_function(
-        "() => window.__visible('selection-chip-wtf') && window.__visible('selection-chip')",
-        timeout=10_000,
-    )
+    # page's release message, so it is on screen at load. On a server that
+    # already knows the term the text may already stand linked; the rect
+    # is re-read each attempt, from text not yet linked.
+    # One term per profile: the profiles share one server (and one page's
+    # learned links), so a second press of the same term would find only
+    # already-linked text, which cannot be selected for quoting.
+    term = "wall-clock ordering" if "android" in driver.profile.name else "flaky ordering test"
+
+    def term_rect() -> object:
+        return driver.js(
+            "((term) => { const rows = [...document.querySelectorAll('#discord-log > li')]; "
+            "for (const row of rows) { "
+            "const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT); "
+            "for (let n = walker.nextNode(); n; n = walker.nextNode()) { "
+            "if (n.parentElement && n.parentElement.closest('.glossary-term')) continue; "
+            "const at = n.textContent.indexOf(term); "
+            "if (at < 0) continue; "
+            "const range = document.createRange(); "
+            "range.setStart(n, at); range.setEnd(n, at + term.length); "
+            "const r = range.getBoundingClientRect(); "
+            "return {x: r.left, y: r.top, width: r.width, height: r.height}; } } "
+            "return null; })(" + json.dumps(term) + ")"
+        )
+
+    # Drag until the chip stands: on a server that already knows the term,
+    # the linking the first selection triggers can clear it, so drag again.
+    for _attempt in range(3):
+        rect = term_rect()
+        assert isinstance(rect, dict), "no selectable term text on screen"
+        driver.page.mouse.move(float(rect["x"]) + 1, float(rect["y"]) + float(rect["height"]) / 2)
+        driver.page.mouse.down()
+        driver.page.mouse.move(
+            float(rect["x"]) + float(rect["width"]) - 1,
+            float(rect["y"]) + float(rect["height"]) / 2,
+            steps=8,
+        )
+        driver.page.mouse.up()
+        # Let any term linking the selection triggers settle before the press.
+        driver.settle(150)
+        try:
+            driver.page.wait_for_function(
+                "() => window.__visible('selection-chip-wtf') && window.__visible('selection-chip')",
+                timeout=1_500,
+            )
+            break
+        except Exception:
+            continue
+    else:
+        raise AssertionError("the WTF? chip never stood under the selection")
     driver.click("selection-chip-wtf")
     driver.page.wait_for_function(
         "() => window.__visible('glossary-popover') "
