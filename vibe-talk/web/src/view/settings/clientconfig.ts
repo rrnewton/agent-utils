@@ -32,6 +32,7 @@ export interface ClientConfigLike {
   upstream_read_mark_supported?: unknown;
   thread_names_supported?: boolean;
   discuss_available?: boolean;
+  glossary_available?: boolean;
   providers?: unknown;
   self_author_id?: unknown;
   owner_author_id?: unknown;
@@ -82,6 +83,7 @@ export interface ClientConfigDependencies {
   };
   serverFacts: {
     setThreadNames(on: boolean): void; setDiscussAvailable(on: boolean): void;
+    setGlossaryAvailable(on: boolean): void;
     setTokenScope(scope: unknown): void; setInternalLinkHosts(said: unknown): void;
     tokenScope(): unknown; markConfigApplied(): void;
   };
@@ -164,6 +166,7 @@ export function createClientConfig(deps: ClientConfigDependencies): ClientConfig
     deps.serverFacts.setThreadNames(config.thread_names_supported === true);
     // `catchup-side-agent`: whether Discuss has a direct LLM summarizer to ask.
     deps.serverFacts.setDiscussAvailable(config.discuss_available === true);
+    deps.serverFacts.setGlossaryAvailable(config.glossary_available === true);
     // `#2007 vibe-talk-speech-short-links`: the deployment's internal link hosts,
     // for the speech rules a device voice applies on this page.
     deps.serverFacts.setInternalLinkHosts(config.internal_link_hosts);

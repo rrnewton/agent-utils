@@ -3374,6 +3374,12 @@
                 which does the same.
               </p>
               <p class="hint">
+                <strong>WTF?</strong> Next to that chip, <strong>WTF?</strong> looks up what the
+                selected words mean in recent messages and fetched documents, and shows the
+                definition with its source. A term it learns is underlined with dots wherever it
+                appears afterwards; tap it to see the definition again.
+              </p>
+              <p class="hint">
                 <strong>N replies</strong> under a message gathers its replies, and the replies to
                 those, directly beneath it, in time order, joined to it by one line, and leaves
                 everything else where it was. Tapping a reply's arrow twice gathers the whole
@@ -4379,6 +4385,23 @@ writable = true</pre>
       placed with the chip by `drawSelectionChip`; its press is stopped before any card handler.
     -->
     <button id="selection-chip-dismiss" class="selection-chip-dismiss" type="button" title="Clear the selection" aria-label="Clear the selection" hidden>&times;</button>
+    <!--
+      `#2156 vibe-talk-wtf-glossary-lookup`. "WTF?", left of the Quoted reply chip while words are
+      selected in a message: look the words up in the glossary. Shown, hidden and placed with the
+      chip by web/src/view/channel/glossary; the dismiss X stays on the chip's right.
+    -->
+    <button id="selection-chip-wtf" class="selection-chip-wtf" type="button" title="Look up what the selected words mean" hidden>WTF?</button>
+    <!--
+      `#2156 vibe-talk-wtf-glossary-lookup`. The glossary popover: the looked-up term, its
+      definition and its source link, or a clear failure. Opened by WTF? and by every
+      glossary-linked term; placed under the selection or the tapped term.
+    -->
+    <div id="glossary-popover" class="glossary-popover" role="dialog" aria-label="Glossary entry" hidden>
+      <p id="glossary-popover-term" class="glossary-popover-term"></p>
+      <p id="glossary-popover-body" class="glossary-popover-body" aria-live="polite"></p>
+      <p id="glossary-popover-source" class="glossary-popover-source" hidden>Source: <a id="glossary-popover-link" href="#">source</a></p>
+      <button id="glossary-popover-close" class="glossary-popover-close" type="button" title="Close" aria-label="Close">&times;</button>
+    </div>
 
     <!--
       `#727 vt-selection-quick-reply`. The quick reply the Quoted reply chip opens: floating under the

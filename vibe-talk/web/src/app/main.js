@@ -150,6 +150,7 @@ import {staleWords} from "../present/rows/index.ts";
 import {tokenFingerprint} from "../core/channels/index.ts";
 import {createDocumentsView, createViewSelector, DOC_STATES_KEY} from "../view/documents/index.ts";
 import {createDiscussView} from "../view/catchup/index.ts";
+import {createGlossaryView} from "../view/channel/index.ts";
 import {createTimelineView} from "../view/channel/index.ts";
 import {COLLAPSE_OVER_CHARS, FOLD_LESS, FOLD_MORE, createFolding} from "../view/channel/index.ts";
 import {createChannelRows} from "../view/channel/index.ts";
@@ -1398,6 +1399,16 @@ const discussView = createDiscussView({
       owner.stopReading();
     }
   },
+});
+
+/** WTF glossary lookup (`#2156 vibe-talk-wtf-glossary-lookup`): the WTF? button, its popover and glossary links. */
+const glossaryView = createGlossaryView({
+  byId: (id) => /** @type {any} */ (el(id)),
+  api: (path, options) => api(path, options),
+  selectedChannelId: () => String(selectedChannelId() ?? ""),
+  glossaryAvailable: () => serverFacts.glossaryAvailable(),
+  idsOf: (row) => idsOf(/** @type {any} */ (row)),
+  openDocument: (key) => { void documentsView.show(key); },
 });
 
 /** `#1388` landing 1. Restate an open summary's strike after any mark settles. */
@@ -9378,6 +9389,8 @@ application.track(mountChannelViewControls({
 // Discuss (`catchup-side-agent`): the bar's button and its panel's controls, in
 // web/src/view/catchup, tracked here in the page's order.
 application.track(discussView.mountControls());
+// WTF glossary (`#2156`): button, popover and term linking, tracked in the page's order.
+application.track(glossaryView);
 // The channel's box, and a thread's, which is the same box posting somewhere else: what is written kept as it is
 // written, Send, its keys, and what is pasted (web/src/view/composer/boxlisteners.ts).
 application.track(mountMessageBox({

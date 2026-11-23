@@ -324,6 +324,15 @@ fn inventory() -> Vec<Route> {
             Write,
             Json(r#"{}"#),
         ),
+        // `#2156 vibe-talk-wtf-glossary-lookup`: one lookup spends a model call
+        // and writes a dynamic entry, so write scope; the term list is a read.
+        route(
+            "POST",
+            "/api/v1/channels/{channel_id}/glossary/lookup",
+            Write,
+            Json(r#"{"selected":"Family A"}"#),
+        ),
+        route("GET", "/api/v1/glossary/terms", Read, Nothing),
         // `#1840`: synced drafts are the owner's unsent words, so write scope,
         // reads included.
         route(

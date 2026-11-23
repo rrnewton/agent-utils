@@ -297,6 +297,12 @@ export interface ElementById {
   "forget-dismissed-sends": HTMLButtonElement;
   "forget-token": HTMLButtonElement;
   "frame-body": HTMLElement;
+  "glossary-popover": HTMLDivElement;
+  "glossary-popover-body": HTMLParagraphElement;
+  "glossary-popover-close": HTMLButtonElement;
+  "glossary-popover-link": HTMLAnchorElement;
+  "glossary-popover-source": HTMLParagraphElement;
+  "glossary-popover-term": HTMLParagraphElement;
   "hang-up": HTMLButtonElement;
   "hangup-label": HTMLSpanElement;
   "help-auto-read": HTMLDetailsElement;
@@ -608,6 +614,7 @@ export interface ElementById {
   "search-toggle": HTMLButtonElement;
   "selection-chip": HTMLButtonElement;
   "selection-chip-dismiss": HTMLButtonElement;
+  "selection-chip-wtf": HTMLButtonElement;
   "send-text": HTMLButtonElement;
   "server-detail": HTMLDivElement;
   "server-hits": HTMLOListElement;

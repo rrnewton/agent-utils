@@ -18,6 +18,9 @@ export interface ServerFacts {
   /** Whether Discuss can run here (`discuss_available`): a direct LLM summarizer is configured. */
   discussAvailable(): boolean;
   setDiscussAvailable(on: boolean): void;
+  /** Whether WTF glossary lookup can run here (`glossary_available`, #2156). */
+  glossaryAvailable(): boolean;
+  setGlossaryAvailable(on: boolean): void;
   /** Whether `/client-config` has answered in this page. */
   configApplied(): boolean;
   /** `/client-config` has answered. */
@@ -41,6 +44,7 @@ export function createServerFacts(): ServerFacts {
   let tokenScope: "read" | "write" | null = null;
   let threadNamesSupported = false;
   let discussSupported = false;
+  let glossarySupported = false;
   let clientConfigApplied = false;
   let serverPageBuild = "";
   let linkHosts: readonly string[] = [];
@@ -57,6 +61,10 @@ export function createServerFacts(): ServerFacts {
     discussAvailable: () => discussSupported,
     setDiscussAvailable(on) {
       discussSupported = on;
+    },
+    glossaryAvailable: () => glossarySupported,
+    setGlossaryAvailable(on) {
+      glossarySupported = on;
     },
     configApplied: () => clientConfigApplied,
     markConfigApplied() {

@@ -46,6 +46,9 @@ mod cache_source;
 #[path = "catchup.rs"]
 mod catchup;
 
+#[path = "glossary_lookup.rs"]
+mod glossary_lookup;
+
 #[path = "route_health.rs"]
 mod route_health;
 

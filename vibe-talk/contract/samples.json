@@ -459,6 +459,7 @@
         "settings_url": "https://voice.example/settings"
       },
       "discuss_available": true,
+      "glossary_available": true,
       "hidden_channels": [
         {
           "added": false,

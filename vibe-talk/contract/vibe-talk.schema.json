@@ -993,6 +993,10 @@
           "description": "Whether Discuss (the catch-up side agent) can answer on this deployment.\n`catchup-side-agent`.\n\nTrue exactly when a direct LLM summariser is configured (`[summaries.llm]`), which is\nwhen the server built a side agent. The page draws its Discuss button disabled\nwithout it — a deployment whose summaries come through its ElevenLabs agent is fully\nconfigured for summaries, and its button must not present as broken; the endpoint\nitself answers such a deployment `discuss_not_available_on_this_backend`. Absent,\nfrom an older server, means false.",
           "type": "boolean"
         },
+        "glossary_available": {
+          "description": "Whether WTF glossary lookup can run on this deployment.\n`#2156 vibe-talk-wtf-glossary-lookup`.\n\nTrue exactly when Discuss can run (a side agent exists): the lookup is\non whenever a side-agent backend exists, with no separate switch. The\npage hides its WTF? button without it. Absent, from an older server,\nmeans false.",
+          "type": "boolean"
+        },
         "hidden_channels": {
           "description": "Channels from the configuration file the owner took off his list, in configuration order.\n`#199 removable-config-channels`.\n\nSettings lists them so each can be shown again; `channels` above already leaves them out.\nSent only to a write-scope caller, because showing one again takes that scope and a\nread-scope credential has no use for the names of channels the owner put away. Absent when\nnone are hidden, and from an older server, which could not hide one.",
           "items": {

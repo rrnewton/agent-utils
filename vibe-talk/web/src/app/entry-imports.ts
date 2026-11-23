@@ -30,6 +30,7 @@ export { staleWords } from "../present/rows/index.ts";
 export { tokenFingerprint } from "../core/channels/index.ts";
 export { createDocumentsView, createViewSelector, DOC_STATES_KEY } from "../view/documents/index.ts";
 export { createDiscussView } from "../view/catchup/index.ts";
+export { createGlossaryView } from "../view/channel/index.ts";
 export { createTimelineView } from "../view/channel/index.ts";
 export { COLLAPSE_OVER_CHARS, FOLD_LESS, FOLD_MORE, createFolding } from "../view/channel/index.ts";
 export { createChannelRows } from "../view/channel/index.ts";

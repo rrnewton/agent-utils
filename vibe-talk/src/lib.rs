@@ -69,6 +69,7 @@ pub mod documents;
 pub mod egress;
 pub mod elevenlabs;
 pub mod glossary;
+pub mod glossary_dynamic;
 pub mod heading;
 pub mod held_replies;
 pub mod history_control;

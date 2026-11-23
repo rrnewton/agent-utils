@@ -1269,6 +1269,8 @@ pub async fn client_config(
         // Discuss disabled on a deployment whose summaries come through its ElevenLabs agent
         // instead of offering a button whose every click refuses.
         discuss_available: state.catchup_summarizer.is_some(),
+        // `#2156 vibe-talk-wtf-glossary-lookup`: on whenever a side agent exists.
+        glossary_available: state.catchup_summarizer.is_some(),
         token_scope: scope.into(),
         // `#2060` Part B: the owner's rules, prompt and prefix stay off
         // the test credential's boot answer, as their own routes refuse it.
@@ -3144,6 +3146,441 @@ fn discuss_not_available() -> ApiError {
     )
 }
 
+/// WTF lookup is not available on this deployment's summariser backend.
+/// `#2156 vibe-talk-wtf-glossary-lookup`.
+fn glossary_not_available() -> ApiError {
+    ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "glossary_not_available_on_this_backend",
+        "Glossary lookup needs the LLM summarizer backend ([summaries.llm]); the ElevenLabs \
+         agent backend that serves this deployment's summaries does not provide it",
+    )
+}
+
+/// Reviewed glossary entries for one channel: the warm-up files the channel
+/// loads, parsed. Unreadable files are left out, as the warm-up leaves them.
+fn reviewed_glossary_entries(
+    state: &AppState,
+    channel_id: Option<&str>,
+) -> Vec<crate::glossary::GlossaryEntry> {
+    let files = match channel_id {
+        Some(id) => {
+            let label = state.channel(id).map(|c| c.label).unwrap_or_default();
+            crate::catchup::select_warmup_files(&state.config.summaries, id, &label)
+        }
+        None => state.config.summaries.catchup_warmup_files.clone(),
+    };
+    let mut entries: Vec<crate::glossary::GlossaryEntry> = Vec::new();
+    for path in &files {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            for entry in crate::glossary::parse_glossary(&text) {
+                if !entries
+                    .iter()
+                    .any(|held| held.term.eq_ignore_ascii_case(&entry.term))
+                {
+                    entries.push(entry);
+                }
+            }
+        }
+    }
+    entries
+}
+
+/// Dynamic entries for this deployment (empty without a state directory).
+fn dynamic_glossary_entries(state: &AppState) -> Vec<crate::glossary_dynamic::DynamicEntry> {
+    crate::glossary_dynamic::state_dir_of(state.config.storage.path.as_deref())
+        .map(|dir| crate::glossary_dynamic::load_entries(&dir))
+        .unwrap_or_default()
+}
+
+fn glossary_source_view(
+    source: &crate::glossary_dynamic::GlossarySource,
+) -> crate::contract::GlossarySourceView {
+    match source {
+        crate::glossary_dynamic::GlossarySource::Message { href, label, .. } => {
+            crate::contract::GlossarySourceView {
+                kind: "message".to_owned(),
+                href: href.clone(),
+                label: label.clone(),
+            }
+        }
+        crate::glossary_dynamic::GlossarySource::Document { key, label, .. } => {
+            crate::contract::GlossarySourceView {
+                kind: "document".to_owned(),
+                href: key.clone(),
+                label: label.clone(),
+            }
+        }
+    }
+}
+
+/// `GET /api/v1/glossary/terms` — every term the page renders as a glossary
+/// link: reviewed entries first (they win), then dynamic ones.
+/// `#2156 vibe-talk-wtf-glossary-lookup`. READ scope: definitions already
+/// served to Discuss, plus reader-learned ones.
+pub async fn glossary_terms(
+    State(state): State<AppState>,
+    _scope: ReadScope,
+) -> Result<Response, ApiError> {
+    let mut terms: Vec<crate::contract::GlossaryTermView> = Vec::new();
+    for entry in reviewed_glossary_entries(&state, None) {
+        terms.push(crate::contract::GlossaryTermView {
+            term: entry.term,
+            definition: entry.definition,
+            source: None,
+            origin: "reviewed".to_owned(),
+        });
+    }
+    for row in dynamic_glossary_entries(&state) {
+        if terms
+            .iter()
+            .any(|held| crate::glossary_dynamic::normalize(&held.term) == row.norm)
+        {
+            continue;
+        }
+        terms.push(crate::contract::GlossaryTermView {
+            term: row.term.clone(),
+            definition: row.definition.clone(),
+            source: row.source.as_ref().map(glossary_source_view),
+            origin: "dynamic".to_owned(),
+        });
+    }
+    Ok(Json(crate::contract::GlossaryTermsResponse { terms }).into_response())
+}
+
+/// `POST /api/v1/channels/{channel_id}/glossary/lookup` — one WTF press:
+/// resolve the selected words to a glossary term from cache-only evidence
+/// and persist a dynamic entry. `#2156 vibe-talk-wtf-glossary-lookup`.
+///
+/// WRITE scope: it spends a model call and writes deployment state.
+/// Cache-only: evidence comes from this server's message cache and its
+/// already-fetched documents; the chat upstream is never called.
+pub async fn glossary_lookup(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Path(channel_id): Path<String>,
+    Json(body): Json<crate::contract::GlossaryLookupRequest>,
+) -> Result<Response, ApiError> {
+    use crate::glossary_dynamic as dyn_gloss;
+    if state.channel(&channel_id).is_none() {
+        return Err(OpError::UnknownChannel.into());
+    }
+    let selected = body.selected.trim().to_owned();
+    if selected.is_empty()
+        || selected.chars().count() > dyn_gloss::MAX_SELECTION_CHARS
+        || selected.split_whitespace().count() > dyn_gloss::MAX_TERM_WORDS
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            format!(
+                "selected must be 1-{} words and at most {} characters",
+                dyn_gloss::MAX_TERM_WORDS,
+                dyn_gloss::MAX_SELECTION_CHARS
+            ),
+        ));
+    }
+    let context: String = body
+        .context
+        .as_deref()
+        .unwrap_or("")
+        .chars()
+        .take(dyn_gloss::MAX_CONTEXT_CHARS)
+        .collect();
+    // 1. Exact-hit short-circuit: no model call.
+    let reviewed = reviewed_glossary_entries(&state, Some(&channel_id));
+    let words: Vec<&str> = selected.split_whitespace().collect();
+    for take in (1..=words.len()).rev() {
+        let candidate = words[..take].join(" ");
+        if let Some(entry) = reviewed
+            .iter()
+            .find(|e| e.term.eq_ignore_ascii_case(&candidate))
+        {
+            return Ok(Json(crate::contract::GlossaryLookupResponse {
+                state: "found".to_owned(),
+                term: entry.term.clone(),
+                definition: Some(entry.definition.clone()),
+                source: None,
+                cached: true,
+                saved: false,
+                reason: None,
+            })
+            .into_response());
+        }
+    }
+    let dynamic = dynamic_glossary_entries(&state);
+    if let Some(row) = dyn_gloss::find_for_selection(&dynamic, &selected) {
+        return Ok(Json(crate::contract::GlossaryLookupResponse {
+            state: "found".to_owned(),
+            term: row.term.clone(),
+            definition: Some(row.definition.clone()),
+            source: row.source.as_ref().map(glossary_source_view),
+            cached: true,
+            saved: false,
+            reason: None,
+        })
+        .into_response());
+    }
+    let Some(agent) = state.catchup_summarizer.clone() else {
+        return Err(glossary_not_available());
+    };
+    // 2. Cache-only evidence: cached messages, then fetched documents.
+    // The search language matches whole phrases, so try the selection then
+    // its word-prefixes, longest first — the logical term is usually one.
+    let channels = state.all_channels();
+    // Union over windows, longest first: the full phrase finds use-sites,
+    // shorter windows find the introducing sighting that defines the term.
+    let mut hits: Vec<Message> = Vec::new();
+    for take in (1..=words.len()).rev() {
+        for start in 0..=(words.len() - take) {
+            let answer = crate::server_search::search(
+                &state,
+                Scope::Write,
+                channels.clone(),
+                &crate::server_search::Ask {
+                    q: words[start..start + take].join(" "),
+                    tz: None,
+                    below_ms: None,
+                    limit: Some(12),
+                },
+            )
+            .await;
+            for hit in answer.map(|a| a.hits).unwrap_or_default() {
+                if hits.len() < 12 && !hits.iter().any(|held: &Message| held.id == hit.id) {
+                    hits.push(hit);
+                }
+            }
+        }
+        if hits.len() >= 12 {
+            break;
+        }
+    }
+    hits.sort_by_key(|m| usize::from(m.channel_id.as_str() != channel_id));
+    let doc_query = crate::search_query::parse(&selected);
+    let doc_search = state.documents.search_documents(&doc_query, 5);
+    if hits.is_empty() && doc_search.hits.is_empty() {
+        return Ok(Json(crate::contract::GlossaryLookupResponse {
+            state: "not_found".to_owned(),
+            term: selected.clone(),
+            definition: None,
+            source: None,
+            cached: false,
+            saved: false,
+            reason: Some("no definition found in recent messages or fetched documents".to_owned()),
+        })
+        .into_response());
+    }
+    // 3. One model step: pick the logical term, define it from evidence.
+    let mut evidence = String::new();
+    for message in &hits {
+        let label = if message.spoken_time.is_empty() {
+            message.timestamp.clone()
+        } else {
+            message.spoken_time.clone()
+        };
+        evidence.push_str(&format!(
+            "[msg id={} channel={} at={} by={}] {}\n",
+            message.id.as_str(),
+            message.channel_id.as_str(),
+            label,
+            message.author,
+            message.content.chars().take(400).collect::<String>()
+        ));
+    }
+    for hit in &doc_search.hits {
+        evidence.push_str(&format!(
+            "[doc key={} title={}] {}\n",
+            hit.key,
+            hit.title,
+            hit.snippet.chars().take(400).collect::<String>()
+        ));
+    }
+    let evidence: String = evidence.chars().take(6000).collect();
+    let system = "You maintain a project glossary. From the fenced evidence only, decide what \
+the reader's selected words mean. Choose the logical term: the shorter name when the phrase \
+around it is just this instance of it, the full phrase when the phrase itself is the named \
+thing. Answer with exactly one JSON object and nothing else: \
+{\"term\": \"<term>\", \"definition\": \"<one line, at most 240 characters>\", \
+\"source_kind\": \"message\" or \"document\", \"source_id\": \"<the msg id or doc key the \
+definition rests on>\"}. When the evidence does not define the words, answer \
+{\"term\": null}. Never invent a meaning the evidence does not support.";
+    let prompt = format!(
+        "Selected words: {selected}\nContaining line: {context}\n\nEvidence:\n{}",
+        untrusted::fenced(&evidence)
+    );
+    let raw = agent
+        .complete_prompt(system, &prompt)
+        .await
+        .map_err(|error| match error {
+            crate::summarize::SummaryError::NotConfigured(_) => glossary_not_available(),
+            other => ApiError::from(OpError::Summarizer(other)),
+        })?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(raw.trim()).unwrap_or(serde_json::Value::Null);
+    let term = parsed
+        .get("term")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned);
+    let Some(term) = term else {
+        return Ok(Json(crate::contract::GlossaryLookupResponse {
+            state: "not_found".to_owned(),
+            term: selected.clone(),
+            definition: None,
+            source: None,
+            cached: false,
+            saved: false,
+            reason: Some("no definition found in recent messages or fetched documents".to_owned()),
+        })
+        .into_response());
+    };
+    if term.chars().count() > dyn_gloss::MAX_SELECTION_CHARS
+        || term.split_whitespace().count() > dyn_gloss::MAX_TERM_WORDS
+    {
+        return Err(ApiError::from(OpError::Summarizer(
+            crate::summarize::SummaryError::Shape(
+                "the glossary answer named a term longer than a selection may be".to_owned(),
+            ),
+        )));
+    }
+    let definition = parsed
+        .get("definition")
+        .and_then(serde_json::Value::as_str)
+        .map(|d| d.trim().replace('\n', " "))
+        .filter(|d| !d.is_empty())
+        .map(|d| {
+            d.chars()
+                .take(dyn_gloss::MAX_DEFINITION_CHARS)
+                .collect::<String>()
+        });
+    let Some(definition) = definition else {
+        return Err(ApiError::from(OpError::Summarizer(
+            crate::summarize::SummaryError::Shape(
+                "the glossary answer carried no definition".to_owned(),
+            ),
+        )));
+    };
+    let source_kind = parsed
+        .get("source_kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let source_id = parsed
+        .get("source_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let source: Option<dyn_gloss::GlossarySource> = match source_kind {
+        "message" => hits
+            .iter()
+            .find(|m| m.id.as_str() == source_id)
+            .map(|message| {
+                let provider = state
+                    .channel(message.channel_id.as_str())
+                    .and_then(|c| c.provider)
+                    .unwrap_or_else(|| "discord".to_owned());
+                let href = crate::catchup::message_link(
+                    &provider,
+                    message.channel_id.as_str(),
+                    "all",
+                    None,
+                    &message.id,
+                    message.thread.as_ref().map(|t| t.id.as_str()),
+                );
+                let label = if message.spoken_time.is_empty() {
+                    format!("message, {}", message.timestamp)
+                } else {
+                    format!("message, {}", message.spoken_time)
+                };
+                dyn_gloss::GlossarySource::Message {
+                    channel: message.channel_id.as_str().to_owned(),
+                    message: message.id.as_str().to_owned(),
+                    href,
+                    label,
+                }
+            }),
+        "document" => doc_search
+            .hits
+            .iter()
+            .find(|h| h.key == source_id)
+            .map(|hit| dyn_gloss::GlossarySource::Document {
+                key: hit.key.clone(),
+                heading: None,
+                href: hit.key.clone(),
+                label: format!("document: {}", hit.title),
+            }),
+        _ => None,
+    };
+    let Some(source) = source else {
+        return Ok(Json(crate::contract::GlossaryLookupResponse {
+            state: "not_found".to_owned(),
+            term: selected.clone(),
+            definition: None,
+            source: None,
+            cached: false,
+            saved: false,
+            reason: Some("no definition found in recent messages or fetched documents".to_owned()),
+        })
+        .into_response());
+    };
+    // Narrow a document source to its section when the evidence names one.
+    let source = match &source {
+        dyn_gloss::GlossarySource::Document { key, label, .. } => {
+            let heading = state.documents.cached(key).and_then(|fetched| {
+                crate::documents::headings(&fetched.content)
+                    .into_iter()
+                    .find(|h| h.text.to_lowercase().contains(&term.to_lowercase()))
+                    .map(|h| h.text)
+            });
+            dyn_gloss::GlossarySource::Document {
+                key: key.clone(),
+                heading: heading.clone(),
+                href: key.clone(),
+                label: match &heading {
+                    Some(h) => format!("{label} § {h}"),
+                    None => label.clone(),
+                },
+            }
+        }
+        other => other.clone(),
+    };
+    // 4. Persist (best-effort) and answer.
+    let model = state
+        .catchup_model
+        .as_deref()
+        .unwrap_or("side-agent")
+        .to_owned();
+    let row = dyn_gloss::DynamicEntry {
+        v: 1,
+        norm: dyn_gloss::normalize(&term),
+        term: term.clone(),
+        definition: definition.clone(),
+        source: Some(source.clone()),
+        model,
+        created: jiff::Timestamp::now().to_string(),
+        deleted: false,
+    };
+    let mut saved = false;
+    if let Some(state_dir) = dyn_gloss::state_dir_of(state.config.storage.path.as_deref()) {
+        let path = dyn_gloss::glossary_path(&state_dir);
+        match dyn_gloss::append_row(&path, &row, dyn_gloss::DEFAULT_MAX_BYTES) {
+            Ok(()) => saved = true,
+            Err(error) => {
+                tracing::warn!(error = %error, "dynamic glossary append failed");
+            }
+        }
+    }
+    Ok(Json(crate::contract::GlossaryLookupResponse {
+        state: "found".to_owned(),
+        term,
+        definition: Some(definition),
+        source: Some(glossary_source_view(&source)),
+        cached: false,
+        saved,
+        reason: None,
+    })
+    .into_response())
+}
+
 /// Query of `GET …/catchup/preview`: the scope, as the POST body's fields name it.
 #[derive(Debug, Default, Deserialize)]
 pub struct CatchupPreviewQuery {
@@ -3339,6 +3776,44 @@ pub async fn catchup(
     let warmup_chars = warmup.chars().count();
     if !warmup.is_empty() {
         built.prompt = format!("{warmup}\n\n{}", built.prompt);
+    }
+    // `#2156 vibe-talk-wtf-glossary-lookup`: learned entries are popover-only
+    // for now (the owner's rule); this path joins them to the warm-up under
+    // their own heading, within the same budget, when the policy opens.
+    if crate::glossary_dynamic::DYNAMIC_IN_WARMUP {
+        if let Some(state_dir) =
+            crate::glossary_dynamic::state_dir_of(state.config.storage.path.as_deref())
+        {
+            let dynamic = crate::glossary_dynamic::load_entries(&state_dir);
+            if !dynamic.is_empty() {
+                let entries: Vec<crate::glossary::GlossaryEntry> = dynamic
+                    .iter()
+                    .map(|row| crate::glossary::GlossaryEntry {
+                        term: row.term.clone(),
+                        definition: row.definition.clone(),
+                    })
+                    .collect();
+                let budget = state
+                    .config
+                    .summaries
+                    .catchup_warmup_max_chars
+                    .saturating_sub(warmup_chars);
+                let mut extra = String::from(
+                "Reference material learned from readers (unreviewed; background only):\n\n## Reference: dynamic-glossary (unreviewed)\n",
+            );
+                for entry in crate::glossary::ranked_entries(&entries, &built.prompt, &[]) {
+                    let line = entry.prompt_line();
+                    if extra.chars().count() + line.chars().count() + 1 > budget {
+                        continue;
+                    }
+                    extra.push_str(&line);
+                    extra.push('\n');
+                }
+                if extra.lines().count() > 3 {
+                    built.prompt = format!("{}\n\n{}", extra.trim_end(), built.prompt);
+                }
+            }
+        }
     }
     let system = crate::catchup::effective_system_prompt(None);
     let context_ms = u64::try_from(context_began.elapsed().as_millis()).unwrap_or(u64::MAX);

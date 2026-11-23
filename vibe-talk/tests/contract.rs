@@ -346,6 +346,7 @@ fn client_config(
         summarizer_warning: None,
         thread_names_supported: full,
         discuss_available: full,
+        glossary_available: full,
         token_scope: scope,
         noise_rules: full.then(|| NoiseRules {
             rules: vec!["Working…".into(), "Thinking*".into()],

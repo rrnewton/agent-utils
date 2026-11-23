@@ -276,6 +276,8 @@ export { createRichHeaders } from "./richheaders.ts";
 export type { RichHeaders, RichHeadersDependencies, RichHeaderSettings } from "./richheaders.ts";
 export { createNoiseActs } from "./noiseacts.ts";
 export type { NoiseActs, NoiseActsDependencies } from "./noiseacts.ts";
+export { createGlossaryView } from "./glossary.ts";
+export type { GlossaryDependencies, GlossaryTerm, GlossaryView } from "./glossary.ts";
 export { mountTextSelection } from "./textselection.ts";
 export type { KeptTextSelection, TextSelection, TextSelectionDependencies } from "./textselection.ts";
 export * from "./searchopen.ts";

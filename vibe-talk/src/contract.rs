@@ -267,6 +267,15 @@ pub struct ClientConfigResponse {
     /// from an older server, means false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub discuss_available: bool,
+    /// Whether WTF glossary lookup can run on this deployment.
+    /// `#2156 vibe-talk-wtf-glossary-lookup`.
+    ///
+    /// True exactly when Discuss can run (a side agent exists): the lookup is
+    /// on whenever a side-agent backend exists, with no separate switch. The
+    /// page hides its WTF? button without it. Absent, from an older server,
+    /// means false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub glossary_available: bool,
     /// The scope of the token that asked.
     ///
     /// The caller's own scope, so it discloses nothing it did not already hold. The page needs it
@@ -1674,6 +1683,70 @@ pub struct CatchupRequest {
     /// contiguous. Absent covers the bound's window as `since_ms` shapes it.
     #[serde(default)]
     pub message_ids: Option<Vec<MessageId>>,
+}
+
+/// The body of `POST /api/v1/channels/{channel_id}/glossary/lookup`.
+/// `#2156 vibe-talk-wtf-glossary-lookup`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct GlossaryLookupRequest {
+    /// The words the reader selected (at most 200 characters, 8 words).
+    pub selected: String,
+    /// The message the selection stands in, when known.
+    #[serde(default)]
+    pub message_id: Option<String>,
+    /// The containing line as rendered, bounded by the server.
+    #[serde(default)]
+    pub context: Option<String>,
+}
+
+/// The source link of one glossary entry, for the popover.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GlossarySourceView {
+    /// `message` or `document`.
+    pub kind: String,
+    /// In-app href the popover's source link follows.
+    pub href: String,
+    /// Human label, e.g. `message, Tue 09:51`.
+    pub label: String,
+}
+
+/// One known glossary term as served to the page.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct GlossaryTermView {
+    /// The term as displayed.
+    pub term: String,
+    /// One-line definition.
+    pub definition: String,
+    /// The best source link, when the entry has one.
+    pub source: Option<GlossarySourceView>,
+    /// `reviewed` (committed or per-channel file) or `dynamic` (WTF-learned).
+    pub origin: String,
+}
+
+/// The answer of one WTF lookup.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct GlossaryLookupResponse {
+    /// `found` or `not_found`.
+    pub state: String,
+    /// The chosen logical term (may be shorter than the selection).
+    pub term: String,
+    /// The one-line definition, when found.
+    pub definition: Option<String>,
+    /// The best source link, when found.
+    pub source: Option<GlossarySourceView>,
+    /// True when an existing entry answered with no model call.
+    pub cached: bool,
+    /// True when this press persisted a new dynamic entry.
+    pub saved: bool,
+    /// Why nothing was found, when `state` is `not_found`.
+    pub reason: Option<String>,
+}
+
+/// The answer of `GET /api/v1/glossary/terms`: every term the page links.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct GlossaryTermsResponse {
+    /// Known terms, reviewed first, then dynamic, each once by identity.
+    pub terms: Vec<GlossaryTermView>,
 }
 
 /// One unread message in a Discuss preview, for the panel's N/since choice.

@@ -5126,6 +5126,46 @@ def _act_discuss_terms(driver: Driver) -> None:
     driver.settle(200)
 
 
+def _act_glossary_wtf(driver: Driver) -> None:
+    """`#2156`: select an unfamiliar term in a message, press WTF?, and
+    photograph the popover the real lookup route answers with (the loopback
+    model stub is the only stub). The learned term then renders as a
+    glossary link in the list."""
+    driver.load(with_token=True)
+    driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    _ensure_pane(driver, "pane-discord")
+    driver.page.wait_for_function(
+        "() => document.querySelectorAll('#discord-log > li').length > 0 "
+        "&& !window.__visible('channel-loading')",
+        timeout=15_000,
+    )
+    driver.js(
+        "(() => { const rows = [...document.querySelectorAll('#discord-log > li')]; "
+        "const row = rows.find((r) => r.textContent.includes('retry-budget')); "
+        "if (!row) return false; "
+        "const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT); "
+        "for (let n = walker.nextNode(); n; n = walker.nextNode()) { "
+        "const at = n.textContent.indexOf('retry-budget'); "
+        "if (at < 0) continue; "
+        "const range = document.createRange(); "
+        "range.setStart(n, at); range.setEnd(n, at + 'retry-budget'.length); "
+        "const sel = getSelection(); sel.removeAllRanges(); sel.addRange(range); "
+        "document.dispatchEvent(new Event('selectionchange')); return true; } "
+        "return false; })()"
+    )
+    driver.page.wait_for_function(
+        "() => window.__visible('selection-chip-wtf') && window.__visible('selection-chip')",
+        timeout=10_000,
+    )
+    driver.click("selection-chip-wtf")
+    driver.page.wait_for_function(
+        "() => window.__visible('glossary-popover') "
+        "&& document.getElementById('glossary-popover-body').textContent.includes('glossary definition')",
+        timeout=30_000,
+    )
+    driver.settle(300)
+
+
 def _act_discuss_search(driver: Driver) -> None:
     """`#2136`: two real summaries (current + earlier via the timeline walk),
     then the header search opened and a query typed, so the shot shows flat
@@ -8414,6 +8454,22 @@ SCENES: tuple[Scene, ...] = (
             ("no error banner is up", "!window.__visible('error-wrap')"),
         ),
     ),
+    Scene(
+        name="91-glossary-wtf",
+        what="WTF? pressed on a selected term: the popover the real lookup route answers, and the term linked",
+        act=_act_glossary_wtf,
+        profiles=MATRIX_PROFILES,
+        keep_transient=True,
+        expect=(
+            ("the WTF? button stands left of the Quote reply chip", "(() => { const w = document.getElementById('selection-chip-wtf').getBoundingClientRect(); const c = document.getElementById('selection-chip').getBoundingClientRect(); return w.right <= c.left + 1; })()"),
+            ("the dismiss X stands right of the chip", "(() => { const x = document.getElementById('selection-chip-dismiss').getBoundingClientRect(); const c = document.getElementById('selection-chip').getBoundingClientRect(); return x.left >= c.right - 1; })()"),
+            ("the popover shows the stub's definition", "window.__visible('glossary-popover') && document.getElementById('glossary-popover-body').textContent.includes('glossary definition')"),
+            ("the popover carries a source link", "window.__visible('glossary-popover-source') && document.getElementById('glossary-popover-link').textContent.trim().length > 0"),
+            ("the learned term renders as a glossary link", "document.querySelectorAll('#discord-log .glossary-term').length > 0"),
+
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
     # LAST IN THE WALK, and not by accident: it empties the server's durable store on the way in,
     # so that the summary the state above cached is really regenerated and can really fail. Nothing
     # after it in this profile would miss what it deletes, and the next profile purges anyway.
@@ -8681,7 +8737,7 @@ def run_captures(
     # empty pane there is the failure the matrix exists to catch. A wider walk skips those
     # states BY NAME instead — its server is deliberately cacheless (the Settings and Help
     # states photograph exactly that), so Discuss has no window to show there.
-    discuss_scenes = [s for s in scenes if s.name.startswith(("73-", "74-", "75-", "76-", "78-", "84-", "85-", "89-", "90-"))]
+    discuss_scenes = [s for s in scenes if s.name.startswith(("73-", "74-", "75-", "76-", "78-", "84-", "85-", "89-", "90-", "91-"))]
     discuss_only = bool(wanted) and len(wanted) == len(discuss_scenes)
     if discuss_scenes and not seed_discuss_cache(60 if discuss_only else 10):
         if discuss_only:

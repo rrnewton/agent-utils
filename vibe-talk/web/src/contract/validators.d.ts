@@ -726,6 +726,16 @@ export interface ClientConfigResponse {
    */
   discuss_available?: boolean;
   /**
+   * Whether WTF glossary lookup can run on this deployment.
+   * `#2156 vibe-talk-wtf-glossary-lookup`.
+   *
+   * True exactly when Discuss can run (a side agent exists): the lookup is
+   * on whenever a side-agent backend exists, with no separate switch. The
+   * page hides its WTF? button without it. Absent, from an older server,
+   * means false.
+   */
+  glossary_available?: boolean;
+  /**
    * Channels from the configuration file the owner took off his list, in configuration order.
    * `#199 removable-config-channels`.
    *

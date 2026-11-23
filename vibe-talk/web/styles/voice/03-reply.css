@@ -363,6 +363,99 @@
   display: none;
 }
 
+/* `#2156 vibe-talk-wtf-glossary-lookup`. "WTF?", left of the Quoted reply chip: the chip's own
+   panel and accent, placed with it by web/src/view/channel/glossary. */
+#selection-chip-wtf {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: var(--z-modal);
+  min-height: 2.5rem;
+  padding: 0 0.8rem;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  background: var(--panel);
+  color: var(--accent);
+  font: inherit;
+  font-size: 0.85rem;
+  font-weight: 700;
+  white-space: nowrap;
+  box-shadow: 0 2px 10px rgb(0 0 0 / 0.25);
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: pointer;
+}
+
+#selection-chip-wtf[hidden] {
+  display: none;
+}
+
+/* `#2156 vibe-talk-wtf-glossary-lookup`. A known glossary term in a message body: a dotted
+   underline, distinct from ordinary links, label chips and citation anchors in both themes. */
+.glossary-term {
+  padding: 0;
+  border: none;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-decoration: underline dotted var(--accent);
+  text-underline-offset: 0.18em;
+  cursor: pointer;
+}
+
+/* `#2156 vibe-talk-wtf-glossary-lookup`. The glossary popover: term, definition and source,
+   floating under the selection or the tapped term like the quick reply. */
+.glossary-popover {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: var(--z-modal);
+  box-sizing: border-box;
+  width: min(22rem, calc(100vw - 1rem));
+  padding: 0.7rem 2rem 0.7rem 0.8rem;
+  border: 1px solid var(--accent);
+  border-radius: 0.6rem;
+  background: var(--panel);
+  color: var(--ink);
+  box-shadow: 0 4px 18px rgb(0 0 0 / 0.3);
+}
+
+.glossary-popover[hidden] {
+  display: none;
+}
+
+.glossary-popover-term {
+  margin: 0 0 0.25rem;
+  font-weight: 700;
+}
+
+.glossary-popover-body {
+  margin: 0;
+}
+
+.glossary-popover-source {
+  margin: 0.4rem 0 0;
+  font-size: 0.85rem;
+}
+
+.glossary-popover-close {
+  position: absolute;
+  top: 0.3rem;
+  right: 0.4rem;
+  min-width: 2rem;
+  min-height: 2rem;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  font-size: 1.1rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
 /* `#727 vt-selection-quick-reply`. The quick reply, floating under the words it quotes: absolute against the
    layout viewport like the chip, over the lists, its width and place set by web/voice.js. */
 #quick-reply {

@@ -68,8 +68,26 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": "not_found", "detail": "the model stub serves /v1/messages"})
             return
         length = int(self.headers.get("Content-Length") or 0)
-        if length:
-            self.rfile.read(length)  # the prompt; its content does not change the stub's answer
+        body = self.rfile.read(length) if length else b""
+        text = body.decode("utf-8", "replace")
+        answer = ANSWER
+        # `#2156`: a WTF glossary lookup asks in its own shape; answer it as
+        # the strict JSON the lookup route parses, citing the first evidence
+        # message the server fenced into the prompt.
+        if "You maintain a project glossary" in text:
+            import re
+
+            selected = re.search(r"Selected words: (.+)", text)
+            evidence = re.search(r"\[msg id=(\S+?) ", text)
+            term = (selected.group(1).strip() if selected else "the term").removeprefix("the ")
+            answer = json.dumps(
+                {
+                    "term": term,
+                    "definition": f"{term}: the stub's glossary definition, through the real lookup route.",
+                    "source_kind": "message",
+                    "source_id": evidence.group(1) if evidence else "",
+                }
+            )
         self._json(
             200,
             {
@@ -77,7 +95,7 @@ class Handler(BaseHTTPRequestHandler):
                 "type": "message",
                 "role": "assistant",
                 "model": "model-stub",
-                "content": [{"type": "text", "text": ANSWER}],
+                "content": [{"type": "text", "text": answer}],
                 "stop_reason": "end_turn",
                 "usage": {"input_tokens": 100, "output_tokens": 40},
             },

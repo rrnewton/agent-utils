@@ -329,6 +329,13 @@ fn routes(state: AppState) -> Router {
         .route("/api/v1/channels/{channel_id}/recap", get(api::recap))
         // `catchup-side-agent`. WRITE scope: one Discuss read — it spends a model call.
         .route("/api/v1/channels/{channel_id}/catchup", post(api::catchup))
+        // `#2156 vibe-talk-wtf-glossary-lookup`. WRITE scope: one lookup spends
+        // a model call and writes a dynamic entry. READ scope for the term list.
+        .route(
+            "/api/v1/channels/{channel_id}/glossary/lookup",
+            post(api::glossary_lookup),
+        )
+        .route("/api/v1/glossary/terms", get(api::glossary_terms))
         // `discuss-summarize-button`. WRITE scope, as the read's: its unread preview.
         .route(
             "/api/v1/channels/{channel_id}/catchup/preview",
