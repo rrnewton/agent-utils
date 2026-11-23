@@ -1,12 +1,13 @@
 ---
 title: 'agentctl-native-session-cross-binding: revive and adopt must refuse a native session already registered to another name'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - agentctl
 created_at: 2026-11-22T12:35:00-05:00
-updated_at: 2026-11-22T12:35:00-05:00
+updated_at: 2026-11-23T12:51:38-05:00
+closed_at: 2026-11-23T12:51:38-05:00
 ---
 
 # Description
