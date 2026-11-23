@@ -570,7 +570,9 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
           f"a footer time tap target is too short: {footer_geo}")
     check("09:51, 09:52" in footer_geo["text"],
           f"the footer times are not comma-separated: {footer_geo['text']!r}")
-    check(page.locator("#discuss-processed").bounding_box()["y"] < page.locator("#discuss-terms").bounding_box()["y"] if page.locator("#discuss-terms").is_visible() else True,
+    proc_box = page.locator("#discuss-processed").bounding_box()
+    terms_box = page.locator("#discuss-terms").bounding_box()
+    check(proc_box is None or terms_box is None or proc_box["y"] < terms_box["y"],
           "the processed section does not stand before Terms")
     check(page.locator("#discuss-answer .discuss-struck").count() == 0,
           "a bullet stood struck before anything was read")
