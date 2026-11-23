@@ -5139,20 +5139,32 @@ def _act_glossary_wtf(driver: Driver) -> None:
         "&& !window.__visible('channel-loading')",
         timeout=15_000,
     )
-    driver.js(
+    # A real drag over the term (a scripted range is cleared by the list's
+    # own selection keeping): "flaky ordering test" stands in the newest
+    # page's release message, so it is on screen at load.
+    rect = driver.js(
         "(() => { const rows = [...document.querySelectorAll('#discord-log > li')]; "
-        "const row = rows.find((r) => r.textContent.includes('retry-budget')); "
-        "if (!row) return false; "
+        "const row = rows.find((r) => r.textContent.includes('flaky ordering test')); "
+        "if (!row) return null; "
         "const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT); "
         "for (let n = walker.nextNode(); n; n = walker.nextNode()) { "
-        "const at = n.textContent.indexOf('retry-budget'); "
+        "const at = n.textContent.indexOf('flaky ordering test'); "
         "if (at < 0) continue; "
         "const range = document.createRange(); "
-        "range.setStart(n, at); range.setEnd(n, at + 'retry-budget'.length); "
-        "const sel = getSelection(); sel.removeAllRanges(); sel.addRange(range); "
-        "document.dispatchEvent(new Event('selectionchange')); return true; } "
-        "return false; })()"
+        "range.setStart(n, at); range.setEnd(n, at + 'flaky ordering test'.length); "
+        "const r = range.getBoundingClientRect(); "
+        "return {x: r.left, y: r.top, width: r.width, height: r.height}; } "
+        "return null; })()"
     )
+    assert isinstance(rect, dict), "no selectable term text on screen"
+    driver.page.mouse.move(float(rect["x"]) + 1, float(rect["y"]) + float(rect["height"]) / 2)
+    driver.page.mouse.down()
+    driver.page.mouse.move(
+        float(rect["x"]) + float(rect["width"]) - 1,
+        float(rect["y"]) + float(rect["height"]) / 2,
+        steps=8,
+    )
+    driver.page.mouse.up()
     driver.page.wait_for_function(
         "() => window.__visible('selection-chip-wtf') && window.__visible('selection-chip')",
         timeout=10_000,

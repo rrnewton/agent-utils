@@ -61,6 +61,7 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
       setHiddenIfChanged(button, true);
       return;
     }
+    setHiddenIfChanged(button, false);
     const rect = chip.getBoundingClientRect();
     const size = button.getBoundingClientRect();
     const width = Number(size.width) || 64;
@@ -69,7 +70,6 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
     if (left < 8) left = Math.min(rect.right + 8, viewWidth - 8 - width);
     button.style.left = `${Math.round(Math.max(8, left))}px`;
     button.style.top = `${Math.round(rect.top)}px`;
-    setHiddenIfChanged(button, false);
   }
 
   function placePopover(): void {
@@ -271,8 +271,11 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
 
   listen<Event>(document, "selectionchange", () => {
     ensureTerms();
-    if (typeof requestAnimationFrame === "function") requestAnimationFrame(placeWtf);
-    else placeWtf();
+    if (typeof requestAnimationFrame === "function") {
+      // Twice: the Quote chip places itself on the first frame after a
+      // selection, so the WTF? button settles against its final place.
+      requestAnimationFrame(() => requestAnimationFrame(placeWtf));
+    } else placeWtf();
   });
   listen<MouseEvent>(wtf(), "click", (event) => {
     event.preventDefault();
