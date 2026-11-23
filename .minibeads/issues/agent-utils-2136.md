@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-discuss-summary-search: search button on the Discuss bar filtering all summary bullets'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
@@ -31,3 +31,7 @@ Owner request: a Search button on the Discuss bar. The icon row at the top right
 # Notes
 
 Owner UI request (fast-track); filed by the coordinator.
+
+## Resolution
+
+Landed as 19917412 on main: a square search icon in the Discuss header row opens a field that live-filters every bullet of the current and earlier summaries, already whole in the page via the record route (no server change, no upstream call). Case-insensitive AND of words; flat hits labelled Current/Earlier summary plus topic heading; hit citations jump in place like summary links. Gate d7273f92 was red only on read-modes-browser (untouched, passes locally); landed under the coordinator's waiver with the combined tree verified over current main.
