@@ -351,20 +351,59 @@ export function createReplyArrows(deps: ReplyArrowsDependencies): ReplyArrows {
     return top;
   }
 
+  /**
+   * Where the list the reader can actually see ends, in viewport pixels (`#2147
+   * vibe-talk-linked-jump-centers-target`): the scroller's own foot, cut by the
+   * shrunk visual viewport when the on-screen keyboard is up, and by the top of
+   * a Discuss sheet that spans the list's whole width (the phone sheet stands
+   * over the list's foot; a desk panel beside the list cuts nothing off it).
+   */
+  function visibleListFoot(area: Element, head: number): number {
+    const box0 = area.getBoundingClientRect();
+    let foot = box0.bottom;
+    // The scroller's own viewport, where it reports one: its rect can run
+    // taller (a fixture's content-tall box, a layout viewport under a
+    // keyboard), and only the client height is ever on screen at once.
+    if (area.clientHeight > 0) foot = Math.min(foot, box0.top + area.clientHeight);
+    try {
+      const visual = typeof window !== "undefined" ? window.visualViewport : null;
+      if (visual && visual.height > 0) foot = Math.min(foot, visual.height);
+    } catch (_error) {
+      // No visual viewport to read: the scroller's own foot stands.
+    }
+    try {
+      const panel = deps.el("discuss-panel");
+      if (panel && !panel.hidden && typeof panel.getBoundingClientRect === "function") {
+        const box = area.getBoundingClientRect();
+        const sheet = panel.getBoundingClientRect();
+        if (sheet.height > 0 && sheet.left <= box.left + 1 && sheet.right >= box.right - 1 &&
+          sheet.top > head && sheet.top < foot) foot = sheet.top;
+      }
+    } catch (_error) {
+      // No Discuss sheet to measure: the scroller's own foot stands.
+    }
+    return foot;
+  }
+
   /** Whether any of `row` shows between the floating line and the foot of the list. */
   function rowOnScreen(row: Element): boolean {
     const area = deps.el("scroll-area");
     const box = row.getBoundingClientRect();
-    return box.bottom > floatingClearance(area) &&
-      box.top < area.getBoundingClientRect().top + area.clientHeight;
+    const head = floatingClearance(area);
+    return box.bottom > head && box.top < visibleListFoot(area, head);
   }
 
   /**
-   * Put `row` at the head of the list, just under the floating line, and light it for a moment.
+   * Put `row` on screen and light it for a moment: at the head of the list, just under the
+   * floating line, or — for a linked-message landing (`center`, `#2147`) — in the middle of
+   * the list area the reader can actually see (above a phone Discuss sheet, inside the
+   * keyboard-shrunk viewport; see `visibleListFoot`).
    *
-   * At the HEAD rather than centred, because what follows a question is usually its answer: the most
-   * room below the row is the best chance the reply is still on screen, and then there is nothing to
-   * come back from. A row nearer the end of the list than a screenful stops where the list does.
+   * At the HEAD rather than centred by default, because what follows a question is usually
+   * its answer: the most room below the row is the best chance the reply is still on screen,
+   * and then there is nothing to come back from. A row nearer the end of the list than a
+   * screenful stops where the list does (the scroller clamps the write); a centred row
+   * taller than the visible area aligns its top under the floating line instead.
    */
   function revealRow(row: ReplyArrowRow, center = false): void {
     // `#1585 linked-message-always-expanded`. Every landing comes through here — a link,
@@ -376,10 +415,11 @@ export function createReplyArrows(deps: ReplyArrowsDependencies): ReplyArrows {
     deps.filterState().hold = null;
     deps.endFilterWalk();
     const clear = floatingClearance(area) + REPLY_LANDING_GAP_PX;
-    // `#580 open-in-chat-jump`: centred in the room under what floats over the list, or under the top
-    // as anywhere else when it is too tall to be.
+    // `#580 open-in-chat-jump`, `#2147`: centred in the visible room under what floats over
+    // the list, or under the top as anywhere else when it is too tall to be.
     const height = row.getBoundingClientRect().bottom - drawnTop(row);
-    const lead = center ? Math.max(clear, (clear + area.getBoundingClientRect().bottom - height) / 2) : clear;
+    const foot = center ? visibleListFoot(area, clear) : area.getBoundingClientRect().bottom;
+    const lead = center ? (height >= foot - clear ? clear : (clear + foot - height) / 2) : clear;
     deps.nudge(area, drawnTop(row) - lead);
     const prior = replyArrows().landed;
     if (prior) {
@@ -406,6 +446,20 @@ export function createReplyArrows(deps: ReplyArrowsDependencies): ReplyArrows {
     // screen". Re-assert over the next frames, each frame the condition
     // check (no wall-clock budget): stop the moment the row is on
     // screen, leaves the list, or a newer landing replaces this one.
+    // `#2147`: a centred landing is only done when it stands centred
+    // (or top-aligned-tall, or at a clamped list end) — merely on screen
+    // is where the sheet's drop left it, half a screen low.
+    const centredNow = (): boolean => {
+      const here = deps.el("scroll-area");
+      const headHere = floatingClearance(here) + REPLY_LANDING_GAP_PX;
+      const footHere = visibleListFoot(here, headHere);
+      const boxHere = row.getBoundingClientRect();
+      const heightHere = boxHere.bottom - drawnTop(row);
+      if (heightHere >= footHere - headHere) return drawnTop(row) <= headHere + 12;
+      const maxHere = here.scrollHeight - here.clientHeight;
+      if (here.scrollTop <= 1 || here.scrollTop >= maxHere - 1) return boxHere.bottom > headHere && boxHere.top < footHere;
+      return Math.abs((drawnTop(row) + boxHere.bottom) / 2 - (headHere + footHere) / 2) <= 32;
+    };
     if (typeof requestAnimationFrame === "function") {
       let frames = 0;
       let lastSettled: readonly [number, number] | null = null;
@@ -413,14 +467,15 @@ export function createReplyArrows(deps: ReplyArrowsDependencies): ReplyArrows {
         frames += 1;
         if (replyArrows().landed !== landed) return;
         if (!row.isConnected) return;
-        if (rowOnScreen(row)) return;
+        if (center ? centredNow() : rowOnScreen(row)) return;
         if (frames > 30) return;
         const again = deps.el("scroll-area");
         const clearAgain = floatingClearance(again) + REPLY_LANDING_GAP_PX;
         const heightAgain = row.getBoundingClientRect().bottom - drawnTop(row);
-        const leadAgain = center ? Math.max(clearAgain, (clearAgain + again.getBoundingClientRect().bottom - heightAgain) / 2) : clearAgain;
+        const footAgain = center ? visibleListFoot(again, clearAgain) : again.getBoundingClientRect().bottom;
+        const leadAgain = center ? (heightAgain >= footAgain - clearAgain ? clearAgain : (clearAgain + footAgain - heightAgain) / 2) : clearAgain;
         deps.nudge(again, drawnTop(row) - leadAgain);
-        if (rowOnScreen(row)) return;
+        if (center ? centredNow() : rowOnScreen(row)) return;
         // Settled and still off screen — the list is clamped at its end, or the row
         // is taller than the room for it: another frame would measure and write the
         // same place again (`#2066 vibe-talk-page-freeze`, the owner's same-value

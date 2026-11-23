@@ -27,6 +27,13 @@ explicitly, never silently.
 
 Pass --screenshots DIR to keep PNGs of the summary open and of the
 thread-reply landing, per profile and scheme.
+
+`#2147 vibe-talk-linked-jump-centers-target`: every landing above also
+asserts the target stands centred in the visible list area (above the
+phone Discuss sheet, inside the shrunk viewport), or top-aligned when
+taller than that area, or visible at a clamped list end; with
+--screenshots each landing writes a `<label>-centered-sidecar.json`
+with the target rect and the visible area's middle.
 """
 
 from __future__ import annotations
@@ -304,6 +311,59 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
         check(landed["note"] and landed["top"] < landed["vh"] and landed["bottom"] > 0,
               f"{label}: {what} did not land visible with the bubble: {landed}")
         assert_stayed(what)
+        assert_centered(target, what)
+
+    # `#2147 vibe-talk-linked-jump-centers-target`: the landed row's middle
+    # stands at the visible list area's middle — the area above a phone
+    # Discuss sheet, inside the shrunk viewport — unless the row is taller
+    # than that area (then its top stands under the floating line) or the
+    # list is clamped at an end. Condition wait, no wall-clock budget.
+    def centered_probe(target: str) -> str:
+        return f"""() => {{
+          const row = [...document.querySelectorAll('#discord-log li')]
+            .find(r => (r.getAttribute('data-ids') || '').split(' ').includes("{target}")
+              && r.getAttribute('data-linked') === 'true');
+          if (!row) return null;
+          const area = document.getElementById('scroll-area');
+          const r = row.getBoundingClientRect();
+          const a = area.getBoundingClientRect();
+          let head = a.top;
+          for (const id of ['channel-freshness', 'search-float']) {{
+            const n = document.getElementById(id);
+            if (n && !n.hidden) {{ const b = n.getBoundingClientRect(); if (b.height > 0) head = Math.max(head, b.bottom); }}
+          }}
+          head += 8;
+          let foot = a.bottom;
+          if (window.visualViewport) foot = Math.min(foot, window.visualViewport.height);
+          const panel = document.getElementById('discuss-panel');
+          if (panel && !panel.hidden) {{
+            const p = panel.getBoundingClientRect();
+            if (p.height > 0 && p.left <= a.left + 1 && p.right >= a.right - 1 && p.top > head && p.top < foot) foot = p.top;
+          }}
+          const height = r.bottom - r.top;
+          const max = area.scrollHeight - area.clientHeight;
+          const clamped = area.scrollTop <= 1 || area.scrollTop >= max - 1;
+          const middle = (head + foot) / 2;
+          const center = (r.top + r.bottom) / 2;
+          const ok = height >= foot - head ? r.top <= head + 12
+            : clamped ? (r.bottom > head && r.top < foot)
+            : Math.abs(center - middle) <= 48;
+          return {{top: r.top, bottom: r.bottom, height, head, foot, middle, center,
+                   scrollTop: area.scrollTop, maxScroll: max, clamped, ok}};
+        }}"""
+
+    def assert_centered(target: str, what: str) -> None:
+        try:
+            page.wait_for_function(
+                f"() => {{ const p = ({centered_probe(target)})(); return p !== null && p.ok; }}",
+                timeout=20_000)
+        except Exception:
+            probe = page.evaluate(centered_probe(target))
+            raise AssertionError(f"{label}: {what} did not land centred in the visible list area: {probe}")
+        if shots is not None:
+            probe = page.evaluate(centered_probe(target))
+            (shots / f"{label}-centered-sidecar.json").write_text(
+                json.dumps({"label": label, "what": what, "target": target, **probe}, indent=2) + "\n")
 
     citations = page.locator("#discuss-answer a")
     check(citations.count() == 5, f"{label}: summary citations missing: {citations.count()}")
@@ -397,6 +457,13 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
     check_stable("reply citation")
     if shots is not None:
         page.screenshot(path=str(shots / f"{label}-reply-landed.png"))
+        # The before/after pair's sidecar (`#2147`): the reply landing the
+        # shot above shows, measured the moment it stands centred.
+        probe = page.evaluate(centered_probe(ids["reply_msg"]))
+        (shots / f"{label}-reply-centered-sidecar.json").write_text(
+            json.dumps({"label": label, "what": "reply citation", "target": ids["reply_msg"],
+                        "before": f"{label}-summary-open.png", "after": f"{label}-reply-landed.png",
+                        **probe}, indent=2) + "\n")
     # Back returns to the previous position in the same view: the row the
     # reader was on, at the height it stood.
     page.go_back()

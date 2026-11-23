@@ -83,7 +83,8 @@ function makeNavigation(state) {
     guardQuietly: (run) => (...args) => run(...args), settleFocus: () => {}, replyOnScreen: () => false,
     setLinkedMark: () => {}, cardsCycle: () => false, rowShown: () => true, visibleList: () => ({ children: [] }),
     rowOnScreen: () => true, eachColumn: (act) => act(), openReadRun: () => {}, setSearchOpen: () => {},
-    finishPackSlide: () => {}, headOfList: () => 0, renderScrollTools: () => {}, revealRow: () => {},
+    finishPackSlide: () => {}, headOfList: () => 0, renderScrollTools: () => {},
+    revealRow: (_row, center) => { (state.reveals ??= []).push(center); },
     toPosition: (area, top) => { area.scrollTop = top; },
     idsOf: () => [], inAppLinksOn: () => true, channelLabel: (channel) => channel, renderedText: () => "x",
     inThisColumn: (act) => act, captureScroll: () => ({ pinned: true, anchor: null, top: 0 }),
@@ -338,6 +339,28 @@ test("`#2080 vibe-talk-summary-link-stays-in-view`: an in-place jump to a thread
     "the reply was not sought in place");
   assert.deepStrictEqual(calls.filter((call) => Array.isArray(call) && call[0] === "oneColumn"), [],
     "the jump opened a thread over All");
+});
+
+test("`#2147 vibe-talk-linked-jump-centers-target`: every linked-message jump lands centred", async () => {
+  for (const take of ["link", "inPlace", "inView"]) {
+    const state = freshState();
+    state.selection = { view: "flat", threadId: null, origin: null };
+    state.landSeek = true;
+    state.row = { className: "" };
+    const { nav } = makeNavigation(state);
+    const ref = { service: "discord", channel: "C1", message: "m42", thread: null };
+    if (take === "link") await nav.jumpToMessageLink(ref);
+    else if (take === "inPlace") await nav.jumpToMessageInPlace(ref);
+    else await nav.jumpToMessageInView(ref, "flat");
+    assert.deepStrictEqual(state.reveals, [true], `a ${take} jump did not ask for a centred landing`);
+  }
+  // An opened-by deep link lands centred too (its seek calls `landOnDeepLink`).
+  const state = freshState();
+  state.landSeek = true;
+  state.row = { className: "" };
+  const { nav } = makeNavigation(state);
+  assert.equal(nav.landOnDeepLink("m42"), true, "the deep-link landing found no row");
+  assert.deepStrictEqual(state.reveals, [true], "a deep-link landing was not centred");
 });
 
 test("`#2080`: a plain jump to a thread reply still drills into its thread (`#543` kept)", async () => {

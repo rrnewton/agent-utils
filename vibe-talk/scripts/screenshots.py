@@ -5145,6 +5145,26 @@ def _act_discuss_search(driver: Driver) -> None:
     )
 
 
+def _act_discuss_centered_jump(driver: Driver) -> None:
+    """`#2147 vibe-talk-linked-jump-centers-target`: summarize through the real
+    route, then tap one of the summary's own message links (the processed
+    list's jump buttons) and leave the landed row where the jump put it, so
+    the shot shows the target centred in the visible list area."""
+    _act_discuss_summary(driver)
+    driver.page.locator("#discuss-processed summary").click()
+    driver.page.wait_for_function(
+        "() => document.getElementById('discuss-processed').open",
+        timeout=15_000,
+    )
+    link = driver.page.locator("#discuss-links .discuss-link").first
+    link.click()
+    driver.page.wait_for_function(
+        "() => document.querySelector('#discord-log li[data-linked=\"true\"]') !== null",
+        timeout=15_000,
+    )
+    driver.settle(300)
+
+
 def _after_discuss_summary(driver: Driver) -> None:
     """Put the summarized messages back to unread, so the next profile's preview is real too."""
     if bool(driver.js("window.__visible('discuss-mark-unread')")):
@@ -8351,6 +8371,34 @@ SCENES: tuple[Scene, ...] = (
             ("no error banner is up", "!window.__visible('error-wrap')"),
         ),
     ),
+    Scene(
+        name="90-discuss-centered-jump",
+        what="a Discuss summary link jump lands its message centred in the visible list area (`#2147`)",
+        act=_act_discuss_centered_jump,
+        after=_after_discuss_summary,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("the Discuss panel is open", "window.__visible('discuss-panel')"),
+            (
+                "the landed message stands centred in the visible list area (or the list is clamped at its end, or it is taller than the area)",
+                "(() => { const row = document.querySelector('#discord-log li[data-linked=\"true\"]'); "
+                "if (!row) return false; const area = document.getElementById('scroll-area'); "
+                "const r = row.getBoundingClientRect(); const a = area.getBoundingClientRect(); "
+                "let head = a.top; for (const id of ['channel-freshness', 'search-float']) { "
+                "const n = document.getElementById(id); if (n && !n.hidden) { const b = n.getBoundingClientRect(); "
+                "if (b.height > 0) head = Math.max(head, b.bottom); } } head += 8; "
+                "let foot = a.bottom; if (window.visualViewport) foot = Math.min(foot, window.visualViewport.height); "
+                "const panel = document.getElementById('discuss-panel'); "
+                "if (panel && !panel.hidden) { const p = panel.getBoundingClientRect(); "
+                "if (p.height > 0 && p.left <= a.left + 1 && p.right >= a.right - 1 && p.top > head && p.top < foot) foot = p.top; } "
+                "const h = r.bottom - r.top; if (h >= foot - head) return r.top <= head + 12; "
+                "const max = area.scrollHeight - area.clientHeight; "
+                "if (area.scrollTop <= 1 || area.scrollTop >= max - 1) return r.bottom > head && r.top < foot; "
+                "return Math.abs((r.top + r.bottom) / 2 - (head + foot) / 2) <= 48; })()",
+            ),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
     # LAST IN THE WALK, and not by accident: it empties the server's durable store on the way in,
     # so that the summary the state above cached is really regenerated and can really fail. Nothing
     # after it in this profile would miss what it deletes, and the next profile purges anyway.
@@ -8618,7 +8666,7 @@ def run_captures(
     # empty pane there is the failure the matrix exists to catch. A wider walk skips those
     # states BY NAME instead — its server is deliberately cacheless (the Settings and Help
     # states photograph exactly that), so Discuss has no window to show there.
-    discuss_scenes = [s for s in scenes if s.name.startswith(("73-", "74-", "75-", "76-", "78-", "84-", "85-", "89-"))]
+    discuss_scenes = [s for s in scenes if s.name.startswith(("73-", "74-", "75-", "76-", "78-", "84-", "85-", "89-", "90-"))]
     discuss_only = bool(wanted) and len(wanted) == len(discuss_scenes)
     if discuss_scenes and not seed_discuss_cache(60 if discuss_only else 10):
         if discuss_only:

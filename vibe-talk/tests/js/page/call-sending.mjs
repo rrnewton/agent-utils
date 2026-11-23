@@ -1095,7 +1095,10 @@ test("`#580 open-in-chat-jump`: the message landed on is centred in the list, wh
   await sentOpenButton(page).click();
   await untilDeepLink(page, () => rowWithId(page, "316")?.getAttribute("data-landed") === "true");
   const area = page.el("scroll-area");
-  const room = { top: page.pure("floatingClearance(el('scroll-area'))"), bottom: area.getBoundingClientRect().bottom };
+  // The visible room (`#2147`): the floating line to the scroller's own
+  // viewport foot — its rect runs content-tall in this fixture, so the
+  // room ends at its top plus its client height, as a browser's does.
+  const room = { top: page.pure("floatingClearance(el('scroll-area'))"), bottom: area.getBoundingClientRect().top + area.clientHeight };
   const box = rowWithId(page, "316").getBoundingClientRect();
   const offCentre = Math.abs((box.top + box.bottom) / 2 - (room.top + room.bottom) / 2);
   assert.ok(offCentre <= 12, `the message is ${offCentre}px off the middle of the list`);

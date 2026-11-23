@@ -2468,6 +2468,83 @@ test("#1820 vibe-talk-summary-strikethrough-live: a landing moved off screen by 
   }
 });
 
+test("#2147 vibe-talk-linked-jump-centers-target: a centred landing puts the row's middle at the visible area's middle", () => {
+  const { createReplyArrows, freshReplyArrows } = CHANNEL_VIEW;
+  const hadWindow = "window" in globalThis;
+  const oldWindow = globalThis.window;
+  try {
+    // Each case: the scroller's rect, the Discuss sheet's rect (or hidden), the
+    // keyboard's visual height (or none), the row's height, and where the row's
+    // top must land. The floating line stands at the scroller's top, so the
+    // visible head is 0 + the 8px landing gap.
+    const cases = [
+      { name: "desktop, Discuss closed", area: { top: 0, bottom: 800, left: 0, right: 1280 }, panel: null, visual: null, height: 100, wantTop: 354 },
+      { name: "phone, Discuss sheet over the foot", area: { top: 0, bottom: 915, left: 0, right: 412 }, panel: { top: 500, bottom: 915, left: 0, right: 412, height: 415 }, visual: null, height: 100, wantTop: 204 },
+      { name: "desktop, Discuss panel beside the list", area: { top: 0, bottom: 800, left: 0, right: 1280 }, panel: { top: 96, bottom: 792, left: 700, right: 1272, height: 696 }, visual: null, height: 100, wantTop: 354 },
+      { name: "keyboard open, viewport shrunk", area: { top: 0, bottom: 915, left: 0, right: 412 }, panel: null, visual: 579, height: 100, wantTop: 243.5 },
+      { name: "taller than the visible area aligns its top", area: { top: 0, bottom: 800, left: 0, right: 1280 }, panel: null, visual: null, height: 900, wantTop: 8 },
+    ];
+    for (const c of cases) {
+      const active = freshReplyArrows();
+      let top = 2000;
+      const area = { hidden: false, children: [], scrollTop: 0, clientHeight: c.area.bottom - c.area.top, getBoundingClientRect: () => ({ ...c.area, height: c.area.bottom - c.area.top, width: c.area.right - c.area.left }) };
+      const panel = c.panel === null
+        ? { hidden: true, children: [], getBoundingClientRect: () => ({ top: 0, bottom: 0, left: 0, right: 0, height: 0, width: 0 }) }
+        : { hidden: false, children: [], getBoundingClientRect: () => ({ ...c.panel, width: c.panel.right - c.panel.left }) };
+      globalThis.window = c.visual === null ? {} : { visualViewport: { height: c.visual } };
+      const owner = createReplyArrows({
+        el: (id) => (id === "scroll-area" ? area : id === "discuss-panel" ? panel : { hidden: true, children: [], getBoundingClientRect: () => ({ top: 0, bottom: 0, left: 0, right: 0, height: 0, width: 0 }) }),
+        leftEl: () => ({ hidden: true, getBoundingClientRect: () => ({ top: 0, bottom: 0, height: 0 }) }),
+        inThisColumn: (fn) => fn,
+        guardQuietly: (fn) => fn,
+        gatherFromReply: () => {},
+        filterState: () => ({ hold: null }),
+        endFilterWalk: () => {}, endSearchWalks: () => {},
+        selectLanded: () => {},
+        setSearchOpen: () => {}, openReadRun: () => {}, renderScrollTools: () => {},
+        nudge: (_area, delta) => { top -= delta; },
+        setStatus: () => {},
+        channelContextKey: () => "ctx",
+        heldMessage: () => null,
+        inView: () => false,
+        selection: () => ({ view: "main", threadId: null }),
+        threading: () => true,
+        olderPages: () => ({ moreAbove: false, cursor: null }),
+        viewKey: () => "main",
+        channelCanon: () => ({ views: new Map() }),
+        selectedChannelId: () => "C1",
+        changeChannelView: async () => {},
+        channelReadsBusy: () => false,
+        loadOlder: () => null,
+        walkCursorOwed: () => false,
+        hidingRead: () => false,
+        timelineMessages: () => [],
+        hiddenEmpty: () => false,
+        readHiding: () => false,
+        layoutColumns: () => false,
+        columnSteps: () => ({ pause: () => {}, resume: () => {} }),
+        activeArrows: () => active,
+        replyJumpTicket: () => { let n = 0; return { current: () => n, bump: () => { n += 1; } }; },
+      });
+      const row = {
+        isConnected: true, className: "", children: [],
+        getAttribute: () => null,
+        setAttribute: () => {}, removeAttribute: () => {},
+        getBoundingClientRect: () => ({ top, bottom: top + c.height, left: 0, right: 100, height: c.height, width: 100 }),
+      };
+      owner.revealRow(row, true);
+      assert.equal(top, c.wantTop, `${c.name}: the row's top landed at ${top}, not ${c.wantTop}`);
+      // The head landing (a reply arrow's) is unchanged: top under the line.
+      top = 2000;
+      owner.revealRow(row);
+      assert.equal(top, 8, `${c.name}: the head landing moved to ${top}`);
+    }
+  } finally {
+    if (hadWindow) globalThis.window = oldWindow;
+    else delete globalThis.window;
+  }
+});
+
 test("`#624 voice-page-modularity`: replies are gathered by pointer and by thread, to any depth, and a fresh column gathers nothing", () => {
   const { createReplyGathering, freshGatherState, freshListState } = CHANNEL_VIEW;
   assert.deepStrictEqual(freshGatherState(), { gathered: null });

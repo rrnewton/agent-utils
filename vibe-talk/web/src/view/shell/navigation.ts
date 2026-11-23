@@ -1042,12 +1042,14 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
   }
 
   /**
-   * Land on the linked message where a row holds it, as the reply arrow lands on its answer. Over the
+   * Land on the linked message where a row holds it, centred in the visible list area
+   * (`#2147 vibe-talk-linked-jump-centers-target`; the reply arrow's own landing keeps the
+   * head). Over the
    * Threads view's cards, a thread's first message is its card: a link to it lands on the card, at the
    * head of the list, never on the hidden column under the cards nor on the root's row unpacked
    * beneath it.
    */
-  function landOnDeepLink(id: string, center = false): boolean {
+  function landOnDeepLink(id: string, center = true): boolean {
     const cardOf = (): HTMLElement | null => (deps.cardsCycle() ? [...deps.leftEl("side-cards").children]
       .find((one) => one.hasAttribute("data-card") && (one as HTMLElement & { cardRoot?: { id: unknown } }).cardRoot &&
         String((one as HTMLElement & { cardRoot?: { id: unknown } }).cardRoot?.id) === String(id)) as HTMLElement || null : null);
@@ -1559,8 +1561,9 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
   /**
    * `jumpToMessageLink` from `spot`, in the left column. `options.view` (`#580`) is the view to land
    * a message in, "flat" for All or "main", where the channel's layout leaves the choice to the jump:
-   * never over two columns, which keep their own. `options.center` centres the message rather than
-   * putting it under the top. `options.enter` runs once the jump is a level, before anything else.
+   * never over two columns, which keep their own. A linked message lands centred in the
+   * visible list area (`#2147`) unless `options.center` is explicitly false. `options.enter`
+   * runs once the jump is a level, before anything else.
    */
   /**
    * `#2080 vibe-talk-summary-link-stays-in-view` (with OWNER 306): the landed-or-reason
@@ -1671,7 +1674,7 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
       let landed = false;
       // A Back while the walk looks further back ends it: nothing lands over the place put back.
       await deps.seekMessage(target, () => {
-        const ok = linkJumps.current(ticket) && landOnDeepLink(target, Boolean(options.center));
+        const ok = linkJumps.current(ticket) && landOnDeepLink(target, options.center !== false);
         if (ok) landed = true;
         return ok;
       },
