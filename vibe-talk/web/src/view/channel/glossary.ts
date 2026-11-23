@@ -297,7 +297,7 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
   // only reads must not spend a glossary read (or any read with its token).
   let termsAsked = false;
   function ensureTerms(): void {
-    if (termsAsked || !deps.tokenKnown()) return;
+    if (termsAsked || !deps.tokenKnown() || !deps.glossaryAvailable()) return;
     termsAsked = true;
     void refreshTerms();
   }
