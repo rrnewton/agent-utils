@@ -1385,9 +1385,10 @@ fn dead_native_missing_identity_is_unproven() {
 }
 
 #[test]
-#[ignore = "#2065 hot-host-census-tests (owner rule 346): live /proc holder scan fails closed on an unrelated same-uid non-dumpable harness process; run with cargo test -- --ignored dead_native_live_session_holder_refuses"]
+#[ignore = "#2162 real-host census opt-in: this is the one integration test that reads the host's real /proc (it spawns a real holder process); outside the gating set, run with cargo test -- --ignored dead_native_live_session_holder_refuses"]
 fn dead_native_live_session_holder_refuses() {
     // F2: a live process carrying the recorded session in its environment.
+    let _real = super::pretend_real_processes();
     let fixture = Fixture::new();
     fixture.start(None);
     let mut record = previous_boot_missing_pane(&fixture);

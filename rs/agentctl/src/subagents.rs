@@ -7170,12 +7170,15 @@ type FakeProcessRows = Vec<(u32, u32, Vec<u8>, Vec<u8>, Vec<PathBuf>)>;
 
 #[cfg(test)]
 thread_local! {
-    /// Fake process rows for the holder scan (#2037): when installed, the holder scan reads
+    /// Fake process rows for the holder scan (#2037): the holder scan reads
     /// these `(pid, uid, cmdline, environ, fd_targets)` rows instead of enumerating the host's
     /// same-uid processes, so revive tests never depend on unrelated host processes.
     /// Production builds always scan `/proc`: this is a test-only seam.
     static FAKE_PROCESS_ROWS: std::cell::RefCell<Option<FakeProcessRows>> =
         const { std::cell::RefCell::new(None) };
+    /// Whether this test opted into the real host census (#2162): the one
+    /// opt-in integration path, held only by `pretend_real_processes`.
+    static REAL_PROCESS_SCAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Held test guard: dropping restores the prior fake process table.
@@ -7201,6 +7204,34 @@ fn fake_processes() -> Option<FakeProcessRows> {
 impl Drop for PretendProcesses {
     fn drop(&mut self) {
         FAKE_PROCESS_ROWS.with(|cell| *cell.borrow_mut() = self.previous.take());
+    }
+}
+
+/// Held test guard for the one opt-in real-host census (#2162): while it
+/// lives, the holder scan enumerates the host's `/proc` as production
+/// does. Only non-gating integration tests hold it.
+#[cfg(test)]
+pub struct PretendRealProcesses {
+    previous: bool,
+}
+
+/// Opt into the real host process census; the returned guard is live while held.
+#[cfg(test)]
+#[must_use = "a real-census opt-in is only live while the guard is held"]
+pub fn pretend_real_processes() -> PretendRealProcesses {
+    let previous = REAL_PROCESS_SCAN.with(|cell| cell.replace(true));
+    PretendRealProcesses { previous }
+}
+
+#[cfg(test)]
+fn real_process_scan() -> bool {
+    REAL_PROCESS_SCAN.with(|cell| cell.get())
+}
+
+#[cfg(test)]
+impl Drop for PretendRealProcesses {
+    fn drop(&mut self) {
+        REAL_PROCESS_SCAN.with(|cell| cell.set(self.previous));
     }
 }
 
@@ -17246,9 +17277,22 @@ its drain would also type, so it was not queued",
         // Short ids are matched exactly as recorded (the full string), per
         // the re-review's "refuse, or match exactly" alternative.
         let needle = session.as_bytes();
-        // Tests may replace the host scan with scripted process rows (#2037).
+        // Tests read scripted process rows (#2037), hermetic by default
+        // (#2162): with no rows installed the table is empty, never the
+        // host's same-uid population. Only a test holding
+        // `pretend_real_processes()` reaches the `/proc` scan below.
         #[cfg(test)]
-        if let Some(rows) = fake_processes() {
+        if !real_process_scan() {
+            // Fail loudly, never vacuously: a test that reaches this scan
+            // with neither a scripted table nor the real-census opt-in
+            // would otherwise pass against an empty world it did not ask
+            // for (#2162). `Fixture` installs an empty table; any other
+            // test must choose explicitly.
+            let rows = fake_processes().expect(
+                "live-session holder scan reached in a test with no process table: \
+                 install pretend_processes(rows), or hold pretend_real_processes() \
+                 for the real host census (#2162)",
+            );
             for (_, _, cmdline, environ, fds) in &rows {
                 if cmdline.windows(needle.len()).any(|w| w == needle) {
                     return Some(
@@ -18319,6 +18363,10 @@ pub(crate) mod tests {
         /// The registry directory's name below `root`: `registry`, or `.agentctl` for a test
         /// that needs the project's profile config beside it.
         pub(crate) registry_name: &'static str,
+        /// An empty fake process table for the holder scan (#2162): a
+        /// fixture never censuses the host unless the test installs its
+        /// own rows or holds the real-census opt-in.
+        _fake_processes: PretendProcesses,
     }
     impl Fixture {
         pub(crate) fn new() -> Self {
@@ -18456,6 +18504,7 @@ pub(crate) mod tests {
                 },
                 root,
                 registry_name: "registry",
+                _fake_processes: pretend_processes(Vec::new()),
             }
         }
         /// This fixture with its registry at `root/<name>`.
