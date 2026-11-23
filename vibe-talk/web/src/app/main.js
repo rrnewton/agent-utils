@@ -2063,6 +2063,11 @@ const { filterChanges, filterKey, filterState, endFilterWalk, anchorAt, anchorHo
 // `#1608`: set by the Transcripts view's open/close wrappers below, read
 // by paints wired before the view itself is created.
 let transcriptsViewActive = false;
+// `#2153`: the open transcript day's place, kept in the UI-state record
+// the way the channel's place is, so a reload reopens the day at its chunk.
+/** @type {import("../core/transcripts/index.ts").TranscriptPlace | null} */
+let transcriptPlace = null;
+let transcriptRestored = false;
 const channelViews = createChannelViews({
   el: (id) => el(id),
   leftEl: (id) => leftEl(id),
@@ -4624,6 +4629,7 @@ const openingViewOwner = createOpeningView({
   documentsDeepLinkKey: () => documentsDeepLinkKey(),
   showView: (name) => showView(name),
   showDocuments: (key) => { void documentsView.show(key); },
+  transcriptPlace: () => transcriptPlace,
   reopenReadOwed: () => reopenReadOwed,
   replayStarted: () => replayLedger.started(),
   readEnteredChannel: (fresh) => readEnteredChannel(fresh),
@@ -4726,6 +4732,10 @@ const transcriptsView = createTranscriptsView({
     const timer = setInterval(fn, ms);
     return () => clearInterval(timer);
   },
+  notePlace: (place) => {
+    transcriptPlace = place;
+    saveUiState();
+  },
 });
 function openTranscripts() {
   transcriptsViewActive = true;
@@ -4737,6 +4747,17 @@ function closeTranscripts() {
   transcriptsViewActive = false;
   transcriptsView.close();
   renderChannelNavigation();
+}
+// `#2153`: once per load, after sign-in reopens the channel, put back an
+// open transcript day the record kept, at the chunk the reader was on.
+function restoreTranscriptsOnce() {
+  if (transcriptRestored) return;
+  transcriptRestored = true;
+  const saved = uiState.saved();
+  const place = saved ? saved.transcript : null;
+  if (!place || screens.view() !== "discord") return;
+  openTranscripts();
+  void transcriptsView.restore(place);
 }
 
 const threadList = createThreadList({
@@ -8479,6 +8500,7 @@ const { signIn, saveToken, forgetToken, setTokenState, noTokenSentence } = creat
     // default: owe its first read (the reopen may already be settled), and a genuine first
     // run meets the Welcome once the main screen is up.
     oweChannelRead();
+    restoreTranscriptsOnce();
     welcome.maybeShowFirstRun();
   },
   setState: (state) => setState(state),

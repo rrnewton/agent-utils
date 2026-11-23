@@ -10,11 +10,12 @@ import {
   chunkMatches,
   filterTranscripts,
   mergeChunks,
+  pickAnchor,
   sortChunks,
   sortTranscripts,
   transcriptLabel,
 } from "../../core/transcripts/index.ts";
-import type { TranscriptWindow } from "../../core/transcripts/index.ts";
+import type { TranscriptPlace, TranscriptWindow } from "../../core/transcripts/index.ts";
 import { messageTimeLabel } from "../../present/time/index.ts";
 import type { TranscriptThread } from "../../core/transcripts/index.ts";
 
@@ -40,6 +41,8 @@ export interface TranscriptsDependencies {
   every?(ms: number, fn: () => void): () => void;
   /** Open a sent message's thread in the channel view (`#1886` part C). */
   openSentThread?(message: TranscriptMessage): void;
+  /** Note where the reader is, for a reload to restore (`#2153`). */
+  notePlace?(place: TranscriptPlace | null): void;
 }
 
 /** Chunks asked for per window, the server's own page size. */
@@ -76,6 +79,10 @@ export interface TranscriptsView {
   closeDay(): void;
   /** Load the next older window of the open day, where there is one. */
   loadOlder(): Promise<void>;
+  /** Where the reader is now, for the UI-state record (`#2153`). */
+  place(): TranscriptPlace | null;
+  /** Restore a saved place after a reload: its day, at its chunk (`#2153`). */
+  restore(place: TranscriptPlace): Promise<void>;
 }
 
 /** Create the view over its panel in the page. */
@@ -112,6 +119,55 @@ export function createTranscriptsView(deps: TranscriptsDependencies): Transcript
     area.scrollTop = area.scrollHeight;
   };
 
+  // `#2153`: the reader's place is a chunk, not a pixel count. Capturing
+  // the anchor chunk and its offset before a redraw and putting that
+  // same chunk back at that offset after it keeps the eye on the same
+  // words while windows land above or below — where the old
+  // scroll-height delta broke whenever anything over the log changed
+  // height (the Earlier button, the title) or the reader scrolled
+  // while a read was out.
+  function captureAnchor(): { id: string; offset: number } | null {
+    const area = scroller();
+    const areaTop = area.getBoundingClientRect().top;
+    const geometry = [...deps.el("transcripts-log").querySelectorAll("[data-transcript-message]")]
+      .map((item) => {
+        const rect = item.getBoundingClientRect();
+        return {
+          id: (item as HTMLElement).dataset.transcriptMessage || "",
+          top: rect.top - areaTop + area.scrollTop,
+          bottom: rect.bottom - areaTop + area.scrollTop,
+        };
+      });
+    return pickAnchor(geometry, area.scrollTop);
+  }
+
+  function restoreAnchor(anchor: { id: string; offset: number }): void {
+    const area = scroller();
+    const target = deps.el("transcripts-log")
+      .querySelector(`[data-transcript-message="${CSS.escape(anchor.id)}"]`);
+    if (!target) return;
+    area.scrollTop += target.getBoundingClientRect().top - area.getBoundingClientRect().top - anchor.offset;
+  }
+
+  /** Where the reader is now, as a reload restores it (`#2153`). */
+  function currentPlace(): TranscriptPlace | null {
+    if (!active) return null;
+    if (!openRow) return { channel: "", thread: "", anchor: null, atNewest: false, offset: 0 };
+    const newest = atBottom();
+    const anchor = captureAnchor();
+    return {
+      channel: String(openRow.channel.id),
+      thread: openRow.thread_id,
+      anchor: newest && chunks.length > 0 ? String(chunks[chunks.length - 1]!.id) : anchor ? anchor.id : null,
+      atNewest: newest,
+      offset: anchor ? anchor.offset : 0,
+    };
+  }
+
+  function notePlace(): void {
+    if (deps.notePlace) deps.notePlace(currentPlace());
+  }
+
   function renderList(): void {
     const list = deps.el("transcripts-list");
     const query = (deps.el("transcripts-search") as HTMLInputElement).value || "";
@@ -137,10 +193,12 @@ export function createTranscriptsView(deps: TranscriptsDependencies): Transcript
         : "";
   }
 
-  function renderDay(stay: { top: number; height: number } | null = null): void {
+  function renderDay(): void {
+    // `#2153`: a redraw keeps the reader's chunk at its offset, unless
+    // a search hit is being landed (it centres, below).
+    const anchor = highlightId === "" ? captureAnchor() : null;
     const log = deps.el("transcripts-log");
     const query = (deps.el("transcripts-search") as HTMLInputElement).value || "";
-    const area = scroller();
     log.replaceChildren();
     for (const chunk of chunks) {
       if (!chunkMatches(chunk.content, query)) continue;
@@ -239,11 +297,8 @@ export function createTranscriptsView(deps: TranscriptsDependencies): Transcript
         if (deps.intoView) deps.intoView(target, "center");
       }
       highlightId = "";
-    } else if (stay) {
-      // Older chunks landed above: keep the reader on the same words.
-      area.scrollTop = stay.top + (area.scrollHeight - stay.height);
-    } else if (following) {
-      toBottom();
+    } else if (anchor) {
+      restoreAnchor(anchor);
     }
   }
 
@@ -280,6 +335,8 @@ export function createTranscriptsView(deps: TranscriptsDependencies): Transcript
       hasMore = older.has_more === true && nextBefore !== null;
     }
     renderDay();
+    if (atMessage === "") toBottom();
+    notePlace();
     startFollow();
   }
 
@@ -287,9 +344,7 @@ export function createTranscriptsView(deps: TranscriptsDependencies): Transcript
     if (!openRow || !hasMore || loadingOlder || nextBefore === null) return;
     loadingOlder = true;
     const gen = generation;
-    const area = scroller();
-    const stay = { top: area.scrollTop, height: area.scrollHeight };
-    renderDay(stay);
+    renderDay();
     try {
       const answer = await readWindow(openRow, nextBefore);
       // Left the view (or the day) while this read was out: it counts
@@ -300,7 +355,13 @@ export function createTranscriptsView(deps: TranscriptsDependencies): Transcript
       hasMore = answer.has_more === true && nextBefore !== null;
     } finally {
       loadingOlder = false;
-      if (gen === generation) renderDay(stay);
+      // renderDay's anchor keep is measured as the new window lands,
+      // so a reader who scrolled while the read was out keeps the
+      // place they scrolled to, not the one the read started from.
+      if (gen === generation) {
+        renderDay();
+        notePlace();
+      }
     }
   }
 
@@ -313,7 +374,13 @@ export function createTranscriptsView(deps: TranscriptsDependencies): Transcript
     const merged = mergeChunks(chunks, answer.messages || []);
     if (merged.length === chunks.length && chunks.every((chunk, at) => chunk.id === merged[at]?.id)) return;
     chunks = merged;
+    // `#2153`: pinned is decided as the new chunks land, not from a
+    // scroll event the redraw itself fired: a reader at the bottom
+    // stays pinned to the new foot; anyone else keeps their chunk.
+    const pinned = atBottom();
     renderDay();
+    if (pinned) toBottom();
+    notePlace();
   }
 
   function startFollow(): void {
@@ -338,6 +405,7 @@ export function createTranscriptsView(deps: TranscriptsDependencies): Transcript
   const onScroll = (): void => {
     if (!active || !openRow) return;
     following = atBottom();
+    notePlace();
     const area = scroller();
     if (area.scrollTop < 240) void loadOlder();
   };
@@ -358,6 +426,7 @@ export function createTranscriptsView(deps: TranscriptsDependencies): Transcript
       if (!loaded) await refresh();
       else if (openRow) renderDay();
       else renderList();
+      notePlace();
     },
     close() {
       active = false;
@@ -365,6 +434,7 @@ export function createTranscriptsView(deps: TranscriptsDependencies): Transcript
       panel().hidden = true;
       stopFollow?.();
       stopFollow = null;
+      notePlace();
     },
     refresh,
     async openAt(hit) {
@@ -396,7 +466,51 @@ export function createTranscriptsView(deps: TranscriptsDependencies): Transcript
       deps.el("transcripts-day").hidden = true;
       deps.el("transcripts-list").hidden = false;
       deps.el("transcripts-title").textContent = "";
+      notePlace();
     },
     loadOlder,
+    place: () => currentPlace(),
+    async restore(place) {
+      // A reload's way back (`#2153`): the index first (it says whether
+      // the day is still there), then the day at its saved chunk —
+      // stepping back a window at a time until the chunk is held, as
+      // a search hit does, then putting the chunk at its saved offset
+      // instead of centring it.
+      await this.open();
+      if (!place || place.thread === "") return;
+      const row = rows.find(
+        (one) => String(one.channel.id) === place.channel && one.thread_id === place.thread,
+      );
+      if (!row) {
+        if (deps.setStatus) deps.setStatus("That transcript is not in the local index yet.");
+        return;
+      }
+      const gen = ++generation;
+      let answer = await readWindow(row, null);
+      if (gen !== generation) return;
+      let held = sortChunks(answer.messages || []);
+      let before = answer.next_before ?? null;
+      let more = answer.has_more === true && before !== null;
+      while (place.anchor && !chunkHeld(held, place.anchor) && more) {
+        const older = await readWindow(row, before);
+        if (gen !== generation) return;
+        held = mergeChunks(held, older.messages || []);
+        before = older.next_before ?? null;
+        more = older.has_more === true && before !== null;
+      }
+      openRow = row;
+      expandedSent.clear();
+      chunks = held;
+      nextBefore = before;
+      hasMore = more;
+      loadingOlder = false;
+      following = place.atNewest;
+      highlightId = "";
+      renderDay();
+      if (place.atNewest) toBottom();
+      else if (place.anchor) restoreAnchor({ id: place.anchor, offset: place.offset });
+      notePlace();
+      startFollow();
+    },
   };
 }

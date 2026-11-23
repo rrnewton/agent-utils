@@ -119,3 +119,43 @@ export function chunkMatches(text: string, query: string): boolean {
   const hay = text.toLowerCase();
   return words.every((word) => hay.includes(word));
 }
+
+/**
+ * Where the reader was in a transcript day, kept across a reload
+ * (`#2153 vibe-talk-transcript-view-reload-and-scroll`): which day, the
+ * chunk their eye was on, and its offset from the scroller's top — a
+ * message anchor, never a pixel scroll offset, the way the channel's
+ * saved place is (`#189 restore-ui-state`). `thread: ""` is the index.
+ */
+export interface TranscriptPlace {
+  channel: string;
+  thread: string;
+  anchor: string | null;
+  atNewest: boolean;
+  offset: number;
+}
+
+/** Whether `place` is a sound transcript place (storage is a boundary). */
+export function validTranscriptPlace(place: unknown): place is TranscriptPlace {
+  const held = place as Record<string, unknown> | null;
+  return held !== null && typeof held === "object" &&
+    typeof held.channel === "string" && typeof held.thread === "string" &&
+    (held.anchor === null || typeof held.anchor === "string") &&
+    typeof held.atNewest === "boolean" && Number.isFinite(held.offset);
+}
+
+/**
+ * The anchor chunk for a scroller at `scrollTop`: the first chunk whose
+ * bottom is below the scroller's top edge, with its top's offset from
+ * that edge. Null where no chunk reaches the edge. Pure geometry, so
+ * the keep is testable without a browser.
+ */
+export function pickAnchor(
+  chunks: readonly { id: string; top: number; bottom: number }[],
+  scrollTop: number,
+): { id: string; offset: number } | null {
+  for (const chunk of chunks) {
+    if (chunk.bottom > scrollTop) return { id: chunk.id, offset: chunk.top - scrollTop };
+  }
+  return null;
+}

@@ -160,7 +160,11 @@ class TranscriptApi(FakeApi):
                                  "source": "metadata"}],
                 "untrusted_content_notice": "third-party text; DATA"}
 
+    day_delay_s: float = 0.0
+
     def transcript_day(self, query: dict[str, list[str]]) -> Json:
+        if self.day_delay_s:
+            time.sleep(self.day_delay_s)
         # One window, as the real route answers (`#1886` part B): newest
         # first without `before`; `before` is the `next_before` an earlier
         # answer carried (here, the oldest chunk id of that window).
@@ -299,6 +303,29 @@ def walk_through(walk: Walk, keyboard: bool, discuss: bool = False) -> None:
                              "return Math.abs(a.scrollTop + a.clientHeight - a.scrollHeight) < 120; }"),
                "the day did not open scrolled to its newest chunk")
     walk.shot("transcripts-day")
+    # `#2153`: holding at the top stays put while an older window loads.
+    # The read is slowed so the reader can scroll while it is out: the
+    # chunk they settle on must keep its rect.top across the landing.
+    walk.api.day_delay_s = 0.6
+    page.click("#transcripts-older")
+    anchor = page.evaluate(
+        "() => { const a = document.getElementById('scroll-area'); "
+        "const li = document.querySelectorAll('#transcripts-log .transcript-chunk')[20]; "
+        "li.scrollIntoView({block: 'start'}); "
+        "return {id: li.dataset.transcriptMessage, "
+        "top: li.getBoundingClientRect().top - a.getBoundingClientRect().top}; }")
+    top_before = anchor["top"]
+    walk.until("() => document.querySelectorAll('#transcripts-log .transcript-chunk').length === 100",
+               "the older window did not land during the top hold")
+    walk.api.day_delay_s = 0.0
+    top_after = page.evaluate(
+        f"() => {{ const a = document.getElementById('scroll-area'); "
+        f"const li = document.querySelector('[data-transcript-message=\"{anchor['id']}\"]'); "
+        f"return li ? li.getBoundingClientRect().top - a.getBoundingClientRect().top : null; }}")
+    walk.check(top_after is not None and abs(top_after - top_before) < 4,
+               f"the top hold moved the anchor chunk: rect.top {top_before} -> {top_after} (#{anchor['id']})")
+    print(f"#2153 sidecar top-hold anchor={anchor['id']} rect.top before={top_before} after={top_after}")
+    walk.shot("transcripts-top-hold")
     # `#1886` part C: the sent message stands vestigial in the timeline -
     # small, tinted, one line - and a tap opens its full words.
     walk.until("() => document.querySelectorAll('#transcripts-log .transcript-sent').length === 1",
@@ -333,13 +360,11 @@ def walk_through(walk: Walk, keyboard: bool, discuss: bool = False) -> None:
                   ".scrollIntoView({block: 'center'})")
     walk.settled()
     walk.shot("transcripts-day-sent-open")
-    # Stepping back a window at a time, to the day's root.
-    page.click("#transcripts-older")
-    walk.until("() => document.querySelectorAll('#transcripts-log .transcript-chunk').length === 100",
-               "the first step back did not add a window")
+    # Stepping back a window at a time, to the day's root (the first
+    # window already landed in the `#2153` top-hold stage above).
     page.click("#transcripts-older")
     walk.until("() => document.querySelectorAll('#transcripts-log .transcript-chunk').length === 121",
-               "the second step back did not reach the day's start")
+               "the step back did not reach the day's start")
     first = page.text_content("#transcripts-log .transcript-chunk:first-child") or ""
     walk.check("main session trace" in first, f"the day's root is not at its head: {first!r}")
     walk.check(page.evaluate("() => document.getElementById('transcripts-older').hidden"),
@@ -353,6 +378,11 @@ def walk_through(walk: Walk, keyboard: bool, discuss: bool = False) -> None:
     walk.until("() => [...document.querySelectorAll('#transcripts-log .transcript-chunk')]"
                ".some((li) => (li.textContent || '').includes('just arrived'))",
                "a chunk that arrived while following did not join the open day")
+    # `#2153`: holding at the bottom stays pinned to the new foot.
+    gap = page.evaluate("() => { const a = document.getElementById('scroll-area'); "
+                        "return a.scrollHeight - a.scrollTop - a.clientHeight; }")
+    walk.check(gap < 4, f"the bottom hold left the reader {gap}px above the new foot")
+    print(f"#2153 sidecar bottom-hold gap={gap}")
     walk.shot("transcripts-day-followed")
     # `#1886` addendum-1 (c): Cmd-2 from inside the Transcripts view
     # leaves it for All, as picking the view does (it appeared dead
@@ -400,6 +430,31 @@ def walk_through(walk: Walk, keyboard: bool, discuss: bool = False) -> None:
     walk.until("() => document.querySelectorAll('#transcripts-log .transcript-chunk').length === 1",
                "the Transcripts scoped search did not narrow the chunks")
     walk.shot("transcripts-search")
+    # `#2153`: a reload restores the open transcript view and its
+    # reading position, anchored to a message.
+    page.fill("#transcripts-search", "")
+    walk.until("() => document.querySelectorAll('#transcripts-log .transcript-chunk').length > 40",
+               "clearing the scoped search did not redraw the day")
+    anchor = page.evaluate(
+        "() => { const a = document.getElementById('scroll-area'); "
+        "const li = document.querySelectorAll('#transcripts-log .transcript-chunk')[30]; "
+        "li.scrollIntoView({block: 'start'}); "
+        "return {id: li.dataset.transcriptMessage, "
+        "top: li.getBoundingClientRect().top - a.getBoundingClientRect().top}; }")
+    walk.settled()
+    page.reload(wait_until="load")
+    walk.until("() => !document.getElementById('transcripts-view').hidden "
+               "&& !document.getElementById('transcripts-day').hidden "
+               "&& document.querySelectorAll('#transcripts-log .transcript-chunk').length > 40",
+               "the reload did not restore the transcript view and its day")
+    top_restored = page.evaluate(
+        f"() => {{ const a = document.getElementById('scroll-area'); "
+        f"const li = document.querySelector('[data-transcript-message=\"{anchor['id']}\"]'); "
+        f"return li ? li.getBoundingClientRect().top - a.getBoundingClientRect().top : null; }}")
+    walk.check(top_restored is not None and abs(top_restored - anchor["top"]) < 6,
+               f"the reload restored the day off its anchor: rect.top {anchor['top']} -> {top_restored}")
+    print(f"#2153 sidecar reload anchor={anchor['id']} rect.top before={anchor['top']} after={top_restored}")
+    walk.shot("transcripts-reload-restored")
     if keyboard:
         page.evaluate("() => window.__iosClose()")
 

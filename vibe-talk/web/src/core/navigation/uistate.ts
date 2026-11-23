@@ -8,6 +8,8 @@
 
 import { is } from "../../contract/index.ts";
 import type { ThreadSummary } from "../../contract/index.ts";
+import { validTranscriptPlace } from "../transcripts/index.ts";
+import type { TranscriptPlace } from "../transcripts/index.ts";
 import type { StoragePort } from "../../ports/index.ts";
 
 /** The record's key, in the device's storage and this window's. */
@@ -56,6 +58,8 @@ export interface UiRecord {
   channel: string;
   place: SavedPlace | null;
   channels: ChosenView[];
+  /** The open transcript day and its place, where one was open (`#2153`). */
+  transcript?: TranscriptPlace | null;
 }
 
 /** A place held in the list, under the channel and view it was measured in (`key`). */
@@ -93,7 +97,8 @@ function validUiState(saved: unknown): saved is UiRecord {
   return held !== null && typeof held === "object" && held.v === UI_STATE_VERSION &&
     typeof held.identity === "string" && ["voice", "discord"].includes(held.view as string) &&
     typeof held.todo === "boolean" && typeof held.channel === "string" &&
-    validSavedPlace(held.place) && Array.isArray(held.channels);
+    validSavedPlace(held.place) && Array.isArray(held.channels) &&
+    (held.transcript === undefined || held.transcript === null || validTranscriptPlace(held.transcript));
 }
 
 /**

@@ -20,7 +20,7 @@ export interface OpeningRecord {
   holdPlace(held: { key: string; place: { view: string; atNewest: boolean; anchor: string | null; offset: number } }): void;
   settled(): boolean;
   settle(): void;
-  saved(): { channel: string; view: string; place: { view: string; atNewest: boolean; anchor: string | null; offset: number } | null } | null;
+  saved(): { channel: string; view: string; place: { view: string; atNewest: boolean; anchor: string | null; offset: number } | null; transcript?: { channel: string; thread: string; anchor: string | null; atNewest: boolean; offset: number } | null } | null;
 }
 
 /** What opening a channel's view asks of the page. */
@@ -57,6 +57,8 @@ export interface OpeningViewDependencies {
   windowStorage(): { getItem(key: string): string | null; setItem(key: string, value: string): void; removeItem(key: string): void };
   deepLinks(): { applied(): boolean };
   sideColumnUp(): boolean;
+  /** The open transcript day's place, where the Transcripts view is up (`#2153`). */
+  transcriptPlace?(): { channel: string; thread: string; anchor: string | null; atNewest: boolean; offset: number } | null;
   /** Whether the thread list (Threads view) is the layout on screen, where one is offered (`#1849`). */
   threadListShown?(): boolean;
   /** The top-visible thread card's id in the thread list, or null (`#1849`). */
@@ -364,6 +366,7 @@ export function createOpeningView(deps: OpeningViewDependencies): OpeningView {
       channel,
       place: held && held.key === placeKey() ? held.place : null,
       channels: deps.uiState().chosenViewsHeld(),
+      transcript: deps.transcriptPlace ? deps.transcriptPlace() : null,
     };
     // Inside its bound by giving up the choices of the channels least recently on screen — never the
     // selected channel's, which is one view and at most one thread's summary.

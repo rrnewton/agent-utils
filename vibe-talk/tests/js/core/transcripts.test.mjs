@@ -151,3 +151,28 @@ test("a chunk's time is said the channel rows' way in Eastern, never as a raw IS
     else process.env.TZ = was;
   }
 });
+
+test("#2153: the anchor pick is the first chunk reaching the scroller's top edge", () => {
+  const geo = [
+    { id: "a", top: 0, bottom: 50 },
+    { id: "b", top: 50, bottom: 110 },
+    { id: "c", top: 110, bottom: 170 },
+  ];
+  assert.deepEqual(CORE.pickAnchor(geo, 0), { id: "a", offset: 0 });
+  assert.deepEqual(CORE.pickAnchor(geo, 60), { id: "b", offset: -10 });
+  assert.deepEqual(CORE.pickAnchor(geo, 110), { id: "c", offset: 0 });
+  assert.equal(CORE.pickAnchor(geo, 500), null);
+  assert.equal(CORE.pickAnchor([], 0), null);
+});
+
+test("#2153: a saved transcript place is checked at the storage boundary", () => {
+  const place = { channel: "C1", thread: "t1", anchor: "m9", atNewest: false, offset: -12 };
+  assert.equal(CORE.validTranscriptPlace(place), true);
+  assert.equal(CORE.validTranscriptPlace({ ...place, anchor: null, atNewest: true }), true);
+  assert.equal(CORE.validTranscriptPlace({ ...place, thread: "" }), true);
+  assert.equal(CORE.validTranscriptPlace({ ...place, offset: Number.NaN }), false);
+  assert.equal(CORE.validTranscriptPlace({ ...place, anchor: 9 }), false);
+  assert.equal(CORE.validTranscriptPlace({ ...place, channel: 9 }), false);
+  assert.equal(CORE.validTranscriptPlace(null), false);
+  assert.equal(CORE.validTranscriptPlace("C1"), false);
+});
