@@ -11,6 +11,7 @@ lock is taken and no locked path is entered, instead of waiting.
 
 from __future__ import annotations
 
+import json
 import pytest
 
 from pathlib import Path
@@ -21,6 +22,16 @@ from wrkslots.tests.test_eden import (
     _absent_project,
     _eden_validate_record,
     _write_row,
+)
+from wrkslots.tests.test_lifecycle import (
+    allow_test_host_for_absent_validate_recovery,
+    control_directory,
+    create,
+    make_project,
+    make_validate_row_absent,
+    mark_recorded_owner_dead,
+    run_absent_validate_recovery,
+    write_absent_validate_input,
 )
 
 
@@ -65,4 +76,74 @@ def test_refusable_row_never_takes_the_registry_locks(
         wrkslots._cmd_recover_absent_validate_rows(
             _absent_args(root, input_path, apply=True)
         )
+    assert created == []
+
+
+def test_precheck_refusal_names_an_already_recovered_row_without_locking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A pre-check refusal must emit the locked path's outcome rows.
+
+    One row is exactly archived already and the other is refused by the
+    pre-check (a bad record checksum in the ACTIVE snapshot). The
+    refusal happens before the locks, yet the archived row must still
+    be named 'already-recovered', nothing may be written, and no
+    registry lock may be taken.
+    """
+
+    project, repository, _remote = make_project(tmp_path)
+    recovered_made = create(
+        project, slot="already", agent="validate-a", branch=None, slot_type="validate"
+    )
+    assert recovered_made.returncode == 0, recovered_made.stderr
+    invalid_made = create(
+        project, slot="invalid", agent="validate-b", branch=None, slot_type="validate"
+    )
+    assert invalid_made.returncode == 0, invalid_made.stderr
+    recovered = mark_recorded_owner_dead(project, "already")
+    invalid = mark_recorded_owner_dead(project, "invalid")
+    make_validate_row_absent(project, repository, recovered)
+    make_validate_row_absent(project, repository, invalid)
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    recovered_input = write_absent_validate_input(project, [recovered])
+    assert run_absent_validate_recovery(project, recovered_input, apply=True) == 0
+    capsys.readouterr()
+
+    mixed_input = write_absent_validate_input(project, [recovered, invalid])
+    value = json.loads(mixed_input.read_text(encoding="utf-8"))
+    value["rows"][1]["record_sha256"] = "0" * 64
+    mixed_input.write_text(json.dumps(value), encoding="utf-8")
+    control = control_directory(project)
+    before = {
+        path.relative_to(control): path.read_bytes()
+        for path in control.rglob("*")
+        if path.is_file()
+    }
+
+    created: list[object] = []
+
+    def fail_if_locked(*args: object, **kwargs: object) -> object:
+        created.append((args, kwargs))
+        raise AssertionError("the pre-check took the registry locks")
+
+    monkeypatch.setattr(wrkslots, "_mutation_locks", fail_if_locked)
+    assert (
+        run_absent_validate_recovery(
+            project, mixed_input, apply=True, output_format="json"
+        )
+        == 3
+    )
+    outcomes = json.loads(capsys.readouterr().out)["rows"]
+    assert [row["outcome"] for row in outcomes] == [
+        "already-recovered",
+        "refused",
+    ]
+    after = {
+        path.relative_to(control): path.read_bytes()
+        for path in control.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
     assert created == []

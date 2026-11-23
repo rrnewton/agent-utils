@@ -98992,13 +98992,26 @@ def _cmd_recover_absent_validate_rows(args: argparse.Namespace) -> int:
                     for item in requested
                     if item.machine == config.machine
                 }
-                for wanted_slot, record in list(snapshot_rows.items()):
-                    item = item_identities[wanted_slot]
-                    _validate_absent_validate_row(record, item)
-                    _assert_absent_validate_row_is_local(record)
-                _assert_absent_validate_rows_storage(
-                    config, tuple(snapshot_rows.values())
-                )
+                try:
+                    for wanted_slot, record in list(snapshot_rows.items()):
+                        item = item_identities[wanted_slot]
+                        _validate_absent_validate_row(record, item)
+                        _assert_absent_validate_row_is_local(record)
+                    _assert_absent_validate_rows_storage(
+                        config, tuple(snapshot_rows.values())
+                    )
+                except Refusal:
+                    # The refusal is raised before the locked path can
+                    # fill this in, so prove it here, still lock-free:
+                    # the outcome rows emitted for this refusal must
+                    # name an exactly-archived row 'already-recovered'
+                    # exactly as the locked path would.
+                    already_recovered_keys = (
+                        _already_recovered_absent_validate_keys(
+                            _load_all_archives_streamed(config), requested
+                        )
+                    )
+                    raise
         # The privileged process census also runs before the lock (#1194):
         # processes never take this lock, so holding it during the census
         # never protected against a process starting in a row later; the
