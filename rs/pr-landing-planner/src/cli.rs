@@ -667,10 +667,8 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "planner-cli-{}-{nonce}-{name}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("planner-cli-{}-{nonce}-{name}", std::process::id()));
         fs::write(&path, text).unwrap();
         path
     }
@@ -693,7 +691,8 @@ mod tests {
 
     /// Digest the retired differential's independent oracle (`review_digest()`)
     /// computed for [`REVIEW_FIXTURE`]; frozen at retirement (G7).
-    const REVIEW_DIGEST_GOLDEN: &str = "5e2f93d98b74e4600056209af299019a49458437dbc3bcc06ca078381fda2f71";
+    const REVIEW_DIGEST_GOLDEN: &str =
+        "5e2f93d98b74e4600056209af299019a49458437dbc3bcc06ca078381fda2f71";
 
     #[test]
     fn help_schema_matches_differential_contract() {
@@ -736,7 +735,10 @@ mod tests {
         let fixture_arg = fixture.to_string_lossy().into_owned();
         let context_arg = context.to_string_lossy().into_owned();
         let exact: [(&str, &str, &str); 7] = [
-            ("plan", "human", r###"Repository: OWNER/NAME  base: main
+            (
+                "plan",
+                "human",
+                r###"Repository: OWNER/NAME  base: main
 14 open PR(s), 1 real conflict(s), 0 file-overlap risk(s), 4 ordering edge(s), 0 mechanism overlap(s)
 
 CI health:
@@ -796,8 +798,12 @@ Held PRs:
   #14: ordering-cycle
 
 Advisory only: this plan recommends; it never arms or merges anything.
-"###),
-            ("plan", "actions", r###"open_prs=14
+"###,
+            ),
+            (
+                "plan",
+                "actions",
+                r###"open_prs=14
 land_now=2
 rebase=0
 refire_stale_gate=1
@@ -831,8 +837,12 @@ NOTE: wait pr=10 why="held: review-required"
 NOTE: wait pr=11 why="held: changes-requested"
 NOTE: wait pr=13 why="held: ordering-cycle (resolve dependency cycle and rerun)"
 NOTE: wait pr=14 why="held: ordering-cycle (resolve dependency cycle and rerun)"
-"###),
-            ("graph", "human", r###"Repository: OWNER/NAME  base: main
+"###,
+            ),
+            (
+                "graph",
+                "human",
+                r###"Repository: OWNER/NAME  base: main
 14 open PR(s), 1 real conflict(s), 0 file-overlap risk(s), 4 ordering edge(s), 0 mechanism overlap(s)
 
 Stacks:
@@ -857,8 +867,12 @@ Held PRs:
   #11: changes-requested
   #13: ordering-cycle
   #14: ordering-cycle
-"###),
-            ("clusters", "human", r###"Repository: OWNER/NAME  base: main
+"###,
+            ),
+            (
+                "clusters",
+                "human",
+                r###"Repository: OWNER/NAME  base: main
 14 open PR(s), 1 real conflict(s) => 13 cluster(s): 1 multi-PR stack(s), 12 independent singleton(s)
 
 Conflict clusters land each as ONE stack (base -> tip):
@@ -874,8 +888,12 @@ Metric:
   A branch behind its fetched base must rebase before landing. The consuming workspace may authorize that rebase to retain soft-green without pre-landing revalidation; post-facto validation remains due. Landing each real-conflict cluster as ONE stack avoids the same count of repeated rebases and post-facto validate runs.
 
 Advisory only: this plan recommends; it never arms or merges anything.
-"###),
-            ("clusters", "json", r###"{
+"###,
+            ),
+            (
+                "clusters",
+                "json",
+                r###"{
   "base": "main",
   "clusters": [
     {
@@ -998,8 +1016,12 @@ Advisory only: this plan recommends; it never arms or merges anything.
     "validate_runs_avoided": 1
   }
 }
-"###),
-            ("status", "human", r###"Open PR health: OWNER/NAME
+"###,
+            ),
+            (
+                "status",
+                "human",
+                r###"Open PR health: OWNER/NAME
 
   #1     ci=passed  green
   #2     ci=passed  behind
@@ -1021,8 +1043,12 @@ Summary
   ci-red:    4
   real reds: 2
   WARNING: 14 open PRs exceeds the 8 threshold; prioritize landing/CI repair.
-"###),
-            ("status", "json", r###"{
+"###,
+            ),
+            (
+                "status",
+                "json",
+                r###"{
   "base": "main",
   "prs": [
     {
@@ -1148,7 +1174,8 @@ Summary
     "real_reds": 2
   }
 }
-"###)
+"###,
+            ),
         ];
         for (command, format, golden) in exact {
             let mut args = vec![
@@ -1274,7 +1301,9 @@ Summary
         assert!(held[&13].contains(&"ordering-cycle".to_owned()));
         assert!(held[&14].contains(&"ordering-cycle".to_owned()));
         let batch = parsed["plan"]["batch"].as_array().unwrap();
-        assert!(!batch.iter().any(|value| [12, 13, 14].contains(&value.as_i64().unwrap())));
+        assert!(!batch
+            .iter()
+            .any(|value| [12, 13, 14].contains(&value.as_i64().unwrap())));
         // Production default (no freshness bound): PR 2 lands behind.
         let default_parsed: Value = serde_json::from_str(&plan_json).unwrap();
         let default_pr2 = default_parsed["plan"]["per_pr_actions"]
@@ -1319,11 +1348,21 @@ Summary
             ("missing-command", &["--priority-source", "command"]),
             (
                 "missing-label-capture",
-                &["--priority-source", "labels", "--priority-label-pattern", "^p[0-9]+$"],
+                &[
+                    "--priority-source",
+                    "labels",
+                    "--priority-label-pattern",
+                    "^p[0-9]+$",
+                ],
             ),
             (
                 "overflow-command-output",
-                &["--priority-source", "command", "--priority-cmd", "printf 9223372036854775808"],
+                &[
+                    "--priority-source",
+                    "command",
+                    "--priority-cmd",
+                    "printf 9223372036854775808",
+                ],
             ),
             (
                 "failed-command",
@@ -1379,7 +1418,10 @@ Summary
         ] {
             let script = temp_file(
                 &format!("fake-gh-{label}"),
-                &format!("#!/bin/sh\nprintf %s '{}'\n", payload.replace('\'', "'\\''")),
+                &format!(
+                    "#!/bin/sh\nprintf %s '{}'\n",
+                    payload.replace('\'', "'\\''")
+                ),
             );
             let mut permissions = fs::metadata(&script).unwrap().permissions();
             permissions.set_mode(0o755);
@@ -1415,7 +1457,10 @@ Summary
         let invalid_fixtures: [(&str, &str); 16] = [
             ("root-array.json", "[]"),
             ("missing-prs.json", "{\"repo\":\"R\",\"base\":\"main\"}"),
-            ("prs-not-list.json", "{\"repo\":\"R\",\"base\":\"main\",\"prs\":{}}"),
+            (
+                "prs-not-list.json",
+                "{\"repo\":\"R\",\"base\":\"main\",\"prs\":{}}",
+            ),
             (
                 "number-not-int.json",
                 "{\"repo\":\"R\",\"base\":\"main\",\"prs\":[{\"number\":\"one\"}]}",
@@ -1425,7 +1470,10 @@ Summary
             ("duplicate-key.json", "{\"prs\":[],\"prs\":[]}"),
             ("duplicate-key.yaml", "prs: []\nprs: []\n"),
             ("merge-key.yaml", "base: &b {repo: R}\n<<: *b\nprs: []\n"),
-            ("duplicate-pr.json", "{\"prs\":[{\"number\":1},{\"number\":1}]}"),
+            (
+                "duplicate-pr.json",
+                "{\"prs\":[{\"number\":1},{\"number\":1}]}",
+            ),
             ("zero-pr.json", "{\"prs\":[{\"number\":0}]}"),
             (
                 "overflow-pr.json",
@@ -1443,7 +1491,10 @@ Summary
                 "self-ancestry.json",
                 "{\"prs\":[{\"number\":1}],\"ancestry\":[{\"before\":1,\"after\":1}]}",
             ),
-            ("relations-shape.json", "{\"prs\":[{\"number\":1}],\"conflicts\":{}}"),
+            (
+                "relations-shape.json",
+                "{\"prs\":[{\"number\":1}],\"conflicts\":{}}",
+            ),
         ];
         for (name, body) in invalid_fixtures {
             let path = temp_file(name, body);
@@ -1521,8 +1572,13 @@ Summary
         let fixture = temp_file("review.json", REVIEW_FIXTURE);
         let fixture_arg = fixture.to_string_lossy().into_owned();
         // Probe only: emitted digest is the frozen oracle value; PR stays held.
-        let (code, probe, stderr) =
-            invoke(&["plan", "--fixture", fixture_arg.as_str(), "--format", "json"]);
+        let (code, probe, stderr) = invoke(&[
+            "plan",
+            "--fixture",
+            fixture_arg.as_str(),
+            "--format",
+            "json",
+        ]);
         assert_eq!(code, 0, "{stderr}");
         let parsed: Value = serde_json::from_str(&probe).unwrap();
         assert_eq!(
@@ -1614,24 +1670,48 @@ Summary
         let cases: [(&str, &[&str], &str); 4] = [
             (
                 r###"{"repo":"R","base":"main","prs":[{"number":1,"head_ref":"feature-1","base_ref":"main","title":"random 0/1","is_draft":true,"review_decision":"REVIEW_REQUIRED","additions":4,"deletions":85,"commits_behind":0,"labels":["priority:0"],"changed_files":["src/2.rs"],"checks":[{"name":"CI","status":"COMPLETED","conclusion":"SUCCESS","text":""},{"name":"merge-gate","status":"COMPLETED","conclusion":"SUCCESS","text":""}]},{"number":2,"head_ref":"feature-2","base_ref":"feature-1","title":"random 0/2","is_draft":false,"review_decision":"APPROVED","additions":82,"deletions":79,"commits_behind":3,"labels":["priority:3"],"changed_files":["src/1.rs"],"checks":[{"name":"CI","status":"IN_PROGRESS","conclusion":"","text":""},{"name":"merge-gate","status":"COMPLETED","conclusion":"SUCCESS","text":""}]},{"number":3,"head_ref":"feature-3","base_ref":"main","title":"random 0/3","is_draft":false,"review_decision":"REVIEW_REQUIRED","additions":69,"deletions":59,"commits_behind":0,"labels":["priority:0"],"changed_files":["src/4.rs"],"checks":[{"name":"CI","status":"COMPLETED","conclusion":"SUCCESS","text":""},{"name":"merge-gate","status":"COMPLETED","conclusion":"CANCELLED","text":""}]},{"number":4,"head_ref":"feature-4","base_ref":"main","title":"random 0/4","is_draft":false,"review_decision":"APPROVED","additions":34,"deletions":31,"commits_behind":1,"labels":["priority:3"],"changed_files":["src/4.rs"],"checks":[{"name":"CI","status":"COMPLETED","conclusion":"FAILURE","text":"assertion"},{"name":"merge-gate","status":"COMPLETED","conclusion":"SUCCESS","text":""}]},{"number":5,"head_ref":"feature-5","base_ref":"main","title":"random 0/5","is_draft":false,"review_decision":"REVIEW_REQUIRED","additions":48,"deletions":21,"commits_behind":0,"labels":["priority:0"],"changed_files":["src/4.rs"],"checks":[{"name":"CI","status":"COMPLETED","conclusion":"SUCCESS","text":""},{"name":"merge-gate","status":"COMPLETED","conclusion":"SUCCESS","text":""}]},{"number":6,"head_ref":"feature-6","base_ref":"feature-5","title":"random 0/6","is_draft":false,"review_decision":"","additions":67,"deletions":18,"commits_behind":2,"labels":["priority:3"],"changed_files":["src/0.rs"],"checks":[{"name":"CI","status":"COMPLETED","conclusion":"SUCCESS","text":""},{"name":"merge-gate","status":"IN_PROGRESS","conclusion":"","text":""}]},{"number":7,"head_ref":"feature-7","base_ref":"main","title":"random 0/7","is_draft":false,"review_decision":"","additions":99,"deletions":59,"commits_behind":0,"labels":["priority:3"],"changed_files":["src/2.rs"],"checks":[{"name":"CI","status":"COMPLETED","conclusion":"SUCCESS","text":""},{"name":"merge-gate","status":"IN_PROGRESS","conclusion":"","text":""}]},{"number":8,"head_ref":"feature-8","base_ref":"feature-7","title":"random 0/8","is_draft":false,"review_decision":"REVIEW_REQUIRED","additions":21,"deletions":56,"commits_behind":4,"labels":["priority:3"],"changed_files":["src/2.rs"],"checks":[{"name":"CI","status":"COMPLETED","conclusion":"CANCELLED","text":""},{"name":"merge-gate","status":"COMPLETED","conclusion":"CANCELLED","text":""}]}],"conflicts":[{"a":1,"b":2,"paths":["src/shared.rs"]}]}"###,
-                &["--batch", "--freshness-max-behind", "1", "--conflict-detector", "file-overlap"],
+                &[
+                    "--batch",
+                    "--freshness-max-behind",
+                    "1",
+                    "--conflict-detector",
+                    "file-overlap",
+                ],
                 "02dd8e1bde4af637ecf8d65527ac9da761a3dd7722e3e47646903bda598452f6",
             ),
             (
                 r###"{"repo":"R","base":"main","prs":[{"number":1,"head_ref":"feature-1","base_ref":"main","title":"random 1/1","is_draft":false,"review_decision":"APPROVED","additions":48,"deletions":84,"commits_behind":2,"labels":["priority:1"],"changed_files":["src/2.rs"],"checks":[{"name":"CI","status":"COMPLETED","conclusion":"SUCCESS","text":""},{"name":"merge-gate","status":"COMPLETED","conclusion":"SUCCESS","text":""}]},{"number":2,"head_ref":"feature-2","base_ref":"main","title":"random 1/2","is_draft":false,"review_decision":"","additions":92,"deletions":41,"commits_behind":3,"labels":["priority:0"],"changed_files":["src/0.rs"],"checks":[{"name":"CI","status":"COMPLETED","conclusion":"SUCCESS","text":""},{"name":"merge-gate","status":"IN_PROGRESS","conclusion":"","text":""}]},{"number":3,"head_ref":"feature-3","base_ref":"main","title":"random 1/3","is_draft":false,"review_decision":"","additions":89,"deletions":40,"commits_behind":2,"labels":["priority:3"],"changed_files":["src/0.rs"],"checks":[{"name":"CI","status":"COMPLETED","conclusion":"SUCCESS","text":""},{"name":"merge-gate","status":"COMPLETED","conclusion":"FAILURE","text":"stale"}]},{"number":4,"head_ref":"feature-4","base_ref":"main","title":"random 1/4","is_draft":false,"review_decision":"","additions":90,"deletions":58,"commits_behind":4,"labels":["priority:1"],"changed_files":["src/2.rs"],"checks":[{"name":"CI","status":"COMPLETED","conclusion":"SUCCESS","text":""},{"name":"merge-gate","status":"COMPLETED","conclusion":"CANCELLED","text":""}]},{"number":5,"head_ref":"feature-5","base_ref":"feature-4","title":"random 1/5","is_draft":false,"review_decision":"APPROVED","additions":7,"deletions":45,"commits_behind":4,"labels":["priority:1"],"changed_files":["src/3.rs"],"checks":[{"name":"CI","status":"IN_PROGRESS","conclusion":"","text":""},{"name":"merge-gate","status":"COMPLETED","conclusion":"CANCELLED","text":""}]},{"number":6,"head_ref":"feature-6","base_ref":"feature-5","title":"random 1/6","is_draft":true,"review_decision":"","additions":18,"deletions":69,"commits_behind":0,"labels":["priority:2"],"changed_files":["src/1.rs"],"checks":[{"name":"CI","status":"COMPLETED","conclusion":"CANCELLED","text":""},{"name":"merge-gate","status":"COMPLETED","conclusion":"FAILURE","text":"stale"}]},{"number":7,"head_ref":"feature-7","base_ref":"main","title":"random 1/7","is_draft":true,"review_decision":"APPROVED","additions":94,"deletions":41,"commits_behind":1,"labels":["priority:3"],"changed_files":["src/2.rs"],"checks":[{"name":"CI","status":"COMPLETED","conclusion":"SUCCESS","text":""},{"name":"merge-gate","status":"IN_PROGRESS","conclusion":"","text":""}]}],"conflicts":[{"a":1,"b":6,"paths":["src/shared.rs"]}]}"###,
-                &["--batch", "--freshness-max-behind", "2", "--conflict-detector", "file-overlap"],
+                &[
+                    "--batch",
+                    "--freshness-max-behind",
+                    "2",
+                    "--conflict-detector",
+                    "file-overlap",
+                ],
                 "f99e8ff86752f914ffd31ead4b97d9fbece8f1b6b5a71454a4ede939ca312195",
             ),
             (
                 r###"{"repo":"R","base":"main","prs":[{"number":1,"head_ref":"feature-1","base_ref":"main","title":"random 2/1","is_draft":false,"review_decision":"APPROVED","additions":52,"deletions":51,"commits_behind":4,"labels":["priority:2"],"changed_files":["src/4.rs"],"checks":[{"name":"CI","status":"IN_PROGRESS","conclusion":"","text":""},{"name":"merge-gate","status":"COMPLETED","conclusion":"SUCCESS","text":""}]},{"number":2,"head_ref":"feature-2","base_ref":"main","title":"random 2/2","is_draft":false,"review_decision":"REVIEW_REQUIRED","additions":50,"deletions":6,"commits_behind":2,"labels":["priority:3"],"changed_files":["src/1.rs"],"checks":[{"name":"CI","status":"COMPLETED","conclusion":"SUCCESS","text":""},{"name":"merge-gate","status":"COMPLETED","conclusion":"CANCELLED","text":""}]},{"number":3,"head_ref":"feature-3","base_ref":"main","title":"random 2/3","is_draft":true,"review_decision":"APPROVED","additions":38,"deletions":54,"commits_behind":3,"labels":["priority:1"],"changed_files":["src/3.rs"],"checks":[{"name":"CI","status":"IN_PROGRESS","conclusion":"","text":""},{"name":"merge-gate","status":"COMPLETED","conclusion":"CANCELLED","text":""}]},{"number":4,"head_ref":"feature-4","base_ref":"main","title":"random 2/4","is_draft":false,"review_decision":"APPROVED","additions":26,"deletions":21,"commits_behind":4,"labels":["priority:3"],"changed_files":["src/3.rs"],"checks":[{"name":"CI","status":"IN_PROGRESS","conclusion":"","text":""},{"name":"merge-gate","status":"COMPLETED","conclusion":"FAILURE","text":"stale"}]},{"number":5,"head_ref":"feature-5","base_ref":"feature-4","title":"random 2/5","is_draft":false,"review_decision":"APPROVED","additions":8,"deletions":17,"commits_behind":4,"labels":["priority:2"],"changed_files":["src/2.rs"],"checks":[{"name":"CI","status":"COMPLETED","conclusion":"CANCELLED","text":""},{"name":"merge-gate","status":"COMPLETED","conclusion":"SUCCESS","text":""}]},{"number":6,"head_ref":"feature-6","base_ref":"main","title":"random 2/6","is_draft":false,"review_decision":"REVIEW_REQUIRED","additions":37,"deletions":72,"commits_behind":1,"labels":["priority:2"],"changed_files":["src/0.rs"],"checks":[{"name":"CI","status":"COMPLETED","conclusion":"FAILURE","text":"assertion"},{"name":"merge-gate","status":"COMPLETED","conclusion":"FAILURE","text":"stale"}]}],"conflicts":[]}"###,
-                &["--batch", "--freshness-max-behind", "1", "--conflict-detector", "file-overlap"],
+                &[
+                    "--batch",
+                    "--freshness-max-behind",
+                    "1",
+                    "--conflict-detector",
+                    "file-overlap",
+                ],
                 "3e0a654bc5a1d0732265abb2085b5abed1571b7d53c1b422205c0ad0edf808ed",
             ),
             (
                 r###"{"repo":"R","base":"main","prs":[{"number":1,"head_ref":"feature-1","base_ref":"main","title":"random 3/1","is_draft":false,"review_decision":"REVIEW_REQUIRED","additions":75,"deletions":74,"commits_behind":4,"labels":["priority:0"],"changed_files":["src/1.rs"],"checks":[{"name":"CI","status":"COMPLETED","conclusion":"FAILURE","text":"assertion"},{"name":"merge-gate","status":"COMPLETED","conclusion":"CANCELLED","text":""}]},{"number":2,"head_ref":"feature-2","base_ref":"feature-1","title":"random 3/2","is_draft":true,"review_decision":"","additions":85,"deletions":5,"commits_behind":1,"labels":["priority:1"],"changed_files":["src/2.rs"],"checks":[{"name":"CI","status":"COMPLETED","conclusion":"FAILURE","text":"assertion"},{"name":"merge-gate","status":"COMPLETED","conclusion":"FAILURE","text":"stale"}]},{"number":3,"head_ref":"feature-3","base_ref":"main","title":"random 3/3","is_draft":false,"review_decision":"APPROVED","additions":89,"deletions":62,"commits_behind":4,"labels":["priority:1"],"changed_files":["src/2.rs"],"checks":[{"name":"CI","status":"COMPLETED","conclusion":"CANCELLED","text":""},{"name":"merge-gate","status":"COMPLETED","conclusion":"SUCCESS","text":""}]},{"number":4,"head_ref":"feature-4","base_ref":"main","title":"random 3/4","is_draft":false,"review_decision":"APPROVED","additions":63,"deletions":87,"commits_behind":1,"labels":["priority:0"],"changed_files":["src/1.rs"],"checks":[{"name":"CI","status":"COMPLETED","conclusion":"SUCCESS","text":""},{"name":"merge-gate","status":"COMPLETED","conclusion":"FAILURE","text":"stale"}]},{"number":5,"head_ref":"feature-5","base_ref":"main","title":"random 3/5","is_draft":false,"review_decision":"REVIEW_REQUIRED","additions":99,"deletions":50,"commits_behind":2,"labels":["priority:1"],"changed_files":["src/4.rs"],"checks":[{"name":"CI","status":"IN_PROGRESS","conclusion":"","text":""},{"name":"merge-gate","status":"IN_PROGRESS","conclusion":"","text":""}]},{"number":6,"head_ref":"feature-6","base_ref":"main","title":"random 3/6","is_draft":false,"review_decision":"REVIEW_REQUIRED","additions":52,"deletions":5,"commits_behind":4,"labels":["priority:0"],"changed_files":["src/2.rs"],"checks":[{"name":"CI","status":"COMPLETED","conclusion":"CANCELLED","text":""},{"name":"merge-gate","status":"COMPLETED","conclusion":"SUCCESS","text":""}]}],"conflicts":[{"a":2,"b":6,"paths":["src/shared.rs"]}]}"###,
-                &["--batch", "--freshness-max-behind", "2", "--conflict-detector", "file-overlap"],
+                &[
+                    "--batch",
+                    "--freshness-max-behind",
+                    "2",
+                    "--conflict-detector",
+                    "file-overlap",
+                ],
                 "7e593dcc956ea5c5de890344cca09bda0de5b3fd19169e973b47dfa3b5b869ed",
-            )
+            ),
         ];
         for (index, (fixture_body, extra, golden_sha)) in cases.iter().enumerate() {
             let path = temp_file(&format!("random-{index}.json"), fixture_body);

@@ -54,6 +54,16 @@ steps:
     hint: *python_package_hint
 
   - group: python
+    job: planner
+    desc: build and smoke-install the planner Python distribution
+    cmd: python3 scripts/check_python_packages.py --project pr-landing-planner
+    jobs_flag: ""
+    labels: [validation-packages, validation-python-packages, component-planner]
+    timeout: 960
+    cpu_timeout: 120
+    hint: *python_package_hint
+
+  - group: python
     job: local-ci-hub
     desc: build and smoke-install the local-ci-hub Python distribution
     cmd: python3 scripts/check_python_packages.py --project local-ci-hub
@@ -69,6 +79,16 @@ steps:
     cmd: python3 scripts/check_python_packages.py --project run-agent-prompt
     jobs_flag: ""
     labels: [validation-packages, validation-python-packages, component-run-agent-prompt]
+    timeout: 960
+    cpu_timeout: 120
+    hint: *python_package_hint
+
+  - group: python
+    job: tick-hub
+    desc: build and smoke-install the tick-hub Python distribution
+    cmd: python3 scripts/check_python_packages.py --project tick-hub
+    jobs_flag: ""
+    labels: [validation-packages, validation-python-packages, component-tick-hub]
     timeout: 960
     cpu_timeout: 120
     hint: *python_package_hint

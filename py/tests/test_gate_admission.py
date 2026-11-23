@@ -572,7 +572,7 @@ def test_timing_sensitive_steps_come_from_the_dag_declaration() -> None:
     # gate-exclusive label, so no real step is timing-sensitive now.
     assert gate.TIMING_SENSITIVE_LABEL not in real["cross.agentctl.differential-0"]
     assert gate._timing_sensitive_steps(["cross.agentctl.differential-0"], real) == []
-    assert gate._timing_sensitive_steps(["python.tick-hub.test"], real) == []
+    assert gate._timing_sensitive_steps(["python.dagrun.shard-0"], real) == []
 
 
 def test_a_non_timing_rerun_runs_shared_and_still_records_a_rerun(tmp_path: Path) -> None:
@@ -581,7 +581,7 @@ def test_a_non_timing_rerun_runs_shared_and_still_records_a_rerun(tmp_path: Path
     env = _env(tmp_path)
     done = subprocess.run(
         [PY, str(GATE), "--rerun", "--", PY, "-c", "print('validate: OK')",
-         "--selected", "python.tick-hub.test"],
+         "--selected", "python.dagrun.shard-0"],
         env=env, capture_output=True, text=True, timeout=60)
     assert done.returncode == 0, done.stdout
     assert "runs in the shared class" in done.stdout
