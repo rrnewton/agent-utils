@@ -26,3 +26,13 @@ Creating a slot for one configured project fails in post-provision hook 1: `git 
 # Notes
 
 Reported by a consuming team on a shared host; filed by the coordinator. Relevant to the wrkslots V2 design (#2138).
+
+## Cause (from the reporting team)
+
+The affected primary checkout is itself a git submodule of a superproject: its git dir lives under the superproject's .git/modules/<name>, with core.bare=false and a relative core.worktree (pointing back to the submodule checkout) set in that COMMON config. Slots are linked worktrees (git worktree add) of that repository. Without extensions.worktreeConfig, a linked worktree inherits the common core.worktree, which git resolves relative to the linked worktree's own gitdir (.../modules/<name>/worktrees/<slot>), so git in the new slot points at a wrong or nonexistent tree and the submodule hook fails. A primary whose git dir has no core.worktree is unaffected.
+
+## Fix options
+
+- Enable extensions.worktreeConfig on such a repository and move core.worktree into the main worktree's config.worktree (one-time migration, detected at create).
+- Run hooks (and any git wrkslots runs in the slot) with GIT_DIR and GIT_WORK_TREE set explicitly for the new worktree, or with -c core.worktree=<slot path>.
+- At minimum, detect a common-config core.worktree when the registry is configured and refuse with this explanation.
