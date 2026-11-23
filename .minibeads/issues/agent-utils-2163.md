@@ -3,12 +3,14 @@ title: 'agentctl-profile-masked-paths: keep launched agents out of owner-declare
 status: open
 priority: 1
 issue_type: feature
+assignee: mu-maskpaths
 labels:
 - agentctl
 - profiles
-assignee: mu-maskpaths
-created_at: 2026-11-23T13:29:03-05:00
-updated_at: 2026-11-23T13:29:03-05:00
+depends_on:
+  agent-utils-2164: blocks
+created_at: 2026-11-23T18:29:03+00:00
+updated_at: 2026-11-23T18:35:55.492915038+00:00
 ---
 
 # Description
@@ -19,7 +21,7 @@ The real off-limits path is host-local configuration only. It never appears in t
 
 # Design
 
-1. Launch-profile key. A launch profile gains `masked_paths`, a list of absolute paths. A per-agent override recorded in the agent record wins over the profile value, following the `reasoning_effort` precedent from #1216 agentctl-effort-option. `agentctl status` shows both the declared masks (from the profile) and the effective masks (after the per-agent override). A profile without `masked_paths` behaves exactly as today. Masking is opt-in per profile until every supported harness passes the in-namespace checks in the Acceptance Criteria.
+1. Launch-profile key. A launch profile gains `masked_paths`, a list of absolute paths. A per-agent override recorded in the agent record wins over the profile value, following the `reasoning_effort` precedent from #1216 agentctl-effort-option. `agentctl status` shows both the declared masks (from the profile) and the effective masks (after the per-agent override). A profile without `masked_paths` behaves exactly as today. Masking is opt-in per profile until every supported harness passes the in-namespace checks in the Acceptance Criteria. This issue is blocked by #2164 agent-utils-node-outside-owner-checkout: masking reaches no real profile until #2164 is live, because builds must no longer need to enter an off-limits path for node.
 
 2. Mechanism. Each launch runs inside a nested user and mount namespace. The outer namespace bind-mounts an empty read-only directory over each masked path, then execs the harness through a second user-namespace step that restores the real uid and gid, so the harness runs with its real identity. Masking the target of a symlink covers the symlink. The Rust edition is primary (native `unshare(2)` and `uid_map` writes, or the equivalent `unshare` helper); the Python edition keeps behaviourally equal behaviour or explicitly refuses the key rather than silently ignoring it, following the repository parity rule.
 
@@ -38,7 +40,8 @@ The real off-limits path is host-local configuration only. It never appears in t
 - `agentctl watch` flags a managed session's process whose working directory is under a masked path, once per process.
 - Tests are hermetic (a temporary directory stands in for the masked path, with no reliance on any real checkout) and use no wall-clock budgets. New test files are classified in `validation/components.json`.
 - `common/docs/agentctl/harness-support-matrix.md` is updated in the same commit if per-harness support differs.
+- Ordering with #2164 agent-utils-node-outside-owner-checkout: this issue is blocked by #2164 (`mb dep`: agent-utils-2163 depends on agent-utils-2164), and masking is enabled on no real profile until #2164 is live. Before any lane, gate or deploy script runs with the mask, the vibe-talk page build and a deploy-style build both run successfully with the mask ON, using only a node from outside every off-limits path.
 
 # Notes
 
-[watermelon-full-preview] mu-maskpaths. Number pre-assigned by the coordinator. Prior work searched before filing: #1216 agentctl-effort-option (the launch-path map and the per-agent override precedent), #1023 (profile refresh on revive and restart), and the tracker and `ai_docs` for namespace and masking prior art; no existing issue covers launch-time path masking. The real off-limits path is set only in host-local profiles outside this repository; no real profile in `.agentctl/profiles.json` is enabled by this issue.
+[watermelon-full-preview] mu-maskpaths. Number pre-assigned by the coordinator. Prior work searched before filing: #1216 agentctl-effort-option (the launch-path map and the per-agent override precedent), #1023 (profile refresh on revive and restart), and the tracker and `ai_docs` for namespace and masking prior art; no existing issue covers launch-time path masking. The real off-limits path is set only in host-local profiles outside this repository; no real profile in `.agentctl/profiles.json` is enabled by this issue. Blocked by #2164 agent-utils-node-outside-owner-checkout (see Design point 1 and the last Acceptance Criterion): implementation may proceed in parallel, but masking reaches no real profile until #2164 is live.
