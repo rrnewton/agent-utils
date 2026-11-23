@@ -17,11 +17,17 @@ goes red. The agentctl subcommands the editions model records as
 python-primary are listed as ``needs-python`` without being executed (one of
 them starts a server). This is the campaign's progress meter
 (#542 rust-primary-rust-only-check); run it in a container from
-`validation/rust-only/` for the hermetic version.
+`validation/rust-only/` for the hermetic version. The functional smoke
+(`validation/rust-only/smoke.sh`, #2131) is the deeper check: real flows
+with known answers plus a whole-repo NOT YET verdict. `--functional`
+runs it on the host against already-built release binaries and skips
+by name when none are built; the smoke remains authoritative for the
+functional claim and this meter for the dispatch claim.
 
 Usage:
     python3 scripts/check_rust_only.py
     python3 scripts/check_rust_only.py --self-test
+    python3 scripts/check_rust_only.py --functional [--bin-dir DIR]
 """
 
 from __future__ import annotations
@@ -195,20 +201,81 @@ def _self_test() -> int:
             failures.append(f"sandbox meter: unexpected lines {lines}")
         if not any("agentctl mcp (subcommand)" in line for line in lines):
             failures.append(f"sandbox meter: subcommand line missing from {lines}")
+    # The functional host mode must skip (exit 0), never fail, when no
+    # release binaries have been built.
+    if run_functional(root) != 0:
+        failures.append("functional mode: expected a named skip (exit 0) with no built binaries")
     if failures:
         print("\n".join(failures), file=sys.stderr)
         print(f"\n{len(failures)} self-test failure(s)", file=sys.stderr)
         return 1
-    print("check-rust-only --self-test: PASSED (3 controls)")
+    print("check-rust-only --self-test: PASSED (4 controls)")
+    return 0
+
+
+FUNCTIONAL_BINARIES = (
+    "agentctl", "agent-teams", "agent-usage", "cpuset-alloc", "dagrun",
+    "gh-paced", "herdr-agent", "herdr-run", "pr-landing-planner",
+    "tick-hub", "wrkslotsd", "wrkvizd",
+)
+
+
+def run_functional(root: Path = REPO_ROOT, *, bin_dir: Path | None = None) -> int:
+    """Host mode for the #2131 functional smoke: run validation/rust-only/smoke.sh
+    against already-built release binaries when they are present.
+
+    This is the scheduled/non-gating wiring that exists today: the rust-only
+    DAG job invokes it after the meter, and it skips by name (exit 0) when
+    the release binaries have not been built, so normal gates never depend
+    on podman or the network. There is no separate scheduler concept for
+    environment-dependent steps in the DAG yet; that gap is recorded on
+    #2131. Exit status is the smoke's own: 1 on any real flow failure.
+    """
+    candidates = []
+    if bin_dir is not None:
+        candidates.append(bin_dir)
+    env_bin = os.environ.get("BIN_DIR")
+    if env_bin:
+        candidates.append(Path(env_bin))
+    candidates.append(root / "rs" / "target" / "release")
+    smoke = root / "validation" / "rust-only" / "smoke.sh"
+    fixtures = root / "validation" / "rust-only" / "fixtures"
+    for candidate in candidates:
+        missing = [name for name in FUNCTIONAL_BINARIES if not (candidate / name).is_file()]
+        if missing:
+            continue
+        print(f"functional smoke: running {smoke} against {candidate}")
+        env = dict(os.environ)
+        env["BIN_DIR"] = str(candidate)
+        env["SMOKE_FIXTURES"] = str(fixtures)
+        result = subprocess.run(
+            ["sh", str(smoke)], cwd=root, env=env, check=False, timeout=600,
+        )
+        return result.returncode
+    print(
+        "SKIP functional smoke: release binaries not built in any of "
+        + ", ".join(str(c) for c in candidates)
+        + " (build with `cargo build --release --locked --workspace --manifest-path rs/Cargo.toml`, "
+        "or run the hermetic podman build from validation/rust-only/Containerfile)"
+    )
     return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--self-test", action="store_true", help="check the meter offline, then exit")
+    parser.add_argument(
+        "--functional",
+        action="store_true",
+        help="run the #2131 functional smoke against built release binaries; "
+        "skips by name (exit 0) when they are absent",
+    )
+    parser.add_argument("--bin-dir", type=Path, default=None, help="release binary directory for --functional")
     args = parser.parse_args(argv)
     if args.self_test:
         return _self_test()
+    if args.functional:
+        return run_functional(bin_dir=args.bin_dir)
     return run_check()
 
 

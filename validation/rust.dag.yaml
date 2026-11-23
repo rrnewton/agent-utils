@@ -292,8 +292,8 @@ steps:
 
   - group: rust-only
     job: check
-    desc: dispatched Rust tools run with no Python interpreter on PATH (campaign progress meter)
-    cmd: python3 scripts/check_rust_only.py --self-test && python3 scripts/check_rust_only.py
+    desc: dispatched Rust tools run with no Python interpreter on PATH (campaign progress meter); the #2131 functional smoke runs against built release binaries when present and skips by name otherwise, so this gate never depends on podman or the network
+    cmd: python3 scripts/check_rust_only.py --self-test && python3 scripts/check_rust_only.py && python3 scripts/check_rust_only.py --functional
     jobs_flag: ""
     labels: [validation-rust]
     timeout: 19200
