@@ -130,9 +130,12 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
     let node: Node | null = range.startContainer;
     let row: Element | null = null;
     while (node) {
-      if (node instanceof Element && (node.tagName === "LI" || node.getAttribute("role") === "row")) {
-        row = node;
-        break;
+      if (node.nodeType === 1) {
+        const element = node as Element;
+        if (element.tagName === "LI" || element.getAttribute("role") === "row") {
+          row = element;
+          break;
+        }
       }
       node = node.parentNode;
     }
@@ -195,12 +198,13 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
         if (!node.textContent || !node.textContent.trim()) return NodeFilter.FILTER_REJECT;
         let at: Node | null = node.parentNode;
         while (at && at !== root) {
-          if (at instanceof Element) {
-            const tag = at.tagName;
+          if (at.nodeType === 1) {
+            const element = at as Element;
+            const tag = element.tagName;
             if (tag === "A" || tag === "CODE" || tag === "PRE" || tag === "BUTTON") {
               return NodeFilter.FILTER_REJECT;
             }
-            if (at.classList.contains("glossary-term")) return NodeFilter.FILTER_REJECT;
+            if (element.classList.contains("glossary-term")) return NodeFilter.FILTER_REJECT;
           }
           at = at.parentNode;
         }
@@ -256,7 +260,17 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
     }
   }
 
+  // Terms load lazily on first selection, never at page load: a page that
+  // only reads must not spend a glossary read (or any read with its token).
+  let termsAsked = false;
+  function ensureTerms(): void {
+    if (termsAsked) return;
+    termsAsked = true;
+    void refreshTerms();
+  }
+
   listen<Event>(document, "selectionchange", () => {
+    ensureTerms();
     if (typeof requestAnimationFrame === "function") requestAnimationFrame(placeWtf);
     else placeWtf();
   });
@@ -281,8 +295,9 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
     const target = event.target as Element | null;
     const termButton =
       target && typeof target.closest === "function" ? target.closest(".glossary-term") : null;
-    if (termButton instanceof HTMLElement) {
-      const entry = byNorm.get(normalize(termButton.dataset.glossaryTerm || termButton.textContent || ""));
+    if (termButton) {
+      const held = termButton as HTMLElement;
+      const entry = byNorm.get(normalize(held.dataset.glossaryTerm || held.textContent || ""));
       if (entry) {
         const rect = termButton.getBoundingClientRect();
         anchor = { top: rect.top, left: rect.left, bottom: rect.bottom };
@@ -314,8 +329,6 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
         })
       : null;
   if (observer && log) observer.observe(log, { childList: true, subtree: true });
-
-  void refreshTerms();
 
   return {
     refreshTerms,
