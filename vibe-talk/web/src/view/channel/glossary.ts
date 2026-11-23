@@ -27,6 +27,8 @@ export interface GlossaryDependencies {
   idsOf(row: Element | null | undefined): string[];
   /** Open a fetched document by key in the Documents view. */
   openDocument(key: string): void;
+  /** Whether the page's token scope is known (a refused token reads nothing). */
+  tokenKnown(): boolean;
 }
 
 /** The glossary view's commands. */
@@ -121,12 +123,14 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
     setHiddenIfChanged(popover(), true);
   }
 
-  function selectionInfo(): { text: string; messageId: string; context: string } | null {
+  function selectionInfo(
+    given?: Range,
+  ): { text: string; messageId: string; context: string } | null {
     const sel = typeof getSelection === "function" ? getSelection() : null;
-    if (!sel || sel.isCollapsed || !sel.rangeCount) return null;
-    const text = sel.toString().split(/\s+/).filter(Boolean).join(" ").trim();
+    if (!given && (!sel || sel.isCollapsed || !sel.rangeCount)) return null;
+    const range = given ?? (sel as Selection).getRangeAt(0);
+    const text = range.toString().split(/\s+/).filter(Boolean).join(" ").trim();
     if (!text) return null;
-    const range = sel.getRangeAt(0);
     let node: Node | null = range.startContainer;
     let row: Element | null = null;
     while (node) {
@@ -149,13 +153,13 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
     };
   }
 
-  // The last live selection, kept because a phone tap on the button can
-  // clear the browser selection before the press reads it (the same hold
-  // Quote reply keeps). A press with nothing live stands on this.
-  let lastSelection: { text: string; messageId: string; context: string } | null = null;
+  // The last live selection's range, kept (unread) because a phone tap on
+  // the button can clear the browser selection before the press reads it
+  // (the same hold Quote reply keeps). Its words are read once, at press.
+  let lastRange: Range | null = null;
 
   async function pressWtf(): Promise<void> {
-    const info = selectionInfo() ?? lastSelection;
+    const info = selectionInfo() ?? (lastRange ? selectionInfo(lastRange) : null);
     const channel = deps.selectedChannelId();
     if (!info || !channel) return;
     anchor = anchor ?? { top: 80, left: 16, bottom: 120 };
@@ -293,17 +297,24 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
   // only reads must not spend a glossary read (or any read with its token).
   let termsAsked = false;
   function ensureTerms(): void {
-    if (termsAsked) return;
+    if (termsAsked || !deps.tokenKnown()) return;
     termsAsked = true;
     void refreshTerms();
   }
 
   listen<Event>(document, "selectionchange", () => {
     ensureTerms();
-    const current = selectionInfo();
-    if (current) lastSelection = current;
-    // A collapsed selection frees the row it stood in for linking.
+    // Keep the range unread: a drag must not read the words at every move
+    // (Quote reply reads them once, at press; so does this).
     const sel = typeof getSelection === "function" ? getSelection() : null;
+    if (sel && !sel.isCollapsed && sel.rangeCount) {
+      try {
+        lastRange = sel.getRangeAt(0).cloneRange();
+      } catch {
+        lastRange = null;
+      }
+    }
+    // A collapsed selection frees the row it stood in for linking.
     if (sel && sel.isCollapsed && terms.length) {
       const log = document.getElementById("discord-log");
       if (log) linkTermsIn(log);

@@ -1409,6 +1409,7 @@ const glossaryView = createGlossaryView({
   glossaryAvailable: () => serverFacts.glossaryAvailable(),
   idsOf: (row) => idsOf(/** @type {any} */ (row)),
   openDocument: (key) => { void documentsView.show(key); },
+  tokenKnown: () => serverFacts.tokenScope() !== null,
 });
 
 /** `#1388` landing 1. Restate an open summary's strike after any mark settles. */
