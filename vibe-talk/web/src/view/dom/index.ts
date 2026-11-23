@@ -1,7 +1,7 @@
 // The page's DOM primitives: small walks and, in time, the shell's typed element lookup. Its public
 // interface. `#624 voice-page-modularity`, plan step 16.
 
-export { childByClass, nodeWithin, shownNode } from "./tree.ts";
+export { childByClass, nodeWithin, replyRowOf, shownNode } from "./tree.ts";
 export { firstMeaningfulVisible, MEANINGFUL_VISIBLE_PX } from "./firstvisible.ts";
 export { centrePopupOver, centredPopupLeft } from "./popup-position.ts";
 export { elementIn, focusLost, focusMinimally, setFocusReveal } from "./shell.ts";

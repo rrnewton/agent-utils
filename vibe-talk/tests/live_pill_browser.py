@@ -341,7 +341,7 @@ def pill_walk(desk: Desk) -> None:
 
     # Main at its head, then the whole list.
     page.select_option("#thread-select", "main")
-    desk.wait_for(f"() => !!document.querySelector(\"#discord-log > li[data-id='{CHIP_ROOT}'] > .thread-unread\")",
+    desk.wait_for(f"() => !!document.querySelector(\"#discord-log > li[data-id='{CHIP_ROOT}'] .thread-unread\")",
                   "Main did not draw the thread's unread chip")
     desk.settled()
     problems = head_at_top(desk)

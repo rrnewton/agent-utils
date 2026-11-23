@@ -4710,7 +4710,7 @@ test("a thread root shows its reactions above the way into its replies", async (
   const page = await reactedThreadPage();
   const root = rowOf(page, "201");
   assert.deepStrictEqual(chipsOf(root), ["👍 2"]);
-  const order = root.children.map((node) => node.className);
+  const order = root.descendants().map((node) => node.className);
   assert.ok(order.indexOf("thread-replies") > order.indexOf("reactions"),
     `the reply count is not below the reactions, where the chat service puts it: ${order}`);
 });

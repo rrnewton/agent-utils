@@ -39,6 +39,24 @@ export function shownNode(node: unknown): boolean {
  * attribute on the way, was a quarter of the page's work in live traffic. A class attribute that does
  * not even contain the name is passed over without being split.
  */
+/** The row's reply row (`#2148`): the one flex line holding the reply counts and the
+ * newest-unread preview, created on first use and kept as the row's last child. Members
+ * already drawn loose on the row are adopted in the order `memberClasses` names. */
+export function replyRowOf(row: unknown, memberClasses: readonly string[]): HTMLElement {
+  const host = row as HTMLElement;
+  let section = childByClass(host, "thread-reply-row");
+  if (!section) {
+    section = document.createElement("div");
+    section.className = "thread-reply-row";
+    host.append(section);
+  }
+  for (const className of memberClasses) {
+    const member = childByClass(host, className);
+    if (member) section.append(member);
+  }
+  return section;
+}
+
 export function childByClass(row: unknown, className: string): HTMLElement | null {
   // Matched among the element's classes rather than against the whole attribute. The row being
   // read carries `msg-author reading-mark`, and an exact-string match stopped finding it the

@@ -404,8 +404,8 @@ MAIN_JS = """(root) => {
     const r = node.getBoundingClientRect();
     return {top: r.top, bottom: r.bottom, left: r.left, right: r.right, height: r.height, width: r.width};
   };
-  const chip = row ? row.querySelector(':scope > .thread-unread') : null;
-  const replies = row ? row.querySelector(':scope > .thread-replies') : null;
+  const chip = row ? row.querySelector(':scope .thread-unread') : null;
+  const replies = row ? row.querySelector(':scope .thread-replies') : null;
   const probe = document.createElement('span');
   probe.style.color = 'var(--accent)';
   document.body.append(probe);
@@ -441,8 +441,8 @@ MAIN_JS = """(root) => {
 LONG_PAIRS = [("about 52 replies", "12+ unread"), ("52 replies", "120 new"), ("about 120 replies", "120+ unread")]
 LONG_PAIRS_JS = """([root, pairs]) => {
   const row = [...document.querySelectorAll('#discord-log > li')].find((li) => li.dataset.id === root);
-  const chip = row.querySelector(':scope > .thread-unread');
-  const replies = row.querySelector(':scope > .thread-replies');
+  const chip = row.querySelector(':scope .thread-unread');
+  const replies = row.querySelector(':scope .thread-replies');
   const box = (node) => {
     const r = node.getBoundingClientRect();
     return {top: r.top, bottom: r.bottom, left: r.left, right: r.right, height: r.height};
@@ -770,7 +770,7 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
     # `#222 unread-replies`: Main, in Show read. The owner's question is read, and kept.
     page.select_option("#thread-select", "main")
     page.wait_for_function(
-        f"() => !!document.querySelector('#discord-log > li[data-id=\"{ROOT_ID}\"] > .thread-unread:not([hidden])')",
+        f"() => !!document.querySelector('#discord-log > li[data-id=\"{ROOT_ID}\"] .thread-unread:not([hidden])')",
         timeout=10_000)
     page.wait_for_function(
         f"() => document.querySelector('#discord-log > li[data-id=\"{ROOT_ID}\"] .thread-unread')?.textContent === '4 unread'",
@@ -823,7 +823,7 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
     notes.append(f"the longest pairs each one line, inside the row; side by side: {', '.join(shared) or 'none'}")
 
     # A real tap on the count enters the thread on its first unread reply.
-    tap(page, f'#discord-log > li[data-id="{ROOT_ID}"] > .thread-unread', touch)
+    tap(page, f'#discord-log > li[data-id="{ROOT_ID}"] .thread-unread', touch)
     page.wait_for_function(
         f"() => {{ const row = document.querySelector('#discord-log > li[data-id=\"{ANSWER_ID}\"]');"
         " return row && row.dataset.collapsed === 'false'; }", timeout=10_000)

@@ -1700,10 +1700,13 @@ test("ON MAIN a root whose thread holds unread replies says how many, beside N r
   assert.equal(unreadChip(page, inboxId(2)).getAttribute("aria-label"),
     "Open this thread at its first unread reply, 1 unread reply");
   assert.equal(chip.getAttribute("title"), "Open this thread at its first unread reply");
-  // Beside N replies, after it: "3 replies  2 unread", then the newest reply's preview (`#1906`).
+  // Beside N replies, after it on the one reply row: "3 replies  2 unread", then the newest
+  // reply's preview (`#1906`, grouped by `#2148`).
   const root = rowWithId(page, inboxId(7));
-  const order = root.children.map((node) => node.className);
-  assert.deepStrictEqual(order.slice(-3), ["thread-replies", "thread-unread", "thread-unread-preview"], `not beside N replies: ${order}`);
+  const replyRow = root.children.find((node) => node.className === "thread-reply-row");
+  assert.ok(replyRow, `the card has no reply row: ${root.children.map((node) => node.className)}`);
+  assert.deepStrictEqual(replyRow.children.map((node) => node.className),
+    ["thread-replies", "thread-unread", "thread-unread-preview"], "the reply row's parts are not in their order");
   assert.equal(threadButton(root).textContent, "3 replies");
   assert.equal(threadBadge(root).textContent, "Thread(3)", "the way into the thread changed its words");
   assert.equal(root.getAttribute("data-unread-replies"), "2");
@@ -1713,9 +1716,8 @@ test("ON MAIN a root whose thread holds unread replies says how many, beside N r
   // The cue is the accent, as the jump to news below wears it, and is not faded with its read root.
   assert.match(cssBlock(".thread-unread"), /color:\s*var\(--accent\)/);
   assert.match(cssBlock(".thread-unread"), /border:\s*1px solid var\(--accent\)/);
-  assert.match(cssBlock("#discord-log li.discord-message[data-unread-replies] > .thread-unread:not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather)"),
+  assert.match(cssBlock("#discord-log li.discord-message[data-unread-replies] > .thread-reply-row > .thread-unread:not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather)"),
     /z-index:\s*1[\s\S]*filter:\s*none/);
-  assert.match(cssBlock("#discord-log li.discord-message[data-unread-replies] > .thread-replies"), /display:\s*inline-block/);
   // `#549 own-read-stored`: turning the setting off changes no count; his reply's read state is kept.
   await page.el("mark-own-read").setChecked(false);
   await page.settle();
@@ -2674,6 +2676,20 @@ test("A ROOT HIDE READ KEEPS SHOWS ITS CHIP, drawn from a copy that has no threa
 test("THE UNREAD COUNT AND N REPLIES never break inside themselves on a narrow row", () => {
   assert.match(cssBlock(".thread-unread"), /white-space:\s*nowrap/);
   assert.match(cssBlock(".thread-replies"), /white-space:\s*nowrap/);
+});
+
+test("`#2148`: THE REPLY ROW stays on one line while its parts fit, and the preview gives first", () => {
+  // This suite lays nothing out, so it pins the frame that keeps the row on one line;
+  // scene 81 measures the tops in Chromium at phone and desktop sizes.
+  assert.match(cssBlock(".thread-reply-row"), /display:\s*flex/);
+  assert.match(cssBlock(".thread-reply-row"), /flex-wrap:\s*wrap/,
+    "the row may wrap only when the viewport is genuinely too narrow");
+  assert.match(cssBlock(".thread-reply-row > .thread-replies"), /flex:\s*none/);
+  assert.match(cssBlock(".thread-reply-row > .thread-unread"), /flex:\s*none/);
+  assert.match(cssBlock(".thread-reply-row > .thread-unread-preview"), /flex:\s*1 1 /);
+  assert.match(cssBlock(".thread-reply-row > .thread-unread-preview"), /min-width:\s*0/,
+    "the preview cannot shrink below its words, so the counts would wrap instead");
+  assert.match(cssBlock(".thread-unread-preview"), /text-overflow:\s*ellipsis/);
 });
 
 // --- `#222 unread-replies`, after the second review ----------------------------------------------

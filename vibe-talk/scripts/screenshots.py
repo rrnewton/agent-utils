@@ -3412,7 +3412,7 @@ def _act_reply_surface(driver: Driver) -> None:
     )
     page.wait_for_function(
         f"() => !!document.querySelector('#discord-log > li[data-id=\"{REPLY_SURFACE_ROOT}\"] "
-        "> .thread-unread-preview:not([hidden])')",
+        " .thread-unread-preview:not([hidden])')",
         timeout=10_000,
     )
     page.evaluate(
@@ -8114,13 +8114,28 @@ SCENES: tuple[Scene, ...] = (
             (
                 "it says two unread replies",
                 f"document.querySelector('#discord-log > li[data-id=\"{REPLY_SURFACE_ROOT}\"] "
-                "> .thread-unread:not([hidden])')?.textContent === '2 unread'",
+                " .thread-unread:not([hidden])')?.textContent === '2 unread'",
             ),
             (
                 "and shows the newest reply's words on the card",
                 f"(document.querySelector('#discord-log > li[data-id=\"{REPLY_SURFACE_ROOT}\"] "
-                "> .thread-unread-preview:not([hidden])')?.textContent || '')"
+                " .thread-unread-preview:not([hidden])')?.textContent || '')"
                 ".includes('Migration fixed')",
+            ),
+            (
+                "the reply row is on one line (`#2148`)",
+                f"(() => {{ const card = document.querySelector('#discord-log > li[data-id=\"{REPLY_SURFACE_ROOT}\"]'); "
+                "const parts = ['.thread-replies', '.thread-unread', '.thread-unread-preview']"
+                ".map((one) => card.querySelector(one)?.getBoundingClientRect()); "
+                "return parts.every((box) => box && Math.abs(box.top - parts[0].top) < 1); })()",
+            ),
+            (
+                "and the preview is one truncated line, not wrapped (`#2148`)",
+                f"(() => {{ const card = document.querySelector('#discord-log > li[data-id=\"{REPLY_SURFACE_ROOT}\"]'); "
+                "const preview = card.querySelector('.thread-unread-preview'); "
+                "const style = getComputedStyle(preview); "
+                "return style.whiteSpace === 'nowrap' && style.textOverflow === 'ellipsis' "
+                "&& preview.getBoundingClientRect().height < 48; })()",
             ),
             ("no error banner is up", "!window.__visible('error-wrap')"),
         ),
@@ -8136,7 +8151,7 @@ SCENES: tuple[Scene, ...] = (
             (
                 "the owner's root is landed in view with its preview",
                 f"(document.querySelector('#discord-log > li[data-id=\"{REPLY_SURFACE_ROOT}\"] "
-                "> .thread-unread-preview:not([hidden])')?.textContent || '')"
+                " .thread-unread-preview:not([hidden])')?.textContent || '')"
                 ".includes('Migration fixed')",
             ),
             ("no error banner is up", "!window.__visible('error-wrap')"),

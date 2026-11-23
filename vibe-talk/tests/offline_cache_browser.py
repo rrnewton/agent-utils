@@ -1408,7 +1408,7 @@ COALESCE_ROWS_JS = """() => [...document.querySelectorAll('#discord-log > li')].
 # Where to put a finger: the centre of a row's N replies chip, arrow or X.
 TARGET_JS = """({id, part}) => {
     const row = document.querySelector(`#discord-log > li[data-id="${id}"]`);
-    const node = row && row.querySelector(part === 'chip' ? ':scope > .thread-replies'
+    const node = row && row.querySelector(part === 'chip' ? ':scope .thread-replies'
         : part === 'x' ? ':scope > .reply-ungather' : part === 'body' ? ':scope > .body' : ':scope > .reply-jump');
     if (!node) return null;
     const b = node.getBoundingClientRect();

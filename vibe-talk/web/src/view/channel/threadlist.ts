@@ -9,6 +9,7 @@ import type { Message } from "../../contract/index.ts";
 import { namedRecord, threadOf } from "../../core/channels/index.ts";
 import { filedThreadSlug, firstLineOf, threadChoice, threadFacts, titleLineOf } from "../../present/rows/index.ts";
 import type { ThreadChoice } from "../../present/rows/index.ts";
+import { replyRowOf } from "../../view/dom/index.ts";
 import { noteRowBuilt } from "./rows.ts";
 
 
@@ -1092,7 +1093,7 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
       gather.style.setProperty("--thread-hue", deps.threadHue(id));
       gather.textContent = deps.threadCount(count, exact);
       gather.addEventListener("click", deps.inThisColumn(() => deps.guardQuietly(() => deps.toggleGathered(String(message.id), row))()));
-      row.append(gather);
+      replyRowOf(row, ["thread-replies", "thread-unread", "thread-unread-preview"]).append(gather);
     }
   }
 

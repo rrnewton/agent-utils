@@ -1248,7 +1248,7 @@ li.discord-message[data-root-child] > .reply-bridge {
    root's, and the root is the card — so none are drawn; the row's own keys and tap still act on the
    root, whose row it is. */
 li.discord-message[data-root-continuation] .row-acts,
-li.discord-message[data-root-continuation] > .thread-replies {
+li.discord-message[data-root-continuation] .thread-replies {
   display: none;
 }
 

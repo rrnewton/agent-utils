@@ -724,11 +724,34 @@
   white-space: nowrap;
 }
 
-/* `#1906`: the newest unread reply's own words under its count, on the root's card. */
+/* `#2148 vibe-talk-thread-card-reply-row-wrap`: the reply row — N replies, M unread and the
+   newest reply's preview — is one flex line. The counts keep their size; the preview is the
+   part that gives, cut with an ellipsis, and the row wraps only when even a short preview
+   cannot stand beside the counts. */
+.thread-reply-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  margin-top: 0.6rem;
+}
+
+.thread-reply-row > .thread-replies,
+.thread-reply-row > .thread-unread {
+  flex: none;
+  margin-top: 0;
+}
+
+.thread-reply-row > .thread-unread-preview {
+  flex: 1 1 6rem;
+  min-width: 0;
+  margin-top: 0;
+}
+
+/* `#1906`: the newest unread reply's own words beside its count, on the root's card. */
 .thread-unread-preview {
   display: block;
   max-width: 100%;
-  margin-top: 0.35rem;
   padding: 0.3rem 0.65rem;
   border: 1px solid var(--accent);
   border-radius: 0.6rem;
@@ -756,16 +779,7 @@
   white-space: nowrap;
 }
 
-/* N replies gives up its line to share it. */
-#side-log li.discord-message[data-unread-replies] > .thread-replies,
-#side-cards li.discord-message[data-unread-replies] > .thread-replies,
-#discord-log li.discord-message[data-unread-replies] > .thread-replies {
-  display: inline-block;
-}
-
-.thread-replies + .thread-unread {
-  margin-inline-start: 0.4rem;
-}
+/* The reply row's gap spaces its parts (`#2148`); no part adds a margin of its own. */
 
 /* `#215 reply-coalesce`. Pressed while its replies are gathered under it, in the bridge's colour, so
    the chip that gathered them says it is the one that will put them back. */

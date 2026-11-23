@@ -7,7 +7,7 @@
 import { allReachesThread, emptyTally, exactReplyCount, replyTallyOf, tallyRecord, threadOf, unseenRepliesIn } from "../../core/channels/index.ts";
 import type { ChannelCanon, ReplyTally } from "../../core/channels/index.ts";
 import { countOf, filedThreadSlug, firstLineOf, replyMarkerName } from "../../present/rows/index.ts";
-import { childByClass } from "../../view/dom/index.ts";
+import { childByClass, replyRowOf } from "../../view/dom/index.ts";
 import type { Message, ThreadSummary } from "../../contract/index.ts";
 import { QUOTE_REPLY_TITLE } from "./quoting.ts";
 
@@ -526,8 +526,8 @@ export function createReplyCounts(deps: ReplyCountsDependencies): ReplyCounts {
       chip.setAttribute("type", "button");
       chip.setAttribute("title", "Open this thread at its first unread reply");
       chip.addEventListener("click", deps.inThisColumn(() => deps.guardQuietly(() => deps.openThread(id))()));
-      // After N replies, the last thing on the row, so the two read as one line: "12 replies  3 unread".
-      row.append(chip);
+      // After N replies on the reply row, so the two read as one line: "12 replies  3 unread" (`#2148`).
+      replyRowOf(row, ["thread-replies", "thread-unread", "thread-unread-preview"]).append(chip);
     }
     // What is known first: the unread replies held, a floor when there may be more. Only when none is
     // held, the replies reported but not yet brought, "1 new": not known to be unread, but nothing has
@@ -560,7 +560,7 @@ export function createReplyCounts(deps: ReplyCountsDependencies): ReplyCounts {
       preview.setAttribute("type", "button");
       preview.setAttribute("title", "Open this thread at its first unread reply");
       preview.addEventListener("click", deps.inThisColumn(() => deps.guardQuietly(() => deps.openThread(id))()));
-      row.append(preview);
+      replyRowOf(row, ["thread-replies", "thread-unread", "thread-unread-preview"]).append(preview);
     }
     const author = typeof newest.author === "string" && newest.author ? `${newest.author}: ` : "";
     // One line, the chip's own footprint: a taller preview would take a reader who is

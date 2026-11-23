@@ -339,9 +339,9 @@
 #side-log li.discord-message[data-stack-under] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
 #side-cards li.discord-message[data-stack-under] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
 #discord-log li.discord-message[data-stack-under] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
-#side-log li.discord-message[data-unread-replies] > :not(.thread-strip):not(.thread-unread):not(.thread-unread-preview):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
-#side-cards li.discord-message[data-unread-replies] > :not(.thread-strip):not(.thread-unread):not(.thread-unread-preview):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
-#discord-log li.discord-message[data-unread-replies] > :not(.thread-strip):not(.thread-unread):not(.thread-unread-preview):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
+#side-log li.discord-message[data-unread-replies] > :not(.thread-strip):not(.thread-reply-row):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
+#side-cards li.discord-message[data-unread-replies] > :not(.thread-strip):not(.thread-reply-row):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
+#discord-log li.discord-message[data-unread-replies] > :not(.thread-strip):not(.thread-reply-row):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
 #side-log li.discord-message[data-reply-marker] > :not(.thread-strip):not(.reply-marker):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
 #side-cards li.discord-message[data-reply-marker] > :not(.thread-strip):not(.reply-marker):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
 #discord-log li.discord-message[data-reply-marker] > :not(.thread-strip):not(.reply-marker):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
@@ -363,15 +363,23 @@
 /* The unread count, over the veil and in its own colour. Weighed above the rule over a reply's
    parts, for a root that is also a reply. (`:not(.thread-strip)` is weight only, as on the rules over
    a row's parts above, which `#299 all-thread-strip` gave it.) */
-#side-log li.discord-message[data-unread-replies] > .thread-unread:not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
-#side-log li.discord-message[data-unread-replies] > .thread-unread-preview,
-#side-cards li.discord-message[data-unread-replies] > .thread-unread:not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
-#side-cards li.discord-message[data-unread-replies] > .thread-unread-preview,
-#discord-log li.discord-message[data-unread-replies] > .thread-unread:not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
-#discord-log li.discord-message[data-unread-replies] > .thread-unread-preview {
+#side-log li.discord-message[data-unread-replies] > .thread-reply-row > .thread-unread:not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
+#side-log li.discord-message[data-unread-replies] > .thread-reply-row > .thread-unread-preview,
+#side-cards li.discord-message[data-unread-replies] > .thread-reply-row > .thread-unread:not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
+#side-cards li.discord-message[data-unread-replies] > .thread-reply-row > .thread-unread-preview,
+#discord-log li.discord-message[data-unread-replies] > .thread-reply-row > .thread-unread:not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
+#discord-log li.discord-message[data-unread-replies] > .thread-reply-row > .thread-unread-preview {
   position: relative;
   z-index: 1;
   filter: none;
+}
+
+/* Inside the reply row, N replies keeps its read veil while its unread neighbours stand
+   over it (`#2148`). */
+#side-log li.discord-message[data-unread-replies] > .thread-reply-row > .thread-replies,
+#side-cards li.discord-message[data-unread-replies] > .thread-reply-row > .thread-replies,
+#discord-log li.discord-message[data-unread-replies] > .thread-reply-row > .thread-replies {
+  filter: var(--row-filter, none);
 }
 
 /* `#1906`: a root with replies still unread is not done, however read the root itself is:

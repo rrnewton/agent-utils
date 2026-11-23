@@ -334,7 +334,7 @@ STRIPS_JS = """async () => {
                 if (ratio < 4.5) problems.push(`${id}: "${name}"'s count reads at ${ratio.toFixed(2)}:1`);
             }
         }
-        const replies = row.querySelector(':scope > .thread-replies');
+        const replies = row.querySelector(':scope .thread-replies');
         if (replies && replies.getBoundingClientRect().top < s.bottom - 0.5) {
             problems.push(`${id}: the reply count is not below the reactions`);
         }
