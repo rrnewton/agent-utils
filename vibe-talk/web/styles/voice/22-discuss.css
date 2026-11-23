@@ -497,10 +497,15 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   font-weight: 600;
 }
 
-/* `#2137`: the You / Discuss label on each follow-up paragraph. */
+/* `#2137`: the You / Discuss label on each follow-up paragraph, on its
+ * own small line so it never runs into the text it labels. */
 .discuss-turn-label {
+  display: block;
+  font-size: 0.78em;
   font-weight: 700;
-  margin-right: 6px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  margin-bottom: 2px;
 }
 
 /* `#1912 vibe-talk-discuss-summary-timeline-layout`: headed sections with
