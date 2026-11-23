@@ -6723,6 +6723,7 @@ provider = "slack"
         );
     }
 
+    #[test]
     fn internal_link_hosts_are_the_deployments_and_empty_by_default() {
         // `#2007 vibe-talk-speech-short-links`: no internal host is named in code.
         let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
