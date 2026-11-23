@@ -649,3 +649,137 @@ def test_recover_reruns_first_hook_after_rollback_removed_worktree(
     runs = (project / "hook1-runs").read_text(encoding="utf-8").splitlines()
     assert len(runs) == 2, runs
     assert len(active_slots(project)) == 1
+
+
+def test_create_fetches_pinned_commit_missing_from_module_repo(
+    tmp_path: Path,
+) -> None:
+    # #1988: the superproject pin names a commit the shared module
+    # repository never fetched (a repin); create fetches exactly it from
+    # the module repo's origin instead of failing "not our ref".
+    project, repository, _remote = make_project(tmp_path)
+    add_recursive_submodules(tmp_path, project, repository)
+    update_configuration(project, share_submodules=True)
+    module = _primary_module(repository)
+    # New commit exists only on the component remote.
+    remote_source = tmp_path / "component-source"
+    (remote_source / "repinned.txt").write_text("repinned\n", encoding="utf-8")
+    git(remote_source, "add", "repinned.txt")
+    git(remote_source, "commit", "-m", "repin target")
+    git(remote_source, "push", "origin", "main")
+    new_pin = git(remote_source, "rev-parse", "HEAD").stdout.strip()
+    assert (
+        subprocess.run(
+            ["git", f"--git-dir={module}", "cat-file", "-e", f"{new_pin}^{{commit}}"],
+            capture_output=True,
+        ).returncode
+        != 0
+    )
+    # Repin the superproject without fetching into the module repo.
+    git(
+        repository,
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        f"160000,{new_pin},component",
+    )
+    git(repository, "commit", "-m", "repin component")
+    git(repository, "push", "origin", "main")
+
+    made = create(project)
+
+    assert made.returncode == 0, made.stderr
+    slot_component = checkout(project) / "component"
+    assert git(slot_component, "rev-parse", "HEAD").stdout.strip() == new_pin
+    assert (slot_component / "repinned.txt").exists()
+
+
+def test_create_refuses_unreachable_pinned_commit_before_hooks(
+    tmp_path: Path,
+) -> None:
+    # #1988: a pin nobody can fetch refuses with a remedy, and no hook
+    # runs against a half-provisioned submodule.
+    project, repository, _remote = make_project(tmp_path)
+    add_recursive_submodules(tmp_path, project, repository)
+    update_configuration(
+        project,
+        post_provision_hooks=['echo hook-ran >> "$WRKSLOTS_PROJECT_ROOT/hook-ran"'],
+        share_submodules=True,
+    )
+    missing = "1" * 40
+    git(
+        repository,
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        f"160000,{missing},component",
+    )
+    git(repository, "commit", "-m", "repin to nowhere")
+    git(repository, "push", "origin", "main")
+
+    made = create(project)
+
+    assert made.returncode != 0
+    assert "pinned commit" in made.stderr
+    assert not (project / "hook-ran").exists()
+    assert active_slots(project) == []
+
+
+def test_ensure_without_fetch_refuses_and_fetches_nothing(tmp_path: Path) -> None:
+    # #1988: the under-lock re-check (allow_fetch=False) never touches
+    # the network; a missing pin refuses with the remedy, unfetched.
+    project, repository, _remote = make_project(tmp_path)
+    add_recursive_submodules(tmp_path, project, repository)
+    module = _primary_module(repository)
+    missing = "2" * 40
+    with pytest.raises(wrkslots.Refusal):
+        wrkslots._ensure_pinned_submodule_commit(
+            wrkslots._GitVcs(),
+            repository,
+            repository / "component",
+            "component",
+            missing,
+            module,
+            allow_fetch=False,
+        )
+    assert (
+        subprocess.run(
+            ["git", f"--git-dir={module}", "cat-file", "-e", f"{missing}^{{commit}}"],
+            capture_output=True,
+        ).returncode
+        != 0
+    )
+
+
+def test_share_without_fetch_refuses_missing_pin_and_fetches_nothing(
+    tmp_path: Path,
+) -> None:
+    # #1988: the recover path shares with fetch_pinned=False, so under
+    # the recover lock a missing pin refuses and is never fetched.
+    project, repository, _remote = make_project(tmp_path)
+    add_recursive_submodules(tmp_path, project, repository)
+    module = _primary_module(repository)
+    missing = "3" * 40
+    git(
+        repository,
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        f"160000,{missing},component",
+    )
+    git(repository, "commit", "-m", "repin to nowhere")
+    slot_checkout = tmp_path / "slot-checkout"
+    git(repository, "worktree", "add", "--detach", str(slot_checkout))
+
+    with pytest.raises(wrkslots.Refusal):
+        wrkslots._share_checkout_submodules(
+            wrkslots._GitVcs(), repository, slot_checkout, fetch_pinned=False
+        )
+
+    assert (
+        subprocess.run(
+            ["git", f"--git-dir={module}", "cat-file", "-e", f"{missing}^{{commit}}"],
+            capture_output=True,
+        ).returncode
+        != 0
+    )

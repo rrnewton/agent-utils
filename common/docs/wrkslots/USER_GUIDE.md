@@ -663,6 +663,10 @@ clone stays the default until they are complete. Preparing a module repository (
 `extensions.worktreeConfig` and moving `core.worktree`) is rolled back byte-identically if the
 create then fails before the slot is registered, so a failed `create` never leaves a shared
 submodule's common config modified; `wrkslots recover` re-prepares it when the create resumes.
+Before the linked worktree is added, `create` also ensures the submodule commit the
+superproject pins is present in the module repository: after a repin it fetches exactly that
+commit from the configured submodule URL (or the module repository's origin), and refuses
+with a remedy, before any hook runs, if the commit cannot be fetched.
 The per-slot cost is the small worktree administration under
 `.git/modules/<name>/worktrees/`; objects and refs live once, in the primary repository, and
 `git gc` there computes reachability over every worktree, so no slot can be pruned out from

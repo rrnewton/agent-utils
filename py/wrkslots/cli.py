@@ -46130,6 +46130,134 @@ def _prepare_shared_submodule_repo(vcs: _GitVcs, source_submodule: Path) -> bool
     return True
 
 
+def _ensure_pinned_submodule_commit(
+    vcs: _GitVcs,
+    source_repository: Path,
+    source_sub: Path,
+    name: str,
+    gitlink: str,
+    common: Path,
+    *,
+    allow_fetch: bool = True,
+) -> None:
+    """Ensure the pinned ``gitlink`` commit exists in the module repo (#1988).
+
+    A repin can name a commit the shared module repository's stale refs
+    never fetched; the slot's linked worktree (and any later
+    `git submodule update` hook) then fails with "not our ref". Fetch
+    exactly that commit from the configured submodule URL (resolved
+    against the source checkout, skipping the module repo itself), then
+    from the module repo's own origin, falling back to each URL's
+    default refs. Refuse, with a remedy, before hooks run if the commit
+    is still missing.
+
+    The fetch runs only where the caller holds no registry lock
+    (``allow_fetch``); under the mutation locks this is a cheap presence
+    re-check, and a miss refuses with the remedy. Every fetch is bounded
+    (subprocess timeout plus low-speed limits), and concurrent creates
+    fetching into the same module repository are safe: a fetch only
+    adds objects and refs under Git's own locking and writes no
+    worktree or config state, so duplicates are harmless.
+    """
+
+    def present() -> bool:
+        return (
+            vcs._run(
+                source_sub, ["cat-file", "-e", f"{gitlink}^{{commit}}"], check=False
+            ).returncode
+            == 0
+        )
+
+    if present():
+        return
+    if not allow_fetch:
+        raise Refusal(
+            f"shared submodule {name}: pinned commit {gitlink} is not in "
+            f"the module repository {common}; remedy: fetch it there "
+            f"(git -C {source_sub} fetch <url> {gitlink}), then rerun"
+        )
+    candidates: list[str] = []
+    configured = vcs._run(
+        source_repository, ["config", "--get", f"submodule.{name}.url"], check=False
+    )
+    if configured.returncode == 0 and configured.stdout.strip():
+        url = configured.stdout.strip()
+        resolved = Path(url)
+        if not resolved.is_absolute():
+            resolved = source_repository / resolved
+        if resolved.resolve() != common.resolve():
+            candidates.append(url)
+    origin = vcs._run(
+        source_sub, ["config", "--get", "remote.origin.url"], check=False
+    )
+    if origin.returncode == 0 and origin.stdout.strip():
+        if origin.stdout.strip() not in candidates:
+            candidates.append(origin.stdout.strip())
+    for url in candidates:
+        for fetch_args in (["fetch", "--no-tags", url, gitlink], ["fetch", "--no-tags", url]):
+            try:
+                vcs._run(
+                    source_sub,
+                    fetch_args,
+                    check=False,
+                    timeout_seconds=120,
+                    timeout_refusal=f"fetch of {gitlink} from {url} timed out",
+                    config=(
+                        ("http.lowSpeedLimit", "1024"),
+                        ("http.lowSpeedTime", "30"),
+                    ),
+                )
+            except Refusal:
+                pass  # Bounded fetch gave up; try the next candidate.
+            if present():
+                print(
+                    f"shared-submodule: fetched pinned commit {gitlink} for "
+                    f"{name} from {url} into {common}",
+                    file=sys.stderr,
+                )
+                return
+    raise Refusal(
+        f"shared submodule {name}: pinned commit {gitlink} is not in the "
+        f"module repository {common} and could not be fetched from "
+        f"{', '.join(candidates) or 'its configured URL'}; remedy: fetch it "
+        f"into the module repository (git -C {source_sub} fetch <url> "
+        f"{gitlink}), refresh the mirror that feeds it, then rerun"
+    )
+
+
+def _prefetch_pinned_submodule_commits(
+    vcs: _GitVcs, repository: Path, *, _depth: int = 0
+) -> None:
+    """Fetch pinned submodule commits lock-free, before create's locks (#1988).
+
+    Mirrors the read-only half of :func:`_share_checkout_submodules` on
+    the source checkouts, so the network work happens in create's
+    lock-free prepare; the locked share step then only re-checks
+    presence. Nested submodules are walked through the populated source
+    checkouts.
+    """
+
+    if _depth > 8:
+        return
+    for name, raw in _declared_submodules(vcs, repository):
+        relative = Path(raw)
+        if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+            continue
+        tree = vcs._run(repository, ["ls-tree", "-z", "HEAD", "--", raw], check=False)
+        fields = tree.stdout.split("\0")[0].split() if tree.returncode == 0 else []
+        if len(fields) < 3 or fields[1] != "commit":
+            continue
+        source_sub = repository / relative
+        state, _detail, common = _shared_module_prep_state(vcs, source_sub)
+        if state == "no-module" or common is None:
+            continue
+        _ensure_pinned_submodule_commit(
+            vcs, repository, source_sub, name, fields[2], common
+        )
+        if _submodule_worktree_populated(source_sub):
+            _prefetch_pinned_submodule_commits(vcs, source_sub, _depth=_depth + 1)
+
+
 def _share_checkout_submodules(
     vcs: _GitVcs,
     source_repository: Path,
@@ -46137,6 +46265,7 @@ def _share_checkout_submodules(
     *,
     _depth: int = 0,
     snapshots: list[_SharedConfigRollback] | None = None,
+    fetch_pinned: bool = True,
 ) -> list[str]:
     """Make ``slot_checkout``'s unpopulated submodules shared linked worktrees.
 
@@ -46169,7 +46298,7 @@ def _share_checkout_submodules(
             )
             if shared:
                 outcomes.extend(
-                    _share_checkout_submodules(vcs, source_sub, slot_sub, _depth=_depth + 1, snapshots=snapshots)
+                    _share_checkout_submodules(vcs, source_sub, slot_sub, _depth=_depth + 1, snapshots=snapshots, fetch_pinned=fetch_pinned)
                 )
             continue
         tree = vcs._run(slot_checkout, ["ls-tree", "-z", "HEAD", "--", raw], check=False)
@@ -46194,6 +46323,10 @@ def _share_checkout_submodules(
                 source_submodule=source_sub,
             )
             snapshots.append(entry)
+        _ensure_pinned_submodule_commit(
+            vcs, source_repository, source_sub, name, gitlink, common,
+            allow_fetch=fetch_pinned,
+        )
         changed = _prepare_shared_submodule_repo(vcs, source_sub)
         if entry is not None:
             if not changed:
@@ -46214,7 +46347,7 @@ def _share_checkout_submodules(
         )
         outcomes.append(f"{raw}: shared")
         outcomes.extend(
-            _share_checkout_submodules(vcs, source_sub, slot_sub, _depth=_depth + 1, snapshots=snapshots)
+            _share_checkout_submodules(vcs, source_sub, slot_sub, _depth=_depth + 1, snapshots=snapshots, fetch_pinned=fetch_pinned)
         )
     return outcomes
 
@@ -46225,6 +46358,7 @@ def _share_created_submodules(
     vcs: _GitVcs,
     *,
     snapshots: list[_SharedConfigRollback] | None = None,
+    fetch_pinned: bool = True,
 ) -> None:
     """Share submodules for every checkout ``create`` just added (#1206)."""
 
@@ -46234,7 +46368,7 @@ def _share_created_submodules(
         _relative, repository = _stored_repository_path(config, checkout.repository)
         path = _stored_path(config, checkout.path, "shared-submodule checkout path")
         for outcome in _share_checkout_submodules(
-            vcs, repository, path, snapshots=snapshots
+            vcs, repository, path, snapshots=snapshots, fetch_pinned=fetch_pinned
         ):
             print(
                 f"shared-submodule: checkout={checkout.name} submodule {outcome}",
@@ -48071,6 +48205,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
             states, archives = _validate_global_state(config)
             _assert_agent_and_slot_free(config, args.slot, args.agent, args.slot_type)
         repositories = _create_plan_repositories(config, args)
+        # #1988: fetch any pinned submodule commit the shared module
+        # repositories lack here, lock-free; the locked share step only
+        # re-checks presence (fetch_pinned=False at its call site).
+        for repository in repositories:
+            _prefetch_pinned_submodule_commits(vcs, repository)
         return _CreatePrevalidated(
             states=tuple(states),
             archives=tuple(archives),
@@ -48548,7 +48687,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
         with _rollback_shared_configs_on_failure(_config_snapshots, vcs, reset_progress=_reset_hook_progress) as _published:
             # #1206: share submodules before hooks run, so a hook's
             # `git submodule update --init` finds them populated and shared.
-            _share_created_submodules(config, created, vcs, snapshots=_config_snapshots)
+            _share_created_submodules(config, created, vcs, snapshots=_config_snapshots, fetch_pinned=False)
             hook_journal = _create_journal_payload(
                 config,
                 args,
@@ -78355,7 +78494,7 @@ def _recover_create(
         _write_journal(config, updated_journal, journal_path=path)
 
     with _rollback_shared_configs_on_failure(_config_snapshots, vcs, reset_progress=_reset_hook_progress) as _published:
-        _share_created_submodules(config, created, vcs, snapshots=_config_snapshots)
+        _share_created_submodules(config, created, vcs, snapshots=_config_snapshots, fetch_pinned=False)
         hook_progress = _run_post_provision_hooks(
             config,
             created,
