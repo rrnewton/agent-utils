@@ -6713,11 +6713,16 @@ def _assert_absent_validate_rows_not_held(config: Config, records: Sequence[Acti
             try:
                 for record in records:
                     entry = slots_index.get(record.slot)
+                    if not isinstance(entry, dict):
+                        # Absence from the index does not prove the
+                        # absence of a hold: unprovable, streamed path.
+                        scoped_complete = False
+                        break
                     scoped_holds[record.slot] = _scoped_slot_hold(
                         config,
                         config.machine,
                         record.slot,
-                        entry if isinstance(entry, dict) else {},
+                        entry,
                     )
             except (OSError, Refusal, StateError, ValueError):
                 scoped_complete = False
@@ -99709,6 +99714,7 @@ def _cmd_recover_absent_validate_rows(args: argparse.Namespace) -> int:
                     )
                     _write_journal(config, journal)
                     _interrupt_for_test("after-absent-validate-batch-journal")
+                    journal_proof = _history_tip_proof(config)
                     try:
                         _recover_absent_validate_rows(
                             config,
@@ -99720,13 +99726,15 @@ def _cmd_recover_absent_validate_rows(args: argparse.Namespace) -> int:
                             prepared=(prepared_states, prepared_archives),
                         )
                     except Refusal:
-                        # Same journal-release rule as the locked path
-                        # (#1554): release it only when every registry
-                        # row is unchanged.
-                        after_states, after_archives = (
-                            _validate_global_state_streamed(config)
-                        )
-                        if _global_rows(after_states, after_archives) == before:
+                        # Journal-release rule (#1554), judged by the
+                        # tip proof, never a replay under the locks
+                        # (owner rule): the journal is released only
+                        # when the recovery appended no event after
+                        # writing it. An unprovable proof keeps the
+                        # journal for recover.
+                        if journal_proof is not None and (
+                            _history_tip_proof(config) == journal_proof
+                        ):
                             _clear_journal(config, journal)
                         raise
                 _emit_absent_validate_outcomes(
@@ -99867,6 +99875,7 @@ def _cmd_recover_absent_validate_rows(args: argparse.Namespace) -> int:
                 journal = _absent_validate_batch_journal(config, input_sha256, planned, coordinator)
                 _write_journal(config, journal)
                 _interrupt_for_test("after-absent-validate-batch-journal")
+                journal_proof = _history_tip_proof(config)
                 try:
                     _recover_absent_validate_rows(
                         config,
@@ -99879,13 +99888,21 @@ def _cmd_recover_absent_validate_rows(args: argparse.Namespace) -> int:
                 except Refusal:
                     # A refusal that wrote nothing must not strand the
                     # journal it just wrote (#1554): release it only
-                    # when every registry row is unchanged, so a
-                    # refusal after any archive or ACTIVE write keeps
-                    # its journal for replay.
-                    after_states, after_archives = _validate_global_state_streamed(
-                        config
-                    )
-                    if _global_rows(after_states, after_archives) == before:
+                    # when the recovery appended no event after writing
+                    # it, judged by the tip proof, never a replay under
+                    # the locks (owner rule); a refusal after any
+                    # archive or ACTIVE write, or an unprovable proof,
+                    # keeps its journal for replay.
+                    if journal_proof is not None:
+                        unchanged = _history_tip_proof(config) == journal_proof
+                    else:
+                        after_states, after_archives = (
+                            _validate_global_state_streamed(config)
+                        )
+                        unchanged = (
+                            _global_rows(after_states, after_archives) == before
+                        )
+                    if unchanged:
                         _clear_journal(config, journal)
                     raise
                 after_states, after_archives = _validate_global_state_streamed(

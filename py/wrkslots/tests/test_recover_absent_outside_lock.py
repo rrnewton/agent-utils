@@ -187,6 +187,91 @@ def test_passing_row_holds_no_replay_under_the_locks(
     assert [row.slot for row in state.slots] == []
 
 
+def test_refusal_before_any_write_clears_the_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refusal that appended nothing releases its journal (#2125a)."""
+
+    project, record = _absent_project(tmp_path)
+    config = wrkslots._load_config(str(project), "testhost")
+    input_path = write_absent_validate_input(project, [record])
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    def refuse_append(*_args: object, **_kwargs: object) -> object:
+        raise wrkslots.Refusal("probe refusal before any write")
+
+    monkeypatch.setattr(
+        wrkslots, "_append_absent_validate_archives", refuse_append
+    )
+    assert run_absent_validate_recovery(project, input_path, apply=True) != 0
+    # Judged by the tip proof, with no replay under the locks: the
+    # recovery wrote nothing after its journal, so the journal is
+    # released and the row is exactly as it was.
+    assert not wrkslots._journal_path(config).exists()
+    state = wrkslots._load_active(config)
+    assert [row.slot for row in state.slots] == [record.slot]
+    archive = wrkslots._load_archive_snapshot(config)
+    assert [entry.get("slot") for entry in archive.records] == []
+
+
+def test_refusal_after_a_write_keeps_the_journal_for_recover(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refusal after the archive write keeps its journal (#2125a)."""
+
+    project, record = _absent_project(tmp_path)
+    config = wrkslots._load_config(str(project), "testhost")
+    input_path = write_absent_validate_input(project, [record])
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    original_removed = wrkslots._write_active_rows_removed
+
+    def refuse_removal(*_args: object, **_kwargs: object) -> object:
+        raise wrkslots.Refusal("probe refusal after the archive write")
+
+    monkeypatch.setattr(wrkslots, "_write_active_rows_removed", refuse_removal)
+    assert run_absent_validate_recovery(project, input_path, apply=True) != 0
+    # The archive append is durable, so the journal stays for replay:
+    # the row is both active and archived until the batch resumes.
+    assert wrkslots._journal_path(config).exists()
+    archive = wrkslots._load_archive_snapshot(config)
+    assert [entry.get("slot") for entry in archive.records] == [record.slot]
+    state = wrkslots._load_active(config)
+    assert [row.slot for row in state.slots] == [record.slot]
+
+    monkeypatch.setattr(wrkslots, "_write_active_rows_removed", original_removed)
+    assert run_absent_validate_recovery(project, input_path, apply=True) == 0
+    assert not wrkslots._journal_path(config).exists()
+    state = wrkslots._load_active(config)
+    assert [row.slot for row in state.slots] == []
+
+
+def test_missing_index_entry_is_unprovable_for_the_hold_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A slot absent from the index takes the streamed hold path (#2125b)."""
+
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    record = wrkslots._load_active_snapshot(config).slots[0]
+    wrkslots._event_writer(config, config.machine).append(
+        "slot-held", {"slot": record.slot, "reason": "probe"}
+    )
+    with pytest.raises(wrkslots.Refusal, match="is held"):
+        wrkslots._assert_absent_validate_rows_not_held(config, [record])
+    # Drop the slot from the event index: absence from the index does
+    # not prove the absence of a hold, so the check must fall back to
+    # the streamed fold, which still finds the hold and refuses.
+    index_path = config.control / f"EVENT-INDEX.{config.machine}.json"
+    index = json.loads(index_path.read_text())
+    index["slots"] = {}
+    index_path.write_text(json.dumps(index))
+    with pytest.raises(wrkslots.Refusal, match="is held"):
+        wrkslots._assert_absent_validate_rows_not_held(config, [record])
+
+
 def test_relocate_rereads_a_history_that_moved_before_the_locks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
