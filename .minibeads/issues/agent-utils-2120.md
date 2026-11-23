@@ -1,12 +1,13 @@
 ---
 title: 'agentctl-turnover-pin-recheck: re-read turnover pins right before touching each unit'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - agentctl
 created_at: 2026-11-22T11:25:00-05:00
-updated_at: 2026-11-22T11:25:00-05:00
+updated_at: 2026-11-23T03:26:59Z
+closed_at: 2026-11-23T03:26:59Z
 ---
 
 # Description

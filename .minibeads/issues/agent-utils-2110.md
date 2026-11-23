@@ -1,12 +1,13 @@
 ---
 title: 'agentctl-turnover-snapshot-build-race: the daily turnover keeps finding a half-built snapshot and refusing'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - agentctl
 created_at: 2026-11-22T10:10:00-05:00
-updated_at: 2026-11-22T10:10:00-05:00
+updated_at: 2026-11-23T03:26:59Z
+closed_at: 2026-11-23T03:26:59Z
 ---
 
 # Description
