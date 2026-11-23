@@ -29,7 +29,9 @@ The real off-limits path is host-local configuration only. It never appears in t
 
 4. Fail closed. If masking cannot be set up (namespace creation refused, a masked path cannot be covered, or the empty-directory mount fails), the launch refuses with a clear message and nothing is launched. There is no silent unmasked fallback.
 
-5. Interim watch guard. Until masking is enabled on a profile, `agentctl watch` flags any process in a managed session's pane process tree whose working directory is under a masked path, with one notice per process rather than a flood.
+5. Interim watch guard. Until masking is enabled on a profile, `agentctl watch` flags any process in a managed session's scope (its cgroup or process tree, including MCP server children and build daemons the harness started) whose working directory is under a masked path, attributed to that session, with one notice per process rather than a flood.
+
+6. Session environment. A launch profile can set environment variables for the session (the existing profile `env` support) and can also unset variables for the session, so a trial profile can remove or repoint a variable that names a large source-tree root instead of letting plugins default to an off-limits path. MCP server children inherit the mask because the whole harness process tree starts inside the namespace; they inherit this session environment the same way.
 
 # Acceptance Criteria
 
@@ -37,10 +39,13 @@ The real off-limits path is host-local configuration only. It never appears in t
 - Masking applies on `start`, `run-headless`, `revive`, `restore`, `restart` and the services turnover relaunch; a per-agent override in the record wins over the profile, and `agentctl status` shows the declared and effective masks.
 - A launch whose masking cannot be set up refuses with a clear message and launches nothing; a profile without `masked_paths` launches exactly as before.
 - Throwaway-session checks prove each harness still works inside the namespace: Claude Code, Codex and Muse (including its own sandbox), plus Herdr panes, ssh to GitHub through herdr-run, `git`, `cargo`, and an Eden-backed path where one is present. Any harness that breaks is recorded here and the key stays opt-in per profile until all pass.
-- `agentctl watch` flags a managed session's process whose working directory is under a masked path, once per process.
+- `agentctl watch` flags a process in a managed session's scope (cgroup or process tree, MCP servers and build daemons included) whose working directory is under a masked path, attributed to the session, once per process.
 - Tests are hermetic (a temporary directory stands in for the masked path, with no reliance on any real checkout) and use no wall-clock budgets. New test files are classified in `validation/components.json`.
 - `common/docs/agentctl/harness-support-matrix.md` is updated in the same commit if per-harness support differs.
 - Ordering with #2164 agent-utils-node-outside-owner-checkout: this issue is blocked by #2164 (`mb dep`: agent-utils-2163 depends on agent-utils-2164), and masking is enabled on no real profile until #2164 is live. Before any lane, gate or deploy script runs with the mask, the vibe-talk page build and a deploy-style build both run successfully with the mask ON, using only a node from outside every off-limits path.
+- MCP inheritance: in a throwaway trial, a harness started with the mask and with an MCP server shows that server a masked path as empty (the server cannot list, enter or build inside it), proving MCP server children inherit the mask from the harness process tree.
+- Watch scope: the interim census flags any process in a managed session's scope (cgroup or process tree, MCP servers and build daemons included) whose working directory is under a masked path, attributed to the session, once per process.
+- Session environment: a profile can set and can unset environment variables for the session; the trial profile unsets a variable that names a large source-tree root (or points it at the lane's own checkout), so plugins do not default to an off-limits path.
 
 # Notes
 
