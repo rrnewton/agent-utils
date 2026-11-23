@@ -44,3 +44,21 @@ operator only. The Rust port follows this Python spec separately.
 # Notes
 
 P0: it blocks every validation launch host-wide. Filed by the coordinator from a consumer report.
+
+## Rust port sequencing (mu-rustwrk, 2026-11-23)
+
+The Python decision landed as 919e765f (plus follow-up 47bbea00) and is
+the spec for the Rust port, but the port is NOT a standalone slice: it
+is sequenced INSIDE the validate-removal writer flip (seals first).
+Premise check on current Rust: there is no consuming gate to wire -
+_finish_remove_paths/private_cleanup has no Rust port (no
+census_captured_here, seal rollback, or CensusState/
+_CensusDidNotClose type), validate-slot removal itself stays Python
+(remove_write refuses non-agent slots; recover_validate defers
+validation censuses), and the Rust census capture returns
+Result<_, String>, discarding authenticated matches on non-closure,
+so the substitute-only-when-no-matches rule is inexpressible. The
+writer flip must therefore first port the finish-remove/seal-recovery
+path plus a structured census error carrying the found matches;
+member-use proof itself needs no new persisted state (owner
+cgroup_path is already recorded).
