@@ -609,8 +609,8 @@ export function summarySearchMatches(text: string, words: readonly string[]): bo
 /** One summary row for search: its topic heading and its rendered row. */
 export interface SummarySearchRow {
   heading: string;
-  /** The row's sanitized HTML (its citation anchors intact); empty draws `text`. */
-  html: string;
+  /** A clone of the row's rendered element (its citation anchors intact); null draws `text`. */
+  row: unknown;
   text: string;
 }
 
@@ -622,7 +622,7 @@ export function summarySearchRows(answer: CatchupAnswer): SummarySearchRow[] {
   const rows: SummarySearchRow[] = [];
   if (answer.text_html !== "") {
     const host = document.createElement("div");
-    insertSanitizedHtml(host as HTMLElement, answer.text_html);
+    insertSanitizedHtml(host, answer.text_html);
     let heading = "";
     const walk = (node: HTMLElement): void => {
       for (const kid of Array.from(node.children ?? [])) {
@@ -633,13 +633,13 @@ export function summarySearchRows(answer: CatchupAnswer): SummarySearchRow[] {
           continue;
         }
         if (tag === "li" || tag === "p") {
-          rows.push({ heading, html: String((el as { outerHTML?: string }).outerHTML ?? ""), text: String(el.textContent ?? "") });
+          rows.push({ heading, row: el.cloneNode(true), text: String(el.textContent ?? "") });
           continue;
         }
         walk(el);
       }
     };
-    walk(host as HTMLElement);
+    walk(host);
     return rows;
   }
   let heading = "";
@@ -652,7 +652,7 @@ export function summarySearchRows(answer: CatchupAnswer): SummarySearchRow[] {
       continue;
     }
     const text = trimmed.replace(/^[-*]\s+/, "");
-    rows.push({ heading, html: "", text });
+    rows.push({ heading, row: null, text });
   }
   return rows;
 }
@@ -1900,7 +1900,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       item.appendChild(place);
       const body = document.createElement("div");
       body.className = "discuss-search-body";
-      if (hit.html !== "") insertSanitizedHtml(body, hit.html);
+      if (hit.row !== null && hit.row !== undefined) body.appendChild(hit.row as Node);
       else body.textContent = hit.text;
       item.appendChild(body);
       list.appendChild(item);
