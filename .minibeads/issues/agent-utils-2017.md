@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-hooks-per-slot-type: post-provision hooks have no per-slot-type selection or skip condition'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
@@ -43,3 +43,7 @@ rolling the create back. Failures fall back to the coordinator route;
 `--coordinator-pid` is otherwise optional at parse time and recover
 refuses with the omission rule named. Covered by
 `py/wrkslots/tests/test_recover_abort_own.py`.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as 51815992 (the abort-own change) and 71144377 (the test classification). `recover --slot X --abort-create` may now omit `--coordinator-pid`: the caller proves itself against the recorded create journal's owner (`_assert_caller_process` on the journal's process identity), so the lane that ran the create can roll it back without a coordinator in its ancestry; anything else still refuses with the coordinator route named, and `--coordinator-pid` is parse-optional only for this path. The per-slot-type hook half already existed (#1122, `{command, slot_types}` entries honoured by `_post_provision_hooks_for`). Regression: `py/wrkslots/tests/test_recover_abort_own.py` (own abort succeeds, foreign-owner refusal), strict mypy clean. Gate on 8920e81a was red only on untouched CPU-timeout/census/browser families and #2158 (fixed on main after the gate's base); landed by the coordinator's waiver through a verified-overlap replay whose landed tree 5988a18e was confirmed.
