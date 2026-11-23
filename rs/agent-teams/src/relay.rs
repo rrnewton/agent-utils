@@ -3520,17 +3520,13 @@ mod tests {
 
     #[test]
     fn post_argv_leaves_no_relay_temp_dir_on_success_or_failure() {
-        let dir =
-            std::env::temp_dir().join(format!("agent-teams-relay-{}", std::process::id()));
-        let ok = run_post_argv(
-            &["/bin/true".to_string()],
-            "chan",
-            "thread",
-            "msg",
-            "hello",
-        );
+        let dir = std::env::temp_dir().join(format!("agent-teams-relay-{}", std::process::id()));
+        let ok = run_post_argv(&["/bin/true".to_string()], "chan", "thread", "msg", "hello");
         assert!(ok.is_ok(), "{ok:?}");
-        assert!(!dir.exists(), "relay temp dir leaked after success: {dir:?}");
+        assert!(
+            !dir.exists(),
+            "relay temp dir leaked after success: {dir:?}"
+        );
         let err = run_post_argv(
             &["/bin/false".to_string()],
             "chan",
@@ -3539,7 +3535,10 @@ mod tests {
             "hello",
         );
         assert!(err.is_err());
-        assert!(!dir.exists(), "relay temp dir leaked after failure: {dir:?}");
+        assert!(
+            !dir.exists(),
+            "relay temp dir leaked after failure: {dir:?}"
+        );
         let missing = run_post_argv(
             &["/nonexistent-agent-teams-helper".to_string()],
             "chan",
