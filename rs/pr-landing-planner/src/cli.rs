@@ -1344,8 +1344,16 @@ Summary
             "d27eb7ba5d54d4f2cd2a94fcfa9feff8cb71d4cdf39224600b76dc52b5ff6213",
             "command-priority bytes drift"
         );
-        let rejects: [(&str, &[&str]); 5] = [
-            ("missing-command", &["--priority-source", "command"]),
+        // The differential compared stderr exactly for these rejects; the
+        // frozen stderr strings below pin the priority error wording (the
+        // `#14` is the last PR of the frozen representative fixture, whose
+        // failed priority resolution is the one that surfaces).
+        let rejects: [(&str, &[&str], &str); 5] = [
+            (
+                "missing-command",
+                &["--priority-source", "command"],
+                "pr-landing-planner: command priority source requires a non-empty command\n",
+            ),
             (
                 "missing-label-capture",
                 &[
@@ -1354,6 +1362,7 @@ Summary
                     "--priority-label-pattern",
                     "^p[0-9]+$",
                 ],
+                "pr-landing-planner: priority label pattern must contain a capture group\n",
             ),
             (
                 "overflow-command-output",
@@ -1363,10 +1372,12 @@ Summary
                     "--priority-cmd",
                     "printf 9223372036854775808",
                 ],
+                "pr-landing-planner: priority command for #14 did not print a signed 64-bit ASCII integer\n",
             ),
             (
                 "failed-command",
                 &["--priority-source", "command", "--priority-cmd", "exit 9"],
+                "pr-landing-planner: priority command for #14 exited 9\n",
             ),
             (
                 "hook-launch-failure",
@@ -1378,9 +1389,10 @@ Summary
                     "--net-wrapper",
                     "/definitely/missing-priority-wrapper",
                 ],
+                "pr-landing-planner: priority command failed to start for #14\n",
             ),
         ];
-        for (label, extra) in rejects {
+        for (label, extra, expected_stderr) in rejects {
             let mut args = vec![
                 "plan",
                 "--fixture",
@@ -1391,6 +1403,10 @@ Summary
             args.extend_from_slice(extra);
             let (code, _, stderr) = invoke(&args);
             assert_eq!(code, 2, "reject:priority/{label} must exit 2: {stderr}");
+            assert_eq!(
+                stderr, expected_stderr,
+                "reject:priority/{label} stderr drift"
+            );
         }
         let _ = fs::remove_file(fixture);
         let _ = fs::remove_file(context);
@@ -1567,8 +1583,13 @@ Summary
     #[test]
     fn review_evidence_dispositions_match_differential() {
         // G7 (CLI half): replaces the case-12 disposition rows. The digest
-        // golden itself is pinned in context::tests; semantics for the
-        // same-timestamp / BY-claim / Unicode matrix stay in context.rs.
+        // golden itself is pinned in context::tests and re-asserted here as
+        // the emitted value; the rows below pin the CLI dispositions
+        // (held <=> `wait` vs unheld <=> `land-now`, exit 2 where the
+        // differential required it) for the no-retirement, unavailable,
+        // same-timestamp, BY-claim / Unicode, and chronological-withdrawal
+        // matrices. Digest-level semantics for those variants stay in
+        // context.rs.
         let fixture = temp_file("review.json", REVIEW_FIXTURE);
         let fixture_arg = fixture.to_string_lossy().into_owned();
         // Probe only: emitted digest is the frozen oracle value; PR stays held.
@@ -1586,6 +1607,9 @@ Summary
             "emitted digest must equal the frozen Python-oracle golden"
         );
         assert_eq!(parsed["nodes"][0]["held"], true);
+        // reject:no-retirement-authority: with no landing context the
+        // objection stays held and the action is `wait`, never landable.
+        assert_eq!(parsed["plan"]["per_pr_actions"][0]["action"], "wait");
         // Exact context: unheld and land-now.
         let head = "a".repeat(40);
         let context_body = serde_json::json!({"prs": [{
@@ -1655,6 +1679,353 @@ Summary
         assert_eq!(parsed["nodes"][0]["review_evidence_unavailable"], true);
         assert_eq!(parsed["nodes"][0]["held"], true);
         assert_eq!(parsed["plan"]["per_pr_actions"][0]["action"], "wait");
+
+        // ---- Variant disposition rows (case 12 remainder) ----
+        // Held nodes must pair with `wait`; resolved nodes with `land-now`;
+        // a stale resolution context must refuse with exit 2.
+        fn disposition(stdout: &str, pr: i64) -> (bool, String) {
+            let parsed: Value = serde_json::from_str(stdout).unwrap();
+            let held = parsed["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|node| node["pr"] == pr)
+                .unwrap()["held"]
+                .as_bool()
+                .unwrap();
+            let action = parsed["plan"]["per_pr_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|decision| decision["pr"] == pr)
+                .unwrap()["action"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            (held, action)
+        }
+        fn variant_outcome(
+            name: &str,
+            doc: &Value,
+            context_arg: Option<&str>,
+        ) -> (i32, String, String, PathBuf) {
+            let path = temp_file(name, &doc.to_string());
+            let path_arg = path.to_string_lossy().into_owned();
+            let mut args = vec!["plan", "--fixture", path_arg.as_str()];
+            if let Some(context) = context_arg {
+                args.push("--landing-context");
+                args.push(context);
+            }
+            args.push("--format");
+            args.push("json");
+            let (code, stdout, stderr) = invoke(&args);
+            (code, stdout, stderr, path)
+        }
+        let review_doc: Value = serde_json::from_str(REVIEW_FIXTURE).unwrap();
+
+        // No retirement authority: a withdrawal with no actor permission
+        // stays visible and held; a read-only retirement refuses (exit 2).
+        let mut no_authority = review_doc.clone();
+        no_authority["prs"][0]["review_events"][1]["retirement_actor_permission"] =
+            serde_json::json!("");
+        let (code, out, stderr, path) =
+            variant_outcome("review-no-authority.json", &no_authority, None);
+        assert_eq!(code, 0, "{stderr}");
+        assert_eq!(disposition(&out, 394), (true, "wait".to_owned()));
+        let _ = fs::remove_file(path);
+        let mut read_only = review_doc.clone();
+        read_only["prs"][0]["review_events"][1]["retirement_actor_permission"] =
+            serde_json::json!("read");
+        let (code, _, stderr, path) = variant_outcome("review-read-only.json", &read_only, None);
+        assert_eq!(code, 2, "read-only retirement must exit 2: {stderr}");
+        let _ = fs::remove_file(path);
+
+        // Unavailable evidence before a base conflict (local paths or the
+        // GitHub CONFLICTING state) still waits under hard-green authority.
+        for (label, field, value) in [
+            (
+                "local",
+                "base_conflict_paths",
+                serde_json::json!(["src/conflict.rs"]),
+            ),
+            ("github", "mergeable", serde_json::json!("CONFLICTING")),
+        ] {
+            let mut pr = serde_json::json!({
+                "number": 1,
+                "title": "review evidence unavailable with base conflict",
+                "head_ref": "green",
+                "head_sha": "sha-1",
+                "review_decision": "APPROVED",
+                "review_evidence_unavailable": true,
+                "changed_files": ["src/a.rs"],
+                "checks": [{"name": "merge-gate", "status": "COMPLETED", "conclusion": "SUCCESS"}],
+            });
+            pr[field] = value;
+            let doc = serde_json::json!({"repo": "OWNER/NAME", "base": "main", "prs": [pr]});
+            let (code, out, stderr, path) = variant_outcome(
+                &format!("review-unavailable-{label}.json"),
+                &doc,
+                Some(authority_arg.as_str()),
+            );
+            assert_eq!(code, 0, "{stderr}");
+            let parsed: Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(parsed["nodes"][0]["review_evidence_unavailable"], true);
+            assert_eq!(disposition(&out, 1), (true, "wait".to_owned()));
+            let _ = fs::remove_file(path);
+        }
+
+        // Same-timestamp mutations invalidate the resolution context.
+        for (label, field, value) in [
+            ("body-change", "body", Value::from("changed objection text")),
+            ("state-change", "state", Value::from("ACTIVE")),
+            ("event-head-change", "head_sha", Value::from("b".repeat(40))),
+            (
+                "creation-time-change",
+                "created_at",
+                Value::from("2026-09-04T11:59:59Z"),
+            ),
+            (
+                "version-time-change",
+                "updated_at",
+                Value::from("2026-09-04T12:00:01Z"),
+            ),
+            (
+                "edit-time-change",
+                "last_edited_at",
+                Value::from("2026-09-04T12:00:01Z"),
+            ),
+        ] {
+            let mut doc = review_doc.clone();
+            doc["prs"][0]["review_events"][2][field] = value;
+            let (code, _, stderr, path) = variant_outcome(
+                &format!("review-same-timestamp-{label}.json"),
+                &doc,
+                Some(context_arg.as_str()),
+            );
+            assert_eq!(code, 2, "same-timestamp {label} must exit 2: {stderr}");
+            let _ = fs::remove_file(path);
+        }
+        let mut objection = review_doc.clone();
+        objection["prs"][0]["review_events"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "kind": "review-comment",
+                "identity": "thread-2",
+                "author": "reviewer",
+                "state": "ACTIVE",
+                "head_sha": "",
+                "created_at": "2026-09-04T12:00:00Z",
+                "updated_at": "2026-09-04T12:00:00Z",
+                "last_edited_at": "",
+                "body": "new objection in the same timestamp tick",
+                "retirement_actor_permission": "",
+            }));
+        let (code, _, stderr, path) = variant_outcome(
+            "review-same-timestamp-objection.json",
+            &objection,
+            Some(context_arg.as_str()),
+        );
+        assert_eq!(code, 2, "same-timestamp objection must exit 2: {stderr}");
+        let _ = fs::remove_file(path);
+
+        // A false `BY` claim is metadata: the withdrawal still resolves.
+        for claimed in ["another-agent", "another_agent", "another.agent", "K"] {
+            let mut doc = review_doc.clone();
+            let body = doc["prs"][0]["review_events"][1]["body"]
+                .as_str()
+                .unwrap()
+                .replace("BY release-authority", &format!("BY {claimed}"));
+            doc["prs"][0]["review_events"][1]["body"] = Value::from(body);
+            let (code, out, stderr, path) = variant_outcome(
+                &format!("review-false-by-{claimed}.json"),
+                &doc,
+                Some(context_arg.as_str()),
+            );
+            assert_eq!(code, 0, "false BY {claimed}: {stderr}");
+            assert_eq!(disposition(&out, 394), (false, "land-now".to_owned()));
+            let _ = fs::remove_file(path);
+        }
+
+        // Non-ASCII identities are not metadata: they change the digest and
+        // invalidate the resolution context (exit 2).
+        for (label, identity) in [
+            ("kelvin", "\u{212a}"),
+            ("dotted-i", "\u{130}"),
+            ("dotless-i", "\u{131}"),
+            ("long-s", "\u{17f}"),
+        ] {
+            let mut doc = review_doc.clone();
+            let body = doc["prs"][0]["review_events"][1]["body"]
+                .as_str()
+                .unwrap()
+                .replace("BY release-authority", &format!("BY {identity}"));
+            doc["prs"][0]["review_events"][1]["body"] = Value::from(body);
+            let (code, _, stderr, path) = variant_outcome(
+                &format!("review-non-ascii-by-{label}.json"),
+                &doc,
+                Some(context_arg.as_str()),
+            );
+            assert_eq!(code, 2, "non-ASCII BY {label} must exit 2: {stderr}");
+            let _ = fs::remove_file(path);
+        }
+        let mut disclosure = review_doc.clone();
+        let body = disclosure["prs"][0]["review_events"][1]["body"]
+            .as_str()
+            .unwrap()
+            .replace("[team, release-authority,", "[team, \u{212a},");
+        disclosure["prs"][0]["review_events"][1]["body"] = Value::from(body);
+        let (code, _, stderr, path) = variant_outcome(
+            "review-non-ascii-disclosure.json",
+            &disclosure,
+            Some(context_arg.as_str()),
+        );
+        assert_eq!(code, 2, "non-ASCII disclosure must exit 2: {stderr}");
+        let _ = fs::remove_file(path);
+        let mut who = review_doc.clone();
+        for event in who["prs"][0]["review_events"].as_array_mut().unwrap() {
+            let body = format!(
+                "{}\nUnverified --who metadata: \u{212a}",
+                event["body"].as_str().unwrap()
+            );
+            event["body"] = Value::from(body);
+        }
+        let (code, _, stderr, path) = variant_outcome(
+            "review-non-ascii-who.json",
+            &who,
+            Some(context_arg.as_str()),
+        );
+        assert_eq!(code, 2, "non-ASCII --who metadata must exit 2: {stderr}");
+        let _ = fs::remove_file(path);
+        let mut nbsp = review_doc.clone();
+        let body = nbsp["prs"][0]["review_events"][1]["body"]
+            .as_str()
+            .unwrap()
+            .replace("BY release-authority", "BY\u{a0}release-authority");
+        nbsp["prs"][0]["review_events"][1]["body"] = Value::from(body);
+        let (code, _, stderr, path) =
+            variant_outcome("review-nbsp-by.json", &nbsp, Some(context_arg.as_str()));
+        assert_eq!(code, 2, "NBSP in BY must exit 2: {stderr}");
+        let _ = fs::remove_file(path);
+
+        // Chronological withdrawal (no RETIRES line): held without a
+        // resolution context, landable with the exact one, held again with
+        // a false one, and refused for a stale head (exit 2).
+        let live_head = "58bf4f5c17880395400ab3cb6482d0de2ee03a84";
+        let refused_head = "c3a85da26110fd8dfc31433c8d4109726127703b";
+        let repaired_head = "2a18b7bea06cf66f5cf4a973466afa506c0bd2a4";
+        let chrono_event = |identity: &str, at: &str, body: String| {
+            serde_json::json!({
+                "kind": "issue-comment",
+                "identity": identity,
+                "author": "example-user",
+                "state": "ACTIVE",
+                "head_sha": "",
+                "created_at": at,
+                "updated_at": at,
+                "last_edited_at": "",
+                "body": body,
+                "retirement_actor_permission": "",
+            })
+        };
+        let chrono_doc = serde_json::json!({
+            "repo": "R",
+            "base": "main",
+            "prs": [{
+                "number": 394,
+                "head_sha": live_head,
+                "review_decision": "",
+                "review_snapshot_review_decision": "",
+                "updated_at": "2026-09-04T12:00:00Z",
+                "review_events": [
+                    chrono_event(
+                        "comment-5545346256",
+                        "2026-09-04T19:14:42Z",
+                        format!("[team, review-cpuid, unresolved, build-host, role=reviewer]\n# Exact-head adversarial review\n\nCHANGES-REQUESTED-AT: claude {refused_head}\n\nMajor: the backend disagreement remains."),
+                    ),
+                    chrono_event(
+                        "comment-5552679512",
+                        "2026-09-05T15:03:48Z",
+                        format!("[team, review-cpuid, unresolved, build-host, role=reviewer]\n# Reassessment at the repaired head\n\nCHANGES-REQUESTED-WITHDRAWN-AT: claude {repaired_head}\n\nAPPROVED-AT: claude {repaired_head}\n\nIt is retired: the objection is met on the mechanism."),
+                    ),
+                    chrono_event(
+                        "comment-5552753110",
+                        "2026-09-05T15:16:26Z",
+                        format!("[team, review-cpuid, unresolved, build-host, role=reviewer]\n# Rebind to the rebased head\n\nAPPROVED-AT: claude {live_head}\n\nMy refusal from the earlier head stays retired."),
+                    ),
+                ],
+                "checks": [{"name": "merge-gate", "status": "COMPLETED", "conclusion": "SUCCESS"}],
+            }],
+        });
+        let (code, out, stderr, path) =
+            variant_outcome("review-chronological.json", &chrono_doc, None);
+        assert_eq!(code, 0, "{stderr}");
+        assert_eq!(disposition(&out, 394), (true, "wait".to_owned()));
+        let chrono_parsed: Value = serde_json::from_str(&out).unwrap();
+        let chrono_digest = chrono_parsed["nodes"][0]["review_evidence_digest"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let _ = fs::remove_file(path);
+        let chrono_context = temp_file(
+            "review-chronological-context.json",
+            &serde_json::json!({"prs": [{
+                "pr": 394,
+                "head_sha": live_head,
+                "review_objections_resolved": true,
+                "review_evidence_digest": chrono_digest,
+            }]})
+            .to_string(),
+        );
+        let chrono_context_arg = chrono_context.to_string_lossy().into_owned();
+        let (code, out, stderr, path) = variant_outcome(
+            "review-chronological.json",
+            &chrono_doc,
+            Some(chrono_context_arg.as_str()),
+        );
+        assert_eq!(code, 0, "{stderr}");
+        assert_eq!(disposition(&out, 394), (false, "land-now".to_owned()));
+        let _ = fs::remove_file(path);
+        let false_context = temp_file(
+            "review-chronological-false-context.json",
+            &serde_json::json!({"prs": [{
+                "pr": 394,
+                "head_sha": live_head,
+                "review_objections_resolved": false,
+            }]})
+            .to_string(),
+        );
+        let false_context_arg = false_context.to_string_lossy().into_owned();
+        let (code, out, stderr, path) = variant_outcome(
+            "review-chronological.json",
+            &chrono_doc,
+            Some(false_context_arg.as_str()),
+        );
+        assert_eq!(code, 0, "{stderr}");
+        assert_eq!(disposition(&out, 394), (true, "wait".to_owned()));
+        let _ = fs::remove_file(path);
+        let stale_context = temp_file(
+            "review-chronological-stale-context.json",
+            &serde_json::json!({"prs": [{
+                "pr": 394,
+                "head_sha": repaired_head,
+                "review_objections_resolved": true,
+                "review_evidence_digest": chrono_parsed["nodes"][0]["review_evidence_digest"],
+            }]})
+            .to_string(),
+        );
+        let stale_context_arg = stale_context.to_string_lossy().into_owned();
+        let (code, _, stderr, path) = variant_outcome(
+            "review-chronological.json",
+            &chrono_doc,
+            Some(stale_context_arg.as_str()),
+        );
+        assert_eq!(code, 2, "stale chronological head must exit 2: {stderr}");
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(chrono_context);
+        let _ = fs::remove_file(false_context);
+        let _ = fs::remove_file(stale_context);
+
         let _ = fs::remove_file(fixture);
         let _ = fs::remove_file(context);
         let _ = fs::remove_file(wrong);
