@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-discuss-followup-prompt-and-labels: follow-up answers restate owner messages and look like the question'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -27,3 +27,7 @@ In the Discuss timeline, a follow-up question is followed by an answer line that
 # Notes
 
 Owner UI request (fast-track); filed by the coordinator from the thread 323 code audit.
+
+## Resolution
+
+Landed on main as b1ef2c40 (follow-up-specific system prompt; verbatim question in the folded header; You / Discuss labels) and 73892095 (label on its own small line), deployed 2026-11-23. Server test through the real router asserts the follow-up prompt; page tests and scene-84 screenshots (phone and desktop, light and dark) show the labelled pair.
