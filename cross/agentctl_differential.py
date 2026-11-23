@@ -85,6 +85,10 @@ def _normalize(value: object, conversations: set[str] | None = None) -> object:
     if isinstance(value, list):
         return [_normalize(item, conversations) for item in value]
     if isinstance(value, dict):
+        # `native_session_duplicates` is a Rust-only doctor key (#2124,
+        # owner decision 326: no Python parity cycle); it is excluded
+        # from the compared form and pinned per edition in the identity
+        # group instead.
         return {str(key): ("<TOKEN>" if key == "token" else 0 if key in ("created_at", "captured_at", "until", "expires", "created")
                           else "<ET>" if key == "until_et"
                           else "<PROCESS_IDENTITY>" if key == "custom_process_identity"
@@ -102,7 +106,7 @@ def _normalize(value: object, conversations: set[str] | None = None) -> object:
                           # Native identity diagnostics use edition-specific quote styles.
                           else re.sub(r'"([a-z][a-z0-9-]*)"', r"'\1'", item)
                           if key == "probe_error" and isinstance(item, str) else _normalize(item, conversations))
-                for key, item in value.items()}
+                for key, item in value.items() if key != "native_session_duplicates"}
     return value
 
 
@@ -3294,7 +3298,17 @@ def _identity_and_rename(harness: Harness, report: Report) -> None:
                    and status["harness_identity"].get("pid") == "<PID>"
                    and status["harness_identity"].get("version") == 1,
                    f"start did not pin terminal and harness: {status!r}")
-    _pair(harness, report, case, "identity/doctor-clean", ("doctor", *common))
+    doctor_python, doctor_rust = _pair(harness, report, case, "identity/doctor-clean", ("doctor", *common))
+    # #2124 (owner decision 326): `native_session_duplicates` is an
+    # intended Rust-only doctor key, excluded from the compared form in
+    # `_normalize`; pin its presence per edition here instead.
+    report.require(
+        "identity/doctor-native-session-duplicates-rust-only",
+        isinstance(doctor_report := json.loads(doctor_rust.stdout), dict)
+        and doctor_report.get("native_session_duplicates") == []
+        and "native_session_duplicates" not in json.loads(doctor_python.stdout),
+        f"doctor's Rust-only duplicates key diverged: python={doctor_python!r} rust={doctor_rust!r}",
+    )
     _pair(harness, report, case, "identity/rename", ("rename", "worker", "reviewer", *common))
     report.require("identity/rename-presentation", all(
         _state(root).get("name") == "reviewer" and _state(root).get("tab_label") == "reviewer"

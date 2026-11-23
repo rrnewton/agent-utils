@@ -5,6 +5,139 @@ fn rotated(fixture: &Fixture) {
         Some((Some("codex".into()), Some("compacted-session".into())));
 }
 
+/// A Codex seat the pane reported no session for, anchored for follow (#2124).
+fn unreported_codex(fixture: &Fixture) {
+    fixture
+        .client
+        .report_session
+        .store(false, Ordering::Relaxed);
+    fixture.adopt();
+    let manager = fixture.manager();
+    manager.anchor("foreign", false, None).unwrap();
+    let record = manager.read_record("foreign").unwrap();
+    assert!(record.native_session.is_none(), "{record:?}");
+    assert!(record.session_value.is_none(), "{record:?}");
+    fixture.client.command_lines.lock().unwrap().insert(
+        record.harness_identity.as_ref().unwrap().pid,
+        vec!["/opt/bin/codex".into()],
+    );
+}
+
+struct PretendHeldFiles;
+impl Drop for PretendHeldFiles {
+    fn drop(&mut self) {
+        crate::subagents::revive::HELD_FILES.with(|cell| *cell.borrow_mut() = None);
+    }
+}
+#[must_use]
+fn pretend_held_files(files: Vec<PathBuf>) -> PretendHeldFiles {
+    crate::subagents::revive::HELD_FILES.with(|cell| *cell.borrow_mut() = Some(files));
+    PretendHeldFiles
+}
+
+#[test]
+fn session_follow_captures_an_initial_codex_session_from_the_pane_report() {
+    // #2124: a seat that named no session at start is observed after its
+    // first turn from the pinned pane's own report, as a rotation is.
+    let fixture = Fixture::new();
+    unreported_codex(&fixture);
+    let manager = fixture.manager();
+    // After the first turn the pane reports its session (the fixture
+    // reports none at all while `report_session` is off).
+    fixture.client.report_session.store(true, Ordering::Relaxed);
+    *fixture.client.session_override.lock().unwrap() =
+        Some((Some("codex".into()), Some("initial-thread".into())));
+    assert!(manager.follow_observed_session("foreign").unwrap());
+    let updated = manager.read_record("foreign").unwrap();
+    let native = updated.native_session.clone().expect("initial capture");
+    assert_eq!(native.value, "initial-thread");
+    assert_eq!(native.source, "observed");
+    assert_eq!(updated.session_value.as_deref(), Some("initial-thread"));
+    assert_eq!(
+        updated.launch_spec.as_ref().unwrap()["native_session"]["value"],
+        "initial-thread"
+    );
+    assert!(!manager.follow_observed_session("foreign").unwrap());
+}
+
+#[test]
+fn session_follow_captures_an_initial_codex_session_from_the_held_rollout() {
+    // #2124: the pane reports nothing yet, so the rollout the pinned
+    // process itself holds is the observer, as at start. No cwd
+    // discovery is involved.
+    let fixture = Fixture::new();
+    unreported_codex(&fixture);
+    let manager = fixture.manager();
+    let id = "22222222-2222-4222-8222-222222222222";
+    let dir = fixture.root.join("codex-home/sessions/2026/11/06");
+    fs::create_dir_all(&dir).unwrap();
+    let rollout = dir.join(format!("rollout-2026-11-06T00-00-00-{id}.jsonl"));
+    fs::write(
+        &rollout,
+        format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\"}}}}\n"),
+    )
+    .unwrap();
+    let _held = pretend_held_files(vec![rollout]);
+    assert!(manager.follow_observed_session("foreign").unwrap());
+    let updated = manager.read_record("foreign").unwrap();
+    assert_eq!(
+        updated.native_session.as_ref().unwrap().value,
+        id,
+        "{updated:?}"
+    );
+    assert_eq!(updated.native_session.as_ref().unwrap().source, "observed");
+}
+
+#[test]
+fn session_follow_initial_capture_refuses_a_session_claimed_by_an_archived_peer() {
+    // #2124: two Codex seats, one cwd: the session belongs to an
+    // archived peer, so initial capture refuses and writes nothing.
+    let fixture = Fixture::new();
+    unreported_codex(&fixture);
+    let manager = fixture.manager();
+    let mut peer = manager.read_record("foreign").unwrap();
+    peer.name = "peer-seat".to_owned();
+    peer.token = "peer-token".to_owned();
+    peer.lifecycle = "stopped".to_owned();
+    peer.native_session = Some(NativeSession::new("codex", "claimed-thread", "observed"));
+    peer.session_agent = Some("codex".to_owned());
+    peer.session_value = Some("claimed-thread".to_owned());
+    let archive = fixture.root.join("registry/archive");
+    agent::create_private_directory(&archive, "test agent archive", false, false).unwrap();
+    let dir = archive.join("peer-seat-peer-token");
+    agent::create_private_directory(&dir, "test archived agent", false, false).unwrap();
+    agent::atomic_json(&dir.join("agent.json"), &json!(peer)).unwrap();
+    fixture.client.report_session.store(true, Ordering::Relaxed);
+    *fixture.client.session_override.lock().unwrap() =
+        Some((Some("codex".into()), Some("claimed-thread".into())));
+    let bytes = fs::read(fixture.root.join("registry/agents/foreign/agent.json")).unwrap();
+    let error = manager
+        .follow_observed_session("foreign")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("already claimed"), "{error}");
+    assert_eq!(
+        fs::read(fixture.root.join("registry/agents/foreign/agent.json")).unwrap(),
+        bytes
+    );
+}
+
+#[test]
+fn session_follow_initial_capture_writes_nothing_when_nothing_is_reported() {
+    // A pane that reports no session and a process holding no rollout:
+    // the record stays missing, byte for byte.
+    let fixture = Fixture::new();
+    unreported_codex(&fixture);
+    let manager = fixture.manager();
+    let _held = pretend_held_files(Vec::new());
+    let bytes = fs::read(fixture.root.join("registry/agents/foreign/agent.json")).unwrap();
+    assert!(!manager.follow_observed_session("foreign").unwrap());
+    assert_eq!(
+        fs::read(fixture.root.join("registry/agents/foreign/agent.json")).unwrap(),
+        bytes
+    );
+}
+
 #[test]
 fn session_follow_rebinds_only_same_pinned_runtime_and_recovers_binding_first_interruption() {
     let fixture = Fixture::new();

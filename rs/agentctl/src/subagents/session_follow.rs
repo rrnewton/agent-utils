@@ -4,16 +4,23 @@ use super::*;
 impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
     pub(crate) fn follow_observed_session(&self, agent_name: &str) -> Result<bool> {
         let initial = self.load(agent_name)?;
+        // #2124: a Codex record that names no session at all is an initial
+        // capture, not a rotation: start could not see the rollout before
+        // the first prompt, so the watch observes it after the first turn
+        // from the pinned pane's own report, exactly as a rotation is
+        // observed. An asserted (operator-named) session is never followed.
+        let initial_capture = initial.native_session.is_none() && initial.session_value.is_none();
         if initial.harness != "codex"
             || initial.harness_anchor().is_none()
             || initial.lifecycle != "running"
             || initial.paused
             || initial.goal_session_id.is_some()
             || initial.resume.is_some()
-            || initial
-                .native_session
-                .as_ref()
-                .is_none_or(|native| native.source != "observed")
+            || (!initial_capture
+                && initial
+                    .native_session
+                    .as_ref()
+                    .is_none_or(|native| native.source != "observed"))
         {
             return Ok(false);
         }
@@ -22,7 +29,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             .as_deref()
             .ok_or_else(|| fail("missing pane"))?;
         let info = self.client.pane_info(pane)?;
-        if session_matches(&initial, &info) {
+        if !initial_capture && session_matches(&initial, &info) {
             return Ok(false);
         }
         let _locks = self.try_record_locks(agent_name, "session follow")?;
@@ -34,13 +41,36 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             .harness_anchor()
             .cloned()
             .ok_or_else(|| fail("missing process pin"))?;
-        let session = info
-            .session_value
-            .as_deref()
-            .filter(|id| valid_metadata_text(id))
-            .ok_or_else(|| fail("session follow requires a positively observed session"))?;
-        if info.session_agent.as_deref() != Some("codex")
-            || info.agent.as_deref() != Some("codex")
+        // The pane's own report is the observer, as for a rotation. An
+        // initial capture whose pane reports nothing yet falls back to
+        // the rollout the pinned process itself holds, the same evidence
+        // start trusts; no session is ever discovered from the cwd here.
+        let mut from_held = false;
+        let session: String = match (
+            info.session_agent.as_deref(),
+            info.session_value
+                .as_deref()
+                .filter(|id| valid_metadata_text(id)),
+        ) {
+            (Some("codex"), Some(value)) => value.to_owned(),
+            (_, None) if initial_capture => {
+                let mut probe = record.clone();
+                let _ = revive::capture_held_session(&mut probe);
+                match probe.native_session {
+                    Some(native) if native.agent == "codex" => {
+                        from_held = true;
+                        native.value
+                    }
+                    _ => return Ok(false),
+                }
+            }
+            _ => {
+                return Err(fail(
+                    "session follow requires a positively observed session",
+                ))
+            }
+        };
+        if info.agent.as_deref() != Some("codex")
             || info.terminal_id != record.terminal_id
             || info.workspace_id != record.workspace_id.as_deref().unwrap_or("")
             || !same_directory(&info.cwd, &record.cwd)
@@ -49,21 +79,27 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             return Err(fail("session follow refused: pinned recipient changed"));
         }
         if self
-            .identity_owner("codex", session, Some(agent_name))?
+            .identity_owner("codex", &session, Some(agent_name))?
             .is_some()
         {
             return Err(fail("session follow refused: conversation already claimed"));
         }
         let old = record.target()?;
         record.session_agent = Some("codex".into());
-        record.session_value = Some(session.to_owned());
-        record.native_session = Some(NativeSession::new("codex", session, "observed"));
+        record.session_value = Some(session.clone());
+        record.native_session = Some(NativeSession::new("codex", &session, "observed"));
         // Refresh the existing process anchor's spec using supported provenance, and
         // validate it before changing the durable queue binding.
         record.launch_spec =
-            self.captured_launch_spec(&record, Some(&anchor), "anchor", None, Some(session))?;
-        // Verify unique native routing plus terminal, shell and process pins on the candidate.
-        self.checked_policy(&record, false)?;
+            self.captured_launch_spec(&record, Some(&anchor), "anchor", None, Some(&session))?;
+        // A pane-reported candidate verifies unique native routing plus
+        // terminal, shell and process pins. A held-rollout candidate is
+        // already pinned to this record's own process (the evidence start
+        // records without a routing check), so the pane-unchanged and
+        // process checks below are its verification.
+        if !from_held {
+            self.checked_policy(&record, false)?;
+        }
         if self.client.pane_info(pane)? != info
             || !self.client.verify_harness_identity(pane, &anchor)?
         {
