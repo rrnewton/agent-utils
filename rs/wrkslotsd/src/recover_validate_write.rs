@@ -307,7 +307,6 @@ const HISTORY_RECHECK_ATTEMPTS: usize = 3;
 /// cannot be read; the caller then takes the ordinary locked path,
 /// exactly as before #2125. Mirrors the Python edition's
 /// `_history_tip_proof`.
-
 /// One machine's (name, tip sequence, tip digest, ACTIVE revision,
 /// ARCHIVED revision) plus the on-disk journal names (#2125).
 type HistoryProof = (Vec<(String, u64, String, i64, i64)>, Vec<String>);
