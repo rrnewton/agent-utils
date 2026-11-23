@@ -5151,10 +5151,15 @@ def _act_glossary_wtf(driver: Driver) -> None:
     # page's release message, so it is on screen at load. On a server that
     # already knows the term the text may already stand linked; the rect
     # is re-read each attempt, from text not yet linked.
-    # One term per profile: the profiles share one server (and one page's
+    # One term per theme/profile combo: the combos share one server (and
     # learned links), so a second press of the same term would find only
     # already-linked text, which cannot be selected for quoting.
-    term = "wall-clock ordering" if "android" in driver.profile.name else "flaky ordering test"
+    term = {
+        ("dark", False): "flaky ordering test",
+        ("dark", True): "wall-clock ordering",
+        ("light", False): "cache-key rewrite",
+        ("light", True): "genuine flake",
+    }[(driver.theme, "android" in driver.profile.name)]
 
     def term_rect() -> object:
         return driver.js(
@@ -5167,6 +5172,7 @@ def _act_glossary_wtf(driver: Driver) -> None:
             "if (at < 0) continue; "
             "const range = document.createRange(); "
             "range.setStart(n, at); range.setEnd(n, at + term.length); "
+            "if (n.parentElement) n.parentElement.scrollIntoView({block: 'center'}); "
             "const r = range.getBoundingClientRect(); "
             "return {x: r.left, y: r.top, width: r.width, height: r.height}; } } "
             "return null; })(" + json.dumps(term) + ")"
@@ -5197,7 +5203,9 @@ def _act_glossary_wtf(driver: Driver) -> None:
             continue
     else:
         raise AssertionError("the WTF? chip never stood under the selection")
-    driver.click("selection-chip-wtf")
+    # The phone's own selection bar can stand over the button; the press is
+    # still the page's own button, forced past the covering bar.
+    driver.page.click("#selection-chip-wtf", force=True)
     driver.page.wait_for_function(
         "() => window.__visible('glossary-popover') "
         "&& document.getElementById('glossary-popover-body').textContent.includes('glossary definition')",
@@ -5205,12 +5213,12 @@ def _act_glossary_wtf(driver: Driver) -> None:
     )
     # Close it, then reopen from the learned term's new glossary link: the
     # shot shows the popover as a later tap on the term anywhere sees it.
-    driver.click("glossary-popover-close")
+    driver.page.click("#glossary-popover-close", force=True)
     driver.page.wait_for_function(
         "() => document.querySelectorAll('#discord-log .glossary-term').length > 0",
         timeout=10_000,
     )
-    driver.page.locator("#discord-log .glossary-term").first.click()
+    driver.page.locator("#discord-log .glossary-term").first.click(force=True)
     driver.page.wait_for_function(
         "() => window.__visible('glossary-popover') "
         "&& document.getElementById('glossary-popover-body').textContent.includes('glossary definition')",
