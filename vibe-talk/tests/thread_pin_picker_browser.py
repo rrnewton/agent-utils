@@ -24,6 +24,7 @@ thread picker", focus returning to the thread button) and Escape close it.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 import mimetypes
 import os
@@ -50,6 +51,27 @@ SIZES = (("desk", 1280, 800, False), ("phone", 390, 852, True))
 BANG = "spaces/A/threads/bang"
 INCIDENT = "spaces/A/threads/incident"
 RELEASE = "spaces/A/threads/release"
+
+
+def brief_age(stamp: str, now: datetime | None = None) -> str:
+    """The page's brief-age rule (`present/time/ages.ts`), in Python:
+    truncating at every step. Computing the expected age from the
+    seeded stamp keeps this check true on any date (#2158)."""
+    at = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    minutes = max(0, int(((now or datetime.now(timezone.utc)) - at).total_seconds()) // 60)
+    if minutes < 1:
+        return "now"
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h"
+    days = hours // 24
+    if days < 10:
+        return f"{days}d" if hours % 24 == 0 else f"{days}d{hours % 24}h"
+    if days < 28:
+        return f"{days}d"
+    return f"{days // 7}w" if days < 365 else f"{days // 365}y"
 
 
 def root(thread_id: str) -> Json:
@@ -388,12 +410,15 @@ def picker_walk(desk: Desk, api: PinApi) -> None:
     desk.check("incident" in str(thread_rows[1]["text"]).lower()
                and "release" in str(thread_rows[2]["text"]).lower(),
                f"threads are not chronological, most recent at the bottom: {names}")
-    # The fixture's ages differ (45w, 14w, days), so the order just asserted
-    # is chronological in the rows' own facts, not only in their names.
-    desk.check(str(thread_rows[0]["text"]).startswith("45w")
-               and str(thread_rows[1]["text"]).startswith("14w")
-               and re.match(r"^\d+d", str(thread_rows[2]["text"])) is not None,
-               f"thread facts do not run oldest to most recent: {texts(thread_rows)}")
+    # The rows' own age facts run oldest to most recent. The expected
+    # ages are computed from the fixture's seeded `updated_at` stamps
+    # with the page's own brief-age rule (#2158: hard-coded "45w"/"14w"
+    # strings aged with the calendar and reddened every gate).
+    expected = [brief_age(str(api.threads[i]["updated_at"])) for i in range(3)]
+    desk.check(all(str(row["text"]).startswith(age)
+                   for row, age in zip(thread_rows, expected)),
+               f"thread facts do not run oldest to most recent: {texts(thread_rows)} "
+               f"(expected ages {expected})")
     for row in thread_rows:
         desk.check(row["pinLeft"] is not None and row["openLeft"] is not None
                    and float(str(row["pinLeft"])) < float(str(row["openLeft"])),
