@@ -3,6 +3,23 @@
 #   podman build -t agent-utils-rust-only -f validation/rust-only/Containerfile .
 #   podman run --rm agent-utils-rust-only
 #
+# In-image network needs (the build has not yet run anywhere; treat
+# these as unverified until the first successful build):
+#   * docker.io, to pull the rust and debian base images;
+#   * crates.io (index and crate downloads), because the workspace
+#     lockfile names ~156 registry crates and nothing is vendored
+#     or built --offline;
+#   * native build dependencies of transitive crates on the slim
+#     image (a C toolchain, pkg-config) are assumed by the base
+#     image, not demonstrated.
+# The runtime stage deliberately has no cargo/rustc, no git, and no
+# systemd: wrkslotsd doctor and herdr-run paths that shell out to
+# git behave accordingly, and cpuset-alloc reports its systemd-scope
+# BLOCKED there. Host run without a container, once release binaries
+# exist (the smoke never builds):
+#   BIN_DIR=rs/target/release SMOKE_FIXTURES=validation/rust-only/fixtures \
+#     sh validation/rust-only/smoke.sh
+#
 # The runtime image is built from the workspace's release binaries and a
 # POSIX shell only. The build stage needs the Rust toolchain; neither stage
 # installs Python, and the smoke entrypoint fails if an interpreter is

@@ -40,3 +40,28 @@ production.cloudfront.docker.com blob CDN for the agent identity); no
 allowlist change will be requested by the lane (owner's call, via coordb).
 Rerun where images are reachable:
 podman build -t agent-utils-rust-only -f validation/rust-only/Containerfile . && podman run --rm agent-utils-rust-only
+
+[watermelon-full-preview] cold-review MUST-FIX pass 2026-11-22
+(mu-rustwrk, on mu-rustwrk/2131-rust-only-smoke): verdict semantics
+split (Rust-primary functional verdict passes only with zero real
+failures; cpuset-alloc BLOCKED now requires the allocator's own
+systemd-scope refusal in stderr, anything else is FAIL; BLOCKED is
+never a per-tool pass; whole-repo verdict stays NOT YET). Real flows
+added for agent-teams (init + check), agent-usage (planted history
+readback), gh-paced (offline classify read vs write); herdr-agent is
+HELP-ONLY (all operations need a Herdr server) and excluded from the
+flow count. Planner (1043 / 987-942 on src/shared.rs /
+refire-stale-gate), wrkvizd events, wrkslotsd slot-a-in-doctor, and
+agentctl capabilities (herdr + muse) assertions tightened to known
+answers. herdr-chat, parallel-experiment-runner, and run-agent-prompt
+restored to the not-yet list. Wiring: check_rust_only.py --functional
+runs the smoke from the existing rust-only DAG job when release
+binaries exist and skips by name otherwise, so gates never need
+podman/network; the DAG has no scheduled/non-gating concept for
+environment-dependent steps, and adding one remains the scheduler
+gap for this issue. In-image network needs (docker.io + crates.io,
+native deps unverified) and the host-run command are documented in
+the Containerfile header. The hermetic podman run and the new flows'
+host run remain pending: no release binaries are built on this host
+and base-image pulls are blocked for agents, so neither was executed
+in this pass; the issue stays open on those two runs.
