@@ -48,7 +48,9 @@ export const PACKAGES = Object.freeze({
   // `#1886` part A: the channel store must know a transcript message to
   // keep it out of the raw feed, so it names the transcripts core.
   "core/channels": [...BASE, "core/transcripts"],
-  "core/navigation": BASE,
+  // `#2153`: the UI-state record keeps the open transcript day's place,
+  // so it names the transcripts core for the place's shape and check.
+  "core/navigation": [...BASE, "core/transcripts"],
   "core/outbox": BASE,
   "core/search": BASE,
   "core/transcripts": BASE,
