@@ -93843,8 +93843,26 @@ def _capture_same_uid_process_path_census_following(
             discarded += 1
             if discarded < _SAME_UID_CENSUS_DISCARDED_SCANS:
                 continue
-            raise Refusal(
-                "same-UID process evidence changed during three liveness attempts"
+            if not handled or proven_rounds < 1:
+                # No PROVEN round ever completed: either the census
+                # scanned nothing, or its last completed round left
+                # generations it could not prove unrelated — a holder
+                # could have handed its reference to an unscanned
+                # child in that round. This is not the bounded
+                # non-closure the seal-recovery substitution covers;
+                # it refuses as before.
+                raise Refusal(
+                    "same-UID process evidence changed during three liveness attempts"
+                )
+            # The last completed round was proven: every generation
+            # it added was shown unrelated, so nothing it held could
+            # pass a reference on. Evidence that kept changing after
+            # that is churn, not a holder: it carries whatever
+            # matches were already authenticated, so the substitution
+            # applies exactly when it found nothing (#2128 follow-up).
+            raise _CensusDidNotClose(
+                "same-UID process evidence changed during three liveness attempts",
+                tuple(found),
             )
         handled.update((process.pid, process.start_ticks) for process in unscanned)
         if reread:
@@ -94138,13 +94156,15 @@ def _scoped_validation_run_cgroup_state(
 ) -> tuple[str, int | None, str]:
     """Scoped no-holder decision for one validation slot (#2128).
 
-    Returns ``("empty", None, detail)``, ``("nonempty", holder_pid,
+    Returns ``("empty", None, detail)``, ``("nonempty", member_pid,
     detail)`` or ``("unknown", None, detail)`` from the batch's own
     scope only: the recorded owner cgroup (already recorded, so no
     new persisted field). The kernel's recursive ``cgroup.events``
-    ``populated`` answer decides the batch scope; a member listing
-    (the scope subtree's ``cgroup.procs``, walked only on refusal)
-    only names a holder. Holders outside the owner cgroup — a dagrun
+    ``populated`` answer decides the batch scope. Members are listed
+    in the populated case too: the first member pid is returned for
+    the caller to check, and a member counts against the slot only
+    when it is shown to use the slot — mere membership of a shared
+    scope is not use. Holders outside the owner cgroup — a dagrun
     step in its own scope, a shell in the checkout — are NOT decided
     here; the caller's reference census remains their decision. An
     absent owner directory is empty only on a unified cgroup2
@@ -94153,8 +94173,8 @@ def _scoped_validation_run_cgroup_state(
     fail-closed. Bounded: a constant number of file reads at one
     direct path, regardless of host load or process churn. Callers
     first prove the recorded owner generation dead, so a live member
-    of the owner cgroup is a holder of the batch's scope, not the
-    owner itself.
+    of the owner cgroup is a process using the batch's scope, not
+    the owner itself.
     """
 
     if record.owner is None:

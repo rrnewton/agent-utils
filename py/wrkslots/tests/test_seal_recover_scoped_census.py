@@ -8,7 +8,10 @@ cgroup present but unreadable.
 
 from __future__ import annotations
 
+import os
+import signal
 import subprocess
+import sys
 import time
 from collections.abc import Sequence
 from pathlib import Path
@@ -26,6 +29,7 @@ from wrkslots.tests.test_lifecycle import (
 
 _REAL_SCOPED = wrkslots._scoped_validation_run_cgroup_state
 _REAL_SAME_UID = wrkslots._capture_same_uid_process_path_census
+_REAL_OBSERVATIONS = wrkslots._same_uid_process_observations
 
 
 def _record(slot: str, cgroup_path: str | None) -> wrkslots.ActiveRecord:
@@ -405,6 +409,170 @@ def test_real_churn_with_real_census_recovers(
         for churner in churners:
             churner.wait()
     assert rc == 0
+    # The substitution actually ran: the real census could not close
+    # and its empty-found refusal was swallowed.
+    assert swallowed
     assert not slot_path.exists()
     assert not finish_path.exists()
     assert not seal_path.exists()
+
+
+_REAL_DIRECT = wrkslots._same_uid_direct_path_processes
+
+
+def test_early_motion_with_real_holder_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Motion before any completed census round must not be substituted."""
+
+    project, config, finish_path, _raw, record = prepare_paired_validation_finish(
+        tmp_path, monkeypatch, "scoped"
+    )
+    slot_path = wrkslots._slot_directory(config, record.slot, record.slot_type)
+    seal_path = wrkslots._validate_batch_seal_journal_path(config)
+    _owner_dead(monkeypatch, record)
+    root = _tree(tmp_path)
+    _real_scoped(monkeypatch, record, root)
+    monkeypatch.setattr(
+        wrkslots, "_capture_same_uid_process_path_census", _REAL_SAME_UID
+    )
+    calls = 0
+
+    def motion(
+        processes: Sequence[wrkslots._AbsentProcessObservation],
+        budget: wrkslots._ReadOnlyCommandBudget,
+    ) -> tuple[
+        tuple[wrkslots._AbsentProcessObservation, ...],
+        tuple[wrkslots._AbsentProcessObservation, ...],
+    ]:
+        nonlocal calls
+        calls += 1
+        if calls <= 3:
+            raise wrkslots._ProcessEvidenceChanged("injected early motion")
+        return _REAL_DIRECT(processes, budget)
+
+    monkeypatch.setattr(wrkslots, "_same_uid_direct_path_processes", motion)
+    holder: subprocess.Popen[str] = subprocess.Popen(
+        ["sleep", "3600"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        cwd=slot_path,
+    )
+    try:
+        rc = _recover(project)
+    finally:
+        terminate_process(holder)
+    assert rc == 3
+    assert slot_path.is_dir()
+    assert finish_path.is_file()
+    assert seal_path.is_file()
+
+
+def test_evidence_changed_after_completed_round_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Motion after one PROVEN round is the substituted non-closure."""
+
+    project, config, finish_path, _raw, record = prepare_paired_validation_finish(
+        tmp_path, monkeypatch, "scoped"
+    )
+    slot_path = wrkslots._slot_directory(config, record.slot, record.slot_type)
+    seal_path = wrkslots._validate_batch_seal_journal_path(config)
+    _owner_dead(monkeypatch, record)
+    root = _tree(tmp_path)
+    _real_scoped(monkeypatch, record, root)
+    inventories = 0
+
+    def observations(
+        budget: wrkslots._ReadOnlyCommandBudget,
+    ) -> tuple[wrkslots._AbsentProcessObservation, ...]:
+        nonlocal inventories
+        inventories += 1
+        if inventories > 1:
+            raise wrkslots._ProcessEvidenceChanged("injected late motion")
+        # A one-process first inventory (this stable test process)
+        # makes the first round deterministically proven on any host.
+        return tuple(
+            process
+            for process in _REAL_OBSERVATIONS(budget)
+            if process.pid == os.getpid()
+        )
+
+    monkeypatch.setattr(wrkslots, "_same_uid_process_observations", observations)
+    swallowed: list[str] = []
+
+    def census_spy(
+        paths: Sequence[Path], *, budget: wrkslots._ReadOnlyCommandBudget
+    ) -> wrkslots._ProcessPathCensus:
+        try:
+            return _REAL_SAME_UID(paths, budget=budget)
+        except wrkslots._CensusDidNotClose as exc:
+            swallowed.append(str(exc))
+            raise
+
+    monkeypatch.setattr(
+        wrkslots, "_capture_same_uid_process_path_census", census_spy
+    )
+    assert _recover(project) == 0
+    # The substituted refusal is specifically the evidence-changed one.
+    assert swallowed and "evidence changed" in swallowed[0]
+    assert not slot_path.exists()
+    assert not finish_path.exists()
+    assert not seal_path.exists()
+
+
+def test_handoff_in_unproven_round_then_motion_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A holder in an unproven round, then motion: never substituted."""
+
+    project, config, finish_path, _raw, record = prepare_paired_validation_finish(
+        tmp_path, monkeypatch, "scoped"
+    )
+    slot_path = wrkslots._slot_directory(config, record.slot, record.slot_type)
+    seal_path = wrkslots._validate_batch_seal_journal_path(config)
+    _owner_dead(monkeypatch, record)
+    root = _tree(tmp_path)
+    _real_scoped(monkeypatch, record, root)
+    monkeypatch.setattr(
+        wrkslots, "_capture_same_uid_process_path_census", _REAL_SAME_UID
+    )
+    inventories = 0
+
+    def observations(
+        budget: wrkslots._ReadOnlyCommandBudget,
+    ) -> tuple[wrkslots._AbsentProcessObservation, ...]:
+        nonlocal inventories
+        inventories += 1
+        if inventories > 1:
+            raise wrkslots._ProcessEvidenceChanged("injected late motion")
+        return _REAL_OBSERVATIONS(budget)
+
+    monkeypatch.setattr(wrkslots, "_same_uid_process_observations", observations)
+    # The holder forks a child in the slot and exits; the child is the
+    # live holder the first round meets and cannot prove unrelated.
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import os, time; "
+            "child = os.fork(); "
+            "child and os._exit(0); "
+            "print(os.getpid(), flush=True); time.sleep(3600)",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+        cwd=slot_path,
+    )
+    assert holder.stdout is not None
+    child_pid = int(holder.stdout.readline())
+    holder.wait(timeout=10)
+    try:
+        rc = _recover(project)
+    finally:
+        os.kill(child_pid, signal.SIGKILL)
+    assert rc == 3
+    assert slot_path.is_dir()
+    assert finish_path.is_file()
+    assert seal_path.is_file()

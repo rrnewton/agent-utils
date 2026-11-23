@@ -247,7 +247,6 @@ def test_early_census_refusal_with_fenced_holder_retains_journal_and_retry_remov
     }
 
 
-@pytest.mark.load_quarantine  # #2128: scoped refusal replaces the real same-UID census on this path
 def test_real_holder_late_census_refusal_in_recover_unfences(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
