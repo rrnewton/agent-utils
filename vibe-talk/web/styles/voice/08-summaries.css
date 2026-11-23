@@ -52,6 +52,14 @@
   border-left: 3px solid var(--summary-tint);
 }
 
+/* `#2154 vibe-talk-dark-true-black-cards`: in dark the summarised card itself stays true
+   black like every other message card; the tint survives only as the bar and edge above,
+   never as a fill, so a summarised (often still unread) card cannot read brown or olive.
+   Light keeps the tinted fill. */
+:root[data-theme="dark"] :is(#side-log, #side-cards, #discord-log, #pinned-log) li.discord-message[data-summarised="true"] {
+  background: #000000;
+}
+
 #side-log li.discord-message[data-summarised="true"][data-summary-hue],
 #side-cards li.discord-message[data-summarised="true"][data-summary-hue],
 #discord-log li.discord-message[data-summarised="true"][data-summary-hue],

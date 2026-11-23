@@ -539,7 +539,13 @@ def desk_walk(desk: Desk) -> None:
     edge, ring, tint, panel = colour(found, "edge"), colour(found, "ring"), colour(found, "tint"), colour(found, "panel")
     desk.check(chroma(edge) >= COLOURED and chroma(ring) >= COLOURED and near(edge, ring),
                f"the card at the top is edged {edge} and ringed {ring}, not in its thread's colour")
-    desk.check(not near(tint, panel), f"the card at the top is not tinted: {tint}, a row's surface {panel}")
+    # `#2154 vibe-talk-dark-true-black-cards`: a dark row's surface is true black and a
+    # colour-mix tint samples on a 0-1 scale, so compare on one scale: the header's tint
+    # must clear the row's surface by a visible margin in either scheme.
+    def scaled(c: list[float]) -> list[float]:
+        return [v * 255 if max(c) <= 1 else v for v in c]
+    desk.check(max(abs(a - b) for a, b in zip(scaled(tint), scaled(panel))) > 8,
+               f"the card at the top is not tinted: {tint}, a row's surface {panel}")
     drawn = pixel(desk, number(box, "left") + 1.5, (number(box, "top") + number(box, "bottom")) / 2)
     desk.check(chroma(drawn) >= COLOURED_PIXEL, f"the card's edge is drawn {drawn}, not in its colour")
     desk.check(number(found, "overflow") <= 0, "the page scrolls sideways")

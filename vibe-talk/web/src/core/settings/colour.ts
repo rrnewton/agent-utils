@@ -2,9 +2,10 @@
 // accent family, resolved for the theme in force. Pure, as `appearance.ts` is: what a stored
 // value means is handed in, so the pre-paint script in the shell and this module cannot drift
 // on the choice itself. The preset tables are the single home of each family's colours; the
-// sheets name only the variables, and the default `blue` family is token-for-token the look
-// the page has always had (its `--accent`, `--mine` and neighbours are the values already in
-// `THEME_TOKENS` and the sheets), so a device that never picks a preset paints as before.
+// sheets name only the variables, and the default `blue` family is token-for-token
+// `THEME_TOKENS` and the sheets, so a device that never picks a preset paints as the
+// scheme does. `#2154 vibe-talk-dark-true-black-cards`: dark `--mine` is true black in
+// every preset, so a preset tints the owner's edge and accent, never the card fill.
 
 import type { ColourTheme } from "./device.ts";
 import type { EffectiveTheme } from "./appearance.ts";
@@ -21,7 +22,7 @@ export const COLOUR_PRESETS: Readonly<Record<ColourTheme, Readonly<Record<Effect
   blue: Object.freeze({
     dark: Object.freeze({
       "--accent": "#5b9dd9", "--on-accent": "#ffffff", "--accent-bright": "#5b9dd9",
-      "--mine": "#24405c", "--mine-edge": "#33587b", "--muted-on-mine": "#b4bcc8",
+      "--mine": "#000000", "--mine-edge": "#33587b", "--muted-on-mine": "#b4bcc8",
       "--row-hover": "#262c36", "--reply-tint": "#181e25", "--discuss-head-bg": "#1d2026",
     }),
     light: Object.freeze({
@@ -36,7 +37,7 @@ export const COLOUR_PRESETS: Readonly<Record<ColourTheme, Readonly<Record<Effect
   "blue-hc": Object.freeze({
     dark: Object.freeze({
       "--accent": "#5b9dd9", "--on-accent": "#14161a", "--accent-bright": "#5b9dd9",
-      "--mine": "#24405c", "--mine-edge": "#33587b", "--muted-on-mine": "#b4bcc8",
+      "--mine": "#000000", "--mine-edge": "#33587b", "--muted-on-mine": "#b4bcc8",
       "--row-hover": "#262c36", "--reply-tint": "#181e25", "--discuss-head-bg": "#1d2026",
     }),
     light: Object.freeze({
@@ -48,7 +49,7 @@ export const COLOUR_PRESETS: Readonly<Record<ColourTheme, Readonly<Record<Effect
   teal: Object.freeze({
     dark: Object.freeze({
       "--accent": "#4cc2b0", "--on-accent": "#14161a", "--accent-bright": "#7ad8c8",
-      "--mine": "#173f3a", "--mine-edge": "#24594f", "--muted-on-mine": "#b4d8d2",
+      "--mine": "#000000", "--mine-edge": "#24594f", "--muted-on-mine": "#b4d8d2",
       "--row-hover": "#253833", "--reply-tint": "#152220", "--discuss-head-bg": "#1d4a42",
     }),
     light: Object.freeze({
@@ -60,7 +61,7 @@ export const COLOUR_PRESETS: Readonly<Record<ColourTheme, Readonly<Record<Effect
   plum: Object.freeze({
     dark: Object.freeze({
       "--accent": "#cf9fe0", "--on-accent": "#14161a", "--accent-bright": "#e2bff0",
-      "--mine": "#3a244d", "--mine-edge": "#53356b", "--muted-on-mine": "#d3bce0",
+      "--mine": "#000000", "--mine-edge": "#53356b", "--muted-on-mine": "#d3bce0",
       "--row-hover": "#332a3d", "--reply-tint": "#211a28", "--discuss-head-bg": "#4a2d63",
     }),
     light: Object.freeze({
@@ -72,7 +73,7 @@ export const COLOUR_PRESETS: Readonly<Record<ColourTheme, Readonly<Record<Effect
   amber: Object.freeze({
     dark: Object.freeze({
       "--accent": "#e8b34b", "--on-accent": "#14161a", "--accent-bright": "#f2cc7e",
-      "--mine": "#4a3517", "--mine-edge": "#6b4d22", "--muted-on-mine": "#e6cf9e",
+      "--mine": "#000000", "--mine-edge": "#6b4d22", "--muted-on-mine": "#e6cf9e",
       "--row-hover": "#38312a", "--reply-tint": "#28211a", "--discuss-head-bg": "#5c421c",
     }),
     light: Object.freeze({

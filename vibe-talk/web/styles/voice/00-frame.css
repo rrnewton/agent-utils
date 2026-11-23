@@ -18,7 +18,10 @@
    surfaces the dock is built from. Declared for both schemes here, next to each other, rather
    than being derived at use-site with a colour function some phone browser may not have. */
 :root {
-  --mine: #24405c; /* what YOU said */
+  /* `#2154 vibe-talk-dark-true-black-cards`: in dark every message card is true black; the
+     speakers still differ by side, corner and edge, and the quiet inks below only gain
+     contrast on black. Light keeps its tinted cards (the light block at the foot). */
+  --mine: #000000; /* what YOU said */
   --mine-edge: #33587b;
   /* Small quiet text and a warning ON `--mine`: the send card's heading, where it goes, its status
      and a frozen card's notes. `--muted` and `--warn` are 4.1:1 and 3.9:1 there, under the 4.5:1
@@ -28,13 +31,13 @@
      4.8:1 on the chip (it was #aab2c0, 4.3:1 there). */
   --muted-on-mine: #b4bcc8;
   --warn-on-mine: #e8a27a;
-  --theirs: #1d2026; /* what the AGENT said */
+  --theirs: #000000; /* what the AGENT said */
   /* Everyone else in the channel: other people, and any bot that is not the coding agent.
      Warm, so it is not read as a lighter or darker version of either principal, but QUIET --
      the coding agent is the thing being read and must stay the loudest row on the list. An
      earlier version of this was strong enough to dominate the view, which only showed up
      because a classification bug was sending every message here. */
-  --third: #26221b;
+  --third: #000000;
   --third-edge: #3b3529;
   /*
    * How far a message is pushed off its own side of the list.

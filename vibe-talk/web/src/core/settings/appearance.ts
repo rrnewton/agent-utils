@@ -32,8 +32,8 @@ export const THEME_TOKENS: Readonly<Record<EffectiveTheme, Readonly<Record<strin
   dark: Object.freeze({
     "--bg": "#14161a", "--panel": "#1d2026", "--edge": "#2c313a", "--ink": "#e7e9ee",
     "--muted": "#99a1b0", "--accent": "#5b9dd9", "--warn": "#d98a5b",
-    "--mine": "#24405c", "--mine-edge": "#33587b", "--muted-on-mine": "#b4bcc8",
-    "--warn-on-mine": "#e8a27a", "--theirs": "#1d2026", "--third": "#26221b",
+    "--mine": "#000000", "--mine-edge": "#33587b", "--muted-on-mine": "#b4bcc8",
+    "--warn-on-mine": "#e8a27a", "--theirs": "#000000", "--third": "#000000",
     "--third-edge": "#3b3529", "--dock": "#191c22", "--ok": "#5bd98a", "--idle": "#6b7484",
     "--paused": "#9b8cf0", "--row-hover": "#262c36", "--summary-fail-ink": "#ff9aa2",
     "--pin-ink": "#f0c75e", "--pin-edge": "#d4a63a", "--pin-bg": "#3a3017",

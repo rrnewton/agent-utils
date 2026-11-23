@@ -94,7 +94,7 @@ ROWS_JS = """(id) => {
         card: box(card), spineLeft: bridgeBox.left, spineRight: bridgeBox.left + stroke,
         spineTop: bridgeBox.top, spineBottom: bridgeBox.bottom, buttonRadius: getComputedStyle(button).borderTopLeftRadius, overflow: document.documentElement.scrollWidth - window.innerWidth,
         rows: rows.map((li) => ({id: li.getAttribute('data-id'), who: li.getAttribute('data-who'),
-            box: box(li), bg: getComputedStyle(li).backgroundColor,
+            box: box(li), bg: getComputedStyle(li).backgroundColor, edge: getComputedStyle(li).borderTopColor,
             bridge: box(li.querySelector(':scope > .reply-bridge'))})),
         button: box(button), mark: markBox, markOpacity: parseFloat(getComputedStyle(mark).opacity),
         buttonBg: getComputedStyle(button).backgroundColor, markColor: getComputedStyle(button).color,
@@ -244,7 +244,14 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                                f"the owner's row is not the narrower one: {box['width']} against {other_width}")
                     desk.check(box["right"] < box_of(others[0], "box")["right"] - 8,
                                "the owner's row reaches the others' right edge")
-                    desk.check(row.get("bg") != others[0].get("bg"), "the owner's row lost its colour")
+                    # `#2154 vibe-talk-dark-true-black-cards`: light keeps its fill check;
+                    # in dark every fill is true black and the owner's colour is his edge.
+                    if scheme == "dark":
+                        desk.check(row.get("bg") == "rgb(0, 0, 0)" and others[0].get("bg") == "rgb(0, 0, 0)",
+                                   "a dark card fill is not true black")
+                        desk.check(row.get("edge") != others[0].get("edge"), "the owner's row lost its colour")
+                    else:
+                        desk.check(row.get("bg") != others[0].get("bg"), "the owner's row lost its colour")
             button, card = part(found, "button"), part(found, "card")
             desk.check(button["width"] >= 32 and button["height"] >= 32,
                        f"the triangle's target is {button['width']:.0f}px by {button['height']:.0f}px")

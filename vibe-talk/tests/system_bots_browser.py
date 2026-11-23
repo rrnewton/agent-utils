@@ -215,7 +215,7 @@ ROWS_JS = """() => {
             named: Boolean(author && !author.hidden && author.getClientRects().length > 0
                 && author.getBoundingClientRect().width > 0),
             name: author ? author.textContent : null,
-            background: getComputedStyle(row).backgroundColor,
+            background: getComputedStyle(row).backgroundColor, edge: getComputedStyle(row).borderTopColor,
             left: r.left - list.left,
             right: list.right - r.right,
         };
@@ -336,8 +336,17 @@ def walk(chromium: BrowserType, args: argparse.Namespace, url: str, label: str, 
                           f"({welcome_left}, {welcome_right})")
                     check(not mobile or (left <= 0.5 and right <= 0.5),
                           f"{where}: the agent's row does not run the list's width ({left}, {right})")
-                    check(agent.get("background") != welcome.get("background"),
-                          f"{where}: the agent and the welcome bot are drawn in one colour")
+                    # `#2154 vibe-talk-dark-true-black-cards`: light keeps its fill check;
+                    # in dark both fills are true black and the agent is told from a bot
+                    # by its edge (its full-width tile geometry is checked above).
+                    if scheme == "dark":
+                        check(agent.get("background") == "rgb(0, 0, 0)" and welcome.get("background") == "rgb(0, 0, 0)",
+                              f"{where}: a dark card fill is not true black")
+                        check(agent.get("edge") != welcome.get("edge"),
+                              f"{where}: the agent and the welcome bot are drawn in one colour")
+                    else:
+                        check(agent.get("background") != welcome.get("background"),
+                              f"{where}: the agent and the welcome bot are drawn in one colour")
                 else:
                     check(isinstance(found, dict) and isinstance(found.get("rows"), dict)
                           and all(isinstance(row, dict) and row.get("who") != "coder"
