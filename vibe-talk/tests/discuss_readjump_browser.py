@@ -110,6 +110,7 @@ class LandedGeo(TypedDict):
     bottom: float
     vh: float
     panelTop: float | None
+    sheetSpansList: bool
     collapsed: str | None
     closedDetails: int
     text: str
@@ -212,8 +213,14 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
           const r = row.getBoundingClientRect();
           const panel = document.getElementById('discuss-panel');
           const pr = panel && !panel.hidden ? panel.getBoundingClientRect() : null;
+          const area = document.getElementById('scroll-area');
+          const ar = area ? area.getBoundingClientRect() : null;
+          // `#2147`: only a sheet spanning the list's whole width (the phone
+          // sheet) stands over the list; a desk panel stands beside it.
+          const sheetSpansList = Boolean(pr && ar && pr.height > 0
+            && pr.left <= ar.left + 1 && pr.right >= ar.right - 1);
           return {{top: r.top, bottom: r.bottom, vh: innerHeight,
-                   panelTop: pr ? pr.top : null,
+                   panelTop: pr ? pr.top : null, sheetSpansList,
                    collapsed: row.getAttribute('data-collapsed'),
                    closedDetails: [...row.querySelectorAll('details')].filter(d => !d.open).length,
                    text: row.textContent}};
@@ -260,7 +267,10 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
     check(geo is not None, f"{label}: the read target row vanished")
     assert geo is not None
     check(geo["top"] >= 0 and geo["top"] < geo["vh"], f"{label}: message top is not on screen: {geo}")
-    check(geo["panelTop"] is None or geo["bottom"] <= geo["panelTop"] + 2 or geo["top"] < geo["panelTop"],
+    # `#2147`: centred in the visible area — above the sheet only where the
+    # sheet spans the list (phone); a desk panel beside the list covers no
+    # part of the row the reader reads, so on-screen is the whole claim there.
+    check(geo["panelTop"] is None or not geo["sheetSpansList"] or geo["bottom"] <= geo["panelTop"] + 2,
           f"{label}: message stands under the Discuss sheet: {geo}")
     check(geo["collapsed"] != "true" and geo["closedDetails"] == 0,
           f"{label}: landed message is not expanded: {geo}")
