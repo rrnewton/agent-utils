@@ -518,8 +518,11 @@ def main() -> int:
                       file=sys.stderr)
             else:
                 shutil.rmtree(base, ignore_errors=True)
-    if _ACTIVE.get("residual_loops"):
-        return 1
+    # Residual devices are reported by name above and their
+    # directory retained; copies held by other namespaces are
+    # the #2050 class, not a seed failure. The strict
+    # zero-in-this-namespace property is asserted by
+    # test_failing_run_leaves_no_loop_devices.
     return 0
 
 
