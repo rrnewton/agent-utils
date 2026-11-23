@@ -1,13 +1,14 @@
 ---
 title: 'vibe-talk-linked-jump-centers-target: a linked-message jump centers the target instead of top-aligning it'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - vibe-talk
 - owner-ui
 created_at: 2026-11-23T05:55:00-05:00
-updated_at: 2026-11-23T05:55:00-05:00
+updated_at: 2026-11-23T08:01:02-05:00
+closed_at: 2026-11-23T08:01:02-05:00
 ---
 
 # Description
@@ -29,3 +30,7 @@ Owner request: when a summary, search or Discuss link jumps to a linked message,
 # Notes
 
 Owner UI request (fast-track); filed by the coordinator.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main at cb64dd4a (gated db75d925, coordinator waiver for the #2158 pin-picker time bomb and a load-flaked reader-resume step). Every linked-message jump now centres the target in the visible list area — above a phone Discuss sheet, inside the keyboard-shrunk viewport — clamped at the list ends, with taller-than-viewport targets top-aligned; the Linked message highlight, the #2080 in-place stability and the #2076 top-anchor holds are unchanged. Evidence: full page JS suite, the real-server summary-link walk with per-landing centred assertions and rect sidecars, and the screenshot matrix (scenes 73–76 plus the new 90-discuss-centered-jump) before and after landing. The read-modes browser check reported failing against this landing passes repeatedly on the landed tree and on current main (its gate failure was a 10 s thread-list wait under load).
