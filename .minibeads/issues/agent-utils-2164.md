@@ -1,6 +1,6 @@
 ---
 title: 'agent-utils-node-outside-owner-checkout: builds get a node outside any off-limits path'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
@@ -8,7 +8,8 @@ labels:
 - build
 assignee: mu-maskpaths
 created_at: 2026-11-23T13:35:39-05:00
-updated_at: 2026-11-23T13:35:39-05:00
+updated_at: 2026-11-23T15:40:00-05:00
+closed_at: 2026-11-23T15:40:00-05:00
 ---
 
 # Description
@@ -31,3 +32,7 @@ Give the vibe-talk page build and the deploy helpers a node source outside any o
 # Notes
 
 [watermelon-full-preview] mu-maskpaths. Number pre-assigned by the coordinator. Filed alongside #2163 agentctl-profile-masked-paths, which is blocked by this issue: the mask must not be enabled on any real profile until builds no longer need to enter an off-limits path for node. Owner chooses the allowed node source; this issue builds the resolution and the loud failure, not the choice itself.
+
+## Resolution
+
+Resolved on the host side rather than in agent-utils: with the owner's approval, the hosts' system node was upgraded to v24 (a distribution module stream, replacing v16), so the page build and the host deploy helpers now use the system node and nothing borrows a binary from an off-limits path. The host-local deploy helper checks for node 18 or later and refuses loudly otherwise; a full build with the system node succeeded. If a later host configuration run rolls the system node back below 18, the helper's refusal names the requirement.
