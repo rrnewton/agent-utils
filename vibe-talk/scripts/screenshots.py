@@ -5182,6 +5182,19 @@ def _act_glossary_wtf(driver: Driver) -> None:
         "&& document.getElementById('glossary-popover-body').textContent.includes('glossary definition')",
         timeout=30_000,
     )
+    # Close it, then reopen from the learned term's new glossary link: the
+    # shot shows the popover as a later tap on the term anywhere sees it.
+    driver.click("glossary-popover-close")
+    driver.page.wait_for_function(
+        "() => document.querySelectorAll('#discord-log .glossary-term').length > 0",
+        timeout=10_000,
+    )
+    driver.page.locator("#discord-log .glossary-term").first.click()
+    driver.page.wait_for_function(
+        "() => window.__visible('glossary-popover') "
+        "&& document.getElementById('glossary-popover-body').textContent.includes('glossary definition')",
+        timeout=10_000,
+    )
     driver.settle(300)
 
 

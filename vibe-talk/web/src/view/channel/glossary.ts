@@ -177,7 +177,9 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
           answer.source ?? null,
           answer.saved === true,
         );
-        void refreshTerms();
+        await refreshTerms();
+        const log = document.getElementById("discord-log");
+        if (log) linkTermsIn(log, true);
       } else {
         showPopover(
           info.text,
@@ -191,11 +193,27 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
     }
   }
 
-  function linkTermsIn(root: ParentNode): void {
+  function linkTermsIn(root: ParentNode, force = false): void {
     if (!terms.length) return;
+    // Never rewrite the row the reader is selecting in: replacing its text
+    // nodes would collapse the selection the WTF? press stands on. `force`
+    // is the press having landed: the popover stands on its own now.
+    let selectedRow: Element | null = null;
+    const live = typeof getSelection === "function" ? getSelection() : null;
+    if (!force && live && !live.isCollapsed && live.rangeCount) {
+      let at: Node | null = live.getRangeAt(0).startContainer;
+      while (at) {
+        if (at.nodeType === 1 && (at as Element).tagName === "LI") {
+          selectedRow = at as Element;
+          break;
+        }
+        at = at.parentNode;
+      }
+    }
     const walker = document.createTreeWalker(root as Node, NodeFilter.SHOW_TEXT, {
       acceptNode(node) {
         if (!node.textContent || !node.textContent.trim()) return NodeFilter.FILTER_REJECT;
+        if (selectedRow && selectedRow.contains(node)) return NodeFilter.FILTER_REJECT;
         let at: Node | null = node.parentNode;
         while (at && at !== root) {
           if (at.nodeType === 1) {
@@ -271,6 +289,12 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
 
   listen<Event>(document, "selectionchange", () => {
     ensureTerms();
+    // A collapsed selection frees the row it stood in for linking.
+    const sel = typeof getSelection === "function" ? getSelection() : null;
+    if (sel && sel.isCollapsed && terms.length) {
+      const log = document.getElementById("discord-log");
+      if (log) linkTermsIn(log);
+    }
     if (typeof requestAnimationFrame === "function") {
       // Twice: the Quote chip places itself on the first frame after a
       // selection, so the WTF? button settles against its final place.
