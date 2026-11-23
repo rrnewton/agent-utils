@@ -307,14 +307,12 @@ const HISTORY_RECHECK_ATTEMPTS: usize = 3;
 /// cannot be read; the caller then takes the ordinary locked path,
 /// exactly as before #2125. Mirrors the Python edition's
 /// `_history_tip_proof`.
+
 /// One machine's (name, tip sequence, tip digest, ACTIVE revision,
 /// ARCHIVED revision) plus the on-disk journal names (#2125).
 type HistoryProof = (Vec<(String, u64, String, i64, i64)>, Vec<String>);
 
-fn history_proof(
-    root: Option<&Path>,
-    cfg: &Cfg,
-) -> Option<HistoryProof> {
+fn history_proof(root: Option<&Path>, cfg: &Cfg) -> Option<HistoryProof> {
     let machines = crate::global_state::discover_machines(&cfg.control).ok()?;
     let mut proof = Vec::new();
     for machine in &machines {
