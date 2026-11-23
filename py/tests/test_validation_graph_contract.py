@@ -892,7 +892,6 @@ def test_distinct_cli_smokes_live_in_the_canonical_graph() -> None:
 
     expected_commands = {
         "python.experiment-runner.cli-smoke": "plan-round",
-        "python.planner.cli-smoke": "--format actions",
         "python.wrkviz.cli-smoke": "wrkviz quickstart",
         "vibe-talk.smoke.cli-help": "--help",
     }
@@ -1479,7 +1478,7 @@ def test_every_package_build_declares_a_cpu_budget_above_the_small_step_default(
 
     config = dag_from_path(REPO_ROOT / "validation.dag.yaml")
     packages = [step for step in config.steps if step.tag.startswith("packages.python.")]
-    assert len(packages) == 9
+    assert len(packages) == 8
     for step in packages:
         assert step.cpu_timeout > DEFAULT_SMALL_CPU_TIMEOUT, step.tag
 

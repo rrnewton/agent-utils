@@ -92,7 +92,7 @@ EXPECTED_COMPONENTS = frozenset(
 )
 
 RUST_ONLY_COMPONENTS = frozenset(
-    {"agent-teams", "agent-usage", "change-classifier", "gh-paced", "merge-queue", "tick-hub"}
+    {"agent-teams", "agent-usage", "change-classifier", "gh-paced", "merge-queue", "planner", "tick-hub"}
 )
 
 
@@ -500,6 +500,7 @@ def _exercise_inventory_guards(manifest: Manifest, discovered: frozenset[str]) -
         (("rs/dagrun/src/io.rs",), {"dagrun", "experiment-runner"}),
         # A frozen separate file owns no component: no DAG node runs it.
         (("py/tests/test_tickhub_cli.py",), set()),
+        (("py/tests/test_planner_cli.py",), set()),
         # A live separate file still routes to its DAG node's component.
         (("py/tests/test_packaging_infrastructure.py",), {"repository-infrastructure"}),
         (("brand-new-tool/source.py",), set()),
@@ -514,6 +515,15 @@ def _exercise_inventory_guards(manifest: Manifest, discovered: frozenset[str]) -
     frozen = separate_suites_for_paths(("py/tests/test_tickhub_cli.py",), manifest)
     if frozen != {"py/tests/test_tickhub_cli.py": "tick-hub-frozen-python-edition"}:
         raise AssertionError(f"frozen separate-suite routing mismatch: {frozen}")
+    frozen_planner = separate_suites_for_paths(
+        ("py/tests/test_planner_cli.py",), manifest
+    )
+    if frozen_planner != {
+        "py/tests/test_planner_cli.py": "planner-frozen-python-edition"
+    }:
+        raise AssertionError(
+            f"frozen planner separate-suite routing mismatch: {frozen_planner}"
+        )
     live = separate_suites_for_paths(
         ("py/tests/test_packaging_infrastructure.py",), manifest
     )

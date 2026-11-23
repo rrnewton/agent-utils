@@ -22,7 +22,6 @@ from pathlib import Path
 ENTRYPOINT_MODULES = [
     "dagrun",
     "dagrun.cpuset_allocator",
-    "pr_landing_planner",
     "parallel_experiment_runner",
     "wrkviz",
     "herdr_run",

@@ -112,9 +112,14 @@
       "primary": "rust",
       "mirror": {
         "edition": "python",
-        "state": "parity"
+        "state": "archived",
+        "archived_at": "be50ffba05c23b249ab4fe6f7efb0f4ed63bab8c",
+        "equivalent_rust_commit": "be50ffba05c23b249ab4fe6f7efb0f4ed63bab8c",
+        "equivalent_rust_version": "0.1.0",
+        "archive_tag": "archive/py-pr-landing-planner-2026-11-23",
+        "tracking_issue": "#2139 python-editions-archive-and-parity-retirement"
       },
-      "parity_check": "cross.planner.differential (python3 cross/differential.py --tool pr-landing-planner)",
+      "parity_check": null,
       "rust_entrypoint": "rs/bin/pr-landing-planner",
       "python_entrypoint": "py/bin/pr-landing-planner"
     },

@@ -90,25 +90,6 @@ steps:
       preferred_inner_jobs: 4
       rss_baseline_bytes: 2147483648
 
-  - group: planner
-    job: differential
-    desc: pr-landing-planner Python and Rust commands agree
-    cmd: python3 cross/differential.py --tool pr-landing-planner
-    jobs_flag: ""
-    labels: [validation-cross, component-planner]
-    timeout: 9600
-    cpu_timeout: 1200
-    hint:
-      est_duration_s: 180
-      classification: latency-bound
-      preferred_inner_jobs: 4
-      rss_baseline_bytes: 2147483648
-      # A successful full-graph sample peaked at 201,678,848 B. Sparse profile feedback lowered
-      # the following run's MemoryMax to 252,096,512 B; it reached that ceiling and recorded three
-      # OOM kills. A boxed retry peaked at 288,268,288 B with no OOM. Keep 512 MiB explicit without
-      # inflating the other differential steps that continue to share the general baseline above.
-      hard_mem_max_bytes: 536870912
-
   # DISABLED by default (owner reply 346, 2026-11-10; #1249
   # cross-differentials-robust; one consuming-project name redacted):
   # "Insane. I hate tests that are real time

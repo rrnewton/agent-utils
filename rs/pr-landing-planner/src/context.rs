@@ -1679,4 +1679,72 @@ mod tests {
             .unwrap_err()
             .contains("unknown review lane"));
     }
+
+    #[test]
+    fn review_digest_matches_frozen_python_oracle_golden() {
+        // G7: the retired differential carried a second, independent implementation
+        // of the canonical digest (review_digest() in cross/differential.py).
+        // Its value for this PR-394 fixture was frozen at retirement (#2139);
+        // cross-implementation equality is now this golden. The CLI half
+        // (emitted digest + held/land-now dispositions) is in cli.rs.
+        let head = "a".repeat(40);
+        let at = "2026-09-04T12:00:00Z";
+        let event = |kind: &str,
+                     identity: &str,
+                     author: &str,
+                     state: &str,
+                     head_sha: &str,
+                     body: String,
+                     permission: &str| ReviewEvidenceEvent {
+            kind: kind.into(),
+            identity: identity.into(),
+            author: author.into(),
+            state: state.into(),
+            head_sha: head_sha.into(),
+            created_at: at.into(),
+            updated_at: at.into(),
+            last_edited_at: String::new(),
+            body,
+            retirement_actor_permission: permission.into(),
+        };
+        let snapshot = ReviewEvidenceSnapshot {
+            head_sha: head.clone(),
+            review_decision: "CHANGES_REQUESTED".into(),
+            events: vec![
+                event(
+                    "review",
+                    "review-1",
+                    "reviewer",
+                    "CHANGES_REQUESTED",
+                    &head,
+                    "please address this".into(),
+                    "",
+                ),
+                event(
+                    "issue-comment",
+                    "comment-1",
+                    "release-authority",
+                    "ACTIVE",
+                    "",
+                    format!(
+                        "[team, release-authority, session, model, role=observer]\nCHANGES-REQUESTED-WITHDRAWN-AT: codex {head} BY release-authority\nRETIRES 123456"
+                    ),
+                    "write",
+                ),
+                event(
+                    "review-comment",
+                    "thread-1",
+                    "reviewer",
+                    "RESOLVED",
+                    "",
+                    "inline objection retired".into(),
+                    "",
+                ),
+            ],
+        };
+        assert_eq!(
+            review_evidence_digest(&snapshot).unwrap(),
+            "5e2f93d98b74e4600056209af299019a49458437dbc3bcc06ca078381fda2f71"
+        );
+    }
 }

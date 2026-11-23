@@ -290,18 +290,7 @@
       "reverse_dependencies": [
         "merge-queue"
       ],
-      "test_files": [
-        "py/tests/test_githubhost_rollup.py",
-        "py/tests/test_planner_check_outcome.py",
-        "py/tests/test_planner_classify.py",
-        "py/tests/test_planner_cli.py",
-        "py/tests/test_planner_collect.py",
-        "py/tests/test_planner_graph.py",
-        "py/tests/test_planner_landing_context.py",
-        "py/tests/test_planner_plan.py",
-        "py/tests/test_planner_priority.py",
-        "py/tests/test_planner_rebase_economics.py"
-      ]
+      "test_files": []
     },
     "repository-infrastructure": {
       "source_prefixes": [
@@ -694,7 +683,17 @@
     "py/tests/test_cross_env_is_hermetic.py": "cross-environment-hermeticity",
     "py/tests/test_cross_skip_accounting.py": "cross-skip-accounting",
     "py/tests/test_differential_tolerant_run.py": "differential-tolerant-run",
+    "py/tests/test_githubhost_rollup.py": "planner-frozen-python-edition",
     "py/tests/test_packaging_infrastructure.py": "packaging-infrastructure",
+    "py/tests/test_planner_check_outcome.py": "planner-frozen-python-edition",
+    "py/tests/test_planner_classify.py": "planner-frozen-python-edition",
+    "py/tests/test_planner_cli.py": "planner-frozen-python-edition",
+    "py/tests/test_planner_collect.py": "planner-frozen-python-edition",
+    "py/tests/test_planner_graph.py": "planner-frozen-python-edition",
+    "py/tests/test_planner_landing_context.py": "planner-frozen-python-edition",
+    "py/tests/test_planner_plan.py": "planner-frozen-python-edition",
+    "py/tests/test_planner_priority.py": "planner-frozen-python-edition",
+    "py/tests/test_planner_rebase_economics.py": "planner-frozen-python-edition",
     "py/tests/test_repo_dispatch_wiring.py": "repository-dispatch-wiring",
     "py/tests/test_tickhub_cadence.py": "tick-hub-frozen-python-edition",
     "py/tests/test_tickhub_cadence_offset.py": "tick-hub-frozen-python-edition",

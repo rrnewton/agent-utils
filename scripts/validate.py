@@ -681,7 +681,7 @@ def announce_partial(verdict: str, lines: Sequence[str], environ: Mapping[str, s
 #: their own counts and emit no per-check record; expecting one would be a
 #: false inventory. Kept beside the selector so the boundary is explicit.
 TIMING_CROSS_TOOLS = frozenset(
-    {"dagrun", "cpuset-alloc", "pr-landing-planner", "herdr-run"}
+    {"dagrun", "cpuset-alloc", "herdr-run"}
 )
 
 #: Command fragments that mark a gate as timing-capable. A selected gate
@@ -1923,6 +1923,11 @@ def self_test() -> int:
         ["py/tests/test_tickhub_cli.py"],
         set(),
         "a frozen separate test is classified to its frozen suite and selects no running lane",
+    )
+    expect(
+        ["py/tests/test_planner_cli.py"],
+        set(),
+        "a frozen planner separate test is classified to its frozen suite and selects no running lane",
     )
     expect(["scripts/something_new.py"], set(ALL_GROUPS), "an unclassified script must select EVERYTHING")
     expect(["brand_new_toplevel/x"], set(ALL_GROUPS), "an unclassified top level must select EVERYTHING")

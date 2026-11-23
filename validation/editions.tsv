@@ -6,7 +6,7 @@ herdr-chat	python	absent
 herdr-run	rust	parity	
 herdr-subagents	python	paused	456ed9ce4f2e93b7c6f201ea106d8b0d58aa910e
 parallel-experiment-runner	python	absent	
-pr-landing-planner	rust	parity	
+pr-landing-planner	rust	archived	
 run-agent-prompt	python	absent	
 tick-hub	rust	archived	
 wrkslots	python	absent	

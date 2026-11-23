@@ -31,7 +31,7 @@ _BLOCK_YAML_BOOT = (
 )
 
 # The primary ``python -m`` entrypoint for each independently packaged tool.
-ENTRYPOINT_MODULES = ["dagrun", "tick_hub", "pr_landing_planner"]
+ENTRYPOINT_MODULES = ["dagrun", "tick_hub"]
 
 # The dependency-free invocations the owner explicitly asked to always work.
 DEPFREE_FLAGS = ["-h", "--help", "--version", ""]
@@ -78,7 +78,6 @@ def test_cpuset_companion_help_starts_without_yaml() -> None:
 YAML_PATH_CASES = [
     ("dagrun", ["yaml", "--dag", "{json_dag}"]),  # dag_to_yaml
     ("tick_hub", ["yaml", "--config", "{json_cfg}"]),  # config_to_yaml
-    ("pr_landing_planner", ["plan", "--fixture", "{yaml_fixture}"]),  # load_fixture_text (YAML)
 ]
 
 

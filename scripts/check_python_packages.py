@@ -78,21 +78,6 @@ PROJECTS: tuple[Project, ...] = (
         required_dependencies=("pyyaml",),
     ),
     Project(
-        directory="pr_landing_planner",
-        distribution="pr-landing-planner",
-        package="pr_landing_planner",
-        commands=("pr-landing-planner",),
-        resources=(
-            "README.md",
-            "USER_GUIDE.md",
-            "py.typed",
-            "examples/flaky-signatures.yaml",
-            "examples/pr-landing-demo.yaml",
-            "check_outcome.py",
-        ),
-        required_dependencies=("pyyaml",),
-    ),
-    Project(
         directory="local_ci_hub",
         distribution="local-ci-hub",
         package="local_ci_hub",

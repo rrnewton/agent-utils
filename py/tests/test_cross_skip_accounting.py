@@ -1379,14 +1379,6 @@ def _all_tools_stubbed(
 
     monkeypatch.setattr(differential, "compare_dagrun", compare_dagrun)
     monkeypatch.setattr(differential, "compare_cpuset_alloc", compare_cpuset_alloc)
-    monkeypatch.setattr(
-        differential, "compare_tick_hub", lambda _rand, _seed: verdict("tick-hub", frozenset())
-    )
-    monkeypatch.setattr(
-        differential,
-        "compare_pr_landing_planner",
-        lambda _rand, _seed: verdict("pr-landing-planner", frozenset()),
-    )
     monkeypatch.setattr(differential, "compare_herdr_run", own_count("herdr-run"))
     monkeypatch.setattr(differential, "compare_herdr_agent", own_count("herdr-agent"))
     monkeypatch.setattr(differential, "compare_agentctl", own_count("agentctl"))
@@ -1401,7 +1393,7 @@ def _all_tools_stubbed(
 @pytest.mark.parametrize(
     ("argv", "dagrun_skips", "diverging", "status", "final"),
     [
-        pytest.param([], 0, None, 0, "cross: OK - all 7 tools agree with no skipped checks", id="ok"),
+        pytest.param([], 0, None, 0, "cross: OK - all 5 tools agree with no skipped checks", id="ok"),
         pytest.param(
             ["--allow-skip", "boxing"],
             2,
@@ -1416,16 +1408,16 @@ def _all_tools_stubbed(
             2,
             None,
             1,
-            "cross: FAILED - 1 of 7 tool(s) did not pass: dagrun INCOMPLETE; "
+            "cross: FAILED - 1 of 5 tool(s) did not pass: dagrun INCOMPLETE; "
             "2 skipped across tools (dagrun 2; by kind: boxing 2)",
             id="incomplete",
         ),
         pytest.param(
             ["--allow-skip", "boxing"],
             1,
-            "tick-hub",
+            "herdr-agent",
             1,
-            "cross: FAILED - 1 of 7 tool(s) did not pass: tick-hub FAILED; "
+            "cross: FAILED - 1 of 5 tool(s) did not pass: herdr-agent FAILED; "
             "1 skipped across tools (dagrun 1; by kind: boxing 1)",
             id="diverged",
         ),
@@ -1434,7 +1426,7 @@ def _all_tools_stubbed(
             0,
             "herdr-run",
             1,
-            "cross: FAILED - 1 of 7 tool(s) did not pass: herdr-run FAILED; 0 skipped across tools",
+            "cross: FAILED - 1 of 5 tool(s) did not pass: herdr-run FAILED; 0 skipped across tools",
             id="own-count-tool-failed",
         ),
     ],
@@ -1466,11 +1458,11 @@ def test_a_single_tool_run_prints_no_multi_tool_line(
     differential = _differential()
     ran = _all_tools_stubbed(differential, monkeypatch)
 
-    assert differential.main(["--tool", "tick-hub"]) == 0
+    assert differential.main(["--tool", "cpuset-alloc"]) == 0
     out = capsys.readouterr().out
 
-    assert ran == ["tick-hub"]
-    assert out == "cross[tick-hub]: OK - 1 checks agree\n"
+    assert ran == ["cpuset-alloc"]
+    assert out == "cross[cpuset-alloc]: OK - 1 checks agree\n"
 
 
 # ------------------------------------------------------------------ validate.py summary
@@ -1641,14 +1633,14 @@ def test_validate_expects_a_record_from_exactly_the_selected_cross_nodes() -> No
     by_tag = dag_from_path(REPO_ROOT / "validation.dag.yaml").by_tag()
     every_cross_node = [tag for tag, step in by_tag.items() if "cross/differential.py" in step.cmd]
 
-    assert len(every_cross_node) == 9  # 7 tools, agentctl sharded into 3 nodes
+    assert len(every_cross_node) == 7  # 5 tools, agentctl sharded into 3 nodes
     assert validate.selected_cross_nodes(frozenset(), frozenset(), all_contract=True) == (
         every_cross_node
     )
     # A component-narrowed run expects only the cross node that component owns.
     assert validate.selected_cross_nodes(
-        frozenset(), frozenset({"tick-hub"}), all_contract=False
-    ) == ["cross.tick-hub.differential"]
+        frozenset(), frozenset({"herdr-run"}), all_contract=False
+    ) == ["cross.herdr-run.differential"]
 
 
 def _validate_with_one_cross_node(
