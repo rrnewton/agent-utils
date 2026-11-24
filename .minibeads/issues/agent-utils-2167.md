@@ -24,3 +24,5 @@ Fast-seeds runs green in a full gate on a loaded host (several gates concurrent)
 # Notes
 
 [watermelon-full-preview] Filed from #2043 land1 gates at the coordinator's instruction; failure evidence in the gate logs for 77d54b2e (shards 8/10/11 across runs, always TimeoutExpired in a CLI communicate, never an oracle assertion). The 600s ceiling and gated-bound raise already landed as the hot-host timeout fix; this issue tracks removing the remaining wall-clock pass/fail surface and un-quarantining.
+
+Second instance (2026-11-23): the e2e teardown detach in py/wrkslots/tests/e2e_stress.py used the interactive 120 s subprocess bound for `wrkslots image unmount`; on a saturated host the unmount census legitimately exceeds it (measured 259 s). Raised to the harness 600 s ceiling as a stopgap in the #2043 landing (e9fb82cb); convert to a condition wait (poll mount state until detached) under this issue.
