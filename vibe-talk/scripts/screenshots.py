@@ -5281,6 +5281,63 @@ def _act_glossary_wtf(driver: Driver) -> None:
     driver.settle(300)
 
 
+
+
+def _act_glossary_not_found(driver: Driver) -> None:
+    """`#2189`: select a term nothing defines, press WTF?, and photograph
+    the not-found popover naming what was searched."""
+    driver.load(with_token=True)
+    driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    if bool(driver.js("window.__visible('discuss-panel')")):
+        driver.click("discuss-open")
+        driver.page.wait_for_function(
+            "() => !window.__visible('discuss-panel')", timeout=10_000
+        )
+    _ensure_pane(driver, "pane-discord")
+    driver.page.wait_for_function(
+        "() => document.querySelectorAll('#discord-log > li').length > 0 "
+        "&& !window.__visible('channel-loading')",
+        timeout=15_000,
+    )
+    term = "loaded-host repro"
+    rect = driver.js(
+        "((term) => { const rows = [...document.querySelectorAll('#discord-log > li')]; "
+        "for (const row of rows) { "
+        "const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT); "
+        "for (let n = walker.nextNode(); n; n = walker.nextNode()) { "
+        "if (n.parentElement && n.parentElement.closest('.glossary-term')) continue; "
+        "const at = n.textContent.indexOf(term); "
+        "if (at < 0) continue; "
+        "const range = document.createRange(); "
+        "range.setStart(n, at); range.setEnd(n, at + term.length); "
+        "if (n.parentElement) n.parentElement.scrollIntoView({block: 'center'}); "
+        "const r = range.getBoundingClientRect(); "
+        "return {x: r.left, y: r.top, width: r.width, height: r.height}; } } "
+        "return null; })(" + json.dumps(term) + ")"
+    )
+    assert isinstance(rect, dict), "no selectable term text on screen"
+    driver.page.mouse.move(float(rect["x"]) + 1, float(rect["y"]) + float(rect["height"]) / 2)
+    driver.page.mouse.down()
+    driver.page.mouse.move(
+        float(rect["x"]) + float(rect["width"]) - 1,
+        float(rect["y"]) + float(rect["height"]) / 2,
+        steps=8,
+    )
+    driver.page.mouse.up()
+    driver.page.wait_for_function(
+        "() => window.__visible('selection-chip-wtf') && window.__visible('selection-chip')",
+        timeout=10_000,
+    )
+    driver.page.click("#selection-chip-wtf", force=True)
+    driver.page.wait_for_function(
+        "() => window.__visible('glossary-popover') "
+        "&& document.getElementById('glossary-popover-body').textContent.includes('Couldn') "
+        "&& document.getElementById('glossary-popover-body').textContent.includes('Searched')",
+        timeout=30_000,
+    )
+    driver.settle(300)
+
+
 def _act_discuss_search(driver: Driver) -> None:
     """`#2136`: two real summaries (current + earlier via the timeline walk),
     then the header search opened and a query typed, so the shot shows flat
@@ -8583,6 +8640,18 @@ SCENES: tuple[Scene, ...] = (
             ("the popover carries a source link", "window.__visible('glossary-popover-source') && document.getElementById('glossary-popover-link').textContent.trim().length > 0"),
             ("the learned term renders as a glossary link", "document.querySelectorAll('#discord-log .glossary-term').length > 0"),
 
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="93-glossary-not-found",
+        what="WTF? on a term nothing defines: the not-found popover naming what was searched",
+        act=_act_glossary_not_found,
+        profiles=MATRIX_PROFILES,
+        keep_transient=True,
+        expect=(
+            ("the popover says the term was not found", "window.__visible('glossary-popover') && document.getElementById('glossary-popover-body').textContent.includes('Couldn')"),
+            ("the popover names what was searched", "document.getElementById('glossary-popover-body').textContent.includes('Searched')"),
             ("no error banner is up", "!window.__visible('error-wrap')"),
         ),
     ),

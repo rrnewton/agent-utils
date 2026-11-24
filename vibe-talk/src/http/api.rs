@@ -3248,9 +3248,9 @@ fn glossary_stem(word: &str) -> String {
 /// Whether folded `text` holds every word of `words`, stem-insensitively.
 fn glossary_holds(text: &str, words: &[String]) -> bool {
     !words.is_empty()
-        && words.iter().all(|word| {
-            text.contains(word.as_str()) || text.contains(glossary_stem(word).as_str())
-        })
+        && words
+            .iter()
+            .all(|word| text.contains(word.as_str()) || text.contains(glossary_stem(word).as_str()))
 }
 
 /// Definitional-fit score of one candidate (`#2189`): phrase adjacency and
@@ -3262,7 +3262,10 @@ fn glossary_score(message: &Message, words: &[String], phrases: &[String]) -> i3
         .filter(|word| text.contains(word.as_str()) || text.contains(glossary_stem(word).as_str()))
         .count() as i32;
     let mut score = matched * 10;
-    if phrases.iter().any(|phrase| !phrase.is_empty() && text.contains(phrase.as_str())) {
+    if phrases
+        .iter()
+        .any(|phrase| !phrase.is_empty() && text.contains(phrase.as_str()))
+    {
         score += 25;
     }
     if text.contains(" is ") || text.contains(" are ") || text.contains(" means ") {
@@ -3401,9 +3404,7 @@ async fn glossary_retrieval(
                 let mut scored: Vec<(i32, Message)> = fetched
                     .messages
                     .into_iter()
-                    .filter(|m| {
-                        glossary_holds(&crate::search_query::fold(&m.content), &words)
-                    })
+                    .filter(|m| glossary_holds(&crate::search_query::fold(&m.content), &words))
                     .map(|m| (glossary_score(&m, &words, &phrases), m))
                     .collect();
                 scored.sort_by_key(|(score, m)| (*score, m.created_ms().unwrap_or(0)));
@@ -3596,7 +3597,14 @@ pub async fn glossary_lookup(
     // reserved slots so none can starve the others (`#2189`). Windows are
     // hyphen/space/nospace and singular/plural insensitive; single common
     // words are rarity-weighted last.
-    let retrieval = glossary_retrieval(&state, &channel_id, &selected, &context, body.message_id.as_deref()).await;
+    let retrieval = glossary_retrieval(
+        &state,
+        &channel_id,
+        &selected,
+        &context,
+        body.message_id.as_deref(),
+    )
+    .await;
     let searched_reason = retrieval.reason.clone();
     let hits = retrieval.hits;
     let doc_query = crate::search_query::parse(&selected);
@@ -3607,7 +3615,8 @@ pub async fn glossary_lookup(
             .documents
             .search_documents(&crate::search_query::parse(&space_form), 5);
         for hit in extra.hits {
-            if doc_search.hits.len() < 5 && !doc_search.hits.iter().any(|held| held.key == hit.key) {
+            if doc_search.hits.len() < 5 && !doc_search.hits.iter().any(|held| held.key == hit.key)
+            {
                 doc_search.hits.push(hit);
             }
         }
