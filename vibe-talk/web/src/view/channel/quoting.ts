@@ -452,15 +452,20 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
     const shownTop = visual ? Number(visual.offsetTop) || 0 : 0;
     const barUnder = touch && box.top - shownTop < SELECTION_BAR_ROOM_PX;
     selectionChipGap = !touch ? SELECTION_CHIP_GAP_PX : SELECTION_CHIP_HANDLES_PX + (barUnder ? SELECTION_BAR_ROOM_PX : 0);
-    let top = Math.max(SELECTION_CHIP_EDGE_PX,
-      Math.min(box.bottom + selectionChipGap, viewHeight - SELECTION_CHIP_EDGE_PX - height));
-    // `#2187`. No room under the words clear of the handles: the whole row goes above the selection,
-    // clear of the start handle and of the native toolbar that stands over the words there.
-    if (top < box.bottom + selectionChipGap) {
-      const aboveGap = touch ? SELECTION_BAR_ROOM_PX : SELECTION_CHIP_GAP_PX;
-      top = Math.max(SELECTION_CHIP_EDGE_PX, box.top - aboveGap - height);
-      selectionChipGap = top - box.bottom;
+    // `#2220` strip rule, chosen once per placement: ABOVE the selection when there is room (on touch,
+    // room includes the native toolbar's height over the words), otherwise BELOW, clear of the handles.
+    const aboveGap = touch ? SELECTION_BAR_ROOM_PX : SELECTION_CHIP_GAP_PX;
+    let top: number;
+    if (box.top - shownTop - aboveGap - height >= SELECTION_CHIP_EDGE_PX) {
+      top = box.top - aboveGap - height;
+    } else {
+      top = Math.max(SELECTION_CHIP_EDGE_PX,
+        Math.min(box.bottom + selectionChipGap, viewHeight - SELECTION_CHIP_EDGE_PX - height));
+      if (top < box.bottom + selectionChipGap) {
+        top = Math.max(SELECTION_CHIP_EDGE_PX, box.top - aboveGap - height);
+      }
     }
+    selectionChipGap = top - box.bottom;
     // `#2220`. ONE position write, on the container. Chips never move individually.
     row.style.left = `${Math.round(left)}px`;
     row.style.top = `${Math.round(top)}px`;
