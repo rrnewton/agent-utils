@@ -1,13 +1,13 @@
 ---
 title: 'wrkslots-stale-module-repo-pin: slot creation fails when the shared module repo lacks the pinned submodule commit'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - wrkslots
 - lifecycle
 created_at: 2026-11-23T12:00:00+00:00
-updated_at: 2026-11-23T12:00:00+00:00
+updated_at: 2026-11-24T06:00:00+00:00
 ---
 
 # Description
@@ -27,3 +27,7 @@ In the shared-submodule path (`_share_checkout_submodules`), before adding the l
 # Notes
 
 Approved plan direction recorded from the coordinator before coding. Whether current main already changes this behaviour is checked before the fix and recorded in the resolution.
+
+## Resolution
+
+[watermelon-full-preview] Landed as 0d263a5c. Current main still failed the repin case, so the fix was needed. Create's lock-free prepare now fetches any pinned submodule commit the shared module repositories lack (`_prefetch_pinned_submodule_commits`, exact-SHA fetch from the configured submodule URL or the module repo's origin under the clean git env, default-refs fallback, every fetch bounded at 120s with low-speed limits); under the mutation locks the share step only re-checks presence. The recover path likewise refuses with the manual-fetch remedy and never fetches under the recover lock — this supersedes the earlier commit-body wording that described the recover path as still fetching. No new persisted field. Tests cover the repin fetch, the unreachable-pin refusal before hooks, and the no-fetch-under-lock re-check; each fails on unmodified main. Refreshing the mirror itself remains the complementary layer outside wrkslots.
