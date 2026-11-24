@@ -60,6 +60,11 @@ pub fn capabilities() -> serde_json::Value {
                      "approvals", "approve", "deny"],
         "approvals": {"default_timeout_s": approval::DEFAULT_TIMEOUT.as_secs(),
                       "answers": ["chat: approve|deny ID", "console: agentctl approve|deny NAME ID"]},
+        // #2214: this build's headless start path ensures the agent's
+        // console viewer tab (#1973). Restore probes a wrapper snapshot's
+        // binary for this marker; a snapshot without it predates the
+        // ensure path and is named stale, with the refresh command.
+        "viewer_ensure": true,
     });
     for harness in adapter::adapters() {
         document[harness.name()] = harness.capabilities();

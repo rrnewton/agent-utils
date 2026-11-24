@@ -296,6 +296,159 @@ fn without_close_permission_a_tail_viewer_is_left_and_a_console_created() {
     assert_eq!(record.viewer_kind().as_deref(), Some("console"));
 }
 
+fn plant_foreground(fixture: &Fixture, pane: &str, argv: Vec<String>) {
+    fixture
+        .client
+        .foreground_argv
+        .lock()
+        .unwrap()
+        .insert(pane.to_owned(), vec![argv]);
+}
+
+fn console_argv(fixture: &Fixture, agent: &str) -> Vec<String> {
+    let registry = fixture.root.join("registry");
+    vec![
+        "agentctl".to_owned(),
+        "--registry".to_owned(),
+        registry.display().to_string(),
+        "console".to_owned(),
+        agent.to_owned(),
+    ]
+}
+
+#[test]
+fn restore_proves_an_idle_shell_viewer_dead_and_recreates_it_in_its_tab() {
+    // #2214, the reboot shape from the issue: the recorded console tab
+    // holds only an empty shell. A dry run reports it dead; a real
+    // restore starts the console in that same tab, and the record still
+    // names it. No tab is created or closed, and no harness is started.
+    let fixture = Fixture::new();
+    let manager = headless_agent(&fixture);
+    record_viewer(&manager, "w1:t5", "console");
+    push_pane(&fixture, "w1:p5", "w1:t5", "w1");
+    pane_blank(&fixture);
+    let (_, proof) = manager.headless_viewer_proof("lead").unwrap();
+    assert!(
+        matches!(proof, HeadlessViewerProof::Dead(ref reason) if reason.contains("idle shell")),
+        "{proof:?}"
+    );
+    let row = manager.restore_headless_viewer("lead", true).unwrap();
+    assert_eq!(row["state"], "dead", "{row}");
+    assert_eq!(row["viewer_tab_id"], "w1:t5");
+    assert!(fixture.client.viewer_commands.lock().unwrap().is_empty());
+    let row = manager.restore_headless_viewer("lead", false).unwrap();
+    assert_eq!(row["state"], "recreated", "{row}");
+    assert_eq!(row["viewer_tab_id"], "w1:t5", "the recorded tab is reused");
+    let commands = fixture.client.viewer_commands.lock().unwrap();
+    assert_eq!(commands.len(), 1, "{commands:?}");
+    assert_eq!(commands[0].0, "w1:p5");
+    assert!(commands[0].1.contains(" console lead"), "{commands:?}");
+    assert!(fixture.client.closed_tabs.lock().unwrap().is_empty());
+    assert_eq!(creates(&fixture), 0, "no new tab was created");
+    let record = manager.load("lead").unwrap();
+    assert_eq!(record.viewer_tab().as_deref(), Some("w1:t5"));
+    assert_eq!(record.viewer_kind().as_deref(), Some("console"));
+}
+
+#[test]
+fn restore_leaves_a_proven_live_console_and_a_follow_tail_untouched() {
+    // #2214: a pane provably running the agent's console (or its follow
+    // tail) for this registry is live; restore touches nothing.
+    let fixture = Fixture::new();
+    let manager = headless_agent(&fixture);
+    record_viewer(&manager, "w1:t5", "console");
+    push_pane(&fixture, "w1:p5", "w1:t5", "w1");
+    pane_busy(&fixture);
+    plant_foreground(&fixture, "w1:p5", console_argv(&fixture, "lead"));
+    let (_, proof) = manager.headless_viewer_proof("lead").unwrap();
+    assert_eq!(proof, HeadlessViewerProof::Live);
+    let row = manager.restore_headless_viewer("lead", false).unwrap();
+    assert_eq!(row["state"], "live", "{row}");
+    assert_eq!(creates(&fixture), 0);
+    assert!(fixture.client.viewer_commands.lock().unwrap().is_empty());
+    assert!(fixture.client.closed_tabs.lock().unwrap().is_empty());
+    // The same pane running the follow tail is a live viewer too.
+    plant_foreground(
+        &fixture,
+        "w1:p5",
+        vec![
+            "agentctl".to_owned(),
+            "tail".to_owned(),
+            "lead".to_owned(),
+            "--follow".to_owned(),
+        ],
+    );
+    let (_, proof) = manager.headless_viewer_proof("lead").unwrap();
+    assert_eq!(proof, HeadlessViewerProof::Live);
+    let row = manager.restore_headless_viewer("lead", false).unwrap();
+    assert_eq!(row["state"], "live", "{row}");
+    assert_eq!(creates(&fixture), 0);
+}
+
+#[test]
+fn restore_recreates_a_missing_viewer_tab_and_records_the_new_one() {
+    // #2214: the recorded tab is gone entirely; the ensure path creates
+    // a console tab and the record names the new tab.
+    let fixture = Fixture::new();
+    let manager = headless_agent(&fixture);
+    record_viewer(&manager, "w1:t9", "console");
+    let row = manager.restore_headless_viewer("lead", true).unwrap();
+    assert_eq!(row["state"], "dead", "{row}");
+    let row = manager.restore_headless_viewer("lead", false).unwrap();
+    assert_eq!(row["state"], "recreated", "{row}");
+    let record = manager.load("lead").unwrap();
+    let tab = record.viewer_tab().unwrap();
+    assert_ne!(tab, "w1:t9");
+    assert_eq!(row["viewer_tab_id"], tab);
+    assert_eq!(record.viewer_kind().as_deref(), Some("console"));
+    assert_eq!(fixture.client.viewer_commands.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn a_viewer_showing_another_agent_is_not_live_and_is_never_closed() {
+    // #2214: the recorded tab's pane runs another agent's console. It
+    // does not count as this agent's viewer; restore records a fresh
+    // console tab and leaves the other agent's viewer exactly as found.
+    let fixture = Fixture::new();
+    let manager = headless_agent(&fixture);
+    record_viewer(&manager, "w1:t5", "console");
+    push_pane(&fixture, "w1:p5", "w1:t5", "w1");
+    pane_busy(&fixture);
+    plant_foreground(&fixture, "w1:p5", console_argv(&fixture, "other"));
+    let (_, proof) = manager.headless_viewer_proof("lead").unwrap();
+    assert!(matches!(proof, HeadlessViewerProof::Dead(_)), "{proof:?}");
+    let row = manager.restore_headless_viewer("lead", false).unwrap();
+    assert_eq!(row["state"], "recreated", "{row}");
+    assert_ne!(row["viewer_tab_id"], "w1:t5");
+    assert!(
+        fixture.client.closed_tabs.lock().unwrap().is_empty(),
+        "the other agent's viewer tab was closed"
+    );
+    assert_eq!(
+        manager.load("lead").unwrap().viewer_tab().as_deref(),
+        row["viewer_tab_id"].as_str()
+    );
+    // A console for the same name in ANOTHER registry is not live here.
+    let fixture = Fixture::new();
+    let manager = headless_agent(&fixture);
+    record_viewer(&manager, "w1:t5", "console");
+    push_pane(&fixture, "w1:p5", "w1:t5", "w1");
+    pane_busy(&fixture);
+    plant_foreground(
+        &fixture,
+        "w1:p5",
+        vec![
+            "agentctl".to_owned(),
+            "--registry".to_owned(),
+            "/some/other/registry".to_owned(),
+            "console".to_owned(),
+            "lead".to_owned(),
+        ],
+    );
+    let (_, proof) = manager.headless_viewer_proof("lead").unwrap();
+    assert!(matches!(proof, HeadlessViewerProof::Dead(_)), "{proof:?}");
+}
+
 #[test]
 fn herdr_down_is_an_error_the_caller_can_retry_not_a_panic() {
     let fixture = Fixture::new();

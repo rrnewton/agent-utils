@@ -1237,6 +1237,63 @@ fn now_seconds() -> f64 {
         .as_secs_f64()
 }
 
+/// Whether an `--registry` argument in `argv` names `registry`: a present
+/// value must match (canonically, so a symlinked spelling still proves);
+/// no `--registry` at all proves nothing against the registry, because the
+/// process discovered the registry of the project it was started in (#2214).
+fn argv_registry_matches(argv: &[String], registry: &Path) -> bool {
+    let mut tokens = argv.iter();
+    while let Some(token) = tokens.next() {
+        if token == "--registry" {
+            let Some(value) = tokens.next() else {
+                return false;
+            };
+            let recorded = Path::new(value);
+            let recorded = fs::canonicalize(recorded).unwrap_or_else(|_| recorded.to_path_buf());
+            let own = fs::canonicalize(registry).unwrap_or_else(|_| registry.to_path_buf());
+            return recorded == own;
+        }
+        if let Some(value) = token.strip_prefix("--registry=") {
+            let recorded = Path::new(value);
+            let recorded = fs::canonicalize(recorded).unwrap_or_else(|_| recorded.to_path_buf());
+            let own = fs::canonicalize(registry).unwrap_or_else(|_| registry.to_path_buf());
+            return recorded == own;
+        }
+    }
+    true
+}
+
+/// Whether one foreground `argv` provably runs `agentctl console NAME` for
+/// `registry` (#2214): the executable names agentctl, a `console` argument
+/// is followed by the agent's name, and any `--registry` names this one.
+fn argv_is_console_for(argv: &[String], agent_name: &str, registry: &Path) -> bool {
+    let Some(argv0) = argv.first() else {
+        return false;
+    };
+    let executable = argv0.rsplit('/').next().unwrap_or(argv0);
+    if !executable.starts_with("agentctl") {
+        return false;
+    }
+    argv.windows(2)
+        .any(|pair| pair[0] == "console" && pair[1] == agent_name)
+        && argv_registry_matches(argv, registry)
+}
+
+/// Whether one foreground `argv` provably runs `agentctl tail NAME
+/// --follow` for `registry` (#2214), the read-only viewer shape.
+fn argv_is_follow_tail_for(argv: &[String], agent_name: &str, registry: &Path) -> bool {
+    argv_is_tail_for(argv, agent_name)
+        && argv.iter().any(|token| token == "--follow")
+        && argv_registry_matches(argv, registry)
+}
+
+/// Whether one foreground `argv` is a live viewer of `agent_name` in
+/// `registry` (#2214): its console, or its follow tail.
+fn argv_is_viewer_for(argv: &[String], agent_name: &str, registry: &Path) -> bool {
+    argv_is_console_for(argv, agent_name, registry)
+        || argv_is_follow_tail_for(argv, agent_name, registry)
+}
+
 /// Whether one foreground `argv` provably runs `agentctl tail NAME` (any
 /// `--registry` etc. arguments may intervene): the executable names agentctl
 /// and a `tail` argument is followed by the agent's name (#1973).
@@ -1250,6 +1307,34 @@ fn argv_is_tail_for(argv: &[String], agent_name: &str) -> bool {
     }
     argv.windows(2)
         .any(|pair| pair[0] == "tail" && pair[1] == agent_name)
+}
+
+/// What a viewer proof found (#2214): see
+/// [`ManagedAgents::headless_viewer_proof`].
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum HeadlessViewerProof {
+    /// The pane provably runs this agent's console or follow tail.
+    Live,
+    /// Proven not a live viewer, with the reason.
+    Dead(String),
+    /// Nothing could prove the state either way, with the reason.
+    Unproven(String),
+    /// The record names no viewer tab.
+    NoViewer,
+}
+
+/// How a viewer recreation acted (#2214): see
+/// [`ManagedAgents::recreate_headless_viewer`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ViewerRecreation {
+    /// The viewer was already live; nothing was touched.
+    AlreadyLive,
+    /// The console was started in the recorded tab's own idle pane.
+    InRecordedTab,
+    /// The ensure path created (and recorded) a fresh console tab.
+    EnsuredNew,
+    /// The ensure path kept the recorded tab as the viewer.
+    EnsuredExisting,
 }
 
 /// Which stage a console-tab ensure failed at (#1973): only a failure to
@@ -2098,6 +2183,22 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         self.client.inherited_workspace()
     }
 
+    /// The shell line that turns a pane into `agent_name`'s console viewer:
+    /// `exec <this agentctl> --registry <registry> console NAME`. Shared by
+    /// the ensure path (a fresh tab) and restore's in-place recreation of a
+    /// dead viewer in its recorded tab (#2214), so both type the same line.
+    fn console_viewer_command(&self, agent_name: &str) -> Result<String> {
+        let executable = std::env::current_exe()
+            .map_err(|error| fail(format!("locate this agentctl: {error}")))?;
+        let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
+        Ok(format!(
+            "exec {} --registry {} console {}",
+            quote(&executable.display().to_string()),
+            quote(&self.registry.display().to_string()),
+            agent_name,
+        ))
+    }
+
     /// The ONE viewer path every headless start goes through (#1973, #1879, #1793):
     /// ensure `agent_name` has a Herdr tab running `agentctl console NAME` in
     /// `workspace`, recorded as its `viewer_tab_id` with kind `console`, and return
@@ -2165,7 +2266,22 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                         .client
                         .pane_is_idle_shell(&pane.pane_id)
                         .unwrap_or(false);
-                if !stale_tail && !blank && ours {
+                // A readable foreground that is provably not this agent's
+                // viewer (another agent's console, an unrelated program)
+                // is not live either (#2214): the tab is left open but a
+                // fresh console is created and recorded below. An empty or
+                // unreadable foreground proves nothing and keeps the
+                // label-based verdict above.
+                let foreground_is_foreign = !stale_tail
+                    && matches!(
+                        self.client.pane_foreground_argv(&pane.pane_id),
+                        Ok(argv)
+                            if !argv.is_empty()
+                                && !argv.iter().any(|argv| {
+                                    argv_is_viewer_for(argv, agent_name, &self.registry)
+                                })
+                    );
+                if !stale_tail && !blank && ours && !foreground_is_foreign {
                     return Ok(tab.to_owned());
                 }
                 if !stale_tail && !blank && !ours && self.client.tab_label(tab).is_err() {
@@ -2206,15 +2322,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         // single-pane, labelled for this agent), so a failed ensure never leaks
         // a tab the record does not name.
         let finish = |manager: &Self| -> Result<String> {
-            let executable = std::env::current_exe()
-                .map_err(|error| fail(format!("locate this agentctl: {error}")))?;
-            let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
-            let command = format!(
-                "exec {} --registry {} console {}",
-                quote(&executable.display().to_string()),
-                quote(&manager.registry.display().to_string()),
-                agent_name,
-            );
+            let command = manager.console_viewer_command(agent_name)?;
             manager.client.send_text(&pane, &command)?;
             manager.client.send_keys(&pane, "Enter")?;
             // Record under the lock, re-checking first: if another starter recorded
@@ -2278,6 +2386,209 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             },
             Err(EnsureError::Failed(error)) => Err(error),
         }
+    }
+
+    /// Prove the recorded viewer tab of a headless agent is live (#2214
+    /// agentctl-restore-headless-viewer-tab), without touching anything:
+    /// the tab exists and its pane provably runs `agentctl console NAME` or
+    /// `agentctl tail NAME --follow` for this registry. An idle shell, a
+    /// missing tab, or a viewer of a different agent is `Dead`; a state
+    /// nothing can prove (unreadable foreground, a just-created viewer
+    /// still starting) is `Unproven`, never a reason to touch the tab.
+    pub(crate) fn headless_viewer_proof(
+        &self,
+        agent_name: &str,
+    ) -> Result<(Option<String>, HeadlessViewerProof)> {
+        let record = self.load(agent_name)?;
+        let Some(tab) = record.viewer_tab() else {
+            return Ok((None, HeadlessViewerProof::NoViewer));
+        };
+        let panes = self.client.panes()?;
+        let Some(pane) = panes.iter().find(|pane| pane.tab_id == tab) else {
+            return Ok((
+                Some(tab.clone()),
+                HeadlessViewerProof::Dead(format!("recorded viewer tab {tab} does not exist")),
+            ));
+        };
+        let young = record.viewer_created_at().is_some_and(|at| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .is_ok_and(|now| now.as_secs_f64() - at < VIEWER_GRACE_SECONDS)
+        });
+        match self.client.pane_foreground_argv(&pane.pane_id) {
+            Ok(argv)
+                if argv
+                    .iter()
+                    .any(|argv| argv_is_viewer_for(argv, agent_name, &self.registry)) =>
+            {
+                Ok((Some(tab), HeadlessViewerProof::Live))
+            }
+            Ok(argv) if !argv.is_empty() => Ok((
+                Some(tab.clone()),
+                HeadlessViewerProof::Dead(format!(
+                    "viewer tab {tab} does not run agentctl console {agent_name} or \
+                     agentctl tail {agent_name} --follow for this registry"
+                )),
+            )),
+            Ok(_) => match self.client.pane_is_idle_shell(&pane.pane_id) {
+                Ok(true) if young => Ok((
+                    Some(tab.clone()),
+                    HeadlessViewerProof::Unproven(format!(
+                        "viewer tab {tab} was just created and is still starting"
+                    )),
+                )),
+                Ok(true) => Ok((
+                    Some(tab.clone()),
+                    HeadlessViewerProof::Dead(format!("viewer tab {tab} holds an idle shell")),
+                )),
+                Ok(false) => Ok((
+                    Some(tab.clone()),
+                    HeadlessViewerProof::Unproven(format!(
+                        "viewer tab {tab} has no readable foreground process"
+                    )),
+                )),
+                Err(error) => Ok((
+                    Some(tab.clone()),
+                    HeadlessViewerProof::Unproven(format!(
+                        "viewer tab {tab} cannot be proved: {error}"
+                    )),
+                )),
+            },
+            Err(error) => Ok((
+                Some(tab.clone()),
+                HeadlessViewerProof::Unproven(format!(
+                    "viewer tab {tab} cannot be proved: {error}"
+                )),
+            )),
+        }
+    }
+
+    /// Recreate a headless agent's dead viewer (#2214), through the same
+    /// ensure path as every headless start (#1973): an idle shell in the
+    /// recorded tab is turned into the console in place (the record keeps
+    /// naming that tab); any other dead state goes through
+    /// [`Self::ensure_headless_console_tab`], which creates, replaces, or
+    /// leaves a tab and records the outcome. A live viewer is returned
+    /// untouched and an unproven one is an error: nothing is typed into a
+    /// pane whose state is unknown, and no harness process is ever started
+    /// or restarted here — the console is a pure client of the session.
+    pub(crate) fn recreate_headless_viewer(
+        &self,
+        agent_name: &str,
+    ) -> Result<(String, ViewerRecreation)> {
+        let (recorded, proof) = self.headless_viewer_proof(agent_name)?;
+        match proof {
+            HeadlessViewerProof::Live => {
+                Ok((recorded.unwrap_or_default(), ViewerRecreation::AlreadyLive))
+            }
+            HeadlessViewerProof::Unproven(reason) => Err(fail(reason)),
+            HeadlessViewerProof::NoViewer => Err(fail(format!(
+                "agent {agent_name:?} records no viewer tab to recreate"
+            ))),
+            HeadlessViewerProof::Dead(_) => {
+                let tab = recorded.unwrap_or_default();
+                // In place when the recorded tab is ours, holds exactly
+                // one pane, and that pane is a proven idle shell: type the
+                // console line into it, as an operator would by hand.
+                let panes = self.client.panes()?;
+                let tab_panes: Vec<&crate::client::Pane> =
+                    panes.iter().filter(|pane| pane.tab_id == tab).collect();
+                let ours = self
+                    .client
+                    .tab_label(&tab)
+                    .is_ok_and(|label| label == agent_name);
+                if ours && tab_panes.len() == 1 {
+                    let pane = tab_panes[0];
+                    if self
+                        .client
+                        .pane_is_idle_shell(&pane.pane_id)
+                        .unwrap_or(false)
+                    {
+                        let command = self.console_viewer_command(agent_name)?;
+                        self.client.send_text(&pane.pane_id, &command)?;
+                        self.client.send_keys(&pane.pane_id, "Enter")?;
+                        let _lock = self.lock(agent_name)?;
+                        let mut record = self.load(agent_name)?;
+                        if record.viewer_tab().as_deref() == Some(tab.as_str()) {
+                            record.set_viewer_kind(Some("console"));
+                            record.set_viewer_created_at(Some(
+                                SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .map(|now| now.as_secs_f64())
+                                    .unwrap_or_default(),
+                            ));
+                            self.save(&record)?;
+                        }
+                        return Ok((tab, ViewerRecreation::InRecordedTab));
+                    }
+                }
+                let ensured = self.ensure_headless_console_tab(agent_name)?;
+                let how = if ensured == tab {
+                    ViewerRecreation::EnsuredExisting
+                } else {
+                    ViewerRecreation::EnsuredNew
+                };
+                Ok((ensured, how))
+            }
+        }
+    }
+
+    /// One `headless_viewers` report row for restore (#2214): prove the
+    /// recorded viewer of `agent_name`, and unless `dry_run`, recreate a
+    /// dead one through [`Self::recreate_headless_viewer`]. `None` when
+    /// the record names no viewer tab. States: `live`, `dead` (dry run
+    /// only), `unproven` (dry run only), `recreated`, `failed` — a failed
+    /// or unproven viewer is never touched, and no row ever starts or
+    /// restarts a harness process.
+    pub(crate) fn restore_headless_viewer(&self, agent_name: &str, dry_run: bool) -> Option<Value> {
+        let (tab, proof) = match self.headless_viewer_proof(agent_name) {
+            Ok(found) => found,
+            Err(error) => {
+                return Some(json!({
+                    "name": agent_name,
+                    "state": if dry_run { "unproven" } else { "failed" },
+                    "reason": error.to_string(),
+                }));
+            }
+        };
+        let tab = tab?;
+        let mut row = json!({"name": agent_name, "viewer_tab_id": tab});
+        match proof {
+            HeadlessViewerProof::Live => row["state"] = json!("live"),
+            HeadlessViewerProof::NoViewer => return None,
+            HeadlessViewerProof::Unproven(reason) => {
+                row["state"] = json!(if dry_run { "unproven" } else { "failed" });
+                row["reason"] = json!(reason);
+            }
+            HeadlessViewerProof::Dead(reason) => {
+                if dry_run {
+                    row["state"] = json!("dead");
+                    row["reason"] = json!(reason);
+                } else {
+                    match self.recreate_headless_viewer(agent_name) {
+                        Ok((now, how)) => {
+                            row["viewer_tab_id"] = json!(now);
+                            let proven = !matches!(how, ViewerRecreation::EnsuredExisting)
+                                || matches!(
+                                    self.headless_viewer_proof(agent_name),
+                                    Ok((_, HeadlessViewerProof::Live))
+                                );
+                            if proven {
+                                row["state"] = json!("recreated");
+                            } else {
+                                row["state"] = json!("failed");
+                                row["reason"] = json!(reason);
+                            }
+                        }
+                        Err(error) => {
+                            row["state"] = json!("failed");
+                            row["reason"] = json!(error.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        Some(row)
     }
 
     /// Read, set, or clear what `agent_name` is for (#1342 agent-purpose-line).

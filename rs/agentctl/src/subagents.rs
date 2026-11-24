@@ -60,6 +60,8 @@ pub(crate) use control::{
     designated_coordinator_name, restore_agent_names, team_declaration_flags,
     team_undeliverable_notices, tree_order,
 };
+#[cfg(test)]
+pub(crate) use control::HeadlessViewerProof;
 pub use control::{render_tree, ManageAction};
 pub use headless::{
     headless_refusal, HeadlessApprovals, HeadlessStart, TakeoverOptions, TurnoverOptions,
@@ -18663,6 +18665,7 @@ pub(crate) mod tests {
                     closed_tabs: Mutex::new(Vec::new()),
                     allow_close_tab: AtomicBool::new(false),
                     tail_panes: Mutex::new(BTreeSet::new()),
+                    foreground_argv: Mutex::new(BTreeMap::new()),
                 },
                 root,
                 registry_name: "registry",
@@ -19210,6 +19213,9 @@ pub(crate) mod tests {
         pub(crate) allow_close_tab: AtomicBool,
         /// Panes whose foreground process is `agentctl tail lead --follow` (#1973).
         pub(crate) tail_panes: Mutex<BTreeSet<String>>,
+        /// Per-pane foreground argument vectors, consulted before
+        /// `tail_panes` (#2214): a test plants exactly what a pane runs.
+        pub(crate) foreground_argv: Mutex<BTreeMap<String, Vec<Vec<String>>>>,
     }
     /// How a read that [`Fake::hold_reads`] holds ends.
     #[derive(Clone)]
@@ -20398,6 +20404,9 @@ pub(crate) mod tests {
                 && self.custom_at_idle_shell.load(Ordering::Relaxed))
         }
         fn pane_foreground_argv(&self, pane: &str) -> AdapterResult<Vec<Vec<String>>> {
+            if let Some(argv) = self.foreground_argv.lock().unwrap().get(pane) {
+                return Ok(argv.clone());
+            }
             Ok(if self.tail_panes.lock().unwrap().contains(pane) {
                 vec![vec![
                     "agentctl".to_owned(),
