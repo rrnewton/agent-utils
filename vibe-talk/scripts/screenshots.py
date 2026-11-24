@@ -5252,7 +5252,7 @@ def _act_chip_row_above_fallback(driver: Driver) -> None:
     rect = driver.js(
         "(() => { const rows = [...document.querySelectorAll('#discord-log > li')]; "
         "for (const row of rows) { const rr = row.getBoundingClientRect(); "
-        "if (rr.bottom > window.innerHeight - 90 || rr.top < 0) continue; "
+        "if (rr.bottom > window.innerHeight - 40 || rr.top < 0) continue; "
         "const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT); "
         "for (let n = walker.nextNode(); n; n = walker.nextNode()) { "
         "if (n.parentElement && n.parentElement.closest('.glossary-term, a, button, code')) continue; "
@@ -5261,7 +5261,7 @@ def _act_chip_row_above_fallback(driver: Driver) -> None:
         "const range = document.createRange(); "
         "range.setStart(n, m.index); range.setEnd(n, m.index + m[0].length); "
         "const r = range.getBoundingClientRect(); "
-        "if (r.bottom > window.innerHeight - 70) continue; "
+        "if (r.bottom > window.innerHeight - 55) continue; "
         "return {x: r.left, y: r.top, width: r.width, height: r.height}; } } "
         "return null; })()"
     )
