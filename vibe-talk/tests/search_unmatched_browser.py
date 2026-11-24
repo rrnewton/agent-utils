@@ -437,6 +437,17 @@ def walk_through(walk: Walk) -> None:
         .find((li) => li.getClientRects().length);
       return Boolean(first) && first.getBoundingClientRect().top >= panel.bottom - 1;
     }"""), "the first result in the thread sits under the chip panel")
+    # `#2200`: the server line at the foot, brought into view, rests clear
+    # of the Newest pill (its centre is the line's own tap target).
+    page.evaluate("() => document.getElementById('server-search').scrollIntoView({block: 'end'})")
+    walk.settled()
+    walk.check(page.evaluate("""() => {
+      const line = document.getElementById('server-line');
+      const pill = document.getElementById('jump-newest');
+      const r = line.getBoundingClientRect();
+      const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+      return hit === line || line.contains(hit);
+    }"""), "the Newest pill covers the server line's tap target")
     page.fill("#search-field", "bright")
     walk.until("() => document.getElementById('search-count').textContent === '1 of 4 loaded'",
                "bright was not counted in the thread")

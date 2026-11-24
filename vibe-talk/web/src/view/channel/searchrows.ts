@@ -773,6 +773,12 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
     // the loaded set, the line says so in the owner's words — "5 found
     // (4 loaded, 1 older)" — never "5 of 4 loaded".
     const fold = !links && deps.foldCounts ? deps.foldCounts() : null;
+    // The long form ("N found (L loaded, M older)") gets its own line
+    // under the field on a phone (liaison, #2200); the short form keeps
+    // its corner. The stylesheet keys on this attribute.
+    const countEl = el("search-count");
+    const form = fold !== null && fold.freshSelected > 0 ? "found" : "";
+    if (countEl.getAttribute("data-form") !== form) countEl.setAttribute("data-form", form);
     el("search-count").textContent = left.pinned
       ? (!filtering ? `${loaded} pinned` : `${matched} of ${loaded} pinned`)
       : (!filtering ? "" : fold !== null

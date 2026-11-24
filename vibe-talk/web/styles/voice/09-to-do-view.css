@@ -1252,6 +1252,16 @@
     flex: 1 1 calc(100% - 4.75rem);
     min-height: var(--toggle-hit);
   }
+
+  /* `#2200`: the count's long form ("5 found (4 loaded, 1 older)") takes
+     its own line under the field, whole, instead of wrapping to three
+     lines in the corner; the short form keeps the corner. */
+  #screen-main[data-searching] .search-count[data-form="found"] {
+    flex: 0 0 100%;
+    max-width: none;
+    white-space: nowrap;
+    text-align: left;
+  }
 }
 
 /* Whichever filter is beside the glass — Pinned over the channel, Links over the call, which has

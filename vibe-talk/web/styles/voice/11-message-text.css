@@ -530,6 +530,13 @@
   scroll-margin-bottom: calc(max(var(--scroll-tools-clearance, 0px), 2.75rem) + 0.5rem);
 }
 
+/* `#2200`: the server search section at the foot of the list takes the
+   same reserve, so its line brought to the foot rests clear of the
+   Newest pill instead of under its left edge. */
+#server-search {
+  scroll-margin-bottom: calc(max(var(--scroll-tools-clearance, 0px), 2.75rem) + 0.5rem);
+}
+
 .server-hit-meta {
   display: flex;
   flex-wrap: wrap;

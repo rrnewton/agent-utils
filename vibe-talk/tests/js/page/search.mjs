@@ -2985,6 +2985,11 @@ test("`#2200 vibe-talk-search-tab-counts-match-cards`: one fold — chips sum to
   assert.equal(chipOf(page, "threads").textContent, "2 in threads");
   // Wording: fresh hits beyond the loaded set are said as found/older.
   assert.equal(page.el("search-count").textContent, "3 found (2 loaded, 1 older)");
+  // The long form is marked for its own line under the field (no wrap
+  // beyond one line at phone width; the rule is in the stylesheet).
+  assert.equal(page.el("search-count").getAttribute("data-form"), "found");
+  assert.ok(cssBlock("#screen-main[data-searching] .search-count[data-form=\"found\"]").includes("white-space: nowrap"),
+    "the long form has no one-line rule of its own");
   assertFold(page, "fresh theme in Main");
   assert.deepStrictEqual(foldSnapshot(page).visible, ["150", "200", "201"],
     "with Threads off, no thread reply stands in Main");
