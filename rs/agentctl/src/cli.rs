@@ -5522,10 +5522,28 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                         })
                         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
                     });
+                    let escalation = stamp
+                        .as_ref()
+                        .and_then(|stamp| stamp["escalation"].as_str().map(str::to_owned))
+                        .unwrap_or_else(|| "unknown".to_owned());
+                    let verdict = stamp
+                        .as_ref()
+                        .and_then(|stamp| stamp["verdict"].as_str().map(str::to_owned))
+                        .unwrap_or_else(|| "no-stamp".to_owned());
+                    let headline = format!("recovery: verdict={verdict} page={escalation}");
+                    let code = if escalation.starts_with("failed")
+                        || escalation.contains("unconfigured")
+                    {
+                        75
+                    } else {
+                        0
+                    };
+                    eprintln!("{headline}");
                     Ok((
                         json!({"schema": "agentctl-recovery-status/v1",
-                                "claim": claim, "stamp": stamp, "exit_code": 0}),
-                        0,
+                                "headline": headline,
+                                "claim": claim, "stamp": stamp, "exit_code": code}),
+                        code,
                     ))
                 }
             })();
