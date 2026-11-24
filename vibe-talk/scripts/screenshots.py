@@ -8664,6 +8664,7 @@ SCENES: tuple[Scene, ...] = (
         keep_transient=True,
         expect=(
             ("the WTF? button reads WTF?", "document.getElementById('selection-chip-wtf').textContent.trim() === 'WTF?'"),
+            ("#2187 the chip bar is one horizontal row inside the viewport", "(() => { const w = document.getElementById('selection-chip-wtf').getBoundingClientRect(); const c = document.getElementById('selection-chip').getBoundingClientRect(); const x = document.getElementById('selection-chip-dismiss').getBoundingClientRect(); return Math.abs(w.top - c.top) <= 2 && w.left >= -1 && x.right <= window.innerWidth + 1; })()"),
             ("the WTF? button stands left of the Quote reply chip", "(() => { const w = document.getElementById('selection-chip-wtf').getBoundingClientRect(); const c = document.getElementById('selection-chip').getBoundingClientRect(); return w.right <= c.left + 1; })()"),
             ("the dismiss X stands right of the chip", "(() => { const x = document.getElementById('selection-chip-dismiss').getBoundingClientRect(); const c = document.getElementById('selection-chip').getBoundingClientRect(); return x.left >= c.right - 1; })()"),
             ("the selection still stands", "String(getSelection()).length > 0"),

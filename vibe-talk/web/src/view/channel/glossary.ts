@@ -64,23 +64,15 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
       return;
     }
     setHiddenIfChanged(button, false);
+    // `#2187 vibe-talk-wtf-chips-one-row-clear-of-handles`. The chip row (WTF?, Quoted reply, X) is placed
+    // as one clamped group by the quoting view; this view only keeps WTF? on that same row, immediately
+    // left of the chip. It never flips above the chip: one row, one top, inside the viewport.
     const rect = chip.getBoundingClientRect();
     const size = button.getBoundingClientRect();
     const width = Number(size.width) || 64;
-    const height = Number(size.height) || 40;
-    // Always LEFT of the chip (the owner's rule), never flipped right:
-    // clamp to the window's edge, and where even that cannot fit, stand
-    // above the chip's left end rather than on its right.
-    let left = rect.left - 8 - width;
-    let top = rect.top;
-    if (left < 8 && rect.left >= 8 + width + 2) {
-      left = 8;
-    } else if (left < 8) {
-      left = 8;
-      top = rect.top - height - 4;
-    }
-    button.style.left = `${Math.round(Math.max(8, left))}px`;
-    button.style.top = `${Math.round(Math.max(8, top))}px`;
+    const left = Math.max(8, rect.left - 8 - width);
+    button.style.left = `${Math.round(left)}px`;
+    button.style.top = `${Math.round(Math.max(8, rect.top))}px`;
   }
 
   function placePopover(): void {

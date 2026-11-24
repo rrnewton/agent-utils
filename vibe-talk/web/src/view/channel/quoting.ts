@@ -423,13 +423,27 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
     setHiddenIfChanged(dismiss, false);
     setHiddenIfChanged(twin, false);
     if (box === null) return;
+    // `#2187 vibe-talk-wtf-chips-one-row-clear-of-handles`. WTF?, Quoted reply and the dismiss X are ONE
+    // horizontal row: measured and clamped as a single group, so no chip can wrap, clip at a screen edge,
+    // or split from the others. The WTF? button keeps its own visibility (the glossary view owns it); here
+    // it is only measured while visible.
+    const wtf = deps.byId("selection-chip-wtf");
     const size = chip.getBoundingClientRect();
     const width = Number(size.width) || 0;
     const height = Number(size.height) || 0;
+    const wtfSize = wtf.hidden ? { width: 0, height: 0 } : wtf.getBoundingClientRect();
+    const wtfWidth = Number(wtfSize.width) || 0;
+    const dismissSize0 = dismiss.getBoundingClientRect();
+    const dismissWidth0 = Number(dismissSize0.width) || 0;
+    const gap = SELECTION_CHIP_EDGE_PX;
+    const rowWidth = (wtfWidth ? wtfWidth + gap : 0) + width + gap + dismissWidth0;
     const viewWidth = (document.documentElement && document.documentElement.clientWidth) || 0;
     const viewHeight = window.innerHeight || 0;
-    const left = Math.max(SELECTION_CHIP_EDGE_PX,
-      Math.min((box.left + box.right) / 2 - width / 2, viewWidth - SELECTION_CHIP_EDGE_PX - width));
+    const visual0 = window.visualViewport;
+    const viewLeft = visual0 ? Number(visual0.offsetLeft) || 0 : 0;
+    const centre = (box.left + box.right) / 2;
+    const left = Math.max(viewLeft + SELECTION_CHIP_EDGE_PX,
+      Math.min(centre - rowWidth / 2, viewLeft + viewWidth - SELECTION_CHIP_EDGE_PX - rowWidth));
     // `#819 voice-page-quoted-reply-and-draft-chip`. After a touch, what the browser draws for the selection
     // takes touches on it over every layer of the page: the handles under the words, and the bar of Copy
     // and Share, which goes under them where there is no room over them. The chip stands clear of both.
@@ -440,23 +454,23 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
     selectionChipGap = !touch ? SELECTION_CHIP_GAP_PX : SELECTION_CHIP_HANDLES_PX + (barUnder ? SELECTION_BAR_ROOM_PX : 0);
     let top = Math.max(SELECTION_CHIP_EDGE_PX,
       Math.min(box.bottom + selectionChipGap, viewHeight - SELECTION_CHIP_EDGE_PX - height));
-    // No room under the words for that: over them, above where the bar stands there.
-    if (touch && top < box.bottom + selectionChipGap) {
-      top = Math.max(SELECTION_CHIP_EDGE_PX, box.top - SELECTION_BAR_ROOM_PX - height);
+    // `#2187`. No room under the words clear of the handles: the whole row goes above the selection,
+    // clear of the start handle and of the native toolbar that stands over the words there.
+    if (top < box.bottom + selectionChipGap) {
+      const aboveGap = touch ? SELECTION_BAR_ROOM_PX : SELECTION_CHIP_GAP_PX;
+      top = Math.max(SELECTION_CHIP_EDGE_PX, box.top - aboveGap - height);
       selectionChipGap = top - box.bottom;
     }
-    chip.style.left = `${Math.round(left)}px`;
-    chip.style.top = `${Math.round(top)}px`;
-    // The X just right of the chip, or just left of it where the window's edge leaves no room,
-    // centred on the chip's height and kept inside the window like the chip.
-    const dismissSize = dismiss.getBoundingClientRect();
-    const dismissWidth = Number(dismissSize.width) || 0;
-    const dismissHeight = Number(dismissSize.height) || 0;
-    let dismissLeft = left + width + SELECTION_CHIP_EDGE_PX;
-    if (dismissLeft + dismissWidth > viewWidth - SELECTION_CHIP_EDGE_PX) {
-      dismissLeft = left - SELECTION_CHIP_EDGE_PX - dismissWidth;
+    // One row, one top: WTF? left, Quoted reply next, X right; the X centred on the row's height.
+    const chipLeft = left + (wtfWidth ? wtfWidth + gap : 0);
+    if (wtfWidth) {
+      wtf.style.left = `${Math.round(left)}px`;
+      wtf.style.top = `${Math.round(top)}px`;
     }
-    dismissLeft = Math.max(SELECTION_CHIP_EDGE_PX, dismissLeft);
+    chip.style.left = `${Math.round(chipLeft)}px`;
+    chip.style.top = `${Math.round(top)}px`;
+    const dismissHeight = Number(dismissSize0.height) || 0;
+    const dismissLeft = chipLeft + width + gap;
     const dismissTop = Math.max(SELECTION_CHIP_EDGE_PX,
       Math.min(top + (height - dismissHeight) / 2, viewHeight - SELECTION_CHIP_EDGE_PX - dismissHeight));
     dismiss.style.left = `${Math.round(dismissLeft)}px`;
