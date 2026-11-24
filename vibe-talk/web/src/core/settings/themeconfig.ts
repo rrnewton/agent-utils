@@ -21,14 +21,99 @@ export type DarkStyle = "standard" | "extra";
 export interface ThemeConfig {
   readonly mode: "default" | "custom";
   readonly style: DarkStyle;
+  /** The premade Default in force (`THEME_PRESETS`); `legacy` is the scheme's own look. */
+  readonly preset: string;
   readonly tokens: Readonly<Record<string, string>>;
 }
 
 export const DEFAULT_THEME_CONFIG: ThemeConfig = Object.freeze({
   mode: "default",
   style: "standard",
+  preset: "legacy",
   tokens: Object.freeze({}),
 });
+
+/** Premade themes (`#2155` owner 352): the scheme's own legacy look, Extra dark, and
+ * palettes modelled on the survey's compared apps (colours only, descriptive names).
+ * Each paints the full token set for its scheme, code colours included. A preset with
+ * no entry for a scheme is not offered there. */
+export const THEME_PRESETS: readonly {
+  readonly id: string;
+  readonly title: string;
+  readonly schemes: Readonly<Partial<Record<EffectiveTheme, Readonly<Record<string, string>>>>>;
+}[] = Object.freeze([
+  { id: "legacy", title: "Default", schemes: {} },
+  { id: "extra", title: "Extra dark (true black)", schemes: { dark: {} } },
+  { id: "discord-dark", title: "Discord-like dark", schemes: { dark: {
+    "--bg": "#313338", "--panel": "#2b2d31", "--edge": "#1e1f22", "--ink": "#dbdee1", "--muted": "#949ba4",
+    "--accent": "#5865f2", "--accent-bright": "#7289da", "--on-accent": "#ffffff", "--discuss-head-bg": "#2b2d31",
+    "--theirs": "#2b2d31", "--mine": "#2e3350", "--mine-edge": "#5865f2", "--third": "#2f3136", "--third-edge": "#404249",
+    "--dock": "#1e1f22", "--row-hover": "#35373c", "--reply-tint": "#2a2d31",
+  } } },
+  { id: "slack-dark", title: "Slack-like dark", schemes: { dark: {
+    "--bg": "#1a1d21", "--panel": "#222529", "--edge": "#383d44", "--ink": "#d1d2d3", "--muted": "#9a9da3",
+    "--accent": "#1264a3", "--accent-bright": "#4a9ede", "--on-accent": "#ffffff", "--discuss-head-bg": "#350d36",
+    "--theirs": "#222529", "--mine": "#12314d", "--mine-edge": "#1264a3", "--third": "#24262b", "--third-edge": "#383d44",
+    "--dock": "#171a1e", "--row-hover": "#27292d", "--reply-tint": "#15181c",
+  } } },
+  { id: "vscode-dark", title: "VS Code-like dark", schemes: { dark: {
+    "--bg": "#1f1f1f", "--panel": "#181818", "--edge": "#2b2b2b", "--ink": "#cccccc", "--muted": "#8b949e",
+    "--accent": "#0078d4", "--accent-bright": "#4da3e8", "--on-accent": "#ffffff", "--discuss-head-bg": "#181818",
+    "--theirs": "#181818", "--mine": "#0e2a44", "--mine-edge": "#0078d4", "--third": "#1c1c1c", "--third-edge": "#2b2b2b",
+    "--dock": "#181818", "--row-hover": "#252526", "--reply-tint": "#171717",
+    "--hl-keyword": "#c678dd", "--hl-string": "#98c379", "--hl-constant": "#d19a66", "--hl-comment": "#7f848e",
+    "--hl-function": "#61afef", "--hl-type": "#e5c07b", "--hl-property": "#56b6c2", "--hl-variable": "#e06c75",
+  } } },
+  { id: "obsidian-dark", title: "Obsidian-like dark", schemes: { dark: {
+    "--bg": "#202020", "--panel": "#262626", "--edge": "#333333", "--ink": "#dcddde", "--muted": "#999999",
+    "--accent": "#8a5cf5", "--accent-bright": "#a68af7", "--on-accent": "#ffffff", "--discuss-head-bg": "#262626",
+    "--theirs": "#262626", "--mine": "#2e2445", "--mine-edge": "#8a5cf5", "--third": "#242422", "--third-edge": "#333333",
+    "--dock": "#1a1a1a", "--row-hover": "#2c2c2c", "--reply-tint": "#1c1c1c",
+  } } },
+  { id: "github-dark", title: "GitHub-like dark", schemes: { dark: {
+    "--bg": "#0d1117", "--panel": "#161b22", "--edge": "#30363d", "--ink": "#e6edf3", "--muted": "#8b949e",
+    "--accent": "#58a6ff", "--accent-bright": "#79b8ff", "--on-accent": "#0d1117", "--discuss-head-bg": "#161b22",
+    "--theirs": "#161b22", "--mine": "#0d2242", "--mine-edge": "#58a6ff", "--third": "#12161c", "--third-edge": "#30363d",
+    "--dock": "#090c10", "--row-hover": "#1c2128", "--reply-tint": "#0a0d12",
+  } } },
+  { id: "notion-dark", title: "Notion-like dark", schemes: { dark: {
+    "--bg": "#191919", "--panel": "#252525", "--edge": "#2f2f2f", "--ink": "#d4d4d4", "--muted": "#9b9b9b",
+    "--accent": "#529cca", "--accent-bright": "#6fb3dd", "--on-accent": "#ffffff", "--discuss-head-bg": "#252525",
+    "--theirs": "#252525", "--mine": "#1d2c38", "--mine-edge": "#529cca", "--third": "#22221f", "--third-edge": "#2f2f2f",
+    "--dock": "#141414", "--row-hover": "#2a2a2a", "--reply-tint": "#171717",
+  } } },
+  { id: "telegram-dark", title: "Telegram-like dark", schemes: { dark: {
+    "--bg": "#0e1621", "--panel": "#17212b", "--edge": "#232e3c", "--ink": "#e8e8e8", "--muted": "#7f91a4",
+    "--accent": "#3390ec", "--accent-bright": "#5aabf0", "--on-accent": "#ffffff", "--discuss-head-bg": "#17212b",
+    "--theirs": "#17212b", "--mine": "#0d2f4d", "--mine-edge": "#3390ec", "--third": "#131c26", "--third-edge": "#232e3c",
+    "--dock": "#0a121c", "--row-hover": "#1c2936", "--reply-tint": "#0b141f",
+  } } },
+  { id: "github-light", title: "GitHub-like light", schemes: { light: {
+    "--bg": "#ffffff", "--panel": "#f6f8fa", "--edge": "#d0d7de", "--ink": "#1f2328", "--muted": "#59636e",
+    "--accent": "#0969da", "--accent-bright": "#0969da", "--on-accent": "#ffffff", "--discuss-head-bg": "#f6f8fa",
+    "--theirs": "#f6f8fa", "--mine": "#dbeafe", "--mine-edge": "#0969da", "--third": "#faf8f2", "--third-edge": "#d0d7de",
+    "--dock": "#eef1f4", "--row-hover": "#eef1f6", "--reply-tint": "#eef2f7",
+  } } },
+  { id: "vscode-light", title: "VS Code-like light", schemes: { light: {
+    "--bg": "#ffffff", "--panel": "#f3f3f3", "--edge": "#e0e0e0", "--ink": "#1f1f1f", "--muted": "#6e6e6e",
+    "--accent": "#0078d4", "--accent-bright": "#0078d4", "--on-accent": "#ffffff", "--discuss-head-bg": "#f3f3f3",
+    "--theirs": "#f3f3f3", "--mine": "#d6e9fa", "--mine-edge": "#0078d4", "--third": "#f7f3ea", "--third-edge": "#e0e0e0",
+    "--dock": "#e8e8e8", "--row-hover": "#e8e8e8", "--reply-tint": "#ececec",
+    "--hl-keyword": "#af00db", "--hl-string": "#a31515", "--hl-constant": "#098658", "--hl-comment": "#008000",
+    "--hl-function": "#795e26", "--hl-type": "#267f99", "--hl-property": "#001080", "--hl-variable": "#001080",
+  } } },
+  { id: "obsidian-light", title: "Obsidian-like light", schemes: { light: {
+    "--bg": "#ffffff", "--panel": "#f2f2f2", "--edge": "#e0e0e0", "--ink": "#222222", "--muted": "#6f6f6f",
+    "--accent": "#7c3aed", "--accent-bright": "#7c3aed", "--on-accent": "#ffffff", "--discuss-head-bg": "#f2f2f2",
+    "--theirs": "#f2f2f2", "--mine": "#eadffc", "--mine-edge": "#7c3aed", "--third": "#f7f2e8", "--third-edge": "#e0e0e0",
+    "--dock": "#e8e8e8", "--row-hover": "#e8e8e8", "--reply-tint": "#ececec",
+  } } },
+]);
+
+/** The premade themes offered for a scheme, legacy first. */
+export function presetsFor(scheme: EffectiveTheme) {
+  return THEME_PRESETS.filter((preset) => preset.id === "legacy" || preset.schemes[scheme]);
+}
 
 /** The colour groups the editor shows (`#2155` survey §3): 13 groups covering every
  * paintable token exactly once. Syntax (`--hl-*`) is deliberately not among them. */
@@ -37,7 +122,7 @@ export const THEME_GROUPS: readonly {
   readonly title: string;
   readonly tokens: readonly string[];
 }[] = Object.freeze([
-  { id: "background", title: "Page background", tokens: ["--bg"] },
+  { id: "background", title: "Page", tokens: ["--bg"] },
   { id: "cards", title: "Message cards", tokens: ["--panel", "--theirs"] },
   { id: "mine", title: "Your messages", tokens: ["--mine", "--mine-edge", "--muted-on-mine", "--warn-on-mine"] },
   { id: "third", title: "Others' messages", tokens: ["--third", "--third-edge"] },
@@ -119,6 +204,9 @@ export function themeConfigOf(raw: string | null): ThemeConfig {
     const record = parsed as Record<string, unknown>;
     const mode = record.mode === "custom" ? "custom" : "default";
     const style: DarkStyle = record.style === "extra" ? "extra" : "standard";
+    const preset = typeof record.preset === "string" && THEME_PRESETS.some((p) => p.id === record.preset)
+      ? record.preset
+      : style === "extra" ? "extra" : "legacy";
     const tokens: Record<string, string> = {};
     if (typeof record.tokens === "object" && record.tokens !== null) {
       for (const [name, value] of Object.entries(record.tokens as Record<string, unknown>)) {
@@ -128,10 +216,10 @@ export function themeConfigOf(raw: string | null): ThemeConfig {
         else if (name === "--unread-stripe" && value === "transparent") tokens[name] = value;
       }
     }
-    if (mode === "default" && style === "standard" && Object.keys(tokens).length === 0) {
+    if (mode === "default" && preset === "legacy" && Object.keys(tokens).length === 0) {
       return DEFAULT_THEME_CONFIG;
     }
-    return Object.freeze({ mode, style, tokens: Object.freeze(tokens) });
+    return Object.freeze({ mode, style: preset === "extra" ? "extra" : "standard", preset, tokens: Object.freeze(tokens) });
   } catch (_error) {
     return DEFAULT_THEME_CONFIG;
   }
@@ -139,10 +227,10 @@ export function themeConfigOf(raw: string | null): ThemeConfig {
 
 /** The kept string for a configuration; the untouched Default keeps nothing. */
 export function themeConfigRaw(config: ThemeConfig): string | null {
-  if (config.mode === "default" && config.style === "standard" && Object.keys(config.tokens).length === 0) {
+  if (config.mode === "default" && config.preset === "legacy" && Object.keys(config.tokens).length === 0) {
     return null;
   }
-  return JSON.stringify({ mode: config.mode, style: config.style, tokens: config.tokens });
+  return JSON.stringify({ mode: config.mode, style: config.preset === "extra" ? "extra" : "standard", preset: config.preset, tokens: config.tokens });
 }
 
 /** A scheme's effective Default tokens: its scheme table, its Colour preset, and — for
@@ -151,7 +239,7 @@ export function themeConfigRaw(config: ThemeConfig): string | null {
 export function defaultTokensFor(
   scheme: EffectiveTheme,
   preset: ColourTheme,
-  style: DarkStyle,
+  themePreset: string,
 ): Readonly<Record<string, string>> {
   const merged: Record<string, string> = {
     ...THEME_TOKENS[scheme],
@@ -160,7 +248,9 @@ export function defaultTokensFor(
     "--discuss-head-bg": scheme === "dark" ? "#1d2026" : "#ffffff",
     ...COLOUR_PRESETS[preset][scheme],
   };
-  if (scheme === "dark" && style === "extra") Object.assign(merged, EXTRA_DARK_TOKENS);
+  if (scheme === "dark" && themePreset === "extra") Object.assign(merged, EXTRA_DARK_TOKENS);
+  const appPreset = THEME_PRESETS.find((p) => p.id === themePreset);
+  if (appPreset && appPreset.schemes[scheme]) Object.assign(merged, appPreset.schemes[scheme]);
   return Object.freeze(merged);
 }
 
@@ -170,7 +260,7 @@ export function tokensForConfig(
   scheme: EffectiveTheme,
   preset: ColourTheme,
 ): Readonly<Record<string, string>> {
-  const defaults = defaultTokensFor(scheme, preset, config.style);
+  const defaults = defaultTokensFor(scheme, preset, config.preset);
   if (config.mode !== "custom") return defaults;
   return Object.freeze({ ...defaults, ...config.tokens });
 }

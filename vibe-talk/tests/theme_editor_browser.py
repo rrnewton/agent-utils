@@ -134,7 +134,13 @@ def main() -> int:
                 if args.screenshots:
                     args.screenshots.mkdir(parents=True, exist_ok=True)
                     page.screenshot(path=str(args.screenshots / "theme-editor-dark-extra.png"))
-                page.select_option("#theme-mode", "default")
+                page.select_option("#theme-mode", "legacy")
+                page.wait_for_function("() => getComputedStyle(document.documentElement).getPropertyValue('--bg').trim() === '#14161a'", timeout=STATE_MS)
+
+                # A premade palette paints its scheme (Discord-like dark from the survey).
+                page.select_option("#theme-mode", "discord-dark")
+                page.wait_for_function("() => getComputedStyle(document.documentElement).getPropertyValue('--bg').trim() === '#313338'", timeout=STATE_MS)
+                page.select_option("#theme-mode", "legacy")
                 page.wait_for_function("() => getComputedStyle(document.documentElement).getPropertyValue('--bg').trim() === '#14161a'", timeout=STATE_MS)
 
                 # Custom: seeded from the Default, then the reader's colour wins.

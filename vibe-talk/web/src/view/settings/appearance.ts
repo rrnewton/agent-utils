@@ -2,7 +2,7 @@
 // The choice itself lives in core/settings; this owner paints it: the effective theme on the
 // document element, the `color-scheme`, the PWA `theme-color`, and the select saying the choice.
 
-import { COLOUR_PRESETS, DEFAULT_THEME_CONFIG, THEME_GROUPS, THEME_TOKEN_NAMES, TOKEN_LABELS, THEME_TOKENS, colourThemeOf, defaultTokensFor, effectiveTheme, themeColorFor, tokensForConfig } from "../../core/settings/index.ts";
+import { COLOUR_PRESETS, DEFAULT_THEME_CONFIG, THEME_GROUPS, THEME_TOKEN_NAMES, TOKEN_LABELS, presetsFor, THEME_TOKENS, colourThemeOf, defaultTokensFor, effectiveTheme, themeColorFor, tokensForConfig } from "../../core/settings/index.ts";
 import type { Appearance, ColourTheme, EffectiveTheme, ThemeConfig } from "../../core/settings/index.ts";
 import { createListening } from "../dom/index.ts";
 
@@ -122,7 +122,7 @@ export function mountAppearance(deps: AppearanceDependencies): AppearanceControl
       // The scheme's own configuration paints last (`#2155`): Extra over the Default,
       // or the reader's Custom tokens over both.
       const effective = tokensForConfig(configs[theme], theme, currentColour);
-      if (configs[theme].mode === "custom" || (theme === "dark" && configs[theme].style === "extra")) {
+      if (configs[theme].mode === "custom" || configs[theme].preset !== "legacy") {
         for (const [name, value] of Object.entries(effective)) root.style.setProperty(name, value);
       }
       paintedTokens = effective;
@@ -195,14 +195,27 @@ export function mountAppearance(deps: AppearanceDependencies): AppearanceControl
     if (lightBtn) lightBtn.setAttribute("aria-pressed", String(editScheme === "light"));
     if (darkBtn) darkBtn.setAttribute("aria-pressed", String(editScheme === "dark"));
     const modeSelect = deps.lookup("theme-mode") as HTMLSelectElement | null;
-    if (modeSelect) {
-      const picker = cfg.mode === "custom" ? "custom" : editScheme === "dark" && cfg.style === "extra" ? "extra" : "default";
+    if (modeSelect && typeof document !== "undefined" && typeof document.createElement === "function") {
+      const picker = cfg.mode === "custom" ? "custom" : cfg.preset;
+      const wanted = [...presetsFor(editScheme).map((preset) => preset.id), "custom"];
+      const current = Array.from(modeSelect.options ?? []).map((option) => (option as HTMLOptionElement).value);
+      if (current.join(",") !== wanted.join(",")) {
+        modeSelect.textContent = "";
+        for (const preset of presetsFor(editScheme)) {
+          const option = document.createElement("option");
+          option.value = preset.id;
+          option.textContent = preset.id === "legacy" ? "Default" : preset.title;
+          modeSelect.appendChild(option);
+        }
+        const customOption = document.createElement("option");
+        customOption.value = "custom";
+        customOption.textContent = "Custom";
+        modeSelect.appendChild(customOption);
+      }
       if (modeSelect.value !== picker) modeSelect.value = picker;
-      const extraOption = modeSelect.options ? modeSelect.options[1] as HTMLOptionElement | undefined : undefined;
-      if (extraOption) extraOption.disabled = editScheme !== "dark";
     }
     const resetBtn = deps.lookup("theme-reset") as HTMLButtonElement | null;
-    if (resetBtn) { resetBtn.disabled = cfg.mode !== "custom"; resetBtn.textContent = "Reset custom to Default"; }
+    if (resetBtn) { resetBtn.hidden = cfg.mode !== "custom"; resetBtn.textContent = "Reset custom to Default"; }
     const host = deps.lookup("theme-groups");
     if (host && typeof document !== "undefined" && typeof document.createElement === "function") {
       const effective = tokensForConfig(cfg, editScheme, currentColour);
@@ -252,7 +265,7 @@ export function mountAppearance(deps: AppearanceDependencies): AppearanceControl
 
   function seedCustom(scheme: EffectiveTheme): void {
     const cfg = configs[scheme];
-    configs[scheme] = { mode: "custom", style: cfg.style, tokens: { ...defaultTokensFor(scheme, currentColour, cfg.style) } };
+    configs[scheme] = { mode: "custom", style: cfg.style, tokens: { ...defaultTokensFor(scheme, currentColour, cfg.preset) } };
   }
 
   const editLight = deps.lookup("theme-edit-light");
@@ -266,7 +279,7 @@ export function mountAppearance(deps: AppearanceDependencies): AppearanceControl
       if (Object.keys(configs[editScheme].tokens).length === 0) seedCustom(editScheme);
       else configs[editScheme] = { ...configs[editScheme], mode: "custom" };
     } else {
-      configs[editScheme] = { ...configs[editScheme], mode: "default", style: picked === "extra" ? "extra" : "standard" };
+      configs[editScheme] = { ...configs[editScheme], mode: "default", preset: picked, style: picked === "extra" ? "extra" : "standard" };
     }
     editorChanged(keepConfig(editScheme));
   });

@@ -122,8 +122,8 @@ test("`#624 voice-page-modularity`: each device setting reads, keeps and refuses
     ["afterDone", "vibe-talk.voice.after-done", "stay", [["next", "next"], ["unread", "unread"], ["stay", "stay"]], "stay"],
     ["appearance", "vibe-talk.voice.appearance", "system", [["light", "light"], ["dark", "dark"], ["system", "system"]], "system"],
     ["colourTheme", "vibe-talk.voice.colour-theme", "blue", [["teal", "teal"], ["plum", "plum"], ["amber", "amber"], ["blue-hc", "blue-hc"], ["blue", "blue"]], "blue"],
-    ["themeLight", "vibe-talk.voice.theme-light", { mode: "default", style: "standard", tokens: {} }, [[{ mode: "custom", style: "standard", tokens: { "--bg": "#000000" } }, '{"mode":"custom","style":"standard","tokens":{"--bg":"#000000"}}'], [{ mode: "default", style: "standard", tokens: {} }, null]], { mode: "default", style: "standard", tokens: {} }],
-    ["themeDark", "vibe-talk.voice.theme-dark", { mode: "default", style: "standard", tokens: {} }, [[{ mode: "default", style: "extra", tokens: {} }, '{"mode":"default","style":"extra","tokens":{}}'], [{ mode: "default", style: "standard", tokens: {} }, null]], { mode: "default", style: "standard", tokens: {} }],
+    ["themeLight", "vibe-talk.voice.theme-light", { mode: "default", style: "standard", preset: "legacy", tokens: {} }, [[{ mode: "custom", style: "standard", preset: "legacy", tokens: { "--bg": "#000000" } }, '{"mode":"custom","style":"standard","preset":"legacy","tokens":{"--bg":"#000000"}}'], [{ mode: "default", style: "standard", preset: "legacy", tokens: {} }, null]], { mode: "default", style: "standard", preset: "legacy", tokens: {} }],
+    ["themeDark", "vibe-talk.voice.theme-dark", { mode: "default", style: "standard", preset: "legacy", tokens: {} }, [[{ mode: "default", style: "extra", preset: "extra", tokens: {} }, '{"mode":"default","style":"extra","preset":"extra","tokens":{}}'], [{ mode: "default", style: "standard", preset: "legacy", tokens: {} }, null]], { mode: "default", style: "standard", preset: "legacy", tokens: {} }],
     ["documentsReactPolicy", "vibe-talk.voice.documents-react-policy", "mention", [["discussion", "discussion"], ["mention", "mention"]], "mention"],
     ["readAudioSource", "vibe-talk.voice.read-audio-source", null, [["agent", "agent"], ["device", "device"], ["wit", "wit"]], null],
     ["witVoice", "vibe-talk.voice.wit-voice", "", [["Charlie", "Charlie"], ["", null]], ""],
@@ -453,6 +453,9 @@ test("`#2155 vibe-talk-theme-settings-pane`: groups cover every token once, Extr
   assert.deepStrictEqual(custom.tokens, { "--bg": "#010203", "--hl-keyword": "#aabbcc" }, "unknown or unusable tokens are dropped");
   assert.equal(tokensForConfig(custom, "dark", "blue")["--bg"], "#010203");
   assert.equal(tokensForConfig(custom, "dark", "blue")["--hl-keyword"], "#aabbcc", "code colours are themeable");
+  assert.equal(defaultTokensFor("dark", "blue", "discord-dark")["--bg"], "#313338", "premade palettes paint their scheme");
+  assert.equal(defaultTokensFor("dark", "blue", "vscode-dark")["--hl-keyword"], "#c678dd", "premade themes set code colours");
+  assert.equal(themeConfigOf('{"mode":"default","style":"extra","tokens":{}}').preset, "extra", "kept Extra style migrates to the preset");
   assert.equal(themeConfigOf("not json").mode, "default");
   assert.equal(themeConfigOf(null).mode, "default");
 });
