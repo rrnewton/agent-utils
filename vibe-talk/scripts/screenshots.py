@@ -5316,18 +5316,26 @@ def _act_glossary_not_found(driver: Driver) -> None:
         "return null; })(" + json.dumps(term) + ")"
     )
     assert isinstance(rect, dict), "no selectable term text on screen"
-    driver.page.mouse.move(float(rect["x"]) + 1, float(rect["y"]) + float(rect["height"]) / 2)
-    driver.page.mouse.down()
-    driver.page.mouse.move(
-        float(rect["x"]) + float(rect["width"]) - 1,
-        float(rect["y"]) + float(rect["height"]) / 2,
-        steps=8,
-    )
-    driver.page.mouse.up()
-    driver.page.wait_for_function(
-        "() => window.__visible('selection-chip-wtf') && window.__visible('selection-chip')",
-        timeout=10_000,
-    )
+    for _attempt in range(3):
+        driver.page.mouse.move(float(rect["x"]) + 1, float(rect["y"]) + float(rect["height"]) / 2)
+        driver.page.mouse.down()
+        driver.page.mouse.move(
+            float(rect["x"]) + float(rect["width"]) - 1,
+            float(rect["y"]) + float(rect["height"]) / 2,
+            steps=8,
+        )
+        driver.page.mouse.up()
+        driver.settle(150)
+        try:
+            driver.page.wait_for_function(
+                "() => window.__visible('selection-chip-wtf') && window.__visible('selection-chip')",
+                timeout=1_500,
+            )
+            break
+        except Exception:
+            continue
+    else:
+        raise AssertionError("the WTF? chip never stood under the selection")
     driver.page.click("#selection-chip-wtf", force=True)
     driver.page.wait_for_function(
         "() => window.__visible('glossary-popover') "
