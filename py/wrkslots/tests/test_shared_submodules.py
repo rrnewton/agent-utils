@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -783,3 +784,338 @@ def test_share_without_fetch_refuses_missing_pin_and_fetches_nothing(
         ).returncode
         != 0
     )
+def _place_shared_submodule(repository: Path, slot_checkout: Path) -> Path:
+    """Place the slot's submodule as the primary module repo's worktree (#2168)."""
+
+    primary_sub = repository / "component"
+    head = git(primary_sub, "rev-parse", "HEAD").stdout.strip()
+    sub = slot_checkout / "component"
+    if sub.exists():
+        shutil.rmtree(sub)
+    git(primary_sub, "worktree", "add", "--detach", str(sub), head)
+    return sub
+
+
+def test_remove_accepts_declared_submodule_placed_as_shared_worktree(
+    tmp_path: Path,
+) -> None:
+    # #2168: a declared submodule sitting in the slot as the primary
+    # module repository's linked worktree (detached at the gitlink,
+    # clean) is expected: removal deregisters it from the owning
+    # repository instead of refusing it as undeclared.
+    project, repository, _remote = make_project(tmp_path)
+    add_recursive_submodules(tmp_path, project, repository)
+    update_configuration(project)
+    assert create(project).returncode == 0
+    sub = _place_shared_submodule(repository, checkout(project))
+    module = _primary_module(repository)
+    assert finish(project).returncode == 0
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    removed = remove(project)
+
+    assert removed.returncode == 0, removed.stderr
+    assert not (module / "worktrees").exists() or not any(
+        (module / "worktrees").iterdir()
+    ), "owning repository still registers the removed worktree"
+    assert (module / "objects").is_dir()
+
+
+def test_remove_accepts_shared_placed_submodule_in_flat_layout(
+    tmp_path: Path,
+) -> None:
+    # #2168, flat layout: the checkout IS the slot directory and the
+    # declared submodule sits inside it as a shared linked worktree.
+    project, repository, _remote = make_project(tmp_path)
+    add_recursive_submodules(tmp_path, project, repository)
+    update_configuration(project, layout="flat")
+    assert create(project).returncode == 0
+    sub = _place_shared_submodule(repository, checkout(project))
+    module = _primary_module(repository)
+    assert finish(project).returncode == 0
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    removed = remove(project)
+
+    assert removed.returncode == 0, removed.stderr
+    assert not (module / "worktrees").exists() or not any(
+        (module / "worktrees").iterdir()
+    ), "owning repository still registers the removed worktree"
+
+
+def test_remove_refuses_unreadable_shared_placed_submodule(tmp_path: Path) -> None:
+    # #2168: expected-nested is fail-closed on salvage: a declared
+    # submodule whose repository cannot be read refuses and survives.
+    project, repository, _remote = make_project(tmp_path)
+    add_recursive_submodules(tmp_path, project, repository)
+    update_configuration(project)
+    assert create(project).returncode == 0
+    sub = _place_shared_submodule(repository, checkout(project))
+    assert finish(project).returncode == 0
+    (sub / ".git").write_text("gitdir: /nonexistent/nowhere\n", encoding="utf-8")
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    removed = remove(project)
+
+    assert removed.returncode == 3, removed.stdout
+    assert sub.is_dir()
+    assert checkout(project).exists()
+
+
+def _sha_survives(tmp_path: Path, sha: str) -> bool:
+    for gitdir in tmp_path.rglob("objects"):
+        repo = gitdir.parent
+        found = subprocess.run(
+            ["git", "--git-dir", str(repo), "cat-file", "-e", f"{sha}^{{commit}}"],
+            capture_output=True,
+        )
+        if found.returncode == 0:
+            return True
+    return any(tmp_path.rglob("*.bundle")) and any(
+        sha in subprocess.run(
+            ["git", "bundle", "list-heads", str(bundle)],
+            capture_output=True, text=True,
+        ).stdout
+        for bundle in tmp_path.rglob("*.bundle")
+    )
+
+
+def _private_commit_in_private_clone(
+    tmp_path: Path, *, unset_core_worktree: bool
+) -> subprocess.CompletedProcess[str]:
+    project, repository, _remote = make_project(tmp_path)
+    add_recursive_submodules(tmp_path, project, repository)
+    update_configuration(project)
+    assert create(project).returncode == 0
+    slot_sub = checkout(project) / "component"
+    private_module = Path(
+        git(slot_sub, "rev-parse", "--absolute-git-dir").stdout.strip()
+    )
+    git(slot_sub, "config", "user.name", "T")
+    git(slot_sub, "config", "user.email", "t@example.invalid")
+    git(slot_sub, "checkout", "-q", "-b", "wip")
+    (slot_sub / "private.txt").write_text("private only here\n", encoding="utf-8")
+    git(slot_sub, "add", "private.txt")
+    git(slot_sub, "commit", "-q", "-m", "unpushed private work")
+    sha = git(slot_sub, "rev-parse", "HEAD").stdout.strip()
+    if unset_core_worktree:
+        subprocess.run(
+            ["git", "config", "--file", str(private_module / "config"),
+             "--unset", "core.worktree"],
+            check=True,
+        )
+    _place_shared_submodule(repository, checkout(project))
+    assert finish(project).returncode == 0
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    removed = remove(project)
+    assert removed.returncode != 0 or _sha_survives(tmp_path, sha), (
+        "private commit in the slot's own module repository was lost"
+    )
+    return removed
+
+
+def test_remove_never_loses_private_module_history_when_shared_placed(
+    tmp_path: Path,
+) -> None:
+    # #2168 B1: the slot's private module clone holds an unpushed
+    # branch; replacing its worktree with the shared placement must
+    # not delete that history unseen (refuse or bundle it).
+    _private_commit_in_private_clone(tmp_path, unset_core_worktree=False)
+
+
+def test_remove_never_loses_private_module_history_without_core_worktree(
+    tmp_path: Path,
+) -> None:
+    # #2168 B2/S2: same, with the module's core.worktree unset, where
+    # the judged repository would share the listed candidate's name.
+    _private_commit_in_private_clone(tmp_path, unset_core_worktree=True)
+
+
+def _private_clone_setup(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+    project, repository, _remote = make_project(tmp_path)
+    add_recursive_submodules(tmp_path, project, repository)
+    update_configuration(project)
+    assert create(project).returncode == 0
+    slot_sub = checkout(project) / "component"
+    private_module = Path(
+        git(slot_sub, "rev-parse", "--absolute-git-dir").stdout.strip()
+    )
+    git(slot_sub, "config", "user.name", "T")
+    git(slot_sub, "config", "user.email", "t@example.invalid")
+    return project, repository, slot_sub, private_module
+
+
+def _object_survives(tmp_path: Path, obj: str, kind: str = "commit") -> bool:
+    seeds: list[Path] = []
+    for objdir in tmp_path.rglob("objects"):
+        repo = objdir.parent
+        if (repo / "HEAD").exists():
+            seeds.append(repo)
+            found = subprocess.run(
+                ["git", "--git-dir", str(repo), "cat-file", "-e", f"{obj}^{{{kind}}}"],
+                capture_output=True,
+            )
+            if found.returncode == 0:
+                return True
+    # Thin salvage bundles need their prerequisites: fetch each into a
+    # scratch cloned from a seed repository that holds them.
+    for number, bundle in enumerate(tmp_path.rglob("*.bundle")):
+        for seed_number, seed in enumerate(seeds):
+            scratch = tmp_path / f"unb-scratch-{number}-{seed_number}"
+            if scratch.exists():
+                continue
+            cloned = subprocess.run(
+                ["git", "clone", "-q", "--bare", str(seed), str(scratch)],
+                capture_output=True,
+            )
+            if cloned.returncode != 0:
+                continue
+            subprocess.run(
+                ["git", "-C", str(scratch), "fetch", "-q", str(bundle), "refs/*:refs/b/*"],
+                capture_output=True,
+            )
+            found = subprocess.run(
+                ["git", "-C", str(scratch), "cat-file", "-e", f"{obj}^{{{kind}}}"],
+                capture_output=True,
+            )
+            if found.returncode == 0:
+                return True
+    return False
+
+
+def _finish_remove_2168(project: Path) -> subprocess.CompletedProcess[str]:
+    assert finish(project).returncode == 0
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    return remove(project)
+
+
+def test_remove_never_loses_linked_worktree_head_of_private_clone(
+    tmp_path: Path,
+) -> None:
+    # #2168 N1/P3: private work only in a linked worktree's detached
+    # HEAD of the slot's private clone must survive or refuse.
+    project, repository, slot_sub, _module = _private_clone_setup(tmp_path)
+    gitlink = git(slot_sub, "rev-parse", "HEAD").stdout.strip()
+    lwt = checkout(project).parent / "lwt-scratch"
+    git(slot_sub, "worktree", "add", "-q", "--detach", str(lwt), gitlink)
+    git(lwt, "config", "user.name", "T")
+    git(lwt, "config", "user.email", "t@example.invalid")
+    (lwt / "d.txt").write_text("detached private\n", encoding="utf-8")
+    git(lwt, "add", "d.txt")
+    git(lwt, "commit", "-q", "-m", "private in linked worktree")
+    sha = git(lwt, "rev-parse", "HEAD").stdout.strip()
+    shutil.rmtree(lwt)
+    git(slot_sub, "remote", "set-url", "--push", "origin", str(tmp_path / "fork.git"))
+    _place_shared_submodule(repository, checkout(project))
+    removed = _finish_remove_2168(project)
+    assert removed.returncode != 0 or _object_survives(tmp_path, sha), "PRIVATE COMMIT LOST"
+
+
+def test_remove_never_loses_index_only_blob_of_private_clone(tmp_path: Path) -> None:
+    # #2168 N1/P4: staged-only content in the private clone.
+    project, repository, slot_sub, _module = _private_clone_setup(tmp_path)
+    (slot_sub / "staged.txt").write_text("staged only\n", encoding="utf-8")
+    git(slot_sub, "add", "staged.txt")
+    blob = git(slot_sub, "rev-parse", ":staged.txt").stdout.strip()
+    _place_shared_submodule(repository, checkout(project))
+    removed = _finish_remove_2168(project)
+    assert removed.returncode == 0, removed.stderr
+    assert _object_survives(tmp_path, blob, "blob"), "STAGED BLOB LOST"
+
+
+def test_remove_never_loses_linked_head_with_stale_core_worktree(
+    tmp_path: Path,
+) -> None:
+    # #2168 N1/P7: stale recorded worktree plus linked-worktree HEAD.
+    project, repository, slot_sub, private_module = _private_clone_setup(tmp_path)
+    gitlink = git(slot_sub, "rev-parse", "HEAD").stdout.strip()
+    lwt = checkout(project).parent / "lwt-scratch"
+    git(slot_sub, "worktree", "add", "-q", "--detach", str(lwt), gitlink)
+    git(lwt, "config", "user.name", "T")
+    git(lwt, "config", "user.email", "t@example.invalid")
+    (lwt / "d.txt").write_text("detached private\n", encoding="utf-8")
+    git(lwt, "add", "d.txt")
+    git(lwt, "commit", "-q", "-m", "private in linked worktree")
+    sha = git(lwt, "rev-parse", "HEAD").stdout.strip()
+    shutil.rmtree(lwt)
+    _place_shared_submodule(repository, checkout(project))
+    subprocess.run(
+        ["git", "config", "--file", str(private_module / "config"),
+         "core.worktree", str(tmp_path / "moved-away" / "slot01" / "component")],
+        check=True,
+    )
+    removed = _finish_remove_2168(project)
+    assert removed.returncode != 0 or private_module.exists() or _object_survives(tmp_path, sha), "PRIVATE COMMIT LOST"
+
+
+def test_remove_never_loses_detached_head_without_reflog(tmp_path: Path) -> None:
+    # #2168 N1/P8: detached HEAD commit, reflogs expired.
+    project, repository, slot_sub, _module = _private_clone_setup(tmp_path)
+    (slot_sub / "h.txt").write_text("detached head private\n", encoding="utf-8")
+    git(slot_sub, "add", "h.txt")
+    git(slot_sub, "commit", "-q", "-m", "detached private")
+    sha = git(slot_sub, "rev-parse", "HEAD").stdout.strip()
+    git(slot_sub, "reflog", "expire", "--expire=now", "--all")
+    git(slot_sub, "remote", "set-url", "--push", "origin", str(tmp_path / "fork.git"))
+    _place_shared_submodule(repository, checkout(project))
+    removed = _finish_remove_2168(project)
+    assert removed.returncode != 0 or _object_survives(tmp_path, sha), "PRIVATE COMMIT LOST"
+
+
+def test_remove_never_loses_orphan_head_commit(tmp_path: Path) -> None:
+    # #2168 N1/P9: detached private commit, then an orphan checkout.
+    project, repository, slot_sub, _module = _private_clone_setup(tmp_path)
+    (slot_sub / "o.txt").write_text("detached then orphan\n", encoding="utf-8")
+    git(slot_sub, "add", "o.txt")
+    git(slot_sub, "commit", "-q", "-m", "detached private")
+    sha = git(slot_sub, "rev-parse", "HEAD").stdout.strip()
+    git(slot_sub, "checkout", "-q", "--orphan", "scratch")
+    _place_shared_submodule(repository, checkout(project))
+    removed = _finish_remove_2168(project)
+    assert removed.returncode != 0 or _object_survives(tmp_path, sha), "PRIVATE COMMIT LOST"
+
+
+def test_remove_keeps_every_linked_worktree_index_of_private_clone(
+    tmp_path: Path,
+) -> None:
+    # #2168: staged-only content in the main index and in two linked
+    # worktrees' indexes is all kept (no label-truncation drop).
+    project, repository, slot_sub, _module = _private_clone_setup(tmp_path)
+    head = git(slot_sub, "rev-parse", "HEAD").stdout.strip()
+    (slot_sub / "m.txt").write_text("main staged\n", encoding="utf-8")
+    git(slot_sub, "add", "m.txt")
+    blobs = [git(slot_sub, "rev-parse", ":m.txt").stdout.strip()]
+    for number in (1, 2):
+        lwt = checkout(project).parent / f"lwt{number}"
+        git(slot_sub, "worktree", "add", "-q", "--detach", str(lwt), head)
+        (lwt / f"l{number}.txt").write_text(f"linked {number}\n", encoding="utf-8")
+        git(lwt, "add", f"l{number}.txt")
+        blobs.append(git(lwt, "rev-parse", f":l{number}.txt").stdout.strip())
+        shutil.rmtree(lwt)
+    _place_shared_submodule(repository, checkout(project))
+
+    removed = _finish_remove_2168(project)
+
+    assert removed.returncode == 0, removed.stderr
+    for blob in blobs:
+        assert _object_survives(tmp_path, blob, "blob"), "STAGED BLOB LOST"
+
+
+def test_remove_refuses_locked_index_of_private_clone(tmp_path: Path) -> None:
+    # #2168: a leftover index.lock means a Git process may be
+    # mid-write; removal refuses rather than judging stale state.
+    project, repository, slot_sub, private_module = _private_clone_setup(tmp_path)
+    (slot_sub / "staged.txt").write_text("staged\n", encoding="utf-8")
+    git(slot_sub, "add", "staged.txt")
+    _place_shared_submodule(repository, checkout(project))
+    shutil.copyfile(private_module / "index", private_module / "index.lock")
+
+    removed = _finish_remove_2168(project)
+
+    assert removed.returncode == 3, removed.stdout
+    assert checkout(project).exists()

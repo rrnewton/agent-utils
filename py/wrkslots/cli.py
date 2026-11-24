@@ -37075,8 +37075,8 @@ def _durable_candidates(
 
 def _index_state_trees(
     vcs: _GitVcs, config: Config, checkout: Checkout, path: Path
-) -> tuple[str, ...]:
-    """Return the trees of a checkout's own index and of its worktree read through it.
+) -> tuple[tuple[str, str], ...]:
+    """Return labelled trees of a checkout's own index and worktree read through it.
 
     Ordinary salvage reads the worktree into an index seeded from HEAD, so it
     keeps neither what only the real index holds (a file staged and then
@@ -37089,9 +37089,50 @@ def _index_state_trees(
     """
 
     if (path / "HEAD").is_file() and (path / "objects").is_dir():
-        # A module repository with no populated worktree (#864) has no
-        # index or worktree state beyond what its refs already name.
-        return ()
+        # A module repository judged as a bare git dir (#864, #2168):
+        # it has no worktree state of its own to read, but its index
+        # (and each linked worktree's index) can hold staged-only
+        # content its refs do not name. Keep each staged tree, computed
+        # from a copy of the index with no work tree involved.
+        indexes = [path / "index"]
+        worktrees_dir = path / "worktrees"
+        if worktrees_dir.is_dir():
+            indexes.extend(sorted(worktrees_dir.glob("*/index")))
+        for index in indexes:
+            if (index.parent / "index.lock").exists():
+                raise Refusal(
+                    f"Git index of checkout {checkout.name} is locked: "
+                    f"{index.parent / 'index.lock'}; a Git process may be "
+                    "mid-write, so its staged state cannot be judged"
+                )
+        trees: list[tuple[str, str]] = []
+        with tempfile.TemporaryDirectory(prefix="wrkslots-index-state-") as temporary:
+            for number, index in enumerate(indexes):
+                if not os.path.lexists(index):
+                    continue
+                if index.is_symlink() or not index.is_file():
+                    raise Refusal(
+                        f"Git index of checkout {checkout.name} is unsafe: {index}"
+                    )
+                copy = Path(temporary) / f"index-{number}"
+                try:
+                    shutil.copyfile(index, copy, follow_symlinks=False)
+                except OSError as exc:
+                    raise Refusal(
+                        f"cannot copy the Git index of checkout {checkout.name}: {exc}"
+                    ) from exc
+                label = "index" if number == 0 else f"linked-{index.parent.name}"
+                trees.append(
+                    (
+                        label,
+                        vcs._run(
+                            path,
+                            ["write-tree"],
+                            env_overrides={"GIT_INDEX_FILE": str(copy)},
+                        ).stdout.strip(),
+                    )
+                )
+        return tuple(trees)
     index = _git_path(vcs, path, "index")
     if not os.path.lexists(index):
         return ()
@@ -37214,7 +37255,7 @@ def _index_state_trees(
     for tree in (staged_tree, worktree_tree):
         if not SHA_RE.fullmatch(tree):
             raise Refusal(f"index tree for checkout {checkout.name} is not a full Git object")
-    return staged_tree, worktree_tree
+    return (("index", staged_tree), ("worktree-through-index", worktree_tree))
 
 
 def _salvage_candidate_uncached(
@@ -37308,11 +37349,11 @@ def _salvage_candidate_uncached(
     salvage_tree = vcs._run(path, ["rev-parse", f"{facts.commit}^{{tree}}"]).stdout.strip()
     extra: list[str] = []
     seen = {head_tree, salvage_tree}
-    for label, tree in zip(
-        ("index", "worktree-through-index"),
-        _index_state_trees(vcs, config, checkout, path),
-    ):
+    index_trees = _index_state_trees(vcs, config, checkout, path)
+    kept_trees = 0
+    for label, tree in index_trees:
         if tree in seen:
+            kept_trees += 1
             continue
         seen.add(tree)
         extra.append(
@@ -37322,6 +37363,12 @@ def _salvage_candidate_uncached(
                 f"Salvage {record.slot}/{checkout.name} {label} after recorded owner "
                 f"exit\n\nsource-head: {facts.head}\n",
             )
+        )
+        kept_trees += 1
+    if kept_trees != len(index_trees):
+        raise Refusal(
+            f"an index tree of checkout {checkout.name} was dropped from "
+            "salvage; nothing removed"
         )
     # What the index holds beyond HEAD is uncommitted work, as a changed
     # status is; the private history below is not (#1255).
@@ -38185,6 +38232,37 @@ def _unlisted_submodule_checkouts(
     return tuple(result)
 
 
+def _is_declared_at(vcs: _GitVcs, checkout_path: Path, judged: Path) -> bool:
+    """Whether ``judged`` is declared along the .gitmodules chain (#2168).
+
+    Each declaring superproject along the path is consulted, so a
+    submodule declared by a nested superproject (component's own
+    ``leaf``) counts, not only the top checkout's declarations.
+    """
+
+    try:
+        remaining = judged.resolve().relative_to(checkout_path.resolve())
+    except ValueError:
+        return False
+    if not remaining.parts:
+        return False
+    parent = checkout_path
+    while remaining.parts:
+        matched = False
+        for _name, raw in _declared_submodules(vcs, parent):
+            declared = Path(raw)
+            if declared.is_absolute() or not declared.parts or ".." in declared.parts:
+                continue
+            if remaining.parts[: len(declared.parts)] == declared.parts:
+                parent = parent / declared
+                remaining = Path(*remaining.parts[len(declared.parts) :])
+                matched = True
+                break
+        if not matched:
+            return False
+    return True
+
+
 def _nested_module_repository_checkouts(
     config: Config,
     checkout: Checkout,
@@ -38243,15 +38321,24 @@ def _nested_module_repository_checkouts(
         judged_worktree = worktree or (checkout_path / relative)
         if _submodule_worktree_populated(judged_worktree):
             if recorded_worktree is not None:
-                continue
+                owner = _worktree_gitdir(recorded_worktree)
+                if owner is not None and owner.resolve() == current.resolve():
+                    continue
+                # The recorded worktree now belongs to another
+                # repository (shared placement, #2168): fall through
+                # and judge this repository itself, never skip it.
             owner = _worktree_gitdir(judged_worktree)
             if owner is not None and owner.resolve() == current.resolve():
                 continue
-            if declared_worktree is None:
+            if declared_worktree is None and not _is_declared_at(
+                vcs, checkout_path, judged_worktree
+            ):
                 # The path spelled by the module NAME is another
                 # repository's populated worktree, and nothing records
                 # where this module's own worktree is: judging either
-                # way could delete its history unseen.
+                # way could delete its history unseen. A worktree at a
+                # path the checkout's .gitmodules declares (#2168) is
+                # judged as this repository itself below instead.
                 raise Refusal(
                     f"nested module repository {current} of checkout "
                     f"{checkout.name} cannot be judged: {judged_worktree} is a "
@@ -38278,6 +38365,7 @@ def _nested_module_repository_checkouts(
             else checkout_path / candidate_relative
         )
         mkdir_target.mkdir(parents=True, exist_ok=True)
+        distinct_name = False
         try:
             head = vcs.head(current)
             authority = vcs.remote_authority(current, remote)
@@ -38306,6 +38394,19 @@ def _nested_module_repository_checkouts(
                     file=sys.stderr,
                 )
                 continue
+            if (
+                f"{checkout.name}/.modules/{relative.as_posix()}"
+                in known_candidate_names
+            ):
+                # Judged pre-fence under its distinct name (#2168);
+                # the receipt name is the evidence on recheck.
+                print(
+                    f"wrkslots: skipping nested module repository {current} "
+                    f"of checkout {checkout.name}: cannot be read here "
+                    f"({exc}); it is judged as a listed candidate instead",
+                    file=sys.stderr,
+                )
+                continue
             if same_name:
                 # Name match is necessary but not sufficient (#1785):
                 # when a candidate worktree still answers, its Git
@@ -38323,27 +38424,75 @@ def _nested_module_repository_checkouts(
                             Path(candidate_gitdir.stdout.strip()).resolve()
                         )
                 if answered and current.resolve() not in answered:
-                    raise Refusal(
-                        f"nested module repository {current} of checkout "
-                        f"{checkout.name} cannot be read: {exc}; the "
-                        f"candidate of the same name is a different "
-                        f"repository ({answered[0]}); preserve it"
-                    ) from exc
-                print(
-                    f"wrkslots: skipping nested module repository {current} "
-                    f"of checkout {checkout.name}: cannot be read here "
-                    f"({exc}); it is judged as a listed candidate instead",
-                    file=sys.stderr,
-                )
-                continue
-            raise Refusal(
-                f"nested module repository {current} of checkout "
-                f"{checkout.name} cannot be read: {exc}; preserve it"
-            ) from exc
+                    # #2168: a different repository is never skipped
+                    # unseen. Read it despite the fence and judge it
+                    # as its own candidate (distinct name, S2); any
+                    # failure refuses to preserve it. Its private
+                    # history, index and untracked state are judged by
+                    # the existing salvage machinery on that candidate.
+                    read = vcs._run(
+                        checkout_path,
+                        [
+                            "--git-dir", str(current),
+                            "--work-tree", str(mkdir_target),
+                            "rev-parse", "--verify", "HEAD^{commit}",
+                        ],
+                        check=False,
+                    )
+                    if read.returncode != 0:
+                        raise Refusal(
+                            f"nested module repository {current} of checkout "
+                            f"{checkout.name} cannot be read: {exc}; the "
+                            f"candidate of the same name is a different "
+                            f"repository ({answered[0]}); preserve it"
+                        ) from exc
+                    head = read.stdout.strip()
+                    authority = vcs.remote_authority(
+                        checkout_path,
+                        remote,
+                        env_overrides={
+                            "GIT_DIR": str(current),
+                            "GIT_WORK_TREE": str(mkdir_target),
+                        },
+                    )
+                    repository = current.relative_to(config.root).as_posix()
+                    distinct_name = True
+                else:
+                    print(
+                        f"wrkslots: skipping nested module repository {current} "
+                        f"of checkout {checkout.name}: cannot be read here "
+                        f"({exc}); it is judged as a listed candidate instead",
+                        file=sys.stderr,
+                    )
+                    continue
+            if not distinct_name:
+                raise Refusal(
+                    f"nested module repository {current} of checkout "
+                    f"{checkout.name} cannot be read: {exc}; preserve it"
+                ) from exc
+        if any(
+            name == f"{checkout.name}/{candidate_relative.as_posix()}"
+            for name, _path in known_candidates
+        ) or any(
+            item.name == f"{checkout.name}/{candidate_relative.as_posix()}"
+            for item, _path in result
+        ):
+            # A listed candidate (or an earlier nested result) already
+            # carries the declared name; this repository is a different
+            # one at (or for) that path, so it is judged under a
+            # distinct name or the callers would discard it (#2168).
+            distinct_name = True
+        candidate_name = (
+            f"{checkout.name}/.modules/{relative.as_posix()}"
+            if distinct_name
+            else f"{checkout.name}/{candidate_relative.as_posix()}"
+        )
+        while any(item.name == candidate_name for item, _path in result):
+            candidate_name += "#"
         result.append(
             (
                 Checkout(
-                    name=f"{checkout.name}/{candidate_relative.as_posix()}",
+                    name=candidate_name,
                     path=(Path(checkout.path) / candidate_relative).as_posix(),
                     repository=repository,
                     branch="",

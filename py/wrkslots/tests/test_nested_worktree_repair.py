@@ -153,7 +153,8 @@ def test_salvage_index_trees_survive_fence_with_nested_worktree(tmp_path: Path) 
         record.checkouts[0], name="product/ignored/nested/agent-utils"
     )
     vcs = wrkslots_cli._GitVcs()
-    trees = wrkslots_cli._index_state_trees(vcs, config, nested_checkout, moved_nested)
+    labelled = wrkslots_cli._index_state_trees(vcs, config, nested_checkout, moved_nested)
+    trees = tuple(tree for _label, tree in labelled)
     assert trees
     assert all(len(tree) == 40 for tree in trees)
     # The worktree tree still carries the submodule's gitlink, at the
