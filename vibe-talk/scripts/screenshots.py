@@ -5266,10 +5266,14 @@ def _act_search_bucket_fold(driver: Driver) -> None:
 
 
 def _act_search_bucket_main_only(driver: Driver) -> None:
-    """`#2200`: the same search with Threads tapped off — only Main's cards
-    stand, and the chips and the count still sum."""
+    """`#2200`: the same search with Threads off — only Main's cards stand,
+    and the chips and the count still sum. (In Main Threads starts off, in
+    All it starts on; the act ensures the end state, not the tap.)"""
     _act_search_bucket_fold(driver)
-    driver.click("search-bucket-threads")
+    if bool(driver.js(
+        "document.getElementById('search-bucket-threads').getAttribute('aria-pressed') === 'true'"
+    )):
+        driver.click("search-bucket-threads")
     driver.page.wait_for_function(
         "() => document.getElementById('search-bucket-threads').getAttribute('aria-pressed') === 'false'",
         timeout=5_000,
