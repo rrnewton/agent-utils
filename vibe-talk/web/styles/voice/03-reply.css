@@ -318,7 +318,7 @@
   padding: 6px 8px;
   border-radius: 999px;
   background: var(--panel);
-  box-shadow: 0 4px 16px rgb(0 0 0 / 0.35);
+  box-shadow: 0 4px 16px color-mix(in srgb, var(--shadow) 35%, transparent);
 }
 
 .selection-chip-row[hidden] {

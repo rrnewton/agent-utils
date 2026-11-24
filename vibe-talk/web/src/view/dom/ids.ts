@@ -613,9 +613,9 @@ export interface ElementById {
   "search-scope": HTMLParagraphElement;
   "search-screen-sep": HTMLDivElement;
   "search-toggle": HTMLButtonElement;
-  "selection-chip-row": HTMLDivElement;
   "selection-chip": HTMLButtonElement;
   "selection-chip-dismiss": HTMLButtonElement;
+  "selection-chip-row": HTMLDivElement;
   "selection-chip-wtf": HTMLButtonElement;
   "send-text": HTMLButtonElement;
   "server-detail": HTMLDivElement;
