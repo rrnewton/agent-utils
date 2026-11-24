@@ -793,6 +793,10 @@ def _in_scope_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Pat
     """
 
     log = _fake_systemd_tools(tmp_path, monkeypatch)
+    # Fake the installed root helper's absence: these tests assert the
+    # checkout helper in the sudo argv and must not depend on whether
+    # the host has one installed.
+    monkeypatch.setattr(sandbox, "_INSTALLED_HELPER", tmp_path / "no-installed-helper.py")
     home = tmp_path / "home"
     for directory in (".cargo/registry", ".cargo/git", ".cache", ".claude", "work"):
         (home / directory).mkdir(parents=True)
