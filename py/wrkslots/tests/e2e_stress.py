@@ -840,25 +840,46 @@ def _detach_project_images(project_root: Path, trace: Trace) -> list[str]:
     images = project_root / "worktrees" / "slot-images"
     if not images.is_dir():
         return problems
-    for type_dir in sorted(images.iterdir()):
-        if not type_dir.is_dir():
-            continue
-        for slot_dir in sorted(type_dir.iterdir()):
-            if not slot_dir.is_dir():
-                continue
-            done = _run(
-                [sys.executable, "-m", "wrkslots", "--project-root",
-                 str(project_root), "--machine", MACHINE,
-                 "image", "unmount", slot_dir.name,
-                 "--slot-type", type_dir.name],
-                cwd=project_root, env=_environment(),
-                expected=(0, 3), trace=trace, timeout=600,
-            )
-            if done.returncode != 0:
-                problems.append(
-                    f"{type_dir.name}/{slot_dir.name}: image unmount "
-                    f"returned {done.returncode}"
-                )
+    slots = [
+        (type_dir.name, slot_dir.name)
+        for type_dir in sorted(images.iterdir()) if type_dir.is_dir()
+        for slot_dir in sorted(type_dir.iterdir()) if slot_dir.is_dir()
+    ]
+    if not slots:
+        return problems
+    # One snippet process for every slot: each wrkslots CLI call
+    # remounts the other slots on startup, so per-slot commands
+    # can never leave all slots unmounted at once. The library
+    # unmount in a single process has no such side effect.
+    program = """
+import sys
+from pathlib import Path
+from wrkslots import slotimage
+root = Path(sys.argv[1])
+problems = []
+for slot_type, slot in [tuple(x.split(":", 1)) for x in sys.argv[2:]]:
+    img_dir = root / "worktrees" / "slot-images" / slot_type / slot
+    for image, mount in (
+        (img_dir / "slot.img", root / "worktrees" / "slots" / slot),
+        (img_dir / "state.img", img_dir / "state"),
+    ):
+        try:
+            slotimage.unmount(image, mount)
+        except Exception as exc:
+            problems.append(f"{slot_type}/{slot}: {image.name}: {exc}")
+print("\\n".join(problems))
+raise SystemExit(1 if problems else 0)
+"""
+    done = _run(
+        [sys.executable, "-c", program, str(project_root),
+         *[f"{t}:{s}" for t, s in slots]],
+        cwd=project_root, env=_environment(),
+        expected=(0, 1), trace=trace, timeout=600,
+    )
+    if done.returncode != 0:
+        problems.append(
+            f"detach snippet: {done.stdout.strip()} {done.stderr.strip()}"
+        )
     return problems
 
 
