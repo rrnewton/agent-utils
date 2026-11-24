@@ -5244,12 +5244,11 @@ def _act_chip_row_below(driver: Driver) -> None:
 
 
 def _act_chip_row_above_fallback(driver: Driver) -> None:
-    """`#2220` fallback: in a short window, words scrolled to its foot leave
-    no room for the strip below, so it stands above the selection."""
+    """`#2220` fallback: with the keyboard shrunk window, the strip has no
+    room under the words and stands above the selection."""
     _act_glossary_button(driver)
-    width = 412 if "android" in driver.profile.name else 1280
-    driver.page.set_viewport_size({"width": width, "height": 480})
-    driver.js("document.getElementById('scroll-area').scrollBy(0, 260)")
+    shrink_keyboard(driver, "104-chip-row-above-fallback")
+    driver.js("document.getElementById('scroll-area').scrollBy(0, 2)")
     driver.page.wait_for_function(
         "() => { const r = document.getElementById('selection-chip-row').getBoundingClientRect(); "
         "const s = getSelection().getRangeAt(0).getBoundingClientRect(); "
