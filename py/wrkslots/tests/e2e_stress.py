@@ -852,7 +852,7 @@ def _detach_project_images(project_root: Path, trace: Trace) -> list[str]:
                  "image", "unmount", slot_dir.name,
                  "--slot-type", type_dir.name],
                 cwd=project_root, env=_environment(),
-                expected=(0, 3), trace=trace,
+                expected=(0, 3), trace=trace, timeout=600,
             )
             if done.returncode != 0:
                 problems.append(
