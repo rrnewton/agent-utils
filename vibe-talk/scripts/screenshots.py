@@ -5251,7 +5251,7 @@ def _act_chip_row_above_fallback(driver: Driver) -> None:
     driver.settle(300)
     rect = driver.js(
         "(() => { const rows = [...document.querySelectorAll('#discord-log > li')]; "
-        "for (const row of rows) { const rr = row.getBoundingClientRect(); "
+        "for (const row of rows) { const rr = row.getBoundingClientRect(); if (rr.height > 140) continue; "
         "if (rr.bottom > window.innerHeight - 40 || rr.top < 0) continue; "
         "const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT); "
         "for (let n = walker.nextNode(); n; n = walker.nextNode()) { "
