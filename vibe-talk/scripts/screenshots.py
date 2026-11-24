@@ -5147,28 +5147,41 @@ def _act_glossary_button(driver: Driver) -> None:
         "for (const row of rows) { "
         "const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT); "
         "for (let n = walker.nextNode(); n; n = walker.nextNode()) { "
-        "const at = n.textContent.indexOf('flaky ordering test'); "
-        "if (at < 0) continue; "
+        # `#2202 vibe-talk-screenshots-glossary-button-scene-order`. Skip text scene 91 already
+        # learned into a glossary link (linked text cannot be selected for quoting); where the
+        # term itself is linked, fall back to any plain run of words in the row.
+        "if (n.parentElement && n.parentElement.closest('.glossary-term, a, button, code')) continue; "
+        "let at = n.textContent.indexOf('flaky ordering test'); let len = 'flaky ordering test'.length; "
+        "if (at < 0) { const m = n.textContent.match(/[A-Za-z][A-Za-z-]+ [A-Za-z][A-Za-z-]+ [A-Za-z][A-Za-z-]+/); "
+        "if (!m) continue; at = m.index; len = m[0].length; } "
         "const range = document.createRange(); "
-        "range.setStart(n, at); range.setEnd(n, at + 'flaky ordering test'.length); "
+        "range.setStart(n, at); range.setEnd(n, at + len); "
         "if (n.parentElement) n.parentElement.scrollIntoView({block: 'center'}); "
         "const r = range.getBoundingClientRect(); "
         "return {x: r.left, y: r.top, width: r.width, height: r.height}; } } "
         "return null; })()"
     )
     assert isinstance(rect, dict), "no selectable term text on screen"
-    driver.page.mouse.move(float(rect["x"]) + 1, float(rect["y"]) + float(rect["height"]) / 2)
-    driver.page.mouse.down()
-    driver.page.mouse.move(
-        float(rect["x"]) + float(rect["width"]) - 1,
-        float(rect["y"]) + float(rect["height"]) / 2,
-        steps=8,
-    )
-    driver.page.mouse.up()
-    driver.page.wait_for_function(
-        "() => window.__visible('selection-chip-wtf') && window.__visible('selection-chip')",
-        timeout=10_000,
-    )
+    # `#2202`. Drag until the chip stands: linking the first selection triggers can clear it.
+    for _attempt in range(3):
+        driver.page.mouse.move(float(rect["x"]) + 1, float(rect["y"]) + float(rect["height"]) / 2)
+        driver.page.mouse.down()
+        driver.page.mouse.move(
+            float(rect["x"]) + float(rect["width"]) - 1,
+            float(rect["y"]) + float(rect["height"]) / 2,
+            steps=8,
+        )
+        driver.page.mouse.up()
+        try:
+            driver.page.wait_for_function(
+                "() => window.__visible('selection-chip-wtf') && window.__visible('selection-chip')",
+                timeout=1_500,
+            )
+            break
+        except Exception:
+            continue
+    else:
+        raise AssertionError("the WTF? chip never stood under the selection")
     # Both buttons place themselves over a frame or two; wait until WTF?
     # stands left of the chip before the shutter, not just visible.
     driver.page.wait_for_function(
