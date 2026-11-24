@@ -287,8 +287,38 @@ def test_transfer_owner_falls_back_to_locked_body_when_every_round_is_overtaken(
     assert _event_count(project) - events_before == 4
     row = _row(project, "slot01")
     assert isinstance(row["owner"], dict) and row["owner"]["pid"] == os.getpid()
-    # The fallback validated under the lock, as the pre-#1975 body did.
-    assert ledger.count("validate", held=True) >= 1
+    # The fallback judges only the touched record under the lock
+    # (#2174): no fleet validation runs there any more.
+    assert ledger.count("validate", held=True) == 0
+
+
+def test_transfer_owner_locked_fallback_counts_zero_fleet_work_under_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#2174: the reboot-storm fallback holds the lock only for its record.
+
+    Dozens of lanes transferring at once overtake every lock-free
+    round, so the command falls back to the locked body. That body
+    used to re-run the whole-fleet validation and the registry
+    storage scan while holding the exclusive lock, serialising the
+    storm for minutes per call. It now judges only the touched
+    record there, exactly as the Rust edition's commit does; the
+    fleet work stays in the lock-free rounds, counted here while
+    the lock is held, never by wall time.
+    """
+    project = _project_with_slots(tmp_path)
+    monkeypatch.setattr(cli, "REGISTRY_VALIDATION_ATTEMPTS", 3)
+    ledger = _LockLedger(monkeypatch, project)
+    writes: list[int] = []
+    ledger.during_validation = _hold_toggle(project, writes)
+
+    assert cli.main(_transfer_argv(project)) == 0, capsys.readouterr().err
+
+    assert len(writes) == 3
+    assert ledger.count("validate", held=False) >= 3
+    assert ledger.count("validate", held=True) == 0
+    row = _row(project, "slot01")
+    assert isinstance(row["owner"], dict) and row["owner"]["pid"] == os.getpid()
 
 
 def test_transfer_owner_with_an_outstanding_journal_takes_the_locked_body(

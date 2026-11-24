@@ -18552,6 +18552,34 @@ def _global_rows(
     return rows
 
 
+def _assert_transfer_only_slot_changed(
+    before: ActiveState, after: ActiveState, transferred: ActiveRecord
+) -> None:
+    """The locked transfer fallback changed only its record (#2174).
+
+    Compares the local ACTIVE snapshots around the write instead of
+    revalidating the fleet: under the mutation locks, the snapshot
+    the write just produced is the current local state, and every
+    other local row must be identical to the one judged.
+    """
+
+    before_rows = {record.slot: record for record in before.slots}
+    after_rows = {record.slot: record for record in after.slots}
+    if set(before_rows) != set(after_rows):
+        raise StateError(
+            f"mutation of slot {transferred.slot!r} changed an unrelated registry row"
+        )
+    for slot, record in before_rows.items():
+        if slot != transferred.slot and after_rows[slot] != record:
+            raise StateError(
+                f"mutation of slot {transferred.slot!r} changed an unrelated registry row"
+            )
+    if after_rows.get(transferred.slot) != transferred:
+        raise StateError(
+            f"mutation of slot {transferred.slot!r} did not record the transfer"
+        )
+
+
 def _assert_only_slot_changed(
     before: Mapping[tuple[str, str, str], object],
     after: Mapping[tuple[str, str, str], object],
@@ -51052,20 +51080,25 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
         """The pre-#1975 transfer, run with the mutation locks held.
 
         Used when a journal is outstanding: its classification and any
-        dead-actor repair belong under the lock.
+        dead-actor repair belong under the lock. Only the touched
+        record is judged here (#2174): the fleet validation and the
+        registry storage scan stay in the lock-free prepare, exactly
+        as the Rust edition's commit re-judges only its record. Under
+        the locks run the journal phase, the one record's own checks
+        (from the local state and its machine's event chain), the
+        write, and a snapshot comparison proving no other local row
+        moved -- never a fleet-wide read.
         """
 
         _refuse_partial_state(config)
         _assert_no_journal(config)
-        states, archives = _validate_global_state(config)
-        findings = _assert_command_registry_storage(
-            config, states, args, tolerate_target_git_registrations=True
-        )
-        nested = findings.target_git_registrations
-        before = _global_rows(states, archives)
         state = _load_active(config)
         record = _find_record(state, args.slot)
-        _report_dead_for_record(config, states, record)
+        findings = _assert_command_registry_storage(
+            config, [state], args, tolerate_target_git_registrations=True
+        )
+        nested = findings.target_git_registrations
+        _report_dead_for_record(config, [state], record)
         events = _load_events(config, record.machine)
         rename, previous_state, released, basis, already, ignored = judge(
             record, events
@@ -51084,12 +51117,8 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
             slot=transferred.slot,
             evidence=evidence,
         )
-        after_states, after_archives = _validate_global_state(config)
-        _assert_only_slot_changed(
-            before,
-            _global_rows(after_states, after_archives),
-            args.slot,
-        )
+        after_state = _load_active_snapshot(config)
+        _assert_transfer_only_slot_changed(state, after_state, transferred)
         outcome = "reopened" if action == "owner-reopened" else "transferred"
         return (outcome, transferred, basis, previous_state, tuple(nested), ignored)
 
