@@ -8,10 +8,15 @@
 //!
 //! - A sender that finds the lock taken writes a waiter record,
 //!   `REGISTRY/.waiting/<agent>/<pid>-<n>.json` (`pid`, `starttime_ticks`, `priority`, `since`,
-//!   `command`), and removes it once it holds the lock or gives up. A record whose process is
-//!   gone is ignored by readers.
+//!   `comm`, and the agentctl subcommand and target agent where derivable), and removes it once
+//!   it holds the lock or gives up. A record whose process is gone is ignored by readers.
 //! - The holder needs no record: Linux lists every `flock` holder in `/proc/locks`, which also
 //!   finds holders started by older agentctl builds.
+//!
+//! Reports name a process by `pid`, `comm` and, for an agentctl process, its subcommand and
+//! target agent (#2217 agentctl-lock-contention-no-argv) — never by its raw command line, which
+//! can hold private paths or credentials passed as arguments. The argument vector is read only
+//! to derive those two fields and is never itself reported.
 //!
 //! [`contention`] reads both, and [`describe`] turns the result into one sentence for a status
 //! line or an alert.
@@ -24,8 +29,28 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
-/// Longest command line kept in a waiter record or a report, in characters.
-const COMMAND_CHARS: usize = 240;
+/// Longest process name (`comm`) a report carries: the kernel's own limit
+/// (`TASK_COMM_LEN` − 1 visible bytes).
+const COMM_CHARS: usize = 15;
+
+/// Subcommands whose first positional argument is the target agent's name. Only for these is
+/// an agent name derived from a process's arguments (#2217); any other subcommand's arguments
+/// stay unreported.
+const AGENT_SUBCOMMANDS: &[&str] = &[
+    "adopt",
+    "approvals",
+    "console",
+    "drain",
+    "handback",
+    "rename",
+    "revive",
+    "send",
+    "start",
+    "status",
+    "stop",
+    "tail",
+    "takeover",
+];
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -61,24 +86,86 @@ fn waiting_directory(registry: &Path, agent: &str) -> PathBuf {
     registry.join(".waiting").join(agent)
 }
 
-fn bounded(text: &str) -> String {
-    let mut kept: String = text.chars().take(COMMAND_CHARS).collect();
-    if text.chars().count() > COMMAND_CHARS {
-        kept.push_str("...");
-    }
-    kept
+/// The name of process `pid` (`/proc/PID/comm`, at most [`COMM_CHARS`] bytes), or `None` when
+/// it cannot be read (the process is gone, or belongs to another user).
+fn comm_of_process(pid: u64) -> Option<String> {
+    let raw = fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    let name = raw.trim_end_matches(['\n', '\r']);
+    (!name.is_empty()).then(|| name.chars().take(COMM_CHARS).collect())
 }
 
-/// The command line of process `pid`, its arguments joined by spaces, or `None` when it cannot
-/// be read (the process is gone, or belongs to another user).
-fn command_line(pid: u64) -> Option<String> {
+/// The name of process `pid`, for a report, or `None` when it cannot be read.
+#[must_use]
+pub(crate) fn comm_of(pid: u64) -> Option<String> {
+    comm_of_process(pid)
+}
+
+/// The argument vector of process `pid`, read only to derive the fields
+/// [`agentctl_action`] returns; it is never itself put in a report (#2217).
+fn arguments_of(pid: u64) -> Option<Vec<String>> {
     let raw = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
     let words: Vec<String> = raw
         .split(|byte| *byte == 0)
         .filter(|word| !word.is_empty())
         .map(|word| String::from_utf8_lossy(word).into_owned())
         .collect();
-    (!words.is_empty()).then(|| bounded(&words.join(" ")))
+    (!words.is_empty()).then_some(words)
+}
+
+/// The agentctl subcommand and target agent a process's arguments name, without exposing the
+/// arguments themselves (#2217): `("send", Some("liaison"))` for `agentctl send liaison …`.
+/// `None` when the process is not an agentctl process or names no subcommand. An agent is
+/// derived only for [`AGENT_SUBCOMMANDS`], whose first positional argument is the agent's
+/// name; global options before the subcommand (`--registry DIR`, `--flag=value`) are skipped,
+/// and a would-be agent containing `/` or whitespace is not an agent name and is not derived.
+fn agentctl_action(arguments: &[String]) -> Option<(String, Option<String>)> {
+    let program = arguments.first()?;
+    if Path::new(program).file_name()?.to_str()? != "agentctl" {
+        return None;
+    }
+    let mut rest = arguments[1..].iter().map(String::as_str);
+    let subcommand = loop {
+        match rest.next()? {
+            // The one global option that takes a separate value; every other leading
+            // `--name` or `--name=value` is skipped as a single token.
+            "--registry" => {
+                rest.next()?;
+            }
+            token if token.starts_with('-') => {}
+            token => break token,
+        }
+    };
+    let agent = AGENT_SUBCOMMANDS
+        .contains(&subcommand)
+        .then(|| {
+            rest.find(|token| !token.starts_with('-'))
+                .filter(|token| !token.contains(['/', ' ', '\t']))
+        })
+        .flatten()
+        .map(str::to_owned);
+    Some((subcommand.to_owned(), agent))
+}
+
+/// How a report names process `pid`: `{"pid", "comm", "subcommand", "agent"}`, with `comm`
+/// absent when the process cannot be read and `subcommand`/`agent` present only for an
+/// agentctl process whose arguments name them. The raw command line never appears (#2217).
+fn process_report(pid: u64) -> Value {
+    report_for(pid, comm_of_process(pid), arguments_of(pid).as_deref())
+}
+
+/// [`process_report`] from its read pieces, so tests can plant arguments.
+fn report_for(pid: u64, comm: Option<String>, arguments: Option<&[String]>) -> Value {
+    let mut report = json!({"pid": pid});
+    if let Some(comm) = comm {
+        report["comm"] = json!(comm);
+    }
+    if let Some((subcommand, agent)) = arguments.and_then(agentctl_action) {
+        report["subcommand"] = json!(subcommand);
+        if let Some(agent) = agent {
+            report["agent"] = json!(agent);
+        }
+    }
+    report
 }
 
 /// A waiter record, removed when dropped.
@@ -128,13 +215,22 @@ pub fn register(registry: &Path, agent: &str, priority: bool) -> Option<Waiting>
         "{pid}-{}.json",
         SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
-    let record = json!({
+    // The record names this process the way a report does (#2217): `comm` plus the derived
+    // subcommand and agent — never the raw command line other processes will read back.
+    let mut record = json!({
         "pid": pid,
         "starttime_ticks": starttime_ticks,
         "priority": priority,
         "since": now(),
-        "command": command_line(pid),
+        "comm": comm_of_process(pid),
     });
+    let own_arguments: Vec<String> = std::env::args().collect();
+    if let Some((subcommand, agent)) = agentctl_action(&own_arguments) {
+        record["subcommand"] = json!(subcommand);
+        if let Some(agent) = agent {
+            record["agent"] = json!(agent);
+        }
+    }
     crate::agent::atomic_json(&path, &record).ok()?;
     Some(Waiting { path })
 }
@@ -164,15 +260,13 @@ fn waiters(registry: &Path, agent: &str, at: f64) -> Vec<Value> {
             let record = live_record(&entry.path())?;
             let pid = record.get("pid")?.as_u64()?;
             let since = record.get("since")?.as_f64()?;
-            Some((
-                since,
-                json!({
-                    "pid": pid,
-                    "priority": record.get("priority").and_then(Value::as_bool).unwrap_or(false),
-                    "waiting_seconds": (at - since).max(0.0).round(),
-                    "command": record.get("command").cloned().unwrap_or(Value::Null),
-                }),
-            ))
+            // The identity is re-derived from the live process, so a record written by an
+            // older build (which stored the raw command line) never surfaces it (#2217).
+            let mut waiter = process_report(pid);
+            waiter["priority"] =
+                json!(record.get("priority").and_then(Value::as_bool).unwrap_or(false));
+            waiter["waiting_seconds"] = json!((at - since).max(0.0).round());
+            Some((since, waiter))
         })
         .collect();
     found.sort_by(|left, right| left.0.total_cmp(&right.0));
@@ -236,15 +330,11 @@ pub(crate) fn holder_of(path: &Path) -> Option<u64> {
     flock_holder(&locks, metadata.dev(), metadata.ino())
 }
 
-/// The command line of process `pid`, for a report, or `None` when it cannot be read.
-#[must_use]
-pub(crate) fn command_of(pid: u64) -> Option<String> {
-    command_line(pid)
-}
-
 /// Who holds `agent`'s lifecycle lock in `registry` and who is waiting for it:
-/// `{"holder": {"pid", "command"} | null, "waiters": [{"pid", "priority", "waiting_seconds",
-/// "command"}]}`, waiters longest first. Reads only; never takes the lock.
+/// `{"holder": {"pid", "comm", "subcommand", "agent"} | null, "waiters": [{"pid", "comm",
+/// "subcommand", "agent", "priority", "waiting_seconds"}]}`, waiters longest first. Each
+/// process is named by pid, `comm` and, for an agentctl process, its subcommand and target
+/// agent — never by its raw command line (#2217). Reads only; never takes the lock.
 #[must_use]
 pub fn contention(registry: &Path, agent: &str) -> Value {
     let at = now();
@@ -254,7 +344,7 @@ pub fn contention(registry: &Path, agent: &str) -> Value {
             let locks = fs::read_to_string("/proc/locks").ok()?;
             flock_holder(&locks, metadata.dev(), metadata.ino())
         })
-        .map(|pid| json!({"pid": pid, "command": command_line(pid)}));
+        .map(process_report);
     json!({
         "holder": holder,
         "waiters": waiters(registry, agent, at),
@@ -273,10 +363,18 @@ pub fn longest_wait(report: &Value) -> f64 {
 
 fn who(process: &Value) -> String {
     let pid = process["pid"].as_u64().unwrap_or_default();
-    match process["command"].as_str() {
-        Some(command) => format!("PID {pid}: {command}"),
-        None => format!("PID {pid}"),
+    let mut name = format!("PID {pid}");
+    if let Some(comm) = process["comm"].as_str() {
+        name.push_str(&format!(" ({comm}"));
+        if let Some(subcommand) = process["subcommand"].as_str() {
+            name.push_str(&format!(" {subcommand}"));
+            if let Some(agent) = process["agent"].as_str() {
+                name.push_str(&format!(" {agent}"));
+            }
+        }
+        name.push(')');
     }
+    name
 }
 
 /// One sentence for a [`contention`] report, or `None` when nobody is waiting.
@@ -352,6 +450,97 @@ mod tests {
         // The wait leaves nothing in the registry tree, not even the
         // `.waiting/worker` directories it created to become visible.
         assert!(!registry.join(".waiting").exists());
+        let _ = fs::remove_dir_all(&registry);
+    }
+
+    fn arguments(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| (*word).to_owned()).collect()
+    }
+
+    #[test]
+    fn an_agentctl_action_is_derived_without_its_arguments() {
+        let sentinel = "SENTINEL-private-brief-path";
+        assert_eq!(
+            agentctl_action(&arguments(&[
+                "/usr/local/bin/agentctl", "send", "liaison", "--file", sentinel,
+            ])),
+            Some(("send".to_owned(), Some("liaison".to_owned())))
+        );
+        // Global options before the subcommand are skipped, value included.
+        assert_eq!(
+            agentctl_action(&arguments(&[
+                "agentctl", "--registry", "/some/registry", "console", "worker",
+            ])),
+            Some(("console".to_owned(), Some("worker".to_owned())))
+        );
+        // A subcommand that takes no agent names none, however it is invoked.
+        assert_eq!(
+            agentctl_action(&arguments(&["agentctl", "chat", "run", "--token", sentinel])),
+            Some(("chat".to_owned(), None))
+        );
+        // Not an agentctl process: nothing is derived, whatever it runs.
+        assert_eq!(agentctl_action(&arguments(&["sleep", "30"])), None);
+        assert_eq!(agentctl_action(&arguments(&["agentctl"])), None);
+    }
+
+    #[test]
+    fn a_process_report_names_pid_comm_and_action_never_the_command_line() {
+        let sentinel = "SENTINEL-secret-argument";
+        let report = report_for(
+            4242,
+            Some("agentctl".to_owned()),
+            Some(&arguments(&[
+                "/usr/local/bin/agentctl",
+                "send",
+                "liaison",
+                "--file",
+                sentinel,
+            ])),
+        );
+        assert_eq!(report["pid"], json!(4242));
+        assert_eq!(report["comm"], json!("agentctl"));
+        assert_eq!(report["subcommand"], json!("send"));
+        assert_eq!(report["agent"], json!("liaison"));
+        let printed = report.to_string();
+        assert!(!printed.contains(sentinel), "{printed}");
+        assert!(!printed.contains("\"command\""), "{printed}");
+        // The watch delivery alarm built from such a report is just as clean.
+        let alarm = describe(
+            "liaison",
+            &json!({"holder": report.clone(), "waiters": [report]}),
+        )
+        .unwrap();
+        assert!(!alarm.contains(sentinel), "{alarm}");
+        assert!(alarm.contains("PID 4242 (agentctl send liaison)"), "{alarm}");
+    }
+
+    #[test]
+    fn a_legacy_waiter_records_command_line_is_never_reported() {
+        let registry = std::env::temp_dir().join(format!(
+            "agentctl-lock-wait-legacy-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let directory = waiting_directory(&registry, "worker");
+        crate::agent::create_private_directory(&directory, "waiters", true, true).unwrap();
+        let own_pid = u64::from(std::process::id());
+        let ticks = agent_queue::identity::read_process_stat(own_pid)
+            .unwrap()
+            .unwrap()
+            .starttime_ticks;
+        let sentinel = "SENTINEL-legacy-brief";
+        crate::agent::atomic_json(
+            &directory.join(format!("{own_pid}-0.json")),
+            &json!({"pid": own_pid, "starttime_ticks": ticks, "priority": false,
+                    "since": now(), "command": format!("agentctl send worker {sentinel}")}),
+        )
+        .unwrap();
+        let report = contention(&registry, "worker");
+        assert_eq!(report["waiters"][0]["pid"], json!(own_pid));
+        assert!(report["waiters"][0]["comm"].is_string(), "{report}");
+        let printed = report.to_string();
+        assert!(!printed.contains(sentinel), "{printed}");
+        assert!(!printed.contains("\"command\""), "{printed}");
         let _ = fs::remove_dir_all(&registry);
     }
 

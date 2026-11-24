@@ -415,7 +415,7 @@ struct Observed {
     /// `chat status`'s document.
     status: Value,
     runner: Option<u64>,
-    runner_command: Option<String>,
+    runner_comm: Option<String>,
     /// [`channel_holders`].
     channels: Vec<Value>,
     checkpoint_age: Option<u64>,
@@ -456,7 +456,7 @@ pub fn health<A: ManagedApi + ?Sized>(
     let observed = Observed {
         status: state.status()?,
         runner,
-        runner_command: runner.and_then(crate::lock_wait::command_of),
+        runner_comm: runner.and_then(crate::lock_wait::comm_of),
         channels: channel_holders(state.config()),
         checkpoint_age: state.checkpoint_age_millis(now),
         alive_age: state.provider_alive_age_millis(now),
@@ -485,7 +485,7 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
         configuration,
         status,
         runner,
-        runner_command,
+        runner_comm,
         channels,
         checkpoint_age,
         alive_age,
@@ -512,7 +512,7 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
         .map(str::to_owned);
     let reply_source = reply_source.filter(|_| stale_source_agent.is_none());
     let process = match runner {
-        Some(pid) => json!({"running": true, "pid": pid, "command": runner_command}),
+        Some(pid) => json!({"running": true, "pid": pid, "comm": runner_comm}),
         None => {
             problems
                 .down
@@ -889,9 +889,9 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
         match runner {
             Some(pid) => format!(
                 "running, process {pid}{}",
-                process["command"]
+                process["comm"]
                     .as_str()
-                    .map(|command| format!(" ({command})"))
+                    .map(|comm| format!(" ({comm})"))
                     .unwrap_or_default()
             ),
             None => "not running".to_owned(),
@@ -1145,7 +1145,7 @@ mod tests {
                 "repoint": {"pending": null, "last": null},
             }),
             runner: Some(42),
-            runner_command: Some("agentctl chat run".to_owned()),
+            runner_comm: Some("agentctl".to_owned()),
             channels: vec![
                 json!({"channel_id": "C1", "lock": "/l", "holder_pid": 42, "holder_bridge_state": "/s"}),
             ],

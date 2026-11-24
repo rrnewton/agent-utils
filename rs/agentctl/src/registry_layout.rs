@@ -102,7 +102,7 @@ fn lock_within(file: &File, wait: Duration) -> bool {
 }
 
 /// A process other than this one whose working directory is inside `directory`, as
-/// `{pid, command}`. Only working directories are read: listing every process's open files costs
+/// `{pid, comm}` (#2217: a report never carries a raw command line). Only working directories are read: listing every process's open files costs
 /// seconds on a busy host, and the lock files inside the directory ([`held_lock_inside`]) cover
 /// the programs that keep it open. Another user's processes cannot use a private registry.
 fn working_inside(directory: &Path) -> Option<Value> {
@@ -122,7 +122,7 @@ fn working_inside(directory: &Path) -> Option<Value> {
         if fs::read_link(process.path().join("cwd")).is_ok_and(|cwd| cwd.starts_with(&canonical)) {
             return Some(json!({
                 "pid": pid,
-                "command": crate::lock_wait::command_of(pid).unwrap_or_default(),
+                "comm": crate::lock_wait::comm_of(pid).unwrap_or_default(),
             }));
         }
     }
@@ -155,7 +155,7 @@ fn held_lock_inside(directory: &Path) -> Option<Value> {
             let pid = crate::lock_wait::holder_of(&path)?;
             Some(json!({
                 "pid": pid,
-                "command": crate::lock_wait::command_of(pid).unwrap_or_default(),
+                "comm": crate::lock_wait::comm_of(pid).unwrap_or_default(),
             }))
         })
 }
@@ -187,7 +187,7 @@ fn unmovable(legacy: &Path) -> Option<String> {
         return Some(format!(
             "in use by process {} ({})",
             user["pid"],
-            user["command"].as_str().unwrap_or("")
+            user["comm"].as_str().unwrap_or("")
         ));
     }
     record_names_its_directory(legacy)
