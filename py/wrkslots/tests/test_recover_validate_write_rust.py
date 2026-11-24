@@ -459,6 +459,86 @@ def test_validate_rows_held_row_refuses_in_both_editions(
     assert "is held" in result.stderr
 
 
+def _registry_snapshot(root: Path) -> dict[str, bytes]:
+    wt = root / "worktrees"
+    snap: dict[str, bytes] = {}
+    for path in sorted(wt.rglob("*")):
+        # Lock files are created by taking the mutation locks in
+        # both editions; they are not journal or state writes.
+        if path.is_file() and not path.name.endswith(".lock"):
+            snap[str(path.relative_to(wt))] = path.read_bytes()
+    return snap
+
+
+def test_validate_rows_bind_record_refuses_and_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    """Bind-record gate (#2125): Python unmounts/forgets binds."""
+    rust_root, _record = _fixture(tmp_path / "rust")
+    _make_absent_dead(rust_root)
+    (rust_root / "worktrees" / ".worktrees-image.json").write_text(
+        json.dumps({"binds": {"slot-a": "/subvol/slot-a"}})
+    )
+    sha = _record_sha(rust_root)
+    before = _registry_snapshot(rust_root)
+    result = _rust_apply(rust_root, _input_file(rust_root, [_row(sha)]))
+    assert result.returncode == 1, result.stdout
+    assert "bind record" in result.stderr
+    assert "Python edition" in result.stderr
+    assert _registry_snapshot(rust_root) == before
+    assert not (rust_root / "worktrees" / f"ACTIVE.{MACHINE}.journal").exists()
+
+
+def test_validate_rows_census_handle_refuses_and_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    """Census gate (#2125): a retained handle needs the /proc census."""
+    rust_root, _record = _fixture(tmp_path / "rust")
+    _make_absent_dead(rust_root)
+    runs = rust_root / "ignored" / "validate" / "runs"
+    runs.mkdir(parents=True)
+    (runs / "run-1.json").write_text(json.dumps({"slot": "slot-a"}))
+    sha = _record_sha(rust_root)
+    before = _registry_snapshot(rust_root)
+    result = _rust_apply(rust_root, _input_file(rust_root, [_row(sha)]))
+    assert result.returncode == 1, result.stdout
+    assert "host-wide process census" in result.stderr
+    assert "Python edition" in result.stderr
+    assert _registry_snapshot(rust_root) == before
+    assert not (rust_root / "worktrees" / f"ACTIVE.{MACHINE}.journal").exists()
+
+
+def test_validate_rows_cross_machine_refuses_and_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    """Cross-machine gate (#2125): other-machine rows need the fold."""
+    rust_root, record = _fixture(tmp_path / "rust")
+    _make_absent_dead(rust_root)
+    other = "otherhost"
+    other_record = json.loads(json.dumps(record))
+    other_record.update(slot="slot-other", machine=other)
+    other_record["checkouts"][0]["path"] = "worktrees/validate/slot-other/repo"
+    (rust_root / "worktrees" / f"ACTIVE.{other}.json").write_text(
+        json.dumps(
+            {
+                "schema": 2, "machine": other, "revision": 1,
+                "slots": [other_record],
+            }
+        )
+    )
+    (rust_root / "worktrees" / f"ARCHIVED.{other}.json").write_text(
+        json.dumps({"schema": 2, "machine": other, "revision": 0, "records": []})
+    )
+    sha = _record_sha(rust_root)
+    before = _registry_snapshot(rust_root)
+    result = _rust_apply(rust_root, _input_file(rust_root, [_row(sha)]))
+    assert result.returncode == 1, result.stdout
+    assert "non-selected machine" in result.stderr
+    assert "Python edition" in result.stderr
+    assert _registry_snapshot(rust_root) == before
+    assert not (rust_root / "worktrees" / f"ACTIVE.{MACHINE}.journal").exists()
+
+
 def test_validate_rows_refusal_prints_outcome_payload(tmp_path: Path) -> None:
     rust_root, _record = _fixture(tmp_path / "rust")
     for root in (rust_root,):

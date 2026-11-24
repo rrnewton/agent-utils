@@ -15,6 +15,13 @@
 //! process census and the deleted-bind unmount stay with the
 //! Python edition: this edition refuses a deleted-bind row and
 //! judges liveness from the scoped evidence it can read.
+//! Never-write-narrower rule (#2125): wherever the Python
+//! edition (037494e9) would run a check this edition cannot run
+//! before writing -- the host-wide /proc census, the deleted-
+//! bind unmount and bind-record forget, or the cross-machine
+//! unrelated-row fold -- this edition refuses before the
+//! journal write and writes nothing; see
+//! `refuse_uncovered_write` for the exact gated conditions.
 //! Fixture registries only until the edition cutover (see
 //! `ensure_states::require_fixture`).
 
@@ -724,6 +731,162 @@ fn journals_absent(root: Option<&Path>) -> bool {
     }
 }
 
+/// Fail-closed gate for conditions this edition cannot prove
+/// as safely as the Python edition (037494e9) before writing
+/// (#2125, never write with narrower safety than Python). The
+/// Python path (`_plan_absent_validate_rows` ->
+/// `_assert_absent_validate_rows_safe`, `_recover_absent_validate_rows`)
+/// runs, before its journal/archive/ACTIVE writes: the host-wide
+/// /proc process census (`_assert_absent_validate_processes_unrelated`,
+/// retained-handle and run-evidence judgements), the deleted-bind
+/// unmount (`_retire_deleted_subvolume_binds`) and bind-record
+/// forget (`_forget_absent_validate_binds`), and the cross-machine
+/// unrelated-row fold (`_global_rows` over every machine, judged
+/// after the writes from all machines' states). This edition has
+/// no host-wide census, never unmounts or forgets binds, and its
+/// readback covers only the selected machine, so it refuses --
+/// naming the Python edition -- when any of these holds:
+///
+/// * a planned slot has a worktrees-image bind record (Python
+///   would unmount a stale deleted bind and forget the record);
+/// * any row (ACTIVE slot or ARCHIVED record) is present on a
+///   non-selected machine (Python folds every machine and proves
+///   no unrelated row changed; this edition cannot);
+/// * a planned row needs the census: it has no recorded owner
+///   generation, an incomplete owner generation (missing pid,
+///   start ticks, boot or host identity), or a retained
+///   validation handle naming it under `ignored/validate/runs`
+///   (Python judges those handles and the host process table).
+///
+/// Covered rows -- a complete owner generation this edition can
+/// prove dead from scoped /proc identity, no bind record, no
+/// retained handle, and no other machine's rows -- keep the
+/// proven writing path unchanged. Called from `classify_rows`
+/// and again at the top of `execute_recovery`, before the
+/// journal write, so a refusal writes nothing: no journal, no
+/// event appends, no snapshot writes.
+fn refuse_uncovered_write(cfg: &Cfg, selected: &str, planned: &[Planned]) -> Result<()> {
+    // Cross-machine unrelated-row fold. Enumerate shards
+    // directly (not `discover_machines`, whose shard-consistency
+    // error would mask which machine's rows block the write).
+    let mut machines: Vec<String> = Vec::new();
+    let entries = std::fs::read_dir(&cfg.control).map_err(|error| {
+        format!(
+            "cannot enumerate machines for the cross-machine check; reconcile it with the Python edition, which folds every machine before writing: {error}"
+        )
+    })?;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        for prefix in ["ACTIVE.", "ARCHIVED."] {
+            if let Some(machine) = name
+                .strip_prefix(prefix)
+                .and_then(|rest| rest.strip_suffix(".json"))
+            {
+                if !machine.is_empty() && !machines.contains(&machine.to_string()) {
+                    machines.push(machine.to_string());
+                }
+            }
+        }
+    }
+    machines.sort();
+    for machine in &machines {
+        if machine == selected {
+            continue;
+        }
+        for (label, file, key) in [
+            ("ACTIVE", format!("ACTIVE.{machine}.json"), "slots"),
+            ("ARCHIVED", format!("ARCHIVED.{machine}.json"), "records"),
+        ] {
+            let path = cfg.control.join(&file);
+            if !path.exists() && !path.is_symlink() {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).map_err(|error| {
+                format!(
+                    "cannot read {label} rows on non-selected machine {machine} for the cross-machine check; reconcile it with the Python edition, which folds every machine before writing: {error}"
+                )
+            })?;
+            let doc: Value = serde_json::from_str(&text).map_err(|error| {
+                format!(
+                    "cannot read {label} rows on non-selected machine {machine} for the cross-machine check; reconcile it with the Python edition, which folds every machine before writing: {error}"
+                )
+            })?;
+            let count = doc.get(key).and_then(Value::as_array).map_or(0, Vec::len);
+            if count > 0 {
+                return Err(format!(
+                    "rows on non-selected machine {machine} are present in state; reconcile it with the Python edition, which folds every machine and proves no unrelated row changed before writing"
+                ));
+            }
+        }
+    }
+    // Deleted-bind unmount / bind-record forget.
+    let binds = crate::worktrees_image::load_bind_records(&cfg.control).map_err(|error| {
+        format!(
+            "cannot read worktrees-image bind records; reconcile it with the Python edition, which unmounts and forgets binds before writing: {error}"
+        )
+    })?;
+    for item in planned {
+        if binds.contains_key(&item.row.slot) {
+            return Err(format!(
+                "validation row {} has a worktrees-image bind record; reconcile it with the Python edition, which unmounts the stale bind and forgets the bind record before writing",
+                item.row.slot
+            ));
+        }
+    }
+    // Host-wide /proc census.
+    for item in planned {
+        let owner = item.record.get("owner");
+        let complete = owner.is_some_and(|identity| {
+            identity
+                .get("pid")
+                .and_then(Value::as_i64)
+                .is_some_and(|pid| pid >= 1)
+                && identity
+                    .get("start_ticks")
+                    .and_then(Value::as_i64)
+                    .is_some()
+                && identity
+                    .get("boot_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.is_empty())
+                && identity
+                    .get("host_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.is_empty())
+        });
+        if !complete {
+            return Err(format!(
+                "validation row {} has no complete recorded owner generation; proving it dead needs the host-wide process census; reconcile it with the Python edition, which runs that census before writing",
+                item.row.slot
+            ));
+        }
+        let handles = cfg.root.join("ignored").join("validate").join("runs");
+        if handles.is_dir() {
+            let entries = std::fs::read_dir(&handles).map_err(|error| {
+                format!(
+                    "cannot read retained validation handles for validation row {}; proving it dead needs the host-wide process census; reconcile it with the Python edition, which runs that census before writing: {error}",
+                    item.row.slot
+                )
+            })?;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    if text.contains(&item.row.slot) {
+                        return Err(format!(
+                            "validation row {} is named by a retained validation handle; proving it dead needs the host-wide process census; reconcile it with the Python edition, which runs that census before writing",
+                            item.row.slot
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Classify every input row against the folded history, shared
 /// by the prove-then-recheck rounds (no locks held) and the
 /// ordinary locked path (#2125). Returns the rows that still need
@@ -867,6 +1030,7 @@ fn classify_rows(
     if !planned.is_empty() {
         let slots: Vec<String> = planned.iter().map(|item| item.row.slot.clone()).collect();
         assert_rows_not_held(root, cfg, selected, &slots)?;
+        refuse_uncovered_write(cfg, selected, &planned)?;
     }
     Ok((planned, already, active, archives))
 }
@@ -956,6 +1120,12 @@ fn execute_recovery(
     input_sha256: &str,
     coordinator: &Value,
 ) -> Result<Vec<Value>> {
+    // Never-write-narrower gate (#2125): before the journal
+    // write, refuse every condition the Python edition proves
+    // with its census, bind unmount/forget, or cross-machine
+    // fold and this edition cannot. A refusal here writes
+    // nothing -- no journal, no event or snapshot appends.
+    refuse_uncovered_write(cfg, selected, planned)?;
     // Owner-liveness gate: a recorded owner that is exactly the
     // live process refuses; anything unreadable is dead evidence.
     for item in planned {
@@ -1330,8 +1500,8 @@ pub(crate) fn recover_absent_validate_rows(
 #[cfg(test)]
 mod tests {
     use super::{
-        history_proof_matches, mountinfo_covers_deleted_bind, scoped_hold_exists,
-        with_lock_seconds, HistoryProof,
+        history_proof_matches, mountinfo_covers_deleted_bind, refuse_uncovered_write,
+        scoped_hold_exists, with_lock_seconds, HistoryProof, Planned, Row,
     };
     use crate::active_state::Cfg;
     use crate::canonical::canonical_sha256;
@@ -1529,6 +1699,97 @@ mod tests {
         let seconds = payload.get("lock_seconds").and_then(Value::as_f64).unwrap();
         assert!(seconds >= 0.0);
         let _ = std::fs::remove_dir_all(&control);
+    }
+
+    fn planned_with_owner(owner: Value) -> Planned {
+        Planned {
+            row: Row {
+                machine: "node-a".to_string(),
+                slot: "slot-a".to_string(),
+                generation: 1,
+                record_sha256: "a".repeat(64),
+            },
+            record: json!({"slot": "slot-a", "owner": owner}),
+            entry: json!({}),
+        }
+    }
+
+    fn complete_owner() -> Value {
+        json!({"pid": 999999, "start_ticks": 1, "boot_id": "boot", "host_id": "host"})
+    }
+
+    fn gate_cfg(tag: &str) -> (PathBuf, Cfg) {
+        let base = temp_control(tag);
+        let control = base.join("worktrees");
+        std::fs::create_dir_all(&control).unwrap();
+        let cfg = test_cfg(control);
+        (base, cfg)
+    }
+
+    #[test]
+    fn uncovered_bind_record_refuses() {
+        let (base, cfg) = gate_cfg("gate-bind");
+        let control = cfg.control.clone();
+        std::fs::write(
+            control.join(".worktrees-image.json"),
+            json!({"binds": {"slot-a": "/subvol/slot-a"}}).to_string(),
+        )
+        .unwrap();
+        let err = refuse_uncovered_write(&cfg, "node-a", &[planned_with_owner(complete_owner())])
+            .unwrap_err();
+        assert!(err.contains("bind record"), "{err}");
+        assert!(err.contains("Python edition"), "{err}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn uncovered_cross_machine_row_refuses() {
+        let (base, cfg) = gate_cfg("gate-cross");
+        let control = cfg.control.clone();
+        std::fs::write(
+            control.join("ACTIVE.node-b.json"),
+            json!({"schema": 2, "machine": "node-b", "revision": 1, "slots": [{"slot": "slot-b"}]})
+                .to_string(),
+        )
+        .unwrap();
+        let err = refuse_uncovered_write(&cfg, "node-a", &[planned_with_owner(complete_owner())])
+            .unwrap_err();
+        assert!(err.contains("non-selected machine node-b"), "{err}");
+        assert!(err.contains("Python edition"), "{err}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn uncovered_census_cases_refuse() {
+        // No recorded owner generation.
+        let (base, cfg) = gate_cfg("gate-census-owner");
+        let err =
+            refuse_uncovered_write(&cfg, "node-a", &[planned_with_owner(Value::Null)]).unwrap_err();
+        assert!(err.contains("host-wide process census"), "{err}");
+        let _ = std::fs::remove_dir_all(&base);
+        // Retained handle naming the row.
+        let (base, cfg) = gate_cfg("gate-census-handle");
+        let runs = base.join("ignored").join("validate").join("runs");
+        std::fs::create_dir_all(&runs).unwrap();
+        std::fs::write(
+            runs.join("run-1.json"),
+            json!({"slot": "slot-a"}).to_string(),
+        )
+        .unwrap();
+        let err = refuse_uncovered_write(&cfg, "node-a", &[planned_with_owner(complete_owner())])
+            .unwrap_err();
+        assert!(err.contains("retained validation handle"), "{err}");
+        assert!(err.contains("host-wide process census"), "{err}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn covered_row_passes_uncovered_gate() {
+        let (base, cfg) = gate_cfg("gate-covered");
+        assert!(
+            refuse_uncovered_write(&cfg, "node-a", &[planned_with_owner(complete_owner())]).is_ok()
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
