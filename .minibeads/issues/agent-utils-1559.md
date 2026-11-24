@@ -1,12 +1,13 @@
 ---
 title: 'restore-recovery-agent-plan: manifest + team act, then an always-on one-shot recovery shepherd'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - agentctl
 created_at: 2026-11-20T22:08:11+00:00
-updated_at: 2026-11-22T10:45:31+00:00
+updated_at: 2026-11-24T23:33:21+00:00
+closed_at: 2026-11-24T23:33:21+00:00
 ---
 
 # Description
@@ -80,3 +81,7 @@ Revised Phase 2 design check (mu-shepherd, 2026-11-22, OWNER 327; supersedes the
 - Documentation and setup deliverables in the same landing: CLI `quickstart`/`userguide` and per-command help for `start-recovery`, `recovery install`, `recovery smoke`, and `recovery status`; profile schema and two worked configurations (a single-profile local setup and a two-profile ordered fallback); service-manager, plain-script/foreground-container, and manual invocation examples; troubleshooting for missing credentials/models, unmounted registry, stale claim, and judge unavailable; and the team-restore skill rewritten around the one entry point. The setup skill asks for the ordered profiles and trigger choice, performs the install/smoke flow, and reports the recorded smoke result. The public recovery guide gets a short link/summary rather than a second protocol.
 - Tests: extend the existing scratch drill rather than relying on the superseded gate: profile order is honoured from the file (including Claude-then-Codex with no first built-in harness), individual and chain smoke tests with fake executables, config/install failure cases, `start-recovery` duplicate-call and stale-claim cases, parallel restore+supervisor start, foreground/container mode, no-service-manager manual invocation, optional unit rendering/enable-never-performed, one action per round, read-only live lead/peer teams, deterministic YES/`judge=none`, bounded give-up, and report/stamp fields. All tests use scratch registries, fake Herdr, and fake harness executables; no real team, registry, pane, unit, or reboot is touched.
 - Revised ETA after coordb approval: day 1, profile schema/plumbing and install/smoke commands with focused tests; day 2, `start-recovery` claim/parallel launcher and recovery-loop rework (reusing the landed manifest, restore, and `team act`, and salvaging only compatible parts of the superseded implementation after re-review); day 3, setup-skill/docs/unit examples and the expanded scratch drill, followed by focused suites and formatting. Then one cold review and one gate; review fixes may add half a day to a day. This replaces the earlier same-day implementation estimate and excludes waiting time for review or landing approval.
+
+## Resolution
+
+[watermelon-full-preview] Closed 2026-11-24: the recovery shepherd landed on main as fd802446 (23 commits replayed from gated 4744cc62; full gate PARTIAL, exit 0, no failed steps, some checks skipped-unverified). All phases delivered: team manifest + team act, run-agent-prompt ordered profiles, the Rust team shepherd with start-recovery/recovery install|smoke|status, the per-registry shepherd boot unit (written only, never enabled by the landing), and the eighth-review fixes (incident-dir alarm in status, every-round blocking drill with both stamp mutants failing, /proc-ticks-only epoch key, best-effort start-failure page). New persisted state was reported to coordb before landing; follow-ups live in agent-utils-2198.
