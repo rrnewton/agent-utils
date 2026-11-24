@@ -14626,12 +14626,28 @@ its drain would also type, so it was not queued",
         }
         // The watch sweep calls this for every registered name: only a
         // Muse lane can show the dialog, so the lifecycle lock is taken
-        // only once the record proves this one is Muse.
-        if self.load(agent_name)?.harness != "muse" {
+        // only once the record proves this one is Muse. A record that
+        // vanishes between the listing above and either load — archived
+        // by a stop mid-pass — is nothing to do, silent (#2222); a record
+        // that still exists but cannot be read keeps its error.
+        let gone = || {
+            agent_queue::registry::record_directories(&self.registry, agent_name)
+                .is_ok_and(|directories| directories.is_empty())
+        };
+        let first = match self.load(agent_name) {
+            Ok(record) => record,
+            Err(_) if gone() => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if first.harness != "muse" {
             return Ok(None);
         }
         let _lock = self.lock(agent_name)?;
-        let record = self.load(agent_name)?;
+        let record = match self.load(agent_name) {
+            Ok(record) => record,
+            Err(_) if gone() => return Ok(None),
+            Err(error) => return Err(error),
+        };
         // Adopted foreign panes are someone else's agent in this
         // registry's bookkeeping, never a lane to type into (#1932).
         if record.harness != "muse" || record.is_foreign() {

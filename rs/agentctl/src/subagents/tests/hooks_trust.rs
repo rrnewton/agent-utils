@@ -80,6 +80,32 @@ fn a_missing_hooks_record_is_silent_in_either_layout() {
 }
 
 #[test]
+fn an_archived_muse_agent_is_silent_to_the_hooks_sweep() {
+    // #2222: a Muse lane answered at the dialog, then stopped so its
+    // record moved to the archive. The watcher's next pass must not run
+    // the sweep against the name at all: no error, no answer, and the
+    // name no longer lists as registered.
+    let fixture = Fixture::new();
+    let manager = start_muse(&fixture);
+    show_dialog(&fixture);
+    assert!(manager
+        .answer_hooks_trust_if_dialog("coord")
+        .unwrap()
+        .is_some());
+    manager.stop("coord").unwrap();
+    let registry = fixture.root.join("registry");
+    assert!(
+        !agent_queue::registry::names(&registry)
+            .unwrap()
+            .iter()
+            .any(|name| name == "coord"),
+        "the archived agent must not list"
+    );
+    assert_eq!(manager.answer_hooks_trust_if_dialog("coord").unwrap(), None);
+    assert_eq!(fixture.client.hooks_answers.lock().unwrap().len(), 1);
+}
+
+#[test]
 fn a_malformed_hooks_record_still_reports_a_problem() {
     // #2121: only a missing file is silent; an existing malformed record
     // is a problem in either layout.

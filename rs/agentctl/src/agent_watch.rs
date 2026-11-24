@@ -1524,9 +1524,11 @@ pub trait Notifier {
     }
     /// Answer Muse's plugin-hooks trust dialog in `agent`'s pane per the
     /// registry's policy (#1932): the manager re-reads the pane and
-    /// re-verifies the exact dialog before any keypress. The default
-    /// cannot act, only report.
-    fn answer_hooks_trust(&mut self, agent: &str) -> Result<String> {
+    /// re-verifies the exact dialog before any keypress. `Ok(None)` is
+    /// nothing to do — the agent is not at the dialog, or its record is
+    /// gone (archived since the pass read it, #2222) — and is silent.
+    /// The default cannot act, only report.
+    fn answer_hooks_trust(&mut self, agent: &str) -> Result<Option<String>> {
         let _ = agent;
         Err(fail("this watcher cannot answer hooks dialogs"))
     }
@@ -3809,6 +3811,20 @@ fn watch_agents_once(
         Ok(observations) => (observations, Value::Null),
         Err(error) => (Vec::new(), json!(error.to_string())),
     };
+    // Every per-agent sweep in this pass works from the CURRENT registered
+    // names, read once at the start of the pass (#2222): an agent archived
+    // or removed since a stale observation was taken is dropped before any
+    // sweep runs, so no sweep ever runs against an unregistered name. An
+    // unreadable listing filters nothing (the state pruning below follows
+    // the same rule).
+    let registered = probe.registered_names();
+    let observations: Vec<Observation> = match &registered {
+        Some(names) => observations
+            .into_iter()
+            .filter(|row| names.contains(&row.name))
+            .collect(),
+        None => observations,
+    };
     let seen: Vec<String> = observations.iter().map(|row| row.name.clone()).collect();
     // An agent the pass ran out of time for keeps its memory as it was: its episodes neither
     // advance nor end, and the report says the pass was partial (#571 watch-agents-scale).
@@ -3854,7 +3870,7 @@ fn watch_agents_once(
         // watch-agents-archived): a recreated watcher must not replay its stale
         // pending notices or keep its episode memory. Only a successful registry
         // listing prunes; an unknown listing changes nothing.
-        if let Some(registered) = probe.registered_names() {
+        if let Some(registered) = &registered {
             state
                 .pending
                 .retain(|notice| registered.contains(&notice.agent));
@@ -3938,8 +3954,11 @@ fn watch_agents_once(
                 continue;
             }
             match notifier.answer_hooks_trust(&observation.name) {
-                Ok(detail) => hooks_trust
+                Ok(Some(detail)) => hooks_trust
                     .push(json!({"agent": observation.name, "acted": true, "outcome": detail})),
+                // Not at the dialog, or the record vanished since the
+                // pass read it (archived, #2222): nothing to do, silent.
+                Ok(None) => {}
                 Err(error) => hooks_trust.push(
                     json!({"agent": observation.name, "acted": false, "outcome": error.to_string()}),
                 ),
@@ -7266,8 +7285,8 @@ impl<A: ManagedApi + ?Sized> Notifier for ManagedNotifier<'_, A> {
         ManagedAgents::new(self.client, &self.registry)?.press_enter(agent)
     }
 
-    fn answer_hooks_trust(&mut self, agent: &str) -> Result<String> {
-        ManagedAgents::new(self.client, &self.registry)?.answer_hooks_trust(agent)
+    fn answer_hooks_trust(&mut self, agent: &str) -> Result<Option<String>> {
+        ManagedAgents::new(self.client, &self.registry)?.answer_hooks_trust_if_dialog(agent)
     }
 
     fn ladder_redraw(&mut self, agent: &str) -> Result<String> {
@@ -7555,6 +7574,76 @@ mod tests {
         );
         assert!(notifier.hooks_answers.is_empty());
         assert_eq!(report["hooks_trust"][0]["acted"], false);
+    }
+
+    #[test]
+    fn an_agent_archived_between_passes_is_dropped_from_every_sweep_and_from_state() {
+        // #2222: pass N sees a Muse lane at the hooks dialog and answers
+        // it; the lane is then archived with agentctl stop. Pass N+1's
+        // probe still returns the stale observation, but the current
+        // registry no longer lists the lane: no sweep runs for it, it is
+        // not listed, and its watch-state memory is pruned.
+        let base = options();
+        let mut state = WatchState::default();
+        let mut notifier = RecordingNotifier::default();
+        let dialog_observation = || {
+            let mut muse = observation("lane", "blocked", Some(HOOKS_DIALOG));
+            muse.harness = Some("muse".to_owned());
+            muse
+        };
+        let mut probe = RegistryProbe {
+            registered: vec!["lane".to_owned()],
+            seen: vec![dialog_observation()],
+        };
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 1_000.0, &base);
+        assert_eq!(notifier.hooks_answers, ["lane"]);
+        assert_eq!(report["hooks_trust"].as_array().map(Vec::len), Some(1));
+        assert!(state.agents.contains_key("lane"));
+        // Archived: the registry no longer lists it, while the probe's
+        // stale list still carries the observation.
+        probe.registered = Vec::new();
+        probe.seen = vec![dialog_observation()];
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 1_060.0, &base);
+        assert_eq!(
+            report["hooks_trust"].as_array().map(Vec::len),
+            Some(0),
+            "{report}"
+        );
+        assert_eq!(notifier.hooks_answers, ["lane"], "no second answer");
+        assert!(
+            !state.agents.contains_key("lane"),
+            "archived agent pruned from watch state"
+        );
+        assert!(
+            report["agents"]
+                .as_array()
+                .is_none_or(|rows| rows.iter().all(|row| row["name"] != "lane")),
+            "archived agent is not listed: {report}"
+        );
+    }
+
+    #[test]
+    fn a_hooks_record_that_vanishes_mid_pass_is_silent() {
+        // #2222: the observation was current when read, but the record
+        // is gone by the time the sweep answers (a stop archived it
+        // mid-pass): the sweep returns nothing and reports nothing,
+        // where a malformed record would still produce an outcome row.
+        let base = options();
+        let mut state = WatchState::default();
+        let mut muse = observation("lane", "blocked", Some(HOOKS_DIALOG));
+        muse.harness = Some("muse".to_owned());
+        let mut probe = ScriptedProbe(vec![vec![muse]]);
+        let mut notifier = RecordingNotifier {
+            hooks_vanish: true,
+            ..RecordingNotifier::default()
+        };
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 1_000.0, &base);
+        assert_eq!(
+            report["hooks_trust"].as_array().map(Vec::len),
+            Some(0),
+            "{report}"
+        );
+        assert!(notifier.hooks_answers.is_empty());
     }
 
     struct ScriptedProbe(Vec<Vec<Observation>>);
@@ -8837,6 +8926,8 @@ mod tests {
         presses: Vec<String>,
         /// Agents whose hooks dialog the watcher answered (#1932).
         hooks_answers: Vec<String>,
+        /// The answered agent's record vanished mid-pass (#2222).
+        hooks_vanish: bool,
         /// Whether every backstop press fails (#1560).
         press_fails: bool,
         /// Notices withdrawn so a newer one replaces them, as (recipient, message ID) (#840).
@@ -8911,11 +9002,16 @@ mod tests {
             }
         }
 
-        fn answer_hooks_trust(&mut self, agent: &str) -> Result<String> {
+        fn answer_hooks_trust(&mut self, agent: &str) -> Result<Option<String>> {
+            if self.hooks_vanish {
+                // The record vanished between the pass reading it and
+                // the sweep answering (#2222): nothing to do.
+                return Ok(None);
+            }
             self.hooks_answers.push(agent.to_owned());
-            Ok(format!(
+            Ok(Some(format!(
                 "{agent}: declined hook trust (39 hooks) per built-in default"
-            ))
+            )))
         }
 
         fn ladder_redraw(&mut self, agent: &str) -> Result<String> {
