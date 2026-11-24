@@ -5314,7 +5314,7 @@ def _act_glossary_not_found(driver: Driver) -> None:
             "range.setStart(n, at); range.setEnd(n, at + term.length); "
             "if (n.parentElement) n.parentElement.scrollIntoView({block: 'center'}); "
             "const r = range.getBoundingClientRect(); "
-            "return {x: r.left, y: r.top, width: r.width, height: r.height}; } } "
+            "if (r.width > 4 && r.height > 4) return {x: r.left, y: r.top, width: r.width, height: r.height}; } } "
             "return null; })(" + json.dumps(term) + ")"
         )
 
