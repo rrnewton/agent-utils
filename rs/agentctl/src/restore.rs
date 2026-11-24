@@ -1550,7 +1550,13 @@ pub fn reports_directory(registry: &Path) -> PathBuf {
 /// `agents/` in the wild (#1359), then the shared XDG state directory.
 /// Readers accept these until [`LEGACY_REPORT_SUPPORT_ENDS`]; an explicit
 /// `report_dir` names the one location, so there are no fallback reads.
-fn legacy_report_directories(registry: &Path, config: &RestoreConfig) -> Vec<PathBuf> {
+/// The legacy directories with the shared directory named, so tests never
+/// depend on the host's real state home.
+fn legacy_report_directories_in(
+    registry: &Path,
+    config: &RestoreConfig,
+    shared: Option<PathBuf>,
+) -> Vec<PathBuf> {
     if config.report_dir.is_some() {
         return Vec::new();
     }
@@ -1558,7 +1564,7 @@ fn legacy_report_directories(registry: &Path, config: &RestoreConfig) -> Vec<Pat
         registry.join("restore-reports"),
         registry.join("agents").join("restore-reports"),
     ];
-    if let Some(directory) = default_report_dir() {
+    if let Some(directory) = shared {
         directories.push(directory);
     }
     directories
@@ -1624,15 +1630,153 @@ pub fn candidate_report_paths(
     config: &RestoreConfig,
     boot_id: &str,
 ) -> Vec<PathBuf> {
+    candidate_report_paths_in(registry, config, boot_id, default_report_dir())
+}
+
+/// [`candidate_report_paths`] with the shared directory named (tests).
+fn candidate_report_paths_in(
+    registry: &Path,
+    config: &RestoreConfig,
+    boot_id: &str,
+    shared: Option<PathBuf>,
+) -> Vec<PathBuf> {
     let file = format!("{boot_id}.json");
     let mut paths = vec![report_path(registry, config, boot_id)];
-    for directory in legacy_report_directories(registry, config) {
+    for directory in legacy_report_directories_in(registry, config, shared) {
         let path = directory.join(&file);
         if !paths.contains(&path) {
             paths.push(path);
         }
     }
     paths
+}
+
+/// The registry identity every new restore report records (#2218): the
+/// stable per-team key ([`team_key`]) and the registry's canonical path.
+/// It names no team, host, or person beyond the path the registry already
+/// lives at, and it is what lets a later reader prove a report found
+/// outside the registry (the legacy shared directory) belongs to it.
+fn registry_identity(registry: &Path) -> (String, String) {
+    let canonical = fs::canonicalize(registry).unwrap_or_else(|_| registry.to_path_buf());
+    (team_key(registry), canonical.display().to_string())
+}
+
+/// Every agent name a report names: its coordinator row, its lane rows,
+/// and its refused lanes (#2218 attribution evidence).
+fn report_agent_names(report: &Value) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut push = |name: Option<&str>| {
+        if let Some(name) = name {
+            if !names.iter().any(|seen| seen == name) {
+                names.push(name.to_owned());
+            }
+        }
+    };
+    push(report["coordinator"]["name"].as_str());
+    if let Some(rows) = report["agents"].as_array() {
+        for row in rows {
+            push(row["name"].as_str());
+        }
+    }
+    if let Some(lanes) = report["refused_lanes"].as_array() {
+        for lane in lanes {
+            push(lane.as_str());
+        }
+    }
+    names
+}
+
+/// Whether a report found at `path` may count for `registry` (#2218
+/// agentctl-restore-legacy-report-scope). A report inside the registry
+/// (its current or own legacy locations, or an explicit `report_dir`)
+/// counts as today. Only a report from the legacy SHARED directory — one
+/// host directory every registry's older builds wrote to — must prove it
+/// belongs to this registry; an unprovable one counts for nobody, so a
+/// registry never reads another registry's restore outcome as its own.
+pub(crate) fn report_counts_for_registry(
+    registry: &Path,
+    config: &RestoreConfig,
+    path: &Path,
+    report: &Value,
+    shared: Option<&Path>,
+) -> bool {
+    if config.report_dir.is_some() {
+        return true;
+    }
+    let from_shared = shared.is_some_and(|directory| path.parent() == Some(directory));
+    if !from_shared {
+        return true;
+    }
+    shared_report_belongs_to_registry(registry, config, report)
+}
+
+/// The proof a shared-directory report belongs to `registry` (#2218): a
+/// recorded registry identity wins outright; a report from before the
+/// identity was recorded proves itself the legacy way — every agent it
+/// names exists in this registry's records, and its coordinator is this
+/// registry's coordinator (restore.json's, else the designated one).
+fn shared_report_belongs_to_registry(
+    registry: &Path,
+    config: &RestoreConfig,
+    report: &Value,
+) -> bool {
+    if let Some(recorded) = report["registry_id"].as_str() {
+        return recorded == team_key(registry);
+    }
+    if let Some(recorded) = report["registry_path"].as_str() {
+        let recorded_path = Path::new(recorded);
+        let recorded_canonical =
+            fs::canonicalize(recorded_path).unwrap_or_else(|_| recorded_path.to_path_buf());
+        let own_canonical = fs::canonicalize(registry).unwrap_or_else(|_| registry.to_path_buf());
+        return recorded_canonical == own_canonical;
+    }
+    let names = report_agent_names(report);
+    if names.is_empty() {
+        return false;
+    }
+    let Ok(registered) = registered_names(registry) else {
+        return false;
+    };
+    if !names
+        .iter()
+        .all(|name| registered.iter().any(|own| own == name))
+    {
+        return false;
+    }
+    let expected = config
+        .coordinator
+        .clone()
+        .or_else(|| crate::subagents::designated_coordinator_name(registry));
+    match (report["coordinator"]["name"].as_str(), expected) {
+        (Some(recorded), Some(expected)) => recorded == expected,
+        _ => false,
+    }
+}
+
+/// This boot's report in the legacy shared directory, when one exists and
+/// provably belongs to another registry (#2218): `restore --dry-run`
+/// names it once as foreign instead of leaving its silence unexplained.
+pub fn foreign_shared_report(
+    registry: &Path,
+    config: &RestoreConfig,
+    boot_id: &str,
+) -> Option<PathBuf> {
+    foreign_shared_report_in(registry, config, boot_id, default_report_dir())
+}
+
+/// [`foreign_shared_report`] with the shared directory named (tests).
+fn foreign_shared_report_in(
+    registry: &Path,
+    config: &RestoreConfig,
+    boot_id: &str,
+    shared: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if config.report_dir.is_some() {
+        return None;
+    }
+    let path = shared?.join(format!("{boot_id}.json"));
+    let report = read_report(&path)?;
+    (!shared_report_belongs_to_registry(registry, config, &report)).then_some(path)
 }
 
 /// This boot's existing report and where it was found: the current location
@@ -1643,9 +1787,14 @@ fn read_boot_report(
     config: &RestoreConfig,
     boot_id: &str,
 ) -> Option<(PathBuf, Value)> {
+    let shared = default_report_dir();
     candidate_report_paths(registry, config, boot_id)
         .into_iter()
-        .find_map(|path| read_report(&path).map(|report| (path, report)))
+        .find_map(|path| {
+            let report = read_report(&path)?;
+            report_counts_for_registry(registry, config, &path, &report, shared.as_deref())
+                .then_some((path, report))
+        })
 }
 
 /// The completed report for `epoch`, scanning every candidate location in
@@ -1719,13 +1868,37 @@ pub fn boot_report_state(
     epoch: &RestoreEpoch,
     manager_started: Option<f64>,
 ) -> BootReportState {
+    boot_report_state_in(
+        registry,
+        config,
+        epoch,
+        manager_started,
+        default_report_dir(),
+    )
+}
+
+/// [`boot_report_state`] with the shared directory named (tests). A
+/// shared-directory report that cannot be proved to belong to this
+/// registry is skipped entirely (#2218): it is neither this registry's
+/// completed restore nor its incomplete one, so the caller falls through
+/// to its normal no-report handling.
+fn boot_report_state_in(
+    registry: &Path,
+    config: &RestoreConfig,
+    epoch: &RestoreEpoch,
+    manager_started: Option<f64>,
+    shared: Option<PathBuf>,
+) -> BootReportState {
     let mut predating: Option<PathBuf> = None;
     let mut incomplete: Option<(PathBuf, Value)> = None;
     let mut incomplete_predating: Option<(PathBuf, Value)> = None;
-    for path in candidate_report_paths(registry, config, &epoch.boot_id) {
+    for path in candidate_report_paths_in(registry, config, &epoch.boot_id, shared.clone()) {
         let Some(report) = read_report(&path) else {
             continue;
         };
+        if !report_counts_for_registry(registry, config, &path, &report, shared.as_deref()) {
+            continue;
+        }
         if report["complete"] != true {
             // #2018: an existing incomplete report is not "no report": keep
             // the first one proven for this epoch, and an unprovable one
@@ -3722,6 +3895,9 @@ pub fn restore<A: ManagedApi + ?Sized>(
             }
         }
     }
+    // #2218: every report this run writes carries the registry identity,
+    // so a reader that finds it outside the registry can prove whose it is.
+    let (registry_id, registry_path) = registry_identity(registry);
     let names = match registered_names(registry) {
         Ok(names) => names,
         Err(error) => {
@@ -3730,6 +3906,8 @@ pub fn restore<A: ManagedApi + ?Sized>(
                     &path,
                     &json!({
                         "schema": REPORT_SCHEMA,
+                        "registry_id": registry_id,
+                        "registry_path": registry_path,
                         "boot_id": boot_id,
                         "epoch": epoch.as_json(),
                         "started_at": host.now(),
@@ -3746,6 +3924,8 @@ pub fn restore<A: ManagedApi + ?Sized>(
     let boots = anchored_boots(registry, &names);
     let mut report = json!({
         "schema": REPORT_SCHEMA,
+        "registry_id": registry_id,
+        "registry_path": registry_path,
         "boot_id": boot_id,
         "epoch": epoch.as_json(),
         // #1405: the recorded report this run supersedes belonged to an
@@ -4340,6 +4520,15 @@ pub fn restore<A: ManagedApi + ?Sized>(
     } else {
         Value::Null
     };
+    // #2218: a dry run names this boot's shared-directory report once when
+    // it provably belongs to another registry, so its being ignored for
+    // this registry is visible instead of silent. A real restore simply
+    // ignores it (see boot_report_state).
+    if options.dry_run {
+        if let Some(foreign) = foreign_shared_report(registry, config, &boot_id) {
+            report["foreign_legacy_report"] = json!(foreign.display().to_string());
+        }
+    }
     if !options.dry_run {
         write_report(&path, &report)?;
     }
@@ -6821,6 +7010,184 @@ mod tests {
             other => panic!("expected Incomplete, got {other:?}"),
         }
         fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A registry holding agent records for `names`, in a fresh temp tree
+    /// (#2218 fixtures): (tree root, registry path).
+    fn registry_with_agents(tag: &str, names: &[&str]) -> (PathBuf, PathBuf) {
+        let directory = std::env::temp_dir().join(format!(
+            "restore-registry-scope-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let registry = directory.join("registry");
+        for name in names {
+            let agent_dir = registry.join("agents").join(name);
+            fs::create_dir_all(&agent_dir).unwrap();
+            fs::write(agent_dir.join("agent.json"), "{}").unwrap();
+        }
+        (directory, registry)
+    }
+
+    #[test]
+    fn a_foreign_shared_report_counts_for_no_registry() {
+        // #2218: registry A has no report of its own for this boot; the
+        // shared directory holds an incomplete report naming only agents
+        // unknown to A. A's watch restore check must fall through to its
+        // normal no-report handling: not incomplete, not completed.
+        let (directory, registry) = registry_with_agents("foreign", &["coord-a", "worker-a"]);
+        let mut config = RestoreConfig::load(&registry).unwrap();
+        config.coordinator = Some("coord-a".to_owned());
+        let boot = "11111111-2222-3333-4444-555555555555";
+        let epoch = RestoreEpoch {
+            boot_id: boot.to_owned(),
+            user_manager: Some("invocation:m1".to_owned()),
+        };
+        let shared = directory.join("shared");
+        fs::create_dir_all(&shared).unwrap();
+        let file = format!("{boot}.json");
+        let foreign = json!({
+            "boot_id": boot, "epoch": epoch.as_json(), "complete": false,
+            "coordinator": {"name": "coord-b", "action": "refused",
+                            "reason": "record has no native conversation ID"},
+            "agents": [{"name": "worker-b", "action": "refused"}],
+            "refused_lanes": ["worker-b"],
+        });
+        fs::write(shared.join(&file), foreign.to_string()).unwrap();
+        assert_eq!(
+            boot_report_state_in(&registry, &config, &epoch, None, Some(shared.clone())),
+            BootReportState::Missing
+        );
+        assert_eq!(
+            foreign_shared_report_in(&registry, &config, boot, Some(shared.clone())),
+            Some(shared.join(&file))
+        );
+        // The registry's OWN legacy locations keep their current meaning:
+        // the same report under restore-reports/ counts as A's own.
+        let own_legacy = registry.join("restore-reports");
+        fs::create_dir_all(&own_legacy).unwrap();
+        fs::write(own_legacy.join(&file), foreign.to_string()).unwrap();
+        match boot_report_state_in(&registry, &config, &epoch, None, Some(shared.clone())) {
+            BootReportState::Incomplete((path, _)) => assert_eq!(path, own_legacy.join(&file)),
+            other => panic!("expected Incomplete from own legacy location, got {other:?}"),
+        }
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn a_shared_report_matching_this_registry_still_counts() {
+        // #2218: legacy behaviour for single-registry hosts is kept: a
+        // shared-directory report whose agents and coordinator all match
+        // registry A counts for A. The coordinator may come from
+        // restore.json or from the registry's designation file.
+        let (directory, registry) = registry_with_agents("matching", &["coord-a", "worker-a"]);
+        let boot = "11111111-2222-3333-4444-555555555555";
+        let epoch = RestoreEpoch {
+            boot_id: boot.to_owned(),
+            user_manager: Some("invocation:m1".to_owned()),
+        };
+        let shared = directory.join("shared");
+        fs::create_dir_all(&shared).unwrap();
+        let file = format!("{boot}.json");
+        let matching = json!({
+            "boot_id": boot, "epoch": epoch.as_json(), "complete": false,
+            "coordinator": {"name": "coord-a", "action": "refused", "reason": "no pane"},
+            "agents": [{"name": "worker-a", "action": "refused"}],
+            "refused_lanes": ["worker-a"],
+        });
+        fs::write(shared.join(&file), matching.to_string()).unwrap();
+        let mut config = RestoreConfig::load(&registry).unwrap();
+        config.coordinator = Some("coord-a".to_owned());
+        match boot_report_state_in(&registry, &config, &epoch, None, Some(shared.clone())) {
+            BootReportState::Incomplete((path, _)) => assert_eq!(path, shared.join(&file)),
+            other => panic!("expected Incomplete from shared match, got {other:?}"),
+        }
+        assert_eq!(
+            foreign_shared_report_in(&registry, &config, boot, Some(shared.clone())),
+            None
+        );
+        // With no restore.json coordinator, the designation file proves it.
+        let mut designated = RestoreConfig::load(&registry).unwrap();
+        designated.coordinator = None;
+        let designation_path = registry.join("coordinator.json");
+        fs::write(
+            &designation_path,
+            json!({"schema": "agentctl-coordinator/v1", "name": "coord-a",
+                   "token": "12345678-1234-1234-1234-123456789abc", "set_at": 0})
+            .to_string(),
+        )
+        .unwrap();
+        // The designation is a private file; its reader refuses a
+        // world-readable one, so the fixture matches a real registry.
+        fs::set_permissions(
+            &designation_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
+        match boot_report_state_in(&registry, &designated, &epoch, None, Some(shared.clone())) {
+            BootReportState::Incomplete((path, _)) => assert_eq!(path, shared.join(&file)),
+            other => panic!("expected Incomplete via designation, got {other:?}"),
+        }
+        // A coordinator that is not this registry's proves nothing.
+        let mut other = RestoreConfig::load(&registry).unwrap();
+        other.coordinator = Some("coord-b".to_owned());
+        assert_eq!(
+            boot_report_state_in(&registry, &other, &epoch, None, Some(shared.clone())),
+            BootReportState::Missing
+        );
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn a_recorded_registry_identity_decides_shared_attribution() {
+        // #2218: new reports carry the registry identity; a second
+        // registry ignores the report even when every name in it matches,
+        // because the recorded identity is another registry's.
+        let (directory, registry_a) = registry_with_agents("identity-a", &["coord-a"]);
+        let (directory_b, registry_b) = registry_with_agents("identity-b", &["coord-a"]);
+        let boot = "11111111-2222-3333-4444-555555555555";
+        let epoch = RestoreEpoch {
+            boot_id: boot.to_owned(),
+            user_manager: Some("invocation:m1".to_owned()),
+        };
+        let (registry_id, registry_path) = registry_identity(&registry_a);
+        let shared = directory.join("shared");
+        fs::create_dir_all(&shared).unwrap();
+        let file = format!("{boot}.json");
+        let stamped = json!({
+            "schema": REPORT_SCHEMA, "registry_id": registry_id,
+            "registry_path": registry_path,
+            "boot_id": boot, "epoch": epoch.as_json(), "complete": true,
+            "coordinator": {"name": "coord-a", "action": "revived"},
+            "agents": [], "refused_lanes": [],
+        });
+        fs::write(shared.join(&file), stamped.to_string()).unwrap();
+        // For A the identity alone proves it: no coordinator configured.
+        let config_a = RestoreConfig::load(&registry_a).unwrap();
+        match boot_report_state_in(&registry_a, &config_a, &epoch, None, Some(shared.clone())) {
+            BootReportState::Completed((path, report)) => {
+                assert_eq!(path, shared.join(&file));
+                assert_eq!(report["registry_id"], json!(team_key(&registry_a)));
+            }
+            other => panic!("expected Completed for the owning registry, got {other:?}"),
+        }
+        // For B every name matches and its coordinator agrees, yet the
+        // recorded identity is A's: B ignores the report entirely.
+        let mut config_b = RestoreConfig::load(&registry_b).unwrap();
+        config_b.coordinator = Some("coord-a".to_owned());
+        assert_eq!(
+            boot_report_state_in(&registry_b, &config_b, &epoch, None, Some(shared.clone())),
+            BootReportState::Missing
+        );
+        assert_eq!(
+            foreign_shared_report_in(&registry_b, &config_b, boot, Some(shared.clone())),
+            Some(shared.join(&file))
+        );
+        fs::remove_dir_all(&directory).unwrap();
+        fs::remove_dir_all(&directory_b).unwrap();
     }
 
     #[test]

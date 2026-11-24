@@ -859,10 +859,23 @@ pub(crate) fn collect_team_probe_snapshot<A: ManagedApi + ?Sized>(
     let boot_id = epoch.boot_id.clone();
     let now = host.now();
     // This boot's restore report, through restore's own candidate order
-    // (current restore/reports/ first, earlier locations after).
+    // (current restore/reports/ first, earlier locations after); a
+    // shared-directory report counts only when proved to be this
+    // registry's (#2218).
+    let shared_dir = crate::restore::default_report_dir();
     let boot_report = crate::restore::candidate_report_paths(registry, config, &boot_id)
         .into_iter()
-        .find_map(|path| crate::restore::read_report(&path));
+        .find_map(|path| {
+            let report = crate::restore::read_report(&path)?;
+            crate::restore::report_counts_for_registry(
+                registry,
+                config,
+                &path,
+                &report,
+                shared_dir.as_deref(),
+            )
+            .then_some(report)
+        });
     let manager = ManagedAgents::new(client, registry)?;
     let desired = desired_set(registry, config)?;
     let statuses: Vec<(String, std::result::Result<Value, String>)> = desired

@@ -275,15 +275,28 @@ pub(crate) fn candidate_report_paths(
     crate::restore::candidate_report_paths(registry, config, boot_id)
 }
 
-/// The first recorded report for this boot that reads, with its path.
+/// The first recorded report for this boot that reads and counts for
+/// this registry (#2218: a foreign shared-directory report never does),
+/// with its path.
 pub(crate) fn read_recorded_report(
     registry: &Path,
     config: &RestoreConfig,
     boot_id: &str,
 ) -> Option<(PathBuf, Value)> {
+    let shared = crate::restore::default_report_dir();
     candidate_report_paths(registry, config, boot_id)
         .into_iter()
-        .find_map(|path| read_report(&path).map(|report| (path, report)))
+        .find_map(|path| {
+            let report = read_report(&path)?;
+            crate::restore::report_counts_for_registry(
+                registry,
+                config,
+                &path,
+                &report,
+                shared.as_deref(),
+            )
+            .then_some((path, report))
+        })
 }
 
 /// One table row per agent in a per-registry report: the coordinator

@@ -430,6 +430,39 @@ fn restore_default_report_lives_under_the_registry_in_its_own_subdirectory() {
     assert_eq!(again["action"], "already-restored");
 }
 
+#[test]
+fn restore_reports_carry_the_registry_identity() {
+    // #2218: every report restore writes records which registry it
+    // belongs to, so a reader that finds the report outside the registry
+    // (the legacy shared directory) can prove it is this registry's.
+    let fixture = Fixture::new();
+    let _old = dead_agent(&fixture);
+    let host = ScriptedHost::new();
+    let registry = fixture.root.join("registry");
+    let document = json!({"schema": "agentctl-restore/v1", "startup_delay_seconds": 0});
+    fs::write(registry.join("restore.json"), document.to_string()).unwrap();
+    let config = RestoreConfig::load(&registry).unwrap();
+    let report = restore(&fixture.client, &registry, &host, &config, &options(None)).unwrap();
+    let canonical = fs::canonicalize(&registry).unwrap();
+    assert_eq!(
+        report["registry_id"],
+        json!(crate::restore::team_key(&registry)),
+        "{report}"
+    );
+    assert_eq!(
+        report["registry_path"],
+        json!(canonical.display().to_string()),
+        "{report}"
+    );
+    let path = registry
+        .join("restore")
+        .join("reports")
+        .join(format!("{BOOT}.json"));
+    let written = crate::restore::read_report(&path).unwrap();
+    assert_eq!(written["registry_id"], report["registry_id"]);
+    assert_eq!(written["registry_path"], report["registry_path"]);
+}
+
 /// Kill the revived `lane` again, as a user-manager restart would (#1405).
 fn kill_lane_again(fixture: &Fixture) {
     let record = fixture.manager().load("lane").unwrap();

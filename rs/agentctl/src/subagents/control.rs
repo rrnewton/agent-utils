@@ -1220,6 +1220,16 @@ fn read_designation(registry: &Path) -> Result<Option<Designation>> {
     Ok(Some(designation))
 }
 
+/// The name in `registry`'s designation file, without resolving it to a
+/// current record: the plain attribution fact a reader with no manager can
+/// prove from the registry's own files (#2218).
+pub(crate) fn designated_coordinator_name(registry: &Path) -> Option<String> {
+    read_designation(registry)
+        .ok()
+        .flatten()
+        .map(|designation| designation.name)
+}
+
 fn now_seconds() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

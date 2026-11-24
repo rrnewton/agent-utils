@@ -2111,13 +2111,24 @@ impl<A: crate::subagents::ManagedApi + ?Sized> DriverEffects for ProductionEffec
                         "epoch": record.epoch,
                     }));
                     if let Some(epoch) = epoch {
+                        let shared_dir = crate::restore::default_report_dir();
                         let finished = crate::restore::candidate_report_paths(
                             &self.registry,
                             &self.config,
                             &epoch.boot_id,
                         )
                         .into_iter()
-                        .find_map(|path| crate::restore::read_report(&path))
+                        .find_map(|path| {
+                            let report = crate::restore::read_report(&path)?;
+                            crate::restore::report_counts_for_registry(
+                                &self.registry,
+                                &self.config,
+                                &path,
+                                &report,
+                                shared_dir.as_deref(),
+                            )
+                            .then_some(report)
+                        })
                         .and_then(|found| found["finished_at"].as_f64());
                         ack_deadline = finished
                             .map(|when| when + self.verify_options.ack_timeout_seconds as f64);
