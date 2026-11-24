@@ -5250,7 +5250,7 @@ def _act_chip_row_above_fallback(driver: Driver) -> None:
     driver.js(
         "(() => { const area = document.getElementById('scroll-area'); "
         "const r = getSelection().getRangeAt(0).getBoundingClientRect(); "
-        "area.scrollBy(0, r.bottom - area.getBoundingClientRect().bottom + 8); })()"
+        "area.scrollBy(0, r.bottom - window.innerHeight + 70); })()"
     )
     driver.page.wait_for_function(
         "() => { const r = document.getElementById('selection-chip-row').getBoundingClientRect(); "
