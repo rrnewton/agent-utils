@@ -870,16 +870,24 @@ for slot_type, slot in [tuple(x.split(":", 1)) for x in sys.argv[2:]]:
 print("\\n".join(problems))
 raise SystemExit(1 if problems else 0)
 """
-    done = _run(
-        [sys.executable, "-c", program, str(project_root),
-         *[f"{t}:{s}" for t, s in slots]],
-        cwd=project_root, env=_environment(),
-        expected=(0, 1), trace=trace, timeout=600,
-    )
-    if done.returncode != 0:
-        problems.append(
-            f"detach snippet: {done.stdout.strip()} {done.stderr.strip()}"
+    # A just-exited worker's grandchildren can hold a slot for
+    # a few seconds; retry on the mount-table condition, never
+    # on a fixed sleep-as-sync.
+    for _attempt in range(6):
+        done = _run(
+            [sys.executable, "-c", program, str(project_root),
+             *[f"{t}:{s}" for t, s in slots]],
+            cwd=project_root, env=_environment(),
+            expected=(0, 1), trace=trace, timeout=600,
         )
+        if not _mount_points_under(project_root):
+            return problems
+        if done.returncode != 0:
+            problems.append(
+                f"detach snippet: {done.stdout.strip()} "
+                f"{done.stderr.strip()}"
+            )
+        time.sleep(2)
     return problems
 
 
