@@ -266,7 +266,8 @@ def _capture_resolved_model(record: AgentRecord) -> None:
 _NESTED_COMMON_FIELDS = frozenset({
     "schema", "name", "token", "created_at", "lifecycle", "launch",
     "workspace_id", "tab_id", "pane_id", "startup_warning",
-    "effective_reasoning_effort", "resolved_model", "model_override", "error", "paused",
+    "effective_reasoning_effort", "resolved_model", "model_override",
+    "masked_paths", "masked_paths_override", "error", "paused",
     "pane_reported_by_agentctl", "foreign_shell_identity",
     "runner_identity", "extensions",
 })
@@ -659,6 +660,10 @@ class AgentRecord:
     native_session: dict[str, str] | None = None
     profile: str | None = None
     reasoning_effort: str | None = None
+    #: Effective owner-declared off-limits paths at the last launch (#2163).
+    masked_paths: list[str] = field(default_factory=list)
+    #: Per-agent masked-path override winning over the profile (#2163).
+    masked_paths_override: list[str] | None = None
     slot: str | None = None
     slot_project: str | None = None
     slot_isolation: str | None = None
@@ -783,6 +788,10 @@ class AgentRecord:
             document["resolved_model"] = self.resolved_model
         if self.model_override is not None:
             document["model_override"] = self.model_override
+        if self.masked_paths:
+            document["masked_paths"] = list(self.masked_paths)
+        if self.masked_paths_override is not None:
+            document["masked_paths_override"] = list(self.masked_paths_override)
         custom_identity = (
             None if self.custom_process_identity is None
             else asdict(self.custom_process_identity)
@@ -1052,7 +1061,7 @@ class AgentRecord:
         }
         # `resolved_model` (#1340) is the one common key a row written before
         # it may lack; every other common key is required as before.
-        if not (expected - {"resolved_model", "model_override"}) <= set(document) or second_authority:
+        if not (expected - {"resolved_model", "model_override", "masked_paths", "masked_paths_override"}) <= set(document) or second_authority:
             raise AgentDeliveryError(f"invalid agent record {schema} fields: {path}")
         launch_value = document.get("launch")
         if not isinstance(launch_value, dict):
@@ -5219,6 +5228,29 @@ class ManagedAgents:
             else "profile" if record.model is not None else "none"
         )
         result["model_override"] = record.model_override
+        # Declared vs effective masks (#2163), as the Rust edition reports.
+        declared_masks = list(record.masked_paths)
+        if record.profile is not None:
+            try:
+                from agentctl import profiles as _profiles_mod
+                _root = _profiles_mod.configuration_root(record.cwd, self.registry)
+                _path, _available = _profiles_mod.load_profiles(_root)
+                if record.profile in _available:
+                    declared_masks = list(_available[record.profile].masked_paths)
+            except Exception:
+                pass
+        effective_masks = (
+            list(record.masked_paths_override)
+            if record.masked_paths_override is not None else declared_masks
+        )
+        result["declared_masked_paths"] = declared_masks
+        result["effective_masked_paths"] = effective_masks
+        result["masked_paths_source"] = (
+            "record" if record.masked_paths_override is not None
+            else "profile" if record.profile is not None
+            else "none" if not record.masked_paths else "record"
+        )
+        result["masked_paths_override"] = record.masked_paths_override
         try:
             destination = self._pending_move_destination(record)
             if destination is not None:

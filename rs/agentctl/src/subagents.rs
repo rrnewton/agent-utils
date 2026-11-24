@@ -13152,10 +13152,10 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             }
             let mut roots = Vec::new();
             if let Some(identity) = record.harness_identity.as_ref() {
-                roots.push(u64::from(identity.pid));
+                roots.push(identity.pid);
             }
             if let Some(identity) = record.custom_process_identity.as_ref() {
-                roots.push(u64::from(identity.pid));
+                roots.push(identity.pid);
             }
             scope.push((name, masked, roots));
         }
