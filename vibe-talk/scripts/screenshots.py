@@ -8657,7 +8657,7 @@ SCENES: tuple[Scene, ...] = (
         ),
     ),
     Scene(
-        name="93-glossary-not-found",
+        name="94-glossary-not-found",
         what="WTF? on a term nothing defines: the not-found popover naming what was searched",
         act=_act_glossary_not_found,
         profiles=MATRIX_PROFILES,
@@ -8949,7 +8949,7 @@ def run_captures(
     # empty pane there is the failure the matrix exists to catch. A wider walk skips those
     # states BY NAME instead — its server is deliberately cacheless (the Settings and Help
     # states photograph exactly that), so Discuss has no window to show there.
-    discuss_scenes = [s for s in scenes if s.name.startswith(("73-", "74-", "75-", "76-", "78-", "84-", "85-", "89-", "90-", "91-", "92-"))]
+    discuss_scenes = [s for s in scenes if s.name.startswith(("73-", "74-", "75-", "76-", "78-", "84-", "85-", "89-", "90-", "91-", "92-", "94-"))]
     discuss_only = bool(wanted) and len(wanted) == len(discuss_scenes)
     if discuss_scenes and not seed_discuss_cache(60 if discuss_only else 10):
         if discuss_only:
