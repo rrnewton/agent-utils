@@ -398,10 +398,10 @@
   cursor: pointer;
 }
 
-/* `#2220`. Hidden WTF? keeps its slot (invisible, not gone), so its late reveal never reflows the row. */
+/* `#2220`. WTF? keeps its slot while invisible (visibility, never display:none in the row), so its
+   late reveal never reflows the row; the glossary view toggles only its visibility. */
 #selection-chip-wtf[hidden] {
-  display: inline-block;
-  visibility: hidden;
+  display: none;
 }
 
 /* `#2156 vibe-talk-wtf-glossary-lookup`. A known glossary term in a message body: a dotted

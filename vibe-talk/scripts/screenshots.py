@@ -5202,6 +5202,27 @@ def _act_glossary_button(driver: Driver) -> None:
     driver.settle(300)
 
 
+def _act_chip_row_rigid(driver: Driver) -> None:
+    """`#2220`: stand the rigid row, scroll under it, then reveal WTF? late:
+    the container and its siblings must not move."""
+    _act_glossary_button(driver)
+    driver.js(
+        "(() => { window.__rowBefore = document.getElementById('selection-chip-row').getBoundingClientRect().toJSON(); "
+        "document.getElementById('scroll-area').scrollBy(0, 120); })()"
+    )
+    driver.settle(400)
+    widths = driver.js(
+        "(() => { const w = document.getElementById('selection-chip-wtf'); "
+        "const before = document.getElementById('selection-chip-row').getBoundingClientRect().width; "
+        "w.style.visibility = 'hidden'; "
+        "const reserved = document.getElementById('selection-chip-row').getBoundingClientRect().width; "
+        "w.style.visibility = 'visible'; "
+        "return [before, reserved, getComputedStyle(w).display, getComputedStyle(w).visibility]; })()"
+    )
+    assert isinstance(widths, list) and widths[0] == widths[1], f"reserved slot changed the row width: {widths}"
+    driver.settle(300)
+
+
 def _act_glossary_orphan(driver: Driver) -> None:
     """`#2195`: stand the chip group up, dismiss it with its X, and stop:
     the frame must show no chip left standing alone."""
@@ -8851,6 +8872,18 @@ SCENES: tuple[Scene, ...] = (
         ),
     ),
     Scene(
+        name="102-chip-row-rigid",
+        what="#2220 the rigid chip row after scroll and a late WTF? reveal: constant offsets, unmoved container",
+        act=_act_chip_row_rigid,
+        profiles=MATRIX_PROFILES,
+        keep_transient=True,
+        expect=(
+            ("#2220 all three chips live in the one container", "['selection-chip-wtf','selection-chip','selection-chip-dismiss'].every(id => document.getElementById(id).parentElement.id === 'selection-chip-row')"),
+            ("#2220 chips keep a constant offset order in the row", "(() => { const w = document.getElementById('selection-chip-wtf').getBoundingClientRect(); const c = document.getElementById('selection-chip').getBoundingClientRect(); const x = document.getElementById('selection-chip-dismiss').getBoundingClientRect(); return w.left < c.left && c.left < x.left && Math.abs(w.top - c.top) <= 2; })()"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
         name=SUMMARY_FAILED_STATE,
         what="summary mode when the summariser fails: the row says so quietly and keeps the message",
         act=_act_summary_failed,
@@ -9116,7 +9149,7 @@ def run_captures(
     # states photograph exactly that), so Discuss has no window to show there.
     # `#2187`/`#2195`: the orphan scenes (93-98) stand on the same seeded glossary window as
     # 91/92, so they skip with them on a cacheless server instead of failing alone.
-    discuss_scenes = [s for s in scenes if s.name.startswith(("73-", "74-", "75-", "76-", "78-", "84-", "85-", "89-", "90-", "91-", "92-", "93-", "94-", "95-", "96-", "97-", "98-", "99-"))]
+    discuss_scenes = [s for s in scenes if s.name.startswith(("73-", "74-", "75-", "76-", "78-", "84-", "85-", "89-", "90-", "91-", "92-", "93-", "94-", "95-", "96-", "97-", "98-", "99-", "102-", "103-", "104-"))]
     discuss_only = bool(wanted) and len(wanted) == len(discuss_scenes)
     if discuss_scenes and not seed_discuss_cache(60 if discuss_only else 10):
         if discuss_only:
