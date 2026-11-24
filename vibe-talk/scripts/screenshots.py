@@ -5244,36 +5244,10 @@ def _act_chip_row_below(driver: Driver) -> None:
 
 
 def _act_chip_row_above_fallback(driver: Driver) -> None:
-    """`#2220` fallback: select words in the last visible row at the foot of
-    the list, so the strip has no room below and stands above the selection."""
+    """`#2220` fallback: in a window too short for the strip under the words,
+    it stands above the selection instead."""
     _act_glossary_button(driver)
-    driver.js("document.getElementById('scroll-area').scrollBy(0, 100000)")
-    driver.settle(300)
-    rect = driver.js(
-        "(() => { const rows = [...document.querySelectorAll('#discord-log > li')].reverse(); "
-        "for (const row of rows) { const rr = row.getBoundingClientRect(); if (rr.height > 140) continue; "
-        "if (rr.bottom > window.innerHeight - 40 || rr.top < 0) continue; "
-        "const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT); "
-        "for (let n = walker.nextNode(); n; n = walker.nextNode()) { "
-        "if (n.parentElement && n.parentElement.closest('.glossary-term, a, button, code')) continue; "
-        "const m = n.textContent.match(/[A-Za-z][A-Za-z-]+ [A-Za-z][A-Za-z-]+ [A-Za-z][A-Za-z-]+/); "
-        "if (!m) continue; "
-        "const range = document.createRange(); "
-        "range.setStart(n, m.index); range.setEnd(n, m.index + m[0].length); "
-        "const r = range.getBoundingClientRect(); "
-        "if (r.bottom > window.innerHeight - 55) continue; "
-        "return {x: r.left, y: r.top, width: r.width, height: r.height}; } } "
-        "return null; })()"
-    )
-    assert isinstance(rect, dict), "no selectable words at the foot of the list"
-    driver.page.mouse.move(float(rect["x"]) + 1, float(rect["y"]) + float(rect["height"]) / 2)
-    driver.page.mouse.down()
-    driver.page.mouse.move(
-        float(rect["x"]) + float(rect["width"]) - 1,
-        float(rect["y"]) + float(rect["height"]) / 2,
-        steps=8,
-    )
-    driver.page.mouse.up()
+    driver.page.set_viewport_size({"width": 1280, "height": 480})
     driver.page.wait_for_function(
         "() => { const r = document.getElementById('selection-chip-row').getBoundingClientRect(); "
         "const s = getSelection().getRangeAt(0).getBoundingClientRect(); "
