@@ -1527,6 +1527,14 @@ agentctl --registry ~/project/.agentctl recovery install --write-unit --unit-des
 agentctl --registry ~/project/.agentctl recovery smoke
 ```
 
+Pages on give-up, a wedged restore, or claim loss are delivered by
+the shepherd itself through the escalation routes
+(`escalation.toml`: ordered `[[route]]` argv commands, incident on
+stdin, first exit 0 delivers; configure at least one route that does
+not depend on this team, for example a peer team's coordinator).
+`recovery status` headlines the verdict and page result and exits
+non-zero when a page failed or is unconfigured.
+
 `recovery install` validates the profile file, renders the optional
 `start-recovery` boot unit without enabling it (the operator enables
 it deliberately), and runs one real tiny structured round trip per

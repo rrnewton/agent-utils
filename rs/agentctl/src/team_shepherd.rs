@@ -209,15 +209,29 @@ pub fn restore_running(claim_path: &Path) -> bool {
 }
 
 /// The canonical epoch identity for claims and state directories:
-/// the boot id plus the user manager's start time, one derivation
-/// whatever format the manager identity was read in.
+/// the boot id plus the raw `ActiveEnterTimestampMonotonic` of the
+/// user manager, from one systemctl read. Never btime (NTP moves
+/// it) and never the manager identity string (its format flips).
+/// When the read fails the identity is the boot alone, for every
+/// caller alike.
 pub fn epoch_identity(host: &dyn Host, epoch: &RestoreEpoch) -> String {
-    match (epoch.user_manager.as_deref(), host.user_manager_started()) {
-        (Some(_), Some(started)) => format!("{}@{started:.0}", epoch.boot_id),
-        (Some(manager), None) => {
-            let digest = format!("{:x}", Sha256::digest(manager.as_bytes()));
-            format!("{}@{}", epoch.boot_id, &digest[..8])
-        }
+    if epoch.user_manager.is_none() {
+        return format!("{}@nomgr", epoch.boot_id);
+    }
+    let uid = unsafe { libc::getuid() };
+    let outcome = host.run(
+        &[
+            crate::restore::systemctl_program(),
+            "show".to_owned(),
+            format!("user@{uid}.service"),
+            "--property=ActiveEnterTimestampMonotonic".to_owned(),
+            "--value".to_owned(),
+        ],
+        None,
+        Duration::from_secs(10),
+    );
+    match outcome.stdout.trim().parse::<u64>() {
+        Ok(micros) if micros > 0 => format!("{}@{micros}", epoch.boot_id),
         _ => format!("{}@nomgr", epoch.boot_id),
     }
 }
@@ -647,19 +661,42 @@ pub fn page(
     }
     state.page_attempts += 1;
     let incident_record = crate::team_escalate::Incident {
-        host: std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_owned()),
+        host: std::fs::read_to_string("/etc/hostname")
+            .map(|text| text.trim().to_owned())
+            .ok()
+            .filter(|text| !text.is_empty())
+            .unwrap_or_else(|| "unknown".to_owned()),
         team: registry.display().to_string(),
         incident: incident.to_owned(),
         text: text.to_owned(),
     };
-    match crate::team_escalate::deliver(host, &config, &incident_record) {
-        crate::team_escalate::Delivery::Delivered { route_index } => {
-            state.page_delivered.push(kind.to_owned());
-            format!("delivered:{route_index}")
-        }
-        crate::team_escalate::Delivery::Unconfigured => "unconfigured".to_owned(),
-        crate::team_escalate::Delivery::Failed { detail } => {
-            format!("failed:{}", detail.chars().take(120).collect::<String>())
+    // Bounded retries with backoff, following failures only; a
+    // final failure writes the alarm beside the claim (the driver's
+    // own escalation bookkeeping shape).
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match crate::team_escalate::deliver(host, &config, &incident_record) {
+            crate::team_escalate::Delivery::Delivered { route_index } => {
+                state.page_delivered.push(kind.to_owned());
+                return format!("delivered:{route_index}");
+            }
+            crate::team_escalate::Delivery::Unconfigured => return "unconfigured".to_owned(),
+            crate::team_escalate::Delivery::Failed { detail } => {
+                if attempt >= 3 {
+                    let _ = crate::team_escalate::write_alarm(
+                        dir,
+                        &incident_record,
+                        &detail,
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d: Duration| d.as_secs_f64())
+                            .unwrap_or(0.0),
+                    );
+                    return format!("failed:{}", detail.chars().take(120).collect::<String>());
+                }
+                std::thread::sleep(Duration::from_secs(if attempt == 1 { 5 } else { 20 }));
+            }
         }
     }
 }
@@ -904,6 +941,7 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
             && !state.restore_done
             && restore_child.is_none()
             && state.restore_pid == 0
+            && heartbeat_claim_result(&claim_path, &incident) == Heartbeat::Owned
         {
             let base = vec![
                 "--registry".to_owned(),
@@ -1132,8 +1170,26 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
     heartbeat_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = heartbeat_thread.join();
     if claim_lost_now {
-        // The new owner owns this incident: exit without stamping
-        // anything over its state.
+        // Page first (paging needs no state dir), naming a restore
+        // still running; then exit without stamping: the new owner
+        // owns this incident.
+        let restore_note = if state.restore_pid != 0
+            && recorded_restore_alive(state.restore_pid, &state.restore_pid_start)
+        {
+            format!("restore pid {} is still running", state.restore_pid)
+        } else {
+            "no restore is running".to_owned()
+        };
+        let _ = page(
+            host,
+            options,
+            &mut state,
+            "claim-loss",
+            &format!("shepherd lost its claim; {restore_note}"),
+            own,
+            &incident,
+            &dir,
+        );
         append_log(&dir, "claim lost; exiting without a stamp");
         return Ok(json!({
             "schema": SHEPHERD_REPORT_SCHEMA,
@@ -1146,7 +1202,9 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
         }));
     }
     let mut escalation = "none".to_owned();
-    if verdict != "YES" {
+    let giveup_row = summaries.get(&own.display().to_string());
+    let giveup_lead_live = giveup_row.is_some_and(|row| row["lead_live"] == json!(true));
+    if verdict != "YES" && !giveup_lead_live {
         escalation = page(
             host,
             options,
@@ -1157,7 +1215,9 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
             &incident,
             &dir,
         );
-        save_state(&dir, &state)?;
+        let _ = save_state(&dir, &state);
+    } else if verdict != "YES" {
+        escalation = "lead-owns".to_owned();
     }
     if verdict != "YES" {
         // Bounded give-up: escalate through the landed path only
@@ -1168,28 +1228,7 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
         let own_yes = own_row.is_some_and(|row| row["yes"] == json!(true));
         let own_lead_live = own_row.is_some_and(|row| row["lead_live"] == json!(true));
         let own_unknown = own_row.is_some_and(|row| row["facts_unknown"] == json!(true));
-        if should_escalate(own_yes, own_lead_live, own_unknown, claim_lost_now) {
-            let code = enqueue_shepherd_act(
-                inputs,
-                own,
-                options,
-                &incident,
-                &format!("shepherd-{incident}-giveup"),
-                &[
-                    "escalate".to_owned(),
-                    "shepherd gave up without a deterministic YES".to_owned(),
-                ],
-                &dir,
-                state.round,
-            );
-            // The enqueued act is for the team driver (drained from
-            // its own paths); the human page above is independent
-            // of it, so its result never overwrites the page status.
-            append_log(
-                &dir,
-                &format!("give-up act enqueue exit={code} (page: {escalation})"),
-            );
-        }
+        let _ = should_escalate(own_yes, own_lead_live, own_unknown, claim_lost_now);
         verdict = "GAVE-UP";
     }
     let stamp = json!({
@@ -1543,13 +1582,13 @@ pub fn claim_decision(
     let Some(claim) = claim else {
         return ClaimDecision::Take;
     };
-    // A different canonical epoch (boot plus manager start time)
-    // never blocks, live heartbeat or not.
-    if claim["epoch_key"].as_str() != Some(epoch_key) {
-        return ClaimDecision::TakeOverPreviousBoot;
-    }
+    // Liveness is checked before any epoch comparison: a live
+    // owner is never taken over, whatever epoch it recorded.
     if owner_alive {
         return ClaimDecision::AlreadyRunning;
+    }
+    if claim["epoch_key"].as_str() != Some(epoch_key) {
+        return ClaimDecision::TakeOverPreviousBoot;
     }
     let heartbeat = claim["heartbeat_at"].as_f64().unwrap_or(0.0);
     if now - heartbeat >= stale_seconds {

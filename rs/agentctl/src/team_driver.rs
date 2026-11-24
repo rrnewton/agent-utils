@@ -1089,6 +1089,12 @@ fn apply_event(
 /// Validate one typed action against the fresh manifest and state.
 /// Production effects re-check their own domain rules (configured
 /// units, pins, bridge targets) before acting.
+/// A queued request's expiry: bound to its incident and epoch at
+/// enqueue, and refused as expired once it is older than this many
+/// seconds, so a later driver never executes a stale revive or
+/// start-unit from a dead incident (review 6).
+pub const ACT_EXPIRY_SECONDS: f64 = 1800.0;
+
 fn validate_action(
     record: &DriverRecord,
     manifest: &Value,
@@ -1243,6 +1249,18 @@ fn run_queued_action<E: DriverEffects>(
             index,
             "refused",
             "stale epoch",
+            None,
+            None,
+            now,
+        );
+    }
+    if now - entry.requested_at > ACT_EXPIRY_SECONDS {
+        return finish_action(
+            directory,
+            record,
+            index,
+            "refused",
+            "expired request",
             None,
             None,
             now,

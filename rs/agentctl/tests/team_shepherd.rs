@@ -145,6 +145,9 @@ fn scratch_processes(root: &Path) -> Vec<u32> {
 struct Scratch {
     root: PathBuf,
     groups: std::cell::RefCell<Vec<GroupGuard>>,
+    /// Whether drill commands may use the recording launcher fakes;
+    /// the harness default is the refusing fake.
+    recording: std::cell::Cell<bool>,
 }
 
 impl Scratch {
@@ -187,6 +190,7 @@ impl Scratch {
         let scratch = Self {
             root,
             groups: std::cell::RefCell::new(Vec::new()),
+            recording: std::cell::Cell::new(false),
         };
         scratch.register("own");
         scratch.register("judged");
@@ -288,6 +292,18 @@ impl Scratch {
         let (output, guard) = spawn_grouped(command);
         self.groups.borrow_mut().push(guard);
         output
+    }
+
+    fn unit_launcher(&self, name: &str) -> PathBuf {
+        if self.recording.get() {
+            self.root.join(name)
+        } else {
+            self.root.join("systemd-refuse")
+        }
+    }
+
+    fn use_recording(&self) {
+        self.recording.set(true);
     }
 
     fn register(&self, team: &str) {
@@ -413,8 +429,8 @@ impl Scratch {
             .env("AGENTCTL_TEST_HARNESS", "1")
             .env("AGENTCTL_SYSTEMCTL", self.root.join("systemd-refuse"))
             .env("AGENTCTL_SYSTEMD_RUN", self.root.join("systemd-refuse"))
-            .env("AGENTCTL_SYSTEMCTL", self.root.join("systemctl"))
-            .env("AGENTCTL_SYSTEMD_RUN", self.root.join("systemd-run"))
+            .env("AGENTCTL_SYSTEMCTL", self.unit_launcher("systemctl"))
+            .env("AGENTCTL_SYSTEMD_RUN", self.unit_launcher("systemd-run"))
             .env_remove("HERDR_SOCKET_PATH")
             .env_remove("HERDR_PANE_ID")
             .env_remove("AGENTCTL_AGENT")
@@ -471,6 +487,7 @@ impl Scratch {
     /// Ordered profiles for the own team plus a passing smoke record,
     /// so the supervisor may consult a model at all (fail closed).
     fn install_profiles(&self, state_dir: &Path) {
+        self.use_recording();
         let profiles = format!(
             "schema = \"agentctl-recovery-profiles/v1\"\n\
              [[profile]]\nname = \"slow-muse\"\nharness = \"muse\"\ntimeout_seconds = 10\ncommand = \"{}\"\n\
@@ -682,8 +699,8 @@ impl Scratch {
             .env("AGENTCTL_TEST_HARNESS", "1")
             .env("AGENTCTL_SYSTEMCTL", self.root.join("systemd-refuse"))
             .env("AGENTCTL_SYSTEMD_RUN", self.root.join("systemd-refuse"))
-            .env("AGENTCTL_SYSTEMCTL", self.root.join("systemctl"))
-            .env("AGENTCTL_SYSTEMD_RUN", self.root.join("systemd-run"))
+            .env("AGENTCTL_SYSTEMCTL", self.unit_launcher("systemctl"))
+            .env("AGENTCTL_SYSTEMD_RUN", self.unit_launcher("systemd-run"))
             .env_remove("HERDR_SOCKET_PATH")
             .env_remove("HERDR_PANE_ID")
             .env_remove("AGENTCTL_AGENT")
@@ -1105,6 +1122,11 @@ fn blocking_restore_blocks_stamp_and_acts_until_released() {
         !any_stamp(&state.join("shepherd")),
         "stamped while its restore was still blocked"
     );
+    let seam_log = fs::read_to_string(scratch.root.join("systemd.log")).unwrap_or_default();
+    assert!(
+        !seam_log.contains("--user start") && !seam_log.contains("--on-active"),
+        "a unit was started while the restore was blocked: {seam_log}"
+    );
     // Release the restore with the embedded throwaway certificate;
     // the incident may now finish and stamp.
     fs::write(&cert, DRILL_CERT).expect("release cert");
@@ -1192,5 +1214,71 @@ fn default_escalation_config_is_refused_under_the_harness() {
             .is_some_and(|s| s.contains("refused") || s.contains("unconfigured")),
         "{stamp}"
     );
+    scratch.reap();
+}
+
+#[test]
+fn live_claim_owner_is_never_taken_over_even_in_another_epoch() {
+    use std::os::unix::process::CommandExt;
+    let scratch = Scratch::new("takeover");
+    scratch.use_recording();
+    let state = scratch.root.join("state");
+    // A live owner (a grouped sleep) holding a claim from another
+    // epoch: start-recovery must refuse, not take over (B2).
+    let mut sleeper = Command::new("sleep");
+    sleeper.arg("120").process_group(0);
+    let sleeper_child = sleeper.spawn().expect("sleeper");
+    scratch.groups.borrow_mut().push(GroupGuard {
+        pgid: sleeper_child.id(),
+        armed: std::cell::Cell::new(true),
+    });
+    let pid = sleeper_child.id();
+    let start = fs::read_to_string(format!("/proc/{pid}/stat"))
+        .expect("sleeper stat")
+        .rsplit_once(')')
+        .map(|(_, rest)| {
+            rest.split_whitespace()
+                .nth(19)
+                .expect("start ticks")
+                .to_owned()
+        })
+        .expect("stat shape");
+    let dir = state
+        .join("recovery")
+        .join(crate_team_key(&scratch.root.join("own")));
+    fs::create_dir_all(&dir).expect("recovery dir");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    write_private(
+        &dir.join("claim.json"),
+        &format!(
+            "{{\"schema\": \"agentctl-recovery-claim/v1\", \"incident\": \"abc123abc123\", \
+             \"boot_id\": \"other-boot\", \"epoch_key\": \"other-boot@1\", \
+             \"pid\": {pid}, \"pid_start\": \"{start}\", \"heartbeat_at\": {now}, \
+             \"started_at\": {now}, \"supervisor_pending\": false}}"
+        ),
+    );
+    let mut args = scratch.base_args();
+    args.extend([
+        "start-recovery".to_owned(),
+        "--state-dir".to_owned(),
+        state.display().to_string(),
+        "--run-agent-prompt".to_owned(),
+        wrapper().display().to_string(),
+    ]);
+    let (code, report) = scratch.run_agentctl(&args);
+    assert_eq!(code, 75, "{report}");
+    assert_eq!(report["status"], "already-running", "{report}");
+    let claim: Value =
+        serde_json::from_str(&fs::read_to_string(dir.join("claim.json")).expect("claim"))
+            .expect("claim json");
+    assert_eq!(
+        claim["pid"].as_u64(),
+        Some(u64::from(pid)),
+        "claim was taken over"
+    );
+    drop(sleeper_child);
     scratch.reap();
 }
