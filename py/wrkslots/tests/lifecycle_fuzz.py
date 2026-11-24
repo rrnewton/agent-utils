@@ -7,7 +7,7 @@ injects crashes at the CLI's test seams between journal and event
 writes, and after every step decodes the real state (event chain,
 ACTIVE snapshot, journals including containing-refs sidecars, seal)
 in a separate snippet process.  The decoded state is judged
-against the invariants transitionmodel.py checks: the event chain
+against the invariants the TLA+ transition spec checks: the event chain
 always loads or its refusal names an outstanding journal/seal,
 the reloaded journal equals the in-memory journal after expansion,
 every interrupted state is completed by one recover (or the

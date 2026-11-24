@@ -14,7 +14,7 @@ point any of this at a live registry.
 | Seeded harness | `py/wrkslots/tests/lifecycle_fuzz.py` (run as a script) |
 | Gated subset | `py/wrkslots/tests/test_lifecycle_fuzz.py` (seeds 1..4 + one concurrent seed) |
 | Fsync fault regression | `py/wrkslots/tests/test_fault_fsync.py` |
-| Model (oracle source) | `py/wrkslots/transitionmodel.py`, `py/wrkslots/TRANSITIONMODEL.md` |
+| Model (oracle source) | `py/wrkslots/spec/WrkslotsTransition.tla`, `py/wrkslots/TRANSITIONMODEL.md` |
 | TLA+ mirror | `py/wrkslots/spec/WrkslotsTransition.tla` (+ `run_tlc.sh`, opt-in) |
 | Prior-art stress suite | `py/wrkslots/tests/e2e_stress.py` (scenarios, mock-agent tree) |
 
@@ -131,20 +131,16 @@ test; product fixes stay with the owning lane.
 
 ## Model-oracle interface
 
-```python
-import sys; sys.path.insert(0, "py")
-from wrkslots import transitionmodel as tm
-ex = tm.explore(tm.Scenario())        # current-main variants
-ex.violations("forked-chain")         # sticky safety ghosts
-ex.wedges(); ex.manual_terminals()    # no-exit / hand-exit states
-ex.trace(state)                       # shortest action-name trace
-tm.is_clean(state); tm.is_resting(state)
-```
+The TLA+ specs under `py/wrkslots/spec/` are the oracle:
+`WrkslotsTransition.tla` (actions named as the old Python
+model's), `WrkslotsLifecycle.tla`, and `WrkslotsLock.tla`,
+checked by TLC through `py/wrkslots/tests/test_tlc_gate.py`
+in the gate (pinned jar; skips by name without one) and by
+`spec/run_tlc.sh` manually. Scenario constants select code
+variants (`pre-delete-classify`, `rebase-on-advance`,
+`stale-previous-refusal`, `assert-compares-revision`);
+counterexample traces read as action-name sequences.
 
-`Scenario(fixes=...)` selects code variants
-(`pre-delete-classify`, `rebase-on-advance`,
-`stale-previous-refusal`, `assert-compares-revision`); the
-TLA+ spec mirrors the same actions and constants for TLC.
 The fuzz oracle above is the decoded-state projection of
 these checks; the gated Python explorer remains the
 in-validation cross-check.
