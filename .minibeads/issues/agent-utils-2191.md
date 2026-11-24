@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-root-box-hangs-without-tty: a root box started with no terminal never runs its command'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -39,3 +39,27 @@ No new persisted fields. The installed root helper is root-owned host state; rei
 # Notes
 
 [watermelon-full-preview] mu-rootbox. Owner priority: the root sandbox must work so agents can start with their filesystem view sandboxed. Related: #1583 (root helper trust boundary), #1792 (fd-based strict build). The test-hermeticity fallout from installing the helper on this host is handled as a separate small commit ahead of this fix.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main: the mount-table fix as edc366b0 (gate 2eff7389 red only on six tests outside this change's code, all passing alone on the gated tree, waived), preceded by the hermetic root-helper tests as 75b48727 + a4449395 (gate b699d58f, one waived load-sensitive census red) and this issue file as badfaba7. The strict build now reads /proc/self/mountinfo once per build (regression-pinned: 124 reads for 40 binds before, at most 4 after, plus a stale-mount-id refusal test), and `place_in_scope`'s `busctl` call is bounded at 10 seconds with the existing systemd-run fallback. Prompt SIGTERM exit follows from the build no longer taking minutes: the helper has no SIGTERM handler, so the default action stops it at once, and the launcher it exec'd through receives the same signal. No new persisted fields.
+
+One step remains outside this repository, as root work for the host owner (the installed helper is root-owned host state): reinstall the installed root helper, then run the real-helper proof. Until the reinstall, every root-isolation launch (wrkslots run/box with isolation root, including a configuration whose default isolation is root, run --in-scope, and their --print forms) refuses cleanly with: "installed root helper /usr/local/lib/wrkslots/sandbox.py is not version 3; refusing. Reinstall it as root with: sudo install -o root -g root -m 0755 <checkout>/py/wrkslots/sandbox.py /usr/local/lib/wrkslots/sandbox.py". User-namespace and cgroup boxes are unaffected. Reinstall and verify exactly:
+
+```sh
+sudo install -o root -g root -m 0755 <agent-utils checkout>/py/wrkslots/sandbox.py /usr/local/lib/wrkslots/sandbox.py
+grep -m1 ^_HELPER_VERSION /usr/local/lib/wrkslots/sandbox.py   # must read: _HELPER_VERSION = "3"
+cmp <agent-utils checkout>/py/wrkslots/sandbox.py /usr/local/lib/wrkslots/sandbox.py   # byte-equal; still root:root 0755
+```
+
+Then the proof (a write outside the writable set fails, a write inside succeeds), from a throwaway wrkslots project's root with no terminal attached:
+
+```sh
+<agent-utils checkout>/common/bin/wrkslots box --isolation root --cwd worktrees -- /bin/sh -c '
+  touch "$PWD/inside-probe" && echo "inside: written"
+  touch <throwaway-project>/outside-probe || echo "outside: refused as expected"'
+ls <throwaway-project>/worktrees/inside-probe   # exists on the host
+ls <throwaway-project>/outside-probe            # must not exist
+```
+
+Expected: the box starts in seconds, prints both lines, the inside probe exists afterwards, the outside probe does not, and no box scope is left behind (`systemctl --user list-units '3pai_sandbox-wrkslots*'` shows only the persistent empty slices). This proof and the reinstall are the only unverified remainder; everything else is pinned by the landed tests.
