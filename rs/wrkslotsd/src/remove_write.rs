@@ -6325,6 +6325,91 @@ mod census_gone_tests {
         let _ = std::fs::remove_dir_all(&proc_root);
         stop(user);
     }
+
+    #[test]
+    fn an_unproven_in_use_census_never_clears() {
+        // #2208 pin: a census over an in-use slot under churn never
+        // returns an empty success a caller could mistake for
+        // "unused" — it names a user or refuses as not closed.
+        // Churn threads keep symlinking newborn in-slot processes
+        // into the fake /proc (the busy-host outcome, planted).
+        let slot = Slot::new("unclosed");
+        // Pre-populate live generations so the first listing admits
+        // holders before churn even starts.
+        let seed: Vec<std::process::Child> = (0..8)
+            .map(|_| {
+                std::process::Command::new("sleep")
+                    .arg("3600")
+                    .current_dir(&slot.slot)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        let seed_refs: Vec<&std::process::Child> = seed.iter().collect();
+        let proc_root = fake_proc_root(&seed_refs);
+        let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let children: std::sync::Arc<std::sync::Mutex<Vec<std::process::Child>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let slot_dir = slot.slot.clone();
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let proc_root = proc_root.clone();
+                let slot_dir = slot_dir.clone();
+                let running = running.clone();
+                let children = children.clone();
+                scope.spawn(move || {
+                    while running.load(std::sync::atomic::Ordering::Relaxed) {
+                        // In-slot churn: every newborn generation uses
+                        // the target, so no round is ever proven.
+                        let child = std::process::Command::new("sleep")
+                            .arg("3600")
+                            .current_dir(&slot_dir)
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .spawn()
+                            .unwrap();
+                        let _ = std::os::unix::fs::symlink(
+                            format!("/proc/{}", child.id()),
+                            proc_root.join(child.id().to_string()),
+                        );
+                        children.lock().unwrap().push(child);
+                    }
+                });
+            }
+            // Condition-based fixture wait (no wall clock): capture
+            // only once churn has planted a population, and churn
+            // keeps adding in-slot generations throughout.
+            while children.lock().unwrap().len() < 64 {
+                std::thread::yield_now();
+            }
+            // The #2208 property: an in-use, unproven slot is never
+            // cleared. Either the snapshot closes and names a user,
+            // or it does not close and refuses — never an empty Ok.
+            let verdict = capture_process_snapshot_at(
+                &proc_root,
+                std::process::id() as i64,
+                std::slice::from_ref(&slot.slot),
+            )
+            .and_then(|snapshot| assert_slot_unused_snapshot(&snapshot, &slot.slot));
+            running.store(false, std::sync::atomic::Ordering::Relaxed);
+            let error = verdict.expect_err("an unproven in-use census must refuse, not clear");
+            assert!(
+                error.contains("uses slot") || error.contains("did not close"),
+                "{error}"
+            );
+        });
+        for child in children.lock().unwrap().drain(..) {
+            stop(child);
+        }
+        for child in seed {
+            stop(child);
+        }
+        let _ = std::fs::remove_dir_all(&proc_root);
+    }
 }
 
 #[cfg(test)]

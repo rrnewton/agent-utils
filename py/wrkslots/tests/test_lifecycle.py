@@ -2320,8 +2320,8 @@ def stub_validate_batch_censuses(
     monkeypatch.setattr(wrkslots, "_capture_process_path_census", shared)
     monkeypatch.setattr(wrkslots, "_capture_lsof_process_path_census", shared)
     monkeypatch.setattr(wrkslots, "_capture_same_uid_process_path_census", fresh)
-    # Seal recovery decides from the batch's own owner cgroup (#2128);
-    # the stubbed-empty censuses above stand for an empty cgroup too.
+    # Seal recovery checks the batch's own owner cgroup first (#2128);
+    # the census still decides, and the stubbed censuses above close.
     monkeypatch.setattr(
         wrkslots,
         "_scoped_validation_run_cgroup_state",

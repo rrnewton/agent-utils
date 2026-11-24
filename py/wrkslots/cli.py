@@ -1454,10 +1454,11 @@ class _CensusDidNotClose(Refusal):
     """A same-UID census could not close under churn (#2128).
 
     ``found`` carries the path matches accumulated before the bound
-    was reached. Seal recovery may substitute its scoped cgroup
-    decision only for this refusal and only when ``found`` is empty;
-    every other census refusal (including one carrying matches)
-    still refuses.
+    was reached. The census has not proven its targets unused, so
+    every caller refuses: seal recovery never substitutes an empty
+    census for this refusal (#2208), whether or not ``found`` is
+    empty — a holder the census never scanned may still use the
+    checkout.
     """
 
     def __init__(
@@ -68329,26 +68330,15 @@ def _finish_remove_paths(
         try:
             if census_captured_here:
                 # Seal recovery (#2128): the batch's own owner cgroup
-                # decides its batch scope. A validate slot whose
-                # recorded owner is proven dead and whose owner cgroup
-                # is empty (or gone) has no holder in its batch scope;
-                # a populated cgroup (often a shared session scope)
-                # refuses only when a member actually uses the slot,
-                # and otherwise the census decides as before; a
-                # present but unreadable cgroup refuses fail-closed.
-                # When the cgroup reads empty the same-UID census
-                # still runs once as a reference scan: a completed
-                # scan's matches refuse exactly as before, but a
-                # census that cannot close under host churn no longer
-                # blocks recovery — the scoped decision stands.
-                # Accepted residual: processes the unclosed census
-                # never finished scanning may have forked unscanned
-                # children; only the owner-cgroup decision and the
-                # all-process census recover ran earlier cover that
-                # window. Only a slot this decision cannot apply to
-                # (not validate, or owner not proven dead) keeps the
-                # census as its decision.
-                scoped_empty = False
+                # is checked first. A validate slot whose recorded
+                # owner is proven dead and whose owner cgroup is
+                # populated refuses when a member actually uses the
+                # slot; a present but unreadable cgroup refuses
+                # fail-closed. An empty (or gone) owner cgroup decides
+                # nothing on its own: it cannot see a holder outside
+                # the owner cgroup (a step in a sibling scope, a shell
+                # in the checkout), so the same-UID census below is
+                # the decision, exactly as at base.
                 if (
                     record.slot_type == "validate"
                     and record.owner is not None
@@ -68382,15 +68372,18 @@ def _finish_remove_paths(
                             f"{scoped_detail}; refusing seal recovery "
                             f"for slot {record.slot} (fail closed)"
                         )
-                    else:
-                        scoped_empty = True
+                    # An empty owner cgroup falls through: the census
+                    # below decides, exactly as at base.
                 # Interrupted-operation recovery still establishes
                 # this snapshot while holding the recovery lock.
                 # Ordinary removal supplies the post-fence census
-                # captured outside mutation locks. Only a census that
-                # could not close under churn, and found nothing, is
-                # substituted by the scoped decision; every other
-                # refusal — including one carrying matches — refuses.
+                # captured outside mutation locks. A census that did
+                # not close has not proven the checkout unused, so it
+                # is never substituted by an empty census (#2208): a
+                # holder outside the recorded owner cgroup may never
+                # have been scanned. Recovery refuses by name and the
+                # fence rollback below retains the checkout, the
+                # finish journal and the seal for a later retry.
                 try:
                     fresh_census = _capture_same_uid_process_path_census(
                         (fenced_slot,),
@@ -68398,11 +68391,19 @@ def _finish_remove_paths(
                     )
                     finish.private_cleanup.same_uid_census_performed = True
                 except _CensusDidNotClose as exc:
-                    if not scoped_empty or exc.found:
-                        raise
-                    fresh_census = _ProcessPathCensus(
-                        (), (), owner_cgroup_complete=False
+                    found_note = (
+                        f"; it had already found {len(exc.found)} match(es)"
+                        if exc.found
+                        else ""
                     )
+                    raise Refusal(
+                        f"holder census for slot {record.slot} did not "
+                        f"close, so seal recovery cannot prove the "
+                        f"checkout unused ({exc}){found_note}; refusing "
+                        "seal recovery: the checkout, finish journal "
+                        "and seal are retained; retry 'wrkslots "
+                        "recover' when fewer processes are starting"
+                    ) from exc
             assert fresh_census is not None
             fresh_census.assert_slot_unused(
                 fenced_slot,
@@ -94265,18 +94266,15 @@ def _capture_same_uid_process_path_census_following(
                 # scanned nothing, or its last completed round left
                 # generations it could not prove unrelated — a holder
                 # could have handed its reference to an unscanned
-                # child in that round. This is not the bounded
-                # non-closure the seal-recovery substitution covers;
-                # it refuses as before.
+                # child in that round. It refuses as before.
                 raise Refusal(
                     "same-UID process evidence changed during three liveness attempts"
                 )
-            # The last completed round was proven: every generation
-            # it added was shown unrelated, so nothing it held could
-            # pass a reference on. Evidence that kept changing after
-            # that is churn, not a holder: it carries whatever
-            # matches were already authenticated, so the substitution
-            # applies exactly when it found nothing (#2128 follow-up).
+            # The last completed round was proven, but evidence kept
+            # changing after it, so the census never closed: it
+            # carries whatever matches were already authenticated and
+            # every caller refuses on it (#2208) — an unscanned holder
+            # may still use the target.
             raise _CensusDidNotClose(
                 "same-UID process evidence changed during three liveness attempts",
                 tuple(found),

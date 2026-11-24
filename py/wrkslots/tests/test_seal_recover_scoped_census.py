@@ -1,9 +1,11 @@
-"""Scoped seal-recovery census (#2128): batch cgroups decide, never /proc.
+"""Scoped seal-recovery census (#2128, #2208): cgroups checked, census decides.
 
 The decision table runs over a fake cgroup tree. Integration cases
 run a paired validation finish recovery under unrelated process
 churn, with a live holder inside the batch cgroup, and with the
-cgroup present but unreadable.
+cgroup present but unreadable. A census that cannot close never
+clears the checkout for deletion (#2208): recovery refuses by name
+and retains the checkout, the finish journal and the seal.
 """
 
 from __future__ import annotations
@@ -249,14 +251,20 @@ def test_real_scoped_decision_recovers_and_refuses_holder(
     finally:
         terminate_process(holder)
 
-    # Empty again: the non-closing census no longer blocks recovery.
+    # Empty again: the non-closing census still blocks recovery
+    # (#2208). An empty owner cgroup cannot see a holder outside it,
+    # so the unproven census refuses by name and nothing is deleted.
     (owner_dir / "cgroup.events").write_text(
         "populated 0\nfrozen 0\n", encoding="ascii"
     )
     (owner_dir / "cgroup.procs").write_text("", encoding="ascii")
-    assert _recover(project) == 0
-    assert not finish_path.exists()
-    assert not seal_path.exists()
+    assert _recover(project) == 3
+    err = capsys.readouterr().err
+    assert "did not close" in err
+    assert "slot target" in err
+    assert slot_path.is_dir()
+    assert finish_path.is_file()
+    assert seal_path.is_file()
 
 
 def test_populated_shared_cgroup_members_not_using_slot_recover(
@@ -293,7 +301,7 @@ def test_populated_shared_cgroup_members_not_using_slot_recover(
 def test_census_refusals_other_than_unclosed_still_refuse(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Only an unclosed census that found nothing is substituted."""
+    """Every census refusal refuses; none is substituted (#2208)."""
 
     project, config, finish_path, _raw, record = prepare_paired_validation_finish(
         tmp_path, monkeypatch, "scoped"
@@ -328,6 +336,40 @@ def test_census_refusals_other_than_unclosed_still_refuse(
         wrkslots, "_capture_same_uid_process_path_census", unclosed_with_match
     )
     assert _recover(project) == 3
+    assert slot_path.is_dir()
+    assert finish_path.is_file()
+    assert seal_path.is_file()
+
+
+def test_unclosed_census_never_clears_checkout_for_deletion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Planted #2208 case: dead owner, empty owner cgroup, census cannot close.
+
+    Deterministic and condition-based: the stub census raises
+    ``_CensusDidNotClose`` with no matches on every call (the busy-host
+    outcome, without depending on host churn or wall-clock timing).
+    On the unfixed code the empty-census substitution deletes the
+    checkout (recover returns 0); after the fix recovery refuses by
+    name and retains the checkout, the finish journal and the seal.
+    """
+
+    project, config, finish_path, _raw, record = prepare_paired_validation_finish(
+        tmp_path, monkeypatch, "scoped"
+    )
+    slot_path = wrkslots._slot_directory(config, record.slot, record.slot_type)
+    seal_path = wrkslots._validate_batch_seal_journal_path(config)
+    _owner_dead(monkeypatch, record)
+    root = _tree(tmp_path)
+    _real_scoped(monkeypatch, record, root)
+    monkeypatch.setattr(
+        wrkslots, "_capture_same_uid_process_path_census", _unclosed_census
+    )
+    assert _recover(project) == 3
+    err = capsys.readouterr().err
+    assert "did not close" in err
+    assert "slot target" in err
+    assert "retry 'wrkslots recover'" in err
     assert slot_path.is_dir()
     assert finish_path.is_file()
     assert seal_path.is_file()
@@ -369,10 +411,10 @@ def test_real_holder_with_real_unclosed_census_refuses(
     assert seal_path.is_file()
 
 
-def test_real_churn_with_real_census_recovers(
+def test_real_churn_with_real_census_refuses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Real churn + real non-closing census + real scoped decision."""
+    """Real churn + real non-closing census + real scoped decision (#2208)."""
 
     project, config, finish_path, _raw, record = prepare_paired_validation_finish(
         tmp_path, monkeypatch, "scoped"
@@ -408,13 +450,14 @@ def test_real_churn_with_real_census_recovers(
             churner.terminate()
         for churner in churners:
             churner.wait()
-    assert rc == 0
-    # The substitution actually ran: the real census could not close
-    # and its empty-found refusal was swallowed.
+    assert rc == 3
+    # The real census could not close under churn, and its
+    # empty-found refusal now refuses by name (#2208): nothing is
+    # deleted on an unproven census.
     assert swallowed
-    assert not slot_path.exists()
-    assert not finish_path.exists()
-    assert not seal_path.exists()
+    assert slot_path.is_dir()
+    assert finish_path.is_file()
+    assert seal_path.is_file()
 
 
 _REAL_DIRECT = wrkslots._same_uid_direct_path_processes
@@ -469,10 +512,10 @@ def test_early_motion_with_real_holder_refuses(
     assert seal_path.is_file()
 
 
-def test_evidence_changed_after_completed_round_recovers(
+def test_evidence_changed_after_completed_round_refuses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Motion after one PROVEN round is the substituted non-closure."""
+    """Motion after one PROVEN round: the census never closed (#2208)."""
 
     project, config, finish_path, _raw, record = prepare_paired_validation_finish(
         tmp_path, monkeypatch, "scoped"
@@ -514,12 +557,13 @@ def test_evidence_changed_after_completed_round_recovers(
     monkeypatch.setattr(
         wrkslots, "_capture_same_uid_process_path_census", census_spy
     )
-    assert _recover(project) == 0
-    # The substituted refusal is specifically the evidence-changed one.
+    assert _recover(project) == 3
+    # The refusal is specifically the evidence-changed non-closure,
+    # and it refuses by name (#2208): nothing is deleted.
     assert swallowed and "evidence changed" in swallowed[0]
-    assert not slot_path.exists()
-    assert not finish_path.exists()
-    assert not seal_path.exists()
+    assert slot_path.is_dir()
+    assert finish_path.is_file()
+    assert seal_path.is_file()
 
 
 def test_handoff_in_unproven_round_then_motion_refuses(
