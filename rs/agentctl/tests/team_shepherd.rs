@@ -803,7 +803,15 @@ fn recovery_smoke_records_profiles_and_start_recovery_claims_once() {
         args
     };
     let (code, report) = scratch.run_agentctl(&status_args);
-    assert_eq!(code, 0, "{report}");
+    // The test stopped the supervisor above, so status headlines
+    // supervisor-dead with a non-zero exit (review 7 B1).
+    assert_eq!(code, 75, "{report}");
+    assert!(
+        report["headline"]
+            .as_str()
+            .is_some_and(|h| h.contains("supervisor-dead")),
+        "{report}"
+    );
     assert_eq!(
         report["claim"]["boot_id"]
             .as_str()
@@ -1029,6 +1037,7 @@ fn blocking_restore_blocks_stamp_and_acts_until_released() {
         .arg(scratch.root.join("herdr"))
         .args(["start-recovery", "--state-dir"])
         .arg(&state)
+        .args(["--round-delay-seconds", "1", "--max-rounds", "6"])
         .args(["--run-agent-prompt"])
         .arg(wrapper())
         .stdin(Stdio::null())
@@ -1251,13 +1260,15 @@ fn live_claim_owner_is_never_taken_over_even_in_another_epoch() {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0);
+    let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").expect("boot id");
     write_private(
         &dir.join("claim.json"),
         &format!(
             "{{\"schema\": \"agentctl-recovery-claim/v1\", \"incident\": \"abc123abc123\", \
-             \"boot_id\": \"other-boot\", \"epoch_key\": \"other-boot@1\", \
+             \"boot_id\": \"{}\", \"epoch_key\": \"other-epoch@1\", \
              \"pid\": {pid}, \"pid_start\": \"{start}\", \"heartbeat_at\": {now}, \
-             \"started_at\": {now}, \"supervisor_pending\": false}}"
+             \"started_at\": {now}, \"supervisor_pending\": false}}",
+            boot.trim()
         ),
     );
     let mut args = scratch.base_args();
@@ -1280,5 +1291,75 @@ fn live_claim_owner_is_never_taken_over_even_in_another_epoch() {
         "claim was taken over"
     );
     drop(sleeper_child);
+    scratch.reap();
+}
+
+#[test]
+fn read_only_state_dir_pages_supervisor_failed_and_status_reports_dead() {
+    let scratch = Scratch::new("readonly");
+    scratch.use_recording();
+    let state = scratch.root.join("state");
+    fs::create_dir_all(&state).expect("state");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o555)).expect("read-only state");
+    let mut args = scratch.base_args();
+    args.extend([
+        "team".to_owned(),
+        "shepherd".to_owned(),
+        "--state-dir".to_owned(),
+        state.display().to_string(),
+        "--escalation-config".to_owned(),
+        scratch.page_config().display().to_string(),
+        "--run-agent-prompt".to_owned(),
+        wrapper().display().to_string(),
+    ]);
+    let output = {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agentctl"));
+        command.args(&args).stdin(Stdio::null());
+        scratch.spawn_grouped(&mut command)
+    };
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).expect("restore state mode");
+    assert_ne!(
+        output.status.code().unwrap_or(0),
+        0,
+        "read-only state dir must fail the supervisor"
+    );
+    let paged = fs::read_to_string(scratch.root.join("page-stdin.txt"))
+        .expect("supervisor-failed page was delivered");
+    assert!(paged.contains("shepherd failed"), "{paged}");
+
+    // Status: a claim whose owner is dead, with no stamp, headlines
+    // supervisor-dead and exits non-zero, with the alarm shown.
+    let dir = state
+        .join("recovery")
+        .join(crate_team_key(&scratch.root.join("own")));
+    fs::create_dir_all(&dir).expect("recovery dir");
+    write_private(
+        &dir.join("claim.json"),
+        "{\"schema\": \"agentctl-recovery-claim/v1\", \"boot_id\": \"nope\", \
+         \"epoch_key\": \"nope@1\", \"pid\": 999999, \"pid_start\": \"1\", \
+         \"heartbeat_at\": 1.0, \"incident\": \"abc123abc123\"}",
+    );
+    write_private(&dir.join("alarm.json"), "{\"detail\": \"page failed\"}");
+    let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").expect("boot id");
+    let claim_path = dir.join("claim.json");
+    let mut claim: Value =
+        serde_json::from_str(&fs::read_to_string(&claim_path).expect("claim")).expect("claim");
+    claim["boot_id"] = json!(boot.trim());
+    fs::write(&claim_path, claim.to_string()).expect("claim boot");
+    let mut args = scratch.base_args();
+    args.extend([
+        "recovery".to_owned(),
+        "status".to_owned(),
+        "--state-dir".to_owned(),
+        state.display().to_string(),
+    ]);
+    let (code, report) = scratch.run_agentctl(&args);
+    assert_eq!(code, 75, "{report}");
+    assert!(
+        report["headline"]
+            .as_str()
+            .is_some_and(|h| h.contains("supervisor-dead")),
+        "{report}"
+    );
     scratch.reap();
 }

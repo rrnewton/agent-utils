@@ -214,9 +214,20 @@ pub fn restore_running(claim_path: &Path) -> bool {
 /// it) and never the manager identity string (its format flips).
 /// When the read fails the identity is the boot alone, for every
 /// caller alike.
-pub fn epoch_identity(host: &dyn Host, epoch: &RestoreEpoch) -> String {
+pub fn epoch_identity(host: &dyn Host, epoch: &RestoreEpoch) -> Result<String> {
     if epoch.user_manager.is_none() {
-        return format!("{}@nomgr", epoch.boot_id);
+        return Ok(format!("{}@nomgr", epoch.boot_id));
+    }
+    // A pid-form manager identity already carries the manager's
+    // /proc start ticks: derive from it directly, one value per
+    // manager start, no second read to disagree with.
+    if let Some(ticks) = epoch
+        .user_manager
+        .as_deref()
+        .and_then(|manager| manager.strip_prefix("pid:"))
+        .and_then(|rest| rest.rsplit(':').next())
+    {
+        return Ok(format!("{}@{ticks}", epoch.boot_id));
     }
     let uid = unsafe { libc::getuid() };
     let outcome = host.run(
@@ -231,8 +242,12 @@ pub fn epoch_identity(host: &dyn Host, epoch: &RestoreEpoch) -> String {
         Duration::from_secs(10),
     );
     match outcome.stdout.trim().parse::<u64>() {
-        Ok(micros) if micros > 0 => format!("{}@{micros}", epoch.boot_id),
-        _ => format!("{}@nomgr", epoch.boot_id),
+        Ok(micros) if micros > 0 => Ok(format!("{}@{micros}", epoch.boot_id)),
+        // Never key an incident on a fallback: a failed manager
+        // read would split one epoch into two incidents (S3).
+        _ => Err(fail(
+            "cannot read the user manager start time for the epoch identity",
+        )),
     }
 }
 
@@ -705,8 +720,60 @@ pub fn page(
 /// ever acted on; `judged` registries are read-only. Exit semantics
 /// ride in the report's `exit_code`: 0 every team YES, 75 gave up with
 /// the stamp written, 1 the run itself was refused.
+/// Run one shepherd incident; ANY error after the claim pages
+/// `supervisor-failed` (naming a still-running restore) before the
+/// error returns, so no abnormal exit is silent (B1).
 #[allow(clippy::too_many_arguments)]
 pub fn run_shepherd<A: ManagedApi + ?Sized>(
+    client: &A,
+    own: &Path,
+    judged: &[PathBuf],
+    host: &dyn Host,
+    inputs: &ShepherdInputs,
+    options: &ShepherdOptions,
+) -> Result<Value> {
+    let result = run_shepherd_inner(client, own, judged, host, inputs, options);
+    if let Err(error) = &result {
+        // Best-effort page: it needs no writable state dir.
+        let mut state = ShepherdState::default();
+        let mut dir = PathBuf::from("/nonexistent");
+        let mut incident = String::new();
+        if let Ok(epoch) = host.epoch() {
+            incident = crate::team_driver::incident_id(own, &epoch);
+            if let Ok(key) = epoch_identity(host, &epoch) {
+                if let Some(found) = shepherd_dir(options.state_dir.as_deref(), own, &key) {
+                    dir = found;
+                    if let Ok(text) = std::fs::read_to_string(dir.join("state.json")) {
+                        if let Ok(saved) = serde_json::from_str::<ShepherdState>(&text) {
+                            state = saved;
+                        }
+                    }
+                }
+            }
+        }
+        let restore_note = if state.restore_pid != 0
+            && recorded_restore_alive(state.restore_pid, &state.restore_pid_start)
+        {
+            format!("restore pid {} is still running", state.restore_pid)
+        } else {
+            "no restore is running".to_owned()
+        };
+        let _ = page(
+            host,
+            options,
+            &mut state,
+            "supervisor-failed",
+            &format!("shepherd failed: {error}; {restore_note}"),
+            own,
+            &incident,
+            &dir,
+        );
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_shepherd_inner<A: ManagedApi + ?Sized>(
     client: &A,
     own: &Path,
     judged: &[PathBuf],
@@ -720,7 +787,7 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
         boot_id: boot_id.clone(),
         user_manager: host.user_manager_id(),
     };
-    let epoch_key = epoch_identity(host, &epoch);
+    let epoch_key = epoch_identity(host, &epoch)?;
     let dir = shepherd_dir(options.state_dir.as_deref(), own, &epoch_key)
         .ok_or_else(|| fail("cannot determine the agentctl state directory"))?;
     agent_queue::fsio::create_private_directory(&dir, "shepherd state directory", true, true)
@@ -1534,7 +1601,12 @@ pub fn pid_start_ticks(pid: u64) -> Option<String> {
 
 /// Whether a claim's recorded owner is verifiably still that process:
 /// same pid, same start ticks.
-pub fn claim_owner_alive(claim: &Value) -> bool {
+pub fn claim_owner_alive(claim: &Value, current_boot: &str) -> bool {
+    // A same-pid, same-start-tick process from a previous boot is
+    // not this boot's owner (S4).
+    if claim["boot_id"].as_str() != Some(current_boot) {
+        return false;
+    }
     let Some(pid) = claim["pid"].as_u64() else {
         return false;
     };
@@ -1679,7 +1751,7 @@ pub fn acquire_claim(
                         .ok()
                 })
                 .unwrap_or(0);
-            if owner == parent || !claim_owner_alive(claim) {
+            if owner == parent || !claim_owner_alive(claim, &epoch.boot_id) {
                 write_claim(
                     claim_path,
                     registry,
@@ -1694,7 +1766,9 @@ pub fn acquire_claim(
             }
         }
     }
-    let owner_alive = existing.as_ref().is_some_and(claim_owner_alive);
+    let owner_alive = existing
+        .as_ref()
+        .is_some_and(|claim| claim_owner_alive(claim, &epoch.boot_id));
     let decision = claim_decision(
         existing.as_ref(),
         epoch_key,
@@ -1962,6 +2036,12 @@ pub fn smoke_profiles(
 pub struct StartOptions {
     /// Keep the supervisor in the foreground (container/manual use).
     pub foreground: bool,
+    /// Supervisor round bounds, passed through to its flags.
+    pub max_rounds: u32,
+    /// Supervisor round delay seconds.
+    pub round_delay_seconds: u64,
+    /// Supervisor no-progress bound.
+    pub no_progress_rounds: u32,
     /// Seconds before a same-boot claim with no heartbeat is stale.
     pub stale_seconds: f64,
     /// The `run-agent-prompt` executable for the supervisor child.
@@ -2006,7 +2086,7 @@ pub fn start_recovery(
         registry,
         &incident,
         &epoch,
-        &epoch_identity(host, &epoch),
+        &epoch_identity(host, &epoch)?,
         options.stale_seconds,
         true,
         ClaimRole::Starter,
@@ -2059,6 +2139,12 @@ pub fn start_recovery(
         "shepherd".to_owned(),
         "--run-agent-prompt".to_owned(),
         options.run_agent_prompt.display().to_string(),
+        "--max-rounds".to_owned(),
+        options.max_rounds.to_string(),
+        "--round-delay-seconds".to_owned(),
+        options.round_delay_seconds.to_string(),
+        "--no-progress-rounds".to_owned(),
+        options.no_progress_rounds.to_string(),
     ]);
     if let Some(state) = state_dir {
         shepherd_args.extend(["--state-dir".to_owned(), state.display().to_string()]);

@@ -893,6 +893,15 @@ struct StartRecovery {
     /// Stay in the foreground with the supervisor (containers, manual runs, process supervisors)
     #[arg(long)]
     foreground: bool,
+    /// Maximum judgement rounds for the supervisor, from 1 to 100 (default: 20)
+    #[arg(long, default_value_t = 20, value_parser = bounded_u32::<1, 100>, value_name = "ROUNDS")]
+    max_rounds: u32,
+    /// Seconds between supervisor rounds, from 0 to 3600 (default: 30)
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(0..=3600), value_name = "SECONDS")]
+    round_delay_seconds: u64,
+    /// Consecutive identical-manifest rounds before early give-up, from 1 to 100 (default: 2)
+    #[arg(long, default_value_t = 2, value_parser = bounded_u32::<1, 100>, value_name = "ROUNDS")]
+    no_progress_rounds: u32,
     /// Seconds before a same-boot claim with no heartbeat counts as stale, from 10 to 86400 (default: 180)
     #[arg(long, default_value_t = 180.0, value_parser = stale_seconds, value_name = "SECONDS")]
     stale_seconds: f64,
@@ -5522,16 +5531,35 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                         })
                         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
                     });
+                    let alarm: Value = std::fs::read_to_string(dir.join("alarm.json"))
+                        .ok()
+                        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                        .unwrap_or(Value::Null);
+                    let owner_dead = !claim.is_null()
+                        && stamp.is_none()
+                        && claim["boot_id"].as_str().is_some_and(|boot| {
+                            let current =
+                                <crate::restore::SystemHost as crate::restore::Host>::boot_id(
+                                    &crate::restore::SystemHost,
+                                )
+                                .unwrap_or_default();
+                            !crate::team_shepherd::claim_owner_alive(&claim, &current)
+                        });
                     let escalation = stamp
                         .as_ref()
                         .and_then(|stamp| stamp["escalation"].as_str().map(str::to_owned))
                         .unwrap_or_else(|| "unknown".to_owned());
-                    let verdict = stamp
-                        .as_ref()
-                        .and_then(|stamp| stamp["verdict"].as_str().map(str::to_owned))
-                        .unwrap_or_else(|| "no-stamp".to_owned());
+                    let verdict = if owner_dead {
+                        "supervisor-dead".to_owned()
+                    } else {
+                        stamp
+                            .as_ref()
+                            .and_then(|stamp| stamp["verdict"].as_str().map(str::to_owned))
+                            .unwrap_or_else(|| "no-stamp".to_owned())
+                    };
                     let headline = format!("recovery: verdict={verdict} page={escalation}");
-                    let code = if escalation.starts_with("failed")
+                    let code = if owner_dead
+                        || escalation.starts_with("failed")
                         || escalation.contains("unconfigured")
                     {
                         75
@@ -5565,6 +5593,9 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 value.state_dir.as_deref(),
                 &crate::team_shepherd::StartOptions {
                     foreground: value.foreground,
+                    max_rounds: value.max_rounds,
+                    round_delay_seconds: value.round_delay_seconds,
+                    no_progress_rounds: value.no_progress_rounds,
                     stale_seconds: value.stale_seconds,
                     run_agent_prompt: value
                         .run_agent_prompt
