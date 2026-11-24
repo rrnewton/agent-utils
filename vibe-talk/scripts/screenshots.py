@@ -5247,8 +5247,8 @@ def _act_chip_row_above_fallback(driver: Driver) -> None:
     """`#2220` fallback: in a window too short for the strip under the words,
     it stands above the selection instead."""
     _act_glossary_button(driver)
-    driver.page.set_viewport_size({"width": 1280, "height": 480})
-    driver.js("document.getElementById('scroll-area').scrollBy(0, 2)")
+    driver.page.set_viewport_size({"width": 412 if "android" in driver.profile.name else 1280, "height": 480})
+    driver.js("document.dispatchEvent(new Event('selectionchange'))")
     driver.page.wait_for_function(
         "() => { const r = document.getElementById('selection-chip-row').getBoundingClientRect(); "
         "const s = getSelection().getRangeAt(0).getBoundingClientRect(); "
