@@ -1,13 +1,13 @@
 ---
 title: 'vibe-talk-wtf-lookup-miss-diagnosis: WTF lookup misses a definition held in the selection thread'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 - owner-ui
 created_at: 2026-11-24T05:30:00-05:00
-updated_at: 2026-11-24T05:30:00-05:00
+updated_at: 2026-11-24T10:00:00-05:00
 ---
 
 # Description
@@ -53,3 +53,18 @@ showed a fixed not-found sentence that hid what was searched.
 
 Owner request 339 (fast-track, owner rule 286); diagnosis approved by
 the coordinator with liaison notes before the fix was coded.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main: the fix as 78b388f1 (thread-first
+retrieval with reserved thread, link-target and global buckets;
+hyphen/space/nospace and singular/plural windows ranked by definitional
+fit; synthetic through-router regression; scene 99-glossary-not-found in
+both harness lists) and the follow-up as f5c3a877 (plain not-found
+wording naming the human search forms, link keys restricted to real
+link targets with a test, formatting). Covered by the fix: hyphen,
+space and joined forms, singular/plural stemming, same-thread and
+shared-link retrieval. Not covered: misspellings and synonyms (no fuzzy
+edit-distance matching). Learned definitions stay popover-only
+(DYNAMIC_IN_WARMUP off, guarded by test). The wide-walk pace flake seen
+while gating is tracked separately. #2189 vibe-talk-wtf-lookup-miss-diagnosis.
