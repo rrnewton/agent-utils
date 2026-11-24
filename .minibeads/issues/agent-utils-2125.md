@@ -1,12 +1,12 @@
 ---
 title: 'wrkslots-history-read-outside-config-lock: read the event history before taking config.lock, then recheck under it'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-11-22T13:15:00-05:00
-updated_at: 2026-11-22T13:15:00-05:00
+updated_at: 2026-11-23T22:02:59-05:00
 ---
 
 # Description
@@ -67,3 +67,13 @@ Tests: `py/wrkslots/tests/test_recover_absent_outside_lock.py` -- a
 concurrent write between read and lock is detected and the read is
 redone (recover and relocate); a passing row on a padded history
 performs no history replay while the locks are held.
+
+## Resolution
+
+Landed on main as 037494e9 (verified-overlap landing; replayed
+tree 312e8a6e). recover-absent-validate-rows (Python and Rust) and
+relocate-repository now replay the event history outside the
+registry locks and mutate only when the O(1) event-index tip proof
+is unchanged under them, with bounded re-reads and the previous
+locked path as fallback. Follow-up lock work continues in #2146
+(fenced finish strands the batch seal) and #2127 (per-slot locks).
