@@ -94,7 +94,7 @@ class Handler(BaseHTTPRequestHandler):
             evidence = re.search(r"\[msg id=(\S+?) ", text)
             term = (selected.group(1).strip() if selected else "the term").removeprefix("the ")
             # `#2189`: the not-found fixture term: nothing defines it.
-            if "loaded-host" in term.lower() or term.lower() == "cryptographic":
+            if "loaded-host" in term.lower() or term.lower() == "overnight":
                 self._json(
                     200,
                     {
