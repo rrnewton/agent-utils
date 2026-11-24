@@ -1216,6 +1216,7 @@ home = base / "home"
 os.environ["HOME"] = str(home)
 sandbox.parent_slice = lambda cgroup_file=None: None
 sandbox._interpreter = lambda: "/usr/bin/python3"
+sandbox._INSTALLED_HELPER = Path("/nonexistent/wrkslots/sandbox.py")
 os.getpid = lambda: 4242
 shutil.which = lambda name: (None if case == "no-systemd" else "/usr/bin/systemd-run")
 isolation = {"cgroup": "cgroup", "userns": "userns", "root": "root"}.get(case, "cgroup")
@@ -1397,6 +1398,7 @@ os.environ["USER"] = "fixture-user"
 home = base / "home"
 os.environ["HOME"] = str(home)
 sandbox._interpreter = lambda: "/usr/bin/python3"
+sandbox._INSTALLED_HELPER = Path("/nonexistent/wrkslots/sandbox.py")
 SLOT = "wrkslots-slot\\x2da.slice"
 SLICES = json.dumps({"enclosing": None, "all_slots": "wrkslots.slice", "slot": SLOT})
 cgroup = base / "cgroup"

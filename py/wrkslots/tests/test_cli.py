@@ -363,12 +363,15 @@ def test_provision_slot_image_uses_the_settings_it_is_given(
 
 
 def test_root_helper_is_a_fixed_stdin_argv(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     # The spec travels on stdin: no path argument, no wildcard, always -I -B.
+    # The installed-helper choice is faked explicitly both ways: this
+    # test must not depend on whether the host has one installed.
     helper = str(Path(sandbox.__file__).resolve())
     interpreter = os.path.realpath(sys.executable)
 
+    monkeypatch.setattr(sandbox, "_INSTALLED_HELPER", tmp_path / "no-installed-helper.py")
     monkeypatch.setenv("WRKSLOTS_ALLOW_CHECKOUT_HELPER", "1")
     monkeypatch.setattr(sys, "dont_write_bytecode", False)
     assert sandbox.root_helper() == [
@@ -379,6 +382,17 @@ def test_root_helper_is_a_fixed_stdin_argv(
     assert sandbox.root_helper() == [
         "sudo", "-n", "--", interpreter, "-I", "-B", "-S", helper, "enter-root"
     ]
+
+    installed = tmp_path / "installed-sandbox.py"
+    installed.write_text(f'_HELPER_VERSION = "{sandbox._HELPER_VERSION}"\n', encoding="utf-8")
+    monkeypatch.setattr(sandbox, "_INSTALLED_HELPER", installed)
+    assert sandbox.root_helper() == [
+        "sudo", "-n", "--", interpreter, "-I", "-B", "-S", str(installed), "enter-root"
+    ]
+
+    installed.write_text('_HELPER_VERSION = "0"\n', encoding="utf-8")
+    with pytest.raises(sandbox.SandboxError, match="not version"):
+        sandbox.root_helper()
 
 
 @pytest.mark.parametrize("flags", [(), ("-B",)])
@@ -397,7 +411,9 @@ def test_root_helper_carries_the_callers_dash_b_across_sudo_by_argv(
     completed = subprocess.run(
         [
             sys.executable, *flags, "-c",
-            "import json; from wrkslots import sandbox; print(json.dumps(sandbox.root_helper()))",
+            "import json; from pathlib import Path; from wrkslots import sandbox; "
+            "sandbox._INSTALLED_HELPER = Path('/nonexistent/wrkslots/sandbox.py'); "
+            "print(json.dumps(sandbox.root_helper()))",
         ],
         cwd=tmp_path, env=environment, text=True, capture_output=True, check=False, timeout=60,
     )
@@ -1065,7 +1081,9 @@ def test_a_dash_b_placement_and_root_helper_write_no_bytecode(
     )
     helper = subprocess.run(
         [sys.executable, "-B", "-c",
-         "import json; from wrkslots import sandbox; print(json.dumps(sandbox.root_helper()))"],
+         "import json; from pathlib import Path; from wrkslots import sandbox; "
+         "sandbox._INSTALLED_HELPER = Path('/nonexistent/wrkslots/sandbox.py'); "
+         "print(json.dumps(sandbox.root_helper()))"],
         cwd=tmp_path, env=environment, text=True, capture_output=True, check=False, timeout=300,
     )
 
