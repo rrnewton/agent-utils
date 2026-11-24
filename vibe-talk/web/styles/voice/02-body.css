@@ -1288,6 +1288,8 @@
 }
 @media (max-width: 899px) {
   #theme-preview .theme-preview-third, #theme-preview .theme-preview-code, #theme-preview .theme-preview-quiet { display: none; }
+  /* A thin edge where the pinned pane meets the list scrolling under it. */
+  #theme-preview { border-top: 2px solid var(--edge); box-shadow: 0 0.6rem 1rem -0.4rem color-mix(in srgb, var(--shadow) 45%, transparent); }
 }
 
 .theme-preview-focus { border-top: 1px solid var(--edge); padding-top: 0.4rem; }

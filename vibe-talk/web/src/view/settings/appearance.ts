@@ -316,7 +316,7 @@ export function mountAppearance(deps: AppearanceDependencies): AppearanceControl
       sample("third", "theme-preview-sample theme-preview-card theme-preview-third", "Others' messages");
       sample("dock", "theme-preview-sample theme-preview-sample-dock", "Bars and dock");
       sample("edge", "theme-preview-sample theme-preview-card theme-preview-theirs theme-preview-sample-edge", "Borders and dividers");
-      sample("ink", "theme-preview-sample", "Text in the edited ink");
+      sample("ink", "theme-preview-sample", "Text");
       sample("muted", "theme-preview-sample theme-preview-quiet", "Quiet text");
       sample("accent", "theme-preview-sample theme-preview-sample-accent", "Accent button");
       sample("highlight", "theme-preview-sample theme-preview-head", "Discuss header");
