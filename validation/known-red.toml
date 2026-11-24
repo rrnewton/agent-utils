@@ -45,6 +45,12 @@ expires = "2026-12-22"
 note = "census/remove timing under load, already seen on unrelated trees"
 
 [[known-red]]
+step = "rust.dagrun.test"
+issue = "#2170"
+expires = "2026-12-24"
+note = "nextest outer-backstop smoke test sizes its outer bound at 2s; startup on a busy host exceeds it before the planted hang exists"
+
+[[known-red]]
 step = "repository.check.wrkslots-debug-test"
 issue = "#2065"
 expires = "2026-12-22"
