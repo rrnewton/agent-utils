@@ -406,6 +406,23 @@ impl Scratch {
         config
     }
 
+    /// An escalation config whose only route always fails, so
+    /// `page` exhausts its retries and writes a real `alarm.json`
+    /// (S1). Fake route only: it never reaches a real channel.
+    fn failing_page_config(&self) -> PathBuf {
+        let page = self.root.join("page-command-fail");
+        install_executable(&page, "#!/bin/sh\ncat > /dev/null\nexit 1\n");
+        let config = self.root.join("escalation-fail.toml");
+        write_private(
+            &config,
+            &format!(
+                "[[route]]\nargv = [\"{}\"]\ntimeout_seconds = 30\n",
+                page.display()
+            ),
+        );
+        config
+    }
+
     fn run_shepherd(&self, state_dir: &Path, wrapper: &Path) -> (i32, Value) {
         let home = self.root.join("home");
         fs::create_dir_all(&home).expect("home");
@@ -1079,57 +1096,129 @@ fn blocking_restore_blocks_stamp_and_acts_until_released() {
         );
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
-    // Wait on the condition "several rounds passed with the child
-    // recorded" (state round >= 3), never a fixed sleep; then the
-    // no-stamp / no-act assertions below are meaningful.
-    fn state_round(dir: &Path) -> u64 {
+    // S2: assert "no stamp while the recorded restore child is
+    // alive" at EVERY round, including PAST the round limit. The
+    // supervisor clamps `state.round` at max_rounds - 1 while the
+    // child lives, so rounds past the limit are counted by the
+    // per-round log entries ("own YES=" lines), not by state.
+    fn find_named(dir: &Path, name: &str) -> Option<PathBuf> {
         if !dir.exists() {
-            return 0;
+            return None;
         }
-        for entry in fs::read_dir(dir).expect("read state") {
-            let path = entry.expect("entry").path();
+        for entry in fs::read_dir(dir).ok()? {
+            let path = entry.ok()?.path();
             if path.is_dir() {
-                let found = state_round(&path);
-                if found > 0 {
-                    return found;
+                if let Some(found) = find_named(&path, name) {
+                    return Some(found);
                 }
-            }
-            if path.file_name().is_some_and(|name| name == "state.json") {
-                if let Ok(text) = fs::read_to_string(&path) {
-                    if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                        return value["round"].as_u64().unwrap_or(0);
-                    }
-                }
+            } else if path.file_name().is_some_and(|n| n == name) {
+                return Some(path);
             }
         }
-        0
+        None
     }
-    let rounds_deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    while state_round(&state.join("shepherd")) < 3 {
+    fn stamp_path(dir: &Path) -> Option<PathBuf> {
+        find_named(dir, "stamp.json")
+    }
+    fn any_stamp(dir: &Path) -> bool {
+        stamp_path(dir).is_some()
+    }
+    fn round_iterations(dir: &Path) -> usize {
+        let Some(log) = find_named(dir, "shepherd.log") else {
+            return 0;
+        };
+        fs::read_to_string(log)
+            .map(|text| text.matches("own YES=").count())
+            .unwrap_or(0)
+    }
+    fn read_json_at(dir: &Path, name: &str) -> Option<Value> {
+        let path = find_named(dir, name)?;
+        serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
+    }
+    fn pid_alive(pid: u64) -> bool {
+        if pid == 0 {
+            return false;
+        }
+        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        stat.rsplit_once(')')
+            .map(|(_, rest)| rest.split_whitespace().next() != Some("Z"))
+            .unwrap_or(false)
+    }
+    fn recorded_restore_alive(dir: &Path) -> bool {
+        let Some(state_json) = read_json_at(dir, "state.json") else {
+            return false;
+        };
+        let Some(pid) = state_json["restore_pid"].as_u64() else {
+            return false;
+        };
+        if pid == 0 || !pid_alive(pid) {
+            return false;
+        }
+        // The recorded start ticks must still name this process,
+        // not a recycled pid.
+        match (
+            state_json["restore_pid_start"].as_str(),
+            fs::read_to_string(format!("/proc/{pid}/stat")).ok(),
+        ) {
+            (Some(recorded), Some(stat)) if !recorded.is_empty() => {
+                stat.rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().nth(19))
+                    == Some(recorded)
+            }
+            _ => true,
+        }
+    }
+    fn supervisor_alive(state_root: &Path) -> bool {
+        let Some(claim) = read_json_at(&state_root.join("recovery"), "claim.json") else {
+            return false;
+        };
+        claim["pid"].as_u64().is_some_and(pid_alive)
+    }
+    // max-rounds is 6 above: run PAST it (max + 2 round entries)
+    // while still blocked, asserting at every poll — rounds tick
+    // about once a second (delay 1), polls run five times faster,
+    // so no round passes unchecked. A mutant that stamps at
+    // round 4 (M1) or at the round limit (M2) while the child
+    // lives is caught here; the old single check at round 3 let
+    // both through.
+    const MAX_ROUNDS: usize = 6;
+    let blocked_deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    while round_iterations(&state.join("shepherd")) < MAX_ROUNDS + 2 {
         assert!(
-            std::time::Instant::now() < rounds_deadline,
-            "rounds never advanced while the restore was blocked"
+            std::time::Instant::now() < blocked_deadline,
+            "rounds never ran past the limit while the restore was blocked (saw {})",
+            round_iterations(&state.join("shepherd"))
+        );
+        assert!(
+            !any_stamp(&state.join("shepherd")),
+            "stamped while its restore was still blocked (after {} rounds)",
+            round_iterations(&state.join("shepherd"))
+        );
+        assert!(
+            recorded_restore_alive(&state.join("shepherd")),
+            "recorded restore child died while blocked (after {} rounds)",
+            round_iterations(&state.join("shepherd"))
+        );
+        assert!(
+            supervisor_alive(&state),
+            "supervisor died while its restore was blocked (after {} rounds)",
+            round_iterations(&state.join("shepherd"))
         );
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
-    fn any_stamp(dir: &Path) -> bool {
-        if !dir.exists() {
-            return false;
-        }
-        for entry in fs::read_dir(dir).expect("read state") {
-            let path = entry.expect("entry").path();
-            if path.is_dir() && any_stamp(&path) {
-                return true;
-            }
-            if path.file_name().is_some_and(|name| name == "stamp.json") {
-                return true;
-            }
-        }
-        false
-    }
     assert!(
         !any_stamp(&state.join("shepherd")),
-        "stamped while its restore was still blocked"
+        "stamped while its restore was still blocked past the round limit"
+    );
+    assert!(
+        recorded_restore_alive(&state.join("shepherd")),
+        "recorded restore child not alive past the round limit"
+    );
+    assert!(
+        supervisor_alive(&state),
+        "supervisor not alive past the round limit"
     );
     let seam_log = fs::read_to_string(scratch.root.join("systemd.log")).unwrap_or_default();
     assert!(
@@ -1137,16 +1226,31 @@ fn blocking_restore_blocks_stamp_and_acts_until_released() {
         "a unit was started while the restore was blocked: {seam_log}"
     );
     // Release the restore with the embedded throwaway certificate;
-    // the incident may now finish and stamp.
+    // the incident may now finish and stamp — and the stamp must
+    // be written AFTER the release, never carried over from the
+    // blocked phase.
     fs::write(&cert, DRILL_CERT).expect("release cert");
+    let cert_mtime = fs::metadata(&cert)
+        .expect("cert metadata")
+        .modified()
+        .expect("cert mtime");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
-    while !any_stamp(&state.join("shepherd")) {
+    while stamp_path(&state.join("shepherd")).is_none() {
         assert!(
             std::time::Instant::now() < deadline,
             "no stamp after the restore was released"
         );
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
+    let stamp_file = stamp_path(&state.join("shepherd")).expect("stamp path");
+    let stamp_mtime = fs::metadata(&stamp_file)
+        .expect("stamp metadata")
+        .modified()
+        .expect("stamp mtime");
+    assert!(
+        stamp_mtime > cert_mtime,
+        "stamp predates the release: stamp {stamp_mtime:?} cert {cert_mtime:?}"
+    );
     drop(child);
     scratch.reap();
 }
@@ -1295,7 +1399,7 @@ fn live_claim_owner_is_never_taken_over_even_in_another_epoch() {
 }
 
 #[test]
-fn read_only_state_dir_pages_supervisor_failed_and_status_reports_dead() {
+fn read_only_state_dir_pages_and_status_finds_the_real_alarm() {
     let scratch = Scratch::new("readonly");
     scratch.use_recording();
     let state = scratch.root.join("state");
@@ -1327,39 +1431,233 @@ fn read_only_state_dir_pages_supervisor_failed_and_status_reports_dead() {
         .expect("supervisor-failed page was delivered");
     assert!(paged.contains("shepherd failed"), "{paged}");
 
-    // Status: a claim whose owner is dead, with no stamp, headlines
-    // supervisor-dead and exits non-zero, with the alarm shown.
-    let dir = state
-        .join("recovery")
-        .join(crate_team_key(&scratch.root.join("own")));
-    fs::create_dir_all(&dir).expect("recovery dir");
-    write_private(
-        &dir.join("claim.json"),
-        "{\"schema\": \"agentctl-recovery-claim/v1\", \"boot_id\": \"nope\", \
-         \"epoch_key\": \"nope@1\", \"pid\": 999999, \"pid_start\": \"1\", \
-         \"heartbeat_at\": 1.0, \"incident\": \"abc123abc123\"}",
+    // S1: a real failing route (never a hand-written alarm file)
+    // makes `page` write a real alarm.json into the shepherd
+    // incident dir; `recovery status` must find it there. On the
+    // old code status read recovery/<team>/alarm.json and showed
+    // null, so this fails before the fix.
+    let state2 = scratch.root.join("state2");
+    let mut fail_args = scratch.base_args();
+    fail_args.extend([
+        "team".to_owned(),
+        "shepherd".to_owned(),
+        "--config".to_owned(),
+        scratch.root.join("teams.json").display().to_string(),
+        "--state-dir".to_owned(),
+        state2.display().to_string(),
+        "--escalation-config".to_owned(),
+        scratch.failing_page_config().display().to_string(),
+        "--max-rounds".to_owned(),
+        "2".to_owned(),
+        "--round-delay-seconds".to_owned(),
+        "0".to_owned(),
+        "--run-agent-prompt".to_owned(),
+        wrapper().display().to_string(),
+    ]);
+    let (code, report) = scratch.run_agentctl(&fail_args);
+    assert_eq!(code, 75, "{report}");
+    // The alarm the page actually wrote lives in the incident dir.
+    fn find_alarm(dir: &Path) -> Option<PathBuf> {
+        if !dir.exists() {
+            return None;
+        }
+        for entry in fs::read_dir(dir).ok()? {
+            let path = entry.ok()?.path();
+            if path.is_dir() {
+                if let Some(found) = find_alarm(&path) {
+                    return Some(found);
+                }
+            } else if path.file_name().is_some_and(|n| n == "alarm.json") {
+                return Some(path);
+            }
+        }
+        None
+    }
+    let alarm_path = find_alarm(&state2.join("shepherd")).expect("real alarm in the incident dir");
+    let real_alarm: Value =
+        serde_json::from_str(&fs::read_to_string(&alarm_path).expect("alarm")).expect("alarm JSON");
+    assert!(
+        real_alarm["detail"].as_str().is_some_and(|d| !d.is_empty()),
+        "{real_alarm}"
     );
-    write_private(&dir.join("alarm.json"), "{\"detail\": \"page failed\"}");
-    let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").expect("boot id");
-    let claim_path = dir.join("claim.json");
-    let mut claim: Value =
-        serde_json::from_str(&fs::read_to_string(&claim_path).expect("claim")).expect("claim");
-    claim["boot_id"] = json!(boot.trim());
-    fs::write(&claim_path, claim.to_string()).expect("claim boot");
-    let mut args = scratch.base_args();
-    args.extend([
+    let mut status_args = scratch.base_args();
+    status_args.extend([
         "recovery".to_owned(),
         "status".to_owned(),
         "--state-dir".to_owned(),
-        state.display().to_string(),
+        state2.display().to_string(),
     ]);
-    let (code, report) = scratch.run_agentctl(&args);
+    let (code, report) = scratch.run_agentctl(&status_args);
     assert_eq!(code, 75, "{report}");
+    assert!(
+        !report["alarm"].is_null(),
+        "status missed the alarm the page wrote: {report}"
+    );
+    assert_eq!(report["alarm"]["detail"], real_alarm["detail"], "{report}");
     assert!(
         report["headline"]
             .as_str()
-            .is_some_and(|h| h.contains("supervisor-dead")),
+            .is_some_and(|h| h.contains("page=failed")),
         "{report}"
+    );
+    scratch.reap();
+}
+
+#[test]
+fn start_recovery_failure_pages_best_effort() {
+    // S9: a start failure (here an unwritable state root, so the
+    // recovery dir cannot be created) must page best-effort
+    // through the same fake route instead of failing silently.
+    // On the old code start_recovery propagated the error with no
+    // page (and had no --escalation-config at all).
+    let scratch = Scratch::new("startfail");
+    scratch.use_recording();
+    let state = scratch.root.join("state-startfail");
+    fs::create_dir_all(&state).expect("state");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o555)).expect("read-only state");
+    let mut args = scratch.base_args();
+    args.extend([
+        "start-recovery".to_owned(),
+        "--state-dir".to_owned(),
+        state.display().to_string(),
+        "--escalation-config".to_owned(),
+        scratch.page_config().display().to_string(),
+        "--run-agent-prompt".to_owned(),
+        wrapper().display().to_string(),
+    ]);
+    let code = {
+        // run_agentctl parses stdout as JSON; a hard failure prints
+        // no report, so run grouped and read the files instead.
+        // Full harness env: recording seams only, fake route only.
+        let home = scratch.root.join("home");
+        fs::create_dir_all(&home).expect("home");
+        let path = format!(
+            "{}:{}",
+            scratch.root.join("fakebin").display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agentctl"));
+        command
+            .current_dir(&scratch.root)
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_STATE_HOME", home.join(".local/state"))
+            .env("PATH", path)
+            .env("AGENTCTL_TEST_HARNESS", "1")
+            .env("AGENTCTL_SYSTEMCTL", scratch.unit_launcher("systemctl"))
+            .env("AGENTCTL_SYSTEMD_RUN", scratch.unit_launcher("systemd-run"))
+            .env_remove("AGENTCTL_AGENT")
+            .args(&args)
+            .stdin(Stdio::null());
+        let output = scratch.spawn_grouped(&mut command);
+        output.status.code().unwrap_or(-1)
+    };
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).expect("restore state mode");
+    assert_ne!(code, 0, "unwritable state must fail start-recovery");
+    let paged = fs::read_to_string(scratch.root.join("page-stdin.txt"))
+        .expect("start-recovery failure was paged best-effort");
+    assert!(paged.contains("start-recovery failed"), "{paged}");
+    scratch.reap();
+}
+
+#[test]
+fn flipped_systemctl_answers_still_share_one_incident_dir() {
+    // S3 integration: two shepherd runs in one manager epoch with
+    // opposite systemctl behaviour (first the recording fake that
+    // answers nothing usable, then a fake answering an invocation
+    // id and monotonic micros) must share ONE incident dir. The
+    // epoch key comes from /proc ticks only, so the second run
+    // resumes the first stamp instead of starting a second
+    // incident. On the old code the keys split (@ticks vs
+    // @micros) and this counted two dirs.
+    let scratch = Scratch::new("epochsplit");
+    scratch.use_recording();
+    let state = scratch.root.join("state");
+    let (code, report) = scratch.run_shepherd(&state, &wrapper());
+    assert_eq!(code, 75, "{report}");
+    // A systemctl that answers: invocation id for the manager
+    // identity, micros for the monotonic start read.
+    let answering = scratch.root.join("systemctl-answering");
+    install_executable(
+        &answering,
+        "#!/bin/sh\ncase \"$*\" in\n*InvocationID*) printf '0123456789abcdef0123456789abcdef\\n' ;;\n*ActiveEnterTimestampMonotonic*) printf '123456789\\n' ;;\n*) printf '\\n' ;;\nesac\nexit 0\n",
+    );
+    // Second run with the answering fake first in the seam.
+    let home = scratch.root.join("home");
+    fs::create_dir_all(&home).expect("home");
+    let path = format!(
+        "{}:{}",
+        scratch.root.join("fakebin").display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agentctl"));
+    command
+        .current_dir(&scratch.root)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_STATE_HOME", home.join(".local/state"))
+        .env("PATH", path)
+        .env("AGENTCTL_TEST_HARNESS", "1")
+        .env("AGENTCTL_SYSTEMCTL", &answering)
+        .env("AGENTCTL_SYSTEMD_RUN", scratch.root.join("systemd-refuse"))
+        .env_remove("AGENTCTL_AGENT")
+        .arg("--registry")
+        .arg(scratch.root.join("own"))
+        .arg("--herdr-bin")
+        .arg(scratch.root.join("herdr"))
+        .args(["team", "shepherd", "--config"])
+        .arg(scratch.root.join("teams.json"))
+        .args(["--state-dir"])
+        .arg(&state)
+        .args(["--escalation-config"])
+        .arg(scratch.page_config())
+        .args([
+            "--max-rounds",
+            "3",
+            "--round-delay-seconds",
+            "0",
+            "--no-progress-rounds",
+            "2",
+            "--call-timeout-seconds",
+            "120",
+            "--run-agent-prompt",
+        ])
+        .arg(wrapper())
+        .stdin(Stdio::null());
+    let output = scratch.spawn_grouped(&mut command);
+    let code = output.status.code().unwrap_or(-1);
+    let text = String::from_utf8(output.stdout).expect("report UTF-8");
+    let report: Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| panic!("report not JSON ({code}): {text}"));
+    assert_eq!(code, 75, "{report}");
+    assert_eq!(
+        report["resumed"], true,
+        "second run started a new incident: {report}"
+    );
+    // Exactly one incident dir under shepherd/<team>/.
+    fn incident_dirs(dir: &Path) -> Vec<PathBuf> {
+        let team_root = dir.join("shepherd");
+        let mut teams = Vec::new();
+        if let Ok(entries) = fs::read_dir(&team_root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    teams.push(path);
+                }
+            }
+        }
+        assert_eq!(teams.len(), 1, "one team dir: {teams:?}");
+        fs::read_dir(&teams[0])
+            .expect("team dir")
+            .map(|e| e.expect("entry").path())
+            .filter(|p| p.is_dir())
+            .collect()
+    }
+    let dirs = incident_dirs(&state);
+    assert_eq!(
+        dirs.len(),
+        1,
+        "epoch split into two incident dirs: {dirs:?}"
     );
     scratch.reap();
 }

@@ -151,7 +151,7 @@ runs. Inside the incident, each round:
 It finishes only on the deterministic YES of section 4 (lead running, bridge healthy, handoff acked,
 each an explicit pass; held/skipped never count), or on bounded give-up (20 rounds / 120 min by
 default, early after two identical manifests) with escalation and a stamp under
-`<state root>/shepherd/<team-key>/<boot-id>-<epoch-tag>/`; `agentctl --registry R recovery status` reads the claim and
+`<state root>/shepherd/<team-key>/<boot-id>@<manager-start-ticks>/`; `agentctl --registry R recovery status` reads the claim and
 stamp without acting. If every profile is down while the checks pass, the stamp still says YES with
 `judge=none`. Profiles are configured and smoke-tested at install time:
 `agentctl --registry R recovery install` validates the ordered profile file and runs one real tiny

@@ -1057,6 +1057,17 @@ pub trait Host {
     fn user_manager_started(&self) -> Option<f64> {
         None
     }
+    /// The user manager's `/proc` start ticks (field 22), when a
+    /// manager process can be found. This is the single epoch-key
+    /// derivation (S3): never systemctl, never btime. The default
+    /// scans `/proc` for this uid's `systemd --user` process; test
+    /// hosts override it to pin an epoch without a real manager.
+    fn manager_start_ticks(&self) -> Option<String> {
+        let uid = unsafe { libc::getuid() };
+        manager_pid_start(uid)
+            .and_then(|id| id.rsplit(':').next().map(str::to_owned))
+            .filter(|ticks| !ticks.is_empty())
+    }
     /// Whether this process runs in the initial (host) PID namespace.
     /// Scope-creating recovery work requires it; test hosts run there by
     /// default.

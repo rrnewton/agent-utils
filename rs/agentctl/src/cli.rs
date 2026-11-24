@@ -908,6 +908,9 @@ struct StartRecovery {
     /// The run-agent-prompt executable the supervisor uses (default: run-agent-prompt on PATH)
     #[arg(long, value_name = "PATH")]
     run_agent_prompt: Option<PathBuf>,
+    /// Escalation route file for pages (default: the synced escalation.toml; refused as a default under a test harness); forwarded to the supervisor
+    #[arg(long, value_name = "PATH")]
+    escalation_config: Option<PathBuf>,
     /// Agentctl state root holding recovery/ (default: $XDG_STATE_HOME/agentctl, else ~/.local/state/agentctl)
     #[arg(long, value_name = "DIR")]
     state_dir: Option<PathBuf>,
@@ -5531,9 +5534,27 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                         })
                         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
                     });
-                    let alarm: Value = std::fs::read_to_string(dir.join("alarm.json"))
-                        .ok()
-                        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                    // The page writes its alarm into the shepherd
+                    // incident dir of the claim's epoch (S1), not
+                    // beside the claim: read it from there, falling
+                    // back to beside the claim for a start failure
+                    // paged before an incident dir existed.
+                    let incident_dir = claim["epoch_key"].as_str().and_then(|epoch_key| {
+                        crate::team_shepherd::shepherd_dir(
+                            status.state_dir.as_deref(),
+                            &args.registry,
+                            epoch_key,
+                        )
+                    });
+                    let read_alarm = |path: &Path| -> Option<Value> {
+                        std::fs::read_to_string(path)
+                            .ok()
+                            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                    };
+                    let alarm: Value = incident_dir
+                        .as_ref()
+                        .and_then(|boot_dir| read_alarm(&boot_dir.join("alarm.json")))
+                        .or_else(|| read_alarm(&dir.join("alarm.json")))
                         .unwrap_or(Value::Null);
                     let owner_dead = !claim.is_null()
                         && stamp.is_none()
@@ -5548,7 +5569,13 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     let escalation = stamp
                         .as_ref()
                         .and_then(|stamp| stamp["escalation"].as_str().map(str::to_owned))
-                        .unwrap_or_else(|| "unknown".to_owned());
+                        .unwrap_or_else(|| {
+                            if alarm.is_null() {
+                                "unknown".to_owned()
+                            } else {
+                                "failed:alarm".to_owned()
+                            }
+                        });
                     let verdict = if owner_dead {
                         "supervisor-dead".to_owned()
                     } else {
@@ -5559,6 +5586,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     };
                     let headline = format!("recovery: verdict={verdict} page={escalation}");
                     let code = if owner_dead
+                        || !alarm.is_null()
                         || escalation.starts_with("failed")
                         || escalation.contains("unconfigured")
                     {
@@ -5601,6 +5629,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                         .run_agent_prompt
                         .clone()
                         .unwrap_or_else(|| PathBuf::from("run-agent-prompt")),
+                    escalation_config: value.escalation_config.clone(),
                 },
             )?;
             let code = report["exit_code"].as_i64().unwrap_or(1) as i32;

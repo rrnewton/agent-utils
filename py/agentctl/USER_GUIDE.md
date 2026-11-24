@@ -1513,7 +1513,7 @@ instead of starting a second restorer when one is live (exit 75). The supervisor
 manifest` facts with stateless one-shot calls and effects only
 through `team act`, until the deterministic YES (lead running, bridge
 healthy, handoff acked) or bounded give-up escalates and stamps under
-`<state root>/shepherd/<team-key>/<boot-id>-<epoch-tag>/`. Its judgement profiles are the
+`<state root>/shepherd/<team-key>/<boot-id>@<manager-start-ticks>/`. Its judgement profiles are the
 team's ordered harness/model list in
 `REGISTRY/recovery-profiles.toml` (schema
 `agentctl-recovery-profiles/v1`: ordered `[[profile]]` entries with

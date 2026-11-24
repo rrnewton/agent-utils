@@ -22,7 +22,7 @@
 //! a restore, a one-shot call, or a `team act` wait.
 //!
 //! Persisted files live only under the shepherd state directory
-//! (`<state root>/shepherd/<team-key>/<boot-id>-<epoch-tag>/`): `state.json` (resumable round
+//! (`<state root>/shepherd/<team-key>/<boot-id>@<manager-start-ticks>/`): `state.json` (resumable round
 //! bookkeeping) and `stamp.json` (the terminal verdict). No older
 //! reader opens either path, and no driver record field changes.
 
@@ -169,7 +169,7 @@ struct TeamRound {
 }
 
 /// The shepherd state directory for one team's one incident:
-/// `<state root>/shepherd/<team-key>/<boot-id>-<epoch-tag>/` (B1: a
+/// `<state root>/shepherd/<team-key>/<boot-id>@<manager-start-ticks>/` (B1: a
 /// host's teams never share a stamp or state file, and a user-manager
 /// restart begins a new epoch in the same boot).
 pub fn shepherd_dir(state_dir: Option<&Path>, registry: &Path, epoch_key: &str) -> Option<PathBuf> {
@@ -208,47 +208,30 @@ pub fn restore_running(claim_path: &Path) -> bool {
     }
 }
 
+/// The epoch key for one boot plus manager start: `boot@ticks`,
+/// or `boot@nomgr` when no manager start ticks can be read. This
+/// pure mapping is the whole derivation; [`epoch_identity`] only
+/// supplies the ticks.
+pub fn epoch_key(boot_id: &str, manager_ticks: Option<&str>) -> String {
+    match manager_ticks {
+        Some(ticks) if !ticks.is_empty() => format!("{boot_id}@{ticks}"),
+        _ => format!("{boot_id}@nomgr"),
+    }
+}
+
 /// The canonical epoch identity for claims and state directories:
-/// the boot id plus the raw `ActiveEnterTimestampMonotonic` of the
-/// user manager, from one systemctl read. Never btime (NTP moves
-/// it) and never the manager identity string (its format flips).
-/// When the read fails the identity is the boot alone, for every
-/// caller alike.
+/// the boot id plus the user manager's `/proc` start ticks ONLY
+/// (S3). One derivation, never systemctl-dependent, never btime:
+/// whether systemctl answers, and how, cannot change the key, so
+/// one manager epoch always maps to one incident directory. When
+/// no manager process can be found the identity is the boot alone
+/// (`@nomgr`), for every caller alike. This never fails, so a
+/// transient manager read can never block recovery (S9).
 pub fn epoch_identity(host: &dyn Host, epoch: &RestoreEpoch) -> Result<String> {
-    if epoch.user_manager.is_none() {
-        return Ok(format!("{}@nomgr", epoch.boot_id));
-    }
-    // A pid-form manager identity already carries the manager's
-    // /proc start ticks: derive from it directly, one value per
-    // manager start, no second read to disagree with.
-    if let Some(ticks) = epoch
-        .user_manager
-        .as_deref()
-        .and_then(|manager| manager.strip_prefix("pid:"))
-        .and_then(|rest| rest.rsplit(':').next())
-    {
-        return Ok(format!("{}@{ticks}", epoch.boot_id));
-    }
-    let uid = unsafe { libc::getuid() };
-    let outcome = host.run(
-        &[
-            crate::restore::systemctl_program(),
-            "show".to_owned(),
-            format!("user@{uid}.service"),
-            "--property=ActiveEnterTimestampMonotonic".to_owned(),
-            "--value".to_owned(),
-        ],
-        None,
-        Duration::from_secs(10),
-    );
-    match outcome.stdout.trim().parse::<u64>() {
-        Ok(micros) if micros > 0 => Ok(format!("{}@{micros}", epoch.boot_id)),
-        // Never key an incident on a fallback: a failed manager
-        // read would split one epoch into two incidents (S3).
-        _ => Err(fail(
-            "cannot read the user manager start time for the epoch identity",
-        )),
-    }
+    Ok(epoch_key(
+        &epoch.boot_id,
+        host.manager_start_ticks().as_deref(),
+    ))
 }
 
 /// SHA-256 of a manifest's canonical JSON text.
@@ -1355,6 +1338,121 @@ mod tests {
         assert_eq!(manifest_hash(&one), manifest_hash(&one));
         assert_ne!(manifest_hash(&one), manifest_hash(&two));
     }
+
+    /// Host stub for epoch tests: the manager identity string and
+    /// the systemctl answer vary; the `/proc` ticks stay fixed.
+    /// `run` records every call so a systemctl-dependent derivation
+    /// is visible, and answers a monotonic-micros read.
+    struct EpochHost {
+        user_manager: Option<String>,
+        ticks: Option<String>,
+        runs: std::cell::RefCell<Vec<Vec<String>>>,
+    }
+
+    impl Host for EpochHost {
+        fn boot_id(&self) -> Result<String> {
+            Ok("boot-epoch".to_owned())
+        }
+        fn user_manager_id(&self) -> Option<String> {
+            self.user_manager.clone()
+        }
+        fn manager_start_ticks(&self) -> Option<String> {
+            self.ticks.clone()
+        }
+        fn boot_time(&self) -> Option<u64> {
+            None
+        }
+        fn now(&self) -> f64 {
+            1_000.0
+        }
+        fn sleep(&self, _duration: Duration) {}
+        fn run(
+            &self,
+            argv: &[String],
+            _cwd: Option<&Path>,
+            _timeout: Duration,
+        ) -> crate::restore::CommandOutcome {
+            self.runs.borrow_mut().push(argv.to_vec());
+            crate::restore::CommandOutcome {
+                status: Some(0),
+                stdout: "123456789".to_owned(),
+                stderr: String::new(),
+            }
+        }
+    }
+
+    #[test]
+    fn epoch_key_is_the_boot_plus_proc_ticks_only() {
+        assert_eq!(epoch_key("boot-a", Some("3773")), "boot-a@3773");
+        assert_eq!(epoch_key("boot-a", None), "boot-a@nomgr");
+        assert_eq!(epoch_key("boot-a", Some("")), "boot-a@nomgr");
+    }
+
+    #[test]
+    fn epoch_identity_never_splits_on_the_manager_identity_string() {
+        // S3 regression: one manager epoch (same boot, same /proc
+        // ticks) must key identically whether the manager identity
+        // reads as invocation form, pid form, or unreadable, and
+        // the derivation must never consult systemctl. On the old
+        // code the invocation host keyed `@123456789` (micros from
+        // a second systemctl read) while the pid host keyed
+        // `@3773`, splitting one incident into two directories.
+        let pid_host = EpochHost {
+            user_manager: Some("pid:4242:3773".to_owned()),
+            ticks: Some("3773".to_owned()),
+            runs: std::cell::RefCell::new(Vec::new()),
+        };
+        let invocation_host = EpochHost {
+            user_manager: Some("invocation:0123456789abcdef0123456789abcdef".to_owned()),
+            ticks: Some("3773".to_owned()),
+            runs: std::cell::RefCell::new(Vec::new()),
+        };
+        let nomgr_host = EpochHost {
+            user_manager: None,
+            ticks: Some("3773".to_owned()),
+            runs: std::cell::RefCell::new(Vec::new()),
+        };
+        let epoch_for = |host: &EpochHost| RestoreEpoch {
+            boot_id: "boot-epoch".to_owned(),
+            user_manager: host.user_manager_id(),
+        };
+        let pid_key = epoch_identity(&pid_host, &epoch_for(&pid_host)).expect("pid key");
+        let invocation_key =
+            epoch_identity(&invocation_host, &epoch_for(&invocation_host)).expect("invocation key");
+        let nomgr_key = epoch_identity(&nomgr_host, &epoch_for(&nomgr_host)).expect("nomgr key");
+        assert_eq!(pid_key, "boot-epoch@3773");
+        assert_eq!(invocation_key, pid_key, "systemctl answer split the epoch");
+        assert_eq!(nomgr_key, pid_key);
+        assert!(
+            pid_host.runs.borrow().is_empty()
+                && invocation_host.runs.borrow().is_empty()
+                && nomgr_host.runs.borrow().is_empty(),
+            "epoch derivation consulted a command: {:?} {:?} {:?}",
+            pid_host.runs.borrow(),
+            invocation_host.runs.borrow(),
+            nomgr_host.runs.borrow()
+        );
+        // A restarted manager (new ticks) is a new epoch; no
+        // manager at all keys on the boot alone.
+        let restarted = EpochHost {
+            user_manager: Some("pid:5555:9999".to_owned()),
+            ticks: Some("9999".to_owned()),
+            runs: std::cell::RefCell::new(Vec::new()),
+        };
+        assert_eq!(
+            epoch_identity(&restarted, &epoch_for(&restarted)).expect("restarted key"),
+            "boot-epoch@9999"
+        );
+        let absent = EpochHost {
+            user_manager: None,
+            ticks: None,
+            runs: std::cell::RefCell::new(Vec::new()),
+        };
+        assert_eq!(
+            epoch_identity(&absent, &epoch_for(&absent)).expect("absent key"),
+            "boot-epoch@nomgr"
+        );
+    }
 }
 
 /// Schema of a recovery profile file.
@@ -2046,15 +2144,68 @@ pub struct StartOptions {
     pub stale_seconds: f64,
     /// The `run-agent-prompt` executable for the supervisor child.
     pub run_agent_prompt: PathBuf,
+    /// Escalation route file for pages (default: the synced
+    /// escalation.toml; never the default under a test harness).
+    /// Forwarded to the supervisor child and used for the
+    /// best-effort page when starting itself fails (S9).
+    pub escalation_config: Option<PathBuf>,
 }
 
-/// Claim or join the incident, then launch restore and the recovery
-/// supervisor concurrently. This is the single trigger-neutral entry
-/// point: a service unit, a script, a remote shell, and a human all
-/// call it, and a second live call joins instead of starting a
-/// second restorer. The claim flock is held only for the claim
-/// read/write itself.
+/// Claim or join the incident, then launch the recovery
+/// supervisor, which spawns and owns the restore child. This is
+/// the single trigger-neutral entry point: a service unit, a
+/// script, a remote shell, and a human all call it, and a second
+/// live call joins instead of starting a second restorer. The
+/// claim flock is held only for the claim read/write itself.
+/// ANY error pages `supervisor-failed` best-effort through the
+/// same escalation route before returning (S9), so a transient
+/// failure at boot is never silent; the epoch key itself never
+/// fails (S3), so this covers the remaining start failures.
 pub fn start_recovery(
+    registry: &Path,
+    host: &dyn Host,
+    inputs: &ShepherdInputs,
+    state_dir: Option<&Path>,
+    options: &StartOptions,
+) -> Result<Value> {
+    let result = start_recovery_inner(registry, host, inputs, state_dir, options);
+    if let Err(error) = &result {
+        // Best-effort page: it needs no writable state dir. The
+        // alarm, when the route also fails, lands where `recovery
+        // status` looks: the shepherd incident dir when the epoch
+        // is derivable, else beside the claim.
+        let page_options = ShepherdOptions {
+            state_dir: state_dir.map(Path::to_path_buf),
+            escalation_config: options.escalation_config.clone(),
+            ..Default::default()
+        };
+        let mut state = ShepherdState::default();
+        let mut incident = String::new();
+        let mut dir =
+            recovery_dir(state_dir, registry).unwrap_or_else(|| PathBuf::from("/nonexistent"));
+        if let Ok(epoch) = host.epoch() {
+            incident = crate::team_driver::incident_id(registry, &epoch);
+            if let Ok(key) = epoch_identity(host, &epoch) {
+                if let Some(found) = shepherd_dir(state_dir, registry, &key) {
+                    dir = found;
+                }
+            }
+        }
+        let _ = page(
+            host,
+            &page_options,
+            &mut state,
+            "supervisor-failed",
+            &format!("start-recovery failed: {error}"),
+            registry,
+            &incident,
+            &dir,
+        );
+    }
+    result
+}
+
+fn start_recovery_inner(
     registry: &Path,
     host: &dyn Host,
     inputs: &ShepherdInputs,
@@ -2148,6 +2299,12 @@ pub fn start_recovery(
     ]);
     if let Some(state) = state_dir {
         shepherd_args.extend(["--state-dir".to_owned(), state.display().to_string()]);
+    }
+    if let Some(config) = &options.escalation_config {
+        shepherd_args.extend([
+            "--escalation-config".to_owned(),
+            config.display().to_string(),
+        ]);
     }
     let mut supervisor = spawn_logged(&shepherd_args, "supervisor.log", true)?;
     if options.foreground {
