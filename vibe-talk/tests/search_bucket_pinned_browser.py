@@ -7,13 +7,16 @@ the screen with the first scroll, and pressed and unpressed chips read the
 same. This walk serves the real page and a fake chat upstream (only the
 upstream is stubbed; the server search answers through the real route) over
 a channel whose server copy holds one "lantern" hit in main and two in
-threads, among enough loaded messages to scroll at both sizes:
+threads, among enough loaded messages to scroll at both sizes (one loaded
+reply also says "lantern", so the fold counts three in threads):
 
-  search "lantern" -> "1 in main" pressed, "2 in threads" unpressed, the
-  two told apart by filled ground, check and `aria-pressed` in light and
-  dark; scroll the results to the bottom -> both chips still under the bar,
-  on phone (keyboard closed and really open) and desktop; a new search
-  ("old lantern") -> the extra chip unpressed again, home chip pressed.
+  search "lantern" -> "1 in main" and "3 in threads", both pressed (All
+  starts both on, `#2200`/owner 349), the pressed pair told apart from
+  the unpressed Transcripts chip by filled ground, check and
+  `aria-pressed` in light and dark; scroll the results to the bottom ->
+  both chips still under the bar, on phone (keyboard closed and really
+  open) and desktop; a new search ("old lantern") -> the chips stand at
+  their All defaults again.
 
 Condition waits only; no wall-clock budgets beyond the page's own loads.
 Pass --screenshots DIR to keep a PNG of each stage.
@@ -191,14 +194,20 @@ def walk_through(walk: Walk, keyboard: bool) -> None:
                "the bucket chips never appeared under the bar")
     main = page.evaluate(CHIP_JS, "search-bucket-main")
     threads = page.evaluate(CHIP_JS, "search-bucket-threads")
+    transcripts = page.evaluate(CHIP_JS, "search-bucket-transcripts")
+    # `#2200`: the fold counts loaded and fresh together — one loaded reply
+    # says "lantern" too — and in All both buckets start on (owner 349).
     walk.check(main is not None and main["text"] == "1 in main" and main["pressed"] == "true",
                f"the main chip says {main}")
-    walk.check(threads is not None and threads["text"] == "2 in threads" and threads["pressed"] == "false",
+    walk.check(threads is not None and threads["text"] == "3 in threads" and threads["pressed"] == "true",
                f"the threads chip says {threads}")
-    walk.check(main["bg"] != threads["bg"] and main["color"] != threads["color"],
-               f"pressed and unpressed read the same: main={main} threads={threads}")
-    walk.check(main["check"] == "visible" and threads["check"] == "hidden",
-               f"the check does not tell the states apart: main={main} threads={threads}")
+    walk.check(transcripts is not None and transcripts["text"] == "0 in Transcripts"
+               and transcripts["pressed"] == "false",
+               f"the transcripts chip says {transcripts}")
+    walk.check(main["bg"] != transcripts["bg"] and main["color"] != transcripts["color"],
+               f"pressed and unpressed read the same: main={main} transcripts={transcripts}")
+    walk.check(main["check"] == "visible" and transcripts["check"] == "hidden",
+               f"the check does not tell the states apart: main={main} transcripts={transcripts}")
     pin = page.evaluate(PIN_JS)
     walk.check(pin is not None and pin["inPanel"] and not pin["inScroller"],
                f"the bucket row is not pinned in the search panel: {pin}")
@@ -228,19 +237,19 @@ def walk_through(walk: Walk, keyboard: bool) -> None:
     walk.check(main is not None and main["height"] > 0 and main["top"] >= -1,
                f"after scrolling to the bottom the main chip is not visible: {main}")
     walk.shot("chips-after-scroll-bottom")
-    # Turn the extra bucket on, so the new search below has something to reset.
+    # Turn the extra bucket off, so the new search below has something to reset.
     page.click("#search-bucket-threads")
-    walk.until("() => document.getElementById('search-bucket-threads').getAttribute('aria-pressed') === 'true'",
-               "tapping the threads chip did not press it")
-    # A new search: extra buckets off again, home bucket on (`#1894`).
+    walk.until("() => document.getElementById('search-bucket-threads').getAttribute('aria-pressed') === 'false'",
+               "tapping the threads chip did not stand it down")
+    # A new search: the buckets go back to All's defaults, both on (`#2200`).
     page.fill("#search-field", "old lantern")
     walk.until("() => document.getElementById('search-bucket-threads')"
-               " && document.getElementById('search-bucket-threads').getAttribute('aria-pressed') === 'false'",
-               "the new search did not stand the threads chip back down")
+               " && document.getElementById('search-bucket-threads').getAttribute('aria-pressed') === 'true'",
+               "the new search did not stand the threads chip back up")
     walk.settled()
     threads = page.evaluate(CHIP_JS, "search-bucket-threads")
     main = page.evaluate(CHIP_JS, "search-bucket-main")
-    walk.check(threads is not None and threads["pressed"] == "false" and main is not None and main["pressed"] == "true",
+    walk.check(threads is not None and threads["pressed"] == "true" and main is not None and main["pressed"] == "true",
                f"the new search states are main={main} threads={threads}")
     walk.shot("new-search-unpressed")
     # A search with no bucket hits: the pinned row does not render at all

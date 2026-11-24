@@ -356,7 +356,9 @@ def walk_through(walk: Walk, keyboard: bool, discuss: bool = False) -> None:
     walk.check(line == "Server search details", f"the foot line is not the details line: {line!r}")
     walk.check(page.evaluate("() => document.getElementById('server-hits').children.length") == 0,
                "snippets were drawn at the foot")
-    walk.check((page.text_content("#search-bucket-main") or "").strip() == "50 in main" and
+    # `#2200`: the chip is the fold — ten loaded "lantern" notes plus the
+    # first page's fifty fresh hits.
+    walk.check((page.text_content("#search-bucket-main") or "").strip() == "60 in main" and
                page.evaluate("() => document.getElementById('search-bucket-main').getAttribute('aria-pressed')") == "true",
                "the main bucket chip does not count the in-channel hits as on")
     # `#2200`: every in-scope chip stands while a search has results — the
