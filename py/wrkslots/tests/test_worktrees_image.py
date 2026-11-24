@@ -9,10 +9,12 @@ repeated here because the shared test host cannot guarantee loop devices.
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import os
 import shutil
 import socket
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -1193,6 +1195,610 @@ def test_ensure_binds_skips_a_record_whose_subvolume_is_gone(
     assert actions == ["bound slot ok from the worktrees image"]
     assert not (slots_dir / "gone").exists()
     assert set(worktreesimage.load_binds(control)) == {"gone", "ok"}
+
+
+def _doubled_setup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    layers: list[slotimage.MountEntry],
+) -> tuple[Path, Path, Path, list[slotimage.MountEntry]]:
+    """One recorded slot whose target carries the given bind layers.
+
+    The fake mount table is the mutable ``table`` list; a fake umount
+    removes the current top layer by the mount-id chain, exactly as a
+    plain umount of the mountpoint removes the top copy.
+    """
+
+    control = tmp_path / "worktrees"
+    mount_dir = worktreesimage.image_mount_dir(control)
+    (mount_dir / "s1").mkdir(parents=True)
+    slots_dir = tmp_path / "slots"
+    canonical = slots_dir / "s1"
+    canonical.mkdir(parents=True)
+    worktreesimage.save_bind_records(
+        control,
+        {
+            "s1": worktreesimage.BindRecord(
+                subvolume="s1", mount_id=111, target=str(canonical)
+            )
+        },
+    )
+    table = list(layers)
+    monkeypatch.setattr(slotimage, "mount_table", lambda: list(table))
+
+    def top_id() -> int | None:
+        ordered = worktreesimage._ordered_stack(
+            [entry for entry in table if entry.mount_point == canonical]
+        )
+        return ordered[-1].mount_id if ordered else None
+
+    monkeypatch.setattr(worktreesimage, "mount_id_at", lambda point: top_id())
+    return control, slots_dir, canonical, table
+
+
+def _stack_entry(
+    point: Path, mount_id: int | None, parent_id: int | None, **overrides: object
+) -> slotimage.MountEntry:
+    values: dict[str, object] = {
+        "mount_point": point,
+        "fstype": "btrfs",
+        "source": "/dev/loop9",
+        "device": "0:999",
+        "root": "/s1",
+        "mount_id": mount_id,
+        "parent_id": parent_id,
+    }
+    values.update(overrides)
+    return slotimage.MountEntry(**values)  # type: ignore[arg-type]
+
+
+def test_collapse_binds_dry_run_reports_without_acting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    canonical = tmp_path / "slots" / "s1"
+    control, slots_dir, _canonical, table = _doubled_setup(
+        tmp_path,
+        monkeypatch,
+        [_stack_entry(canonical, 20, 10), _stack_entry(canonical, 30, 20)],
+    )
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        worktreesimage, "_run", lambda argv, sudo=False: calls.append(list(argv))
+    )
+
+    done, skipped = worktreesimage.collapse_duplicate_binds(
+        control, slots_dir, apply=False
+    )
+
+    assert skipped == []
+    assert done == [
+        "slot s1: 2 identical binds stacked at "
+        f"{canonical}; would unmount 1 top copy, leaving mount id 20"
+    ]
+    assert calls == []
+    assert len(table) == 2
+    assert worktreesimage.load_bind_records(control)["s1"].mount_id == 111
+
+
+def test_collapse_binds_apply_unmounts_only_the_top_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The table lists the top copy first; the mount-id chain, not
+    # table order, decides which layer is top, and each unmount is
+    # preceded by a fresh table read.
+    canonical = tmp_path / "slots" / "s1"
+    bottom = _stack_entry(canonical, 20, 10)
+    top = _stack_entry(canonical, 30, 20)
+    control, slots_dir, _canonical, table = _doubled_setup(
+        tmp_path, monkeypatch, [top, bottom]
+    )
+    umounts: list[list[str]] = []
+
+    def run(argv: list[str], *, sudo: bool = False) -> None:
+        umounts.append(list(argv))
+        ordered = worktreesimage._ordered_stack(table)
+        assert ordered is not None
+        top = ordered[-1]
+        table[:] = [entry for entry in table if entry is not top]
+
+    monkeypatch.setattr(worktreesimage, "_run", run)
+
+    done, skipped = worktreesimage.collapse_duplicate_binds(
+        control, slots_dir, apply=True
+    )
+
+    assert skipped == []
+    assert done == [
+        f"slot s1: removed 1 duplicate bind(s) at {canonical}; "
+        "surviving mount id 20"
+    ]
+    assert umounts == [["umount", str(canonical)]]
+    assert table == [bottom]
+    assert worktreesimage.load_bind_records(control)["s1"].mount_id == 20
+
+
+def test_collapse_binds_busy_top_is_skipped_as_busy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    canonical = tmp_path / "slots" / "s1"
+    control, slots_dir, _canonical, table = _doubled_setup(
+        tmp_path,
+        monkeypatch,
+        [_stack_entry(canonical, 20, 10), _stack_entry(canonical, 30, 20)],
+    )
+
+    def run(argv: list[str], *, sudo: bool = False) -> None:
+        raise worktreesimage.WorktreesImageError("umount: target is busy")
+
+    monkeypatch.setattr(worktreesimage, "_run", run)
+
+    done, skipped = worktreesimage.collapse_duplicate_binds(
+        control, slots_dir, apply=True
+    )
+
+    assert done == []
+    assert len(skipped) == 1
+    assert "busy" in skipped[0] and "needs root" not in skipped[0]
+    assert len(table) == 2
+    assert worktreesimage.load_bind_records(control)["s1"].mount_id == 111
+
+
+def test_collapse_binds_partial_failure_reports_what_happened(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Three layers; the second unmount is busy. The report says how
+    # many layers went, what remains, and the record names the fresh
+    # top mount id rather than the unmounted one.
+    canonical = tmp_path / "slots" / "s1"
+    control, slots_dir, _canonical, table = _doubled_setup(
+        tmp_path,
+        monkeypatch,
+        [
+            _stack_entry(canonical, 20, 10),
+            _stack_entry(canonical, 30, 20),
+            _stack_entry(canonical, 40, 30),
+        ],
+    )
+    attempts: list[list[str]] = []
+
+    def run(argv: list[str], *, sudo: bool = False) -> None:
+        attempts.append(list(argv))
+        if len(attempts) == 2:
+            raise worktreesimage.WorktreesImageError("umount: target is busy")
+        ordered = worktreesimage._ordered_stack(table)
+        assert ordered is not None
+        top = ordered[-1]
+        table[:] = [entry for entry in table if entry is not top]
+
+    monkeypatch.setattr(worktreesimage, "_run", run)
+
+    done, skipped = worktreesimage.collapse_duplicate_binds(
+        control, slots_dir, apply=True
+    )
+
+    assert done == [
+        f"slot s1: removed 1 duplicate bind(s) at {canonical}; "
+        "2 layers remain, top mount id 30"
+    ]
+    assert len(skipped) == 1
+    assert "stopped after 1 removal(s)" in skipped[0] and "busy" in skipped[0]
+    assert worktreesimage.load_bind_records(control)["s1"].mount_id == 30
+
+
+def test_collapse_binds_differing_options_are_left_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A read-only self-bind over the slot is not a duplicate: the
+    # per-mount options differ, so nothing is unmounted or rewritten.
+    canonical = tmp_path / "slots" / "s1"
+    control, slots_dir, _canonical, _table = _doubled_setup(
+        tmp_path,
+        monkeypatch,
+        [
+            _stack_entry(canonical, 20, 10, options="rw"),
+            _stack_entry(canonical, 30, 20, options="ro"),
+        ],
+    )
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        worktreesimage, "_run", lambda argv, sudo=False: calls.append(list(argv))
+    )
+
+    done, skipped = worktreesimage.collapse_duplicate_binds(
+        control, slots_dir, apply=True
+    )
+
+    assert done == []
+    assert len(skipped) == 1 and "differ" in skipped[0]
+    assert calls == []
+    assert worktreesimage.load_bind_records(control)["s1"].mount_id == 111
+
+
+def test_collapse_binds_ambiguous_mount_ids_refuse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    canonical = tmp_path / "slots" / "s1"
+    control, slots_dir, _canonical, _table = _doubled_setup(
+        tmp_path,
+        monkeypatch,
+        [_stack_entry(canonical, None, None), _stack_entry(canonical, None, None)],
+    )
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        worktreesimage, "_run", lambda argv, sudo=False: calls.append(list(argv))
+    )
+
+    done, skipped = worktreesimage.collapse_duplicate_binds(
+        control, slots_dir, apply=True
+    )
+
+    assert done == []
+    assert len(skipped) == 1 and "cannot order" in skipped[0]
+    assert calls == []
+
+
+def test_ensure_binds_never_collapses_on_config_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Prevention only: a doubled target found on load is left for
+    # the explicit collapse-binds command; no umount runs here.
+    canonical = tmp_path / "slots" / "s1"
+    control = tmp_path / "worktrees"
+    mount_dir = worktreesimage.image_mount_dir(control)
+    (mount_dir / "s1").mkdir(parents=True)
+    slots_dir = tmp_path / "slots"
+    canonical.mkdir(parents=True)
+    worktreesimage.save_bind_records(
+        control,
+        {
+            "s1": worktreesimage.BindRecord(
+                subvolume="s1", mount_id=111, target=str(canonical)
+            )
+        },
+    )
+    table = [_bind_entry(canonical), _bind_entry(canonical)]
+    monkeypatch.setattr(slotimage, "mount_table", lambda: list(table))
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        worktreesimage, "_run", lambda argv, sudo=False: calls.append(list(argv))
+    )
+
+    actions = worktreesimage.ensure_binds(control, mount_dir, slots_dir)
+
+    assert actions == []
+    assert calls == []
+    assert len(table) == 2
+
+
+def test_flock_records_until_gap_acquisition_is_not_leaked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The helper can publish its acquired descriptor in the gap
+    # between the waiter's deadline expiring and its check: the
+    # waiter must then use that descriptor, never leak the lock on
+    # it for the rest of the process.
+    lock_path = tmp_path / ".worktrees-image.json.lock"
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(descriptor, fcntl.LOCK_EX)
+    real_event = threading.Event
+    real_wait = threading.Event.wait
+
+    class LyingEvent(threading.Event):
+        def wait(self, timeout: float | None = None) -> bool:
+            real_wait(self, timeout)
+            return False
+
+    monkeypatch.setattr(threading, "Event", LyingEvent)
+    helper_blocking = real_event()
+    real_flock = fcntl.flock
+
+    def flock_spy(fd: int, operation: int) -> None:
+        if operation & fcntl.LOCK_EX and not operation & fcntl.LOCK_NB:
+            helper_blocking.set()
+        real_flock(fd, operation)
+
+    monkeypatch.setattr(fcntl, "flock", flock_spy)
+    outcome: list[int | None] = []
+
+    def call() -> None:
+        fd = os.open(lock_path, os.O_RDWR)
+        outcome.append(
+            worktreesimage._flock_records_until(fd, time.monotonic() + 60)
+        )
+        if outcome[-1] is None:
+            os.close(fd)
+
+    waiter = threading.Thread(target=call)
+    waiter.start()
+    # Free the lock only once the helper is inside its blocking
+    # flock: it then acquires and publishes, while the lying wait
+    # reports a timeout, which is exactly the gap interleaving.
+    assert helper_blocking.wait(timeout=60)
+    real_flock(descriptor, fcntl.LOCK_UN)
+    os.close(descriptor)
+    waiter.join(timeout=60)
+    assert not waiter.is_alive()
+    assert outcome[0] is not None
+    held_fd = outcome[0]
+    assert held_fd is not None
+    fcntl.flock(held_fd, fcntl.LOCK_UN)
+    os.close(held_fd)
+    # Nothing leaked: a fresh non-blocking acquisition succeeds.
+    fresh = os.open(lock_path, os.O_RDWR)
+    try:
+        fcntl.flock(fresh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fresh, fcntl.LOCK_UN)
+    finally:
+        os.close(fresh)
+
+
+def test_collapse_binds_raced_empty_target_is_an_error_not_a_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Another unmount takes the second-to-last layer between the
+    # fresh read and our umount, so ours removes the last one: that
+    # is reported as an error with a rebind hint, the record keeps
+    # its mount id, and nothing claims success.
+    canonical = tmp_path / "slots" / "s1"
+    control, slots_dir, _canonical, table = _doubled_setup(
+        tmp_path,
+        monkeypatch,
+        [_stack_entry(canonical, 20, 10), _stack_entry(canonical, 30, 20)],
+    )
+
+    def run(argv: list[str], *, sudo: bool = False) -> None:
+        table.clear()
+
+    monkeypatch.setattr(worktreesimage, "_run", run)
+
+    done, skipped = worktreesimage.collapse_duplicate_binds(
+        control, slots_dir, apply=True
+    )
+
+    assert done == []
+    assert len(skipped) == 1
+    assert "NO bind remains" in skipped[0] and "rebind" in skipped[0]
+    assert worktreesimage.load_bind_records(control)["s1"].mount_id == 111
+
+
+def test_collapse_binds_reports_earlier_progress_when_a_later_slot_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Slot a collapses; slot b's mount table read fails. The done
+    # line for a is still returned, and b lands in skipped, not a
+    # traceback.
+    control = tmp_path / "worktrees"
+    mount_dir = worktreesimage.image_mount_dir(control)
+    (mount_dir / "a1").mkdir(parents=True)
+    (mount_dir / "b1").mkdir(parents=True)
+    slots_dir = tmp_path / "slots"
+    target_a = slots_dir / "a1"
+    target_b = slots_dir / "b1"
+    target_a.mkdir(parents=True)
+    target_b.mkdir(parents=True)
+    worktreesimage.save_bind_records(
+        control,
+        {
+            "a1": worktreesimage.BindRecord(
+                subvolume="a1", mount_id=111, target=str(target_a)
+            ),
+            "b1": worktreesimage.BindRecord(
+                subvolume="b1", mount_id=111, target=str(target_b)
+            ),
+        },
+    )
+    table = [
+        _stack_entry(target_a, 20, 10),
+        _stack_entry(target_a, 30, 20),
+        _stack_entry(target_b, 20, 10),
+        _stack_entry(target_b, 30, 20),
+    ]
+    reads = {"count": 0}
+
+    def table_read() -> list[slotimage.MountEntry]:
+        reads["count"] += 1
+        if reads["count"] > 4:
+            raise slotimage.ImageError("mount table vanished")
+        return list(table)
+
+    monkeypatch.setattr(slotimage, "mount_table", table_read)
+
+    def run(argv: list[str], *, sudo: bool = False) -> None:
+        target = Path(argv[-1])
+        ordered = worktreesimage._ordered_stack(
+            [entry for entry in table if entry.mount_point == target]
+        )
+        assert ordered is not None
+        top = ordered[-1]
+        table[:] = [entry for entry in table if entry is not top]
+
+    monkeypatch.setattr(worktreesimage, "_run", run)
+    monkeypatch.setattr(worktreesimage, "mount_id_at", lambda point: 20)
+
+    done, skipped = worktreesimage.collapse_duplicate_binds(
+        control, slots_dir, apply=True
+    )
+
+    assert done == [
+        f"slot a1: removed 1 duplicate bind(s) at {target_a}; "
+        "surviving mount id 20"
+    ]
+    assert len(skipped) == 1 and "b1" in skipped[0]
+
+
+def test_ensure_binds_skips_the_lock_when_everything_is_mounted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Double-checked locking: the common load finds every target
+    # mounted and private, and never waits on the records lock.
+    control = tmp_path / "worktrees"
+    mount_dir = worktreesimage.image_mount_dir(control)
+    (mount_dir / "s1").mkdir(parents=True)
+    slots_dir = tmp_path / "slots"
+    canonical = slots_dir / "s1"
+    canonical.mkdir(parents=True)
+    worktreesimage.save_bind_records(
+        control,
+        {
+            "s1": worktreesimage.BindRecord(
+                subvolume="s1", mount_id=111, target=str(canonical)
+            )
+        },
+    )
+    monkeypatch.setattr(
+        slotimage, "mount_table", lambda: [_bind_entry(canonical)]
+    )
+
+    def fail_if_locked(*args: object, **kwargs: object) -> object:
+        raise AssertionError("ensure_binds took the records lock")
+
+    monkeypatch.setattr(worktreesimage, "_records_lock", fail_if_locked)
+
+    assert worktreesimage.ensure_binds(control, mount_dir, slots_dir) == []
+
+
+def test_records_lock_wait_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A wedged holder must fail its own waiter, not freeze it: the
+    # records lock refuses after its bound with the holder named as
+    # the retry condition.
+    control = tmp_path / "worktrees"
+    control.mkdir(parents=True)
+    monkeypatch.setattr(worktreesimage, "RECORDS_LOCK_TIMEOUT_SECONDS", 0.2)
+    failures: list[BaseException] = []
+
+    def wait_for_it() -> None:
+        try:
+            with worktreesimage._records_lock(control):
+                pass
+        except BaseException as exc:  # asserted below
+            failures.append(exc)
+
+    with worktreesimage._records_lock(control):
+        waiter = threading.Thread(target=wait_for_it)
+        waiter.start()
+        waiter.join(timeout=60)
+    assert not waiter.is_alive()
+    assert len(failures) == 1
+    assert isinstance(failures[0], worktreesimage.WorktreesImageError)
+    assert "bind records lock is busy" in str(failures[0])
+
+
+def test_ensure_image_mounted_mounts_under_the_records_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The image mount's check and mount hold the same lock as bind
+    # establishment, so two post-boot commands cannot stack image
+    # mounts either.
+    config = _config(tmp_path, worktreesimage.NOT_MOUNTED)
+    control = config.control
+    (config.root / "worktrees.img").write_bytes(b"x")
+    lock_path = control / worktreesimage.RECORD_LOCK_NAME
+    held: list[bool] = []
+
+    def run(argv: list[str], *, sudo: bool = False) -> None:
+        if argv[:1] == ["mount"]:
+            descriptor = os.open(lock_path, os.O_RDWR)
+            try:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    held.append(True)
+                else:
+                    held.append(False)
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+    monkeypatch.setattr(worktreesimage, "_run", run)
+    monkeypatch.setattr(slotimage, "mount_table", lambda: [])
+    monkeypatch.setattr(
+        worktreesimage, "apply_quota_mode", lambda *args, **kwargs: None
+    )
+
+    settings = config.worktrees_image
+    assert settings is not None
+    worktreesimage.ensure_image_mounted(
+        config.root, control, settings, config.worktrees
+    )
+
+    assert held == [True]
+
+
+def test_concurrent_ensure_binds_binds_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #2178: two config loads racing on one unmounted checkout must
+    # produce one bind, not a stack. The fake bind blocks on an event
+    # while the first caller is inside it; whether the second caller
+    # then attempts its own bind is decided by the records lock's
+    # state, never by timing: while the first caller binds, the lock
+    # is either held (serialised) or free (the second bind follows).
+    control = tmp_path / "worktrees"
+    mount_dir = worktreesimage.image_mount_dir(control)
+    (mount_dir / "s1").mkdir(parents=True)
+    slots_dir = tmp_path / "slots"
+    canonical = slots_dir / "s1"
+    worktreesimage.save_bind_records(
+        control,
+        {"s1": worktreesimage.BindRecord(subvolume="s1", target=str(canonical))},
+    )
+    table: list[slotimage.MountEntry] = []
+    binds: list[list[str]] = []
+    bind_entered = threading.Event()
+    second_bind = threading.Event()
+    proceed = threading.Event()
+
+    def run(argv: list[str], *, sudo: bool = False) -> None:
+        if argv[:2] == ["mount", "--bind"]:
+            binds.append(list(argv))
+            if len(binds) == 1:
+                bind_entered.set()
+                proceed.wait(timeout=60)
+            else:
+                second_bind.set()
+            table.append(_bind_entry(canonical))
+
+    monkeypatch.setattr(worktreesimage, "_run", run)
+    monkeypatch.setattr(slotimage, "mount_table", lambda: list(table))
+    monkeypatch.setattr(worktreesimage, "mount_id_at", lambda point: 777)
+    errors: list[BaseException] = []
+
+    def load() -> None:
+        try:
+            worktreesimage.ensure_binds(control, mount_dir, slots_dir)
+        except BaseException as exc:  # surfaced by the assertions below
+            errors.append(exc)
+
+    first = threading.Thread(target=load)
+    first.start()
+    assert bind_entered.wait(timeout=60)
+    second = threading.Thread(target=load)
+    second.start()
+    lock_path = control / worktreesimage.RECORD_LOCK_NAME
+    descriptor = os.open(lock_path, os.O_RDWR)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            serialized = True
+        else:
+            serialized = False
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+    if not serialized:
+        # No lock is held across the bind: the second caller reaches
+        # its own bind, which is the race this test guards against.
+        assert second_bind.wait(timeout=60)
+    proceed.set()
+    first.join(timeout=60)
+    second.join(timeout=60)
+    assert not first.is_alive() and not second.is_alive()
+    assert errors == []
+    assert len(binds) == 1
+    assert len(table) == 1
 
 
 def _scoped_project(tmp_path: Path) -> Path:

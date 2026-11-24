@@ -1293,6 +1293,21 @@ pub(crate) fn render_wt_status(report: &Value, format: &str) -> String {
         text("validate_dir"),
         text("validate_bind")
     ));
+    if let Some(doubled) = report.get("doubled_binds").and_then(Value::as_array) {
+        for entry in doubled {
+            out.push_str(&format!(
+                "doubled binds: slot {} at {} ({} layers, identical={}); repair with 'wrkslots worktrees-image collapse-binds'\n",
+                entry["slot"].as_str().unwrap_or_default(),
+                entry["target"].as_str().unwrap_or_default(),
+                entry["layers"],
+                if entry["identical"].as_bool().unwrap_or(false) {
+                    "True"
+                } else {
+                    "False"
+                },
+            ));
+        }
+    }
     if report["image_exists"].as_bool().unwrap_or(false) {
         out.push_str(&format!(
             "apparent={} allocated={}\n",
@@ -1373,6 +1388,52 @@ pub(crate) fn status_report_with_quota(
             .collect()
     };
     report.insert("binds".into(), Value::Object(binds));
+    // Python `doubled_bind_targets`: recorded targets with more
+    // than one bind layer, read-only (#2178).
+    let doubled: Vec<Value> = if settings.direct() {
+        Vec::new()
+    } else {
+        let binds_root = ctx.worktrees.parent().unwrap_or(ctx.worktrees);
+        let records = load_bind_records(binds_root).unwrap_or_default();
+        records
+            .iter()
+            .filter_map(|(slot, record)| {
+                let canonical = ctx.worktrees.join(slot);
+                let target = record
+                    .target
+                    .clone()
+                    .map(PathBuf::from)
+                    .unwrap_or(canonical);
+                let normalized = crate::image_mounts::normalize_absolute(&target);
+                let layers: Vec<&crate::image_mounts::MountEntry> = ctx
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        crate::image_mounts::normalize_absolute(&entry.mount_point) == normalized
+                    })
+                    .collect();
+                if layers.len() < 2 {
+                    return None;
+                }
+                let first = layers[0];
+                let identical = layers.iter().all(|entry| {
+                    entry.device == first.device
+                        && entry.root == first.root
+                        && entry.source == first.source
+                        && entry.fstype == first.fstype
+                        && entry.options == first.options
+                        && entry.propagation == first.propagation
+                });
+                Some(json!({
+                    "slot": slot,
+                    "target": target.to_string_lossy(),
+                    "layers": layers.len(),
+                    "identical": identical,
+                }))
+            })
+            .collect()
+    };
+    report.insert("doubled_binds".into(), Value::Array(doubled));
     let validate_dir = validate_external_dir(ctx.worktrees);
     report.insert("validate_dir".into(), json!(validate_dir.to_string_lossy()));
     let validate_mounted = ctx.entries.iter().any(|entry| {
@@ -1477,6 +1538,7 @@ fn render_report_json(report: &Value) -> String {
         "quota_mode",
         "configured_quota_mode",
         "binds",
+        "doubled_binds",
         "validate_dir",
         "validate_bind",
         "apparent_bytes",
@@ -2287,6 +2349,7 @@ mod tests {
             device: "0:7".to_string(),
             root: "/".to_string(),
             propagation: String::new(),
+            options: String::new(),
         }];
         assert_eq!(classify_mount(&slots, &btrfs, true, false), MOUNTED);
 
@@ -2563,6 +2626,7 @@ mod tests {
                 device: "0:999".to_string(),
                 root: "/s1".to_string(),
                 propagation: "shared:42".to_string(),
+                options: String::new(),
             },
             MountEntry {
                 mount_point: PathBuf::from("/mirror/s1"),
@@ -2571,6 +2635,7 @@ mod tests {
                 device: "0:999".to_string(),
                 root: "/s1".to_string(),
                 propagation: "shared:42".to_string(),
+                options: String::new(),
             },
         ];
         assert_eq!(

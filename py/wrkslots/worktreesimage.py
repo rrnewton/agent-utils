@@ -28,6 +28,7 @@ slots can never be created silently on the host underneath the mount.
 from __future__ import annotations
 
 import contextlib
+import threading
 import dataclasses
 import fcntl
 import json
@@ -527,32 +528,67 @@ def ensure_image_mounted(
     settings: WorktreesImageSettings,
     slots_dir: Path,
 ) -> None:
-    """Mount the image at its configured mount point if it is not mounted."""
+    """Mount the image at its configured mount point if it is not mounted.
 
-    if settings.direct:
-        mount_image(settings.image_file(root), slots_dir, settings)
-        ensure_validate_bind(slots_dir)
-        return
-    mount_dir = image_mount_dir(control)
-    mount_dir.mkdir(parents=True, exist_ok=True)
-    state = classify_mount(
-        mount_dir,
-        slotimage.mount_table(),
-        slots_dir_exists=True,
-        slots_dir_empty=next(mount_dir.iterdir(), None) is None,
-    )
-    if state == MOUNTED:
-        return
-    _run(
-        ["mount", "-o", "loop,compress=zstd:3,noatime", str(settings.image_file(root)), str(mount_dir)],
-        sudo=True,
-    )
-    apply_quota_mode(mount_dir, settings.image_file(root), settings.quota_mode)
+    The check and the mount hold the bind-records lock, so two
+    commands starting together after a boot cannot each see the
+    image unmounted and stack two mounts on its mount point (#2178).
+    """
+
+    if not settings.direct:
+        # Unlocked quick check (#2178): an already-mounted image
+        # needs no lock at all; the locked pass below re-reads and
+        # re-checks before mounting anything.
+        quick_dir = image_mount_dir(control)
+        if quick_dir.is_dir() and classify_mount(
+            quick_dir,
+            slotimage.mount_table(),
+            slots_dir_exists=True,
+            slots_dir_empty=next(quick_dir.iterdir(), None) is None,
+        ) == MOUNTED:
+            return
+    with _records_lock(control):
+        if settings.direct:
+            mount_image(settings.image_file(root), slots_dir, settings)
+            ensure_validate_bind(slots_dir)
+            return
+        mount_dir = image_mount_dir(control)
+        mount_dir.mkdir(parents=True, exist_ok=True)
+        state = classify_mount(
+            mount_dir,
+            slotimage.mount_table(),
+            slots_dir_exists=True,
+            slots_dir_empty=next(mount_dir.iterdir(), None) is None,
+        )
+        if state == MOUNTED:
+            return
+        _run(
+            ["mount", "-o", "loop,compress=zstd:3,noatime", str(settings.image_file(root)), str(mount_dir)],
+            sudo=True,
+        )
+        apply_quota_mode(mount_dir, settings.image_file(root), settings.quota_mode)
+
+
+#: Bound for one privileged (sudo) command. A wedged mount or
+#: umount must fail its own command, never freeze every wrkslots
+#: command behind the records lock (#2178).
+_SUDO_TIMEOUT_SECONDS = 120.0
 
 
 def _run(argv: list[str], *, sudo: bool = False) -> subprocess.CompletedProcess[str]:
     command = (["sudo", "-n"] if sudo else []) + argv
-    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_SUDO_TIMEOUT_SECONDS if sudo else None,
+        )
+    except subprocess.TimeoutExpired:
+        raise WorktreesImageError(
+            f"{' '.join(command)} timed out after {_SUDO_TIMEOUT_SECONDS:g}s"
+        ) from None
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
         raise WorktreesImageError(f"{' '.join(command)} failed: {detail}")
@@ -1002,29 +1038,120 @@ def load_binds(control: Path) -> dict[str, str]:
 RECORD_LOCK_NAME = ".worktrees-image.json.lock"
 
 
+#: How long a command waits for the bind-records lock before
+#: refusing. The lock is now held across sudo mounts, so an unbounded
+#: wait would let one wedged holder freeze every wrkslots command on
+#: the host; a bounded one fails only its own command, and the config
+#: load already warns and continues on WorktreesImageError (#2178).
+RECORDS_LOCK_TIMEOUT_SECONDS = 120.0
+
+
+def _flock_records_until(descriptor: int, deadline: float) -> int | None:
+    """Acquire the records flock, kernel-blocked until ``deadline``.
+
+    Mirrors cli.py's ``_flock_until`` pattern without importing it
+    (cli.py imports this module): try non-blocking first, then let a
+    helper thread block in the kernel on a duplicated descriptor and
+    hand that descriptor to the caller as the held one. If the
+    deadline passes first the wait is cancelled, and a late
+    acquisition by the helper is unlocked and closed at once, so it
+    never acts and never leaks the lock. Returns the descriptor that
+    holds the lock, or None on timeout.
+    """
+
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return descriptor
+    except BlockingIOError:
+        pass
+    if time.monotonic() >= deadline:
+        return None
+    try:
+        duplicate = os.dup(descriptor)
+    except OSError:
+        return None
+    acquired = threading.Event()
+    decision = threading.Lock()
+    state: dict[str, int | bool] = {"cancelled": False, "fd": -1}
+
+    def helper() -> None:
+        try:
+            fcntl.flock(duplicate, fcntl.LOCK_EX)
+        except OSError:
+            os.close(duplicate)
+            acquired.set()
+            return
+        with decision:
+            if state["cancelled"]:
+                fcntl.flock(duplicate, fcntl.LOCK_UN)
+                os.close(duplicate)
+            else:
+                state["fd"] = duplicate
+        acquired.set()
+
+    threading.Thread(target=helper, daemon=True).start()
+    if not acquired.wait(timeout=max(0.0, deadline - time.monotonic())):
+        with decision:
+            held = state["fd"]
+            if isinstance(held, int) and held >= 0:
+                # The helper acquired in the gap between its publish
+                # and our timeout: the lock is ours, so use it rather
+                # than leaking it on the duplicate descriptor.
+                return held
+            state["cancelled"] = True
+        return None
+    held = state["fd"]
+    return held if isinstance(held, int) and held >= 0 else None
+
+
+#: Records locks this thread already holds, by lock path. The lock is
+#: reentrant for its holder: bind establishment holds it across a
+#: whole re-check-and-bind section whose steps themselves update
+#: records through ``_update_bind_records`` (#2178).
+_RECORDS_HELD = threading.local()
+
+
 @contextlib.contextmanager
 def _records_lock(control: Path) -> Iterator[None]:
     """Hold the one flock that serialises bind-record mutations.
 
     Every writer reads, modifies and writes under this lock, so two
     concurrent wrkslots processes (migrate, create, a config load
-    re-establishing binds) can never drop each other's entries. Mounts
-    stay outside the lock: no writer holds it across a sudo mount.
+    re-establishing binds) can never drop each other's entries. Bind
+    establishment also holds it across its mount-table re-check and
+    its one mount, so two config loads cannot each see a checkout
+    unmounted and stack identical binds on it (#2178); the work under
+    it stays constant-time per slot, with no registry scan.
     """
 
     control.mkdir(parents=True, exist_ok=True)
     lock_path = control / RECORD_LOCK_NAME
+    held: set[Path] = getattr(_RECORDS_HELD, "paths", set())
+    _RECORDS_HELD.paths = held
+    if lock_path in held:
+        yield
+        return
     descriptor = os.open(
         lock_path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600
     )
-    try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-    finally:
+    deadline = time.monotonic() + RECORDS_LOCK_TIMEOUT_SECONDS
+    held_descriptor = _flock_records_until(descriptor, deadline)
+    if held_descriptor is None:
         os.close(descriptor)
+        raise WorktreesImageError(
+            f"bind records lock is busy: {lock_path} was not free within "
+            f"{RECORDS_LOCK_TIMEOUT_SECONDS:g}s; another wrkslots command "
+            "holds it; retry after it exits"
+        )
+    held.add(lock_path)
+    try:
+        yield
+    finally:
+        held.discard(lock_path)
+        fcntl.flock(held_descriptor, fcntl.LOCK_UN)
+        os.close(held_descriptor)
+        if held_descriptor != descriptor:
+            os.close(descriptor)
 
 
 def _write_bind_records(control: Path, records: dict[str, BindRecord]) -> None:
@@ -1529,23 +1656,276 @@ def bind_slot(control: Path, mount_dir: Path, slot: str, slot_path: Path) -> Non
     Crash order (mount, then record): a crash between them leaves a
     mounted bind with no record. ``ensure_binds`` ignores it (nothing
     recorded), the mount census counts it as foreign use of the slot
-    path until it is unmounted, and a retried bind records it.
+    path until it is unmounted, and a retried bind records it. The
+    mount and the record happen under the records lock, so a
+    concurrent bind of the same slot serialises instead of stacking
+    a second bind on the first (#2178).
     """
 
-    source = mount_dir / slot
-    if not source.is_dir():
-        raise WorktreesImageError(f"slot subvolume is missing: {source}")
-    slot_path.mkdir(parents=True, exist_ok=True)
-    _bind_private(source, slot_path)
-    mount_id = mount_id_at(slot_path)
+    with _records_lock(control):
+        source = mount_dir / slot
+        if not source.is_dir():
+            raise WorktreesImageError(f"slot subvolume is missing: {source}")
+        slot_path.mkdir(parents=True, exist_ok=True)
+        _bind_private(source, slot_path)
+        mount_id = mount_id_at(slot_path)
 
-    def record(records: dict[str, BindRecord]) -> dict[str, BindRecord]:
-        records[slot] = BindRecord(
-            subvolume=slot, mount_id=mount_id, target=str(slot_path)
+        def record(records: dict[str, BindRecord]) -> dict[str, BindRecord]:
+            records[slot] = BindRecord(
+                subvolume=slot, mount_id=mount_id, target=str(slot_path)
+            )
+            return records
+
+        _update_bind_records(control, record)
+
+
+def _identical_bind_layers(layers: Sequence[slotimage.MountEntry]) -> bool:
+    """Whether every layer is the same bind repeated (#2178).
+
+    Device, root, source, fstype, per-mount options and propagation
+    must all match: a deliberate read-only or differently-propagated
+    self-bind is not a duplicate and is never collapsed.
+    """
+
+    first = layers[0]
+    identity = (
+        first.device,
+        first.root,
+        first.source,
+        first.fstype,
+        first.options,
+        first.propagation,
+    )
+    return all(
+        (entry.device, entry.root, entry.source, entry.fstype, entry.options, entry.propagation)
+        == identity
+        for entry in layers[1:]
+    )
+
+
+def _ordered_stack(
+    layers: Sequence[slotimage.MountEntry],
+) -> list[slotimage.MountEntry] | None:
+    """Stacked layers bottom-first by their mount-id chain, or None.
+
+    In mountinfo each stacked layer's parent ID names the layer
+    beneath it. When IDs are missing, duplicated, or the chain is
+    not a single line, the order is ambiguous and the caller refuses
+    rather than guessing from table order (#2178).
+    """
+
+    by_id: dict[int, slotimage.MountEntry] = {}
+    for entry in layers:
+        if entry.mount_id is None or entry.mount_id in by_id:
+            return None
+        by_id[entry.mount_id] = entry
+    ids = set(by_id)
+    bottoms = [entry for entry in layers if entry.parent_id not in ids]
+    if len(bottoms) != 1:
+        return None
+    ordered = [bottoms[0]]
+    seen = {bottoms[0].mount_id}
+    while len(ordered) < len(layers):
+        nxt = [
+            entry
+            for entry in layers
+            if entry.parent_id == ordered[-1].mount_id and entry.mount_id not in seen
+        ]
+        if len(nxt) != 1:
+            return None
+        ordered.append(nxt[0])
+        seen.add(nxt[0].mount_id)
+    return ordered
+
+
+def doubled_bind_targets(
+    control: Path, slots_dir: Path
+) -> list[dict[str, object]]:
+    """Recorded targets carrying more than one bind layer (read-only)."""
+
+    records = load_bind_records(control)
+    try:
+        entries = slotimage.mount_table()
+    except slotimage.ImageError:
+        return []
+    doubled: list[dict[str, object]] = []
+    for slot in sorted(records):
+        record = records[slot]
+        target = Path(record.target) if record.target else slots_dir / slot
+        layers = [entry for entry in entries if entry.mount_point == target]
+        if len(layers) > 1:
+            doubled.append(
+                {
+                    "slot": slot,
+                    "target": str(target),
+                    "layers": len(layers),
+                    "identical": _identical_bind_layers(layers),
+                }
+            )
+    return doubled
+
+
+def collapse_duplicate_binds(
+    control: Path, slots_dir: Path, *, apply: bool
+) -> tuple[list[str], list[str]]:
+    """Report, and with ``apply`` collapse, identical stacked binds.
+
+    This is the explicit repair for binds stacked by racing config
+    loads before the locked re-check landed (#2178); config load
+    itself never unmounts. Without ``apply`` nothing changes: each
+    doubled target is reported with what would be done. With
+    ``apply``, each slot is handled under the records lock with the
+    mount table re-read before every unmount; an unmount proceeds
+    only while at least two layers are identical (device, root,
+    source, fstype, options, propagation) with an unambiguous
+    mount-id order, and only the top copy is unmounted (a plain
+    umount of the exact mountpoint, never lazy). A busy top layer is
+    skipped and reported as busy. The bind record is rewritten only
+    from a fresh read. Returns (done, skipped) report lines.
+    """
+
+    records = load_bind_records(control)
+    done: list[str] = []
+    skipped: list[str] = []
+    for slot in sorted(records):
+        try:
+            _collapse_slot(control, slots_dir, records[slot], slot, apply, done, skipped)
+        except (WorktreesImageError, slotimage.ImageError) as exc:
+            # One slot's failure never hides another slot's progress.
+            skipped.append(f"slot {slot}: {exc}")
+    return done, skipped
+
+
+def _collapse_slot(
+    control: Path,
+    slots_dir: Path,
+    record: BindRecord,
+    slot: str,
+    apply: bool,
+    done: list[str],
+    skipped: list[str],
+) -> None:
+    target = Path(record.target) if record.target else slots_dir / slot
+    layers = [
+        entry for entry in slotimage.mount_table() if entry.mount_point == target
+    ]
+    if len(layers) < 2:
+        return
+    if not _identical_bind_layers(layers):
+        skipped.append(
+            f"slot {slot}: {len(layers)} binds stacked at {target} "
+            "differ in device, root, source, fstype, options or "
+            "propagation; left alone"
         )
-        return records
+        return
+    ordered = _ordered_stack(layers)
+    if ordered is None:
+        skipped.append(
+            f"slot {slot}: cannot order the {len(layers)} binds at "
+            f"{target} by mount id; refusing to collapse"
+        )
+        return
+    if not apply:
+        done.append(
+            f"slot {slot}: {len(layers)} identical binds stacked at "
+            f"{target}; would unmount {len(layers) - 1} top "
+            f"cop{'y' if len(layers) == 2 else 'ies'}, leaving "
+            f"mount id {ordered[0].mount_id}"
+        )
+        return
+    removed = 0
+    stop_reason: str | None = None
+    with _records_lock(control):
+        # At most one unmount per extra layer seen at discovery: an
+        # unmount that exits 0 without changing the table must not
+        # spin here issuing sudo calls under the lock.
+        max_removals = len(layers) - 1
+        while removed < max_removals:
+            fresh = [
+                entry
+                for entry in slotimage.mount_table()
+                if entry.mount_point == target
+            ]
+            if len(fresh) < 2:
+                break
+            if not _identical_bind_layers(fresh):
+                stop_reason = "the remaining layers differ; left alone"
+                break
+            fresh_ordered = _ordered_stack(fresh)
+            if fresh_ordered is None:
+                stop_reason = "cannot order the remaining layers by mount id; refusing"
+                break
+            top = fresh_ordered[-1]
+            try:
+                _run(["umount", str(target)], sudo=True)
+            except WorktreesImageError as exc:
+                detail = str(exc)
+                kind = (
+                    "busy"
+                    if "busy" in detail.lower()
+                    else "not unmountable here"
+                )
+                stop_reason = (
+                    f"top layer (mount id {top.mount_id}) is {kind}: {detail}"
+                )
+                break
+            removed += 1
+        remaining = [
+            entry
+            for entry in slotimage.mount_table()
+            if entry.mount_point == target
+        ]
+        if (
+            stop_reason is None
+            and removed >= max_removals
+            and len(remaining) >= 2
+        ):
+            stop_reason = "unmounts did not reduce the stack; left alone"
+        if removed and not remaining:
+            # A concurrent unmount raced ours and took the last
+            # layer too. That is an error, never a success, and the
+            # record keeps its previous mount id: the next wrkslots
+            # command rebinds from it.
+            skipped.append(
+                f"slot {slot}: NO bind remains at {target} (a "
+                "concurrent unmount raced this one); run 'wrkslots "
+                "worktrees-image mount' to rebind"
+            )
+            return
+        if removed:
+            survivor_id = mount_id_at(target)
 
-    _update_bind_records(control, record)
+            def name_survivor(
+                current_records: dict[str, BindRecord],
+            ) -> dict[str, BindRecord]:
+                current = current_records.get(slot)
+                if current is not None:
+                    current_records[slot] = BindRecord(
+                        subvolume=current.subvolume,
+                        mount_id=survivor_id,
+                        target=current.target,
+                    )
+                return current_records
+
+            _update_bind_records(control, name_survivor)
+            if len(remaining) == 1:
+                done.append(
+                    f"slot {slot}: removed {removed} duplicate "
+                    f"bind(s) at {target}; surviving mount id "
+                    f"{survivor_id}"
+                )
+            else:
+                done.append(
+                    f"slot {slot}: removed {removed} duplicate "
+                    f"bind(s) at {target}; {len(remaining)} layers "
+                    f"remain, top mount id {survivor_id}"
+                )
+    if stop_reason is not None and removed == 0:
+        skipped.append(f"slot {slot}: {stop_reason}")
+    elif stop_reason is not None:
+        skipped.append(
+            f"slot {slot}: stopped after {removed} removal(s): {stop_reason}"
+        )
 
 
 def relocate_bind(control: Path, mount_dir: Path, slot: str, source: Path, destination: Path) -> None:
@@ -1621,6 +2001,44 @@ def unbind_slot(control: Path, slot: str, slot_path: Path) -> None:
     _update_bind_records(control, drop)
 
 
+def _binds_need_locked_pass(
+    control: Path,
+    mount_dir: Path,
+    slots_dir: Path,
+    records: dict[str, BindRecord],
+    entries: Sequence[slotimage.MountEntry],
+) -> bool:
+    """Whether the locked re-check could have anything to do (#2178).
+
+    Mirrors the locked loop's skips from an unlocked read: journaled
+    and fenced slots are left alone either way, a mounted target
+    needs the lock only while its top is shared, and an unmounted
+    target needs it only while its subvolume still exists.
+    """
+
+    mounted_points = {entry.mount_point for entry in entries}
+    journaled = removal_journaled_slots(control)
+    for slot in sorted(records):
+        record = records[slot]
+        canonical = slots_dir / slot
+        target = Path(record.target) if record.target else canonical
+        if slot in journaled:
+            continue
+        if target == canonical and any(
+            sibling.name.startswith(f".{slot}.fenced.")
+            for sibling in slots_dir.glob(f".{slot}.fenced.*")
+        ):
+            continue
+        if target in mounted_points:
+            top = _top_entry(target, entries)
+            if top is not None and "shared:" in top.propagation:
+                return True
+            continue
+        if (mount_dir / record.subvolume).is_dir():
+            return True
+    return False
+
+
 def ensure_binds(
     control: Path,
     mount_dir: Path,
@@ -1648,35 +2066,52 @@ def ensure_binds(
     actions: list[str] = []
     if not mount_dir.is_dir() or next(mount_dir.iterdir(), None) is None:
         pass
-    records = load_bind_records(control)
-    entries = slotimage.mount_table()
-    mounted_points = {entry.mount_point for entry in entries}
-    journaled = removal_journaled_slots(control)
-    for slot in sorted(records):
-        record = records[slot]
-        canonical = slots_dir / slot
-        target = Path(record.target) if record.target else canonical
-        if slot in journaled:
-            continue
-        if target == canonical and any(
-            sibling.name.startswith(f".{slot}.fenced.")
-            for sibling in slots_dir.glob(f".{slot}.fenced.*")
-        ):
-            continue
-        if target in mounted_points:
-            top = _top_entry(target, entries)
-            if top is not None and "shared:" in top.propagation:
-                make_private(target, entries)
-                actions.append(f"made slot {slot} bind private")
-            continue
-        if not (mount_dir / record.subvolume).is_dir():
-            # The record outlived its subvolume (a remove deleted the
-            # subvolume outside unbind's crash order). Skip it: do not
-            # fail every config load, do not re-create the slot path or
-            # subvolume, and do not block the remaining binds.
-            continue
-        bind_slot(control, mount_dir, slot, target)
-        actions.append(f"bound slot {slot} from the worktrees image")
+    # Double-checked locking (#2178): most config loads, read-only
+    # ones included, find the image mounted and every bind already
+    # in place. That case is decided from an unlocked read and never
+    # waits on the records lock; the lock is taken, and everything
+    # re-read inside it, only when a bind or a privatise is missing.
+    unlocked_records = load_bind_records(control)
+    unlocked_entries = slotimage.mount_table()
+    if not _binds_need_locked_pass(
+        control, mount_dir, slots_dir, unlocked_records, unlocked_entries
+    ):
+        return []
+    # The re-check-and-bind runs under the records lock (#2178):
+    # the mount table and the records are read again inside it, so a
+    # concurrent config load that bound a slot first is seen, not
+    # raced. Each slot's work under the lock is constant-time (one
+    # table, one mount at most), never a registry scan.
+    with _records_lock(control):
+        records = load_bind_records(control)
+        entries = slotimage.mount_table()
+        mounted_points = {entry.mount_point for entry in entries}
+        journaled = removal_journaled_slots(control)
+        for slot in sorted(records):
+            record = records[slot]
+            canonical = slots_dir / slot
+            target = Path(record.target) if record.target else canonical
+            if slot in journaled:
+                continue
+            if target == canonical and any(
+                sibling.name.startswith(f".{slot}.fenced.")
+                for sibling in slots_dir.glob(f".{slot}.fenced.*")
+            ):
+                continue
+            if target in mounted_points:
+                top = _top_entry(target, entries)
+                if top is not None and "shared:" in top.propagation:
+                    make_private(target, entries)
+                    actions.append(f"made slot {slot} bind private")
+                continue
+            if not (mount_dir / record.subvolume).is_dir():
+                # The record outlived its subvolume (a remove deleted the
+                # subvolume outside unbind's crash order). Skip it: do not
+                # fail every config load, do not re-create the slot path or
+                # subvolume, and do not block the remaining binds.
+                continue
+            bind_slot(control, mount_dir, slot, target)
+            actions.append(f"bound slot {slot} from the worktrees image")
     return actions
 
 
@@ -1697,6 +2132,11 @@ def status_report(root: Path, worktrees: Path, settings: WorktreesImageSettings)
         ),
         "configured_quota_mode": settings.quota_mode,
         "binds": {} if settings.direct else load_binds(worktrees.parent),
+        "doubled_binds": (
+            []
+            if settings.direct
+            else doubled_bind_targets(worktrees.parent, worktrees)
+        ),
         "validate_dir": str(validate_external_dir(worktrees)),
         "validate_bind": (
             "mounted"

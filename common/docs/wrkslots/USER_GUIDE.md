@@ -3409,6 +3409,15 @@ The image file is created owner-only (0600): it holds every slot.
   unmount a bounded number of times, and otherwise names the processes and units still holding
   the mount. A bind an older version left shared becomes private at the next mount or removal,
   and config load never re-binds a slot whose removal is journaled or fenced.
+  Config loads establish each bind under the bind-records lock, so two loads after a boot cannot
+  stack two binds of one subvolume on a slot path. A stack left by an older version is reported by
+  `wrkslots worktrees-image status` as doubled binds and repaired explicitly, never on load:
+  `wrkslots worktrees-image collapse-binds` prints each doubled target and what it would do, and
+  with `--apply` unmounts only the top copy of an identical stack (same device, root, source,
+  fstype, options and propagation, in mount-id order), skipping and reporting a busy layer and
+  exiting non-zero when anything was skipped. Run `collapse-binds --apply` BEFORE removing or
+  relocating a doubled slot: removal unmounts only the top layer, and relocation re-stacks the
+  bind at the source when its rename then fails, so a doubled slot must be collapsed first.
 - `worktrees_dir`: the image mounts at the slots directory itself and agent slot subvolumes are
   its top-level entries; there are no per-slot binds and no bind records. Validation slots stay
   at `worktrees/validate/<slot>` in this layout too: their storage is the image's top-level

@@ -14,6 +14,7 @@ import json
 import os
 import secrets
 import shutil
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, TypeVar
 
@@ -254,6 +255,29 @@ def register(subparsers: argparse._SubParsersAction[_ParserT], formatter: type[a
     wt_status = wt_actions.add_parser("status", help="show image file, mount state, and allocated bytes")
     wt_status.add_argument("--format", choices=("human", "json"), default="human")
     wt_status.set_defaults(handler=_cmd_wt_image_status)
+    wt_collapse = wt_actions.add_parser(
+        "collapse-binds",
+        help="collapse identical stacked binds left by racing config loads (dry run by default)",
+        description=(
+            "Report recorded slot targets carrying more than one bind "
+            "layer (binds stacked by concurrent config loads before the "
+            "locked re-check). The default is a dry run: each doubled "
+            "target is printed with what would be done. With --apply, "
+            "each slot is handled under the bind-records lock with the "
+            "mount table re-read before every unmount; only identical "
+            "layers (device, root, source, fstype, options, "
+            "propagation) with an unambiguous mount-id order are "
+            "collapsed, only the top copy is unmounted, and a busy "
+            "layer is skipped and reported. Prints every action and "
+            "exits 3 when anything was skipped. Never run from a lane."
+        ),
+        formatter_class=formatter,
+    )
+    wt_collapse.add_argument(
+        "--apply", action="store_true",
+        help="perform the collapse (default: dry run - report only)",
+    )
+    wt_collapse.set_defaults(handler=_cmd_wt_image_collapse_binds)
     wt_grow = wt_actions.add_parser("grow", help="grow the image online (truncate, loop refresh, resize)")
     wt_grow.add_argument("--to-size-bytes", type=int, required=True, help="new apparent size in bytes")
     wt_grow.set_defaults(handler=_cmd_wt_image_grow)
@@ -924,6 +948,28 @@ def _cmd_wt_image_mount(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_wt_image_collapse_binds(args: argparse.Namespace) -> int:
+    config, settings = _wt_settings(args)
+    if settings.direct:
+        raise _refuse(
+            "in mount_at: worktrees_dir layout there are no per-slot "
+            "binds to collapse"
+        )
+    try:
+        done, skipped = worktreesimage.collapse_duplicate_binds(
+            config.control, config.worktrees, apply=args.apply
+        )
+    except worktreesimage.WorktreesImageError as exc:
+        raise _refuse(str(exc)) from exc
+    for line in done:
+        print(line)
+    for line in skipped:
+        print(f"skipped: {line}", file=sys.stderr)
+    if not done and not skipped:
+        print("no doubled binds")
+    return 3 if skipped else 0
+
+
 def _cmd_wt_image_unmount(args: argparse.Namespace) -> int:
     config, settings = _wt_settings(args)
     mount_point = settings.mount_point(config.control, config.worktrees)
@@ -967,6 +1013,15 @@ def _cmd_wt_image_status(args: argparse.Namespace) -> int:
         f"mount_at={report['mount_at']} quota={report['quota_mode']}"
     )
     print(f"validate: {report['validate_dir']} bind={report['validate_bind']}")
+    doubled_binds = report["doubled_binds"]
+    assert isinstance(doubled_binds, list)
+    for doubled in doubled_binds:
+        assert isinstance(doubled, dict)
+        print(
+            f"doubled binds: slot {doubled['slot']} at {doubled['target']} "
+            f"({doubled['layers']} layers, identical={doubled['identical']}); "
+            "repair with 'wrkslots worktrees-image collapse-binds'"
+        )
     if report["image_exists"]:
         print(f"apparent={report['apparent_bytes']} allocated={report['allocated_bytes']}")
     for entry in lock_missing:

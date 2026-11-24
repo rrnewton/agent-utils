@@ -158,6 +158,20 @@ class MountEntry:
     device: str = ""
     root: str = "/"
     propagation: str = ""
+    #: Per-mount options (field 6: rw, ro, nosuid, ...), when the
+    #: table line carried them. Two binds of one subvolume with
+    #: different options are not duplicates of each other (#2178).
+    #: Excluded from equality: an entry parsed from a live table and
+    #: the same mount described by a caller compare by their mount
+    #: identity fields, as before these were parsed.
+    options: str = dataclasses.field(default="", compare=False)
+    #: Mount ID and parent mount ID in this namespace (fields 1 and
+    #: 2), when the table line carried them. Stacked mounts at one
+    #: point chain through these: each layer's parent is the layer
+    #: beneath it, so they order a stack bottom-first (#2178).
+    #: Excluded from equality, like ``options`` above.
+    mount_id: int | None = dataclasses.field(default=None, compare=False)
+    parent_id: int | None = dataclasses.field(default=None, compare=False)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -742,6 +756,13 @@ def mount_table(mountinfo: Path = Path("/proc/self/mountinfo")) -> list[MountEnt
     return _parse_mount_table(text)
 
 
+def _mount_id_field(field: str) -> int | None:
+    try:
+        return int(field)
+    except ValueError:
+        return None
+
+
 def _parse_mount_table(text: str) -> list[MountEntry]:
     entries: list[MountEntry] = []
     for line in text.splitlines():
@@ -760,6 +781,9 @@ def _parse_mount_table(text: str) -> list[MountEntry]:
                 device=left_fields[2],
                 root=_unescape(left_fields[3]),
                 propagation=" ".join(left_fields[5:]),
+                options=left_fields[5] if len(left_fields) > 5 else "",
+                mount_id=_mount_id_field(left_fields[0]),
+                parent_id=_mount_id_field(left_fields[1]),
             )
         )
     return entries
