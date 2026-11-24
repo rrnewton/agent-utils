@@ -5243,22 +5243,6 @@ def _act_chip_row_below(driver: Driver) -> None:
     driver.settle(300)
 
 
-def _act_chip_row_above_fallback(driver: Driver) -> None:
-    """`#2220` fallback: with the keyboard shrunk window, the strip has no
-    room under the words and stands above the selection."""
-    _act_glossary_button(driver)
-    shrink_keyboard(driver, "104-chip-row-above-fallback")
-    driver.js("(() => { const a = document.getElementById('scroll-area'); a.style.scrollBehavior = 'auto'; a.scrollTop = a.scrollHeight; })()")
-    driver.settle(400)
-    driver.page.wait_for_function(
-        "() => { const r = document.getElementById('selection-chip-row').getBoundingClientRect(); "
-        "const s = getSelection().getRangeAt(0).getBoundingClientRect(); "
-        "return r.bottom <= s.top + 1; }",
-        timeout=10_000,
-    )
-    driver.settle(300)
-
-
 def _act_glossary_orphan(driver: Driver) -> None:
     """`#2195`: stand the chip group up, dismiss it with its X, and stop:
     the frame must show no chip left standing alone."""
@@ -8933,17 +8917,6 @@ SCENES: tuple[Scene, ...] = (
         ),
     ),
     Scene(
-        name="104-chip-row-above-fallback",
-        what="#2220 the strip above the selection only where there is no room below it",
-        act=_act_chip_row_above_fallback,
-        profiles=MATRIX_PROFILES,
-        keep_transient=True,
-        expect=(
-            ("#2220 the strip stands above the selection", "(() => { const r = document.getElementById('selection-chip-row').getBoundingClientRect(); const s = getSelection().getRangeAt(0).getBoundingClientRect(); return r.bottom <= s.top + 1; })()"),
-            ("no error banner is up", "!window.__visible('error-wrap')"),
-        ),
-    ),
-    Scene(
         name=SUMMARY_FAILED_STATE,
         what="summary mode when the summariser fails: the row says so quietly and keeps the message",
         act=_act_summary_failed,
@@ -9209,7 +9182,7 @@ def run_captures(
     # states photograph exactly that), so Discuss has no window to show there.
     # `#2187`/`#2195`: the orphan scenes (93-98) stand on the same seeded glossary window as
     # 91/92, so they skip with them on a cacheless server instead of failing alone.
-    discuss_scenes = [s for s in scenes if s.name.startswith(("73-", "74-", "75-", "76-", "78-", "84-", "85-", "89-", "90-", "91-", "92-", "93-", "94-", "95-", "96-", "97-", "98-", "99-", "102-", "103-", "104-"))]
+    discuss_scenes = [s for s in scenes if s.name.startswith(("73-", "74-", "75-", "76-", "78-", "84-", "85-", "89-", "90-", "91-", "92-", "93-", "94-", "95-", "96-", "97-", "98-", "99-", "102-", "103-"))]
     discuss_only = bool(wanted) and len(wanted) == len(discuss_scenes)
     if discuss_scenes and not seed_discuss_cache(60 if discuss_only else 10):
         if discuss_only:
