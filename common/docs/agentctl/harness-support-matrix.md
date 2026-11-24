@@ -86,7 +86,8 @@ Every cell names its code path. Paths are relative to this repository;
 | Goal commands | supported | supported | supported | none | partial |
 | Skill installation | supported | supported | supported | none | n/a |
 | Boxed launch (`--slot`, userns) | none | none | supported | none | n/a |
-| Masked paths (`masked_paths`, #2163) | partial | partial | supported | none | partial (Muse only) |
+| Masked paths (`masked_paths`, #2163) | none | none | supported | none | partial (Muse only) |
+| No MCP servers (`no_mcp_servers`, #2163) | supported | partial | none | none | partial (Claude only) |
 | Transient-failure recovery | supported | supported | none | none | none |
 | Stalled-goal resume | none | supported | none | none | none |
 
@@ -855,16 +856,41 @@ masked path):
 - **Muse**: supported — masked pane and headless launches run the
   runtime beside the launcher with its shell sandbox disabled, as in a
   slot box; the runtime works inside the namespace.
-- **Claude Code**: partial — `git`, `cargo`, shell children and an
+- **Claude Code**: none yet — `git`, `cargo`, shell children and an
   MCP-like child process all work inside the namespace and see the
   masked path as empty, but the Claude launcher itself dies setting
   its effective UID to root (the same failure as the boxed-launch row
   above), so a masked Claude launch fails closed until a runtime form
-  exists.
-- **Codex**: partial — same launcher failure as Claude Code.
+  exists. Claude Code is not supported under `masked_paths` yet.
+- **Codex**: none yet — same launcher failure as Claude Code. Codex
+  is not supported under `masked_paths` yet.
 - **Headless**: partial — Muse headless works (runtime form, above);
   Claude headless hits the same launcher failure.
 - **Unknown TUI**: none — no masked form is declared.
+
+### No MCP servers (`no_mcp_servers`, #2163)
+
+A launch profile may opt into starting its harness with no MCP
+servers (off by default; `no_mcp_servers` in
+`rs/agentctl/src/profiles.rs`, rendered at launch by
+`profiles::no_mcp_arguments`, never stored in profile argv, so a
+rendered Codex `-c` never trips the raw-config refusal beside
+structured model or effort):
+
+- **Claude Code**: supported — agentctl renders
+  `--strict-mcp-config --mcp-config <agentctl-owned empty config>`
+  (a `{"mcpServers":{}}` file under the registry). Proven in a
+  throwaway session: no plugin MCP servers start and no build daemon
+  appears.
+- **Codex**: partial — agentctl renders one
+  `-c mcp_servers.<name>.enabled=false` per server the user's Codex
+  config declares (a whole-table `mcp_servers={}` override does not
+  clear them). Config-proven (`codex mcp list` shows them disabled);
+  session-unproven on the reporting host, where `codex exec` fails
+  before MCP startup for an unrelated provider reason.
+- **Muse**: none — Muse has no per-launch MCP-off form, so a Muse
+  profile with the key refuses at launch.
+- **Headless**: Claude only, through the same rendering.
 
 ### Transient-failure recovery; stalled-goal resume
 

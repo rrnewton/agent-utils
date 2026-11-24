@@ -4352,6 +4352,16 @@ fn report_delivery_jams(
     rows
 }
 
+/// The systemd scope (or slice) unit naming a process's session scope:
+/// the last cgroup path component, for example `run-p123-i456.scope`.
+fn proc_scope(pid: &u64) -> Option<String> {
+    let text = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    text.lines()
+        .filter_map(|line| line.rsplit('/').next())
+        .find(|part| part.ends_with(".scope") || part.ends_with(".slice"))
+        .map(str::to_owned)
+}
+
 /// (pid, parent pid, start ticks) from `/proc/PID/stat`, parsed after
 /// the last `)` so a command name with spaces cannot shift the fields.
 fn proc_lineage(pid: &str) -> Option<(u64, u64, u64)> {
@@ -4386,8 +4396,19 @@ fn session_masked_processes(agent: &str, roots: &[u64], masked: &[String]) -> Ve
         children.entry(*ppid).or_default().push(*pid);
         started.insert(*pid, *start);
     }
+    // Session scope is the process tree PLUS the cgroup scope of each
+    // root (#2163): harness sandboxes run their servers and daemons in
+    // a systemd scope under the harness process, and a daemonised child
+    // that reparents out of the tree stays in that scope.
+    let scopes: BTreeSet<String> = roots.iter().filter_map(proc_scope).collect();
+    let mut in_scope: Vec<u64> = lineage
+        .iter()
+        .map(|(pid, _, _)| *pid)
+        .filter(|pid| proc_scope(pid).is_some_and(|scope| scopes.contains(&scope)))
+        .collect();
     let mut hits = Vec::new();
     let mut stack: Vec<u64> = roots.to_vec();
+    stack.append(&mut in_scope);
     let mut seen: BTreeSet<u64> = BTreeSet::new();
     while let Some(pid) = stack.pop() {
         if !seen.insert(pid) {

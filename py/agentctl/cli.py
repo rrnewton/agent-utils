@@ -718,6 +718,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "of agentctl implements; start the agent with the Rust agentctl rather than "
                     "launching unmasked"
                 )
+            if profile is not None and profile.no_mcp_servers:
+                raise ValueError(
+                    f"profile {profile.name!r} declares no_mcp_servers, which only the Rust edition "
+                    "of agentctl renders; start the agent with the Rust agentctl"
+                )
             if profile is not None and profile.unset_env:
                 raise ValueError(
                     f"profile {profile.name!r} declares unset_env, which only the Rust edition "

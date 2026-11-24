@@ -122,3 +122,75 @@ fn unmasked_record_reports_no_masks() {
     assert_eq!(row["effective_masked_paths"], json!([]));
     assert_eq!(row["masked_paths_source"], "none");
 }
+
+#[test]
+fn no_mcp_profile_renders_strict_mcp_for_claude() {
+    // #2163 follow-up: a Claude profile opting into no_mcp_servers
+    // launches with agentctl-rendered strict-MCP arguments naming the
+    // agentctl-owned empty config under the registry.
+    let fixture = Fixture::new();
+    assert!(std::process::Command::new("/usr/bin/git")
+        .args(["init", "-q"])
+        .arg(&fixture.root)
+        .status()
+        .unwrap()
+        .success());
+    fs::write(fixture.root.join(".gitignore"), ".agentctl/\n").unwrap();
+    let directory = fixture.root.join(".agentctl");
+    agent::create_private_directory(&directory, "test launch profiles", false, false).unwrap();
+    agent::atomic_json(
+        &directory.join("profiles.json"),
+        &json!({
+            "schema": "agentctl-profiles/v1",
+            "profiles": {"quiet": {
+                "harness": "claude",
+                "mode": "interactive",
+                "reasoning_effort": "high",
+                "argv": ["--dangerously-skip-permissions"],
+                "no_mcp_servers": true,
+            }},
+        }),
+    )
+    .unwrap();
+    let manager = fixture.manager();
+    manager
+        .start(
+            "worker",
+            &fixture.root,
+            StartOptions {
+                workspace_id: Some("workspace".to_owned()),
+                profile: Some("quiet".to_owned()),
+                harness: "claude".to_owned(),
+                no_mcp_servers: true,
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    let record = manager.load("worker").unwrap();
+    assert!(
+        record
+            .arguments
+            .iter()
+            .any(|arg| arg == "--strict-mcp-config"),
+        "{:?}",
+        record.arguments
+    );
+    assert!(
+        record
+            .arguments
+            .windows(2)
+            .any(|pair| pair[0] == "--mcp-config" && pair[1].ends_with("mcp-empty.json")),
+        "{:?}",
+        record.arguments
+    );
+}
+
+#[test]
+fn codex_mcp_server_names_come_from_config_tables() {
+    // #2163 follow-up: per-server disables need the declared names;
+    // a server's `.env` subtable is not another server.
+    let names = crate::profiles::codex_mcp_server_names(
+        "[mcp_servers.kernel-mcp]\ncommand = \"x\"\n[mcp_servers.kernel-mcp.env]\nA = \"1\"\n[mcp_servers.meta_core]\ncommand = \"y\"\n",
+    );
+    assert_eq!(names, vec!["kernel-mcp".to_owned(), "meta_core".to_owned()]);
+}

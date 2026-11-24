@@ -101868,7 +101868,7 @@ the project's outputs (ai_docs, experiments), and shared harness state writable.
 every default into the configuration's sandbox section; inspect it with `sandbox show-config`.
 
      wrkslots run slot01 -- make test
-     wrkslots run slot01 --isolation root -- HARNESS ...   # setuid helpers work inside
+     wrkslots run slot01 --isolation root -- HARNESS ...   # root-built view, no setuid gain (no_new_privs)
      wrkslots shell-command slot01 --format json            # for agent launchers
      wrkslots sandbox write-defaults                        # older projects: add missing keys
 

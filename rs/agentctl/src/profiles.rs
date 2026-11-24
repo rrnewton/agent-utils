@@ -57,6 +57,11 @@ pub(crate) struct LaunchProfile {
     /// a profile can unset a root-naming variable so plugins do not
     /// default to an off-limits path.
     pub(crate) unset_env: Vec<String>,
+    /// Start the harness with no MCP servers (#2163): agentctl renders
+    /// the per-harness form at launch (Claude strict-MCP with an
+    /// agentctl-owned empty config; Codex per-server disables). Off by
+    /// default; a profile opts in explicitly.
+    pub(crate) no_mcp_servers: bool,
 }
 
 /// The roles a launch profile may give its agents (#897 chat-latency-stamps).
@@ -191,6 +196,8 @@ pub(crate) struct PublicProfile {
     masked_paths: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     unset_env: Vec<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    no_mcp_servers: bool,
 }
 
 impl LaunchProfile {
@@ -215,6 +222,7 @@ impl LaunchProfile {
             required_env: self.required_env.clone(),
             masked_paths: self.masked_paths.clone(),
             unset_env: self.unset_env.clone(),
+            no_mcp_servers: self.no_mcp_servers,
         }
     }
 }
@@ -367,6 +375,8 @@ struct RawProfile {
     masked_paths: Option<Value>,
     #[serde(default)]
     unset_env: Option<Value>,
+    #[serde(default)]
+    no_mcp_servers: Option<bool>,
     #[serde(default)]
     muse_hooks_trust: Option<Value>,
     /// The agent's role, one of [`ROLES`], and its protocol, one of [`PROTOCOLS`]: checked here,
@@ -1256,6 +1266,7 @@ fn validate(name: String, mut raw: RawProfile) -> Result<LaunchProfile, AgentErr
         required_env,
         masked_paths,
         unset_env,
+        no_mcp_servers: raw.no_mcp_servers.unwrap_or(false),
     })
 }
 
@@ -1752,6 +1763,76 @@ fn required_names(value: Option<&Value>, label: &str) -> Result<Vec<String>, Age
         Some(_) => Err(fail(format!(
             "{label} required_env must be an array of environment variable names"
         ))),
+    }
+}
+
+/// MCP server names a Codex config declares, from its `[mcp_servers.X]`
+/// tables (the `.env` subtable of a server is not another server).
+pub(crate) fn codex_mcp_server_names(config_text: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for line in config_text.lines() {
+        let line = line.trim();
+        let Some(rest) = line
+            .strip_prefix("[mcp_servers.")
+            .and_then(|r| r.strip_suffix(']'))
+        else {
+            continue;
+        };
+        let name = rest
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .trim_matches(['"', '\'']);
+        if !name.is_empty() && !names.iter().any(|seen| seen == name) {
+            names.push(name.to_owned());
+        }
+    }
+    names.sort();
+    names
+}
+
+/// The agentctl-owned empty MCP config a strict-MCP launch names,
+/// written once under the registry (never a harness or user config).
+pub(crate) fn empty_mcp_config(registry: &Path) -> std::path::PathBuf {
+    let path = registry.join("mcp-empty.json");
+    if !path.exists() {
+        let _ = fs::write(&path, "{\"mcpServers\":{}}\n");
+    }
+    path
+}
+
+/// Arguments that start `harness` with no MCP servers (#2163), rendered
+/// by agentctl so a profile never carries raw harness config: Claude
+/// takes strict-MCP with the agentctl-owned empty config; Codex takes
+/// one `-c mcp_servers.<name>.enabled=false` per server its user config
+/// declares (a whole-table override does not clear them, and a raw `-c`
+/// in a profile would refuse beside structured model/effort, so these
+/// are appended after that validation, never stored in profile argv).
+/// Muse has no per-launch form, so it refuses (fail closed).
+pub(crate) fn no_mcp_arguments(harness: &str, registry: &Path) -> Result<Vec<String>, AgentError> {
+    match harness {
+        "claude" => Ok(vec![
+            "--strict-mcp-config".to_owned(),
+            "--mcp-config".to_owned(),
+            empty_mcp_config(registry).display().to_string(),
+        ]),
+        "codex" => {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+            let text = home
+                .as_ref()
+                .and_then(|home| fs::read_to_string(home.join(".codex/config.toml")).ok())
+                .unwrap_or_default();
+            let mut arguments = Vec::new();
+            for name in codex_mcp_server_names(&text) {
+                arguments.push("-c".to_owned());
+                arguments.push(format!("mcp_servers.{name}.enabled=false"));
+            }
+            Ok(arguments)
+        }
+        "muse" => Err(fail(
+            "no_mcp_servers has no per-launch form for harness \"muse\"; remove the key or the MCP servers for this profile",
+        )),
+        _ => Ok(Vec::new()),
     }
 }
 

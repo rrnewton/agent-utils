@@ -115,6 +115,9 @@ pub struct HeadlessStart {
     /// Per-agent masked-path override from `--masked-paths` (#2163):
     /// recorded and winning over the profile on every launch.
     pub masked_paths_override: Option<Vec<String>>,
+    /// Start with no MCP servers (#2163), from the profile's opt-in;
+    /// relaunches re-derive it from the current profile.
+    pub no_mcp_servers: bool,
 }
 
 /// Why `harness` cannot run headless, naming the support-matrix row (#1879 E).
@@ -860,6 +863,17 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             config.command = vec![launcher.display().to_string()];
         }
         config.arguments = declared_arguments(&record);
+        // No-MCP rendering (#2163): from the current profile's opt-in,
+        // re-derived at every wrapper launch like the masks above.
+        let no_mcp = self
+            .profile_for_record(&record)
+            .is_some_and(|profile| profile.no_mcp_servers);
+        if no_mcp {
+            config.arguments.extend(crate::profiles::no_mcp_arguments(
+                &record.harness,
+                &self.registry,
+            )?);
+        }
         // Masked paths (#2163): wrap the harness command so the wrapper's
         // harness, its MCP children and every restart spawn inside the
         // mask namespace with the real uid/gid. An empty list leaves the

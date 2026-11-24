@@ -161,6 +161,9 @@ class LaunchProfile:
     masked_paths: tuple[str, ...] = ()
     #: Session variables to unset (#2163); likewise refused at launch here.
     unset_env: tuple[str, ...] = ()
+    #: Start with no MCP servers (#2163); the Rust edition renders the
+    #: per-harness form, this edition refuses at launch.
+    no_mcp_servers: bool = False
 
     def public(self) -> dict[str, object]:
         """Return discovery metadata without argument or environment values."""
@@ -178,6 +181,8 @@ class LaunchProfile:
             result["masked_paths"] = list(self.masked_paths)
         if self.unset_env:
             result["unset_env"] = list(self.unset_env)
+        if self.no_mcp_servers:
+            result["no_mcp_servers"] = True
         if self.agentcloud is not None:
             result["agentcloud"] = dict(self.agentcloud)
             result["requires_edition"] = "rust"
@@ -696,9 +701,12 @@ def _profile(name: str, raw: object) -> LaunchProfile:
     # empty by rule, and this edition runs no headless Claude.
     if mode == "interactive":
         require_permission_bypass(f'profile "{name}"', harness, argv)
+    no_mcp = raw.get("no_mcp_servers")
+    if no_mcp is not None and not isinstance(no_mcp, bool):
+        raise AgentDeliveryError(f"profile {name!r} no_mcp_servers must be true or false")
     return LaunchProfile(
         name, harness, mode, model, effort, argv, tuple(environment), agentcloud,
-        required, hooks_trust, tuple(masked or ()), tuple(unset or ()),
+        required, hooks_trust, tuple(masked or ()), tuple(unset or ()), bool(no_mcp),
     )
 
 
@@ -894,6 +902,7 @@ _KNOWN_TOP_LEVEL_KEYS = frozenset({"schema", "profiles", "workspace", "wrkslots"
 _PROFILE_FIELDS = frozenset({
     "harness", "mode", "model", "reasoning_effort", "argv", "env", "agentcloud", "record_edges",
     "role", "protocol", "required_env", "muse_hooks_trust", "masked_paths", "unset_env",
+    "no_mcp_servers",
 })
 _ROLES = ("coordinator", "liaison", "coordinator-hands", "worker")
 _PROTOCOLS = ("self-tooling", "hands-delegating")

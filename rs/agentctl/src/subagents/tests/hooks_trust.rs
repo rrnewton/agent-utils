@@ -248,3 +248,26 @@ fn an_adopted_foreign_muse_at_the_dialog_is_never_answered() {
         Some(DIALOG)
     );
 }
+
+#[test]
+fn a_relaunch_launch_skips_pretrust() {
+    // #2163 follow-up: a relaunch (skip_pretrust, as revive/restore set)
+    // never runs a muse binary as agentctl's own child before the pane
+    // exists, even under an explicit trust policy.
+    let fixture = Fixture::new();
+    write_trust_config(&fixture);
+    let manager = fixture.manager();
+    manager
+        .start(
+            "coord",
+            &fixture.root,
+            StartOptions {
+                workspace_id: Some("workspace".to_owned()),
+                harness: "muse".to_owned(),
+                skip_pretrust: true,
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    assert!(fixture.client.pretrust_calls.lock().unwrap().is_empty());
+}

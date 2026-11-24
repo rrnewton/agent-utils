@@ -5480,6 +5480,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 profile_write_sandbox,
                 profile_slot_isolation,
                 profile_masked_paths,
+                profile_no_mcp_servers,
             ) = if let Some(profile_name) = value.profile.as_deref() {
                 let mut overlaps = Vec::new();
                 if value.harness.is_some() {
@@ -5529,6 +5530,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     profile.write_sandbox,
                     profile.slot_isolation.clone(),
                     profile.masked_paths.clone(),
+                    profile.no_mcp_servers,
                 )
             } else {
                 let harness = value.harness.unwrap_or_else(|| "codex".to_owned());
@@ -5576,6 +5578,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     false,
                     None,
                     Vec::new(),
+                    false,
                 )
             };
             // #1216 (owner reply 321): effort is always declared by the agentctl layer,
@@ -5643,6 +5646,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                         profile: value.profile.clone(),
                         masked_paths: profile_masked_paths,
                         masked_paths_override: masked_override,
+                        no_mcp_servers: profile_no_mcp_servers,
                     },
                 )?
             } else if mode != "interactive" {
@@ -5731,6 +5735,8 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     slot,
                     record_edges,
                     masked_paths_override: masked_override,
+                    no_mcp_servers: profile_no_mcp_servers,
+                    skip_pretrust: false,
                     pinned: if value.pinned {
                         Some(true)
                     } else {

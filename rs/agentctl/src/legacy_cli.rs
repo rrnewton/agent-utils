@@ -528,6 +528,8 @@ fn run_managed(args: Args) -> Result<i32, CliError> {
                 record_edges: true,
                 pinned: None,
                 masked_paths_override: None,
+                no_mcp_servers: false,
+                skip_pretrust: false,
             };
             write_json(&manager.start(name, cwd, options)?)?;
         }

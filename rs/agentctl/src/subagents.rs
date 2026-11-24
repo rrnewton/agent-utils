@@ -6850,6 +6850,15 @@ pub struct StartOptions {
     /// Per-agent masked-path override (#2163): recorded on the agent
     /// record and winning over its launch profile on every launch.
     pub masked_paths_override: Option<Vec<String>>,
+    /// Start with no MCP servers (#2163): agentctl renders the
+    /// per-harness arguments at launch from the profile's opt-in.
+    pub no_mcp_servers: bool,
+    /// Skip the Muse hook pre-trust on this launch (#2163 follow-up):
+    /// revive, restore and restart relaunches must not run a harness
+    /// binary as agentctl's own child before the pane exists (it starts
+    /// the harness's MCP/build chain in the caller's cgroup). The
+    /// in-pane dialog answer (#1932) remains the fallback.
+    pub skip_pretrust: bool,
 }
 
 /// The wrkslots slot an interactive agent is boxed to (`agentctl start --slot`).
@@ -7118,6 +7127,8 @@ impl Default for StartOptions {
             record_edges: true,
             pinned: None,
             masked_paths_override: None,
+            no_mcp_servers: false,
+            skip_pretrust: false,
         }
     }
 }
@@ -11388,6 +11399,15 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let mut structured_arguments =
             crate::profiles::reasoning_arguments(&options.harness, reasoning_effort)?;
         structured_arguments.extend_from_slice(&options.harness_args);
+        // No-MCP rendering (#2163): agentctl-owned arguments, appended
+        // after profile validation so a rendered Codex `-c` never trips
+        // the raw-config refusal beside structured model/effort.
+        if options.no_mcp_servers {
+            structured_arguments.extend(crate::profiles::no_mcp_arguments(
+                &options.harness,
+                &self.registry,
+            )?);
+        }
         // #1158: a launch that can park on an in-TUI question says so at once,
         // while someone is still watching the start.
         if let Some(warning) =
@@ -12545,11 +12565,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             None
         };
         if let Some((decision, source)) = &hooks_policy {
-            if decision.as_str() == "trust" {
+            if decision.as_str() == "trust" && !options.skip_pretrust {
                 // Pre-trust our plugin hooks through Muse's supported
                 // approve verb so the dialog never appears (#1972). Only
                 // under an explicit trust policy; failure never blocks
                 // the launch, and #1932's dialog answer is the fallback.
+                // Relaunches skip it (#2163): see StartOptions::skip_pretrust.
                 self.run_hook_pretrust(
                     &record.name,
                     source,
@@ -14794,38 +14815,12 @@ its drain would also type, so it was not queued",
             .as_ref()
             .map(|(_, source)| source.clone())
             .unwrap_or_default();
-        if let Some((decision, source)) = &hooks_policy {
-            if decision.as_str() == "trust" {
-                // Same-pane relaunch pre-trust (#1972), as at start.
-                // The pane reuses its shell, so Muse comes back with
-                // the tab's environment: the profile's relaunch
-                // environment, as revive reconstructs it (best effort;
-                // pre-trust never blocks the restart).
-                let entries = record
-                    .profile
-                    .as_deref()
-                    .and_then(|profile_name| {
-                        let root = crate::profiles::configuration_root(
-                            Path::new(&record.cwd),
-                            &self.registry,
-                            false,
-                        )
-                        .ok()?;
-                        let (_, profiles) = crate::profiles::load_profiles(&root, false).ok()?;
-                        profiles
-                            .get(profile_name)
-                            .map(|profile| Self::relaunch_environment(&record, profile))
-                    })
-                    .unwrap_or_default();
-                self.run_hook_pretrust(
-                    agent_name,
-                    source,
-                    &entries,
-                    launch_env.as_ref(),
-                    Path::new(&record.cwd),
-                );
-            }
-        }
+        // No pre-trust on a relaunch (#2163 follow-up): it runs a muse
+        // binary as agentctl's own child before the pane harness exists,
+        // starting the harness's MCP/build chain in the caller's cgroup
+        // (a boot restore did exactly this). The in-pane dialog answer
+        // below (#1932) handles the hooks dialog instead. Fresh starts
+        // still pre-trust (see `launch`).
         let mut hooks_answered = {
             let name = agent_name.to_owned();
             let source = hooks_source.clone();

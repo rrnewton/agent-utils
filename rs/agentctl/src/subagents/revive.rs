@@ -2389,6 +2389,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 Some(native.value.clone())
             },
             startup_timeout,
+            skip_pretrust: true,
             ..StartOptions::default()
         };
         options.reuse_pane = reuse_pane;
@@ -2454,6 +2455,22 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         )?;
         let mut structured = effort;
         structured.extend(options.harness_args.iter().cloned());
+        // No-MCP rendering (#2163): re-derived from the current profile
+        // on a policy relaunch (a spec relaunch already replays the
+        // rendered arguments from the record).
+        if let Some(profile_name) = record.profile.as_deref() {
+            let root = crate::profiles::configuration_root(&cwd, &self.registry, false)?;
+            let (_, profiles) = crate::profiles::load_profiles(&root, false)?;
+            if profiles
+                .get(profile_name)
+                .is_some_and(|profile| profile.no_mcp_servers)
+            {
+                structured.extend(crate::profiles::no_mcp_arguments(
+                    &record.harness,
+                    &self.registry,
+                )?);
+            }
+        }
         let declared_model = record.declared_model();
         let arguments = match &fresh {
             Some((session, _)) => fresh_selector(
@@ -2525,6 +2542,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             model: record.model.clone(),
             resume: Some(native.value.clone()),
             startup_timeout,
+            skip_pretrust: true,
             ..StartOptions::default()
         };
         options.reuse_pane = reuse_pane;
