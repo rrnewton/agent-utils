@@ -5142,28 +5142,37 @@ def _act_glossary_button(driver: Driver) -> None:
         "&& !window.__visible('channel-loading')",
         timeout=15_000,
     )
-    rect = driver.js(
-        "(() => { const rows = [...document.querySelectorAll('#discord-log > li')]; "
-        "for (const row of rows) { "
-        "const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT); "
-        "for (let n = walker.nextNode(); n; n = walker.nextNode()) { "
+    def candidate_rects() -> list:
         # `#2202 vibe-talk-screenshots-glossary-button-scene-order`. Skip text scene 91 already
         # learned into a glossary link (linked text cannot be selected for quoting); where the
-        # term itself is linked, fall back to any plain run of words in the row.
-        "if (n.parentElement && n.parentElement.closest('.glossary-term, a, button, code')) continue; "
-        "let at = n.textContent.indexOf('flaky ordering test'); let len = 'flaky ordering test'.length; "
-        "if (at < 0) { const m = n.textContent.match(/[A-Za-z][A-Za-z-]+ [A-Za-z][A-Za-z-]+ [A-Za-z][A-Za-z-]+/); "
-        "if (!m) continue; at = m.index; len = m[0].length; } "
-        "const range = document.createRange(); "
-        "range.setStart(n, at); range.setEnd(n, at + len); "
-        "if (n.parentElement) n.parentElement.scrollIntoView({block: 'center'}); "
-        "const r = range.getBoundingClientRect(); "
-        "return {x: r.left, y: r.top, width: r.width, height: r.height}; } } "
-        "return null; })()"
-    )
-    assert isinstance(rect, dict), "no selectable term text on screen"
-    # `#2202`. Drag until the chip stands: linking the first selection triggers can clear it.
-    for _attempt in range(3):
+        # term itself is linked, fall back to plain runs of words in later rows. Re-read on every
+        # attempt: linking a first selection triggers can replace the nodes it stood on.
+        found = driver.js(
+            "(() => { const out = []; const rows = [...document.querySelectorAll('#discord-log > li')]; "
+            "for (const row of rows) { "
+            "const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT); "
+            "for (let n = walker.nextNode(); n; n = walker.nextNode()) { "
+            "if (n.parentElement && n.parentElement.closest('.glossary-term, a, button, code')) continue; "
+            "let at = n.textContent.indexOf('flaky ordering test'); let len = 'flaky ordering test'.length; "
+            "if (at < 0) { const m = n.textContent.match(/[A-Za-z][A-Za-z-]+ [A-Za-z][A-Za-z-]+ [A-Za-z][A-Za-z-]+/); "
+            "if (!m) continue; at = m.index; len = m[0].length; } "
+            "const range = document.createRange(); "
+            "range.setStart(n, at); range.setEnd(n, at + len); "
+            "if (n.parentElement) n.parentElement.scrollIntoView({block: 'center'}); "
+            "const r = range.getBoundingClientRect(); "
+            "out.push({x: r.left, y: r.top, width: r.width, height: r.height}); "
+            "if (out.length >= 4) return out; "
+            "break; } } "
+            "return out; })()"
+        )
+        return found if isinstance(found, list) else []
+
+    # Drag until the chip stands: linking the first selection triggers can clear it.
+    stood = False
+    for _attempt in range(4):
+        rects = candidate_rects()
+        assert rects, "no selectable term text on screen"
+        rect = rects[min(_attempt, len(rects) - 1)]
         driver.page.mouse.move(float(rect["x"]) + 1, float(rect["y"]) + float(rect["height"]) / 2)
         driver.page.mouse.down()
         driver.page.mouse.move(
@@ -5177,11 +5186,11 @@ def _act_glossary_button(driver: Driver) -> None:
                 "() => window.__visible('selection-chip-wtf') && window.__visible('selection-chip')",
                 timeout=1_500,
             )
+            stood = True
             break
         except Exception:
             continue
-    else:
-        raise AssertionError("the WTF? chip never stood under the selection")
+    assert stood, "the WTF? chip never stood under the selection"
     # Both buttons place themselves over a frame or two; wait until WTF?
     # stands left of the chip before the shutter, not just visible.
     driver.page.wait_for_function(
@@ -9105,7 +9114,9 @@ def run_captures(
     # empty pane there is the failure the matrix exists to catch. A wider walk skips those
     # states BY NAME instead — its server is deliberately cacheless (the Settings and Help
     # states photograph exactly that), so Discuss has no window to show there.
-    discuss_scenes = [s for s in scenes if s.name.startswith(("73-", "74-", "75-", "76-", "78-", "84-", "85-", "89-", "90-", "91-", "92-", "99-"))]
+    # `#2187`/`#2195`: the orphan scenes (93-98) stand on the same seeded glossary window as
+    # 91/92, so they skip with them on a cacheless server instead of failing alone.
+    discuss_scenes = [s for s in scenes if s.name.startswith(("73-", "74-", "75-", "76-", "78-", "84-", "85-", "89-", "90-", "91-", "92-", "93-", "94-", "95-", "96-", "97-", "98-", "99-"))]
     discuss_only = bool(wanted) and len(wanted) == len(discuss_scenes)
     if discuss_scenes and not seed_discuss_cache(60 if discuss_only else 10):
         if discuss_only:
