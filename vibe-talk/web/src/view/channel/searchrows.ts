@@ -103,6 +103,9 @@ export interface SearchRowsDependencies {
   setSearched(count: SearchCount): void;
   searchWalkHeld(): boolean;
   preservingScroll(fn: () => void): void;
+  /** `#2200`: bring a row into view through the scroll owner (`#1251`), so an
+   * opened run's first row lands fully below the chip panel. Optional for doubles. */
+  intoView?(element: Element, block: string): void;
   applyReadRuns(): void;
   threading(): boolean;
   heldMessages(): Message[];
@@ -987,9 +990,17 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
       const focused = document.activeElement === lineEl && lineEl.matches(":focus-visible");
       const first = lineEl.gapUnpack ? deps.openUnpackGap(row as unknown as Element, below)
         : lineEl.gapCards ? deps.openCardGap(row as unknown as Element, below) : openSearchGap(row as unknown as Element, below);
-      if (focused && first) {
-        first.setAttribute("tabindex", "-1");
-        first.focus({ preventScroll: true });
+      if (first) {
+        // `#2200` seam landing: what was just opened stands fully in view —
+        // through the scroll owner, whose scroll-margin stops it below the
+        // floating chip panel, never under it with only its last line
+        // showing. (Before: the row was only refocused, preventScroll, so
+        // an opened run's first row could sit under the panel.)
+        if (deps.intoView) deps.intoView(first, "start");
+        if (focused) {
+          first.setAttribute("tabindex", "-1");
+          first.focus({ preventScroll: true });
+        }
       }
     }) as never,
   });

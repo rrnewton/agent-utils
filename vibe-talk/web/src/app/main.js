@@ -3023,6 +3023,7 @@ const searchRows = createSearchRows({
   setSearched: (count) => { columnWork.active().searched = count; },
   searchWalkHeld: () => Boolean(columnWork.active().searchWalk),
   preservingScroll,
+  intoView: (element, block) => scrollKeeping.intoView(element, block),
   applyReadRuns: () => applyReadRuns(),
   threading: () => providerFacts.threading(),
   heldMessages: () => channelStore.current().messages,

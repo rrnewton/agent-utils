@@ -393,6 +393,13 @@ def walk_through(walk: Walk) -> None:
     # 2. A real press on the middle line shows its run where it stands; the count is unmoved.
     walk.press("#discord-log > li[data-id='209'] > button.row-seam:not(.row-seam-below)")
     walk.until_shown(["201", "204", "205", "206", "207", "208", "209", "214"], "the opened run did not show its messages")
+    # `#2200` seam landing: the first opened row stands fully below the
+    # chip panel, never under it with only its last line showing.
+    walk.check(page.evaluate("""() => {
+      const panel = document.getElementById('search-bucket-row').getBoundingClientRect();
+      const first = document.querySelector('#discord-log > li[data-id="205"]');
+      return Boolean(first) && first.getBoundingClientRect().top >= panel.bottom - 1;
+    }"""), "the first opened row sits under the chip panel")
     walk.check(walk.shown() == ["201", "204", "205", "206", "207", "208", "209", "214"],
                f"the opened run shows {walk.shown()}")
     walk.check(page.evaluate("() => document.getElementById('search-count').textContent") == "4 of 16 loaded",
@@ -405,6 +412,12 @@ def walk_through(walk: Walk) -> None:
     walk.notes.append("lantern 4 of 16, the run above 209 opened by its line")
 
     # 3. Into the lantern thread under the search: the bar stays, and the thread is searched.
+    # The opened run landed at the head (`#2200`), leaving the root's badge
+    # in the floating bar's band at the viewport's very top, where a tap
+    # would land on the bar: scroll the row into view first, as a reader
+    # does (Playwright's own needed-check cannot see the occlusion).
+    page.evaluate("() => document.querySelector('#discord-log > li[data-id=\"201\"]').scrollIntoView({block: 'start'})")
+    walk.settled()
     walk.press("#discord-log > li[data-id='201'] .thread-badge")
     walk.until("() => !document.getElementById('thread-heading').hidden", "the thread did not open")
     walk.check(not page.evaluate("() => document.getElementById('search-field').hidden"),
