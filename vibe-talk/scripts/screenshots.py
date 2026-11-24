@@ -5229,9 +5229,9 @@ def _act_chip_row_below(driver: Driver) -> None:
     _act_glossary_button(driver)
     driver.js(
         "(() => { const sel = getSelection(); "
-        "let n = sel.getRangeAt(0).startContainer; "
-        "while (n && !(n.nodeType === 1 && n.tagName === 'LI')) n = n.parentNode; "
-        "if (n) n.scrollIntoView({block: 'start'}); })()"
+        "const area = document.getElementById('scroll-area'); "
+        "const r = sel.getRangeAt(0).getBoundingClientRect(); "
+        "area.scrollBy(0, r.top - area.getBoundingClientRect().top - 4); })()"
     )
     driver.page.wait_for_function(
         "() => { const r = document.getElementById('selection-chip-row').getBoundingClientRect(); "
