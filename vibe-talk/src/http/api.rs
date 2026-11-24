@@ -3277,22 +3277,58 @@ fn glossary_score(message: &Message, words: &[String], phrases: &[String]) -> i3
     score
 }
 
-/// Link-target tokens in `text`: letter+digit tokens worth joining on.
+/// Link-target keys in `text` (`#2189`): only real link targets — URLs and
+/// diff/task-style ids as linked in the text. Author handles, dates and
+/// other letter+digit words are not links and never become keys.
 fn glossary_link_tokens(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for raw in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_')) {
-        let token = raw.trim_matches('-');
-        if token.len() >= 4
-            && token.chars().any(|c| c.is_ascii_digit())
-            && token.chars().any(|c| c.is_ascii_alphabetic())
-            && !out.iter().any(|held| held.eq_ignore_ascii_case(token))
-        {
+    for raw in text
+        .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '<' | '>' | ','))
+    {
+        let token = raw.trim_matches(|c| matches!(c, '.' | ';' | ':' | '!' | '?'));
+        let is_url = token.starts_with("http://") || token.starts_with("https://");
+        let is_id = {
+            let upper: String = token
+                .chars()
+                .take_while(|c| c.is_ascii_alphabetic() || *c == '-')
+                .collect();
+            let digits = token.chars().filter(|c| c.is_ascii_digit()).count();
+            token.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                && upper.chars().all(|c| c.is_ascii_uppercase() || c == '-')
+                && digits >= 3
+                && token.len() >= 5
+                && token
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '/')
+        };
+        if (is_url || is_id) && !out.iter().any(|held: &String| held == token) {
             out.push(token.to_owned());
         }
         if out.len() >= 5 {
             break;
         }
     }
+    out
+}
+
+/// The selection's human-readable search forms for the not-found sentence:
+/// the spaced full form, its longest shorter window, and its first word.
+fn glossary_human_queries(selected: &str) -> Vec<String> {
+    let spaced = selected.replace('-', " ");
+    let words: Vec<&str> = spaced.split_whitespace().collect();
+    let mut out: Vec<String> = Vec::new();
+    let full = words.join(" ");
+    if !full.is_empty() {
+        out.push(full);
+    }
+    if words.len() > 2 {
+        out.push(words[..words.len() - 1].join(" "));
+    }
+    if words.len() > 1 {
+        out.push(words[0].to_owned());
+    }
+    out.dedup();
+    out.truncate(3);
     out
 }
 
@@ -3378,7 +3414,7 @@ async fn glossary_retrieval(
     };
     // Thread-first: resolve the selected message from the cache alone.
     let mut thread_hits: Vec<Message> = Vec::new();
-    let mut thread_note = "no thread".to_owned();
+    let mut thread_searched = false;
     let selected_message = match message_id {
         Some(id) if !id.is_empty() => {
             state
@@ -3400,7 +3436,7 @@ async fn glossary_retrieval(
             )
             .await
             {
-                thread_note = format!("its thread ({} held)", fetched.messages.len());
+                thread_searched = true;
                 let mut scored: Vec<(i32, Message)> = fetched
                     .messages
                     .into_iter()
@@ -3464,20 +3500,29 @@ async fn glossary_retrieval(
         }
         hits.push(hit);
     }
-    let keywords = glossary_queries(selected)
-        .into_iter()
-        .take(3)
-        .collect::<Vec<_>>()
-        .join(", ");
-    let links = if tokens.is_empty() {
-        "no link targets".to_owned()
-    } else {
-        tokens.join(", ")
+    let quoted: Vec<String> = glossary_human_queries(selected)
+        .iter()
+        .map(|q| format!("\"{q}\""))
+        .collect();
+    let searched_for = match quoted.len() {
+        0 => String::new(),
+        1 => quoted[0].clone(),
+        _ => format!(
+            "{} and {}",
+            quoted[..quoted.len() - 1].join(", "),
+            quoted[quoted.len() - 1]
+        ),
+    };
+    let tail = match (thread_searched, tokens.is_empty()) {
+        (false, true) => "this message has no thread or links to follow".to_owned(),
+        (true, true) => "I also searched its thread".to_owned(),
+        (false, false) => "I also followed the links in this message".to_owned(),
+        (true, false) => "I also searched its thread and followed its links".to_owned(),
     };
     GlossaryRetrieval {
         hits,
         reason: format!(
-            "no definition found; searched {thread_note}, keywords ({keywords}), links ({links}) in cached messages and fetched documents"
+            "I searched recent messages and fetched documents for {searched_for}; {tail}."
         ),
     }
 }

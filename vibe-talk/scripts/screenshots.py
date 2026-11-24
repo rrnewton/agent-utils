@@ -5345,7 +5345,7 @@ def _act_glossary_not_found(driver: Driver) -> None:
     driver.page.wait_for_function(
         "() => window.__visible('glossary-popover') "
         "&& document.getElementById('glossary-popover-body').textContent.includes('Couldn') "
-        "&& document.getElementById('glossary-popover-body').textContent.includes('Searched')",
+        "&& document.getElementById('glossary-popover-body').textContent.includes('searched recent messages')",
         timeout=30_000,
     )
     driver.settle(300)
@@ -8681,7 +8681,7 @@ SCENES: tuple[Scene, ...] = (
         keep_transient=True,
         expect=(
             ("the popover says the term was not found", "window.__visible('glossary-popover') && document.getElementById('glossary-popover-body').textContent.includes('Couldn')"),
-            ("the popover names what was searched", "document.getElementById('glossary-popover-body').textContent.includes('Searched')"),
+            ("the popover names what was searched", "document.getElementById('glossary-popover-body').textContent.includes('searched recent messages')"),
             ("no error banner is up", "!window.__visible('error-wrap')"),
         ),
     ),

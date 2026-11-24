@@ -467,3 +467,34 @@ async fn a_learned_entry_stays_out_of_the_discuss_warmup() {
         );
     }
 }
+
+#[tokio::test]
+async fn link_keys_are_real_targets_only_and_a_miss_says_so_plainly() {
+    // Author-handle noise ("claude-integ8" from a header line) must never
+    // become a link key; a real id (TKT-101) must. The miss names the
+    // human search forms and notes there was nothing to follow.
+    let backend = backend_with(vec![message(1, "TKT-101 is the tracking ticket for the rollout")]);
+    let (state, summarizer, _dir) = cached_state(backend.clone(), true).await;
+    fill(&state).await;
+    summarizer.answer_with("{\"term\": null}");
+    let app = vibe_talk::http::router(state);
+    let (status, body) = post(
+        &app,
+        &lookup_path(),
+        Some(WRITE_TOKEN),
+        &json!({"selected": "Zanzibar Protocol", "context": "claude-integ8 posted about TKT-101 and the Zanzibar Protocol"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], json!("not_found"), "{body}");
+    let reason = body["reason"].as_str().expect("reason");
+    assert!(reason.contains("\"Zanzibar Protocol\""), "{reason}");
+    assert!(!reason.contains("claude-integ8"), "{reason}");
+    assert!(!reason.contains("Zanzibarprotocol"), "{reason}");
+    assert!(reason.contains("followed the links"), "{reason}");
+    assert!(!reason.contains("keywords ("), "{reason}");
+    // The TKT-101 key was actually searched: its message reached the model.
+    let calls = summarizer.prompt_calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert!(calls[0].1.contains("tracking ticket"), "{}", calls[0].1);
+}
