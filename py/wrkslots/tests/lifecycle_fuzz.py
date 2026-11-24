@@ -691,6 +691,29 @@ def _run_ops_file(ops_path: Path, root: Path) -> None:
     print(f"worker done seed={spec['seed']}")
 
 
+def _wait_no_holders(root: Path, *, timeout: float = 300.0) -> None:
+    """Condition wait: no live process cwd under ``root``.
+
+    A joined worker's mock command tree can drain for a few
+    seconds after the worker exits; unmounting into that window
+    refuses on the census. Poll the condition, never a duration.
+    """
+    prefix = str(root) + "/"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        holders = []
+        for cwd in Path("/proc").glob("[0-9]*/cwd"):
+            try:
+                target = os.readlink(cwd)
+            except OSError:
+                continue
+            if target == str(root) or target.startswith(prefix):
+                holders.append(cwd.parent.name)
+        if not holders:
+            return
+        time.sleep(1)
+
+
 def _run_concurrent(seed: int, base: Path) -> None:
     """Two processes, disjoint slots, one shared registry."""
     trace = e2e.Trace(base / "trace.jsonl", seed=seed)
@@ -721,6 +744,7 @@ def _run_concurrent(seed: int, base: Path) -> None:
             failures.append(f"worker pid={child.pid} rc={child.returncode}: {err[-400:]}")
     if failures:
         raise FuzzFailure(" | ".join(failures))
+    _wait_no_holders(project.root)
     healed = _wait_chain_loads(project)
     problems = _oracle(healed, step=f"seed={seed} concurrent final")
     e2e._cli(project, "recover", "--coordinator-pid", str(os.getpid()),
