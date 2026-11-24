@@ -439,8 +439,9 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
     const height = Number(rowSize.height) || 0;
     const viewWidth = (document.documentElement && document.documentElement.clientWidth) || 0;
     const visual0 = window.visualViewport;
-    // The visible height is the visual viewport's: an on-screen keyboard shrinks it, not innerHeight.
-    const viewHeight = (visual0 ? Number(visual0.height) : 0) || window.innerHeight || 0;
+    // The visible height is the smaller viewport: a short window shrinks innerHeight, an on-screen
+    // keyboard shrinks only the visual viewport.
+    const viewHeight = Math.min(window.innerHeight || 0, (visual0 ? Number(visual0.height) : 0) || window.innerHeight || 0);
     const viewLeft = visual0 ? Number(visual0.offsetLeft) || 0 : 0;
     const centre = (box.left + box.right) / 2;
     const left = Math.max(viewLeft + SELECTION_CHIP_EDGE_PX,
