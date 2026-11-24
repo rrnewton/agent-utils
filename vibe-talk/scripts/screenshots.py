@@ -5248,8 +5248,7 @@ def _act_chip_row_above_fallback(driver: Driver) -> None:
     room under the words and stands above the selection."""
     _act_glossary_button(driver)
     shrink_keyboard(driver, "104-chip-row-above-fallback")
-    driver.js("document.getElementById('scroll-area').scrollBy(0, -220)")
-    driver.settle(600)
+    driver.js("(() => { const a = document.getElementById('scroll-area'); a.style.scrollBehavior = 'auto'; a.scrollTop -= 320; })()")
     driver.page.wait_for_function(
         "() => { const r = document.getElementById('selection-chip-row').getBoundingClientRect(); "
         "const s = getSelection().getRangeAt(0).getBoundingClientRect(); "
