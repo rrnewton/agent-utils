@@ -3,7 +3,8 @@
 // both handed in, so the pre-paint script in the shell and this module cannot drift on the
 // choice itself — only on the one line each uses to ask the system.
 
-import type { Appearance } from "./device.ts";
+/** The Appearance choice (`#1845 vibe-talk-appearance-setting`): follow the system, or force light or dark. */
+export type Appearance = "light" | "dark" | "system";
 
 /** The theme actually painted: the choice, or the system's where the choice is System. */
 export type EffectiveTheme = "light" | "dark";

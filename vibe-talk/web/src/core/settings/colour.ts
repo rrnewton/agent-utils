@@ -7,7 +7,10 @@
 // scheme does. `#2154 vibe-talk-dark-true-black-cards`: dark `--mine` is true black in
 // every preset, so a preset tints the owner's edge and accent, never the card fill.
 
-import type { ColourTheme } from "./device.ts";
+/** The Colour theme preset (`#1961 vibe-talk-colour-themes`): which family paints the accent
+ * colours. `blue` is the look the page has always had; `blue-hc` is blue with dark ink on the
+ * dark scheme's accent, the AA repair the default keeps as a documented exception. */
+export type ColourTheme = "blue" | "blue-hc" | "teal" | "plum" | "amber";
 import type { EffectiveTheme } from "./appearance.ts";
 
 /** What a kept value means: a known preset as kept, anything else (or nothing) the default blue. */

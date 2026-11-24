@@ -10,7 +10,7 @@
 import { COLOUR_PRESETS } from "./colour.ts";
 import { THEME_TOKENS } from "./appearance.ts";
 import type { EffectiveTheme } from "./appearance.ts";
-import type { ColourTheme } from "./device.ts";
+import type { ColourTheme } from "./colour.ts";
 
 /** Which Default the Dark side paints where its mode is Default. */
 export type DarkStyle = "standard" | "extra";
@@ -34,23 +34,23 @@ export const DEFAULT_THEME_CONFIG: ThemeConfig = Object.freeze({
  * paintable token exactly once. Syntax (`--hl-*`) is deliberately not among them. */
 export const THEME_GROUPS: readonly {
   readonly id: string;
-  readonly label: string;
+  readonly title: string;
   readonly tokens: readonly string[];
 }[] = Object.freeze([
-  { id: "background", label: "Page background", tokens: ["--bg"] },
-  { id: "cards", label: "Message cards", tokens: ["--panel", "--theirs"] },
-  { id: "mine", label: "Your messages", tokens: ["--mine", "--mine-edge", "--muted-on-mine", "--warn-on-mine"] },
-  { id: "third", label: "Others' messages", tokens: ["--third", "--third-edge"] },
-  { id: "dock", label: "Bars and dock", tokens: ["--dock", "--scrim-bg", "--shadow"] },
-  { id: "edge", label: "Borders and dividers", tokens: ["--edge"] },
-  { id: "ink", label: "Text", tokens: ["--ink"] },
-  { id: "muted", label: "Quiet text", tokens: ["--muted", "--read-ring", "--thread-grey", "--idle", "--grey-wash"] },
-  { id: "accent", label: "Accent", tokens: ["--accent", "--on-accent", "--accent-bright", "--thread-sat", "--thread-light"] },
-  { id: "highlight", label: "Highlight (Discuss header)", tokens: ["--discuss-head-bg", "--unread-stripe"] },
-  { id: "hover", label: "Hover and reply shade", tokens: ["--row-hover", "--reply-tint"] },
-  { id: "status", label: "Status and warnings", tokens: ["--ok", "--warn", "--paused", "--summary-fail-ink", "--tick-ink", "--tick-ok", "--tick-bad", "--discuss-ok-bg", "--danger", "--on-warn"] },
-  { id: "marks", label: "Pins and search marks", tokens: ["--pin-ink", "--pin-edge", "--pin-bg", "--hit-bg", "--hit-ink"] },
-  { id: "code", label: "Code colours", tokens: ["--hl-comment", "--hl-string", "--hl-constant", "--hl-keyword", "--hl-type", "--hl-function", "--hl-escape", "--hl-property", "--hl-macro", "--hl-variable", "--hl-inserted", "--hl-inserted-bg", "--hl-deleted", "--hl-deleted-bg", "--data-bg", "--data-ink", "--data-muted", "--data-rule", "--debug-ink"] },
+  { id: "background", title: "Page background", tokens: ["--bg"] },
+  { id: "cards", title: "Message cards", tokens: ["--panel", "--theirs"] },
+  { id: "mine", title: "Your messages", tokens: ["--mine", "--mine-edge", "--muted-on-mine", "--warn-on-mine"] },
+  { id: "third", title: "Others' messages", tokens: ["--third", "--third-edge"] },
+  { id: "dock", title: "Bars and dock", tokens: ["--dock", "--scrim-bg", "--shadow"] },
+  { id: "edge", title: "Borders and dividers", tokens: ["--edge"] },
+  { id: "ink", title: "Text", tokens: ["--ink"] },
+  { id: "muted", title: "Quiet text", tokens: ["--muted", "--read-ring", "--thread-grey", "--idle", "--grey-wash"] },
+  { id: "accent", title: "Accent", tokens: ["--accent", "--on-accent", "--accent-bright", "--thread-sat", "--thread-light"] },
+  { id: "highlight", title: "Highlight (Discuss header)", tokens: ["--discuss-head-bg", "--unread-stripe"] },
+  { id: "hover", title: "Hover and reply shade", tokens: ["--row-hover", "--reply-tint"] },
+  { id: "status", title: "Status and warnings", tokens: ["--ok", "--warn", "--paused", "--summary-fail-ink", "--tick-ink", "--tick-ok", "--tick-bad", "--discuss-ok-bg", "--danger", "--on-warn"] },
+  { id: "marks", title: "Pins and search marks", tokens: ["--pin-ink", "--pin-edge", "--pin-bg", "--hit-bg", "--hit-ink"] },
+  { id: "code", title: "Code colours", tokens: ["--hl-comment", "--hl-string", "--hl-constant", "--hl-keyword", "--hl-type", "--hl-function", "--hl-escape", "--hl-property", "--hl-macro", "--hl-variable", "--hl-inserted", "--hl-inserted-bg", "--hl-deleted", "--hl-deleted-bg", "--data-bg", "--data-ink", "--data-muted", "--data-rule", "--debug-ink"] },
 ]);
 
 /** Plain words for each token in the editor (`#2155` liaison review): the reader sees

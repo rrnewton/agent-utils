@@ -3,7 +3,7 @@
 // document element, the `color-scheme`, the PWA `theme-color`, and the select saying the choice.
 
 import { COLOUR_PRESETS, DEFAULT_THEME_CONFIG, THEME_GROUPS, THEME_TOKEN_NAMES, TOKEN_LABELS, THEME_TOKENS, colourThemeOf, defaultTokensFor, effectiveTheme, themeColorFor, tokensForConfig } from "../../core/settings/index.ts";
-import type { Appearance, ColourTheme, DarkStyle, EffectiveTheme, ThemeConfig } from "../../core/settings/index.ts";
+import type { Appearance, ColourTheme, EffectiveTheme, ThemeConfig } from "../../core/settings/index.ts";
 import { createListening } from "../dom/index.ts";
 
 export interface AppearanceDependencies {
@@ -213,7 +213,7 @@ export function mountAppearance(deps: AppearanceDependencies): AppearanceControl
         const box = document.createElement("fieldset");
         box.className = "theme-group";
         const legend = document.createElement("legend");
-        legend.textContent = group.label;
+        legend.textContent = group.title;
         box.appendChild(legend);
         for (const name of group.tokens) {
           const row = document.createElement("label");
@@ -224,7 +224,7 @@ export function mountAppearance(deps: AppearanceDependencies): AppearanceControl
           const value = effective[name] ?? "";
           const input = document.createElement("input");
           input.setAttribute("data-token", name);
-          input.setAttribute("aria-label", `${group.label}: ${name}`);
+          input.setAttribute("aria-label", `${group.title}: ${name}`);
           if (/^#[0-9a-f]{6}$/i.test(value)) {
             input.type = "color";
             input.value = value;
@@ -287,7 +287,7 @@ export function mountAppearance(deps: AppearanceDependencies): AppearanceControl
   if (groupsHost) listen<Event>(groupsHost, "input", (event: Event) => {
     const input = event.target as HTMLInputElement | null;
     const name = input && typeof input.getAttribute === "function" ? input.getAttribute("data-token") : undefined;
-    if (!name || configs[editScheme].mode !== "custom") return;
+    if (!input || !name || configs[editScheme].mode !== "custom") return;
     configs[editScheme] = { ...configs[editScheme], tokens: { ...configs[editScheme].tokens, [name]: input.value } };
     editorChanged(keepConfig(editScheme));
   });

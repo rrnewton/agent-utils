@@ -105,6 +105,7 @@ export interface ElementById {
   "collapsed-lines-smaller": HTMLButtonElement;
   "collapsed-lines-state": HTMLParagraphElement;
   "colour-theme": HTMLSelectElement;
+  "colour-theme-note": HTMLParagraphElement;
   "colour-theme-state": HTMLParagraphElement;
   "column-links": HTMLElement;
   "column-reply": HTMLDivElement;
@@ -732,6 +733,7 @@ export interface ElementById {
   "theme-edit-dark": HTMLButtonElement;
   "theme-edit-light": HTMLButtonElement;
   "theme-editor": HTMLDivElement;
+  "theme-explain": HTMLParagraphElement;
   "theme-groups": HTMLDivElement;
   "theme-mode": HTMLSelectElement;
   "theme-preview-slot": HTMLDivElement;

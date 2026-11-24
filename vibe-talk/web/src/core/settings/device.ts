@@ -85,13 +85,13 @@ export type ReadAudioSource = "agent" | "device" | "wit";
 /** What `e` does after marking a message Done (`#1321 after-done-setting`): stay on it, go to the next message, or go to the next unread one. */
 export type AfterDone = "stay" | "next" | "unread";
 
-/** The Appearance choice (`#1845 vibe-talk-appearance-setting`): follow the system, or force light or dark. */
-export type Appearance = "light" | "dark" | "system";
-
-/** The Colour theme preset (`#1961 vibe-talk-colour-themes`): which family paints the accent
- * colours. `blue` is the look the page has always had; `blue-hc` is blue with dark ink on the
- * dark scheme's accent, the AA repair the default keeps as a documented exception. */
-export type ColourTheme = "blue" | "blue-hc" | "teal" | "plum" | "amber";
+// The Appearance and Colour choices are defined by their own modules (`appearance.ts`,
+// `colour.ts`) so the theme tables can use them without an import cycle; re-exported here
+// because the device's settings speak them.
+export type { Appearance } from "./appearance.ts";
+export type { ColourTheme } from "./colour.ts";
+import type { Appearance } from "./appearance.ts";
+import type { ColourTheme } from "./colour.ts";
 
 /** Where a Documents React posts (`#2006 vibe-talk-documents-react`): the thread of the most
  * recent mention ("mention", the default), or one top-level discussion thread in that

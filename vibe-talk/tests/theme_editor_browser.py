@@ -17,6 +17,10 @@ import tempfile
 import threading
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from playwright.sync_api import Page
 
 import offline_cache_browser as fixture
 from offline_cache_browser import TOKEN, FakeApi, check, handler_for
@@ -24,7 +28,7 @@ import browser_waits
 
 STATE_MS = 30_000
 
-def write_build_stamp(folder) -> None:
+def write_build_stamp(folder: Path) -> None:
     def git(*argv: str) -> str:
         return subprocess.run(["git", "-C", str(Path(__file__).resolve().parent.parent.parent), *argv],
                               capture_output=True, text=True).stdout.strip() or "unknown"
@@ -42,7 +46,7 @@ def write_build_stamp(folder) -> None:
 
 
 
-def open_editor(page) -> None:
+def open_editor(page: Page) -> None:
     page.wait_for_selector("#open-settings", state="visible", timeout=STATE_MS)
     page.click("#open-settings")
     page.wait_for_selector("#theme-mode", state="attached", timeout=STATE_MS)
@@ -63,13 +67,13 @@ def open_editor(page) -> None:
     )
 
 
-def bg(page) -> str:
-    return page.evaluate(
+def bg(page: Page) -> str:
+    return str(page.evaluate(
         "() => getComputedStyle(document.documentElement).getPropertyValue('--bg').trim()"
-    )
+    ))
 
 
-def set_colour(page, token: str, value: str) -> None:
+def set_colour(page: Page, token: str, value: str) -> None:
     page.evaluate("""([token, value]) => {
       const input = document.querySelector(`#theme-groups input[data-token="${token}"]`);
       if (!input) throw new Error(`no editor input for ${token}`);
