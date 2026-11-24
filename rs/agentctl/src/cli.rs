@@ -5537,7 +5537,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                         .unwrap_or(Value::Null);
                     let owner_dead = !claim.is_null()
                         && stamp.is_none()
-                        && claim["boot_id"].as_str().is_some_and(|boot| {
+                        && claim["boot_id"].as_str().is_some_and(|_boot| {
                             let current =
                                 <crate::restore::SystemHost as crate::restore::Host>::boot_id(
                                     &crate::restore::SystemHost,
