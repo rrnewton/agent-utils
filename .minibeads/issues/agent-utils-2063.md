@@ -1,13 +1,13 @@
 ---
 title: 'vibe-talk-quote-reply-view-stability: quote-replying in two-column thread view must keep the quoted post still'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 - owner-ui
 created_at: 2026-11-21T12:26:00-05:00
-updated_at: 2026-11-21T13:30:00-05:00
+updated_at: 2026-11-24T05:00:00-05:00
 ---
 
 # Description
@@ -59,6 +59,20 @@ and that low on screen the box stands visible docked at the column's foot.
 Measured on the fixed tree: worst 0.0 px in all eight cases.
 
 # Notes
+
+## Resolution
+
+Closed 2026-11-24 after verification on the deployed tree (2dd8642a, the
+build coordb deployed): `vibe-talk.check.quote-still-browser` passes there
+in 32s, worst 0.0px across all eight frame-captured cases (two-column thread
+at 1280x800 and one-column thread at 412x915, windowed on and off, post
+mid-column and low on screen). The screenshot matrix (light and dark, phone
+and desktop, two-column thread view with the quote-reply open, box docked
+visible at the foot) was captured from the same tree and inspected: the
+quoted post stands highlighted and still, the reply box under it. The one
+neighbouring item the handoff held for the owner's answer (cap the dock
+lift at the quoted post's last line, phone low case) is separate follow-up
+work on lane mu-dockcap (#2119), not part of this issue's acceptance.
 
 Related earlier anchoring work: #1983, #2008, #2009. Filed by the coordinator so the issue link resolves on main; the owning lane refines this file as it works.
 
