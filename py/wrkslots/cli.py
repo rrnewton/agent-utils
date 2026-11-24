@@ -99723,6 +99723,9 @@ def _cmd_recover_absent_validate_rows(args: argparse.Namespace) -> int:
                         item = item_identities[wanted_slot]
                         _validate_absent_validate_row(record, item)
                         _assert_absent_validate_row_is_local(record)
+                    _assert_absent_validate_rows_not_held(
+                        config, tuple(snapshot_rows.values())
+                    )
                     _assert_absent_validate_rows_storage(
                         config, tuple(snapshot_rows.values())
                     )
@@ -99738,6 +99741,39 @@ def _cmd_recover_absent_validate_rows(args: argparse.Namespace) -> int:
                         )
                     )
                     raise
+        # Operator-class presence checks (#2088 follow-up): a partial
+        # atomic update, a validate-batch seal, or an interrupted
+        # mutation journal that is not this command's own resumable
+        # batch refuses here, before the locks, with exactly the
+        # refusal the locked path raises; each is re-checked unchanged
+        # under the locks. The command's own interrupted batch (same
+        # journal kind and input digest) falls through to the locked
+        # resume, and anything unreadable falls back to that path too.
+        if args.apply:
+            _refuse_partial_state(config)
+            try:
+                journals = _outstanding_journals(config, stream_events=True)
+            except (OSError, StateError, ValueError):
+                journals = []
+            if len(journals) > 1:
+                raise StateError(
+                    "multiple interrupted mutations require inspection"
+                )
+            if journals:
+                try:
+                    loaded_path, loaded_raw = _load_journal(config)
+                except (OSError, Refusal, StateError, ValueError):
+                    loaded_path, loaded_raw = None, None
+                if loaded_path is not None and loaded_raw is not None:
+                    if loaded_raw.get("kind") != "recover-absent-validate-rows":
+                        raise Refusal(
+                            f"another interrupted mutation is recorded in {loaded_path}; "
+                            "run wrkslots recover"
+                        )
+                    if loaded_raw.get("input_sha256") != input_sha256:
+                        raise Refusal(
+                            "absent-validation-row input differs from the interrupted batch"
+                        )
         # The privileged process census also runs before the lock (#1194):
         # processes never take this lock, so holding it during the census
         # never protected against a process starting in a row later; the
