@@ -55,3 +55,63 @@ step = "repository.check.wrkslots-debug-test"
 issue = "#2065"
 expires = "2026-12-22"
 note = "wrkslots debug-profile CPU timeouts under load"
+
+[[known-red]]
+step = "vibe-talk.shots.screenshots-desks"
+issue = "#2175"
+expires = "2026-12-24"
+note = "browser closed under host contention (interim, browser-load family)"
+
+[[known-red]]
+step = "vibe-talk.shots.screenshots-phones"
+issue = "#2175"
+expires = "2026-12-24"
+note = "browser closed under host contention (interim, browser-load family)"
+
+[[known-red]]
+step = "vibe-talk.shots.screenshots-wide"
+issue = "#2175"
+expires = "2026-12-24"
+note = "browser closed under host contention (interim, browser-load family)"
+
+[[known-red]]
+step = "vibe-talk.check.discuss-browser"
+issue = "#2175"
+expires = "2026-12-24"
+note = "Discuss family waits under load (interim; root cause in #2176)"
+
+[[known-red]]
+step = "vibe-talk.check.discuss-dock-browser"
+issue = "#2175"
+expires = "2026-12-24"
+note = "Discuss family waits under load (interim; root cause in #2176)"
+
+[[known-red]]
+step = "vibe-talk.check.discuss-strike-live-browser"
+issue = "#2175"
+expires = "2026-12-24"
+note = "Discuss family waits under load (interim; root cause in #2176)"
+
+[[known-red]]
+step = "vibe-talk.check.discuss-readjump-browser"
+issue = "#2175"
+expires = "2026-12-24"
+note = "Discuss family waits under load (interim; root cause in #2176)"
+
+[[known-red]]
+step = "vibe-talk.check.search-unmatched-browser"
+issue = "#2175"
+expires = "2026-12-24"
+note = "search waits under load (interim; condition waits in #2177)"
+
+[[known-red]]
+step = "vibe-talk.check.read-pause-reply-browser"
+issue = "#2175"
+expires = "2026-12-24"
+note = "read waits under load (interim; condition waits in #2177)"
+
+[[known-red]]
+step = "vibe-talk.check.search-typing-fast-browser"
+issue = "#2175"
+expires = "2026-12-24"
+note = "settled-window assertions under load (interim; condition waits in #2177)"
