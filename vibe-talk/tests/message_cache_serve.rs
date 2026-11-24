@@ -1459,6 +1459,91 @@ async fn a_slack_search_finds_replies_in_their_threads_and_withholds_a_thread_in
     cache.unblock(&chan, Some(&thread));
 }
 
+#[tokio::test]
+async fn a_search_partitions_main_and_threads_disjointly_and_themes_is_a_subset_of_theme() {
+    // `#2200 vibe-talk-search-tab-counts-match-cards`, through the real
+    // route: Main is top-level messages, Threads is replies only, the two
+    // are disjoint, and "themes" (substring) is a strict subset of "theme"
+    // on the server exactly as on the page.
+    let (state, fake, clock, _dir) = slack_deployment("cache-search-2200").await;
+    slack_edit(&fake, 0, "theme announcement");
+    slack_edit(&fake, 60, "unrelated words");
+    slack_edit(&fake, 120, "themes root");
+    slack_edit(&fake, 180, "themes on main");
+    slack_edit(&fake, 240, "plain answer");
+    let root = slack_fake::ts(120, 0);
+    {
+        let mut fixture = fake.state.lock().expect("the fake's state");
+        let mut message = fixture.history[SLACK_CH][2].clone();
+        let replies = [
+            (slack_fake::ts(130, 0), "a theme reply".to_owned()),
+            (slack_fake::ts(140, 0), "more themes reply".to_owned()),
+        ];
+        slack_fake::thread(&mut fixture, SLACK_CH, &mut message, &replies);
+        fixture.history.get_mut(SLACK_CH).expect("the channel")[2] = message;
+    }
+    clock.advance(SECOND);
+    // A re-read of Main, so the cache holds the edited texts, then the
+    // thread read that fills the replies.
+    ok(
+        &state,
+        &path(SLACK_CH, "/timeline?view=main&limit=50"),
+        WRITE_TOKEN,
+    )
+    .await;
+    settled(&state).await;
+    ok(
+        &state,
+        &path(
+            SLACK_CH,
+            &format!("/timeline?view=thread&thread_id={root}&limit=50"),
+        ),
+        WRITE_TOKEN,
+    )
+    .await;
+    settled(&state).await;
+    state.message_cache.set_serve(true);
+
+    let partition = |body: &Value| {
+        let mut main = Vec::new();
+        let mut threads = Vec::new();
+        for hit in body["hits"].as_array().expect("hits") {
+            let text = hit["content"].as_str().expect("content").to_owned();
+            match hit["thread"].as_object() {
+                Some(thread) if thread["is_root"] == Value::Bool(false) => threads.push(text),
+                _ => main.push(text),
+            }
+        }
+        (main, threads)
+    };
+    let theme = ok(&state, &search_path(SLACK_CH, "theme"), WRITE_TOKEN).await;
+    let (main, threads) = partition(&theme);
+    assert_eq!(main.len(), 3, "top-level theme hits (root included): {theme}");
+    assert_eq!(threads.len(), 2, "reply theme hits: {theme}");
+    let ids: Vec<&str> = theme["hits"]
+        .as_array()
+        .expect("hits")
+        .iter()
+        .map(|hit| hit["id"].as_str().expect("id"))
+        .collect();
+    let mut deduped = ids.clone();
+    deduped.sort_unstable();
+    deduped.dedup();
+    assert_eq!(ids.len(), deduped.len(), "a hit stands in both buckets: {theme}");
+    assert_eq!(ids.len(), main.len() + threads.len(), "the buckets do not sum to the total: {theme}");
+
+    let themes = ok(&state, &search_path(SLACK_CH, "themes"), WRITE_TOKEN).await;
+    let (main_s, threads_s) = partition(&themes);
+    assert_eq!(main_s.len(), 2, "top-level themes hits: {themes}");
+    assert_eq!(threads_s.len(), 1, "reply themes hits: {themes}");
+    for text in main_s.iter().chain(threads_s.iter()) {
+        assert!(
+            main.iter().chain(threads.iter()).any(|hit| hit == text),
+            "a themes hit is not a theme hit (the rules differ): {text}"
+        );
+    }
+}
+
 // --- `#611 timeline-read-failures`: the cache stands in for a provider that fails or is slow ----
 
 /// A rate limit that did not clear in its budget, as the Slack client reports one.

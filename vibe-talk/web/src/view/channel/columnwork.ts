@@ -121,6 +121,8 @@ export interface ColumnSearchCount {
   loaded: number;
   tally: unknown;
   pinned: boolean;
+  /** `#2200`: the loaded half of the search-result fold, per disjoint bucket. */
+  buckets: { main: number; threads: number; transcripts: number };
 }
 
 /** One column's own records, by field group (`#624 voice-page-modularity`, plan step 15). */

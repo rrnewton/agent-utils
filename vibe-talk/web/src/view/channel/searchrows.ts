@@ -61,6 +61,10 @@ type SearchRow = HTMLElement & {
 export interface SearchCount {
   matched: number;
   loaded: number;
+  /** `#2200 vibe-talk-search-tab-counts-match-cards`: the loaded half of the one
+   * search-result fold — matched loaded messages per disjoint bucket
+   * (Main = top-level, Threads = replies only, Transcripts = classed). */
+  buckets: { main: number; threads: number; transcripts: number };
   tally: {
     linked: number; kept: number; saidLinked: number;
     everywhere: Map<string, number>; matching: Map<string, number>;
@@ -133,6 +137,12 @@ export interface SearchRowsDependencies {
   scheduleServerSearch(): void;
   /** `#1913`: retire bucket chips earned by an older query (O(1), no fetch). Optional for doubles. */
   retireStaleBuckets?(): void;
+  /** `#2200`: whether a bucket's results stand in the timeline, or null where the
+   * bucket fold is not standing for this search (no server search in play). */
+  bucketOn?(id: string): boolean | null;
+  /** `#2200`: the one search-result fold's counts per bucket chip, or null where
+   * the fold is not standing. `total` is their sum. */
+  foldCounts?(): { counts: Map<string, number>; total: number } | null;
   placeInlineReply(): void;
   placeRowsInPlaceAgain(): void;
   replyDocked(): boolean;
@@ -456,7 +466,15 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
       if (deps.side() && id === "transcript") continue;
       const list = el(id);
       for (const row of list.children) {
-        if (row.getAttribute("data-server-hit") === "quote") continue;
+        // `#2200`: server-placed rows follow their bucket even on the fast
+        // pass, so an edited query never leaves a toggled-off bucket's rows
+        // standing while the full pass is still to come.
+        if (row.hasAttribute("data-server-hit")) {
+          const bucket = row.getAttribute("data-bucket");
+          const on = !deps.bucketOn || bucket === null ? null : deps.bucketOn(bucket);
+          if (on === false) setSearchHidden(row as SearchRow, true);
+          continue;
+        }
         const text = row.getAttribute("data-search");
         if (text === null) continue;
         let hit = true;
@@ -470,6 +488,39 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
     // `#1913`: retire the previous query's bucket chips at once (O(1)); the server ask and
     // its counts stay debounced with the full pass — no fetch, no recompute leaves this event.
     if (!deps.side() && deps.retireStaleBuckets) deps.retireStaleBuckets();
+  }
+
+  /** `#2200`: the one disjoint bucket a message counts in: Transcripts when its
+   * thread is classed, Threads for a reply only, Main for everything else
+   * (top-level and thread roots). The same rule `hitBucket` partitions the
+   * server's fresh hits by, so a message is never in two buckets. */
+  function messageBucket(message: Message): "main" | "threads" | "transcripts" {
+    const thread = (message as { thread?: { is_root?: boolean; class?: unknown } }).thread;
+    if (thread && thread.class) return "transcripts";
+    if (thread && thread.is_root === false) return "threads";
+    return "main";
+  }
+
+  /** `#2200`: whether `row`'s bucket stands in the timeline under the fold:
+   * true where the fold is not standing (older behaviour), else the bucket's
+   * own toggle. A row's bucket is its own messages' bucket: a thread root
+   * standing for its matching replies is a Main card, as it always was —
+   * the replies themselves are the Threads hits, and they have no row in
+   * Main. (`viaThread` is kept for the tally's sake, not the gate's.) */
+  function bucketPasses(row: Element, viaThread: boolean): boolean {
+    void viaThread;
+    if (!deps.bucketOn) return true;
+    const probe = deps.bucketOn("main");
+    if (probe === null) return true;
+    const messages = rowMessages(row);
+    let bucket: string = "main";
+    if (!viaThread && messages.length > 0) {
+      const buckets = new Set(messages.map((message) => messageBucket(message)));
+      bucket = buckets.size === 1 ? [...buckets][0]! : buckets.has("threads") && !buckets.has("main") ? "threads" : "main";
+    }
+    // In a thread view every loaded row is this thread's, whatever its shape.
+    if (bucket !== "transcripts" && deps.selectionView() === "thread") bucket = "thread";
+    return deps.bucketOn(bucket) === true;
   }
 
   function searchScope(): string[] {
@@ -499,6 +550,7 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
     const scope = searchScope();
     let matched = 0;
     let loaded = 0;
+    const buckets = { main: 0, threads: 0, transcripts: 0 };
     const tally = {
       linked: 0,
       kept: 0,
@@ -513,10 +565,17 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
       const list = el(id);
       const counts = scope.includes(id);
       for (const row of list.children) {
-        // `#1786 vibe-talk-search-scope-server-hits`: a quoted server hit in the
-        // timeline was judged by the server's search, not this one; the filter
-        // neither hides it nor counts it among the loaded messages.
-        if (row.getAttribute("data-server-hit") === "quote") continue;
+        // `#2200`: a server-placed row was judged by the server's search, so
+        // this pass neither re-judges nor counts it — but it is no longer
+        // exempt from the filter: it stands exactly when its bucket stands,
+        // so a stale placed row of an edited query or a toggled-off bucket
+        // never lingers in the timeline.
+        if (row.hasAttribute("data-server-hit")) {
+          const bucket = row.getAttribute("data-bucket");
+          const on = !deps.bucketOn || bucket === null ? null : deps.bucketOn(bucket);
+          setSearchHidden(row as SearchRow, on === false);
+          continue;
+        }
         const text = row.getAttribute("data-search");
         const shown = links && text !== null ? deps.showRowLinks(row) : deps.takeDownRowLinks(row);
         const said = !typed || (text !== null && (rowMatches(row, matchNode, text) ||
@@ -535,7 +594,15 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
           ? (linkThreadHits !== null && linkThreadHits.has(String(row.getAttribute("data-context-id")))) ||
             (linkThreads !== null && linkThreads.has(String(row.getAttribute("data-context-id"))))
           : id === "discord-log" && linkThreadHits !== null && rowHeadsHitThread(row, linkThreadHits);
-        const hit = said && (!links || shown > 0 || threadLinkHit) && deps.authorPasses(row, author);
+        // `#2200`: the bucket fold gates loaded rows too — a row stands only
+        // when its bucket's chip stands. A row that stands only because a
+        // reply of its thread matched is a Threads hit, not a Main one.
+        const direct = text !== null && rowMatches(row, matchNode, text);
+        const viaThread = !direct && replyHits !== null &&
+          (id === "thread-list" ? replyHits.has(String(row.getAttribute("data-context-id")))
+            : id === "discord-log" && rowHeadsHitThread(row, replyHits));
+        const matchedRow = said && (!links || shown > 0 || threadLinkHit) && deps.authorPasses(row, author);
+        const hit = matchedRow && bucketPasses(row, viaThread);
         const revealed = !hit && text !== null && (id === "thread-list"
           ? openedCards !== null && openedCards.threads.has(String(row.getAttribute("data-context-id")))
           : inOpenedGap(row, opened));
@@ -555,6 +622,18 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
             if (said) tally.matching.set(link.kind, (tally.matching.get(link.kind) || 0) + 1);
           }
           if (hit) matched += weight;
+          if (matchedRow) {
+            // `#2200`: the loaded half of the fold, per disjoint bucket,
+            // tallied BEFORE the bucket gate: an off bucket's chip still
+            // says how many it holds, and toggling it on changes only which
+            // cards stand, never the counts. Each message counts in its
+            // own bucket (a root in Main, its replies in Threads), so the
+            // breakdown is disjoint and sums to the fold's total.
+            void viaThread;
+            const messages = rowMessages(row);
+            if (messages.length > 0) for (const message of messages) buckets[messageBucket(message)] += 1;
+            else buckets.main += weight;
+          }
         }
       }
     }
@@ -571,7 +650,7 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
       if (sep.hidden === show) sep.hidden = !show;
     }
     const pinned = deps.pinsOnly() && deps.view() === "discord";
-    deps.setSearched({ matched, loaded, tally, pinned });
+    deps.setSearched({ matched, loaded, tally, pinned, buckets });
     renderSearchCount(typed, links, author !== "everyone");
     if (deps.view() === "discord") deps.renderOlderControl();
     if (!deps.side()) renderSearchInAll();
@@ -664,9 +743,13 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
     const matched = counted.reduce((sum, one) => sum + one.matched, 0);
     const loaded = counted.reduce((sum, one) => sum + one.loaded, 0);
     const filtering = typed || links || author;
+    // `#2200`: while the bucket fold stands, X is the fold's total — by
+    // construction the sum of the Main, Threads and Transcripts chips, and
+    // the number of result cards the selected buckets stand in the timeline.
+    const fold = !links && deps.foldCounts ? deps.foldCounts() : null;
     el("search-count").textContent = left.pinned
       ? (!filtering ? `${loaded} pinned` : `${matched} of ${loaded} pinned`)
-      : (!filtering ? "" : `${matched} of ${loaded} loaded`);
+      : (!filtering ? "" : fold !== null ? `${fold.total} of ${loaded} loaded` : `${matched} of ${loaded} loaded`);
   }
 
   function refreshSearchCount(): void {

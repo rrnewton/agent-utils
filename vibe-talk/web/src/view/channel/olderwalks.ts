@@ -36,7 +36,7 @@ export interface SearchWalk {
 }
 
 /** A column with its search walk on it. */
-export type OlderWalkColumn = TimelineColumn & { searchWalk: SearchWalk | null; searchNote: { key: string; text: string } | null; searched?: { loaded: number } | null };
+export type OlderWalkColumn = TimelineColumn & { searchWalk: SearchWalk | null; searchNote: { key: string; text: string } | null; searched?: { loaded: number; buckets?: { main: number; threads: number; transcripts: number } } | null };
 
 /** How far back the rows on screen reach, as the search line says it. */
 export interface OlderHistoryReach {
@@ -77,6 +77,8 @@ export interface OlderWalksDependencies {
   guardQuietly(fn: (...args: never[]) => unknown): (...args: never[]) => unknown;
   renderJumpNewest(): void;
   applySearch(): void;
+  /** `#2200`: redraw "X of Y loaded" from the fold after the chips move. Optional for doubles. */
+  refreshSearchCount?(): void;
   preservingScroll(mutate: () => void): void;
   /** Put `area` at a measured scroll position through the scroll owner (`#1251`). */
   toPosition(area: HTMLElement, top: number): void;
@@ -166,6 +168,10 @@ export interface OlderWalks {
   scheduleServerSearch(): void;
   /** `#1913`: retire the bucket chips when the typed query no longer matches the answered one. */
   retireStaleBuckets(): void;
+  /** `#2200`: whether a bucket chip stands, for the search filter (null: fold not standing). */
+  bucketOnFor(id: string): boolean | null;
+  /** `#2200`: the one search-result fold's counts per chip and their sum (null: fold not standing). */
+  foldCounts(): { counts: Map<string, number>; total: number } | null;
   channelViewWords(): string;
   oldestLoadedMs(): number | null;
   toggleServerHits(): void;
@@ -206,8 +212,10 @@ const searchBucketDefs: SearchBucketDef[] = [
   // screen) starts on at a new search; every extra bucket is the reader's
   // tap on its chip away, never an uninvited interleave that moves them.
   { id: "main", words: "in main", defaultOn: (view) => view !== "thread" && view !== "transcripts" },
+  // `#2200` (owner 349): searching in All searches the whole view — Main and
+  // Threads both start on there. In Main only Main starts on, as before.
   { id: "threads", words: (view) => (view === "thread" ? "in other threads" : "in threads"),
-    defaultOn: () => false },
+    defaultOn: (view) => view === "flat" },
 ];
 
 /** The bucket registry: `#1608` plugs its Agent Transcripts bucket in here. */
@@ -980,11 +988,6 @@ function hitBucket(hit: Message): string {
   return "threads";
 }
 
-/** The home bucket, whose in-channel hits draw as normal cards. */
-function homeBucket(): string {
-  return bucketView() === "thread" ? "thread" : "main";
-}
-
 const byHitTime = (a: Message, b: Message): number =>
   (Date.parse(a.timestamp) || 0) - (Date.parse(b.timestamp) || 0);
 
@@ -1008,6 +1011,70 @@ function bucketCounts(grouped: Map<string, Message[]>): Map<string, number> {
     counts.set(def.id, def.source ? def.source.count() : (grouped.get(def.id) || []).length);
   }
   return counts;
+}
+
+/**
+ * `#2200 vibe-talk-search-tab-counts-match-cards`: THE search-result fold.
+ * One computation over the client's result state — the loaded matches the
+ * filter tallied (`searched.buckets`, counted before the bucket gate) plus
+ * the server's fresh hits per bucket — partitioned disjointly, from which
+ * the chips, the "X of Y loaded" line and the placed cards all read. A hit
+ * that loads for real moves from the fresh half to the loaded half and the
+ * counts do not move; an edited query recomputes the same fold from the
+ * same state, so it lands where a fresh query lands.
+ */
+function searchFoldCounts(grouped: Map<string, Message[]>): Map<string, number> {
+  const loaded = columns.main.searched?.buckets || { main: 0, threads: 0, transcripts: 0 };
+  const fresh = bucketCounts(grouped);
+  const counts = new Map<string, number>();
+  for (const def of searchBucketDefs) {
+    let loadedPart = 0;
+    if (def.id === "thread") loadedPart = loaded.main + loaded.threads;
+    else if (def.id === "threads") loadedPart = bucketView() === "thread" ? 0 : loaded.threads;
+    else if (def.id === "main") loadedPart = bucketView() === "thread" ? 0 : loaded.main;
+    else if (def.id === "transcripts") loadedPart = loaded.transcripts;
+    counts.set(def.id, loadedPart + (fresh.get(def.id) || 0));
+  }
+  return counts;
+}
+
+/** `#2200`: whether the fold stands for the search in the field: a server
+ * search was asked and has answered (or is answering). A purely local
+ * search — no server copy in play — keeps the older behaviour and no chips. */
+function foldStanding(): boolean {
+  const now = serverSearchNow();
+  return now.key !== "" && (now.scopes.length > 0 || now.loading || now.hits.length > 0 || (now.transcriptHits || []).length > 0);
+}
+
+/** `#2200`: the fold as the search filter reads it — counts and total, or
+ * null where no server search stands for the words in the field. */
+function foldCounts(): { counts: Map<string, number>; total: number } | null {
+  if (!foldStanding()) return null;
+  const counts = searchFoldCounts(bucketHits());
+  // The total sums the chips that stand in this view — the out-of-scope
+  // "this thread" bucket outside a thread view is not one of them.
+  const view = bucketView();
+  let total = 0;
+  for (const def of searchBucketDefs) {
+    if (def.id === "thread" && view !== "thread") continue;
+    total += counts.get(def.id) || 0;
+  }
+  return { counts, total };
+}
+
+/** `#2200`: whether a bucket chip stands, as the filter asks it — null where
+ * the fold is not standing for this search (the identity the toggles were
+ * defaulted for is not the search in the field). */
+function bucketOnFor(id: string): boolean | null {
+  const key = serverSearchNow().key;
+  if (!foldStanding()) return null;
+  let identity = key;
+  try {
+    const parsed = JSON.parse(key) as unknown;
+    if (Array.isArray(parsed)) identity = String(parsed[1] ?? key);
+  } catch (_error) { /* the key itself is the identity */ }
+  if (identity !== bucketsFor) return null;
+  return bucketOnNow(id);
 }
 
 /** The attribute marking a row the server search placed in the timeline. */
@@ -1074,7 +1141,6 @@ function placeServerHits(grouped: Map<string, Message[]>): void {
   clearServerHits();
   const placed: { at: number; node: HTMLElement }[] = [];
   const channel = String(selectedChannelId() || "");
-  const home = homeBucket();
   for (const def of searchBucketDefs) {
     if (!bucketOnNow(def.id)) continue;
     if (def.source) {
@@ -1086,7 +1152,11 @@ function placeServerHits(grouped: Map<string, Message[]>): void {
       continue;
     }
     for (const hit of grouped.get(def.id) || []) {
-      const asCard = def.id === home && String(hit.channel_id) === channel;
+      // `#2200`: an enabled bucket's hit in this channel is a normal result
+      // card, whichever bucket admitted it — the quote style remains only
+      // for another channel's hits, which are pointers, not this channel's
+      // cards.
+      const asCard = String(hit.channel_id) === channel;
       const node = asCard && deps.serverCardNode ? deps.serverCardNode(hit) : serverHitNode(hit);
       node.setAttribute(SERVER_HIT_MARK, asCard ? "card" : "quote");
       node.setAttribute("data-bucket", def.id);
@@ -1124,6 +1194,9 @@ function bucketChip(id: string): HTMLButtonElement | null {
 /** A bucket chip tapped: interleave its hits in the timeline, or put them away. */
 function toggleBucket(id: string): void {
   bucketOn.set(id, !bucketOnNow(id));
+  // `#2200`: the toggle filters the loaded rows too, through the one filter
+  // pass, before the chips are redrawn from the fold.
+  deps.applySearch();
   renderServerSearch();
   if (!bucketOnNow(id)) return;
   // The reader asked to see them: bring the bucket's first hit into view (it
@@ -1204,8 +1277,13 @@ function renderServerSearch() {
   if (serverExpanded && serverExpandedFor !== "" &&
     identityOf(serverSearch.key) !== identityOf(serverExpandedFor)) serverExpanded = false;
   const identity = identityOf(serverSearch.key);
-  if (identity !== bucketsFor) resetBuckets(identity, true);
-  else if (bucketView() !== bucketsView) resetBuckets(identity, false);
+  let reset = false;
+  if (identity !== bucketsFor) { resetBuckets(identity, true); reset = true; }
+  else if (bucketView() !== bucketsView) { resetBuckets(identity, false); reset = true; }
+  // `#2200`: a fresh answer (re)defaults the buckets — the loaded rows are
+  // re-filtered under them at once, so the timeline and the chips never
+  // speak for different searches.
+  if (reset) deps.applySearch();
   const all = serverSearchOwner.allChannels();
   // `#1786`: the bottom separator is retired — the hits stand in the
   // timeline, and the bucket row under the search bar speaks for them.
@@ -1217,19 +1295,27 @@ function renderServerSearch() {
   if (line.getAttribute("aria-expanded") !== expanded) line.setAttribute("aria-expanded", expanded);
   const detail = el("server-detail");
   if (detail.hidden === serverExpanded) detail.hidden = !serverExpanded;
-  // The bucket row under the search bar: one toggle chip per bucket with hits.
+  // The bucket row under the search bar: one toggle chip per bucket in
+  // scope, drawn from THE fold (`searchFoldCounts`), never from the fresh
+  // hits alone. `#2200`: every in-scope chip stands while a search stands —
+  // a zero count is shown, never a lone chip — so the breakdown the reader
+  // sees always sums to the "X of Y loaded" line beside it.
   const grouped = bucketHits();
-  const counts = bucketCounts(grouped);
+  const counts = searchFoldCounts(grouped);
   const view = bucketView();
   let anyChip = false;
   for (const def of searchBucketDefs) {
     const chip = bucketChip(def.id);
     if (!chip) continue;
-    const count = counts.get(def.id) || 0;
-    const show = count > 0;
+    const inScope = def.id !== "thread" || view === "thread";
+    // With no result anywhere the row stays down (the `#1899` follow-up:
+    // no empty panel over the head of the list); with any result, every
+    // in-scope chip stands.
+    const show = inScope && foldStanding() && (foldCounts()?.total || 0) > 0;
     if (chip.hidden === show) chip.hidden = !show;
     if (!show) continue;
     anyChip = true;
+    const count = counts.get(def.id) || 0;
     const words = typeof def.words === "function" ? def.words(view) : def.words;
     setTextIfChanged(chip, `${count} ${words}`);
     const pressed = bucketOnNow(def.id) ? "true" : "false";
@@ -1258,6 +1344,8 @@ function renderServerSearch() {
   for (const row of el("discord-log").children) {
     if (row.getAttribute(SERVER_HIT_MARK) === "card") markSearchHits(row, searchParsed(searchField.query()).terms);
   }
+  // `#2200`: the "X of Y loaded" line reads the same fold the chips just drew.
+  if (deps.refreshSearchCount) deps.refreshSearchCount();
   if (!serverExpanded) return;
   setTextIfChanged(el("search-scope"), searchScopeLine());
   const checkbox = el("search-all-channels") as HTMLInputElement;
@@ -1573,7 +1661,7 @@ function renderOlderControl() {
   return {
     renderOlderControl, olderControlPressed, searchOlder, searchOlderFromField,
     searchReplies, searchOffered, searchKey, endSearchWalks, endSearchWalk, stopSearchWalk,
-    renderSearchOlderNote, historyReach, renderServerSearch, searchFurtherPressed, chooseSearchAllChannels, renderRepliesSearch, scheduleServerSearch, retireStaleBuckets, channelViewWords, oldestLoadedMs, toggleServerHits, toggleBucket, serviceWords, repliesFloor, repliesSearchOffered, allCover, allLoaded, repliesKey, endRepliesWalk,
+    renderSearchOlderNote, historyReach, renderServerSearch, searchFurtherPressed, chooseSearchAllChannels, renderRepliesSearch, scheduleServerSearch, retireStaleBuckets, channelViewWords, oldestLoadedMs, toggleServerHits, toggleBucket, serviceWords, repliesFloor, repliesSearchOffered, allCover, allLoaded, repliesKey, endRepliesWalk, bucketOnFor, foldCounts,
     dispose() { disposed = true; },
   };
 }

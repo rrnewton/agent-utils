@@ -2863,9 +2863,9 @@ test("`#1797 vibe-talk-search-bucket-toggles`: in a thread, this thread's server
   const placed = page.el("discord-log").children.filter((li) => li.getAttribute("data-server-hit"));
   assert.deepStrictEqual(placed.map((li) => li.getAttribute("data-id")), ["150", "151"],
     "the outside hit is not interleaved chronologically with this thread's");
-  assert.equal(placed[1].getAttribute("data-server-hit"), "quote");
-  assert.ok(placed[1].descendants().some((n) => n.textContent === "in thread x-y-z"),
-    "the quoted hit does not name its thread by slug");
+  // `#2200`: an enabled bucket's in-channel hit is a normal result card,
+  // whichever bucket admitted it — never the quote style.
+  assert.equal(placed[1].getAttribute("data-server-hit"), "card");
   // A second tap puts the outside hit away; this thread's card stays.
   await chip.click();
   await page.settle();
@@ -2900,7 +2900,177 @@ test("`#1797 vibe-talk-search-bucket-toggles`: in Main, main starts on as cards,
   await page.settle();
   const placed = page.el("discord-log").children.filter((li) => li.getAttribute("data-server-hit"));
   assert.deepStrictEqual(placed.map((li) => li.getAttribute("data-id")), ["150", "151", "152"]);
-  assert.equal(placed[2].getAttribute("data-server-hit"), "quote");
+  // `#2200`: the threads bucket's in-channel hit stands as a normal card too.
+  assert.equal(placed[2].getAttribute("data-server-hit"), "card");
+});
+
+// --- `#2200 vibe-talk-search-tab-counts-match-cards`: one fold, disjoint buckets -----------
+
+/** A channel whose loaded messages and older server hits both speak of themes. */
+async function foldPage(view = "main", holdOld = false) {
+  const page = newPage();
+  page.messageCache = messageCacheStatus();
+  const first = { id: "spaces/A/threads/one & two", root_message_id: "201", is_root: true,
+    reply_count: 1, reply_count_exact: true };
+  const second = { id: "spaces/A/threads/another", root_message_id: "203", is_root: true,
+    reply_count: 1, reply_count_exact: false };
+  const messages = [
+    message({ id: "200", content: "theme announcement" }),
+    message({ id: "201", content: "themes root", thread: first }),
+    message({ id: "202", content: "theme answer", thread: { ...first, is_root: false } }),
+    message({ id: "203", content: "second root", thread: second }),
+    message({ id: "204", content: "plain answer", thread: { ...second, is_root: false } }),
+  ];
+  const oldMain = message({ id: "150", content: "an old theme on main", timestamp: "2026-08-02T09:00:00Z" });
+  if (holdOld) messages.unshift(oldMain);
+  page.threadingSupported = true;
+  page.threads = [first, second].map((thread) => ({
+    id: thread.id, root: messages.find((m) => m.id === thread.root_message_id),
+    title: thread.root_message_id === "201" ? "First discussion" : "Second discussion",
+    reply_count: thread.reply_count, reply_count_exact: thread.reply_count_exact,
+    updated_at: messages.find((m) => m.thread && m.thread.id === thread.id && !m.thread.is_root).timestamp,
+  }));
+  await signIn(page);
+  await showDiscord(page, messages);
+  await pickThread(page, view);
+  const older = [
+    ...(holdOld ? [] : [oldMain]),
+    message({ id: "152", content: "a theme reply", timestamp: "2026-08-04T09:00:00Z", thread: { ...second, is_root: false } }),
+    message({ id: "153", content: "more themes reply", timestamp: "2026-08-05T09:00:00Z", thread: { ...second, is_root: false } }),
+  ];
+  // The server's copy answers by the same substring rule as the page.
+  page.serverSearch = async (path) => {
+    const q = new URL(path, "http://fixture.test").searchParams.get("q") || "";
+    return searchAnswer(older.filter((hit) => hit.content.includes(q)), [searchedScope()]);
+  };
+  return page;
+}
+
+const chipOf = (page, id) => page.el(`search-bucket-${id}`);
+const chipCount = (page, id) => Number((chipOf(page, id).textContent.match(/^\d+/) || ["0"])[0]);
+const foldSnapshot = (page) => ({
+  main: [chipOf(page, "main").hidden, chipOf(page, "main").getAttribute("aria-pressed"), chipOf(page, "main").textContent],
+  threads: [chipOf(page, "threads").hidden, chipOf(page, "threads").getAttribute("aria-pressed"), chipOf(page, "threads").textContent],
+  transcripts: [chipOf(page, "transcripts").hidden, chipOf(page, "transcripts").getAttribute("aria-pressed"), chipOf(page, "transcripts").textContent],
+  count: page.el("search-count").textContent,
+  visible: unfiltered(page, "discord-log").map((row) => row.getAttribute("data-id")).sort(),
+  styles: page.el("discord-log").children.filter((li) => li.getAttribute("data-server-hit"))
+    .map((li) => li.getAttribute("data-server-hit")),
+});
+
+/** The owner's invariants, checked after every settled step. */
+function assertFold(page, when) {
+  for (const id of ["main", "threads", "transcripts"]) {
+    assert.equal(chipOf(page, id).hidden, false, `${when}: the ${id} chip is missing (a lone chip stood)`);
+  }
+  const sum = chipCount(page, "main") + chipCount(page, "threads") + chipCount(page, "transcripts");
+  const x = Number((page.el("search-count").textContent.match(/^\d+/) || ["-1"])[0]);
+  assert.equal(x, sum, `${when}: "X of Y loaded" is not the sum of the bucket chips`);
+  const visible = unfiltered(page, "discord-log").map((row) => row.getAttribute("data-id"));
+  assert.equal(new Set(visible).size, visible.length, `${when}: a card appears twice (buckets not disjoint)`);
+  const on = (id) => chipOf(page, id).getAttribute("aria-pressed") === "true";
+  const expected = (on("main") ? chipCount(page, "main") : 0) + (on("threads") ? chipCount(page, "threads") : 0) +
+    (on("transcripts") ? chipCount(page, "transcripts") : 0);
+  assert.equal(visible.length, expected, `${when}: the selected chips' counts do not equal the cards shown`);
+  assert.ok(foldSnapshot(page).styles.every((style) => style === "card"),
+    `${when}: a result is not rendered as a normal card`);
+}
+
+test("`#2200 vibe-talk-search-tab-counts-match-cards`: one fold — chips sum to X, selected counts equal cards shown, Main and Threads disjoint", async () => {
+  const page = await foldPage("main");
+  await searchServer(page, "theme");
+  // Loaded: 200 (main), 201 (root). Fresh: 150 (main), 152+153 (threads).
+  assert.equal(chipOf(page, "main").textContent, "3 in main");
+  assert.equal(chipOf(page, "threads").textContent, "2 in threads");
+  assertFold(page, "fresh theme in Main");
+  assert.deepStrictEqual(foldSnapshot(page).visible, ["150", "200", "201"],
+    "with Threads off, no thread reply stands in Main");
+  await chipOf(page, "threads").click();
+  await page.settle();
+  assertFold(page, "threads on in Main");
+  assert.deepStrictEqual(foldSnapshot(page).visible, ["150", "152", "153", "200", "201"]);
+  await chipOf(page, "threads").click();
+  await page.settle();
+  assertFold(page, "threads off again in Main");
+  // Substring rule: "themes" is a strict subset of "theme", on both sides.
+  await searchServer(page, "themes");
+  assert.equal(chipOf(page, "main").textContent, "1 in main");
+  assert.equal(chipOf(page, "threads").textContent, "1 in threads");
+  assertFold(page, "fresh themes in Main");
+});
+
+test("`#2200 vibe-talk-search-tab-counts-match-cards`: in All, Main and Threads both start on and the fold still sums", async () => {
+  const page = await foldPage("flat");
+  await searchServer(page, "theme");
+  assert.equal(chipOf(page, "main").getAttribute("aria-pressed"), "true", "Main does not start on in All");
+  assert.equal(chipOf(page, "threads").getAttribute("aria-pressed"), "true", "Threads does not start on in All (owner 349)");
+  assert.equal(chipOf(page, "main").textContent, "3 in main");
+  assert.equal(chipOf(page, "threads").textContent, "3 in threads");
+  assertFold(page, "fresh theme in All");
+  assert.deepStrictEqual(foldSnapshot(page).visible, ["150", "152", "153", "200", "201", "202"]);
+});
+
+test("`#2200 vibe-talk-search-tab-counts-match-cards`: an edited query lands where the fresh query lands, over random edit sequences", async () => {
+  let seed = 2200;
+  const rnd = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+  const words = ["theme", "themes", "them", "theme", "themes", "the", "theme"];
+  for (let round = 0; round < 3; round += 1) {
+    const page = await foldPage("main");
+    let query = "";
+    const steps = 4 + Math.floor(rnd() * 3);
+    for (let step = 0; step < steps; step += 1) {
+      const target = words[Math.floor(rnd() * words.length)];
+      // Edit toward the target one keystroke at a time, as the owner did.
+      while (query !== target) {
+        query = target.startsWith(query) ? target.slice(0, query.length + 1) : query.slice(0, -1);
+        await page.el("search-field").setValue(query);
+        await page.settle();
+      }
+      page.expireTimers(SERVER_SEARCH_DELAY_MS);
+      await page.settle();
+      if (chipOf(page, "main").hidden) {
+        // The fold is not standing for these words (no hit anywhere the
+        // server searched): nothing to fold, and that is said, not shown.
+        continue;
+      }
+      assertFold(page, `round ${round} step ${step} query "${query}"`);
+      if (rnd() < 0.5) {
+        await chipOf(page, "threads").click();
+        await page.settle();
+        assertFold(page, `round ${round} step ${step} after a threads toggle at "${query}"`);
+        await chipOf(page, "threads").click();
+        await page.settle();
+      }
+    }
+    // End on a fresh identity so the toggles re-default, then compare with
+    // a page that only ever typed the final query.
+    await searchServer(page, "theme");
+    assertFold(page, `round ${round} edited to theme`);
+    const fresh = await foldPage("main");
+    await searchServer(fresh, "theme");
+    assert.deepStrictEqual(foldSnapshot(page), foldSnapshot(fresh),
+      `round ${round}: the edited query's state differs from the fresh query's`);
+  }
+});
+
+test("`#2200 vibe-talk-search-tab-counts-match-cards`: a hit that loads for real moves within the fold and the counts do not move", async () => {
+  const page = await foldPage("main");
+  await searchServer(page, "theme");
+  assertFold(page, "the hit still fresh from the server");
+  const before = foldSnapshot(page);
+  // The same channel, now holding hit 150 among its loaded messages (as a
+  // load-older or a re-read would leave it): the server no longer returns
+  // it as fresh, and the fold must not move.
+  const loaded = await foldPage("main", true);
+  await searchServer(loaded, "theme");
+  assertFold(loaded, "the hit loaded for real");
+  // The chips, X and the cards shown are the fold; the loaded denominator
+  // and the row's origin (a real row now, not a placed card) legitimately
+  // differ, and are not compared.
+  const foldOf = (snap) => ({ main: snap.main, threads: snap.threads, transcripts: snap.transcripts,
+    x: snap.count.split(" ")[0], visible: snap.visible });
+  assert.deepStrictEqual(foldOf(foldSnapshot(loaded)), foldOf(before),
+    "a hit moving from the fresh half of the fold to the loaded half changed a count or a card");
 });
 
 test("`#605 server-side-search`: the line never says the server searched further back than it says it did", async () => {

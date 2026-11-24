@@ -328,7 +328,7 @@ const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
  * on the column itself. One owner in web/src/view/channel/columnwork.ts (`createColumns`), made here
  * from the page's fresh records.
  *
- * @typedef {{matched: number, loaded: number, tally: any, pinned: boolean}} SearchCount
+ * @typedef {{matched: number, loaded: number, tally: any, pinned: boolean, buckets: {main: number, threads: number, transcripts: number}}} SearchCount
  * @typedef {{name: string, left: boolean, searched: SearchCount | null,
  *   searchWalk: any, searchNote: {key: string, text: string} | null,
  *   older: ReturnType<typeof freshOlderPages>, arrows: ReturnType<typeof freshReplyArrows>,
@@ -3053,6 +3053,8 @@ const searchRows = createSearchRows({
   renderOlderControl: () => renderOlderControl(),
   scheduleServerSearch: () => scheduleServerSearch(),
   retireStaleBuckets: () => retireStaleBuckets(),
+  bucketOn: (id) => bucketOnFor(id),
+  foldCounts: () => foldCounts(),
   placeInlineReply: () => placeInlineReply(),
   placeRowsInPlaceAgain: () => placeRowsInPlaceAgain(),
   replyDocked: () => replyState.docked,
@@ -7614,11 +7616,11 @@ const olderWalks = mountOlderWalks({
   jumpToMessageLink, messageBody, markSearchHits, searchParsed, heldMessagesById,
   serverCardNode: (hit) => discordNode(/** @type {any} */ ([hit])),
   keepingCardPlace, walkCursorOwed: timelineView.walkCursorOwed, loadOlder: timelineView.loadOlder,
-  guardQuietly: (fn) => guardQuietly(fn), renderJumpNewest, applySearch, preservingScroll, toPosition: (area, top) => scrollKeeping.toPosition(area, top), intoView: (element, block) => scrollKeeping.intoView(element, block), setStatus,
+  guardQuietly: (fn) => guardQuietly(fn), renderJumpNewest, applySearch, refreshSearchCount: () => refreshSearchCount(), preservingScroll, toPosition: (area, top) => scrollKeeping.toPosition(area, top), intoView: (element, block) => scrollKeeping.intoView(element, block), setStatus,
   columnWork, columns, sideShowing, inColumn, columnSteps: () => /** @type {any} */ (columnSteps()), filterChanges,
   replyJumpCurrent: () => replyJumpTicket.current(), idsOf, rowMessages, plainReach, replyTally, providerOfChannel, channelDirectoryName: () => channelDirectory.providerName(),
 });
-const { renderOlderControl, olderControlPressed, searchOlder, searchOlderFromField, searchReplies, searchOffered, searchKey, endSearchWalks, endSearchWalk, stopSearchWalk, renderSearchOlderNote, historyReach, searchFurtherPressed, chooseSearchAllChannels, renderRepliesSearch, renderServerSearch, scheduleServerSearch, retireStaleBuckets, channelViewWords, oldestLoadedMs, toggleServerHits, toggleBucket, serviceWords, repliesFloor, repliesSearchOffered, allCover, allLoaded, repliesKey, endRepliesWalk } = olderWalks;
+const { renderOlderControl, olderControlPressed, searchOlder, searchOlderFromField, searchReplies, searchOffered, searchKey, endSearchWalks, endSearchWalk, stopSearchWalk, renderSearchOlderNote, historyReach, searchFurtherPressed, chooseSearchAllChannels, renderRepliesSearch, renderServerSearch, scheduleServerSearch, retireStaleBuckets, channelViewWords, oldestLoadedMs, toggleServerHits, toggleBucket, serviceWords, repliesFloor, repliesSearchOffered, allCover, allLoaded, repliesKey, endRepliesWalk, bucketOnFor, foldCounts } = olderWalks;
 // `#1608`: the Transcripts view's own search and way back to its index.
 el("transcripts-search").addEventListener("input", () => transcriptsView.searchChanged());
 el("transcripts-back").addEventListener("click", () => transcriptsView.closeDay());
