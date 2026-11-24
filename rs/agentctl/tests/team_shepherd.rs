@@ -369,6 +369,27 @@ impl Scratch {
         found
     }
 
+    fn page_config(&self) -> PathBuf {
+        let page = self.root.join("page-command");
+        install_executable(
+            &page,
+            &format!(
+                "#!/bin/sh\ncat > {}\nprintf '%s\\n' \"$@\" >> {}\n",
+                self.root.join("page-stdin.txt").display(),
+                self.root.join("page-argv.txt").display()
+            ),
+        );
+        let config = self.root.join("escalation.toml");
+        write_private(
+            &config,
+            &format!(
+                "[[route]]\nargv = [\"{}\"]\ntimeout_seconds = 30\n",
+                page.display()
+            ),
+        );
+        config
+    }
+
     fn run_shepherd(&self, state_dir: &Path, wrapper: &Path) -> (i32, Value) {
         let home = self.root.join("home");
         fs::create_dir_all(&home).expect("home");
@@ -403,6 +424,8 @@ impl Scratch {
             .arg(self.root.join("teams.json"))
             .args(["--state-dir"])
             .arg(state_dir)
+            .args(["--escalation-config"])
+            .arg(self.page_config())
             .args([
                 "--max-rounds",
                 "3",
@@ -1070,5 +1093,80 @@ fn blocking_restore_blocks_stamp_and_acts_until_released() {
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
     drop(child);
+    scratch.reap();
+}
+
+#[test]
+fn give_up_pages_through_the_configured_route_without_a_driver() {
+    let scratch = Scratch::new("page");
+    let state = scratch.root.join("state");
+    // No driver record exists in this scratch; the page must still
+    // reach the configured route (review 5 blocker).
+    let (code, report) = scratch.run_shepherd(&state, &wrapper());
+    assert_eq!(code, 75, "{report}");
+    let stamp = scratch.stamp(&state);
+    assert!(
+        stamp["escalation"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("delivered")),
+        "{stamp}"
+    );
+    let paged = fs::read_to_string(scratch.root.join("page-stdin.txt"))
+        .expect("fake page command received the page");
+    assert!(paged.contains("gave up"), "{paged}");
+    scratch.reap();
+}
+
+#[test]
+fn default_escalation_config_is_refused_under_the_harness() {
+    let scratch = Scratch::new("pagerefuse");
+    // A default config exists under the scratch HOME and would page
+    // for real; under the test marker it must never be loaded.
+    let home = scratch.root.join("home");
+    let config_dir = home.join(".config/agent-utils");
+    fs::create_dir_all(&config_dir).expect("config dir");
+    let page = scratch.root.join("page-command");
+    install_executable(
+        &page,
+        &format!(
+            "#!/bin/sh\\ncat > {}\\n",
+            scratch.root.join("page-stdin.txt").display()
+        ),
+    );
+    write_private(
+        &config_dir.join("escalation.toml"),
+        &format!(
+            "[[route]]\nargv = [\"{}\"]\ntimeout_seconds = 30\n",
+            page.display()
+        ),
+    );
+    let state = scratch.root.join("state");
+    // run_shepherd passes an explicit fake route; run without it:
+    let mut args = scratch.base_args();
+    args.extend([
+        "team".to_owned(),
+        "shepherd".to_owned(),
+        "--state-dir".to_owned(),
+        state.display().to_string(),
+        "--max-rounds".to_owned(),
+        "2".to_owned(),
+        "--round-delay-seconds".to_owned(),
+        "0".to_owned(),
+        "--run-agent-prompt".to_owned(),
+        wrapper().display().to_string(),
+    ]);
+    let (code, report) = scratch.run_agentctl(&args);
+    assert_eq!(code, 75, "{report}");
+    assert!(
+        !scratch.root.join("page-stdin.txt").exists(),
+        "default escalation config was loaded under the test harness"
+    );
+    let stamp = scratch.stamp(&state);
+    assert!(
+        stamp["escalation"]
+            .as_str()
+            .is_some_and(|s| s.contains("refused") || s.contains("unconfigured")),
+        "{stamp}"
+    );
     scratch.reap();
 }

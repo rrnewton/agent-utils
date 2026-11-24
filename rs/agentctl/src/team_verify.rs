@@ -882,7 +882,7 @@ pub(crate) fn collect_team_probe_snapshot<A: ManagedApi + ?Sized>(
         .map(|unit| {
             let outcome = host.run(
                 &[
-                    "systemctl".to_owned(),
+                    crate::restore::systemctl_program(),
                     "--user".to_owned(),
                     "is-active".to_owned(),
                     unit.clone(),

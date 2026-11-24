@@ -819,6 +819,9 @@ struct TeamShepherd {
     /// Ordered recovery profiles TOML (default: REGISTRY/recovery-profiles.toml when present); judgement runs only on a current all-pass recovery smoke record for the file
     #[arg(long, value_name = "PATH")]
     profile_file: Option<PathBuf>,
+    /// Escalation route file for pages (default: the synced escalation.toml; refused as a default under a test harness)
+    #[arg(long, value_name = "PATH")]
+    escalation_config: Option<PathBuf>,
     /// Minutes a restore may run before the wedged escalation is enqueued (default: 60)
     #[arg(long, default_value_t = 60, value_parser = bounded_u64::<1, 1440>, value_name = "MINUTES")]
     restore_bound_minutes: u64,
@@ -5091,6 +5094,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                             .map(PathBuf::from),
                         stale_seconds: 180.0,
                         restore_bound_minutes: shepherd.restore_bound_minutes,
+                        escalation_config: shepherd.escalation_config.clone(),
                         act_wait_seconds: shepherd.act_wait_seconds,
                     },
                 )?;
@@ -5504,16 +5508,14 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
                         .unwrap_or(Value::Null);
                     let stamp = claim["boot_id"].as_str().and_then(|boot| {
-                        let epoch = crate::restore::RestoreEpoch {
-                            boot_id: boot.to_owned(),
-                            user_manager: claim["epoch"]["user_manager"]
-                                .as_str()
-                                .map(str::to_owned),
-                        };
+                        let epoch_key = claim["epoch_key"]
+                            .as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| format!("{boot}@nomgr"));
                         crate::team_shepherd::shepherd_dir(
                             status.state_dir.as_deref(),
                             &args.registry,
-                            &epoch,
+                            &epoch_key,
                         )
                         .and_then(|boot_dir| {
                             std::fs::read_to_string(boot_dir.join("stamp.json")).ok()

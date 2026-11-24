@@ -84,6 +84,9 @@ pub struct ShepherdOptions {
     /// Minutes a restore may run before the wedged escalation is
     /// enqueued (the loop keeps watching past it).
     pub restore_bound_minutes: u64,
+    /// Escalation route file for pages (default: the synced
+    /// escalation.toml; never the default under a test harness).
+    pub escalation_config: Option<PathBuf>,
     /// Seconds a `team act` execution may wait for its receipt.
     pub act_wait_seconds: u64,
 }
@@ -102,6 +105,7 @@ impl Default for ShepherdOptions {
             claim_file: None,
             stale_seconds: 180.0,
             restore_bound_minutes: 60,
+            escalation_config: None,
             act_wait_seconds: 60,
         }
     }
@@ -139,6 +143,14 @@ pub struct ShepherdState {
     /// The wedged-restore escalation was already enqueued.
     #[serde(default)]
     pub wedged_escalated: bool,
+    /// Verdict kinds already paged this incident (at most one
+    /// delivered page per kind).
+    #[serde(default)]
+    pub page_delivered: Vec<String>,
+    /// Page delivery attempts this incident (retries only follow
+    /// failures).
+    #[serde(default)]
+    pub page_attempts: u32,
     /// One grace round after restore finishes before no-progress
     /// counting resumes.
     #[serde(default)]
@@ -160,28 +172,12 @@ struct TeamRound {
 /// `<state root>/shepherd/<team-key>/<boot-id>-<epoch-tag>/` (B1: a
 /// host's teams never share a stamp or state file, and a user-manager
 /// restart begins a new epoch in the same boot).
-pub fn shepherd_dir(
-    state_dir: Option<&Path>,
-    registry: &Path,
-    epoch: &RestoreEpoch,
-) -> Option<PathBuf> {
-    let tag = epoch
-        .user_manager
-        .as_deref()
-        .map(|manager| {
-            // Normalised epoch key: the identity with its format
-            // prefix stripped, so the directory matches the claim's
-            // format-insensitive epoch comparison.
-            let identity = manager.split_once(':').map_or(manager, |(_, rest)| rest);
-            let digest = format!("{:x}", Sha256::digest(identity.as_bytes()));
-            digest[..8].to_owned()
-        })
-        .unwrap_or_else(|| "nomgr".to_owned());
+pub fn shepherd_dir(state_dir: Option<&Path>, registry: &Path, epoch_key: &str) -> Option<PathBuf> {
     Some(
         state_root(state_dir)?
             .join("shepherd")
             .join(crate::restore::team_key(registry))
-            .join(format!("{}-{tag}", epoch.boot_id)),
+            .join(epoch_key.replace('/', "-")),
     )
 }
 
@@ -209,6 +205,20 @@ pub fn restore_running(claim_path: &Path) -> bool {
     match (claim["restore_pid_start"].as_str(), pid_start_ticks(pid)) {
         (Some(recorded), Some(current)) => recorded == current,
         _ => Path::new(&format!("/proc/{pid}")).exists(),
+    }
+}
+
+/// The canonical epoch identity for claims and state directories:
+/// the boot id plus the user manager's start time, one derivation
+/// whatever format the manager identity was read in.
+pub fn epoch_identity(host: &dyn Host, epoch: &RestoreEpoch) -> String {
+    match (epoch.user_manager.as_deref(), host.user_manager_started()) {
+        (Some(_), Some(started)) => format!("{}@{started:.0}", epoch.boot_id),
+        (Some(manager), None) => {
+            let digest = format!("{:x}", Sha256::digest(manager.as_bytes()));
+            format!("{}@{}", epoch.boot_id, &digest[..8])
+        }
+        _ => format!("{}@nomgr", epoch.boot_id),
     }
 }
 
@@ -593,6 +603,66 @@ pub fn enqueue_shepherd_act(
     }
 }
 
+/// Page the humans through the escalation routes, delivered by the
+/// shepherd itself (never through the team driver or lead). At most
+/// one delivered page per verdict kind per incident; retries only
+/// follow failures. Returns the stamp status string.
+pub fn page(
+    host: &dyn Host,
+    options: &ShepherdOptions,
+    state: &mut ShepherdState,
+    kind: &str,
+    text: &str,
+    registry: &Path,
+    incident: &str,
+    dir: &Path,
+) -> String {
+    if state.page_delivered.iter().any(|known| known == kind) {
+        return "already-delivered".to_owned();
+    }
+    // Tests must never reach a real route: under a test harness the
+    // default config path is refused loudly, not loaded.
+    if options.escalation_config.is_none() && std::env::var_os("AGENTCTL_TEST_HARNESS").is_some() {
+        append_log(
+            dir,
+            "page refused: default escalation config under a test harness",
+        );
+        return "unconfigured-refused-default".to_owned();
+    }
+    let config = match &options.escalation_config {
+        Some(path) => crate::team_escalate::load_escalation_config(path),
+        None => match crate::team_escalate::default_escalation_config_path() {
+            Some(path) if path.exists() => crate::team_escalate::load_escalation_config(&path),
+            _ => Ok(crate::team_escalate::EscalationConfig::default()),
+        },
+    };
+    let config = match config {
+        Ok(config) => config,
+        Err(error) => return format!("failed:config {error}"),
+    };
+    if config.routes.is_empty() {
+        append_log(dir, "page unconfigured: no escalation routes");
+        return "unconfigured".to_owned();
+    }
+    state.page_attempts += 1;
+    let incident_record = crate::team_escalate::Incident {
+        host: std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_owned()),
+        team: registry.display().to_string(),
+        incident: incident.to_owned(),
+        text: text.to_owned(),
+    };
+    match crate::team_escalate::deliver(host, &config, &incident_record) {
+        crate::team_escalate::Delivery::Delivered { route_index } => {
+            state.page_delivered.push(kind.to_owned());
+            format!("delivered:{route_index}")
+        }
+        crate::team_escalate::Delivery::Unconfigured => "unconfigured".to_owned(),
+        crate::team_escalate::Delivery::Failed { detail } => {
+            format!("failed:{}", detail.chars().take(120).collect::<String>())
+        }
+    }
+}
+
 /// Run one shepherd incident to its stamp. `own` is the only registry
 /// ever acted on; `judged` registries are read-only. Exit semantics
 /// ride in the report's `exit_code`: 0 every team YES, 75 gave up with
@@ -612,7 +682,8 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
         boot_id: boot_id.clone(),
         user_manager: host.user_manager_id(),
     };
-    let dir = shepherd_dir(options.state_dir.as_deref(), own, &epoch)
+    let epoch_key = epoch_identity(host, &epoch);
+    let dir = shepherd_dir(options.state_dir.as_deref(), own, &epoch_key)
         .ok_or_else(|| fail("cannot determine the agentctl state directory"))?;
     agent_queue::fsio::create_private_directory(&dir, "shepherd state directory", true, true)
         .map_err(|error| fail(error.to_string()))?;
@@ -659,6 +730,7 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
         own,
         &incident,
         &epoch,
+        &epoch_key,
         options.stale_seconds,
         false,
         ClaimRole::Supervisor,
@@ -881,19 +953,17 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
                 - state.restore_started_at
                 > (options.restore_bound_minutes.max(1) * 60) as f64
         {
-            enqueue_shepherd_act(
-                inputs,
-                own,
+            let wedged_status = page(
+                host,
                 options,
+                &mut state,
+                "wedged",
+                "restore is still running past its bound",
+                own,
                 &incident,
-                &format!("shepherd-{incident}-wedged"),
-                &[
-                    "escalate".to_owned(),
-                    "restore is still running past its bound".to_owned(),
-                ],
                 &dir,
-                round,
             );
+            append_log(&dir, &format!("round {round}: wedged page {wedged_status}"));
             state.wedged_escalated = true;
             save_state(&dir, &state)?;
         }
@@ -1069,6 +1139,19 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
     }
     let mut escalation = "none".to_owned();
     if verdict != "YES" {
+        escalation = page(
+            host,
+            options,
+            &mut state,
+            "give-up",
+            "shepherd gave up without a deterministic YES",
+            own,
+            &incident,
+            &dir,
+        );
+        save_state(&dir, &state)?;
+    }
+    if verdict != "YES" {
         // Bounded give-up: escalate through the landed path only
         // while the own lead is down (B4). A live lead owns recovery
         // under step 0: the stamp records the outcome and no `team
@@ -1091,14 +1174,13 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
                 &dir,
                 state.round,
             );
-            // The queue is drained by the team driver from its own
-            // paths (its unit, wake timers, or the lead's next
-            // kick); a refusal here is recorded, never silent.
-            escalation = if code == 75 || code == 0 {
-                "enqueued".to_owned()
-            } else {
-                format!("failed:{code}")
-            };
+            // The enqueued act is for the team driver (drained from
+            // its own paths); the human page above is independent
+            // of it, so its result never overwrites the page status.
+            append_log(
+                &dir,
+                &format!("give-up act enqueue exit={code} (page: {escalation})"),
+            );
         }
         verdict = "GAVE-UP";
     }
@@ -1435,7 +1517,7 @@ pub enum ClaimDecision {
 /// is also past the stale interval.
 pub fn claim_decision(
     claim: Option<&Value>,
-    epoch: &RestoreEpoch,
+    epoch_key: &str,
     now: f64,
     stale_seconds: f64,
     owner_alive: bool,
@@ -1443,22 +1525,9 @@ pub fn claim_decision(
     let Some(claim) = claim else {
         return ClaimDecision::Take;
     };
-    // A different epoch — another boot, or the same boot under a new
-    // user manager (NS1) — never blocks, live heartbeat or not. The
-    // manager identity's FORMAT flips (invocation: vs pid:) whenever
-    // a systemctl read fails, so a format flip alone is not a new
-    // epoch (review 3): only two identities in the same format that
-    // differ prove a manager restart.
-    let manager_changed = match (
-        claim["epoch"]["user_manager"].as_str(),
-        epoch.user_manager.as_deref(),
-    ) {
-        (Some(recorded), Some(current)) if recorded != current => {
-            recorded.split(':').next() == current.split(':').next()
-        }
-        _ => false,
-    };
-    if claim["boot_id"].as_str() != Some(epoch.boot_id.as_str()) || manager_changed {
+    // A different canonical epoch (boot plus manager start time)
+    // never blocks, live heartbeat or not.
+    if claim["epoch_key"].as_str() != Some(epoch_key) {
         return ClaimDecision::TakeOverPreviousBoot;
     }
     if owner_alive {
@@ -1502,6 +1571,7 @@ pub fn acquire_claim(
     registry: &Path,
     incident: &str,
     epoch: &RestoreEpoch,
+    epoch_key: &str,
     stale_seconds: f64,
     supervisor_pending: bool,
     role: ClaimRole,
@@ -1557,6 +1627,7 @@ pub fn acquire_claim(
                     registry,
                     incident,
                     epoch,
+                    epoch_key,
                     now,
                     supervisor_pending,
                     "adopted",
@@ -1566,7 +1637,13 @@ pub fn acquire_claim(
         }
     }
     let owner_alive = existing.as_ref().is_some_and(claim_owner_alive);
-    let decision = claim_decision(existing.as_ref(), epoch, now, stale_seconds, owner_alive);
+    let decision = claim_decision(
+        existing.as_ref(),
+        epoch_key,
+        now,
+        stale_seconds,
+        owner_alive,
+    );
     if decision == ClaimDecision::AlreadyRunning {
         return Ok(ClaimOutcome::AlreadyRunning);
     }
@@ -1575,6 +1652,7 @@ pub fn acquire_claim(
         registry,
         incident,
         epoch,
+        epoch_key,
         now,
         supervisor_pending,
         &format!("{decision:?}"),
@@ -1587,6 +1665,7 @@ fn write_claim(
     registry: &Path,
     incident: &str,
     epoch: &RestoreEpoch,
+    epoch_key: &str,
     now: f64,
     supervisor_pending: bool,
     takeover: &str,
@@ -1598,6 +1677,7 @@ fn write_claim(
         "incident": incident,
         "boot_id": epoch.boot_id,
         "epoch": epoch.as_json(),
+        "epoch_key": epoch_key,
         "pid": me,
         "pid_start": pid_start_ticks(u64::from(me)),
         "heartbeat_at": now,
@@ -1867,6 +1947,7 @@ pub fn start_recovery(
         registry,
         &incident,
         &epoch,
+        &epoch_identity(host, &epoch),
         options.stale_seconds,
         true,
         ClaimRole::Starter,
@@ -1963,43 +2044,30 @@ mod profile_tests {
 
     #[test]
     fn previous_boot_claim_never_blocks() {
-        let epoch = RestoreEpoch {
-            boot_id: "new".to_owned(),
-            user_manager: None,
-        };
-        let claim = json!({"boot_id": "old", "pid": 999999, "heartbeat_at": 10.0});
+        let claim = json!({"boot_id": "old", "epoch_key": "old@nomgr", "pid": 999999, "heartbeat_at": 10.0});
         assert_eq!(
-            claim_decision(Some(&claim), &epoch, 20.0, 180.0, false),
+            claim_decision(Some(&claim), "new@nomgr", 20.0, 180.0, false),
             ClaimDecision::TakeOverPreviousBoot
         );
-        // A dead claim from before a user-manager restart in the
-        // same boot is a previous epoch too (NS1).
-        let restarted = RestoreEpoch {
-            boot_id: "new".to_owned(),
-            user_manager: Some("mgr2".to_owned()),
-        };
-        assert_eq!(
-            claim_decision(Some(&claim), &restarted, 20.0, 180.0, false),
-            ClaimDecision::TakeOverPreviousBoot
-        );
-        let live = json!({"boot_id": "new", "pid": 1, "heartbeat_at": 19.0});
+        let live =
+            json!({"boot_id": "new", "epoch_key": "new@nomgr", "pid": 1, "heartbeat_at": 19.0});
         // A verifiably live owner is never taken over, however old
         // its heartbeat; a dead owner with a fresh heartbeat is not
         // stale yet either; only dead + past the interval is.
         assert_eq!(
-            claim_decision(Some(&live), &epoch, 20.0, 180.0, true),
+            claim_decision(Some(&live), "new@nomgr", 20.0, 180.0, true),
             ClaimDecision::AlreadyRunning
         );
         assert_eq!(
-            claim_decision(Some(&live), &epoch, 20.0, 180.0, false),
+            claim_decision(Some(&live), "new@nomgr", 20.0, 180.0, false),
             ClaimDecision::AlreadyRunning
         );
         assert_eq!(
-            claim_decision(Some(&live), &epoch, 500.0, 180.0, false),
+            claim_decision(Some(&live), "new@nomgr", 500.0, 180.0, false),
             ClaimDecision::TakeOverStale
         );
         assert_eq!(
-            claim_decision(None, &epoch, 20.0, 180.0, false),
+            claim_decision(None, "new@nomgr", 20.0, 180.0, false),
             ClaimDecision::Take
         );
     }
