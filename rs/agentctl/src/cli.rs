@@ -5569,7 +5569,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     eprintln!("{headline}");
                     Ok((
                         json!({"schema": "agentctl-recovery-status/v1",
-                                "headline": headline,
+                                "headline": headline, "alarm": alarm,
                                 "claim": claim, "stamp": stamp, "exit_code": code}),
                         code,
                     ))
