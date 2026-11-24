@@ -1279,13 +1279,17 @@ function renderServerSearch() {
   if (serverExpanded && serverExpandedFor !== "" &&
     identityOf(serverSearch.key) !== identityOf(serverExpandedFor)) serverExpanded = false;
   const identity = identityOf(serverSearch.key);
+  // `#2200`: a fresh answer (re)defaults the buckets — the loaded rows are
+  // re-filtered under them at once, so the timeline and the chips never
+  // speak for different searches. Only where a toggle actually moved:
+  // an answer landing between keystrokes whose defaults already stand
+  // must not land a settled pass in the typing (search-typing-fast).
+  const togglesBefore = [...bucketOn.entries()];
   let reset = false;
   if (identity !== bucketsFor) { resetBuckets(identity, true); reset = true; }
   else if (bucketView() !== bucketsView) { resetBuckets(identity, false); reset = true; }
-  // `#2200`: a fresh answer (re)defaults the buckets — the loaded rows are
-  // re-filtered under them at once, so the timeline and the chips never
-  // speak for different searches.
-  if (reset) deps.applySearch();
+  if (reset && ([...bucketOn.entries()].join() !== togglesBefore.join() ||
+    togglesBefore.length === 0)) deps.applySearch();
   const all = serverSearchOwner.allChannels();
   // `#1786`: the bottom separator is retired — the hits stand in the
   // timeline, and the bucket row under the search bar speaks for them.

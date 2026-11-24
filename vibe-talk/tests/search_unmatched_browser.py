@@ -496,13 +496,16 @@ def walk_server_search(walk: Walk, api: GapApi) -> None:
     walk.check(scope.startswith("No upstream search · this page: back to ") and
                " · server: back to " in scope and "(still expanding)" in scope and
                scope.endswith("messages searched"), f"the line says {scope!r}")
-    # `#1894`: the thread hits are extra results - off by default at the new
-    # search, standing only when the reader taps their chip.
-    walk.check(page.evaluate(HITS_JS) == ["150"], f"before the chip the hits are {page.evaluate(HITS_JS)}")
+    # `#2200` (owner 349): in All the thread hits are results like any
+    # other — Main and Threads both on at the new search, every hit placed.
+    walk.check(page.evaluate(HITS_JS) == ["151", "152", "150"], f"before the chip the hits are {page.evaluate(HITS_JS)}")
+    walk.press("#search-bucket-threads")
+    walk.until("() => document.querySelectorAll('#discord-log > li[data-server-hit]').length === 1",
+               "the threads chip did not put its hits away")
+    walk.check(page.evaluate(HITS_JS) == ["150"], f"the hits are {page.evaluate(HITS_JS)}")
     walk.press("#search-bucket-threads")
     walk.until("() => document.querySelectorAll('#discord-log > li[data-server-hit]').length === 3",
-               "the threads chip did not interleave its hits")
-    walk.check(page.evaluate(HITS_JS) == ["151", "152", "150"], f"the hits are {page.evaluate(HITS_JS)}")
+               "the threads chip did not interleave its hits again")
     line = page.evaluate(BOX_JS, "#search-scope")
     width = float(page.evaluate("() => window.innerWidth"))
     walk.check(isinstance(line, dict) and float(line["right"]) <= width + 1, f"the line runs off the screen: {line}")
@@ -533,7 +536,9 @@ def walk_server_search(walk: Walk, api: GapApi) -> None:
     page.evaluate(PICK_JS, f"thread:{LANTERN}")
     walk.until("() => document.querySelector('#discord-log > li[data-server-hit=\"card\"][data-id=\"151\"]') !== null",
                "in the thread, its own older hit did not stand as a card")
-    for chip_id, words, pressed in (("search-bucket-thread", "1 in this thread", "true"),
+    # `#2200`: the chips are the fold — this thread's chip counts its four
+    # loaded lantern messages and its one fresh hit together.
+    for chip_id, words, pressed in (("search-bucket-thread", "5 in this thread", "true"),
                                     ("search-bucket-main", "1 in main", "false"),
                                     ("search-bucket-threads", "1 in other threads", "false")):
         text = (page.text_content(f"#{chip_id}") or "").strip()
@@ -567,8 +572,11 @@ def walk_server_search(walk: Walk, api: GapApi) -> None:
                "the other-threads chip did not interleave its hit in the thread")
     walk.check(page.evaluate(HITS_JS) == ["151", "152", "150"],
                f"in the thread the hits are {page.evaluate(HITS_JS)}")
-    harbor = page.text_content("#discord-log > li[data-id='152'] .server-hit-meta") or ""
-    walk.check("in thread harbor-thread" in harbor, f"the quoted hit's header says {harbor!r}")
+    # `#2200`: the other thread's in-channel hit stands as a normal card
+    # here too, not the quoted snippet with its slug header.
+    walk.check(page.evaluate("() => document.querySelector('#discord-log > li[data-id=\"152\"]')"
+                             "?.getAttribute('data-server-hit')") == "card",
+               "the harbor hit does not stand as a normal card in the thread")
     walk.no_overflow()
     shot_buckets("7b3-all-on")
     walk.press("#search-bucket-thread")
@@ -578,7 +586,7 @@ def walk_server_search(walk: Walk, api: GapApi) -> None:
     walk.press("#search-bucket-thread")
     walk.until("() => document.querySelectorAll('#discord-log > li[data-server-hit]').length === 3",
                "turning this thread back on did not restore its card")
-    walk.notes.append("thread buckets: own card on, main/other behind chips, slug in harbor header, combinations shot")
+    walk.notes.append("thread buckets: own card on, main/other behind chips, harbor hit as a normal card, combinations shot")
 
     # Main: a thread stands for its children, so the reply's word keeps the lantern root.
     page.evaluate(PICK_JS, "main")

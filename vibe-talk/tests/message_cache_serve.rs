@@ -1518,7 +1518,11 @@ async fn a_search_partitions_main_and_threads_disjointly_and_themes_is_a_subset_
     };
     let theme = ok(&state, &search_path(SLACK_CH, "theme"), WRITE_TOKEN).await;
     let (main, threads) = partition(&theme);
-    assert_eq!(main.len(), 3, "top-level theme hits (root included): {theme}");
+    assert_eq!(
+        main.len(),
+        3,
+        "top-level theme hits (root included): {theme}"
+    );
     assert_eq!(threads.len(), 2, "reply theme hits: {theme}");
     let ids: Vec<&str> = theme["hits"]
         .as_array()
@@ -1529,8 +1533,16 @@ async fn a_search_partitions_main_and_threads_disjointly_and_themes_is_a_subset_
     let mut deduped = ids.clone();
     deduped.sort_unstable();
     deduped.dedup();
-    assert_eq!(ids.len(), deduped.len(), "a hit stands in both buckets: {theme}");
-    assert_eq!(ids.len(), main.len() + threads.len(), "the buckets do not sum to the total: {theme}");
+    assert_eq!(
+        ids.len(),
+        deduped.len(),
+        "a hit stands in both buckets: {theme}"
+    );
+    assert_eq!(
+        ids.len(),
+        main.len() + threads.len(),
+        "the buckets do not sum to the total: {theme}"
+    );
 
     let themes = ok(&state, &search_path(SLACK_CH, "themes"), WRITE_TOKEN).await;
     let (main_s, threads_s) = partition(&themes);

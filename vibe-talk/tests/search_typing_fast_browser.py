@@ -12,10 +12,10 @@ phone and desktop sizes:
   bound does not grow with the 800 rows on screen, where the old per-keystroke full pass read
   one rectangle per row (800+) plus its seams and place-keeping; after the typing pauses the
   full result lands exactly ("4 of N loaded", the lantern rows shown);
-  with the pinned bucket chips standing for "lantern" ("1 in main" / "2 in threads"), typing a
-  new query retires those chips at once — the previous query's counts never stand for the new
-  words — and after the debounced server answer the chips stay down for a query with no server
-  hits, while the loaded count speaks for the new query.
+  with the pinned bucket chips standing for "lantern" ("1 in main" / "3 in threads" — the
+  fold counts loaded and fresh together, `#2200`), typing a new query retires those chips at
+  once — the previous query's counts never stand for the new words — and after the debounced
+  server answer the chips stand for the new query's own fold, summing to its count.
 
 The gate is a count of synchronous work per input event, never a wall-clock budget (owner
 rule 346); every wait is a condition wait. Pass --screenshots DIR to keep a PNG of each stage.
@@ -253,7 +253,7 @@ def walk_through(walk: Walk, total: int) -> None:
     threads_chip = page.evaluate(CHIP_JS, "search-bucket-threads")
     walk.check(main_chip is not None and main_chip["text"] == "1 in main",
                f"the main chip says {main_chip}")
-    walk.check(threads_chip is not None and threads_chip["text"] == "2 in threads",
+    walk.check(threads_chip is not None and threads_chip["text"] == "3 in threads",
                f"the threads chip says {threads_chip}")
     walk.shot("chips-lantern")
     # A new query: the standing chips retire inside the input event, before any answer lands.
@@ -270,12 +270,20 @@ def walk_through(walk: Walk, total: int) -> None:
                f"the lantern chips still stand for 'routine': {retired}")
     walk.check(retired["chipText"] in ("", "1 in main"),
                f"the retired chip still speaks with fresh words: {retired}")
-    # Settled on the new query: its loaded count, and no bucket chips (the server holds none).
+    # Settled on the new query: its count, and the chips standing for its own
+    # fold (`#2200` — loaded matches count, so the row stands and sums to X).
     walk.until("() => document.getElementById('search-count').textContent.includes('of')"
                " && !document.getElementById('search-count').textContent.startsWith('4 of')",
                "the settled count does not speak for the routine search")
-    walk.until("() => document.getElementById('search-bucket-row').hidden",
-               "the bucket row came back for a query with no server hits")
+    walk.until("() => { const row = document.getElementById('search-bucket-row');"
+               " return row && !row.hidden && !document.getElementById('search-bucket-main').hidden; }",
+               "the bucket chips never stood for the routine search")
+    summed = page.evaluate("""() => {
+      const n = (id) => Number((document.getElementById(id).textContent || '').match(/^\\d+/)[0]);
+      const x = Number((document.getElementById('search-count').textContent || '').match(/^\\d+/)[0]);
+      return x === n('search-bucket-main') + n('search-bucket-threads') + n('search-bucket-transcripts');
+    }""")
+    walk.check(summed, "the routine chips do not sum to the count")
     walk.shot("chips-retired")
 
 
