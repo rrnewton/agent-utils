@@ -184,6 +184,37 @@
      The row menu also renders in the top layer while open (see channelrows.ts), because a z-index
      inside the scrolling list can never rise above a sibling of the list: the list itself is one
      stacking context (contain and mask), so its children's z-indexes compete only among themselves. */
+  --danger: #b3453a;
+  --on-warn: #10131a;
+  --grey-wash: #808080;
+  --tick-ink: #9aa0a6;
+  --tick-ok: #1a9e54;
+  --tick-bad: #c0392b;
+  --scrim-bg: #000000;
+  --shadow: #000000;
+  --discuss-ok-bg: #2ea05a;
+  --unread-stripe: transparent;
+  --thread-sat: 55%;
+  --thread-light: 50%;
+  --data-bg: #0e1116;
+  --data-ink: #d3dae3;
+  --data-muted: #8b96a5;
+  --data-rule: #252b34;
+  --debug-ink: #88ff88;
+  --hl-comment: #8b949e;
+  --hl-string: #a5d6ff;
+  --hl-constant: #79c0ff;
+  --hl-keyword: #ff7b72;
+  --hl-type: #ffa657;
+  --hl-function: #d2a8ff;
+  --hl-escape: #56d4dd;
+  --hl-property: #7ee787;
+  --hl-macro: #f2cc60;
+  --hl-variable: #ffa198;
+  --hl-inserted: #7ee787;
+  --hl-inserted-bg: #2ea043;
+  --hl-deleted: #ffa198;
+  --hl-deleted-bg: #f85149;
   --z-chips: 20;
   --z-strip: 30;
   --z-pill: 40;
@@ -221,6 +252,37 @@
     --read-ring: #7f8896;
     /* Half the light scheme's `--muted` and half its `--edge`. */
     --thread-grey: #9ba1ac;
+    --danger: #b3453a;
+  --on-warn: #10131a;
+  --grey-wash: #808080;
+  --tick-ink: #9aa0a6;
+    --tick-ok: #1a9e54;
+    --tick-bad: #c0392b;
+    --scrim-bg: #000000;
+    --shadow: #000000;
+    --discuss-ok-bg: #2ea05a;
+    --unread-stripe: transparent;
+    --thread-sat: 55%;
+    --thread-light: 50%;
+    --data-bg: #0e1116;
+    --data-ink: #d3dae3;
+    --data-muted: #8b96a5;
+    --data-rule: #252b34;
+    --debug-ink: #88ff88;
+    --hl-comment: #57606a;
+    --hl-string: #0a3069;
+    --hl-constant: #0550ae;
+    --hl-keyword: #cf222e;
+    --hl-type: #953800;
+    --hl-function: #8250df;
+    --hl-escape: #1b7c83;
+    --hl-property: #116329;
+    --hl-macro: #7d4e00;
+    --hl-variable: #a40e26;
+    --hl-inserted: #116329;
+    --hl-inserted-bg: #dafbe1;
+    --hl-deleted: #82071e;
+    --hl-deleted-bg: #ffebe9;
   }
 }
 

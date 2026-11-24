@@ -571,7 +571,7 @@
   border: 1px solid var(--edge);
   border-radius: 999px;
   font-size: 0.78rem;
-  box-shadow: 0 1px 6px rgb(0 0 0 / 35%);
+  box-shadow: 0 1px 6px color-mix(in srgb, var(--shadow) 35%, transparent);
   pointer-events: none;
 }
 
@@ -724,7 +724,7 @@
      a 360px phone then left it, and the time at its end is the part the ellipsis would take. */
   font-size: 0.75rem;
   text-align: center;
-  box-shadow: 0 1px 6px rgb(0 0 0 / 35%);
+  box-shadow: 0 1px 6px color-mix(in srgb, var(--shadow) 35%, transparent);
   pointer-events: none;
 }
 
@@ -785,7 +785,7 @@
   background: var(--panel);
   color: var(--muted);
   border: 1px solid var(--edge);
-  box-shadow: 0 1px 6px rgb(0 0 0 / 35%);
+  box-shadow: 0 1px 6px color-mix(in srgb, var(--shadow) 35%, transparent);
 }
 
 /* `#211 link-filter`: 21px, up from 0.95rem — the glyph is most of what made it look small. In px
@@ -980,7 +980,7 @@
   background: var(--panel);
   border: 1px solid var(--edge);
   border-radius: 0.6rem;
-  box-shadow: 0 4px 18px rgb(0 0 0 / 35%);
+  box-shadow: 0 4px 18px color-mix(in srgb, var(--shadow) 35%, transparent);
   padding: 0.5rem;
   /* Rows scrolled to stop below the sticky filter box, never under it. */
   scroll-padding-top: calc(var(--toggle-hit) + 0.9rem);
@@ -1090,7 +1090,7 @@
   color: var(--ink);
   border: 1px solid var(--edge);
   border-radius: 0.5rem;
-  box-shadow: 0 1px 6px rgb(0 0 0 / 35%);
+  box-shadow: 0 1px 6px color-mix(in srgb, var(--shadow) 35%, transparent);
   font-size: 0.75rem;
   line-height: 1.3;
   pointer-events: none;
@@ -1188,7 +1188,7 @@
   background: var(--panel);
   border: 1px solid var(--edge);
   border-radius: 999px;
-  box-shadow: 0 1px 6px rgb(0 0 0 / 35%);
+  box-shadow: 0 1px 6px color-mix(in srgb, var(--shadow) 35%, transparent);
 }
 
 /* `#1852` + `#1853` on a phone: five toggles and the count leave the focused
@@ -1417,7 +1417,7 @@
   background: var(--panel);
   border: 1px solid var(--edge);
   border-radius: 999px;
-  box-shadow: 0 1px 6px rgb(0 0 0 / 35%);
+  box-shadow: 0 1px 6px color-mix(in srgb, var(--shadow) 35%, transparent);
   pointer-events: none;
 }
 
@@ -1521,7 +1521,7 @@
 
   #author-filter:not([aria-pressed="true"])::before {
     background: var(--panel);
-    box-shadow: inset 0 0 0 1px var(--edge), 0 1px 6px rgb(0 0 0 / 35%);
+    box-shadow: inset 0 0 0 1px var(--edge), 0 1px 6px color-mix(in srgb, var(--shadow) 35%, transparent);
   }
 
   /* ...and the list STARTS at the disc's foot, rather than only making room for it at its head: room
@@ -1595,7 +1595,7 @@
   align-items: center;
   gap: 0.3rem;
   pointer-events: auto;
-  box-shadow: 0 1px 6px rgb(0 0 0 / 35%);
+  box-shadow: 0 1px 6px color-mix(in srgb, var(--shadow) 35%, transparent);
 }
 
 /*

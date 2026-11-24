@@ -57,14 +57,14 @@
    never as a fill, so a summarised (often still unread) card cannot read brown or olive.
    Light keeps the tinted fill. */
 :root[data-theme="dark"] :is(#side-log, #side-cards, #discord-log, #pinned-log) li.discord-message[data-summarised="true"] {
-  background: #000000;
+  background: var(--theirs);
 }
 
 #side-log li.discord-message[data-summarised="true"][data-summary-hue],
 #side-cards li.discord-message[data-summarised="true"][data-summary-hue],
 #discord-log li.discord-message[data-summarised="true"][data-summary-hue],
 #pinned-log li.discord-message[data-summarised="true"][data-summary-hue] {
-  --summary-tint: hsl(var(--summary-hue, 210) 55% 50%);
+  --summary-tint: hsl(var(--summary-hue, 210) var(--thread-sat, 55%) var(--thread-light, 50%));
 }
 
 /* A coding agent's row stacked under another (`[data-stack-under][data-who="coder"]`) puts its left

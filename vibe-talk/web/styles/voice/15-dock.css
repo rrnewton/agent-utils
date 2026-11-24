@@ -97,7 +97,7 @@
   background: var(--panel);
   border: 1px solid var(--edge);
   border-radius: 999px;
-  box-shadow: 0 1px 8px rgb(0 0 0 / 35%);
+  box-shadow: 0 1px 8px color-mix(in srgb, var(--shadow) 35%, transparent);
   color: var(--muted);
   pointer-events: none;
   /* The small type is on #status below, not here. Same reason as #connection-banner: the desktop
@@ -136,7 +136,7 @@
   background: var(--panel);
   border: 1px solid var(--warn);
   border-radius: 999px;
-  box-shadow: 0 1px 8px rgb(0 0 0 / 35%);
+  box-shadow: 0 1px 8px color-mix(in srgb, var(--shadow) 35%, transparent);
   pointer-events: none;
 }
 
@@ -303,7 +303,7 @@
   border-radius: 0.6rem;
   border-color: var(--warn);
   background: var(--warn);
-  color: var(--on-warn, #10131a);
+  color: var(--on-warn);
   font-weight: 700;
   white-space: nowrap;
 }
@@ -327,7 +327,7 @@
 /* `#821`. The quick reply listening: its edge in the accent, as a live microphone. */
 #quick-reply[data-listening] {
   border-width: 2px;
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 35%, transparent), 0 4px 18px rgb(0 0 0 / 0.3);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 35%, transparent), 0 4px 18px color-mix(in srgb, var(--shadow) 30%, transparent);
 }
 
 /* `#829 voice-page-dictation-polish`. The microphone badge, hanging off the listening box's lower-left corner
@@ -348,7 +348,7 @@
   border-radius: 50%;
   background: var(--accent);
   color: var(--on-accent);
-  box-shadow: 0 1px 4px rgb(0 0 0 / 0.4);
+  box-shadow: 0 1px 4px color-mix(in srgb, var(--shadow) 40%, transparent);
   touch-action: manipulation;
   animation: quick-reply-mic-pulse 1.6s ease-in-out infinite;
 }
@@ -371,10 +371,10 @@
 
 @keyframes quick-reply-mic-pulse {
   0%, 100% {
-    box-shadow: 0 1px 4px rgb(0 0 0 / 0.4), 0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent);
+    box-shadow: 0 1px 4px color-mix(in srgb, var(--shadow) 40%, transparent), 0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent);
   }
   50% {
-    box-shadow: 0 1px 4px rgb(0 0 0 / 0.4), 0 0 0 6px color-mix(in srgb, var(--accent) 0%, transparent);
+    box-shadow: 0 1px 4px color-mix(in srgb, var(--shadow) 40%, transparent), 0 0 0 6px color-mix(in srgb, var(--accent) 0%, transparent);
   }
 }
 

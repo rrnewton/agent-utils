@@ -45,6 +45,17 @@
         var colourPresets = {"blue":{"dark":{"--accent":"#5b9dd9","--on-accent":"#ffffff","--accent-bright":"#5b9dd9","--mine":"#000000","--mine-edge":"#33587b","--muted-on-mine":"#b4bcc8","--row-hover":"#262c36","--reply-tint":"#181e25","--discuss-head-bg":"#1d2026"},"light":{"--accent":"#24618f","--on-accent":"#ffffff","--accent-bright":"#5b9dd9","--mine":"#dbeaf8","--mine-edge":"#b4d0e8","--muted-on-mine":"#525b68","--row-hover":"#edf1f7","--reply-tint":"#e9eef3","--discuss-head-bg":"#ffffff"}},"blue-hc":{"dark":{"--accent":"#5b9dd9","--on-accent":"#14161a","--accent-bright":"#5b9dd9","--mine":"#000000","--mine-edge":"#33587b","--muted-on-mine":"#b4bcc8","--row-hover":"#262c36","--reply-tint":"#181e25","--discuss-head-bg":"#1d2026"},"light":{"--accent":"#24618f","--on-accent":"#ffffff","--accent-bright":"#5b9dd9","--mine":"#dbeaf8","--mine-edge":"#b4d0e8","--muted-on-mine":"#525b68","--row-hover":"#edf1f7","--reply-tint":"#e9eef3","--discuss-head-bg":"#ffffff"}},"teal":{"dark":{"--accent":"#4cc2b0","--on-accent":"#14161a","--accent-bright":"#7ad8c8","--mine":"#000000","--mine-edge":"#24594f","--muted-on-mine":"#b4d8d2","--row-hover":"#253833","--reply-tint":"#152220","--discuss-head-bg":"#1d4a42"},"light":{"--accent":"#0f766e","--on-accent":"#ffffff","--accent-bright":"#3aa79b","--mine":"#d7f0ea","--mine-edge":"#a9d8ce","--muted-on-mine":"#3f5a55","--row-hover":"#e6f4f0","--reply-tint":"#e2efec","--discuss-head-bg":"#d9f0ea"}},"plum":{"dark":{"--accent":"#cf9fe0","--on-accent":"#14161a","--accent-bright":"#e2bff0","--mine":"#000000","--mine-edge":"#53356b","--muted-on-mine":"#d3bce0","--row-hover":"#332a3d","--reply-tint":"#211a28","--discuss-head-bg":"#4a2d63"},"light":{"--accent":"#7e3a9e","--on-accent":"#ffffff","--accent-bright":"#b07cc6","--mine":"#f0e2f7","--mine-edge":"#d3b3e6","--muted-on-mine":"#5d4a68","--row-hover":"#f4ecf9","--reply-tint":"#efe6f5","--discuss-head-bg":"#ecd9f7"}},"amber":{"dark":{"--accent":"#e8b34b","--on-accent":"#14161a","--accent-bright":"#f2cc7e","--mine":"#000000","--mine-edge":"#6b4d22","--muted-on-mine":"#e6cf9e","--row-hover":"#38312a","--reply-tint":"#28211a","--discuss-head-bg":"#5c421c"},"light":{"--accent":"#8a5a00","--on-accent":"#ffffff","--accent-bright":"#c08b14","--mine":"#f7ead0","--mine-edge":"#e8cf9e","--muted-on-mine":"#66552f","--row-hover":"#faf3e0","--reply-tint":"#f5ecd7","--discuss-head-bg":"#f7ead0"}}};
         var colourTokens = colourPresets[colourPreset][effective];
         for (var colourName in colourTokens) document.documentElement.style.setProperty(colourName, colourTokens[colourName]);
+        var themeRaw = localStorage.getItem(effective === "dark" ? "vibe-talk.voice.theme-dark" : "vibe-talk.voice.theme-light");
+        var themeCfg = null;
+        try { themeCfg = themeRaw ? JSON.parse(themeRaw) : null; } catch (ignoredTheme) { themeCfg = null; }
+        if (themeCfg && themeCfg.mode === "custom" && themeCfg.tokens) {
+          for (var themeName in themeCfg.tokens) document.documentElement.style.setProperty(themeName, themeCfg.tokens[themeName]);
+          if (themeCfg.tokens["--bg"]) document.querySelector('meta[name="theme-color"]').setAttribute("content", themeCfg.tokens["--bg"]);
+        } else if (effective === "dark" && themeCfg && themeCfg.style === "extra") {
+          var extraTokens = {"--bg":"#000000","--panel":"#000000","--edge":"#2f2f36","--ink":"#edeff3","--muted":"#a3abb9","--warn":"#e0956b","--mine-edge":"#4a7db0","--muted-on-mine":"#c2cad6","--warn-on-mine":"#f0b28c","--third-edge":"#7a6540","--dock":"#0a0a0c","--paused":"#a99bf5","--row-hover":"#17171b","--pin-bg":"#2e2510","--hit-bg":"#5c4a0e","--reply-tint":"#0d0f14","--read-ring":"#a3abb9","--thread-grey":"#6e7684","--accent-bright":"#7ab5e8","--discuss-head-bg":"#2e2340","--unread-stripe":"#5b9dd9"};
+          for (var extraName in extraTokens) document.documentElement.style.setProperty(extraName, extraTokens[extraName]);
+          document.querySelector('meta[name="theme-color"]').setAttribute("content", "#000000");
+        }
       } catch (ignored) {}
     </script>
     <title>vibe-talk</title>
@@ -1985,6 +1996,28 @@
                         <option value="amber">Amber</option>
                       </select>
                       <p id="colour-theme-state" class="hint" aria-live="polite"></p>
+                      <div class="theme-editor" id="theme-editor">
+                        <div class="theme-edit-toggle" role="group" aria-label="Scheme to edit">
+                          <button type="button" id="theme-edit-light" aria-pressed="false">Light</button>
+                          <button type="button" id="theme-edit-dark" aria-pressed="true">Dark</button>
+                        </div>
+                        <div id="dark-style-row">
+                          <label for="dark-style">Dark style</label>
+                          <select id="dark-style" aria-label="Dark style">
+                            <option value="standard">Standard</option>
+                            <option value="extra">Extra dark (true black)</option>
+                          </select>
+                        </div>
+                        <label for="theme-mode">Theme</label>
+                        <select id="theme-mode" aria-label="Theme mode" aria-describedby="theme-state">
+                          <option value="default">Default</option>
+                          <option value="custom">Custom</option>
+                        </select>
+                        <button type="button" id="theme-reset">Reset custom to Default</button>
+                        <p id="theme-state" class="hint" aria-live="polite"></p>
+                        <div id="theme-groups"></div>
+                        <div id="theme-preview-slot"></div>
+                      </div>
                     </div>
                   </section>
 

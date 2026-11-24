@@ -91,6 +91,9 @@ pub const SYNCED_KEYS: &[&str] = &[
     "vibe-talk.voice.appearance",
     // The accent-family preset (`#1961 vibe-talk-colour-themes`).
     "vibe-talk.voice.colour-theme",
+    // Per-scheme theme configurations (`#2155 vibe-talk-theme-settings-pane`).
+    "vibe-talk.voice.theme-light",
+    "vibe-talk.voice.theme-dark",
     // Where a Documents React posts (`#2006 vibe-talk-documents-react`).
     "vibe-talk.voice.documents-react-policy",
     "vibe-talk.voice.collapsed-lines",

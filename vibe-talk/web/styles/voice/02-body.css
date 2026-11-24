@@ -600,9 +600,9 @@
 
 .thread-badge,
 .thread-replies {
-  border: 1px solid hsl(var(--thread-hue, 210) 55% 50%);
+  border: 1px solid hsl(var(--thread-hue, 210) var(--thread-sat, 55%) var(--thread-light, 50%));
   border-radius: 1rem;
-  background: hsl(var(--thread-hue, 210) 55% 50% / 0.12);
+  background: hsl(var(--thread-hue, 210) var(--thread-sat, 55%) var(--thread-light, 50%) / 0.12);
   color: inherit;
   padding: 0.2rem 0.65rem;
   min-height: 2rem;
@@ -798,7 +798,7 @@
   flex-wrap: wrap;
   align-items: center;
   gap: 0.3rem 0.6rem;
-  border-inline-start: 3px solid hsl(var(--thread-hue, 210) 55% 50%);
+  border-inline-start: 3px solid hsl(var(--thread-hue, 210) var(--thread-sat, 55%) var(--thread-light, 50%));
   /* `#483 thread-card-read-style`: a card recedes by the message rows' amounts (below). */
   opacity: var(--row-opacity, 1);
   filter: var(--row-filter, none);
@@ -838,8 +838,8 @@
 }
 
 #thread-list .thread-card[data-highlighted] {
-  border-color: hsl(var(--thread-hue, 210) 55% 50%);
-  background: color-mix(in srgb, hsl(var(--thread-hue, 210) 55% 50%) 14%, var(--panel));
+  border-color: hsl(var(--thread-hue, 210) var(--thread-sat, 55%) var(--thread-light, 50%));
+  background: color-mix(in srgb, hsl(var(--thread-hue, 210) var(--thread-sat, 55%) var(--thread-light, 50%)) 14%, var(--panel));
 }
 
 #thread-list:has(> .thread-card[data-highlighted]:not([hidden]):not(.search-hidden)) > .thread-card:not([data-highlighted]) {
@@ -941,9 +941,9 @@
 
 /* `#621 send-double-check`: two very small ticks after the Sending ellipsis. */
 .send-ticks { display: inline-flex; gap: 1px; margin-left: 2px; cursor: pointer; }
-.send-tick { font-size: 9px; line-height: 1; color: #9aa0a6; }
-.send-tick.ok { color: #1a9e54; }
-.send-tick.bad { color: #c0392b; }
+.send-tick { font-size: 9px; line-height: 1; color: var(--tick-ink); }
+.send-tick.ok { color: var(--tick-ok); }
+.send-tick.bad { color: var(--tick-bad); }
 .send-times { font-size: 0.72rem; color: var(--muted); }
 
 .outgoing-actions {
@@ -961,10 +961,6 @@
    both colour schemes, so a list of records or a connection's facts reads as data to look at and not as
    a row of controls. Its own two colours, legible on each other whatever the page's scheme is. */
 .data-panel {
-  --data-bg: #0e1116;
-  --data-ink: #d3dae3;
-  --data-muted: #8b96a5;
-  --data-rule: #252b34;
   background: var(--data-bg);
   color: var(--data-ink);
   border: 1px solid var(--data-rule);
@@ -1065,7 +1061,7 @@
      A shadow is clipped like any overflow, so this one ends at the edges of Settings' scrolling box;
      what is inert beyond them is dimmed by the rule below. The status pill, which floats over the box
      from outside it, is drawn under this shadow, and so dimmed by it. */
-  box-shadow: 0 0 0 100vmax rgb(0 0 0 / 0.45), 0 0.6rem 2rem rgb(0 0 0 / 0.45);
+  box-shadow: 0 0 0 100vmax color-mix(in srgb, var(--shadow) 45%, transparent), 0 0.6rem 2rem color-mix(in srgb, var(--shadow) 45%, transparent);
 }
 
 /* `#351 settings-polish`. What the pop-out makes inert beyond the box its shadow is drawn in (`dimBoxOf`
@@ -1242,8 +1238,8 @@
   z-index: var(--z-debug);
   margin: 0;
   padding: 0.25rem 0.4rem;
-  background: rgb(0 0 0 / 0.8);
-  color: #8f8;
+  background: color-mix(in srgb, var(--shadow) 80%, transparent);
+  color: var(--debug-ink);
   font: 11px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -1254,3 +1250,15 @@
   display: none;
 }
 
+
+/* `#2155 vibe-talk-theme-settings-pane`. The theme editor: scheme toggle, mode, groups. */
+.theme-editor { margin-top: 0.75rem; }
+.theme-edit-toggle { display: flex; gap: 0.5rem; margin: 0.5rem 0; }
+.theme-edit-toggle button { background: var(--panel); color: var(--ink); border: 1px solid var(--edge); }
+.theme-edit-toggle button[aria-pressed="true"] { background: var(--accent); color: var(--on-accent); }
+.theme-group { border: 1px solid var(--edge); border-radius: 0.5rem; margin: 0.5rem 0; padding: 0.5rem 0.75rem; }
+.theme-group legend { color: var(--muted); font-size: 0.85rem; padding: 0 0.25rem; }
+.theme-token { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; min-height: 2.5rem; }
+.theme-token input[type="color"] { flex: 0 0 auto; width: 3.5rem; height: 2.25rem; padding: 0.15rem; }
+.theme-token input[type="text"] { flex: 0 0 8rem; }
+.theme-token input[disabled] { opacity: 0.55; }

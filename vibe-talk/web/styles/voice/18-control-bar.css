@@ -170,7 +170,7 @@
   border-radius: 0.85rem;
   /* Lifted off what it covers. The bar's own members sit ON the background; this one sits over a
      transcript, and without a shadow the two read as one surface. */
-  box-shadow: 0 0.4rem 1.2rem rgb(0 0 0 / 35%);
+  box-shadow: 0 0.4rem 1.2rem color-mix(in srgb, var(--shadow) 35%, transparent);
 }
 
 /*
@@ -379,7 +379,7 @@
   color: var(--ink, CanvasText);
   border: 1px solid var(--edge, currentColor);
   border-radius: 0.6rem;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  box-shadow: 0 8px 24px color-mix(in srgb, var(--shadow) 35%, transparent);
   font: 1rem/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
 }
 .thread-picker-threads {
@@ -419,7 +419,7 @@
 .thread-picker-thread {
   margin: 0.3rem 0;
   border: 1px solid var(--edge, currentColor);
-  border-inline-start: 3px solid hsl(var(--thread-hue, 210) 55% 50%);
+  border-inline-start: 3px solid hsl(var(--thread-hue, 210) var(--thread-sat, 55%) var(--thread-light, 50%));
   border-radius: 0.6rem;
 }
 .thread-picker-thread[data-read] {
@@ -462,7 +462,7 @@
   padding: 0.1rem 0.55rem;
   border-radius: 999px;
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   font-size: 0.85rem;
   font-weight: 600;
   white-space: nowrap;
@@ -542,9 +542,9 @@
   cursor: pointer;
 }
 .thread-pin[aria-pressed="true"] {
-  background: var(--pin-bg, #3a3017);
-  color: var(--pin-ink, #f0c75e);
-  border-color: var(--pin-edge, #d4a63a);
+  background: var(--pin-bg);
+  color: var(--pin-ink);
+  border-color: var(--pin-edge);
 }
 .thread-pin-icon {
   flex: none;

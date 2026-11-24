@@ -10,6 +10,8 @@ export { DEVICE_SETTINGS, createDeviceSettings } from "./device.ts";
 export type { AfterDone, Appearance, ColourTheme, DeviceSetting, DeviceSettings, DiscussPanelState, DocumentsReactPolicy, ReadAudioSource, SteerOffset } from "./device.ts";
 export { THEME_TOKENS, appearanceOf, effectiveTheme, themeColorFor } from "./appearance.ts";
 export { COLOUR_PRESETS, COLOUR_THEME_WORDS, colourThemeOf } from "./colour.ts";
+export { DEFAULT_THEME_CONFIG, EXTRA_DARK_TOKENS, THEME_GROUPS, THEME_TOKEN_NAMES, defaultTokensFor, themeConfigOf, themeConfigRaw, tokensForConfig } from "./themeconfig.ts";
+export type { DarkStyle, ThemeConfig } from "./themeconfig.ts";
 export type { EffectiveTheme } from "./appearance.ts";
 export {
   DEFAULT_CARD_MAX_LINES,

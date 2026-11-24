@@ -4,6 +4,8 @@
 // setting IS — its key, its encoding, its default — is said once, and the page only draws it.
 
 import type { StoragePort } from "../../ports/index.ts";
+import { DEFAULT_THEME_CONFIG, themeConfigOf, themeConfigRaw } from "./themeconfig.ts";
+import type { ThemeConfig } from "./themeconfig.ts";
 import {
   DEFAULT_CARD_MAX_LINES,
   DEFAULT_MARK_READ_FIRST_PERCENT,
@@ -192,6 +194,26 @@ export const DEVICE_SETTINGS = Object.freeze({
     write: (choice: ColourTheme) => choice,
     refused: { value: "blue" },
   } satisfies DeviceSetting<ColourTheme>,
+  /**
+   * `#2155 vibe-talk-theme-settings-pane`. The Light scheme's theme configuration
+   * (Default/Custom, Custom tokens): absent means the untouched Default. Synced.
+   */
+  themeLight: {
+    key: "vibe-talk.voice.theme-light",
+    read: (raw: string | null) => themeConfigOf(raw),
+    write: (choice: ThemeConfig) => themeConfigRaw(choice),
+    refused: { value: DEFAULT_THEME_CONFIG },
+  } satisfies DeviceSetting<ThemeConfig>,
+  /**
+   * `#2155 vibe-talk-theme-settings-pane`. The Dark scheme's theme configuration,
+   * including its Default style (standard/extra). Absent means Standard Default.
+   */
+  themeDark: {
+    key: "vibe-talk.voice.theme-dark",
+    read: (raw: string | null) => themeConfigOf(raw),
+    write: (choice: ThemeConfig) => themeConfigRaw(choice),
+    refused: { value: DEFAULT_THEME_CONFIG },
+  } satisfies DeviceSetting<ThemeConfig>,
   /**
    * `#2006 vibe-talk-documents-react`. Where a Documents React posts: the thread of the
    * most recent mention unless the reader chose the discussion thread. ABSENT MEANS

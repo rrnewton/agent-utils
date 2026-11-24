@@ -38,8 +38,8 @@ test("two ticks render gray then green, failure is not green", () => {
   assert.match(rows, /entry\.serverTick \? " ok"/);
   assert.match(rows, /entry\.tickFailed \? " bad"/);
   assert.match(css, /\.send-tick \{[^}]*font-size: 9px/);
-  assert.match(css, /\.send-tick\.ok \{[^}]*color: #1a9e54/);
-  assert.match(css, /\.send-tick\.bad \{[^}]*color: #c0392b/);
+  assert.match(css, /\.send-tick\.ok \{[^}]*color: var\(--tick-ok\)/);
+  assert.match(css, /\.send-tick\.bad \{[^}]*color: var\(--tick-bad\)/);
 });
 
 test("page asks for accepted phase then reads outcome", () => {

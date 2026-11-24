@@ -122,6 +122,8 @@ test("`#624 voice-page-modularity`: each device setting reads, keeps and refuses
     ["afterDone", "vibe-talk.voice.after-done", "stay", [["next", "next"], ["unread", "unread"], ["stay", "stay"]], "stay"],
     ["appearance", "vibe-talk.voice.appearance", "system", [["light", "light"], ["dark", "dark"], ["system", "system"]], "system"],
     ["colourTheme", "vibe-talk.voice.colour-theme", "blue", [["teal", "teal"], ["plum", "plum"], ["amber", "amber"], ["blue-hc", "blue-hc"], ["blue", "blue"]], "blue"],
+    ["themeLight", "vibe-talk.voice.theme-light", { mode: "default", style: "standard", tokens: {} }, [[{ mode: "custom", style: "standard", tokens: { "--bg": "#000000" } }, '{"mode":"custom","style":"standard","tokens":{"--bg":"#000000"}}'], [{ mode: "default", style: "standard", tokens: {} }, null]], { mode: "default", style: "standard", tokens: {} }],
+    ["themeDark", "vibe-talk.voice.theme-dark", { mode: "default", style: "standard", tokens: {} }, [[{ mode: "default", style: "extra", tokens: {} }, '{"mode":"default","style":"extra","tokens":{}}'], [{ mode: "default", style: "standard", tokens: {} }, null]], { mode: "default", style: "standard", tokens: {} }],
     ["documentsReactPolicy", "vibe-talk.voice.documents-react-policy", "mention", [["discussion", "discussion"], ["mention", "mention"]], "mention"],
     ["readAudioSource", "vibe-talk.voice.read-audio-source", null, [["agent", "agent"], ["device", "device"], ["wit", "wit"]], null],
     ["witVoice", "vibe-talk.voice.wit-voice", "", [["Charlie", "Charlie"], ["", null]], ""],
@@ -433,4 +435,24 @@ test("`#1846 vibe-talk-windowed-rendering`: two knobs apart — data reach-back 
   assert.equal(windowedConfig(settings, false).dataReach, 42, "a kept reach-back did not override the desk default");
   assert.equal(reachBackExcess(6000, 6000 * 1500, desk), 1000);
   assert.equal(reachBackExcess(10, 10, desk), 0);
+});
+
+test("`#2155 vibe-talk-theme-settings-pane`: groups cover every token once, Extra is true black, Custom seeds and overrides", () => {
+  const { THEME_GROUPS, THEME_TOKEN_NAMES, EXTRA_DARK_TOKENS, themeConfigOf, themeConfigRaw, defaultTokensFor, tokensForConfig } = SETTINGS;
+  const grouped = THEME_GROUPS.flatMap((g) => g.tokens);
+  assert.deepStrictEqual([...grouped].sort(), [...THEME_TOKEN_NAMES].sort(), "every paintable token in exactly one group");
+  assert.equal(THEME_GROUPS.length, 14, "13 colour groups plus Code colours");
+  assert.equal(EXTRA_DARK_TOKENS["--bg"], "#000000");
+  assert.equal(EXTRA_DARK_TOKENS["--discuss-head-bg"], "#2e2340", "the second highlight, distinct from the accent");
+  assert.equal(defaultTokensFor("dark", "blue", "extra")["--bg"], "#000000");
+  assert.equal(defaultTokensFor("dark", "blue", "standard")["--bg"], "#14161a");
+  assert.equal(defaultTokensFor("light", "blue", "extra")["--bg"], "#f6f7f9", "Extra touches dark only");
+  const seeded = defaultTokensFor("dark", "teal", "standard");
+  assert.equal(seeded["--discuss-head-bg"], "#1d4a42", "Custom seeds from the effective Default, preset included");
+  const custom = themeConfigOf(themeConfigRaw({ mode: "custom", style: "standard", tokens: { "--bg": "#010203", "--hl-keyword": "#aabbcc", "--bogus": "#000000", "--edge": "red" } }));
+  assert.deepStrictEqual(custom.tokens, { "--bg": "#010203", "--hl-keyword": "#aabbcc" }, "unknown or unusable tokens are dropped");
+  assert.equal(tokensForConfig(custom, "dark", "blue")["--bg"], "#010203");
+  assert.equal(tokensForConfig(custom, "dark", "blue")["--hl-keyword"], "#aabbcc", "code colours are themeable");
+  assert.equal(themeConfigOf("not json").mode, "default");
+  assert.equal(themeConfigOf(null).mode, "default");
 });

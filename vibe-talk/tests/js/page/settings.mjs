@@ -2240,7 +2240,7 @@ function dataListProblems(html, css) {
   if (!/font-family:\s*ui-monospace/.test(panel) || !/background:\s*var\(--data-bg\)/.test(panel)) {
     problems.push("there is no dark, monospaced data panel");
   }
-  const bg = /--data-bg:\s*#([0-9a-f]{6})/i.exec(panel);
+  const bg = /--data-bg:\s*#([0-9a-f]{6})/i.exec(css);
   if (!bg || parseInt(bg[1].slice(0, 2), 16) > 0x30) problems.push("the data panel is not dark");
   if (!/<ol id="dismissed-sends" class="dismissed-sends data-panel"/.test(code)) {
     problems.push("Recently dismissed is not drawn as a data panel");
@@ -2292,7 +2292,7 @@ test("`#348 settings-dynamic-lists`: the check refuses the readouts from before 
     "Connection status is not drawn in the data panel",
   ]);
   // ...and a light panel is not a terminal's.
-  assert.deepStrictEqual(dataListProblems(HTML, CSS_CODE.replace(/--data-bg:\s*#[0-9a-f]{6}/i, "--data-bg: #f6f7f9")),
+  assert.deepStrictEqual(dataListProblems(HTML, CSS_CODE.replace(/--data-bg:\s*#[0-9a-f]{6}/gi, "--data-bg: #f6f7f9")),
     ["the data panel is not dark"]);
 });
 
@@ -2581,7 +2581,8 @@ test("`#351 settings-polish`: what the pop-out makes inert beyond the box its sh
     assert.equal(page.el(id).hasAttribute("data-under-dim"), false, `#${id}, under the shadow, is dimmed twice`);
   }
   // The stylesheet: the dim beyond the box is the shadow's own depth.
-  const shadow = /box-shadow:\s*0 0 0 100vmax rgb\(0 0 0 \/ ([0-9.]+)\)/.exec(cssBlock(".data-popout"));
+  const shadowPct = /box-shadow:\s*0 0 0 100vmax color-mix\(in srgb, var\(--shadow\) (\d+)%, transparent\)/.exec(cssBlock(".data-popout"));
+  const shadow = shadowPct ? [shadowPct[0], String(Number(shadowPct[1]) / 100)] : null;
   assert.ok(shadow, "the pop-out's dim is no longer a shadow of one colour");
   const filter = /filter:\s*brightness\(([0-9.]+)\)/.exec(cssBlock("[data-under-dim]"));
   assert.ok(filter, "what is dimmed beyond the box is not dimmed by a brightness filter");

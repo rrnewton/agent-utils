@@ -220,7 +220,7 @@
 }
 
 #control-pane #read-aloud[data-read-state="failed"] {
-  background: var(--danger, #b3453a);
+  background: var(--danger);
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -329,7 +329,7 @@
 #discord-log li.discord-message[data-thread-strip][data-who] {
   opacity: 1;
   filter: none;
-  background-image: linear-gradient(rgb(128 128 128 / var(--row-grey, 0)), rgb(128 128 128 / var(--row-grey, 0)));
+  background-image: linear-gradient(color-mix(in srgb, var(--grey-wash) calc(var(--row-grey, 0) * 100%), transparent), color-mix(in srgb, var(--grey-wash) calc(var(--row-grey, 0) * 100%), transparent));
   background-blend-mode: saturation;
 }
 
@@ -1021,7 +1021,7 @@
  * (tests/bridge_even_browser.py measures it). A phone's gutter is too narrow for that: see the
  * phone rule at the foot of this file. */
 #side-cards .reply-ungather.unpack-pack {
-  color: hsl(var(--thread-hue, 210) 55% 50%);
+  color: hsl(var(--thread-hue, 210) var(--thread-sat, 55%) var(--thread-light, 50%));
   min-width: 2rem;
   min-height: 2rem;
   top: -0.55rem;

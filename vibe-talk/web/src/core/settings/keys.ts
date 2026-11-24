@@ -28,6 +28,9 @@ export const SYNCED_SETTING_KEYS: readonly string[] = [
   "vibe-talk.voice.appearance",
   // `#1961 vibe-talk-colour-themes`. The accent-family preset.
   "vibe-talk.voice.colour-theme",
+  // `#2155 vibe-talk-theme-settings-pane`. Per-scheme Default/Custom configurations.
+  "vibe-talk.voice.theme-light",
+  "vibe-talk.voice.theme-dark",
   // `#2006 vibe-talk-documents-react`. Where a Documents React posts.
   "vibe-talk.voice.documents-react-policy",
   "vibe-talk.voice.collapsed-lines",

@@ -525,7 +525,7 @@ test("`#1078 bottom-bar-switcher`: the pane stands over the bar, Outline is in t
   assert.match(cssBlock("#doc-outline button:hover"), /text-decoration:\s*underline/,
     "outline entries do not underline on hover");
   assert.doesNotMatch(row, /var\(--accent\)/, "outline rows are filled from the accent again");
-  assert.match(cssBlock("#doc-outline-pop"), /background:\s*#[0-9a-f]/i, "the outline panel has no stated dark ground");
+  assert.match(cssBlock("#doc-outline-pop"), /background:\s*var\(--data-bg\)/, "the outline panel has no stated dark ground");
   // `#1166 switcher-frame-panel`: the tab row stands in its own framed panel, and its current
   // cell is a tint with ink text — never the Talk button's solid accent fill with white text.
   const frame = cssBlock(".view-cards");

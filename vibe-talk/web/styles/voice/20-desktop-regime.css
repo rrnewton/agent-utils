@@ -1044,7 +1044,7 @@
   /* In the thread's own colour, the tag's and the card edge's. Quiet, all but the selection's. */
   #column-links .column-link {
     fill: none;
-    stroke: hsl(var(--thread-hue, 210) 55% 50%);
+    stroke: hsl(var(--thread-hue, 210) var(--thread-sat, 55%) var(--thread-light, 50%));
     stroke-width: 2px;
     stroke-linejoin: round;
     stroke-linecap: round;
@@ -1052,7 +1052,7 @@
   }
 
   #column-links .column-link-marks {
-    fill: hsl(var(--thread-hue, 210) 55% 50%);
+    fill: hsl(var(--thread-hue, 210) var(--thread-sat, 55%) var(--thread-light, 50%));
     stroke: none;
     opacity: 0.8;
   }
@@ -1210,7 +1210,7 @@
    cards list (every `#side-log` row rule above has its `#side-cards` twin), hung one gutter in on
    a bridge in the thread's own colour, as All's gathered replies hang on theirs in the accent. */
 #side-cards .reply-bridge {
-  color: hsl(var(--thread-hue, 210) 55% 50%);
+  color: hsl(var(--thread-hue, 210) var(--thread-sat, 55%) var(--thread-light, 50%));
 }
 
 /* `#407 unpack-row-parity`. A collapsed run of read rows in an unpacked thread is the run line every
@@ -1234,12 +1234,12 @@
    in the thread's colour; in a thread, an edge in that colour inside its own box, so the row keeps
    its width and its place beside the link's lane (`#385 thread-line-overlap`). */
 li.discord-message[data-root-child] > .reply-bridge {
-  color: hsl(var(--thread-hue, 210) 55% 50%);
+  color: hsl(var(--thread-hue, 210) var(--thread-sat, 55%) var(--thread-light, 50%));
 }
 
 #side-log li.discord-message[data-root-child],
 #discord-log li.discord-message[data-root-child] {
-  box-shadow: inset 3px 0 hsl(var(--thread-hue, 210) 55% 50%);
+  box-shadow: inset 3px 0 hsl(var(--thread-hue, 210) var(--thread-sat, 55%) var(--thread-light, 50%));
 }
 
 /* `#522 thread-card-max-lines`. The rest of a root split for its card, unpacked as the card's first
@@ -1353,7 +1353,7 @@ li.discord-message[data-root-continuation] .thread-replies {
   padding: 0 0.6rem 0.45rem 0;
   background: var(--panel);
   border: 1px solid var(--edge);
-  border-left: 3px solid hsl(var(--thread-hue, 210) 55% 50%);
+  border-left: 3px solid hsl(var(--thread-hue, 210) var(--thread-sat, 55%) var(--thread-light, 50%));
   border-radius: 0.6rem;
   cursor: pointer;
   touch-action: manipulation;
@@ -1383,7 +1383,7 @@ li.discord-message[data-root-continuation] .thread-replies {
    the keys' one. The card's own buttons keep the browser's ring for the Tab that lands on them. */
 .side-card-row[data-selected="true"] {
   border-color: var(--accent);
-  border-left-color: hsl(var(--thread-hue, 210) 55% 50%);
+  border-left-color: hsl(var(--thread-hue, 210) var(--thread-sat, 55%) var(--thread-light, 50%));
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
@@ -1445,8 +1445,8 @@ li.discord-message[data-root-continuation] .thread-replies {
 
 /* `#277 thread-card-focus`. The card highlighted: ringed and tinted in its thread's colour. */
 .side-card-row[data-highlighted] {
-  border-color: hsl(var(--thread-hue, 210) 55% 50%);
-  background: color-mix(in srgb, hsl(var(--thread-hue, 210) 55% 50%) 14%, var(--panel));
+  border-color: hsl(var(--thread-hue, 210) var(--thread-sat, 55%) var(--thread-light, 50%));
+  background: color-mix(in srgb, hsl(var(--thread-hue, 210) var(--thread-sat, 55%) var(--thread-light, 50%)) 14%, var(--panel));
 }
 
 /* ...and every other card's edge and unread count grey, while the highlighted one shows: a card the
@@ -1673,8 +1673,8 @@ li.discord-message[data-root-continuation] .thread-replies {
   grid-template-rows: auto minmax(1.75rem, auto);
   column-gap: min(0.6rem, 10px);
   padding-inline-end: 0.3rem;
-  border-color: hsl(var(--thread-hue, 210) 55% 50%);
-  background: color-mix(in srgb, hsl(var(--thread-hue, 210) 55% 50%) 14%, var(--panel));
+  border-color: hsl(var(--thread-hue, 210) var(--thread-sat, 55%) var(--thread-light, 50%));
+  background: color-mix(in srgb, hsl(var(--thread-hue, 210) var(--thread-sat, 55%) var(--thread-light, 50%)) 14%, var(--panel));
 }
 
 /* `#252 thread-button-state`: a thread nobody has answered spends no colour, here as on its tag. */
@@ -2142,7 +2142,7 @@ li.discord-message[data-root-continuation] .thread-replies {
   left: 0;
   width: var(--strip-bar);
   border-radius: inherit;
-  background: hsl(var(--thread-hue, 210) 55% 50%);
+  background: hsl(var(--thread-hue, 210) var(--thread-sat, 55%) var(--thread-light, 50%));
 }
 
 #discord-log > li.discord-message > .thread-strip:focus-visible {

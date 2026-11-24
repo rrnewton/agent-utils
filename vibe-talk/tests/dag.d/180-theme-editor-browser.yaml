@@ -1,0 +1,16 @@
+steps:
+  - group: check
+    job: theme-editor-browser
+    desc: the theme editor shows 14 colour groups, Extra dark repaints the Dark Default true black with the violet Discuss highlight, Custom seeds from the Default and owns changed colours including code colours, the Light editor leaves the painted dark page alone, and a reload restores the kept configuration, in current Chromium at 412x915
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/theme_editor_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools, build.page]
+    timeout: 480
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 30
+      classification: latency-bound
+      preferred_inner_jobs: 4
+      rss_baseline_bytes: 1073741824

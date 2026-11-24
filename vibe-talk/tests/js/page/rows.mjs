@@ -2105,7 +2105,7 @@ test("...and a row showing a summary is DRAWN differently from one showing the m
   assert.match(drawn, /--summary-tint:\s*var\(--muted\)/, "a row in no thread has a fixed accent");
   assert.match(
     cssBlock('#discord-log li.discord-message[data-summarised="true"][data-summary-hue]'),
-    /--summary-tint:\s*hsl\(var\(--summary-hue, 210\) 55% 50%\)/,
+    /--summary-tint:\s*hsl\(var\(--summary-hue, 210\) var\(--thread-sat, 55%\) var\(--thread-light, 50%\)\)/,
     "a summarised row in a thread is not drawn in its thread's hue"
   );
   assert.doesNotMatch(CSS, /--summary-(bg|edge|ink):/, "the fixed summary teal is still declared");

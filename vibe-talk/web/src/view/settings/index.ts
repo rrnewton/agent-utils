@@ -71,7 +71,7 @@ export { mountHelpScreen } from "./helpscreen.ts";
 export type { HelpScreen, HelpScreenDependencies } from "./helpscreen.ts";
 export { createStoredScreen } from "./screen.ts";
 export type { StoredScreen, StoredScreenDependencies } from "./screen.ts";
-export { appearanceStateWords, colourStateWords, mountAppearance } from "./appearance.ts";
+export { appearanceStateWords, colourStateWords, mountAppearance, themeStateWords } from "./appearance.ts";
 export { mountDocumentsReact } from "./docreact.ts";
 export type { DocumentsReactControl, DocumentsReactDependencies } from "./docreact.ts";
 export type { AppearanceControl, AppearanceDependencies } from "./appearance.ts";

@@ -240,7 +240,7 @@
   }
 
   :root:not([data-input="keys"]) #discord-log[data-focus-thread] > li:not([data-thread-in]) > .thread-strip:hover::before {
-    background: hsl(var(--thread-hue, 210) 55% 50%);
+    background: hsl(var(--thread-hue, 210) var(--thread-sat, 55%) var(--thread-light, 50%));
   }
 
   /* `#1265 documents-star-hide`: a document card's Hide button appears under a resting mouse. */
@@ -400,7 +400,16 @@
 .transcript-highlight { outline: 2px solid currentColor; outline-offset: 2px; }
 /* A sent chat message standing in a transcript day (`#1886` part C):
    small and tinted with its thread's colour until tapped open. */
-.transcript-sent { border-left: 4px solid hsl(var(--thread-hue, 210) 55% 50%); padding-left: 0.5rem; font-size: 0.85em; opacity: 0.8; cursor: pointer; }
+.transcript-sent { border-left: 4px solid hsl(var(--thread-hue, 210) var(--thread-sat, 55%) var(--thread-light, 50%)); padding-left: 0.5rem; font-size: 0.85em; opacity: 0.8; cursor: pointer; }
 .transcript-sent-open { font-size: 1em; opacity: 1; }
 .transcript-sent-actions { display: flex; gap: 0.4rem; margin-top: 0.3rem; }
 .transcript-sent-open .transcript-body { white-space: pre-wrap; }
+
+/* `#2155`: unread is an edge, never a fill. The stripe token is transparent except
+   where a theme (Extra dark) gives it a colour. */
+#side-log li.discord-message:not([data-archived="true"]),
+#side-cards li.discord-message:not([data-archived="true"]),
+#discord-log li.discord-message:not([data-archived="true"]),
+#pinned-log li.discord-message:not([data-archived="true"]) {
+  box-shadow: inset 3px 0 0 var(--unread-stripe, transparent);
+}

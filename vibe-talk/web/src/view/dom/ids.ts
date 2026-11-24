@@ -121,6 +121,8 @@ export interface ElementById {
   "control-bar-bottom": HTMLDivElement;
   "control-bar-top": HTMLDivElement;
   "control-pane": HTMLDivElement;
+  "dark-style": HTMLSelectElement;
+  "dark-style-row": HTMLDivElement;
   "data-reach-back": HTMLInputElement;
   "discord-channel": HTMLSelectElement;
   "discord-log": HTMLOListElement;
@@ -729,6 +731,14 @@ export interface ElementById {
   "talk-label": HTMLSpanElement;
   "talk-note": HTMLSpanElement;
   "talk-slash": HTMLElement;
+  "theme-edit-dark": HTMLButtonElement;
+  "theme-edit-light": HTMLButtonElement;
+  "theme-editor": HTMLDivElement;
+  "theme-groups": HTMLDivElement;
+  "theme-mode": HTMLSelectElement;
+  "theme-preview-slot": HTMLDivElement;
+  "theme-reset": HTMLButtonElement;
+  "theme-state": HTMLParagraphElement;
   "thread-back": HTMLButtonElement;
   "thread-card": HTMLDivElement;
   "thread-card-age": HTMLSpanElement;

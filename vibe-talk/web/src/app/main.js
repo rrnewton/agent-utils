@@ -8891,6 +8891,9 @@ const appearanceControl = mountAppearance({
   storedColour: () => deviceSettings().get(DEVICE_SETTINGS.colourTheme),
   keepColour: (choice) => deviceSettings().keep(DEVICE_SETTINGS.colourTheme, choice),
   keptAsColour: (choice) => deviceSettings().keptAs(DEVICE_SETTINGS.colourTheme, choice),
+  storedTheme: (scheme) => deviceSettings().get(scheme === "dark" ? DEVICE_SETTINGS.themeDark : DEVICE_SETTINGS.themeLight),
+  keepTheme: (scheme, config) => deviceSettings().keep(scheme === "dark" ? DEVICE_SETTINGS.themeDark : DEVICE_SETTINGS.themeLight, config),
+  keptAsTheme: (scheme, config) => deviceSettings().keptAs(scheme === "dark" ? DEVICE_SETTINGS.themeDark : DEVICE_SETTINGS.themeLight, config),
   systemQuery: () => window.matchMedia("(prefers-color-scheme: dark)"),
 });
 application.track(appearanceControl);

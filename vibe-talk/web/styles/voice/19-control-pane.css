@@ -51,7 +51,7 @@
   border: none;
   border-radius: 0.85rem;
   font: inherit;
-  color: #fff;
+  color: var(--on-accent);
 }
 
 .control-label {
@@ -208,7 +208,7 @@
   grid-column: 3;
   grid-row: 1 / span 2;
   background: var(--warn);
-  color: var(--on-warn, #10131a);
+  color: var(--on-warn);
 }
 
 /* `#1355 phone-bar-discuss-slot`: the audio toggle in the narrow column
@@ -274,7 +274,7 @@
  */
 #control-pane .control-read[data-active="true"] {
   background: var(--warn);
-  color: var(--on-warn, #10131a);
+  color: var(--on-warn);
 }
 
 #control-pane .control-read[data-active="true"] .control-icon {
@@ -293,7 +293,7 @@
   border: 1px solid var(--edge);
   border-radius: 0.8rem;
   background: var(--dock);
-  box-shadow: 0 0.5rem 1.5rem rgb(0 0 0 / 35%);
+  box-shadow: 0 0.5rem 1.5rem color-mix(in srgb, var(--shadow) 35%, transparent);
 }
 
 /* `#567 pace-stepper`. [-] [100%] [+]: the buttons a thumb's width at least (44px), the box between

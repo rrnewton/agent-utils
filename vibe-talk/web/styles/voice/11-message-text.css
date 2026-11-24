@@ -183,76 +183,11 @@
    Primer palette, every one at least 4.5:1 on the block's background in its scheme, so a phone in
    sunlight still reads a comment. Operators and punctuation keep the text's own colour. */
 .md pre {
-  --hl-comment: #8b949e;
-  --hl-string: #a5d6ff;
-  --hl-constant: #79c0ff;
-  --hl-keyword: #ff7b72;
-  --hl-type: #ffa657;
-  --hl-function: #d2a8ff;
-  --hl-escape: #56d4dd;
-  --hl-property: #7ee787;
-  --hl-macro: #f2cc60;
-  --hl-variable: #ffa198;
-  --hl-inserted: #7ee787;
-  --hl-inserted-bg: rgba(46, 160, 67, 0.15);
-  --hl-deleted: #ffa198;
-  --hl-deleted-bg: rgba(248, 81, 73, 0.15);
-}
-
-@media (prefers-color-scheme: light) {
-  .md pre {
-    --hl-comment: #57606a;
-    --hl-string: #0a3069;
-    --hl-constant: #0550ae;
-    --hl-keyword: #cf222e;
-    --hl-type: #953800;
-    --hl-function: #8250df;
-    --hl-escape: #1b7c83;
-    --hl-property: #116329;
-    --hl-macro: #7d4e00;
-    --hl-variable: #a40e26;
-    --hl-inserted: #116329;
-    --hl-inserted-bg: #dafbe1;
-    --hl-deleted: #82071e;
-    --hl-deleted-bg: #ffebe9;
-  }
+  /* Code colours (`--hl-*`) live in the theme token tables (`#2155`); the block inherits them. */
 }
 
 /* `#1845 vibe-talk-appearance-setting`: a forced choice beats the system, for the
    code colours the sheets scope to the block itself. */
-:root[data-theme="light"] .md pre {
-  --hl-comment: #57606a;
-  --hl-string: #0a3069;
-  --hl-constant: #0550ae;
-  --hl-keyword: #cf222e;
-  --hl-type: #953800;
-  --hl-function: #8250df;
-  --hl-escape: #1b7c83;
-  --hl-property: #116329;
-  --hl-macro: #7d4e00;
-  --hl-variable: #a40e26;
-  --hl-inserted: #116329;
-  --hl-inserted-bg: #dafbe1;
-  --hl-deleted: #82071e;
-  --hl-deleted-bg: #ffebe9;
-}
-
-:root[data-theme="dark"] .md pre {
-  --hl-comment: #8b949e;
-  --hl-string: #a5d6ff;
-  --hl-constant: #79c0ff;
-  --hl-keyword: #ff7b72;
-  --hl-type: #ffa657;
-  --hl-function: #d2a8ff;
-  --hl-escape: #56d4dd;
-  --hl-property: #7ee787;
-  --hl-macro: #f2cc60;
-  --hl-variable: #ffa198;
-  --hl-inserted: #7ee787;
-  --hl-inserted-bg: rgba(46, 160, 67, 0.15);
-  --hl-deleted: #ffa198;
-  --hl-deleted-bg: rgba(248, 81, 73, 0.15);
-}
 
 .md .hl-c {
   color: var(--hl-comment);
@@ -486,7 +421,7 @@
   background: var(--panel);
   border: 1px solid var(--edge);
   border-radius: 1rem;
-  box-shadow: 0 1px 6px rgb(0 0 0 / 35%);
+  box-shadow: 0 1px 6px color-mix(in srgb, var(--shadow) 35%, transparent);
   /* `#1852`: one chip tall even while a server answer is pending, so the row
      keeps the height its chips give it and the reader's place never moves
      for it (`#243`). Counts landing change no height. */
@@ -505,7 +440,7 @@
   border-radius: 999px;
   font-weight: 600;
   cursor: pointer;
-  box-shadow: 0 1px 6px rgb(0 0 0 / 35%);
+  box-shadow: 0 1px 6px color-mix(in srgb, var(--shadow) 35%, transparent);
 }
 
 /* `#1899`: pressed reads at a glance in light and dark — a filled accent
@@ -523,18 +458,13 @@
 .search-bucket-chip[aria-pressed="true"] {
   background: var(--accent);
   border-color: var(--accent);
-  color: #14161a;
+  color: var(--on-accent);
 }
 
 .search-bucket-chip[aria-pressed="true"]::before {
   visibility: visible;
 }
 
-@media (prefers-color-scheme: light) {
-  .search-bucket-chip[aria-pressed="true"] {
-    color: #fff;
-  }
-}
 
 /* The one line: a full-width tap target, quiet until pressed. */
 .server-line {

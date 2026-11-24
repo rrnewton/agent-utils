@@ -1695,7 +1695,7 @@ test("`#299 all-thread-strip`: the stylesheet — a strip a hit area wide over t
   // ...drawn as a straight bar in the thread's colour, the formula its tag and its card are edged in.
   const bar = cssBlock("#discord-log > li.discord-message > .thread-strip::before");
   assert.equal(declaredIn(bar, "width"), "var(--strip-bar)");
-  assert.equal(declaredIn(bar, "background"), "hsl(var(--thread-hue, 210) 55% 50%)");
+  assert.equal(declaredIn(bar, "background"), "hsl(var(--thread-hue, 210) var(--thread-sat, 55%) var(--thread-light, 50%))");
   assert.match(cssBlock("#discord-log > li.discord-message > .thread-strip:focus-visible"), /outline:\s*2px solid var\(--accent\)/,
     "the keys get no ring on the strip");
   // A resting mouse widens it, only where a pointer hovers and not while the keys are in use.
@@ -2640,7 +2640,7 @@ test("`#440 thread-card-pack-toggle`: the triangle in the first unpacked row's g
   assert.match(markRule, /transform:\s*translateX\(-50%\);/, "the triangle is not centred across its button");
   assert.match(cssBlock("#side-cards .reply-ungather.unpack-pack"), /top:\s*-0\.55rem;/,
     "the triangle does not stand up against the message above it");
-  assert.match(cssBlock("#side-cards .reply-ungather.unpack-pack"), /color:\s*hsl\(var\(--thread-hue, 210\) 55% 50%\);/,
+  assert.match(cssBlock("#side-cards .reply-ungather.unpack-pack"), /color:\s*hsl\(var\(--thread-hue, 210\) var\(--thread-sat, 55%\) var\(--thread-light, 50%\)\);/,
     "the triangle is not in its thread's colour");
   assert.match(cssBlock('#side-cards[data-unpack="unread"] > .side-card-row[data-thread-read] + li[data-unpack-thread] .unpack-pack'),
     /color:\s*var\(--thread-grey\);/, "under Unpack unread a read thread's triangle does not follow its grey edge");

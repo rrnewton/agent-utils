@@ -1840,9 +1840,9 @@ test("`#261 two-column-connectors`: the links are one SVG over the main screen, 
   const drawn = cssBlockIn(TWO_COLUMN_QUERY, '#screen-main[data-columns="two"] > #column-links');
   assert.match(drawn, /pointer-events:\s*none/, "the links can take a press meant for a row or a card");
   assert.match(drawn, /position:\s*absolute/);
-  assert.match(cssBlockIn(TWO_COLUMN_QUERY, "#column-links .column-link"), /stroke:\s*hsl\(var\(--thread-hue, 210\) 55% 50%\)/,
+  assert.match(cssBlockIn(TWO_COLUMN_QUERY, "#column-links .column-link"), /stroke:\s*hsl\(var\(--thread-hue, 210\) var\(--thread-sat, 55%\) var\(--thread-light, 50%\)\)/,
     "a link is not drawn in its thread's colour, as the card's edge is");
-  assert.match(cssBlockOutside(TWO_COLUMN_QUERY, ".side-card-row"), /border-left:\s*3px solid hsl\(var\(--thread-hue, 210\) 55% 50%\)/,
+  assert.match(cssBlockOutside(TWO_COLUMN_QUERY, ".side-card-row"), /border-left:\s*3px solid hsl\(var\(--thread-hue, 210\) var\(--thread-sat, 55%\) var\(--thread-light, 50%\)\)/,
     "the card's edge is no longer the colour a link is drawn in");
   // A reduced-motion reader's glide is a jump: the stylesheet says so, and the script reads it.
   assert.match(CSS_CODE, /@media \(prefers-reduced-motion: reduce\) \{\s*#screen-main \{\s*--column-glide: auto;/,
@@ -2614,7 +2614,7 @@ test("`#298 thread-card-header`: the card at the top of a thread is in the right
   // unclamps a card's text — and grey for a thread nobody has answered.
   const look = cssBlockOutside(TWO_COLUMN_QUERY, ".side-card-row.thread-card-header");
   const lit = cssBlockOutside(TWO_COLUMN_QUERY, ".side-card-row[data-highlighted]");
-  assert.match(look, /border-color:\s*hsl\(var\(--thread-hue, 210\) 55% 50%\)/, "the card at the top is not ringed in its colour");
+  assert.match(look, /border-color:\s*hsl\(var\(--thread-hue, 210\) var\(--thread-sat, 55%\) var\(--thread-light, 50%\)\)/, "the card at the top is not ringed in its colour");
   const background = (rule) => (/(?:^|[;{\s])background:\s*([^;]+);/.exec(rule) || [])[1];
   assert.ok(background(lit), "the highlighted card has no tint to compare with");
   assert.equal(background(look), background(lit), "the card at the top is not tinted as a highlighted card");

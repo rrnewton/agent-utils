@@ -29,7 +29,7 @@
   background: var(--dock);
   border: 1px solid var(--edge);
   border-radius: 12px;
-  box-shadow: 0 0.5rem 1.5rem rgb(0 0 0 / 35%);
+  box-shadow: 0 0.5rem 1.5rem color-mix(in srgb, var(--shadow) 35%, transparent);
   /* The frame itself takes no tap: the panel is taller than the bare row was, and
      over the reader controls above the bar its padding ate the taps meant for
      them (the pace and read browser walks). Only its cells are buttons. */
@@ -253,9 +253,9 @@
 }
 .doc-star[aria-pressed="true"],
 #doc-star[aria-pressed="true"] {
-  background: var(--pin-bg, #3a3017);
-  color: var(--pin-ink, #f0c75e);
-  border-color: var(--pin-edge, #d4a63a);
+  background: var(--pin-bg);
+  color: var(--pin-ink);
+  border-color: var(--pin-edge);
 }
 .doc-star {
   flex: none;
@@ -370,7 +370,7 @@
   background: var(--dock);
   border: 1px solid var(--edge);
   border-radius: 12px;
-  box-shadow: 0 0.5rem 1.5rem rgb(0 0 0 / 35%);
+  box-shadow: 0 0.5rem 1.5rem color-mix(in srgb, var(--shadow) 35%, transparent);
 }
 .docs-since-title {
   margin: 0;
@@ -549,18 +549,18 @@
   min-width: 0;
   overflow: hidden;
   padding: 2px;
-  border: 1px solid var(--warn, #d98a5b);
+  border: 1px solid var(--warn);
   border-radius: 0.35rem;
-  background: color-mix(in srgb, var(--warn, #d98a5b) 6%, transparent);
+  background: color-mix(in srgb, var(--warn) 6%, transparent);
 }
 .doc-nav-outline[data-depth="1"] {
-  background: color-mix(in srgb, var(--warn, #d98a5b) 13%, transparent);
+  background: color-mix(in srgb, var(--warn) 13%, transparent);
 }
 .doc-nav-outline[data-depth="2"] {
-  background: color-mix(in srgb, var(--warn, #d98a5b) 20%, transparent);
+  background: color-mix(in srgb, var(--warn) 20%, transparent);
 }
 .doc-nav-outline[data-depth="3"] {
-  background: color-mix(in srgb, var(--warn, #d98a5b) 27%, transparent);
+  background: color-mix(in srgb, var(--warn) 27%, transparent);
 }
 .doc-nav-children {
   display: flex;
@@ -575,7 +575,7 @@
   min-height: 1.75rem;
   padding: 2px 1px;
   overflow: hidden;
-  border: 1px solid var(--warn, #d98a5b);
+  border: 1px solid var(--warn);
   border-radius: 0.3rem;
   background: transparent;
   color: inherit;
@@ -595,12 +595,12 @@
 }
 .doc-nav-unit[data-heard],
 .doc-nav-chunk[data-heard] {
-  background: color-mix(in srgb, var(--warn, #d98a5b) 35%, var(--panel));
+  background: color-mix(in srgb, var(--warn) 35%, var(--panel));
 }
 .doc-nav-unit[aria-current="true"],
 .doc-nav-chunk[aria-current="true"] {
-  background: var(--warn, #d98a5b);
-  color: var(--bg, #111);
+  background: var(--warn);
+  color: var(--bg);
   font-weight: 700;
 }
 .doc-nav-gap {
@@ -614,7 +614,7 @@
   display: inline-block;
   min-width: 2.2ch;
   margin-right: 0.45em;
-  color: var(--muted, #888);
+  color: var(--muted);
   font-size: 0.72em;
   font-weight: 600;
   vertical-align: baseline;
@@ -699,11 +699,11 @@ body:has(#pane-docs:not([hidden]) #docs-reader:not([hidden])) #doc-outline-open:
   max-height: 60vh;
   overflow-y: auto;
   padding: 6px;
-  border: 1px solid #3d4452;
+  border: 1px solid var(--data-rule);
   border-radius: 8px;
-  background: #1f232b;
-  color: #e7e9ee;
-  box-shadow: 0 0.5rem 1.5rem rgb(0 0 0 / 35%);
+  background: var(--data-bg);
+  color: var(--data-ink);
+  box-shadow: 0 0.5rem 1.5rem color-mix(in srgb, var(--shadow) 35%, transparent);
   z-index: var(--z-modal);
 }
 body:has(#control-bar[data-placement="top"]) #doc-outline-pop {
@@ -731,7 +731,7 @@ body:has(#control-bar[data-placement="top"]) #doc-outline-pop {
   text-align: left;
   cursor: pointer;
   background: transparent;
-  color: #e7e9ee;
+  color: var(--data-ink);
   border: none;
   border-radius: 0;
   font: inherit;
@@ -742,7 +742,7 @@ body:has(#control-bar[data-placement="top"]) #doc-outline-pop {
   text-underline-offset: 3px;
 }
 #doc-outline button:focus-visible {
-  outline: 2px solid #7ab3e3;
+  outline: 2px solid var(--accent-bright);
   outline-offset: 1px;
 }
 #doc-outline .doc-ol-1 {
@@ -768,9 +768,9 @@ body:has(#control-bar[data-placement="top"]) #doc-outline-pop {
    leave it to hue, and its `aria-current` says it where colour cannot. */
 #doc-outline button.doc-here {
   font-weight: 700;
-  color: #fff;
+  color: var(--ink);
   background: transparent;
-  box-shadow: inset 3px 0 0 #5b9dd9;
+  box-shadow: inset 3px 0 0 var(--accent);
 }
 /* A jumped-to heading clears the scroller's top fade instead of hiding under
    it. The reader's HERE slack covers this margin plus fractional layout, so
@@ -826,7 +826,7 @@ body:has(#control-bar[data-placement="top"]) #doc-outline-pop {
 .doc-bucket[aria-pressed="true"] {
   background: var(--accent, Highlight);
   border-color: var(--accent, Highlight);
-  color: var(--on-accent, #fff);
+  color: var(--on-accent);
   font-weight: 700;
 }
 .doc-bucket[aria-pressed="true"]::before {
@@ -841,9 +841,9 @@ body:has(#control-bar[data-placement="top"]) #doc-outline-pop {
   color: var(--muted, CanvasText);
 }
 #docs-starred-toggle[aria-pressed="true"] {
-  background: var(--pin-bg, #3a3017);
-  color: var(--pin-ink, #f0c75e);
-  border-color: var(--pin-edge, #d4a63a);
+  background: var(--pin-bg);
+  color: var(--pin-ink);
+  border-color: var(--pin-edge);
 }
 /* The Downloaded toggle (`#2001`), left of the star: the row's download
    glyph in muted ink off, accent-filled on, so its pressed state reads in
@@ -855,7 +855,7 @@ body:has(#control-bar[data-placement="top"]) #doc-outline-pop {
 #docs-downloaded-toggle[aria-pressed="true"] {
   background: var(--accent, Highlight);
   border-color: var(--accent, Highlight);
-  color: var(--on-accent, #fff);
+  color: var(--on-accent);
   font-weight: 700;
 }
 /* Phone room (`#2001`): the Documents list bar has no room for the audio
@@ -883,7 +883,7 @@ body:has(#control-bar[data-placement="top"]) #doc-outline-pop {
   gap: 8px;
   align-items: baseline;
   padding: 8px 10px;
-  border-bottom: 1px solid #3a4a61;
+  border-bottom: 1px solid var(--edge);
   font-weight: 700;
 }
 .doc-issue-status {

@@ -73,7 +73,7 @@
   border-radius: 8px 8px 0 0;
   background: var(--panel);
   color: var(--ink);
-  box-shadow: 0 -0.5rem 1.5rem rgb(0 0 0 / 35%);
+  box-shadow: 0 -0.5rem 1.5rem color-mix(in srgb, var(--shadow) 35%, transparent);
   z-index: var(--z-modal);
 }
 
@@ -105,7 +105,7 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
     max-height: calc(100vh - 6rem);
     border-bottom: 1px solid var(--edge);
     border-radius: 8px;
-    box-shadow: 0 0.5rem 1.5rem rgb(0 0 0 / 35%);
+    box-shadow: 0 0.5rem 1.5rem color-mix(in srgb, var(--shadow) 35%, transparent);
   }
 
   body:has(#control-bar[data-placement="top"]) #discuss-panel {
@@ -1254,7 +1254,7 @@ stay its owner's (#1524). The pane itself already ends above the
 }
 
 #discuss-answer li.discuss-fresh {
-  background: rgb(46 160 90 / 22%);
+  background: color-mix(in srgb, var(--discuss-ok-bg) 22%, transparent);
   border-radius: 4px;
 }
 
