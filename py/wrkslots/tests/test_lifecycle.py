@@ -1095,6 +1095,22 @@ def terminate_process_id(process_id: int) -> None:
 
 
 TEST_ALLOW_IMAGE_FIXTURES = "WRKSLOTS_TEST_ALLOW_IMAGE_FIXTURES"
+
+def _require_root_mounts() -> None:
+    """Root-mount tests are opt-in (owner rule).
+
+    Image slots and real bind mounts go through sudo -n.
+    Without WRKSLOTS_ALLOW_ROOT_TESTS=1 these tests skip
+    by name: image-slot removal/recovery and bind-root
+    coverage is lost in that run.
+    """
+    if os.environ.get("WRKSLOTS_ALLOW_ROOT_TESTS") != "1":
+        pytest.skip(
+            "root-mount coverage lost: image-slot and bind-mount "
+            "tests not run; set WRKSLOTS_ALLOW_ROOT_TESTS=1 "
+            "to run them"
+        )
+
 """The opt-in a fixture needs before these helpers create an image-backed project."""
 
 
@@ -62723,6 +62739,7 @@ def test_recover_checks_a_fenced_slot_without_checkouts_before_deleting(
 def test_remove_of_an_image_backed_agent_slot_checks_use_outside_the_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _require_root_mounts()
     """Default remove of an image-backed agent slot is a batch of one (#1142).
 
     Its lsof scan runs before the registry locks are taken, and no lsof check
@@ -63538,6 +63555,7 @@ def test_remove_agent_batch_removes_a_slot_whose_fence_changed_its_device_and_in
 def test_remove_agent_batch_removes_disk_image_slots(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, group_max: int,
 ) -> None:
+    _require_root_mounts()
     """The batch removes slots kept in disk images, the default for a new project.
 
     The fence of an image-backed slot unmounts the image and mounts it again
@@ -63711,6 +63729,7 @@ def destroy_leftover_images(project: Path) -> None:
 def test_remove_agent_batch_refuses_a_detached_holder_of_an_image_slot_after_its_fence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, holding: str,
 ) -> None:
+    _require_root_mounts()
     """A late use through a detached alias of an image-backed slot blocks removal (#1142).
 
     After the shared scan a process enters a bind alias of the slot in a mount
@@ -63794,6 +63813,7 @@ def test_remove_agent_batch_refuses_a_detached_holder_of_an_image_slot_after_its
 def test_remove_refuses_an_image_slot_whose_fence_mounted_another_device_while_the_old_one_holds_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _require_root_mounts()
     """The checks after an image-backed slot's fence prove its one file system (#1142).
 
     They rely on the root helper never attaching an image to a second loop
@@ -63932,6 +63952,7 @@ def test_sole_file_system_doubt_names_every_other_live_file_system_of_the_image(
 def test_remove_agent_batch_refuses_before_fencing_an_image_slot_whose_budget_ran_out(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _require_root_mounts()
     """An item whose budget runs out in the checks before its fence leaves nothing fenced.
 
     The item is refused at the path fence, before the image is unmounted or
@@ -64010,6 +64031,7 @@ def test_remove_agent_batch_refuses_before_fencing_an_image_slot_whose_budget_ra
 def test_recover_finishes_an_image_slot_removal_interrupted_at_its_fence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, point: str,
 ) -> None:
+    _require_root_mounts()
     """A removal of an image-backed slot that stops at its fence is finished by recover.
 
     No use check runs between the fence and its journal record any more

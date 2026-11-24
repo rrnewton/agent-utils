@@ -384,9 +384,30 @@ def _on_signal(signum: int, _frame: object) -> None:
     os._exit(128 + signum)
 
 
+def _assert_mounts_allowed() -> None:
+    """Fail loudly before any sudo -n mount helper can run.
+
+    Image slots mount through wrkslots' sudo -n helper. Root
+    mounts are opt-in (owner rule): a run whose projects would
+    use the image representation refuses here, by name, unless
+    WRKSLOTS_ALLOW_ROOT_TESTS=1. Plain-worktree runs
+    never reach the helper.
+    """
+    representation = os.environ.get("WRKSLOTS_INIT_REPRESENTATION", "image")
+    if representation != "worktree" and \
+            os.environ.get("WRKSLOTS_ALLOW_ROOT_TESTS") != "1":
+        raise FuzzFailure(
+            "image slots would mount through the sudo -n helper; "
+            "set WRKSLOTS_INIT_REPRESENTATION=worktree for a "
+            "root-free run or WRKSLOTS_ALLOW_ROOT_TESTS=1 "
+            "to allow root mounts"
+        )
+
+
 def _run_seed(
     seed: int, steps: int, base: Path, *, keep: bool, faults: bool = False
 ) -> None:
+    _assert_mounts_allowed()
     trace = e2e.Trace(base / "trace.jsonl", seed=seed)
     project = e2e._make_project(base, trace, ttl_seconds=2)
     _ACTIVE.update(project=project, trace=trace)

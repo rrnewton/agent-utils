@@ -645,6 +645,12 @@ def _sandbox_host_or_skip(isolation: str) -> None:
         if subprocess.run(["unshare", "-rm", "true"], capture_output=True, check=False).returncode:
             pytest.skip("unprivileged user and mount namespaces are unavailable")
     elif isolation == "root":
+        if os.environ.get("WRKSLOTS_ALLOW_ROOT_TESTS") != "1":
+            pytest.skip(
+                "root coverage lost: root-isolation live tests "
+                "not run; set WRKSLOTS_ALLOW_ROOT_TESTS=1 to run "
+                "them"
+            )
         if os.getuid() == 0 or shutil.which("sudo") is None:
             pytest.skip("isolation root needs a non-root user with sudo")
         if subprocess.run(["sudo", "-n", "true"], capture_output=True, check=False).returncode:

@@ -627,6 +627,12 @@ def test_stale_copy_holders_lists_every_namespace_and_flags_a_foreign_root(
 
 
 def _sudo_or_skip() -> None:
+    if os.environ.get("WRKSLOTS_ALLOW_ROOT_TESTS") != "1":
+        pytest.skip(
+            "root-mount coverage lost: foreign mount-namespace "
+            "cases not run; set WRKSLOTS_ALLOW_ROOT_TESTS=1 "
+            "to run them"
+        )
     if subprocess.run(["sudo", "-n", "true"], capture_output=True, check=False).returncode:
         pytest.skip("needs passwordless sudo")
 

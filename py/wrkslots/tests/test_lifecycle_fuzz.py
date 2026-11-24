@@ -23,6 +23,23 @@ def _limits() -> None:
 
 
 @pytest.mark.load_quarantine
+
+def _require_root_mounts() -> None:
+    """Root-mount tests are opt-in (owner rule).
+
+    These tests force image slots, whose mounts go through
+    wrkslots' sudo -n helper. Without the explicit opt-in they
+    skip by name: loop-device teardown and SIGTERM image-sweep
+    coverage is lost in that run.
+    """
+    if os.environ.get("WRKSLOTS_ALLOW_ROOT_TESTS") != "1":
+        pytest.skip(
+            "root-mount coverage lost: loop-device teardown and "
+            "SIGTERM image sweep not run; set "
+            "WRKSLOTS_ALLOW_ROOT_TESTS=1 to run them"
+        )
+
+
 def test_lifecycle_fuzz_fast_seeds(tmp_path: Path) -> None:
     runner = Path(__file__).with_name("lifecycle_fuzz.py")
     for seed in (1, 2, 3, 4):
@@ -47,6 +64,7 @@ def test_failing_run_leaves_no_loop_devices(
     this run's devices remain (other runs' devices, including
     pre-existing orphans, are never touched or counted).
     """
+    _require_root_mounts()
     monkeypatch.setenv("WRKSLOTS_INIT_REPRESENTATION", "image")
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from wrkslots.tests import e2e_stress as e2e
@@ -95,6 +113,7 @@ def test_sigterm_sweeps_run_images(tmp_path: Path) -> None:
 
     runner = Path(__file__).with_name("lifecycle_fuzz.py")
     before = set(glob.glob("/tmp/wrkslots-fuzz-*"))
+    _require_root_mounts()
     env = dict(os.environ)
     # conftest defaults new projects to plain worktrees; this test
     # needs real image mounts to sweep.

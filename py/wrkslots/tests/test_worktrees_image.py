@@ -972,6 +972,12 @@ def test_finish_recognises_an_empty_fenced_bind_root(
 def test_remove_worktree_accepts_the_recorded_bind_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    if os.environ.get("WRKSLOTS_ALLOW_ROOT_TESTS") != "1":
+        pytest.skip(
+            "root-mount coverage lost: recorded bind-root test "
+            "not run; set WRKSLOTS_ALLOW_ROOT_TESTS=1 to "
+            "run it"
+        )
     # Real bind mount, real Git: a flat checkout at the bind root cannot be
     # rmdir'ed by git, but git still empties it and drops its registration;
     # the recorded bind root accepts exactly that outcome (#898 follow-up).
