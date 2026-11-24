@@ -1114,19 +1114,33 @@ pub trait Host {
 /// fake so no drill ever reaches a real user manager), else the
 /// plain name resolved on PATH.
 pub fn systemctl_program() -> String {
-    std::env::var("AGENTCTL_SYSTEMCTL")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "systemctl".to_owned())
+    resolve_program(
+        std::env::var("AGENTCTL_SYSTEMCTL").ok().as_deref(),
+        std::env::var_os("AGENTCTL_TEST_HARNESS").is_some(),
+        "systemctl",
+    )
 }
 
 /// The `systemd-run` program wake timers are armed through:
 /// `AGENTCTL_SYSTEMD_RUN` when set, else `systemd-run`.
 pub fn systemd_run_program() -> String {
-    std::env::var("AGENTCTL_SYSTEMD_RUN")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "systemd-run".to_owned())
+    resolve_program(
+        std::env::var("AGENTCTL_SYSTEMD_RUN").ok().as_deref(),
+        std::env::var_os("AGENTCTL_TEST_HARNESS").is_some(),
+        "systemd-run",
+    )
+}
+
+/// Resolve one launcher program: the explicit seam value wins; under
+/// a test harness (`AGENTCTL_TEST_HARNESS` set) an unset seam refuses
+/// by resolving to a path that cannot run, so no test can ever reach
+/// a real user manager by forgetting the seam.
+pub fn resolve_program(seam: Option<&str>, test_harness: bool, default: &str) -> String {
+    match seam {
+        Some(value) if !value.is_empty() => value.to_owned(),
+        _ if test_harness => "/nonexistent/agentctl-test-harness-refusal".to_owned(),
+        _ => default.to_owned(),
+    }
 }
 
 /// The real host.
@@ -7442,5 +7456,18 @@ mod tests {
         duties.apply_override("unit_repair=off").unwrap();
         assert!(!duties.unit_repair && duties.notify);
         fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod seam_tests {
+    use super::resolve_program;
+
+    #[test]
+    fn resolve_program_refuses_under_a_test_harness() {
+        assert_eq!(resolve_program(None, true, "systemctl"), "/nonexistent/agentctl-test-harness-refusal");
+        assert_eq!(resolve_program(Some("/fake/systemctl"), true, "systemctl"), "/fake/systemctl");
+        assert_eq!(resolve_program(None, false, "systemctl"), "systemctl");
+        assert_eq!(resolve_program(Some(""), true, "systemd-run"), "/nonexistent/agentctl-test-harness-refusal");
     }
 }

@@ -208,6 +208,18 @@ impl Scratch {
         // manager. The log path is baked in (children get a trimmed
         // environment).
         let systemd_log = scratch.root.join("systemd.log");
+        // Refusing fake: the harness default. Every drill command
+        // carries the test marker and this refusal unless the
+        // recording seam below overrides it, so a future test that
+        // forgets the seam fails closed instead of reaching the
+        // real user manager.
+        install_executable(
+            &scratch.root.join("systemd-refuse"),
+            &format!(
+                "#!/bin/sh\necho refused \"$@\" >> {}\nexit 1\n",
+                scratch.root.join("systemd-refused.log").display()
+            ),
+        );
         for name in ["systemctl", "systemd-run"] {
             install_executable(
                 &scratch.root.join(name),
@@ -377,6 +389,7 @@ impl Scratch {
             .env("XDG_STATE_HOME", home.join(".local/state"))
             .env("PATH", path)
             .env("FAKE_LOG", &fake_log)
+            .env("AGENTCTL_TEST_HARNESS", "1")
             .env("AGENTCTL_SYSTEMCTL", self.root.join("systemctl"))
             .env("AGENTCTL_SYSTEMD_RUN", self.root.join("systemd-run"))
             .env_remove("HERDR_SOCKET_PATH")
@@ -635,6 +648,7 @@ impl Scratch {
             .env("XDG_DATA_HOME", home.join(".local/share"))
             .env("XDG_STATE_HOME", home.join(".local/state"))
             .env("PATH", path)
+            .env("AGENTCTL_TEST_HARNESS", "1")
             .env("AGENTCTL_SYSTEMCTL", self.root.join("systemctl"))
             .env("AGENTCTL_SYSTEMD_RUN", self.root.join("systemd-run"))
             .env_remove("HERDR_SOCKET_PATH")
