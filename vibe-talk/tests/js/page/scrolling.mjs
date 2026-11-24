@@ -274,12 +274,13 @@ test("expanding one message leaves its neighbours exactly as they were", async (
 
 test("the collapsed height is really LINES — the reader's count, three until they say otherwise — and the chips are outside the faded region", () => {
   // The fixture cannot prove a line clamp — it has no renderer — so the clamp is asserted as a
-  // declaration on the selector that has to carry it. `overflow: hidden` is checked by name
-  // because without it the box shows every line and the clamp does nothing at all.
+  // declaration on the selector that has to carry it. `overflow: clip` is checked by name
+  // because without it the box shows every line and the clamp does nothing at all (`#2203`:
+  // `hidden` would also make the preview a scroll box a selection can scroll).
   const clamped = cssBlock(".body.clamped");
   assert.match(clamped, /-webkit-line-clamp:\s*var\(--collapsed-lines\)/, "the clamp is not the reader's lines");
   assert.match(cssBlock(":root"), /--collapsed-lines:\s*3\b/, "the page has no default collapsed-lines count");
-  assert.match(clamped, /overflow:\s*hidden/, "without this the clamp shows every line anyway");
+  assert.match(clamped, /overflow:\s*clip/, "without this the clamp shows every line anyway");
   assert.match(clamped, /-webkit-box-orient:\s*vertical/);
 
   // #scroll-area carries a mask-image gradient that fades its top edge. A chip inside it would be

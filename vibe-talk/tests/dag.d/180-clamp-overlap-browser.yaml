@@ -1,0 +1,16 @@
+steps:
+  - group: check
+    job: clamp-overlap-browser
+    desc: a folded bullet or plain preview never draws two text lines in the same place (client rects compared, shown and kept-back lines alike), folded and selected by a text drag, at 412x915 by touch and 1280x800 (`#2203 vibe-talk-folded-card-preview-clamp-overlap`)
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/clamp_overlap_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools, build.page]
+    timeout: 720
+    cpu_timeout: 90
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 30
+      classification: latency-bound
+      preferred_inner_jobs: 4
+      rss_baseline_bytes: 1073741824

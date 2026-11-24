@@ -10,15 +10,25 @@
  * that Safari and Chromium both honour today; `line-clamp` is the standard property it is becoming
  * and is stated beside it so this stops needing the prefix on its own.
  *
- * NOTE for anyone trimming this: `overflow: hidden` is not decoration. Without it the box shows
+ * NOTE for anyone trimming this: the overflow is not decoration. Without it the box shows
  * every line and the clamp does nothing at all.
+ *
+ * `#2203 vibe-talk-folded-card-preview-clamp-overlap`. It is `clip`, not `hidden`: `hidden`
+ * makes the clamped body a SCROLL BOX, and the lines past the clamp — which the clamp lays
+ * out collapsed at the clamp line's own place — can be scrolled into the box and painted
+ * there, on top of each other. Selecting words in the preview is what scrolls them in (a
+ * selection reveal, the reader's own or the browser's): scene 92's selected bullet card
+ * drew the third bullet's lines over each other inside the preview, on the owner's phone
+ * and in the harness frames. `clip` clips exactly as `hidden` did and cannot be scrolled
+ * by any means, so the collapsed lines can never be brought into paint. The clamp, its
+ * geometry and its ellipsis are otherwise exactly as they were.
  */
 .body.clamped {
   display: -webkit-box;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: var(--collapsed-lines);
   line-clamp: var(--collapsed-lines);
-  overflow: hidden;
+  overflow: clip;
 }
 
 /*
