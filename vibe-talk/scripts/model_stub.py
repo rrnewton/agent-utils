@@ -108,23 +108,6 @@ class Handler(BaseHTTPRequestHandler):
                     },
                 )
                 return
-            # `#2189`: evidence that is only the selection's own use-site
-            # defines nothing; refuse as a real glossary model must.
-            bodies = re.findall(r"\[msg id=\S+? [^\]]*\] (.*)", text)
-            if len(set(bodies)) <= 1:
-                self._json(
-                    200,
-                    {
-                        "id": "msg_model_stub",
-                        "type": "message",
-                        "role": "assistant",
-                        "model": "model-stub",
-                        "content": [{"type": "text", "text": json.dumps({"term": None})}],
-                        "stop_reason": "end_turn",
-                        "usage": {"input_tokens": 100, "output_tokens": 40},
-                    },
-                )
-                return
             answer = json.dumps(
                 {
                     "term": term,
