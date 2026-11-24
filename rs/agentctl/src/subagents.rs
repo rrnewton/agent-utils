@@ -55,13 +55,13 @@ pub(crate) use cloud::{
     validate_create_arguments as validate_cloud_create_arguments, CLOUD_DRIVERS,
 };
 pub use cloud::{CloudLaunch, CloudTools};
+#[cfg(test)]
+pub(crate) use control::HeadlessViewerProof;
 pub(crate) use control::{
     acknowledge_team_notice, agent_teams_state_dir, controller_of, declared_team_for_registry,
     designated_coordinator_name, restore_agent_names, team_declaration_flags,
     team_undeliverable_notices, tree_order,
 };
-#[cfg(test)]
-pub(crate) use control::HeadlessViewerProof;
 pub use control::{render_tree, ManageAction};
 pub use headless::{
     headless_refusal, HeadlessApprovals, HeadlessStart, TakeoverOptions, TurnoverOptions,
