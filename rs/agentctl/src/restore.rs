@@ -8,8 +8,9 @@
 //! 2. Replay this epoch's recorded report when it already says the restore completed. The
 //!    epoch is the kernel boot plus the user manager's identity (#1405), so a user-manager
 //!    restart in the same boot runs a real restore instead of replaying the old report.
-//! 3. Run the project's slot manager once (`wrkslots image status`), which remounts every
-//!    image-backed slot before any agent starts in one.
+//! 3. Run the slot manager once per wrkslots project (`wrkslots image status` in the
+//!    restore project and in every distinct project recorded by a slotted agent), which
+//!    remounts every image-backed slot before any agent starts in one.
 //! 4. Wait for the Herdr server to answer.
 //! 5. Revive the coordinator from its launch spec, then register its new pane in every other
 //!    registry that names it (for example a chat bridge's).
@@ -1896,6 +1897,42 @@ fn remount_slot_images(host: &dyn Host, wrkslots: Option<&Path>, project: &Path)
     })
 }
 
+/// Canonical form of a project path for comparison and ordering; an
+/// unresolvable path compares as written.
+fn canonical_project(project: &Path) -> PathBuf {
+    fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf())
+}
+
+/// Every wrkslots project a restore must remount (#2089): the restore
+/// project first, then the distinct canonicalised projects recorded by
+/// the desired slotted agents (`slot_agents`, self-referential records
+/// already healed), sorted for determinism. One project's failure never
+/// blocks the others because each gets its own `remount_slot_images` run.
+fn slot_image_projects(boxed: &[SlotAgent], restore_project: &Path) -> Vec<PathBuf> {
+    let restore_canonical = canonical_project(restore_project);
+    let mut rest: Vec<PathBuf> = boxed
+        .iter()
+        .map(|agent| canonical_project(&agent.project))
+        .filter(|project| *project != restore_canonical)
+        .collect();
+    rest.sort();
+    rest.dedup();
+    let mut projects = vec![restore_project.to_path_buf()];
+    projects.extend(rest);
+    projects
+}
+
+/// The `slot_images_by_project` row for one project: the remount row
+/// fields plus its `project` (the remount row already carries it).
+fn project_image_row<'a>(by_project: &'a [Value], project: &Path) -> Option<&'a Value> {
+    let wanted = canonical_project(project);
+    by_project.iter().find(|row| {
+        row["project"]
+            .as_str()
+            .is_some_and(|recorded| canonical_project(Path::new(recorded)) == wanted)
+    })
+}
+
 /// Outer budget for one slot in the single Eden verb run (#1977): the
 /// verb itself caps each `eden info` at 15s and each `eden start` at
 /// 60s, and one slot can cost info + start + verify + re-query.
@@ -2895,24 +2932,34 @@ fn record_slot_owner<A: ManagedApi + ?Sized>(
 }
 
 /// Verify, before a revive, that an image-backed slot's bind is actually
-/// mounted at the location the lane will start in (#1130 D3).
+/// mounted at the location the lane will start in (#1130 D3, #2089).
 ///
-/// The evidence is the `wrkslots image status` run already in the report
-/// plus one `findmnt` on the mounted location. A slot the image status does
-/// not list is not image-backed, so there is no bind to verify. The slot is
-/// resolved from its recorded name and project (see `slot_agents`), never
-/// from the stored working directory; the directory is only checked to be
-/// the mounted slot itself, not a bare mount point or a stale original.
+/// The evidence is the `wrkslots image status` run for the agent's own
+/// recorded project plus one `findmnt` on the mounted location. A missing
+/// project row, or a project row whose status call failed, refuses the
+/// lane: its bind was never checked, so it must not be waved through. A
+/// slot the project's (successful) image status does not list is not
+/// image-backed — a plain worktree — so there is no bind to verify. The
+/// slot is resolved from its recorded name and project (see
+/// `slot_agents`), never from the stored working directory; the directory
+/// is only checked to be the mounted slot itself, not a bare mount point
+/// or a stale original.
 fn verify_slot_bind(
     host: &dyn Host,
     agent: &SlotAgent,
-    images: &Value,
+    images: Option<&Value>,
 ) -> std::result::Result<Value, String> {
     let refuse = |detail: String| {
         format!(
             "slot bind not verified for {} (slot {}): {detail}",
             agent.name, agent.slot
         )
+    };
+    let Some(images) = images else {
+        return Err(refuse(format!(
+            "no wrkslots image status row for the slot's project {}; the slot bind was not verified",
+            agent.project.display()
+        )));
     };
     let warnings = images["warnings"]
         .as_array()
@@ -2931,6 +2978,18 @@ fn verify_slot_bind(
         .find(|line| line.contains("slot image not mounted") && line.contains(agent.slot.as_str()))
     {
         return Err(refuse(format!("the slot image is not mounted: {line}")));
+    }
+    if images["action"].as_str() != Some("ran") {
+        let detail = images["detail"]
+            .as_str()
+            .filter(|detail| !detail.is_empty())
+            .or_else(|| images["reason"].as_str())
+            .unwrap_or("no detail recorded");
+        return Err(refuse(format!(
+            "wrkslots image status for the slot's project {} did not run successfully (action {}): {detail}",
+            agent.project.display(),
+            images["action"].as_str().unwrap_or("unknown")
+        )));
     }
     let entry = images["slots"].as_array().and_then(|rows| {
         rows.iter().find(|row| {
@@ -3609,14 +3668,44 @@ pub fn restore<A: ManagedApi + ?Sized>(
     };
     write_progress(&report);
     let project = registry.parent().unwrap_or(registry);
-    report["slot_images"] = if options.dry_run {
-        json!({"action": "skipped", "reason": "dry run"})
+    // Read-only, so it is computed before the remount (#2089): the
+    // remount must cover every project a desired slotted agent records.
+    let boxed = slot_agents(registry, &names, config);
+    let projects = slot_image_projects(&boxed, project);
+    // `slot_images` keeps its exact single-project shape (the restore
+    // project's row, first in `projects`); `slot_images_by_project` is
+    // the additive per-project form, one row per project in the same
+    // order. One project's failure never blocks the others or restore.
+    let (slot_images, images_by_project): (Value, Vec<Value>) = if options.dry_run {
+        (
+            json!({"action": "skipped", "reason": "dry run"}),
+            projects
+                .iter()
+                .map(
+                    |project| json!({"action": "skipped", "reason": "dry run", "project": project}),
+                )
+                .collect(),
+        )
     } else {
-        remount_slot_images(host, options.wrkslots.as_deref(), project)
+        let rows: Vec<Value> = projects
+            .iter()
+            .map(|project| {
+                let mut row = remount_slot_images(host, options.wrkslots.as_deref(), project);
+                row["project"] = json!(project);
+                row
+            })
+            .collect();
+        (
+            rows.first().cloned().unwrap_or_else(
+                || json!({"action": "skipped", "reason": "no wrkslots configured or on PATH"}),
+            ),
+            rows,
+        )
     };
+    report["slot_images"] = slot_images;
+    report["slot_images_by_project"] = json!(images_by_project);
     // After a restart, every running agent boxed to a slot is dead: hold its slot so no
     // cleanup can retire it before the agent is revived and owns it again.
-    let boxed = slot_agents(registry, &names, config);
     // #1977: restart this registry's own slots' Eden daemons after the
     // image remount and before the holds, limited to those slots. Like
     // the holds below, the step runs only when a restart was detected:
@@ -3704,7 +3793,11 @@ pub fn restore<A: ManagedApi + ?Sized>(
             // slot-owner transfer as every other lane.
             let bind = match boxed.iter().find(|agent| agent.name == name) {
                 Some(agent) if options.wrkslots.is_some() && !options.dry_run => {
-                    Some(verify_slot_bind(host, agent, &report["slot_images"]))
+                    Some(verify_slot_bind(
+                        host,
+                        agent,
+                        project_image_row(&images_by_project, &agent.project),
+                    ))
                 }
                 _ => None,
             };
@@ -3805,7 +3898,11 @@ pub fn restore<A: ManagedApi + ?Sized>(
             // mount is missing; refuse that lane and carry on with the rest.
             let bind = match boxed.iter().find(|agent| agent.name == *name) {
                 Some(agent) if options.wrkslots.is_some() && !options.dry_run => {
-                    Some(verify_slot_bind(host, agent, &report["slot_images"]))
+                    Some(verify_slot_bind(
+                        host,
+                        agent,
+                        project_image_row(&images_by_project, &agent.project),
+                    ))
                 }
                 _ => None,
             };
@@ -6944,6 +7041,43 @@ mod tests {
                 stderr: String::new(),
             }
         }
+    }
+
+    #[test]
+    fn verify_slot_bind_refuses_a_lane_with_no_project_row() {
+        // #2089: a lane recorded under a project with no image row is
+        // held, never waved through as not image-backed; a failed row
+        // for an image-backed project holds it too, while a successful
+        // row listing no slot (a plain worktree) still verifies.
+        let host = BusyOnceHost {
+            status_calls: RefCell::new(0),
+        };
+        let agent = SlotAgent {
+            name: "beta".to_owned(),
+            slot: "slot-b".to_owned(),
+            project: PathBuf::from("/projects/b"),
+            cwd: None,
+            running: true,
+        };
+        let missing = verify_slot_bind(&host, &agent, None).unwrap_err();
+        assert!(
+            missing.contains("no wrkslots image status row"),
+            "{missing}"
+        );
+        let failed =
+            json!({"action": "failed", "status": 3, "detail": "boom", "warnings": [], "slots": []});
+        let refused = verify_slot_bind(&host, &agent, Some(&failed)).unwrap_err();
+        assert!(refused.contains("did not run successfully"), "{refused}");
+        let plain = json!({"action": "ran", "status": 0, "warnings": [], "slots": []});
+        let verified = verify_slot_bind(&host, &agent, Some(&plain)).unwrap();
+        assert_eq!(verified["action"], "verified");
+        assert!(
+            verified["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not image-backed"),
+            "{verified}"
+        );
     }
 
     #[test]

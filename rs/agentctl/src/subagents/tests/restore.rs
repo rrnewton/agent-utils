@@ -16,8 +16,9 @@ struct ScriptedHost {
     boot_time: u64,
     manager: RefCell<Option<String>>,
     calls: RefCell<Vec<Vec<String>>>,
+    cwds: RefCell<Vec<Option<PathBuf>>>,
     timeouts: RefCell<Vec<Duration>>,
-    answers: RefCell<Vec<(String, CommandOutcome)>>,
+    answers: RefCell<Vec<(String, Option<String>, CommandOutcome)>>,
 }
 
 impl ScriptedHost {
@@ -28,6 +29,7 @@ impl ScriptedHost {
             boot_time: 2_000_000_000 - 3600,
             manager: RefCell::new(Some("invocation:manager-a".to_owned())),
             calls: RefCell::new(Vec::new()),
+            cwds: RefCell::new(Vec::new()),
             timeouts: RefCell::new(Vec::new()),
             answers: RefCell::new(Vec::new()),
         }
@@ -43,6 +45,20 @@ impl ScriptedHost {
     fn answer(&self, needle: &str, status: i32, stdout: &str, stderr: &str) {
         self.answers.borrow_mut().push((
             needle.to_owned(),
+            None,
+            CommandOutcome {
+                status: Some(status),
+                stdout: stdout.to_owned(),
+                stderr: stderr.to_owned(),
+            },
+        ));
+    }
+
+    /// Like `answer`, but only for a command run with a cwd containing `cwd_needle` (#2089).
+    fn answer_in(&self, needle: &str, cwd_needle: &str, status: i32, stdout: &str, stderr: &str) {
+        self.answers.borrow_mut().push((
+            needle.to_owned(),
+            Some(cwd_needle.to_owned()),
             CommandOutcome {
                 status: Some(status),
                 stdout: stdout.to_owned(),
@@ -56,6 +72,21 @@ impl ScriptedHost {
             .borrow()
             .iter()
             .map(|argv| argv.join(" "))
+            .collect()
+    }
+
+    /// Every recorded call as `argv [cwd=DIR]`, so a test can prove which project a call ran in.
+    fn commands_with_cwd(&self) -> Vec<String> {
+        self.calls
+            .borrow()
+            .iter()
+            .zip(self.cwds.borrow().iter())
+            .map(|(argv, cwd)| {
+                let cwd = cwd
+                    .as_deref()
+                    .map_or_else(|| "-".to_owned(), |path| path.display().to_string());
+                format!("{} [cwd={}]", argv.join(" "), cwd)
+            })
             .collect()
     }
 
@@ -81,16 +112,20 @@ impl Host for ScriptedHost {
     fn sleep(&self, duration: Duration) {
         self.now.set(self.now.get() + duration.as_secs_f64());
     }
-    fn run(&self, argv: &[String], _cwd: Option<&Path>, timeout: Duration) -> CommandOutcome {
+    fn run(&self, argv: &[String], cwd: Option<&Path>, timeout: Duration) -> CommandOutcome {
         self.calls.borrow_mut().push(argv.to_vec());
+        self.cwds.borrow_mut().push(cwd.map(Path::to_path_buf));
         self.timeouts.borrow_mut().push(timeout);
         let joined = argv.join(" ");
+        let cwd_text = cwd.map_or_else(String::new, |path| path.display().to_string());
         let mut answers = self.answers.borrow_mut();
-        match answers
-            .iter()
-            .position(|(needle, _)| joined.contains(needle.as_str()))
-        {
-            Some(index) => answers.remove(index).1,
+        match answers.iter().position(|(needle, cwd_needle, _)| {
+            joined.contains(needle.as_str())
+                && cwd_needle
+                    .as_deref()
+                    .map_or(true, |wanted| cwd_text.contains(wanted))
+        }) {
+            Some(index) => answers.remove(index).2,
             None => CommandOutcome {
                 status: Some(0),
                 ..CommandOutcome::default()
@@ -2292,6 +2327,310 @@ fn restore_promotes_and_transfers_a_slot_lane_whose_bind_is_present() {
     assert_eq!(report["refused"], 0, "{report}");
 }
 
+/// A dead slotted lane recorded under `project`, working in `location` (#2089).
+fn slotted_in_project(fixture: &Fixture, name: &str, slot: &str, project: &Path, _location: &Path) {
+    // A promotable slotted lane, as in the other bind tests: its
+    // recorded cwd stays the fixture root the fake pane reports, so
+    // only the recorded slot project moves to `project`.
+    promotable_slotted(fixture, name, slot);
+    let mut record = fixture.manager().load(name).unwrap();
+    record.slot_project = Some(project.display().to_string());
+    fixture.manager().save(&record).unwrap();
+}
+
+/// Two lanes, one per project: script each project's image status by cwd (#2089).
+fn two_project_fixture() -> (Fixture, PathBuf, PathBuf, PathBuf) {
+    let fixture = Fixture::new();
+    let project_a = fixture.root.clone();
+    let project_b = fixture.root.join("project-b");
+    fs::create_dir_all(&project_b).unwrap();
+    let location_a = project_a.clone();
+    let location_b = project_a.clone();
+    slotted_in_project(&fixture, "alpha", "slot-a", &project_a, &location_a);
+    slotted_in_project(&fixture, "beta", "slot-b", &project_b, &location_b);
+    (fixture, project_a, project_b, location_b)
+}
+
+fn script_findmnt(host: &ScriptedHost, location: &Path) {
+    host.answer(
+        &format!("findmnt -n -o TARGET,SOURCE {}", location.display()),
+        0,
+        &format!("{} /dev/loop0\n", location.display()),
+        "",
+    );
+}
+
+#[test]
+fn restore_remounts_every_project_and_revives_both_lanes() {
+    // #2089: one image-status run per project, each in its own project;
+    // `slot_images` is still the restore project's row alone.
+    let (fixture, project_a, project_b, location_b) = two_project_fixture();
+    let location_a = project_a.clone();
+    let host = ScriptedHost::new();
+    host.answer_in(
+        "image status",
+        &project_b.display().to_string(),
+        0,
+        &format!("work/slot-b at {} (ready)\n", location_b.display()),
+        "",
+    );
+    host.answer_in(
+        "image status",
+        &project_a.display().to_string(),
+        0,
+        &format!("work/slot-a at {} (ready)\n", location_a.display()),
+        "",
+    );
+    script_findmnt(&host, &location_a);
+    script_findmnt(&host, &location_b);
+    script_slot_transfer(&host, "slot-a", "alpha");
+    script_slot_transfer(&host, "slot-b", "beta");
+    let registry = fixture.root.join("registry");
+    let report = restore(
+        &fixture.client,
+        &registry,
+        &host,
+        &config(&fixture, None),
+        &options(Some("/opt/wrkslots")),
+    )
+    .unwrap();
+    let image_calls: Vec<String> = host
+        .commands_with_cwd()
+        .into_iter()
+        .filter(|command| command.contains("image status"))
+        .collect();
+    assert_eq!(
+        image_calls,
+        [
+            format!("/opt/wrkslots image status [cwd={}]", project_a.display()),
+            format!("/opt/wrkslots image status [cwd={}]", project_b.display()),
+        ],
+        "{:?}",
+        host.commands_with_cwd()
+    );
+    // The restore project's row keeps its exact shape and content.
+    assert_eq!(report["slot_images"]["action"], "ran", "{report}");
+    assert_eq!(
+        report["slot_images"]["project"],
+        json!(project_a.display().to_string()),
+        "{report}"
+    );
+    assert_eq!(
+        report["slot_images"]["slots"],
+        json!([{"slot": "work/slot-a", "location": location_a.display().to_string(), "phase": "ready"}]),
+        "{report}"
+    );
+    let by_project = report["slot_images_by_project"].as_array().unwrap();
+    assert_eq!(by_project.len(), 2, "{report}");
+    assert_eq!(by_project[0], report["slot_images"], "{report}");
+    assert_eq!(
+        by_project[1]["project"],
+        json!(project_b.display().to_string()),
+        "{report}"
+    );
+    assert_eq!(by_project[1]["action"], "ran", "{report}");
+    assert_eq!(by_project[1]["slots"][0]["slot"], "work/slot-b", "{report}");
+    assert_eq!(
+        agent_row(&report, "alpha")["action"],
+        "promoted",
+        "{report}"
+    );
+    assert_eq!(agent_row(&report, "beta")["action"], "promoted", "{report}");
+    assert_eq!(
+        agent_row(&report, "beta")["slot_bind"]["action"],
+        "verified",
+        "{report}"
+    );
+    // The persisted report carries the additive key (#1934 progress shape).
+    let path = fixture.root.join("reports").join(format!("{BOOT}.json"));
+    let persisted = crate::restore::read_report(&path).unwrap();
+    assert_eq!(
+        persisted["slot_images_by_project"], report["slot_images_by_project"],
+        "{persisted}"
+    );
+}
+
+#[test]
+fn restore_holds_a_lane_whose_project_image_is_not_mounted_and_revives_the_other() {
+    // #2089: project B's not-mounted warning refuses only B's lane.
+    let (fixture, project_a, project_b, location_b) = two_project_fixture();
+    let location_a = project_a.clone();
+    let host = ScriptedHost::new();
+    host.answer_in(
+        "image status",
+        &project_b.display().to_string(),
+        0,
+        "",
+        "wrkslots: WARNING: slot image not mounted: work/slot-b: device busy\n",
+    );
+    host.answer_in(
+        "image status",
+        &project_a.display().to_string(),
+        0,
+        &format!("work/slot-a at {} (ready)\n", location_a.display()),
+        "",
+    );
+    script_findmnt(&host, &location_a);
+    script_slot_transfer(&host, "slot-a", "alpha");
+    let registry = fixture.root.join("registry");
+    let report = restore(
+        &fixture.client,
+        &registry,
+        &host,
+        &config(&fixture, None),
+        &options(Some("/opt/wrkslots")),
+    )
+    .unwrap();
+    let _ = location_b;
+    assert_eq!(
+        agent_row(&report, "alpha")["action"],
+        "promoted",
+        "{report}"
+    );
+    let beta = agent_row(&report, "beta");
+    assert_eq!(beta["action"], "refused", "{report}");
+    assert!(
+        beta["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("slot-b"),
+        "{beta}"
+    );
+    assert_eq!(report["refused"], 1, "{report}");
+}
+
+#[test]
+fn restore_holds_a_lane_when_its_project_image_status_fails_and_revives_the_other() {
+    // #2089: a nonzero image status in project B holds B's lane only;
+    // one project's failure never blocks the others or restore itself.
+    let (fixture, project_a, project_b, _) = two_project_fixture();
+    let location_a = project_a.clone();
+    let host = ScriptedHost::new();
+    host.answer_in(
+        "image status",
+        &project_b.display().to_string(),
+        3,
+        "",
+        "image status exploded\n",
+    );
+    host.answer_in(
+        "image status",
+        &project_a.display().to_string(),
+        0,
+        &format!("work/slot-a at {} (ready)\n", location_a.display()),
+        "",
+    );
+    script_findmnt(&host, &location_a);
+    script_slot_transfer(&host, "slot-a", "alpha");
+    let registry = fixture.root.join("registry");
+    let report = restore(
+        &fixture.client,
+        &registry,
+        &host,
+        &config(&fixture, None),
+        &options(Some("/opt/wrkslots")),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_row(&report, "alpha")["action"],
+        "promoted",
+        "{report}"
+    );
+    let beta = agent_row(&report, "beta");
+    assert_eq!(beta["action"], "refused", "{report}");
+    assert!(
+        beta["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("did not run successfully"),
+        "{beta}"
+    );
+    assert_eq!(report["slot_images"]["action"], "ran", "{report}");
+    assert_eq!(
+        report["slot_images_by_project"][1]["action"], "failed",
+        "{report}"
+    );
+}
+
+#[test]
+fn restore_revives_a_plain_worktree_lane_in_a_second_project() {
+    // #2089 hold precision: a project whose status is fine and lists no
+    // image-backed slot for the lane is a plain worktree; it revives.
+    let (fixture, project_a, project_b, _) = two_project_fixture();
+    let location_a = project_a.clone();
+    let host = ScriptedHost::new();
+    host.answer_in(
+        "image status",
+        &project_b.display().to_string(),
+        0,
+        "no image-backed slots\n",
+        "",
+    );
+    host.answer_in(
+        "image status",
+        &project_a.display().to_string(),
+        0,
+        &format!("work/slot-a at {} (ready)\n", location_a.display()),
+        "",
+    );
+    script_findmnt(&host, &location_a);
+    script_slot_transfer(&host, "slot-a", "alpha");
+    script_slot_transfer(&host, "slot-b", "beta");
+    let registry = fixture.root.join("registry");
+    let report = restore(
+        &fixture.client,
+        &registry,
+        &host,
+        &config(&fixture, None),
+        &options(Some("/opt/wrkslots")),
+    )
+    .unwrap();
+    let beta = agent_row(&report, "beta");
+    assert_eq!(beta["action"], "promoted", "{report}");
+    assert_eq!(beta["slot_bind"]["action"], "verified", "{report}");
+    assert!(
+        beta["slot_bind"]["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not image-backed"),
+        "{beta}"
+    );
+}
+
+#[test]
+fn restore_dry_run_lists_every_project_as_skipped() {
+    // #2089: dry run keeps `slot_images` as the bare skipped row and
+    // lists each discovered project as skipped/dry-run by project.
+    let (fixture, project_a, project_b, _) = two_project_fixture();
+    let host = ScriptedHost::new();
+    let registry = fixture.root.join("registry");
+    let report = restore(
+        &fixture.client,
+        &registry,
+        &host,
+        &config(&fixture, None),
+        &RestoreOptions {
+            dry_run: true,
+            ..options(Some("/opt/wrkslots"))
+        },
+    )
+    .unwrap();
+    assert!(host.commands().is_empty(), "{:?}", host.commands());
+    assert_eq!(
+        report["slot_images"],
+        json!({"action": "skipped", "reason": "dry run"}),
+        "{report}"
+    );
+    assert_eq!(
+        report["slot_images_by_project"],
+        json!([
+            {"action": "skipped", "reason": "dry run", "project": project_a.display().to_string()},
+            {"action": "skipped", "reason": "dry run", "project": project_b.display().to_string()},
+        ]),
+        "{report}"
+    );
+}
+
 #[test]
 fn restore_restarts_eden_daemons_for_its_own_slots_only() {
     // #1977: after the image remount and before any slot hold/transfer,
@@ -3370,6 +3709,7 @@ fn watch_says_when_wrkslots_image_status_never_finished() {
     let host = ScriptedHost::new();
     host.answers.borrow_mut().push((
         "image status".to_owned(),
+        None,
         CommandOutcome {
             status: None,
             stdout: String::new(),
