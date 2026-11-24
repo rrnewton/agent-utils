@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-seal-recovery-empty-census-data-loss: seal recovery deletes a checkout on an unproven census'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -67,3 +67,15 @@ Pre-assigned #2208 wrkslots-seal-recovery-empty-census-data-loss.
 Follows #2128 wrkslots-seal-recover-scoped-census (919e765f), whose
 substitution this issue removes; the scoped cgroup decision itself
 stays for its refusal cases.
+
+## Resolution
+
+Landed on main as 735821e1 (waiver gate on 1f362ae1; the four red
+steps were classified unrelated with alone-run evidence on both the
+fix tree and clean main). `_finish_remove_paths` no longer
+substitutes an empty census for `_CensusDidNotClose`: recovery
+refuses by name (slot, cause, retained checkout/journal/seal, retry
+guidance) and the fence rollback retains the checkout. Planted
+deterministic test red on unfixed main, green after, mutant caught;
+Rust census pin added (its capture already failed closed). No
+persisted-format change.
