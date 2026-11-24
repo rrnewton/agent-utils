@@ -171,6 +171,21 @@ def main() -> int:
                 })""")
                 check(hl["v"] == "#ff7b72" and not hl["input"], f"code colours token-owned, not Custom-edited: {hl}")
 
+                # Sticky compact preview: edit Danger at the foot of the list; its sample
+                # shows in the pinned preview without scrolling the editor back.
+                page.evaluate("() => document.querySelector('#theme-groups input[data-token=\"--danger\"]').scrollIntoView({block: 'end'})")
+                page.wait_for_timeout(300)
+                set_colour(page, "--danger", "#ff0000")
+                page.wait_for_function("() => getComputedStyle(document.querySelector('[data-focus-sample=\"status\"]')).backgroundColor === 'rgb(255, 0, 0)'", timeout=STATE_MS)
+                sticky = page.evaluate("""() => {
+                  const host = document.getElementById('theme-preview').getBoundingClientRect();
+                  const sample = document.querySelector('[data-focus-sample="status"]').getBoundingClientRect();
+                  return { top: host.top, bottom: host.bottom, sampleTop: sample.top, vh: innerHeight };
+                }""")
+                check(sticky["top"] >= -1 and sticky["bottom"] <= sticky["vh"] + 1 and sticky["sampleTop"] >= sticky["top"], f"phone compact preview visible while editing Danger: {sticky}")
+                if args.screenshots:
+                    page.screenshot(path=str(args.screenshots / "theme-sticky-phone-focus.png"))
+
                 # The Light editor edits light while dark is painted.
                 page.click("#theme-edit-light")
                 page.select_option("#theme-mode", "custom")
@@ -221,6 +236,24 @@ def main() -> int:
                         pass
                     open_editor(dpage)
                     dpage.screenshot(path=str(args.screenshots / "theme-editor-desktop.png"))
+                    # Sticky rail: scroll the colour list; the preview stays in view beside it.
+                    dpage.evaluate("() => document.querySelector('#theme-groups input[data-token=\"--danger\"]').scrollIntoView({block: 'end'})")
+                    dpage.wait_for_timeout(300)
+                    rail = dpage.evaluate("""() => {
+                      const host = document.getElementById('theme-preview').getBoundingClientRect();
+                      const groups = document.getElementById('theme-groups').getBoundingClientRect();
+                      return { top: host.top, bottom: host.bottom, left: host.left, groupsRight: groups.right, vh: innerHeight };
+                    }""")
+                    check(rail["top"] >= -1 and rail["bottom"] <= rail["vh"] + 1, f"desktop preview sticks in viewport: {rail}")
+                    check(rail["left"] > 600, f"desktop preview beside the list: {rail}")
+                    if args.screenshots:
+                        dpage.screenshot(path=str(args.screenshots / "theme-sticky-desktop-dark.png"))
+                    dpage.select_option("#appearance", "light")
+                    dpage.wait_for_function("() => document.documentElement.getAttribute('data-theme') === 'light'", timeout=STATE_MS)
+                    dpage.evaluate("() => document.querySelector('#theme-groups input[data-token=\"--danger\"]').scrollIntoView({block: 'end'})")
+                    dpage.wait_for_timeout(300)
+                    if args.screenshots:
+                        dpage.screenshot(path=str(args.screenshots / "theme-sticky-desktop-light.png"))
                     desk.close()
         print("theme editor browser: ok")
         return 0

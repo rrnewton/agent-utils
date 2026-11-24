@@ -226,6 +226,7 @@ export function mountAppearance(deps: AppearanceDependencies): AppearanceControl
         if (group.id === "code") continue;
         const box = document.createElement("fieldset");
         box.className = "theme-group";
+        box.setAttribute("data-group", group.id);
         const legend = document.createElement("legend");
         legend.textContent = group.title;
         box.appendChild(legend);
@@ -258,6 +259,22 @@ export function mountAppearance(deps: AppearanceDependencies): AppearanceControl
     paintPreview();
   }
 
+  let focusGroup = "highlight";
+  function paintFocusSample(host: HTMLElement): void {
+    const strip = host.querySelector ? host.querySelector("[data-focus-strip]") : null;
+    if (!strip) return;
+    for (const node of Array.from(strip.children ?? [])) {
+      const el = node as HTMLElement;
+      const active = el.getAttribute("data-focus-sample") === focusGroup;
+      el.hidden = !active;
+      if (active && el.style) {
+        if (focusGroup === "status") { el.style.background = "var(--danger)"; el.style.color = "var(--on-warn)"; }
+        if (focusGroup === "marks") { el.style.background = "var(--pin-bg)"; el.style.color = "var(--pin-ink)"; el.style.borderColor = "var(--pin-edge)"; }
+        if (focusGroup === "accent") { el.style.background = "var(--accent)"; el.style.color = "var(--on-accent)"; }
+      }
+    }
+  }
+
   // Live preview (`#2155` Part B): a sample pane wearing the edited scheme's tokens,
   // repainted on every editor change so the reader sees the colours before leaving.
   function paintPreview(): void {
@@ -267,6 +284,7 @@ export function mountAppearance(deps: AppearanceDependencies): AppearanceControl
     if (host.style && typeof host.style.setProperty === "function") {
       for (const [name, value] of Object.entries(tokens)) host.style.setProperty(name, value);
     }
+    paintFocusSample(host);
     if (!host.hasChildNodes || !host.hasChildNodes()) {
       const make = (tag: string, className: string, text?: string): HTMLElement => {
         const node = document.createElement(tag);
@@ -283,9 +301,32 @@ export function mountAppearance(deps: AppearanceDependencies): AppearanceControl
       const str = make("span", "theme-preview-str", '"landed"');
       code.append(kw, document.createTextNode("main() { println!("), str, document.createTextNode(") }"));
       const quiet = make("div", "theme-preview-quiet", "Quiet text, pins and marks ride along.");
+      const focus = make("div", "theme-preview-focus");
+      focus.setAttribute("data-focus-strip", "");
+      const samples: Record<string, HTMLElement> = {};
+      const sample = (group: string, className: string, text: string): void => {
+        const node = make("div", className, text);
+        node.setAttribute("data-focus-sample", group);
+        samples[group] = node;
+        focus.appendChild(node);
+      };
+      sample("background", "theme-preview-sample theme-preview-sample-bg", "Page background");
+      sample("cards", "theme-preview-sample theme-preview-card theme-preview-theirs", "Message card");
+      sample("mine", "theme-preview-sample theme-preview-card theme-preview-mine", "Your message");
+      sample("third", "theme-preview-sample theme-preview-card theme-preview-third", "Others' messages");
+      sample("dock", "theme-preview-sample theme-preview-sample-dock", "Bars and dock");
+      sample("edge", "theme-preview-sample theme-preview-card theme-preview-theirs theme-preview-sample-edge", "Borders and dividers");
+      sample("ink", "theme-preview-sample", "Text in the edited ink");
+      sample("muted", "theme-preview-sample theme-preview-quiet", "Quiet text");
+      sample("accent", "theme-preview-sample theme-preview-sample-accent", "Accent button");
+      sample("highlight", "theme-preview-sample theme-preview-head", "Discuss header");
+      sample("hover", "theme-preview-sample theme-preview-sample-hover", "Hover and reply shade");
+      sample("status", "theme-preview-sample theme-preview-sample-status", "Danger · Warning · OK");
+      sample("marks", "theme-preview-sample theme-preview-sample-marks", "Pinned · Search mark");
+      sample("code", "theme-preview-sample theme-preview-code", "fn main() {}");
       const button = make("button", "theme-preview-button", "Send");
       button.setAttribute("type", "button");
-      host.append(head, agent, mine, third, code, quiet, button);
+      host.append(head, agent, mine, third, code, quiet, focus, button);
     }
   }
 
@@ -337,11 +378,21 @@ export function mountAppearance(deps: AppearanceDependencies): AppearanceControl
     previewToggle.setAttribute("aria-expanded", String(!open));
     host.hidden = open;
   });
+  const groupsFocusHost = deps.lookup("theme-groups");
+  if (groupsFocusHost) listen<Event>(groupsFocusHost, "focusin", (event: Event) => {
+    const input = event.target as HTMLInputElement | null;
+    const name = input && typeof input.getAttribute === "function" ? input.getAttribute("data-token") : undefined;
+    if (!name) return;
+    const owner = THEME_GROUPS.find((group) => group.tokens.includes(name));
+    if (owner && owner.id !== focusGroup) { focusGroup = owner.id; paintPreview(); }
+  });
   const groupsHost = deps.lookup("theme-groups");
   if (groupsHost) listen<Event>(groupsHost, "input", (event: Event) => {
     const input = event.target as HTMLInputElement | null;
     const name = input && typeof input.getAttribute === "function" ? input.getAttribute("data-token") : undefined;
     if (!input || !name || configs[editScheme].mode !== "custom") return;
+    const owner = THEME_GROUPS.find((group) => group.tokens.includes(name));
+    if (owner) focusGroup = owner.id;
     configs[editScheme] = { ...configs[editScheme], tokens: { ...configs[editScheme].tokens, [name]: input.value } };
     editorChanged(keepConfig(editScheme));
   });

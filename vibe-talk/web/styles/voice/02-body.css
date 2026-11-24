@@ -1276,3 +1276,25 @@
 .theme-preview-str { color: var(--hl-string); }
 .theme-preview-quiet { color: var(--muted); font-size: 0.85rem; }
 .theme-preview-button { background: var(--accent); color: var(--on-accent); justify-self: end; }
+
+/* `#2155` sticky preview: beside the list on a desk, a compact pinned pane on a phone,
+   so the colour being edited and its effect stay in view together. */
+.theme-editor > :not(#theme-preview-slot) { grid-column: 1; }
+#theme-preview-slot { position: sticky; top: 0.25rem; z-index: 5; align-self: start; }
+@media (min-width: 900px) {
+  /* The Settings column is too narrow to split, so the rail floats beside it. */
+  #theme-preview-slot { position: fixed; right: 1rem; top: 4.5rem; width: 340px; z-index: var(--z-menu); }
+  #theme-preview { max-height: calc(100dvh - 8.5rem); overflow-y: auto; box-shadow: 0 0.5rem 1.5rem color-mix(in srgb, var(--shadow) 35%, transparent); }
+}
+@media (max-width: 899px) {
+  #theme-preview .theme-preview-third, #theme-preview .theme-preview-code, #theme-preview .theme-preview-quiet { display: none; }
+}
+
+.theme-preview-focus { border-top: 1px solid var(--edge); padding-top: 0.4rem; }
+.theme-preview-sample { border-radius: 0.4rem; padding: 0.4rem 0.6rem; }
+.theme-preview-sample-bg { background: var(--bg); border: 1px solid var(--edge); }
+.theme-preview-sample-dock { background: var(--dock); }
+.theme-preview-sample-edge { border: 2px solid var(--edge); }
+.theme-preview-sample-hover { background: var(--row-hover); }
+.theme-preview-sample-status, .theme-preview-sample-marks, .theme-preview-sample-accent { text-align: center; font-weight: 600; }
+.theme-preview-sample-marks { border: 1px solid var(--pin-edge); }
