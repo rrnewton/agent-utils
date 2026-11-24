@@ -448,7 +448,7 @@ impl Scratch {
     fn install_profiles(&self, state_dir: &Path) {
         let profiles = format!(
             "schema = \"agentctl-recovery-profiles/v1\"\n\
-             [[profile]]\nname = \"slow-muse\"\nharness = \"muse\"\ntimeout_seconds = 2\ncommand = \"{}\"\n\
+             [[profile]]\nname = \"slow-muse\"\nharness = \"muse\"\ntimeout_seconds = 10\ncommand = \"{}\"\n\
              [[profile]]\nname = \"answering-claude\"\nharness = \"claude\"\ntimeout_seconds = 30\ncommand = \"{}\"\n",
             self.root.join("fakebin/muse").display(),
             self.root.join("fakebin/claude").display(),
@@ -891,8 +891,8 @@ fn no_progress_bound_stops_early_after_restore_settles() {
     assert_eq!(stamp["verdict"], "GAVE-UP");
     scratch.reap();
 
-    // Dedicated run: max-rounds 6, no-progress 1 — the loop must stop
-    // well before 6 once facts stop changing (S2/NB1 settle grace).
+    // Dedicated run: max-rounds 10, no-progress 1 — the loop must
+    // stop well before 10 once facts stop changing (S2/NB1 settle).
     let scratch = Scratch::new("noprogress2");
     let state = scratch.root.join("state");
     let mut args = scratch.base_args();
@@ -902,7 +902,7 @@ fn no_progress_bound_stops_early_after_restore_settles() {
         "--state-dir".to_owned(),
         state.display().to_string(),
         "--max-rounds".to_owned(),
-        "6".to_owned(),
+        "10".to_owned(),
         "--no-progress-rounds".to_owned(),
         "1".to_owned(),
         "--round-delay-seconds".to_owned(),
@@ -915,7 +915,7 @@ fn no_progress_bound_stops_early_after_restore_settles() {
     let (code, report) = scratch.run_agentctl(&args);
     assert_eq!(code, 75, "{report}");
     assert!(
-        report["rounds"].as_u64().expect("rounds") < 6,
+        report["rounds"].as_u64().expect("rounds") < 10,
         "no-progress bound never fired: {report}"
     );
     scratch.reap();
@@ -938,5 +938,125 @@ fn tampered_profiles_lose_judgement() {
         !scratch.root.join("harness.log").exists(),
         "wrapper consulted on a stale smoke record"
     );
+    scratch.reap();
+}
+
+#[test]
+fn blocking_restore_blocks_stamp_and_acts_until_released() {
+    use std::os::unix::process::CommandExt;
+    let scratch = Scratch::new("blocked");
+    // The restore child waits for a certificate file that does not
+    // exist yet: a condition-based blocker, released by writing it.
+    let cert = scratch.root.join("cert.pem");
+    let registry = scratch.root.join("own");
+    write_private(
+        &registry.join("restore.json"),
+        &format!(
+            "{{\"schema\": \"agentctl-restore/v1\", \"coordinator\": \"lane\", \
+             \"units\": [], \"herdr_wait_seconds\": 0, \"startup_delay_seconds\": 0, \
+             \"certificate_file\": \"{}\", \"certificate_wait_seconds\": 3600}}",
+            cert.display()
+        ),
+    );
+    let state = scratch.root.join("state");
+    let home = scratch.root.join("home");
+    fs::create_dir_all(&home).expect("home");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agentctl"));
+    command
+        .current_dir(&scratch.root)
+        .process_group(0)
+        .env("HOME", &home)
+        .env("XDG_STATE_HOME", home.join(".local/state"))
+        .env("AGENTCTL_TEST_HARNESS", "1")
+        .env("AGENTCTL_SYSTEMCTL", scratch.root.join("systemctl"))
+        .env("AGENTCTL_SYSTEMD_RUN", scratch.root.join("systemd-run"))
+        .env_remove("AGENTCTL_AGENT")
+        .arg("--registry")
+        .arg(&registry)
+        .arg("--herdr-bin")
+        .arg(scratch.root.join("herdr"))
+        .args(["team", "shepherd", "--state-dir"])
+        .arg(&state)
+        .args([
+            "--max-rounds",
+            "50",
+            "--round-delay-seconds",
+            "1",
+            "--no-progress-rounds",
+            "1",
+            "--call-timeout-seconds",
+            "120",
+            "--run-agent-prompt",
+        ])
+        .arg(wrapper())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let child = command.spawn().expect("spawn supervisor");
+    scratch.groups.borrow_mut().push(GroupGuard {
+        pgid: child.id(),
+        armed: std::cell::Cell::new(true),
+    });
+    // While the restore waits: no stamp, whatever the rounds do.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let mut saw_restore_record = false;
+    while std::time::Instant::now() < deadline {
+        if state.join("shepherd").exists() {
+            saw_restore_record = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert!(saw_restore_record, "supervisor never started");
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    fn any_stamp(dir: &Path) -> bool {
+        if !dir.exists() {
+            return false;
+        }
+        for entry in fs::read_dir(dir).expect("read state") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() && any_stamp(&path) {
+                return true;
+            }
+            if path.file_name().is_some_and(|name| name == "stamp.json") {
+                return true;
+            }
+        }
+        false
+    }
+    assert!(
+        !any_stamp(&state.join("shepherd")),
+        "stamped while its restore was still blocked"
+    );
+    // Release the restore with a real (throwaway) certificate; the
+    // incident may now finish and stamp.
+    let made = Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-subj",
+            "/CN=drill",
+            "-days",
+            "1",
+            "-keyout",
+        ])
+        .arg(scratch.root.join("cert-key.pem"))
+        .arg("-out")
+        .arg(&cert)
+        .status()
+        .expect("openssl");
+    assert!(made.success(), "openssl could not make the drill cert");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    while !any_stamp(&state.join("shepherd")) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no stamp after the restore was released"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    drop(child);
     scratch.reap();
 }

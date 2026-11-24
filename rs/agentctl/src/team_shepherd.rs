@@ -81,9 +81,9 @@ pub struct ShepherdOptions {
     pub claim_file: Option<PathBuf>,
     /// Seconds before a dead claim with no heartbeat counts as stale.
     pub stale_seconds: f64,
-    /// A restore child was already launched by `start-recovery`:
-    /// supervise it, never start a second one.
-    pub restore_launched: bool,
+    /// Minutes a restore may run before the wedged escalation is
+    /// enqueued (the loop keeps watching past it).
+    pub restore_bound_minutes: u64,
     /// Seconds a `team act` execution may wait for its receipt.
     pub act_wait_seconds: u64,
 }
@@ -101,7 +101,7 @@ impl Default for ShepherdOptions {
             profile_file: None,
             claim_file: None,
             stale_seconds: 180.0,
-            restore_launched: false,
+            restore_bound_minutes: 60,
             act_wait_seconds: 60,
         }
     }
@@ -125,6 +125,20 @@ pub struct ShepherdState {
     pub no_progress: u32,
     /// The deterministic restore arm already ran for this incident.
     pub restore_done: bool,
+    /// The owned restore child's pid (0 = none), recorded so a
+    /// restarted supervisor re-adopts the running restore instead of
+    /// starting a second one.
+    #[serde(default)]
+    pub restore_pid: u32,
+    /// `/proc` start ticks of `restore_pid`, verifying the record.
+    #[serde(default)]
+    pub restore_pid_start: String,
+    /// Unix seconds the restore child started (wedged bound).
+    #[serde(default)]
+    pub restore_started_at: f64,
+    /// The wedged-restore escalation was already enqueued.
+    #[serde(default)]
+    pub wedged_escalated: bool,
     /// One grace round after restore finishes before no-progress
     /// counting resumes.
     #[serde(default)]
@@ -207,7 +221,10 @@ pub fn progress_hash(manifest: &Value) -> String {
     fn strip(value: &mut Value) {
         match value {
             Value::Object(map) => {
-                map.retain(|key, _| key != "checked_at");
+                // checked_at clocks and evidence prose (which
+                // embeds ages) are volatile; check identities,
+                // statuses and agent facts are the progress signal.
+                map.retain(|key, _| key != "checked_at" && key != "evidence");
                 for inner in map.values_mut() {
                     strip(inner);
                 }
@@ -418,11 +435,12 @@ fn append_log(dir: &Path, line: &str) {
     }
 }
 
-/// Whether bounded give-up may escalate through `team act`: never
-/// when the team is verified, its lead is live (B4), its facts are
-/// unknown (NS4), or the claim was lost.
-pub fn should_escalate(yes: bool, lead_live: bool, facts_unknown: bool, claim_lost: bool) -> bool {
-    !yes && !lead_live && !facts_unknown && !claim_lost
+/// Whether bounded give-up may enqueue an escalation: never when
+/// the team is verified, its lead is live (B4), or the claim was
+/// lost. Unknown facts DO page (NS4 remainder) — through the
+/// enqueue-only path, so paging never kicks a driver.
+pub fn should_escalate(yes: bool, lead_live: bool, _facts_unknown: bool, claim_lost: bool) -> bool {
+    !yes && !lead_live && !claim_lost
 }
 
 /// Whether the team's verified lead is live this round: the
@@ -475,6 +493,99 @@ pub struct ShepherdInputs {
     pub agentctl: PathBuf,
     /// The Herdr binary every subprocess and client uses.
     pub herdr_bin: PathBuf,
+}
+
+/// Whether a recorded restore (pid plus start ticks) is still the
+/// live process. A zombie of our own child is reaped by `try_wait`
+/// before this is consulted for adopted records; for an adopted pid
+/// the state field reads Z from /proc.
+pub fn recorded_restore_alive(pid: u32, start: &str) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    if stat
+        .rsplit_once(')')
+        .map(|(_, rest)| rest.split_whitespace().next() == Some("Z"))
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    pid_start_ticks(u64::from(pid)).is_some_and(|current| current == start)
+}
+
+/// Spawn the restore child in its own process group (its own
+/// session scope), so a supervisor stop cannot take it down, with
+/// output appended to the incident's restore log.
+pub fn spawn_restore(agentctl: &Path, args: &[String], dir: &Path) -> Result<std::process::Child> {
+    use std::os::unix::process::CommandExt;
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("restore.log"))
+        .map_err(|error| fail(format!("cannot open the restore log: {error}")))?;
+    let err = log
+        .try_clone()
+        .map_err(|error| fail(format!("cannot clone the restore log: {error}")))?;
+    Command::new(agentctl)
+        .args(args)
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(err))
+        .spawn()
+        .map_err(|error| fail(format!("cannot launch restore: {error}")))
+}
+
+/// Enqueue one shepherd act (never kick, never run a driver): the
+/// shepherd's only effect path. Returns the child exit code.
+pub fn enqueue_shepherd_act(
+    inputs: &ShepherdInputs,
+    own: &Path,
+    options: &ShepherdOptions,
+    incident: &str,
+    request_id: &str,
+    action_argv: &[String],
+    dir: &Path,
+    round: u32,
+) -> i32 {
+    let mut args = vec![
+        "--registry".to_owned(),
+        own.display().to_string(),
+        "--herdr-bin".to_owned(),
+        inputs.herdr_bin.display().to_string(),
+        "team".to_owned(),
+        "act".to_owned(),
+        "--enqueue-only".to_owned(),
+        "--wait-seconds".to_owned(),
+        "0".to_owned(),
+    ];
+    if let Some(state) = &options.state_dir {
+        args.extend(["--state-dir".to_owned(), state.display().to_string()]);
+    }
+    args.extend([
+        "--incident".to_owned(),
+        incident.to_owned(),
+        "--request-id".to_owned(),
+        request_id.to_owned(),
+    ]);
+    args.extend(action_argv.iter().cloned());
+    match run_bounded(
+        &inputs.agentctl,
+        &args,
+        Duration::from_secs(options.max_minutes.max(1) * 60),
+    ) {
+        Ok((code, _, _)) => code,
+        Err(error) => {
+            append_log(
+                dir,
+                &format!("round {round}: team act could not run: {error}"),
+            );
+            1
+        }
+    }
 }
 
 /// Run one shepherd incident to its stamp. `own` is the only registry
@@ -584,13 +695,20 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
                 if stop.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-                if heartbeat_claim(&claim_path, &incident) {
-                    failures = 0;
-                } else {
-                    failures += 1;
-                    if failures >= 3 {
+                match heartbeat_claim_result(&claim_path, &incident) {
+                    Heartbeat::Owned => failures = 0,
+                    // Another owner took the claim: stop at once,
+                    // not after retries.
+                    Heartbeat::Lost => {
                         lost.store(true, std::sync::atomic::Ordering::Relaxed);
                         break;
+                    }
+                    Heartbeat::Transient => {
+                        failures += 1;
+                        if failures >= 3 {
+                            lost.store(true, std::sync::atomic::Ordering::Relaxed);
+                            break;
+                        }
                     }
                 }
             }
@@ -600,6 +718,7 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
     let mut verdict = "NO";
     let mut summaries: BTreeMap<String, Value> = BTreeMap::new();
     let mut round = state.round;
+    let mut restore_child: Option<std::process::Child> = None;
     while round < options.max_rounds {
         round += 1;
         let mut rounds_teams: Vec<TeamRound> = Vec::new();
@@ -674,11 +793,42 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
             break;
         }
         // Step 0 + the deterministic arm, own team only, and only
-        // while its lead is down. When start-recovery launched the
-        // restore child, the supervisor only reads its reports as
-        // facts and never starts a second restore (S4).
+        // while its lead is down. The supervisor owns the restore:
+        // it spawns the child in its own session (so a supervisor
+        // stop cannot take the restore down), records it, and a
+        // restarted supervisor re-adopts the running child by that
+        // record instead of starting a second one. While the child
+        // runs, the loop only watches: no acts, no no-progress
+        // counting, and no exit (NB1).
         let own_actionable = !own_round.lead_live && !own_round.facts_unknown;
-        if own_actionable && !state.restore_done && !options.restore_launched {
+        // Poll the owned or adopted restore child.
+        let mut restore_alive = false;
+        if let Some(child) = &mut restore_child {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    append_log(&dir, &format!("round {round}: restore exit={status}"));
+                    state.restore_done = true;
+                    state.restore_settle = true;
+                    state.restore_pid = 0;
+                    restore_child = None;
+                }
+                Ok(None) => restore_alive = true,
+                Err(_) => restore_child = None,
+            }
+        } else if state.restore_pid != 0 && !state.restore_done {
+            if recorded_restore_alive(state.restore_pid, &state.restore_pid_start) {
+                restore_alive = true;
+            } else {
+                state.restore_done = true;
+                state.restore_settle = true;
+                state.restore_pid = 0;
+            }
+        }
+        if own_actionable
+            && !state.restore_done
+            && restore_child.is_none()
+            && state.restore_pid == 0
+        {
             let base = vec![
                 "--registry".to_owned(),
                 own.display().to_string(),
@@ -692,31 +842,56 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
                 &dry_args,
                 Duration::from_secs(options.call_timeout_seconds.max(60)),
             );
-            // A dry run never replays (restore.rs), so there is no
-            // replayed-but-down signal to force from: the real run's
-            // own replay guard decides. The user-manager-restart
-            // --force case stays a manual team-restore step.
             let mut real_args = base;
             real_args.push("restore".to_owned());
-            let code = match run_bounded(
-                &inputs.agentctl,
-                &real_args,
-                Duration::from_secs(options.max_minutes.max(1) * 60),
-            ) {
-                Ok((code, _, _)) => code,
+            match spawn_restore(&inputs.agentctl, &real_args, &dir) {
+                Ok(child) => {
+                    state.restore_pid = child.id();
+                    state.restore_pid_start =
+                        pid_start_ticks(u64::from(child.id())).unwrap_or_default();
+                    state.restore_started_at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d: Duration| d.as_secs_f64())
+                        .unwrap_or(0.0);
+                    save_state(&dir, &state)?;
+                    restore_child = Some(child);
+                    restore_alive = true;
+                }
                 Err(error) => {
                     append_log(
                         &dir,
                         &format!("round {round}: restore could not run: {error}"),
                     );
-                    1
+                    state.restore_done = true;
                 }
-            };
-            append_log(&dir, &format!("round {round}: restore exit={code}"));
-            state.restore_done = true;
-            // The next round is the settle grace: facts may still
-            // be moving as units and bridges come up (NB1).
-            state.restore_settle = true;
+            }
+        }
+        // A restore wedged past the bound pages the humans once,
+        // through an enqueued escalation only, and keeps watching.
+        if restore_alive
+            && !state.wedged_escalated
+            && state.restore_started_at > 0.0
+            && std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d: Duration| d.as_secs_f64())
+                .unwrap_or(0.0)
+                - state.restore_started_at
+                > (options.restore_bound_minutes.max(1) * 60) as f64
+        {
+            enqueue_shepherd_act(
+                inputs,
+                own,
+                options,
+                &incident,
+                &format!("shepherd-{incident}-wedged"),
+                &[
+                    "escalate".to_owned(),
+                    "restore is still running past its bound".to_owned(),
+                ],
+                &dir,
+                round,
+            );
+            state.wedged_escalated = true;
             save_state(&dir, &state)?;
         }
         // One judgement call per round; at most one own-team act.
@@ -796,47 +971,22 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
                 proposal = parse_proposal(text);
             }
         }
-        if own_actionable && !(options.restore_launched && restore_running(&claim_path)) {
+        if own_actionable && !restore_alive {
             if let Some(proposal) = &proposal {
                 match proposal_argv(proposal) {
                     Ok(action_argv) => {
-                        let mut args = vec![
-                            "--registry".to_owned(),
-                            own.display().to_string(),
-                            "--herdr-bin".to_owned(),
-                            inputs.herdr_bin.display().to_string(),
-                            "team".to_owned(),
-                            "act".to_owned(),
-                        ];
-                        if let Some(state) = &options.state_dir {
-                            args.extend(["--state-dir".to_owned(), state.display().to_string()]);
-                        }
-                        args.extend([
-                            "--incident".to_owned(),
-                            incident.clone(),
-                            "--request-id".to_owned(),
-                            format!("shepherd-{incident}-r{round}"),
-                            // Enqueue and kick only: polling here
-                            // could time-kill a foreground driver
-                            // mid-restore (NS3).
-                            "--wait-seconds".to_owned(),
-                            "0".to_owned(),
-                        ]);
-                        args.extend(action_argv);
-                        let code = match run_bounded(
-                            &inputs.agentctl,
-                            &args,
-                            Duration::from_secs(options.max_minutes.max(1) * 60),
-                        ) {
-                            Ok((code, _, _)) => code,
-                            Err(error) => {
-                                append_log(
-                                    &dir,
-                                    &format!("round {round}: team act could not run: {error}"),
-                                );
-                                1
-                            }
-                        };
+                        // Enqueue only: the shepherd never kicks or
+                        // runs a driver (structural B2/NS3 fix).
+                        let code = enqueue_shepherd_act(
+                            inputs,
+                            own,
+                            options,
+                            &incident,
+                            &format!("shepherd-{incident}-r{round}"),
+                            &action_argv,
+                            &dir,
+                            round,
+                        );
                         append_log(
                             &dir,
                             &format!("round {round}: team act {} exit={code}", proposal["action"]),
@@ -853,7 +1003,7 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
         // first round after it finishes, or while a live lead is
         // mid-handoff (pending ack is progress, NB1): a normal slow
         // boot must not read as no progress.
-        let restore_live = options.restore_launched && restore_running(&claim_path);
+        let restore_live = restore_alive;
         let hash = progress_hash(&own_round.manifest);
         if restore_live || own_round.lead_live {
             state.no_progress = 0;
@@ -876,8 +1026,16 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
             break;
         }
         let elapsed = started.elapsed() >= Duration::from_secs(options.max_minutes * 60);
-        if elapsed || state.no_progress >= options.no_progress_rounds {
+        // Every exit is gated on the restore child (NB1): while it
+        // runs, bounds do not fire and no stamp is written.
+        if !restore_alive && (elapsed || state.no_progress >= options.no_progress_rounds) {
             break;
+        }
+        if restore_alive && round >= options.max_rounds {
+            // Keep watching past the round bound until the child
+            // exits; rounds stop counting against the bound.
+            round = options.max_rounds - 1;
+            state.round = round;
         }
         if round < options.max_rounds && options.round_delay_seconds > 0 {
             std::thread::sleep(Duration::from_secs(options.round_delay_seconds));
@@ -896,31 +1054,18 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
         let own_lead_live = own_row.is_some_and(|row| row["lead_live"] == json!(true));
         let own_unknown = own_row.is_some_and(|row| row["facts_unknown"] == json!(true));
         if should_escalate(own_yes, own_lead_live, own_unknown, claim_lost_now) {
-            let mut args = vec![
-                "--registry".to_owned(),
-                own.display().to_string(),
-                "--herdr-bin".to_owned(),
-                inputs.herdr_bin.display().to_string(),
-                "team".to_owned(),
-                "act".to_owned(),
-            ];
-            if let Some(state) = &options.state_dir {
-                args.extend(["--state-dir".to_owned(), state.display().to_string()]);
-            }
-            args.extend([
-                "--incident".to_owned(),
-                incident.clone(),
-                "--request-id".to_owned(),
-                format!("shepherd-{incident}-giveup"),
-                "--wait-seconds".to_owned(),
-                options.act_wait_seconds.to_string(),
-                "escalate".to_owned(),
-                "shepherd gave up without a deterministic YES".to_owned(),
-            ]);
-            let _ = run_bounded(
-                &inputs.agentctl,
-                &args,
-                Duration::from_secs(options.act_wait_seconds + 120),
+            enqueue_shepherd_act(
+                inputs,
+                own,
+                options,
+                &incident,
+                &format!("shepherd-{incident}-giveup"),
+                &[
+                    "escalate".to_owned(),
+                    "shepherd gave up without a deterministic YES".to_owned(),
+                ],
+                &dir,
+                state.round,
             );
         }
         verdict = "GAVE-UP";
@@ -1064,11 +1209,13 @@ pub fn parse_profiles(text: &str) -> Result<Vec<RecoveryProfile>> {
             "effort" => profile.effort = Some(unquote(value)?),
             "command" => profile.command = Some(unquote(value)?),
             "timeout_seconds" => {
-                profile.timeout_seconds = Some(
-                    value
-                        .parse::<f64>()
-                        .map_err(|_| fail("profile timeout_seconds must be a number"))?,
-                );
+                let parsed: f64 = value
+                    .parse()
+                    .map_err(|_| fail("profile timeout_seconds must be a number"))?;
+                if !parsed.is_finite() {
+                    return Err(fail("profile timeout_seconds must be finite"));
+                }
+                profile.timeout_seconds = Some(parsed);
             }
             "disabled" => {
                 profile.disabled = match value {
@@ -1264,10 +1411,21 @@ pub fn claim_decision(
         return ClaimDecision::Take;
     };
     // A different epoch — another boot, or the same boot under a new
-    // user manager (NS1) — never blocks, live heartbeat or not.
-    if claim["boot_id"].as_str() != Some(epoch.boot_id.as_str())
-        || claim["epoch"]["user_manager"].as_str() != epoch.user_manager.as_deref()
-    {
+    // user manager (NS1) — never blocks, live heartbeat or not. The
+    // manager identity's FORMAT flips (invocation: vs pid:) whenever
+    // a systemctl read fails, so a format flip alone is not a new
+    // epoch (review 3): only two identities in the same format that
+    // differ prove a manager restart.
+    let manager_changed = match (
+        claim["epoch"]["user_manager"].as_str(),
+        epoch.user_manager.as_deref(),
+    ) {
+        (Some(recorded), Some(current)) if recorded != current => {
+            recorded.split(':').next() == current.split(':').next()
+        }
+        _ => false,
+    };
+    if claim["boot_id"].as_str() != Some(epoch.boot_id.as_str()) || manager_changed {
         return ClaimDecision::TakeOverPreviousBoot;
     }
     if owner_alive {
@@ -1404,7 +1562,20 @@ fn write_claim(
 /// file work only, never across a round's long operations. Returns
 /// false when this process no longer owns the claim (another owner
 /// took it, or it vanished): the caller must stop acting.
-pub fn heartbeat_claim(path: &Path, incident: &str) -> bool {
+/// Lost = another owner holds the claim (stop at once); Transient =
+/// an io/parse error (retry); Owned = heartbeat refreshed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Heartbeat {
+    /// This process still owns the claim; heartbeat refreshed.
+    Owned,
+    /// Another owner holds the claim; stop at once.
+    Lost,
+    /// An io or parse error; retry before declaring loss.
+    Transient,
+}
+
+/// Refresh the claim heartbeat and report ownership precisely.
+pub fn heartbeat_claim_result(path: &Path, incident: &str) -> Heartbeat {
     let Ok(file) = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -1412,21 +1583,21 @@ pub fn heartbeat_claim(path: &Path, incident: &str) -> bool {
         .truncate(false)
         .open(path.with_extension("lock"))
     else {
-        return false;
+        return Heartbeat::Transient;
     };
     if file.lock_exclusive().is_err() {
-        return false;
+        return Heartbeat::Transient;
     }
     let Ok(text) = std::fs::read_to_string(path) else {
-        return false;
+        return Heartbeat::Transient;
     };
     let Ok(mut record) = serde_json::from_str::<Value>(&text) else {
-        return false;
+        return Heartbeat::Transient;
     };
     if record["incident"].as_str() != Some(incident)
         || record["pid"].as_u64() != Some(u64::from(std::process::id()))
     {
-        return false;
+        return Heartbeat::Lost;
     }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1434,7 +1605,16 @@ pub fn heartbeat_claim(path: &Path, incident: &str) -> bool {
         .unwrap_or(0.0);
     record["heartbeat_at"] = json!(now);
     record["supervisor_pending"] = json!(false);
-    crate::agent::atomic_json(path, &record).is_ok()
+    if crate::agent::atomic_json(path, &record).is_ok() {
+        Heartbeat::Owned
+    } else {
+        Heartbeat::Transient
+    }
+}
+
+/// Whether this process still owns the claim (heartbeat refreshed).
+pub fn heartbeat_claim(path: &Path, incident: &str) -> bool {
+    heartbeat_claim_result(path, incident) == Heartbeat::Owned
 }
 
 /// The fixed harmless smoke prompt: an exact final JSON marker, so a
@@ -1461,6 +1641,11 @@ pub fn smoke_profiles(
     only: Option<&str>,
     state_dir: Option<&Path>,
 ) -> Result<(Value, i32)> {
+    // Resolve the wrapper once, to the absolute canonical path the
+    // record binds and every attempt uses (NS2).
+    let resolved = resolve_wrapper(wrapper)
+        .ok_or_else(|| fail("run-agent-prompt is not resolvable to an absolute executable"))?;
+    let wrapper = &resolved;
     let profiles = load_profiles(profile_file)?;
     let bytes = std::fs::read(profile_file)
         .map_err(|error| fail(format!("cannot read {}: {error}", profile_file.display())))?;
@@ -1642,9 +1827,10 @@ pub fn start_recovery(
                 "claim": claim_path, "exit_code": 75}));
         }
     }
-    // Launch restore and the supervisor concurrently; neither waits
-    // for the other, and both are idempotent underneath (restore's
-    // replay guard, team act request ids).
+    // Launch the supervisor; it spawns and owns the restore child
+    // itself (in the child's own session), so the starter never
+    // holds a restore pid and a supervisor restart re-adopts the
+    // running restore by the supervisor's own state record.
     let base = vec![
         "--registry".to_owned(),
         registry.display().to_string(),
@@ -1676,9 +1862,6 @@ pub fn start_recovery(
                 .spawn()
                 .map_err(|error| fail(format!("cannot launch a recovery child: {error}")))
         };
-    let mut restore_args = base.clone();
-    restore_args.push("restore".to_owned());
-    let mut restore_child = spawn_logged(&restore_args, "restore.log", false)?;
     let mut shepherd_args = base;
     shepherd_args.extend([
         "team".to_owned(),
@@ -1690,36 +1873,17 @@ pub fn start_recovery(
         shepherd_args.extend(["--state-dir".to_owned(), state.display().to_string()]);
     }
     let mut supervisor = spawn_logged(&shepherd_args, "supervisor.log", true)?;
-    {
-        let lock = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(dir.join("claim.lock"))
-            .map_err(|error| fail(format!("cannot open the claim lock: {error}")))?;
-        lock.lock_exclusive()
-            .map_err(|error| fail(format!("cannot take the claim lock: {error}")))?;
-        if let Ok(text) = std::fs::read_to_string(&claim_path) {
-            if let Ok(mut claim) = serde_json::from_str::<Value>(&text) {
-                claim["restore_pid"] = json!(restore_child.id());
-                claim["restore_pid_start"] = json!(pid_start_ticks(u64::from(restore_child.id())));
-                let _ = crate::agent::atomic_json(&claim_path, &claim);
-            }
-        }
-    }
     if options.foreground {
         let status = supervisor
             .wait()
             .map_err(|error| fail(format!("cannot wait on the supervisor: {error}")))?;
-        let _ = restore_child.wait();
         return Ok(json!({"schema": "agentctl-start-recovery/v1",
             "status": "finished", "incident": incident, "claim": claim_path,
             "exit_code": status.code().unwrap_or(1)}));
     }
     Ok(json!({"schema": "agentctl-start-recovery/v1",
         "status": "started", "incident": incident, "claim": claim_path,
-        "restore_pid": restore_child.id(), "supervisor_pid": supervisor.id(),
+        "supervisor_pid": supervisor.id(),
         "exit_code": 0}))
 }
 
@@ -1803,7 +1967,8 @@ mod profile_tests {
         assert!(should_escalate(false, false, false, false));
         assert!(!should_escalate(true, false, false, false));
         assert!(!should_escalate(false, true, false, false));
-        assert!(!should_escalate(false, false, true, false));
+        // Unknown facts page through the enqueue-only path.
+        assert!(should_escalate(false, false, true, false));
         assert!(!should_escalate(false, false, false, true));
     }
 

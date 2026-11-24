@@ -652,7 +652,7 @@ enum TeamCommand {
     Kick(TeamKick),
     /// Shepherd this registry's team back after a boot: judge team manifest facts with stateless run-agent-prompt one-shots (muse, then claude, then codex) and effect only through team act, one incident per restore epoch, until a deterministic YES (lead running, bridge healthy, handoff acked) or bounded give-up escalates and stamps. A live lead means judge-only. Prints schema agentctl-team-shepherd/v1; exit 0 every judged team YES, 75 gave up, 1 refused
     #[command(
-        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl team shepherd\n  agentctl --registry ~/project/.agentctl team shepherd --config ~/.config/agentctl/teams.json --max-rounds 5\n\nOne incident per restore epoch (kernel boot plus user-manager identity): a rerun in the same epoch reports the existing stamp and repeats no effect. Inside the incident the loop gathers team manifest facts each round, runs restore --dry-run then restore for its own team only while its lead is down (--force only when the dry run replayed a completed report yet agents are down), and accepts at most one own-team team act proposal per round from the one-shot's final JSON line. Teams named by --config are judged read-only, as is its own team while its lead is live (team-restore step 0). Bounds: --max-rounds/--max-minutes per incident, --call-timeout-seconds per one-shot chain, early give-up after --no-progress-rounds identical manifests. The per-boot stamp and state live under <state root>/shepherd/<boot-id>/ (stamp.json schema agentctl-team-shepherd-stamp/v1). Install the boot unit with install-units --shepherd; installing never enables it."
+        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl team shepherd\n  agentctl --registry ~/project/.agentctl team shepherd --config ~/.config/agentctl/teams.json --max-rounds 5\n\nOne incident per restore epoch (kernel boot plus user-manager identity): a rerun in the same epoch reports the existing stamp and repeats no effect. Inside the incident the loop gathers team manifest facts each round, spawns and owns the restore child for its own team only while its lead is down, watches it (no acts, no give-up, no stamp until it exits), and accepts at most one own-team team act proposal per round from the one-shot's final JSON line; acts only enqueue, never kick a driver. Teams named by --config are judged read-only, as is its own team while its lead is live (team-restore step 0). Bounds: --max-rounds/--max-minutes per incident, --call-timeout-seconds per one-shot chain, early give-up after --no-progress-rounds identical manifests. The per-incident stamp and state live under <state root>/shepherd/<team-key>/<boot-id>-<epoch-tag>/ (stamp.json schema agentctl-team-shepherd-stamp/v1). Install the boot unit with install-units --shepherd; installing never enables it."
     )]
     Shepherd(TeamShepherd),
 }
@@ -696,6 +696,9 @@ struct TeamAct {
     /// Seconds to poll for the terminal receipt after kicking, from 0 to 3600 (default: 600; 0 enqueues and kicks only)
     #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(0..=3600), value_name = "SECONDS")]
     wait_seconds: u64,
+    /// Enqueue only: record the request and return queued (75) without kicking or running the driver. The recovery shepherd uses this so its acts can never start a driver or a unit; the driver runs from its own paths
+    #[arg(long)]
+    enqueue_only: bool,
     #[command(subcommand)]
     action: TeamActAction,
 }
@@ -816,6 +819,9 @@ struct TeamShepherd {
     /// Ordered recovery profiles TOML (default: REGISTRY/recovery-profiles.toml when present); judgement runs only on a current all-pass recovery smoke record for the file
     #[arg(long, value_name = "PATH")]
     profile_file: Option<PathBuf>,
+    /// Minutes a restore may run before the wedged escalation is enqueued (default: 60)
+    #[arg(long, default_value_t = 60, value_parser = bounded_u64::<1, 1440>, value_name = "MINUTES")]
+    restore_bound_minutes: u64,
     /// Seconds a team act execution may wait for its receipt, from 0 to 3600 (default: 60)
     #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(0..=3600), value_name = "SECONDS")]
     act_wait_seconds: u64,
@@ -1135,7 +1141,7 @@ struct InstallUnits {
     /// Example: agentctl --registry ~/project/.agentctl install-units --dest ~/.config/systemd/user --tab-hygiene
     #[arg(long, conflicts_with_all = ["bridge_unit", "bridge", "headless", "scheduled", "teams_config"])]
     tab_hygiene: bool,
-    /// Write only agentctl-shepherd.service, the always-on boot unit that runs `agentctl team shepherd` for this registry (#1559), instead of the restore units; with --teams-config PATH the unit also judges those teams read-only. Writes the file only and never enables, starts, or reloads anything: the operator enables it deliberately. Example: agentctl --registry ~/project/.agentctl install-units --dest ~/.config/systemd/user --shepherd
+    /// Write only this registry's agentctl-shepherd-<key>.service, the always-on boot unit that runs `agentctl start-recovery` for this registry (#1559), instead of the restore units. Writes the file only and never enables, starts, or reloads anything: the operator enables it deliberately. Example: agentctl --registry ~/project/.agentctl install-units --dest ~/.config/systemd/user --shepherd
     #[arg(long, conflicts_with_all = ["bridge_unit", "bridge", "headless", "scheduled", "teams_config"])]
     shepherd: bool,
 }
@@ -4832,6 +4838,25 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                         .map_err(Failure::Output)?;
                     return Ok(1);
                 }
+                if act.enqueue_only {
+                    let mut report = json!({
+                        "schema": "agentctl-team-act/v1",
+                        "registry": args.registry,
+                        "incident": act.incident,
+                        "request_id": act.request_id,
+                        "action_name": typed.name(),
+                        "status": "queued",
+                        "detail": "enqueued without kick",
+                        "exit_code": 75,
+                    });
+                    if designation_problem.is_some() {
+                        report["designation_problem"] = json!(
+                            "coordinator designation unreadable or disagrees with restore.json"
+                        );
+                    }
+                    write_json(&report).map_err(Failure::Output)?;
+                    return Ok(75);
+                }
                 let kick_failed =
                     crate::team_driver::kick(&client, &args.registry, &host, &inputs, &options)
                         .is_err();
@@ -5051,8 +5076,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                         claim_file: std::env::var_os("AGENTCTL_RECOVERY_CLAIM_FILE")
                             .map(PathBuf::from),
                         stale_seconds: 180.0,
-                        restore_launched: std::env::var_os("AGENTCTL_RECOVERY_RESTORE_LAUNCHED")
-                            .is_some(),
+                        restore_bound_minutes: shepherd.restore_bound_minutes,
                         act_wait_seconds: shepherd.act_wait_seconds,
                     },
                 )?;

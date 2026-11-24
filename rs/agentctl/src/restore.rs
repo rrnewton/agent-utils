@@ -7465,9 +7465,18 @@ mod seam_tests {
 
     #[test]
     fn resolve_program_refuses_under_a_test_harness() {
-        assert_eq!(resolve_program(None, true, "systemctl"), "/nonexistent/agentctl-test-harness-refusal");
-        assert_eq!(resolve_program(Some("/fake/systemctl"), true, "systemctl"), "/fake/systemctl");
+        assert_eq!(
+            resolve_program(None, true, "systemctl"),
+            "/nonexistent/agentctl-test-harness-refusal"
+        );
+        assert_eq!(
+            resolve_program(Some("/fake/systemctl"), true, "systemctl"),
+            "/fake/systemctl"
+        );
         assert_eq!(resolve_program(None, false, "systemctl"), "systemctl");
-        assert_eq!(resolve_program(Some(""), true, "systemd-run"), "/nonexistent/agentctl-test-harness-refusal");
+        assert_eq!(
+            resolve_program(Some(""), true, "systemd-run"),
+            "/nonexistent/agentctl-test-harness-refusal"
+        );
     }
 }
