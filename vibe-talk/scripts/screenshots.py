@@ -5230,6 +5230,38 @@ def _act_whole_threads_no_duplicates(driver: Driver) -> None:
     driver.settle(300)
 
 
+def _act_search_bucket_fold(driver: Driver) -> None:
+    """`#2200 vibe-talk-search-tab-counts-match-cards`: "runner" searched in
+    All — Main and Threads both on, every chip standing, X the sum of the
+    chips, the cards shown the selected buckets' members."""
+    _act_open_channel(driver)
+    driver.click("search-toggle")
+    driver.page.wait_for_function("() => window.__visible('search-field')", timeout=5_000)
+    driver.page.fill("#search-field", "runner")
+    driver.page.wait_for_function(
+        "() => /Server search details|No more hits/.test(document.getElementById('server-line').textContent)",
+        timeout=20_000,
+    )
+    driver.page.wait_for_function(
+        "() => !document.getElementById('search-bucket-main').hidden"
+        " && !document.getElementById('search-bucket-threads').hidden",
+        timeout=10_000,
+    )
+    driver.settle(300)
+
+
+def _act_search_bucket_main_only(driver: Driver) -> None:
+    """`#2200`: the same search with Threads tapped off — only Main's cards
+    stand, and the chips and the count still sum."""
+    _act_search_bucket_fold(driver)
+    driver.click("search-bucket-threads")
+    driver.page.wait_for_function(
+        "() => document.getElementById('search-bucket-threads').getAttribute('aria-pressed') === 'false'",
+        timeout=5_000,
+    )
+    driver.settle(300)
+
+
 def _act_discuss_preview(driver: Driver) -> None:
     _open_discuss(driver)
 
@@ -9532,6 +9564,36 @@ SCENES: tuple[Scene, ...] = (
         ),
     ),
     Scene(
+        name="100-search-bucket-fold",
+        what="search in All: Main and Threads both on, chips sum to X, cards shown are the selected buckets'",
+        act=_act_search_bucket_fold,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            (
+                "every in-scope chip stands and X is the sum of the chips",
+                "(() => { const n = (id) => { const c = document.getElementById(id); "
+                "return c.hidden ? null : Number(c.textContent.match(/^\\d+/)[0]); }; "
+                "const x = Number(document.getElementById('search-count').textContent.match(/^\\d+/)[0]); "
+                "const m = n('search-bucket-main'), t = n('search-bucket-threads'), tr = n('search-bucket-transcripts'); "
+                "return m !== null && t !== null && tr !== null && x === m + t + tr; })()",
+            ),
+            (
+                "the cards shown are exactly the selected buckets' members",
+                "(() => { const on = (id) => document.getElementById(id).getAttribute('aria-pressed') === 'true'; "
+                "const n = (id) => Number(document.getElementById(id).textContent.match(/^\\d+/)[0]); "
+                "const rows = [...document.querySelectorAll('#discord-log > li[data-id]')]"
+                ".filter((li) => li.getClientRects().length); "
+                "const want = (on('search-bucket-main') ? n('search-bucket-main') : 0) "
+                "+ (on('search-bucket-threads') ? n('search-bucket-threads') : 0) "
+                "+ (on('search-bucket-transcripts') ? n('search-bucket-transcripts') : 0); "
+                "return rows.length === want; })()",
+            ),
+            ("no result stands in the quote style", "!document.querySelector('#discord-log > li[data-server-hit=\"quote\"]')"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
         name="94-glossary-orphan-cleared",
         what="#2195 after the selection is cleared, no orphan WTF? chip",
         act=_act_orphan_cleared,
@@ -9583,6 +9645,29 @@ SCENES: tuple[Scene, ...] = (
         keep_transient=True,
         expect=(
             ("#2195 no orphan WTF? chip remains", "!window.__visible('selection-chip-wtf') && !window.__visible('selection-chip')"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="101-search-bucket-main-only",
+        what="search with Threads off: only Main's cards stand, chips and count still sum",
+        act=_act_search_bucket_main_only,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            (
+                "Threads is off and every chip still stands",
+                "document.getElementById('search-bucket-threads').getAttribute('aria-pressed') === 'false'"
+                " && !document.getElementById('search-bucket-main').hidden"
+                " && !document.getElementById('search-bucket-threads').hidden"
+                " && !document.getElementById('search-bucket-transcripts').hidden",
+            ),
+            (
+                "the cards shown are exactly Main's count",
+                "(() => { const n = Number(document.getElementById('search-bucket-main').textContent.match(/^\\d+/)[0]); "
+                "const rows = [...document.querySelectorAll('#discord-log > li[data-id]')]"
+                ".filter((li) => li.getClientRects().length); return rows.length === n; })()",
+            ),
             ("no error banner is up", "!window.__visible('error-wrap')"),
         ),
     ),
@@ -10094,7 +10179,7 @@ def run_captures(
     # states photograph exactly that), so Discuss has no window to show there.
     # `#2187`/`#2195`: the orphan scenes (93-98) stand on the same seeded glossary window as
     # 91/92, so they skip with them on a cacheless server instead of failing alone.
-    discuss_scenes = [s for s in scenes if s.name.startswith(("73-", "74-", "75-", "76-", "78-", "84-", "85-", "89-", "90-", "91-", "92-", "93-", "94-", "95-", "96-", "97-", "98-", "99-", "102-", "103-",
+    discuss_scenes = [s for s in scenes if s.name.startswith(("73-", "74-", "75-", "76-", "78-", "84-", "85-", "89-", "90-", "91-", "92-", "93-", "94-", "95-", "96-", "97-", "98-", "99-", "100-", "101-", "102-", "103-",
                                                                         "107-", "108-", "109-", "110-", "111-", "112-", "113-", "114-", "115-", "116-", "117-"))]
     discuss_only = bool(wanted) and len(wanted) == len(discuss_scenes)
     if discuss_scenes and not seed_discuss_cache(60 if discuss_only else 10):

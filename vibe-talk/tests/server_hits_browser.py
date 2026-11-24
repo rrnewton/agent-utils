@@ -359,8 +359,12 @@ def walk_through(walk: Walk, keyboard: bool, discuss: bool = False) -> None:
     walk.check((page.text_content("#search-bucket-main") or "").strip() == "50 in main" and
                page.evaluate("() => document.getElementById('search-bucket-main').getAttribute('aria-pressed')") == "true",
                "the main bucket chip does not count the in-channel hits as on")
-    walk.check(page.evaluate("() => document.getElementById('search-bucket-threads').hidden && document.getElementById('search-bucket-thread').hidden"),
-               "a thread bucket chip appeared on a threadless fixture")
+    # `#2200`: every in-scope chip stands while a search has results — the
+    # threads chip says 0 here, never a lone main chip; the this-thread chip
+    # is a thread view's alone.
+    walk.check((page.text_content("#search-bucket-threads") or "").strip() == "0 in threads" and
+               page.evaluate("() => document.getElementById('search-bucket-thread').hidden"),
+               "the bucket chips do not stand together on a threadless fixture")
     sep = page.text_content("#search-screen-sep") or ""
     walk.check("On this screen" in sep, f"the loaded separator is missing: {sep!r}")
     walk.check(page.evaluate("() => document.getElementById('server-sep').hidden"),
@@ -425,8 +429,8 @@ def walk_through(walk: Walk, keyboard: bool, discuss: bool = False) -> None:
     while time.monotonic() < deadline and len(api.searches) <= before:
         page.wait_for_timeout(25)
     walk.check(len(api.searches) > before, "All channels did not ask the server again")
-    walk.check(page.evaluate("() => document.getElementById('search-bucket-threads').hidden"),
-               "a threads bucket chip appeared on a one-channel fixture")
+    walk.check((page.text_content("#search-bucket-threads") or "").strip() == "0 in threads",
+               "the threads chip does not stand at 0 on a one-channel fixture (`#2200`)")
     walk.shot("after-all-channels")
     page.uncheck("#search-all-channels")
     # Search further back asks the server to gather, from inside the expanded view.
