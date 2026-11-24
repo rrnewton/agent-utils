@@ -171,7 +171,10 @@ export interface OlderWalks {
   /** `#2200`: whether a bucket chip stands, for the search filter (null: fold not standing). */
   bucketOnFor(id: string): boolean | null;
   /** `#2200`: the one search-result fold's counts per chip and their sum (null: fold not standing). */
-  foldCounts(): { counts: Map<string, number>; total: number } | null;
+  foldCounts(): {
+    counts: Map<string, number>; total: number;
+    loadedSelected: number; freshSelected: number;
+  } | null;
   channelViewWords(): string;
   oldestLoadedMs(): number | null;
   toggleServerHits(): void;
@@ -769,6 +772,8 @@ function serverSearchKeyNow() {
 /** The scope the placed server hits were last drawn for (`#1786`). */
 let placedScopeKey = "";
 
+
+
 /** `#1913`: the typing-fast pass's note that the words changed: retire the chips the answered
  * query earned (see `hideBucketChips`). The server ask itself stays with the full pass. */
 function retireStaleBuckets(): void {
@@ -1024,18 +1029,29 @@ function bucketCounts(grouped: Map<string, Message[]>): Map<string, number> {
  * same state, so it lands where a fresh query lands.
  */
 function searchFoldCounts(grouped: Map<string, Message[]>): Map<string, number> {
+  return searchFoldParts(grouped).counts;
+}
+
+/** The fold's two halves per bucket: loaded matches and fresh server hits. */
+function searchFoldParts(grouped: Map<string, Message[]>): {
+  counts: Map<string, number>;
+  parts: Map<string, { loaded: number; fresh: number }>;
+} {
   const loaded = columns.main.searched?.buckets || { main: 0, threads: 0, transcripts: 0 };
   const fresh = bucketCounts(grouped);
   const counts = new Map<string, number>();
+  const parts = new Map<string, { loaded: number; fresh: number }>();
   for (const def of searchBucketDefs) {
     let loadedPart = 0;
     if (def.id === "thread") loadedPart = loaded.main + loaded.threads;
     else if (def.id === "threads") loadedPart = bucketView() === "thread" ? 0 : loaded.threads;
     else if (def.id === "main") loadedPart = bucketView() === "thread" ? 0 : loaded.main;
     else if (def.id === "transcripts") loadedPart = loaded.transcripts;
-    counts.set(def.id, loadedPart + (fresh.get(def.id) || 0));
+    const freshPart = fresh.get(def.id) || 0;
+    counts.set(def.id, loadedPart + freshPart);
+    parts.set(def.id, { loaded: loadedPart, fresh: freshPart });
   }
-  return counts;
+  return { counts, parts };
 }
 
 /** `#2200`: whether the fold stands for the search in the field: a server
@@ -1047,7 +1063,10 @@ function foldStanding(): boolean {
 }
 
 /** The fold last computed, and the state it was computed from. */
-let foldCache: { key: string; counts: Map<string, number>; total: number } | null = null;
+let foldCache: {
+  key: string; counts: Map<string, number>; total: number;
+  loadedSelected: number; freshSelected: number;
+} | null = null;
 
 /** `#2200`: the fold as the search filter reads it — counts and total, or
  * null where no server search stands for the words in the field. Computed
@@ -1057,28 +1076,34 @@ let foldCache: { key: string; counts: Map<string, number>; total: number } | nul
  * (`heldMessagesById` builds its map per call), which stretched the
  * typing walk's frames until a debounced server ask landed between keys
  * (search-typing-fast on the stack gate). */
-function foldCounts(): { counts: Map<string, number>; total: number } | null {
+function foldCounts(): {
+  counts: Map<string, number>; total: number;
+  loadedSelected: number; freshSelected: number;
+} | null {
   if (!foldStanding()) return null;
   const now = serverSearchNow();
   const loaded = columns.main.searched?.buckets || { main: 0, threads: 0, transcripts: 0 };
   const view = bucketView();
   const key = `${now.ticket}|${now.hits.length}|${(now.transcriptHits || []).length}|` +
-    `${loaded.main},${loaded.threads},${loaded.transcripts}|${view}|${bucketsFor}`;
+    `${loaded.main},${loaded.threads},${loaded.transcripts}|${view}|${bucketsFor}|` +
+    `${[...bucketOn.entries()].join()}`;
   if (foldCache && foldCache.key === key) return foldCache;
-  const counts = searchFoldCounts(bucketHits());
-  // The total sums the chips that stand in this view — the out-of-scope
-  // "this thread" bucket outside a thread view is not one of them.
+  const { counts, parts } = searchFoldParts(bucketHits());
+  // The count's first number is the sum of the SELECTED chips: an
+  // unselected chip is an offer, never part of the count (liaison,
+  // #2200). In a thread view that is the thread bucket alone unless the
+  // reader turned another bucket on there.
   let total = 0;
+  let loadedSelected = 0;
+  let freshSelected = 0;
   for (const def of searchBucketDefs) {
     if (def.id === "thread" && view !== "thread") continue;
+    if (!bucketOnNow(def.id)) continue;
     total += counts.get(def.id) || 0;
+    loadedSelected += parts.get(def.id)?.loaded || 0;
+    freshSelected += parts.get(def.id)?.fresh || 0;
   }
-  // In a thread view the count speaks for that thread alone (owner 349):
-  // fresh hits from main or other threads stand on their chips, but they
-  // are not this thread's results and never enter its X — "7 of 4 loaded"
-  // was a visibly wrong number.
-  if (view === "thread") total = counts.get("thread") || 0;
-  foldCache = { key, counts, total };
+  foldCache = { key, counts, total, loadedSelected, freshSelected };
   return foldCache;
 }
 
@@ -1410,6 +1435,9 @@ function renderServerSearch() {
   for (const row of el("discord-log").children) {
     if (row.getAttribute(SERVER_HIT_MARK) === "card") markSearchHits(row, searchParsed(searchField.query()).terms);
   }
+  // (The thread-entry landing lives in the count's render, which runs on
+  // every pass after the thread's messages draw; this render can precede
+  // them.)
   // `#2200`: the "X of Y loaded" line reads the same fold the chips just drew.
   if (deps.refreshSearchCount) deps.refreshSearchCount();
   if (!serverExpanded) return;

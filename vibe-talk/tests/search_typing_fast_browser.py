@@ -199,7 +199,7 @@ def walk_through(walk: Walk, total: int) -> None:
     # fold, so the answer must have landed before the first refining key.
     walk.until("() => document.getElementById('server-line').textContent === 'Server search details'",
                "the server's answer never settled before refining")
-    walk.until(f"() => document.getElementById('search-count').textContent === '7 of {total} loaded'",
+    walk.until(f"() => document.getElementById('search-count').textContent === '7 found (4 loaded, 3 older)'",
                "the settled fold count does not speak for the lantern search")
     page.evaluate("""() => {
         window.__keyCounts = { cls: 0, fetch: 0, lsSet: 0 };
@@ -252,7 +252,7 @@ def walk_through(walk: Walk, total: int) -> None:
     for value in ("l", "la", "lan", "lant", "lante", "lanter", "lantern"):
         page.evaluate("""(value) => { const f = document.getElementById('search-field'); f.value = value; f.dispatchEvent(new Event('input', { bubbles: true })); }""", value)
         page.wait_for_timeout(30)
-    walk.until(f"() => document.getElementById('search-count').textContent === '7 of {total} loaded'",
+    walk.until(f"() => document.getElementById('search-count').textContent === '7 found (4 loaded, 3 older)'",
                "the retyped lantern search did not settle to the same count")
     walk.until("() => document.querySelectorAll('#discord-log .search-hit').length > 0",
                "the retyped hits were not re-marked after the pause")
@@ -285,7 +285,7 @@ def walk_through(walk: Walk, total: int) -> None:
     # Settled on the new query: its count, and the chips standing for its own
     # fold (`#2200` — loaded matches count, so the row stands and sums to X).
     walk.until("() => document.getElementById('search-count').textContent.includes('of')"
-               " && !document.getElementById('search-count').textContent.startsWith('7 of')",
+               " && !document.getElementById('search-count').textContent.startsWith('7 found')",
                "the settled count does not speak for the routine search")
     walk.until("() => { const row = document.getElementById('search-bucket-row');"
                " return row && !row.hidden && !document.getElementById('search-bucket-main').hidden; }",

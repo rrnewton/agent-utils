@@ -2963,12 +2963,13 @@ function assertFold(page, when) {
   for (const id of ["main", "threads", "transcripts"]) {
     assert.equal(chipOf(page, id).hidden, false, `${when}: the ${id} chip is missing (a lone chip stood)`);
   }
-  const sum = chipCount(page, "main") + chipCount(page, "threads") + chipCount(page, "transcripts");
+  const on = (id) => chipOf(page, id).getAttribute("aria-pressed") === "true";
+  const sum = (on("main") ? chipCount(page, "main") : 0) + (on("threads") ? chipCount(page, "threads") : 0) +
+    (on("transcripts") ? chipCount(page, "transcripts") : 0);
   const x = Number((page.el("search-count").textContent.match(/^\d+/) || ["-1"])[0]);
-  assert.equal(x, sum, `${when}: "X of Y loaded" is not the sum of the bucket chips`);
+  assert.equal(x, sum, `${when}: the count's first number is not the sum of the selected chips`);
   const visible = unfiltered(page, "discord-log").map((row) => row.getAttribute("data-id"));
   assert.equal(new Set(visible).size, visible.length, `${when}: a card appears twice (buckets not disjoint)`);
-  const on = (id) => chipOf(page, id).getAttribute("aria-pressed") === "true";
   const expected = (on("main") ? chipCount(page, "main") : 0) + (on("threads") ? chipCount(page, "threads") : 0) +
     (on("transcripts") ? chipCount(page, "transcripts") : 0);
   assert.equal(visible.length, expected, `${when}: the selected chips' counts do not equal the cards shown`);
@@ -2982,6 +2983,8 @@ test("`#2200 vibe-talk-search-tab-counts-match-cards`: one fold — chips sum to
   // Loaded: 200 (main), 201 (root). Fresh: 150 (main), 152+153 (threads).
   assert.equal(chipOf(page, "main").textContent, "3 in main");
   assert.equal(chipOf(page, "threads").textContent, "2 in threads");
+  // Wording: fresh hits beyond the loaded set are said as found/older.
+  assert.equal(page.el("search-count").textContent, "3 found (2 loaded, 1 older)");
   assertFold(page, "fresh theme in Main");
   assert.deepStrictEqual(foldSnapshot(page).visible, ["150", "200", "201"],
     "with Threads off, no thread reply stands in Main");
@@ -3006,6 +3009,7 @@ test("`#2200 vibe-talk-search-tab-counts-match-cards`: in All, Main and Threads 
   assert.equal(chipOf(page, "threads").getAttribute("aria-pressed"), "true", "Threads does not start on in All (owner 349)");
   assert.equal(chipOf(page, "main").textContent, "3 in main");
   assert.equal(chipOf(page, "threads").textContent, "3 in threads");
+  assert.equal(page.el("search-count").textContent, "6 found (3 loaded, 3 older)");
   assertFold(page, "fresh theme in All");
   assert.deepStrictEqual(foldSnapshot(page).visible, ["150", "152", "153", "200", "201", "202"]);
 });

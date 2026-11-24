@@ -145,7 +145,10 @@ export interface SearchRowsDependencies {
   bucketOn?(id: string): boolean | null;
   /** `#2200`: the one search-result fold's counts per bucket chip, or null where
    * the fold is not standing. `total` is their sum. */
-  foldCounts?(): { counts: Map<string, number>; total: number } | null;
+  foldCounts?(): {
+    counts: Map<string, number>; total: number;
+    loadedSelected: number; freshSelected: number;
+  } | null;
   placeInlineReply(): void;
   placeRowsInPlaceAgain(): void;
   replyDocked(): boolean;
@@ -739,6 +742,21 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
       sayCardCount();
       return;
     }
+    // `#2200`: in a thread view under a standing search, the first result
+    // stands below the chip panel. The thread header stands over the
+    // list there, and both the carried scroll and the entry's own
+    // landing can leave results under the panel (only their last lines
+    // showing), so this is checked on every pass: while the first shown
+    // row's top is above the panel's bottom, it is landed through the
+    // scroll owner, whose margin parks it below the panel.
+    if (deps.selectionView() === "thread" && deps.intoView && searchField.open()) {
+      const panel = el("search-bucket-row");
+      const first = [...el("discord-log").children].find((row) => isMessageRow(row) && rowShown(row));
+      if (first && panel && !panel.hidden &&
+        first.getBoundingClientRect().top < panel.getBoundingClientRect().bottom - 1) {
+        deps.intoView(first, "start");
+      }
+    }
     const left = deps.mainColumnRecord().searched;
     if (!left) return;
     const counted = [left, ...(deps.sideShowing() && deps.sideColumnRecord().searched && !left.pinned ? [deps.sideColumnRecord().searched as SearchCount] : [])];
@@ -749,13 +767,19 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
     const matched = counted.reduce((sum, one) => sum + one.matched, 0);
     const loaded = counted.reduce((sum, one) => sum + one.loaded, 0);
     const filtering = typed || links || author;
-    // `#2200`: while the bucket fold stands, X is the fold's total — by
-    // construction the sum of the Main, Threads and Transcripts chips, and
-    // the number of result cards the selected buckets stand in the timeline.
+    // `#2200`: while the bucket fold stands, the first number is the sum
+    // of the SELECTED chips, and the number of result cards the selected
+    // buckets stand in the timeline. When the server brought hits beyond
+    // the loaded set, the line says so in the owner's words — "5 found
+    // (4 loaded, 1 older)" — never "5 of 4 loaded".
     const fold = !links && deps.foldCounts ? deps.foldCounts() : null;
     el("search-count").textContent = left.pinned
       ? (!filtering ? `${loaded} pinned` : `${matched} of ${loaded} pinned`)
-      : (!filtering ? "" : fold !== null ? `${fold.total} of ${loaded} loaded` : `${matched} of ${loaded} loaded`);
+      : (!filtering ? "" : fold !== null
+        ? (fold.freshSelected > 0
+          ? `${fold.total} found (${fold.loadedSelected} loaded, ${fold.freshSelected} older)`
+          : `${fold.total} of ${loaded} loaded`)
+        : `${matched} of ${loaded} loaded`);
   }
 
   function refreshSearchCount(): void {

@@ -427,8 +427,16 @@ def walk_through(walk: Walk) -> None:
     # `#2200`: in the thread the count is the fold's thread bucket —
     # the four loaded lantern messages plus its one fresh in-thread hit.
     # Wait on the fold landing, not on a render race.
-    walk.until("() => document.getElementById('search-count').textContent === '5 of 4 loaded'",
+    walk.until("() => document.getElementById('search-count').textContent === '5 found (4 loaded, 1 older)'",
                "the count does not speak for the thread")
+    # `#2200`: the first result stands fully below the chip panel in the
+    # thread view too (header plus search plus chips).
+    walk.check(page.evaluate("""() => {
+      const panel = document.getElementById('search-bucket-row').getBoundingClientRect();
+      const first = [...document.querySelectorAll('#discord-log > li[data-id]')]
+        .find((li) => li.getClientRects().length);
+      return Boolean(first) && first.getBoundingClientRect().top >= panel.bottom - 1;
+    }"""), "the first result in the thread sits under the chip panel")
     page.fill("#search-field", "bright")
     walk.until("() => document.getElementById('search-count').textContent === '1 of 4 loaded'",
                "bright was not counted in the thread")
