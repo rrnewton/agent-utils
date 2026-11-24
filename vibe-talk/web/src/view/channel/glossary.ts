@@ -92,8 +92,17 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
     const viewWidth = (document.documentElement && document.documentElement.clientWidth) || 0;
     const viewHeight = window.innerHeight || 0;
     const left = Math.max(8, Math.min(anchor.left, viewWidth - 8 - width));
+    // `#2188 vibe-talk-wtf-popover-below-chip`. Below the chip it spawned from, never over it: when the
+    // WTF? chip stands, the popover starts under the chip (and under the selection), whichever is lower.
+    const chipButton = wtf();
+    const chipRect = chipButton && !chipButton.hidden ? chipButton.getBoundingClientRect() : null;
     let top = anchor.bottom + 8;
-    if (top + height > viewHeight - 8) top = Math.max(8, anchor.top - height - 8);
+    if (chipRect) top = Math.max(top, chipRect.bottom + 8);
+    if (top + height > viewHeight - 8) {
+      // No room below: above the selection, and still never over the chip.
+      const aboveFrom = chipRect ? Math.min(anchor.top, chipRect.top) : anchor.top;
+      top = Math.max(8, aboveFrom - height - 8);
+    }
     box.style.left = `${Math.round(left)}px`;
     box.style.top = `${Math.round(top)}px`;
   }

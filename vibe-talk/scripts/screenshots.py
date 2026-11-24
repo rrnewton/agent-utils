@@ -8578,6 +8578,7 @@ SCENES: tuple[Scene, ...] = (
         expect=(
             ("the WTF? button stands left of the Quote reply chip", "(() => { const w = document.getElementById('selection-chip-wtf').getBoundingClientRect(); const c = document.getElementById('selection-chip').getBoundingClientRect(); return w.right <= c.left + 1; })()"),
             ("the dismiss X stands right of the chip", "(() => { const x = document.getElementById('selection-chip-dismiss').getBoundingClientRect(); const c = document.getElementById('selection-chip').getBoundingClientRect(); return x.left >= c.right - 1; })()"),
+            ("#2188 the popover never overlaps the WTF? chip", "(() => { const p = document.getElementById('glossary-popover').getBoundingClientRect(); const w = document.getElementById('selection-chip-wtf'); if (!w || w.hidden) return true; const r = w.getBoundingClientRect(); return p.bottom <= r.top + 1 || p.top >= r.bottom - 1; })()"),
             ("the popover shows the stub's definition", "window.__visible('glossary-popover') && document.getElementById('glossary-popover-body').textContent.includes('glossary definition')"),
             ("the popover carries a source link", "window.__visible('glossary-popover-source') && document.getElementById('glossary-popover-link').textContent.trim().length > 0"),
             ("the learned term renders as a glossary link", "document.querySelectorAll('#discord-log .glossary-term').length > 0"),
