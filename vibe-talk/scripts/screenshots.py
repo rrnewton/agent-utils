@@ -5239,14 +5239,29 @@ def _act_search_bucket_fold(driver: Driver) -> None:
     driver.page.wait_for_function("() => window.__visible('search-field')", timeout=5_000)
     driver.page.fill("#search-field", "runner")
     driver.page.wait_for_function(
+        "() => (window.__text('search-count') || '').includes('of')", timeout=10_000
+    )
+    # As scene 78: the Whole-threads tap is what settles the server's ask on
+    # this harness. On, wait for the answer, back off again — the state
+    # photographed is the search as typed, with no extra filter standing.
+    driver.click("search-entire-threads")
+    driver.page.wait_for_function(
+        "() => document.getElementById('search-entire-threads').getAttribute('aria-pressed') === 'true'",
+        timeout=5_000,
+    )
+    driver.page.wait_for_function(
         "() => /Server search details|No more hits/.test(document.getElementById('server-line').textContent)",
         timeout=20_000,
     )
+    driver.click("search-entire-threads")
     driver.page.wait_for_function(
-        "() => !document.getElementById('search-bucket-main').hidden"
-        " && !document.getElementById('search-bucket-threads').hidden",
-        timeout=10_000,
+        "() => document.getElementById('search-entire-threads').getAttribute('aria-pressed') === 'false'",
+        timeout=5_000,
     )
+    # No wait on the chips themselves: on the broken build a chip whose
+    # bucket holds no FRESH hit never stands at all, and that absence is
+    # exactly what the before frame must show. The expects say what the
+    # fixed build stands; the act only has to arrive.
     driver.settle(300)
 
 
