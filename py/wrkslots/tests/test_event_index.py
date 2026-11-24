@@ -54,6 +54,20 @@ def _active(payload: dict[str, object]) -> list[dict[str, object]]:
     return active
 
 
+def _timeless(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Rows without the one field two reads can legitimately differ in.
+
+    heartbeat_age_seconds is computed at read time, so a scoped read
+    and a full read a second apart differ in exactly that field
+    (#2215). Everything else must still compare exactly.
+    """
+
+    return [
+        {key: value for key, value in row.items() if key != "heartbeat_age_seconds"}
+        for row in rows
+    ]
+
+
 def _status_json(
     project: Path, *args: str, capsys: pytest.CaptureFixture[str]
 ) -> tuple[int, dict[str, object]]:
@@ -100,7 +114,7 @@ def test_scoped_status_matches_full_without_parsing_log(
     full_rc, full = _status_json(project, capsys=capsys)
     assert scoped_rc == 0 and full_rc == 0
     full_rows = [row for row in _active(full) if row["slot"] == "slot01"]
-    assert _active(scoped) == full_rows
+    assert _timeless(_active(scoped)) == _timeless(full_rows)
     assert _active(scoped)[0]["held"] is True
 
 
@@ -127,7 +141,7 @@ def test_scoped_status_ignores_a_tampered_snapshot_row(
     full_rc, full = _status_json(project, capsys=capsys)
     assert scoped_rc == 0 and full_rc == 0
     full_rows = [row for row in _active(full) if row["slot"] == "slot01"]
-    assert _active(scoped) == full_rows
+    assert _timeless(_active(scoped)) == _timeless(full_rows)
     assert _active(scoped)[0]["task"] == "task-slot01"
 
 

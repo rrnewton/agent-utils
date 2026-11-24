@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-scoped-status-heartbeat-age-flake: a status equivalence test compares two reads across a second boundary'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
@@ -26,3 +26,7 @@ Make the comparison time-free: exclude heartbeat_age_seconds from the row compar
 # Notes
 
 Diagnosed while triaging an unrelated change's gate (the failing shard was first blamed on that change; the sole-differing-field evidence cleared it). The scoped-status code itself is correct: both reads are right, one second apart.
+
+## Resolution
+
+[watermelon-full-preview] Fixed in the same change that closes this issue: both scoped-vs-full status equivalence comparisons in py/wrkslots/tests/test_event_index.py now drop only heartbeat_age_seconds (a _timeless helper) and keep every other field exact, so a corrupted scoped row still fails. The whole file passes (6 tests), both affected tests pass 5/5 consecutively, and strict mypy is clean on the file.
