@@ -3053,6 +3053,20 @@ test("`#2200 vibe-talk-search-tab-counts-match-cards`: an edited query lands whe
   }
 });
 
+test("`#2200 vibe-talk-search-tab-counts-match-cards`: in a thread view X counts only that thread's bucket, never fresh hits from elsewhere", async () => {
+  const page = await foldPage("thread:spaces/A/threads/one & two");
+  await searchServer(page, "theme");
+  // The thread holds 201 (root) and 202 (reply), both matching; the fresh
+  // hits are a main note and the other thread's replies — on their chips,
+  // but never in this thread's X. (The regression: "7 of 4 loaded".)
+  assert.equal(page.el("search-count").textContent, "2 of 2 loaded",
+    "the thread's count counts fresh hits from outside the thread");
+  const x = Number(page.el("search-count").textContent.match(/^\d+/)[0]);
+  const n = Number(page.el("search-count").textContent.match(/of (\d+)/)[1]);
+  assert.ok(x <= n, `X (${x}) exceeds N (${n}) in a thread view`);
+  assert.equal(chipOf(page, "thread").textContent, "2 in this thread");
+});
+
 test("`#2200 vibe-talk-search-tab-counts-match-cards`: a hit that loads for real moves within the fold and the counts do not move", async () => {
   const page = await foldPage("main");
   await searchServer(page, "theme");

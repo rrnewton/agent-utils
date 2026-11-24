@@ -10,7 +10,7 @@ import type { Message, SearchScope } from "../../contract/index.ts";
 import { DISCORD_PAGE_LIMIT, exactReplyCount, threadOf } from "../../core/channels/index.ts";
 import type { ChannelStore, ReplyTally } from "../../core/channels/index.ts";
 import { failureWords, searchMomentWords, searchWalkProgress, searchWalkWords } from "../../present/notices/index.ts";
-import { setTextIfChanged } from "../dom/index.ts";
+import { setClassWord, setTextIfChanged } from "../dom/index.ts";
 import { isMessageRow, rowSentMs, rowShown } from "./rows.ts";
 import type { TimelineColumn, TimelineColumnSteps, TimelineOlderPages, TimelineSelection } from "./readcore.ts";
 import type { CancelSignal } from "../../ports/index.ts";
@@ -1073,6 +1073,11 @@ function foldCounts(): { counts: Map<string, number>; total: number } | null {
     if (def.id === "thread" && view !== "thread") continue;
     total += counts.get(def.id) || 0;
   }
+  // In a thread view the count speaks for that thread alone (owner 349):
+  // fresh hits from main or other threads stand on their chips, but they
+  // are not this thread's results and never enter its X — "7 of 4 loaded"
+  // was a visibly wrong number.
+  if (view === "thread") total = counts.get("thread") || 0;
   foldCache = { key, counts, total };
   return foldCache;
 }
@@ -1211,6 +1216,11 @@ function placeServerHits(grouped: Map<string, Message[]>): void {
       }
       node.setAttribute(SERVER_HIT_MARK, asCard ? "card" : "quote");
       node.setAttribute("data-bucket", def.id);
+      // A reused row may carry the filter's hidden word from when its
+      // bucket was off (the filter hid it in the list, then placement
+      // took it out): placing it is showing it, so the word comes off.
+      // The filter's own per-row bit reconciles with the class it wears.
+      setClassWord(node as never, "search-hidden", false);
       // Marked like every other hit on the page (the quoted hits are at their
       // build in `serverHitNode`); later filter passes re-mark it as a row.
       // A reused row is re-marked for the current query here.

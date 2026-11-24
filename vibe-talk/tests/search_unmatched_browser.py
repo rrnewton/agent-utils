@@ -424,7 +424,10 @@ def walk_through(walk: Walk) -> None:
                "the search field left the screen inside the thread")
     walk.check(page.evaluate("() => document.getElementById('search-field').value") == "lantern",
                "the words were not kept into the thread")
-    walk.check(page.evaluate("() => document.getElementById('search-count').textContent") == "4 of 4 loaded",
+    # `#2200`: in the thread the count is the fold's thread bucket —
+    # the four loaded lantern messages plus its one fresh in-thread hit.
+    # Wait on the fold landing, not on a render race.
+    walk.until("() => document.getElementById('search-count').textContent === '5 of 4 loaded'",
                "the count does not speak for the thread")
     page.fill("#search-field", "bright")
     walk.until("() => document.getElementById('search-count').textContent === '1 of 4 loaded'",
