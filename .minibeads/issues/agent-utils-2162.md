@@ -1,13 +1,14 @@
 ---
 title: 'agentctl-revive-tests-read-real-host-processes: two subagents revive tests fail on a busy host because they census real same-UID processes'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - agentctl
 - flaky-test
 created_at: 2026-11-23T10:15:00-05:00
-updated_at: 2026-11-23T10:15:00-05:00
+updated_at: 2026-11-24T02:21:24-05:00
+closed_at: 2026-11-24T02:21:24-05:00
 ---
 
 # Description

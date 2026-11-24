@@ -1,13 +1,14 @@
 ---
 title: 'dagrun-nextest-outer-wallclock: the nextest outer-backstop smoke test sizes its outer bound at 2 seconds'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - dagrun
 - flaky-test
 created_at: 2026-11-23T14:05:00-05:00
-updated_at: 2026-11-23T14:05:00-05:00
+updated_at: 2026-11-24T02:21:24-05:00
+closed_at: 2026-11-24T02:21:24-05:00
 ---
 
 # Description
