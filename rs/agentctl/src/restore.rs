@@ -1109,6 +1109,26 @@ pub trait Host {
     }
 }
 
+/// The `systemctl` program every unit operation launches through:
+/// `AGENTCTL_SYSTEMCTL` when set (tests point it at a recording
+/// fake so no drill ever reaches a real user manager), else the
+/// plain name resolved on PATH.
+pub fn systemctl_program() -> String {
+    std::env::var("AGENTCTL_SYSTEMCTL")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "systemctl".to_owned())
+}
+
+/// The `systemd-run` program wake timers are armed through:
+/// `AGENTCTL_SYSTEMD_RUN` when set, else `systemd-run`.
+pub fn systemd_run_program() -> String {
+    std::env::var("AGENTCTL_SYSTEMD_RUN")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "systemd-run".to_owned())
+}
+
 /// The real host.
 pub struct SystemHost;
 
@@ -1144,7 +1164,7 @@ impl Host for SystemHost {
         let uid = unsafe { libc::getuid() };
         let outcome = self.run(
             &strings(&[
-                "systemctl",
+                &systemctl_program(),
                 "show",
                 &format!("user@{uid}.service"),
                 "--property=InvocationID",
@@ -1237,7 +1257,7 @@ impl Host for SystemHost {
         // No answering bus means no timer can be armed; the caller waits
         // resident, which is always safe, instead of exiting unwoken.
         let probe = self.run(
-            &strings(&["systemctl", "--user", "show-environment"]),
+            &strings(&[&systemctl_program(), "--user", "show-environment"]),
             None,
             Duration::from_secs(15),
         );
@@ -1250,20 +1270,18 @@ impl Host for SystemHost {
         // One wake per team: retiring any previous deadline first is what
         // makes re-arming idempotent instead of cumulative.
         let _ = self.run(
-            &strings(&["systemctl", "--user", "stop", &timer]),
+            &strings(&[&systemctl_program(), "--user", "stop", &timer]),
             None,
             Duration::from_secs(30),
         );
         let _ = self.run(
-            &strings(&["systemctl", "--user", "reset-failed", &timer, &service]),
+            &strings(&[&systemctl_program(), "--user", "reset-failed", &timer, &service]),
             None,
             Duration::from_secs(30),
         );
-        let outcome = self.run(
-            &wake_argv(request, self.now()),
-            None,
-            Duration::from_secs(30),
-        );
+        let mut argv = wake_argv(request, self.now());
+        argv[0] = systemd_run_program();
+        let outcome = self.run(&argv, None, Duration::from_secs(30));
         match outcome.status {
             Some(0) => WakeOutcome::Armed { unit: timer },
             _ => WakeOutcome::Failed {
@@ -3113,7 +3131,7 @@ fn verify_slot_bind(
 
 fn systemctl(host: &dyn Host, verb: &str, unit: &str) -> CommandOutcome {
     host.run(
-        &strings(&["systemctl", "--user", verb, unit]),
+        &strings(&[&systemctl_program(), "--user", verb, unit]),
         None,
         Duration::from_secs(90),
     )
@@ -4403,7 +4421,7 @@ fn show_once(
     unit: &str,
     keys: &[&str],
 ) -> std::result::Result<BTreeMap<String, String>, String> {
-    let mut argv = strings(&["systemctl", "--user", "show", unit, "--timestamp=unix"]);
+    let mut argv = strings(&[&systemctl_program(), "--user", "show", unit, "--timestamp=unix"]);
     for key in keys {
         argv.push("-p".to_owned());
         argv.push((*key).to_owned());
@@ -4646,7 +4664,7 @@ fn confirm_inactive_timer(
     let command = "systemctl --user list-timers --all";
     let listed = host.run(
         &strings(&[
-            "systemctl",
+            &systemctl_program(),
             "--user",
             "list-timers",
             "--all",

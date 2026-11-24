@@ -2011,7 +2011,7 @@ impl<A: crate::subagents::ManagedApi + ?Sized> DriverEffects for ProductionEffec
             }
             let outcome = self.host.run(
                 &[
-                    "systemctl".to_owned(),
+                    crate::restore::systemctl_program(),
                     "--user".to_owned(),
                     "is-active".to_owned(),
                     unit.clone(),
@@ -2255,7 +2255,7 @@ impl<A: crate::subagents::ManagedApi + ?Sized> DriverEffects for ProductionEffec
                 if reset {
                     let outcome = self.host.run(
                         &[
-                            "systemctl".to_owned(),
+                            crate::restore::systemctl_program(),
                             "--user".to_owned(),
                             "reset-failed".to_owned(),
                             unit.clone(),
@@ -2274,7 +2274,7 @@ impl<A: crate::subagents::ManagedApi + ?Sized> DriverEffects for ProductionEffec
                 }
                 let outcome = self.host.run(
                     &[
-                        "systemctl".to_owned(),
+                        crate::restore::systemctl_program(),
                         "--user".to_owned(),
                         "start".to_owned(),
                         unit.clone(),
@@ -2489,7 +2489,7 @@ pub fn kick<A: crate::subagents::ManagedApi + ?Sized>(
     let directory = prepare_driver_dir(registry, options.state_dir.as_deref())?;
     let probe = host.run(
         &[
-            "systemctl".to_owned(),
+            crate::restore::systemctl_program(),
             "--user".to_owned(),
             "show-environment".to_owned(),
         ],
@@ -2500,7 +2500,7 @@ pub fn kick<A: crate::subagents::ManagedApi + ?Sized>(
         let unit = format!("agentctl-team@{}.service", team_key(registry));
         let started = host.run(
             &[
-                "systemctl".to_owned(),
+                crate::restore::systemctl_program(),
                 "--user".to_owned(),
                 "start".to_owned(),
                 unit,

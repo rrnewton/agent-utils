@@ -203,6 +203,21 @@ impl Scratch {
             .expect("mkfifo");
         assert!(fifo.success());
         install_executable(&scratch.root.join("herdr"), FAKE_HERDR);
+        // Injectable launcher seam: every unit operation in the
+        // drill goes to these recording fakes, never the real user
+        // manager. The log path is baked in (children get a trimmed
+        // environment).
+        let systemd_log = scratch.root.join("systemd.log");
+        for name in ["systemctl", "systemd-run"] {
+            install_executable(
+                &scratch.root.join(name),
+                &format!(
+                    "#!/bin/sh\necho {} \"$@\" >> {}\nexit 0\n",
+                    name,
+                    systemd_log.display()
+                ),
+            );
+        }
         // The wrapper gives each attempt an explicit-name environment,
         // so the fakes log to this scratch path baked into the script.
         let log = scratch.root.join("harness.log");
@@ -362,6 +377,8 @@ impl Scratch {
             .env("XDG_STATE_HOME", home.join(".local/state"))
             .env("PATH", path)
             .env("FAKE_LOG", &fake_log)
+            .env("AGENTCTL_SYSTEMCTL", self.root.join("systemctl"))
+            .env("AGENTCTL_SYSTEMD_RUN", self.root.join("systemd-run"))
             .env_remove("HERDR_SOCKET_PATH")
             .env_remove("HERDR_PANE_ID")
             .env_remove("AGENTCTL_AGENT")
@@ -508,6 +525,14 @@ fn shepherd_drill_gives_up_bounded_and_judges_cross_team_read_only() {
         "shepherd restored a judged team"
     );
 
+    // The launcher seam recorded every unit operation; nothing
+    // reached the real user manager (guard).
+    let systemd_log = fs::read_to_string(scratch.root.join("systemd.log"))
+        .expect("unit operations must go through the fake launcher seam");
+    assert!(
+        systemd_log.contains("systemd-run") || systemd_log.contains("systemctl"),
+        "{systemd_log}"
+    );
     // One incident per epoch: a rerun reports the stamp, repeats nothing.
     let before = fs::read_to_string(scratch.root.join("harness.log")).expect("log");
     let (code, report) = scratch.run_shepherd(&state, &wrapper());
@@ -610,6 +635,8 @@ impl Scratch {
             .env("XDG_DATA_HOME", home.join(".local/share"))
             .env("XDG_STATE_HOME", home.join(".local/state"))
             .env("PATH", path)
+            .env("AGENTCTL_SYSTEMCTL", self.root.join("systemctl"))
+            .env("AGENTCTL_SYSTEMD_RUN", self.root.join("systemd-run"))
             .env_remove("HERDR_SOCKET_PATH")
             .env_remove("HERDR_PANE_ID")
             .env_remove("AGENTCTL_AGENT")
