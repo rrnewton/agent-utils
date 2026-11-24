@@ -8081,9 +8081,10 @@ mod tests {
             vec![(
                 "coordinator".to_owned(),
                 json!({
-                    "holder": {"pid": 11, "command": "agentctl send coordinator --file note"},
+                    "holder": {"pid": 11, "comm": "agentctl", "subcommand": "send",
+                               "agent": "coordinator"},
                     "waiters": [{"pid": 22, "priority": true, "waiting_seconds": waited,
-                                 "command": "agentctl chat run"}],
+                                 "comm": "agentctl", "subcommand": "chat"}],
                 }),
             )]
         }
@@ -8114,8 +8115,8 @@ mod tests {
             text.contains("deliveries to coordinator are waiting"),
             "{text}"
         );
-        assert!(text.contains("the longest for 11 min (PID 22: agentctl chat run, priority)"));
-        assert!(text.contains("held by PID 11: agentctl send coordinator --file note"));
+        assert!(text.contains("the longest for 11 min (PID 22 (agentctl chat), priority)"));
+        assert!(text.contains("held by PID 11 (agentctl send coordinator)"));
         assert_eq!(id, "agent-watch-jam-coordinator-1360");
         assert_eq!(notifier.urgent, vec![id.clone()]);
         pass(1_420.0, &mut state, &mut notifier);
