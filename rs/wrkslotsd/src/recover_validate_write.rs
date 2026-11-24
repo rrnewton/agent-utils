@@ -1543,6 +1543,7 @@ mod tests {
     fn test_cfg(control: PathBuf) -> Cfg {
         let root = control.parent().unwrap_or(&control).to_path_buf();
         Cfg {
+            config_sha256: String::new(),
             root: root.clone(),
             worktrees: control.clone(),
             control,
