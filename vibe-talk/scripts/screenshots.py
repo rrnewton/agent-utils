@@ -5300,23 +5300,28 @@ def _act_glossary_not_found(driver: Driver) -> None:
         timeout=15_000,
     )
     term = "loaded-host repro"
-    rect = driver.js(
-        "((term) => { const rows = [...document.querySelectorAll('#discord-log > li')]; "
-        "for (const row of rows) { "
-        "const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT); "
-        "for (let n = walker.nextNode(); n; n = walker.nextNode()) { "
-        "if (n.parentElement && n.parentElement.closest('.glossary-term')) continue; "
-        "const at = n.textContent.indexOf(term); "
-        "if (at < 0) continue; "
-        "const range = document.createRange(); "
-        "range.setStart(n, at); range.setEnd(n, at + term.length); "
-        "if (n.parentElement) n.parentElement.scrollIntoView({block: 'center'}); "
-        "const r = range.getBoundingClientRect(); "
-        "return {x: r.left, y: r.top, width: r.width, height: r.height}; } } "
-        "return null; })(" + json.dumps(term) + ")"
-    )
-    assert isinstance(rect, dict), "no selectable term text on screen"
+
+    def term_rect() -> object:
+        return driver.js(
+            "((term) => { const rows = [...document.querySelectorAll('#discord-log > li')]; "
+            "for (const row of rows) { "
+            "const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT); "
+            "for (let n = walker.nextNode(); n; n = walker.nextNode()) { "
+            "if (n.parentElement && n.parentElement.closest('.glossary-term')) continue; "
+            "const at = n.textContent.indexOf(term); "
+            "if (at < 0) continue; "
+            "const range = document.createRange(); "
+            "range.setStart(n, at); range.setEnd(n, at + term.length); "
+            "if (n.parentElement) n.parentElement.scrollIntoView({block: 'center'}); "
+            "const r = range.getBoundingClientRect(); "
+            "return {x: r.left, y: r.top, width: r.width, height: r.height}; } } "
+            "return null; })(" + json.dumps(term) + ")"
+        )
+
     for _attempt in range(3):
+        rect = term_rect()
+        assert isinstance(rect, dict), "no selectable term text on screen"
+        driver.settle(200)
         driver.page.mouse.move(float(rect["x"]) + 1, float(rect["y"]) + float(rect["height"]) / 2)
         driver.page.mouse.down()
         driver.page.mouse.move(
