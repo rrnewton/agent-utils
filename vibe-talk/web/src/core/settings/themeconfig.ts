@@ -37,11 +37,13 @@ export const DEFAULT_THEME_CONFIG: ThemeConfig = Object.freeze({
  * palettes modelled on the survey's compared apps (colours only, descriptive names).
  * Each paints the full token set for its scheme, code colours included. A preset with
  * no entry for a scheme is not offered there. */
-export const THEME_PRESETS: readonly {
+export interface ThemePreset {
   readonly id: string;
   readonly title: string;
-  readonly schemes: Readonly<Partial<Record<EffectiveTheme, Readonly<Record<string, string>>>>>;
-}[] = Object.freeze([
+  readonly schemes: Partial<Record<EffectiveTheme, Record<string, string>>>;
+}
+
+export const THEME_PRESETS: readonly ThemePreset[] = [
   { id: "legacy", title: "Default", schemes: {} },
   { id: "extra", title: "Extra dark (true black)", schemes: { dark: {} } },
   { id: "discord-dark", title: "Discord-like dark", schemes: { dark: {
@@ -108,7 +110,7 @@ export const THEME_PRESETS: readonly {
     "--theirs": "#f2f2f2", "--mine": "#eadffc", "--mine-edge": "#7c3aed", "--third": "#f7f2e8", "--third-edge": "#e0e0e0",
     "--dock": "#e8e8e8", "--row-hover": "#e8e8e8", "--reply-tint": "#ececec",
   } } },
-]);
+];
 
 /** The premade themes offered for a scheme, legacy first. */
 export function presetsFor(scheme: EffectiveTheme) {

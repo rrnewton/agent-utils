@@ -265,7 +265,7 @@ export function mountAppearance(deps: AppearanceDependencies): AppearanceControl
 
   function seedCustom(scheme: EffectiveTheme): void {
     const cfg = configs[scheme];
-    configs[scheme] = { mode: "custom", style: cfg.style, tokens: { ...defaultTokensFor(scheme, currentColour, cfg.preset) } };
+    configs[scheme] = { mode: "custom", style: cfg.style, preset: cfg.preset, tokens: { ...defaultTokensFor(scheme, currentColour, cfg.preset) } };
   }
 
   const editLight = deps.lookup("theme-edit-light");
