@@ -3797,9 +3797,15 @@ def _restore_team(harness: Harness, report: Report) -> None:
         rust.returncode == 0 and isinstance(value, dict)
         and value.get("complete") is True and value.get("dry_run") is False
         and value.get("refused") == 0
+        # Multi-project images (#2089): `slot_images` is the restore
+        # project's own row, so the #2089 change decorates it with the project
+        # path, and the additive `slot_images_by_project` carries the same row.
         and value.get("slot_images") == {
-            "action": "skipped", "reason": "no wrkslots configured or on PATH",
+            "action": "skipped",
+            "project": "<ROOT>",
+            "reason": "no wrkslots configured or on PATH",
         }
+        and value.get("slot_images_by_project") == [value.get("slot_images")]
         and isinstance(persisted, dict) and persisted.get("complete") is True
         and persisted.get("schema") == "agentctl-restore-report/v1"
         and not (real.python_root / "restore-reports").exists()

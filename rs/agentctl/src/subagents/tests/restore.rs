@@ -123,7 +123,7 @@ impl Host for ScriptedHost {
             joined.contains(needle.as_str())
                 && cwd_needle
                     .as_deref()
-                    .map_or(true, |wanted| cwd_text.contains(wanted))
+                    .is_none_or(|wanted| cwd_text.contains(wanted))
         }) {
             Some(index) => answers.remove(index).2,
             None => CommandOutcome {
