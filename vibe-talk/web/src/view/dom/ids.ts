@@ -121,8 +121,6 @@ export interface ElementById {
   "control-bar-bottom": HTMLDivElement;
   "control-bar-top": HTMLDivElement;
   "control-pane": HTMLDivElement;
-  "dark-style": HTMLSelectElement;
-  "dark-style-row": HTMLDivElement;
   "data-reach-back": HTMLInputElement;
   "discord-channel": HTMLSelectElement;
   "discord-log": HTMLOListElement;

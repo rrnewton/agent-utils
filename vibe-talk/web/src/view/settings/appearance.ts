@@ -2,7 +2,7 @@
 // The choice itself lives in core/settings; this owner paints it: the effective theme on the
 // document element, the `color-scheme`, the PWA `theme-color`, and the select saying the choice.
 
-import { COLOUR_PRESETS, DEFAULT_THEME_CONFIG, THEME_GROUPS, THEME_TOKEN_NAMES, THEME_TOKENS, colourThemeOf, defaultTokensFor, effectiveTheme, themeColorFor, tokensForConfig } from "../../core/settings/index.ts";
+import { COLOUR_PRESETS, DEFAULT_THEME_CONFIG, THEME_GROUPS, THEME_TOKEN_NAMES, TOKEN_LABELS, THEME_TOKENS, colourThemeOf, defaultTokensFor, effectiveTheme, themeColorFor, tokensForConfig } from "../../core/settings/index.ts";
 import type { Appearance, ColourTheme, DarkStyle, EffectiveTheme, ThemeConfig } from "../../core/settings/index.ts";
 import { createListening } from "../dom/index.ts";
 
@@ -194,14 +194,15 @@ export function mountAppearance(deps: AppearanceDependencies): AppearanceControl
     const darkBtn = deps.lookup("theme-edit-dark") as HTMLButtonElement | null;
     if (lightBtn) lightBtn.setAttribute("aria-pressed", String(editScheme === "light"));
     if (darkBtn) darkBtn.setAttribute("aria-pressed", String(editScheme === "dark"));
-    const styleRow = deps.lookup("dark-style-row");
-    if (styleRow) styleRow.hidden = editScheme !== "dark";
-    const styleSelect = deps.lookup("dark-style") as HTMLSelectElement | null;
-    if (styleSelect && styleSelect.value !== configs.dark.style) styleSelect.value = configs.dark.style;
     const modeSelect = deps.lookup("theme-mode") as HTMLSelectElement | null;
-    if (modeSelect && modeSelect.value !== cfg.mode) modeSelect.value = cfg.mode;
+    if (modeSelect) {
+      const picker = cfg.mode === "custom" ? "custom" : editScheme === "dark" && cfg.style === "extra" ? "extra" : "default";
+      if (modeSelect.value !== picker) modeSelect.value = picker;
+      const extraOption = modeSelect.options ? modeSelect.options[1] as HTMLOptionElement | undefined : undefined;
+      if (extraOption) extraOption.disabled = editScheme !== "dark";
+    }
     const resetBtn = deps.lookup("theme-reset") as HTMLButtonElement | null;
-    if (resetBtn) resetBtn.disabled = cfg.mode !== "custom";
+    if (resetBtn) { resetBtn.disabled = cfg.mode !== "custom"; resetBtn.textContent = "Reset custom to Default"; }
     const host = deps.lookup("theme-groups");
     if (host && typeof document !== "undefined" && typeof document.createElement === "function") {
       const effective = tokensForConfig(cfg, editScheme, currentColour);
@@ -218,7 +219,8 @@ export function mountAppearance(deps: AppearanceDependencies): AppearanceControl
           const row = document.createElement("label");
           row.className = "theme-token";
           const word = document.createElement("span");
-          word.textContent = name.replace(/^--/, "").replaceAll("-", " ");
+          word.textContent = TOKEN_LABELS[name] ?? name;
+          word.title = name;
           const value = effective[name] ?? "";
           const input = document.createElement("input");
           input.setAttribute("data-token", name);
@@ -259,19 +261,28 @@ export function mountAppearance(deps: AppearanceDependencies): AppearanceControl
   if (editDark) listen<Event>(editDark, "click", () => { editScheme = "dark"; renderEditor(); });
   const modeSelectEl = deps.lookup("theme-mode");
   if (modeSelectEl) listen<Event>(modeSelectEl, "change", () => {
-    const next = (modeSelectEl as HTMLSelectElement).value === "custom" ? "custom" : "default";
-    if (next === "custom" && Object.keys(configs[editScheme].tokens).length === 0) seedCustom(editScheme);
-    else configs[editScheme] = { ...configs[editScheme], mode: next };
+    const picked = (modeSelectEl as HTMLSelectElement).value;
+    if (picked === "custom") {
+      if (Object.keys(configs[editScheme].tokens).length === 0) seedCustom(editScheme);
+      else configs[editScheme] = { ...configs[editScheme], mode: "custom" };
+    } else {
+      configs[editScheme] = { ...configs[editScheme], mode: "default", style: picked === "extra" ? "extra" : "standard" };
+    }
     editorChanged(keepConfig(editScheme));
   });
-  const styleSelectEl = deps.lookup("dark-style");
-  if (styleSelectEl) listen<Event>(styleSelectEl, "change", () => {
-    const next: DarkStyle = (styleSelectEl as HTMLSelectElement).value === "extra" ? "extra" : "standard";
-    configs.dark = { ...configs.dark, style: next };
-    editorChanged(keepConfig("dark"));
+  let resetArmed = false;
+  const resetEl = deps.lookup("theme-reset") as HTMLButtonElement | null;
+  if (resetEl) listen<Event>(resetEl, "click", () => {
+    if (!resetArmed) {
+      resetArmed = true;
+      resetEl.textContent = "Tap again to reset to Default";
+      return;
+    }
+    resetArmed = false;
+    resetEl.textContent = "Reset custom to Default";
+    seedCustom(editScheme);
+    editorChanged(keepConfig(editScheme));
   });
-  const resetEl = deps.lookup("theme-reset");
-  if (resetEl) listen<Event>(resetEl, "click", () => { seedCustom(editScheme); editorChanged(keepConfig(editScheme)); });
   const groupsHost = deps.lookup("theme-groups");
   if (groupsHost) listen<Event>(groupsHost, "input", (event: Event) => {
     const input = event.target as HTMLInputElement | null;

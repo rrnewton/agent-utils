@@ -53,6 +53,39 @@ export const THEME_GROUPS: readonly {
   { id: "code", label: "Code colours", tokens: ["--hl-comment", "--hl-string", "--hl-constant", "--hl-keyword", "--hl-type", "--hl-function", "--hl-escape", "--hl-property", "--hl-macro", "--hl-variable", "--hl-inserted", "--hl-inserted-bg", "--hl-deleted", "--hl-deleted-bg", "--data-bg", "--data-ink", "--data-muted", "--data-rule", "--debug-ink"] },
 ]);
 
+/** Plain words for each token in the editor (`#2155` liaison review): the reader sees
+ * these, never the raw `--token` (that stays in the row's tooltip). */
+export const TOKEN_LABELS: Readonly<Record<string, string>> = Object.freeze({
+  "--bg": "Page background", "--panel": "Panel background", "--theirs": "Message card",
+  "--mine": "Your message card", "--mine-edge": "Your message edge",
+  "--muted-on-mine": "Quiet text on your messages", "--warn-on-mine": "Warning on your messages",
+  "--third": "Other people's messages", "--third-edge": "Others' message edge",
+  "--dock": "Bars and dock", "--scrim-bg": "Dim behind pop-ups", "--shadow": "Shadow",
+  "--edge": "Borders and dividers", "--ink": "Text", "--muted": "Quiet text",
+  "--read-ring": "Read selection ring", "--thread-grey": "Quiet thread lines",
+  "--idle": "Idle dot", "--grey-wash": "Read wash",
+  "--accent": "Accent", "--on-accent": "Text on accent", "--accent-bright": "Bright accent",
+  "--thread-sat": "Thread colour strength", "--thread-light": "Thread colour lightness",
+  "--discuss-head-bg": "Discuss header", "--unread-stripe": "Unread stripe",
+  "--row-hover": "Hover background", "--reply-tint": "Reply background",
+  "--ok": "Success", "--warn": "Warning", "--paused": "Paused",
+  "--summary-fail-ink": "Failed summary text", "--tick-ink": "Send tick",
+  "--tick-ok": "Sent tick", "--tick-bad": "Failed tick",
+  "--discuss-ok-bg": "New-in-Discuss background", "--danger": "Danger",
+  "--on-warn": "Text on warning",
+  "--pin-ink": "Pin text", "--pin-edge": "Pin edge", "--pin-bg": "Pin background",
+  "--hit-bg": "Search mark background", "--hit-ink": "Search mark text",
+  "--hl-comment": "Comment", "--hl-string": "String", "--hl-constant": "Number and constants",
+  "--hl-keyword": "Keyword", "--hl-type": "Type", "--hl-function": "Function",
+  "--hl-escape": "Escape", "--hl-property": "Property", "--hl-macro": "Macro",
+  "--hl-variable": "Variable", "--hl-inserted": "Inserted text",
+  "--hl-inserted-bg": "Inserted background", "--hl-deleted": "Deleted text",
+  "--hl-deleted-bg": "Deleted background",
+  "--data-bg": "Data panel background", "--data-ink": "Data text",
+  "--data-muted": "Data quiet text", "--data-rule": "Data divider",
+  "--debug-ink": "Debug readout",
+});
+
 /** Every token a Custom configuration may own: the scheme tokens plus the accent family. */
 export const THEME_TOKEN_NAMES: readonly string[] = Object.freeze([
   ...Object.keys(THEME_TOKENS.dark),

@@ -12,6 +12,7 @@ Condition waits only — no fixed sleeps in any assertion.
 from __future__ import annotations
 
 import argparse
+import subprocess
 import tempfile
 import threading
 from http.server import ThreadingHTTPServer
@@ -22,6 +23,23 @@ from offline_cache_browser import TOKEN, FakeApi, check, handler_for
 import browser_waits
 
 STATE_MS = 30_000
+
+def write_build_stamp(folder) -> None:
+    def git(*argv: str) -> str:
+        return subprocess.run(["git", "-C", str(Path(__file__).resolve().parent.parent.parent), *argv],
+                              capture_output=True, text=True).stdout.strip() or "unknown"
+    assets = Path(__file__).resolve().parent.parent / "target" / "web" / "assets.json"
+    page_build = "unknown"
+    try:
+        import json
+        page_build = json.loads(assets.read_text(encoding="utf-8")).get("page_build", page_build)
+    except Exception:
+        pass
+    (folder / "BUILD.txt").write_text(
+        f"commit {git('rev-parse', 'HEAD')}\n"
+        f"commit-date {git('log', '-1', '--format=%cI', 'HEAD')}\n"
+        f"page-build {page_build}\n", encoding="utf-8")
+
 
 
 def open_editor(page) -> None:
@@ -96,18 +114,23 @@ def main() -> int:
                     pass
                 open_editor(page)
 
+                labels = page.evaluate("() => document.getElementById('theme-groups').textContent")
+                check("Page background" in labels and "Message card" in labels, "editor rows use plain labels, not token names")
                 groups = page.evaluate("() => document.querySelectorAll('#theme-groups .theme-group').length")
                 check(groups == 13, f"editor shows 13 editable groups (code colours not in Custom v1), saw {groups}")
                 check(bg(page) == "#14161a", f"standard dark bg before Extra: {bg(page)}")
 
                 # Extra dark: the Dark Default variant, true black.
-                page.select_option("#dark-style", "extra")
+                page.select_option("#theme-mode", "extra")
                 page.wait_for_function("() => getComputedStyle(document.documentElement).getPropertyValue('--bg').trim() === '#000000'", timeout=STATE_MS)
                 stored = page.evaluate("() => localStorage.getItem('vibe-talk.voice.theme-dark')")
                 check(stored is not None and '"style":"extra"' in stored, f"Extra kept: {stored}")
                 head = page.evaluate("() => getComputedStyle(document.documentElement).getPropertyValue('--discuss-head-bg').trim()")
                 check(head == "#2e2340", f"Extra Discuss highlight: {head}")
-                page.select_option("#dark-style", "standard")
+                if args.screenshots:
+                    args.screenshots.mkdir(parents=True, exist_ok=True)
+                    page.screenshot(path=str(args.screenshots / "theme-editor-dark-extra.png"))
+                page.select_option("#theme-mode", "default")
                 page.wait_for_function("() => getComputedStyle(document.documentElement).getPropertyValue('--bg').trim() === '#14161a'", timeout=STATE_MS)
 
                 # Custom: seeded from the Default, then the reader's colour wins.
@@ -130,11 +153,18 @@ def main() -> int:
                 check(bg(page) == "#112233", f"painted dark untouched by light edit: {bg(page)}")
                 page.select_option("#appearance", "light")
                 page.wait_for_function("() => getComputedStyle(document.documentElement).getPropertyValue('--bg').trim() === '#fafafa'", timeout=STATE_MS)
-                page.select_option("#appearance", "dark")
+                if args.screenshots:
+                    page.reload(wait_until="load")
+                    page.wait_for_selector("#discord-log", state="visible", timeout=STATE_MS)
+                    page.screenshot(path=str(args.screenshots / "theme-main-light-custom.png"))
+                    page.evaluate("() => localStorage.setItem('vibe-talk.voice.appearance', 'dark')")
+                    page.reload(wait_until="load")
+                page.wait_for_selector("#discord-log", state="visible", timeout=STATE_MS) if args.screenshots else page.select_option("#appearance", "dark")
                 page.wait_for_function("() => getComputedStyle(document.documentElement).getPropertyValue('--bg').trim() === '#112233'", timeout=STATE_MS)
 
                 if args.screenshots:
                     args.screenshots.mkdir(parents=True, exist_ok=True)
+                    write_build_stamp(args.screenshots)
                     page.screenshot(path=str(args.screenshots / "theme-editor-dark-custom.png"))
                     page.reload(wait_until="load")
                     page.wait_for_selector("#discord-log", state="visible", timeout=STATE_MS)
@@ -145,6 +175,28 @@ def main() -> int:
                 page.wait_for_function("() => getComputedStyle(document.documentElement).getPropertyValue('--bg').trim() === '#112233'", timeout=STATE_MS)
                 check(True, "reload restores Custom")
                 context.close()
+            if args.screenshots:
+                with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-theme-desk-") as profile:
+                    desk = playwright.chromium.launch_persistent_context(
+                        profile, headless=True, executable_path=args.browser_executable,
+                        viewport={"width": 1280, "height": 800}, color_scheme="dark",
+                    )
+                    browser_waits.hot_host_timeouts(desk)
+                    dpage = desk.pages[0]
+                    dpage.goto(url, wait_until="load")
+                    dpage.fill("#api-token", TOKEN)
+                    dpage.click("#save-token")
+                    try:
+                        dpage.wait_for_function(
+                            "() => !document.getElementById('screen-welcome').hidden"
+                            " || !document.getElementById('screen-main').hidden", timeout=3000)
+                        if dpage.evaluate("() => !document.getElementById('screen-welcome').hidden"):
+                            dpage.click("#welcome-start")
+                    except Exception:
+                        pass
+                    open_editor(dpage)
+                    dpage.screenshot(path=str(args.screenshots / "theme-editor-desktop.png"))
+                    desk.close()
         print("theme editor browser: ok")
         return 0
     finally:

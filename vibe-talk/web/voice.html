@@ -1996,24 +1996,20 @@
                         <option value="amber">Amber</option>
                       </select>
                       <p id="colour-theme-state" class="hint" aria-live="polite"></p>
+                      <p class="hint">Colour theme presets repaint the accent family of the Default theme below. Custom colours override them.</p>
                       <div class="theme-editor" id="theme-editor">
+                        <p class="hint">Edit one scheme at a time. Its Theme is the Default, Extra dark on the Dark scheme, or your own Custom colours (started from the Default).</p>
                         <div class="theme-edit-toggle" role="group" aria-label="Scheme to edit">
                           <button type="button" id="theme-edit-light" aria-pressed="false">Light</button>
                           <button type="button" id="theme-edit-dark" aria-pressed="true">Dark</button>
                         </div>
-                        <div id="dark-style-row">
-                          <label for="dark-style">Dark style</label>
-                          <select id="dark-style" aria-label="Dark style">
-                            <option value="standard">Standard</option>
-                            <option value="extra">Extra dark (true black)</option>
-                          </select>
-                        </div>
                         <label for="theme-mode">Theme</label>
-                        <select id="theme-mode" aria-label="Theme mode" aria-describedby="theme-state">
+                        <select id="theme-mode" aria-label="Theme" aria-describedby="theme-state">
                           <option value="default">Default</option>
+                          <option value="extra">Extra dark (true black)</option>
                           <option value="custom">Custom</option>
                         </select>
-                        <button type="button" id="theme-reset">Reset custom to Default</button>
+                        <button type="button" id="theme-reset" class="secondary">Reset custom to Default</button>
                         <p id="theme-state" class="hint" aria-live="polite"></p>
                         <div id="theme-groups"></div>
                         <div id="theme-preview-slot"></div>
