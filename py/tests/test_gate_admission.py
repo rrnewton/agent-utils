@@ -155,6 +155,30 @@ def test_finished_runs_append_to_the_durable_ledger(tmp_path: Path) -> None:
     assert "queue wait over 3 run(s): median" in stats.stdout
 
 
+def test_incomplete_run_records_partial_with_incomplete_steps(tmp_path: Path) -> None:
+    """#2207: a NO_RESULT (INCOMPLETE, exit 3) run records verdict "partial".
+
+    The unmeasured step names land in their own ledger field, apart from
+    failed steps, so rerunning exactly those steps is the obvious next move.
+    """
+    ledger = tmp_path / "ledger.jsonl"
+    env = {**_env(tmp_path), "GATE_LEDGER": str(ledger)}
+    incomplete = subprocess.run(
+        [PY, str(GATE), "--", PY, "-c",
+         "print('[g.fail] ◌ NO_RESULT   x (0s, NO_RESULT: killed)'); "
+         "print('dagrun: PARTIAL - 0 passed, 0 failed, 1 no-result, 0 aborted'); "
+         "print('validate: PARTIAL (incomplete: g.fail)'); raise SystemExit(3)"],
+        env=env, capture_output=True, text=True)
+    assert incomplete.returncode == 3, incomplete.stdout
+
+    import json as _json
+    rows = [_json.loads(line) for line in ledger.read_text().splitlines()]
+    assert [row["verdict"] for row in rows] == ["partial"]
+    assert rows[0]["exit_code"] == 3
+    assert rows[0]["incomplete_steps"] == ["g.fail"]
+    assert rows[0]["failed_steps"] == []
+
+
 def test_gate_children_do_not_inherit_the_host_readers_optin(tmp_path: Path) -> None:
     """#1170: gate children force the wrkslots readers opt-out.
 

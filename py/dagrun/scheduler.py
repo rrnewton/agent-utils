@@ -87,7 +87,12 @@ from dagrun.protocols import (
     RunWindow,
     StepOutcome,
 )
-from dagrun.sizing import CapOomVerdict, _step_mem_cap_for_inner_jobs, classify_memory_cap_oom
+from dagrun.sizing import (
+    CapOomVerdict,
+    _step_mem_cap_for_inner_jobs,
+    classify_memory_cap_oom,
+    independent_failure_signal,
+)
 from dagrun.teardown import (
     STEP_NONCE_ENV,
     mint_step_nonce,
@@ -2441,9 +2446,19 @@ class Runner:
                     step.hint.rss_baseline_bytes is not None
                     and step.hint.rss_baseline_bytes > 0
                 )
+                # #2207: NO_RESULT only when the step delivered no failure
+                # signal of its own. A real exit failure, a timeout, or a
+                # structured failure stays FAILED (named OOM-killed by the
+                # failure-reason precedence) and trips the failure path, so
+                # dependents skip because of it and the run fails.
                 if (
                     classify_memory_cap_oom(memory_events, cap_is_learned=cap_is_learned)
                     is CapOomVerdict.NO_RESULT
+                    and not independent_failure_signal(
+                        returncode,
+                        timed_out=timed_out,
+                        cpu_timed_out=cpu_timed_out,
+                    )
                 ):
                     outcome = replace(
                         outcome,

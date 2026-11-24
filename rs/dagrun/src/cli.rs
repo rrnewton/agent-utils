@@ -90,6 +90,30 @@ use crate::{PROG, VERSION};
 /// `--perf-dir` still wins over this; `--no-profile` disables logging entirely.
 const PROFILE_DIR_ENV: &str = "DAGRUN_PROFILE_DIR";
 
+/// Environment variable naming a file the run overwrites with the tags of
+/// its NO_RESULT steps, one per line (#2207). A consumer that only sees the
+/// exit status (which stays 0 for a no-signal NO_RESULT, rule 346) reads
+/// this to name the unmeasured steps instead of printing a plain OK. The
+/// file is written even when the list is empty, so "no no-result steps"
+/// and "the runner never reported" stay distinct.
+const NO_RESULT_FILE_ENV: &str = "DAGRUN_NO_RESULT_FILE";
+
+/// Write the NO_RESULT step tags to `$DAGRUN_NO_RESULT_FILE` when set (#2207).
+fn write_no_result_file(result: &crate::model::RunResult) {
+    let Ok(path) = std::env::var(NO_RESULT_FILE_ENV) else {
+        return;
+    };
+    let body: String = result
+        .outcomes
+        .iter()
+        .filter(|o| o.no_result)
+        .map(|o| format!("{}\n", o.tag))
+        .collect();
+    if let Err(error) = std::fs::write(&path, body) {
+        eprintln!("{PROG}: cannot write no-result file {path}: {error}");
+    }
+}
+
 /// Default profile-store directory, RELATIVE TO THE CURRENT WORKING DIRECTORY, used when neither
 /// `--perf-dir` nor `$DAGRUN_PROFILE_DIR` is set and `--no-profile` is absent. Created on
 /// demand; runs and sweeps auto-append here so profiling data lands somewhere obvious.
@@ -287,7 +311,7 @@ delegated_children: opt into child dagrun; preserves cgroups or names an unboxed
 - a failing step fails the run (exit 1) and, by default, eager-cancels in-flight steps\n    ({keepgoing} continues launching independent ready steps; failed dependents are skipped)\n  \
 - {maxmem} derives a conservative model-based active-step ceiling from RAM hints\n\n\
 {note}  cgroup-v2 per-step boxing is ON by default; {acf} downgrades to a best-effort\n        unboxed run. Sweeps use {outputdir} ({perfalias} is an alias); other commands use\n        {perfdir} for profiling artifacts.\n\n\
-{exits}  0 = all steps passed | 1 = a step failed | 2 = bad usage / bad DAG file | 3 = cgroup\n           boxing required but unavailable (use {acf})\n",
+{exits}  0 = all steps passed | 1 = a step failed | 2 = bad usage / bad DAG file | 3 = INCOMPLETE:\n           a step produced no result (never a pass), or cgroup boxing required but unavailable (use {acf})\n",
         banner = banner(c),
         i1 = h("1. Install"),
         i2 = h("2. Write a DAG (JSON)"),
@@ -4967,6 +4991,10 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
     for (tag, reason) in &result.runtime_skips {
         eprintln!("{PROG}: runtime-skipped {tag}: {reason}");
     }
+    for outcome in result.outcomes.iter().filter(|o| o.no_result) {
+        eprintln!("{PROG}: no-result {}: {}", outcome.tag, outcome.reason);
+    }
+    write_no_result_file(&result);
     if !result.not_launched.is_empty() {
         eprintln!("{PROG}: not launched: {}", result.not_launched.join(", "));
     }
@@ -5039,10 +5067,21 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
     // Keep the reservation live through every child, profile write, and report.  Explicitly drop
     // it here so long-lived library callers release promptly instead of waiting for process exit.
     drop(core_reservation);
-    if result.ok {
-        0
-    } else {
+    run_exit_code(result.ok, no_result)
+}
+
+/// Exit status of a finished run (#2207): 0 when every step passed, 1 when
+/// the run FAILED (a real failure wins over incompleteness), and 3
+/// (INCOMPLETE) when nothing failed but at least one step produced
+/// NO_RESULT — that step was never measured, so the run is not a pass and
+/// must not read as one. Documented in the user guide.
+fn run_exit_code(result_ok: bool, no_result: usize) -> i32 {
+    if !result_ok {
         1
+    } else if no_result > 0 {
+        3
+    } else {
+        0
     }
 }
 
@@ -5879,6 +5918,17 @@ fn diagnostic_failure_summary(outcomes: &[StepOutcome]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn run_exit_code_maps_pass_fail_and_incomplete() {
+        // #2207: 0 pass, 1 FAILED, 3 INCOMPLETE; a failure wins over
+        // incompleteness when both occur. A mutant that exits 0 for the
+        // incomplete case fails the third assertion.
+        assert_eq!(run_exit_code(true, 0), 0);
+        assert_eq!(run_exit_code(false, 0), 1);
+        assert_eq!(run_exit_code(true, 2), 3);
+        assert_eq!(run_exit_code(false, 2), 1);
+    }
+
     #[test]
     fn diagnostic_failure_summary_names_each_step_and_the_total() {
         use crate::test_results::{TestAttemptOutcome, TestAttemptResult, TestResult};

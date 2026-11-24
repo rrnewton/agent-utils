@@ -96,7 +96,7 @@ from dagrun.profile_capture import (
     select_sweet_spot,
 )
 from dagrun.profile_enrich import container_core_budget
-from dagrun.protocols import CgroupManager, MetricsSink, RunWindow, StepOutcome
+from dagrun.protocols import CgroupManager, MetricsSink, RunResult, RunWindow, StepOutcome
 from dagrun.reservation import Reservation
 from dagrun.scheduler import (
     _checked_jobs_env_export,
@@ -135,6 +135,38 @@ CGROUP_SETUP_ENVIRONMENT_ERROR = (
 #: Environment variable overriding the default profile-store location (Feature D). An explicit
 #: ``--perf-dir`` still wins over this; ``--no-profile`` disables logging entirely.
 PROFILE_DIR_ENV = "DAGRUN_PROFILE_DIR"
+
+#: Environment variable naming a file the run overwrites with the tags of
+#: its NO_RESULT steps, one per line (#2207). A consumer that only sees the
+#: exit status reads this to name the unmeasured steps. The file is written
+#: even when the list is empty, so "no no-result steps" and "the runner
+#: never reported" stay distinct. Mirrors the other edition.
+NO_RESULT_FILE_ENV = "DAGRUN_NO_RESULT_FILE"
+
+
+def run_exit_code(ok: bool, no_result: int) -> int:
+    """Exit status of a finished run (#2207): 0 pass, 1 FAILED, 3 INCOMPLETE.
+
+    INCOMPLETE means nothing failed but at least one step produced
+    NO_RESULT — that step was never measured, so the run is not a pass. A
+    real failure (exit 1) wins over incompleteness when both occur.
+    Mirrors ``run_exit_code`` in the other edition.
+    """
+    if not ok:
+        return 1
+    return 3 if no_result else 0
+
+
+def _write_no_result_file(result: RunResult) -> None:
+    """Write the NO_RESULT step tags to ``$DAGRUN_NO_RESULT_FILE`` (#2207)."""
+    path = os.environ.get(NO_RESULT_FILE_ENV)
+    if not path:
+        return
+    body = "".join(f"{o.tag}\n" for o in result.outcomes if o.no_result)
+    try:
+        Path(path).write_text(body, encoding="utf-8")
+    except OSError as exc:
+        print(f"{PROG}: cannot write no-result file {path}: {exc}", file=sys.stderr)
 
 #: Default profile-store directory, RELATIVE TO THE CURRENT WORKING DIRECTORY, used when neither
 #: ``--perf-dir`` nor ``$DAGRUN_PROFILE_DIR`` is set and ``--no-profile`` is absent. Created on
@@ -343,7 +375,8 @@ def _quickstart(c: Palette) -> str:
   print(to_ascii(cfg)); result = run_dag_limited(cfg, max_steps=2, max_cpus=8)
 
 {h('Exit codes')}  0 = all steps passed | 1 = a step failed | 2 = bad usage / bad DAG file
-             | 3 = cgroup boxing required but unavailable (use {k('--allow-cgroup-failure')})
+             | 3 = INCOMPLETE: a step produced no result (never a pass), or cgroup boxing
+             required but unavailable (use {k('--allow-cgroup-failure')})
 """
 
 
@@ -4586,6 +4619,10 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
     )
     for tag, reason in result.runtime_skips:
         print(f"{PROG}: runtime-skipped {tag}: {reason}", file=sys.stderr)
+    for outcome in result.outcomes:
+        if outcome.no_result:
+            print(f"{PROG}: no-result {outcome.tag}: {outcome.reason}", file=sys.stderr)
+    _write_no_result_file(result)
     if result.not_launched:
         print(f"{PROG}: not launched: {', '.join(result.not_launched)}", file=sys.stderr)
     if perf_dir is not None:
@@ -4607,7 +4644,7 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
         _print_profile_table(result.step_profile_rows, c)
     if core_reservation is not None:
         core_reservation.release()
-    return 0 if result.ok else 1
+    return run_exit_code(result.ok, no_result)
 
 
 def _main(argv: Sequence[str] | None = None) -> int:

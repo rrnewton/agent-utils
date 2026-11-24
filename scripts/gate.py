@@ -388,7 +388,11 @@ DEFAULT_LEDGER = Path("~/.local/state/agent-utils/gate-ledger.jsonl")
 
 _FAILED_STEP = re.compile(r"\[([^\]]+)\] ✗ FAIL")
 _PASSED_STEP = re.compile(r"\[([^\]]+)\] ✓ PASS")
-_VERDICT = re.compile(r"validate: (OK|PARTIAL|FAILED)")
+#: A dagrun NO_RESULT step (#2207): never measured, so the run is
+#: INCOMPLETE (exit 3), not a pass. Recorded apart from failed steps so a
+#: `--rerun --selected` of exactly these steps is the obvious next move.
+_INCOMPLETE_STEP = re.compile(r"\[([^\]]+)\] ◌ NO_RESULT")
+_VERDICT = re.compile(r"(?:validate|dagrun): (OK|PARTIAL|FAILED|PASS|FAIL)\b")
 
 
 def state_dir() -> Path:
@@ -3103,6 +3107,7 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
     rc = 1
     passed_steps: set[str] = set()
     failed_steps: set[str] = set()
+    incomplete_steps: set[str] = set()
     verdict_word: str | None = None
     last_line = ""
     aborted: str | None = None
@@ -3141,6 +3146,9 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
             match = _FAILED_STEP.search(line)
             if match:
                 failed_steps.add(match.group(1))
+            match = _INCOMPLETE_STEP.search(line)
+            if match:
+                incomplete_steps.add(match.group(1))
             match = _PASSED_STEP.search(line)
             if match:
                 passed_steps.add(match.group(1))
@@ -3198,6 +3206,7 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
             sys.stdout.flush()
         _record_ledger(args, command, started, finished, rc,
                        passed_steps, failed_steps, verdict_word, pruned, queued_at,
+                       incomplete_steps=incomplete_steps,
                        preflight=preflight, aborted=aborted, rerun_flag=rerun, local_preflight=local_preflight,
                        nested_phase=nested_phase, phase_priority_source=phase_mark_source,
                        priority=priority, priority_reason=priority_reason,
@@ -3306,6 +3315,7 @@ def _record_ledger(
     log_path: str | None = None,
     memory_peak_gib: float | None = None,
     memory_peak_source: str | None = None,
+    incomplete_steps: set[str] | None = None,
 ) -> None:
     """Append one durable ledger line for the finished run (#827). Best effort:
     a ledger failure must never change the gate's own result. `queued_utc` and
@@ -3319,7 +3329,7 @@ def _record_ledger(
         base: str | None = None
         if "--base" in command:
             base = command[command.index("--base") + 1]
-        verdict = "aborted" if aborted else {"OK": "pass", "PARTIAL": "partial", "FAILED": "fail"}.get(
+        verdict = "aborted" if aborted else {"OK": "pass", "PASS": "pass", "PARTIAL": "partial", "FAILED": "fail", "FAIL": "fail"}.get(
             verdict_word or "", "pass" if rc == 0 else "fail"
         )
         if kind is None:
@@ -3337,6 +3347,7 @@ def _record_ledger(
             "kind": kind,
             "steps": len(passed_steps) + len(failed_steps),
             "failed_steps": sorted(failed_steps),
+            "incomplete_steps": sorted(incomplete_steps or []),
             "known_red_steps": _known_red[0],
             "only_known_red": bool(failed_steps) and not _known_red[1],
             "rerun_passed": (rc == 0) if kind == "exclusive-rerun" else None,

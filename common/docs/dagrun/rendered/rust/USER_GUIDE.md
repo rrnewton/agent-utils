@@ -788,6 +788,19 @@ and the journal, its dependents are dependency-skipped, and the run's verdict is
 never a plain clean pass. Unknown tags and empty reasons are refused before any step runs.
 This is distinct from a step's authored `skip_reason`, which is a closed load-time vocabulary.
 
+Run exit codes: `0` means every step passed; `1` means the run **FAILED** (a step delivered a
+failure verdict of its own — a non-zero exit, a timeout, or a structured test failure); `2` is
+bad usage or a bad DAG file; `3` means the run is **INCOMPLETE**: nothing failed, but at least
+one step produced `NO_RESULT` (for example, an OOM kill at a learned memory cap terminated the
+step before it could deliver any verdict of its own), so that step was never measured and the
+run is not a pass. The verdict line prints `PARTIAL` for an incomplete run, names each
+no-result step, and lists it again as `dagrun: no-result <tag>: <reason>`. When both a failure
+and a no-result occur, the failure wins and the exit is `1`. An OOM-killed step whose command
+did deliver a failure verdict counts as FAILED (exit `1`, named `OOM-KILLED`), never as
+`NO_RESULT`. Setting `DAGRUN_NO_RESULT_FILE` to a path makes the run overwrite that file with
+the no-result step tags, one per line, so a caller that only sees the exit status can still
+name the unmeasured steps.
+
 When all prerequisite outputs are already present and must not be rebuilt,
 `--ignore-selected-deps` runs only the named tags and drops dependency edges to steps outside the
 selection:

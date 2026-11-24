@@ -927,6 +927,32 @@ def test_keep_going_reaches_dagrun_only_when_asked(monkeypatch: pytest.MonkeyPat
     assert [arg for arg in keep_going if arg != "--keep-going"] == eager
 
 
+def test_no_result_steps_make_validate_partial_never_ok(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#2207: a dagrun NO_RESULT report makes validate PARTIAL (incomplete), exit 3.
+
+    The planted runner writes the no-result report file itself. Both the
+    honest exit 3 and a mutant runner that exits 0 over the same report
+    must leave validate at PARTIAL with the step named, never OK.
+    """
+    validate = _validate_module()
+
+    for runner_code in (3, 0):
+        def capture(command: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
+            env = kw["env"]  # type: ignore[assignment]
+            Path(env[validate.DAGRUN_NO_RESULT_FILE_ENV]).write_text(  # type: ignore[attr-defined,index]
+                "g.fail\n", encoding="utf-8"
+            )
+            return subprocess.CompletedProcess(command, runner_code)
+
+        monkeypatch.setattr(validate.subprocess, "run", capture)
+        assert validate.run(frozenset(), frozenset(), all_contract=True) == 3
+        out = capsys.readouterr().out
+        assert "validate: PARTIAL (incomplete: g.fail)" in out
+        assert "validate: OK" not in out
+
+
 def test_gate_exclusive_phases_run_argv_in_both_positions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

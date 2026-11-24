@@ -46,7 +46,8 @@ pub fn learned_mem_cap_bytes(peak_bytes: i64) -> i64 {
 pub enum CapOomVerdict {
     /// No kernel OOM counter fired.
     NotOom,
-    /// OOM-killed at a LEARNED cap: owner rule 346 — `no_result`, never a failure.
+    /// OOM-killed at a LEARNED cap with no failure signal of its own:
+    /// owner rule 346 — `no_result`, never a failure (#2207).
     NoResult,
     /// OOM at an authored hard cap: a genuine failure.
     Fail,
@@ -69,6 +70,27 @@ pub fn classify_memory_cap_oom(
     } else {
         CapOomVerdict::Fail
     }
+}
+
+/// Whether a step delivered a failure verdict of its own (#2207).
+///
+/// A learned-cap OOM may only become `no_result` when the step produced no
+/// signal of its own: it was terminated by the kill itself (`-9`, or `137`
+/// as a shell reports a SIGKILLed child), or it exited 0 while an OOM
+/// landed on a helper. A non-zero exit that is not the kill termination, a
+/// wall/CPU timeout, or a structured test failure is a real failure the
+/// OOM must not mask. Mirrors `independent_failure_signal` in the other
+/// edition.
+pub fn independent_failure_signal(
+    returncode: Option<i64>,
+    timed_out: bool,
+    cpu_timed_out: bool,
+    structured_failure: bool,
+) -> bool {
+    if timed_out || cpu_timed_out || structured_failure {
+        return true;
+    }
+    matches!(returncode, Some(rc) if rc != 0 && rc != -9 && rc != 137)
 }
 
 /// Resolve the inner-cgroup memory cap for a step.
@@ -1380,6 +1402,21 @@ mod tests {
             classify_memory_cap_oom(0, 0, 0, false),
             CapOomVerdict::NotOom
         );
+    }
+
+    #[test]
+    fn independent_failure_signal_only_counts_a_delivered_verdict() {
+        // #2207: a real failure signal is a verdict the step itself delivered.
+        assert!(independent_failure_signal(Some(3), false, false, false));
+        assert!(independent_failure_signal(Some(1), false, false, false));
+        assert!(independent_failure_signal(Some(-11), false, false, false));
+        assert!(independent_failure_signal(Some(0), true, false, false));
+        assert!(independent_failure_signal(None, false, true, false));
+        assert!(independent_failure_signal(Some(0), false, false, true));
+        assert!(!independent_failure_signal(Some(0), false, false, false));
+        assert!(!independent_failure_signal(Some(-9), false, false, false));
+        assert!(!independent_failure_signal(Some(137), false, false, false));
+        assert!(!independent_failure_signal(None, false, false, false));
     }
 
     #[test]

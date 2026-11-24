@@ -511,6 +511,32 @@ def changed_paths(base: str, *, repo_root: Path = REPO_ROOT) -> list[str]:
 #: PARTIAL cross node from a complete one.
 CROSS_COVERAGE_ENV = "AGENT_UTILS_CROSS_COVERAGE_DIR"
 
+#: dagrun overwrites the file named by this variable with the tags of its
+#: NO_RESULT steps, one per line (#2207 dagrun-oom-learned-cap-no-result-masks-failure).
+#: A no-signal NO_RESULT run exits 3 (INCOMPLETE), never 0, and this channel
+#: lets validate name the unmeasured steps in its own PARTIAL line instead of
+#: ever printing "validate: OK" over them.
+DAGRUN_NO_RESULT_FILE_ENV = "DAGRUN_NO_RESULT_FILE"
+
+
+def _read_no_result_steps(path: Path) -> list[str]:
+    """Read (and clear) the dagrun NO_RESULT report file (#2207).
+
+    A missing file means the runner never reported (an older dagrun, or a
+    stubbed run in tests): that is "no information", not a crash. Clearing
+    after each phase keeps one phase's steps from being reported twice.
+    """
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    tags = [line.strip() for line in lines if line.strip()]
+    try:
+        path.write_text("", encoding="utf-8")
+    except OSError:
+        pass
+    return tags
+
 #: The host settings validate.env may supply (see HOST SETTINGS in the module docstring).
 HOST_ENV_KEYS = ("AGENT_UTILS_NPM", "AGENT_UTILS_NODE_DIST_URL", "npm_config_registry")
 
@@ -1134,6 +1160,13 @@ def run(
         # An ambient nested marker would classify the whole run as an
         # alternate-environment rerun and empty the primary report.
         env.pop(case_timings.TIMING_NESTED_ENV, None)
+    # #2207: dagrun reports its NO_RESULT steps into this file (both phases
+    # share it; each phase's report is read and cleared before the next).
+    no_result_dir = Path(tempfile.mkdtemp(prefix="agent-utils-validate-no-result-"))
+    scratch.append(no_result_dir)
+    no_result_path = no_result_dir / "no-result-steps.txt"
+    env[DAGRUN_NO_RESULT_FILE_ENV] = str(no_result_path)
+    no_result_steps: list[str] = []
 
     # `main` computes the phase split from the canonical graph and passes it
     # in; without it (direct callers, the graph-contract tests) the run is
@@ -1175,6 +1208,7 @@ def run(
         print(f"\n=== flattened validation DAG ({len(command)} argv entries) ===", flush=True)
         done = subprocess.run(command, cwd=REPO_ROOT, check=False, env=env)
         result = done.returncode
+        no_result_steps.extend(_read_no_result_steps(no_result_path))
     if exclusive_tags and (result == 0 or keep_going):
         # gate.py releases this run's own admission slot before queueing
         # (the parent is blocked here), then these steps run under the one
@@ -1206,7 +1240,21 @@ def run(
         done = subprocess.run(command, cwd=REPO_ROOT, check=False, env=phase_env)
         if done.returncode != 0 and result == 0:
             result = done.returncode
-    if result != 0:
+        no_result_steps.extend(_read_no_result_steps(no_result_path))
+    if no_result_steps and result == 0:
+        # A runner that reports NO_RESULT steps must never leave validate
+        # reading OK over unmeasured steps, even if it exited 0 (#2207).
+        result = 3
+    if result == 3:
+        names = ", ".join(no_result_steps) if no_result_steps else "names unavailable"
+        verdict = f"validate: PARTIAL (incomplete: {names})"
+        announce_partial(
+            verdict,
+            [f"dagrun no-result step: {tag}" for tag in no_result_steps],
+            os.environ,
+        )
+        print(f"\n{verdict}", flush=True)
+    elif result != 0:
         print("\nvalidate: FAILED in flattened validation DAG", file=sys.stderr)
     _finish_scratch(result != 0)
     if _previous_term is not None:

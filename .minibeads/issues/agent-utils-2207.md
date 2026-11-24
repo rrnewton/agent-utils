@@ -1,12 +1,13 @@
 ---
 title: 'dagrun-oom-learned-cap-no-result-masks-failure: a learned-cap OOM turns a real step failure into NO_RESULT and the run exits 0'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - dagrun
 created_at: 2026-11-24T07:45:00-05:00
-updated_at: 2026-11-24T07:45:00-05:00
+updated_at: 2026-11-24T07:49:00-05:00
+closed_at: 2026-11-24T07:49:00-05:00
 ---
 
 # Description
@@ -71,3 +72,21 @@ Owner rule 346 (a learned-cap breach under contention is not a
 failure) is preserved for the genuinely-no-signal case; this issue is
 about a real failure being masked, not about reclassifying the kill
 itself as a product failure.
+
+## Resolution
+
+Fixed in both editions. A learned-cap OOM now becomes NO_RESULT only
+when the step delivered no failure signal of its own
+(`independent_failure_signal`: a non-kill non-zero exit, a timeout, or
+a structured failure is a delivered verdict). With such a signal the
+step stays FAILED, named OOM-killed, trips the failure path, its
+dependents are dependency-skipped, and dagrun exits 1. A genuine
+no-signal NO_RESULT is not a pass: dagrun prints PARTIAL naming the
+steps and exits 3 (INCOMPLETE), validate.py prints
+"validate: PARTIAL (incomplete: <steps>)" and passes 3 through (never
+"validate: OK"), and gate.py records verdict "partial" with the steps
+in a new `incomplete_steps` ledger field. Planted fake-cgroup tests
+(exit 3 + OOM, plus a dependent) were red on the old code and are
+green after, in both editions, and a mutant restoring the old
+unconditional conversion is caught by them. No persisted schema
+change: only verdict values, plus the additive gate-ledger field.

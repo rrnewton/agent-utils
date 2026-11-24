@@ -102,8 +102,10 @@ class CapOomVerdict(Enum):
 
     #: No kernel OOM counter fired; the OOM mapping does not apply.
     NOT_OOM = "not_oom"
-    #: OOM-killed at a LEARNED cap: owner rule 346 — a cap breach under contention is
-    #: ``no_result``, never a failure. The step did not pass; it was not measured.
+    #: OOM-killed at a LEARNED cap with no failure signal of its own: owner
+    #: rule 346 — a cap breach under contention is ``no_result``, never a
+    #: failure. The step did not pass; it was not measured. A step that did
+    #: deliver a failure signal stays FAILED instead (#2207).
     NO_RESULT = "no_result"
     #: OOM at an authored hard cap (or otherwise not learned): a genuine failure. The
     #: kernel still stopped the step at its cap; the run reports it red.
@@ -133,6 +135,39 @@ def classify_memory_cap_oom(
     if oom_events <= 0:
         return CapOomVerdict.NOT_OOM
     return CapOomVerdict.NO_RESULT if cap_is_learned else CapOomVerdict.FAIL
+
+
+#: Returncodes that ARE the OOM-kill termination itself, not a verdict the
+#: step delivered: ``-9`` is a process reaped by SIGKILL, ``137`` is a shell
+#: reporting that its child was (128 + 9). Either can be how an OOM kill
+#: presents, so neither counts as an independent failure signal (#2207).
+OOM_KILL_RETURNCODES = frozenset({-9, 137})
+
+
+def independent_failure_signal(
+    returncode: int | None,
+    *,
+    timed_out: bool = False,
+    cpu_timed_out: bool = False,
+    structured_failure: bool = False,
+) -> bool:
+    """Whether a step delivered a failure verdict of its own (#2207).
+
+    A learned-cap OOM may only become ``no_result`` when the step produced
+    no signal of its own: it was terminated by the kill itself, or it
+    exited 0 while an OOM landed on a helper. A non-zero exit that is not
+    the kill termination, a wall/CPU timeout, or a structured test
+    failure is a real failure the OOM must not mask: the step counts as
+    FAILED (named OOM-killed), never as ``no_result``. Pure and
+    deterministic; mirrored in the other edition.
+    """
+    if timed_out or cpu_timed_out or structured_failure:
+        return True
+    return (
+        returncode is not None
+        and returncode != 0
+        and returncode not in OOM_KILL_RETURNCODES
+    )
 
 
 def step_mem_cap_bytes(

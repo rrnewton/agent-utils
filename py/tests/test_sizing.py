@@ -11,6 +11,7 @@ from dagrun.sizing import (
     CapOomVerdict,
     classify_memory_cap_oom,
     derive_build_jobs,
+    independent_failure_signal,
     learned_mem_cap_bytes,
     jobs_footprint_bytes,
     jobs_for_budget,
@@ -434,6 +435,23 @@ def test_classify_memory_cap_oom_fake_cgroup_events() -> None:
     assert classify_memory_cap_oom(quiet, cap_is_learned=False) is CapOomVerdict.NOT_OOM
     assert classify_memory_cap_oom(None, cap_is_learned=True) is CapOomVerdict.NOT_OOM
     assert classify_memory_cap_oom({}, cap_is_learned=True) is CapOomVerdict.NOT_OOM
+
+
+def test_independent_failure_signal_only_counts_a_delivered_verdict() -> None:
+    """#2207: a real failure signal is a verdict the step itself delivered."""
+    # A plain non-zero exit is a real failure, whatever landed beside it.
+    assert independent_failure_signal(3)
+    assert independent_failure_signal(1)
+    assert independent_failure_signal(-11)  # a crash signal is a verdict too
+    # Timeouts and structured failures are delivered verdicts.
+    assert independent_failure_signal(0, timed_out=True)
+    assert independent_failure_signal(None, cpu_timed_out=True)
+    assert independent_failure_signal(0, structured_failure=True)
+    # No signal: clean exit, the kill termination itself, or no returncode.
+    assert not independent_failure_signal(0)
+    assert not independent_failure_signal(-9)
+    assert not independent_failure_signal(137)
+    assert not independent_failure_signal(None)
 
 
 def test_box_mem_budget_is_min_of_readable_signals() -> None:

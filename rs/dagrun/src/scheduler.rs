@@ -4769,7 +4769,19 @@ fn run_step(ctx: StepCtx) {
                 ),
                 None => (0, 0, 0),
             };
+            // #2207: NO_RESULT only when the step delivered no failure
+            // signal of its own. A real exit failure, a timeout, or a
+            // structured failure stays FAILED (named OOM-killed by the
+            // failure-reason precedence) and trips the failure path, so
+            // dependents skip because of it and the run fails.
             if abort_cause.is_none()
+                && !crate::sizing::independent_failure_signal(
+                    returncode,
+                    timed_out,
+                    cpu_timed_out,
+                    structured_test_results_error.is_some()
+                        || test_results_report_failure(&test_counts),
+                )
                 && crate::sizing::classify_memory_cap_oom(ev_oom, ev_kill, ev_group, cap_is_learned)
                     == crate::sizing::CapOomVerdict::NoResult
             {
@@ -6569,6 +6581,90 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
         DagConfig {
             steps: vec![producer],
             ..Default::default()
+        }
+    }
+
+    // #2207: a learned-cap OOM must not mask a real failure. The planted
+    // cgroup counters say an OOM kill landed; the step's own command still
+    // delivered its own verdict. Exit 3 is a real failure signal, so the
+    // step is FAILED (named OOM-killed), its dependent is skipped because
+    // of it, and the run is not ok. Exit 0 and a kill termination carry no
+    // failure signal of their own, so those stay NO_RESULT (rule 346).
+    fn learned_cap_oom_run(cmd: &str) -> RunResult {
+        let mut fail = step("g", "fail", cmd, &[], 0.0, &[]);
+        fail.hint.rss_baseline_bytes = Some(64 * 1024 * 1024);
+        let after = step("g", "after", "true", &["g.fail"], 0.0, &[]);
+        let cfg = DagConfig {
+            steps: vec![fail, after],
+            ..Default::default()
+        };
+        let cgroups = Arc::new(PlantedCgroups::new(&[(
+            "g.fail",
+            4096,
+            "4096",
+            &[("oom", 1), ("oom_kill", 2)],
+        )]));
+        let mut runner = Runner::new(
+            &cfg,
+            2,
+            2,
+            true,
+            0,
+            Some(cgroups),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        runner.evidence = None;
+        let (_ok, wall) = runner.run();
+        runner.result(wall)
+    }
+
+    #[test]
+    fn learned_cap_oom_with_a_real_exit_failure_is_failed_not_no_result() {
+        let result = learned_cap_oom_run("echo assertion failed; exit 3");
+        let outcome = &result.outcomes[0];
+        assert_eq!(outcome.returncode, Some(3));
+        assert!(outcome.oomed && outcome.oom_kills == 2, "{outcome:#?}");
+        assert!(!outcome.ok, "{outcome:#?}");
+        assert!(
+            !outcome.no_result,
+            "a real exit failure must not be masked as NO_RESULT: {outcome:#?}"
+        );
+        assert!(
+            outcome.reason.contains("OOM-KILLED"),
+            "the failure must be named as OOM-killed: {}",
+            outcome.reason
+        );
+        assert!(
+            result.skipped.iter().any(|tag| tag == "g.after"),
+            "dependent must be dependency-skipped: {:?}",
+            result.skipped
+        );
+        assert!(!result.ok, "the run must not read ok: {result:#?}");
+    }
+
+    #[test]
+    fn learned_cap_oom_without_a_failure_signal_stays_no_result() {
+        for cmd in ["true", "kill -9 $$"] {
+            let result = learned_cap_oom_run(cmd);
+            let outcome = &result.outcomes[0];
+            assert!(!outcome.ok, "{cmd}: {outcome:#?}");
+            assert!(
+                outcome.no_result,
+                "{cmd}: no failure signal of its own, so NO_RESULT stands: {outcome:#?}"
+            );
+            assert!(
+                result.skipped.iter().any(|tag| tag == "g.after"),
+                "{cmd}: dependent must be dependency-skipped: {:?}",
+                result.skipped
+            );
+            assert!(
+                result.ok,
+                "{cmd}: rule 346 — a no-signal NO_RESULT does not fail the run: {result:#?}"
+            );
         }
     }
 

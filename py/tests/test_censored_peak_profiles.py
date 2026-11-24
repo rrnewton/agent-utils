@@ -350,6 +350,44 @@ def test_an_oom_kill_cannot_be_a_false_exit_zero_pass(tmp_path: Path) -> None:
         assert row["oom_kills"] == row["memory_events_oom_kill"] == str(kills)
 
 
+def _learned_cap_oom_run(cmd: str):  # type: ignore[no-untyped-def]
+    """#2207: a learned-cap step plus a dependent, with planted OOM counters."""
+    fail = Step(
+        "g", "fail", "", cmd,
+        hint=ResourceHint(rss_baseline_bytes=64 * 1024 * 1024),
+    )
+    after = _step("after", "true", deps=["g.fail"])
+    cfg = DagConfig(steps=(fail, after))
+    cgroups = _PlantedCgroups({"g.fail": (4096, "4096", {"oom": 1, "oom_kill": 2})})
+    return run_dag(cfg, jobs=2, cgroups=cgroups, keep_going=True, verbosity=0)
+
+
+def test_learned_cap_oom_with_a_real_exit_failure_is_failed_not_no_result() -> None:
+    """#2207: exit 3 is the step's own verdict; an OOM kill on the side must not mask it."""
+    result = _learned_cap_oom_run("echo assertion failed; exit 3")
+    outcome = result.outcomes[0]
+    assert outcome.returncode == 3
+    assert outcome.oomed and outcome.oom_kills == 2, outcome
+    assert not outcome.ok, outcome
+    assert not outcome.no_result, (
+        f"a real exit failure must not be masked as NO_RESULT: {outcome}"
+    )
+    assert "OOM-KILLED" in outcome.reason, outcome.reason
+    assert "g.after" in result.skipped, result.skipped
+    assert not result.ok, result
+
+
+def test_learned_cap_oom_without_a_failure_signal_stays_no_result() -> None:
+    """#2207 control: exit 0 and a kill termination carry no failure signal (rule 346)."""
+    for cmd in ("true", "kill -9 $$"):
+        result = _learned_cap_oom_run(cmd)
+        outcome = result.outcomes[0]
+        assert not outcome.ok, (cmd, outcome)
+        assert outcome.no_result, (cmd, outcome)
+        assert "g.after" in result.skipped, (cmd, result.skipped)
+        assert result.ok, (cmd, result)
+
+
 def test_an_oom_kill_below_the_cap_with_no_local_limit_event_names_an_outer_or_host_oom(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

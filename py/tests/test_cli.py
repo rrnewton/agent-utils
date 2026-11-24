@@ -26,6 +26,7 @@ from dagrun.cli import (
     PROG,
     _load_userguide,
     main,
+    run_exit_code,
 )
 from dagrun.io import dag_from_json
 from dagrun.model import DagConfig, Step
@@ -72,6 +73,17 @@ def _skip_if_parent_validation_is_unboxed(
         pytest.skip(
             "parent validation is explicitly unboxed; no kernel subtree exists to verify"
         )
+
+
+def test_run_exit_code_maps_pass_fail_and_incomplete() -> None:
+    """#2207: 0 pass, 1 FAILED, 3 INCOMPLETE; a failure wins over incompleteness.
+
+    A mutant that exits 0 for the incomplete case fails the third assertion.
+    """
+    assert run_exit_code(True, 0) == 0
+    assert run_exit_code(False, 0) == 1
+    assert run_exit_code(True, 2) == 3
+    assert run_exit_code(False, 2) == 1
 
 
 def test_no_args_prints_help() -> None:
