@@ -402,41 +402,20 @@ def _rust_apply(root: Path, input_path: Path) -> subprocess.CompletedProcess[str
     )
 
 
-def test_validate_rows_apply_writes_and_reports_lock_seconds(
+def test_validate_rows_apply_refuses_without_census_and_writes_nothing(
     tmp_path: Path,
 ) -> None:
-    """Proven path writes (#2125): journal, archives, ACTIVE removal."""
+    """R1 (#2125): covered apply refuses until the census is in Rust."""
     rust_root, _record = _fixture(tmp_path / "rust")
-    oracle_root, _orecord = _fixture(tmp_path / "oracle")
     _make_absent_dead(rust_root)
-    _make_absent_dead(oracle_root)
     rust_sha = _record_sha(rust_root)
-    oracle_sha = _record_sha(oracle_root)
-    args = argparse.Namespace(
-        project_root=str(oracle_root), machine=None,
-        input=str(_input_file(oracle_root, [_row(oracle_sha)])),
-        apply=True, coordinator_authorized=True,
-        coordinator_pid=os.getpid(), format="json", wait_lock=0.0,
-    )
-    buffer = io.StringIO()
-    with redirect_stdout(buffer):
-        assert wrkslots_cli._cmd_recover_absent_validate_rows(args) == 0
-    expected = json.loads(buffer.getvalue())
+    before = _registry_snapshot(rust_root)
     result = _rust_apply(rust_root, _input_file(rust_root, [_row(rust_sha)]))
-    assert result.returncode == 0, result.stderr
-    payload = json.loads(result.stdout)
-    assert [row["outcome"] for row in payload["rows"]] == ["recovered"]
-    assert [row["outcome"] for row in expected["rows"]] == ["recovered"]
-    # lock_seconds is observed from the final save, never asserted.
-    assert payload["lock_seconds"] >= 0
-    assert expected["lock_seconds"] >= 0
-    for root in (rust_root, oracle_root):
-        config = wrkslots_cli._load_config(str(root), None)
-        assert not wrkslots_cli._journal_path(config).exists()
-        state = wrkslots_cli._load_active(config)
-        assert [row.slot for row in state.slots] == []
-        archive = wrkslots_cli._load_archive_snapshot(config)
-        assert [entry.get("slot") for entry in archive.records] == ["slot-a"]
+    assert result.returncode == 1, result.stdout
+    assert "census is unavailable in Rust" in result.stderr
+    assert "use the Python edition" in result.stderr
+    assert _registry_snapshot(rust_root) == before
+    assert not (rust_root / "worktrees" / f"ACTIVE.{MACHINE}.journal").exists()
 
 
 def test_validate_rows_held_row_refuses_in_both_editions(

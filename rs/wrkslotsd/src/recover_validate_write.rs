@@ -9,12 +9,18 @@
 //! scoped hold check, and the still-has-physical-storage refusal.
 //! The prove-then-recheck path (#2125) folds the history outside
 //! the mutation locks and, only when the O(1) tip proof is
-//! unchanged under them, performs the journal write and the
+//! unchanged under them, would perform the journal write and the
 //! recovery writes (archive appends, ACTIVE removal, snapshot
-//! readback, journal clear) without re-folding. The host-wide
-//! process census and the deleted-bind unmount stay with the
-//! Python edition: this edition refuses a deleted-bind row and
-//! judges liveness from the scoped evidence it can read.
+//! readback, journal clear) without re-folding. Until a host-wide
+//! census and Python-exact retained-handle matching exist in Rust,
+//! the apply path refuses outright instead (see
+//! `refuse_apply_census_unavailable` in `execute_recovery`): every
+//! apply row refuses before the journal write and writes nothing.
+//! Read, proof, plan, and already-recovered paths stay intact for
+//! the census follow-up. The host-wide process census and the
+//! deleted-bind unmount stay with the Python edition: this edition
+//! refuses a deleted-bind row and judges liveness from the scoped
+//! evidence it can read.
 //! Never-write-narrower rule (#2125): wherever the Python
 //! edition (037494e9) would run a check this edition cannot run
 //! before writing -- the host-wide /proc census, the deleted-
@@ -760,11 +766,13 @@ fn journals_absent(root: Option<&Path>) -> bool {
 ///
 /// Covered rows -- a complete owner generation this edition can
 /// prove dead from scoped /proc identity, no bind record, no
-/// retained handle, and no other machine's rows -- keep the
-/// proven writing path unchanged. Called from `classify_rows`
-/// and again at the top of `execute_recovery`, before the
-/// journal write, so a refusal writes nothing: no journal, no
-/// event appends, no snapshot writes.
+/// retained handle, and no other machine's rows -- pass this
+/// gate, but `execute_recovery` still refuses them at apply via
+/// `refuse_apply_census_unavailable` until the census exists.
+/// Called from `classify_rows` and again at the top of
+/// `execute_recovery`, before the journal write, so a refusal
+/// writes nothing: no journal, no event appends, no snapshot
+/// writes.
 fn refuse_uncovered_write(cfg: &Cfg, selected: &str, planned: &[Planned]) -> Result<()> {
     // Cross-machine unrelated-row fold. Enumerate shards
     // directly (not `discover_machines`, whose shard-consistency
@@ -883,6 +891,23 @@ fn refuse_uncovered_write(cfg: &Cfg, selected: &str, planned: &[Planned]) -> Res
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Apply gate for R1 (#2125, never-write-narrower): Python runs
+/// its host-wide census and retained-handle matching for every
+/// planned row, so until both exist in Rust every apply row is
+/// census-dependent. Called only from `execute_recovery` -- the
+/// one place every apply write passes, before the journal write
+/// -- so plan/read/proof paths keep working and a refusal here
+/// writes nothing: no journal, no events, no snapshots.
+fn refuse_apply_census_unavailable(planned: &[Planned]) -> Result<()> {
+    if let Some(item) = planned.first() {
+        return Err(format!(
+            "validation row {} apply refused: host-wide process census is unavailable in Rust; use the Python edition",
+            item.row.slot
+        ));
     }
     Ok(())
 }
@@ -1120,6 +1145,10 @@ fn execute_recovery(
     input_sha256: &str,
     coordinator: &Value,
 ) -> Result<Vec<Value>> {
+    // R1 apply gate (#2125): refuse every apply row outright
+    // until the census exists in Rust; this is before the
+    // journal write, so it writes nothing.
+    refuse_apply_census_unavailable(planned)?;
     // Never-write-narrower gate (#2125): before the journal
     // write, refuse every condition the Python edition proves
     // with its census, bind unmount/forget, or cross-machine
@@ -1500,8 +1529,8 @@ pub(crate) fn recover_absent_validate_rows(
 #[cfg(test)]
 mod tests {
     use super::{
-        history_proof_matches, mountinfo_covers_deleted_bind, refuse_uncovered_write,
-        scoped_hold_exists, with_lock_seconds, HistoryProof, Planned, Row,
+        history_proof_matches, mountinfo_covers_deleted_bind, refuse_apply_census_unavailable,
+        refuse_uncovered_write, scoped_hold_exists, with_lock_seconds, HistoryProof, Planned, Row,
     };
     use crate::active_state::Cfg;
     use crate::canonical::canonical_sha256;
@@ -1784,11 +1813,16 @@ mod tests {
     }
 
     #[test]
-    fn covered_row_passes_uncovered_gate() {
+    fn covered_row_refuses_at_apply() {
+        // R1: a row passing the uncovered gate still refuses at
+        // apply until the census exists in Rust.
         let (base, cfg) = gate_cfg("gate-covered");
-        assert!(
-            refuse_uncovered_write(&cfg, "node-a", &[planned_with_owner(complete_owner())]).is_ok()
-        );
+        let planned = [planned_with_owner(complete_owner())];
+        assert!(refuse_uncovered_write(&cfg, "node-a", &planned).is_ok());
+        let err = refuse_apply_census_unavailable(&planned).unwrap_err();
+        assert!(err.contains("census is unavailable in Rust"), "{err}");
+        assert!(err.contains("use the Python edition"), "{err}");
+        assert!(refuse_apply_census_unavailable(&[]).is_ok());
         let _ = std::fs::remove_dir_all(&base);
     }
 
