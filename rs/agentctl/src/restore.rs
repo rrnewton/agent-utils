@@ -1550,8 +1550,8 @@ pub fn reports_directory(registry: &Path) -> PathBuf {
 /// `agents/` in the wild (#1359), then the shared XDG state directory.
 /// Readers accept these until [`LEGACY_REPORT_SUPPORT_ENDS`]; an explicit
 /// `report_dir` names the one location, so there are no fallback reads.
-/// The legacy directories with the shared directory named, so tests never
-/// depend on the host's real state home.
+/// The earlier report directories, with the shared directory named, so
+/// tests never depend on the host's real state home.
 fn legacy_report_directories_in(
     registry: &Path,
     config: &RestoreConfig,
@@ -1655,7 +1655,7 @@ fn candidate_report_paths_in(
 /// stable per-team key ([`team_key`]) and the registry's canonical path.
 /// It names no team, host, or person beyond the path the registry already
 /// lives at, and it is what lets a later reader prove a report found
-/// outside the registry (the legacy shared directory) belongs to it.
+/// outside the registry (the shared state directory) belongs to it.
 fn registry_identity(registry: &Path) -> (String, String) {
     let canonical = fs::canonicalize(registry).unwrap_or_else(|_| registry.to_path_buf());
     (team_key(registry), canonical.display().to_string())
@@ -1686,10 +1686,10 @@ fn report_agent_names(report: &Value) -> Vec<String> {
     names
 }
 
-/// Whether a report found at `path` may count for `registry` (#2218
-/// agentctl-restore-legacy-report-scope). A report inside the registry
-/// (its current or own legacy locations, or an explicit `report_dir`)
-/// counts as today. Only a report from the legacy SHARED directory — one
+/// Whether a report found at `path` may count for `registry` (#2218).
+/// A report inside the registry (its current or own earlier locations,
+/// or an explicit `report_dir`) counts as today. Only a report from the
+/// SHARED state directory — one
 /// host directory every registry's older builds wrote to — must prove it
 /// belongs to this registry; an unprovable one counts for nobody, so a
 /// registry never reads another registry's restore outcome as its own.
@@ -1712,7 +1712,7 @@ pub(crate) fn report_counts_for_registry(
 
 /// The proof a shared-directory report belongs to `registry` (#2218): a
 /// recorded registry identity wins outright; a report from before the
-/// identity was recorded proves itself the legacy way — every agent it
+/// identity was recorded proves itself by names — every agent it
 /// names exists in this registry's records, and its coordinator is this
 /// registry's coordinator (restore.json's, else the designated one).
 fn shared_report_belongs_to_registry(
@@ -1753,7 +1753,7 @@ fn shared_report_belongs_to_registry(
     }
 }
 
-/// This boot's report in the legacy shared directory, when one exists and
+/// This boot's report in the shared state directory, when one exists and
 /// provably belongs to another registry (#2218): `restore --dry-run`
 /// names it once as foreign instead of leaving its silence unexplained.
 pub fn foreign_shared_report(
