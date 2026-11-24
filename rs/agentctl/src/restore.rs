@@ -1978,26 +1978,29 @@ fn eden_slot_dir(
 }
 
 /// Restart the per-slot Eden daemons of this registry's own slotted agents
-/// (#1977): one `wrkslots eden restart-slot-daemons` run naming every
-/// Eden slot of the project at once. Launching wrkslots loads every
-/// active record, so a run per slot — git slots included — was pure
-/// cost before the slot holds on every boot. Slots restore can prove
-/// non-Eden itself never reach the verb: when the slot directory is
-/// derivable (see `eden_slot_dir`) and `<slot>/.eden-state` is absent,
-/// exactly as the verb classifies it, the slot's `skipped` row is
-/// synthesised here, so a git-only registry produces no invocation at
-/// all. A slot whose directory cannot be derived is passed to the
-/// verb, which classifies it. The wrkslots binary is the one already
-/// resolved for `image status` (`RestoreOptions::wrkslots`), and the
-/// run is against the restore project (the registry's parent, exactly
-/// as `remount_slot_images` receives it): because this verb starts
-/// processes, each agent's recorded slot project is canonicalised and
-/// a slot whose project is not the restore project gets a `refused`
-/// row without any invocation, so restore never starts a daemon for
-/// another registry's slots. The outer timeout scales with the slots
-/// in the run (`EDEN_PER_SLOT_TIMEOUT_SECONDS` each; the verb caps
-/// every call inside). Every other failure — no binary configured, a
-/// failed or unparsable verb run, an Eden slot the verb did not
+/// (#1977, #2089): one `wrkslots eden restart-slot-daemons` run per
+/// covered project, naming every Eden slot of that project at once, with
+/// that project as the verb's root and working directory. The covered
+/// projects are the per-project image rows (`slot_images_by_project`:
+/// the restore project plus every distinct project recorded by a
+/// slotted agent). Launching wrkslots loads every active record, so a
+/// run per slot — git slots included — was pure cost before the slot
+/// holds on every boot. Slots restore can prove non-Eden itself never
+/// reach the verb: when the slot directory is derivable (see
+/// `eden_slot_dir`, canonicalised against the slot's own project) and
+/// `<slot>/.eden-state` is absent, exactly as the verb classifies it,
+/// the slot's `skipped` row is synthesised here, so a git-only project
+/// produces no invocation at all. A slot whose directory cannot be
+/// derived is passed to the verb, which classifies it. Because this verb
+/// starts processes, a slot recorded under no covered project gets a
+/// `refused` row without any invocation, and a slot whose project's
+/// image row did not run (its status call failed) is refused without an
+/// invocation for that project, while other projects restart normally.
+/// The wrkslots binary is the one already resolved for `image status`
+/// (`RestoreOptions::wrkslots`). The outer timeout scales with the
+/// slots in each run (`EDEN_PER_SLOT_TIMEOUT_SECONDS` each; the verb
+/// caps every call inside). Every other failure — no binary configured,
+/// a failed or unparsable verb run, an Eden slot the verb did not
 /// report — degrades to a per-slot `refused` row here and never fails
 /// restore. The verb's own rows pass through in full (every checkout's
 /// row included) with each slot's agents named; only a slot passed to
@@ -2007,14 +2010,26 @@ fn restart_eden_daemons(
     host: &dyn Host,
     wrkslots: Option<&Path>,
     boxed: &[SlotAgent],
-    restore_project: &Path,
-    images: &Value,
+    images_by_project: &[Value],
 ) -> Vec<Value> {
     if boxed.is_empty() {
         return Vec::new();
     }
-    let restore_canonical =
-        fs::canonicalize(restore_project).unwrap_or_else(|_| restore_project.to_path_buf());
+    // Covered projects in report order, each with its image row.
+    let covered: Vec<(PathBuf, &Value)> = images_by_project
+        .iter()
+        .filter_map(|row| {
+            row["project"]
+                .as_str()
+                .map(|project| (PathBuf::from(project), row))
+        })
+        .collect();
+    let cover_for = |project: &Path| -> Option<&(PathBuf, &Value)> {
+        let wanted = canonical_project(project);
+        covered
+            .iter()
+            .find(|(recorded, _)| canonical_project(recorded) == wanted)
+    };
     let mut slot_agents: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut slot_records: BTreeMap<String, Vec<&SlotAgent>> = BTreeMap::new();
     let mut slot_project: BTreeMap<String, PathBuf> = BTreeMap::new();
@@ -2031,13 +2046,19 @@ fn restart_eden_daemons(
             .entry(agent.slot.clone())
             .or_insert_with(|| agent.project.clone());
     }
+    // The project each slot is settled or invoked under (its covered
+    // project's recorded path, or its own recorded project when refused
+    // as foreign), for the rows assembled below.
+    let mut slot_row_project: BTreeMap<String, PathBuf> = BTreeMap::new();
     let mut settled: BTreeMap<String, Value> = BTreeMap::new();
-    let mut verb_slots: Vec<String> = Vec::new();
+    let mut verb_slots: Vec<(PathBuf, Vec<String>)> = covered
+        .iter()
+        .map(|(project, _)| (project.clone(), Vec::new()))
+        .collect();
     for (slot, agents) in &slot_agents {
         let recorded_project = &slot_project[slot];
-        let in_scope = fs::canonicalize(recorded_project)
-            .is_ok_and(|canonical| canonical == restore_canonical);
-        if !in_scope {
+        let Some((row_project, images)) = cover_for(recorded_project) else {
+            slot_row_project.insert(slot.clone(), recorded_project.clone());
             settled.insert(
                 slot.clone(),
                 json!({
@@ -2046,15 +2067,17 @@ fn restart_eden_daemons(
                     "project": recorded_project,
                     "status": "refused",
                     "reason": format!(
-                        "slot project {} is not the restore project {}; the slot is not this registry's, so it was not passed to wrkslots",
-                        recorded_project.display(),
-                        restore_project.display()
+                        "slot project {} is not among the projects this restore covers; the slot was not passed to wrkslots",
+                        recorded_project.display()
                     ),
                 }),
             );
             continue;
-        }
-        let has_state = eden_slot_dir(slot, &slot_records[slot], images, &restore_canonical)
+        };
+        let row_project = (*row_project).clone();
+        slot_row_project.insert(slot.clone(), row_project.clone());
+        let project_canonical = canonical_project(&row_project);
+        let has_state = eden_slot_dir(slot, &slot_records[slot], images, &project_canonical)
             .map(|directory| directory.join(".eden-state").symlink_metadata().is_ok());
         if has_state == Some(false) {
             settled.insert(
@@ -2065,7 +2088,7 @@ fn restart_eden_daemons(
                     "mount": null,
                     "config_dir": null,
                     "agents": agents,
-                    "project": restore_project,
+                    "project": row_project,
                     "status": "skipped",
                     "reason": "slot has no Eden checkout; no Eden daemon to restart",
                 }),
@@ -2078,25 +2101,50 @@ fn restart_eden_daemons(
                 json!({
                     "slot": slot,
                     "agents": agents,
-                    "project": restore_project,
+                    "project": row_project,
                     "status": "refused",
                     "reason": "no wrkslots configured or on PATH; the slot's Eden daemon was not restarted",
                 }),
             );
             continue;
         }
-        verb_slots.push(slot.clone());
+        if images["action"].as_str() != Some("ran") {
+            settled.insert(
+                slot.clone(),
+                json!({
+                    "slot": slot,
+                    "agents": agents,
+                    "project": row_project,
+                    "status": "refused",
+                    "reason": format!(
+                        "slot images for project {} did not run successfully (action {}); the slot's Eden daemon was not restarted",
+                        row_project.display(),
+                        images["action"].as_str().unwrap_or("unknown")
+                    ),
+                }),
+            );
+            continue;
+        }
+        if let Some((_, slots)) = verb_slots
+            .iter_mut()
+            .find(|(project, _)| *project == row_project)
+        {
+            slots.push(slot.clone());
+        }
     }
     let mut verb_rows: BTreeMap<String, Vec<Value>> = BTreeMap::new();
-    let mut verb_outcome: Option<(Option<i32>, String)> = None;
-    if !verb_slots.is_empty() {
+    let mut verb_outcomes: BTreeMap<String, (Option<i32>, String)> = BTreeMap::new();
+    for (project, slots) in &verb_slots {
+        if slots.is_empty() {
+            continue;
+        }
         let wrkslots = wrkslots.expect("verb slots imply a wrkslots binary");
         eprintln!(
             "agentctl restore: restarting Eden daemons for slots {}",
-            verb_slots.join(", ")
+            slots.join(", ")
         );
-        let mut argv = wrkslots_argv(wrkslots, restore_project, &["eden", "restart-slot-daemons"]);
-        for slot in &verb_slots {
+        let mut argv = wrkslots_argv(wrkslots, project, &["eden", "restart-slot-daemons"]);
+        for slot in slots {
             argv.push("--slot".to_owned());
             argv.push(slot.clone());
         }
@@ -2104,8 +2152,8 @@ fn restart_eden_daemons(
         argv.push("json".to_owned());
         let outcome = host.run(
             &argv,
-            Some(restore_project),
-            Duration::from_secs(EDEN_PER_SLOT_TIMEOUT_SECONDS * verb_slots.len() as u64),
+            Some(project),
+            Duration::from_secs(EDEN_PER_SLOT_TIMEOUT_SECONDS * slots.len() as u64),
         );
         let reported: Vec<Value> = serde_json::from_str::<Value>(&outcome.stdout)
             .ok()
@@ -2116,10 +2164,12 @@ fn restart_eden_daemons(
             if let Some(agents) = slot_agents.get(&row_slot) {
                 row["agents"] = json!(agents);
             }
-            row["project"] = json!(restore_project);
+            row["project"] = json!(project);
             verb_rows.entry(row_slot).or_default().push(row);
         }
-        verb_outcome = Some((outcome.status, outcome.stderr.clone()));
+        for slot in slots {
+            verb_outcomes.insert(slot.clone(), (outcome.status, outcome.stderr.clone()));
+        }
     }
     let mut rows: Vec<Value> = Vec::new();
     for (slot, agents) in &slot_agents {
@@ -2127,10 +2177,14 @@ fn restart_eden_daemons(
             rows.push(row);
             continue;
         }
+        let row_project = slot_row_project
+            .get(slot)
+            .cloned()
+            .unwrap_or_else(|| slot_project[slot].clone());
         match verb_rows.remove(slot) {
             Some(mut mine) if !mine.is_empty() => rows.append(&mut mine),
             _ => {
-                let detail = match &verb_outcome {
+                let detail = match verb_outcomes.get(slot) {
                     Some((Some(status), stderr)) => {
                         format!("exit {status}: {}", first_error_lines(stderr))
                     }
@@ -2142,7 +2196,7 @@ fn restart_eden_daemons(
                 rows.push(json!({
                     "slot": slot,
                     "agents": agents,
-                    "project": restore_project,
+                    "project": row_project,
                     "status": "refused",
                     "reason": format!(
                         "wrkslots eden restart-slot-daemons did not report slot {slot}: {detail}"
@@ -3706,12 +3760,13 @@ pub fn restore<A: ManagedApi + ?Sized>(
     report["slot_images_by_project"] = json!(images_by_project);
     // After a restart, every running agent boxed to a slot is dead: hold its slot so no
     // cleanup can retire it before the agent is revived and owns it again.
-    // #1977: restart this registry's own slots' Eden daemons after the
-    // image remount and before the holds, limited to those slots. Like
-    // the holds below, the step runs only when a restart was detected:
-    // on an ordinary same-boot run a stopped daemon was stopped on
-    // purpose and must not come back. A refused daemon is a report row
-    // (`eden_refused` counts them), never a failed restore.
+    // #1977, #2089: restart the covered projects' slots' Eden daemons
+    // after the image remount and before the holds, one verb run per
+    // project. Like the holds below, the step runs only when a restart
+    // was detected: on an ordinary same-boot run a stopped daemon was
+    // stopped on purpose and must not come back. A refused daemon is a
+    // report row (`eden_refused` counts them across projects), never a
+    // failed restore.
     let eden_rows = if options.dry_run || report["restart_detected"] != true {
         Vec::new()
     } else {
@@ -3719,8 +3774,7 @@ pub fn restore<A: ManagedApi + ?Sized>(
             host,
             options.wrkslots.as_deref(),
             &boxed,
-            project,
-            &report["slot_images"],
+            &images_by_project,
         )
     };
     report["eden_refused"] = json!(eden_rows
@@ -7078,6 +7132,36 @@ mod tests {
                 .contains("not image-backed"),
             "{verified}"
         );
+    }
+
+    #[test]
+    fn eden_refuses_a_slot_recorded_under_no_covered_project() {
+        // #2089: a slot whose project has no covered image row is
+        // refused and never passed to the verb, which starts processes.
+        let host = BusyOnceHost {
+            status_calls: RefCell::new(0),
+        };
+        let agent = SlotAgent {
+            name: "beta".to_owned(),
+            slot: "slot-b".to_owned(),
+            project: PathBuf::from("/projects/b"),
+            cwd: None,
+            running: true,
+        };
+        let covered =
+            vec![json!({"action": "ran", "project": "/projects/a", "slots": [], "warnings": []})];
+        let rows =
+            restart_eden_daemons(&host, Some(Path::new("/opt/wrkslots")), &[agent], &covered);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["status"], "refused");
+        assert!(
+            rows[0]["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not among the projects"),
+            "{rows:?}"
+        );
+        assert_eq!(*host.status_calls.borrow(), 0, "the verb was not run");
     }
 
     #[test]

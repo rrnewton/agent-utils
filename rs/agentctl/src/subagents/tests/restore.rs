@@ -2865,24 +2865,45 @@ fn restore_passes_a_skipped_git_slot_through_without_an_eden_refusal() {
 }
 
 #[test]
-fn restore_never_passes_a_foreign_slot_project_to_wrkslots() {
-    // #1977 fix 2: this verb starts processes, so a slot bound to a
-    // different project is refused locally and never invoked.
+fn restore_passes_a_second_project_slot_to_wrkslots_under_its_own_project() {
+    // #2089 (superseding #1977 fix 2 for recorded projects): a slot
+    // recorded under a second project is now covered, so the verb runs
+    // once under that project; only a project no restore covers (not
+    // reachable through `restore`, whose covered set is derived from
+    // the same records) would be refused without an invocation.
     let fixture = Fixture::new();
     dead_agent(&fixture);
     promotable_slotted(&fixture, "foreign", "foreign-slot");
+    let other = fixture.root.join("other-project");
+    fs::create_dir_all(&other).unwrap();
     let mut record = fixture.manager().load("foreign").unwrap();
-    record.slot_project = Some(fixture.root.join("other-project").display().to_string());
+    record.slot_project = Some(other.display().to_string());
     fixture.manager().save(&record).unwrap();
     let host = ScriptedHost::new();
     let root = fixture.root.display().to_string();
-    host.answer(
+    host.answer_in(
         "image status",
+        &other.display().to_string(),
         0,
         &format!("work/foreign-slot at {root} (ready)\n"),
         "",
     );
+    host.answer_in("image status", &root, 0, "", "");
     host.answer("findmnt", 0, &format!("{root} /dev/loop0\n"), "");
+    host.answer(
+        &format!(
+            "--project-root {} eden restart-slot-daemons",
+            other.display()
+        ),
+        0,
+        &json!({"eden_daemons": [{
+            "slot": "foreign-slot", "checkout": "main",
+            "mount": "/mounts/foreign-slot", "config_dir": "/slots/foreign-slot/.eden-state",
+            "status": "restarted",
+        }], "refused": 0})
+        .to_string(),
+        "",
+    );
     script_slot_transfer(&host, "foreign-slot", "foreign");
     let registry = fixture.root.join("registry");
     let report = restore(
@@ -2896,22 +2917,296 @@ fn restore_never_passes_a_foreign_slot_project_to_wrkslots() {
     let rows = report["eden_daemons"].as_array().unwrap();
     assert_eq!(rows.len(), 1, "{report}");
     assert_eq!(rows[0]["slot"], "foreign-slot", "{report}");
-    assert_eq!(rows[0]["status"], "refused", "{report}");
-    assert!(
-        rows[0]["reason"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("is not the restore project"),
+    assert_eq!(rows[0]["status"], "restarted", "{report}");
+    assert_eq!(
+        rows[0]["project"],
+        json!(other.display().to_string()),
         "{report}"
     );
-    assert_eq!(report["eden_refused"], 1, "{report}");
+    assert_eq!(report["eden_refused"], 0, "{report}");
+    let eden_calls: Vec<String> = host
+        .commands_with_cwd()
+        .into_iter()
+        .filter(|command| command.contains("restart-slot-daemons"))
+        .collect();
+    assert_eq!(
+        eden_calls,
+        [format!(
+            "/opt/wrkslots --project-root {} eden restart-slot-daemons --slot foreign-slot --format json [cwd={}]",
+            other.display(),
+            other.display()
+        )],
+        "{:?}",
+        host.commands_with_cwd()
+    );
+}
+
+fn eden_row<'a>(report: &'a Value, slot: &str) -> &'a Value {
+    report["eden_daemons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["slot"] == slot)
+        .unwrap_or_else(|| panic!("no eden row for {slot}: {report}"))
+}
+
+fn eden_calls(host: &ScriptedHost) -> Vec<String> {
+    host.commands_with_cwd()
+        .into_iter()
+        .filter(|command| command.contains("restart-slot-daemons"))
+        .collect()
+}
+
+/// Script one project's Eden verb run, keyed by its `--project-root` argv (#2089).
+fn script_eden_restart(host: &ScriptedHost, project: &Path, slot: &str) {
+    host.answer(
+        &format!(
+            "--project-root {} eden restart-slot-daemons",
+            project.display()
+        ),
+        0,
+        &json!({"eden_daemons": [{
+            "slot": slot, "checkout": "main",
+            "mount": format!("/mounts/{slot}"), "config_dir": format!("/slots/{slot}/.eden-state"),
+            "status": "restarted",
+        }], "refused": 0})
+        .to_string(),
+        "",
+    );
+}
+
+#[test]
+fn restore_restarts_eden_daemons_in_a_second_project_with_that_project_as_root() {
+    // #2089: an Eden slot in project B restarts with B as the verb's
+    // root and working directory, in its own invocation.
+    let fixture = Fixture::new();
+    dead_agent(&fixture);
+    let (fixture, project_a, project_b, _) = {
+        // Reuse the two-project lanes on this fixture's registry.
+        let project_b = fixture.root.join("project-b");
+        fs::create_dir_all(&project_b).unwrap();
+        slotted_in_project(
+            &fixture,
+            "alpha",
+            "slot-a",
+            &fixture.root.clone(),
+            &fixture.root.clone(),
+        );
+        slotted_in_project(
+            &fixture,
+            "beta",
+            "slot-b",
+            &project_b.clone(),
+            &project_b.clone(),
+        );
+        let project_a = fixture.root.clone();
+        (fixture, project_a, project_b, ())
+    };
+    let host = ScriptedHost::new();
+    let root = project_a.display().to_string();
+    host.answer_in(
+        "image status",
+        &project_b.display().to_string(),
+        0,
+        &format!("work/slot-b at {root} (ready)\n"),
+        "",
+    );
+    host.answer_in(
+        "image status",
+        &root,
+        0,
+        &format!("work/slot-a at {root} (ready)\n"),
+        "",
+    );
+    script_findmnt(&host, &project_a);
+    script_findmnt(&host, &project_a);
+    script_eden_restart(&host, &project_b, "slot-b");
+    script_eden_restart(&host, &project_a, "slot-a");
+    script_slot_transfer(&host, "slot-a", "alpha");
+    script_slot_transfer(&host, "slot-b", "beta");
+    let registry = fixture.root.join("registry");
+    let report = restore(
+        &fixture.client,
+        &registry,
+        &host,
+        &config(&fixture, None),
+        &options(Some("/opt/wrkslots")),
+    )
+    .unwrap();
+    assert_eq!(
+        eden_row(&report, "slot-a")["status"],
+        "restarted",
+        "{report}"
+    );
+    let beta = eden_row(&report, "slot-b");
+    assert_eq!(beta["status"], "restarted", "{report}");
+    assert_eq!(
+        beta["project"],
+        json!(project_b.display().to_string()),
+        "{report}"
+    );
+    assert_eq!(report["eden_refused"], 0, "{report}");
+    assert_eq!(
+        eden_calls(&host),
+        [
+            format!(
+                "/opt/wrkslots --project-root {} eden restart-slot-daemons --slot slot-a --format json [cwd={}]",
+                project_a.display(),
+                project_a.display()
+            ),
+            format!(
+                "/opt/wrkslots --project-root {} eden restart-slot-daemons --slot slot-b --format json [cwd={}]",
+                project_b.display(),
+                project_b.display()
+            ),
+        ],
+        "{:?}",
+        host.commands_with_cwd()
+    );
+}
+
+#[test]
+fn restore_refuses_second_project_eden_slots_when_its_image_failed() {
+    // #2089: project B's failed image row refuses B's Eden slots
+    // without any invocation for B; project A restarts normally.
+    let fixture = Fixture::new();
+    dead_agent(&fixture);
+    let project_b = fixture.root.join("project-b");
+    fs::create_dir_all(&project_b).unwrap();
+    slotted_in_project(
+        &fixture,
+        "alpha",
+        "slot-a",
+        &fixture.root.clone(),
+        &fixture.root.clone(),
+    );
+    slotted_in_project(
+        &fixture,
+        "beta",
+        "slot-b",
+        &project_b.clone(),
+        &project_b.clone(),
+    );
+    let project_a = fixture.root.clone();
+    let host = ScriptedHost::new();
+    let root = project_a.display().to_string();
+    host.answer_in(
+        "image status",
+        &project_b.display().to_string(),
+        3,
+        "",
+        "image status exploded\n",
+    );
+    host.answer_in(
+        "image status",
+        &root,
+        0,
+        &format!("work/slot-a at {root} (ready)\n"),
+        "",
+    );
+    script_findmnt(&host, &project_a);
+    script_eden_restart(&host, &project_a, "slot-a");
+    script_slot_transfer(&host, "slot-a", "alpha");
+    let registry = fixture.root.join("registry");
+    let report = restore(
+        &fixture.client,
+        &registry,
+        &host,
+        &config(&fixture, None),
+        &options(Some("/opt/wrkslots")),
+    )
+    .unwrap();
+    assert_eq!(
+        eden_row(&report, "slot-a")["status"],
+        "restarted",
+        "{report}"
+    );
+    let beta = eden_row(&report, "slot-b");
+    assert_eq!(beta["status"], "refused", "{report}");
     assert!(
-        !host
-            .commands()
-            .iter()
-            .any(|command| command.contains("restart-slot-daemons")),
-        "a foreign slot must never reach the verb: {:?}",
-        host.commands()
+        beta["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("did not run successfully"),
+        "{beta}"
+    );
+    assert_eq!(report["eden_refused"], 1, "{report}");
+    let calls = eden_calls(&host);
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert!(
+        calls[0].contains(&format!("--project-root {} ", project_a.display())),
+        "{calls:?}"
+    );
+    assert_eq!(
+        agent_row(&report, "alpha")["action"],
+        "promoted",
+        "{report}"
+    );
+    assert_eq!(agent_row(&report, "beta")["action"], "refused", "{report}");
+}
+
+#[test]
+fn restore_makes_no_eden_invocation_for_a_git_only_second_project() {
+    // #2089: a plain-worktree second project (slot directory derivable
+    // under it, no `.eden-state`) produces no Eden invocation for it.
+    let fixture = Fixture::new();
+    dead_agent(&fixture);
+    let project_b = fixture.root.join("project-b");
+    let git_dir = project_b.join("worktrees/slot-b");
+    fs::create_dir_all(&git_dir).unwrap();
+    slotted_in_project(
+        &fixture,
+        "alpha",
+        "slot-a",
+        &fixture.root.clone(),
+        &fixture.root.clone(),
+    );
+    promotable_slotted(&fixture, "beta", "slot-b");
+    let mut record = fixture.manager().load("beta").unwrap();
+    record.slot_project = Some(project_b.display().to_string());
+    record.cwd = git_dir.display().to_string();
+    fixture.manager().save(&record).unwrap();
+    let project_a = fixture.root.clone();
+    let host = ScriptedHost::new();
+    let root = project_a.display().to_string();
+    host.answer_in(
+        "image status",
+        &project_b.display().to_string(),
+        0,
+        "no image-backed slots\n",
+        "",
+    );
+    host.answer_in(
+        "image status",
+        &root,
+        0,
+        &format!("work/slot-a at {root} (ready)\n"),
+        "",
+    );
+    script_findmnt(&host, &project_a);
+    script_eden_restart(&host, &project_a, "slot-a");
+    script_slot_transfer(&host, "slot-a", "alpha");
+    let registry = fixture.root.join("registry");
+    let report = restore(
+        &fixture.client,
+        &registry,
+        &host,
+        &config(&fixture, None),
+        &options(Some("/opt/wrkslots")),
+    )
+    .unwrap();
+    assert_eq!(
+        eden_row(&report, "slot-a")["status"],
+        "restarted",
+        "{report}"
+    );
+    assert_eq!(eden_row(&report, "slot-b")["status"], "skipped", "{report}");
+    assert_eq!(report["eden_refused"], 0, "{report}");
+    let calls = eden_calls(&host);
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert!(
+        !calls[0].contains(&project_b.display().to_string()),
+        "{calls:?}"
     );
 }
 
