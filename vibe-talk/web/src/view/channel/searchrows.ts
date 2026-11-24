@@ -578,7 +578,11 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
         }
         const text = row.getAttribute("data-search");
         const shown = links && text !== null ? deps.showRowLinks(row) : deps.takeDownRowLinks(row);
-        const said = !typed || (text !== null && (rowMatches(row, matchNode, text) ||
+        // `#2200`: judged once, here, and only while a search is typed (the
+        // pass's old short-circuit): a second `rowMatches` per row per pass
+        // re-renders bodies (the rendered-body test counts template parses).
+        const direct = typed && text !== null && rowMatches(row, matchNode, text);
+        const said = !typed || (text !== null && (direct ||
           (links && rowLinkMatch(row, termsForLinks)) || (replyHits !== null &&
           (id === "thread-list" ? replyHits.has(String(row.getAttribute("data-context-id")))
             : id === "discord-log" && rowHeadsHitThread(row, replyHits))) ||
@@ -597,7 +601,6 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
         // `#2200`: the bucket fold gates loaded rows too — a row stands only
         // when its bucket's chip stands. A row that stands only because a
         // reply of its thread matched is a Threads hit, not a Main one.
-        const direct = text !== null && rowMatches(row, matchNode, text);
         const viaThread = !direct && replyHits !== null &&
           (id === "thread-list" ? replyHits.has(String(row.getAttribute("data-context-id")))
             : id === "discord-log" && rowHeadsHitThread(row, replyHits));
