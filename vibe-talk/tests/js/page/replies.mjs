@@ -3923,10 +3923,13 @@ const chipAt = (page) => {
   return row.hidden ? null : { top: parseFloat(row.style.top), left: parseFloat(row.style.left) };
 };
 
-/** Where the strip stands for words at `rect`, by the `#2220` rule: above with room, else below. */
+/** Where the strip stands for words at `rect`, by the `#2220` rule: below, above only with no room below. */
 const stripTop = (page, rect, gap, edge) => {
   const height = page.el("selection-chip-row").getBoundingClientRect().height;
-  return rect.top - gap - height >= edge ? rect.top - gap - height : rect.bottom + gap;
+  const viewHeight = page.viewport.layout ?? 852;
+  return rect.bottom + gap <= viewHeight - edge - height
+    ? rect.bottom + gap
+    : Math.max(edge, rect.top - gap - height);
 };
 
 test("`#726 vt-selection-chip`: words selected in one message stand the chip row by them, and nothing else does", async () => {
@@ -3953,14 +3956,14 @@ test("`#726 vt-selection-chip`: words selected in one message stand the chip row
   await page.clearSelection();
   assert.equal(chipAt(page), null, "the chip outlived the selection");
 
-  // THE CONTROL: with the above-room branch broken off, the row stands under the words instead.
+  // THE CONTROL: placed over the words, the row no longer reads as under them.
   const control = await quotePage(null, await brokenModule([{ file: "src/view/channel/quoting.ts",
-    find: "    if (!touch && box.top - shownTop - aboveGap - height >= SELECTION_CHIP_EDGE_PX) {",
-    replace: "    if (false) {" }]));
+    find: "      Math.min(box.bottom + selectionChipGap, viewHeight - SELECTION_CHIP_EDGE_PX - height));",
+    replace: "      Math.min(box.top - selectionChipGap - height, viewHeight - SELECTION_CHIP_EDGE_PX - height));" }]));
   const words = wordsIn(rowWithId(control, "1000000000000000001"));
   await control.selectText(words, null, "about the runner");
   assert.notEqual(chipAt(control)?.top, stripTop(control, words.getBoundingClientRect(), gap, edge),
-    "with the above branch broken it still read as above them, so this test cannot see where it stands");
+    "with the row placed over the words it still read as under them, so this test cannot see where it stands");
 });
 
 test("`#819 voice-page-quoted-reply-and-draft-chip`: after a touch the chip stands clear of the phone's handles, of its Copy bar where that goes under the words, and over them where there is no room under", async () => {
@@ -4002,7 +4005,7 @@ test("`#819 voice-page-quoted-reply-and-draft-chip`: after a touch the chip stan
     "with the chip placed as for the mouse it still read as clear of the handles");
 });
 
-test("`#2220 vibe-talk-selection-chip-rigid-row`: with a fine pointer the strip stands above the words where there is room, and under them where there is not", async () => {
+test("`#2220 vibe-talk-selection-chip-rigid-row`: the strip stands under the words, and above them only where there is no room under", async () => {
   const gap = sourceConstant("SELECTION_CHIP_GAP_PX");
   const edge = sourceConstant("SELECTION_CHIP_EDGE_PX");
   const page = await quotePage();
@@ -4011,12 +4014,11 @@ test("`#2220 vibe-talk-selection-chip-rigid-row`: with a fine pointer the strip 
   await page.selectText(wordsIn(first), null, "about the runner");
   const words = wordsIn(first).getBoundingClientRect();
   const height = page.el("selection-chip-row").getBoundingClientRect().height;
-  assert.ok(words.top - gap - height >= edge, "the premise: room above the words");
-  assert.equal(chipAt(page)?.top, words.top - gap - height, "the strip did not stand above the words");
-  // Too near the window's top for the strip above: under the words instead.
-  page.viewport.offsetTop = words.top - 1;
-  await page.selectText(wordsIn(first), null, "about the run");
   assert.equal(chipAt(page)?.top, words.bottom + gap, "the strip did not stand under the words");
+  // A window too short for the strip under the words: above them instead.
+  page.viewport.layout = words.bottom + gap + height - 1;
+  await page.selectText(wordsIn(first), null, "about the run");
+  assert.equal(chipAt(page)?.top, Math.max(edge, words.top - gap - height), "the strip did not go above the words");
 });
 
 test("`#726 vt-selection-chip`: a press of the chip quotes the words it stands under, and never takes the selection first", async () => {

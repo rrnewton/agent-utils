@@ -452,19 +452,13 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
     const shownTop = visual ? Number(visual.offsetTop) || 0 : 0;
     const barUnder = touch && box.top - shownTop < SELECTION_BAR_ROOM_PX;
     selectionChipGap = !touch ? SELECTION_CHIP_GAP_PX : SELECTION_CHIP_HANDLES_PX + (barUnder ? SELECTION_BAR_ROOM_PX : 0);
-    // `#2220` strip rule, chosen once per placement: after a TOUCH the strip stands BELOW, clear of the
-    // phone's handles and its Copy bar over the words (#819); after the mouse or keys (fine pointer) it
-    // stands ABOVE when there is room, otherwise below.
+    // `#2220` strip rule (owner 339: stay placed UNDER the selection): BELOW for touch and mouse alike,
+    // clear of the handles after a touch (#819); ABOVE only where there is no room below.
     const aboveGap = touch ? SELECTION_BAR_ROOM_PX : SELECTION_CHIP_GAP_PX;
-    let top: number;
-    if (!touch && box.top - shownTop - aboveGap - height >= SELECTION_CHIP_EDGE_PX) {
-      top = box.top - aboveGap - height;
-    } else {
-      top = Math.max(SELECTION_CHIP_EDGE_PX,
-        Math.min(box.bottom + selectionChipGap, viewHeight - SELECTION_CHIP_EDGE_PX - height));
-      if (top < box.bottom + selectionChipGap) {
-        top = Math.max(SELECTION_CHIP_EDGE_PX, box.top - aboveGap - height);
-      }
+    let top = Math.max(SELECTION_CHIP_EDGE_PX,
+      Math.min(box.bottom + selectionChipGap, viewHeight - SELECTION_CHIP_EDGE_PX - height));
+    if (top < box.bottom + selectionChipGap) {
+      top = Math.max(SELECTION_CHIP_EDGE_PX, box.top - aboveGap - height);
     }
     selectionChipGap = top - box.bottom;
     // `#2220`. ONE position write, on the container. Chips never move individually.
