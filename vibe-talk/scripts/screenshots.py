@@ -5299,7 +5299,7 @@ def _act_glossary_not_found(driver: Driver) -> None:
         "&& !window.__visible('channel-loading')",
         timeout=15_000,
     )
-    term = "wedged"
+    term = "cryptographic"
 
     def term_rect() -> object:
         return driver.js(
