@@ -1356,7 +1356,19 @@
    tap never reaches it (search-unmatched-browser, gate on e57d8602). */
 #screen-main[data-searching] #discord-log > li,
 #screen-main[data-searching] #discord-log .row-seam {
+  /* The panel's own top (its anchor's `--float-line`, then its `top:`
+     above) plus its height (`--bucket-head` carries it): a row flicked
+     to the head stops below the panel, not under it. Measured on the
+     412 phone: panel bottom 204px; without the anchor's line the margin
+     parked a seam at 185px, still under it. */
   scroll-margin-top: calc(var(--float-line) + var(--search-bar) / 2 + 0.35rem + var(--bucket-head));
+}
+
+@media (max-width: 480px) {
+  #screen-main[data-searching] #discord-log > li,
+  #screen-main[data-searching] #discord-log .row-seam {
+    scroll-margin-top: calc(var(--float-line) + var(--search-bar) / 2 + var(--toggle-hit) + 11px + var(--bucket-head));
+  }
 }
 
 
