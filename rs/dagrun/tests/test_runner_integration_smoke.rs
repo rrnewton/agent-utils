@@ -157,14 +157,15 @@ bash -c 'while :; do :; done' & cpu=$!; wait"#;
         eprintln!("SKIP nextest exact-process bracket: cargo-nextest is not installed");
         return;
     }
-    // The fixture's default nextest profile has a 1s per-test bound below this 5s step and 9s
-    // whole-run bound. It must produce the clearest result at the innermost level without any DAG
-    // timeout or process-tree forensics.
+    // The fixture's default nextest profile has a 1s per-test bound below this 30s step bound
+    // (generous for the same reason as the outer bracket below, #2170; the run still ends when
+    // the per-test bound fires). It must produce the clearest result at the innermost level
+    // without any DAG timeout or process-tree forensics.
     let nextest_command = format!(
         "DAG_RUNNER_PROBE_MODE=wall cargo nextest run --manifest-path '{}' --status-level all --final-status-level all",
         manifest.display()
     );
-    let (output, console, journal) = fixture.run("nextest_inner", &nextest_command, 5);
+    let (output, console, journal) = fixture.run("nextest_inner", &nextest_command, 30);
     assert_ne!(output.status.code(), Some(0), "{console}");
     assert!(
         console.contains("tests::planted_wall_hang") && console.contains("TIMEOUT"),
@@ -176,14 +177,17 @@ bash -c 'while :; do :; done' & cpu=$!; wait"#;
         "an outer DAG bound fired before nextest's per-test bound:\n{journal}"
     );
 
-    // A deliberately mis-sized third-party profile keeps the 60s per-test timeout outside the 2s
-    // step bound. This negative bracket exercises the outer backstop: exact child argv is a direct
-    // binding and the killed test must still be named without guessing from prose.
+    // A deliberately mis-sized third-party profile keeps the 60s per-test timeout outside the
+    // 30s step bound. This negative bracket exercises the outer backstop: exact child argv is a
+    // direct binding and the killed test must still be named without guessing from prose. The
+    // bound is a backstop, not a measurement: it stays 2x below the per-test timeout while
+    // giving nextest startup on a busy host ample room, so what fires it is the planted hang,
+    // never runner startup (#2170).
     let nextest_outer_command = format!(
         "DAG_RUNNER_PROBE_MODE=wall cargo nextest run --profile outer-backstop --manifest-path '{}' --status-level all --final-status-level all",
         manifest.display()
     );
-    let (output, console, journal) = fixture.run("nextest_outer", &nextest_outer_command, 2);
+    let (output, console, journal) = fixture.run("nextest_outer", &nextest_outer_command, 30);
     assert_ne!(output.status.code(), Some(0), "{console}");
     assert!(
         console.contains("culprit test tests::planted_wall_hang")
