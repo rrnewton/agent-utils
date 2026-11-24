@@ -2210,7 +2210,7 @@ test("quoteSelectionNow opens the quick reply for held words, and does nothing w
   const byIdMap = new Map();
   for (const id of ["quick-reply", "quick-reply-quote", "quick-reply-text", "quick-reply-state",
     "quick-reply-to-main", "quick-reply-to-main-row",
-    "selection-chip", "selection-chip-dismiss", "read-steer-quote", "scroll-area", "side-scroll", "discord-log"]) {
+    "selection-chip-row", "selection-chip", "selection-chip-dismiss", "read-steer-quote", "scroll-area", "side-scroll", "discord-log"]) {
     byIdMap.set(id, el(id === "quick-reply-to-main" ? { checked: false } : {}));
   }
   const quoting = createQuoting({
@@ -2247,7 +2247,7 @@ test("#2195 vibe-talk-wtf-chip-orphan-lifecycle: clearing the held quote hides W
   const byIdMap = new Map();
   for (const id of ["quick-reply", "quick-reply-quote", "quick-reply-text", "quick-reply-state",
     "quick-reply-to-main", "quick-reply-to-main-row",
-    "selection-chip", "selection-chip-dismiss", "selection-chip-wtf", "read-steer-quote", "scroll-area", "side-scroll", "discord-log"]) {
+    "selection-chip-row", "selection-chip", "selection-chip-dismiss", "selection-chip-wtf", "read-steer-quote", "scroll-area", "side-scroll", "discord-log"]) {
     byIdMap.set(id, el(id === "quick-reply-to-main" ? { checked: false } : {}));
   }
   const quoting = createQuoting({

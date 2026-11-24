@@ -304,14 +304,28 @@
   --pencil-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 20h4L19 9l-4-4L4 16z'/%3E%3Cpath d='M13 7l4 4'/%3E%3C/svg%3E");
 }
 
-/* `#726 vt-selection-chip`. "Quoted reply" under words selected in a message, placed by web/voice.js from
-   the selection's box. Absolute against the layout viewport, which never scrolls (nothing on this page is
-   fixed, `#226`), over the lists, and a finger's width tall: it is pressed with the thumb that selected. */
-#selection-chip {
+/* `#2220 vibe-talk-selection-chip-rigid-row`. The chip row container: ONE rigid unit positioned once
+   (single left/top by `drawSelectionChip`), a flex row inside. No chip is positioned on its own. */
+.selection-chip-row {
   position: absolute;
   top: 0;
   left: 0;
   z-index: var(--z-modal);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.selection-chip-row[hidden] {
+  display: none;
+}
+
+/* `#726 vt-selection-chip`. "Quoted reply" under words selected in a message, placed by web/voice.js from
+   the selection's box. Absolute against the layout viewport, which never scrolls (nothing on this page is
+   fixed, `#226`), over the lists, and a finger's width tall: it is pressed with the thumb that selected. */
+#selection-chip {
+  order: 2;
+  flex: none;
   min-height: 2.5rem;
   padding: 0 0.95rem;
   border: 1px solid var(--accent);
@@ -336,10 +350,8 @@
 /* `#1717 vibe-talk-quote-reply-dismiss-x`. The little X beside the chip: the chip's own panel and
    accent, a round target at least 32px square for the thumb that selected, quieter than the chip. */
 #selection-chip-dismiss {
-  position: absolute;
-  top: 0;
-  left: 0;
-  z-index: var(--z-modal);
+  order: 3;
+  flex: none;
   min-width: 2rem;
   min-height: 2rem;
   padding: 0;
@@ -366,10 +378,8 @@
 /* `#2156 vibe-talk-wtf-glossary-lookup`. "WTF?", left of the Quoted reply chip: the chip's own
    panel and accent, placed with it by web/src/view/channel/glossary. */
 #selection-chip-wtf {
-  position: absolute;
-  top: 0;
-  left: 0;
-  z-index: var(--z-modal);
+  order: 1;
+  flex: none;
   min-height: 2.5rem;
   padding: 0 0.8rem;
   border: 1px solid var(--accent);
@@ -388,8 +398,10 @@
   cursor: pointer;
 }
 
+/* `#2220`. Hidden WTF? keeps its slot (invisible, not gone), so its late reveal never reflows the row. */
 #selection-chip-wtf[hidden] {
-  display: none;
+  display: inline-block;
+  visibility: hidden;
 }
 
 /* `#2156 vibe-talk-wtf-glossary-lookup`. A known glossary term in a message body: a dotted

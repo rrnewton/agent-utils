@@ -409,11 +409,14 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
     const chip = deps.byId("selection-chip");
     // `#1717 vibe-talk-quote-reply-dismiss-x`. The X beside the chip: shown, hidden and placed with it.
     const dismiss = deps.byId("selection-chip-dismiss");
+    // `#2220 vibe-talk-selection-chip-rigid-row`. The ONE container positioned for the whole row.
+    const row = deps.byId("selection-chip-row");
     const box = quoteHeld ? selectionBox() : null;
     // A touch's held selection, gone from the page, keeps the chip where it was until the hold ends.
     // `#819 voice-page-quoted-reply-and-draft-chip`. And its twin in the read's strip, which nothing covers.
     const twin = deps.byId("read-steer-quote");
     if (!quoteHeld || (box === null && chip.hidden)) {
+      setHiddenIfChanged(row, true);
       setHiddenIfChanged(chip, true);
       setHiddenIfChanged(dismiss, true);
       setHiddenIfChanged(twin, true);
@@ -424,31 +427,23 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
       if (wtfEl) setHiddenIfChanged(wtfEl, true);
       return;
     }
+    setHiddenIfChanged(row, false);
     setHiddenIfChanged(chip, false);
     setHiddenIfChanged(dismiss, false);
     setHiddenIfChanged(twin, false);
     if (box === null) return;
-    // `#2187 vibe-talk-wtf-chips-one-row-clear-of-handles`. WTF?, Quoted reply and the dismiss X are ONE
-    // horizontal row: measured and clamped as a single group, so no chip can wrap, clip at a screen edge,
-    // or split from the others. The WTF? button keeps its own visibility (the glossary view owns it); here
-    // it is only measured while visible.
-    const wtf = deps.byId("selection-chip-wtf");
-    const size = chip.getBoundingClientRect();
-    const width = Number(size.width) || 0;
-    const height = Number(size.height) || 0;
-    const wtfSize = wtf.hidden ? { width: 0, height: 0 } : wtf.getBoundingClientRect();
-    const wtfWidth = Number(wtfSize.width) || 0;
-    const dismissSize0 = dismiss.getBoundingClientRect();
-    const dismissWidth0 = Number(dismissSize0.width) || 0;
-    const gap = SELECTION_CHIP_EDGE_PX;
-    const rowWidth = (wtfWidth ? wtfWidth + gap : 0) + width + gap + dismissWidth0;
+    // `#2220`. Measure the container once (WTF?'s slot is reserved even while it is invisible, so the
+    // width never changes when it reveals); position the container only. No chip gets its own left/top.
+    const rowSize = row.getBoundingClientRect();
+    const width = Number(rowSize.width) || 0;
+    const height = Number(rowSize.height) || 0;
     const viewWidth = (document.documentElement && document.documentElement.clientWidth) || 0;
     const viewHeight = window.innerHeight || 0;
     const visual0 = window.visualViewport;
     const viewLeft = visual0 ? Number(visual0.offsetLeft) || 0 : 0;
     const centre = (box.left + box.right) / 2;
     const left = Math.max(viewLeft + SELECTION_CHIP_EDGE_PX,
-      Math.min(centre - rowWidth / 2, viewLeft + viewWidth - SELECTION_CHIP_EDGE_PX - rowWidth));
+      Math.min(centre - width / 2, viewLeft + viewWidth - SELECTION_CHIP_EDGE_PX - width));
     // `#819 voice-page-quoted-reply-and-draft-chip`. After a touch, what the browser draws for the selection
     // takes touches on it over every layer of the page: the handles under the words, and the bar of Copy
     // and Share, which goes under them where there is no room over them. The chip stands clear of both.
@@ -466,20 +461,9 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
       top = Math.max(SELECTION_CHIP_EDGE_PX, box.top - aboveGap - height);
       selectionChipGap = top - box.bottom;
     }
-    // One row, one top: WTF? left, Quoted reply next, X right; the X centred on the row's height.
-    const chipLeft = left + (wtfWidth ? wtfWidth + gap : 0);
-    if (wtfWidth) {
-      wtf.style.left = `${Math.round(left)}px`;
-      wtf.style.top = `${Math.round(top)}px`;
-    }
-    chip.style.left = `${Math.round(chipLeft)}px`;
-    chip.style.top = `${Math.round(top)}px`;
-    const dismissHeight = Number(dismissSize0.height) || 0;
-    const dismissLeft = chipLeft + width + gap;
-    const dismissTop = Math.max(SELECTION_CHIP_EDGE_PX,
-      Math.min(top + (height - dismissHeight) / 2, viewHeight - SELECTION_CHIP_EDGE_PX - dismissHeight));
-    dismiss.style.left = `${Math.round(dismissLeft)}px`;
-    dismiss.style.top = `${Math.round(dismissTop)}px`;
+    // `#2220`. ONE position write, on the container. Chips never move individually.
+    row.style.left = `${Math.round(left)}px`;
+    row.style.top = `${Math.round(top)}px`;
   }
 
   /**

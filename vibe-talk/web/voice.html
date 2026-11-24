@@ -4410,6 +4410,12 @@ writable = true</pre>
       reply, offered where the selecting thumb is, and placed by `drawSelectionChip` in web/voice.js
       under the selection's box. Hidden while nothing in a message is selected.
     -->
+    <!--
+      `#2220 vibe-talk-selection-chip-rigid-row`. The chip row is ONE rigid container: WTF?, Quoted
+      reply and the dismiss X inside a flex row, positioned once by `drawSelectionChip`. No chip is
+      placed on its own; WTF?'s slot is reserved so its late reveal never reflows the row.
+    -->
+    <div id="selection-chip-row" class="selection-chip-row" hidden>
     <button id="selection-chip" class="selection-chip" type="button" title="Reply to this message, starting with the words you selected in it quoted" hidden>Quoted reply</button>
     <!--
       `#1717 vibe-talk-quote-reply-dismiss-x`. A little X beside the chip: clearing an accidental
@@ -4423,6 +4429,7 @@ writable = true</pre>
       chip by web/src/view/channel/glossary; the dismiss X stays on the chip's right.
     -->
     <button id="selection-chip-wtf" class="selection-chip-wtf" type="button" title="Look up what the selected words mean" hidden>WTF?</button>
+    </div>
     <!--
       `#2156 vibe-talk-wtf-glossary-lookup`. The glossary popover: the looked-up term, its
       definition and its source link, or a clear failure. Opened by WTF? and by every

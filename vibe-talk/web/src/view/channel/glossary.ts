@@ -66,16 +66,10 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
       setHiddenIfChanged(button, true);
       return;
     }
+    // `#2220 vibe-talk-selection-chip-rigid-row`. WTF? is never positioned here: the quoting view
+    // positions the one container, and this view only toggles WTF?'s visibility inside its reserved
+    // slot. Revealing it cannot move the container or its siblings.
     setHiddenIfChanged(button, false);
-    // `#2187 vibe-talk-wtf-chips-one-row-clear-of-handles`. The chip row (WTF?, Quoted reply, X) is placed
-    // as one clamped group by the quoting view; this view only keeps WTF? on that same row, immediately
-    // left of the chip. It never flips above the chip: one row, one top, inside the viewport.
-    const rect = chip.getBoundingClientRect();
-    const size = button.getBoundingClientRect();
-    const width = Number(size.width) || 64;
-    const left = Math.max(8, rect.left - 8 - width);
-    button.style.left = `${Math.round(left)}px`;
-    button.style.top = `${Math.round(Math.max(8, rect.top))}px`;
   }
 
   function placePopover(): void {
@@ -338,11 +332,8 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
       const log = document.getElementById("discord-log");
       if (log) linkTermsIn(log);
     }
-    if (typeof requestAnimationFrame === "function") {
-      // Twice: the Quote chip places itself on the first frame after a
-      // selection, so the WTF? button settles against its final place.
-      requestAnimationFrame(() => requestAnimationFrame(placeWtf));
-    } else placeWtf();
+    // `#2220`. No re-alignment pass: visibility only, in the same frame as the selection change.
+    placeWtf();
   });
   listen<MouseEvent>(wtf(), "click", (event) => {
     event.preventDefault();
