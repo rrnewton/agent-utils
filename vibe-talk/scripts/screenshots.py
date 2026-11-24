@@ -5142,7 +5142,7 @@ def _act_glossary_button(driver: Driver) -> None:
         "&& !window.__visible('channel-loading')",
         timeout=15_000,
     )
-    def candidate_rects() -> list:
+    def candidate_rects() -> list[dict[str, float]]:
         # `#2202 vibe-talk-screenshots-glossary-button-scene-order`. Skip text scene 91 already
         # learned into a glossary link (linked text cannot be selected for quoting); where the
         # term itself is linked, fall back to plain runs of words in later rows. Re-read on every
