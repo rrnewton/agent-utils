@@ -8657,18 +8657,6 @@ SCENES: tuple[Scene, ...] = (
         ),
     ),
     Scene(
-        name="99-glossary-not-found",
-        what="WTF? on a term nothing defines: the not-found popover naming what was searched",
-        act=_act_glossary_not_found,
-        profiles=MATRIX_PROFILES,
-        keep_transient=True,
-        expect=(
-            ("the popover says the term was not found", "window.__visible('glossary-popover') && document.getElementById('glossary-popover-body').textContent.includes('Couldn')"),
-            ("the popover names what was searched", "document.getElementById('glossary-popover-body').textContent.includes('Searched')"),
-            ("no error banner is up", "!window.__visible('error-wrap')"),
-        ),
-    ),
-    Scene(
         name="92-glossary-button",
         what="the selection bar standing: WTF? left of Quoted reply, X on its right",
         act=_act_glossary_button,
@@ -8685,6 +8673,18 @@ SCENES: tuple[Scene, ...] = (
     # LAST IN THE WALK, and not by accident: it empties the server's durable store on the way in,
     # so that the summary the state above cached is really regenerated and can really fail. Nothing
     # after it in this profile would miss what it deletes, and the next profile purges anyway.
+    Scene(
+        name="99-glossary-not-found",
+        what="WTF? on a term nothing defines: the not-found popover naming what was searched",
+        act=_act_glossary_not_found,
+        profiles=MATRIX_PROFILES,
+        keep_transient=True,
+        expect=(
+            ("the popover says the term was not found", "window.__visible('glossary-popover') && document.getElementById('glossary-popover-body').textContent.includes('Couldn')"),
+            ("the popover names what was searched", "document.getElementById('glossary-popover-body').textContent.includes('Searched')"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
     Scene(
         name=SUMMARY_FAILED_STATE,
         what="summary mode when the summariser fails: the row says so quietly and keeps the message",
