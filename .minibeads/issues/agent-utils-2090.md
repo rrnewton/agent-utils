@@ -16,11 +16,11 @@ The owner asked whether the wrkslots formal model could have caught a night-long
 
 # Design
 
-In the transition model (Python explorer and TLA+ twin): model lock acquisition, hold and release as separate steps for recover-absent (acquire, expensive load, refuse-release) and for heartbeat and create; add a client that repeats a refusable call unboundedly; state the liveness property that a heartbeat or create that wants the lock eventually holds it, under weak fairness. Expect a starvation counterexample for the pre-#2088 shape (non-FIFO flock) and a pass for the #2088 shape (refusal checks before the lock); record both runs. Extend the Python explorer's liveness check to match if it can express it.
+TLA+ only (owner direction 2026-11-22: the Python explorers are deleted in this change; the gated check becomes a bounded TLC step). In py/wrkslots/spec/WrkslotsLock.tla: model lock acquisition, hold and release as separate steps for recover-absent (acquire, expensive load, refuse-release) and for heartbeat and create; add a client that repeats a refusable call unboundedly; state the liveness property that a heartbeat or create that wants the lock eventually holds it, under weak fairness. Expect a starvation counterexample for the pre-#2088 shape (non-FIFO flock) and a pass for the #2088 shape (refusal checks before the lock); record both runs as committed configurations checked by the gated TLC step (runs when a checksum-pinned jar is provisioned, skips by name otherwise).
 
 # Acceptance Criteria
 
-- The model reproduces the starvation counterexample for the pre-#2088 shape and passes for the #2088 shape; both configurations are committed and documented; the Python explorer gate stays fast.
+- The model reproduces the starvation counterexample for the pre-#2088 shape and passes for the #2088 shape; both configurations are committed and documented; the gated TLC step stays fast and skips by name when no jar is provisioned.
 
 # Notes
 

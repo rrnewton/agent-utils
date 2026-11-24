@@ -574,6 +574,7 @@
         "py/wrkslots/tests/test_status_interrupted.py",
         "py/wrkslots/tests/test_status_state_rust.py",
         "py/wrkslots/tests/test_storage_state_rust.py",
+        "py/wrkslots/tests/test_tlc_gate.py",
         "py/wrkslots/tests/test_tool_authority.py",
         "py/wrkslots/tests/test_transfer_lock_scope.py",
         "py/wrkslots/tests/test_transfer_owner_write_rust.py",
