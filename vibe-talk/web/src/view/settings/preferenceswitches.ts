@@ -53,6 +53,9 @@ export function mountPreferenceSwitches(deps: PreferenceSwitchesDependencies): P
     if (!popover.hidden) centrePopupOver(popover, el("read-speed"));
     return answered;
   });
+  // `#2216`: the tile can be tapped from this moment; the page says so, so a
+  // reader (or a check) can wait on a real readiness condition.
+  el("read-speed").setAttribute("data-wired", "true");
   listen<Event>(el("own-read-apply"), "click", () => deps.applyOwnRead());
   listen<Event>(el("own-read-undo"), "click", () => deps.undoOwnRead());
   listen<Event>(el("mark-own-read"), "change", () => deps.markOwnReadChanged());

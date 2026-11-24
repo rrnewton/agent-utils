@@ -77,7 +77,7 @@ import {childByClass,
   setHiddenIfChanged,
   setTextIfChanged,
   shownNode,} from "../view/dom/index.ts";
-import {SCREEN_TITLES, WELCOME_DISMISSED_KEY, createActionMenu, createChannelDirectoryView, createDeploymentWords, createChannelSelection, createChipsOverComposer, createControlBar, createFreezeWatch, createPromptsTray, createReaderRow, createReplySight, createPageNavigation, createScreens, createScreenShowing, createShellNotices, createPageVisibility, createUndoOffer, createUndoStamps, createWelcome, modHeld, mountDocumentListeners, mountKeyListeners, mountMenuOpeners, mountPageListeners, pageStep, swallow} from "../view/shell/index.ts";
+import {SCREEN_TITLES, WELCOME_DISMISSED_KEY, createActionMenu, createChannelDirectoryView, createDeploymentWords, createChannelSelection, createChipsOverComposer, createControlBar, createEarlyTaps, createFreezeWatch, createPromptsTray, createReaderRow, createReplySight, createPageNavigation, createScreens, createScreenShowing, createShellNotices, createPageVisibility, createUndoOffer, createUndoStamps, createWelcome, modHeld, mountDocumentListeners, mountKeyListeners, mountMenuOpeners, mountPageListeners, pageStep, swallow} from "../view/shell/index.ts";
 import {KEYBOARD_SEND_PARTS,
   NEWLINE_KEYS,
   createComposerBoxes,
@@ -217,6 +217,11 @@ import { decode, decodeTagged, is, roots } from "../contract/index.ts";
 //
 // The offer and its redemption are web/src/view/settings `mountPairing` (`#624 voice-page-modularity`),
 // made here, with the code, so it holds it from the page's first statement.
+// `#2216`: taps on the dock's Read and Pace tiles that land before their listeners
+// mount (late in the ordered boot below) are recorded from here — the bundle's first
+// moments — and replayed by the mounts that wire them, so a first-second tap is
+// never lost. Stopped once both mounts have asked (see the replays below).
+const earlyTaps = createEarlyTaps(document, ["read-aloud", "read-speed"]);
 const openedWithPairingCode = takePairingCode();
 const VibeTalkContract = Object.freeze({ roots, is, decode, decodeTagged });
 /** @type {import("../view/settings/index.ts").Pairing} */
@@ -9119,6 +9124,8 @@ application.track(mountPreferenceSwitches({
   markReadFinalGuardChanged: messagePreferences.markRead.finalGuardChanged,
   markReadFirstGuardChanged: messagePreferences.markRead.firstGuardChanged,
 }));
+// `#2216`: replay a Pace tap that landed before this mount wired the tile.
+if (earlyTaps.take("read-speed") && el("speed-popover").hidden) el("read-speed").click();
 
 // `#240 reading-bookmark`. The ways back: to the bookmark, to where the reader was reading (the left column's chip, as
 // b is), and back to a reply (web/src/view/channel/readingjumps.ts).
@@ -9226,7 +9233,10 @@ application.track(mountReadControls({
   },
   leaveReadingMode: () => leaveReadingMode(),
 }));
-
+// `#2216`: replay a Read tap that landed before this mount wired the tile,
+// and close the early-tap window: everything it covered is wired now.
+if (earlyTaps.take("read-aloud")) el("read-aloud").click();
+earlyTaps.stop();
 
 // The call's controls: Talk, Hang up, the speaker, clearing the view, forgetting the stored conversations, and a
 // failed start tried again. One owner in web/src/view/voice/callcontrols.ts (`#624 voice-page-modularity`), mounted

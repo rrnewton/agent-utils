@@ -92,19 +92,36 @@ def walk(desk: Desk, touch: bool, pace_supported: bool) -> None:
         desk.check(tile["title"] == REASON, f"the Pace tile's title is {tile['title']!r}")
         desk.notes.append("Pace tile muted on the closed bar, reason on its title")
     desk.shot("toolbar")
-    # A coordinate tap, not Playwright's click: its actionability check reads
-    # `aria-disabled` as a dead button, but a real tap lands — the tile is
-    # muted, never disabled, precisely so this tap opens the reason.
-    tile_box = page.locator("#read-speed").bounding_box()
-    check(tile_box is not None, "#read-speed is not drawn")
-    assert tile_box is not None
-    centre_x, centre_y = tile_box["x"] + tile_box["width"] / 2, tile_box["y"] + tile_box["height"] / 2
+    # `#2216`: readiness is a condition, never a sleep — the tile says when
+    # it is wired (`data-wired`, set by its mount), and the tap loop below
+    # re-reads the tile's box and taps again until the popover's own
+    # condition holds, bounded by the shared hang backstop. A first tap
+    # lands at once, as early as the tile is drawn: if it beat the wiring,
+    # the page's early-tap replay (`createEarlyTaps`) owes the popover, and
+    # the loop's condition is what proves it.
+    # The earliest tap: as soon as the tile is drawn, before its handler can
+    # be wired. If it beat the wiring, the replay owes the popover.
+    earliest = page.locator("#read-speed").bounding_box()
+    check(earliest is not None, "#read-speed is not drawn at the earliest moment")
+    assert earliest is not None
     if touch:
-        page.touchscreen.tap(centre_x, centre_y)
+        page.touchscreen.tap(earliest["x"] + earliest["width"] / 2, earliest["y"] + earliest["height"] / 2)
     else:
-        page.mouse.click(centre_x, centre_y)
-    desk.wait_for("() => !document.getElementById('speed-popover').hidden",
-                  "Pace did not open its popover", STATE_S)
+        page.mouse.click(earliest["x"] + earliest["width"] / 2, earliest["y"] + earliest["height"] / 2)
+    desk.wait_for("() => document.getElementById('read-speed').getAttribute('data-wired') === 'true'",
+                  "the Pace tile never said it was wired", STATE_S)
+    deadline = time.monotonic() + 120
+    while page.evaluate("() => document.getElementById('speed-popover').hidden"):
+        check(time.monotonic() < deadline, "Pace did not open its popover")
+        tile_box = page.locator("#read-speed").bounding_box()
+        check(tile_box is not None, "#read-speed is not drawn")
+        assert tile_box is not None
+        centre_x, centre_y = tile_box["x"] + tile_box["width"] / 2, tile_box["y"] + tile_box["height"] / 2
+        if touch:
+            page.touchscreen.tap(centre_x, centre_y)
+        else:
+            page.mouse.click(centre_x, centre_y)
+        page.wait_for_timeout(250)
     state = "() => ({box: document.getElementById('read-speed-box').disabled, " \
             "down: document.getElementById('read-speed-down').disabled, " \
             "up: document.getElementById('read-speed-up').disabled, " \
