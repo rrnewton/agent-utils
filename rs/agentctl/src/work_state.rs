@@ -43,6 +43,9 @@ pub struct ProcInfo {
     pub cpu_ticks: u64,
     /// Start time after boot, in clock ticks: with the PID, a process generation.
     pub start_ticks: u64,
+    /// Session ID: the session the process belongs to, which a process
+    /// re-parented out of its harness's tree keeps (#2225).
+    pub session: u32,
 }
 
 /// One open file descriptor.
@@ -78,6 +81,12 @@ pub trait ProcView {
     }
     /// The process's environment as `KEY=VALUE` entries, when readable.
     fn environ(&self, _pid: u32) -> Option<Vec<String>> {
+        None
+    }
+    /// The process's cgroup path (`/proc/PID/cgroup`), when readable:
+    /// the scope a process re-parented out of its harness's tree usually
+    /// keeps (#2225). `None` proves nothing either way.
+    fn cgroup(&self, _pid: u32) -> Option<String> {
         None
     }
 }
@@ -122,6 +131,9 @@ impl ProcView for PassProc {
     fn environ(&self, pid: u32) -> Option<Vec<String>> {
         LinuxProc.environ(pid)
     }
+    fn cgroup(&self, pid: u32) -> Option<String> {
+        LinuxProc.cgroup(pid)
+    }
 }
 
 fn parse_stat(pid: u32, text: &str) -> Option<ProcInfo> {
@@ -134,6 +146,7 @@ fn parse_stat(pid: u32, text: &str) -> Option<ProcInfo> {
         ppid: u32::try_from(number(1)?).ok()?,
         cpu_ticks: number(11)?.saturating_add(number(12)?),
         start_ticks: number(19)?,
+        session: u32::try_from(number(3)?).ok()?,
     })
 }
 
@@ -143,6 +156,20 @@ fn lock_id(dev: u64, ino: u64) -> String {
 }
 
 impl ProcView for LinuxProc {
+    fn cgroup(&self, pid: u32) -> Option<String> {
+        let text = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+        // The unified hierarchy line is `0::/path`; on a v1 host the
+        // first named hierarchy's path serves the same purpose.
+        text.lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .or_else(|| {
+                text.lines()
+                    .filter_map(|line| line.splitn(3, ':').nth(2))
+                    .next()
+            })
+            .map(str::to_owned)
+    }
+
     fn environ(&self, pid: u32) -> Option<Vec<String>> {
         let bytes = fs::read(format!("/proc/{pid}/environ")).ok()?;
         Some(
@@ -268,11 +295,26 @@ pub struct WorkItem {
     pub waits_on: Option<String>,
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// What one pass saw under the harness.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct WorkSample {
     /// Tool commands and gate steps, in a stable order.
     pub items: Vec<WorkItem>,
+    /// Live processes that belong to the lane's scope — the harness's
+    /// cgroup, or the session its shells were started in — but sit OUTSIDE
+    /// its process tree (#2225): a background child that was re-parented
+    /// (double fork, setsid) away from the harness is live background
+    /// work, never a phantom.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scoped_live: Vec<u32>,
+    /// The harness's cgroup could not be read (#2225): a shell the tree
+    /// cannot find is then unverified, never phantom.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cgroup_unreadable: bool,
 }
 
 impl WorkSample {
@@ -651,7 +693,30 @@ pub fn sample(view: &dyn ProcView, harness: u32, harness_start: Option<u64>) -> 
             });
         }
     }
-    Some(WorkSample { items })
+    // Background work that left the tree (#2225): a child the harness's
+    // shell double-forked or setsid'd away is re-parented out of the
+    // subtree above, but it keeps the harness's cgroup and usually its
+    // session. Any live process in either set, outside the tree, is
+    // scoped live work the phantom check must find first.
+    let harness_cgroup = view.cgroup(harness);
+    let in_tree: BTreeSet<u32> = table.subtree(harness).into_iter().collect();
+    let mut scoped_live: Vec<u32> = table
+        .by_pid
+        .values()
+        .filter(|row| !in_tree.contains(&row.pid) && row.state != 'Z')
+        .filter(|row| {
+            (harness_cgroup.is_some()
+                && view.cgroup(row.pid).as_deref() == harness_cgroup.as_deref())
+                || (root.session != 0 && row.session == root.session)
+        })
+        .map(|row| row.pid)
+        .collect();
+    scoped_live.sort_unstable();
+    Some(WorkSample {
+        items,
+        scoped_live,
+        cgroup_unreadable: harness_cgroup.is_none(),
+    })
 }
 
 /// Whether a command line runs the suite's step runner, whose steps are its children.
@@ -764,19 +829,52 @@ pub(crate) mod fake {
         pub fds: BTreeMap<u32, Vec<FdTarget>>,
         pub locks: String,
         pub files: BTreeMap<String, String>,
+        /// Cgroup path per process (#2225); unlisted processes share the
+        /// default scope, and `unreadable` ones answer `None`.
+        pub cgroups: BTreeMap<u32, String>,
+        /// Processes whose cgroup cannot be read (#2225).
+        pub cgroup_unreadable: BTreeSet<u32>,
     }
 
     impl FakeProc {
-        /// Add a process sleeping (`S`) or in state `state`.
+        /// Add a process sleeping (`S`) or in state `state`. The session
+        /// is inherited from the parent when it was spawned first, as
+        /// the kernel keeps it; a parentless process leads its own.
         pub fn spawn(&mut self, pid: u32, ppid: u32, state: char, command: &str) -> &mut Self {
+            let session = self
+                .processes
+                .iter()
+                .find(|row| row.pid == ppid)
+                .map_or(pid, |parent| parent.session);
             self.processes.push(ProcInfo {
                 pid,
                 ppid,
                 state,
                 cpu_ticks: 0,
                 start_ticks: u64::from(pid) * 10,
+                session,
             });
             self.cmdline.insert(pid, command.to_owned());
+            self
+        }
+
+        /// Put a spawned process in its own session, as `setsid` does (#2225).
+        pub fn setsid(&mut self, pid: u32) -> &mut Self {
+            if let Some(row) = self.processes.iter_mut().find(|row| row.pid == pid) {
+                row.session = pid;
+            }
+            self
+        }
+
+        /// Move a spawned process into cgroup `path` (#2225).
+        pub fn in_cgroup(&mut self, pid: u32, path: &str) -> &mut Self {
+            self.cgroups.insert(pid, path.to_owned());
+            self
+        }
+
+        /// Make a spawned process's cgroup unreadable (#2225).
+        pub fn cgroup_unreadable(&mut self, pid: u32) -> &mut Self {
+            self.cgroup_unreadable.insert(pid);
             self
         }
 
@@ -824,6 +922,17 @@ pub(crate) mod fake {
         fn read_tail(&self, path: &Path, _limit: u64) -> Option<String> {
             self.files.get(path.to_str()?).cloned()
         }
+        fn cgroup(&self, pid: u32) -> Option<String> {
+            if self.cgroup_unreadable.contains(&pid) {
+                return None;
+            }
+            Some(
+                self.cgroups
+                    .get(&pid)
+                    .cloned()
+                    .unwrap_or_else(|| "/scope".to_owned()),
+            )
+        }
     }
 }
 
@@ -839,6 +948,51 @@ mod tests {
             .spawn(150, 100, 'S', "node /opt/mcp/server.js")
             .spawn(200, 100, 'S', "/bin/bash -c cargo build --release");
         proc
+    }
+
+    #[test]
+    fn a_reparented_background_child_in_the_harness_scope_is_scoped_live() {
+        // #2225: the background shell double-forked and exited; its long
+        // child was re-parented to init, out of the harness tree, but it
+        // stayed in the harness's cgroup. The tree finds no tool, yet the
+        // child is live background work the phantom check must find.
+        let mut proc = FakeProc::default();
+        proc.spawn(100, 1, 'S', "claude");
+        proc.spawn(300, 1, 'S', "node await-remote-build");
+        let seen = sample(&proc, 100, None).unwrap();
+        assert!(seen.tools().next().is_none(), "{seen:?}");
+        assert_eq!(seen.scoped_live, [300]);
+        assert!(!seen.cgroup_unreadable);
+        // A setsid child leads its own session; the cgroup still holds it.
+        proc.setsid(300);
+        let seen = sample(&proc, 100, None).unwrap();
+        assert_eq!(seen.scoped_live, [300]);
+        // A re-parented child in the harness's session counts too, even
+        // in another cgroup.
+        let mut by_session = FakeProc::default();
+        by_session.spawn(100, 1, 'S', "claude");
+        by_session
+            .spawn(300, 1, 'S', "node await-remote-build")
+            .in_cgroup(300, "/elsewhere");
+        // Spawned parentless, 300 leads its own session; move it into the
+        // harness's session (100), as a double fork without setsid keeps it.
+        if let Some(row) = by_session.processes.iter_mut().find(|row| row.pid == 300) {
+            row.session = 100;
+        }
+        let seen = sample(&by_session, 100, None).unwrap();
+        assert_eq!(seen.scoped_live, [300]);
+        // Truly nothing in tree, cgroup, or session: no scoped evidence,
+        // and the scope read fine (the phantom case itself).
+        let mut gone = FakeProc::default();
+        gone.spawn(100, 1, 'S', "claude");
+        let seen = sample(&gone, 100, None).unwrap();
+        assert!(seen.scoped_live.is_empty());
+        assert!(!seen.cgroup_unreadable);
+        // An unreadable harness cgroup is marked, never read as empty.
+        gone.cgroup_unreadable(100);
+        let seen = sample(&gone, 100, None).unwrap();
+        assert!(seen.scoped_live.is_empty());
+        assert!(seen.cgroup_unreadable);
     }
 
     #[test]

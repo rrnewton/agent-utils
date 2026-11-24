@@ -1925,6 +1925,43 @@ fn classify(
                 // threshold, idle ones at the stall threshold, and running ones not at all.
                 let since = memory.screen_changed_at.max(memory.work_changed_at);
                 if sample.tools().next().is_none() {
+                    // Before calling the counted shell phantom, look past
+                    // the harness's process tree (#2225): a background
+                    // child re-parented out of it (double fork, setsid)
+                    // still sits in the harness's cgroup or session, and
+                    // is live work. Live scoped processes are named, so
+                    // an operator can check before acting.
+                    if !sample.scoped_live.is_empty() {
+                        let pids = sample
+                            .scoped_live
+                            .iter()
+                            .map(u32::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return Some(Finding::timed(
+                            EpisodeKind::BackgroundWait,
+                            format!(
+                                "status {} waiting on background work the screen counts ({what}); no shell runs under its harness, but live process(es) in its scope outside its tree (PID {pids}) still run, so the counted work is not phantom",
+                                observation.status
+                            ),
+                            since,
+                            Some(options.stall.as_secs_f64()),
+                        ));
+                    }
+                    // Without the cgroup the scope cannot be proven
+                    // empty: the count is unverified, and no restart is
+                    // ever suggested from an unverified check (#2225).
+                    if sample.cgroup_unreadable {
+                        return Some(Finding::timed(
+                            EpisodeKind::BackgroundWait,
+                            format!(
+                                "status {} waiting on background work the screen counts ({what}), but its harness cgroup could not be read, so the count is unverified and no shell can be called phantom; no restart is suggested from an unverified check",
+                                observation.status
+                            ),
+                            since,
+                            Some(options.idle.as_secs_f64()),
+                        ));
+                    }
                     return Some(Finding::timed(
                         EpisodeKind::BackgroundWait,
                         format!(
@@ -10186,6 +10223,78 @@ mod tests {
             "{changed}"
         );
         assert_eq!(changed["episodes"][0]["level"], "info", "{changed}");
+    }
+
+    #[test]
+    fn a_reparented_live_background_child_is_named_and_never_called_phantom() {
+        // #2225: the counted background shell's long child was
+        // re-parented out of the harness tree but still runs in its
+        // scope. The notice names its PID and calls nothing phantom;
+        // no restart is suggested.
+        let options = options();
+        let footer = "● Started the gate in the background.\n\n❯\u{a0}\n\n  ⏵⏵ auto mode on · 1 shell · ↓ to manage\n";
+        let mut proc = FakeProc::default();
+        proc.spawn(100, 1, 'S', "claude");
+        proc.spawn(300, 1, 'S', "node await-remote-build");
+        let idle = |work: Option<WorkSample>| Observation {
+            work,
+            ..observation("lane-a", "idle", Some(footer))
+        };
+        let mut probe = ScriptedProbe(vec![
+            vec![idle(sample(&proc, 100, None))],
+            vec![idle(sample(&proc, 100, None))],
+        ]);
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        pass(&mut probe, &mut notifier, &mut state, 0.0, &options);
+        let flagged = pass(&mut probe, &mut notifier, &mut state, 3_600.0, &options);
+        assert_eq!(
+            flagged["episodes"][0]["kind"], "background-wait",
+            "{flagged}"
+        );
+        let detail = flagged["episodes"][0]["detail"].to_string();
+        assert!(detail.contains("PID 300"), "{detail}");
+        assert!(detail.contains("not phantom"), "{detail}");
+        assert!(
+            !only_notice(&notifier).contains("agentctl restart"),
+            "{}",
+            only_notice(&notifier)
+        );
+    }
+
+    #[test]
+    fn an_unreadable_harness_cgroup_makes_the_count_unverified_not_phantom() {
+        // #2225: the count says 1 shell, the tree finds none, and the
+        // harness's cgroup cannot be read, so the scope cannot be proven
+        // empty: the finding is unverified and suggests no restart.
+        let options = options();
+        let footer = "● Started the gate in the background.\n\n❯\u{a0}\n\n  ⏵⏵ auto mode on · 1 shell · ↓ to manage\n";
+        let mut proc = FakeProc::default();
+        proc.spawn(100, 1, 'S', "claude");
+        proc.cgroup_unreadable(100);
+        let idle = |work: Option<WorkSample>| Observation {
+            work,
+            ..observation("lane-a", "idle", Some(footer))
+        };
+        let mut probe = ScriptedProbe(vec![
+            vec![idle(sample(&proc, 100, None))],
+            vec![idle(sample(&proc, 100, None))],
+        ]);
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        pass(&mut probe, &mut notifier, &mut state, 0.0, &options);
+        let flagged = pass(&mut probe, &mut notifier, &mut state, 900.0, &options);
+        assert_eq!(
+            flagged["episodes"][0]["kind"], "background-wait",
+            "{flagged}"
+        );
+        let detail = flagged["episodes"][0]["detail"].to_string();
+        assert!(detail.contains("unverified"), "{detail}");
+        assert!(
+            !only_notice(&notifier).contains("agentctl restart"),
+            "{}",
+            only_notice(&notifier)
+        );
     }
 
     // Rows drawn by Claude Code at the bottom of an idle pane while two background shells
