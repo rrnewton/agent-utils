@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-wtf-chip-orphan-lifecycle: the WTF? chip is never left standing after the selection chip group hides'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -23,3 +23,7 @@ Owner 340 (2026-11-24): the WTF? chip sometimes stays on screen after Quoted rep
 # Notes
 
 Owner UI request (fast-track, owner rule 286). Prior work: #2156 vibe-talk-wtf-glossary-lookup, #2187 vibe-talk-wtf-chips-one-row-clear-of-handles.
+
+## Resolution
+
+[watermelon-full-preview] Landed in the chip stack on main as 5434da2b (full gate PASS 225/225 on a3396451). One chip-group show/hide path; orphan scenes 93-98 cover every dismiss path. #2195 vibe-talk-wtf-chip-orphan-lifecycle.

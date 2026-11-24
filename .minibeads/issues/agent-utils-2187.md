@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-wtf-chips-one-row-clear-of-handles: the selection chip bar stays one row, inside the viewport and clear of the selection handles'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -25,3 +25,7 @@ Owner 339 (2026-11-24): selecting words at the left edge of a message wraps the 
 # Notes
 
 Owner UI request (fast-track, owner rule 286). Prior work: #2156 vibe-talk-wtf-glossary-lookup.
+
+## Resolution
+
+[watermelon-full-preview] Landed in the chip stack on main as 5434da2b (full gate PASS 225/225 on a3396451). The chip bar is one clamped row below the selection, clear of the handles, with the solid strip and rigid container (#2220) completing the row. #2187 vibe-talk-wtf-chips-one-row-clear-of-handles.

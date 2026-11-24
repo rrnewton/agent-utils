@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-selection-chip-rigid-row: WTF?, Quoted reply and X are one rigid chip-group container'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -31,3 +31,7 @@ The selection chips (WTF?, Quoted reply, dismiss X) are three separately positio
 # Notes
 
 Owner UI request (fast-track, owner rule 286). Follow-up to #2187 vibe-talk-wtf-chips-one-row-clear-of-handles and #2195 vibe-talk-wtf-chip-orphan-lifecycle.
+
+## Resolution
+
+[watermelon-full-preview] Landed in the chip stack on main as 5434da2b (full gate PASS 225/225 on a3396451). One #selection-chip-row container positioned once, WTF? slot reserved, strip always under the selection (owner 339/368). #2220 vibe-talk-selection-chip-rigid-row.
