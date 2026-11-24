@@ -5243,6 +5243,23 @@ def _act_chip_row_below(driver: Driver) -> None:
     driver.settle(300)
 
 
+def _act_chip_row_above_fallback(driver: Driver) -> None:
+    """`#2220` fallback: the selected row at the foot of the list, so the strip
+    has no room below and stands above the selection."""
+    _act_glossary_button(driver)
+    driver.js(
+        "(() => { const area = document.getElementById('scroll-area'); "
+        "area.scrollBy(0, area.scrollHeight); })()"
+    )
+    driver.page.wait_for_function(
+        "() => { const r = document.getElementById('selection-chip-row').getBoundingClientRect(); "
+        "const s = getSelection().getRangeAt(0).getBoundingClientRect(); "
+        "return r.bottom <= s.top + 1; }",
+        timeout=10_000,
+    )
+    driver.settle(300)
+
+
 def _act_glossary_orphan(driver: Driver) -> None:
     """`#2195`: stand the chip group up, dismiss it with its X, and stop:
     the frame must show no chip left standing alone."""
@@ -8913,6 +8930,17 @@ SCENES: tuple[Scene, ...] = (
         expect=(
             ("#2220 the strip stands below the selection", "(() => { const r = document.getElementById('selection-chip-row').getBoundingClientRect(); const s = getSelection().getRangeAt(0).getBoundingClientRect(); return r.top >= s.bottom - 1; })()"),
             ("#2220 the strip is opaque and covers all three chips plus their gaps", "(() => { const row = document.getElementById('selection-chip-row'); const bg = getComputedStyle(row).backgroundColor; const m = bg.match(/rgba?\\(([^)]+)\\)/); const alpha = m && m[1].split(',').length === 4 ? parseFloat(m[1].split(',')[3]) : 1; if (alpha !== 1) return false; const r = row.getBoundingClientRect(); return ['selection-chip-wtf','selection-chip','selection-chip-dismiss'].every(id => { const b = document.getElementById(id).getBoundingClientRect(); return b.left >= r.left - 1 && b.right <= r.right + 1 && b.top >= r.top - 1 && b.bottom <= r.bottom + 1; }); })()"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="104-chip-row-above-fallback",
+        what="#2220 the strip above the selection only where there is no room below it",
+        act=_act_chip_row_above_fallback,
+        profiles=MATRIX_PROFILES,
+        keep_transient=True,
+        expect=(
+            ("#2220 the strip stands above the selection", "(() => { const r = document.getElementById('selection-chip-row').getBoundingClientRect(); const s = getSelection().getRangeAt(0).getBoundingClientRect(); return r.bottom <= s.top + 1; })()"),
             ("no error banner is up", "!window.__visible('error-wrap')"),
         ),
     ),
