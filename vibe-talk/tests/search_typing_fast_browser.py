@@ -143,7 +143,7 @@ class Walk:
         if self.shots is not None:
             self.page.screenshot(path=str(self.shots / f"{self.label}-{name}.png"))
 
-    def until(self, script: str, why: str, seconds: float = 20) -> None:
+    def until(self, script: str, why: str, seconds: float = browser_waits.HANG_BACKSTOP_MS / 1000) -> None:
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline and not self.page.evaluate(script):
             self.page.wait_for_timeout(25)
@@ -162,11 +162,11 @@ def walk_through(walk: Walk, total: int) -> None:
             page.click("#welcome-start")
     except Exception:
         pass
-    page.wait_for_selector("#search-toggle", state="visible", timeout=15_000)
+    page.wait_for_selector("#search-toggle", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
     walk.until(f"() => document.querySelectorAll('#discord-log > li[data-id]').length >= {total - 20}",
                "the big channel did not open with its messages")
     page.click("#search-toggle")
-    page.wait_for_selector("#search-field", state="visible", timeout=10_000)
+    page.wait_for_selector("#search-field", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
     page.evaluate(RECT_INSTALL_JS)
     deltas = page.evaluate(TYPE_KEYS_JS)
     walk.check(all(isinstance(one, int) for one in deltas) and len(deltas) == 7,
@@ -202,20 +202,22 @@ def walk_through(walk: Walk, total: int) -> None:
         const proto = Object.getPrototypeOf(localStorage); const os = proto.setItem;
         proto.setItem = function (k, v) { window.__keyCounts.lsSet += 1; return os.call(this, k, v); };
     }""")
-    # Keys dispatched in-page at a steady 30 ms pace, each sampled after two frames, so the
-    # pace the page sees is the pace asserted — no harness round-trip between keys.
-    deltas = page.evaluate("""async () => {
-        const field = document.getElementById('search-field');
-        const out = [];
-        for (const value of ['lanter', 'lantern', 'lanter', 'lantern']) {
+    # Keys dispatched at a steady pace ON THE PAGE'S CLOCK (#2177): the page clock is
+    # frozen and advanced 80 ms per key (about two frames plus the pace), so the pace
+    # the page sees is the pace asserted no matter how starved the host is. Before
+    # this, two real frames under load could take longer than the product's settle
+    # pause, and the settled ask legitimately fired mid-burst on slow hosts.
+    page.clock.install()
+    deltas = []
+    for value in ["lanter", "lantern", "lanter", "lantern"]:
+        page.evaluate("""() => {
             window.__keyCounts.cls = 0; window.__keyCounts.fetch = 0; window.__keyCounts.lsSet = 0; window.__keyCounts.urls = [];
-            field.value = value; field.dispatchEvent(new Event('input', { bubbles: true }));
-            await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-            out.push({ ...window.__keyCounts, count: document.getElementById('search-count').textContent });
-            await new Promise((r) => setTimeout(r, 30));
-        }
-        return out;
-    }""")
+            const field = document.getElementById('search-field');
+            field.value = %r; field.dispatchEvent(new Event('input', { bubbles: true }));
+        }""" % value)
+        page.clock.fast_forward(80)
+        deltas.append(page.evaluate("() => ({ ...window.__keyCounts, count: document.getElementById('search-count').textContent })"))
+    page.clock.fast_forward(10_000)  # let the settled pass land for the checks below
     for delta in deltas:
         walk.check(delta["cls"] <= max(8, total // 20),
                    f"a refining keystroke wrote {delta['cls']} row classes over {total} rows (changed-only bound {max(8, total // 20)})")
@@ -227,6 +229,7 @@ def walk_through(walk: Walk, total: int) -> None:
                "the settled marks did not return after refining and retyping")
     # Backspacing the query away: every hit stands again and no mark outlives its words.
     page.evaluate("""() => { const f = document.getElementById('search-field'); f.value = ''; f.dispatchEvent(new Event('input', { bubbles: true })); }""")
+    page.clock.fast_forward(10_000)  # the cleared query settles on the page clock too
     walk.until("() => document.getElementById('search-count').textContent === ''",
                "the cleared search left its settled count standing")
     walk.check(page.evaluate("() => document.querySelectorAll('#discord-log .search-hit').length === 0"),

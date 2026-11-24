@@ -269,14 +269,14 @@ class Walk:
         # geometry. Never the only wait before reading what a search or a press draws.
         self.page.evaluate("() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))")
 
-    def until_shown(self, expected: list[str], why: str, list_id: str = "discord-log", seconds: float = 10) -> None:
+    def until_shown(self, expected: list[str], why: str, list_id: str = "discord-log", seconds: float = browser_waits.HANG_BACKSTOP_MS / 1000) -> None:
         """Wait until `shown(list_id)` is exactly `expected`, judging it as `why` (`#1118`)."""
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline and self.shown(list_id) != expected:
             self.page.wait_for_timeout(25)
         self.check(self.shown(list_id) == expected, why)
 
-    def until(self, script: str, why: str, seconds: float = 10) -> None:
+    def until(self, script: str, why: str, seconds: float = browser_waits.HANG_BACKSTOP_MS / 1000) -> None:
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline and not self.page.evaluate(script):
             self.page.wait_for_timeout(25)
@@ -366,7 +366,7 @@ def walk_through(walk: Walk) -> None:
             page.click("#welcome-start")
     except Exception:
         pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
-    page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
+    page.wait_for_selector("#search-toggle", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
     walk.until(f"() => document.querySelectorAll('#discord-log > li[data-id]').length === {len(SCRIPT)}",
                "the channel did not open with its sixteen messages")
     walk.settled()
