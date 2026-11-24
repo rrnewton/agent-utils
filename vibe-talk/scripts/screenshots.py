@@ -5227,11 +5227,12 @@ def _act_chip_row_below(driver: Driver) -> None:
     """`#2220` below case: the selected row scrolled to the top of the list,
     so the strip has no room above and must stand below the selection."""
     _act_glossary_button(driver)
+    # A touch selection: the strip stands below the words, clear of the phone's handles (#819).
     driver.js(
         "(() => { const sel = getSelection(); "
         "const area = document.getElementById('scroll-area'); "
-        "const r = sel.getRangeAt(0).getBoundingClientRect(); "
-        "area.scrollBy(0, r.top - area.getBoundingClientRect().top - 4); })()"
+        "document.dispatchEvent(new PointerEvent('pointerdown', {pointerType: 'touch', bubbles: true})); "
+        "area.scrollBy(0, 2); })()"
     )
     driver.page.wait_for_function(
         "() => { const r = document.getElementById('selection-chip-row').getBoundingClientRect(); "
