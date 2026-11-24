@@ -1339,6 +1339,14 @@
   padding-top: calc(var(--float-line) + var(--search-bar) / 2 + 0.35rem + var(--bucket-head));
 }
 
+/* `#2200`: the same head room as a scroll margin, so a result scrolled
+   into view (a bucket tap's first hit, a jump) also stops below the
+   floating chip panel, never under it — at rest the padding above does
+   this, in motion this does. */
+#screen-main[data-searching] #discord-log > li {
+  scroll-margin-top: calc(var(--float-line) + var(--search-bar) / 2 + 0.35rem + var(--bucket-head));
+}
+
 
 /* The two-row phone bar above takes the second row's room at the head too,
    so its foot never covers the first row. Only where no hang margin already

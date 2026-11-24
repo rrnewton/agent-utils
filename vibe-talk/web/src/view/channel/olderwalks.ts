@@ -1115,7 +1115,9 @@ function transcriptBucketHits(): Message[] {
 // screen; tapping a hit opens that day in the Transcripts view.
 searchBuckets.register({
   id: "transcripts",
-  words: "in Agent Transcripts",
+  // `#2200`: shortened so the three chips fit one row at phone width; the
+  // full name stays on the chip's aria-label in the page.
+  words: "in Transcripts",
   defaultOn: (view) => view === "transcripts",
   source: {
     count: () => transcriptBucketHits().length,

@@ -206,6 +206,14 @@ def walk_through(walk: Walk, keyboard: bool) -> None:
     # whole under the chips rather than wherever the search landing left it.
     page.evaluate("() => { document.getElementById('scroll-area').scrollTop = 0; }")
     walk.settled()
+    # `#2200`: the first result starts below the chip panel, never under it.
+    first_below = page.evaluate("""() => {
+      const row = document.getElementById('search-bucket-row');
+      const first = [...document.querySelectorAll('#discord-log > li[data-id]')]
+        .find((li) => li.getClientRects().length);
+      return Boolean(first) && first.getBoundingClientRect().top >= row.getBoundingClientRect().bottom - 1;
+    }""")
+    walk.check(first_below, "the chip panel covers the first result")
     walk.shot("chips-under-bar")
     # Scroll the results to the bottom: the chips stay under the bar.
     page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; }")

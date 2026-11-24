@@ -9609,6 +9609,13 @@ SCENES: tuple[Scene, ...] = (
                 "return rows.length === want; })()",
             ),
             ("no result stands in the quote style", "!document.querySelector('#discord-log > li[data-server-hit=\"quote\"]')"),
+            (
+                "the first result starts below the chip panel",
+                "(() => { const row = document.getElementById('search-bucket-row'); "
+                "const first = [...document.querySelectorAll('#discord-log > li[data-id]')]"
+                ".find((li) => li.getClientRects().length); "
+                "return Boolean(first) && first.getBoundingClientRect().top >= row.getBoundingClientRect().bottom - 1; })()",
+            ),
             ("no error banner is up", "!window.__visible('error-wrap')"),
         ),
     ),
@@ -9686,6 +9693,13 @@ SCENES: tuple[Scene, ...] = (
                 "(() => { const n = Number(document.getElementById('search-bucket-main').textContent.match(/^\\d+/)[0]); "
                 "const rows = [...document.querySelectorAll('#discord-log > li[data-id]')]"
                 ".filter((li) => li.getClientRects().length); return rows.length === n; })()",
+            ),
+            (
+                "the first result starts below the chip panel",
+                "(() => { const row = document.getElementById('search-bucket-row'); "
+                "const first = [...document.querySelectorAll('#discord-log > li[data-id]')]"
+                ".find((li) => li.getClientRects().length); "
+                "return Boolean(first) && first.getBoundingClientRect().top >= row.getBoundingClientRect().bottom - 1; })()",
             ),
             ("no error banner is up", "!window.__visible('error-wrap')"),
         ),

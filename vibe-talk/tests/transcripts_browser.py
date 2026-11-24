@@ -410,7 +410,10 @@ def walk_through(walk: Walk, keyboard: bool, discuss: bool = False) -> None:
     page.evaluate("() => document.getElementById('search-bucket-transcripts').scrollIntoView({block: 'center'})")
     walk.settled()
     chip = page.text_content("#search-bucket-transcripts") or ""
-    walk.check("1" in chip and "Agent Transcripts" in chip, f"the chip does not count its hits: {chip!r}")
+    # `#2200`: the chip's short label counts; its full name is its aria-label.
+    walk.check("1" in chip and page.evaluate(
+        "() => document.getElementById('search-bucket-transcripts').getAttribute('aria-label')") == "in Agent Transcripts",
+        f"the chip does not count its hits: {chip!r}")
     walk.check(page.evaluate("() => document.getElementById('search-bucket-transcripts').getAttribute('aria-pressed')") == "false",
                "the transcripts bucket is not off by default outside its view")
     walk.check(page.evaluate("() => document.querySelectorAll('#discord-log > li[data-bucket=\"transcripts\"]').length") == 0,
