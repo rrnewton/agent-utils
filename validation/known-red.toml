@@ -115,3 +115,9 @@ step = "vibe-talk.check.search-typing-fast-browser"
 issue = "#2175"
 expires = "2026-12-24"
 note = "settled-window assertions under load (interim; condition waits in #2177)"
+
+[[known-red]]
+step = "vibe-talk.check.pace-availability-browser"
+issue = "#2175"
+expires = "2026-12-24"
+note = "red on 4 distinct heads in 7d; kept log signature is a popover wait expiring (browser-load family)"
