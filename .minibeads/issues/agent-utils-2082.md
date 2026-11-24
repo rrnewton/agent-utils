@@ -47,3 +47,28 @@ followed-generation total. Counter semantics unchanged. The
 consumer's scripted short-lived-churn controls are vendored as
 py/wrkslots/tests/test_census_short_lived_churn.py. The holder-found
 naming and distinct exit status follow in a separate slice.
+
+## Holder-found slice: PARKED (2026-11-23)
+
+The holder-found slice (exit 4 naming) is parked after five review
+rounds; the work sits on mu-census/2082clean at 36ca5aa9 as reference
+and must not land. Holder naming belongs to the wrkslots V2 design
+(#2138), whose requirements from the final cold review are:
+
+- N1: device-and-inode proof may only decide whether to NAME a
+  process; never put it inside the census matchers (the in-use check
+  must keep failing closed on may-use text matches, including
+  unlinked or unstattable references).
+- N2: proof must stat the process's actual object (os.stat on
+  /proc/PID/fd/N, cwd, root, exe), not the link text in wrkslots' own
+  mount namespace.
+- N3: maps-only evidence never names (inode numbers collide across
+  btrfs subvolumes and fresh ext4 images); it still refuses.
+- N4: matches carry (pid, start_ticks) from match time; naming
+  re-verifies that exact generation and brackets the proof with
+  generation checks; a released or reused PID names nobody.
+- N5: the Rust post-fence holder path must not say "stop it and
+  retry" while the slot stays fenced; name recover or roll back.
+
+The landed part of #2082 is the stderr budget, the remedy text and
+the truthful rounds wording (407fcda7).
