@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-recover-absent-check-before-locks: recover-absent-validate-rows holds every lock for minutes just to refuse'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -37,3 +37,7 @@ indexes, and any other unproven case fall back unchanged. Covered by
 # Notes
 
 Filed by the coordinator from a consumer report; the owning lane refines this file as it works.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main in two parts. The row-only refusal pre-check (record identity, checksum, Git registration, locality, storage) landed as 304f431b + ad5c4972 + 6e9e6e0b, proven from the event-index snapshot before any registry lock and re-run unchanged under the locks; a mixed-input regression keeps the 'already-recovered' outcome byte-identical to the locked path. The follow-up (holds via the scoped index derivation, plus interrupted-mutation journal and validate-batch seal presence via _refuse_partial_state itself, with the command's own resumable batch falling through) landed as cc67c386 after a green full gate (3404dcdd) and a verified-overlap replay. The full history read for passing rows moved outside the locks separately in #2125 (mu-lockread). No new persisted fields.
