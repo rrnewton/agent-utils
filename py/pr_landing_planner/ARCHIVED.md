@@ -2,8 +2,8 @@
 
 This Python edition of pr-landing-planner is frozen in place and is no longer
 maintained or kept at parity with the Rust edition. It was archived on
-2026-11-23 at commit 73892095cdb70a3536ba3e71d43a0fa9e6f8413d, when it was equivalent to the Rust edition
-at commit 73892095cdb70a3536ba3e71d43a0fa9e6f8413d (pr-landing-planner 0.1.0). Annotated tag:
+2026-11-23 at commit bed289eb7c84984bbe878efaa17b1d36ea56fdd5, when it was equivalent to the Rust edition
+at commit bed289eb7c84984bbe878efaa17b1d36ea56fdd5 (pr-landing-planner 0.1.0). Annotated tag:
 `archive/py-pr-landing-planner-2026-11-23`. Tracking issue:
 #2139 python-editions-archive-and-parity-retirement.
 

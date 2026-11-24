@@ -113,8 +113,8 @@
       "mirror": {
         "edition": "python",
         "state": "archived",
-        "archived_at": "73892095cdb70a3536ba3e71d43a0fa9e6f8413d",
-        "equivalent_rust_commit": "73892095cdb70a3536ba3e71d43a0fa9e6f8413d",
+        "archived_at": "bed289eb7c84984bbe878efaa17b1d36ea56fdd5",
+        "equivalent_rust_commit": "bed289eb7c84984bbe878efaa17b1d36ea56fdd5",
         "equivalent_rust_version": "0.1.0",
         "archive_tag": "archive/py-pr-landing-planner-2026-11-23",
         "tracking_issue": "#2139 python-editions-archive-and-parity-retirement"
@@ -141,8 +141,8 @@
       "mirror": {
         "edition": "python",
         "state": "archived",
-        "archived_at": "73892095cdb70a3536ba3e71d43a0fa9e6f8413d",
-        "equivalent_rust_commit": "73892095cdb70a3536ba3e71d43a0fa9e6f8413d",
+        "archived_at": "bed289eb7c84984bbe878efaa17b1d36ea56fdd5",
+        "equivalent_rust_commit": "bed289eb7c84984bbe878efaa17b1d36ea56fdd5",
         "equivalent_rust_version": "0.2.0",
         "archive_tag": "archive/py-tick-hub-2026-11-22",
         "tracking_issue": "#2139 python-editions-archive-and-parity-retirement"

@@ -2,8 +2,8 @@
 
 This Python edition of tick-hub is frozen in place and is no longer maintained
 or kept at parity with the Rust edition. It was archived on 2026-11-22 at
-commit 73892095cdb70a3536ba3e71d43a0fa9e6f8413d, when it was equivalent to the Rust edition at commit
-73892095cdb70a3536ba3e71d43a0fa9e6f8413d (tick-hub 0.2.0). Annotated tag:
+commit bed289eb7c84984bbe878efaa17b1d36ea56fdd5, when it was equivalent to the Rust edition at commit
+bed289eb7c84984bbe878efaa17b1d36ea56fdd5 (tick-hub 0.2.0). Annotated tag:
 `archive/py-tick-hub-2026-11-22`. Tracking issue:
 #2139 python-editions-archive-and-parity-retirement.
 
