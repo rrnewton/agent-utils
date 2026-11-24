@@ -1162,7 +1162,25 @@ searchBuckets.register({
  * so a hit the page has since loaded for real goes (it is no longer fresh)
  * and its real row stands instead.
  */
+/** The placement last built, and the answer state it was built from. */
+let placedFor = "";
+
+/** Placed rows by hit, bucket and shape, reused across answers. Entries for
+ * hits a later answer no longer holds are simply never placed again. */
+const placedNodes = new Map<string, HTMLElement>();
+
 function placeServerHits(grouped: Map<string, Message[]>): void {
+  // Rebuilding every placed card on every render is real work per answer
+  // (a full row render each); when the answer, the toggles and the view
+  // are unchanged since the last build, the rows already standing are
+  // that build. A hit loaded for real since changes the hit counts the
+  // key reads, so it rebuilds then.
+  const now = serverSearchNow();
+  const key = `${now.ticket}|${now.hits.length}|${(now.transcriptHits || []).length}|` +
+    `${[...grouped.values()].map((hits) => hits.length).join()}|` +
+    `${[...bucketOn.entries()].join()}|${bucketView()}|${String(selectedChannelId() || "")}|${serverSearchOwner.allChannels()}`;
+  if (key === placedFor) return;
+  placedFor = key;
   clearServerHits();
   const placed: { at: number; node: HTMLElement }[] = [];
   const channel = String(selectedChannelId() || "");
@@ -1182,12 +1200,21 @@ function placeServerHits(grouped: Map<string, Message[]>): void {
       // for another channel's hits, which are pointers, not this channel's
       // cards.
       const asCard = String(hit.channel_id) === channel;
-      const node = asCard && deps.serverCardNode ? deps.serverCardNode(hit) : serverHitNode(hit);
+      // A hit already built for this bucket and shape keeps its row: a
+      // refined query whose answer holds the same hits reuses the cards
+      // instead of rendering them again per answer.
+      const nodeKey = `${hit.id}|${def.id}|${asCard ? "card" : "quote"}`;
+      let node = placedNodes.get(nodeKey);
+      if (!node) {
+        node = asCard && deps.serverCardNode ? deps.serverCardNode(hit) : serverHitNode(hit);
+        placedNodes.set(nodeKey, node);
+      }
       node.setAttribute(SERVER_HIT_MARK, asCard ? "card" : "quote");
       node.setAttribute("data-bucket", def.id);
       // Marked like every other hit on the page (the quoted hits are at their
       // build in `serverHitNode`); later filter passes re-mark it as a row.
-      if (asCard && deps.serverCardNode) markSearchHits(node, searchParsed(searchField.query()).terms);
+      // A reused row is re-marked for the current query here.
+      markSearchHits(node, searchParsed(searchField.query()).terms);
       placed.push({ at: Date.parse(hit.timestamp) || 0, node });
     }
   }
