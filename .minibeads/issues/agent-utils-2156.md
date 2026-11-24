@@ -1,13 +1,13 @@
 ---
 title: 'vibe-talk-wtf-glossary-lookup: a WTF button looks up a selected term and grows a dynamic glossary'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - vibe-talk
 - owner-ui
 created_at: 2026-11-23T06:50:00-05:00
-updated_at: 2026-11-23T06:50:00-05:00
+updated_at: 2026-11-23T12:40:00-05:00
 ---
 
 # Description
@@ -29,3 +29,7 @@ Owner request: a "WTF?" button in the text-selection bar, to the left of the Quo
 # Notes
 
 Owner UI request (fast-track); filed by the coordinator.
+
+## Resolution
+
+[watermelon-full-preview] Landed 2dd8642a8e6a2c89f9172243c1a298edd08c4ef2 on main (gated 7897f77c, ledger verdict pass, 211 steps) and deployed by coordb: design plan reviewed first; first slice with the WTF? button (left of the Quote reply chip, X right), cache-only lookup with placeholder and popover, dynamic entries in deployment state (popover-only; the Discuss warm-up stays reviewed-only behind DYNAMIC_IN_WARMUP), and dotted glossary links reopening the popover. Shot matrix in /tmp/mu-wtfglossary-shots and /tmp/mu-wtfglossary-shots-button; the placeholder state is exercised by the scene flow but has no captured frame (the model stub answers too fast to photograph it). #2156 vibe-talk-wtf-glossary-lookup.
