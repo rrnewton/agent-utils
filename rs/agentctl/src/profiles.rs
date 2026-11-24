@@ -1791,6 +1791,28 @@ pub(crate) fn codex_mcp_server_names(config_text: &str) -> Vec<String> {
     names
 }
 
+/// Whether the resolved Codex installation carries the provider mux
+/// (its built-in MCP server): the mux binary and its config beside the
+/// canonicalised `codex` on PATH.
+fn codex_provider_mux_present() -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    for directory in std::env::split_paths(&path) {
+        let candidate = directory.join("codex");
+        let Ok(canonical) = fs::canonicalize(&candidate) else {
+            continue;
+        };
+        let Some(install) = canonical.parent() else {
+            continue;
+        };
+        if install.join("bin/fast_mux").exists() && install.join("mcp/config.md").exists() {
+            return true;
+        }
+    }
+    false
+}
+
 /// The agentctl-owned empty MCP config a strict-MCP launch names,
 /// written once under the registry (never a harness or user config).
 pub(crate) fn empty_mcp_config(registry: &Path) -> std::path::PathBuf {
@@ -1822,8 +1844,17 @@ pub(crate) fn no_mcp_arguments(harness: &str, registry: &Path) -> Result<Vec<Str
                 .as_ref()
                 .and_then(|home| fs::read_to_string(home.join(".codex/config.toml")).ok())
                 .unwrap_or_default();
+            let mut names = codex_mcp_server_names(&text);
+            // The provider's built-in mux server is not in the user
+            // config; it exists when the installation beside the
+            // resolved `codex` carries its mux (bin/fast_mux and
+            // mcp/config.md). Disabling a server Codex does not have
+            // is an error, so it is named only when that mux is there.
+            if codex_provider_mux_present() && !names.iter().any(|name| name == "meta_core") {
+                names.push("meta_core".to_owned());
+            }
             let mut arguments = Vec::new();
-            for name in codex_mcp_server_names(&text) {
+            for name in names {
                 arguments.push("-c".to_owned());
                 arguments.push(format!("mcp_servers.{name}.enabled=false"));
             }
