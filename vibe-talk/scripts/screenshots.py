@@ -5250,7 +5250,7 @@ def _act_chip_row_above_fallback(driver: Driver) -> None:
     driver.js("document.getElementById('scroll-area').scrollBy(0, 100000)")
     driver.settle(300)
     rect = driver.js(
-        "(() => { const rows = [...document.querySelectorAll('#discord-log > li')]; "
+        "(() => { const rows = [...document.querySelectorAll('#discord-log > li')].reverse(); "
         "for (const row of rows) { const rr = row.getBoundingClientRect(); if (rr.height > 140) continue; "
         "if (rr.bottom > window.innerHeight - 40 || rr.top < 0) continue; "
         "const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT); "
