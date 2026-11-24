@@ -263,8 +263,10 @@ fn waiters(registry: &Path, agent: &str, at: f64) -> Vec<Value> {
             // The identity is re-derived from the live process, so a record written by an
             // older build (which stored the raw command line) never surfaces it (#2217).
             let mut waiter = process_report(pid);
-            waiter["priority"] =
-                json!(record.get("priority").and_then(Value::as_bool).unwrap_or(false));
+            waiter["priority"] = json!(record
+                .get("priority")
+                .and_then(Value::as_bool)
+                .unwrap_or(false));
             waiter["waiting_seconds"] = json!((at - since).max(0.0).round());
             Some((since, waiter))
         })
@@ -462,20 +464,30 @@ mod tests {
         let sentinel = "SENTINEL-private-brief-path";
         assert_eq!(
             agentctl_action(&arguments(&[
-                "/usr/local/bin/agentctl", "send", "liaison", "--file", sentinel,
+                "/usr/local/bin/agentctl",
+                "send",
+                "liaison",
+                "--file",
+                sentinel,
             ])),
             Some(("send".to_owned(), Some("liaison".to_owned())))
         );
         // Global options before the subcommand are skipped, value included.
         assert_eq!(
             agentctl_action(&arguments(&[
-                "agentctl", "--registry", "/some/registry", "console", "worker",
+                "agentctl",
+                "--registry",
+                "/some/registry",
+                "console",
+                "worker",
             ])),
             Some(("console".to_owned(), Some("worker".to_owned())))
         );
         // A subcommand that takes no agent names none, however it is invoked.
         assert_eq!(
-            agentctl_action(&arguments(&["agentctl", "chat", "run", "--token", sentinel])),
+            agentctl_action(&arguments(&[
+                "agentctl", "chat", "run", "--token", sentinel
+            ])),
             Some(("chat".to_owned(), None))
         );
         // Not an agentctl process: nothing is derived, whatever it runs.
@@ -511,7 +523,10 @@ mod tests {
         )
         .unwrap();
         assert!(!alarm.contains(sentinel), "{alarm}");
-        assert!(alarm.contains("PID 4242 (agentctl send liaison)"), "{alarm}");
+        assert!(
+            alarm.contains("PID 4242 (agentctl send liaison)"),
+            "{alarm}"
+        );
     }
 
     #[test]
