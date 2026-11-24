@@ -1339,7 +1339,7 @@ mod tests {
         assert_ne!(manifest_hash(&one), manifest_hash(&two));
     }
 
-    /// Host stub for epoch tests: the manager identity string and
+    /// Epoch test host: the manager identity string and
     /// the systemctl answer vary; the `/proc` ticks stay fixed.
     /// `run` records every call so a systemctl-dependent derivation
     /// is visible, and answers a monotonic-micros read.
