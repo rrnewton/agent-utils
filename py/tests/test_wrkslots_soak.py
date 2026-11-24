@@ -602,7 +602,13 @@ def _shadow_sandbox(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
     return root, log, project, tmp_path / "divergence.jsonl"
 
 
-def _shadow_run(root, log, project, divergence, **env):
+def _shadow_run(
+    root: Path,
+    log: Path,
+    project: Path,
+    divergence: Path,
+    **env: str,
+) -> subprocess.CompletedProcess[str]:
     return _run(
         root,
         log,

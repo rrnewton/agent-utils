@@ -30,19 +30,28 @@ def _load_helper() -> ModuleType:
 HELPER = _load_helper()
 
 
-def _compare(**overrides):
-    base = dict(
-        py_rc=0,
-        rs_rc=0,
-        rs_timed_out=False,
-        py_out='{"active": [], "heartbeat_age_seconds": 3}',
-        rs_out='{"heartbeat_age_seconds": 9, "active": []}',
-        rs_err="",
-        fp_before="abc",
-        fp_after="abc",
+def _compare(
+    *,
+    py_rc: int = 0,
+    rs_rc: int = 0,
+    rs_timed_out: bool = False,
+    py_out: str = '{"active": [], "heartbeat_age_seconds": 3}',
+    rs_out: str = '{"heartbeat_age_seconds": 9, "active": []}',
+    rs_err: str = "",
+    fp_before: str = "abc",
+    fp_after: str = "abc",
+) -> dict[str, object]:
+    result: dict[str, object] = HELPER.compare(
+        py_rc=py_rc,
+        rs_rc=rs_rc,
+        rs_timed_out=rs_timed_out,
+        py_out=py_out,
+        rs_out=rs_out,
+        rs_err=rs_err,
+        fp_before=fp_before,
+        fp_after=fp_after,
     )
-    base.update(overrides)
-    return HELPER.compare(**base)
+    return result
 
 
 def test_agree_after_scrub_and_key_order() -> None:
