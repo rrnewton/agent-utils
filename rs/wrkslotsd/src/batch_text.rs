@@ -139,6 +139,10 @@ pub(crate) fn validate_rows(value: &Value, format_json: bool) -> String {
         return pretty_json(value);
     }
     let mut out = String::new();
+    // Observed lock hold (#2125), as the Python `_emit` prints it.
+    if let Some(seconds) = value.get("lock_seconds").and_then(Value::as_f64) {
+        out.push_str(&format!("lock_seconds={seconds:.3}\n"));
+    }
     if let Some(rows) = value.get("rows").and_then(Value::as_array) {
         for row in rows {
             out.push_str(&format!(

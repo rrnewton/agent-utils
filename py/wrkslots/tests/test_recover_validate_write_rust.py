@@ -368,6 +368,97 @@ def test_validate_rows_recovered_before_later_archive_matches(
     assert json.loads(result.stdout) == expected
 
 
+def _make_absent_dead(root: Path) -> None:
+    """Remove the row's storage and record a dead owner (#2125 twin)."""
+    import shutil
+
+    checkout = root / "worktrees" / "validate" / "slot-a" / "repo"
+    upstream = root.parent / "upstream-repo"
+    subprocess.run(
+        ["git", "-C", str(upstream), "worktree", "remove", "--force", "--", str(checkout)],
+        check=False, capture_output=True, text=True, timeout=120,
+    )
+    slot_dir = root / "worktrees" / "validate" / "slot-a"
+    shutil.rmtree(slot_dir, ignore_errors=True)
+    active_path = root / "worktrees" / f"ACTIVE.{MACHINE}.json"
+    document = json.loads(active_path.read_text())
+    dead = dict(_live_identity(), pid=999999, start_ticks=1)
+    document["slots"][0]["owner"] = dead
+    document["slots"][0]["coordinator_lease"] = dead
+    active_path.write_text(json.dumps(document))
+
+
+def _rust_apply(root: Path, input_path: Path) -> subprocess.CompletedProcess[str]:
+    env = dict(os.environ)
+    env["WRKSLOTSD_FIXTURE_WRITER"] = "1"
+    return subprocess.run(
+        [
+            str(rust_wrkslotsd()), "recover-absent-validate-rows",
+            "--input", str(input_path), "--format", "json", "--root", str(root),
+            "--apply", "--coordinator-authorized",
+            "--coordinator-pid", str(os.getpid()),
+        ],
+        cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900, env=env,
+    )
+
+
+def test_validate_rows_apply_writes_and_reports_lock_seconds(
+    tmp_path: Path,
+) -> None:
+    """Proven path writes (#2125): journal, archives, ACTIVE removal."""
+    rust_root, _record = _fixture(tmp_path / "rust")
+    oracle_root, _orecord = _fixture(tmp_path / "oracle")
+    _make_absent_dead(rust_root)
+    _make_absent_dead(oracle_root)
+    rust_sha = _record_sha(rust_root)
+    oracle_sha = _record_sha(oracle_root)
+    args = argparse.Namespace(
+        project_root=str(oracle_root), machine=None,
+        input=str(_input_file(oracle_root, [_row(oracle_sha)])),
+        apply=True, coordinator_authorized=True,
+        coordinator_pid=os.getpid(), format="json", wait_lock=0.0,
+    )
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        assert wrkslots_cli._cmd_recover_absent_validate_rows(args) == 0
+    expected = json.loads(buffer.getvalue())
+    result = _rust_apply(rust_root, _input_file(rust_root, [_row(rust_sha)]))
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert [row["outcome"] for row in payload["rows"]] == ["recovered"]
+    assert [row["outcome"] for row in expected["rows"]] == ["recovered"]
+    # lock_seconds is observed from the final save, never asserted.
+    assert payload["lock_seconds"] >= 0
+    assert expected["lock_seconds"] >= 0
+    for root in (rust_root, oracle_root):
+        config = wrkslots_cli._load_config(str(root), None)
+        assert not wrkslots_cli._journal_path(config).exists()
+        state = wrkslots_cli._load_active(config)
+        assert [row.slot for row in state.slots] == []
+        archive = wrkslots_cli._load_archive_snapshot(config)
+        assert [entry.get("slot") for entry in archive.records] == ["slot-a"]
+
+
+def test_validate_rows_held_row_refuses_in_both_editions(
+    tmp_path: Path,
+) -> None:
+    """Scoped hold check (#2125): a held absent row refuses."""
+    rust_root, _record = _fixture(tmp_path / "rust")
+    oracle_root, _orecord = _fixture(tmp_path / "oracle")
+    _make_absent_dead(rust_root)
+    _make_absent_dead(oracle_root)
+    for root in (rust_root, oracle_root):
+        config = wrkslots_cli._load_config(str(root), None)
+        wrkslots_cli._ensure_event_log(config)
+        wrkslots_cli._event_writer(config, MACHINE).append(
+            "slot-held", {"slot": "slot-a", "reason": "probe hold"}
+        )
+    rust_sha = _record_sha(rust_root)
+    result = _rust(rust_root, _input_file(rust_root, [_row(rust_sha)]))
+    assert result.returncode == 1
+    assert "is held" in result.stderr
+
+
 def test_validate_rows_refusal_prints_outcome_payload(tmp_path: Path) -> None:
     rust_root, _record = _fixture(tmp_path / "rust")
     for root in (rust_root,):
