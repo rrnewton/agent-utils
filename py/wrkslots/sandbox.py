@@ -1544,12 +1544,20 @@ def _remount_tree_read_only(
     """
 
     failures: list[str] = []
-    # A remount by path reaches only the TOPMOST mount at that path, so use
-    # the flags of the last mountinfo row for each path (a stacked mount's
-    # locked flags differ from the one it covers).
-    topmost: dict[str, int] = {}
-    for point, flags in _mounts():
-        topmost[point] = flags
+    if strict_fd:
+        # Strict remounts preserve nothing but read-only (see
+        # _remount_read_only_strict), so only the point set matters; take
+        # it from the build's mount-id cache instead of re-reading the
+        # whole mount table for every bound entry.
+        points: Sequence[str] = list(_strict_mount_ids())
+        topmost: dict[str, int] = dict.fromkeys(points, 0)
+    else:
+        # A remount by path reaches only the TOPMOST mount at that path, so use
+        # the flags of the last mountinfo row for each path (a stacked mount's
+        # locked flags differ from the one it covers).
+        topmost = {}
+        for point, flags in _mounts():
+            topmost[point] = flags
     for point, flags in topmost.items():
         if not _under(point, [base]) or _under(point, keep) or point in keep_exact:
             continue
@@ -2163,21 +2171,53 @@ def _mount_ids_by_point() -> dict[str, list[int]]:
     return out
 
 
+#: Mount ids per point for the strict build in progress: read from the
+#: mount table ONCE, then extended with every mount the build itself
+#: makes (every mount the build makes stays mounted, so its id stays
+#: allocated and cannot be handed to a later clone). Re-reading the
+#: whole table for each of several hundred home binds made the root
+#: build take minutes on hosts with large mount tables (#2191); the
+#: final sweep and audits drop the cache and re-read fresh, so a mount
+#: that arrives from the host mid-build is still caught there.
+_STRICT_MOUNT_IDS: dict[str, list[int]] | None = None
+
+
+def _strict_mount_ids() -> dict[str, list[int]]:
+    global _STRICT_MOUNT_IDS
+    if _STRICT_MOUNT_IDS is None:
+        _STRICT_MOUNT_IDS = _mount_ids_by_point()
+    return _STRICT_MOUNT_IDS
+
+
+def _note_strict_mount(point: str, mount_id: int) -> None:
+    """Record a mount the strict build just made in the build's table."""
+
+    if _STRICT_MOUNT_IDS is not None:
+        _STRICT_MOUNT_IDS.setdefault(point, []).append(mount_id)
+
+
+def _drop_strict_mount_ids() -> None:
+    global _STRICT_MOUNT_IDS
+    _STRICT_MOUNT_IDS = None
+
+
 def _bind_fd_strict(source_fd: int, target: str, roots: Sequence[str] = ()) -> None:
     source_info = os.fstat(source_fd)
     is_directory = stat.S_ISDIR(source_info.st_mode)
-    before = _mount_ids_by_point().get(target, [])
+    before = _strict_mount_ids().get(target, [])
     target_fd = _resolve_fd(target, roots, create="dir" if is_directory else "file", target=True)
     try:
         mount_id = _bind_resolved_fd(source_fd, target_fd)
     finally:
         os.close(target_fd)
-    # The tree we moved was cloned from the pinned source fd, so a
-    # fresh mount id at the point proves the bind landed there; the
-    # name may already be covered (a scratch root under /tmp), which
-    # is why this reads the mount table, not the path.
-    if not any(identifier not in before for identifier in _mount_ids_by_point().get(target, [])):
+    # The tree we moved was cloned from the pinned source fd, so its
+    # own mount id (captured from the open_tree fd before the move)
+    # proves the bind landed at the target: a stale id, already known
+    # at the point before the move, refuses instead of trusting that
+    # something is mounted there.
+    if mount_id in before:
         raise SandboxError(f"built view mounts do not match: bind {target} did not land; refusing")
+    _note_strict_mount(target, mount_id)
     _STRICT_BIND_RECORDS.append(
         {"target": target, "dev": source_info.st_dev, "ino": source_info.st_ino, "mount_id": mount_id}
     )
@@ -2219,9 +2259,10 @@ def _mount_tmpfs_strict(target: str, data: str | None, flags: int, roots: Sequen
     # spec-chosen target, so it may resolve from "/" itself.
     target_fd = _resolve_fd(target, roots, allow_unrooted=target == "/tmp", target=True)
     try:
-        _mount_tmpfs_fd(target_fd, data, flags)
+        mount_id = _mount_tmpfs_fd(target_fd, data, flags)
     finally:
         os.close(target_fd)
+    _note_strict_mount(target, mount_id)
     _drop_cached_roots_at_or_below(target)
     if target == "/tmp":
         # By name, not through the cached host fd: this must name the
@@ -2272,10 +2313,11 @@ def _mount_at_fd_strict(
     source_fd = _resolve_fd(source, roots, allow_unrooted=source == "/dev/null")
     target_fd = _resolve_fd(target, roots, target=True)
     try:
-        _bind_resolved_fd(source_fd, target_fd, recursive=False)
+        mount_id = _bind_resolved_fd(source_fd, target_fd, recursive=False)
     finally:
         os.close(source_fd)
         os.close(target_fd)
+    _note_strict_mount(target, mount_id)
     _drop_cached_roots_at_or_below(target)
 
 
@@ -2310,6 +2352,7 @@ def _mask_strict(path: str, roots: Sequence[str] = ()) -> tuple[str, str, int] |
                 os.close(source_fd)
     finally:
         os.close(descriptor)
+    _note_strict_mount(path, mount_id)
     _drop_cached_roots_at_or_below(path)
     if not is_directory:
         _remount_read_only_strict(path, None, roots)
@@ -2599,6 +2642,7 @@ def build_view(spec: Mapping[str, object], *, strict_fd: bool = False, strict_ro
     if strict_fd:
         _STRICT_BIND_RECORDS.clear()
         _STRICT_MASK_RECORDS.clear()
+        _drop_strict_mount_ids()
         _require_fd_mount_syscalls()
         _cache_strict_roots(strict_roots)
         slash_fd = _resolve_fd("/", strict_roots)
@@ -2724,6 +2768,12 @@ def build_view(spec: Mapping[str, object], *, strict_fd: bool = False, strict_ro
     # 6. Everything else read-only. The layer mount is skipped by its EXACT
     # path only: the read-only binds below it must not be skipped with it.
     if spec.get("protect_system", True):
+        if strict_fd:
+            # The sweep judges the finished view, not the build's
+            # running table: drop the cache so it (and the audit below)
+            # re-read the mount table fresh and catch any mount that
+            # arrived from the host while the view was being built.
+            _drop_strict_mount_ids()
         keep = [*(target for _source, target in binds), "/tmp", *_ALWAYS_WRITABLE_PREFIXES]
         if isinstance(spec.get("eden_backing"), str):
             # The backing skeleton stays writable for Sapling's shared-dir
@@ -3666,7 +3716,11 @@ def userns_helper(spec: Mapping[str, object], command: Sequence[str]) -> list[st
 
 #: Version of the root-helper protocol in this file. The launcher refuses
 #: an installed copy whose version differs (#1583, review finding 5).
-_HELPER_VERSION = "2"
+#: Version 3 is the first whose strict build reads the mount table once
+#: per build; version 2 helpers take minutes to build a view on hosts
+#: with many home entries and mounts, which looks like a hang (#2191),
+#: so they must refuse rather than run.
+_HELPER_VERSION = "3"
 
 
 def _installed_helper_version(path: Path) -> str | None:
@@ -3693,7 +3747,8 @@ def root_helper() -> list[str]:
     if _INSTALLED_HELPER.is_file():
         if _installed_helper_version(_INSTALLED_HELPER) != _HELPER_VERSION:
             raise SandboxError(
-                f"installed root helper {_INSTALLED_HELPER} is not version {_HELPER_VERSION}; refusing"
+                f"installed root helper {_INSTALLED_HELPER} is not version {_HELPER_VERSION}; refusing. "
+                f"Reinstall it as root with: sudo install -o root -g root -m 0755 {script} {_INSTALLED_HELPER}"
             )
         script = _INSTALLED_HELPER
     elif os.environ.get("WRKSLOTS_ALLOW_CHECKOUT_HELPER") != "1":
@@ -3851,33 +3906,42 @@ def place_in_scope(unit: str, slice_unit: str) -> bool:
 
     if shutil.which("busctl") is None:
         return False
-    result = subprocess.run(
-        [
-            "busctl",
-            "--user",
-            "call",
-            "org.freedesktop.systemd1",
-            "/org/freedesktop/systemd1",
-            "org.freedesktop.systemd1.Manager",
-            "StartTransientUnit",
-            "ssa(sv)a(sa(sv))",
-            unit,
-            "fail",
-            "2",
-            "PIDs",
-            "au",
-            "1",
-            str(os.getpid()),
-            "Slice",
-            "s",
-            slice_unit,
-            "0",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
+    result: subprocess.CompletedProcess[str] | None = None
+    try:
+        result = subprocess.run(
+            [
+                "busctl",
+                "--user",
+                "call",
+                "org.freedesktop.systemd1",
+                "/org/freedesktop/systemd1",
+                "org.freedesktop.systemd1.Manager",
+                "StartTransientUnit",
+                "ssa(sv)a(sa(sv))",
+                unit,
+                "fail",
+                "2",
+                "PIDs",
+                "au",
+                "1",
+                str(os.getpid()),
+                "Slice",
+                "s",
+                slice_unit,
+                "0",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        # A user manager that never answers must not wedge the launch
+        # before anything runs (#2191). The request may still have
+        # landed, so let the cgroup poll below decide; otherwise the
+        # caller falls back to systemd-run.
+        result = None
+    if result is not None and result.returncode != 0:
         return False
     for _ in range(100):
         try:

@@ -699,3 +699,127 @@ def test_seal_and_dumpable_are_pinned() -> None:
     assert "_PR_SET_DUMPABLE, 1" not in source
     # (a): root mode is sealed; harness setuid steps fail honestly there.
     assert "_prctl(_PR_SET_NO_NEW_PRIVS, 1)" in source
+
+
+def test_strict_build_reads_the_mount_table_a_constant_number_of_times() -> None:
+    # #2191: the strict build used to re-read and re-parse all of
+    # /proc/self/mountinfo twice per home bind (plus once per tree
+    # remount), so a real $HOME with hundreds of entries on a host with
+    # a large mount table took minutes and the box looked hung. The
+    # build now reads the table a constant number of times however
+    # many entries it binds.
+    import shutil
+    import tempfile
+
+    py = str(Path(__file__).resolve().parents[2])
+    script = r'''
+import os, sys
+sys.path.insert(0, sys.argv[1])
+from wrkslots import sandbox
+base = sys.argv[2]
+uid, gid = os.getuid(), os.getgid()
+sandbox._check(sandbox._libc().unshare(sandbox._CLONE_NEWUSER | sandbox._CLONE_NEWNS), "unshare")
+sandbox._write("/proc/self/setgroups", "deny")
+sandbox._write("/proc/self/uid_map", f"{uid} {uid} 1\n")
+sandbox._write("/proc/self/gid_map", f"{gid} {gid} 1\n")
+reads = [0]
+real_ids = sandbox._mount_ids_by_point
+real_mounts = sandbox._mounts
+def counting_ids():
+    reads[0] += 1
+    return real_ids()
+def counting_mounts():
+    reads[0] += 1
+    return real_mounts()
+sandbox._mount_ids_by_point = counting_ids
+sandbox._mounts = counting_mounts
+entries = [f"e{index:02d}" for index in range(40)]
+spec = {
+    "home": os.path.join(base, "home"), "home_layer": os.path.join(base, "layer"),
+    "home_mode": "ro", "home_aliases": [], "home_binds": entries, "read_only": [],
+    "binds": [], "masks": [], "tmp_size": "64M",
+    "protect_system": True, "propagate": [], "cwd": base,
+}
+sandbox.build_view(spec, strict_fd=True, strict_roots=[base])
+assert open(os.path.join(base, "home", "e07", "file"), encoding="utf-8").read() == "x"
+try:
+    open(os.path.join(base, "home", "e07", "new"), "w", encoding="utf-8").write("no")
+except OSError:
+    pass
+else:
+    raise AssertionError("a bound home entry stayed writable")
+assert reads[0] <= 4, f"mount table read {reads[0]} times for 40 home binds"
+print(f"MOUNT-READS-OK reads={reads[0]}")
+'''
+    base = Path(tempfile.mkdtemp(prefix="wrkslots-strict-", dir="/var/tmp"))
+    try:
+        for index in range(40):
+            entry = base / "home" / f"e{index:02d}"
+            entry.mkdir(parents=True)
+            (entry / "file").write_text("x", encoding="utf-8")
+            (base / "layer" / f"e{index:02d}").mkdir(parents=True)
+        completed = _userns_completed(script, py, str(base))
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+    assert completed.returncode == 0, completed.stderr
+    assert "MOUNT-READS-OK" in completed.stdout
+
+
+def test_strict_bind_with_a_stale_mount_id_is_refused() -> None:
+    # #2191: the build's mount table is cached, so the bind proof must
+    # fail closed: a mount id that was already known at the target
+    # before the move is not proof the bind landed, and the build
+    # refuses instead of leaving the entry unprotected.
+    import shutil
+    import tempfile
+
+    py = str(Path(__file__).resolve().parents[2])
+    script = r'''
+import os, sys
+sys.path.insert(0, sys.argv[1])
+from wrkslots import sandbox
+base = sys.argv[2]
+uid, gid = os.getuid(), os.getgid()
+sandbox._check(sandbox._libc().unshare(sandbox._CLONE_NEWUSER | sandbox._CLONE_NEWNS), "unshare")
+sandbox._write("/proc/self/setgroups", "deny")
+sandbox._write("/proc/self/uid_map", f"{uid} {uid} 1\n")
+sandbox._write("/proc/self/gid_map", f"{gid} {gid} 1\n")
+src = os.path.join(base, "src")
+dst = os.path.join(base, "dst")
+dst2 = os.path.join(base, "dst2")
+# A real mount already sits at dst, so the build's table knows its id.
+sandbox._mount("tmpfs", dst, "tmpfs", 0, "size=1m")
+known = sandbox._mount_ids_by_point()[dst][0]
+real_bind = sandbox._bind_resolved_fd
+sandbox._bind_resolved_fd = lambda source_fd, target_fd, recursive=True: known
+try:
+    source_fd = sandbox._resolve_fd(src, [base])
+    try:
+        sandbox._bind_fd_strict(source_fd, dst, [base])
+    finally:
+        os.close(source_fd)
+except sandbox.SandboxError:
+    print("STALE-ID-REFUSED")
+else:
+    raise AssertionError("a bind whose mount id was already known at the target was trusted")
+sandbox._bind_resolved_fd = real_bind
+source_fd = sandbox._resolve_fd(src, [base])
+try:
+    sandbox._bind_fd_strict(source_fd, dst2, [base])
+finally:
+    os.close(source_fd)
+assert open(os.path.join(dst2, "marker"), encoding="utf-8").read() == "src"
+print("FRESH-ID-OK")
+'''
+    base = Path(tempfile.mkdtemp(prefix="wrkslots-strict-", dir="/var/tmp"))
+    try:
+        (base / "src").mkdir(parents=True)
+        (base / "src" / "marker").write_text("src", encoding="utf-8")
+        (base / "dst").mkdir()
+        (base / "dst2").mkdir()
+        completed = _userns_completed(script, py, str(base))
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+    assert completed.returncode == 0, completed.stderr
+    assert "STALE-ID-REFUSED" in completed.stdout
+    assert "FRESH-ID-OK" in completed.stdout
