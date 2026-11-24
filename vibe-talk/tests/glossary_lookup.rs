@@ -473,7 +473,10 @@ async fn link_keys_are_real_targets_only_and_a_miss_says_so_plainly() {
     // Author-handle noise ("claude-integ8" from a header line) must never
     // become a link key; a real id (TKT-101) must. The miss names the
     // human search forms and notes there was nothing to follow.
-    let backend = backend_with(vec![message(1, "TKT-101 is the tracking ticket for the rollout")]);
+    let backend = backend_with(vec![message(
+        1,
+        "TKT-101 is the tracking ticket for the rollout",
+    )]);
     let (state, summarizer, _dir) = cached_state(backend.clone(), true).await;
     fill(&state).await;
     summarizer.answer_with("{\"term\": null}");
