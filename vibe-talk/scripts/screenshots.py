@@ -5262,6 +5262,8 @@ def _act_search_bucket_fold(driver: Driver) -> None:
     # bucket holds no FRESH hit never stands at all, and that absence is
     # exactly what the before frame must show. The expects say what the
     # fixed build stands; the act only has to arrive.
+    # The frame is the head of the results, as a search lands: from the top.
+    driver.js("document.getElementById('scroll-area').scrollTop = 0")
     driver.settle(300)
 
 

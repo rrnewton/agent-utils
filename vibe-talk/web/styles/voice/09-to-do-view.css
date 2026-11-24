@@ -1287,6 +1287,15 @@
   --bucket-head: 3.7rem;
 }
 
+/* `#2200`: at phone width the chips can wrap to a second row; the head
+   room carries both rows, so the first result never stands under the
+   panel however the chips fall. */
+@media (max-width: 480px) {
+  #screen-main[data-searching]:has(> #channel-freshness-anchor .search-bucket-chip:not([hidden])) {
+    --bucket-head: calc(3.7rem + 2.9rem);
+  }
+}
+
 #search-bucket-row:not([hidden]) {
   position: absolute;
   top: calc(var(--search-bar) / 2 + 0.35rem);
