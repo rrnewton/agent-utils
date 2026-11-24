@@ -14,11 +14,10 @@ StartLimitBurst=3
 
 [Service]
 Type=oneshot
-ExecStart=@AGENTCTL@ --registry @REGISTRY@ --herdr-bin @HERDR@ start-recovery@WRAPPER_ARG@
-# Covers the incident bound (120 minutes of rounds) plus one final
-# escalation attempt; the loop gives up and stamps on its own bounds
-# long before systemd needs this watchdog.
-TimeoutStartSec=7800
+ExecStart=@AGENTCTL@ --registry @REGISTRY@ --herdr-bin @HERDR@ start-recovery@WRAPPER_ARG@@STATE_ARG@
+# start-recovery claims and launches, then returns; this bounds the
+# claim and launch only, never the incident (the supervisor detaches).
+TimeoutStartSec=300
 KillMode=process
 SuccessExitStatus=75
 StandardOutput=journal

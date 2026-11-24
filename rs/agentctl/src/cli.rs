@@ -1136,7 +1136,7 @@ struct InstallUnits {
     #[arg(long, conflicts_with_all = ["bridge_unit", "bridge", "headless", "scheduled", "teams_config"])]
     tab_hygiene: bool,
     /// Write only agentctl-shepherd.service, the always-on boot unit that runs `agentctl team shepherd` for this registry (#1559), instead of the restore units; with --teams-config PATH the unit also judges those teams read-only. Writes the file only and never enables, starts, or reloads anything: the operator enables it deliberately. Example: agentctl --registry ~/project/.agentctl install-units --dest ~/.config/systemd/user --shepherd
-    #[arg(long, conflicts_with_all = ["bridge_unit", "bridge", "headless", "scheduled"])]
+    #[arg(long, conflicts_with_all = ["bridge_unit", "bridge", "headless", "scheduled", "teams_config"])]
     shepherd: bool,
 }
 
@@ -5420,6 +5420,13 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                         let herdr_bin = resolve_herdr_bin(&args.registry, &args.herdr_bin);
                         let agentctl = std::env::current_exe()
                             .map_err(|error| Failure::Usage(error.to_string()))?;
+                        let resolved_wrapper =
+                            crate::team_shepherd::resolve_wrapper(&wrapper).ok_or_else(|| {
+                                Failure::Usage(
+                                    "run-agent-prompt is not resolvable to an absolute executable; pass --run-agent-prompt with an absolute path"
+                                        .to_owned(),
+                                )
+                            })?;
                         report["unit"] = crate::units::install_shepherd(
                             &crate::units::InstallOptions {
                                 dest,
@@ -5431,10 +5438,8 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                                 dry_run: false,
                                 force: false,
                             },
-                            Some(
-                                &std::path::absolute(&wrapper)
-                                    .map_err(|error| Failure::Usage(error.to_string()))?,
-                            ),
+                            Some(&resolved_wrapper),
+                            install.state_dir.as_deref(),
                         )?;
                     }
                     let (smoke, code) = crate::team_shepherd::smoke_profiles(
@@ -5580,6 +5585,8 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 return Ok(0);
             }
             if value.shepherd {
+                let resolved_wrapper =
+                    crate::team_shepherd::resolve_wrapper(Path::new("run-agent-prompt"));
                 write_json(&crate::units::install_shepherd(
                     &crate::units::InstallOptions {
                         dest: value.dest,
@@ -5590,13 +5597,8 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                         dry_run: value.dry_run,
                         force: value.force,
                     },
-                    std::env::var_os("PATH")
-                        .and_then(|path| {
-                            std::env::split_paths(&path)
-                                .map(|dir| dir.join("run-agent-prompt"))
-                                .find(|candidate| candidate.is_file())
-                        })
-                        .as_deref(),
+                    resolved_wrapper.as_deref(),
+                    None,
                 )?)
                 .map_err(Failure::Output)?;
                 return Ok(0);

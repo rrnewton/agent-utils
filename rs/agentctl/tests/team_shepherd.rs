@@ -70,10 +70,22 @@ fn group_exists(pgid: u32) -> bool {
 }
 
 impl GroupGuard {
-    /// Kill the group once, only while membership is verifiable.
+    /// Kill the group once, only while membership is verifiable:
+    /// TERM first so the wrapper can clean up its own harness
+    /// sessions, a short grace, then KILL what remains.
     fn kill_group(&self) {
         if !self.armed.replace(false) {
             return;
+        }
+        if !group_exists(self.pgid) {
+            return;
+        }
+        let _ = Command::new("kill")
+            .args(["-TERM", &format!("-{}", self.pgid)])
+            .status();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while group_exists(self.pgid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
         if group_exists(self.pgid) {
             let _ = Command::new("kill")
@@ -141,7 +153,7 @@ impl Scratch {
         for guard in self.groups.borrow().iter() {
             guard.kill_group();
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         loop {
             let survivors = scratch_processes(&self.root);
             if survivors.is_empty() {
@@ -183,6 +195,13 @@ impl Scratch {
         // proposal, codex must never be reached.
         let bin = scratch.root.join("fakebin");
         fs::create_dir_all(&bin).expect("fake bin");
+        // A fifo the slow fake blocks on: condition-based, never a
+        // wall-clock race (NS5).
+        let fifo = Command::new("mkfifo")
+            .arg(bin.join("muse.fifo"))
+            .status()
+            .expect("mkfifo");
+        assert!(fifo.success());
         install_executable(&scratch.root.join("herdr"), FAKE_HERDR);
         // The wrapper gives each attempt an explicit-name environment,
         // so the fakes log to this scratch path baked into the script.
@@ -194,10 +213,11 @@ impl Scratch {
                  open({log:?}, 'a').write('muse\\n')\n\
                  prompt = open(sys.argv[sys.argv.index('--prompt-file') + 1]).read()\n\
                  if 'agentctl-recovery-smoke' not in prompt:\n\
-                 \ttime.sleep(3)\n\
+                 \topen({fifo:?}).read()\n\
                  text = '{{\"marker\": \"agentctl-recovery-smoke\"}}' if 'agentctl-recovery-smoke' in prompt else 'slow'\n\
                  print(json.dumps({{'payload': {{'kind': 'run_terminal', 'terminal': 'completed', 'reason': None, 'text': text}}}}))\n",
-                log = log.display().to_string()
+                log = log.display().to_string(),
+                fifo = bin.join("muse.fifo").display().to_string()
             ),
         );
         install_executable(
@@ -361,7 +381,7 @@ impl Scratch {
                 "--no-progress-rounds",
                 "2",
                 "--call-timeout-seconds",
-                "1",
+                "120",
                 "--act-wait-seconds",
                 "0",
                 "--run-agent-prompt",
@@ -815,5 +835,67 @@ fn generated_unit_execstart_actually_starts_recovery() {
     let (code, report) = scratch.run_agentctl(&tokens[1..]);
     assert_eq!(code, 0, "generated ExecStart failed: {report}");
     assert_eq!(report["status"], "started", "{report}");
+    scratch.reap();
+}
+
+#[test]
+fn no_progress_bound_stops_early_after_restore_settles() {
+    let scratch = Scratch::new("noprogress");
+    let state = scratch.root.join("state");
+    let (code, report) = scratch.run_shepherd(&state, &wrapper());
+    assert_eq!(code, 75, "{report}");
+    let stamp = scratch.stamp(&state);
+    // max-rounds is 3 in run_shepherd; use the stamp of a dedicated
+    // run below for the early-stop proof.
+    assert_eq!(stamp["verdict"], "GAVE-UP");
+    scratch.reap();
+
+    // Dedicated run: max-rounds 6, no-progress 1 — the loop must stop
+    // well before 6 once facts stop changing (S2/NB1 settle grace).
+    let scratch = Scratch::new("noprogress2");
+    let state = scratch.root.join("state");
+    let mut args = scratch.base_args();
+    args.extend([
+        "team".to_owned(),
+        "shepherd".to_owned(),
+        "--state-dir".to_owned(),
+        state.display().to_string(),
+        "--max-rounds".to_owned(),
+        "6".to_owned(),
+        "--no-progress-rounds".to_owned(),
+        "1".to_owned(),
+        "--round-delay-seconds".to_owned(),
+        "0".to_owned(),
+        "--call-timeout-seconds".to_owned(),
+        "120".to_owned(),
+        "--run-agent-prompt".to_owned(),
+        wrapper().display().to_string(),
+    ]);
+    let (code, report) = scratch.run_agentctl(&args);
+    assert_eq!(code, 75, "{report}");
+    assert!(
+        report["rounds"].as_u64().expect("rounds") < 6,
+        "no-progress bound never fired: {report}"
+    );
+    scratch.reap();
+}
+
+#[test]
+fn tampered_profiles_lose_judgement() {
+    let scratch = Scratch::new("tamper");
+    let state = scratch.root.join("state");
+    scratch.install_profiles(&state);
+    // Change a model after the smoke: the record no longer binds.
+    let path = scratch.root.join("own/recovery-profiles.toml");
+    let text = fs::read_to_string(&path).expect("profiles");
+    fs::write(&path, text.replace("slow-muse", "slow-muse-two")).expect("tamper");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("mode");
+    let _ = fs::remove_file(scratch.root.join("harness.log"));
+    let (code, report) = scratch.run_shepherd(&state, &wrapper());
+    assert_eq!(code, 75, "{report}");
+    assert!(
+        !scratch.root.join("harness.log").exists(),
+        "wrapper consulted on a stale smoke record"
+    );
     scratch.reap();
 }

@@ -446,6 +446,7 @@ pub fn install_restore_teams(options: &InstallOptions, teams_config: &Path) -> R
 pub fn rendered_shepherd(
     options: &InstallOptions,
     wrapper: Option<&Path>,
+    state_dir: Option<&Path>,
 ) -> Result<(PathBuf, String)> {
     let agentctl = unit_path("agentctl", &options.agentctl)?;
     let registry = unit_path("registry", &options.registry)?;
@@ -463,21 +464,30 @@ pub fn rendered_shepherd(
         ),
         None => String::new(),
     };
+    let state_arg = match state_dir {
+        Some(path) => format!(" --state-dir {}", unit_path("state dir", path)?),
+        None => String::new(),
+    };
     Ok((
         PathBuf::from(name),
         SHEPHERD
             .replace("@AGENTCTL@", &agentctl)
             .replace("@REGISTRY@", &registry)
             .replace("@HERDR@", &herdr)
-            .replace("@WRAPPER_ARG@", &wrapper_arg),
+            .replace("@WRAPPER_ARG@", &wrapper_arg)
+            .replace("@STATE_ARG@", &state_arg),
     ))
 }
 
 /// Write only this registry's `agentctl-shepherd-<key>.service`;
 /// refuse to replace a different existing file without `force`.
 /// Enables and starts nothing: the operator enables it deliberately.
-pub fn install_shepherd(options: &InstallOptions, wrapper: Option<&Path>) -> Result<Value> {
-    let file = rendered_shepherd(options, wrapper)?;
+pub fn install_shepherd(
+    options: &InstallOptions,
+    wrapper: Option<&Path>,
+    state_dir: Option<&Path>,
+) -> Result<Value> {
+    let file = rendered_shepherd(options, wrapper, state_dir)?;
     let unit = file.0.display().to_string();
     let (written, unchanged) = write_files(options, &[file])?;
     Ok(json!({
