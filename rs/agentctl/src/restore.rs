@@ -1275,7 +1275,13 @@ impl Host for SystemHost {
             Duration::from_secs(30),
         );
         let _ = self.run(
-            &strings(&[&systemctl_program(), "--user", "reset-failed", &timer, &service]),
+            &strings(&[
+                &systemctl_program(),
+                "--user",
+                "reset-failed",
+                &timer,
+                &service,
+            ]),
             None,
             Duration::from_secs(30),
         );
@@ -4421,7 +4427,13 @@ fn show_once(
     unit: &str,
     keys: &[&str],
 ) -> std::result::Result<BTreeMap<String, String>, String> {
-    let mut argv = strings(&[&systemctl_program(), "--user", "show", unit, "--timestamp=unix"]);
+    let mut argv = strings(&[
+        &systemctl_program(),
+        "--user",
+        "show",
+        unit,
+        "--timestamp=unix",
+    ]);
     for key in keys {
         argv.push("-p".to_owned());
         argv.push((*key).to_owned());
