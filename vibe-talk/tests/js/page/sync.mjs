@@ -2632,7 +2632,13 @@ test("THE SCROLLER IS SIZED BY ITS CELL ALONE, so a change beside it does not la
   // no more than Discuss's bars do.
   assert.match(cssBlock(".thread-picker-group"), /position:\s*sticky/, "the THREADS heading does not stick in its pane");
   const withoutPickerGroup = withoutComposer.replace(/\.thread-picker-group\s*\{[^}]*\}/, " ");
-  assert.doesNotMatch(withoutPickerGroup, /position:\s*(fixed|sticky)/, "something now escapes the scroller's containment");
+  // The theme preview's exception (`#2155` sticky preview): `#theme-preview-slot`
+  // sticks (phone) or floats fixed (desk) inside Settings, outside #scroll-area,
+  // so it hangs off the list no more than Discuss's bars do.
+  const withoutPreview = withoutPickerGroup
+    .replace(/#theme-preview-slot\s*\{[^}]*\}/, " ")
+    .replace(/#theme-preview-slot\s*\{[^}]*position:\s*fixed[^}]*\}/, " ");
+  assert.doesNotMatch(withoutPreview, /position:\s*(fixed|sticky)/, "something now escapes the scroller's containment");
 });
 
 test("A HIDDEN PAGE POLLS NOTHING: the poll waits for it to come back, and one that came due meanwhile runs then", async () => {
