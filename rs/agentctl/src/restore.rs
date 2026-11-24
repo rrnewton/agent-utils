@@ -1202,7 +1202,7 @@ impl Host for SystemHost {
         let uid = unsafe { libc::getuid() };
         let outcome = self.run(
             &strings(&[
-                "systemctl",
+                &systemctl_program(),
                 "show",
                 &format!("user@{uid}.service"),
                 "--property=ActiveEnterTimestampMonotonic",

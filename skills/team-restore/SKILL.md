@@ -130,7 +130,8 @@ It runs on the agents host in the host PID namespace (restore refuses descendant
 `--foreground` is for a supervised process there, not for an isolated container. It
 claims one incident per restore epoch (the kernel boot plus the user-manager identity, the same
 epoch the restore replay guard uses — a claim from a previous boot never blocks), launches
-deterministic restore and the recovery supervisor together, and returns. A second live call joins
+the recovery supervisor, which spawns and owns the restore child,
+and returns. A second live call joins
 and starts nothing (exit 75). `--foreground` stays with the supervisor, for containers and manual
 runs. Inside the incident, each round:
 
@@ -143,7 +144,9 @@ runs. Inside the incident, each round:
 3. asks one stateless one-shot through the team's ordered harness/model profiles
    (`REGISTRY/recovery-profiles.toml`, tried in file order through `run-agent-prompt`) to judge the
    manifest, and accepts at most one own-team `team act` proposal from its final JSON line — every
-   effect goes through `team act`, so the driver validates, persists and re-verifies it.
+   effect goes through `team act --enqueue-only`, which only records the request — the
+   shepherd never kicks or runs a driver; the driver validates, persists and re-verifies
+   it from its own paths.
 
 It finishes only on the deterministic YES of section 4 (lead running, bridge healthy, handoff acked,
 each an explicit pass; held/skipped never count), or on bounded give-up (20 rounds / 120 min by
@@ -155,7 +158,8 @@ stamp without acting. If every profile is down while the checks pass, the stamp 
 structured round trip per profile (recorded in `install-smoke.json`); judgement runs only on a
 current all-pass smoke record. The optional boot unit comes from
 `agentctl --registry R install-units --dest ~/.config/systemd/user --shepherd`: installing writes
-`agentctl-shepherd.service` (a thin `start-recovery` caller) only and never enables it — the
+the per-registry `agentctl-shepherd-<key>.service` (a thin `start-recovery` caller)
+only and never enables it — the
 operator reviews and enables it deliberately.
 
 ## 4. Verify: a restore isn't done until all of these hold

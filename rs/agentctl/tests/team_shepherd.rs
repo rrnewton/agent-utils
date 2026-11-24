@@ -546,6 +546,12 @@ fn shepherd_drill_gives_up_bounded_and_judges_cross_team_read_only() {
         systemd_log.contains("systemd-run") || systemd_log.contains("systemctl"),
         "{systemd_log}"
     );
+    // Enqueue-only acts: the shepherd never starts a unit or arms a
+    // wake timer (blocker: acts must not kick).
+    assert!(
+        !systemd_log.contains("--user start") && !systemd_log.contains("--on-active"),
+        "shepherd acts kicked a driver: {systemd_log}"
+    );
     // One incident per epoch: a rerun reports the stamp, repeats nothing.
     let before = fs::read_to_string(scratch.root.join("harness.log")).expect("log");
     let (code, report) = scratch.run_shepherd(&state, &wrapper());
@@ -941,6 +947,8 @@ fn tampered_profiles_lose_judgement() {
     scratch.reap();
 }
 
+const DRILL_CERT: &str = "-----BEGIN CERTIFICATE-----\nMIIDATCCAemgAwIBAgIUWgamaOG2iz+doY19sRp6IRDQmoswDQYJKoZIhvcNAQEL\nBQAwEDEOMAwGA1UEAwwFZHJpbGwwHhcNMjYxMTI0MDkwNDMyWhcNMzYxMTIxMDkw\nNDMyWjAQMQ4wDAYDVQQDDAVkcmlsbDCCASIwDQYJKoZIhvcNAQEBBQADggEPADCC\nAQoCggEBAJh2L3kf3aOhenj7emkvKwHrCbrK/bWsmafTnvtfKVJarVw45wlHHGqa\nQ8S8FAa7n9Pv7UXeguA4s3/e6ggFLqObdmERPYUCgWjY9dJ40ZFJIdyLVbTUBooC\ncIM4FCelRkfiWQVjdTzV32KnGw5JwOq/1+gza5kFFtfpIETTvaCBkFIMVtwDJZXH\n9jO9NAudz7w1xE7WtUezJKcDtRZovq9j7NNYq6HRKTORvIv86WXV7CVRKtP6rzKZ\nrpaPA5nfwfHdRN4X7DzVJIhqOaD7D5gDm356+wkgixNckaqeSE2hCQnWdD3hed/k\ns1DAlgx6/wLoaSQiC9ULam1IRwinRUkCAwEAAaNTMFEwHQYDVR0OBBYEFKN7YFg6\nuEYm63WqvFGV30/usbWEMB8GA1UdIwQYMBaAFKN7YFg6uEYm63WqvFGV30/usbWE\nMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggEBAHBCfCauWKMos9VQ\ndMrdMM9uwM8+b8c9DYvVu8e4FdssSL7vQ5Yh5c1OB/w6rwrgDX9SlhDMuMp9veVq\nGTaiov+T2U6svWjS3GQ08Aq4SpJ8jN07dGzMYPEfftSD5VxONC90+EqCE1wXK/zh\nW7K2D3r2szN713uUjkhqMn3vi0FibkY47g3+c8zwTJ2Ox4Ly/60ccVndeKGc9QaX\nOaZ7moR4Pa0yNyxfgkFKRclpNv+WP/yKztpTJnQd3I0kGFfiFLJYzMoIsj8thRzu\n8bJBaKRp8ZcFxj3+TFGvUVbYrqfVJ6zskZa/gSJqZDoaBZpDojpWONk5HjJFBd59\ngjziovY=\n-----END CERTIFICATE-----\n";
+
 #[test]
 fn blocking_restore_blocks_stamp_and_acts_until_released() {
     use std::os::unix::process::CommandExt;
@@ -997,18 +1005,40 @@ fn blocking_restore_blocks_stamp_and_acts_until_released() {
         pgid: child.id(),
         armed: std::cell::Cell::new(true),
     });
-    // While the restore waits: no stamp, whatever the rounds do.
+    // While the restore waits: wait on the condition (the recorded
+    // restore child in the supervisor state), never a fixed sleep.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    let mut saw_restore_record = false;
-    while std::time::Instant::now() < deadline {
-        if state.join("shepherd").exists() {
-            saw_restore_record = true;
-            break;
+    fn recorded_child(dir: &Path) -> bool {
+        if !dir.exists() {
+            return false;
         }
+        for entry in fs::read_dir(dir).expect("read state") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() && recorded_child(&path) {
+                return true;
+            }
+            if path.file_name().is_some_and(|name| name == "state.json") {
+                if let Ok(text) = fs::read_to_string(&path) {
+                    if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                        if value["restore_pid"].as_u64().is_some_and(|pid| pid != 0) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+    while !recorded_child(&state.join("shepherd")) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "supervisor never recorded its restore child"
+        );
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
-    assert!(saw_restore_record, "supervisor never started");
-    std::thread::sleep(std::time::Duration::from_secs(5));
+    // Several rounds pass with the child recorded; still no stamp
+    // and no unit start from any act.
+    std::thread::sleep(std::time::Duration::from_secs(3));
     fn any_stamp(dir: &Path) -> bool {
         if !dir.exists() {
             return false;
@@ -1028,27 +1058,9 @@ fn blocking_restore_blocks_stamp_and_acts_until_released() {
         !any_stamp(&state.join("shepherd")),
         "stamped while its restore was still blocked"
     );
-    // Release the restore with a real (throwaway) certificate; the
-    // incident may now finish and stamp.
-    let made = Command::new("openssl")
-        .args([
-            "req",
-            "-x509",
-            "-newkey",
-            "rsa:2048",
-            "-nodes",
-            "-subj",
-            "/CN=drill",
-            "-days",
-            "1",
-            "-keyout",
-        ])
-        .arg(scratch.root.join("cert-key.pem"))
-        .arg("-out")
-        .arg(&cert)
-        .status()
-        .expect("openssl");
-    assert!(made.success(), "openssl could not make the drill cert");
+    // Release the restore with the embedded throwaway certificate;
+    // the incident may now finish and stamp.
+    fs::write(&cert, DRILL_CERT).expect("release cert");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
     while !any_stamp(&state.join("shepherd")) {
         assert!(

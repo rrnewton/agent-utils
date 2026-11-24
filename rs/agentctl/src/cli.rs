@@ -4785,7 +4785,10 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     return Ok(1);
                 }
                 let mut record = crate::team_driver::load_record(&directory, &args.registry)?;
-                if record.is_none() {
+                if record.is_none() && !act.enqueue_only {
+                    // Enqueue-only never kicks or runs a driver, not
+                    // even to create the record: the incident is
+                    // derived from the current epoch instead.
                     let _ = crate::team_driver::kick(
                         &client,
                         &args.registry,
@@ -4795,9 +4798,20 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     )?;
                     record = crate::team_driver::load_record(&directory, &args.registry)?;
                 }
-                let Some(current) = record else {
-                    write_json(&refusal("driver state unavailable")).map_err(Failure::Output)?;
-                    return Ok(1);
+                let current = match record {
+                    Some(current) => current,
+                    None if act.enqueue_only => {
+                        let epoch = crate::restore::RestoreEpoch {
+                            boot_id: <crate::restore::SystemHost as crate::restore::Host>::boot_id(&host)?,
+                            user_manager: <crate::restore::SystemHost as crate::restore::Host>::user_manager_id(&host),
+                        };
+                        crate::team_driver::DriverRecord::new(&args.registry, &epoch, 0.0)
+                    }
+                    None => {
+                        write_json(&refusal("driver state unavailable"))
+                            .map_err(Failure::Output)?;
+                        return Ok(1);
+                    }
                 };
                 if current.incident != act.incident {
                     write_json(&refusal("stale incident")).map_err(Failure::Output)?;

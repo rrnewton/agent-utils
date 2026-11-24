@@ -233,7 +233,7 @@ impl RealUnitView {
 
 impl Default for RealUnitView {
     fn default() -> Self {
-        Self::new(PathBuf::from("systemctl"))
+        Self::new(PathBuf::from(crate::restore::systemctl_program()))
     }
 }
 

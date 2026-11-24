@@ -1507,9 +1507,9 @@ agentctl --registry ~/project/.agentctl recovery status
 ```
 
 `start-recovery` claims one incident per restore epoch (a claim from
-a previous boot never blocks), launches deterministic restore and the
-recovery supervisor together, and joins instead of starting a second
-restorer when one is live (exit 75). The supervisor judges `team
+a previous boot never blocks), launches the recovery supervisor, which
+spawns and owns the deterministic restore child itself, and joins
+instead of starting a second restorer when one is live (exit 75). The supervisor judges `team
 manifest` facts with stateless one-shot calls and effects only
 through `team act`, until the deterministic YES (lead running, bridge
 healthy, handoff acked) or bounded give-up escalates and stamps under

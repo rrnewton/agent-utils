@@ -169,7 +169,11 @@ pub fn shepherd_dir(
         .user_manager
         .as_deref()
         .map(|manager| {
-            let digest = format!("{:x}", Sha256::digest(manager.as_bytes()));
+            // Normalised epoch key: the identity with its format
+            // prefix stripped, so the directory matches the claim's
+            // format-insensitive epoch comparison.
+            let identity = manager.split_once(':').map_or(manager, |(_, rest)| rest);
+            let digest = format!("{:x}", Sha256::digest(identity.as_bytes()));
             digest[..8].to_owned()
         })
         .unwrap_or_else(|| "nomgr".to_owned());
@@ -657,6 +661,7 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
         &epoch,
         options.stale_seconds,
         false,
+        ClaimRole::Supervisor,
     )? {
         ClaimOutcome::Owned(_) => {}
         ClaimOutcome::AlreadyRunning => {
@@ -787,12 +792,9 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
                 own_round.yes, own_round.lead_live
             ),
         );
-        if rounds_teams.iter().all(|team| team.yes) {
-            verdict = "YES";
-            state.round = round;
-            save_state(&dir, &state)?;
-            break;
-        }
+        // The YES exit is computed here but only taken once the
+        // restore child has exited (below, after the poll): a
+        // wedged restore after YES still needs its page.
         // Step 0 + the deterministic arm, own team only, and only
         // while its lead is down. The supervisor owns the restore:
         // it spawns the child in its own session (so a supervisor
@@ -894,6 +896,12 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
             );
             state.wedged_escalated = true;
             save_state(&dir, &state)?;
+        }
+        if rounds_teams.iter().all(|team| team.yes) && !restore_alive {
+            verdict = "YES";
+            state.round = round;
+            save_state(&dir, &state)?;
+            break;
         }
         // One judgement call per round; at most one own-team act.
         // Fail closed (S1): no profile file, or no current all-pass
@@ -1045,6 +1053,21 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
     let claim_lost_now = claim_lost.load(std::sync::atomic::Ordering::Relaxed);
     heartbeat_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = heartbeat_thread.join();
+    if claim_lost_now {
+        // The new owner owns this incident: exit without stamping
+        // anything over its state.
+        append_log(&dir, "claim lost; exiting without a stamp");
+        return Ok(json!({
+            "schema": SHEPHERD_REPORT_SCHEMA,
+            "boot_id": boot_id,
+            "verdict": "claim-lost",
+            "judge": state.judge,
+            "rounds": state.round,
+            "resumed": false,
+            "exit_code": 75,
+        }));
+    }
+    let mut escalation = "none".to_owned();
     if verdict != "YES" {
         // Bounded give-up: escalate through the landed path only
         // while the own lead is down (B4). A live lead owns recovery
@@ -1055,7 +1078,7 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
         let own_lead_live = own_row.is_some_and(|row| row["lead_live"] == json!(true));
         let own_unknown = own_row.is_some_and(|row| row["facts_unknown"] == json!(true));
         if should_escalate(own_yes, own_lead_live, own_unknown, claim_lost_now) {
-            enqueue_shepherd_act(
+            let code = enqueue_shepherd_act(
                 inputs,
                 own,
                 options,
@@ -1068,12 +1091,21 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
                 &dir,
                 state.round,
             );
+            // The queue is drained by the team driver from its own
+            // paths (its unit, wake timers, or the lead's next
+            // kick); a refusal here is recorded, never silent.
+            escalation = if code == 75 || code == 0 {
+                "enqueued".to_owned()
+            } else {
+                format!("failed:{code}")
+            };
         }
         verdict = "GAVE-UP";
     }
     let stamp = json!({
         "schema": SHEPHERD_STAMP_SCHEMA,
-        "reason": if claim_lost_now { "claim-lost" } else if verdict == "YES" { "verified" } else { "bounded-give-up" },
+        "reason": if verdict == "YES" { "verified" } else { "bounded-give-up" },
+        "escalation": escalation,
         "boot_id": boot_id,
         "epoch": epoch.as_json(),
         "incident": incident,
@@ -1452,6 +1484,19 @@ pub enum ClaimOutcome {
 /// Claim (or adopt a starter's pending claim) under the short flock.
 /// The starter marks its claim `supervisor_pending`; the supervisor it
 /// launched adopts it by incident. Any other live claim refuses.
+/// Who is claiming: the starter (which only creates a pending
+/// claim for its supervisor) or the supervisor itself (which may
+/// adopt a starter's pending claim). A second starter must never
+/// adopt the first starter's pending claim.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ClaimRole {
+    /// Creating a pending claim for a supervisor about to launch.
+    Starter,
+    /// The supervisor: may adopt a starter's pending claim.
+    Supervisor,
+}
+
+/// Claim (or adopt) the incident under its short flock.
 pub fn acquire_claim(
     claim_path: &Path,
     registry: &Path,
@@ -1459,6 +1504,7 @@ pub fn acquire_claim(
     epoch: &RestoreEpoch,
     stale_seconds: f64,
     supervisor_pending: bool,
+    role: ClaimRole,
 ) -> Result<ClaimOutcome> {
     let lock_path = claim_path.with_extension("lock");
     if let Some(parent) = claim_path.parent() {
@@ -1487,9 +1533,12 @@ pub fn acquire_claim(
         if same_incident && claim["pid"].as_u64() == Some(u64::from(me)) {
             return Ok(ClaimOutcome::Owned(ClaimDecision::Take));
         }
-        // Adoption: the starter that claimed for us is our parent, or
-        // has exited leaving its pending claim to its supervisor.
-        if same_incident && claim["supervisor_pending"] == json!(true) {
+        // Adoption (supervisors only): the starter that claimed for
+        // us is our parent, or has exited leaving its pending claim.
+        if role == ClaimRole::Supervisor
+            && same_incident
+            && claim["supervisor_pending"] == json!(true)
+        {
             let owner = claim["pid"].as_u64().unwrap_or(0);
             let parent = std::fs::read_to_string("/proc/self/stat")
                 .ok()
@@ -1820,6 +1869,7 @@ pub fn start_recovery(
         &epoch,
         options.stale_seconds,
         true,
+        ClaimRole::Starter,
     )? {
         ClaimOutcome::Owned(_) => {}
         ClaimOutcome::AlreadyRunning => {
