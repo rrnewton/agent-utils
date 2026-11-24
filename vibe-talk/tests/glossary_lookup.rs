@@ -426,7 +426,7 @@ async fn a_hyphenated_selection_finds_the_spaced_definition_in_its_thread() {
 async fn a_learned_entry_stays_out_of_the_discuss_warmup() {
     // Owner-decision guard (#2189): WTF-learned definitions are popover-only
     // until the owner decides otherwise; Discuss must never see them.
-    assert!(!vibe_talk::glossary_dynamic::DYNAMIC_IN_WARMUP);
+    const { assert!(!vibe_talk::glossary_dynamic::DYNAMIC_IN_WARMUP) };
     let defining = message(
         1,
         "Memory safety in guest-memory access, which makes record and replay trustworthy: Alpha fix, Beta fix, Gamma fix",

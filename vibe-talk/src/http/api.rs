@@ -3357,7 +3357,7 @@ async fn glossary_retrieval(
     let phrases = vec![
         crate::search_query::fold(&selected.replace('-', " ")),
         crate::search_query::fold(selected),
-        selected.replace('-', "").replace(' ', "").to_lowercase(),
+        selected.replace(['-', ' '], "").to_lowercase(),
     ];
     let channels = state.all_channels();
     let search = async |q: &str, limit: usize| -> Vec<Message> {
