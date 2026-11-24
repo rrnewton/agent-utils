@@ -603,6 +603,7 @@ pub fn enqueue_shepherd_act(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 /// Page the humans through the escalation routes, delivered by the
 /// shepherd itself (never through the team driver or lead). At most
 /// one delivered page per verdict kind per incident; retries only
@@ -1565,6 +1566,7 @@ pub enum ClaimRole {
     Supervisor,
 }
 
+#[allow(clippy::too_many_arguments)]
 /// Claim (or adopt) the incident under its short flock.
 pub fn acquire_claim(
     claim_path: &Path,
@@ -1660,6 +1662,7 @@ pub fn acquire_claim(
     Ok(ClaimOutcome::Owned(decision))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_claim(
     claim_path: &Path,
     registry: &Path,
