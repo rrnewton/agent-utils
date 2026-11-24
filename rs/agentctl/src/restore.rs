@@ -3788,7 +3788,7 @@ fn exec_start_binary(exec_start: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Whether the binary at `binary` predates the headless viewer-ensure
+/// Whether the binary at `binary` is older than the headless viewer-ensure
 /// path (#2214): this build's own binary never does; another binary is
 /// stale only when its `capabilities` answer reads cleanly and carries
 /// no `headless.viewer_ensure` marker. An unreadable or unparseable
