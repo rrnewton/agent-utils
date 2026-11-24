@@ -2235,6 +2235,43 @@ test("quoteSelectionNow opens the quick reply for held words, and does nothing w
   assert.equal(byIdMap.get("quick-reply-quote").textContent, "held words");
 });
 
+test("#2195 vibe-talk-wtf-chip-orphan-lifecycle: clearing the held quote hides WTF? with the chip group", () => {
+  globalThis.document = { documentElement: { clientWidth: 800 } };
+  globalThis.window = { innerHeight: 800, visualViewport: undefined };
+  const { createQuoting } = CHANNEL_VIEW;
+  const el = (extra = {}) => ({
+    style: {}, hidden: false, textContent: "", value: "",
+    getBoundingClientRect: () => ({ top: 0, bottom: 40, left: 0, right: 300, width: 300, height: 40 }),
+    focus() {}, ...extra,
+  });
+  const byIdMap = new Map();
+  for (const id of ["quick-reply", "quick-reply-quote", "quick-reply-text", "quick-reply-state",
+    "quick-reply-to-main", "quick-reply-to-main-row",
+    "selection-chip", "selection-chip-dismiss", "selection-chip-wtf", "read-steer-quote", "scroll-area", "side-scroll", "discord-log"]) {
+    byIdMap.set(id, el(id === "quick-reply-to-main" ? { checked: false } : {}));
+  }
+  const quoting = createQuoting({
+    byId: (id) => byIdMap.get(id),
+    inputKind: () => "touch",
+    drawReplyLabel() {},
+    selectedChannelId: () => "c1",
+    replyRoute: () => ({ thread: null, branch: null, into: null, unknown: false, removed: false }),
+    readOnly: () => false,
+    replyMarksRead: () => null,
+    queueOutgoingMessage: async () => {},
+    toStream() {},
+    drafts: { get: () => undefined, set() {}, delete() {}, save: () => true },
+    noteDraft() {},
+    closed() {},
+  });
+  const row = el({ messages: [{ id: "m1" }], replyButton: el({ isConnected: true }) });
+  quoting.holdQuote({ row, button: row.replyButton, text: "held words", timer: null });
+  quoting.holdQuote(null);
+  assert.equal(byIdMap.get("selection-chip-wtf").hidden, true, "WTF? was left standing alone");
+  assert.equal(byIdMap.get("selection-chip").hidden, true);
+  assert.equal(byIdMap.get("selection-chip-dismiss").hidden, true);
+});
+
 test("`#624 voice-page-modularity`: the two columns are made fresh, each with its own records, the right one a list not from cards", () => {
   const { createColumns, COLUMN_IDS } = CHANNEL_VIEW;
   let made = 0;

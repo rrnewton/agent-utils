@@ -5180,6 +5180,21 @@ def _act_glossary_button(driver: Driver) -> None:
     driver.settle(300)
 
 
+def _act_glossary_orphan(driver: Driver) -> None:
+    """`#2195`: stand the chip group up, dismiss it with its X, and stop:
+    the frame must show no chip left standing alone."""
+    _act_glossary_button(driver)
+    driver.js("document.getElementById('selection-chip-dismiss').click()")
+    driver.settle(800)
+    driver.page.wait_for_function(
+        "() => !window.__visible('selection-chip-wtf') "
+        "&& !window.__visible('selection-chip') "
+        "&& !window.__visible('selection-chip-dismiss')",
+        timeout=10_000,
+    )
+    driver.settle(300)
+
+
 def _act_glossary_wtf(driver: Driver) -> None:
     """`#2156`: select an unfamiliar term in a message, press WTF?, and
     photograph the popover the real lookup route answers with (the loopback
@@ -8668,6 +8683,17 @@ SCENES: tuple[Scene, ...] = (
             ("the WTF? button stands left of the Quote reply chip", "(() => { const w = document.getElementById('selection-chip-wtf').getBoundingClientRect(); const c = document.getElementById('selection-chip').getBoundingClientRect(); return w.right <= c.left + 1; })()"),
             ("the dismiss X stands right of the chip", "(() => { const x = document.getElementById('selection-chip-dismiss').getBoundingClientRect(); const c = document.getElementById('selection-chip').getBoundingClientRect(); return x.left >= c.right - 1; })()"),
             ("the selection still stands", "String(getSelection()).length > 0"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="93-glossary-orphan",
+        what="#2195 after dismissing the selection, no WTF? chip is left standing alone",
+        act=_act_glossary_orphan,
+        profiles=MATRIX_PROFILES,
+        keep_transient=True,
+        expect=(
+            ("#2195 no orphan WTF? chip remains", "!window.__visible('selection-chip-wtf') && !window.__visible('selection-chip') && !window.__visible('selection-chip-dismiss')"),
             ("no error banner is up", "!window.__visible('error-wrap')"),
         ),
     ),

@@ -417,6 +417,11 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
       setHiddenIfChanged(chip, true);
       setHiddenIfChanged(dismiss, true);
       setHiddenIfChanged(twin, true);
+      // `#2195 vibe-talk-wtf-chip-orphan-lifecycle`. ONE show/hide path for the whole chip group:
+      // WTF? hides with Quoted reply and the X on every path that takes the group down (selection
+      // cleared, scroll, tap elsewhere, re-render), so it can never be left standing alone.
+      const wtfEl = deps.byId("selection-chip-wtf");
+      if (wtfEl) setHiddenIfChanged(wtfEl, true);
       return;
     }
     setHiddenIfChanged(chip, false);

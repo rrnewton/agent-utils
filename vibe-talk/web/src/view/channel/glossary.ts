@@ -59,7 +59,10 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
   function placeWtf(): void {
     const chip = deps.byId("selection-chip");
     const button = wtf();
-    if (!deps.glossaryAvailable() || chip.hidden) {
+    // `#2195 vibe-talk-wtf-chip-orphan-lifecycle`. A collapsed selection takes WTF? down at once:
+    // never re-show it against a chip the quoting view is about to hide.
+    const selNow = typeof getSelection === "function" ? getSelection() : null;
+    if (!deps.glossaryAvailable() || chip.hidden || (selNow && selNow.isCollapsed)) {
       setHiddenIfChanged(button, true);
       return;
     }
@@ -131,6 +134,9 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
 
   function closePopover(): void {
     setHiddenIfChanged(popover(), true);
+    // `#2195 vibe-talk-wtf-chip-orphan-lifecycle`. Closing the popover takes the WTF? chip down
+    // with it; the quoting view's one show/hide path owns the rest of the group.
+    setHiddenIfChanged(wtf(), true);
   }
 
   function selectionInfo(
