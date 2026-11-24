@@ -1046,34 +1046,57 @@ function foldStanding(): boolean {
   return now.key !== "" && (now.scopes.length > 0 || now.loading || now.hits.length > 0 || (now.transcriptHits || []).length > 0);
 }
 
+/** The fold last computed, and the state it was computed from. */
+let foldCache: { key: string; counts: Map<string, number>; total: number } | null = null;
+
 /** `#2200`: the fold as the search filter reads it — counts and total, or
- * null where no server search stands for the words in the field. */
+ * null where no server search stands for the words in the field. Computed
+ * once per state it reads (the loaded tally's three numbers, the server
+ * answer's ticket and hit counts, the view): the count line asks on every
+ * pass of the filter, and recomputing walks every held message
+ * (`heldMessagesById` builds its map per call), which stretched the
+ * typing walk's frames until a debounced server ask landed between keys
+ * (search-typing-fast on the stack gate). */
 function foldCounts(): { counts: Map<string, number>; total: number } | null {
   if (!foldStanding()) return null;
+  const now = serverSearchNow();
+  const loaded = columns.main.searched?.buckets || { main: 0, threads: 0, transcripts: 0 };
+  const view = bucketView();
+  const key = `${now.ticket}|${now.hits.length}|${(now.transcriptHits || []).length}|` +
+    `${loaded.main},${loaded.threads},${loaded.transcripts}|${view}|${bucketsFor}`;
+  if (foldCache && foldCache.key === key) return foldCache;
   const counts = searchFoldCounts(bucketHits());
   // The total sums the chips that stand in this view — the out-of-scope
   // "this thread" bucket outside a thread view is not one of them.
-  const view = bucketView();
   let total = 0;
   for (const def of searchBucketDefs) {
     if (def.id === "thread" && view !== "thread") continue;
     total += counts.get(def.id) || 0;
   }
-  return { counts, total };
+  foldCache = { key, counts, total };
+  return foldCache;
 }
+
+/** The last search key whose identity was parsed, and the answer. */
+let identityCache: { key: string; identity: string } | null = null;
 
 /** `#2200`: whether a bucket chip stands, as the filter asks it — null where
  * the fold is not standing for this search (the identity the toggles were
- * defaulted for is not the search in the field). */
+ * defaulted for is not the search in the field). The identity parse is
+ * remembered per key: the filter asks per row, and parsing the key per
+ * row was real per-key work (search-typing-fast on the stack gate). */
 function bucketOnFor(id: string): boolean | null {
   const key = serverSearchNow().key;
   if (!foldStanding()) return null;
-  let identity = key;
-  try {
-    const parsed = JSON.parse(key) as unknown;
-    if (Array.isArray(parsed)) identity = String(parsed[1] ?? key);
-  } catch (_error) { /* the key itself is the identity */ }
-  if (identity !== bucketsFor) return null;
+  if (!identityCache || identityCache.key !== key) {
+    let identity = key;
+    try {
+      const parsed = JSON.parse(key) as unknown;
+      if (Array.isArray(parsed)) identity = String(parsed[1] ?? key);
+    } catch (_error) { /* the key itself is the identity */ }
+    identityCache = { key, identity };
+  }
+  if (identityCache.identity !== bucketsFor) return null;
   return bucketOnNow(id);
 }
 

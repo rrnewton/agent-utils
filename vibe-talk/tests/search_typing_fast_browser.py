@@ -12,7 +12,7 @@ phone and desktop sizes:
   bound does not grow with the 800 rows on screen, where the old per-keystroke full pass read
   one rectangle per row (800+) plus its seams and place-keeping; after the typing pauses the
   full result lands exactly ("4 of N loaded", the lantern rows shown);
-  with the pinned bucket chips standing for "lantern" ("1 in main" / "3 in threads" — the
+  with the pinned bucket chips standing for "lantern" ("2 in main" / "5 in threads" — the
   fold counts loaded and fresh together, `#2200`), typing a new query retires those chips at
   once — the previous query's counts never stand for the new words — and after the debounced
   server answer the chips stand for the new query's own fold, summing to its count.
@@ -193,6 +193,14 @@ def walk_through(walk: Walk, total: int) -> None:
     walk.until("() => { const row = document.getElementById('search-bucket-row');"
                " return row && !row.hidden && !document.getElementById('search-bucket-main').hidden; }",
                "the bucket chips never appeared for lantern")
+    # `#2200`: the count and the chips are the fold — when the answer lands
+    # they move from the loaded-only numbers (4; 1 in main, 3 in threads)
+    # to the fold's (7; 2 and 5). Refining below starts from the settled
+    # fold, so the answer must have landed before the first refining key.
+    walk.until("() => document.getElementById('server-line').textContent === 'Server search details'",
+               "the server's answer never settled before refining")
+    walk.until(f"() => document.getElementById('search-count').textContent === '7 of {total} loaded'",
+               "the settled fold count does not speak for the lantern search")
     page.evaluate("""() => {
         window.__keyCounts = { cls: 0, fetch: 0, lsSet: 0 };
         const log = document.getElementById('discord-log');
@@ -223,8 +231,12 @@ def walk_through(walk: Walk, total: int) -> None:
                    f"a refining keystroke wrote {delta['cls']} row classes over {total} rows (changed-only bound {max(8, total // 20)})")
         walk.check(delta["fetch"] == 0 and delta["lsSet"] == 0,
                    f"a keystroke reached the server search or storage: {delta}")
-        walk.check(delta["count"].startswith("4 of"),
-                   f"a settled pass landed between keys typed at a steady pace: {delta}")
+        # No count-stability check between keys: since `#2200` the count is
+        # the fold, and it legitimately moves when a server answer lands or
+        # the fresh set resets for a refined query — the owner-approved
+        # behaviour the old two-computation count never had. What a key may
+        # not do is the event work asserted above (row classes, a fetch, a
+        # storage write); the count is checked settled, before and after.
     walk.until("() => document.querySelectorAll('#discord-log .search-hit').length > 0",
                "the settled marks did not return after refining and retyping")
     # Backspacing the query away: every hit stands again and no mark outlives its words.
@@ -240,7 +252,7 @@ def walk_through(walk: Walk, total: int) -> None:
     for value in ("l", "la", "lan", "lant", "lante", "lanter", "lantern"):
         page.evaluate("""(value) => { const f = document.getElementById('search-field'); f.value = value; f.dispatchEvent(new Event('input', { bubbles: true })); }""", value)
         page.wait_for_timeout(30)
-    walk.until(f"() => document.getElementById('search-count').textContent === '4 of {total} loaded'",
+    walk.until(f"() => document.getElementById('search-count').textContent === '7 of {total} loaded'",
                "the retyped lantern search did not settle to the same count")
     walk.until("() => document.querySelectorAll('#discord-log .search-hit').length > 0",
                "the retyped hits were not re-marked after the pause")
@@ -251,9 +263,9 @@ def walk_through(walk: Walk, total: int) -> None:
                "the bucket chips never appeared for lantern")
     main_chip = page.evaluate(CHIP_JS, "search-bucket-main")
     threads_chip = page.evaluate(CHIP_JS, "search-bucket-threads")
-    walk.check(main_chip is not None and main_chip["text"] == "1 in main",
+    walk.check(main_chip is not None and main_chip["text"] == "2 in main",
                f"the main chip says {main_chip}")
-    walk.check(threads_chip is not None and threads_chip["text"] == "3 in threads",
+    walk.check(threads_chip is not None and threads_chip["text"] == "5 in threads",
                f"the threads chip says {threads_chip}")
     walk.shot("chips-lantern")
     # A new query: the standing chips retire inside the input event, before any answer lands.
@@ -268,12 +280,12 @@ def walk_through(walk: Walk, total: int) -> None:
     }""")
     walk.check(retired["rowHidden"] is True and retired["chipHidden"] is True,
                f"the lantern chips still stand for 'routine': {retired}")
-    walk.check(retired["chipText"] in ("", "1 in main"),
+    walk.check(retired["chipText"] in ("", "2 in main"),
                f"the retired chip still speaks with fresh words: {retired}")
     # Settled on the new query: its count, and the chips standing for its own
     # fold (`#2200` — loaded matches count, so the row stands and sums to X).
     walk.until("() => document.getElementById('search-count').textContent.includes('of')"
-               " && !document.getElementById('search-count').textContent.startsWith('4 of')",
+               " && !document.getElementById('search-count').textContent.startsWith('7 of')",
                "the settled count does not speak for the routine search")
     walk.until("() => { const row = document.getElementById('search-bucket-row');"
                " return row && !row.hidden && !document.getElementById('search-bucket-main').hidden; }",
