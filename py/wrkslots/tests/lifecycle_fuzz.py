@@ -718,6 +718,9 @@ def _run_concurrent(seed: int, base: Path) -> None:
     """Two processes, disjoint slots, one shared registry."""
     trace = e2e.Trace(base / "trace.jsonl", seed=seed)
     project = e2e._make_project(base, trace, ttl_seconds=2)
+    _ACTIVE.update(project=project, trace=trace, trees={})
+    atexit.register(_exit_sweep)
+    _record_attached(project)
     rng = random.Random(seed)
     children: list[subprocess.Popen[str]] = []
     specs: list[Path] = []
