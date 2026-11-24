@@ -260,9 +260,9 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
             page.click("#discuss-open")
         else:
             page.click("#action-menu-open")
-            page.wait_for_selector("#discuss-menu-open", state="visible", timeout=20_000)
+            page.wait_for_selector("#discuss-menu-open", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
             page.click("#discuss-menu-open")
-        page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
+        page.wait_for_selector("#discuss-panel", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
 
     page.route("**/api/v1/client-config", client_config)
     page.route(f"**/api/v1/channels/{CHANNEL}/catchup/preview*", preview)
@@ -279,7 +279,7 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
     page.add_init_script(
         "try { localStorage.setItem('vibe-talk.welcome.dismissed', '1'); } catch (e) {}")
     page.goto(base + "/", wait_until="load")
-    page.wait_for_selector("#view-switch", state="visible", timeout=20_000)
+    page.wait_for_selector("#view-switch", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
     # To the channel view, which carries Discuss: the switch rotates through
     # the views, so press it until the channel picker (channel view only) is up.
     for _ in range(3):
@@ -291,14 +291,14 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
             break
         except Exception:
             continue
-    page.wait_for_selector("#discord-channel", state="visible", timeout=20_000)
+    page.wait_for_selector("#discord-channel", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
     # The way in, whichever this build carries: the fixed bar icon (#1355)
     # where it stands visible, else the action menu's item.
     via_menu = page.locator("#discuss-open").is_hidden()
     if via_menu:
-        page.wait_for_selector("#action-menu-open", state="visible", timeout=20_000)
+        page.wait_for_selector("#action-menu-open", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
     else:
-        page.wait_for_selector("#discuss-open", state="visible", timeout=20_000)
+        page.wait_for_selector("#discuss-open", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
 
     scroller_before = page.evaluate("""() => {
       const area = document.getElementById('scroll-area');
@@ -313,11 +313,11 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
             page.click("#discuss-open")
         else:
             page.click("#action-menu-open")
-            page.wait_for_selector("#discuss-menu-open", state="visible", timeout=20_000)
+            page.wait_for_selector("#discuss-menu-open", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
             page.click("#discuss-menu-open")
     else:
         page.click("#discuss-open")
-    page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
+    page.wait_for_selector("#discuss-panel", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
     # `#1531 discuss-top-bar-slim-fixed`: no Read in the top bar; its slim
     # fixed bar carries the scope title beside the layout/close buttons.
     check(page.locator("#discuss-read").count() == 0, "the top bar still carries a Read button")
@@ -396,7 +396,7 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
         "() => document.getElementById('discuss-summarize').textContent === 'Summarize'"
         " && document.getElementById('discuss-count').value === '2'"
         " && document.getElementById('discuss-since').value !== ''",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     check(posts == [], f"opening posted {posts}, not nothing")
     # `#1524 discuss-bound-hours-control`: the hours end stands beside N, the
     # bound is one row, and "since HH:MM" is dropped whole only when the head
@@ -431,17 +431,17 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
     page.wait_for_function(
         "() => document.getElementById('discuss-hours').value === '1'"
         " && document.getElementById('discuss-count').value === '0'",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     page.fill("#discuss-hours", "150")
     page.wait_for_function(
         "() => document.getElementById('discuss-hours').value === '150'",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     page.fill("#discuss-count", "2")
     page.wait_for_function(
         "() => document.getElementById('discuss-count').value === '2'"
         " && document.getElementById('discuss-hours').value !== ''"
         " && document.getElementById('discuss-hours').value.includes('.')",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     # `#1527 discuss-summarize-bottom-bar-mobile`: on a phone the ask row is a
     # bar at the pane's bottom with Summarize rightmost; on a desk it stays
     # at the top in its one row. Condition waits only.
@@ -468,7 +468,7 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
     page.click("#discuss-summarize")
     page.wait_for_function(
         "() => document.getElementById('discuss-answer').textContent.includes('Ada shipped')",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     check(len(posts) == 1 and posts[0].get("thread_id") is None
           and posts[0].get("view") in ("flat", "main")
           and posts[0].get("since_ms") == 1760000000000,
@@ -477,7 +477,7 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
     page.fill("#discuss-hours", "9715")
     page.wait_for_function(
         "() => document.getElementById('discuss-hours').value === '9715'",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     fits = page.evaluate(
         "() => { const el = document.getElementById('discuss-hours');"
         " return el.scrollWidth <= el.clientWidth + 1; }")
@@ -528,17 +528,17 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
     first_fold = page.locator("#discuss-answer details").first
     page.locator("#discuss-answer details > summary > h2").first.click()
     page.wait_for_function(
-        "() => document.querySelector('#discuss-answer details').open", timeout=20_000)
+        "() => document.querySelector('#discuss-answer details').open", timeout=browser_waits.HANG_BACKSTOP_MS)
     page.locator("#discuss-answer details > summary > h2").first.click()
     page.wait_for_function(
-        "() => !document.querySelector('#discuss-answer details').open", timeout=20_000)
+        "() => !document.querySelector('#discuss-answer details').open", timeout=browser_waits.HANG_BACKSTOP_MS)
     page.evaluate("() => document.querySelector('#discuss-answer details > summary').focus()")
     page.keyboard.press("Enter")
     page.wait_for_function(
-        "() => document.querySelector('#discuss-answer details').open", timeout=20_000)
+        "() => document.querySelector('#discuss-answer details').open", timeout=browser_waits.HANG_BACKSTOP_MS)
     page.keyboard.press("Enter")
     page.wait_for_function(
-        "() => !document.querySelector('#discuss-answer details').open", timeout=20_000)
+        "() => !document.querySelector('#discuss-answer details').open", timeout=browser_waits.HANG_BACKSTOP_MS)
     check(not first_fold.evaluate("(d) => d.open"), "the fold did not end closed")
     raw = page.locator("#discuss-answer").text_content() or ""
     check("##" not in raw, f"raw Markdown showed in the answer: {raw!r}")
@@ -549,7 +549,7 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
     # `#2133`: the processed list is a collapsible suffix of the summary,
     # just before Terms — open it before measuring its links.
     page.locator("#discuss-processed summary").click()
-    page.wait_for_function("() => document.getElementById('discuss-processed').open", timeout=20_000)
+    page.wait_for_function("() => document.getElementById('discuss-processed').open", timeout=browser_waits.HANG_BACKSTOP_MS)
     check(page.locator("#discuss-links .discuss-link").count() == 10, "the footer links are missing")
     check(page.locator("#discuss-links .discuss-link").first.text_content() == "09:51", "the footer links are not dense HH:MM")
     # `#1540 discuss-footer-inline-links`: the times read as one dense,
@@ -604,7 +604,7 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
               const strip = document.getElementById('read-steer');
               const count = document.getElementById('read-steer-count');
               return !!strip && !strip.hidden && !!count && count.textContent.trim() === want;
-            }""", arg=want, timeout=20_000)
+            }""", arg=want, timeout=browser_waits.HANG_BACKSTOP_MS)
 
     def wait_read_stopped() -> None:
         page.wait_for_function(
@@ -613,7 +613,7 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
               const strip = document.getElementById('read-steer');
               return owner.nowPlaying === null && owner.pendingRead === null && !!strip && strip.hidden
                 && document.querySelectorAll('#discuss-answer [data-reading-block]').length === 0;
-            }""", timeout=20_000)
+            }""", timeout=browser_waits.HANG_BACKSTOP_MS)
 
     toggle = page.locator("#audio-source")
     check(toggle.is_visible(), "the audio source toggle is not offered with Discuss open")
@@ -621,37 +621,37 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
         page.click("#audio-source")
         page.wait_for_function(
             "() => document.getElementById('audio-source').getAttribute('aria-checked') === 'false'",
-            timeout=20_000)
+            timeout=browser_waits.HANG_BACKSTOP_MS)
     # `#1531`: the bottom toolbar's Read starts the summary read now.
     check(page.locator("#read-aloud").is_visible(), "the toolbar Read is not offered with Discuss open")
     page.click("#read-aloud")
     wait_read_count("1 of 4")
-    page.wait_for_function("() => window.deviceSpeech.length >= 1", timeout=20_000)
+    page.wait_for_function("() => window.deviceSpeech.length >= 1", timeout=browser_waits.HANG_BACKSTOP_MS)
     said = page.evaluate("() => window.deviceSpeech.map((u) => u.text)")
     check(said == ["Progress"], f"Read said {said}, not the first block alone")
     page.wait_for_function(
         "() => document.querySelector('#discuss-answer [data-reading-block=\"current\"]')?.textContent.trim() === 'Progress'",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     owner_id = page.evaluate("() => readAloudOwner().nowPlaying?.id || null")
     check(isinstance(owner_id, str) and owner_id.startswith("doc:discuss:"),
           f"the playing read is not the Discuss read: {owner_id!r}")
     page.click("#read-next")
     wait_read_count("2 of 4")
-    page.wait_for_function("() => window.deviceSpeech.length >= 2", timeout=20_000)
+    page.wait_for_function("() => window.deviceSpeech.length >= 2", timeout=browser_waits.HANG_BACKSTOP_MS)
     said = page.evaluate("() => window.deviceSpeech.map((u) => u.text)")
     check(said[-1] == "Ada shipped the fix", f"Next said {said}, not the second block")
     page.click("#discuss-close")
-    page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
+    page.wait_for_selector("#discuss-panel", state="hidden", timeout=browser_waits.HANG_BACKSTOP_MS)
     wait_read_stopped()
     open_discuss()
     page.wait_for_function(
         "() => document.getElementById('discuss-answer').textContent.includes('Ada shipped')",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     # `#1960`: one toggle now lives in the Current summary header; Expand.
     page.locator("#discuss-current-head .discuss-toggle").click()
     page.wait_for_function(
         "() => [...document.querySelectorAll('#discuss-answer details')].every((d) => d.open)",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     # `#1543`: inactive — a tap on the answer text starts no read.
     said_before = page.evaluate("() => window.deviceSpeech.length")
     page.locator("#discuss-answer p", has_text="Ben is reviewing it.").click()
@@ -666,24 +666,24 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
     page.locator("#discuss-answer p", has_text="Ben is reviewing it.").click()
     wait_read_count("4 of 4")
     page.wait_for_function(
-        f"() => window.deviceSpeech.length > {said_before}", timeout=20_000)
+        f"() => window.deviceSpeech.length > {said_before}", timeout=browser_waits.HANG_BACKSTOP_MS)
     said = page.evaluate("() => window.deviceSpeech.map((u) => u.text)")
     check(said[-1] == "Ben is reviewing it.", f"the tap said {said}, not its own block")
     page.wait_for_function(
         "() => document.querySelector('#discuss-answer [data-reading-block=\"current\"]')?.textContent.trim() === 'Ben is reviewing it.'",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     page.click("#discuss-close")
-    page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
+    page.wait_for_selector("#discuss-panel", state="hidden", timeout=browser_waits.HANG_BACKSTOP_MS)
     wait_read_stopped()
     open_discuss()
     page.wait_for_function(
         "() => document.getElementById('discuss-answer').textContent.includes('Ada shipped')",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     # `#1960`: the same single toggle now reads Collapse; fold all shut.
     page.locator("#discuss-current-head .discuss-toggle").click()
     page.wait_for_function(
         "() => [...document.querySelectorAll('#discuss-answer details')].every((d) => !d.open)",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
 
     # `#1530 discuss-summary-cloud-read-404`: the cloud voice reads the
     # summary too. The prepare is answered at the network edge in this
@@ -714,7 +714,7 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
         page.click("#audio-source")
         page.wait_for_function(
             "() => document.getElementById('audio-source').getAttribute('aria-checked') === 'true'",
-            timeout=20_000)
+            timeout=browser_waits.HANG_BACKSTOP_MS)
     page.click("#read-aloud")  # `#1531`: the toolbar Read, not a top-bar button
     wait_read_count("1 of 4")
     check(len(cloud_prepares) > 0 and "discuss%3A" in cloud_prepares[-1] and "%7C" in cloud_prepares[-1],
@@ -723,56 +723,56 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
     check("unknown_document" not in banner and "not archived" not in banner,
           f"the cloud Discuss read showed the old banner: {banner!r}")
     page.click("#discuss-close")
-    page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
+    page.wait_for_selector("#discuss-panel", state="hidden", timeout=browser_waits.HANG_BACKSTOP_MS)
     wait_read_stopped()
     open_discuss()
     page.wait_for_function(
         "() => document.getElementById('discuss-answer').textContent.includes('Ada shipped')",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     page.click("#read-aloud")  # `#1531`: the toolbar Read, not a top-bar button
     wait_read_count("1 of 4")
     check(len(cloud_prepares) == 2 and urllib.parse.unquote(cloud_prepares[0].split("/documents/")[1].split("/speech")[0])
           == urllib.parse.unquote(cloud_prepares[1].split("/documents/")[1].split("/speech")[0]),
           f"close/reopen prepared a different key: {cloud_prepares}")
     page.click("#discuss-close")
-    page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
+    page.wait_for_selector("#discuss-panel", state="hidden", timeout=browser_waits.HANG_BACKSTOP_MS)
     wait_read_stopped()
     open_discuss()
     page.wait_for_function(
         "() => document.getElementById('discuss-answer').textContent.includes('Ada shipped')",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     page.unroute("**/api/v1/documents/*/speech/prepare", speech_prepare)
     page.unroute("**/api/v1/speech/check-ticket*", speech_audio)
     if page.locator("#audio-source").get_attribute("aria-checked") == "true":
         page.click("#audio-source")
         page.wait_for_function(
             "() => document.getElementById('audio-source').getAttribute('aria-checked') === 'false'",
-            timeout=20_000)
+            timeout=browser_waits.HANG_BACKSTOP_MS)
 
     # `#1497 discuss-fold-state-persist`: the summary's sections start
     # collapsed; an opened one survives close/reopen and a reload, kept on
     # this device for the saved record only; a new Summarize starts
     # collapsed again. Condition waits only — no fixed sleeps.
     folds_open = "[...document.querySelectorAll('#discuss-answer details')].map((d) => d.open)"
-    page.wait_for_function(f"() => JSON.stringify({folds_open}) === '[false,false]'", timeout=20_000)
+    page.wait_for_function(f"() => JSON.stringify({folds_open}) === '[false,false]'", timeout=browser_waits.HANG_BACKSTOP_MS)
     page.locator("#discuss-answer details").nth(1).locator("summary").click()
-    page.wait_for_function(f"() => JSON.stringify({folds_open}) === '[false,true]'", timeout=20_000)
+    page.wait_for_function(f"() => JSON.stringify({folds_open}) === '[false,true]'", timeout=browser_waits.HANG_BACKSTOP_MS)
     # The toggle event (and so the keep) lands a task after the open flips.
     page.wait_for_function(
         "() => (localStorage.getItem('vibe-talk.voice.discuss-folds') || '').includes('\"Review\"')",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     page.click("#discuss-close")
-    page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
+    page.wait_for_selector("#discuss-panel", state="hidden", timeout=browser_waits.HANG_BACKSTOP_MS)
     open_discuss()
-    page.wait_for_function(f"() => JSON.stringify({folds_open}) === '[false,true]'", timeout=20_000)
+    page.wait_for_function(f"() => JSON.stringify({folds_open}) === '[false,true]'", timeout=browser_waits.HANG_BACKSTOP_MS)
     # `#1821 vibe-talk-discuss-state-persists`: open stands across a reload
     # with the same scope, kept on this device; no reopen tap is needed.
     scope_before = page.locator("#discuss-scope").text_content() or ""
     page.wait_for_function(
         "() => { try { return JSON.parse(localStorage.getItem('vibe-talk.voice.discuss-panel') || 'null')?.open === true; } catch (e) { return false; } }",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     page.reload(wait_until="load")
-    page.wait_for_selector("#view-switch", state="visible", timeout=20_000)
+    page.wait_for_selector("#view-switch", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
     for _ in range(3):
         if not page.locator("#discord-channel").is_hidden():
             break
@@ -782,15 +782,15 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
             break
         except Exception:
             continue
-    page.wait_for_selector("#discord-channel", state="visible", timeout=20_000)
-    page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
+    page.wait_for_selector("#discord-channel", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
+    page.wait_for_selector("#discuss-panel", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
     check((page.locator("#discuss-scope").text_content() or "") == scope_before,
           f"the restored scope differs: {scope_before!r} -> {page.locator('#discuss-scope').text_content()!r}")
-    page.wait_for_function(f"() => JSON.stringify({folds_open}) === '[false,true]'", timeout=20_000)
+    page.wait_for_function(f"() => JSON.stringify({folds_open}) === '[false,true]'", timeout=browser_waits.HANG_BACKSTOP_MS)
     page.wait_for_function(
-        "() => !document.getElementById('discuss-summarize').disabled", timeout=20_000)
+        "() => !document.getElementById('discuss-summarize').disabled", timeout=browser_waits.HANG_BACKSTOP_MS)
     page.click("#discuss-summarize")
-    page.wait_for_function(f"() => JSON.stringify({folds_open}) === '[false,false]'", timeout=20_000)
+    page.wait_for_function(f"() => JSON.stringify({folds_open}) === '[false,false]'", timeout=browser_waits.HANG_BACKSTOP_MS)
 
     panel_box = page.locator("#discuss-panel").bounding_box()
     check(panel_box is not None and 0 <= panel_box["x"] and panel_box["x"] + panel_box["width"] <= width,
@@ -831,16 +831,16 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
         page.mouse.up()
         page.wait_for_function(
             "() => document.getElementById('discuss-panel').getBoundingClientRect().width >= 660",
-            timeout=20_000)
+            timeout=browser_waits.HANG_BACKSTOP_MS)
         kept = page.evaluate("() => localStorage.getItem('vibe-talk.voice.discuss-width')")
         check(kept is not None and int(kept) >= 660, f"the dragged width was not kept: {kept!r}")
         page.click("#discuss-close")
-        page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
+        page.wait_for_selector("#discuss-panel", state="hidden", timeout=browser_waits.HANG_BACKSTOP_MS)
         page.click("#discuss-open")
-        page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
+        page.wait_for_selector("#discuss-panel", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
         page.wait_for_function(
             "() => document.getElementById('discuss-answer').textContent.includes('Ada shipped')",
-            timeout=20_000)
+            timeout=browser_waits.HANG_BACKSTOP_MS)
         reopened = page.locator("#discuss-panel").bounding_box()
         check(reopened is not None and reopened["width"] >= 660,
               f"the kept width did not survive close/reopen: {reopened}")
@@ -849,7 +849,7 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
         page.click("#discuss-dock-toggle")
         page.wait_for_function(
             "() => document.getElementById('screen-main').dataset.discuss === 'docked'",
-            timeout=20_000)
+            timeout=browser_waits.HANG_BACKSTOP_MS)
         docked = page.locator("#discuss-panel").bounding_box()
         list_box = page.locator("#scroll-area").bounding_box()
         check(docked is not None and list_box is not None
@@ -861,41 +861,41 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
         page.click("#discuss-dock-toggle")
         page.wait_for_function(
             "() => !document.getElementById('screen-main').hasAttribute('data-discuss')",
-            timeout=20_000)
+            timeout=browser_waits.HANG_BACKSTOP_MS)
         page.click("#discuss-dock-toggle")
         page.wait_for_function(
             "() => document.getElementById('screen-main').dataset.discuss === 'docked'",
-            timeout=20_000)
+            timeout=browser_waits.HANG_BACKSTOP_MS)
         # Docked then closed reserves no column (#1397): the screen loses
         # the mark and the list takes the full width again; reopening docks.
         page.click("#discuss-close")
-        page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
+        page.wait_for_selector("#discuss-panel", state="hidden", timeout=browser_waits.HANG_BACKSTOP_MS)
         page.wait_for_function(
             "() => !document.getElementById('screen-main').hasAttribute('data-discuss')",
-            timeout=20_000)
+            timeout=browser_waits.HANG_BACKSTOP_MS)
         freed = page.locator("#scroll-area").bounding_box()
         check(freed is not None and list_box is not None and freed["width"] > list_box["width"],
               f"closing docked did not free the column: list={list_box} after={freed}")
         page.click("#discuss-open")
-        page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
+        page.wait_for_selector("#discuss-panel", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
         page.wait_for_function(
             "() => document.getElementById('screen-main').dataset.discuss === 'docked'",
-            timeout=20_000)
+            timeout=browser_waits.HANG_BACKSTOP_MS)
         page.click("#discuss-full-toggle")
         page.wait_for_function(
             "() => document.getElementById('screen-main').dataset.discuss === 'maximized'",
-            timeout=20_000)
+            timeout=browser_waits.HANG_BACKSTOP_MS)
         full = page.locator("#discuss-panel").bounding_box()
         check(full is not None and full["width"] >= width - 100,
               f"maximized does not fill the main area: {full} in {width}x{height}")
         page.click("#discuss-full-toggle")
         page.wait_for_function(
             "() => document.getElementById('screen-main').dataset.discuss === 'docked'",
-            timeout=20_000)
+            timeout=browser_waits.HANG_BACKSTOP_MS)
         page.click("#discuss-dock-toggle")
         page.wait_for_function(
             "() => !document.getElementById('screen-main').hasAttribute('data-discuss')",
-            timeout=20_000)
+            timeout=browser_waits.HANG_BACKSTOP_MS)
     else:
         check(page.locator("#discuss-dock-toggle").is_hidden(),
               "the phone sheet shows the desk dock toggle")
@@ -908,48 +908,48 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
         page.click("#discuss-full-toggle")
         page.wait_for_function(
             "() => document.getElementById('discuss-panel').getBoundingClientRect().height >= innerHeight * 0.75",
-            timeout=20_000)
+            timeout=browser_waits.HANG_BACKSTOP_MS)
         close_box = page.locator("#discuss-close").bounding_box()
         check(close_box is not None and close_box["y"] >= 0,
               f"the full sheet's header is off screen: {close_box}")
         kept = page.evaluate("() => localStorage.getItem('vibe-talk.voice.discuss-sheet-full')")
         check(kept == "1", f"the full height was not kept: {kept!r}")
         page.click("#discuss-close")
-        page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
+        page.wait_for_selector("#discuss-panel", state="hidden", timeout=browser_waits.HANG_BACKSTOP_MS)
         # Reopen by whichever entry this build shows (`#1470` promotion):
         # the bar icon when promoted, the menu item when not.
         if page.locator("#discuss-open").is_visible():
             page.click("#discuss-open")
         else:
             page.click("#action-menu-open")
-            page.wait_for_selector("#discuss-menu-open", state="visible", timeout=20_000)
+            page.wait_for_selector("#discuss-menu-open", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
             page.click("#discuss-menu-open")
-        page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
+        page.wait_for_selector("#discuss-panel", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
         page.wait_for_function(
             "() => document.getElementById('discuss-panel').getBoundingClientRect().height >= innerHeight * 0.75",
-            timeout=20_000)
+            timeout=browser_waits.HANG_BACKSTOP_MS)
         page.click("#discuss-full-toggle")
         page.wait_for_function(
             "() => document.getElementById('discuss-panel').getBoundingClientRect().height <= innerHeight * 0.6",
-            timeout=20_000)
+            timeout=browser_waits.HANG_BACKSTOP_MS)
 
     # `#1386 discuss-mod8-toggle`: Mod+8 closes and reopens over this view.
     page.keyboard.press("Control+8")
-    page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
+    page.wait_for_selector("#discuss-panel", state="hidden", timeout=browser_waits.HANG_BACKSTOP_MS)
     page.keyboard.press("Control+8")
-    page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
+    page.wait_for_selector("#discuss-panel", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
 
     # `#1388` landing 2: the banner's Update appends its new section green.
-    page.wait_for_selector("#discuss-stale", state="visible", timeout=20_000)
+    page.wait_for_selector("#discuss-stale", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
     page.click("#discuss-update")
     page.wait_for_function(
         "() => document.querySelectorAll('#discuss-answer details.discuss-fresh').length === 1"
         " && document.querySelectorAll('#discuss-answer li.discuss-fresh').length === 1",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
 
     page.click("#discuss-mark-read")
     page.wait_for_function(
-        "() => !document.getElementById('discuss-mark-read').disabled", timeout=20_000)
+        "() => !document.getElementById('discuss-mark-read').disabled", timeout=browser_waits.HANG_BACKSTOP_MS)
     check(bool(writes) and writes[-1][0].endswith("/dismiss") and writes[-1][1] == {"messages": MARKABLE},
           f"Mark read sent {writes}, not exactly the markable ids")
 
@@ -959,19 +959,19 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
         "() => { const li = document.querySelector('#discuss-answer li');"
         " return li && li.classList.contains('discuss-struck')"
         " && getComputedStyle(li).textDecorationLine.includes('line-through'); }",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     page.wait_for_function(
         "() => document.querySelectorAll('#discuss-answer li.discuss-struck').length === 2"
         " && document.querySelectorAll('#discuss-answer details.discuss-struck-section').length === 2"
         " && document.querySelectorAll('#discuss-answer .discuss-fresh').length === 0",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
 
     # A footer jump stays in its scope: the panel stays open (`#1395`).
     page.evaluate("() => { const d = document.getElementById('discuss-processed'); if (d && !d.open) d.querySelector('summary').click(); }")
-    page.wait_for_function("() => document.getElementById('discuss-processed').open", timeout=20_000)
+    page.wait_for_function("() => document.getElementById('discuss-processed').open", timeout=browser_waits.HANG_BACKSTOP_MS)
     page.click("#discuss-links .discuss-link >> nth=0")
     # The jump keeps the panel open (it overlays the list it jumped).
-    page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
+    page.wait_for_selector("#discuss-panel", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
 
     # `#1531`: the top bar stays fixed while the pane's content scrolls.
     page.evaluate("""() => {
@@ -994,19 +994,19 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
           return panel.scrollTop >= 100
             && Math.abs(headRect.top - panelRect.top) <= 2
             && closeRect.top >= panelRect.top && closeRect.bottom <= headRect.bottom + 1;
-        }""", timeout=20_000)
+        }""", timeout=browser_waits.HANG_BACKSTOP_MS)
     page.evaluate("() => document.getElementById('discuss-test-spacer')?.remove()")
     page.click("#discuss-close")
-    page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
+    page.wait_for_selector("#discuss-panel", state="hidden", timeout=browser_waits.HANG_BACKSTOP_MS)
 
     # `#1821`: closing persists as closed across a reload, then opening
     # persists as open with the same scope. Condition waits only.
     page.wait_for_function(
         "() => { try { return JSON.parse(localStorage.getItem('vibe-talk.voice.discuss-panel') || 'null')?.open === false; } catch (e) { return false; } }",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
 
     def to_channel() -> None:
-        page.wait_for_selector("#view-switch", state="visible", timeout=20_000)
+        page.wait_for_selector("#view-switch", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
         for _ in range(3):
             if not page.locator("#discord-channel").is_hidden():
                 break
@@ -1016,7 +1016,7 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
                 break
             except Exception:
                 continue
-        page.wait_for_selector("#discord-channel", state="visible", timeout=20_000)
+        page.wait_for_selector("#discord-channel", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
 
     page.reload(wait_until="load")
     to_channel()
@@ -1024,22 +1024,22 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
     open_discuss()
     page.wait_for_function(
         "() => { try { return JSON.parse(localStorage.getItem('vibe-talk.voice.discuss-panel') || 'null')?.open === true; } catch (e) { return false; } }",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     scope_open = page.locator("#discuss-scope").text_content() or ""
     page.reload(wait_until="load")
     to_channel()
-    page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
+    page.wait_for_selector("#discuss-panel", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
     check((page.locator("#discuss-scope").text_content() or "") == scope_open,
           "the reopened scope differs after the second reload")
     # `#2136 vibe-talk-discuss-summary-search`: last, because a hit's jump
     # moves the list — the header search icon opens a field; typing lists
     # labelled hits from the current and an earlier summary.
     page.click("#discuss-search-toggle")
-    page.wait_for_selector("#discuss-search-input", state="visible", timeout=20_000)
+    page.wait_for_selector("#discuss-search-input", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
     page.fill("#discuss-search-input", "FIX")
     page.wait_for_function(
         "() => document.querySelectorAll('#discuss-search-results .discuss-search-hit').length === 2",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     hit_text = page.locator("#discuss-search-results").text_content() or ""
     check("Current summary" in hit_text and "Progress" in hit_text,
           f"the current hit is not labelled with its topic: {hit_text!r}")
@@ -1048,15 +1048,15 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
     page.fill("#discuss-search-input", "fix missingword")
     page.wait_for_function(
         "() => document.querySelectorAll('#discuss-search-results .discuss-search-hit').length === 0",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     page.fill("#discuss-search-input", "fix")
     page.wait_for_function(
         "() => document.querySelectorAll('#discuss-search-results .discuss-search-hit').length === 2",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     page.locator("#discuss-search-results .discuss-search-hit a").first.click()
-    page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
+    page.wait_for_selector("#discuss-panel", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
     page.click("#discuss-close")
-    page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
+    page.wait_for_selector("#discuss-panel", state="hidden", timeout=browser_waits.HANG_BACKSTOP_MS)
 
 
 def main() -> int:

@@ -138,7 +138,7 @@ def install_routes(page: Page, base: str, target: dict[str, str]) -> None:
 
 
 def to_channel(page: Page) -> None:
-    page.wait_for_selector("#view-switch", state="visible", timeout=20_000)
+    page.wait_for_selector("#view-switch", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
     for _ in range(3):
         if not page.locator("#discord-channel").is_hidden():
             break
@@ -148,7 +148,7 @@ def to_channel(page: Page) -> None:
             break
         except Exception:
             continue
-    page.wait_for_selector("#discord-channel", state="visible", timeout=20_000)
+    page.wait_for_selector("#discord-channel", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
 
 
 def open_discuss(page: Page) -> None:
@@ -156,9 +156,9 @@ def open_discuss(page: Page) -> None:
         page.click("#discuss-open")
     else:
         page.click("#action-menu-open")
-        page.wait_for_selector("#discuss-menu-open", state="visible", timeout=20_000)
+        page.wait_for_selector("#discuss-menu-open", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
         page.click("#discuss-menu-open")
-    page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
+    page.wait_for_selector("#discuss-panel", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
 
 
 def seeded_id(base: str, label: str) -> str:
@@ -198,7 +198,7 @@ def start(page: Page, base: str, target: dict[str, str]) -> None:
     to_channel(page)
     page.wait_for_function(
         "() => document.querySelectorAll('#scroll-area [data-ids]').length >= 20",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
 
 
 def walk_phone(page: Page, base: str, width: int, height: int) -> None:
@@ -209,7 +209,7 @@ def walk_phone(page: Page, base: str, width: int, height: int) -> None:
     open_discuss(page)
     page.wait_for_function(
         "() => document.getElementById('discuss-summarize').textContent === 'Summarize'",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
 
     # Docked: the panel is in the layout, and the scroller ends at its top.
     geo = page.evaluate("""() => {
@@ -271,7 +271,7 @@ def walk_phone(page: Page, base: str, width: int, height: int) -> None:
     page.wait_for_function(
         "() => document.getElementById('discuss-panel')"
         ".getBoundingClientRect().height >= innerHeight * 0.55",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     dragged = page.evaluate("""() => ({
       now: document.getElementById('discuss-head').getAttribute('aria-valuenow'),
       kept: localStorage.getItem('vibe-talk.voice.discuss-docked-height'),
@@ -300,30 +300,30 @@ def walk_phone(page: Page, base: str, width: int, height: int) -> None:
     page.wait_for_function(
         f"() => Number(document.getElementById('discuss-head')"
         f".getAttribute('aria-valuenow')) <= {grip_before} - 4",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     # Keyboard: the focused bar resizes with the arrows.
     page.locator("#discuss-head").focus()
     page.keyboard.press("ArrowDown")
     page.wait_for_function(
         "() => Number(document.getElementById('discuss-head')"
         ".getAttribute('aria-valuenow')) < 56 + 3",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     # Close/reopen keeps the dragged height.
     kept_now = page.evaluate(
         "() => document.getElementById('discuss-head').getAttribute('aria-valuenow')")
     page.click("#discuss-close")
-    page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
+    page.wait_for_selector("#discuss-panel", state="hidden", timeout=browser_waits.HANG_BACKSTOP_MS)
     open_discuss(page)
     page.wait_for_function(
         f"() => document.getElementById('discuss-head')"
         f".getAttribute('aria-valuenow') === '{kept_now}'",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     # `#1556` at 320px: the grip still shows and still clears the ends.
     page.set_viewport_size({"width": 320, "height": 700})
     page.wait_for_function(
         "() => getComputedStyle(document.querySelector('.discuss-grip'))"
         ".display !== 'none'",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     grip320 = page.evaluate("""() => {
       const g = document.querySelector('.discuss-grip').getBoundingClientRect();
       const t = document.querySelector('.discuss-title').getBoundingClientRect();
@@ -350,14 +350,14 @@ def walk_phone(page: Page, base: str, width: int, height: int) -> None:
         page.screenshot(path=f"{os.environ['DISCUSS_SHOT_DIR']}/discuss-drag-phone.png")
 
     page.click("#discuss-summarize")
-    page.wait_for_selector("#discuss-answer a", state="attached", timeout=20_000)
+    page.wait_for_selector("#discuss-answer a", state="attached", timeout=browser_waits.HANG_BACKSTOP_MS)
     # `#1960`: one toggle in the Current summary header; Expand.
     page.locator("#discuss-current-head .discuss-toggle").click()
     page.wait_for_function(
         "() => [...document.querySelectorAll('#discuss-answer details')]"
         ".every((d) => d.open)",
-        timeout=20_000)
-    page.wait_for_selector("#discuss-answer a", state="visible", timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
+    page.wait_for_selector("#discuss-answer a", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
 
     # (b, at the dragged height) A citation tap far up lands its row fully
     # in the visible list area above the taller pane.
@@ -370,15 +370,15 @@ def walk_phone(page: Page, base: str, width: int, height: int) -> None:
       const box = area.getBoundingClientRect();
       return r.top >= box.top - 1.5 && r.bottom <= box.bottom + 1.5
         && r.height > 0;
-    }""", timeout=20_000)
-    page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
+    }""", timeout=browser_waits.HANG_BACKSTOP_MS)
+    page.wait_for_selector("#discuss-panel", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
 
     # A double-click on the bar restores half height for the checks below.
     page.dblclick(".discuss-title")
     page.wait_for_function(
         "() => document.getElementById('discuss-head')"
         ".getAttribute('aria-valuenow') === '50'",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
 
     # (a) The list scrolls to its true bottom inside the visible upper area:
     # at the end the list's foot (the channel composer) stands fully in the
@@ -393,7 +393,7 @@ def walk_phone(page: Page, base: str, width: int, height: int) -> None:
         .getBoundingClientRect();
       return area.scrollTop + area.clientHeight >= area.scrollHeight - 2
         && foot.bottom <= box.bottom + 1.5 && foot.top >= box.top - 1.5;
-    }""", timeout=20_000)
+    }""", timeout=browser_waits.HANG_BACKSTOP_MS)
     page.wait_for_function("""() => {
       const area = document.getElementById('scroll-area');
       const rows = [...area.querySelectorAll('[data-ids]')]
@@ -403,24 +403,24 @@ def walk_phone(page: Page, base: str, width: int, height: int) -> None:
       const r = last.getBoundingClientRect();
       const box = area.getBoundingClientRect();
       return r.top >= box.top - 1.5 && r.bottom <= box.bottom + 1.5 && r.height > 0;
-    }""", timeout=20_000)
+    }""", timeout=browser_waits.HANG_BACKSTOP_MS)
 
     # Full height still covers; back to half docks again; close frees the list.
     page.click("#discuss-full-toggle")
     page.wait_for_function(
         "() => document.getElementById('discuss-panel')"
         ".getBoundingClientRect().height >= innerHeight * 0.75",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     # `#1556`: no grip where the bar does not drag (the full-height sheet).
     page.wait_for_function(
         "() => getComputedStyle(document.querySelector('.discuss-grip'))"
         ".display === 'none'",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     page.click("#discuss-full-toggle")
     page.wait_for_function(
         "() => document.getElementById('discuss-panel')"
         ".getBoundingClientRect().height <= innerHeight * 0.6",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
 
     # `#1586 discuss-full-drops-to-half-on-link`: from full screen, a
     # citation tap drops Discuss back to half at the kept height (50 after
@@ -430,7 +430,7 @@ def walk_phone(page: Page, base: str, width: int, height: int) -> None:
     page.wait_for_function(
         "() => document.getElementById('discuss-panel')"
         ".dataset.sheet === 'full'",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     page.click("#discuss-answer a")
     page.wait_for_function("""() => {
       const panel = document.getElementById('discuss-panel');
@@ -442,7 +442,7 @@ def walk_phone(page: Page, base: str, width: int, height: int) -> None:
       const box = area.getBoundingClientRect();
       return r.top >= box.top - 1.5 && r.bottom <= box.bottom + 1.5
         && r.height > 0;
-    }""", timeout=20_000)
+    }""", timeout=browser_waits.HANG_BACKSTOP_MS)
     kept_after_drop = page.evaluate("""() => ({
       now: document.getElementById('discuss-head').getAttribute('aria-valuenow'),
       kept: localStorage.getItem('vibe-talk.voice.discuss-docked-height'),
@@ -456,18 +456,18 @@ def walk_phone(page: Page, base: str, width: int, height: int) -> None:
     page.wait_for_function(
         "() => document.getElementById('discuss-panel')"
         ".getBoundingClientRect().height >= innerHeight * 0.75",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     page.click("#discuss-full-toggle")
     page.wait_for_function(
         "() => document.getElementById('discuss-panel')"
         ".getBoundingClientRect().height <= innerHeight * 0.6",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     page.click("#discuss-close")
-    page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
+    page.wait_for_selector("#discuss-panel", state="hidden", timeout=browser_waits.HANG_BACKSTOP_MS)
     page.wait_for_function(
         f"() => Math.abs(document.getElementById('scroll-area')"
         f".getBoundingClientRect().height - {before}) <= 2",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
 
 
 def walk_desk(page: Page, base: str, width: int, height: int) -> None:
@@ -480,7 +480,7 @@ def walk_desk(page: Page, base: str, width: int, height: int) -> None:
     open_discuss(page)
     page.wait_for_function(
         "() => document.getElementById('discuss-summarize').textContent === 'Summarize'",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     after = page.evaluate("""() => {
       const r = document.getElementById('scroll-area').getBoundingClientRect();
       const panel = document.getElementById('discuss-panel');
@@ -493,15 +493,15 @@ def walk_desk(page: Page, base: str, width: int, height: int) -> None:
         "() => getComputedStyle(document.querySelector('.discuss-grip')).display")
     check(grip_desk == "none", f"the grip shows on the desk overlay: {grip_desk}")
     page.click("#discuss-summarize")
-    page.wait_for_selector("#discuss-answer a", state="attached", timeout=20_000)
+    page.wait_for_selector("#discuss-answer a", state="attached", timeout=browser_waits.HANG_BACKSTOP_MS)
     # `#1960`: one toggle in the Current summary header; Expand.
     page.locator("#discuss-current-head .discuss-toggle").click()
     page.wait_for_function(
         "() => [...document.querySelectorAll('#discuss-answer details')]"
         ".every((d) => d.open)",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     page.click("#discuss-answer a")
-    page.wait_for_selector("#scroll-area [data-linked]", state="attached", timeout=20_000)
+    page.wait_for_selector("#scroll-area [data-linked]", state="attached", timeout=browser_waits.HANG_BACKSTOP_MS)
     overlap = page.evaluate("""() => {
       const row = document.querySelector('#scroll-area [data-linked]')
         .getBoundingClientRect();
@@ -523,7 +523,7 @@ def walk_desk(page: Page, base: str, width: int, height: int) -> None:
     page.wait_for_function(
         "() => document.getElementById('screen-main')"
         ".getAttribute('data-discuss') === 'maximized'",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     page.click("#discuss-answer a")
     page.wait_for_function(
         "() => document.getElementById('screen-main')"
@@ -531,22 +531,22 @@ def walk_desk(page: Page, base: str, width: int, height: int) -> None:
         " && document.getElementById('discuss-panel')"
         ".getAttribute('data-mode') === 'overlay'"
         " && document.querySelector('#scroll-area [data-linked]') !== null",
-        timeout=20_000)
-    page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
+    page.wait_for_selector("#discuss-panel", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
     if os.environ.get("DISCUSS_SHOT_DIR"):
         page.screenshot(path=f"{os.environ['DISCUSS_SHOT_DIR']}/discuss-drop-desktop.png")
     page.click("#discuss-full-toggle")
     page.wait_for_function(
         "() => document.getElementById('screen-main')"
         ".getAttribute('data-discuss') === 'maximized'",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     page.click("#discuss-full-toggle")
     page.wait_for_function(
         "() => document.getElementById('screen-main')"
         ".getAttribute('data-discuss') === null",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     page.click("#discuss-close")
-    page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
+    page.wait_for_selector("#discuss-panel", state="hidden", timeout=browser_waits.HANG_BACKSTOP_MS)
 
 
 def main() -> int:

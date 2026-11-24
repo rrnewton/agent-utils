@@ -174,7 +174,7 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
     page.add_init_script(
         "try { localStorage.setItem('vibe-talk.welcome.dismissed', '1'); } catch (e) {}")
     page.goto(base + "/", wait_until="load")
-    page.wait_for_selector("#view-switch", state="visible", timeout=20_000)
+    page.wait_for_selector("#view-switch", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
     for _ in range(3):
         if not page.locator("#discord-channel").is_hidden():
             break
@@ -184,8 +184,8 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
             break
         except Exception:
             continue
-    page.wait_for_selector("#discord-channel", state="visible", timeout=20_000)
-    page.wait_for_selector("#discord-log > li[data-id]", state="visible", timeout=20_000)
+    page.wait_for_selector("#discord-channel", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
+    page.wait_for_selector("#discord-log > li[data-id]", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
     loaded = page.evaluate(
         "() => [...document.querySelectorAll('#discord-log > li[data-id]')]"
         ".map(r => r.getAttribute('data-id'))")
@@ -199,11 +199,11 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
         page.click("#discuss-open")
     else:
         page.click("#action-menu-open")
-        page.wait_for_selector("#discuss-menu-open", state="visible", timeout=20_000)
+        page.wait_for_selector("#discuss-menu-open", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
         page.click("#discuss-menu-open")
-    page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
-    page.wait_for_selector("#discuss-answer a", state="attached", timeout=20_000)
-    page.wait_for_selector("#discuss-timeline a", state="attached", timeout=20_000)
+    page.wait_for_selector("#discuss-panel", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
+    page.wait_for_selector("#discuss-answer a", state="attached", timeout=browser_waits.HANG_BACKSTOP_MS)
+    page.wait_for_selector("#discuss-timeline a", state="attached", timeout=browser_waits.HANG_BACKSTOP_MS)
     page.evaluate("() => { for (const d of document.querySelectorAll('#discuss-answer details, #discuss-timeline details')) d.open = true; }")
 
     def landed_geo(target: str) -> LandedGeo | None:
@@ -233,7 +233,7 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
             f"() => document.querySelector('#discord-log > li[data-id=\"{target}\"]') !== null"
             f" && document.querySelector('#discord-log > li[data-id=\"{target}\"]')"
             ".getAttribute('data-linked') === 'true'",
-            timeout=20_000)
+            timeout=browser_waits.HANG_BACKSTOP_MS)
 
     # Reader OFF: the old behaviour, landing only, no read started.
     click_and_land("#discuss-timeline a", targets["timeline"])
@@ -249,11 +249,11 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
         page.click("#audio-source")
         page.wait_for_function(
             "() => document.getElementById('audio-source').getAttribute('aria-checked') === 'false'",
-            timeout=20_000)
+            timeout=browser_waits.HANG_BACKSTOP_MS)
     page.click("#read-aloud")
     page.wait_for_function(
         "() => { const o = readAloudOwner(); return o.nowPlaying !== null || o.pendingRead !== null; }",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
 
     # ONE click on the summary's citation: land expanded, top on screen, read it.
     said_before = page.evaluate("() => window.deviceSpeech.length")
@@ -261,8 +261,8 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
     page.wait_for_function(
         f"() => readAloudOwner().nowPlaying?.id === '{targets['answer']}'"
         f" || readAloudOwner().pendingRead === '{targets['answer']}'",
-        timeout=20_000)
-    page.wait_for_function(f"() => window.deviceSpeech.length > {said_before}", timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
+    page.wait_for_function(f"() => window.deviceSpeech.length > {said_before}", timeout=browser_waits.HANG_BACKSTOP_MS)
     geo = landed_geo(targets["answer"])
     check(geo is not None, f"{label}: the read target row vanished")
     assert geo is not None

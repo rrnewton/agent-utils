@@ -132,7 +132,7 @@ def walk(page: Page, base: str, width: int, height: int, scheme: Literal["dark",
     page.add_init_script(
         "try { localStorage.setItem('vibe-talk.welcome.dismissed', '1'); } catch (e) {}")
     page.goto(base + "/", wait_until="load")
-    page.wait_for_selector("#view-switch", state="visible", timeout=20_000)
+    page.wait_for_selector("#view-switch", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
     for _ in range(3):
         if not page.locator("#discord-channel").is_hidden():
             break
@@ -142,8 +142,8 @@ def walk(page: Page, base: str, width: int, height: int, scheme: Literal["dark",
             break
         except Exception:
             continue
-    page.wait_for_selector("#discord-channel", state="visible", timeout=20_000)
-    page.wait_for_selector("#discord-log > *", timeout=20_000)
+    page.wait_for_selector("#discord-channel", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
+    page.wait_for_selector("#discord-log > *", timeout=browser_waits.HANG_BACKSTOP_MS)
     # Two real seeded rows the summary will cite: one near the head, one
     # further down, so following their links has somewhere to travel.
     ids = page.evaluate(
@@ -156,13 +156,13 @@ def walk(page: Page, base: str, width: int, height: int, scheme: Literal["dark",
         page.click("#discuss-open")
     else:
         page.click("#action-menu-open")
-        page.wait_for_selector("#discuss-menu-open", state="visible", timeout=20_000)
+        page.wait_for_selector("#discuss-menu-open", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
         page.click("#discuss-menu-open")
-    page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
+    page.wait_for_selector("#discuss-panel", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
     page.click("#discuss-summarize")
     page.wait_for_function(
         "() => document.getElementById('discuss-answer').textContent.includes('First point')",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     check(page.locator("#discuss-answer .discuss-struck").count() == 0,
           "a bullet stood struck before anything was read")
     # `#1960`: the single header toggle must stand; expand so citations show.
@@ -171,7 +171,7 @@ def walk(page: Page, base: str, width: int, height: int, scheme: Literal["dark",
     page.locator("#discuss-current-head .discuss-toggle").click()
     page.wait_for_function(
         "() => [...document.querySelectorAll('#discuss-answer details')].every((d) => d.open)",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     page.evaluate("() => { window.__strikeLiveMark = 'no reload'; }")
 
     def on_screen(mid: str) -> str:
@@ -186,7 +186,7 @@ def walk(page: Page, base: str, width: int, height: int, scheme: Literal["dark",
 
     def follow(bullet: int, mid: str) -> None:
         page.locator("#discuss-answer li a").nth(bullet).click()
-        page.wait_for_function(on_screen(mid), timeout=20_000)
+        page.wait_for_function(on_screen(mid), timeout=browser_waits.HANG_BACKSTOP_MS)
 
     # Repeated link following always lands on screen: A, B, back to A,
     # B again, A again — the owner's 1st/3rd/back-to-1st walk.
@@ -206,7 +206,7 @@ def walk(page: Page, base: str, width: int, height: int, scheme: Literal["dark",
         "() => { const li = document.querySelectorAll('#discuss-answer li')[0];"
         " return li && li.classList.contains('discuss-struck')"
         " && getComputedStyle(li).textDecorationLine.includes('line-through'); }",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     check(page.evaluate("() => window.__strikeLiveMark") == "no reload",
           "the page reloaded when the row was archived")
     check(page.locator("#discuss-answer li.discuss-struck").count() == 1,
@@ -217,19 +217,19 @@ def walk(page: Page, base: str, width: int, height: int, scheme: Literal["dark",
     page.wait_for_function(
         "() => { const li = document.querySelectorAll('#discuss-answer li')[0];"
         " return li && !li.classList.contains('discuss-struck'); }",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
 
     # And archiving both cited rows strikes both bullets, still no reload.
     row_a.locator(".done-button").click()
     page.wait_for_function(
         "() => document.querySelectorAll('#discuss-answer li')[0]"
-        ".classList.contains('discuss-struck')", timeout=20_000)
+        ".classList.contains('discuss-struck')", timeout=browser_waits.HANG_BACKSTOP_MS)
     follow(1, cited["b"])
     row_b = page.locator(f'#discord-log > [data-id="{cited["b"]}"]')
     row_b.locator(".done-button").click()
     page.wait_for_function(
         "() => document.querySelectorAll('#discuss-answer li.discuss-struck').length === 2",
-        timeout=20_000)
+        timeout=browser_waits.HANG_BACKSTOP_MS)
     check(page.evaluate("() => window.__strikeLiveMark") == "no reload",
           "the page reloaded while archiving from the rows")
     check(any(url.endswith("/dismiss") for url, _ in writes),
