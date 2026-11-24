@@ -2378,6 +2378,27 @@ def _meminfo_file(tmp_path: Path, total_gib: float, avail_gib: float) -> Path:
     return path
 
 
+def _start_gate_below_floor(tmp_path: Path, env: dict[str, str]) -> tuple[subprocess.Popen[str], Path]:
+    """Start a gate that must wait below the memory floor, and return
+    it only once its own output shows the wait (#2171: condition, not
+    a sleep — subprocess startup under load outlasts any fixed one).
+    The 120s is only a backstop against a gate that never waits."""
+    out_path = tmp_path / "gate-output.log"
+    out_file = out_path.open("w")
+    proc = subprocess.Popen(
+        [PY, str(GATE), "--memory-need-gib", "32", "--", PY, "-c", "pass"],
+        env=env, stdout=out_file, stderr=subprocess.STDOUT, text=True)
+    out_file.close()
+    deadline = time.time() + 120
+    while "memory-floor: waiting" not in out_path.read_text():
+        assert proc.poll() is None, (
+            "the gate exited before ever waiting below the floor: " + out_path.read_text())
+        assert time.time() < deadline, (
+            "the gate never waited below the floor (backstop): " + out_path.read_text())
+        time.sleep(0.05)
+    return proc, out_path
+
+
 def test_memory_floor_waits_then_admits_and_is_recorded(tmp_path: Path) -> None:
     """#2062: below the floor the gate waits (observably); when memory
     frees it starts, and the wait lands in the ledger. Heavy floor on a
@@ -2386,11 +2407,15 @@ def test_memory_floor_waits_then_admits_and_is_recorded(tmp_path: Path) -> None:
     (tmp_path / "memory-floor.toml").write_text("poll_s = 0.05\n")
     info = _meminfo_file(tmp_path, 200.0, 90.0)
     env = {**_env(tmp_path), "MEMORY_FLOOR_MEMINFO": str(info)}
-    proc = _start_env(tmp_path, env, "--memory-need-gib", "32", "--", PY, "-c", "pass")
-    time.sleep(1.0)
-    assert proc.poll() is None, "the gate must still be waiting below the floor"
-    _meminfo_file(tmp_path, 200.0, 150.0)
-    out, _ = proc.communicate(timeout=30)
+    proc, out_path = _start_gate_below_floor(tmp_path, env)
+    try:
+        assert proc.poll() is None, "the gate must still be waiting below the floor"
+        _meminfo_file(tmp_path, 200.0, 150.0)
+        proc.wait(timeout=60)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    out = out_path.read_text()
     assert proc.returncode == 0, out
     assert "memory-floor: waiting" in out
     assert "memory floor admits" in out
@@ -2424,18 +2449,20 @@ def test_a_torn_meminfo_read_mid_wait_neither_crashes_nor_refuses(tmp_path: Path
     (tmp_path / "memory-floor.toml").write_text("poll_s = 0.05\n")
     info = _meminfo_file(tmp_path, 200.0, 90.0)
     env = {**_env(tmp_path), "MEMORY_FLOOR_MEMINFO": str(info)}
-    proc = _start_env(tmp_path, env, "--memory-need-gib", "32", "--", PY, "-c", "pass")
+    proc, out_path = _start_gate_below_floor(tmp_path, env)
     try:
-        time.sleep(1.0)
-        assert proc.poll() is None, "the gate must be waiting below the floor"
         info.write_text("MemTotal:")  # a torn, half-written meminfo
-        time.sleep(0.5)
-        assert proc.poll() is None, "one torn read must not kill or refuse the gate"
+        deadline = time.time() + 120
+        while "cannot read the floor this poll" not in out_path.read_text():
+            assert proc.poll() is None, "one torn read must not kill or refuse the gate"
+            assert time.time() < deadline, "the torn read was never logged (backstop)"
+            time.sleep(0.05)
         _meminfo_file(tmp_path, 200.0, 150.0)
-        out, _ = proc.communicate(timeout=30)
+        proc.wait(timeout=60)
     finally:
         if proc.poll() is None:
             proc.kill()
+    out = out_path.read_text()
     assert proc.returncode == 0, out
     assert "cannot read the floor this poll" in out
     assert "Traceback" not in out
