@@ -1051,6 +1051,13 @@ pub fn run_shepherd<A: ManagedApi + ?Sized>(
                 proposal = parse_proposal(text);
             }
         }
+        if claim_lost.load(std::sync::atomic::Ordering::Relaxed) {
+            append_log(
+                &dir,
+                &format!("round {round}: claim lost before acting; stopping"),
+            );
+            break;
+        }
         if own_actionable && !restore_alive {
             if let Some(proposal) = &proposal {
                 match proposal_argv(proposal) {
@@ -1492,6 +1499,16 @@ pub fn claim_owner_alive(claim: &Value) -> bool {
     let Some(pid) = claim["pid"].as_u64() else {
         return false;
     };
+    // A zombie is dead: its parent simply has not reaped it yet.
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        if stat
+            .rsplit_once(')')
+            .map(|(_, rest)| rest.split_whitespace().next() == Some("Z"))
+            .unwrap_or(false)
+        {
+            return false;
+        }
+    }
     match (claim["pid_start"].as_str(), pid_start_ticks(pid)) {
         (Some(recorded), Some(current)) => recorded == current,
         _ => Path::new(&format!("/proc/{pid}")).exists(),

@@ -17,7 +17,7 @@ pub use turnover::TurnoverOptions;
 
 /// Whether a systemd user manager answers (#1879 D).
 fn systemd_user_available() -> bool {
-    std::process::Command::new("systemctl")
+    std::process::Command::new(crate::restore::systemctl_program())
         .args(["--user", "show-environment"])
         .output()
         .is_ok_and(|out| out.status.success())
@@ -36,7 +36,7 @@ fn systemd_user_dir() -> Result<PathBuf> {
 
 /// Run one `systemctl --user` command, naming its failure.
 fn run_systemctl(args: &[&str]) -> Result<()> {
-    let output = std::process::Command::new("systemctl")
+    let output = std::process::Command::new(crate::restore::systemctl_program())
         .arg("--user")
         .args(args)
         .output()
@@ -608,7 +608,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         while Instant::now() < deadline {
             if hcontrol::request(&socket, &json!({"op": "status"}), Duration::from_secs(2)).is_ok()
             {
-                let pid = std::process::Command::new("systemctl")
+                let pid = std::process::Command::new(crate::restore::systemctl_program())
                     .args(["--user", "show", "-p", "MainPID", "--value", &unit])
                     .output()
                     .ok()

@@ -629,7 +629,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
     fn start_wrapper_again(&self, agent_name: &str, unit: Option<&str>) -> Result<Value> {
         let mut unit_error = None;
         if let Some(unit) = unit {
-            match std::process::Command::new("systemctl")
+            match std::process::Command::new(crate::restore::systemctl_program())
                 .args(["--user", "start", unit])
                 .output()
             {

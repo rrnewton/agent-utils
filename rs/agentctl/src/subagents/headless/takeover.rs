@@ -757,7 +757,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         let unit = marker["systemd_unit"].as_str().map(str::to_owned);
         let mut unit_error = None;
         if let Some(unit) = &unit {
-            match std::process::Command::new("systemctl")
+            match std::process::Command::new(crate::restore::systemctl_program())
                 .args(["--user", "start", unit])
                 .output()
             {

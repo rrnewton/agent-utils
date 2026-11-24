@@ -411,6 +411,8 @@ impl Scratch {
             .env("PATH", path)
             .env("FAKE_LOG", &fake_log)
             .env("AGENTCTL_TEST_HARNESS", "1")
+            .env("AGENTCTL_SYSTEMCTL", self.root.join("systemd-refuse"))
+            .env("AGENTCTL_SYSTEMD_RUN", self.root.join("systemd-refuse"))
             .env("AGENTCTL_SYSTEMCTL", self.root.join("systemctl"))
             .env("AGENTCTL_SYSTEMD_RUN", self.root.join("systemd-run"))
             .env_remove("HERDR_SOCKET_PATH")
@@ -678,6 +680,8 @@ impl Scratch {
             .env("XDG_STATE_HOME", home.join(".local/state"))
             .env("PATH", path)
             .env("AGENTCTL_TEST_HARNESS", "1")
+            .env("AGENTCTL_SYSTEMCTL", self.root.join("systemd-refuse"))
+            .env("AGENTCTL_SYSTEMD_RUN", self.root.join("systemd-refuse"))
             .env("AGENTCTL_SYSTEMCTL", self.root.join("systemctl"))
             .env("AGENTCTL_SYSTEMD_RUN", self.root.join("systemd-run"))
             .env_remove("HERDR_SOCKET_PATH")
@@ -1006,19 +1010,9 @@ fn blocking_restore_blocks_stamp_and_acts_until_released() {
         .arg(&registry)
         .arg("--herdr-bin")
         .arg(scratch.root.join("herdr"))
-        .args(["team", "shepherd", "--state-dir"])
+        .args(["start-recovery", "--state-dir"])
         .arg(&state)
-        .args([
-            "--max-rounds",
-            "50",
-            "--round-delay-seconds",
-            "1",
-            "--no-progress-rounds",
-            "1",
-            "--call-timeout-seconds",
-            "120",
-            "--run-agent-prompt",
-        ])
+        .args(["--run-agent-prompt"])
         .arg(wrapper())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1059,9 +1053,39 @@ fn blocking_restore_blocks_stamp_and_acts_until_released() {
         );
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
-    // Several rounds pass with the child recorded; still no stamp
-    // and no unit start from any act.
-    std::thread::sleep(std::time::Duration::from_secs(3));
+    // Wait on the condition "several rounds passed with the child
+    // recorded" (state round >= 3), never a fixed sleep; then the
+    // no-stamp / no-act assertions below are meaningful.
+    fn state_round(dir: &Path) -> u64 {
+        if !dir.exists() {
+            return 0;
+        }
+        for entry in fs::read_dir(dir).expect("read state") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                let found = state_round(&path);
+                if found > 0 {
+                    return found;
+                }
+            }
+            if path.file_name().is_some_and(|name| name == "state.json") {
+                if let Ok(text) = fs::read_to_string(&path) {
+                    if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                        return value["round"].as_u64().unwrap_or(0);
+                    }
+                }
+            }
+        }
+        0
+    }
+    let rounds_deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while state_round(&state.join("shepherd")) < 3 {
+        assert!(
+            std::time::Instant::now() < rounds_deadline,
+            "rounds never advanced while the restore was blocked"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
     fn any_stamp(dir: &Path) -> bool {
         if !dir.exists() {
             return false;
