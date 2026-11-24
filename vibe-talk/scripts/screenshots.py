@@ -5195,6 +5195,67 @@ def _act_glossary_orphan(driver: Driver) -> None:
     driver.settle(300)
 
 
+def _act_orphan_cleared(driver: Driver) -> None:
+    """`#2195` selection cleared programmatically: no orphan chip."""
+    _act_glossary_button(driver)
+    driver.js("getSelection().removeAllRanges()")
+    driver.page.wait_for_function(
+        "() => !window.__visible('selection-chip-wtf') && !window.__visible('selection-chip')",
+        timeout=10_000,
+    )
+    driver.settle(300)
+
+
+def _act_orphan_scroll(driver: Driver) -> None:
+    """`#2195` list scrolled under a standing selection: WTF? never stands alone."""
+    _act_glossary_button(driver)
+    driver.js("document.getElementById('scroll-area').scrollBy(0, 240)")
+    driver.page.wait_for_function(
+        "() => window.__visible('selection-chip-wtf') === window.__visible('selection-chip')",
+        timeout=10_000,
+    )
+    driver.settle(300)
+
+
+def _act_orphan_tap(driver: Driver) -> None:
+    """`#2195` tap elsewhere on the page: no orphan chip."""
+    _act_glossary_button(driver)
+    driver.page.mouse.click(200, 120)
+    driver.page.wait_for_function(
+        "() => window.__visible('selection-chip-wtf') === window.__visible('selection-chip') "
+        "&& (!window.__visible('selection-chip-wtf') || String(getSelection()).length > 0)",
+        timeout=10_000,
+    )
+    driver.settle(300)
+
+
+def _act_orphan_popover(driver: Driver) -> None:
+    """`#2195` popover opened then closed: the WTF? chip goes with it."""
+    _act_glossary_button(driver)
+    driver.page.click("#selection-chip-wtf", force=True)
+    driver.page.wait_for_function(
+        "() => window.__visible('glossary-popover')", timeout=30_000
+    )
+    driver.page.click("#glossary-popover-close", force=True)
+    driver.page.wait_for_function(
+        "() => !window.__visible('selection-chip-wtf')",
+        timeout=10_000,
+    )
+    driver.settle(300)
+
+
+def _act_orphan_rerender(driver: Driver) -> None:
+    """`#2195` list re-rendered (channel reselected): WTF? never stands alone."""
+    _act_glossary_button(driver)
+    driver.load(with_token=True)
+    driver.page.wait_for_function(
+        "() => document.querySelectorAll('#discord-log > li').length > 0 "
+        "&& !window.__visible('selection-chip-wtf') && !window.__visible('selection-chip')",
+        timeout=15_000,
+    )
+    driver.settle(300)
+
+
 def _act_glossary_wtf(driver: Driver) -> None:
     """`#2156`: select an unfamiliar term in a message, press WTF?, and
     photograph the popover the real lookup route answers with (the loopback
@@ -8694,6 +8755,61 @@ SCENES: tuple[Scene, ...] = (
         keep_transient=True,
         expect=(
             ("#2195 no orphan WTF? chip remains", "!window.__visible('selection-chip-wtf') && !window.__visible('selection-chip') && !window.__visible('selection-chip-dismiss')"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="94-glossary-orphan-cleared",
+        what="#2195 after the selection is cleared, no orphan WTF? chip",
+        act=_act_orphan_cleared,
+        profiles=("android-412",),
+        keep_transient=True,
+        expect=(
+            ("#2195 no orphan WTF? chip remains", "!window.__visible('selection-chip-wtf') && !window.__visible('selection-chip') && !window.__visible('selection-chip-dismiss')"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="95-glossary-orphan-scroll",
+        what="#2195 after scrolling with a selection standing, WTF? never stands alone",
+        act=_act_orphan_scroll,
+        profiles=("android-412",),
+        keep_transient=True,
+        expect=(
+            ("#2195 WTF? stands only with the chip group", "window.__visible('selection-chip-wtf') === window.__visible('selection-chip')"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="96-glossary-orphan-tap",
+        what="#2195 after tapping elsewhere, no orphan WTF? chip",
+        act=_act_orphan_tap,
+        profiles=("android-412",),
+        keep_transient=True,
+        expect=(
+            ("#2195 WTF? stands only with the chip group", "window.__visible('selection-chip-wtf') === window.__visible('selection-chip')"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="97-glossary-orphan-popover",
+        what="#2195 after the popover closes, no orphan WTF? chip",
+        act=_act_orphan_popover,
+        profiles=("android-412",),
+        keep_transient=True,
+        expect=(
+            ("#2195 no orphan WTF? chip remains", "!window.__visible('selection-chip-wtf')"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="98-glossary-orphan-rerender",
+        what="#2195 after a reload re-renders the list, no orphan WTF? chip",
+        act=_act_orphan_rerender,
+        profiles=("android-412",),
+        keep_transient=True,
+        expect=(
+            ("#2195 no orphan WTF? chip remains", "!window.__visible('selection-chip-wtf') && !window.__visible('selection-chip')"),
             ("no error banner is up", "!window.__visible('error-wrap')"),
         ),
     ),
