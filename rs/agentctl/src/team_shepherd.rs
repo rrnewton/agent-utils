@@ -539,6 +539,7 @@ pub fn spawn_restore(agentctl: &Path, args: &[String], dir: &Path) -> Result<std
         .map_err(|error| fail(format!("cannot launch restore: {error}")))
 }
 
+#[allow(clippy::too_many_arguments)]
 /// Enqueue one shepherd act (never kick, never run a driver): the
 /// shepherd's only effect path. Returns the child exit code.
 pub fn enqueue_shepherd_act(
