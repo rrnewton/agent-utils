@@ -3766,6 +3766,121 @@ pub fn restore_exit_code(report: &Value, dry_run: bool) -> i32 {
     }
 }
 
+/// The refresh command naming how an operator moves a stale wrapper
+/// snapshot at a safe point (#2214): the per-registry services refresh.
+fn wrapper_refresh_command(registry: &Path) -> String {
+    format!(
+        "agentctl --registry {} services refresh",
+        registry.display()
+    )
+}
+
+/// The agentctl binary a headless wrapper unit starts, from its
+/// `ExecStart` as `systemctl show` prints it (`/path ...` or systemd's
+/// `{ path=/path ; argv[]=... }` shape), or `None` when no token names
+/// one. The first absolute token naming agentctl wins, so a `sh -c`
+/// wrapper around the binary is read through.
+fn exec_start_binary(exec_start: &str) -> Option<PathBuf> {
+    exec_start
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, ';' | '=' | '{' | '}'))
+        .map(|token| token.trim_matches(['"', '\'']))
+        .find(|token| token.starts_with('/') && token.rsplit('/').next() == Some("agentctl"))
+        .map(PathBuf::from)
+}
+
+/// Whether the binary at `binary` predates the headless viewer-ensure
+/// path (#2214): this build's own binary never does; another binary is
+/// stale only when its `capabilities` answer reads cleanly and carries
+/// no `headless.viewer_ensure` marker. An unreadable or unparseable
+/// answer proves nothing and is never called stale.
+fn binary_predates_viewer_ensure(host: &dyn Host, binary: &Path) -> bool {
+    if let Ok(current) = std::env::current_exe() {
+        if current == binary {
+            return false;
+        }
+    }
+    let outcome = host.run(
+        &[binary.display().to_string(), "capabilities".to_owned()],
+        None,
+        Duration::from_secs(15),
+    );
+    if outcome.status != Some(0) {
+        return false;
+    }
+    let Ok(document) = serde_json::from_str::<Value>(&outcome.stdout) else {
+        return false;
+    };
+    // `capabilities` prints its document; tolerate a document wrapped in
+    // an envelope that names it.
+    let headless = if document["headless"].is_object() {
+        &document["headless"]
+    } else if document["capabilities"]["headless"].is_object() {
+        &document["capabilities"]["headless"]
+    } else {
+        return false;
+    };
+    headless["viewer_ensure"] != true
+}
+
+/// The refresh command for `agent_name` when its headless wrapper unit
+/// provably runs a snapshot older than the viewer-ensure path (#2214):
+/// read the unit's `ExecStart` binary and probe it. `None` when the
+/// unit, its binary, or the probe proves nothing — restore only ever
+/// names a snapshot stale on proof.
+fn stale_wrapper_refresh(host: &dyn Host, registry: &Path, agent_name: &str) -> Option<String> {
+    let unit = format!("agentctl-headless-{agent_name}.service");
+    let outcome = host.run(
+        &[
+            "systemctl".to_owned(),
+            "--user".to_owned(),
+            "show".to_owned(),
+            unit,
+            "--property=ExecStart".to_owned(),
+            "--value".to_owned(),
+        ],
+        None,
+        Duration::from_secs(15),
+    );
+    if outcome.status != Some(0) {
+        return None;
+    }
+    let binary = exec_start_binary(&outcome.stdout)?;
+    binary_predates_viewer_ensure(host, &binary).then(|| wrapper_refresh_command(registry))
+}
+
+/// One `headless_viewers` row per headless agent whose record names a
+/// viewer tab (#2214): proof (and, unless `dry_run`, recreation) through
+/// the manager, plus the stale-snapshot note when the agent's wrapper
+/// unit provably runs a pre-ensure snapshot. Viewer rows never change
+/// the restore's completion or exit class; they are evidence beside it.
+fn headless_viewer_rows<A: ManagedApi + ?Sized>(
+    manager: &crate::subagents::ManagedAgents<'_, A>,
+    registry: &Path,
+    host: &dyn Host,
+    names: &[String],
+    dry_run: bool,
+) -> Vec<Value> {
+    let mut rows = Vec::new();
+    for name in names {
+        let Ok(census) = manager.census_record(name) else {
+            continue;
+        };
+        if census["mode"].as_str() != Some("headless") || census["viewer_tab_id"].as_str().is_none()
+        {
+            continue;
+        }
+        let Some(mut row) = manager.restore_headless_viewer(name, dry_run) else {
+            continue;
+        };
+        if let Some(refresh) = stale_wrapper_refresh(host, registry, name) {
+            row["wrapper_snapshot"] = json!("stale");
+            row["refresh_command"] = json!(refresh);
+        }
+        rows.push(row);
+    }
+    rows
+}
+
 /// Repair whatever differs from the desired state: revive the coordinator, then the
 /// agents, then start the units, and write the per-boot report.
 pub fn restore<A: ManagedApi + ?Sized>(
@@ -4310,6 +4425,14 @@ pub fn restore<A: ManagedApi + ?Sized>(
                 .filter_map(|name| manager.census_record(name).ok())
                 .filter_map(|status| status["pane_id"].as_str().map(str::to_owned))
                 .collect();
+            // A tab a record names as its headless viewer is claimed as
+            // that viewer (#2214): the tidy never parks or closes it as
+            // an orphan shell — the viewer check below owns its fate.
+            let viewer_tabs: std::collections::BTreeSet<String> = names
+                .iter()
+                .filter_map(|name| manager.census_record(name).ok())
+                .filter_map(|status| status["viewer_tab_id"].as_str().map(str::to_owned))
+                .collect();
             let cwd_of = |name: &str| {
                 manager
                     .census_record(name)
@@ -4323,7 +4446,7 @@ pub fn restore<A: ManagedApi + ?Sized>(
                     .and_then(|s| s["pane_id"].as_str().map(str::to_owned))
             };
             for pane in panes {
-                if claimed.contains(&pane.pane_id) {
+                if claimed.contains(&pane.pane_id) || viewer_tabs.contains(&pane.tab_id) {
                     continue;
                 }
                 if !client.pane_is_idle_shell(&pane.pane_id).unwrap_or(false) {
@@ -4461,6 +4584,16 @@ pub fn restore<A: ManagedApi + ?Sized>(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default());
+    // #2214: prove every headless agent's recorded viewer tab, and
+    // recreate a dead one through the #1973 ensure path. Report-only:
+    // viewers change neither completion nor the exit class.
+    report["headless_viewers"] = json!(headless_viewer_rows(
+        &manager,
+        registry,
+        host,
+        &names,
+        options.dry_run,
+    ));
     report["in_progress"] = json!(false);
     report["complete"] =
         json!(herdr_ready && coordinator_ok && launched_survived && !options.dry_run);

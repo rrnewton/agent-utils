@@ -430,6 +430,160 @@ fn restore_default_report_lives_under_the_registry_in_its_own_subdirectory() {
     assert_eq!(again["action"], "already-restored");
 }
 
+/// A stopped headless agent whose record names viewer tab `tab`
+/// (#2214 fixture): stopped, so restore never tries to revive the lane
+/// itself — only its viewer is in play.
+fn headless_viewer_agent(fixture: &Fixture, name: &str, tab: &str) {
+    fixture
+        .client
+        .allow_close_tab
+        .store(true, Ordering::Relaxed);
+    let manager = fixture.manager();
+    manager
+        .start_headless(
+            name,
+            &fixture.root,
+            HeadlessStart {
+                harness: "claude".to_owned(),
+                arguments: vec!["--permission-mode=bypassPermissions".to_owned()],
+                launch: false,
+                ..HeadlessStart::default()
+            },
+        )
+        .unwrap();
+    let mut record = manager.load(name).unwrap();
+    record.lifecycle = "stopped".to_owned();
+    manager.save(&record).unwrap();
+    manager
+        .set_viewer_tab_kind(name, Some(tab.to_owned()), Some("console"))
+        .unwrap();
+}
+
+fn viewer_row<'a>(report: &'a Value, name: &str) -> &'a Value {
+    report["headless_viewers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == name)
+        .unwrap_or_else(|| panic!("no headless_viewers row for {name}: {report}"))
+}
+
+fn push_viewer_pane(fixture: &Fixture, pane: &str, tab: &str, agent: &str) {
+    fixture.client.panes.lock().unwrap().push(Pane {
+        pane_id: pane.to_owned(),
+        tab_id: tab.to_owned(),
+        workspace_id: "w1".to_owned(),
+    });
+    fixture
+        .client
+        .labels
+        .lock()
+        .unwrap()
+        .insert(tab.to_owned(), agent.to_owned());
+}
+
+#[test]
+fn restore_dry_run_reports_a_dead_headless_viewer_and_a_real_restore_recreates_it_in_place() {
+    // #2214, the issue's reboot shape at restore level: the recorded
+    // console tab holds an idle shell. The dry run reports it dead and
+    // types nothing; the real restore starts the console in that same
+    // tab, the record still names it, and no harness process is started.
+    let fixture = Fixture::new();
+    let registry = fixture.root.join("registry");
+    let config = config(&fixture, None);
+    headless_viewer_agent(&fixture, "viewerlane", "w1:t9");
+    push_viewer_pane(&fixture, "w1:p9", "w1:t9", "viewerlane");
+    fixture.client.custom_alive.store(false, Ordering::Relaxed);
+    fixture
+        .client
+        .custom_at_idle_shell
+        .store(true, Ordering::Relaxed);
+    let host = ScriptedHost::new();
+    let mut dry = options(None);
+    dry.dry_run = true;
+    let report = restore(&fixture.client, &registry, &host, &config, &dry).unwrap();
+    let row = viewer_row(&report, "viewerlane");
+    assert_eq!(row["state"], "dead", "{row}");
+    assert_eq!(row["viewer_tab_id"], "w1:t9");
+    assert!(
+        row["reason"].as_str().unwrap().contains("idle shell"),
+        "{row}"
+    );
+    assert!(
+        fixture.client.viewer_commands.lock().unwrap().is_empty(),
+        "a dry run types nothing"
+    );
+    let report = restore(&fixture.client, &registry, &host, &config, &options(None)).unwrap();
+    let row = viewer_row(&report, "viewerlane");
+    assert_eq!(row["state"], "recreated", "{row}");
+    assert_eq!(row["viewer_tab_id"], "w1:t9", "the recorded tab is reused");
+    let commands = fixture.client.viewer_commands.lock().unwrap();
+    assert_eq!(commands.len(), 1, "{commands:?}");
+    assert_eq!(commands[0].0, "w1:p9");
+    assert!(
+        commands[0].1.contains(" console viewerlane"),
+        "{commands:?}"
+    );
+    assert!(fixture.client.closed_tabs.lock().unwrap().is_empty());
+    let record = fixture.manager().load("viewerlane").unwrap();
+    assert_eq!(record.viewer_tab().as_deref(), Some("w1:t9"));
+    assert_eq!(record.viewer_kind().as_deref(), Some("console"));
+    // The scripted host saw no unit or wrapper start for the viewer:
+    // every command it ran belongs to the restore's own bookkeeping.
+    assert!(
+        !host
+            .commands()
+            .iter()
+            .any(|call| call.contains("run-headless")),
+        "{:?}",
+        host.commands()
+    );
+}
+
+#[test]
+fn restore_recreates_a_missing_headless_viewer_tab_and_names_a_stale_wrapper_snapshot() {
+    // #2214: the recorded tab is gone, so the ensure path creates a
+    // console tab and records it; and the agent's wrapper unit provably
+    // runs a pre-ensure snapshot (its binary's capabilities carry no
+    // viewer marker), so the row names the refresh command.
+    let fixture = Fixture::new();
+    let registry = fixture.root.join("registry");
+    let config = config(&fixture, None);
+    headless_viewer_agent(&fixture, "viewerlane", "w1:t9");
+    let host = ScriptedHost::new();
+    host.answer(
+        "systemctl --user show agentctl-headless-viewerlane.service",
+        0,
+        "/old/snapshots/0123456789ab/bin/agentctl --registry /reg run-headless viewerlane\n",
+        "",
+    );
+    host.answer(
+        "/old/snapshots/0123456789ab/bin/agentctl capabilities",
+        0,
+        "{\"headless\": {\"commands\": [\"run-headless\"]}}",
+        "",
+    );
+    let report = restore(&fixture.client, &registry, &host, &config, &options(None)).unwrap();
+    let row = viewer_row(&report, "viewerlane");
+    assert_eq!(row["state"], "recreated", "{row}");
+    assert_ne!(row["viewer_tab_id"], "w1:t9");
+    assert_eq!(row["wrapper_snapshot"], "stale", "{row}");
+    assert!(
+        row["refresh_command"]
+            .as_str()
+            .unwrap()
+            .contains("services refresh"),
+        "{row}"
+    );
+    let record = fixture.manager().load("viewerlane").unwrap();
+    assert_eq!(
+        record.viewer_tab().as_deref(),
+        row["viewer_tab_id"].as_str()
+    );
+    assert_eq!(record.viewer_kind().as_deref(), Some("console"));
+    assert_eq!(fixture.client.viewer_commands.lock().unwrap().len(), 1);
+}
+
 #[test]
 fn restore_reports_carry_the_registry_identity() {
     // #2218: every report restore writes records which registry it
