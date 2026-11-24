@@ -1262,3 +1262,17 @@
 .theme-token input[type="color"] { flex: 0 0 auto; width: 3.5rem; height: 2.25rem; padding: 0.15rem; }
 .theme-token input[type="text"] { flex: 0 0 8rem; }
 .theme-token input[disabled] { opacity: 0.55; }
+
+/* `#2155` Part B: the editor's live preview pane, wearing the edited tokens inline. */
+#theme-preview { background: var(--bg); color: var(--ink); border: 1px solid var(--edge); border-radius: 0.6rem; padding: 0.6rem; margin-top: 0.5rem; display: grid; gap: 0.45rem; }
+#theme-preview[hidden] { display: none; }
+.theme-preview-head { background: var(--discuss-head-bg); color: var(--ink); border-radius: 0.4rem; padding: 0.45rem 0.6rem; font-weight: 600; }
+.theme-preview-card { border: 1px solid var(--edge); border-radius: 0.5rem; padding: 0.45rem 0.6rem; }
+.theme-preview-theirs { background: var(--theirs); box-shadow: inset 3px 0 0 var(--unread-stripe, transparent); }
+.theme-preview-mine { background: var(--mine); border-color: var(--mine-edge); margin-left: 1.5rem; }
+.theme-preview-third { background: var(--third); border-color: var(--third-edge); margin-inline: 0.75rem; }
+.theme-preview-code { background: var(--data-bg); color: var(--data-ink); border-radius: 0.4rem; padding: 0.45rem 0.6rem; font-family: ui-monospace, monospace; font-size: 0.85rem; }
+.theme-preview-kw { color: var(--hl-keyword); }
+.theme-preview-str { color: var(--hl-string); }
+.theme-preview-quiet { color: var(--muted); font-size: 0.85rem; }
+.theme-preview-button { background: var(--accent); color: var(--on-accent); justify-self: end; }

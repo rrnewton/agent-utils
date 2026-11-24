@@ -736,7 +736,9 @@ export interface ElementById {
   "theme-explain": HTMLParagraphElement;
   "theme-groups": HTMLDivElement;
   "theme-mode": HTMLSelectElement;
+  "theme-preview": HTMLDivElement;
   "theme-preview-slot": HTMLDivElement;
+  "theme-preview-toggle": HTMLButtonElement;
   "theme-reset": HTMLButtonElement;
   "theme-state": HTMLParagraphElement;
   "thread-back": HTMLButtonElement;

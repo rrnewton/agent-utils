@@ -174,6 +174,7 @@ export function mountAppearance(deps: AppearanceDependencies): AppearanceControl
       kept = false;
     }
     deps.lookup("colour-theme-state").textContent = colourStateWords(next, kept);
+    renderEditor();
   }
 
 
@@ -254,6 +255,38 @@ export function mountAppearance(deps: AppearanceDependencies): AppearanceControl
     }
     const state = deps.lookup("theme-state");
     if (state) state.textContent = themeStateWords(editScheme, cfg, true);
+    paintPreview();
+  }
+
+  // Live preview (`#2155` Part B): a sample pane wearing the edited scheme's tokens,
+  // repainted on every editor change so the reader sees the colours before leaving.
+  function paintPreview(): void {
+    const host = deps.lookup("theme-preview");
+    if (!host || typeof document === "undefined" || typeof document.createElement !== "function") return;
+    const tokens = tokensForConfig(configs[editScheme], editScheme, currentColour);
+    if (host.style && typeof host.style.setProperty === "function") {
+      for (const [name, value] of Object.entries(tokens)) host.style.setProperty(name, value);
+    }
+    if (!host.hasChildNodes || !host.hasChildNodes()) {
+      const make = (tag: string, className: string, text?: string): HTMLElement => {
+        const node = document.createElement(tag);
+        node.className = className;
+        if (text) node.textContent = text;
+        return node;
+      };
+      const head = make("div", "theme-preview-head", "Discuss: preview");
+      const agent = make("div", "theme-preview-card theme-preview-theirs", "Agent: the build is green, the gate is queued.");
+      const mine = make("div", "theme-preview-card theme-preview-mine", "You: ship it when it passes.");
+      const third = make("div", "theme-preview-card theme-preview-third", "Teammate: watching the queue.");
+      const code = make("div", "theme-preview-code");
+      const kw = make("span", "theme-preview-kw", "fn ");
+      const str = make("span", "theme-preview-str", '"landed"');
+      code.append(kw, document.createTextNode("main() { println!("), str, document.createTextNode(") }"));
+      const quiet = make("div", "theme-preview-quiet", "Quiet text, pins and marks ride along.");
+      const button = make("button", "theme-preview-button", "Send");
+      button.setAttribute("type", "button");
+      host.append(head, agent, mine, third, code, quiet, button);
+    }
   }
 
   function editorChanged(kept: boolean): void {
@@ -295,6 +328,14 @@ export function mountAppearance(deps: AppearanceDependencies): AppearanceControl
     resetEl.textContent = "Reset custom to Default";
     seedCustom(editScheme);
     editorChanged(keepConfig(editScheme));
+  });
+  const previewToggle = deps.lookup("theme-preview-toggle") as HTMLButtonElement | null;
+  if (previewToggle) listen<Event>(previewToggle, "click", () => {
+    const host = deps.lookup("theme-preview");
+    if (!host) return;
+    const open = previewToggle.getAttribute("aria-expanded") !== "false";
+    previewToggle.setAttribute("aria-expanded", String(!open));
+    host.hidden = open;
   });
   const groupsHost = deps.lookup("theme-groups");
   if (groupsHost) listen<Event>(groupsHost, "input", (event: Event) => {

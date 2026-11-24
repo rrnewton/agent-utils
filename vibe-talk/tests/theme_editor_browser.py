@@ -131,6 +131,17 @@ def main() -> int:
                 check(stored is not None and '"style":"extra"' in stored, f"Extra kept: {stored}")
                 head = page.evaluate("() => getComputedStyle(document.documentElement).getPropertyValue('--discuss-head-bg').trim()")
                 check(head == "#2e2340", f"Extra Discuss highlight: {head}")
+                preview = page.evaluate("""() => {
+                  const head = document.querySelector('.theme-preview-head');
+                  const host = document.getElementById('theme-preview');
+                  return { head: getComputedStyle(head).backgroundColor, bg: getComputedStyle(host).backgroundColor };
+                }""")
+                check(preview["head"] == "rgb(46, 35, 64)", f"preview Discuss head follows Extra: {preview}")
+                page.click("#theme-preview-toggle")
+                check(page.evaluate("() => document.getElementById('theme-preview').hidden"), "preview toggle hides the pane")
+                page.click("#theme-preview-toggle")
+
+
                 if args.screenshots:
                     args.screenshots.mkdir(parents=True, exist_ok=True)
                     page.screenshot(path=str(args.screenshots / "theme-editor-dark-extra.png"))
@@ -146,6 +157,10 @@ def main() -> int:
                 # Custom: seeded from the Default, then the reader's colour wins.
                 page.select_option("#theme-mode", "custom")
                 page.wait_for_function("() => !document.querySelector('#theme-groups input[data-token=\"--bg\"]').disabled", timeout=STATE_MS)
+                set_colour(page, "--discuss-head-bg", "#334455")
+                page.wait_for_function("() => getComputedStyle(document.querySelector('.theme-preview-head')).backgroundColor === 'rgb(51, 68, 85)'", timeout=STATE_MS)
+                if args.screenshots:
+                    page.screenshot(path=str(args.screenshots / "theme-editor-preview.png"))
                 set_colour(page, "--bg", "#112233")
                 page.wait_for_function("() => getComputedStyle(document.documentElement).getPropertyValue('--bg').trim() === '#112233'", timeout=STATE_MS)
                 stored = page.evaluate("() => localStorage.getItem('vibe-talk.voice.theme-dark')")
