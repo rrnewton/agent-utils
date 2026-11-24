@@ -1,12 +1,13 @@
 ---
 title: 'wrkslots-lifecycle-fuzz: a TLA+ transition model checked with TLC, then seeded fuzz of the real registry'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
 - wrkslots
 created_at: 2026-11-21T08:18:00.000000000-05:00
-updated_at: 2026-11-21T08:18:00.000000000-05:00
+updated_at: 2026-11-24T18:09:15.000000000-05:00
+closed_at: 2026-11-24T18:09:15.000000000-05:00
 ---
 
 # Description
@@ -30,3 +31,7 @@ Phase 1: TLC checks the spec at the stated bounds and the two explorers agree on
 # Notes
 
 [watermelon-full-preview] Owner request relayed by the coordinator (2026-11-21). Phase 1 first TLC results are recorded in py/wrkslots/TRANSITIONMODEL.md. Product-code fixes stay with the owning lanes (the #2041 compare sites are not touched here); this lane adds models, tests and harnesses. Phase 2 starts on the coordinator's #2041-landed signal. No landing without the coordinator's LAND NOW.
+
+## Resolution
+
+[watermelon-full-preview] Complete. Phase 1 landed 2b9e11b4 (TLA+ transition model, TLC cross-checks, #2041 sidecar class). Phase 2 landed e9fb82cb and 55a3e4c5 (seeded harness with model-as-oracle decode, crash seams, concurrent workers, fsync fault family pinned as #2049, exit-sweep loop-device teardown #2048, root-mount opt-in 88ee8c53). Transferred residuals: fast-seeds un-quarantine under #2167, orphan loop recovery under #2050, finer-grained lock modelling under #2090 (landed) and #2127.
