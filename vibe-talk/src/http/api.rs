@@ -3218,6 +3218,269 @@ fn glossary_source_view(
     }
 }
 
+/// What one WTF retrieval gathered: the capped candidate set plus the
+/// human-readable scope for the not-found answer (`#2189`).
+struct GlossaryRetrieval {
+    /// Candidates in evidence order: thread, link-target, then global.
+    hits: Vec<Message>,
+    /// `no definition found; searched …` for a miss.
+    reason: String,
+}
+
+/// Folded word set of a selection with hyphens read as spaces (`#2189`).
+fn glossary_word_set(selected: &str) -> Vec<String> {
+    crate::search_query::fold(&selected.replace('-', " "))
+        .split(' ')
+        .filter(|w| !w.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Cheap singular stem: drop a trailing `s` (never `ss`) on longer words.
+fn glossary_stem(word: &str) -> String {
+    if word.len() > 3 && word.ends_with('s') && !word.ends_with("ss") {
+        word[..word.len() - 1].to_owned()
+    } else {
+        word.to_owned()
+    }
+}
+
+/// Whether folded `text` holds every word of `words`, stem-insensitively.
+fn glossary_holds(text: &str, words: &[String]) -> bool {
+    !words.is_empty()
+        && words.iter().all(|word| {
+            text.contains(word.as_str()) || text.contains(glossary_stem(word).as_str())
+        })
+}
+
+/// Definitional-fit score of one candidate (`#2189`): phrase adjacency and
+/// definitional cues beat scattered single-word matches.
+fn glossary_score(message: &Message, words: &[String], phrases: &[String]) -> i32 {
+    let text = crate::search_query::fold(&message.content);
+    let matched = words
+        .iter()
+        .filter(|word| text.contains(word.as_str()) || text.contains(glossary_stem(word).as_str()))
+        .count() as i32;
+    let mut score = matched * 10;
+    if phrases.iter().any(|phrase| !phrase.is_empty() && text.contains(phrase.as_str())) {
+        score += 25;
+    }
+    if text.contains(" is ") || text.contains(" are ") || text.contains(" means ") {
+        score += 8;
+    }
+    if matched <= 1 && words.len() > 1 {
+        score -= 12;
+    }
+    score
+}
+
+/// Link-target tokens in `text`: letter+digit tokens worth joining on.
+fn glossary_link_tokens(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_')) {
+        let token = raw.trim_matches('-');
+        if token.len() >= 4
+            && token.chars().any(|c| c.is_ascii_digit())
+            && token.chars().any(|c| c.is_ascii_alphabetic())
+            && !out.iter().any(|held| held.eq_ignore_ascii_case(token))
+        {
+            out.push(token.to_owned());
+        }
+        if out.len() >= 5 {
+            break;
+        }
+    }
+    out
+}
+
+/// Search queries for a selection, best first (`#2189`): every window in
+/// space, hyphen and stemmed forms (multi-word before single-word), then
+/// the joined nospace form. Capped so a lookup stays cheap.
+fn glossary_queries(selected: &str) -> Vec<String> {
+    let raw_words: Vec<&str> = selected.split_whitespace().collect();
+    let mut multi: Vec<String> = Vec::new();
+    let mut single: Vec<String> = Vec::new();
+    let push = |list: &mut Vec<String>, query: String| {
+        if !query.is_empty() && !list.iter().any(|held| held == &query) {
+            list.push(query);
+        }
+    };
+    for take in (1..=raw_words.len()).rev() {
+        for start in 0..=(raw_words.len() - take) {
+            let window = &raw_words[start..start + take];
+            let base = window.join(" ");
+            let space = window
+                .iter()
+                .map(|w| w.replace('-', " "))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let stemmed = space
+                .split(' ')
+                .map(glossary_stem)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let target = if take > 1 { &mut multi } else { &mut single };
+            push(target, space.clone());
+            push(target, base);
+            push(target, stemmed);
+            if take == raw_words.len() {
+                push(
+                    &mut multi,
+                    window
+                        .iter()
+                        .map(|w| w.replace('-', ""))
+                        .collect::<Vec<_>>()
+                        .join(""),
+                );
+            }
+        }
+    }
+    multi.extend(single);
+    multi.truncate(16);
+    multi
+}
+
+/// Cache-only WTF retrieval with reserved buckets (`#2189`): up to four
+/// thread candidates, up to four link-target candidates, then global
+/// window hits ranked by definitional fit, twelve in all.
+async fn glossary_retrieval(
+    state: &AppState,
+    channel_id: &str,
+    selected: &str,
+    context: &str,
+    message_id: Option<&str>,
+) -> GlossaryRetrieval {
+    let words = glossary_word_set(selected);
+    let phrases = vec![
+        crate::search_query::fold(&selected.replace('-', " ")),
+        crate::search_query::fold(selected),
+        selected.replace('-', "").replace(' ', "").to_lowercase(),
+    ];
+    let channels = state.all_channels();
+    let search = async |q: &str, limit: usize| -> Vec<Message> {
+        crate::server_search::search(
+            state,
+            Scope::Write,
+            channels.clone(),
+            &crate::server_search::Ask {
+                q: q.to_owned(),
+                tz: None,
+                below_ms: None,
+                limit: Some(limit),
+            },
+        )
+        .await
+        .map(|answer| answer.hits)
+        .unwrap_or_default()
+    };
+    // Thread-first: resolve the selected message from the cache alone.
+    let mut thread_hits: Vec<Message> = Vec::new();
+    let mut thread_note = "no thread".to_owned();
+    let selected_message = match message_id {
+        Some(id) if !id.is_empty() => {
+            state
+                .message_cache
+                .held_message(&ChannelId(channel_id.to_owned()), &MessageId(id.to_owned()))
+                .await
+        }
+        _ => None,
+    };
+    if let Some(held) = &selected_message {
+        if let Some(thread) = held.thread.as_ref().map(|t| t.id.clone()) {
+            if let Ok(fetched) = crate::ops::catchup_fetch(
+                state,
+                Scope::Write,
+                channel_id,
+                crate::threads::TimelineView::Thread,
+                Some(&thread),
+                64,
+            )
+            .await
+            {
+                thread_note = format!("its thread ({} held)", fetched.messages.len());
+                let mut scored: Vec<(i32, Message)> = fetched
+                    .messages
+                    .into_iter()
+                    .filter(|m| {
+                        glossary_holds(&crate::search_query::fold(&m.content), &words)
+                    })
+                    .map(|m| (glossary_score(&m, &words, &phrases), m))
+                    .collect();
+                scored.sort_by_key(|(score, m)| (*score, m.created_ms().unwrap_or(0)));
+                scored.reverse();
+                thread_hits = scored.into_iter().take(4).map(|(_, m)| m).collect();
+            }
+        }
+    }
+    // Link-target keys from the containing line and the held message.
+    let mut token_text = context.to_owned();
+    if let Some(held) = &selected_message {
+        token_text.push(' ');
+        token_text.push_str(&held.content);
+    }
+    token_text.push(' ');
+    token_text.push_str(selected);
+    let tokens = glossary_link_tokens(&token_text);
+    let mut link_hits: Vec<Message> = Vec::new();
+    for token in &tokens {
+        for hit in search(token, 6).await {
+            let folded = crate::search_query::fold(&hit.content);
+            if folded.contains(&token.to_lowercase())
+                && !link_hits.iter().any(|held: &Message| held.id == hit.id)
+                && !thread_hits.iter().any(|held: &Message| held.id == hit.id)
+            {
+                link_hits.push(hit);
+            }
+        }
+        if link_hits.len() >= 4 {
+            break;
+        }
+    }
+    link_hits.truncate(4);
+    // Global windows, rarity-weighted by definitional fit.
+    let mut global: Vec<(i32, Message)> = Vec::new();
+    for query in glossary_queries(selected) {
+        for hit in search(&query, 12).await {
+            if thread_hits.iter().any(|held: &Message| held.id == hit.id)
+                || link_hits.iter().any(|held: &Message| held.id == hit.id)
+                || global.iter().any(|(_, held)| held.id == hit.id)
+            {
+                continue;
+            }
+            let score = glossary_score(&hit, &words, &phrases)
+                + i32::from(hit.channel_id.as_str() == channel_id) * 3;
+            global.push((score, hit));
+        }
+    }
+    global.sort_by_key(|(score, m)| (*score, m.created_ms().unwrap_or(0)));
+    global.reverse();
+    let mut hits: Vec<Message> = Vec::new();
+    hits.extend(thread_hits);
+    hits.extend(link_hits);
+    for (_, hit) in global {
+        if hits.len() >= 12 {
+            break;
+        }
+        hits.push(hit);
+    }
+    let keywords = glossary_queries(selected)
+        .into_iter()
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let links = if tokens.is_empty() {
+        "no link targets".to_owned()
+    } else {
+        tokens.join(", ")
+    };
+    GlossaryRetrieval {
+        hits,
+        reason: format!(
+            "no definition found; searched {thread_note}, keywords ({keywords}), links ({links}) in cached messages and fetched documents"
+        ),
+    }
+}
+
 /// `GET /api/v1/glossary/terms` — every term the page renders as a glossary
 /// link: reviewed entries first (they win), then dynamic ones.
 /// `#2156 vibe-talk-wtf-glossary-lookup`. READ scope: definitions already
@@ -3328,40 +3591,27 @@ pub async fn glossary_lookup(
     let Some(agent) = state.catchup_summarizer.clone() else {
         return Err(glossary_not_available());
     };
-    // 2. Cache-only evidence: cached messages, then fetched documents.
-    // The search language matches whole phrases, so try the selection then
-    // its word-prefixes, longest first — the logical term is usually one.
-    let channels = state.all_channels();
-    // Union over windows, longest first: the full phrase finds use-sites,
-    // shorter windows find the introducing sighting that defines the term.
-    let mut hits: Vec<Message> = Vec::new();
-    for take in (1..=words.len()).rev() {
-        for start in 0..=(words.len() - take) {
-            let answer = crate::server_search::search(
-                &state,
-                Scope::Write,
-                channels.clone(),
-                &crate::server_search::Ask {
-                    q: words[start..start + take].join(" "),
-                    tz: None,
-                    below_ms: None,
-                    limit: Some(12),
-                },
-            )
-            .await;
-            for hit in answer.map(|a| a.hits).unwrap_or_default() {
-                if hits.len() < 12 && !hits.iter().any(|held: &Message| held.id == hit.id) {
-                    hits.push(hit);
-                }
+    // 2. Cache-only evidence: the selection's own thread first, then hits
+    // sharing its link targets, then global windows — each bucket with
+    // reserved slots so none can starve the others (`#2189`). Windows are
+    // hyphen/space/nospace and singular/plural insensitive; single common
+    // words are rarity-weighted last.
+    let retrieval = glossary_retrieval(&state, &channel_id, &selected, &context, body.message_id.as_deref()).await;
+    let searched_reason = retrieval.reason.clone();
+    let hits = retrieval.hits;
+    let doc_query = crate::search_query::parse(&selected);
+    let mut doc_search = state.documents.search_documents(&doc_query, 5);
+    let space_form = selected.replace('-', " ");
+    if space_form != selected {
+        let extra = state
+            .documents
+            .search_documents(&crate::search_query::parse(&space_form), 5);
+        for hit in extra.hits {
+            if doc_search.hits.len() < 5 && !doc_search.hits.iter().any(|held| held.key == hit.key) {
+                doc_search.hits.push(hit);
             }
         }
-        if hits.len() >= 12 {
-            break;
-        }
     }
-    hits.sort_by_key(|m| usize::from(m.channel_id.as_str() != channel_id));
-    let doc_query = crate::search_query::parse(&selected);
-    let doc_search = state.documents.search_documents(&doc_query, 5);
     if hits.is_empty() && doc_search.hits.is_empty() {
         return Ok(Json(crate::contract::GlossaryLookupResponse {
             state: "not_found".to_owned(),
@@ -3370,7 +3620,7 @@ pub async fn glossary_lookup(
             source: None,
             cached: false,
             saved: false,
-            reason: Some("no definition found in recent messages or fetched documents".to_owned()),
+            reason: Some(searched_reason.clone()),
         })
         .into_response());
     }
@@ -3435,7 +3685,7 @@ definition rests on>\"}. When the evidence does not define the words, answer \
             source: None,
             cached: false,
             saved: false,
-            reason: Some("no definition found in recent messages or fetched documents".to_owned()),
+            reason: Some(searched_reason.clone()),
         })
         .into_response());
     };
@@ -3522,7 +3772,7 @@ definition rests on>\"}. When the evidence does not define the words, answer \
             source: None,
             cached: false,
             saved: false,
-            reason: Some("no definition found in recent messages or fetched documents".to_owned()),
+            reason: Some(searched_reason.clone()),
         })
         .into_response());
     };

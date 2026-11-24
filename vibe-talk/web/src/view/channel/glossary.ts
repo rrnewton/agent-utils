@@ -208,9 +208,12 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
         const log = document.getElementById("discord-log");
         if (log) linkTermsIn(log, true);
       } else {
+        const searched = answer && typeof answer.reason === "string" ? answer.reason : "";
         showPopover(
           info.text,
-          `Couldn't find what “${info.text}” means in recent messages or fetched documents.`,
+          searched
+            ? `Couldn't find what “${info.text}” means. Searched ${searched.replace(/^no definition found; searched /, "")}.`
+            : `Couldn't find what “${info.text}” means in recent messages or fetched documents.`,
           null,
           false,
         );

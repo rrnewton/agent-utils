@@ -343,3 +343,127 @@ async fn a_read_token_cannot_spend_a_lookup() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
+
+/// Synthetic shape of #2189 (no live data): the definition uses the spaced
+/// form in the selection's own thread; the selection uses the hyphenated
+/// form and names shared link-target tokens; newer generic "stack" noise
+/// would otherwise fill the candidate cap.
+fn threaded_message(seq: i64, thread_id: &str, is_root: bool, content: &str) -> Message {
+    let mut held = message(seq, content);
+    held.thread = Some(vibe_talk::threads::MessageThread {
+        class: None,
+        hue: None,
+        display_name: None,
+        summary: None,
+        id: thread_id.to_owned(),
+        root_message_id: None,
+        is_root,
+        broadcast: false,
+        reply_count: None,
+        reply_count_exact: false,
+        unread_count: None,
+        unread_exact: false,
+        last_reply_at: None,
+        last_reply_author: None,
+        last_reply_author_id: None,
+        last_reply_excerpt: None,
+        participants: Vec::new(),
+        participants_more: 0,
+        pinned: None,
+        root_done: None,
+        replies_done: None,
+    });
+    held
+}
+
+#[tokio::test]
+async fn a_hyphenated_selection_finds_the_spaced_definition_in_its_thread() {
+    let thread = "thread-wtf-fixture";
+    let defining = threaded_message(
+        1,
+        thread,
+        true,
+        "Memory safety in guest-memory access, which makes record and replay trustworthy: Alpha fix (TKT-101), Beta fix (TKT-102), Gamma fix (TKT-103)",
+    );
+    let use_site = threaded_message(
+        2,
+        thread,
+        false,
+        "Memory-safety stack: the bottom three (TKT-101, TKT-102, TKT-103) wait for review",
+    );
+    let defining_id = defining.id.as_str().to_owned();
+    let use_site_id = use_site.id.as_str().to_owned();
+    let mut msgs = vec![defining, use_site];
+    for i in 3..15 {
+        msgs.push(message(i, &format!("unrelated stack cleanup note {i}")));
+    }
+    let backend = backend_with(msgs);
+    let (state, summarizer, _dir) = cached_state(backend.clone(), true).await;
+    fill(&state).await;
+    summarizer.answer_with(&format!(
+        "{{\"term\":\"Memory safety\",\"definition\":\"guest-memory access safety that makes record and replay trustworthy\",\"source_kind\":\"message\",\"source_id\":\"{defining_id}\"}}"
+    ));
+    let app = vibe_talk::http::router(state);
+    let (status, body) = post(
+        &app,
+        &lookup_path(),
+        Some(WRITE_TOKEN),
+        &json!({"selected": "Memory-safety stack", "message_id": use_site_id, "context": "Memory-safety stack: the bottom three (TKT-101, TKT-102, TKT-103) wait for review"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], json!("found"), "{body}");
+    let calls = summarizer.prompt_calls();
+    assert_eq!(calls.len(), 1, "one model step");
+    assert!(
+        calls[0].1.contains("guest-memory access"),
+        "definition must reach the model: {}",
+        calls[0].1
+    );
+}
+
+#[tokio::test]
+async fn a_learned_entry_stays_out_of_the_discuss_warmup() {
+    // Owner-decision guard (#2189): WTF-learned definitions are popover-only
+    // until the owner decides otherwise; Discuss must never see them.
+    assert!(!vibe_talk::glossary_dynamic::DYNAMIC_IN_WARMUP);
+    let defining = message(
+        1,
+        "Memory safety in guest-memory access, which makes record and replay trustworthy: Alpha fix, Beta fix, Gamma fix",
+    );
+    let use_site = message(2, "the Memory safety test fix landed this morning");
+    let source_id = defining.id.as_str().to_owned();
+    let backend = backend_with(vec![defining, use_site]);
+    let (state, summarizer, _dir) = cached_state(backend.clone(), true).await;
+    fill(&state).await;
+    summarizer.answer_with(&format!(
+        "{{\"term\":\"Memory safety\",\"definition\":\"guest-memory access safety that makes record and replay trustworthy\",\"source_kind\":\"message\",\"source_id\":\"{source_id}\"}}"
+    ));
+    let app = vibe_talk::http::router(state);
+    let (status, body) = post(
+        &app,
+        &lookup_path(),
+        Some(WRITE_TOKEN),
+        &json!({"selected": "Memory safety"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], json!("found"), "{body}");
+    let before = summarizer.prompt_calls().len();
+    summarizer.answer_with("a short summary");
+    let path = format!("/api/v1/channels/{WRITE_CHANNEL}/catchup");
+    let (status, _body) = post(&app, &path, Some(WRITE_TOKEN), &json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{_body}");
+    let calls = summarizer.prompt_calls();
+    assert!(calls.len() > before, "Discuss must have run: {calls:?}");
+    for (_, prompt) in &calls[before..] {
+        assert!(
+            !prompt.contains("access safety that makes"),
+            "learned definition leaked into Discuss: {prompt}"
+        );
+        assert!(
+            !prompt.contains("learned from readers"),
+            "dynamic warm-up block leaked into Discuss: {prompt}"
+        );
+    }
+}
