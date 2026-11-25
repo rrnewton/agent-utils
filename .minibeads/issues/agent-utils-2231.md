@@ -1,13 +1,14 @@
 ---
 title: 'vibe-talk-selection-strip-atomic: the selection strip and all its chips appear in one frame, WTF never late or covered'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
 - vibe-talk
 - owner-ui
 created_at: 2026-11-25T06:30:00-05:00
-updated_at: 2026-11-25T06:30:00-05:00
+updated_at: 2026-11-25T09:19:55-05:00
+closed_at: 2026-11-25T14:19:55.000000000+00:00
 ---
 
 # Description
@@ -31,3 +32,15 @@ Keep the selection strip (the owner accepts it). The strip (Quote reply, WTF?, d
 # Notes
 
 Owner UI request (fast-track, owner rule 286). Diagnose first with a failing test; fix on a branch from github/main; one owner gate; land only on the coordinator's LAND NOW.
+
+## Resolution
+
+Landed on main as d80a818f (gated as cde27ab1, owner gate green 2026-11-25 8:58 AM ET), deployed 9:04 AM ET 11-25, and the 15-minute deploy watch came back clean (9:04 to 9:19 AM ET: no app errors or panics, no restarts, no server errors on any route). The quoting view's
+`drawSelectionChip` is now the one owner of the strip group: WTF? is shown and hidden with the row, Quoted reply and the X in
+the same call, so all of them paint in one frame (out of the row, with no empty slot, where lookups cannot run); the glossary
+view no longer decides WTF?'s visibility on selection change or popover close. The cause was a timing race, not z-order:
+the glossary view's own selection-change listener hid WTF? synchronously before the strip's next-frame draw on a first
+selection, and nothing showed it again until the next selection change, so the strip painted an empty slot where WTF? belongs.
+Page tests step frames and assert the whole strip from its first frame (first selection on a fresh load, selection change,
+re-selection, popover close, touch hold, keyboard open; phone and desktop) and fail on the previous page code. Side findings
+filed as #2235 vibe-talk-wtf-popover-late-answer-reopens and #2236 vibe-talk-screenshots-discuss-config-scenes.
