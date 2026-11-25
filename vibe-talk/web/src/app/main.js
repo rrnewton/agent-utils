@@ -2035,6 +2035,8 @@ const filterPlaceOwner = createFilterPlace({
   activeFilter: () => columnWork.active().filter,
   activeColumn: () => columnWork.active(),
   columnSide: () => columnWork.side(),
+  // `#2256`: one column only (the right column's room past its foot keeps main's behaviour).
+  searchWordsTyped: () => !sideColumnUp() && screens.view() === "discord" && searchField.open() && searchTyped(searchField.query()),
   mainColumn: () => columns.main,
   sideColumn: () => columns.side,
   inColumn: (column, act) => inColumn(/** @type {any} */ (column), act),

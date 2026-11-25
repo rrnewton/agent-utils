@@ -76,6 +76,9 @@ export interface FilterPlaceDependencies {
   activeFilter(): FilterState;
   activeColumn(): unknown;
   columnSide(): boolean;
+  /** `#2256`: whether the channel list's own search is open with words in one column (no right
+   * column up), so its server line is to land at the list's foot. Optional for doubles. */
+  searchWordsTyped?(): boolean;
   mainColumn(): unknown;
   sideColumn(): unknown;
   inColumn<T>(column: unknown, act: () => T): T;
@@ -373,7 +376,12 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
     }
     if (showing && pane && mark && chosen) return anchorAt(chosen, mark);
     if (deps.atBottom(area)) {
-      const newestRow = lastShownMessageRow();
+      // `#2256`: only for the channel list's own search in one column (`searchWordsTyped` says no
+      // right column is up), whose server line lands at the foot. Any other change at the newest
+      // line, two columns included, measures nothing more here and keeps main's follow: with the
+      // right column up, its room past its foot takes an arrival in place (`#2230`).
+      const newestRow = !deps.columnSide() && deps.searchWordsTyped && deps.searchWordsTyped()
+        ? lastShownMessageRow() : null;
       return { placeMark: deps.inputStamp ? { inputAt: deps.inputStamp() } : undefined,
         newest: true, row: null, ids: [], selected: null, drawn: false, focused: false, time: NaN, offset: 0,
         alternate: null, newestRow, newestBottom: newestRow ? newestRow.getBoundingClientRect().bottom : undefined };
@@ -458,15 +466,16 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
       // the newest line keeps that line where it stood while it still stands. What the change adds
       // below it (the search's server line at the foot) is seen past its bottom edge, never taken by
       // following the list's foot. With the line gone (filtered away), the newest line is followed.
-      const kept = anchor ? anchor.newestRow : null;
-      if (kept && typeof anchor?.newestBottom === "number" && kept.isConnected && typeof kept.getClientRects === "function" &&
-        kept.getClientRects().length > 0) {
-        deps.nudge(area, kept.getBoundingClientRect().bottom - anchor.newestBottom);
-        deps.renderJumpNewest();
-        return;
-      }
+      // The foot is followed first, as ever (it also reclaims any held room past it, `#2076`, and
+      // closes a column's overscroll room); then the line is put back where it stood.
       if (anchor || wasEmptied) deps.scrollToNewest();
       else deps.renderJumpNewest();
+      const kept = anchor ? anchor.newestRow : null;
+      if (kept && typeof anchor?.newestBottom === "number" && kept.isConnected && typeof kept.getClientRects === "function" &&
+        kept.getClientRects().length > 0 && (typeof area.contains !== "function" || area.contains(kept))) {
+        deps.nudge(area, kept.getBoundingClientRect().bottom - anchor.newestBottom);
+        deps.renderJumpNewest();
+      }
       return;
     }
     let row = anchorRow(anchor);
