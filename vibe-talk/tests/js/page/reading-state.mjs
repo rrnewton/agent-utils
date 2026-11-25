@@ -3639,6 +3639,76 @@ test("`#240 reading-bookmark`: the chip points toward the line, goes when the li
   assert.equal(chip.hidden, true, "the chip is offered over the call's transcript");
 });
 
+test("`#2229 bookmark-chip-clear-popover`: hold and right-click open Clear once; Clear uses the old path with Undo", async () => {
+  const chipPage = async () => {
+    const page = await keyboardPageAtTop(tallChannel(30));
+    await bookmarkRow(page, "15");
+    const area = page.el("scroll-area");
+    area.scrollTop = area.scrollHeight;
+    await area.dispatch("scroll");
+    assert.equal(page.el("jump-bookmark").hidden, false, "the chip is not up");
+    return page;
+  };
+  // A tap still jumps.
+  const tap = await chipPage();
+  await tap.el("jump-bookmark").click();
+  await tap.settle();
+  assert.equal(selectedId(tap), "15", "a tap no longer jumps to the bookmark");
+  // Hold opens; the Android contextmenu behind it must not reopen, toggle or flash it shut, and
+  // the click behind the hold must not jump. Exactly one open: still open after both arrivals.
+  const held = await chipPage();
+  const chip = held.el("jump-bookmark");
+  const popover = held.el("bookmark-clear-popover");
+  assert.equal(popover.hidden, true);
+  await chip.dispatch("pointerdown", { pointerType: "touch", clientX: 10, clientY: 10 });
+  assert.equal(held.expireTimers(450), 1, "the hold armed no timer");
+  await held.settle();
+  assert.equal(popover.hidden, false, "a hold did not open the popover");
+  assert.equal(chip.getAttribute("aria-expanded"), "true");
+  await chip.dispatch("contextmenu", {});
+  await held.settle();
+  assert.equal(popover.hidden, false, "contextmenu after a hold closed or reopened the popover");
+  assert.equal(chip.getAttribute("aria-expanded"), "true", "the popover opened twice");
+  await chip.dispatch("pointerup", { pointerType: "touch", clientX: 10, clientY: 10 });
+  await chip.click();
+  await held.settle();
+  assert.notEqual(selectedId(held), "15", "the click behind a hold also jumped");
+  assert.equal(popover.hidden, false, "letting go closed the popover");
+  // Escape closes it and returns focus to the chip.
+  await press(held, held.el("bookmark-clear-button"), "Escape");
+  assert.equal(popover.hidden, true, "Escape did not close the popover");
+  assert.equal(focused(held), chip, "Escape did not return focus to the chip");
+  // A press that travels is a scroll, not a hold.
+  const scrolled = await chipPage();
+  const scrollChip = scrolled.el("jump-bookmark");
+  await scrollChip.dispatch("pointerdown", { pointerType: "touch", clientX: 10, clientY: 10 });
+  await scrollChip.dispatch("pointermove", { pointerType: "touch", clientX: 10, clientY: 40 });
+  assert.equal(scrolled.expireTimers(450), 0, "a travelled press still armed the hold");
+  await scrolled.settle();
+  assert.equal(scrolled.el("bookmark-clear-popover").hidden, true, "a scroll from the chip opened the popover");
+  // Right-click alone opens; an outside press closes; Clear goes through the old path with Undo.
+  const mouse = await chipPage();
+  const mouseChip = mouse.el("jump-bookmark");
+  await mouseChip.dispatch("contextmenu", {});
+  await mouse.settle();
+  assert.equal(mouse.el("bookmark-clear-popover").hidden, false, "right-click did not open the popover");
+  await mouse.documentEvent("pointerdown", { target: mouse.el("scroll-area"), pointerType: "mouse" });
+  await mouse.settle();
+  assert.equal(mouse.el("bookmark-clear-popover").hidden, true, "an outside press did not close the popover");
+  await mouseChip.dispatch("contextmenu", {});
+  await mouse.settle();
+  const calls = mouse.bookmarkCalls.length;
+  await mouse.el("bookmark-clear-button").click();
+  await mouse.settle();
+  assert.equal(mouse.el("bookmark-clear-popover").hidden, true, "choosing Clear left the popover up");
+  assert.equal(bookmarkAt(mouse), null, "Clear did not take the bookmark away");
+  assert.equal(mouse.bookmarkCalls[calls].method, "DELETE", "Clear did not use the existing removal write");
+  assert.equal(mouse.el("undo-bookmark").hidden, false, "Clear offered no Undo chip");
+  await mouse.el("undo-bookmark").click();
+  await mouse.settle();
+  assert.deepStrictEqual(bookmarkAt(mouse), { id: "15", place: "above" }, "Undo did not put the bookmark back");
+});
+
 test("`#240 reading-bookmark`: Done through here at or below the line slides it below that message; above it, the line stays", async () => {
   const page = newPage();
   await signIn(page);

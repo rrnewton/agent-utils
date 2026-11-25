@@ -9138,6 +9138,7 @@ application.track(mountReadingJumps({
   jumpToUnread: () => jumpToUnread(),
   jumpToReading: () => readingJump.jump(),
   backToReply: () => backToReply(),
+  clearBookmark: () => removeBookmark(currentChannelId()),
 }));
 
 /**

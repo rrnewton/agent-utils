@@ -1346,7 +1346,7 @@
               reading. Up only while the line is off the screen, its arrow pointing toward it. b does
               the same. See `renderJumpBookmark`.
             -->
-            <button id="jump-bookmark" class="chip" type="button" aria-label="Jump to your bookmark" hidden>
+            <button id="jump-bookmark" class="chip" type="button" aria-label="Jump to your bookmark" aria-haspopup="menu" aria-expanded="false" hidden>
               <svg class="chip-icon bookmark-arrow" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M12 19V6" />
                 <path d="M6 11.5 12 5l6 6.5" />
@@ -1414,6 +1414,16 @@
               Shift+B, the ⋯ item), for a few seconds after. See `removeBookmark`.
             -->
             <button id="undo-bookmark" class="chip" type="button" hidden>Undo remove bookmark</button>
+          </div>
+
+          <!--
+            `#2229 bookmark-chip-clear-popover`. Press and hold the Bookmark chip (or right-click it
+            on a desk) for the way to take the bookmark away without travelling to its line. One
+            item, calling the same removal as the line's X (`#420 bookmark-clear`), Undo included.
+            Placed by the script above the chip, clamped inside the viewport.
+          -->
+          <div id="bookmark-clear-popover" class="bookmark-clear-popover" role="menu" aria-label="Bookmark" hidden>
+            <button id="bookmark-clear-button" class="bookmark-clear-item" type="button" role="menuitem">Clear bookmark</button>
           </div>
 
           <!--

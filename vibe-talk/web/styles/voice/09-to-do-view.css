@@ -485,6 +485,43 @@
   margin-inline-end: auto;
   color: var(--accent);
   border-color: var(--accent);
+  /* `#2229 bookmark-chip-clear-popover`. A hold on this chip alone must not select its label or
+     raise the browser's own callout; the page at large keeps both. */
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+  touch-action: manipulation;
+}
+
+/* `#2229 bookmark-chip-clear-popover`. The hold's one item, fixed above the chip by the script so
+   neither the chip stack nor the dock can cover it and it never covers the chip. */
+.bookmark-clear-popover {
+  position: fixed;
+  z-index: var(--z-menu);
+  box-sizing: border-box;
+  padding: 0.4rem;
+  border: 1px solid var(--edge);
+  border-radius: 0.6rem;
+  background: var(--panel);
+  box-shadow: 0 4px 18px color-mix(in srgb, var(--shadow) 30%, transparent);
+}
+
+.bookmark-clear-popover[hidden] {
+  display: none;
+}
+
+.bookmark-clear-item {
+  min-height: 2.75rem;
+  padding: 0.5rem 0.9rem;
+  border: 1px solid var(--edge);
+  border-radius: 0.6rem;
+  background: none;
+  color: var(--ink);
+  font: inherit;
+  font-size: 1rem;
+  text-align: left;
+  cursor: pointer;
+  white-space: nowrap;
 }
 
 /* `#1167 jump-to-unread-chip`. Beside the bookmark chip, in the accent like the way back it is. */

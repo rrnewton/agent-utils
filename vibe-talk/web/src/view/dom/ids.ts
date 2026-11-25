@@ -35,6 +35,8 @@ export interface ElementById {
   "autoplay-toggle": HTMLButtonElement;
   "autoplay-toggle-label": HTMLSpanElement;
   "back-to-reply": HTMLButtonElement;
+  "bookmark-clear-button": HTMLButtonElement;
+  "bookmark-clear-popover": HTMLDivElement;
   "bar-pack": HTMLDivElement;
   "bar-placement": HTMLSelectElement;
   "bar-placement-state": HTMLParagraphElement;

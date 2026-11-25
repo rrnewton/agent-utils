@@ -1717,6 +1717,17 @@ body .side-card-row[data-linked="true"] {
   outline-offset: -2px;
 }
 
+/* `#2229 bookmark-chip-clear-popover`. The 44px target the chips beside Newest provide, drawn as
+   nothing: the X's box, glyph and line stay exactly where they are, and only the hit area grows
+   (the chip ::after idiom in 09-to-do-view.css). */
+#side-log .bookmark-clear::after,
+#side-cards .bookmark-clear::after,
+#discord-log .bookmark-clear::after {
+  content: "";
+  position: absolute;
+  inset: min(0px, calc((100% - 2.75rem) / 2));
+}
+
 
 /*
  * THE LINES BETWEEN ROWS. `#249 search-highlight`: where a filter choosing rows takes messages out

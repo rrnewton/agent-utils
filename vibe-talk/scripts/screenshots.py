@@ -3696,6 +3696,42 @@ def _act_bookmark_chip(driver: Driver) -> None:
     driver.settle(300)
 
 
+def _hold_bookmark_chip(driver: Driver) -> None:
+    """`#2229 bookmark-chip-clear-popover`: a real hold on the chip until its popover stands."""
+    driver.js(
+        "(() => { const chip = document.getElementById('jump-bookmark'); "
+        "const box = chip.getBoundingClientRect(); "
+        "chip.dispatchEvent(new PointerEvent('pointerdown', { pointerType: 'touch', "
+        "clientX: box.left + box.width / 2, clientY: box.top + box.height / 2, bubbles: true })); "
+        "return true; })()"
+    )
+    driver.page.wait_for_function(
+        "() => window.__visible('bookmark-clear-popover')", timeout=5_000
+    )
+    driver.settle(300)
+
+
+def _act_bookmark_clear_popover(driver: Driver) -> None:
+    """`#2229 bookmark-chip-clear-popover`: the chip held, its Clear popover above it."""
+    # Re-setting the bookmark the previous scene left would toggle it away; only set it when absent.
+    if not bool(driver.js("window.__visible('jump-bookmark')")):
+        _act_bookmark_chip(driver)
+    _hold_bookmark_chip(driver)
+
+
+def _act_bookmark_cleared(driver: Driver) -> None:
+    """`#2229 bookmark-chip-clear-popover`: Clear chosen from the hold popover; the Undo chip stands."""
+    if not bool(driver.js("window.__visible('jump-bookmark')")):
+        _act_bookmark_chip(driver)
+    _hold_bookmark_chip(driver)
+    driver.click("bookmark-clear-button")
+    driver.page.wait_for_function(
+        "() => window.__visible('undo-bookmark') && !window.__visible('jump-bookmark')",
+        timeout=5_000,
+    )
+    driver.settle(300)
+
+
 def _act_settings_text_size(driver: Driver) -> None:
     """`#230 text-size-buttons`: the Text size group, a − and a + either side of its slider.
 
@@ -7281,6 +7317,46 @@ SCENES: tuple[Scene, ...] = (
                 "const apart = (x, y) => x.right <= y.left || y.right <= x.left || x.bottom <= y.top || y.bottom <= x.top; "
                 "return b.left >= n.right - 1 && b.left - n.right < 16 && Math.abs(b.bottom - n.bottom) < 2 "
                 "&& others.every((c) => apart(c.getBoundingClientRect(), b) && apart(c.getBoundingClientRect(), n)); })()",
+            ),
+            (
+                "nothing runs off the side of the screen",
+                "document.scrollingElement.scrollWidth <= innerWidth",
+            ),
+        ),
+    ),
+    Scene(
+        name="48b-bookmark-clear-popover",
+        what="the Bookmark chip held: its Clear bookmark popover above the chip, covering neither it nor the dock",
+        act=_act_bookmark_clear_popover,
+        profiles=("android-412", "laptop-1280"),
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            (
+                "the popover offers Clear bookmark above the chip, inside the viewport",
+                "(() => { const p = document.getElementById('bookmark-clear-popover'); "
+                "const c = document.getElementById('jump-bookmark'); if (!p || !c) return false; "
+                "const b = p.getBoundingClientRect(); const chip = c.getBoundingClientRect(); "
+                "return /Clear bookmark/.test(p.textContent) && b.bottom <= chip.top + 1 "
+                "&& b.left >= 0 && b.right <= innerWidth && b.top >= 0; })()",
+            ),
+            (
+                "nothing runs off the side of the screen",
+                "document.scrollingElement.scrollWidth <= innerWidth",
+            ),
+        ),
+    ),
+    Scene(
+        name="48c-bookmark-cleared",
+        what="Clear chosen from the chip popover: the bookmark gone, its Undo chip standing, no Bookmark chip",
+        act=_act_bookmark_cleared,
+        profiles=("android-412", "laptop-1280"),
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            ("the Undo chip stands", "window.__visible('undo-bookmark')"),
+            ("the Bookmark chip is gone", "!window.__visible('jump-bookmark')"),
+            (
+                "no bookmark line is drawn",
+                "!document.querySelector('#discord-log .bookmark-line')",
             ),
             (
                 "nothing runs off the side of the screen",
