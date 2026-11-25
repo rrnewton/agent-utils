@@ -106,7 +106,8 @@ export function mountReadControls(deps: ReadControlsDependencies): ReadControls 
     deps.setReadingMode(!deps.readingMode());
   });
   // `#2216`: the tile can be tapped from this moment (see preferenceswitches).
-  el("read-aloud").setAttribute("data-wired", "true");
+  const readTile = el("read-aloud") as { setAttribute?: (name: string, value: string) => void };
+  if (typeof readTile.setAttribute === "function") readTile.setAttribute("data-wired", "true");
   listen(el("read-aloud-stop"), "click", () => deps.leaveReadingMode());
   // `#886 voice-page-autoplay`. Stop forgets a Hang up's halt, as nothing it stopped will end and go on.
   listen(el("read-aloud-stop"), "click", () => deps.forgetAutoplayHalt());

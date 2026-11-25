@@ -55,7 +55,8 @@ export function mountPreferenceSwitches(deps: PreferenceSwitchesDependencies): P
   });
   // `#2216`: the tile can be tapped from this moment; the page says so, so a
   // reader (or a check) can wait on a real readiness condition.
-  el("read-speed").setAttribute("data-wired", "true");
+  const speedTile = el("read-speed") as { setAttribute?: (name: string, value: string) => void };
+  if (typeof speedTile.setAttribute === "function") speedTile.setAttribute("data-wired", "true");
   listen<Event>(el("own-read-apply"), "click", () => deps.applyOwnRead());
   listen<Event>(el("own-read-undo"), "click", () => deps.undoOwnRead());
   listen<Event>(el("mark-own-read"), "change", () => deps.markOwnReadChanged());
