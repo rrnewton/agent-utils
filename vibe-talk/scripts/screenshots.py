@@ -5472,6 +5472,132 @@ def _act_search_head_room_first_key(driver: Driver) -> None:
     })
 
 
+# `#2257 vibe-talk-search-fast-pass-holds-reader` (owner 370). The owner's channels are long, and in
+# a list of over 200 rows the search's first pass runs inside the input event (`#1913`). The channel
+# gets FAST_NOTES seeded messages through the server's fake-seed route (once per server), the walk
+# back loads them all, and the reader parks on note FAST_READ just under the floating search panel.
+# Then one key, every frame traced until the server's answer stands: 124 types words the row says
+# and the rows above it do not (they go; it keeps its top), 125 words it does not say (the next
+# standing row below takes its place). The
+# message is measured by its meta line (`.anchor.json`), beside the frame before the key.
+FAST_NOTES = 250
+FAST_READ = 125
+_FAST_SEEDED: set[str] = set()
+
+FAST_PARK_JS = """(note) => {
+  const area = document.getElementById('scroll-area');
+  let clear = area.getBoundingClientRect().top;
+  for (const id of ['channel-freshness', 'search-float']) {
+    const node = document.getElementById(id);
+    if (node && !node.hidden) { const box = node.getBoundingClientRect(); if (box.height > 0) clear = Math.max(clear, box.bottom); }
+  }
+  const row = [...document.querySelectorAll('#discord-log > li[data-id]')]
+    .find((one) => one.getClientRects().length && (one.textContent || '').includes(`fastpass note ${note} `));
+  if (!row) return null;
+  area.scrollTop += row.getBoundingClientRect().top - clear - 2;
+  return row.getAttribute('data-id');
+}"""
+
+FAST_TRACE_JS = """async ([value, anchorId, keptNote]) => {
+  const meta = (row) => (row.querySelector(':scope > .meta') || row).getBoundingClientRect().top;
+  const anchor = document.querySelector(`#discord-log > li[data-id="${anchorId}"]`);
+  const kept = [...document.querySelectorAll('#discord-log > li[data-id]')]
+    .find((one) => (one.textContent || '').includes(`fastpass note ${keptNote} `));
+  const before = meta(anchor);
+  const rows = document.querySelectorAll('#discord-log > li').length;
+  const field = document.getElementById('search-field');
+  field.value = value;
+  field.dispatchEvent(new Event('input', { bubbles: true }));
+  const dyNow = () => kept && kept.getClientRects().length ? Math.round((meta(kept) - before) * 10) / 10 : null;
+  const atKey = dyNow();
+  const settled = () => /Server search details|No more hits/.test(document.getElementById('server-line').textContent);
+  const frames = []; let after = 0; let n = 0;
+  while (n < 6000 && after < 10) {
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+    n += 1;
+    frames.push({ frame: n, dy: dyNow(), scrollTop: Math.round(document.getElementById('scroll-area').scrollTop) });
+    if (settled()) after += 1;
+  }
+  const moved = frames.filter((f) => f.dy === null || Math.abs(f.dy) > 1).length + (atKey === null || Math.abs(atKey) > 1 ? 1 : 0);
+  const record = { anchorId, keptId: kept ? kept.getAttribute('data-id') : null, keptText: kept ? (kept.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 80) : null,
+    rowsInList: rows, before: Math.round(before * 10) / 10, dyAtKey: atKey, frames, moved, settled: settled() };
+  window.__fastTrace = record;
+  return record;
+}"""
+
+
+def _fast_seed(driver: Driver) -> None:
+    """FAST_NOTES messages through the throwaway server's fake-seed route, once per server: every
+    tenth says 'harbor', the other even ones 'kestrel', the odd ones 'filed'."""
+    if driver.base_url in _FAST_SEEDED:
+        return
+    channel = driver.js("document.getElementById('discord-channel').value")
+    # Older than every message the harness seeds itself, so the newest page every other scene reads
+    # is unchanged; only a walk back reaches them (a run walking the whole channel should not ride
+    # with these two).
+    start = int(time.time() * 1000) - 400 * 24 * 3600 * 1000
+    for note in range(FAST_NOTES):
+        text = f"fastpass note {note} " + ("harbor" if note % 10 == 0 else "filed" if note % 2 else "kestrel")
+        body = {"author": "codex-eng" if note % 2 else "claude-integ", "text": text, "at_ms": start + note * 20_000}
+        request = Request(  # noqa: S310 - the loopback throwaway server this run started
+            f"{driver.base_url}/api/v1/channels/{channel}/fake-seed",
+            data=json.dumps(body).encode("utf-8"), method="POST",
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {driver.token}"},
+        )
+        with urlopen(request, timeout=10) as response:  # noqa: S310 - loopback
+            response.read()
+    _FAST_SEEDED.add(driver.base_url)
+
+
+def _fast_open(driver: Driver) -> str:
+    """The seeded channel loaded past 200 rows by the walk back, the search open, the reader parked."""
+    _act_open_channel(driver)
+    _fast_seed(driver)
+    _act_open_channel(driver)
+    for _ in range(80):
+        if int(cast(float, driver.js("document.querySelectorAll('#discord-log > li[data-id]').length"))) > 210:
+            break
+        if not bool(driver.js("window.__visible('load-older')")):
+            break
+        driver.js("(() => { window.__walkFrom = document.querySelectorAll('#discord-log > li').length; "
+                  "document.getElementById('scroll-area').scrollTop = 0; return window.__walkFrom; })()")
+        driver.page.wait_for_function(
+            "() => document.querySelectorAll('#discord-log > li').length > window.__walkFrom", timeout=10_000)
+        driver.settle(80)
+    rows = int(cast(float, driver.js("document.querySelectorAll('#discord-log > li').length")))
+    if rows <= 200:
+        raise Unreachable("the seeded channel", "over 200 rows loaded, so the fast pass runs", f"{rows} rows")
+    driver.click("search-toggle")
+    driver.page.wait_for_function("() => window.__visible('search-field')", timeout=5_000)
+    driver.settle(300)
+    anchor = driver.page.evaluate(FAST_PARK_JS, FAST_READ)
+    if not isinstance(anchor, str):
+        raise Unreachable("the seeded channel", f"note {FAST_READ} is on the list to read", "not found")
+    driver.settle(300)
+    return anchor
+
+
+def _fast_act(driver: Driver, name: str, value: str, kept_note: int, moment: str) -> None:
+    anchor = _fast_open(driver)
+    driver.page.screenshot(path=str(driver.out_dir / f"{driver.theme}--{driver.profile.name}--{name}.before-key.png"))
+    record = driver.page.evaluate(FAST_TRACE_JS, [value, anchor, kept_note])
+    _search_sidecar(driver, name, {"moment": moment, "query": value, **cast(dict[str, object], record)})
+
+
+def _act_search_fast_pass_row_matches(driver: Driver) -> None:
+    """`#2257`: the reader on note FAST_READ mid-list; 'filed', which that row says and every even note
+    above it does not: the rows above it go, and it keeps its top."""
+    _fast_act(driver, "124-search-fast-pass-row-matches", "filed", FAST_READ,
+              "first key 'filed' (the row read says it; the even notes above it do not) mid-list, over 200 rows")
+
+
+def _act_search_fast_pass_row_hidden(driver: Driver) -> None:
+    """`#2257`: the same, 'harbor', which only every tenth note says: the row read is hidden and the
+    next standing row below (the next tenth note) takes its place."""
+    _fast_act(driver, "125-search-fast-pass-row-hidden", "harbor", (FAST_READ // 10 + 1) * 10,
+              "first key 'harbor' (the row read does not say it; the next tenth note does) mid-list, over 200 rows")
+
+
 def _act_discuss_preview(driver: Driver) -> None:
     _open_discuss(driver)
 
@@ -9955,6 +10081,32 @@ SCENES: tuple[Scene, ...] = (
             ("no error banner is up", "!window.__visible('error-wrap')"),
         ),
     ),
+    Scene(
+        name="124-search-fast-pass-row-matches",
+        what="#2257 a search's first key with the reader mid-list in a long channel: the row read says the words and keeps its top",
+        act=_act_search_fast_pass_row_matches,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            ("over 200 rows were loaded, so the fast pass ran", "!!window.__fastTrace && window.__fastTrace.rowsInList > 200"),
+            ("#2257 the row read (or the row that took its place) kept its top from the key through the settled answer",
+             "!!window.__fastTrace && window.__fastTrace.settled && window.__fastTrace.moved === 0"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="125-search-fast-pass-row-hidden",
+        what="#2257 the same with words the row read does not say: the next standing row below takes its place",
+        act=_act_search_fast_pass_row_hidden,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            ("over 200 rows were loaded, so the fast pass ran", "!!window.__fastTrace && window.__fastTrace.rowsInList > 200"),
+            ("#2257 the row read (or the row that took its place) kept its top from the key through the settled answer",
+             "!!window.__fastTrace && window.__fastTrace.settled && window.__fastTrace.moved === 0"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
     # LAST IN THE WALK, and not by accident: it empties the server's durable store on the way in,
     # so that the summary the state above cached is really regenerated and can really fail. Nothing
     # after it in this profile would miss what it deletes, and the next profile purges anyway.
@@ -10465,7 +10617,7 @@ def run_captures(
     # 91/92, so they skip with them on a cacheless server instead of failing alone.
     discuss_scenes = [s for s in scenes if s.name.startswith(("73-", "74-", "75-", "76-", "78-", "84-", "85-", "89-", "90-", "91-", "92-", "93-", "94-", "95-", "96-", "97-", "98-", "99-", "100-", "101-", "102-", "103-",
                                                                         "107-", "108-", "109-", "110-", "111-", "112-", "113-", "114-", "115-", "116-", "117-",
-                                                                        "120-", "121-", "123-"))]
+                                                                        "120-", "121-", "123-", "124-", "125-"))]
     discuss_only = bool(wanted) and len(wanted) == len(discuss_scenes)
     if discuss_scenes and not seed_discuss_cache(60 if discuss_only else 10):
         if discuss_only:
