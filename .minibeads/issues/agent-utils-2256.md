@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-search-head-room-no-shift: adding or releasing the search chip panel''s head room never moves the reading row'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -8,7 +8,8 @@ labels:
 - search
 - owner-ui
 created_at: 2026-11-25T15:07:00-05:00
-updated_at: 2026-11-25T15:07:00-05:00
+updated_at: 2026-11-25T17:26:00-05:00
+closed_at: 2026-11-25T17:26:00-05:00
 ---
 
 # Description
@@ -30,3 +31,7 @@ Found by the per-frame traces of #2251 vibe-talk-search-current-view-scope, and 
 # Notes
 
 Owner-UI fast-track (rule 286). Stacked on #2249 vibe-talk-search-signpost-hidden-while-reserved (the same head code). Related: #2200 vibe-talk-search-tab-counts-match-cards (the reservation and its release on settle), #1899 vibe-talk-search-bucket-chips-pinned, #1901 vibe-talk-search-late-hits-shift-anchor (the same hold for late hits), #2230 vibe-talk-reading-row-stays-put.
+
+## Resolution
+
+Landed as 3cbd9f7b (four commits: the head room and foot line never move the row being read, scene 123, no false Newest offer for a reader kept on the newest row, and the newest-row hold scoped to the one-column channel search) on a green owner gate on the same change (9c0434ef, 2026-11-25 5:06 PM ET). Evidence: real-server scene 123 keeps the newest row within 0.5 px from before the key through the answer (main -56.4 phone, -56.8 desk); fixture traces mid-list and foot 0.0 every frame (main foot -57). The first gate found the hold broke the right column's overscroll room when two columns are up (column-overscroll-1920), so the hold runs only with one column; the two-column foot shift (about -57 px, same as main) is #2262 vibe-talk-search-head-room-two-columns. Deployed the same afternoon; the 15-minute post-deploy watch was clean.
