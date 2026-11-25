@@ -395,6 +395,13 @@ export interface PageNavigationDependencies<Column, ThreadLike, Pane> {
    */
   noteJumpAnchor?(row: HTMLElement, id: string): void;
   /**
+   * Back undid the jump that made the landing in the column being worked on
+   * (`#2261 vibe-talk-summary-link-back-race`): end that landing — its flash and
+   * its per-frame re-assert — and let go of the jump's anchor (`#1224`) on the
+   * row the reader is leaving. Optional where a host wires neither.
+   */
+  leaveLanding?(): void;
+  /**
    * `#1959 vibe-talk-reader-one-click-jump`. Whether the read-aloud reader
    * is active (playing or pending) at the tap. Unwired, no jump starts a read.
    */
@@ -1720,6 +1727,11 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
     if (!jump) return;
     // A walk the jump's seek is still making is over: its next step finds another ticket.
     deps.bumpReplyJump();
+    // ...and so is what its landing still does on its own (`#2261`): the landing's
+    // re-assert would put the row the reader is leaving back on screen over the place
+    // the return puts back, one frame after it. Ended now, in the tap's own task,
+    // before any wait the return makes; the jump landed in the left column.
+    if (deps.leaveLanding) deps.inColumn(deps.mainColumn(), () => deps.leaveLanding?.());
     linkJumps.returnStarted();
     void deps.guardQuietly(returnToLinkSpot)(jump.spot).finally(() => {
       linkJumps.returnEnded();

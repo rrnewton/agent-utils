@@ -32,11 +32,13 @@ Back trace as `<label>-back-trace.json`.
 `#2261 vibe-talk-summary-link-back-race`: Back after the reply-citation
 jump is traced frame by frame (the main row's top against its pre-jump
 top, the list's scroll position, the landed and linked rows, every write
-to the list's place with the code that made it, the popstate). Should the
-wait for the row to come back time out, the step's log carries that trace
-with the row's current and expected top, the list's state, `history.state`
-and the walk label, and a screenshot is kept beside it, so an
-intermittent red leaves its evidence.
+to the list's place with the code that made it, the popstate). The row
+must stand within 0.5 px of its pre-jump top on the first frame drawn
+with the place put back and on each of the next 45 frames (past the
+landing's 30-frame re-assert, which once undid Back one frame after it).
+Should it not, the step's log carries that trace with the row's current
+and expected top, the list's state, `history.state` and the walk label,
+and a screenshot is kept beside it.
 
 `#2147 vibe-talk-linked-jump-centers-target`: every landing above also
 asserts the target stands centred in the visible list area (above the
@@ -70,6 +72,11 @@ STAMP = {"context_ms": 1, "model_ms": 1, "first_token_ms": None, "total_ms": 2,
 WINDOW = {"count": 120, "unread_count": 2, "read_count": 118,
           "from_id": "x", "through_id": "y", "truncated": False, "noise_hidden": 0}
 SEEDED = 120
+# `#2261`: how near its pre-jump top Back must put the reader's row, and for how
+# many drawn frames after that first frame it must stay there: past the
+# landing's per-frame re-assert window (30 frames) with room to spare.
+BACK_TOLERANCE_PX = 0.5
+BACK_WATCH_FRAMES = 45
 
 
 def check(condition: bool, message: str) -> None:
@@ -572,8 +579,8 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
         }""")
         return trace if isinstance(trace, dict) else {}
 
-    def back_failure(what: str, row_id: str, expected: float, error: Exception) -> AssertionError:
-        """`#2261`: what a timed-out Back wait leaves in the step's log, and a screenshot."""
+    def back_failure(what: str, row_id: str, expected: float, error: object) -> AssertionError:
+        """`#2261`: what a failed Back check leaves in the step's log, and a screenshot."""
         dump: object = page.evaluate(BACK_DUMP, [row_id, expected])
         back_trace_stop()
         folder = shots if shots is not None else Path(tempfile.gettempdir())
@@ -584,9 +591,10 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
             shot = Path(f"(no screenshot: {shot_error})")
         print(f"summary link ({label}): {what} BACK DUMP {json.dumps(dump)}", flush=True)
         delta = dump.get("delta") if isinstance(dump, dict) else None
-        return AssertionError(f"{label}: {what}: the main row did not come back within 4 px of its"
-                              f" pre-jump top {expected} (off by {delta} px; {error}); screenshot {shot};"
-                              " the BACK DUMP line above has the trace and the page's state")
+        return AssertionError(f"{label}: {what}: the main row did not come back to its pre-jump top"
+                              f" {expected} and stay there to {BACK_TOLERANCE_PX} px (now off by {delta} px;"
+                              f" {error}); screenshot {shot}; the BACK DUMP line above has the trace and the"
+                              " page's state")
 
     # (a) a main-channel message, in place. Tapped at its on-screen point,
     # as a finger taps: no scroll-into-view may move the summary for it.
@@ -611,6 +619,14 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
         f".find(r => (r.getAttribute('data-ids') || '').split(' ').includes('{ids['main_msg']}'))"
         ".getBoundingClientRect().top")
     page.evaluate("(top) => { window.__scrollLog = []; window.__backTrace.mark('anchor top', top); }", anchor_top)
+    row_probe = ("() => { const r = [...document.querySelectorAll('#discord-log li')]"
+                 f".find(r => (r.getAttribute('data-ids') || '').split(' ').includes('{ids['main_msg']}'));"
+                 " return {top: r.getBoundingClientRect().top, text: r.textContent.trim().slice(0, 80)}; }")
+    if shots is not None:
+        # The before frame of the Back pair (`#2261`): the reader's row the
+        # moment before the tap, as Back must put it back.
+        page.screenshot(path=str(shots / f"{label}-before-reply-tap.png"))
+        before_row: object = page.evaluate(row_probe)
     tap_visible(citations.nth(1), "reply citation")
     assert_landed(ids["reply_msg"], "reply citation")
     check_stable("reply citation")
@@ -624,22 +640,48 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
                         "before": f"{label}-summary-open.png", "after": f"{label}-reply-landed.png",
                         **probe}, indent=2) + "\n")
     # Back returns to the previous position in the same view: the row the
-    # reader was on, at the height it stood.
-    page.evaluate("() => window.__backTrace.mark('go_back')")
+    # reader was on, at the height it stood (`#2261`): within half a pixel
+    # on the first frame drawn with the place put back, and on every frame
+    # after it through the landing's re-assert window. Frames, not time:
+    # the wait is for that many frames to be drawn, however slowly.
+    page.evaluate("() => { const t = window.__backTrace; t.mark('go_back'); t.backAt = t.frames.length; }")
     page.go_back()
+    expected = float(anchor_top)
+    settled_probe = f"""() => {{
+      const t = window.__backTrace;
+      const after = t.frames.slice(t.backAt);
+      const first = after.findIndex(f => f[2] !== null && Math.abs(f[2] - {expected}) <= {BACK_TOLERANCE_PX});
+      if (first < 0) return null;
+      const watched = after.slice(first);
+      const drift = Math.max(...watched.map(f => (f[2] === null ? Infinity : Math.abs(f[2] - {expected}))));
+      return {{first: t.backAt + first, frames: watched.length, drift,
+               moved: watched.filter(f => f[2] === null || Math.abs(f[2] - {expected}) > {BACK_TOLERANCE_PX}).slice(0, 8)}};
+    }}"""
     try:
         page.wait_for_function(
-            "() => Math.abs([...document.querySelectorAll('#discord-log li')]"
-            f".find(r => (r.getAttribute('data-ids') || '').split(' ').includes('{ids['main_msg']}'))"
-            f".getBoundingClientRect().top - {float(anchor_top)}) < 4",
+            f"() => {{ const p = ({settled_probe})(); return p !== null && (p.frames >= {BACK_WATCH_FRAMES} || p.moved.length > 0); }}",
             timeout=20_000)
     except Exception as error:
-        raise back_failure("Back after stay-jump", ids["main_msg"], float(anchor_top), error) from error
-    page.evaluate("() => window.__backTrace.mark('back returned')")
+        raise back_failure("Back after stay-jump", ids["main_msg"], expected, error) from error
+    settled: object = page.evaluate(settled_probe)
+    check(isinstance(settled, dict), f"{label}: the Back trace lost its settled reading: {settled}")
+    assert isinstance(settled, dict)
+    if settled["moved"]:
+        raise back_failure("Back after stay-jump", ids["main_msg"], expected,
+                           f"put back at frame {settled['first']}, then moved: {settled['moved']}")
+    page.evaluate("() => window.__backTrace.mark('back settled')")
     trace = back_trace_stop()
     if shots is not None:
+        page.screenshot(path=str(shots / f"{label}-back-returned.png"))
+        (shots / f"{label}-back-sidecar.json").write_text(json.dumps({
+            "label": label, "row": ids["main_msg"], "expected_top": anchor_top,
+            "before": f"{label}-before-reply-tap.png", "before_row": before_row,
+            "after": f"{label}-back-returned.png", "after_row": page.evaluate(row_probe),
+            "max_drift_px": settled["drift"], "watched_frames": settled["frames"]}, indent=2) + "\n")
         (shots / f"{label}-back-trace.json").write_text(json.dumps({
             "label": label, "row": ids["main_msg"], "expected_top": anchor_top,
+            "tolerance_px": BACK_TOLERANCE_PX, "first_restored_frame": settled["first"],
+            "watched_frames": settled["frames"], "max_drift_px": settled["drift"],
             "columns": ["frame", "ms", "rowTop", "scrollTop", "scrollHeight", "landed", "linked",
                         "panelTop", "vvHeight"],
             **trace}, indent=1) + "\n")

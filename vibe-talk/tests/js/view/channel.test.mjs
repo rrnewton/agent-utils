@@ -2512,6 +2512,89 @@ test("#1820 vibe-talk-summary-strikethrough-live: a landing moved off screen by 
   }
 });
 
+test("#2261 vibe-talk-summary-link-back-race: a landing Back has ended no longer re-asserts over the place put back", () => {
+  const { createReplyArrows, freshReplyArrows } = CHANNEL_VIEW;
+  const frames = [];
+  const hadRaf = "requestAnimationFrame" in globalThis;
+  const oldRaf = globalThis.requestAnimationFrame;
+  globalThis.requestAnimationFrame = (fn) => { frames.push(fn); return frames.length; };
+  try {
+    const make = () => {
+      const active = freshReplyArrows();
+      const area = { hidden: false, children: [], scrollTop: 0, clientHeight: 100, getBoundingClientRect: () => ({ top: 0, bottom: 100, height: 100 }) };
+      const box = { top: 500, nudges: [], unlit: 0 };
+      const owner = createReplyArrows({
+        el: (id) => (id === "scroll-area" ? area : { hidden: true, children: [] }),
+        leftEl: () => ({ hidden: true, getBoundingClientRect: () => ({ top: 0, bottom: 0, height: 0 }) }),
+        inThisColumn: (fn) => fn,
+        guardQuietly: (fn) => fn,
+        gatherFromReply: () => {},
+        filterState: () => ({ hold: null }),
+        endFilterWalk: () => {}, endSearchWalks: () => {},
+        selectLanded: () => {},
+        setSearchOpen: () => {}, openReadRun: () => {}, renderScrollTools: () => {},
+        nudge: (_area, delta) => { box.nudges.push(delta); box.top -= delta; },
+        setStatus: () => {},
+        channelContextKey: () => "ctx",
+        heldMessage: () => null,
+        inView: () => false,
+        selection: () => ({ view: "main", threadId: null }),
+        threading: () => true,
+        olderPages: () => ({ moreAbove: false, cursor: null }),
+        viewKey: () => "main",
+        channelCanon: () => ({ views: new Map() }),
+        selectedChannelId: () => "C1",
+        changeChannelView: async () => {},
+        channelReadsBusy: () => false,
+        loadOlder: () => null,
+        walkCursorOwed: () => false,
+        hidingRead: () => false,
+        timelineMessages: () => [],
+        hiddenEmpty: () => false,
+        readHiding: () => false,
+        layoutColumns: () => false,
+        columnSteps: () => ({ pause: () => {}, resume: () => {} }),
+        activeArrows: () => active,
+        replyJumpTicket: () => { let n = 0; return { current: () => n, bump: () => { n += 1; } }; },
+      });
+      const row = {
+        isConnected: true, className: "", children: [],
+        getAttribute: (k) => (k === "data-id" ? "m1" : null),
+        setAttribute: () => {}, removeAttribute: (k) => { if (k === "data-landed") box.unlit += 1; },
+        getBoundingClientRect: () => ({ top: box.top, bottom: box.top + 20, left: 0 }),
+      };
+      return { owner, row, box, active };
+    };
+    // The race as captured: the landing's first re-assert frame has not run when
+    // Back puts the reader back (the landed row now far off screen, at 1400).
+    const control = make();
+    control.owner.revealRow(control.row, true);
+    const landedTop = control.box.top;
+    control.box.top = 1400;
+    while (frames.length > 0) frames.shift()();
+    assert.equal(control.box.top, landedTop, "the control did not reproduce the re-assert landing the row again over Back");
+    // Fixed: Back ends the landing first, so no frame after it moves the list.
+    const fixed = make();
+    fixed.owner.revealRow(fixed.row, true);
+    const nudgesAtLanding = fixed.box.nudges.length;
+    fixed.box.top = 1400;
+    fixed.owner.endLanding();
+    assert.equal(fixed.active.landed, null, "the ended landing is still the column's");
+    assert.equal(fixed.box.unlit, 1, "the ended landing's flash did not go out");
+    let ran = 0;
+    while (frames.length > 0) { frames.shift()(); ran += 1; }
+    assert.ok(ran >= 1, "the landing queued no re-assert frame to check");
+    assert.equal(fixed.box.nudges.length, nudgesAtLanding, `a frame after Back moved the list (nudges ${fixed.box.nudges.slice(nudgesAtLanding)})`);
+    assert.equal(fixed.box.top, 1400, "the place Back put back did not hold");
+    // With nothing landed, ending is a no-op.
+    fixed.owner.endLanding();
+    assert.equal(fixed.box.unlit, 1, "ending with nothing landed touched a row");
+  } finally {
+    if (hadRaf) globalThis.requestAnimationFrame = oldRaf;
+    else delete globalThis.requestAnimationFrame;
+  }
+});
+
 test("#2147 vibe-talk-linked-jump-centers-target: a centred landing puts the row's middle at the visible area's middle", () => {
   const { createReplyArrows, freshReplyArrows } = CHANNEL_VIEW;
   const hadWindow = "window" in globalThis;

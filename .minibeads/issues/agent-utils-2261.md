@@ -57,3 +57,13 @@ Step 2, fix:
 # Notes
 
 Filed from the #2232 owner gate (5d0695c9), where this step was the only red. Reframed the same day as a fix at owner tier (diagnostics first, then the Back landing fix) and retitled from vibe-talk-summary-link-back-race-diagnostics to vibe-talk-summary-link-back-race. A fresh lane takes it.
+
+## Captured (2026-11-25)
+
+The step-1 trace (7e4f4090) caught the race on the 27th plain solo run of the step (desk 1280, light, host load near 99); the same shape fits the phone red on 5d0695c9:
+- 12 ms: the reply citation lands (`landOnDeepLink` -> `revealRow`), writing the list from 1074 to 39 and queueing the landing's per-frame re-assert (#1820, #2147) for the next frame.
+- 23-26 ms, the same frame: Back (`returnFromLinkJump` -> `putBackOnSpot` -> `restoreScroll`) puts the main row back, 0.19 px from its pre-jump top.
+- 29 ms, the next frame: the reply landing's re-assert runs its first frame. Nothing on Back ended that landing, so it still counts as current; it finds its row off centre and nudges the list back to 39, undoing Back.
+- With the list at 39, under the older-page trigger (80 px), an older page loads and holds the top row, so the main row stays 1074 px away for good.
+
+So Back did not end the landing it undid. The window runs from a landing until its first re-assert frame, and stays open for up to 30 frames while the layout still moves (for example the phone sheet settling). It is wider on a loaded host. The bug is in the page, not the tree, so it showed up on unrelated heads.

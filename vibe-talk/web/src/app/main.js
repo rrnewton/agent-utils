@@ -1011,6 +1011,12 @@ const shellNavigation = createPageNavigation({
   replyOnScreen: () => replyOnScreen(),
   setLinkedMark: (channel, id) => linkedMark.set(channel, id),
   noteJumpAnchor: (row, id) => jumpAnchor.note(/** @type {HTMLElement} */ (row), id),
+  // `#2261 vibe-talk-summary-link-back-race`: Back ends the landing it undoes (flash and
+  // per-frame re-assert) and the jump's hold on the row it leaves.
+  leaveLanding: () => {
+    endLanding();
+    jumpAnchor.clear();
+  },
   readerActive: () => readAloudOwner().nowPlaying !== null || readAloudOwner().pendingRead !== null,
   startReadingMessage: (id) => {
     const owner = readAloudOwner();
@@ -2265,7 +2271,7 @@ const replyArrowsOwner = createReplyArrows({
   activeArrows: () => columnWork.active().arrows,
   replyJumpTicket: () => createStreamGeneration(),
 });
-const { replyJumpTicket, replyArrows, dropReplyArrowTap, replyArrow, rowHolding, listPlaceTop, floatingClearance, drawnTop, rowOnScreen, revealRow, putOutLanding, replyReturnRow, backToReply, landOnAnswered, answeredElsewhere, historyReadToStart, jumpToAnswered, seekMessage, measureReplyArrows, holdingReplyArrows, rootFontPx } = replyArrowsOwner;
+const { replyJumpTicket, replyArrows, dropReplyArrowTap, replyArrow, rowHolding, listPlaceTop, floatingClearance, drawnTop, rowOnScreen, revealRow, putOutLanding, endLanding, replyReturnRow, backToReply, landOnAnswered, answeredElsewhere, historyReadToStart, jumpToAnswered, seekMessage, measureReplyArrows, holdingReplyArrows, rootFontPx } = replyArrowsOwner;
 
 /** Gathering a message's replies under it, the bridge and the X are web/src/view/channel's now
  * (`createReplyGathering`, `#624 voice-page-modularity`). */

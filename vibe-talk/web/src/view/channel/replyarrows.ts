@@ -94,6 +94,8 @@ export interface ReplyArrows {
   rowOnScreen(row: Element): boolean;
   revealRow(row: ReplyArrowRow, center?: boolean): void;
   putOutLanding(row: ReplyArrowRow): void;
+  /** End the landing in this column, whatever row it is on: its flash and its re-assert (`#2261`). */
+  endLanding(): void;
   replyReturnRow(): ReplyArrowRow | null;
   backToReply(): void;
   landOnAnswered(target: string, from: string): boolean;
@@ -493,6 +495,23 @@ export function createReplyArrows(deps: ReplyArrowsDependencies): ReplyArrows {
   function putOutLanding(row: ReplyArrowRow): void {
     const landed = replyArrows().landed;
     if (!landed || landed.row === row) return;
+    endLanding();
+  }
+
+  /**
+   * End the landing standing in this column, whatever row it is on
+   * (`#2261 vibe-talk-summary-link-back-race`): its flash goes out, and its
+   * re-assert (`revealRow`'s per-frame loop, which asks whether its landing is
+   * still the column's) stops at its next frame. Back undoing the jump that
+   * made the landing calls this before it puts the reader back: a landing
+   * still re-asserting would put its row back over the restored place on the
+   * very next frame, and with the list then near its head an older page loads
+   * and holds that wrong place for good (captured in the summary-link walk:
+   * restore at 26 ms, the landing's first re-assert frame at 29 ms).
+   */
+  function endLanding(): void {
+    const landed = replyArrows().landed;
+    if (!landed) return;
     clearTimeout(landed.timer);
     landed.row.removeAttribute("data-landed");
     replyArrows().landed = null;
@@ -862,7 +881,7 @@ export function createReplyArrows(deps: ReplyArrowsDependencies): ReplyArrows {
   }
   return {
     replyJumpTicket, replyArrows, dropReplyArrowTap, replyArrow, rowHolding, listPlaceTop,
-    floatingClearance, drawnTop, rowOnScreen, revealRow, putOutLanding, replyReturnRow, backToReply,
+    floatingClearance, drawnTop, rowOnScreen, revealRow, putOutLanding, endLanding, replyReturnRow, backToReply,
     landOnAnswered, answeredElsewhere, historyReadToStart, jumpToAnswered, seekMessage,
     measureReplyArrows, holdingReplyArrows, rootFontPx,
   };

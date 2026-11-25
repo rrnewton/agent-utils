@@ -81,16 +81,18 @@ function makeNavigation(state) {
     providerNameOf: () => "discord", providerName: () => "discord", threadOf: () => null,
     setStatus: (text) => calls.push(["status", text]), showError: (text) => calls.push(["error", text]),
     guardQuietly: (run) => (...args) => run(...args), settleFocus: () => {}, replyOnScreen: () => false,
-    setLinkedMark: () => {}, cardsCycle: () => false, rowShown: () => true, visibleList: () => ({ children: [] }),
+    setLinkedMark: () => {}, cardsCycle: () => false, rowShown: () => true, visibleList: () => ({ children: state.listRows ?? [] }),
     rowOnScreen: () => true, eachColumn: (act) => act(), openReadRun: () => {}, setSearchOpen: () => {},
     finishPackSlide: () => {}, headOfList: () => 0, renderScrollTools: () => {},
     revealRow: (_row, center) => { (state.reveals ??= []).push(center); },
     toPosition: (area, top) => { area.scrollTop = top; },
     idsOf: () => [], inAppLinksOn: () => true, channelLabel: (channel) => channel, renderedText: () => "x",
-    inThisColumn: (act) => act, captureScroll: () => ({ pinned: true, anchor: null, top: 0 }),
+    inThisColumn: (act) => act, captureScroll: () => state.capture ?? ({ pinned: true, anchor: null, top: 0 }),
     listPlaceTop: () => 0, sideShowing: () => false,
     restoreScroll: (place) => calls.push(["restore", place]), scrollToNewest: () => {},
     bumpReplyJump: () => {}, settleUiState: () => {},
+    // `#2261`: wired only where a test asks, as a host may leave it unwired.
+    ...(state.leaveLanding ? { leaveLanding: () => calls.push("leaveLanding") } : {}),
     viewRestored: () => false, stopDiscordPolling: () => {}, storedOpenInView: () => "flat",
     cycleView: () => calls.push("cycleView"),
     loadDiscord: async (options) => calls.push(["loadDiscord", options]),
@@ -339,6 +341,45 @@ test("`#2080 vibe-talk-summary-link-stays-in-view`: an in-place jump to a thread
     "the reply was not sought in place");
   assert.deepStrictEqual(calls.filter((call) => Array.isArray(call) && call[0] === "oneColumn"), [],
     "the jump opened a thread over All");
+});
+
+test("`#2261 vibe-talk-summary-link-back-race`: Back ends the undone jump's landing in its own task, before it puts the reader back", async () => {
+  const state = freshState();
+  state.selection = { view: "flat", threadId: null, origin: null };
+  state.landSeek = true;
+  state.row = { className: "" };
+  state.leaveLanding = true;
+  // The reader's eye is on m1 at 120px when they tap; the jump lands elsewhere.
+  const eye = { getAttribute: (name) => (name === "data-context-id" ? "m1" : null), className: "" };
+  state.capture = { pinned: false, anchor: eye, top: 120 };
+  state.listRows = [eye];
+  const { nav, calls } = makeNavigation(state);
+  await nav.jumpToMessageInPlace({ service: "discord", channel: "C1", message: "m42", thread: "T1" });
+  assert.deepStrictEqual(calls.filter((call) => call === "leaveLanding"), [], "the landing was ended by the jump itself");
+  calls.length = 0;
+  nav.returnFromLinkJump();
+  // In Back's own task: the landing is over before any wait the return makes, so
+  // its next re-assert frame cannot land the row the reader is leaving again.
+  assert.deepStrictEqual(calls.filter((call) => call === "leaveLanding"), ["leaveLanding"],
+    "Back did not end the undone jump's landing at once");
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  const order = calls.filter((call) => call === "leaveLanding" || (Array.isArray(call) && call[0] === "restore"));
+  assert.deepStrictEqual(order.map((call) => (Array.isArray(call) ? call[0] : call)), ["leaveLanding", "restore"],
+    "the landing was not ended before the reader was put back");
+  assert.equal(order[1][1].anchor, eye, "the return did not put back the row the reader was on");
+  assert.equal(order[1][1].top, 120, "the return did not put the row back at its height");
+  // Unwired (a host without landings): Back still returns, and nothing throws.
+  const bare = freshState();
+  bare.selection = { view: "flat", threadId: null, origin: null };
+  bare.landSeek = true;
+  bare.row = { className: "" };
+  bare.capture = { pinned: false, anchor: eye, top: 120 };
+  bare.listRows = [eye];
+  const plain = makeNavigation(bare);
+  await plain.nav.jumpToMessageInPlace({ service: "discord", channel: "C1", message: "m42", thread: "T1" });
+  plain.nav.returnFromLinkJump();
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  assert.ok(plain.calls.some((call) => Array.isArray(call) && call[0] === "restore"), "unwired, Back no longer returned");
 });
 
 test("`#2147 vibe-talk-linked-jump-centers-target`: every linked-message jump lands centred", async () => {
