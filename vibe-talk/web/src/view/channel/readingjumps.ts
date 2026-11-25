@@ -6,6 +6,8 @@ import { createListening, nodeWithin } from "../dom/index.ts";
 
 /** How long a press on the Bookmark chip is held before it offers Clear, in milliseconds (the row hold's). */
 const BOOKMARK_HOLD_MS = 450;
+/** How far a press may travel before it is a scroll or swipe, not a hold, in CSS pixels. */
+const BOOKMARK_HOLD_SLOP_PX = 12;
 
 /**
  * The popover's top (viewport coordinates): above the chip, clear of a standing status line
@@ -32,8 +34,6 @@ export function bookmarkPopoverTop(
   if (above < gap) return Math.min(chipBottom + gap, Math.max(gap, viewHeight - height - gap));
   return above;
 }
-/** How far a press may travel before it is a scroll or swipe, not a hold, in CSS pixels. */
-const BOOKMARK_HOLD_SLOP_PX = 12;
 
 export interface ReadingJumpsDependencies {
   /** An element of the page by id, and one of the left column's (where the reading chip is, as b is). */
@@ -139,7 +139,7 @@ export function mountReadingJumps(deps: ReadingJumpsDependencies): ReadingJumps 
       closePopover();
       return;
     }
-    deps.jumpToBookmark();
+    return deps.jumpToBookmark();
   });
   listen<Event>(deps.lookup("jump-unread"), "click", () => deps.jumpToUnread());
   listen<Event>(deps.leftLookup("jump-reading"), "click", () => deps.jumpToReading());
@@ -167,7 +167,7 @@ export function mountReadingJumps(deps: ReadingJumpsDependencies): ReadingJumps 
   listen<PointerEvent>(chip, "pointerup", endPress);
   listen<PointerEvent>(chip, "pointercancel", endPress);
   // Under node (the module suites) there is no window to hear scroll or resize from.
-  const win = typeof window !== "undefined" ? window : null;
+  const win = typeof window !== "undefined" && window ? window : null;
   if (win) {
     listen<Event>(win, "scroll", () => cancelHold(), { capture: true });
     // The keyboard opening shrinks the viewport under an open popover; keep it above its chip.
@@ -184,7 +184,7 @@ export function mountReadingJumps(deps: ReadingJumpsDependencies): ReadingJumps 
   });
   listen<MouseEvent>(clearButton, "click", () => {
     closePopover();
-    deps.clearBookmark();
+    return deps.clearBookmark();
   });
   listen<KeyboardEvent>(popover, "keydown", (event) => {
     if (event && event.key === "Escape") {
@@ -198,15 +198,19 @@ export function mountReadingJumps(deps: ReadingJumpsDependencies): ReadingJumps 
       closePopover(true);
     }
   });
-  listen<KeyboardEvent>(document, "keydown", (event) => {
-    if (open && event && event.key === "Escape") closePopover(true);
-  });
-  listen<PointerEvent>(document, "pointerdown", (event) => {
-    if (!open || !event) return;
-    const target = event.target as Node | null;
-    if (target && (nodeWithin(popover, target) || nodeWithin(chip, target))) return;
-    closePopover();
-  });
+  // Under node (the module suites) there is no document to hear Escape or an outside press from either.
+  const doc = typeof document !== "undefined" && document ? document : null;
+  if (doc) {
+    listen<KeyboardEvent>(doc, "keydown", (event) => {
+      if (open && event && event.key === "Escape") closePopover(true);
+    });
+    listen<PointerEvent>(doc, "pointerdown", (event) => {
+      if (!open || !event) return;
+      const target = event.target as Node | null;
+      if (target && (nodeWithin(popover, target) || nodeWithin(chip, target))) return;
+      closePopover();
+    });
+  }
 
   // The chip going away (bookmark cleared, line back on screen, another view) takes its popover with it.
   let watcher: MutationObserver | null = null;
