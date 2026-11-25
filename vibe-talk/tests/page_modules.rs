@@ -49,6 +49,7 @@ const SUITES: &[&str] = &[
     "tests/js/view/channel-next11.test.mjs",
     "tests/js/view/channel-next12.test.mjs",
     "tests/js/view/channel-gathering.test.mjs",
+    "tests/js/view/channel-readingjumps.test.mjs",
     "tests/js/view/voice-watchframe.test.mjs",
     "tests/js/view/voice-readingacts.test.mjs",
     "tests/js/view/readcore.test.mjs",
