@@ -745,7 +745,8 @@ export function createFolding(deps: FoldingDependencies): Folding {
     scrollTools().owed = false;
     if (!toolsDrawnThisTask) {
       toolsDrawnThisTask = true;
-      queueMicrotask(() => { toolsDrawnThisTask = false; });
+      if (typeof queueMicrotask === "function") queueMicrotask(() => { toolsDrawnThisTask = false; });
+      else toolsDrawnThisTask = false;
     }
     // `#1236 documents-reader-layout`. The fold items act on a message list —
     // the channel's, or the call transcript's — and the Documents view shows

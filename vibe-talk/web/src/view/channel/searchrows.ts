@@ -554,7 +554,8 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
     if (settledStamp && settledStamp.live && settledStamp.key === stampKey) return;
     const stamp = { key: stampKey, live: true };
     settledStamp = stamp;
-    queueMicrotask(() => { stamp.live = false; });
+    if (typeof queueMicrotask === "function") queueMicrotask(() => { stamp.live = false; });
+    else stamp.live = false;
     deps.applyReadRuns();
     const node = searchField.open() ? searchParsed(searchField.query()).node : null;
     // `#1825`: matching sees the group-expanded query; identity/terms stay raw.
