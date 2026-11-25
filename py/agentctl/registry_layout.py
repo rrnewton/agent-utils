@@ -334,12 +334,14 @@ def _lock_within(descriptor: int, wait: float) -> bool:
             time.sleep(0.02)
 
 
-def _command(pid: int) -> str:
+def _comm(pid: int) -> str:
+    """The process name (``/proc/PID/comm``, at most 15 bytes): a report names
+    a process by pid and comm, never by its raw command line (#2217)."""
     try:
-        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        raw = Path(f"/proc/{pid}/comm").read_bytes()
     except OSError:
         return ""
-    return " ".join(word.decode(errors="replace") for word in raw.split(b"\0") if word)
+    return raw.rstrip(b"\r\n").decode(errors="replace")[:15]
 
 
 def _working_inside(directory: Path) -> dict[str, object] | None:
@@ -360,7 +362,7 @@ def _working_inside(directory: Path) -> dict[str, object] | None:
         except OSError:
             continue
         if cwd == canonical or cwd.startswith(canonical + "/"):
-            return {"pid": int(pid), "command": _command(int(pid))}
+            return {"pid": int(pid), "comm": _comm(int(pid))}
     return None
 
 
@@ -412,7 +414,7 @@ def _held_lock_inside(directory: Path) -> dict[str, object] | None:
         if path.suffix == ".lock":
             pid = _flock_holder(path)
             if pid is not None:
-                return {"pid": pid, "command": _command(pid)}
+                return {"pid": pid, "comm": _comm(pid)}
     return None
 
 
@@ -435,7 +437,7 @@ def _record_names_its_directory(path: Path) -> str | None:
 def _unmovable(path: Path) -> str | None:
     user = _working_inside(path) or _held_lock_inside(path)
     if user is not None:
-        return f"in use by process {user['pid']} ({user['command']})"
+        return f"in use by process {user['pid']} ({user['comm']})"
     return _record_names_its_directory(path)
 
 
