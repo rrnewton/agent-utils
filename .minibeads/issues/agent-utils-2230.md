@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-reading-row-stays-put: the message being read keeps its screen position through refreshes and inserts below it'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -8,7 +8,8 @@ labels:
 - scroll
 - owner-ui
 created_at: 2026-11-25T06:28:00-05:00
-updated_at: 2026-11-25T06:28:00-05:00
+updated_at: 2026-11-25T12:48:40-05:00
+closed_at: 2026-11-25T17:48:40.000000000+00:00
 ---
 
 # Description
@@ -32,3 +33,7 @@ Invariant: the message being read keeps its exact screen position (rect.top, dy 
 # Notes
 
 Diagnose first: prior issues for the top-anchor policy, shrink-anchor policy and scroll stability, and the settle/anchor code paths; whether branches for in-flight anchor work touch the same code. Fix on a branch from github/main; one owner gate; land only on the coordinator's LAND NOW.
+
+## Resolution
+
+Landed on main as c8896041 in the stack range ending e637f97c (with #2233 and #2242, one owner gate on the stack top), deployed 12:33 PM ET 11-25, and the deploy watch came back clean (12:33 to 12:48 PM ET: no errors, no restarts). The same patch passed its own owner gate as 319969b4 (11:34 AM ET, no failed steps) before it was rebased unchanged onto the stack. Nothing that arrives moves the row being read, at the foot or mid-list: a mutation re-read, a visible catch-up, a replay, a live insert (threaded or not) and a refresh, pull-up refresh included, all keep the reading row's top where it was (dy 0) and show or update the Newest chip. The three follow paths were the post-read settle, the live-insert path and the right column's foot keeper. Still follows: the reader's own composer send exactly as #1983 specifies (no move outside the fitted keyboard), a confirmed approval-card send at the foot, a Newest tap, and End or Ctrl+End. The reader's own messages, composer or card, never count as new. The voice-call transcript is unchanged. Page tests cover each arrival kind at the foot and mid-list, with threads on and off, at phone and desktop sizes, and the own-send paths (optimistic draw, live read, mutation re-read, catch-up). They fail on the code before the fix, and the column-overscroll negative controls still fail for the new policy's reason. Evidence: real-browser top-anchor checks measured 94 px of movement before the fix and 0.0 px after. Screenshot scenes 104 to 106 (before and after the same arrival, with the reading row's text and top in a sidecar) were taken in light and dark at phone 412 and laptop 1280 from the gated tree, the stack top and landed main, each folder with BUILD.txt, and sent to the coordinator; the matrix scenes 73 to 76 were taken on the branch before its gate. Scene 106 shows dy 0.0 with the "1 new" chip in every combination. The stack-top shots are byte-identical to the gated tree's. Landed main differs from the stack top only by one colour level on rounded corners outside the list. The windowed renderer's coverage shift, which can still lose the reading row in shrink-anchor fuzz runs (opt-in, off by default), is #2239.
