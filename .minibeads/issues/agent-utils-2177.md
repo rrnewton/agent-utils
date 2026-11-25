@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-search-read-browser-condition-waits'
-status: open
+status: closed
 priority: 2
 issue_type: task
 labels:
@@ -21,5 +21,9 @@ Harden each wait to a condition (observable page/server state) where one exists,
 - Each named wait is condition-based (or justified as a pure backstop); the three checks pass under load in a gate and their #2175 known-red entries can drop.
 
 # Notes
+
+## Resolution
+
+Landed as fb4553c9 on github/main (gate pass on 6c4f813b). The search walks' authoritative waits now use the hot-host hang backstop instead of 10-20s wall budgets, and the typing burst runs on the page clock (80ms per key) so a starved host cannot make the settled ask fire mid-burst. read-pause-reply was already condition-based; no change there. The family's interim known-red entries stay until regular gates show the steps green on this fix, then drop per #2175.
 
 Filed by the coordinator from the browser-red plan (mu-clientperf, 2026-11-24); the owning lane refines this file as it works.
