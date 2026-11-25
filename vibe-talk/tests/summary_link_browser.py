@@ -26,7 +26,17 @@ thread short-ref injected into one row also land with the bubble or drill
 explicitly, never silently.
 
 Pass --screenshots DIR to keep PNGs of the summary open and of the
-thread-reply landing, per profile and scheme.
+thread-reply landing, per profile and scheme, and each walk's per-frame
+Back trace as `<label>-back-trace.json`.
+
+`#2261 vibe-talk-summary-link-back-race`: Back after the reply-citation
+jump is traced frame by frame (the main row's top against its pre-jump
+top, the list's scroll position, the landed and linked rows, every write
+to the list's place with the code that made it, the popstate). Should the
+wait for the row to come back time out, the step's log carries that trace
+with the row's current and expected top, the list's state, `history.state`
+and the walk label, and a screenshot is kept beside it, so an
+intermittent red leaves its evidence.
 
 `#2147 vibe-talk-linked-jump-centers-target`: every landing above also
 asserts the target stands centred in the visible list area (above the
@@ -40,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import tempfile
 import time
@@ -85,6 +96,124 @@ def call(base: str, method: str, path: str, token: str,
         parsed: object = json.loads(res.read() or b"null")
     assert isinstance(parsed, dict)
     return parsed
+
+
+# `#2261`: the per-frame Back trace. Started on the row the reader is on, it
+# records on every animation frame the row's top, the list's scroll position
+# and height, the landed and linked rows, the Discuss panel's top and the
+# visual viewport's height; every write to the list's place (and every
+# `scrollIntoView`) with the first frames of the code that made it; and
+# marks (the tap, the Back, the popstate) with the row's top at that moment.
+# The prototype wrappers are installed once per page and only observe.
+BACK_TRACE_START = """(rowId) => {
+  const prior = window.__backTrace;
+  if (prior) prior.on = false;
+  const t = {on: true, start: performance.now(), frames: [], writes: [], marks: [], row: rowId, n: 0};
+  window.__backTrace = t;
+  const r2 = (v) => (v === null || v === undefined ? null : Math.round(v * 100) / 100);
+  const rowOf = () => [...document.querySelectorAll('#discord-log li')]
+    .find(r => (r.getAttribute('data-ids') || '').split(' ').includes(rowId));
+  t.top = () => { const r = rowOf(); return r ? r2(r.getBoundingClientRect().top) : null; };
+  t.ms = () => Math.round(performance.now() - t.start);
+  t.mark = (what, extra) => { if (t.on) t.marks.push([t.n, t.ms(), what, t.top(), extra === undefined ? null : extra]); };
+  const snap = () => {
+    const a = document.getElementById('scroll-area');
+    const landed = document.querySelector('#discord-log [data-landed="true"]');
+    const linked = [...document.querySelectorAll('#discord-log li[data-linked="true"]')]
+      .map(r => r.getAttribute('data-id')).join(' ');
+    const panel = document.getElementById('discuss-panel');
+    return [t.n, t.ms(), t.top(), a ? r2(a.scrollTop) : null, a ? a.scrollHeight : null,
+      landed ? landed.getAttribute('data-id') : null, linked,
+      panel && !panel.hidden ? r2(panel.getBoundingClientRect().top) : null,
+      window.visualViewport ? r2(window.visualViewport.height) : null];
+  };
+  const step = () => {
+    if (!t.on) return;
+    t.frames.push(snap());
+    t.n += 1;
+    if (t.frames.length < 4000) requestAnimationFrame(step);
+  };
+  t.frames.push(snap());
+  requestAnimationFrame(step);
+  if (window.__backTraceWrapped) return t.top();
+  window.__backTraceWrapped = true;
+  const stack = () => (new Error().stack || '').split('\\n').slice(3, 10)
+    .map(s => s.trim().replace(/^at /, '').replace(/\\(?(?:https?:)?\\/\\/[^)]*\\/([^/)]+)\\)?/, '@$1')).join(' < ');
+  const log = (kind, node, from, to) => {
+    const tr = window.__backTrace;
+    if (tr && tr.on) tr.writes.push([tr.n, tr.ms(), kind, node.id || node.tagName, from, to, stack()]);
+  };
+  const desc = Object.getOwnPropertyDescriptor(Element.prototype, 'scrollTop');
+  Object.defineProperty(Element.prototype, 'scrollTop', {
+    configurable: true, enumerable: desc.enumerable,
+    get() { return desc.get.call(this); },
+    set(v) {
+      if (this.id === 'scroll-area') log('scrollTop', this, r2(desc.get.call(this)), r2(Number(v)));
+      desc.set.call(this, v);
+    },
+  });
+  for (const name of ['scrollTo', 'scrollBy']) {
+    const orig = Element.prototype[name];
+    Element.prototype[name] = function (...args) {
+      if (this.id === 'scroll-area') log(name, this, r2(this.scrollTop), JSON.stringify(args).slice(0, 80));
+      return orig.apply(this, args);
+    };
+  }
+  const into = Element.prototype.scrollIntoView;
+  Element.prototype.scrollIntoView = function (...args) {
+    log('scrollIntoView', this, null, JSON.stringify(args).slice(0, 60));
+    return into.apply(this, args);
+  };
+  window.addEventListener('popstate', (e) => {
+    const tr = window.__backTrace;
+    let state = null;
+    try { state = JSON.stringify(e.state).slice(0, 240); } catch (err) { state = String(err); }
+    if (tr) tr.mark('popstate', state);
+  }, true);
+  return t.top();
+}"""
+
+# `#2261`: the page's state when a Back wait times out, beside the trace above.
+BACK_DUMP = """([rowId, expected]) => {
+  const t = window.__backTrace;
+  const r2 = (v) => (v === null || v === undefined ? null : Math.round(v * 100) / 100);
+  const row = [...document.querySelectorAll('#discord-log li')]
+    .find(r => (r.getAttribute('data-ids') || '').split(' ').includes(rowId));
+  const rect = row ? row.getBoundingClientRect() : null;
+  const area = document.getElementById('scroll-area');
+  const list = document.getElementById('discord-log');
+  const panel = document.getElementById('discuss-panel');
+  const answer = document.getElementById('discuss-answer');
+  const box = (id) => { const n = document.getElementById(id); if (!n || n.hidden) return null;
+    const b = n.getBoundingClientRect(); return b.height > 0 ? [r2(b.top), r2(b.bottom)] : null; };
+  let hist = null;
+  try { hist = JSON.stringify(history.state); } catch (err) { hist = String(err); }
+  const frames = t ? t.frames.filter((f, i, a) => i === 0 || i === a.length - 1
+    || JSON.stringify(f.slice(2)) !== JSON.stringify(a[i - 1].slice(2))) : [];
+  return {
+    row: rowId, row_top: rect ? r2(rect.top) : null, expected_top: r2(expected),
+    delta: rect ? r2(rect.top - expected) : null, row_height: rect ? r2(rect.height) : null,
+    row_attrs: row ? {linked: row.getAttribute('data-linked'), landed: row.getAttribute('data-landed'),
+      selected: row.getAttribute('aria-selected') || row.getAttribute('data-selected')} : null,
+    list: area ? {scrollTop: r2(area.scrollTop), scrollHeight: area.scrollHeight, clientHeight: area.clientHeight,
+      top: r2(area.getBoundingClientRect().top), footPadding: list ? list.style.paddingBottom : null} : null,
+    landed: [...document.querySelectorAll('#discord-log [data-landed="true"]')].map(r => r.getAttribute('data-id')),
+    linked: [...document.querySelectorAll('#discord-log [data-linked="true"]')].map(r => r.getAttribute('data-id')),
+    floating: {freshness: box('channel-freshness'), search: box('search-float'), error: box('error-wrap')},
+    status: (document.getElementById('status') || {}).textContent || '',
+    view: (document.getElementById('thread-select') || {}).value,
+    panel: panel ? {hidden: panel.hidden, top: r2(panel.getBoundingClientRect().top),
+      mode: panel.getAttribute('data-mode'), sheet: panel.getAttribute('data-sheet'),
+      scrollTop: r2(panel.scrollTop), answerScrollTop: answer ? r2(answer.scrollTop) : null} : null,
+    history_state: hist, history_length: history.length, href: location.href,
+    viewport: {inner: innerHeight, visual: window.visualViewport ? r2(window.visualViewport.height) : null},
+    trace_columns: ['frame', 'ms', 'rowTop', 'scrollTop', 'scrollHeight', 'landed', 'linked', 'panelTop', 'vvHeight'],
+    trace_frames_total: t ? t.frames.length : 0,
+    trace_frames_changed: frames.slice(-160),
+    trace_writes: t ? t.writes.slice(-80) : [],
+    trace_marks: t ? t.marks : [],
+  };
+}"""
 
 
 def cite(target: str, label: str, thread: str | None = None, extra: str = "") -> str:
@@ -428,9 +557,36 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
 
     def tap_visible(locator: Locator, what: str) -> None:
         # A tap on the anchor itself, with no scroll-into-view: whatever the
-        # panel's scroll does next is the app's doing, not the driver's.
+        # panel's scroll does next is the app's doing, not the driver's. A
+        # running Back trace (`#2261`) marks the tap, in the tap's own task.
         check(locator.count() > 0, f"{label}: {what} is not drawn to tap")
-        locator.evaluate("el => el.click()")
+        locator.evaluate("(el, what) => { const t = window.__backTrace; if (t && t.on) t.mark('tap ' + what); el.click(); }", what)
+
+    def back_trace_stop() -> dict[str, object]:
+        """Stop the Back trace; its frames, writes and marks."""
+        trace: object = page.evaluate("""() => {
+          const t = window.__backTrace;
+          if (!t) return {};
+          t.on = false;
+          return {row: t.row, frames: t.frames, writes: t.writes, marks: t.marks};
+        }""")
+        return trace if isinstance(trace, dict) else {}
+
+    def back_failure(what: str, row_id: str, expected: float, error: Exception) -> AssertionError:
+        """`#2261`: what a timed-out Back wait leaves in the step's log, and a screenshot."""
+        dump: object = page.evaluate(BACK_DUMP, [row_id, expected])
+        back_trace_stop()
+        folder = shots if shots is not None else Path(tempfile.gettempdir())
+        shot = folder / f"summary-link-back-{label}-{os.getpid()}.png"
+        try:
+            page.screenshot(path=str(shot))
+        except Exception as shot_error:  # the dump stands without its picture
+            shot = Path(f"(no screenshot: {shot_error})")
+        print(f"summary link ({label}): {what} BACK DUMP {json.dumps(dump)}", flush=True)
+        delta = dump.get("delta") if isinstance(dump, dict) else None
+        return AssertionError(f"{label}: {what}: the main row did not come back within 4 px of its"
+                              f" pre-jump top {expected} (off by {delta} px; {error}); screenshot {shot};"
+                              " the BACK DUMP line above has the trace and the page's state")
 
     # (a) a main-channel message, in place. Tapped at its on-screen point,
     # as a finger taps: no scroll-into-view may move the summary for it.
@@ -446,12 +602,15 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
         raise AssertionError(f"{label}: the summary scroll moved on a jump: {scroll_before} -> {panel_scroll()} {both}")
     check_stable("main citation")
 
-    # (b) a thread reply, in place in All — never the Thread view.
+    # (b) a thread reply, in place in All — never the Thread view. The Back
+    # trace (`#2261`) starts on the main row here, so the frames before the
+    # tap show whether the row still moved after its pre-jump top was taken.
+    page.evaluate(BACK_TRACE_START, ids["main_msg"])
     anchor_top = page.evaluate(
         "() => [...document.querySelectorAll('#discord-log li')]"
         f".find(r => (r.getAttribute('data-ids') || '').split(' ').includes('{ids['main_msg']}'))"
         ".getBoundingClientRect().top")
-    page.evaluate("() => { window.__scrollLog = []; }")
+    page.evaluate("(top) => { window.__scrollLog = []; window.__backTrace.mark('anchor top', top); }", anchor_top)
     tap_visible(citations.nth(1), "reply citation")
     assert_landed(ids["reply_msg"], "reply citation")
     check_stable("reply citation")
@@ -466,12 +625,24 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
                         **probe}, indent=2) + "\n")
     # Back returns to the previous position in the same view: the row the
     # reader was on, at the height it stood.
+    page.evaluate("() => window.__backTrace.mark('go_back')")
     page.go_back()
-    page.wait_for_function(
-        "() => Math.abs([...document.querySelectorAll('#discord-log li')]"
-        f".find(r => (r.getAttribute('data-ids') || '').split(' ').includes('{ids['main_msg']}'))"
-        f".getBoundingClientRect().top - {float(anchor_top)}) < 4",
-        timeout=20_000)
+    try:
+        page.wait_for_function(
+            "() => Math.abs([...document.querySelectorAll('#discord-log li')]"
+            f".find(r => (r.getAttribute('data-ids') || '').split(' ').includes('{ids['main_msg']}'))"
+            f".getBoundingClientRect().top - {float(anchor_top)}) < 4",
+            timeout=20_000)
+    except Exception as error:
+        raise back_failure("Back after stay-jump", ids["main_msg"], float(anchor_top), error) from error
+    page.evaluate("() => window.__backTrace.mark('back returned')")
+    trace = back_trace_stop()
+    if shots is not None:
+        (shots / f"{label}-back-trace.json").write_text(json.dumps({
+            "label": label, "row": ids["main_msg"], "expected_top": anchor_top,
+            "columns": ["frame", "ms", "rowTop", "scrollTop", "scrollHeight", "landed", "linked",
+                        "panelTop", "vvHeight"],
+            **trace}, indent=1) + "\n")
     assert_stayed("Back after stay-jump")
 
     # (c) a message not yet loaded, loaded in place.
