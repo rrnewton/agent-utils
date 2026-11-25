@@ -1424,13 +1424,18 @@ function renderServerSearch() {
     if (chip.getAttribute("aria-pressed") !== pressed) chip.setAttribute("aria-pressed", pressed);
   }
   // `#2200`: the list's head reservation (`--bucket-head`) stands while a
-  // search stands or its answer is pending, on this page-side flag — never
-  // on chip visibility, so retiring the chips for a refined query (the
-  // typing-fast pass) drops no reserved head and shifts nothing.
+  // chip stands or an answer is pending, on this page-side flag — never on
+  // chip visibility alone, so retiring the chips for a refined query (the
+  // typing-fast pass) drops no reserved head and shifts nothing. Settled
+  // with no chips, the reservation is released through the scroll owner,
+  // whose hold puts the reader's row back at its place in the same frame,
+  // so the release moves nothing they see (`#1899`).
   const screenMain = el("screen-main");
-  const reserve = serverSearchNow().key !== "" && (foldStanding() || serverSearchNow().loading);
+  const reserve = anyChip || (serverSearchNow().key !== "" && serverSearchNow().loading);
   if (reserve && !screenMain.hasAttribute("data-bucket-head")) screenMain.setAttribute("data-bucket-head", "");
-  if (!reserve && screenMain.hasAttribute("data-bucket-head")) screenMain.removeAttribute("data-bucket-head");
+  if (!reserve && screenMain.hasAttribute("data-bucket-head")) {
+    preservingScroll(() => screenMain.removeAttribute("data-bucket-head"));
+  }
   const bucketRow = el("search-bucket-row");
   // The row stands only while a chip stands (`#1899` follow-up, liaison
   // scene 80): with no bucket hits it takes no space at all, so its opaque
