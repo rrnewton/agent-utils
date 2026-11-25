@@ -754,7 +754,7 @@ Its output is above. Without it Discuss cannot answer and its states are unreach
     SHOTS_GLOSSARY=0
     SHOTS_READER=0
     for shots_state in "${SHOTS_ONLY[@]}"; do
-        case "$shots_state" in 73-*|74-*|75-*|76-*|78-*|84-*|85-*|89-*|90-*|91-*|92-*|99-*|100-*|101-*|10[7-9]-*|11[0-7]-*|12[01]-*|12[3-5]-*|122-*) SHOTS_DISCUSS=1 ;; esac
+        case "$shots_state" in 73-*|74-*|75-*|76-*|78-*|84-*|85-*|89-*|90-*|91-*|92-*|99-*|100-*|101-*|10[7-9]-*|11[0-7]-*|12[01]-*|12[3-7]-*) SHOTS_DISCUSS=1 ;; esac
         case "$shots_state" in 10[7-9]-*|11[0-3]-*|11[5-7]-*) SHOTS_GLOSSARY=1 ;; esac
         case "$shots_state" in 118-*|119-*) SHOTS_READER=1 ;; esac
     done
