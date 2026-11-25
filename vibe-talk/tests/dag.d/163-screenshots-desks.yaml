@@ -3,7 +3,7 @@ steps:
     job: screenshots-desks
     desc: the screenshot harness on the desk profiles — a real server and a real browser
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && ./scripts/run.sh --screenshots --theme dark --profiles desktop,laptop-1280
+    cmd: cd vibe-talk && ./scripts/run.sh --screenshots --theme dark --profiles desktop,laptop-1280,desk-1000
     jobs_flag: ""
     deps: [build.release, setup.contract-tools]
     # Wall, not only CPU: a browser waiting on a page that never loads burns no CPU at all, so a
@@ -11,9 +11,11 @@ steps:
     timeout: 4800
     cpu_timeout: 600
     hint:
-      # One browser slot per profile shard: the six device profiles walk in parallel steps
+      # One browser slot per profile shard: the seven device profiles walk in parallel steps
       # instead of one step holding every browser slot for the whole walk. Together the
       # three shards photograph every profile, exactly as the single step did.
+      # desk-1000 (`#2242`) is opt-in: its only scenes are the Documents reader ones (118/119),
+      # which a wider walk skips by name, so here it costs one empty context.
       # run.sh claims each shard's four ports (server, +1/+2 for the mock, +3 for the model stub) before binding
       # them, so shards and other checkouts' gates starting together get distinct ports; a
       # fixed port per shard collided whenever two gates photographed at once (#1037).

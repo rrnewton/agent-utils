@@ -225,37 +225,75 @@
   grid-row: 2;
 }
 
-/* `#2006 vibe-talk-documents-react`. The Documents reader's two jumps: their own row
-   under the pane's, each half of it, labels on one line. The short words stand on a
-   phone; the owner's full words where the room is (and always to a screen reader). */
-#control-pane #doc-jumps {
-  grid-column: 1 / -1;
-  display: flex;
-  gap: 0.4rem;
-}
+/* `#2006 vibe-talk-documents-react`, made compact by `#2242
+   vibe-talk-documents-reader-toolbar`. The Documents reader's two jumps, Mention
+   and Discussion, never a row of their own: on a phone they are the tile's
+   second narrow column, stacked like Sound and Clear in the first, each an icon
+   over a one-word caption, so the tile stays one tile and the dock is shorter
+   than it was with the jumps' row under it. The owner's full words are the
+   tooltip and the screen reader's name.
 
+   Every rule here is scoped to the jumps being shown, which is only while a
+   document is open: with no document open the tile is exactly as it was. The
+   columns are 3.5rem (Sound over the audio toggle), 4.5rem (the jumps), Pace
+   and Read, with Stop's own column on Read's left while a read plays. The
+   jumps' 44px rows are the touch target, and they make the first column's
+   pair 44px too (38px before). */
 #control-pane #doc-jumps[hidden] {
   display: none;
 }
 
-#control-pane #doc-jumps .control {
+#control-pane:has(> #doc-jumps:not([hidden])) {
+  grid-template-columns: 3.5rem 4.5rem 1fr 1fr;
+}
+
+#control-pane:has(> #doc-jumps:not([hidden])):has(> #read-aloud-stop:not([hidden])) {
+  grid-template-columns: 3.5rem 4.5rem 1fr 1fr 1fr;
+}
+
+#control-pane:has(> #doc-jumps:not([hidden])) #read-speed {
+  grid-column: 3;
+}
+
+#control-pane:has(> #doc-jumps:not([hidden])) #read-aloud,
+#control-pane:has(> #doc-jumps:not([hidden])) #read-aloud-stop {
+  grid-column: 4;
+}
+
+#control-pane:has(> #doc-jumps:not([hidden])):has(> #read-aloud-stop:not([hidden])) #read-aloud {
+  grid-column: 5;
+}
+
+#control-pane #doc-jumps {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+/* Quiet, like the bar's own buttons: the accent stays on Pace and Read, the
+   playing controls, and the jumps read as the navigation they are. */
+#control-pane .doc-jump {
   flex: 1 1 0;
-  min-height: 2.4rem;
+  min-height: 2.75rem;
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--edge);
+  gap: 0.05rem;
+}
+
+#control-pane .doc-jump .control-icon {
+  width: 1.15rem;
+  height: 1.15rem;
+}
+
+#control-pane .doc-jump .doc-jump-word {
+  font-size: 0.55rem;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
   white-space: nowrap;
-}
-
-#control-pane #doc-jumps .label-short {
-  display: none;
-}
-
-@media (max-width: 700px) {
-  #control-pane #doc-jumps .label-full {
-    display: none;
-  }
-
-  #control-pane #doc-jumps .label-short {
-    display: inline;
-  }
+  color: var(--muted);
 }
 
 /* Only while the reader row is the pane's content: with a call up, Sound and

@@ -298,15 +298,64 @@
      plays) — in one centred box named for what it controls. The box is the
      pane while it holds the reader's controls; the call's pane (Sound,
      Clear, Hang up, Talk) keeps the row's right end as before. */
+  /* `#2242 vibe-talk-documents-reader-toolbar`: ONE row at the bar's height, in
+     the bar. The box is placed across the dock and centred by its auto margins
+     at its own width, not from `left: 50%`: placed from the middle it could only
+     be as wide as the window's right half, which is what wrapped it onto a
+     second row standing over the page when the jumps (#2006) joined it. It
+     never wraps; its padding is cut so its buttons stand on the bar buttons'
+     line and the box no higher than the bar. */
   :root:has(#pane-docs:not([hidden])) #control-pane:has(> #read-aloud:not([hidden])) {
     position: absolute;
-    left: 50%;
-    transform: translateX(-50%);
-    bottom: 0.4rem;
+    left: 0;
+    right: 0;
+    width: fit-content;
+    margin-inline: auto;
+    bottom: calc(0.3rem - 1px);
+    flex-wrap: nowrap;
     border: 1px solid var(--edge);
     border-radius: 0.85rem;
     background: var(--panel);
-    padding: 0.35rem 0.5rem;
+    padding: 0.1rem 0.35rem;
+  }
+
+  /* The jumps on a desk: one row inside the Reader box, first in it (their
+     markup place, so Tab meets them first), each the quiet bar dress with an
+     icon and its one word at the row's size. */
+  #control-pane #doc-jumps {
+    flex-direction: row;
+    gap: 0.4rem;
+  }
+
+  #control-pane .doc-jump {
+    flex: 0 0 auto;
+  }
+
+  #control-pane .doc-jump .doc-jump-word {
+    font-size: 0.85rem;
+    letter-spacing: 0.01em;
+    text-transform: none;
+    color: inherit;
+  }
+
+  /* The tooltip on KEYBOARD focus too: `title` shows only under a mouse, and
+     below 1200px the button is its icon alone. Drawn from `data-tip`, above
+     the button; the screen reader's name stays the aria-label. */
+  #control-pane .doc-jump[data-tip]:focus-visible::after {
+    content: attr(data-tip);
+    position: absolute;
+    bottom: calc(100% + 0.5rem);
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: var(--z-menu);
+    padding: 0.25rem 0.5rem;
+    border: 1px solid var(--edge);
+    border-radius: 0.4rem;
+    background: var(--dock);
+    color: var(--ink);
+    font-size: 0.8rem;
+    white-space: nowrap;
+    pointer-events: none;
   }
 
   :root:has(#pane-docs:not([hidden])) #control-pane:has(> #read-aloud:not([hidden]))::before {
@@ -857,6 +906,28 @@
     max-height: 60vh;
     overflow-y: auto;
     resize: none;
+  }
+}
+
+/* `#2242 vibe-talk-documents-reader-toolbar`. A narrow desk (900-1199px): the
+   jumps are their icons alone (the tooltip, the focus tip and the aria-label
+   carry their names), and the Reader box is centred in the band the bar
+   leaves it, between the gear and the corner's hamburger, Outline and switch,
+   so it never runs under them, Stop shown or not. */
+@media (min-width: 900px) and (max-width: 1199.98px) and (pointer: fine) {
+  #control-pane .doc-jump .doc-jump-word {
+    display: none;
+  }
+
+  #control-pane .doc-jump {
+    grid-template-columns: auto;
+    min-width: 2.25rem;
+    padding: 0 0.5rem;
+  }
+
+  :root:has(#pane-docs:not([hidden])) #control-pane:has(> #read-aloud:not([hidden])) {
+    left: 3.5rem;
+    right: calc(var(--dock-inset) + var(--dock-switch) + var(--dock-fetch) + var(--dock-menu) + 1.2rem);
   }
 }
 

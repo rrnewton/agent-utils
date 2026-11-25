@@ -1,7 +1,7 @@
 steps:
   - group: check
     job: documents-control-bar-browser
-    desc: the Documents desktop control bar (centred Reader box, Fetch in list view and Outline in reader view, popups centred over their buttons and clamped), against the real server (fake chat upstream) in current Chromium at 393x852 and 1280x800
+    desc: the Documents desktop control bar (centred one-row Reader box in the bottom bar with compact Mention/Discussion jumps, focus tips, keyboard and tap jumps landing, the phone tile's jump column at 44px, Fetch in list view and Outline in reader view, popups centred over their buttons and clamped), against the real server (fake chat upstream) in current Chromium at 412x915, 1000x800 and 1280x800
     labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/documents_control_bar_browser.py
     jobs_flag: ""

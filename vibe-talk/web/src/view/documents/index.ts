@@ -432,7 +432,7 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     if (deps.reactPolicy() === "discussion") {
       const root = await findDiscussionRoot(mention.channel_id);
       if (root === null) {
-        deps.onStatus?.("No discussion yet — use Last mention.");
+        deps.onStatus?.("No discussion yet — use Mention for the last mention.");
         return;
       }
       deps.onJumpToMention?.({

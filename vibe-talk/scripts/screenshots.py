@@ -1038,6 +1038,19 @@ PROFILES: tuple[Profile, ...] = (
         user_agent=DESKTOP_UA,
         opt_in=True,
     ),
+    Profile(
+        # `#2242 vibe-talk-documents-reader-toolbar`. The narrow desk, inside the desktop regime
+        # (900px and a fine pointer) but under the 1200px where the Documents reader's jumps drop
+        # their words for their icons. Opt-in: only the scenes that name it run here.
+        name="desk-1000",
+        what="a narrow desktop window, 1000x800, below the reader jumps' word width",
+        width=1000,
+        height=800,
+        scale=1.0,
+        mobile=False,
+        user_agent=DESKTOP_UA,
+        opt_in=True,
+    ),
 )
 
 # `#345 settings-multi-column` and the rest of the owner's Settings batch: the phone he uses, the small
@@ -6094,6 +6107,100 @@ def _act_documents_filter_bar(driver: Driver) -> None:
     )
 
 
+# `#2242 vibe-talk-documents-reader-toolbar`. The paste link the reader scenes post: run.sh gives
+# the throwaway server a [documents] paste section (only when one of these scenes is selected)
+# whose command reads this name from a fixture file in its own directory.
+READER_DOC_URL = "https://paste.example/reader-toolbar-report"
+
+
+def _act_documents_reader_toolbar(driver: Driver) -> None:
+    """`#2242`: a document open in the Documents reader, its controls in the bottom toolbar.
+
+    The document is a real one: the page posts the paste link through the real reply route,
+    the server registers it on the channel read, and the card is opened from the real list.
+    """
+    driver.load(with_token=True)
+    driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    posted = driver.page.evaluate(
+        "async (url) => {"
+        "  const headers = { Authorization: 'Bearer ' + localStorage.getItem('vibe-talk.token'),"
+        "    'Content-Type': 'application/json' };"
+        "  const listed = await (await fetch('/api/v1/documents?limit=10', { headers })).json();"
+        "  if ((listed.documents || []).length > 0) return 'already there';"
+        "  const channel = document.getElementById('discord-channel').value;"
+        "  const response = await fetch('/api/v1/channels/' + encodeURIComponent(channel) +"
+        "    '/reply', { method: 'POST', headers, body: JSON.stringify({ text: 'Report: ' + url }) });"
+        "  return response.status;"
+        "}",
+        READER_DOC_URL,
+    )
+    if posted not in ("already there", 200):
+        raise Unreachable(
+            "118-documents-reader-toolbar",
+            "the paste link could be posted into the channel",
+            f"the server answered {posted!r} to the reply route",
+        )
+    # The server registers a link's document when the channel is read; read it until it has.
+    driver.page.wait_for_function(
+        "async () => {"
+        "  const headers = { Authorization: 'Bearer ' + localStorage.getItem('vibe-talk.token') };"
+        "  const channel = document.getElementById('discord-channel').value;"
+        "  await fetch('/api/v1/channels/' + encodeURIComponent(channel) + '/page?limit=10&render=html', { headers });"
+        "  const listed = await (await fetch('/api/v1/documents?limit=10', { headers })).json();"
+        "  return (listed.documents || []).length > 0;"
+        "}",
+        polling=500,
+        timeout=60_000,
+    )
+    _ensure_pane(driver, "pane-docs")
+    card = driver.page.locator("#documents-list .doc-card").first
+    card.wait_for(state="visible", timeout=30_000)
+    card.click()
+    driver.page.wait_for_function(
+        "() => !!document.querySelector('#doc-body h1') && window.__visible('doc-jump-mention')"
+        " && window.__visible('read-aloud')",
+        timeout=30_000,
+    )
+
+
+def _act_documents_reader_toolbar_playing(driver: Driver) -> None:
+    """`#2242`: the same document read aloud, Stop standing beside Read (Pause while it plays).
+
+    The browser's speech engine is the one stub: a device voice that starts and never ends, so
+    the read stands for the photograph. The page and the server are real.
+    """
+    _act_documents_reader_toolbar(driver)
+    driver.page.evaluate(
+        "() => { const voice = {name: 'Shot voice', lang: 'en-US', localService: true, default: true,"
+        "  voiceURI: 'shot'};"
+        "  const engine = { paused: false, speaking: false, pending: false, getVoices: () => [voice],"
+        "    addEventListener() {}, removeEventListener() {},"
+        "    speak(u) { this.speaking = true; setTimeout(() => { if (u.onstart) u.onstart({}); }, 30); },"
+        "    cancel() { this.speaking = false; }, pause() { this.paused = true; },"
+        "    resume() { this.paused = false; } };"
+        "  Object.defineProperty(window, 'speechSynthesis', {value: engine, configurable: true});"
+        "  window.SpeechSynthesisUtterance = function (text) { this.text = text; }; }"
+    )
+    driver.page.wait_for_function(
+        "() => { const t = document.getElementById('audio-source');"
+        " return !!t && !t.hidden && t.getAttribute('aria-checked') !== null; }",
+        timeout=20_000,
+    )
+    if driver.js("document.getElementById('audio-source').getAttribute('aria-checked')") == "true":
+        driver.click("audio-source")
+        driver.page.wait_for_function(
+            "() => document.getElementById('audio-source').getAttribute('aria-checked') === 'false'",
+            timeout=20_000,
+        )
+    driver.click("read-aloud")
+    driver.page.wait_for_function(
+        "() => window.__visible('read-aloud-stop')", timeout=20_000
+    )
+
+
+# `#2242`: the reader toolbar at the matrix's phone and desk, and the narrow desk below 1200px.
+READER_TOOLBAR_PROFILES = ("android-412", "laptop-1280", "desk-1000")
+
 MATRIX_PROFILES = ("android-412", "laptop-1280")
 
 
@@ -9692,6 +9799,36 @@ SCENES: tuple[Scene, ...] = (
         ),
     ),
     Scene(
+        name="118-documents-reader-toolbar",
+        what="#2242 a document open in the Documents reader: its controls docked in the bottom "
+             "toolbar (Mention, Discussion, audio, Pace, Read)",
+        act=_act_documents_reader_toolbar,
+        profiles=READER_TOOLBAR_PROFILES,
+        expect=(
+            ("the Documents reader is open on a real document",
+             "window.__visible('docs-reader') && !!document.querySelector('#doc-body h1')"),
+            ("#2242 both jumps stand in the reader's controls",
+             "window.__visible('doc-jump-mention') && window.__visible('doc-jump-discussion')"),
+            ("Read and Pace stand", "window.__visible('read-aloud') && window.__visible('read-speed')"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="119-documents-reader-toolbar-playing",
+        what="#2242 the same document read aloud: Stop beside Read (its Pause), the jumps still "
+             "in the toolbar",
+        act=_act_documents_reader_toolbar_playing,
+        profiles=READER_TOOLBAR_PROFILES,
+        expect=(
+            ("the Documents reader is open on a real document",
+             "window.__visible('docs-reader') && !!document.querySelector('#doc-body h1')"),
+            ("#2242 both jumps stand in the reader's controls",
+             "window.__visible('doc-jump-mention') && window.__visible('doc-jump-discussion')"),
+            ("a read plays: Stop stands beside Read", "window.__visible('read-aloud-stop')"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
         name=SUMMARY_FAILED_STATE,
         what="summary mode when the summariser fails: the row says so quietly and keeps the message",
         act=_act_summary_failed,
@@ -9970,6 +10107,16 @@ def run_captures(
         for scene in discuss_scenes:
             print(f"  skip  {scene.name:<30} no Discuss window on a cacheless server")
         scenes = [s for s in scenes if s not in discuss_scenes]
+
+    # `#2242`: the Documents reader scenes open a REAL document, which the server can resolve only
+    # with the [documents] paste section (and the message cache) run.sh writes when those scenes
+    # are NAMED with --only. A wider walk's server has neither, so it skips them by name, as it
+    # skips Discuss above, rather than failing on a document that never registers.
+    reader_scenes = [s for s in scenes if s.name.startswith(("118-", "119-"))]
+    if reader_scenes and not wanted:
+        for scene in reader_scenes:
+            print(f"  skip  {scene.name:<30} no [documents] section on a wider walk's server")
+        scenes = [s for s in scenes if s not in reader_scenes]
 
     everything: list[tuple[str, Path, Verdict]] = []
     # Two processes judge the captures while the walk goes on; see `start_capture`. Spawned rather

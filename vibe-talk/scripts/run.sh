@@ -748,11 +748,15 @@ Its output is above. Without it Discuss cannot answer and its states are unreach
     # SYNTHETIC reviewed glossary (warm-up file, made-up terms only), so the popup shows
     # reviewed entries beside the ones the walk learns; 114 photographs the empty glossary and
     # runs alone, on a server that knows no term at all.
+    # `#2242 vibe-talk-documents-reader-toolbar`: the Documents reader states (118, 119) open a
+    # REAL document: they get the [documents] paste section and a plain message cache below.
     SHOTS_DISCUSS=0
     SHOTS_GLOSSARY=0
+    SHOTS_READER=0
     for shots_state in "${SHOTS_ONLY[@]}"; do
         case "$shots_state" in 73-*|74-*|75-*|76-*|78-*|84-*|85-*|89-*|90-*|91-*|92-*|99-*|10[7-9]-*|11[0-7]-*) SHOTS_DISCUSS=1 ;; esac
         case "$shots_state" in 10[7-9]-*|11[0-3]-*|11[5-7]-*) SHOTS_GLOSSARY=1 ;; esac
+        case "$shots_state" in 118-*|119-*) SHOTS_READER=1 ;; esac
     done
     if [ "$SHOTS_GLOSSARY" = 1 ]; then
         cat > "$SHOTS_TMP/glossary-synthetic.md" <<'EOF'
@@ -833,6 +837,9 @@ EOF
         # `#1855`: the served message cache (SHOTS_DISCUSS, decided above). Only for a Discuss
         # run: the Settings and Help states photograph a server with NO cache, and that stays the
         # default here. Beside the store, inside the 0700 throwaway directory the cache check requires.
+        # `#2242`: the Documents reader scenes (SHOTS_READER, decided above) need a cache as well
+        # (the Documents list reads its documents' mentions through it), a plain one; a run with
+        # Discuss scenes already has one.
         if [ "$SHOTS_DISCUSS" = 1 ]; then
             cat <<'EOF'
 
@@ -842,6 +849,8 @@ serve = true
 backfill = "full"
 EOF
             printf 'path = "%s/state/message-cache.sqlite3"\n' "$SHOTS_TMP"
+        elif [ "$SHOTS_READER" = 1 ]; then
+            printf '\n[message_cache]\nenabled = true\npath = "%s/state/message-cache.sqlite3"\n' "$SHOTS_TMP"
         fi
         # `#1855`: Discuss through the real router. Without a [summaries.llm] section the
         # catchup endpoint refuses by name; with one pointed at the loopback model stub
@@ -852,8 +861,30 @@ EOF
             printf '\n[summaries.llm]\nbase_url = "http://127.0.0.1:%s"\n' "$SHOTS_MODEL_PORT"
             printf 'model = "model-stub"\napi_key_file = "%s/model-key"\n' "$SHOTS_TMP"
         fi
+        # `#2242 vibe-talk-documents-reader-toolbar`: the Documents reader scenes open a REAL
+        # document, a paste link the scene posts through the reply route, which the server
+        # resolves with a local cat of a fixture file in this throwaway directory (its cwd).
+        # Only for those scenes: every other run keeps a server with no documents to resolve.
+        if [ "$SHOTS_READER" = 1 ]; then
+            cat <<'EOF'
+
+[documents]
+paste_url_prefixes = ["https://paste.example/"]
+paste_command = ["/bin/cat", "--", "{}"]
+EOF
+        fi
     } > "$SHOTS_TMP/vibe-talk.toml"
     printf 'screenshot-run-model-key-not-a-real-credential' > "$SHOTS_TMP/model-key"
+    if [ "$SHOTS_READER" = 1 ]; then
+        {
+            printf '# Reader toolbar report\n\nThe nightly run finished green.\n\n'
+            printf '## Details\n\nThe detail under the second heading.\n\n'
+            printf '## Later\n\nThe words under the third heading.\n\n'
+            for shots_para in $(seq 1 24); do
+                printf 'Paragraph %s: the report goes on, so the page scrolls behind the toolbar.\n\n' "$shots_para"
+            done
+        } > "$SHOTS_TMP/reader-toolbar-report"
+    fi
 
     step "Starting the throwaway server"
     (

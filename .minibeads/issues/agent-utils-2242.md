@@ -9,19 +9,25 @@ labels:
 - reader
 - ui
 assignee: cl-docbar
-created_at: 2026-11-25T10:30:00-05:00
-updated_at: 2026-11-25T10:30:00-05:00
+created_at: 2026-11-25T10:12:00-05:00
+updated_at: 2026-11-25T11:50:00-05:00
 ---
 
 # Description
 
 Owner UI request 373 (2026-11-25 10:05 AM ET, owner-UI fast-track), part B. With a document open, the Documents reader's controls pop up as a two-row panel: on a desk the centred Reader box (#1544) wraps onto a second row for the two wide jump buttons that #2006 added ("Jump to last mention", "Jump to discussion"), and on a phone the jumps take a third row of their own under the control tile. The owner: "this is all around badly designed... these could be shorter length buttons and could easily fit docked on the one tool bar at the bottom in this desktop layout."
 
-Part A of the same request (opening a document link returned non-JSON, HTTP 502) is tracked separately.
+Part A of the same request (opening a document link returned non-JSON, HTTP 502) is #2241 vibe-talk-document-load-502-readable.
 
 # Design
 
-Design note sent to the coordinator before any code; the settled design is recorded here when approved. Sketch: on a desk the jumps become compact icon buttons with one short word each, a tooltip and the existing aria-label, inside the Reader group, so the group is one row at the bar's height and stands in the one bottom toolbar; at narrow desk widths the words drop and the icons stay. On a phone the jumps leave their extra row for one compact place in the existing tile, every touch target at least 44 px. Every action, its keyboard reach and its screen-reader name stay as they are.
+Approved by the coordinator and the liaison before code (2026-11-25).
+
+- The two jumps keep their ids, aria-labels ("Jump to last mention", "Jump to discussion") and tooltips, and each becomes a compact quiet button (the bar's panel-and-edge dress, so the accent stays on Pace and Read): an icon (a speech bubble with a jump-back arrow; two overlapping bubbles) and one word, "Mention" and "Discussion". A `data-tip` draws the tooltip on keyboard focus as well, since `title` shows only under a mouse; the screen reader's name stays the aria-label.
+- Desktop (900px and up, fine pointer): the #1544 Reader box stays, as ONE row at the bar's 36px height inside the bottom toolbar: Reader, Mention, Discussion, audio, Pace, Stop (while a read plays), Read, in markup and Tab order. The box is placed across the dock and centred by auto margins at its own width; placed from `left: 50%` it could only be as wide as the window's right half, which is what wrapped it onto a second row standing over the page. It never wraps, and its padding is cut so its buttons stand on the bar buttons' line.
+- Narrow desk (900-1199px): the jumps drop their words (icon only) and the box centres in the band between the gear and the corner's hamburger, Outline and switch, so it never runs under them, Stop shown or not.
+- Phone (under 900px or a touch pointer): the jumps leave their row for the tile's second narrow column, stacked like Sound and the audio toggle in the first, each an icon over a one-word caption; the tile's rows become 44px (the first column's pair were 38px), Pace and Read keep their words, and the dock is 160px instead of 194px with a document open. Every rule is scoped to the jumps being shown, so with no document open the tile is exactly as before.
+- Files: `vibe-talk/web/voice.html`, `web/styles/voice/19-control-pane.css`, `web/styles/voice/20-desktop-regime.css`, the no-discussion notice's words in `web/src/view/documents/index.ts`; the real-server check `tests/documents_control_bar_browser.py`; screenshot scenes 118 and 119 and an opt-in desk-1000 profile in the shared harness (`scripts/screenshots.py`), whose `scripts/run.sh` gives the throwaway server a `[documents]` paste section and a plain message cache only when one of those scenes runs.
 
 # Acceptance Criteria
 
