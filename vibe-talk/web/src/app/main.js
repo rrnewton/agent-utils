@@ -3159,7 +3159,10 @@ function noteSearchScreen() {
   // leaving them out lets `rowsOnScreen` measure only the screen's neighbourhood.
   const rows = [...list.children].filter((row) => row.getAttribute("data-search") !== null &&
     !(/** @type {any} */ (row)).hidden && !String(row.className).split(/\s+/).includes("search-hidden"));
-  searchScreenRows = scrollKeeping.rowsOnScreen(rows);
+  // By id, not by element: placed server rows are rebuilt per answer, so
+  // an element captured here may be a different node by the landing even
+  // when the same message stands on screen (`#2200`).
+  searchScreenRows = scrollKeeping.rowsOnScreen(rows).map((row) => String(row.getAttribute("data-id")));
 }
 function landSearchEntry() {
   if (!searchField.open() || !searchTyped(searchField.query())) {
@@ -3172,7 +3175,7 @@ function landSearchEntry() {
   enteredSearchIdentity = identity;
   const hits = new Set([...visibleList().children].filter((row) =>
     row.getAttribute("data-search") !== null &&
-    !String(row.className).split(/\s+/).includes("search-hidden")));
+    !String(row.className).split(/\s+/).includes("search-hidden")).map((row) => String(row.getAttribute("data-id"))));
   // Nothing matched: the emptied list's own placement takes the reader to
   // the sentence at its head that says why; there are no recent hits to show.
   if (hits.size === 0) return;

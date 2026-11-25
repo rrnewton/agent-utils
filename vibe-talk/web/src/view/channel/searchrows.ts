@@ -779,13 +779,15 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
     const countEl = el("search-count");
     const form = fold !== null && fold.freshSelected > 0 ? "found" : "";
     if (countEl.getAttribute("data-form") !== form) countEl.setAttribute("data-form", form);
-    el("search-count").textContent = left.pinned
+    // Written only on change: this render runs per settled pass and again
+    // per server answer, and an unchanged assignment still invalidates.
+    setTextIfChanged(countEl as never, left.pinned
       ? (!filtering ? `${loaded} pinned` : `${matched} of ${loaded} pinned`)
       : (!filtering ? "" : fold !== null
         ? (fold.freshSelected > 0
           ? `${fold.total} found (${fold.loadedSelected} loaded, ${fold.freshSelected} older)`
           : `${fold.total} of ${loaded} loaded`)
-        : `${matched} of ${loaded} loaded`);
+        : `${matched} of ${loaded} loaded`));
   }
 
   function refreshSearchCount(): void {
