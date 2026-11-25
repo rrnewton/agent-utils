@@ -18,6 +18,16 @@ The answer is fixed prose with a marker line, so a scene can assert that
 the summary on screen is the one this stub served (through the server),
 not text the page made up.
 
+CITING MODE (`#2265`)
+=====================
+
+By default the answer cites nothing, so every Discuss shot stays as it
+was. A scene that needs bullets citing real window messages (the summary
+strike, current and earlier) turns citing on with `POST /control/cite`
+`{"on": true}` and off again after: the answer's bullets then cite the
+newest unread window lines as `[m:<id>]`, exactly as a model is told to,
+and the REAL server validates and links them (`shape_answer`).
+
 USAGE
 =====
 
@@ -29,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ANSWER = (
@@ -48,6 +59,34 @@ ANSWER = (
 )
 
 
+# `#2265`: whether answers cite window lines now (`/control/cite`).
+CITING = {"on": False}
+
+# One window line as the server builds it (`build_context`): read state,
+# the optional owner mark, then `[m:<full id> | <time> | <speaker>]`.
+WINDOW_LINE = re.compile(r"\[(UNREAD|READ)\](?: \[OWNER\])? \[m:([^\s|\]]+) \|")
+
+
+def citing_answer(prompt: str) -> str | None:
+    """The stub answer with bullets citing the newest unread window lines; None with too few."""
+    unread = [mid for state, mid in WINDOW_LINE.findall(prompt) if state == "UNREAD"]
+    if len(unread) < 3:
+        return None
+    first, second, third = unread[-1], unread[-2], unread[-3]
+    return (
+        "## Progress\n"
+        f"- Ada shipped the fix [m:{first}]\n"
+        f"- Ben is reviewing it [m:{second}]\n\n"
+        "## Review\n"
+        f"- Nothing is blocked; the next step is the review pass [m:{third}]\n\n"
+        "Model stub summary: this answer came from the loopback model stub "
+        "through the real Discuss route.\n\n"
+        "## Terms I didn't understand\n"
+        "- cache-key rewrite\n"
+        "- flaky ordering test"
+    )
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_args: object) -> None:  # keep the run's log clean
         pass
@@ -64,6 +103,15 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {"ok": True, "stub": "model"})
 
     def do_POST(self) -> None:  # noqa: N802 - the handler's own name
+        if self.path.rstrip("/") == "/control/cite":
+            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                wanted = json.loads(self.rfile.read(length) or b"{}")
+            except ValueError:
+                wanted = {}
+            CITING["on"] = isinstance(wanted, dict) and wanted.get("on") is True
+            self._json(200, {"ok": True, "citing": CITING["on"]})
+            return
         if self.path.rstrip("/") not in ("/v1/messages", ""):
             self._json(404, {"error": "not_found", "detail": "the model stub serves /v1/messages"})
             return
@@ -74,8 +122,9 @@ class Handler(BaseHTTPRequestHandler):
         # the strict JSON the lookup route parses, citing the first evidence
         # message the server fenced into the prompt. The prompt arrives
         # JSON-wrapped, so decode before reading its lines.
+        whole = body.decode("utf-8", "replace")
         try:
-            payload = json.loads(body.decode("utf-8", "replace"))
+            payload = json.loads(whole)
             text = json.dumps(payload)
             for message in payload.get("messages", []):
                 content = message.get("content", "")
@@ -87,9 +136,10 @@ class Handler(BaseHTTPRequestHandler):
                             text = str(block.get("text", ""))
         except ValueError:
             text = body.decode("utf-8", "replace")
+        if CITING["on"] and "You maintain a project glossary" not in text:
+            # The whole request, system prompt and every message: the window lines are in it.
+            answer = citing_answer(whole) or answer
         if "You maintain a project glossary" in text or "Selected words:" in text:
-            import re
-
             selected = re.search(r"Selected words: (.+)", text)
             evidence = re.search(r"\[msg id=(\S+?) ", text)
             term = (selected.group(1).strip() if selected else "the term").removeprefix("the ")

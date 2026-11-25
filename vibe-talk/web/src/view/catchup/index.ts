@@ -8,6 +8,8 @@
 export { DISCUSS_DOCUMENTS_HINT, DISCUSS_UNAVAILABLE_HINT, HOUR_MS, asCatchupAnswer, asCatchupPreview, asCatchupRecord, boundForCount, boundForHours, countForHours, countSince, createDiscussPanel, uncoveredInScope, discussReadKey, discussTitle, formatHoursFloor1, formatStampLine, hhmm, hoursFloor1, hoursSinceStart, isDiscussUnavailable, summarySearchHits, summarySearchMatches, summarySearchRows, summarySearchWords, summaryTimeLabel, withoutTimestampCitations } from "./panel.ts";
 export { FRESH_CLASS, STRUCK_BULLET_CLASS, STRUCK_SECTION_CLASS, applyStrikes, citationIdsOf, hasWord } from "./strikes.ts";
 export type { StrikeElement } from "./strikes.ts";
+export { DELETED_CITE_CLASS, createStrikeIndex } from "./strikeindex.ts";
+export type { StrikeFacts, StrikeIndex, StrikeIndexElement, StrikeTally } from "./strikeindex.ts";
 export type {
   CatchupAnswer,
   CatchupFooterLink,
@@ -112,6 +114,8 @@ export interface DiscussViewDependencies {
   catchupNewSummary?(channelId: string, scope: DiscussScope): Promise<unknown>;
   /** `#1388` landing 1. Whether a message is read now, from the page's read set. */
   isReadNow?(id: string): boolean;
+  /** `#2265`. Whether a message was deleted upstream, as far as the page was told; counts as done. */
+  isDeletedNow?(id: string): boolean;
   /** Whether a bare Enter sends, handed to the panel's composer keys. */
   enterSends?(): boolean;
   /** `#1840`: the follow-up box's words as typed, for cross-device sync. */
@@ -250,8 +254,12 @@ export interface DiscussView {
   setMode(mode: "overlay" | "docked" | "maximized"): void;
   /** `#1586`. Leave full screen so a linked message can land in the list. */
   dropToPartialForLink(): void;
-  /** `#1388` landing 1. Restate the summary's strike from the read set now. */
-  refreshStrikes(): void;
+  /**
+   * `#1388` landing 1. Restate the summary's strike from the read set now.
+   * `#2265`: `ids` names the messages that changed (one lookup each, every
+   * summary that cites them); none, only what cites a message that moved.
+   */
+  refreshStrikes(ids?: readonly string[]): void;
   /** `#1531 discuss-top-bar-slim-fixed`. Read the summary on screen aloud whole; false with none. */
   readSummary(): boolean;
 }
@@ -510,6 +518,7 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
       });
     },
     isReadNow: (id: string) => deps.isReadNow?.(id) ?? false,
+    isDeletedNow: (id: string) => deps.isDeletedNow?.(id) ?? false,
     enterSends: () => deps.enterSends?.() ?? true,
     onFollowupTyped: (text, scope) => deps.onFollowupTyped?.(text, scope),
     onFollowupCleared: (scope) => deps.onFollowupCleared?.(scope),
@@ -723,7 +732,7 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
     mode: () => panel.mode(),
     setMode: (mode: "overlay" | "docked" | "maximized") => panel.setMode(mode),
     dropToPartialForLink: () => panel.dropToPartialForLink(),
-    refreshStrikes: () => panel.refreshStrikes(),
+    refreshStrikes: (ids?: readonly string[]) => panel.refreshStrikes(Array.isArray(ids) ? ids : undefined),
     readSummary: () => panel.readSummary(),
   };
 }

@@ -118,9 +118,11 @@ export interface DoneActDependencies {
    * here — a Done, a put back, or server read state a read just brought — in
    * the same turn the message row changes. Optional: a host with nothing
    * watching the read set (a summary's live strike is the page's watcher)
-   * omits it.
+   * omits it. `#2265`: `ids` names the messages the act moved (a Done, a put
+   * back, a refusal's take-back), so a watcher restyles only what cites them;
+   * none (server read state landing) means "something may have moved".
    */
-  onReadStateChanged?(): void;
+  onReadStateChanged?(ids?: readonly string[]): void;
   lastDismissal(): DismissalOffer;
   inboxLedger(): DoneLedger;
 }
@@ -974,7 +976,7 @@ export function createDoneAct(deps: DoneActDependencies): DoneAct {
     // `#1820`: Done here from now on, drawn on the row at once: the read
     // set's watchers (an open summary's strike) move in this same turn,
     // not when the write below is answered or a refresh redraws.
-    deps.onReadStateChanged?.();
+    deps.onReadStateChanged?.(requested);
     // Done here from now on, and saved only once the write below is (`doneSaved`).
     const saved = noteDoneSaving(requested);
     // `#229 desktop-two-column`. Done is the message's, so the other column shows it Done as well.
@@ -1074,7 +1076,7 @@ export function createDoneAct(deps: DoneActDependencies): DoneAct {
       deps.followDoneEverywhere(requested, column);
       renderTodoControls();
       // `#1820`: the take-back changed the read set again.
-      deps.onReadStateChanged?.();
+      deps.onReadStateChanged?.(requested);
       if (landed.length > 0) (error as { landed?: number }).landed = landed.length;
       throw error;
     } finally {
@@ -1141,7 +1143,7 @@ export function createDoneAct(deps: DoneActDependencies): DoneAct {
     }
     // `#1820`: back here from now on, as the row draws it at once: the
     // read set's watchers move in this same turn.
-    deps.onReadStateChanged?.();
+    deps.onReadStateChanged?.(restored);
     // On its way from now on, for what waits on a Done of these messages to be saved (`doneSaved`,
     // `#327 done-races-remaining`): settled once the write has been answered and a refusal taken back.
     const saving = noteDoneSaving(restored);
@@ -1230,7 +1232,7 @@ export function createDoneAct(deps: DoneActDependencies): DoneAct {
       deps.followDoneEverywhere(restored, column);
       renderTodoControls();
       // `#1820`: the take-back changed the read set again.
-      deps.onReadStateChanged?.();
+      deps.onReadStateChanged?.(restored);
       if (landed.length > 0) (error as { landed?: number }).landed = landed.length;
       throw error;
     } finally {

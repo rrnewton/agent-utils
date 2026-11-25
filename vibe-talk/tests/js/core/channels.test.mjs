@@ -302,6 +302,30 @@ test("`#624 voice-page-modularity`: the record of removals, from the module alon
   forgetUnplaced(canon, "nothing");
 });
 
+test("`#2265`: the record of removals tells its watcher the ids that moved, and a watcher's slip never stops it", () => {
+  const { emptyCanon, createRemovals } = CHANNELS;
+  const told = [];
+  const removals = createRemovals((ids) => told.push([...ids]));
+  const canon = emptyCanon("c");
+  removals.noteRemoved(canon, "1", 4, 1000);
+  removals.noteRemoved(canon, "2", 4, 1000);
+  assert.deepStrictEqual(told, [["1"], ["2"]], "a removal was not told by id");
+  // A read before the removal changes nothing, so it tells nothing.
+  removals.believeCarried(canon, { messages: [{ id: "1" }], observed_ms: 900 }, () => 9);
+  assert.equal(told.length, 2, "a read that changed nothing was told");
+  // Carried after all: told, as one batch, only the ids that came back.
+  removals.believeCarried(canon, { messages: [{ id: "1" }, { id: "2" }, { id: "3" }], observed_ms: 1100 }, () => 9);
+  assert.deepStrictEqual(told.at(-1), ["1", "2"], "the ids carried after all were not told");
+  // A watcher that throws: the record still stands.
+  const throwing = createRemovals(() => { throw new Error("watcher slip"); });
+  const other = emptyCanon("d");
+  throwing.noteRemoved(other, "9", 1, null);
+  assert.equal(other.removed.get("9"), 1, "a throwing watcher stopped the record");
+  // No watcher: as before.
+  createRemovals().noteRemoved(other, "8", 1, null);
+  assert.equal(other.removed.get("8"), 1);
+});
+
 test("`#624 voice-page-modularity`: a delta folded into a store, from the module alone, the page's part injected", () => {
   const { emptyCanon, foldDeltaIn, createCopyOrder, createRemovals } = CHANNELS;
   const at = (s) => `2026-10-01T00:00:${String(s).padStart(2, "0")}Z`;

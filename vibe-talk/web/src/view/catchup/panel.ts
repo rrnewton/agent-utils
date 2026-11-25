@@ -14,7 +14,8 @@
 // parts); the panel narrows the decoded body to the fields it reads.
 
 import { createListening, foldSectionsByHeading, insertSanitizedHtml, openSectionKeys, setAllSections, setClassWord } from "../dom/index.ts";
-import { applyStrikes } from "./strikes.ts";
+import { hasWord } from "./strikes.ts";
+import { createStrikeIndex, type StrikeFacts } from "./strikeindex.ts";
 import { createComposerKeys } from "../composer/index.ts";
 import { deepLinkRefFrom } from "../../foundation/index.ts";
 import type { MessageLinkRef } from "../../foundation/index.ts";
@@ -114,6 +115,12 @@ export interface DiscussPanelDependencies {
    * set; absent, nothing is ever struck. Read on every strike recompute.
    */
   isReadNow?(id: string): boolean;
+  /**
+   * `#2265`. Whether message `id` was deleted upstream, as far as the page
+   * was told (its removal record). A deleted cited message counts as done
+   * for the strike, and its citation links are marked deleted.
+   */
+  isDeletedNow?(id: string): boolean;
   /** Whether a bare Enter sends (the reader's "Enter to send"), for the composer keys. */
   enterSends?(): boolean;
   /** `#1840`: the follow-up box's words as typed, for cross-device sync. */
@@ -317,8 +324,13 @@ export interface DiscussPanel {
    * full again. A no-op at partial or closed.
    */
   dropToPartialForLink(): void;
-  /** `#1388` landing 1. Restate the strike from the read set now (a mark landed elsewhere). */
-  refreshStrikes(): void;
+  /**
+   * `#1388` landing 1. Restate the strike from the read set now (a mark
+   * landed elsewhere). `#2265`: with `ids`, only the bullets (current and
+   * earlier summaries) citing them; without, only those citing an id whose
+   * state moved since it was last styled.
+   */
+  refreshStrikes(ids?: readonly string[]): void;
   /**
    * `#1531 discuss-top-bar-slim-fixed`. Read the summary on screen aloud
    * whole, through the shared owner (the bottom toolbar's Read path).
@@ -793,6 +805,8 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
   let generation = 0;
   let lastScope: DiscussScope | null = null;
   let lastAnswer: CatchupAnswer | null = null;
+  // `#2265`: every drawn summary bullet, current and earlier, by cited id.
+  const strikeIndex = createStrikeIndex();
   let marking = false;
   // `#1841 vibe-talk-discuss-title-and-body-match-scope`: one Discuss state
   // per scope. The answer each scope last showed, keyed by channel plus
@@ -1390,24 +1404,53 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
   }
 
   /**
-   * `#1388` landing 1. Restate the strike over the drawn answer from the
-   * page's read set now: a bullet or section whose cited messages are all
-   * read is struck (still readable, tappable, foldable); an uncited bullet
-   * never is. Class words only — read-aloud still reads struck bullets.
+   * `#1388` landing 1, `#2265`. Restate the strike from the page's read set
+   * now: a bullet or section whose cited messages are all done (read, or
+   * deleted upstream) is struck (still readable, tappable, foldable); an
+   * uncited bullet never is. Class words only — read-aloud still reads
+   * struck bullets. Through the strike index, so the current summary and
+   * every earlier one move together: with `ids`, one lookup per id; without,
+   * only what cites an id whose state moved.
    */
-  function restrike(): void {
-    if (lastAnswer === null) return;
-    const isRead = (id: string): boolean => {
-      try {
-        return deps.isReadNow?.(id) === true;
-      } catch {
-        return false;
-      }
+  function strikeFacts(): StrikeFacts {
+    return {
+      read: (id) => {
+        try {
+          return deps.isReadNow?.(id) === true;
+        } catch {
+          return false;
+        }
+      },
+      deleted: (id) => {
+        try {
+          return deps.isDeletedNow?.(id) === true;
+        } catch {
+          return false;
+        }
+      },
     };
+  }
+
+  function restrike(ids?: readonly string[]): void {
     try {
-      applyStrikes(deps.byId("discuss-answer") as never, isRead, new Set(lastAnswer.fresh_ids));
+      if (Array.isArray(ids)) strikeIndex.strikeIds(ids, strikeFacts());
+      else strikeIndex.strikeChanged(strikeFacts());
     } catch {
-      // No answer box in this host: nothing to strike.
+      // Nothing drawn to strike in this host.
+    }
+  }
+
+  /** `#2265`: index one freshly drawn group and style it from the facts now. */
+  function indexStrikes(group: "answer" | "timeline", root: HTMLElement | null, fresh: readonly string[] = []): void {
+    try {
+      strikeIndex.replace(group, root as never, {
+        fresh: new Set(fresh),
+        // The timeline strikes earlier summaries only, never a follow-up turn.
+        within: group === "timeline" ? (el) => hasWord(el, "discuss-old-body") : undefined,
+      });
+      strikeIndex.strikeGroup(group, strikeFacts());
+    } catch {
+      // No box in this host: nothing to strike.
     }
   }
 
@@ -1577,8 +1620,9 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       box.textContent = answer.text;
     }
     // `#1388` landing 1: the strike stands from this draw (a plain draw has
-    // no citation links to map, so nothing is struck there).
-    restrike();
+    // no citation links to map, so nothing is struck there). `#2265`: the
+    // answer's bullets join the strike index, replacing the last draw's.
+    indexStrikes("answer", box, answer.fresh_ids);
     drawSearchHits();
   }
 
@@ -1736,7 +1780,10 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         }
       }
     }
-    if (entries.length === 0) return;
+    if (entries.length === 0) {
+      indexStrikes("timeline", null);
+      return;
+    }
     const timelineToggle = makeDiscussToggle("timeline", () => box as unknown as HTMLElement, (open) => setDetailsDeep(box as unknown as HTMLElement, open));
     if (head !== null) {
       head.appendChild(timelineToggle.button as never);
@@ -1860,6 +1907,9 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     }
     timelineToggle.refresh();
     keepCitationsInApp(box);
+    // `#2265`: earlier summaries' bullets join the strike index, so a Done
+    // on a message they cite strikes them as it strikes the current one.
+    indexStrikes("timeline", box);
     drawSearchHits();
     void scope;
   }
@@ -2459,7 +2509,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       readButton.disabled = false;
       unreadButton.disabled = false;
       // `#1388` landing 1: the Discuss mark buttons move the strike at once.
-      restrike();
+      restrike(ids);
     });
   }
 
@@ -2871,8 +2921,8 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       applyMode(mode, true);
     },
     dropToPartialForLink,
-    refreshStrikes() {
-      restrike();
+    refreshStrikes(ids?: readonly string[]) {
+      restrike(ids);
     },
     readSummary,
   };

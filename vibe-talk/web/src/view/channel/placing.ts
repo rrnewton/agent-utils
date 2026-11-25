@@ -54,6 +54,8 @@ export interface PlacingDependencies {
   selectedChannelId(): unknown;
   selection(): { view: string; threadId: unknown };
   sentNumberOf(payload: unknown): number;
+  /** `#2265`: the removal record changed for `ids` (removed upstream, or carried after all). */
+  onRemovalsChanged?(ids: readonly string[]): void;
   settleAfterRead(shown: Message[], opts: unknown): void;
   syncUnreadReplies(): void;
   timelineRows(): { messages: Message[] };
@@ -164,7 +166,7 @@ export function createPlacing(deps: PlacingDependencies): Placing {
    * The removals the page was told of, and when the server observed each (web/src/core/channels
    * `createRemovals`, `#473 replication-c7-server-versions`). Here where the map it replaces stood.
    */
-  const removalRecord = createRemovals();
+  const removalRecord = createRemovals((ids) => deps.onRemovalsChanged?.(ids));
 
   /** Whether a page with versions `versions` began before the server observed message `id`'s removal (`Removals.removedAfterRead`). */
   function removedAfterRead(canon: ChannelCanon, id: string, versions: Parameters<Removals["removedAfterRead"]>[2]) {

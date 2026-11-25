@@ -754,7 +754,7 @@ Its output is above. Without it Discuss cannot answer and its states are unreach
     SHOTS_GLOSSARY=0
     SHOTS_READER=0
     for shots_state in "${SHOTS_ONLY[@]}"; do
-        case "$shots_state" in 73-*|74-*|75-*|76-*|78-*|84-*|85-*|89-*|90-*|91-*|92-*|99-*|100-*|101-*|10[7-9]-*|11[0-7]-*|12[01]-*|12[3-8]-*) SHOTS_DISCUSS=1 ;; esac
+        case "$shots_state" in 73-*|74-*|75-*|76-*|78-*|84-*|85-*|89-*|90-*|91-*|92-*|99-*|100-*|101-*|10[7-9]-*|11[0-7]-*|12[01]-*|12[3-8]-*|13[01]-*) SHOTS_DISCUSS=1 ;; esac
         case "$shots_state" in 10[7-9]-*|11[0-3]-*|11[5-7]-*) SHOTS_GLOSSARY=1 ;; esac
         case "$shots_state" in 118-*|119-*) SHOTS_READER=1 ;; esac
     done
@@ -926,6 +926,8 @@ EOF
         SHOTS_ONLY_ARGS+=(--only "$shots_state")
     done
     rc=0
+    # `#2265`: the strike scenes turn the model stub's citing on and off through its control route.
+    VIBE_TALK_SHOTS_MODEL_STUB="http://127.0.0.1:$SHOTS_MODEL_PORT" \
     "$SHOTS_SCRIPT" \
         --url "http://127.0.0.1:$SHOTS_PORT" \
         --channel "$SHOTS_CHANNEL" \

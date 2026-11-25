@@ -1260,14 +1260,36 @@ stay its owner's (#1524). The pane itself already ends above the
  * muted, still readable, still tappable, still foldable; a section's strike
  * is its heading only, so an uncited bullet inside is never struck. The
  * latest Update's unread parts are green until read or the next Update. */
-#discuss-answer li.discuss-struck {
+#discuss-answer li.discuss-struck,
+#discuss-timeline .discuss-old-body li.discuss-struck {
   text-decoration: line-through;
   color: var(--muted);
 }
 
-#discuss-answer details.discuss-struck-section > summary {
+#discuss-answer details.discuss-struck-section > summary,
+#discuss-timeline .discuss-old-body details.discuss-struck-section > summary {
   text-decoration: line-through;
   color: var(--muted);
+}
+
+/* `#2265 vibe-talk-summary-bullet-restyle-everywhere`: an Earlier summary's
+ * bullets strike as the current one's do (above), and a citation link whose
+ * message was deleted upstream says so after it, muted. The words are the
+ * stylesheet's, not the bullet's, so search and read-aloud never meet them;
+ * inline-block keeps the bullet's line-through off them. */
+#discuss-answer a.discuss-cite-deleted,
+#discuss-timeline .discuss-old-body a.discuss-cite-deleted {
+  color: var(--muted);
+}
+
+#discuss-answer a.discuss-cite-deleted::after,
+#discuss-timeline .discuss-old-body a.discuss-cite-deleted::after {
+  content: "(deleted)";
+  display: inline-block;
+  margin-left: 0.3em;
+  color: var(--muted);
+  font-style: italic;
+  text-decoration: none;
 }
 
 #discuss-answer li.discuss-fresh {

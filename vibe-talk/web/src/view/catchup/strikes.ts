@@ -26,7 +26,7 @@ export const STRUCK_SECTION_CLASS = "discuss-struck-section";
 export const FRESH_CLASS = "discuss-fresh";
 
 /** Add or remove one class word, leaving the rest alone. */
-function setWord(el: StrikeElement, word: string, on: boolean): void {
+export function setWord(el: StrikeElement, word: string, on: boolean): void {
   const words = String(el.className ?? "").split(/\s+/).filter((one) => one !== "" && one !== word);
   if (on) words.push(word);
   el.className = words.join(" ");
@@ -45,18 +45,26 @@ export function hasWord(el: StrikeElement, word: string): boolean {
 export function citationIdsOf(el: StrikeElement): string[] {
   const found: string[] = [];
   const walk = (node: StrikeElement): void => {
-    if (node.tagName.toLowerCase() === "a" && typeof node.getAttribute === "function") {
-      const href = node.getAttribute("href") ?? "";
-      const queryAt = href.indexOf("?");
-      if (!href.startsWith("http") && queryAt >= 0) {
-        const ref = deepLinkRefFrom(new URLSearchParams(href.slice(queryAt + 1)).get("m") ?? "");
-        if (ref !== null && !found.includes(ref.message)) found.push(ref.message);
-      }
-    }
+    const id = citedIdOfAnchor(node);
+    if (id !== null && !found.includes(id)) found.push(id);
     for (const kid of Array.from(node.children ?? [])) walk(kid);
   };
   walk(el);
   return found;
+}
+
+/**
+ * The message id one element names when it is an in-app citation link
+ * (`a` with an `m=` ref the page's own parser accepts); null for any other
+ * element, issue links and outside links included.
+ */
+export function citedIdOfAnchor(node: StrikeElement): string | null {
+  if (node.tagName.toLowerCase() !== "a" || typeof node.getAttribute !== "function") return null;
+  const href = node.getAttribute("href") ?? "";
+  const queryAt = href.indexOf("?");
+  if (href.startsWith("http") || queryAt < 0) return null;
+  const ref = deepLinkRefFrom(new URLSearchParams(href.slice(queryAt + 1)).get("m") ?? "");
+  return ref === null ? null : ref.message;
 }
 
 /** Every element of `tag` under `root`, `root` itself included, in tree order. */

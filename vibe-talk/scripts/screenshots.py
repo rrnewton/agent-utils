@@ -888,6 +888,22 @@ STUB_JS = r"""
     __liveController.enqueue(new TextEncoder().encode(frame));
     return true;
   };
+
+  // `#2265`: a message deleted upstream, exactly as src/live.rs frames a `message_delete`: only the
+  // ids, and when the server observed the removal (`observedMs`, on its clock).
+  window.__channelDeletes = (id, observedMs) => {
+    if (!__liveController) return false;
+    const payload = {
+      channel_id: document.getElementById("discord-channel").value,
+      message_id: String(id),
+      replayed: false,
+      from_tail: false,
+    };
+    if (typeof observedMs === "number") payload.observed_ms = observedMs;
+    const frame = "event: message_delete\ndata: " + JSON.stringify(payload) + "\n\n";
+    __liveController.enqueue(new TextEncoder().encode(frame));
+    return true;
+  };
 })();
 """
 
@@ -6723,6 +6739,219 @@ def _act_discuss_centered_jump(driver: Driver) -> None:
     driver.settle(300)
 
 
+# `#2265 vibe-talk-summary-bullet-restyle-everywhere`. A Done on a message cited by a summary
+# bullet restyles EVERY bullet citing it, the current summary's and an Earlier summary's alike.
+# The model stub cites window lines only while a scene asks it to (`/control/cite`, run.sh hands
+# its origin over in VIBE_TALK_SHOTS_MODEL_STUB), so every other Discuss shot is unchanged.
+STRIKE_CITE_JS = """(id) => {
+  const cites = (li) => [...li.querySelectorAll('a')].some((a) => new URLSearchParams((a.getAttribute('href') || '').split('?')[1] || '').get('m')?.split(':')[2] === id);
+  const current = [...document.querySelectorAll('#discuss-answer li')].filter(cites);
+  const earlier = [...document.querySelectorAll('#discuss-timeline .discuss-old-body li')].filter(cites);
+  const look = (li) => ({ text: li.textContent.trim().slice(0, 80), struck: li.classList.contains('discuss-struck'),
+    line: getComputedStyle(li).textDecorationLine,
+    deleted: [...li.querySelectorAll('a.discuss-cite-deleted')].length,
+    after: [...li.querySelectorAll('a.discuss-cite-deleted')].map((a) => getComputedStyle(a, '::after').content)[0] || null });
+  return { id, current: current.map(look), earlier: earlier.map(look) };
+}"""
+
+
+def _model_cite(on: bool) -> None:
+    """Turn the loopback model stub's citing on or off (`#2265`)."""
+    origin = os.environ.get("VIBE_TALK_SHOTS_MODEL_STUB", "").rstrip("/")
+    if not origin:
+        raise RuntimeError(
+            "no model stub origin: run.sh --screenshots exports VIBE_TALK_SHOTS_MODEL_STUB for the "
+            "#2265 strike scenes, whose summaries must cite real window messages"
+        )
+    request = Request(origin + "/control/cite", data=json.dumps({"on": on}).encode(),
+                      headers={"Content-Type": "application/json"}, method="POST")
+    with urlopen(request, timeout=10) as response:  # noqa: S310 - loopback stub only
+        answer = json.loads(response.read())
+    if answer.get("citing") is not on:
+        raise RuntimeError(f"the model stub did not turn citing {'on' if on else 'off'}: {answer}")
+
+
+def _strike_record(driver: Driver, mid: str) -> dict[str, object]:
+    return cast(dict[str, object], driver.page.evaluate(STRIKE_CITE_JS, mid))
+
+
+def _discuss_cited_twice(driver: Driver) -> tuple[str, str]:
+    """Summarize twice with the stub citing, so the first summary stands Earlier and both cite the
+    same newest unread messages; open the Earlier one with its sections. Answers the ids the
+    current summary's first two bullets cite."""
+    _model_cite(True)
+    try:
+        _act_discuss_summary(driver)
+        driver.page.wait_for_function(
+            "() => document.querySelectorAll('#discuss-answer li a[href*=\"m=\"]').length >= 3", timeout=30_000)
+        if int(cast(float, driver.js("Number(document.getElementById('discuss-count').value)"))) == 0:
+            driver.page.fill("#discuss-count", "6")
+        before = int(cast(float, driver.js("document.querySelectorAll('#discuss-timeline .discuss-old').length")))
+        driver.click("discuss-summarize")
+        driver.page.wait_for_function(
+            f"() => document.querySelectorAll('#discuss-timeline .discuss-old').length > {before} "
+            "&& document.querySelectorAll('#discuss-answer li a[href*=\"m=\"]').length >= 3",
+            timeout=30_000,
+        )
+    finally:
+        _model_cite(False)
+    ids = cast(list[str], driver.js(
+        "[...document.querySelectorAll('#discuss-answer li')].slice(0, 2).map((li) => "
+        "new URLSearchParams((li.querySelector('a').getAttribute('href') || '').split('?')[1] || '').get('m').split(':')[2])"))
+    first, second = ids[0], ids[1]
+    # The current summary's sections open, so its bullets are on screen as well.
+    driver.js("(() => { document.querySelectorAll('#discuss-answer details').forEach((d) => { d.open = true; }); return true; })()")
+    driver.page.wait_for_function(
+        "() => [...document.querySelectorAll('#discuss-answer li')].some((li) => li.getClientRects().length > 0)", timeout=5_000)
+    # The newest Earlier summary citing the first message: opened, every fold in it open.
+    driver.js(
+        "(() => { const olds = [...document.querySelectorAll('#discuss-timeline .discuss-old')]; "
+        "const old = olds.reverse().find((d) => d.querySelector('.discuss-old-body li a')); "
+        "if (!old) return false; old.setAttribute('data-strike-shot', 'true'); old.open = true; "
+        "old.querySelectorAll('details').forEach((d) => { d.open = true; }); return true; })()")
+    driver.page.wait_for_function(
+        "() => { const old = document.querySelector('.discuss-old[data-strike-shot]'); "
+        "return !!old && old.open && [...old.querySelectorAll('.discuss-old-body li')].some((li) => li.getClientRects().length > 0); }",
+        timeout=5_000)
+    return first, second
+
+
+def _strike_shot(driver: Driver, name: str, part: str, selector: str) -> None:
+    """Bring `selector` to the top of the Discuss panel's view and save one extra frame of scene `name`."""
+    driver.js(f"(() => {{ const el = document.querySelector({json.dumps(selector)}); if (!el) return false; "
+              "el.scrollIntoView({block: 'start'}); return true; })()")
+    driver.settle(250)
+    driver.page.screenshot(path=str(driver.out_dir / f"{driver.theme}--{driver.profile.name}--{name}.{part}.png"))
+
+
+def _strike_row_done(driver: Driver, mid: str) -> None:
+    """Press Done on message `mid`'s own row, reached the reader's way: the current summary's
+    citation link lands the row on screen (on a phone the docked sheet leaves the list little
+    room), then the row's Done button."""
+    driver.page.locator(f'#discuss-answer li a[href*=":{mid}"]').first.click()
+    driver.page.wait_for_function(
+        "(id) => { const row = document.querySelector(`#discord-log > li[data-id=\"${id}\"]`); "
+        "const area = document.getElementById('scroll-area'); if (!row || !area) return false; "
+        "const r = row.getBoundingClientRect(); const a = area.getBoundingClientRect(); "
+        "return r.bottom > a.top && r.top < a.bottom; }", arg=mid, timeout=10_000)
+    driver.page.locator(f'#discord-log > li[data-id="{mid}"] .done-button').click()
+
+
+def _act_discuss_strike_earlier(driver: Driver) -> None:
+    """`#2265`: the message the current summary's first bullet cites is marked Done from its own row
+    (the real dismiss route); its bullet in the current summary AND in the Earlier summary strike.
+    Before and current-summary frames are saved beside the capture, the readings in a sidecar."""
+    name = "130-discuss-strike-earlier"
+    first, _second = _discuss_cited_twice(driver)
+    record: dict[str, object] = {"moment": "Done on the cited message's own row", "before": _strike_record(driver, first)}
+    _strike_shot(driver, name, "before-done", ".discuss-old[data-strike-shot] > summary")
+    _strike_row_done(driver, first)
+    driver.page.wait_for_function(
+        "(id) => { const r = (" + STRIKE_CITE_JS + ")(id); return r.current.length > 0 && r.earlier.length > 0 "
+        "&& r.current.every((b) => b.struck) && r.earlier.every((b) => b.struck); }",
+        arg=first, timeout=10_000)
+    record["after"] = _strike_record(driver, first)
+    driver.js("window.__strikeShot = " + json.dumps({"id": first}))
+    _strike_shot(driver, name, "current-after", "#discuss-current-heading")
+    _strike_shot(driver, name, "earlier-after", ".discuss-old[data-strike-shot] > summary")
+    _search_sidecar(driver, name, record)
+
+
+def _after_discuss_strike_earlier(driver: Driver) -> None:
+    """Put the Done back from the row: both bullets un-strike (recorded), and the next profile's
+    walk finds the message unread again."""
+    shot = driver.js("window.__strikeShot || null")
+    if not isinstance(shot, dict):
+        return
+    mid = str(shot.get("id"))
+    _strike_row_done(driver, mid)
+    driver.page.wait_for_function(
+        "(id) => { const r = (" + STRIKE_CITE_JS + ")(id); return r.current.length > 0 && r.earlier.length > 0 "
+        "&& r.current.every((b) => !b.struck) && r.earlier.every((b) => !b.struck); }",
+        arg=mid, timeout=10_000)
+    path = driver.out_dir / f"{driver.theme}--{driver.profile.name}--130-discuss-strike-earlier.put-back.json"
+    path.write_text(json.dumps(_strike_record(driver, mid), indent=2) + "\n", encoding="utf-8")
+    _after_discuss_summary(driver)
+
+
+# `#2265`: the timeline reads a deletion scene patches, so the walk can undo it after the capture.
+STRIKE_DELETE_ROUTE = "**/api/v1/channels/*/timeline*"
+STRIKE_DELETED: dict[str, str] = {}
+
+
+def _strike_deleted_timeline(route: "Route") -> None:
+    """The REAL server's timeline answer with the deleted message taken out, as the server answers
+    once its upstream deleted it (a refresh's answer also lists it under `delta.deleted`)."""
+    response = route.fetch()
+    gone_id = STRIKE_DELETED.get("id", "")
+    try:
+        body = response.json()
+    except ValueError:
+        route.fulfill(response=response)
+        return
+    if isinstance(body, dict) and gone_id:
+        messages = body.get("messages")
+        if isinstance(messages, list):
+            body["messages"] = [m for m in messages if not (isinstance(m, dict) and str(m.get("id")) == gone_id)]
+        delta = body.get("delta")
+        if isinstance(delta, dict):
+            gone = [str(one) for one in delta.get("deleted") or []]
+            delta["deleted"] = gone if gone_id in gone else [*gone, gone_id]
+    route.fulfill(response=response, json=body)
+
+
+def _act_discuss_strike_deleted(driver: Driver) -> None:
+    """`#2265`: the message the current summary's second bullet cites is deleted upstream. Counted
+    done: its bullets in the current AND the Earlier summary strike, and their links say
+    "(deleted)".
+
+    The page keeps a removal record for a threaded chat (the owner's Slack), where a live
+    `message_delete` says at once which message went. The fake chat upstream is a flat Discord
+    with no delete, so the walk models one where the page meets the server, as the threaded
+    scenes above do: the client configuration says threads (`_threaded_config`), every timeline
+    read is the REAL server's answer with the message taken out, and the delete arrives as a live
+    `message_delete` frame on the walk's stream. The catchup and record routes stay untouched."""
+    name = "131-discuss-strike-deleted"
+    page = driver.page
+    STRIKE_DELETED.clear()
+    page.route("**/api/v1/client-config", _threaded_config)
+    page.route(STRIKE_DELETE_ROUTE, _strike_deleted_timeline)
+    driver.load(with_token=True)
+    page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    _ensure_pane(driver, "pane-discord")
+    page.wait_for_function(
+        "() => document.querySelectorAll('#discord-log > li[data-id]').length > 0 "
+        "&& !window.__visible('channel-loading')",
+        timeout=15_000,
+    )
+    _first, second = _discuss_cited_twice(driver)
+    record: dict[str, object] = {"moment": "the cited message deleted upstream", "before": _strike_record(driver, second)}
+    _strike_shot(driver, name, "before-delete", ".discuss-old[data-strike-shot] > summary")
+    STRIKE_DELETED["id"] = second
+    sent = driver.js(f"window.__channelDeletes({json.dumps(second)})")
+    if sent is not True:
+        raise RuntimeError("the walk's live stream was not open to carry the delete")
+    page.wait_for_function(
+        "(id) => { const r = (" + STRIKE_CITE_JS + ")(id); return r.current.length > 0 && r.earlier.length > 0 "
+        "&& [...r.current, ...r.earlier].every((b) => b.struck && b.deleted > 0); }",
+        arg=second, timeout=20_000)
+    record["after"] = _strike_record(driver, second)
+    record["row_gone"] = bool(driver.js(f"document.querySelector('#discord-log > li[data-id=\"{second}\"]') === null"))
+    _strike_shot(driver, name, "current-after", "#discuss-current-heading")
+    _strike_shot(driver, name, "earlier-after", ".discuss-old[data-strike-shot] > summary")
+    _search_sidecar(driver, name, record)
+
+
+def _after_discuss_strike_deleted(driver: Driver) -> None:
+    """Stop modelling the deletion and the threads, and load the page again as the server holds it."""
+    _after_discuss_summary(driver)
+    driver.page.unroute("**/api/v1/client-config", _threaded_config)
+    driver.page.unroute(STRIKE_DELETE_ROUTE, _strike_deleted_timeline)
+    STRIKE_DELETED.clear()
+    driver.load(with_token=True)
+    driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+
+
 def _after_discuss_summary(driver: Driver) -> None:
     """Put the summarized messages back to unread, so the next profile's preview is real too."""
     if bool(driver.js("window.__visible('discuss-mark-unread')")):
@@ -10463,6 +10692,39 @@ SCENES: tuple[Scene, ...] = (
             ("no error banner is up", "!window.__visible('error-wrap')"),
         ),
     ),
+    Scene(
+        name="130-discuss-strike-earlier",
+        what="#2265 Done on a cited message from its own row: its bullet strikes in the current "
+             "summary AND in the Earlier summary (real catchup, record and dismiss routes)",
+        act=_act_discuss_strike_earlier,
+        after=_after_discuss_strike_earlier,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("the Discuss panel is open", "window.__visible('discuss-panel')"),
+            ("#2265 the Earlier summary is open", "!!document.querySelector('.discuss-old[data-strike-shot]')?.open"),
+            ("#2265 the current summary's bullet citing the Done message is struck",
+             "!!window.__strikeShot && document.querySelectorAll('#discuss-answer li.discuss-struck').length > 0"),
+            ("#2265 the Earlier summary's bullet citing it is struck too",
+             "document.querySelectorAll('#discuss-timeline .discuss-old-body li.discuss-struck').length > 0"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="131-discuss-strike-deleted",
+        what="#2265 a cited message deleted upstream counts as done: its bullets strike in the current "
+             "and the Earlier summary and their links say (deleted)",
+        act=_act_discuss_strike_deleted,
+        after=_after_discuss_strike_deleted,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("the Discuss panel is open", "window.__visible('discuss-panel')"),
+            ("#2265 the current summary marks the deleted message's link",
+             "document.querySelectorAll('#discuss-answer li.discuss-struck a.discuss-cite-deleted').length > 0"),
+            ("#2265 the Earlier summary marks it too",
+             "document.querySelectorAll('#discuss-timeline .discuss-old-body li.discuss-struck a.discuss-cite-deleted').length > 0"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
     # LAST IN THE WALK, and not by accident: it empties the server's durable store on the way in,
     # so that the summary the state above cached is really regenerated and can really fail. Nothing
     # after it in this profile would miss what it deletes, and the next profile purges anyway.
@@ -10973,7 +11235,7 @@ def run_captures(
     # 91/92, so they skip with them on a cacheless server instead of failing alone.
     discuss_scenes = [s for s in scenes if s.name.startswith(("73-", "74-", "75-", "76-", "78-", "84-", "85-", "89-", "90-", "91-", "92-", "93-", "94-", "95-", "96-", "97-", "98-", "99-", "100-", "101-", "102-", "103-",
                                                                         "107-", "108-", "109-", "110-", "111-", "112-", "113-", "114-", "115-", "116-", "117-",
-                                                                        "120-", "121-", "123-", "124-", "125-", "126-", "127-", "128-"))]
+                                                                        "120-", "121-", "123-", "124-", "125-", "126-", "127-", "128-", "130-", "131-"))]
     discuss_only = bool(wanted) and len(wanted) == len(discuss_scenes)
     if discuss_scenes and not seed_discuss_cache(60 if discuss_only else 10):
         if discuss_only:

@@ -37,7 +37,20 @@ export interface Removals {
  * however late it was sent (the replication model's rule 3). Kept beside `removed`, which orders
  * removals by when reads were sent, for a server that says neither.
  */
-export function createRemovals(): Removals {
+export function createRemovals(onChange?: (ids: readonly string[]) => void): Removals {
+  /**
+   * `#2265`: who watches which messages are removed (a summary bullet citing
+   * one is struck and its link marked deleted), told the ids that moved. A
+   * watcher's slip never stops the record.
+   */
+  const changed = (ids: readonly string[]): void => {
+    if (ids.length === 0 || onChange === undefined) return;
+    try {
+      onChange(ids);
+    } catch {
+      // The watcher's own business; the record stands.
+    }
+  };
   const removalsObserved = new Map<string, Map<string, number>>();
   /** The removals of `channel` the server said when it observed. */
   const observedFor = (channel: unknown): Map<string, number> => {
@@ -71,6 +84,7 @@ export function createRemovals(): Removals {
       forgetUnplaced(canon, id);
       canon.removed.set(id, number);
       if (typeof observedMs === "number") observedFor(canon.channel).set(String(id), observedMs);
+      changed([String(id)]);
     },
     /**
      * Whether a page whose versions are `versions` (`serverVersions`) began before the server observed the
@@ -91,6 +105,7 @@ export function createRemovals(): Removals {
       if (canon.removed.size === 0) return;
       const number = numberOf();
       const versions = serverVersions(payload);
+      const back: string[] = [];
       for (const message of payload.messages || []) {
         const at = canon.removed.get(String(message.id));
         // `#473`: not a page whose read began before the server observed the removal.
@@ -98,8 +113,10 @@ export function createRemovals(): Removals {
         if (at !== undefined && number > at) {
           canon.removed.delete(String(message.id));
           observedFor(canon.channel).delete(String(message.id));
+          back.push(String(message.id));
         }
       }
+      changed(back);
     },
   };
   return record;

@@ -22,6 +22,7 @@ const {
   DISCUSS_BINDING_RULES, WIDEN_OR_SIDEWAYS_ACTION, discussScopeKey, isSameDiscussScope,
   linkDecision, normalizeDiscussScope, viewChangeDecision,
   applyStrikes, citationIdsOf, hasWord, STRUCK_BULLET_CLASS, STRUCK_SECTION_CLASS, FRESH_CLASS,
+  createStrikeIndex, DELETED_CITE_CLASS,
   hoursSinceStart, countForHours, boundForHours, hoursFloor1, formatHoursFloor1, summaryTimeLabel, withoutTimestampCitations, uncoveredInScope,
   summarySearchWords, summarySearchMatches, summarySearchRows, summarySearchHits,
 } = VIEW;
@@ -243,12 +244,20 @@ function fixture({ selection = { view: "flat", threadId: null, thread: null }, r
           const nodes = [fakeElement("span")];
           // Anchors in the handed markup, as elements with their attributes:
           // a drawn link's own attributes are observable behaviour (`#1911`).
-          for (const match of this._html.matchAll(/<a\s+([^>]*)>([^<]*)<\/a>/g)) {
+          const anchorsIn = (markup) => [...markup.matchAll(/<a\s+([^>]*)>([^<]*)<\/a>/g)].map((match) => {
             const anchor = fakeElement("a");
             for (const attr of match[1].matchAll(/([\w-]+)="([^"]*)"/g)) anchor.setAttribute(attr[1], attr[2]);
             anchor.textContent = match[2];
-            nodes.push(anchor);
+            return anchor;
+          });
+          // `#2265`: a list item as an `li` holding its own anchors, so a
+          // drawn bullet's citations are there when the draw indexes them.
+          for (const item of this._html.matchAll(/<li>(.*?)<\/li>/g)) {
+            const li = fakeElement("li");
+            for (const anchor of anchorsIn(item[1])) li.appendChild(anchor);
+            nodes.push(li);
           }
+          for (const anchor of anchorsIn(this._html.replace(/<li>.*?<\/li>/g, ""))) nodes.push(anchor);
           this.content = { childNodes: nodes };
         },
         get innerHTML() { return this._html; },
@@ -2436,25 +2445,31 @@ test("catchup strike: folds survive a strike; fresh is green until read (#1388)"
   assert.equal(section.open, true, "the fold moved on recompute");
 });
 
+/** Every `li` under a fake element, in tree order. */
+function bulletsUnder(root) {
+  const out = [];
+  const walk = (node) => {
+    if (String(node.tagName ?? "").toLowerCase() === "li") out.push(node);
+    for (const kid of Array.from(node.children ?? [])) walk(kid);
+  };
+  walk(root);
+  return out;
+}
+
 test("catchup strike: the panel strikes live from isReadNow and its mark buttons (#1388)", async () => {
   const read = new Set();
-  const fx = fixture({ respond: () => Promise.resolve(answer({ cited_ids: ["m1", "m2"], text: "x", text_html: "<h2>S</h2><ul><li>one</li></ul>" })) });
+  // The answer's bullets carry their citation links through the one parser,
+  // so the draw maps them (`#2265`: indexed at draw time, as the page's).
+  const html = '<h2>S</h2><ul><li><a href="?c=C9&v=all&m=discord:C9:m1">m1</a></li><li>one</li></ul>';
+  const fx = fixture({ respond: () => Promise.resolve(answer({ cited_ids: ["m1", "m2"], text: "x", text_html: html })) });
   fx.deps.isReadNow = (id) => read.has(id);
   try {
     const view = createDiscussView(fx.deps);
     view.mountControls();
-    // Hand-draw the answer box's bullets with citation links (the one-parser
-    // fake cannot), then restate: the panel maps links, not answer fields.
     await openAndSummarize(view, fx);
     await flush();
-    const box = fx.els["discuss-answer"];
-    const li = fakeElement("li");
-    const link = fakeElement("a");
-    link.attributes.href = "?c=C9&v=all&m=discord:C9:m1";
-    li.appendChild(link);
-    const plain = fakeElement("li");
-    box.appendChild(li);
-    box.appendChild(plain);
+    const [li, plain] = bulletsUnder(fx.els["discuss-answer"]);
+    assert.ok(li && plain, "the answer's two bullets were not drawn");
     view.refreshStrikes();
     assert.equal(hasWord(li, STRUCK_BULLET_CLASS), false, "an unread bullet was struck");
     read.add("m1");
@@ -2475,6 +2490,12 @@ test("catchup update: the banner's Update is one delta call; new parts green unt
   const read = new Set();
   const fx = fixture();
   fx.deps.isReadNow = (id) => read.has(id);
+  // The merged answer's fresh bullet comes through the one parser, so the
+  // draw maps it (`#2265`: indexed at draw time).
+  fx.deps.catchupUpdate = (channelId, scope) => {
+    fx.calls.updates.push({ channelId, scope });
+    return Promise.resolve(answer({ fresh_ids: ["m2"], text: "old and new", text_html: '<ul><li><a href="?c=C9&v=all&m=discord:C9:m2">m2</a></li></ul>' }));
+  };
   try {
     const view = createDiscussView(fx.deps);
     view.mountControls();
@@ -2486,18 +2507,198 @@ test("catchup update: the banner's Update is one delta call; new parts green unt
     assert.equal(fx.calls.posts.length, 1, "Update refetched a full summary");
     assert.equal(fx.els["discuss-status"].textContent, "Updated.");
     // The merged answer's fresh bullet draws green; read, it strikes instead.
-    const box = fx.els["discuss-answer"];
-    const li = fakeElement("li");
-    const link = fakeElement("a");
-    link.attributes.href = "?c=C9&v=all&m=discord:C9:m2";
-    li.appendChild(link);
-    box.appendChild(li);
+    const [li] = bulletsUnder(fx.els["discuss-answer"]);
+    assert.ok(li, "the Update's bullet was not drawn");
     view.refreshStrikes();
     assert.equal(hasWord(li, FRESH_CLASS), true, "the Update's bullet was not green");
     read.add("m2");
     view.refreshStrikes();
     assert.equal(hasWord(li, FRESH_CLASS), false, "a read bullet stayed green");
     assert.equal(hasWord(li, STRUCK_BULLET_CLASS), true, "a read fresh bullet was not struck");
+  } finally { fx.restore(); }
+});
+
+// ---- `#2265 vibe-talk-summary-bullet-restyle-everywhere` ----------------------------------------
+
+/** A tiny element tree for the strike index: `li`/`details`/`a` with an href, connected unless said. */
+function strikeTree(spec) {
+  const make = (node) => {
+    const el = { tagName: node.tag.toUpperCase(), className: node.className ?? "", children: [], attributes: {} };
+    if (node.cite !== undefined) el.attributes.href = `?c=C9&v=all&m=discord:C9:${node.cite}`;
+    el.getAttribute = (name) => (name in el.attributes ? el.attributes[name] : null);
+    el.isConnected = true;
+    for (const kid of node.kids ?? []) el.children.push(make(kid));
+    return el;
+  };
+  return make(spec);
+}
+
+const citeLi = (...ids) => ({ tag: "li", kids: ids.map((id) => ({ tag: "a", cite: id })) });
+
+/** Every element of `tag` under `root`, in tree order. */
+function allTagged(root, tag) {
+  const out = [];
+  const walk = (node) => {
+    if (String(node.tagName).toLowerCase() === tag) out.push(node);
+    for (const kid of Array.from(node.children ?? [])) walk(kid);
+  };
+  walk(root);
+  return out;
+}
+
+test("strike index: one lookup restyles every bullet citing the id, in every group (#2265)", () => {
+  const read = new Set();
+  const facts = { read: (id) => read.has(id), deleted: () => false };
+  const index = createStrikeIndex();
+  const answer = strikeTree({ tag: "div", kids: [{ tag: "ul", kids: [citeLi("m1"), citeLi("m2"), { tag: "li" }] }] });
+  const timeline = strikeTree({ tag: "div", kids: [
+    { tag: "div", className: "discuss-old-body", kids: [{ tag: "ul", kids: [citeLi("m1"), citeLi("m3")] }] },
+    // A follow-up turn's bullets are not a summary's: never indexed.
+    { tag: "div", className: "discuss-qa-body", kids: [{ tag: "ul", kids: [citeLi("m1")] }] },
+  ] });
+  index.replace("answer", answer);
+  index.strikeGroup("answer", facts);
+  index.replace("timeline", timeline, { within: (el) => hasWord(el, "discuss-old-body") });
+  index.strikeGroup("timeline", facts);
+  const [curM1, curM2, plain] = allTagged(answer, "li");
+  const [oldM1, oldM3, turnM1] = allTagged(timeline, "li");
+  assert.equal(index.citing("m1").length, 2, "m1's bullets in the answer and the earlier summary are not both indexed");
+  assert.deepEqual(index.size(), { ids: 3, entries: 4, links: 4 });
+  read.add("m1");
+  const tally = index.strikeIds(["m1"], facts);
+  assert.equal(hasWord(curM1, STRUCK_BULLET_CLASS), true, "the current summary's bullet did not strike");
+  assert.equal(hasWord(oldM1, STRUCK_BULLET_CLASS), true, "the earlier summary's bullet did not strike");
+  assert.equal(hasWord(turnM1, STRUCK_BULLET_CLASS), false, "a follow-up turn's bullet was struck");
+  assert.equal(hasWord(curM2, STRUCK_BULLET_CLASS) || hasWord(oldM3, STRUCK_BULLET_CLASS) || hasWord(plain, STRUCK_BULLET_CLASS), false, "a bullet not citing m1 moved");
+  assert.equal(tally.restyled, 4, "the lookup restyled more than m1's two bullets and two links");
+  read.delete("m1");
+  index.strikeIds(["m1"], facts);
+  assert.equal(hasWord(curM1, STRUCK_BULLET_CLASS) || hasWord(oldM1, STRUCK_BULLET_CLASS), false, "a put back left a bullet struck");
+});
+
+test("strike index: a change with no ids restyles only what cites an id that moved (#2265)", () => {
+  const read = new Set();
+  const facts = { read: (id) => read.has(id), deleted: () => false };
+  const index = createStrikeIndex();
+  const root = strikeTree({ tag: "ul", kids: [citeLi("m1"), citeLi("m2"), citeLi("m1", "m2")] });
+  index.replace("answer", root);
+  index.strikeGroup("answer", facts);
+  assert.equal(index.strikeChanged(facts).restyled, 0, "nothing moved, yet something restyled");
+  read.add("m2");
+  const tally = index.strikeChanged(facts);
+  const [one, two, both] = allTagged(root, "li");
+  assert.equal(hasWord(two, STRUCK_BULLET_CLASS), true);
+  assert.equal(hasWord(one, STRUCK_BULLET_CLASS) || hasWord(both, STRUCK_BULLET_CLASS), false, "a bullet with an unread citation was struck");
+  assert.equal(tally.restyled, 4, "m2's two bullets and two links are all that should restyle");
+  read.add("m1");
+  index.strikeChanged(facts);
+  assert.equal(hasWord(both, STRUCK_BULLET_CLASS), true, "a bullet whose citations are all read did not strike");
+});
+
+test("strike index: a redraw replaces its group; a detached element is dropped when an event reaches it (#2265)", () => {
+  const read = new Set(["m1"]);
+  const facts = { read: (id) => read.has(id), deleted: () => false };
+  const index = createStrikeIndex();
+  const first = strikeTree({ tag: "ul", kids: [citeLi("m1")] });
+  index.replace("timeline", first);
+  index.strikeGroup("timeline", facts);
+  const second = strikeTree({ tag: "ul", kids: [citeLi("m1")] });
+  index.replace("timeline", second);
+  index.strikeGroup("timeline", facts);
+  assert.equal(hasWord(allTagged(second, "li")[0], STRUCK_BULLET_CLASS), true, "the redrawn bullet did not strike at its draw");
+  assert.deepEqual(index.citing("m1"), [allTagged(second, "li")[0]], "the old draw is still indexed");
+  // An answer box blanked without a redraw: its elements leave the page.
+  const answer = strikeTree({ tag: "ul", kids: [citeLi("m1")] });
+  index.replace("answer", answer);
+  index.strikeGroup("answer", facts);
+  for (const el of [answer, ...allTagged(answer, "li"), ...allTagged(answer, "a")]) el.isConnected = false;
+  read.delete("m1");
+  index.strikeIds(["m1"], facts);
+  assert.equal(index.citing("m1").length, 1, "a detached bullet stayed indexed");
+  assert.deepEqual(index.size(), { ids: 1, entries: 1, links: 1 });
+  index.replace("timeline", null);
+  assert.deepEqual(index.size(), { ids: 0, entries: 0, links: 0 }, "an emptied group left entries behind");
+});
+
+test("strike index: a deleted cited message counts as done and its links are marked deleted (#2265)", () => {
+  const read = new Set();
+  const deleted = new Set();
+  const facts = { read: (id) => read.has(id), deleted: (id) => deleted.has(id) };
+  const index = createStrikeIndex();
+  const root = strikeTree({ tag: "div", kids: [
+    { tag: "details", kids: [{ tag: "summary" }, { tag: "ul", kids: [citeLi("m1", "m2"), citeLi("m3")] }] },
+  ] });
+  index.replace("answer", root);
+  index.strikeGroup("answer", facts);
+  const [pair, solo] = allTagged(root, "li");
+  const [section] = allTagged(root, "details");
+  const [linkM1, linkM2] = allTagged(pair, "a");
+  read.add("m1");
+  deleted.add("m2");
+  index.strikeIds(["m1", "m2"], facts);
+  assert.equal(hasWord(pair, STRUCK_BULLET_CLASS), true, "read plus deleted did not strike the bullet");
+  assert.equal(hasWord(linkM2, DELETED_CITE_CLASS), true, "the deleted message's link was not marked");
+  assert.equal(hasWord(linkM1, DELETED_CITE_CLASS), false, "a read message's link was marked deleted");
+  assert.equal(hasWord(solo, STRUCK_BULLET_CLASS) || hasWord(section, STRUCK_SECTION_CLASS), false, "an unread bullet or its section struck");
+  deleted.add("m3");
+  index.strikeIds(["m3"], facts);
+  assert.equal(hasWord(section, STRUCK_SECTION_CLASS), true, "a section whose citations are all done did not strike");
+  // A later read carried the message after all: no longer deleted.
+  deleted.delete("m2");
+  index.strikeIds(["m2"], facts);
+  assert.equal(hasWord(linkM2, DELETED_CITE_CLASS), false, "the deleted mark outlived the removal");
+  assert.equal(hasWord(pair, STRUCK_BULLET_CLASS), false, "an undeleted unread citation left its bullet struck");
+});
+
+test("catchup strike: a Done strikes the current AND the earlier summary's bullet; put back clears both; deleted stays struck and marked (#2265)", async () => {
+  const read = new Set();
+  const deleted = new Set();
+  const cite = (id) => `<a href="?c=chan-1&v=all&m=discord:chan-1:${id}">${id}</a>`;
+  const fx = fixture();
+  fx.deps.isReadNow = (id) => read.has(id);
+  fx.deps.isDeletedNow = (id) => deleted.has(id);
+  const base = savedRecord();
+  const record = savedRecord({
+    current_summary: { ...base.current_summary, text_html: `<ul><li>${cite("m1")}</li><li>${cite("m2")}</li></ul>` },
+    timeline: [
+      { kind: "summary", summary: { view: "flat", window: { count: 9, unread_count: 2 }, covered_ids: ["m1", "m3"], markable_ids: ["m1", "m3"], footer_links: [], text: "older", text_html: `<ul><li>${cite("m1")}</li><li>${cite("m3")}</li></ul>`, unknown_terms: [], stamp: null, created_ms: T1 } },
+    ],
+    staleness: null,
+  });
+  fx.deps.catchupRecord = (channelId, scope) => {
+    fx.calls.records.push({ channelId, scope });
+    return Promise.resolve(record);
+  };
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    view.open();
+    await flush();
+    const [curM1, curM2] = bulletsUnder(fx.els["discuss-answer"]);
+    const [oldM1, oldM3] = bulletsUnder(fx.els["discuss-timeline"]);
+    assert.ok(curM1 && curM2 && oldM1 && oldM3, "the current and earlier summaries' bullets were not drawn");
+    assert.equal([curM1, curM2, oldM1, oldM3].some((li) => hasWord(li, STRUCK_BULLET_CLASS)), false, "an unread bullet was struck");
+    // The row's own Done names its message: one lookup, both summaries.
+    read.add("m1");
+    view.refreshStrikes(["m1"]);
+    assert.equal(hasWord(curM1, STRUCK_BULLET_CLASS), true, "the current summary's bullet did not strike");
+    assert.equal(hasWord(oldM1, STRUCK_BULLET_CLASS), true, "the earlier summary's bullet did not strike");
+    assert.equal(hasWord(curM2, STRUCK_BULLET_CLASS) || hasWord(oldM3, STRUCK_BULLET_CLASS), false, "a bullet citing another message struck");
+    read.delete("m1");
+    view.refreshStrikes(["m1"]);
+    assert.equal(hasWord(curM1, STRUCK_BULLET_CLASS) || hasWord(oldM1, STRUCK_BULLET_CLASS), false, "a put back left a bullet struck");
+    // Server read state landing (no ids): what moved restyles.
+    read.add("m3");
+    view.refreshStrikes();
+    assert.equal(hasWord(oldM3, STRUCK_BULLET_CLASS), true, "a read landing with no ids missed the earlier summary");
+    // Deleted upstream: done for the strike, its links marked, in both summaries.
+    deleted.add("m1");
+    view.refreshStrikes(["m1"]);
+    for (const li of [curM1, oldM1]) {
+      assert.equal(hasWord(li, STRUCK_BULLET_CLASS), true, "a deleted cited message left its bullet unstruck");
+      assert.equal(hasWord(li.children[0], DELETED_CITE_CLASS), true, "a deleted cited message's link was not marked");
+    }
+    assert.equal(hasWord(curM2.children[0], DELETED_CITE_CLASS), false, "a live message's link was marked deleted");
   } finally { fx.restore(); }
 });
 

@@ -840,7 +840,7 @@ function readAloudOwner() {
       const raw = dismissMessages;
       return (body) => {
         const run = raw(body);
-        void Promise.resolve(run).then(refreshDiscussStrikes, refreshDiscussStrikes);
+        void Promise.resolve(run).then(() => refreshDiscussStrikes(), () => refreshDiscussStrikes());
         return run;
       };
     },
@@ -1373,6 +1373,8 @@ const discussView = createDiscussView({
   // `#1388` landing 1: the strike reads the page's read (Done) set — the
   // Done marks made here at once, and the store's folded dismissals.
   isReadNow: (id) => doneState().archived.has(String(id)) || channelStore.current().dismissed.has(String(id)),
+  // `#2265`: a cited message deleted upstream counts as done, its link marked deleted.
+  isDeletedNow: (id) => removedUpstream(String(id)),
   showError: (text) => showError(text),
   setStatus: (text) => setStatus(text),
   // `#1344 discuss-panel-resize`. The panel's kept layout, on this device as the
@@ -1435,9 +1437,14 @@ const glossaryView = createGlossaryView({
   scheduleBackSync: () => shellNavigation.scheduleBackSync(),
 });
 
-/** `#1388` landing 1. Restate an open summary's strike after any mark settles. */
-const refreshDiscussStrikes = () => {
-  try { discussView.refreshStrikes(); } catch { /* no panel yet */ }
+/**
+ * `#1388` landing 1. Restate an open summary's strike after any mark settles.
+ * `#2265`: `ids`, when the change knows them, restyles only the bullets (current
+ * and earlier summaries) citing them; none restyles what cites a message that moved.
+ * @param {readonly string[]} [ids]
+ */
+const refreshDiscussStrikes = (ids) => {
+  try { discussView.refreshStrikes(Array.isArray(ids) ? ids : undefined); } catch { /* no panel yet */ }
 };
 
 /** The three-way selector over `#view-switch`; its press is `pressViewSwitch`. */
@@ -2346,7 +2353,8 @@ const doneAct = createDoneAct({
   // `#1820 vibe-talk-summary-strikethrough-live`: the row's own Done, archive
   // and put back, and read state a read brings, restate an open summary's
   // strike in the same turn — the event the row itself moves on.
-  onReadStateChanged: () => refreshDiscussStrikes(),
+  // `#2265`: with the ids the act moved, so every summary citing them restyles.
+  onReadStateChanged: (ids) => refreshDiscussStrikes(ids),
   doneHeldHere: (ids) => doneHeldHere(ids), doneSettlesHere: () => doneSettlesHere(),
   followDoneEverywhere: (ids, column) => followDoneEverywhere(/** @type {any} */ (ids), /** @type {any} */ (column)),
   guardQuietly: (fn) => guardQuietly(fn), heldDonePart: (held, ids) => heldDonePart(/** @type {any} */ (held), /** @type {any} */ (ids)),
@@ -5288,6 +5296,8 @@ const placing = createPlacing({
   renderScrollTools: () => renderScrollTools(), saveChannelScope: () => saveChannelScope(),
   selectedChannelId: () => selectedChannelId(), selection: () => selection(),
   sentNumberOf: (payload) => sentNumberOf(payload), settleAfterRead: (shown, opts) => settleAfterRead(shown, /** @type {any} */ (opts)),
+  // `#2265`: a message removed upstream (or carried after all) restyles the summary bullets citing it.
+  onRemovalsChanged: (ids) => refreshDiscussStrikes(ids),
   syncUnreadReplies: () => syncUnreadReplies(), timelineRows: () => timelineRows(),
   viewKey: (view, threadId) => viewKey(view, /** @type {any} */ (threadId)),
   within: (ms, fn, late) => within(ms, fn, late),
@@ -6358,7 +6368,7 @@ const readActs = createReadActs({
   // `#1388` landing 1: a channel mark restates an open summary's strike.
   restoreMessages: (messages) => {
     const run = restoreMessages(messages);
-    void Promise.resolve(run).then(refreshDiscussStrikes, refreshDiscussStrikes);
+    void Promise.resolve(run).then(() => refreshDiscussStrikes(), () => refreshDiscussStrikes());
     return run;
   },
   undoBookmarkBump: (bump, restoring) => undoBookmarkBump(bump, restoring),
@@ -6370,7 +6380,7 @@ const readActs = createReadActs({
   // `#1388` landing 1: a channel mark restates an open summary's strike.
   dismissMessages: (body, bump) => {
     const run = dismissMessages(body, /** @type {any} */ (bump));
-    void Promise.resolve(run).then(refreshDiscussStrikes, refreshDiscussStrikes);
+    void Promise.resolve(run).then(() => refreshDiscussStrikes(), () => refreshDiscussStrikes());
     return run;
   },
   throughBump: (row) => throughBump(/** @type {any} */ (row)),
