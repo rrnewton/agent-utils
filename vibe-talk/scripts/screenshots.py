@@ -5267,6 +5267,227 @@ def _act_search_bucket_fold(driver: Driver) -> None:
     driver.settle(300)
 
 
+# `#2251 vibe-talk-search-current-view-scope` (and `#2250`'s evidence): a threaded
+# channel for the search's scopes, seeded through the server's own test-only fake-seed
+# route (`#1843`) — real routes all the way; only the chat upstream is the in-memory
+# fake. Current timestamps, so the serving message cache holds them and the server's
+# search answers for them. One word, "quokka": said in main, in thread one (root and a
+# reply) and in thread two (a reply); thread three says it nowhere.
+SCOPE_WORD = "quokka"
+SCOPE_THREAD_ONE = "scope-thread-one"
+SCOPE_THREAD_THREE = "scope-thread-three"
+_SCOPE_SEEDED: set[str] = set()
+
+
+def _seed_message(driver: Driver, channel: str, body: dict[str, object]) -> str:
+    request = Request(  # noqa: S310 - the loopback throwaway server this run started
+        f"{driver.base_url}/api/v1/channels/{channel}/fake-seed",
+        data=json.dumps(body).encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {driver.token}"},
+    )
+    with urlopen(request, timeout=10) as response:  # noqa: S310 - loopback
+        return str(json.loads(response.read().decode("utf-8") or "{}")["id"])
+
+
+def _scope_get(driver: Driver, path: str) -> dict[str, object]:
+    request = Request(f"{driver.base_url}{path}", headers={"Authorization": f"Bearer {driver.token}"})  # noqa: S310
+    with urlopen(request, timeout=10) as response:  # noqa: S310 - loopback
+        return cast(dict[str, object], json.loads(response.read().decode("utf-8") or "{}"))
+
+
+def _cache_scope_fixture(driver: Driver, channel: str) -> None:
+    """Have the server read the seeded fixture (All and each thread, through its own
+    timeline routes), so its message cache holds every message and its search finds all
+    five; then wait until it does. Condition wait; the bound only reports a server that
+    never caches them."""
+    _scope_get(driver, f"/api/v1/channels/{channel}/timeline?view=flat&limit=50")
+    for thread_id in (SCOPE_THREAD_ONE, "scope-thread-two", SCOPE_THREAD_THREE):
+        _scope_get(driver, f"/api/v1/channels/{channel}/timeline?view=thread&thread_id={thread_id}&limit=50")
+    deadline = time.monotonic() + 30
+    found = 0
+    while time.monotonic() < deadline:
+        answer = _scope_get(driver, f"/api/v1/channels/{channel}/search?q={SCOPE_WORD}&tz=UTC")
+        found = len(cast(list[object], answer.get("hits") or []))
+        if found >= 5:
+            return
+        time.sleep(0.25)
+    raise Unreachable("scope-fixture", "the server's search finds the five seeded quokka messages",
+                      f"it found {found}")
+
+
+def _open_scope_channel(driver: Driver) -> None:
+    """The channel, threaded by the seeded scope fixture (seeded once per server), in All."""
+    _act_open_channel(driver)
+    channel = str(driver.js("document.getElementById('discord-channel').value"))
+    if driver.base_url not in _SCOPE_SEEDED:
+        start = int(time.time() * 1000) - 20 * 60 * 1000
+        at = lambda step: start + step * 60_000  # noqa: E731 - one line of arithmetic
+        _seed_message(driver, channel, {"author": "codex-eng", "at_ms": at(0),
+                                        "text": "a quokka spotted on main: the first sighting of the day"})
+        thread_one = [("claude-integ", "thread one: the quokka migration plan"),
+                      ("codex-review", "a quokka reply in thread one: the plan holds"),
+                      ("codex-eng", "a plain reply in thread one")]
+        thread_two = [("claude-integ", "thread two: the deploy notes"),
+                      ("codex-eng", "a quokka reply in thread two: the deploy waits")]
+        thread_three = [("codex-review", "thread three: the cache key review"),
+                        ("claude-integ", "a plain reply in thread three")]
+        step = 1
+        for thread_id, posts in ((SCOPE_THREAD_ONE, thread_one), ("scope-thread-two", thread_two),
+                                 (SCOPE_THREAD_THREE, thread_three)):
+            root = None
+            for author, text in posts:
+                body: dict[str, object] = {"author": author, "text": text, "at_ms": at(step), "thread_id": thread_id,
+                                           "thread_root": root is None}
+                if root is not None:
+                    body["root_message_id"] = root
+                seeded = _seed_message(driver, channel, body)
+                root = root or seeded
+                step += 1
+        _seed_message(driver, channel, {"author": "codex-eng", "at_ms": at(step),
+                                        "text": "a late quokka on main, after the threads began"})
+        _cache_scope_fixture(driver, channel)
+        _SCOPE_SEEDED.add(driver.base_url)
+    # A fresh load reads the threaded channel (the picker offers All and the threads).
+    _act_open_channel(driver)
+    driver.page.wait_for_function(
+        f"() => [...document.getElementById('thread-select').options].some((o) => o.value === 'thread:{SCOPE_THREAD_THREE}')",
+        timeout=20_000,
+    )
+    if driver.js("document.getElementById('thread-select').value") != "flat":
+        driver.page.select_option("#thread-select", "flat")
+    driver.page.wait_for_function(
+        "() => document.getElementById('discord-log').getAttribute('data-view') === 'flat' "
+        "&& !window.__visible('channel-loading')",
+        timeout=15_000,
+    )
+    driver.settle(300)
+
+
+def _scope_search(driver: Driver, settled: str) -> None:
+    """Open the bar, type the fixture's word, and wait for `settled` (the server's answer stood)."""
+    if not bool(driver.js("window.__visible('search-field')")):
+        driver.click("search-toggle")
+        driver.page.wait_for_function("() => window.__visible('search-field')", timeout=5_000)
+    driver.page.fill("#search-field", SCOPE_WORD)
+    driver.page.wait_for_function(f"() => {settled}", timeout=20_000)
+    driver.settle(300)
+
+
+SCOPE_ANSWERED = "/Server search details|No more hits/.test(document.getElementById('server-line').textContent) && "
+SCOPE_ALL_SETTLED = SCOPE_ANSWERED + (
+    "!document.getElementById('search-bucket-row').hidden "
+    "&& document.getElementById('search-bucket-threads').getAttribute('aria-pressed') === 'true' "
+    "&& /^[1-9]/.test(document.getElementById('search-bucket-threads').textContent)"
+)
+SCOPE_THREAD_SETTLED = SCOPE_ANSWERED + (
+    "!document.getElementById('search-bucket-row').hidden "
+    "&& !document.getElementById('search-bucket-thread').hidden "
+    "&& /^[1-9]/.test(document.getElementById('search-bucket-main').textContent)"
+)
+
+
+def _open_scope_thread(driver: Driver, thread_id: str) -> None:
+    _open_scope_channel(driver)
+    driver.page.select_option("#thread-select", f"thread:{thread_id}")
+    driver.page.wait_for_function(
+        "() => document.getElementById('discord-log').getAttribute('data-view') === 'thread' "
+        "&& !window.__visible('channel-loading')",
+        timeout=15_000,
+    )
+    driver.settle(300)
+
+
+#: `#2251`: a per-frame trace of the reading row while the search's answer lands in a
+#: thread view and its bucket row stands up: every animation frame, the anchor's
+#: rect.top (the first shown result, else the empty sentence) and whether the row stands.
+SCOPE_TRACE_START_JS = """(() => {
+  const samples = [];
+  window.__scopeTrace = samples;
+  window.__scopeTraceStop = false;
+  const anchorOf = () => {
+    const rows = [...document.querySelectorAll('#discord-log > li[data-id]')].filter((li) => li.getClientRects().length);
+    if (rows.length) return { id: rows[0].getAttribute('data-id'), el: rows[0] };
+    const empty = document.getElementById('search-empty');
+    return empty && empty.getClientRects().length ? { id: 'search-empty', el: empty } : null;
+  };
+  const tick = () => {
+    const anchor = anchorOf();
+    samples.push({ t: Math.round(performance.now()), id: anchor ? anchor.id : null,
+      top: anchor ? Math.round(anchor.el.getBoundingClientRect().top * 10) / 10 : null,
+      row: !document.getElementById('search-bucket-row').hidden });
+    if (!window.__scopeTraceStop) requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+})()"""
+
+
+def _scope_traced_search(driver: Driver, scene: str) -> None:
+    """Search in the open thread view with the per-frame trace running; write its sidecar.
+
+    The trace starts once the typed word has filtered the rows on the page (the anchor
+    stands) and before the server's answer stands the row; it runs on until the row has
+    stood for 30 frames. dy is the anchor's move from the last frame before the row stood.
+    """
+    driver.click("search-toggle")
+    driver.page.wait_for_function("() => window.__visible('search-field')", timeout=5_000)
+    driver.js(SCOPE_TRACE_START_JS)
+    driver.page.fill("#search-field", SCOPE_WORD)
+    driver.page.wait_for_function(f"() => {SCOPE_THREAD_SETTLED}", timeout=20_000)
+    driver.page.wait_for_function(
+        "() => { const s = window.__scopeTrace; const i = s.findIndex((x) => x.row); return i >= 0 && s.length - i > 30; }",
+        timeout=10_000,
+    )
+    driver.js("window.__scopeTraceStop = true")
+    samples = cast(list[dict[str, object]], driver.js("window.__scopeTrace"))
+    stood = next(i for i, sample in enumerate(samples) if sample["row"])
+    before = samples[stood - 1] if stood > 0 else None
+    after = [sample for sample in samples[stood:] if before is not None and sample["id"] == before["id"]]
+    moves = [abs(float(cast(float, sample["top"])) - float(cast(float, before["top"])))
+             for sample in after if before is not None and sample["top"] is not None and before["top"] is not None]
+    record = {
+        "scene": scene, "theme": driver.theme, "profile": driver.profile.name,
+        "moment": "the server's answer lands and the bucket row stands up in a thread view",
+        "anchor": before["id"] if before else None,
+        "top_before_row": before["top"] if before else None,
+        "frames_after_row": len(after),
+        "max_abs_dy": max(moves) if moves else None,
+        "samples": samples[max(0, stood - 10): stood + 31],
+    }
+    path = driver.out_dir / f"{driver.theme}--{driver.profile.name}--{scene}.dy.json"
+    path.write_text(json.dumps(record, indent=1) + "\n", encoding="utf-8")
+    if before is None or not moves or max(moves) > 0.5:
+        raise Unreachable(scene, "the reading row stays put while the row stands (dy 0)",
+                          f"anchor {record['anchor']} moved {record['max_abs_dy']} px; sidecar {path.name}")
+    driver.settle(300)
+
+
+def _act_search_scope_thread(driver: Driver) -> None:
+    """`#2251`: the word searched in a thread that says it — this thread's hits as cards,
+    the scope pressed, main and the other threads offered beside it."""
+    _open_scope_thread(driver, SCOPE_THREAD_ONE)
+    _scope_traced_search(driver, "120-search-scope-thread")
+
+
+def _act_search_scope_thread_elsewhere(driver: Driver) -> None:
+    """`#2251`: the word searched in a thread that never says it — "0 in this thread",
+    pressed, and the offers from main and the other threads: the way to widen in place."""
+    _open_scope_thread(driver, SCOPE_THREAD_THREE)
+    _scope_traced_search(driver, "121-search-scope-thread-elsewhere")
+
+
+def _act_search_scope_back_to_all(driver: Driver) -> None:
+    """`#2251`: from the searched thread, Back — All with the search kept, both buckets on."""
+    _open_scope_thread(driver, SCOPE_THREAD_ONE)
+    _scope_search(driver, SCOPE_THREAD_SETTLED)
+    driver.click("thread-back")
+    driver.page.wait_for_function(
+        "() => document.getElementById('discord-log').getAttribute('data-view') === 'flat'", timeout=15_000)
+    driver.page.wait_for_function(f"() => {SCOPE_ALL_SETTLED}", timeout=20_000)
+    driver.js("document.getElementById('scroll-area').scrollTop = 0")
+    driver.settle(300)
+
+
 def _act_search_bucket_main_only(driver: Driver) -> None:
     """`#2200`: the same search with Threads off — only Main's cards stand,
     and the chips and the count still sum. (In Main Threads starts off, in
@@ -9992,6 +10213,47 @@ SCENES: tuple[Scene, ...] = (
         ),
     ),
     Scene(
+        name="120-search-scope-thread",
+        what="#2251: searched in a thread that says the word: the field says Search this thread, the scope pressed, main and other threads offered",
+        act=_act_search_scope_thread,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("the thread view is up", "document.getElementById('discord-log').getAttribute('data-view') === 'thread'"),
+            ("the field names its scope", "document.getElementById('search-field').getAttribute('placeholder') === 'Search this thread'"),
+            ("the thread's own chip is pressed and counts its hits",
+             "document.getElementById('search-bucket-thread').getAttribute('aria-pressed') === 'true' && /^[1-9]\\d* in this thread$/.test(document.getElementById('search-bucket-thread').textContent)"),
+            ("main and the other threads are offered, not pressed",
+             "document.getElementById('search-bucket-main').getAttribute('aria-pressed') === 'false' && /^[1-9]/.test(document.getElementById('search-bucket-main').textContent) && document.getElementById('search-bucket-threads').getAttribute('aria-pressed') === 'false' && /^[1-9]/.test(document.getElementById('search-bucket-threads').textContent)"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="121-search-scope-thread-elsewhere",
+        what="#2251: searched in a thread that never says the word: 0 in this thread pressed, the offers from main and other threads standing",
+        act=_act_search_scope_thread_elsewhere,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("the thread view is up", "document.getElementById('discord-log').getAttribute('data-view') === 'thread'"),
+            ("the row stands with 0 in this thread pressed",
+             "!document.getElementById('search-bucket-row').hidden && document.getElementById('search-bucket-thread').textContent === '0 in this thread' && document.getElementById('search-bucket-thread').getAttribute('aria-pressed') === 'true'"),
+            ("main and the other threads are offered",
+             "/^[1-9]/.test(document.getElementById('search-bucket-main').textContent) && /^[1-9]/.test(document.getElementById('search-bucket-threads').textContent)"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="122-search-scope-back-to-all",
+        what="#2251: Back from the searched thread: All, the search kept, Main and Threads both on",
+        act=_act_search_scope_back_to_all,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("the search is kept", "document.getElementById('search-field').value === 'quokka' && window.__visible('search-field')"),
+            ("the field says Search All", "document.getElementById('search-field').getAttribute('placeholder') === 'Search All'"),
+            ("All is the view and Main and Threads are both pressed", "document.getElementById('thread-select').value === 'flat' && document.getElementById('search-bucket-main').getAttribute('aria-pressed') === 'true' && document.getElementById('search-bucket-threads').getAttribute('aria-pressed') === 'true' && !document.getElementById('search-bucket-main').hidden && !document.getElementById('search-bucket-threads').hidden"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
         name="101-search-bucket-main-only",
         what="search with Threads off: only Main's cards stand, chips and count still sum",
         act=_act_search_bucket_main_only,
@@ -10617,7 +10879,7 @@ def run_captures(
     # 91/92, so they skip with them on a cacheless server instead of failing alone.
     discuss_scenes = [s for s in scenes if s.name.startswith(("73-", "74-", "75-", "76-", "78-", "84-", "85-", "89-", "90-", "91-", "92-", "93-", "94-", "95-", "96-", "97-", "98-", "99-", "100-", "101-", "102-", "103-",
                                                                         "107-", "108-", "109-", "110-", "111-", "112-", "113-", "114-", "115-", "116-", "117-",
-                                                                        "120-", "121-", "123-", "124-", "125-"))]
+                                                                        "120-", "121-", "122-", "123-", "124-", "125-"))]
     discuss_only = bool(wanted) and len(wanted) == len(discuss_scenes)
     if discuss_scenes and not seed_discuss_cache(60 if discuss_only else 10):
         if discuss_only:

@@ -1224,7 +1224,7 @@ test("`#262 search-load-older`: Hide read steps aside while a filter chooses row
   await page.el("author-filter").click();
   await page.settle();
   assert.equal(authorState(page)[0], "theirs");
-  assert.ok(shownIds(page).includes("200"), "Theirs under Fold read left a read message of theirs out");
+  assert.ok(scopeShown(page).includes("200"), "Theirs under Fold read left a read message of theirs out");
 });
 
 test("`#262 search-load-older`: the count is in messages, so what is shown and the gaps' lines add up to it", async () => {
@@ -1549,7 +1549,7 @@ test("`#262 search-load-older`: Hide read steps aside under the search, so a wal
   // Closed, the search gives the list back to Hide read.
   await page.el("search-toggle").click();
   await page.settle();
-  assert.ok(shownIds(page).includes(all[28].id) && collapsedRows(page).length >= 0, "Fold read did not come back");
+  assert.ok(scopeShown(page).includes(all[28].id) && collapsedRows(page).length >= 0, "Fold read did not come back");
 });
 
 test("`#262 search-load-older`: a change to the search ends the walk, and aborts its read on the wire", async () => {
@@ -3094,6 +3094,120 @@ test("`#2200 vibe-talk-search-tab-counts-match-cards`: a hit that loads for real
     x: snap.count.split(" ")[0], visible: snap.visible });
   assert.deepStrictEqual(foldOf(foldSnapshot(loaded)), foldOf(before),
     "a hit moving from the fresh half of the fold to the loaded half changed a count or a card");
+});
+
+const THREAD_ONE = "thread:spaces/A/threads/one & two";
+const scopeShown = (page) => unfiltered(page, "discord-log").map((row) => row.getAttribute("data-id")).sort();
+const searchAsks = (page) => page.serverSearchCalls.filter((path) => path.includes("/search?"));
+
+test("`#2251 vibe-talk-search-current-view-scope`: the field says what it searches — the view it is opened over", async () => {
+  const page = await foldPage("main");
+  await search(page, "theme");
+  await page.settle();
+  const field = page.el("search-field");
+  assert.equal(field.getAttribute("placeholder"), "Search Main");
+  assert.match(field.getAttribute("aria-label"), /^Search Main; Enter searches older messages; Up and Down recall previous searches$/);
+  await pickThread(page, "flat");
+  assert.equal(field.getAttribute("placeholder"), "Search All");
+  await pickThread(page, THREAD_ONE);
+  assert.equal(field.getAttribute("placeholder"), "Search this thread");
+  assert.match(field.getAttribute("aria-label"), /^Search this thread; /);
+  // NEGATIVE CONTROL: the words follow the view back out, never stick.
+  await page.el("thread-back").click();
+  await page.settle();
+  assert.notEqual(field.getAttribute("placeholder"), "Search this thread", "the thread's words outlived the thread");
+});
+
+test("`#2251 vibe-talk-search-current-view-scope`: a thread with no hit of its own stands its row — 0 in this thread, pressed, beside the offers, held messages counted", async () => {
+  const page = await foldPage(THREAD_ONE);
+  // "announcement" is said only by 200, a top-level message the page HOLDS
+  // (All and Main loaded it) and the server's older copy does not return:
+  // on main this showed "0 of 2 loaded" and no row at all.
+  await searchServer(page, "announcement");
+  assert.equal(page.el("search-bucket-row").hidden, false, "the row stayed down: no visible way to widen");
+  assert.equal(chipOf(page, "thread").textContent, "0 in this thread");
+  assert.equal(chipOf(page, "thread").getAttribute("aria-pressed"), "true", "the scope is not the pressed chip");
+  assert.equal(chipOf(page, "main").textContent, "1 in main", "a held match outside the thread was not offered");
+  assert.equal(chipOf(page, "main").getAttribute("aria-pressed"), "false", "an outside bucket started on in a thread");
+  assert.equal(chipOf(page, "threads").textContent, "0 in other threads");
+  assert.deepStrictEqual(scopeShown(page), [], "an outside hit stood before the reader asked");
+  assert.equal(page.el("search-count").textContent, "0 of 2 loaded");
+  await chipOf(page, "main").click();
+  await page.settle();
+  assert.deepStrictEqual(scopeShown(page), ["200"], "the offer did not place its hit");
+  assert.equal(page.el("search-count").textContent, "1 found (0 in this thread, 1 elsewhere)");
+  assert.ok(foldSnapshot(page).styles.every((style) => style === "card"), "the placed hit is not a normal card");
+});
+
+test("`#2251 vibe-talk-search-current-view-scope`: in a thread, the offers count main and the other threads whole — held and the server's — each once", async () => {
+  const page = await foldPage(THREAD_ONE);
+  await searchServer(page, "theme");
+  // Thread: 201 and 202, both on screen. Main: 200 (held) and 150 (the
+  // server's). Other threads: 152 and 153 (the server's).
+  assert.equal(chipOf(page, "thread").textContent, "2 in this thread");
+  assert.equal(chipOf(page, "main").textContent, "2 in main");
+  assert.equal(chipOf(page, "threads").textContent, "2 in other threads");
+  assert.equal(page.el("search-count").textContent, "2 of 2 loaded", "outside offers counted before they were chosen");
+  assert.deepStrictEqual(scopeShown(page), ["201", "202"]);
+  await chipOf(page, "threads").click();
+  await page.settle();
+  assert.deepStrictEqual(scopeShown(page), ["152", "153", "201", "202"]);
+  assert.equal(page.el("search-count").textContent, "4 found (2 in this thread, 2 elsewhere)");
+  await chipOf(page, "main").click();
+  await page.settle();
+  const ids = scopeShown(page);
+  assert.deepStrictEqual(ids, ["150", "152", "153", "200", "201", "202"]);
+  assert.equal(new Set(ids).size, ids.length, "a card appears twice");
+  assert.equal(page.el("search-count").textContent, "6 found (2 in this thread, 4 elsewhere)");
+});
+
+test("`#2251 vibe-talk-search-current-view-scope`: a thread view asks once, from the newest, and typing asks once per pause", async () => {
+  const page = await foldPage("flat");
+  await searchServer(page, "theme");
+  const before = searchAsks(page).length;
+  assert.match(searchAsks(page).at(-1), /[?&]below=/, "All asks below its loaded floor");
+  await pickThread(page, THREAD_ONE);
+  page.expireTimers(SERVER_SEARCH_DELAY_MS);
+  await page.settle();
+  assert.equal(searchAsks(page).length, before + 1, "entering the thread did not ask exactly once");
+  assert.doesNotMatch(searchAsks(page).at(-1), /[?&]below=/, "the thread view's ask kept a floor");
+  // Another thread reads the same answer: no new ask.
+  await pickThread(page, "thread:spaces/A/threads/another");
+  page.expireTimers(SERVER_SEARCH_DELAY_MS);
+  await page.settle();
+  assert.equal(searchAsks(page).length, before + 1, "moving between threads asked again");
+  // Typing in the thread: no ask per keystroke, one after the pause.
+  for (const query of ["them", "theme", "themes", "theme"]) {
+    await page.el("search-field").setValue(query);
+    await page.settle();
+  }
+  assert.equal(searchAsks(page).length, before + 1, "a keystroke asked before the typing paused");
+  await page.el("search-field").setValue("themes");
+  await page.settle();
+  page.expireTimers(SERVER_SEARCH_DELAY_MS);
+  await page.settle();
+  assert.equal(searchAsks(page).length, before + 2, "the pause did not ask exactly once");
+});
+
+test("`#2251 vibe-talk-search-current-view-scope`: Back from a thread keeps the search and lands on the parent view's defaults", async () => {
+  const page = await foldPage("flat");
+  await searchServer(page, "theme");
+  await pickThread(page, THREAD_ONE);
+  page.expireTimers(SERVER_SEARCH_DELAY_MS);
+  await page.settle();
+  assert.equal(chipOf(page, "thread").getAttribute("aria-pressed"), "true");
+  await page.el("thread-back").click();
+  await page.settle();
+  page.expireTimers(SERVER_SEARCH_DELAY_MS);
+  await page.settle();
+  assert.equal(page.el("thread-select").value, "flat", "Back did not land on All");
+  assert.equal(page.el("search-field").value, "theme", "Back dropped the search");
+  assert.equal(page.el("search-field").hidden, false, "Back closed the search");
+  assert.equal(page.el("search-field").getAttribute("placeholder"), "Search All");
+  assert.equal(chipOf(page, "thread").hidden, true, "the thread's chip outlived the thread");
+  assert.equal(chipOf(page, "main").getAttribute("aria-pressed"), "true");
+  assert.equal(chipOf(page, "threads").getAttribute("aria-pressed"), "true");
+  assertFold(page, "back in All");
 });
 
 test("`#605 server-side-search`: the line never says the server searched further back than it says it did", async () => {

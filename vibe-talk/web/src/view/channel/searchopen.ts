@@ -41,6 +41,8 @@ export interface SearchOpenDependencies {
   renderScrollTools(): void;
   sideColumnUp(): boolean;
   refilterSideCards(): void;
+  /** `#2251`: name the view the field searches, as it opens. Optional for doubles. */
+  renderSearchScope?(): void;
 }
 
 /** The search bar opened and closed. */
@@ -105,6 +107,7 @@ export function createSearchOpenControl(deps: SearchOpenDependencies): SearchOpe
     deps.eachColumn(deps.renderScrollTools);
     if (deps.sideColumnUp()) deps.refilterSideCards();
     if (open) {
+      deps.renderSearchScope?.();
       deps.el("search-field").focus();
     }
   }

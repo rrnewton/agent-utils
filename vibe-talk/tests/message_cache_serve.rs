@@ -1556,6 +1556,118 @@ async fn a_search_partitions_main_and_threads_disjointly_and_themes_is_a_subset_
     }
 }
 
+#[tokio::test]
+async fn a_thread_scope_search_asks_from_the_newest_and_never_reads_upstream() {
+    // `#2251 vibe-talk-search-current-view-scope`, through the real route
+    // with the page's exact request for a thread view: no `below` floor, so
+    // main and the other threads answer whole (a main message newer than the
+    // thread's root included) — and the answer comes from the server's own
+    // copy alone: not one call to the chat service, however often it is
+    // asked (owner quota; the poll storm of 2026-11-10).
+    let (state, fake, clock, _dir) = slack_deployment("cache-search-2251").await;
+    slack_edit(&fake, 0, "an early quokka on main");
+    slack_edit(&fake, 60, "unrelated words");
+    slack_edit(&fake, 120, "thread one root: the quokka plan");
+    slack_edit(&fake, 180, "thread two root");
+    slack_edit(&fake, 240, "a late quokka on main");
+    let one = slack_fake::ts(120, 0);
+    let two = slack_fake::ts(180, 0);
+    {
+        let mut fixture = fake.state.lock().expect("the fake's state");
+        for (index, replies) in [
+            (
+                2,
+                vec![
+                    (slack_fake::ts(130, 0), "a quokka reply in thread one".to_owned()),
+                    (slack_fake::ts(140, 0), "a plain reply in thread one".to_owned()),
+                ],
+            ),
+            (
+                3,
+                vec![(slack_fake::ts(190, 0), "a quokka reply in thread two".to_owned())],
+            ),
+        ] {
+            let mut message = fixture.history[SLACK_CH][index].clone();
+            slack_fake::thread(&mut fixture, SLACK_CH, &mut message, &replies);
+            fixture.history.get_mut(SLACK_CH).expect("the channel")[index] = message;
+        }
+    }
+    clock.advance(SECOND);
+    ok(
+        &state,
+        &path(SLACK_CH, "/timeline?view=main&limit=50"),
+        WRITE_TOKEN,
+    )
+    .await;
+    settled(&state).await;
+    for root in [&one, &two] {
+        ok(
+            &state,
+            &path(
+                SLACK_CH,
+                &format!("/timeline?view=thread&thread_id={root}&limit=50"),
+            ),
+            WRITE_TOKEN,
+        )
+        .await;
+        settled(&state).await;
+    }
+    state.message_cache.set_serve(true);
+
+    let upstream = || {
+        fake.state
+            .lock()
+            .expect("the fake's state")
+            .calls
+            .values()
+            .sum::<usize>()
+    };
+    let before = upstream();
+    // The page's thread-view ask: `q` and `tz`, no `below`.
+    let ask = search_path(SLACK_CH, "quokka");
+    assert!(!ask.contains("below="), "{ask}");
+    let body = ok(&state, &ask, WRITE_TOKEN).await;
+    let mut texts = hit_texts(&body);
+    texts.sort();
+    assert_eq!(
+        texts,
+        [
+            "a late quokka on main",
+            "a quokka reply in thread one",
+            "a quokka reply in thread two",
+            "an early quokka on main",
+            "thread one root: the quokka plan",
+        ],
+        "{body}"
+    );
+    // Asked again (entering another thread, a reload), still nothing upstream.
+    for _ in 0..3 {
+        ok(&state, &ask, WRITE_TOKEN).await;
+    }
+    settled(&state).await;
+    assert_eq!(
+        upstream(),
+        before,
+        "a thread-scope search called the chat service"
+    );
+    // NEGATIVE CONTROL: the counter does count — a timeline read past the
+    // cache reaches the chat service and moves it.
+    state.message_cache.set_serve(false);
+    state.read_ahead.clear();
+    clock.advance(SECOND);
+    ok(
+        &state,
+        &path(SLACK_CH, "/timeline?view=main&limit=50"),
+        WRITE_TOKEN,
+    )
+    .await;
+    settled(&state).await;
+    assert!(
+        upstream() > before,
+        "the upstream counter missed a real read"
+    );
+}
+
 // --- `#611 timeline-read-failures`: the cache stands in for a provider that fails or is slow ----
 
 /// A rate limit that did not clear in its budget, as the Slack client reports one.

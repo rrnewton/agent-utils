@@ -7,6 +7,7 @@
 
 import type { Message } from "../../contract/index.ts";
 import { linksIn } from "../../foundation/index.ts";
+import { searchScopeWords } from "../../present/notices/index.ts";
 import { LINK_KINDS, seamPlan } from "../../present/rows/index.ts";
 import { dayClock, dayKeyOf, messageTimeLabel } from "../../present/time/index.ts";
 import { classWords, setClassWord, setTextIfChanged } from "../dom/index.ts";
@@ -152,8 +153,10 @@ export interface SearchRowsDependencies {
    * the fold is not standing. `total` is their sum. */
   foldCounts?(): {
     counts: Map<string, number>; total: number;
-    loadedSelected: number; freshSelected: number;
+    loadedSelected: number; freshSelected: number; outsideSelected?: number;
   } | null;
+  /** `#2251`: whether the Transcripts screen is up (its scope words are its own). Optional for doubles. */
+  transcriptsOpen?(): boolean;
   placeInlineReply(): void;
   placeRowsInPlaceAgain(): void;
   replyDocked(): boolean;
@@ -230,6 +233,8 @@ export interface SearchRows {
   rowLinkMatch(row: Element, terms: readonly string[]): boolean;
   /** `#1895`: whether a row holds any link at all. */
   rowHasLink(row: Element): boolean;
+  /** `#2251`: say on the field what it searches — the view it is opened over. */
+  renderSearchScope(): void;
 }
 
 /** No search open, no seams drawn. */
@@ -871,14 +876,20 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
     // under the field on a phone (liaison, #2200); the short form keeps
     // its corner. The stylesheet keys on this attribute.
     const countEl = el("search-count");
-    const form = fold !== null && fold.freshSelected > 0 ? "found" : "";
+    // `#2251`: in a thread view with an outside chip turned on, the line
+    // says how much of the count is this thread's and how much came from
+    // elsewhere — those cards are not "older", they are another scope's.
+    const outside = fold !== null ? fold.outsideSelected || 0 : 0;
+    const form = fold !== null && (fold.freshSelected > 0 || outside > 0) ? "found" : "";
     if (countEl.getAttribute("data-form") !== form) countEl.setAttribute("data-form", form);
     // Written only on change: this render runs per settled pass and again
     // per server answer, and an unchanged assignment still invalidates.
     setTextIfChanged(countEl as never, left.pinned
       ? (!filtering ? `${loaded} pinned` : `${matched} of ${loaded} pinned`)
       : (!filtering ? "" : fold !== null
-        ? (fold.freshSelected > 0
+        ? (outside > 0
+          ? `${fold.total} found (${fold.total - outside} in this thread, ${outside} elsewhere)`
+          : fold.freshSelected > 0
           ? `${fold.total} found (${fold.loadedSelected} loaded, ${fold.freshSelected} older)`
           : `${fold.total} of ${loaded} loaded`)
         : `${matched} of ${loaded} loaded`));
@@ -1238,6 +1249,27 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
     }
   }
 
+  /**
+   * `#2251 vibe-talk-search-current-view-scope`: the field names its scope — the
+   * view it is opened over ("Search this thread", "Search All", ...) — in its
+   * placeholder and at the head of its accessible name, read from the main
+   * column (the one bar searches both columns). Written only on change: this
+   * runs on every view change, never per keystroke.
+   */
+  function renderSearchScope(): void {
+    const words = deps.inColumn(deps.mainColumn(), () => searchScopeWords({
+      screenView: deps.view(),
+      transcripts: deps.transcriptsOpen ? deps.transcriptsOpen() : false,
+      threadList: deps.threadListOnScreen(),
+      columns: deps.sideColumnUp(),
+      view: deps.selectionView(),
+    }));
+    const field = el("search-field");
+    if (field.getAttribute("placeholder") !== words) field.setAttribute("placeholder", words);
+    const label = `${words}; Enter searches older messages; Up and Down recall previous searches`;
+    if (field.getAttribute("aria-label") !== label) field.setAttribute("aria-label", label);
+  }
+
   function seamsAfterMidnight(): void {
     const today = (dayClock() as { today: number }).today;
     for (const list of [el("discord-log"), el("pinned-log")]) {
@@ -1254,7 +1286,7 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
     linkTerms, threadsWithLinkHits, threadsWithLinks, rowLinkMatch, rowHasLink,
     setEntireThreads: (on: boolean) => { entireThreadsOn = on; },
     entireThreads: () => entireThreadsOn,
-    sayCardCount, openedGaps,
+    sayCardCount, openedGaps, renderSearchScope,
     placeSeam: (row: Element, seam: unknown, below: boolean) => placeSeam(row as never, seam as never, below),
     seamDrawn: (row: Element, seam: unknown, below: boolean) => seamDrawn(row as never, seam as never, below),
   };

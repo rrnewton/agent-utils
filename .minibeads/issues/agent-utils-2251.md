@@ -8,7 +8,7 @@ labels:
 - search
 - owner-ui
 created_at: 2026-11-25T14:20:00-05:00
-updated_at: 2026-11-25T14:20:00-05:00
+updated_at: 2026-11-25T15:10:00-05:00
 ---
 
 # Description
@@ -26,6 +26,7 @@ On main after #2200 the thread view already starts with only "this thread" on an
 - Transcripts screen: the search bar is that screen's one search (the in-view "Search transcripts" field goes; its filtering moves under the bar's query). With a day open, the day shows only its matching chunks: held chunks that match plus this transcript's server hits not yet held, placed by time as normal chunk rows, marked; the count and the home chip "N in this transcript" agree. On the index, only the days whose label matches or that hold a hit are listed. Other transcripts' hits stand behind an "N in other transcripts" offer whose tap goes to the index with the query. Matching uses the bar's search language, as the channel and the server do.
 - Keyboard and phone: the bar's chord and Escape work on every screen, the Transcripts screen included; the chips are buttons in the same row on a phone; the scope words fit the field at 360px.
 - Landed in two steps, each with its own gate: (a) the scope words, the widen-in-place row and Back keeping the query; (b) the Transcripts screen.
+- Step (a) found the thread view's offers undercounting: a thread view asked the server only below the thread's own oldest row and dropped every hit the page already held, so after reading All the offers said "0 in main" while main held matches. A thread view now asks from the newest (no `below`), keeps out only what stands on screen (the thread's own rows), and also offers the held messages outside the thread that match (the page's own state), each once; the search key carries the thread scope, so entering or leaving a thread asks once and moving between threads reuses the answer. The ask stays served from the server's own copy: no upstream read, ever (liaison guard; a real-router test counts the chat service's calls), and no ask per keystroke beyond the existing debounce. With an outside chip turned on, the count reads "N found (X in this thread, Y elsewhere)".
 
 # Acceptance Criteria
 

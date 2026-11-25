@@ -3114,6 +3114,7 @@ const searchRows = createSearchRows({
   currentFilterHold,
   keepFilterHold,
   visibleList,
+  transcriptsOpen: () => transcriptsViewActive,
 });
 const {
   markSearchSoon, markSearchNow, searchParsed, searchTyped, searchIdentity, searchable,
@@ -3121,7 +3122,7 @@ const {
   listEmptied, drawSeams, seamsAfterMidnight, openSearchGap, inOpenedGap,
   rowsChosen, rowDay, markSearchHits, messageMatches, threadsWithHits, rowMatches,
   linkTerms, threadsWithLinkHits, threadsWithLinks, rowLinkMatch, rowHasLink,
-  sayCardCount, openedGaps, placeSeam, seamDrawn, setEntireThreads, entireThreads,
+  sayCardCount, openedGaps, placeSeam, seamDrawn, setEntireThreads, entireThreads, renderSearchScope,
 } = searchRows;
 
 // `#1734 vibe-talk-search-view-scroll-default`. The search identity the reader
@@ -3299,6 +3300,7 @@ const searchOpenControl = createSearchOpenControl({
   renderScrollTools: () => renderScrollTools(),
   sideColumnUp,
   refilterSideCards: () => refilterSideCards(),
+  renderSearchScope: () => renderSearchScope(),
 });
 const { setSearchOpen, showSearchOpen } = searchOpenControl;
 
@@ -4823,6 +4825,7 @@ function restoreTranscriptsOnce() {
 }
 
 const threadList = createThreadList({
+  renderSearchScope: () => renderSearchScope(),
   openTranscripts: () => openTranscripts(),
   transcriptsOpen: () => transcriptsViewActive,
   closeTranscripts: () => closeTranscripts(),
@@ -5948,7 +5951,8 @@ const serverSearchCopy = createServerSearchCopy({
   leftById: leftEl,
   selectedChannelId,
   query: () => searchField.query(),
-  oldestLoadedMs: () => oldestLoadedMs(),
+  // `#2251`: the ask's floor — a thread view asks from the newest (`serverAskBelowMs`).
+  oldestLoadedMs: () => serverAskBelowMs(),
   fetchAnswer: (path) => apiDecoded("SearchResponse", path),
   renderServerSearch: () => renderServerSearch(),
   guardQuietly,
@@ -7645,13 +7649,18 @@ const olderWalks = mountOlderWalks({
   openTranscriptHit: (hit) => { openTranscripts(); void transcriptsView.openAt(hit); },
   api, channelName, channelDirectoryChannels: () => channelDirectory.channels(),
   jumpToMessageLink, messageBody, markSearchHits, searchParsed, heldMessagesById,
+  // `#2251`: the filter's own matcher, for a thread view's held messages outside its thread.
+  messageMatchesQuery: (message) => {
+    const node = searchParsed(searchField.query()).node;
+    return node !== null && messageMatches(node, message);
+  },
   serverCardNode: (hit) => discordNode(/** @type {any} */ ([hit])),
   keepingCardPlace, walkCursorOwed: timelineView.walkCursorOwed, loadOlder: timelineView.loadOlder,
   guardQuietly: (fn) => guardQuietly(fn), renderJumpNewest, applySearch, refreshSearchCount: () => refreshSearchCount(), preservingScroll, beginUserChange: () => scrollKeeping.beginUserChange(), toPosition: (area, top) => scrollKeeping.toPosition(area, top), intoView: (element, block) => scrollKeeping.intoView(element, block), setStatus,
   columnWork, columns, sideShowing, inColumn, columnSteps: () => /** @type {any} */ (columnSteps()), filterChanges,
   replyJumpCurrent: () => replyJumpTicket.current(), idsOf, rowMessages, plainReach, replyTally, providerOfChannel, channelDirectoryName: () => channelDirectory.providerName(),
 });
-const { renderOlderControl, olderControlPressed, searchOlder, searchOlderFromField, searchReplies, searchOffered, searchKey, endSearchWalks, endSearchWalk, stopSearchWalk, renderSearchOlderNote, historyReach, searchFurtherPressed, chooseSearchAllChannels, renderRepliesSearch, renderServerSearch, scheduleServerSearch, retireStaleBuckets, channelViewWords, oldestLoadedMs, toggleServerHits, toggleBucket, serviceWords, repliesFloor, repliesSearchOffered, allCover, allLoaded, repliesKey, endRepliesWalk, bucketOnFor, foldCounts } = olderWalks;
+const { renderOlderControl, olderControlPressed, searchOlder, searchOlderFromField, searchReplies, searchOffered, searchKey, endSearchWalks, endSearchWalk, stopSearchWalk, renderSearchOlderNote, historyReach, searchFurtherPressed, chooseSearchAllChannels, renderRepliesSearch, renderServerSearch, scheduleServerSearch, retireStaleBuckets, channelViewWords, oldestLoadedMs, toggleServerHits, toggleBucket, serviceWords, repliesFloor, repliesSearchOffered, allCover, allLoaded, repliesKey, endRepliesWalk, bucketOnFor, foldCounts, serverAskBelowMs } = olderWalks;
 // `#1608`: the Transcripts view's own search and way back to its index.
 el("transcripts-search").addEventListener("input", () => transcriptsView.searchChanged());
 el("transcripts-back").addEventListener("click", () => transcriptsView.closeDay());

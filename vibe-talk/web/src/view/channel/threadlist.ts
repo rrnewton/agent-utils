@@ -49,6 +49,8 @@ export interface ThreadListDependencies {
   transcriptsOpen?(): boolean;
   /** `#1608`: leave the Transcripts view for another picker choice. */
   closeTranscripts?(): void;
+  /** `#2251`: the search field names the view it searches; redrawn with the picker. Optional for doubles. */
+  renderSearchScope?(): void;
   openThreadFromList(id: string, summary: unknown): unknown;
   selectSideThread(id: string, summary: unknown): unknown;
   closeSideThread(): unknown;
@@ -451,6 +453,9 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
     if (deps.sideColumnUp()) deps.renderSideColumn();
     mountThreadPickerPopup(select);
     if (pickerPopup && !pickerPopup.hidden) drawThreadPickerPopup(select);
+    // `#2251`: the picker says which view is read; the search field says the
+    // same view is what it searches. One render, so the two never disagree.
+    deps.renderSearchScope?.();
   }
 
   // The picker's own pop-up (`#1550 thread-list-pins`): the native select's

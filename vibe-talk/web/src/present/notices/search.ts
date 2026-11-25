@@ -191,3 +191,35 @@ function repliesWalkWords(walk: EndedWalk, reason: string, facts: RepliesWalkFac
 export { messagesWords, reachBackWords, reachClause, repliesWalkWords, searchMomentWords, searchWalkProgress, searchWalkWords };
 export type { EndedWalk, RepliesWalkFacts, WalkFacts };
 export type { HistoryReach };
+
+/** Where the search bar is opened over, as `searchScopeWords` reads it (`#2251`). */
+export interface SearchScopeFacts {
+  /** The page's view: "discord" for the channel; anything else keeps the default words. */
+  screenView: string;
+  /** The Transcripts screen is up (its own scope words come with its search, `#2251` step b). */
+  transcripts: boolean;
+  /** The thread list stands as the list being read. */
+  threadList: boolean;
+  /** Two columns stand, the main column and the side one both searched. */
+  columns: boolean;
+  /** The main column's view: "main", "flat" (All) or "thread". */
+  view: string;
+}
+
+/** The field's words where no scope of its own is named: what it always said. */
+export const SEARCH_DEFAULT_WORDS = "Search loaded messages";
+
+/**
+ * `#2251 vibe-talk-search-current-view-scope`: what the search field says it searches —
+ * the view it is opened over, the scope a search there covers by default. Its placeholder
+ * and the head of its accessible name.
+ */
+export function searchScopeWords(facts: SearchScopeFacts): string {
+  if (facts.screenView !== "discord" || facts.transcripts) return SEARCH_DEFAULT_WORDS;
+  if (facts.threadList) return "Search the thread list";
+  if (facts.columns) return "Search both columns";
+  if (facts.view === "thread") return "Search this thread";
+  if (facts.view === "flat") return "Search All";
+  if (facts.view === "main") return "Search Main";
+  return SEARCH_DEFAULT_WORDS;
+}

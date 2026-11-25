@@ -122,6 +122,9 @@ export interface OlderWalksDependencies {
   jumpToMessageLink(ref: unknown): void;
   messageBody(message: Message): Node;
   heldMessagesById(): Map<string, Message>;
+  /** `#2251`: whether `message` matches the words in the search field (the filter's own
+   * matcher), for the held messages outside a thread view's scope. Optional for doubles. */
+  messageMatchesQuery?(message: Message): boolean;
   /** `#1786 vibe-talk-search-scope-server-hits`. Draw one in-scope server hit as a normal message card. */
   serverCardNode?(hit: Message): HTMLElement;
   markSearchHits(row: Element, terms: unknown): void;
@@ -176,8 +179,10 @@ export interface OlderWalks {
   /** `#2200`: the one search-result fold's counts per chip and their sum (null: fold not standing). */
   foldCounts(): {
     counts: Map<string, number>; total: number;
-    loadedSelected: number; freshSelected: number;
+    loadedSelected: number; freshSelected: number; outsideSelected: number;
   } | null;
+  /** `#2251`: where the server's search of this channel starts below (null: from the newest). */
+  serverAskBelowMs(): number | null;
   channelViewWords(): string;
   oldestLoadedMs(): number | null;
   toggleServerHits(): void;
@@ -764,7 +769,29 @@ function serverSearchKeyNow() {
   if (!searchField.open() || screens.screen() !== "main" || screens.view() !== "discord" || !searchTyped(searchField.query())) return "";
   const channel = String(selectedChannelId() || "");
   if (!channel) return "";
-  return JSON.stringify([serverSearchOwner.allChannels() ? "*" : channel, searchIdentity(searchField.query())]);
+  // `#2251`: a thread view asks the server differently (no floor: see
+  // `serverAskBelowMs`), so its search is another ask; entering or leaving a
+  // thread asks once. Moving between threads keeps the one answer.
+  return JSON.stringify([serverSearchOwner.allChannels() ? "*" : channel, searchIdentity(searchField.query()),
+    ...(threadScoped() ? ["thread"] : [])]);
+}
+
+/** `#2251 vibe-talk-search-current-view-scope`: whether the search is scoped
+ * to the thread on screen (a thread view in the main column). */
+function threadScoped(): boolean {
+  return selection().view === "thread" && Boolean(selection().threadId);
+}
+
+/**
+ * `#2251`: where the server's search of this channel starts below. Main and
+ * All ask only below their oldest loaded row (the rows above are searched
+ * here). A thread view asks from the newest: its rows are one thread's, so
+ * the rest of the channel — main and the other threads, the offers under
+ * the bar — would otherwise be asked only below the thread's own oldest row,
+ * and every newer match there missed.
+ */
+function serverAskBelowMs(): number | null {
+  return threadScoped() ? null : oldestLoadedMs();
 }
 
 /**
@@ -983,6 +1010,7 @@ function serverFreshHits(): Message[] {
   const channel = String(selectedChannelId() || "");
   const held = heldMessagesById();
   const onScreen = onScreenMessageIds();
+  if (threadScoped()) return threadScopeHits(serverSearch.hits, channel, held, onScreen);
   // `#1864 vibe-talk-whole-threads-no-duplicate-hits`: a hit whose real row
   // already stands in the timeline is not fresh, even when the store does
   // not hold it yet — the server-rendered first paint draws rows the store
@@ -990,6 +1018,36 @@ function serverFreshHits(): Message[] {
   // every hit twice.
   return serverSearch.hits.filter((hit) => !(String(hit.channel_id) === channel &&
     (held.has(String(hit.id)) || onScreen.has(String(hit.id)))));
+}
+
+/**
+ * `#2251`: a thread view's hits beyond its own rows. The thread's rows are
+ * the only ones on screen, so a message of main or of another thread is
+ * never "already shown" there, held or not: the server's hits outside the
+ * rows, plus every held message outside the thread that matches (the page's
+ * own state; the server's copy can lag it), each once. These are what the
+ * "in main" and "in other threads" offers count and, turned on, place.
+ */
+function threadScopeHits(hits: readonly Message[], channel: string, held: Map<string, Message>, onScreen: Set<string>): Message[] {
+  const seen = new Set<string>();
+  const out: Message[] = [];
+  for (const hit of hits) {
+    const id = String(hit.id);
+    if (String(hit.channel_id) === channel && onScreen.has(id)) continue;
+    seen.add(`${hit.channel_id} ${id}`);
+    out.push(hit);
+  }
+  if (!deps.messageMatchesQuery) return out;
+  const thread = String(selection().threadId);
+  for (const message of held.values()) {
+    const id = String(message.id);
+    if (onScreen.has(id) || seen.has(`${channel} ${id}`)) continue;
+    if (threadOf(message) === thread) continue;
+    if (!deps.messageMatchesQuery(message)) continue;
+    // A held message carries no channel of its own here: it is this channel's.
+    out.push(message.channel_id ? message : { ...message, channel_id: channel } as Message);
+  }
+  return out;
 }
 
 // `#1786 vibe-talk-search-scope-server-hits`. The scope on screen: this thread in
@@ -1059,7 +1117,9 @@ let bucketHitsCache: { key: string; grouped: Map<string, Message[]> } | null = n
 function bucketHits(): Map<string, Message[]> {
   const now = serverSearchNow();
   const key = `${now.ticket}|${now.hits.length}|${(now.transcriptHits || []).length}|` +
-    `${String(selectedChannelId() || "")}|${columns.main.searched?.loaded || 0}|${el("discord-log").children.length}`;
+    `${String(selectedChannelId() || "")}|${columns.main.searched?.loaded || 0}|${el("discord-log").children.length}|` +
+    // `#2251`: a thread view's offers read the held store and the thread.
+    `${threadScoped() ? `${String(selection().threadId)}|${heldMessagesById().size}|${searchField.query()}` : ""}`;
   if (bucketHitsCache && bucketHitsCache.key === key) return bucketHitsCache.grouped;
   const grouped = new Map<string, Message[]>();
   for (const hit of serverFreshHits()) {
@@ -1129,7 +1189,7 @@ function foldStanding(): boolean {
 /** The fold last computed, and the state it was computed from. */
 let foldCache: {
   key: string; counts: Map<string, number>; total: number;
-  loadedSelected: number; freshSelected: number;
+  loadedSelected: number; freshSelected: number; outsideSelected: number;
 } | null = null;
 
 /** `#2200`: the fold as the search filter reads it — counts and total, or
@@ -1142,7 +1202,7 @@ let foldCache: {
  * (search-typing-fast on the stack gate). */
 function foldCounts(): {
   counts: Map<string, number>; total: number;
-  loadedSelected: number; freshSelected: number;
+  loadedSelected: number; freshSelected: number; outsideSelected: number;
 } | null {
   if (!foldStanding()) return null;
   const now = serverSearchNow();
@@ -1160,14 +1220,18 @@ function foldCounts(): {
   let total = 0;
   let loadedSelected = 0;
   let freshSelected = 0;
+  // `#2251`: in a thread view, what the reader turned on from outside the
+  // thread (main, other threads, transcripts): said apart on the count line.
+  let outsideSelected = 0;
   for (const def of searchBucketDefs) {
     if (def.id === "thread" && view !== "thread") continue;
     if (!bucketOnNow(def.id)) continue;
     total += counts.get(def.id) || 0;
     loadedSelected += parts.get(def.id)?.loaded || 0;
     freshSelected += parts.get(def.id)?.fresh || 0;
+    if (view === "thread" && def.id !== "thread") outsideSelected += counts.get(def.id) || 0;
   }
-  foldCache = { key, counts, total, loadedSelected, freshSelected };
+  foldCache = { key, counts, total, loadedSelected, freshSelected, outsideSelected };
   return foldCache;
 }
 
@@ -1466,6 +1530,17 @@ function renderServerSearch() {
   const grouped = bucketHits();
   const counts = searchFoldCounts(grouped);
   const view = bucketView();
+  // `#2251 vibe-talk-search-current-view-scope`: a thread view is scoped to
+  // its thread, so its row also stands when the thread holds no hit but
+  // main or another thread does — "0 in this thread", pressed, beside the
+  // offers is the reader's visible way to widen in place. Elsewhere the row
+  // stands for the results the count counts, as `#2200` has it.
+  let inScopeHits = 0;
+  for (const def of searchBucketDefs) {
+    if (def.id !== "thread" || view === "thread") inScopeHits += counts.get(def.id) || 0;
+  }
+  const rowStands = foldStanding() &&
+    ((foldCounts()?.total || 0) > 0 || (view === "thread" && inScopeHits > 0));
   let anyChip = false;
   for (const def of searchBucketDefs) {
     const chip = bucketChip(def.id);
@@ -1474,7 +1549,7 @@ function renderServerSearch() {
     // With no result anywhere the row stays down (the `#1899` follow-up:
     // no empty panel over the head of the list); with any result, every
     // in-scope chip stands.
-    const show = inScope && foldStanding() && (foldCounts()?.total || 0) > 0;
+    const show = inScope && rowStands;
     if (chip.hidden === show) chip.hidden = !show;
     if (!show) continue;
     anyChip = true;
@@ -1846,7 +1921,7 @@ function renderOlderControl() {
   return {
     renderOlderControl, olderControlPressed, searchOlder, searchOlderFromField,
     searchReplies, searchOffered, searchKey, endSearchWalks, endSearchWalk, stopSearchWalk,
-    renderSearchOlderNote, historyReach, renderServerSearch, searchFurtherPressed, chooseSearchAllChannels, renderRepliesSearch, scheduleServerSearch, retireStaleBuckets, channelViewWords, oldestLoadedMs, toggleServerHits, toggleBucket, serviceWords, repliesFloor, repliesSearchOffered, allCover, allLoaded, repliesKey, endRepliesWalk, bucketOnFor, foldCounts,
+    renderSearchOlderNote, historyReach, renderServerSearch, searchFurtherPressed, chooseSearchAllChannels, renderRepliesSearch, scheduleServerSearch, retireStaleBuckets, channelViewWords, oldestLoadedMs, toggleServerHits, toggleBucket, serviceWords, repliesFloor, repliesSearchOffered, allCover, allLoaded, repliesKey, endRepliesWalk, bucketOnFor, foldCounts, serverAskBelowMs,
     dispose() { disposed = true; },
   };
 }
