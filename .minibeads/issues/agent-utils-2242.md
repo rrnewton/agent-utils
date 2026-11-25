@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-documents-reader-toolbar: the Documents reader controls are compact buttons docked in the one bottom toolbar'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 labels:
@@ -10,7 +10,8 @@ labels:
 - ui
 assignee: cl-docbar
 created_at: 2026-11-25T10:12:00-05:00
-updated_at: 2026-11-25T11:50:00-05:00
+updated_at: 2026-11-25T12:50:00-05:00
+closed_at: 2026-11-25T12:50:00-05:00
 ---
 
 # Description
@@ -40,3 +41,8 @@ Approved by the coordinator and the liaison before code (2026-11-25).
 # Notes
 
 Owner request 373, part B (cl-docbar). Related: #2006 (added the jumps), #1544 (the desktop Reader box), #1545, #1542, #2033, #2058.
+
+## Resolution
+
+[opus 5.5] Landed on main as e637f97c (land-main exit 0, 2026-11-25 12:30 PM ET; deployed 12:33 PM ET, deploy watch clean to 12:48 PM ET: no errors, no restarts), the top of one stack with #2230 (c8896041) and #2233 (f631fcdd) under one owner-tier gate, green on 6a801dbd (12:05-12:22 PM ET, no failed steps). With a document open, the reader's controls are one row inside the bottom toolbar on a desk (the Reader box 519x41 at 1280, was 463x94 on two rows standing over the bar; icons only at 900-1199px, clear of the gear and the corner with Stop shown), and on a phone the jumps are the tile's second column instead of a third row (dock 160px, was 194px; every reader control at least 44px). With no document open the dock is pixel-identical to before. Checks: page suite, documents view tests, the real-server documents control bar browser check (it fails on the old page), validation graph, screenshot self-test, and the combined replay with #2241. Screenshots: scenes 118 (document open) and 119 (read aloud, Stop shown) at phone 412, desk 1280 and desk 1000, dark and light, before (main) and after (landed main), reviewed by the coordinator and the liaison. Evidence folders (each with its BUILD.txt): after-main (landed main e637f97c), t3-shots and t3-diff (T3 6a801dbd), comb-shots (the replay with #2241), shots-before-main, shots-after-dev and pairs (before and after), all under the lane's scratch evidence directory.
+
