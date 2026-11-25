@@ -4021,6 +4021,118 @@ test("`#2220 vibe-talk-selection-chip-rigid-row`: the strip stands under the wor
   assert.equal(chipAt(page)?.top, Math.max(edge, words.top - gap - height), "the strip did not go above the words");
 });
 
+// --- `#2231 vibe-talk-selection-strip-atomic`: the strip and every chip in it paint in ONE frame -----
+
+/** The strip's parts, left to right: WTF?, Quoted reply, the dismiss X. */
+const STRIP_PARTS = ["selection-chip-wtf", "selection-chip", "selection-chip-dismiss"];
+
+/** Whether `id` paints: neither it nor the strip is hidden, nor left invisible in its slot. */
+const stripPartShows = (page, id) => {
+  const row = page.el("selection-chip-row");
+  const part = page.el(id);
+  return !row.hidden && row.style.visibility !== "hidden" && !part.hidden && part.style.visibility !== "hidden";
+};
+
+/**
+ * What the strip paints in the next frame: a frame asked for after every one the page has asked for,
+ * so it reads the strip after the page's own draw in that frame, as the browser paints it.
+ */
+const stripNextFrame = async (page) => {
+  let seen = null;
+  page.frames.push(() => {
+    seen = Object.fromEntries(["selection-chip-row", ...STRIP_PARTS].map((id) => [id, stripPartShows(page, id)]));
+  });
+  await page.nextFrame();
+  return seen;
+};
+
+/** The frame the strip first paints in, stepped one frame at a time (at most `limit`), or null. */
+const stripFirstFrame = async (page, limit = 4) => {
+  for (let frame = 0; frame < limit; frame += 1) {
+    const seen = await stripNextFrame(page);
+    if (seen["selection-chip-row"]) return seen;
+  }
+  return null;
+};
+
+const WHOLE_STRIP = { "selection-chip-row": true, "selection-chip-wtf": true, "selection-chip": true, "selection-chip-dismiss": true };
+const NO_STRIP = { "selection-chip-row": false, "selection-chip-wtf": false, "selection-chip": false, "selection-chip-dismiss": false };
+
+/** A quote page with animation frames, at a phone's or a desk's size, where WTF? lookups can run. */
+const stripPage = async (size, script = SCRIPT) => {
+  const page = await quotePage((p) => {
+    p.enableAnimationFrames();
+    p.glossaryAvailable = true;
+  }, script);
+  page.viewport.layout = size.height;
+  page.viewport.visual = size.height;
+  while (page.frames.length) await page.nextFrame();
+  return page;
+};
+
+for (const size of [{ name: "phone 412x915", height: 915 }, { name: "desktop 1280x800", height: 800 }]) {
+  test(`\`#2231 vibe-talk-selection-strip-atomic\`: WTF?, Quoted reply and the X paint in the strip's first frame and every one after (${size.name})`, async () => {
+    // Hot load: the first selection on a page just loaded, its glossary terms never read yet.
+    const page = await stripPage(size);
+    const first = rowWithId(page, "1000000000000000001");
+    const second = rowWithId(page, "1000000000000000002");
+    await page.documentEvent("pointerdown", { pointerType: "mouse", target: wordsIn(first) });
+    await page.selectText(wordsIn(first), null, "about the runner");
+    assert.deepStrictEqual(await stripFirstFrame(page), WHOLE_STRIP, "the strip's first frame painted without every chip");
+    // A selection that changes (a drag going on): the whole strip in every frame.
+    await page.selectText(wordsIn(first), null, "about the run");
+    assert.deepStrictEqual(await stripNextFrame(page), WHOLE_STRIP, "a changed selection's frame lost a chip");
+    // Let go: the whole strip goes in one frame.
+    await page.clearSelection();
+    assert.deepStrictEqual(await stripNextFrame(page), NO_STRIP, "the strip went piecemeal");
+    // Re-selection, in another message: the whole strip again in its first frame.
+    await page.selectText(wordsIn(second), null, "the deploy");
+    assert.deepStrictEqual(await stripFirstFrame(page), WHOLE_STRIP, "a re-selection's first frame painted without every chip");
+    // The WTF? popover opened and closed over a standing selection: the strip stays whole.
+    await page.el("selection-chip-wtf").dispatch("click", { preventDefault() {}, stopPropagation() {} });
+    await page.settle();
+    assert.equal(page.el("glossary-popover").hidden, false, "the premise: WTF? opened its popover");
+    await page.el("glossary-popover-close").click();
+    await page.settle();
+    assert.deepStrictEqual(await stripNextFrame(page), WHOLE_STRIP, "closing the popover took a chip out of a standing strip");
+    await page.clearSelection();
+    await stripNextFrame(page);
+    // After a touch: first frame whole, and still whole while the phone's cleared selection is held.
+    await page.documentEvent("pointerdown", { pointerType: "touch", target: wordsIn(first) });
+    await page.selectText(wordsIn(first), null, "about the runner");
+    assert.deepStrictEqual(await stripFirstFrame(page), WHOLE_STRIP, "a touch's first frame painted without every chip");
+    await page.clearSelection();
+    assert.deepStrictEqual(await stripNextFrame(page), WHOLE_STRIP, "the held strip after a touch lost a chip");
+    page.expireTimers(sourceConstant("QUOTE_HOLD_MS"));
+    assert.deepStrictEqual(await stripNextFrame(page), NO_STRIP, "the held strip went piecemeal");
+    if (size.height === 915) {
+      // A phone's keyboard up (the visual viewport shrunk): the first frame is still whole.
+      await page.resizeViewport({ visual: size.height - 336 });
+      while (page.frames.length) await page.nextFrame();
+      await page.selectText(wordsIn(second), null, "the deploy");
+      assert.deepStrictEqual(await stripFirstFrame(page), WHOLE_STRIP, "with the keyboard up the first frame painted without every chip");
+    }
+  });
+}
+
+test("`#2231 vibe-talk-selection-strip-atomic`: where WTF? lookups cannot run, the strip is Quoted reply and the X from its first frame, with no empty slot", async () => {
+  const page = await quotePage((p) => p.enableAnimationFrames());
+  while (page.frames.length) await page.nextFrame();
+  const first = rowWithId(page, "1000000000000000001");
+  await page.selectText(wordsIn(first), null, "about the runner");
+  assert.deepStrictEqual(await stripFirstFrame(page), { ...WHOLE_STRIP, "selection-chip-wtf": false });
+  assert.equal(page.el("selection-chip-wtf").hidden, true, "WTF? kept an empty slot in the strip");
+});
+
+test("`#2231 vibe-talk-selection-strip-atomic`: THE CONTROL: a strip drawn without WTF? reads as missing it", async () => {
+  const control = await stripPage({ height: 915 }, await brokenModule([{ file: "src/view/channel/quoting.ts",
+    find: "    showWtf(wtfEl);\n", replace: "" }]));
+  const words = wordsIn(rowWithId(control, "1000000000000000001"));
+  await control.selectText(words, null, "about the runner");
+  const seen = await stripFirstFrame(control);
+  assert.notDeepStrictEqual(seen, WHOLE_STRIP, "a strip drawn without WTF? still read as whole, so the test cannot see it");
+});
+
 test("`#726 vt-selection-chip`: a press of the chip quotes the words it stands under, and never takes the selection first", async () => {
   const page = await quotePage();
   const first = rowWithId(page, "1000000000000000001");

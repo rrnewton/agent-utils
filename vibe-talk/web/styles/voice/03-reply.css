@@ -381,7 +381,7 @@
 }
 
 /* `#2156 vibe-talk-wtf-glossary-lookup`. "WTF?", left of the Quoted reply chip: the chip's own
-   panel and accent, placed with it by web/src/view/channel/glossary. */
+   panel and accent, shown with it by `drawSelectionChip` (web/src/view/channel/quoting.ts). */
 #selection-chip-wtf {
   order: 1;
   flex: none;
@@ -403,8 +403,8 @@
   cursor: pointer;
 }
 
-/* `#2220`. WTF? keeps its slot while invisible (visibility, never display:none in the row), so its
-   late reveal never reflows the row; the glossary view toggles only its visibility. */
+/* `#2231 vibe-talk-selection-strip-atomic`. WTF? is shown and hidden with the strip in one call, so it
+   never reveals late and the row is measured with it in place; out of the row where lookups cannot run. */
 #selection-chip-wtf[hidden] {
   display: none;
 }

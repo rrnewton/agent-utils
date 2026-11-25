@@ -1,8 +1,8 @@
 // WTF glossary lookup (`#2156 vibe-talk-wtf-glossary-lookup`): the WTF? button left of the
 // Quoted reply chip, the popover it opens, and the glossary links known terms render as.
-// The button shows exactly while the selection chip does (it reads the chip's own place each
-// frame the selection moves), so the two can never disagree about whether a selection stands;
-// the dismiss X stays on the chip's right, untouched. Learned entries are popover-only: they
+// `#2231 vibe-talk-selection-strip-atomic`. This view never shows, hides or places the button: the
+// quoting view's `drawSelectionChip` shows it with the strip, in the same call and frame as Quoted
+// reply and the X, so the strip paints as one object. Learned entries are popover-only: they
 // are stored by the server, shown here and linked below, and never fed to the Discuss warm-up.
 
 import { createListening } from "../dom/index.ts";
@@ -55,21 +55,6 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
 
   const wtf = () => deps.byId("selection-chip-wtf");
   const popover = () => deps.byId("glossary-popover");
-
-  function placeWtf(): void {
-    const chip = deps.byId("selection-chip");
-    const button = wtf();
-    // `#2195 vibe-talk-wtf-chip-orphan-lifecycle`. A collapsed selection takes WTF? down at once:
-    // never re-show it against a chip the quoting view is about to hide.
-    const selNow = typeof getSelection === "function" ? getSelection() : null;
-    // `#2220 vibe-talk-selection-chip-rigid-row`. WTF? is never positioned here and never display:none
-    // inside the row: the quoting view positions the one container, and this view only toggles WTF?'s
-    // visibility inside its reserved slot. Revealing it cannot move the container or its siblings.
-    const off = !deps.glossaryAvailable() || chip.hidden || (selNow && selNow.isCollapsed);
-    setHiddenIfChanged(button, false);
-    const want = off ? "hidden" : "visible";
-    if (button.style.visibility !== want) button.style.visibility = want;
-  }
 
   function placePopover(): void {
     const box = popover();
@@ -126,10 +111,9 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
   }
 
   function closePopover(): void {
+    // `#2231 vibe-talk-selection-strip-atomic`. Only the popover closes: WTF? stays with the strip it
+    // belongs to (shown and hidden only by the quoting view, with Quoted reply and the X, `#2195`).
     setHiddenIfChanged(popover(), true);
-    // `#2195 vibe-talk-wtf-chip-orphan-lifecycle`. Closing the popover takes the WTF? chip down
-    // with it; the quoting view's one show/hide path owns the rest of the group.
-    wtf().style.visibility = "hidden";
   }
 
   function selectionInfo(
@@ -331,8 +315,8 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
       const log = document.getElementById("discord-log");
       if (log) linkTermsIn(log);
     }
-    // `#2220`. No re-alignment pass: visibility only, in the same frame as the selection change.
-    placeWtf();
+    // `#2231 vibe-talk-selection-strip-atomic`. WTF?'s visibility is not decided here: the quoting
+    // view shows the whole strip, WTF? included, in one call at its next frame.
   });
   listen<MouseEvent>(wtf(), "click", (event) => {
     event.preventDefault();

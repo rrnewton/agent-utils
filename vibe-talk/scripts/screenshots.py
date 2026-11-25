@@ -5293,15 +5293,23 @@ def _act_orphan_tap(driver: Driver) -> None:
 
 
 def _act_orphan_popover(driver: Driver) -> None:
-    """`#2195` popover opened then closed: the WTF? chip goes with it."""
+    """`#2195` popover opened then closed: the WTF? chip stays with its strip.
+    `#2231 vibe-talk-selection-strip-atomic`: WTF?, Quoted reply and the X
+    stand or go together; closing the popover never takes WTF? alone."""
     _act_glossary_button(driver)
     driver.page.click("#selection-chip-wtf", force=True)
+    # The lookup's answer, not its "Looking this up" placeholder: an answer landing after the
+    # close would open the popover again over the shot.
     driver.page.wait_for_function(
-        "() => window.__visible('glossary-popover')", timeout=30_000
+        "() => window.__visible('glossary-popover') "
+        "&& !document.getElementById('glossary-popover-body').textContent.includes('Looking this up')",
+        timeout=30_000,
     )
     driver.page.click("#glossary-popover-close", force=True)
     driver.page.wait_for_function(
-        "() => !window.__visible('selection-chip-wtf')",
+        "() => !window.__visible('glossary-popover') "
+        "&& window.__visible('selection-chip-wtf') === window.__visible('selection-chip') "
+        "&& window.__visible('selection-chip-dismiss') === window.__visible('selection-chip')",
         timeout=10_000,
     )
     driver.settle(300)
@@ -8856,12 +8864,12 @@ SCENES: tuple[Scene, ...] = (
     ),
     Scene(
         name="97-glossary-orphan-popover",
-        what="#2195 after the popover closes, no orphan WTF? chip",
+        what="#2195 after the popover closes, WTF? stands or goes with its strip (#2231)",
         act=_act_orphan_popover,
         profiles=("android-412",),
         keep_transient=True,
         expect=(
-            ("#2195 no orphan WTF? chip remains", "!window.__visible('selection-chip-wtf')"),
+            ("#2231 WTF? stands exactly with Quoted reply and the X", "window.__visible('selection-chip-wtf') === window.__visible('selection-chip') && window.__visible('selection-chip-dismiss') === window.__visible('selection-chip')"),
             ("no error banner is up", "!window.__visible('error-wrap')"),
         ),
     ),

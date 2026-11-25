@@ -4413,7 +4413,7 @@ writable = true</pre>
     <!--
       `#2220 vibe-talk-selection-chip-rigid-row`. The chip row is ONE rigid container: WTF?, Quoted
       reply and the dismiss X inside a flex row, positioned once by `drawSelectionChip`. No chip is
-      placed on its own; WTF?'s slot is reserved so its late reveal never reflows the row.
+      placed on its own; `#2231 vibe-talk-selection-strip-atomic`: all of them show in one call and frame.
     -->
     <div id="selection-chip-row" class="selection-chip-row" hidden>
     <button id="selection-chip" class="selection-chip" type="button" title="Reply to this message, starting with the words you selected in it quoted" hidden>Quoted reply</button>
@@ -4425,8 +4425,8 @@ writable = true</pre>
     <button id="selection-chip-dismiss" class="selection-chip-dismiss" type="button" title="Clear the selection" aria-label="Clear the selection" hidden>&times;</button>
     <!--
       `#2156 vibe-talk-wtf-glossary-lookup`. "WTF?", left of the Quoted reply chip while words are
-      selected in a message: look the words up in the glossary. Shown, hidden and placed with the
-      chip by web/src/view/channel/glossary; the dismiss X stays on the chip's right.
+      selected in a message: look the words up in the glossary. Shown and hidden with the chip by
+      `drawSelectionChip` (`#2231`); the dismiss X stays on the chip's right.
     -->
     <button id="selection-chip-wtf" class="selection-chip-wtf" type="button" title="Look up what the selected words mean" hidden>WTF?</button>
     </div>

@@ -6643,6 +6643,8 @@ const quoteOwner = createQuoting({
   },
   // `#1967 vibe-talk-reader-pause-on-any-composer`. A quick-reply Send from a composer-held read resumes it.
   resumeAfterSend: () => readAloudOwner().resumeComposerHeldRead(),
+  // `#2231 vibe-talk-selection-strip-atomic`. WTF? is shown with the strip, in the same frame, where lookups run.
+  wtfAvailable: () => serverFacts.glossaryAvailable(),
 });
 
 

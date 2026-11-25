@@ -2190,6 +2190,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         broadcast_supported: page.broadcastSupported,
         // Absent unless a test says Discuss can run, as the server omits it when no summarizer is configured.
         discuss_available: page.discussAvailable,
+        // `#2156 vibe-talk-wtf-glossary-lookup`. Absent unless a test says WTF? lookups can run.
+        glossary_available: page.glossaryAvailable,
         // `#528 thread-card-markdown-and-cap`. Absent unless a test says the server names threads.
         thread_names_supported: page.threadNamesSupported,
         upstream_read_mark_supported: page.upstreamReadMarkSupported,
@@ -2344,6 +2346,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     broadcastSupported: undefined,
     /** Whether client-config says Discuss can run; `undefined` sends nothing, as a server with no summarizer does. */
     discussAvailable: undefined,
+    /** Whether client-config says WTF? glossary lookups can run (`#2156`); `undefined` sends nothing. */
+    glossaryAvailable: undefined,
     /** The scope the server reports for the saved token; `undefined` plays a malformed answer. */
     tokenScope: "write",
     /** Every explicit provider read-boundary request. Separate from local Done/archive calls. */

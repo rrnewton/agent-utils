@@ -213,6 +213,11 @@ export interface QuotingDependencies {
   resumeAfterSend?: () => void;
   /** `#846 draft-chip-honest`. The box has opened on a message's words, its draft on screen. */
   opened?(): void;
+  /**
+   * `#2231 vibe-talk-selection-strip-atomic`. Whether WTF? glossary lookups can run here, so the strip
+   * shows WTF? with Quoted reply and the X. Optional: a page without the glossary omits it (no WTF?).
+   */
+  wtfAvailable?(): boolean;
 }
 
 /** The quoting owner's commands. */
@@ -404,6 +409,20 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
     });
   }
 
+  /**
+   * `#2231 vibe-talk-selection-strip-atomic`. WTF? stands in the strip exactly while the strip does and
+   * lookups can run: decided here, in the same call that shows the strip, so all of it paints in one
+   * frame. Never left invisible in a slot (the glossary view no longer decides it on its own, which on a
+   * first selection ran before this frame and hid WTF? until the next selection change). Where lookups
+   * cannot run it is out of the row, with no empty slot.
+   */
+  function showWtf(wtfEl: HTMLElement | null): void {
+    if (!wtfEl) return;
+    const on = typeof deps.wtfAvailable === "function" && deps.wtfAvailable();
+    setHiddenIfChanged(wtfEl, !on);
+    if (wtfEl.style.visibility) wtfEl.style.visibility = "";
+  }
+
   /** Show the chip under the selection Quote reply would quote, or hide it where there is none. */
   function drawSelectionChip(): void {
     const chip = deps.byId("selection-chip");
@@ -411,6 +430,8 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
     const dismiss = deps.byId("selection-chip-dismiss");
     // `#2220 vibe-talk-selection-chip-rigid-row`. The ONE container positioned for the whole row.
     const row = deps.byId("selection-chip-row");
+    // `#2156 vibe-talk-wtf-glossary-lookup`. WTF?, left of the chip: shown and hidden with it, here only.
+    const wtfEl = deps.byId("selection-chip-wtf");
     const box = quoteHeld ? selectionBox() : null;
     // A touch's held selection, gone from the page, keeps the chip where it was until the hold ends.
     // `#819 voice-page-quoted-reply-and-draft-chip`. And its twin in the read's strip, which nothing covers.
@@ -423,17 +444,20 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
       // `#2195 vibe-talk-wtf-chip-orphan-lifecycle`. ONE show/hide path for the whole chip group:
       // WTF? hides with Quoted reply and the X on every path that takes the group down (selection
       // cleared, scroll, tap elsewhere, re-render), so it can never be left standing alone.
-      const wtfEl = deps.byId("selection-chip-wtf");
       if (wtfEl) setHiddenIfChanged(wtfEl, true);
       return;
     }
-    setHiddenIfChanged(row, false);
+    // `#2231 vibe-talk-selection-strip-atomic`. The strip and every chip in it in ONE synchronous step,
+    // so they paint in one frame: WTF? with the row, never after it.
+    showWtf(wtfEl);
     setHiddenIfChanged(chip, false);
     setHiddenIfChanged(dismiss, false);
+    setHiddenIfChanged(row, false);
     setHiddenIfChanged(twin, false);
     if (box === null) return;
-    // `#2220`. Measure the container once (WTF?'s slot is reserved even while it is invisible, so the
-    // width never changes when it reveals); position the container only. No chip gets its own left/top.
+    // `#2220`. Measure the container once, with every chip it shows already in it (`#2231`: WTF? is shown
+    // in this same step, so its width is in the measure); position the container only. No chip gets its
+    // own left/top.
     const rowSize = row.getBoundingClientRect();
     const width = Number(rowSize.width) || 0;
     const height = Number(rowSize.height) || 0;
