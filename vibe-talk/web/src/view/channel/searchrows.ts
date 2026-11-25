@@ -828,7 +828,10 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
     } else {
       said = `Searched the ${deps.messagesWords(loaded)} loaded in this browser${deps.reachBackWords(deps.oldestLoadedMs())}. None match.`;
     }
-    if (deps.holdsWholeHistory()) {
+    // `#2251 vibe-talk-search-current-view-scope`: not in a thread. Its search is the thread's, and
+    // the server is asked over its whole cache from the newest, the bucket row naming what main and
+    // the other threads hold, so "does not reach yet" would be false beside those offers.
+    if (deps.holdsWholeHistory() && deps.selectionView() !== "thread") {
       said += " This server holds the complete history of this channel, which this search does not reach yet.";
     }
     if (deps.threading() && deps.selectionView() === "main") return `${said} ${MAIN_REPLIES_SEARCHED}`;

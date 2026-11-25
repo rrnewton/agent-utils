@@ -2907,9 +2907,9 @@ test("`#1797 vibe-talk-search-bucket-toggles`: in Main, main starts on as cards,
 // --- `#2200 vibe-talk-search-tab-counts-match-cards`: one fold, disjoint buckets -----------
 
 /** A channel whose loaded messages and older server hits both speak of themes. */
-async function foldPage(view = "main", holdOld = false) {
+async function foldPage(view = "main", holdOld = false, cache = messageCacheStatus()) {
   const page = newPage();
-  page.messageCache = messageCacheStatus();
+  page.messageCache = cache;
   const first = { id: "spaces/A/threads/one & two", root_message_id: "201", is_root: true,
     reply_count: 1, reply_count_exact: true };
   const second = { id: "spaces/A/threads/another", root_message_id: "203", is_root: true,
@@ -3137,6 +3137,24 @@ test("`#2251 vibe-talk-search-current-view-scope`: a thread with no hit of its o
   assert.deepStrictEqual(scopeShown(page), ["200"], "the offer did not place its hit");
   assert.equal(page.el("search-count").textContent, "1 found (0 in this thread, 1 elsewhere)");
   assert.ok(foldSnapshot(page).styles.every((style) => style === "card"), "the placed hit is not a normal card");
+});
+
+test("`#2251 vibe-talk-search-current-view-scope`: a thread's None match does not say the search falls short of the server's whole history", async () => {
+  // The server holds every channel whole (`#595 cache-full-history`). A
+  // thread's search is the thread's, asked of the server from the newest,
+  // and its row offers what main and the other threads hold.
+  const whole = messageCacheStatus({ max_days: 65535, history: { mode: "full", channels: 3, complete: 3 } });
+  const page = await foldPage(THREAD_ONE, false, whole);
+  await searchServer(page, "announcement");
+  assert.equal(chipOf(page, "main").textContent, "1 in main");
+  const thread = page.el("search-empty").textContent;
+  assert.match(thread, /None match\.$/, "the thread's own sentence is gone");
+  assert.doesNotMatch(thread, /This server holds/, "a thread's search said it does not reach the server's history");
+  // NEGATIVE CONTROL: a channel view's None match still says it.
+  await pickThread(page, "main");
+  await searchServer(page, "zebra");
+  assert.match(page.el("search-empty").textContent,
+    /None match\. This server holds the complete history of this channel, which this search does not reach yet\./);
 });
 
 test("`#2251 vibe-talk-search-current-view-scope`: in a thread, the offers count main and the other threads whole — held and the server's — each once", async () => {
