@@ -14,6 +14,7 @@ import { createDocStatesStore, docStateOf } from "./docstate.ts";
 import type { DocStatesStore } from "./docstate.ts";
 import type { DocumentRow, DocumentsListAnswer } from "./types.ts";
 import { listAnchorDelta, listAnchorOf } from "./viewstate.ts";
+import { documentLoadFailure } from "./loadfailure.ts";
 import type { ListAnchor } from "./viewstate.ts";
 
 export interface DocumentsListDependencies {
@@ -1095,10 +1096,13 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
       const answer = await deps.api(FETCH_PATH, { method: "POST", body: { key: row.key } });
       return fetchedPatchOf(answer, row.key);
     } catch (error) {
+      // vibe-talk's own cause as it wrote it; anything else — a proxy's or
+      // tunnel's error page above all — in the reader's words, which say whose
+      // answer it was and never the raw parse error (`#2241`).
       const detail = (error as { detail?: unknown })?.detail;
       const words = typeof detail === "string" && detail.trim() !== ""
         ? detail.trim()
-        : error instanceof Error ? error.message : String(error);
+        : documentLoadFailure(error, row.url).reason;
       errors.set(row.key, `Could not fetch it. ${words}`);
       deps.onStatus?.(`Could not fetch ${row.file_name}. ${words}`);
       return false;

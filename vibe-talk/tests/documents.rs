@@ -1124,6 +1124,195 @@ async fn a_commit_ref_never_looks_in_the_tree() {
         "a commit ref looked in the tree"
     );
 }
+
+/// A raw host that accepts every connection and reads the request, then never
+/// answers (`#2241 vibe-talk-document-load-502-readable`): the upstream that
+/// used to hold a document fetch open until a front end answered its own 502.
+/// Each held connection stays open for the life of the test process.
+fn stalled_raw_host() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let base = format!("http://{}", listener.local_addr().expect("addr"));
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            use std::io::Read as _;
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            held.push(stream);
+        }
+    });
+    base
+}
+
+/// A router whose one document is `docs/stalled.md`, fetched through the real
+/// `GithubFetcher` from `raw_base`, under `deadline`.
+fn stalled_router(raw_base: String, deadline: std::time::Duration) -> axum::Router {
+    let (mut state, _discord, _elevenlabs) = testing::state_parts();
+    let index = Arc::new(Index::new(Vec::new()));
+    index.apply_message(
+        READ_CHANNEL,
+        "1000000000000000123",
+        Some(9_000),
+        "agent",
+        None,
+        "https://github.com/octo/widgets/blob/main/docs/stalled.md",
+    );
+    let fetcher =
+        GithubFetcher::new(TokenSource::None, Some(raw_base.clone()), None).with_api_base(raw_base);
+    state.documents = Arc::new(
+        Service::new(index, Arc::new(fetcher), 100, 1 << 20).with_fetch_deadline(deadline),
+    );
+    router(state)
+}
+
+/// `#2241`: a document whose upstream never answers gets this server's own
+/// JSON answer, `504 document_fetch_timeout` naming the upstream, through the
+/// real router with only the raw host stubbed — never a request held open for
+/// a front end to time out. The deadline is injected, and the stub never
+/// answers, so the outcome cannot depend on how loaded the host is; no timing
+/// is asserted.
+#[tokio::test]
+async fn a_stalled_upstream_answers_json_504_through_the_real_router() {
+    let base = stalled_raw_host();
+    let host = base.trim_start_matches("http://").to_owned();
+    let app = stalled_router(base, std::time::Duration::from_millis(200));
+    let key = "github:octo/widgets@main:docs/stalled.md";
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/v1/documents/fetch",
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({ "key": key })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+    assert_eq!(body["error"], "document_fetch_timeout", "{body}");
+    let detail = body["detail"].as_str().expect("detail");
+    assert!(
+        detail.contains(&format!("GitHub ({host})")),
+        "the detail does not name the upstream: {detail}"
+    );
+    assert!(detail.contains("did not answer within 200 ms"), "{detail}");
+    // The page's next read: the row is still there, unfetched, and names its
+    // own address for the reader's way out.
+    let (status, body) = call(
+        &app,
+        "GET",
+        &format!("/api/v1/documents/{}", encoded(key)),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["content"].is_null(), "{body}");
+    assert_eq!(
+        body["document"]["url"],
+        "https://github.com/octo/widgets/blob/main/docs/stalled.md"
+    );
+}
+
+/// A fetcher that panics, standing in for any handler bug on the fetch path.
+struct PanickingFetcher;
+
+#[async_trait::async_trait]
+impl Fetcher for PanickingFetcher {
+    async fn fetch(&self, _entry: &Entry) -> Result<FetchedRaw, FetchError> {
+        panic!("fetcher bug: internal detail 2241");
+    }
+
+    async fn current_version(&self, _entry: &Entry) -> Result<Option<String>, FetchError> {
+        Ok(None)
+    }
+}
+
+/// Everything a test subscriber writes, shared with the test.
+#[derive(Clone, Default)]
+struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log lock").extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// `#2241`: a handler that panics answers JSON 500 `internal_error` with a
+/// fixed sentence (never the panic's words), through the real router, and
+/// leaves exactly ONE ERROR line in the log naming the route, the cause code
+/// and the panic's message, so a caught panic is never silent.
+#[tokio::test]
+async fn a_panicking_handler_answers_json_500_and_logs_one_error_line() {
+    let logs = LogBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let (mut state, _discord, _elevenlabs) = testing::state_parts();
+    let index = Arc::new(Index::new(Vec::new()));
+    index.apply_message(
+        READ_CHANNEL,
+        "1000000000000000124",
+        Some(9_000),
+        "agent",
+        None,
+        "https://github.com/octo/widgets/blob/main/docs/panics.md",
+    );
+    state.documents = Arc::new(Service::new(
+        index,
+        Arc::new(PanickingFetcher),
+        100,
+        1 << 20,
+    ));
+    let app = router(state);
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/v1/documents/fetch",
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({ "key": "github:octo/widgets@main:docs/panics.md" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["error"], "internal_error", "{body}");
+    assert_eq!(
+        body["detail"],
+        vibe_talk::http::panic_layer::PANIC_DETAIL,
+        "{body}"
+    );
+    assert!(
+        !body.to_string().contains("internal detail 2241"),
+        "the panic's words reached the caller: {body}"
+    );
+    let text = String::from_utf8(logs.0.lock().expect("log lock").clone()).expect("utf-8 log");
+    let errors: Vec<&str> = text
+        .lines()
+        .filter(|line| line.contains(" ERROR "))
+        .collect();
+    assert_eq!(errors.len(), 1, "want exactly one ERROR line:\n{text}");
+    let line = errors[0];
+    for part in [
+        "/api/v1/documents/fetch",
+        "internal_error",
+        "fetcher bug: internal detail 2241",
+    ] {
+        assert!(line.contains(part), "the ERROR line lacks {part:?}: {line}");
+    }
+}
 /// `#1039 documents-read-parity`: a cached document prepares like a channel
 /// message — one ticket naming the server's cached words, its blocks listed,
 /// each block playable through the same ticket URL. Text a caller puts in

@@ -1009,6 +1009,43 @@ pub enum FetchError {
     /// The source refused or failed.
     #[error("fetch failed: {0}")]
     Failed(String),
+    /// The source did not answer within the fetch deadline, so the server
+    /// stopped waiting (`#2241 vibe-talk-document-load-502-readable`): a
+    /// stalled upstream ends as this server's own answer naming it, never as
+    /// a request held open until whatever fronts the deployment gives up
+    /// and answers its own error page.
+    #[error("fetch timed out: {0}")]
+    TimedOut(String),
+}
+
+/// How long one document fetch or freshness check may take before the
+/// server stops waiting and answers `document_fetch_timeout`
+/// (`#2241 vibe-talk-document-load-502-readable`). Under the common
+/// 60-second proxy timeout (and a tunnel's 100 seconds), so the page hears
+/// this server's reason rather than a front end's error page.
+pub const FETCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// How long the GitHub client may take to open a connection. A host that
+/// never accepts fails by itself, inside [`FETCH_DEADLINE`].
+const GITHUB_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A deadline in words: whole seconds, or milliseconds below one.
+fn deadline_words(deadline: std::time::Duration) -> String {
+    if deadline.as_secs() >= 1 {
+        format!("{} s", deadline.as_secs())
+    } else {
+        format!("{} ms", deadline.as_millis())
+    }
+}
+
+/// `host[:port]` of a base address, for naming the upstream in a failure.
+fn authority_of(base: &str) -> Option<String> {
+    let parsed = url::Url::parse(base).ok()?;
+    let host = parsed.host_str()?;
+    Some(match parsed.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_owned(),
+    })
 }
 
 /// SHA-256 of `content`, hex: the version a fetched document is cached under.
@@ -1174,6 +1211,12 @@ pub trait Fetcher: Send + Sync {
     /// Check the GitHub helper now (`#1998`); only the GitHub fetcher runs one.
     async fn check_github_helper(&self) -> HelperReport {
         self.github_helper_report()
+    }
+    /// The upstream this fetcher would ask for `entry`, in words, for a
+    /// failure that must name it (`#2241`); `None` where it asks none or
+    /// does not serve the kind.
+    fn upstream(&self, _entry: &Entry) -> Option<String> {
+        None
     }
 }
 
@@ -1389,7 +1432,7 @@ fn candidate_is_eligible(
 
 fn failure_detail(error: &FetchError) -> String {
     match error {
-        FetchError::Failed(detail) => detail.clone(),
+        FetchError::Failed(detail) | FetchError::TimedOut(detail) => detail.clone(),
         FetchError::Unsupported(kind) => format!("no fetcher for {kind} documents yet"),
     }
 }
@@ -1818,7 +1861,7 @@ impl GithubFetcher {
     /// `https_proxy`, when set, applies to this client only.
     #[must_use]
     pub fn new(token: TokenSource, raw_base: Option<String>, https_proxy: Option<String>) -> Self {
-        let mut builder = reqwest::Client::builder();
+        let mut builder = reqwest::Client::builder().connect_timeout(GITHUB_CONNECT_TIMEOUT);
         if let Some(proxy) = https_proxy.as_deref().filter(|p| !p.trim().is_empty()) {
             if let Ok(proxy) = reqwest::Proxy::https(proxy) {
                 builder = builder.proxy(proxy);
@@ -2229,6 +2272,18 @@ impl Fetcher for GithubFetcher {
     async fn check_github_helper(&self) -> HelperReport {
         self.token.check_github_helper().await
     }
+
+    fn upstream(&self, entry: &Entry) -> Option<String> {
+        let base = match entry.kind {
+            DocKind::GithubMarkdown | DocKind::GithubFile | DocKind::GithubIssue => &self.raw_base,
+            DocKind::GithubGist => &self.api_base,
+            _ => return None,
+        };
+        Some(match authority_of(base) {
+            Some(host) => format!("GitHub ({host})"),
+            None => "GitHub".to_owned(),
+        })
+    }
 }
 
 /// The paste fetcher: a configured command, run without a shell, after `--`.
@@ -2366,6 +2421,12 @@ impl Fetcher for CompositeFetcher {
             }
         }
         HelperReport::not_configured()
+    }
+
+    fn upstream(&self, entry: &Entry) -> Option<String> {
+        self.fetchers
+            .iter()
+            .find_map(|fetcher| fetcher.upstream(entry))
     }
 }
 
@@ -2646,6 +2707,9 @@ pub struct Service {
     cache: Mutex<CacheState>,
     fetcher: Arc<dyn Fetcher>,
     persist_path: Option<std::path::PathBuf>,
+    /// How long one fetch or freshness check may take ([`FETCH_DEADLINE`]
+    /// unless a test sets a shorter one with [`Service::with_fetch_deadline`]).
+    fetch_deadline: std::time::Duration,
 }
 
 impl Service {
@@ -2669,6 +2733,41 @@ impl Service {
             }),
             fetcher,
             persist_path: None,
+            fetch_deadline: FETCH_DEADLINE,
+        }
+    }
+
+    /// The same service with another fetch deadline: a test's stalled
+    /// upstream ends in milliseconds instead of [`FETCH_DEADLINE`]
+    /// (`#2241`).
+    #[must_use]
+    pub fn with_fetch_deadline(mut self, deadline: std::time::Duration) -> Self {
+        self.fetch_deadline = deadline;
+        self
+    }
+
+    /// Run one upstream call for `entry` under the fetch deadline; one that
+    /// outlasts it is [`FetchError::TimedOut`], naming the upstream
+    /// (`#2241 vibe-talk-document-load-502-readable`).
+    async fn within_deadline<T>(
+        &self,
+        entry: &Entry,
+        call: impl std::future::Future<Output = Result<T, FetchError>>,
+    ) -> Result<T, FetchError> {
+        match tokio::time::timeout(self.fetch_deadline, call).await {
+            Ok(answer) => answer,
+            Err(_) => {
+                let who = self
+                    .fetcher
+                    .upstream(entry)
+                    .unwrap_or_else(|| "the document's source".to_owned());
+                let detail = format!(
+                    "{who} did not answer within {}, so vibe-talk stopped waiting; try again later",
+                    deadline_words(self.fetch_deadline)
+                );
+                tracing::warn!(key = %entry.key, %detail, "document fetch timed out");
+                Err(FetchError::TimedOut(detail))
+            }
         }
     }
 
@@ -2703,6 +2802,7 @@ impl Service {
             cache: Mutex::new(cache),
             fetcher,
             persist_path,
+            fetch_deadline: FETCH_DEADLINE,
         };
         if trimmed {
             // What was dropped or evicted on load leaves the disk too, so
@@ -2844,7 +2944,9 @@ impl Service {
             .index
             .get(key)
             .ok_or_else(|| FetchError::Failed(format!("unknown document {key}")))?;
-        let raw = self.fetcher.fetch(&entry).await?;
+        let raw = self
+            .within_deadline(&entry, self.fetcher.fetch(&entry))
+            .await?;
         if raw.content.len() > MAX_DOCUMENT_BYTES {
             return Err(FetchError::Failed("document over 1 MiB".to_owned()));
         }
@@ -2970,7 +3072,9 @@ impl Service {
                 update_available: false,
             });
         };
-        let latest = self.fetcher.current_version(&entry).await?;
+        let latest = self
+            .within_deadline(&entry, self.fetcher.current_version(&entry))
+            .await?;
         Ok(Freshness {
             key: key.to_owned(),
             fetched: true,

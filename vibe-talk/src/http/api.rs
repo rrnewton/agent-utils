@@ -10792,6 +10792,14 @@ fn fetch_error(error: crate::documents::FetchError) -> ApiError {
         crate::documents::FetchError::Failed(detail) => {
             ApiError::new(StatusCode::BAD_GATEWAY, "document_fetch_failed", detail)
         }
+        // This server's own answer for a stalled upstream (`#2241`): JSON,
+        // naming the upstream, before any front end's timeout can answer
+        // with its own error page instead.
+        crate::documents::FetchError::TimedOut(detail) => ApiError::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            "document_fetch_timeout",
+            detail,
+        ),
     }
 }
 

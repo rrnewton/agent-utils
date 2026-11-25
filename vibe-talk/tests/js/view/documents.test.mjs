@@ -1809,10 +1809,12 @@ test("documents reader: an unindexed key falls through to fetch, other failures 
     if (savedDocument === undefined) delete globalThis.document; else globalThis.document = savedDocument;
   }
   assert.deepEqual(refused, [`GET /api/v1/documents/${encodeURIComponent(key)}`]);
-  assert.deepEqual(statuses, [
-    "vibe-talk has no access to this document: the request was refused (private repository or a credential GitHub refused).",
-  ]);
-  assert.ok(!statuses.join(" ").includes("Could not load the document."),
+  // Said once, in the body, not repeated on the status line (`#2241`).
+  assert.ok(els["doc-body"].textContent.includes(
+    "vibe-talk has no access to this document: the request was refused (private repository or a credential GitHub refused)."),
+    `the body does not say why: ${els["doc-body"].textContent}`);
+  assert.deepEqual(statuses, [], "an inline failure was repeated on the status line");
+  assert.ok(!els["doc-body"].textContent.includes("Could not load the document."),
     "a failed load still says only that it could not load");
 });
 
@@ -1847,7 +1849,8 @@ test("documents reader: a failed private fetch shows its reason and an Open on G
   } finally {
     if (savedDocument === undefined) delete globalThis.document; else globalThis.document = savedDocument;
   }
-  assert.deepEqual(statuses, [detail], "the status is not the server's specific reason");
+  // The specific reason stands in the body (below), not repeated on the status line (`#2241`).
+  assert.deepEqual(statuses, [], "an inline failure was repeated on the status line");
   const bodyText = els["doc-body"].textContent;
   assert.ok(bodyText.includes("no access to octo/widgets"), `the body shows no reason: ${bodyText}`);
   assert.ok(bodyText.includes("Open on GitHub"), `the body has no way out: ${bodyText}`);
@@ -1901,6 +1904,185 @@ test("documents reader: helper failures name vibe-talk and the real cause (#1997
     assert.equal(failure.href, url);
     assert.equal(failure.linkLabel, "Open on GitHub");
   }
+});
+
+// ---- a failed load says whose answer it was, and offers Retry (`#2241`) -------------------------
+//
+// Owner report: a document link on a deployment behind a tunnel showed only
+// "vibe-talk returned non-JSON (HTTP 502)". These drive the page's REAL API
+// client (`createApi`) over a fake transport, so the error the reader words is
+// exactly what the client throws for a proxy's HTML 502 page.
+
+const API = await load("src/core/api/client.ts");
+const DOC_URL_2241 = "https://github.com/octo/widgets/blob/main/docs/stalled.md";
+const DOC_KEY_2241 = "github:octo/widgets@main:docs/stalled.md";
+const PROXY_PAGE = "<!DOCTYPE html><html><head><title>502 Bad gateway</title></head><body>Bad gateway</body></html>";
+
+// The real client over a transport answering by request: `answer(method, path)`
+// returns { status, text } for each call, in order of arrival.
+function realApi(answer) {
+  const { createApi } = requireModule(API, "src/core/api/client.ts");
+  const sent = [];
+  const server = createApi({
+    http: {
+      fetch: async (path, init) => {
+        sent.push(`${init.method} ${path}`);
+        const reply = answer(init.method, path);
+        return { status: reply.status, ok: reply.status >= 200 && reply.status < 300, text: async () => reply.text };
+      },
+    },
+    clock: { setTimeout: () => 0, clearTimeout: () => {} },
+    cancellation: { create: () => ({ signal: { aborted: false }, abort() {} }) },
+  }, { token: () => "tok", readRefused: () => {}, asking: () => {}, answerer: () => "Discord" });
+  return { api: (path, options) => server.request(path, options), sent };
+}
+
+// One reader over fakes, opened on `key` through `api`; the body, statuses and reader returned.
+async function openFailing(api, key = DOC_KEY_2241) {
+  const mod = requireModule(READER, "src/view/documents/reader.ts");
+  const els = {};
+  for (const id of ["doc-title", "doc-kind", "doc-outline", "doc-outline-pop", "doc-outline-open",
+    "doc-back", "doc-read", "doc-body", "scroll-area"]) els[id] = readerEl("div");
+  els["doc-body"].querySelectorAll = () => [];
+  const statuses = [];
+  const reader = mod.createDocumentsReader({
+    intoView: () => {},
+    api, byId: (id) => els[id], readDocument: () => {}, onBack: () => {},
+    onStatus: (text) => statuses.push(text),
+  });
+  globalThis.document = { createElement: (tag) => readerEl(tag) };
+  await reader.open(key).then(() => null, (error) => error);
+  return { els, statuses, reader };
+}
+
+function failureBox(els) {
+  const box = els["doc-body"].children.at(-1);
+  assert.ok(box && box.className === "doc-load-error", "the reader drew no failure box");
+  return box;
+}
+
+test("documents reader: a proxy's non-JSON 502 says the front end answered, names the host, never the raw string (#2241)", async () => {
+  const savedDocument = globalThis.document;
+  try {
+    const row = JSON.stringify({ document: { title: "stalled.md", url: DOC_URL_2241, kind: "github_markdown" }, content: null, outline: [] });
+    const { api, sent } = realApi((method) => (method === "POST" ? { status: 502, text: PROXY_PAGE } : { status: 200, text: row }));
+    const { els, statuses } = await openFailing(api);
+    assert.deepEqual(sent, [
+      `GET /api/v1/documents/${encodeURIComponent(DOC_KEY_2241)}`,
+      "POST /api/v1/documents/fetch",
+    ]);
+    const box = failureBox(els);
+    const reason = box.children.find((kid) => kid.className === "doc-load-error-reason").textContent;
+    assert.ok(!/non-JSON/i.test(reason), `the raw parse error reached the reader: ${reason}`);
+    assert.deepEqual(statuses, [], "an inline failure was repeated on the status line (its toast covered the reader's controls)");
+    assert.match(reason, /from github\.com/, "the reason does not name the document's host");
+    assert.match(reason, /HTTP 502/, "the reason does not name the status");
+    assert.match(reason, /proxy or tunnel in front of vibe-talk/, "the reason does not say the front end answered");
+    assert.match(reason, /not vibe-talk's answer/);
+    assert.equal(box.getAttribute("data-source"), "front-end");
+    assert.equal(box.getAttribute("role"), "alert");
+    const retry = box.children.find((kid) => kid.tagName === "BUTTON");
+    assert.ok(retry, "the failure offers no Retry");
+    assert.equal(retry.textContent, "Retry");
+    const link = box.children.find((kid) => kid.tagName === "A");
+    assert.equal(link.getAttribute("href"), DOC_URL_2241, "the way out to GitHub is gone");
+  } finally {
+    if (savedDocument === undefined) delete globalThis.document; else globalThis.document = savedDocument;
+  }
+});
+
+test("documents reader: vibe-talk's own JSON 504 keeps its cause and says it is vibe-talk's (#2241)", async () => {
+  const savedDocument = globalThis.document;
+  try {
+    const detail = "GitHub (raw.githubusercontent.com) did not answer within 45 s, so vibe-talk stopped waiting; try again later";
+    const row = JSON.stringify({ document: { title: "stalled.md", url: DOC_URL_2241 }, content: null, outline: [] });
+    const { api } = realApi((method) => (method === "POST"
+      ? { status: 504, text: JSON.stringify({ error: "document_fetch_timeout", detail }) }
+      : { status: 200, text: row }));
+    const { els, statuses } = await openFailing(api);
+    const box = failureBox(els);
+    const reason = box.children.find((kid) => kid.className === "doc-load-error-reason").textContent;
+    assert.equal(reason, `vibe-talk could not fetch this document: ${detail}`);
+    assert.deepEqual(statuses, [], "an inline failure was repeated on the status line");
+    assert.equal(box.getAttribute("data-source"), "vibe-talk");
+    assert.ok(box.children.some((kid) => kid.tagName === "BUTTON" && kid.textContent === "Retry"),
+      "a vibe-talk failure offers no Retry");
+  } finally {
+    if (savedDocument === undefined) delete globalThis.document; else globalThis.document = savedDocument;
+  }
+});
+
+test("documents reader: Retry runs the load again, and a load that then lands shows the document (#2241)", async () => {
+  const savedDocument = globalThis.document;
+  try {
+    let fetched = false;
+    let posts = 0;
+    let releaseRetry;
+    const retryHeld = new Promise((resolve) => { releaseRetry = resolve; });
+    const rowOf = () => JSON.stringify({
+      document: { title: "Stalled report", url: DOC_URL_2241, kind: "github_markdown" },
+      content: fetched ? "# Stalled report\n\nArrived on retry.\n" : null,
+      outline: [],
+    });
+    const { createApi } = requireModule(API, "src/core/api/client.ts");
+    const sent = [];
+    const server = createApi({
+      http: {
+        fetch: async (path, init) => {
+          sent.push(`${init.method} ${path}`);
+          if (init.method === "POST") {
+            posts += 1;
+            if (posts === 1) return { status: 502, ok: false, text: async () => PROXY_PAGE };
+            // The retry's fetch is held until the test has seen the busy button.
+            await retryHeld;
+            fetched = true;
+            return { status: 200, ok: true, text: async () => JSON.stringify({ fetched: [{ key: DOC_KEY_2241 }] }) };
+          }
+          return { status: 200, ok: true, text: async () => rowOf() };
+        },
+      },
+      clock: { setTimeout: () => 0, clearTimeout: () => {} },
+      cancellation: { create: () => ({ signal: { aborted: false }, abort() {} }) },
+    }, { token: () => "tok", readRefused: () => {}, asking: () => {}, answerer: () => "Discord" });
+    const { els, statuses, reader } = await openFailing((path, options) => server.request(path, options));
+    const box = failureBox(els);
+    const retry = box.children.find((kid) => kid.tagName === "BUTTON");
+    for (const listener of retry.listeners.click || []) listener({ type: "click" });
+    assert.equal(retry.disabled, true, "Retry is not disabled while it runs");
+    assert.equal(retry.textContent, "Retrying…");
+    // A second tap while it runs is not a second load.
+    for (const listener of retry.listeners.click || []) listener({ type: "click" });
+    // Condition: the retry's own fetch has been sent.
+    while (posts < 2) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(posts, 2, "a double tap on Retry ran two loads");
+    releaseRetry();
+    // Condition: the retried open has drawn the document.
+    while (reader.current() === null) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(reader.current().key, DOC_KEY_2241);
+    // Nothing is left on the status line once the retried document lands:
+    // neither the failure nor a "Retrying…" (the button said that itself).
+    assert.deepEqual(statuses, [], `a status outlived the landed retry: ${statuses}`);
+    assert.equal(sent.filter((line) => line === "POST /api/v1/documents/fetch").length, 2);
+    // The landed load draws the document's own body (its markup replaces the failure box).
+    assert.match(els["doc-body"].innerHTML, /Arrived on retry/, "the retried document was not drawn");
+  } finally {
+    if (savedDocument === undefined) delete globalThis.document; else globalThis.document = savedDocument;
+  }
+});
+
+test("documents load failure: a gateway's own JSON 5xx is the front end's, not vibe-talk's (#2241)", () => {
+  const { documentLoadFailure } = requireModule(READER, "src/view/documents/reader.ts");
+  const gateway = documentLoadFailure(
+    Object.assign(new Error("HTTP 504 error: (no detail)"), { status: 504, code: "error", detail: "" }),
+    DOC_URL_2241);
+  assert.equal(gateway.source, "front-end");
+  assert.match(gateway.reason, /answered HTTP 504 with its own answer, not vibe-talk's answer/);
+  const garbled = documentLoadFailure(new Error("vibe-talk returned non-JSON (HTTP 200)"), undefined);
+  assert.equal(garbled.source, "front-end");
+  assert.ok(!/non-JSON/.test(garbled.reason), `the raw parse error survived: ${garbled.reason}`);
+  assert.match(garbled.reason, /^Could not load this document: /, "no host is invented without an address");
+  const network = documentLoadFailure(Object.assign(new Error("down"), { network: true }), DOC_URL_2241);
+  assert.equal(network.source, "network");
 });
 
 // ---- reader kind header (`#1327 doc-reader-kind-header`) ---------------------------------------

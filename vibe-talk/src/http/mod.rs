@@ -61,6 +61,7 @@ pub mod api;
 pub mod assets;
 pub mod bearer_layer;
 pub mod json_error_layer;
+pub mod panic_layer;
 pub mod redact_layer;
 pub mod voice_socket;
 
@@ -82,7 +83,12 @@ use crate::state::AppState;
 pub fn router(state: AppState) -> Router {
     Router::new()
         .fallback_service(routes(state.clone()))
-        // Innermost, beside the routes: every `/api/` refusal answers JSON,
+        // Innermost of all: a handler that panics still answers, a JSON 500
+        // with one ERROR log line, instead of dropping the connection for a
+        // front end to answer with its own 502 page (`#2241`; see
+        // `panic_layer`).
+        .layer(axum::middleware::from_fn(panic_layer::catch_panics))
+        // Beside the routes: every `/api/` refusal answers JSON,
         // extractor refusals included (`#1844`; see `json_error_layer`).
         .layer(axum::middleware::from_fn(json_error_layer::json_errors))
         // What a read-scope caller is sent carries no pairing code, whichever route

@@ -28,6 +28,8 @@ import type { ScrubSectionCell, SectionModel } from "./sections.ts";
 import { splitIssueHeader } from "./issueheader.ts";
 import { readerAnchorDelta, readerAnchorOf } from "./viewstate.ts";
 import type { ReaderAnchor } from "./viewstate.ts";
+import { documentLoadFailure, safeSourceHref } from "./loadfailure.ts";
+import type { DocumentLoadFailure } from "./loadfailure.ts";
 
 /** What the reader asks of the page. */
 export interface DocumentsReaderDependencies {
@@ -229,82 +231,10 @@ function isUnknownDocument(error: unknown): boolean {
   return typeof record.message === "string" && record.message.includes("unknown_document");
 }
 
-/** One failed load, in the words and with the way out the reader shows (`#1980`). */
-export interface DocumentLoadFailure {
-  /** The specific reason, as a sentence. Never a bare "could not load". */
-  reason: string;
-  /** The document's own safe http(s) address, or null where none is known. */
-  href: string | null;
-  /** What the way-out link says: GitHub by name for a github.com address. */
-  linkLabel: string;
-}
-
-/**
- * Why one load failed, from the API error's own facts (`#1980
- * vibe-talk-docs-private-github-load`): the server's detail sentence is the
- * reason where it gave one; a network failure, a rate limit, a refusal and
- * an unindexed key are each named. Pure, so the wording is testable without
- * a reader. The result always names a specific cause.
- */
-export function documentLoadFailure(error: unknown, url?: unknown): DocumentLoadFailure {
-  const record = (typeof error === "object" && error !== null ? error : {}) as {
-    message?: unknown; detail?: unknown; code?: unknown; status?: unknown; network?: unknown;
-  };
-  const detail = typeof record.detail === "string" ? record.detail.trim() : "";
-  const message = typeof record.message === "string" ? record.message : String(error ?? "");
-  const code = typeof record.code === "string" ? record.code : "";
-  const status = typeof record.status === "number" ? record.status : null;
-  let reason: string;
-  if (record.network === true || /could not reach vibe-talk/i.test(message)) {
-    reason = "Could not reach vibe-talk (network) while loading this document. Check the connection and try again.";
-  } else if (detail !== "") {
-    reason = detail;
-  } else if (code === "unknown_document" || message.includes("unknown_document")) {
-    reason = "This document is not in vibe-talk's index yet, and it could not be fetched.";
-  } else if (status === 429 || /rate limit/i.test(message)) {
-    reason = "GitHub rate limit: GitHub asked vibe-talk to pause. Try again later.";
-  } else if (status === 401 || status === 403 || /\bHTTP (401|403)\b/.test(message) || code === "forbidden") {
-    reason = "vibe-talk has no access to this document: the request was refused (private repository or a credential GitHub refused).";
-  } else if (status === 404 || /\bHTTP 404\b/.test(message)) {
-    reason = "Not found: GitHub has no such document at this address, or the repository is private and vibe-talk has no access to it.";
-  } else if (/could not reach GitHub/i.test(message)) {
-    reason = message.replace(/^HTTP \d+ [^:]+:\s*/, "");
-  } else if (message !== "") {
-    reason = message;
-  } else {
-    reason = "vibe-talk could not fetch this document for an unknown reason.";
-  }
-  // The address is the server's own data (the document row), never one the
-  // page invents from the key: the page hardcodes no off-origin destination.
-  const href = safeSourceHref(url);
-  let linkLabel = "Open source";
-  if (href !== null) {
-    try {
-      if (new URL(href).hostname === "github.com" || new URL(href).hostname === "gist.github.com") linkLabel = "Open on GitHub";
-    } catch {
-      // A non-parsing address keeps the generic label; safeSourceHref already vetted it.
-    }
-  }
-  return { reason, href, linkLabel };
-}
-
-/** Characters that may not appear in an address the title may link to (render.ts's discipline). */
-const UNSAFE_URL_CHARS = /[\s"<>\u0000-\u001f\u007f]/;
-
-/**
- * The `href` for the title's source link, or null where the address is not one the
- * page will follow: `http://` and `https://` (in any casing) only, with no
- * whitespace or control characters. Anything else — `javascript:` included —
- * leaves the title plain text.
- */
-function safeSourceHref(value: unknown): string | null {
-  if (typeof value !== "string") return null;
-  const trimmed = value.trim();
-  if (trimmed === "" || UNSAFE_URL_CHARS.test(trimmed)) return null;
-  const lower = trimmed.toLowerCase();
-  if (lower.startsWith("http://") || lower.startsWith("https://")) return trimmed;
-  return null;
-}
+// The failure wording is shared with the list (`#2241`); re-exported so the
+// reader's callers and tests keep one import.
+export { documentLoadFailure } from "./loadfailure.ts";
+export type { DocumentLoadFailure, DocumentFailureSource } from "./loadfailure.ts";
 
 /**
  * The `owner/repo` a document's address is under, or null where it is not a
@@ -698,26 +628,52 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
   }
 
   /**
-   * Draw a failed load in the body (`#1980`): the specific reason as text
-   * and, where the document's address is a safe one, the way out to it.
-   * Text and a page-built anchor only, never markup from the error.
+   * Draw a failed load in the body (`#1980`): the specific reason as text,
+   * saying whose answer it was (`#2241`), a Retry that runs the same load
+   * again, and, where the document's address is a safe one, the way out to
+   * it. Text, a page-built button and a page-built anchor only, never markup
+   * from the error. Says whether it drew: a host without the body has only
+   * the status line left to say it on.
    */
-  function drawLoadFailure(failure: DocumentLoadFailure, titleText: string): void {
+  function drawLoadFailure(
+    failure: DocumentLoadFailure,
+    titleText: string,
+    retry: () => Promise<void>,
+  ): boolean {
     drawTitle(titleText, failure.href ?? undefined);
     let body: HTMLElement;
     try {
       body = deps.byId("doc-body");
     } catch {
-      return;
+      return false;
     }
-    if (!body) return;
-    body.textContent = "";
+    if (!body) return false;
     const box = document.createElement("div");
     box.className = "doc-load-error";
+    box.setAttribute("role", "alert");
+    box.setAttribute("data-source", failure.source);
     const words = document.createElement("p");
     words.className = "doc-load-error-reason";
     words.textContent = failure.reason;
     box.appendChild(words);
+    // Retry (`#2241`): the same open again. A retry that fails draws its own
+    // failure over this one (a fresh button); one that lands draws the
+    // document. Disabled while it runs, so a double tap is one load. The
+    // button itself says it is retrying: nothing goes on the status line, so
+    // nothing is left standing there once the document lands.
+    const again = document.createElement("button");
+    again.className = "doc-load-retry";
+    again.setAttribute("type", "button");
+    again.textContent = "Retry";
+    again.addEventListener("click", () => {
+      if ((again as HTMLButtonElement).disabled) return;
+      (again as HTMLButtonElement).disabled = true;
+      again.textContent = "Retrying…";
+      retry().catch(() => {
+        // The retry's own failure is already drawn and said.
+      });
+    });
+    box.appendChild(again);
     if (failure.href !== null) {
       const link = document.createElement("a");
       link.className = "doc-load-error-link";
@@ -727,7 +683,8 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
       link.textContent = failure.linkLabel;
       box.appendChild(link);
     }
-    body.appendChild(box);
+    body.replaceChildren(box);
+    return true;
   }
 
   /**
@@ -1323,8 +1280,16 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
         }
       }
       const failure = documentLoadFailure(error, knownUrl);
-      drawLoadFailure(failure, typeof knownTitle === "string" && knownTitle !== "" ? knownTitle : key);
-      deps.onStatus?.(failure.reason);
+      const drawn = drawLoadFailure(
+        failure,
+        typeof knownTitle === "string" && knownTitle !== "" ? knownTitle : key,
+        () => open(key, highlightTerms),
+      );
+      // The reader says it once, where the reader is looking (`#2241`): a
+      // failure drawn in the body is not repeated on the status line, whose
+      // toast stood over the reader's controls repeating the same sentence.
+      // Only a host with no body to draw in says it there.
+      if (!drawn) deps.onStatus?.(failure.reason);
       throw error;
     }
     markdown = typeof answer.content === "string" ? answer.content : null;

@@ -469,6 +469,29 @@
 .doc-load-error-link {
   text-decoration: underline;
 }
+/* Retry (`#2241 vibe-talk-document-load-502-readable`): the same load again,
+   beside the way out, as the Discuss panel's own Retry is dressed. */
+.doc-load-retry {
+  margin: 0 12px 0 0;
+  padding: 6px 14px;
+  cursor: pointer;
+  background: var(--row-hover);
+  color: var(--ink);
+  border: 1px solid var(--edge);
+  border-radius: 6px;
+  font: inherit;
+  /* The button's own disabled "Retrying…" is the feedback; no square tap
+     flash over its rounded corners on a phone. */
+  -webkit-tap-highlight-color: transparent;
+}
+.doc-load-retry:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.doc-load-retry[disabled] {
+  opacity: 0.55;
+  cursor: default;
+}
 @media (min-width: 900px) and (pointer: fine) {
   #doc-body {
     max-width: 90ch;
