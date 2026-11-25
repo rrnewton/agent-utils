@@ -992,6 +992,14 @@ def _cmd_wt_image_unmount(args: argparse.Namespace) -> int:
     return 0
 
 
+#: What each reclaim marker state means for the slot's bind (#2238).
+_RECLAIM_MARKER_MEANING = {
+    worktreesimage.RECLAIM_LIVE: "a reclaimer holds it; its bind is not re-established",
+    worktreesimage.RECLAIM_STALE: "its reclaimer exited; ignored, reused by the next reclaim",
+    worktreesimage.RECLAIM_UNVERIFIABLE: "not a lockable regular file; honoured as live",
+}
+
+
 def _cmd_wt_image_status(args: argparse.Namespace) -> int:
     from wrkslots import cli
 
@@ -1022,6 +1030,10 @@ def _cmd_wt_image_status(args: argparse.Namespace) -> int:
             f"({doubled['layers']} layers, identical={doubled['identical']}); "
             "repair with 'wrkslots worktrees-image collapse-binds'"
         )
+    reclaim_markers = report["reclaim_markers"]
+    assert isinstance(reclaim_markers, dict)
+    for slot, state in reclaim_markers.items():
+        print(f"reclaim marker: slot {slot} {state} ({_RECLAIM_MARKER_MEANING[state]})")
     if report["image_exists"]:
         print(f"apparent={report['apparent_bytes']} allocated={report['allocated_bytes']}")
     for entry in lock_missing:
@@ -1680,8 +1692,12 @@ def _migrate_layout_to_direct(
     direct_settings = dataclasses.replace(
         settings, mount_at=worktreesimage.MOUNT_AT_WORKTREES_DIR
     )
+    # Slots whose bind record this switch may have dropped; a rollback
+    # puts back only theirs (#2238).
+    attempted: list[str] = []
     try:
         for record in agents:
+            attempted.append(record.slot)
             worktreesimage.unbind_slot(
                 config.control,
                 record.slot,
@@ -1708,7 +1724,14 @@ def _migrate_layout_to_direct(
         try:
             with contextlib.suppress(Exception):
                 worktreesimage.unmount_image(config.worktrees)
-            worktreesimage.save_bind_records(config.control, records)
+            # Put back only the records this switch dropped, under the
+            # records lock (#2238): a whole-map save of the records read
+            # before the switch would drop another slot's concurrent
+            # bind or resurrect a record a reclaimer dropped meanwhile.
+            worktreesimage.restore_bind_records(
+                config.control,
+                {slot: records[slot] for slot in attempted if slot in records},
+            )
             worktreesimage.ensure_image_mounted(
                 config.root, config.control, settings, config.worktrees
             )

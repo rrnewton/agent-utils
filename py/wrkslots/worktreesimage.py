@@ -33,6 +33,7 @@ import dataclasses
 import fcntl
 import json
 import os
+import stat
 import subprocess
 import time
 import uuid
@@ -1213,6 +1214,50 @@ def save_bind_records(control: Path, records: dict[str, BindRecord]) -> None:
     _update_bind_records(control, lambda _current: dict(records))
 
 
+def record_bind_if_absent(control: Path, slot: str, record: BindRecord) -> bool:
+    """Record ``slot``'s bind unless one is recorded; True when added (#2238).
+
+    A locked read-modify-write that touches only ``slot``: a record
+    another writer added, changed or dropped for any other slot in the
+    meantime is never lost or resurrected, as a whole-map save of an
+    earlier unlocked read would.
+    """
+
+    added: list[bool] = []
+
+    def add(records: dict[str, BindRecord]) -> dict[str, BindRecord]:
+        if slot not in records:
+            records[slot] = record
+            added.append(True)
+        return records
+
+    _update_bind_records(control, add)
+    return bool(added)
+
+
+def restore_bind_records(control: Path, originals: dict[str, BindRecord]) -> list[str]:
+    """Put back records a failed multi-slot operation dropped; return them (#2238).
+
+    A locked read-modify-write that touches only the named slots, so
+    concurrent changes to every other slot survive. A slot recorded
+    again meanwhile keeps its newer record, and a slot whose reclaim
+    marker is held is not resurrected: its reclaimer owns it now.
+    """
+
+    restored: list[str] = []
+
+    def put_back(records: dict[str, BindRecord]) -> dict[str, BindRecord]:
+        for slot, record in sorted(originals.items()):
+            if slot in records or reclaim_marker_honoured(control, slot):
+                continue
+            records[slot] = record
+            restored.append(slot)
+        return records
+
+    _update_bind_records(control, put_back)
+    return restored
+
+
 def save_binds(control: Path, binds: dict[str, str]) -> None:
     """Persist the bind record atomically beside the registry."""
 
@@ -1631,6 +1676,232 @@ def removal_journaled_slots(control: Path) -> set[str]:
     return slots
 
 
+#: Per-slot reclaim marker (#2238): ``<control>/RECLAIM.<slot>.lock``.
+#: A reclaimer (wrkslots' own unbind and remove, or a tool outside
+#: wrkslots) holds an exclusive flock on it from before its first
+#: unmount of the slot's binds until the slot's bind record is dropped,
+#: and ``ensure_binds`` leaves a slot alone while that flock is held.
+#: The ``.lock`` suffix is deliberate: every reader, older ones
+#: included, counts a top-level ``*.journal`` as registry state (its
+#: registry and read identities), so a marker named like a journal
+#: would cost concurrent mutations validation rounds; every reader
+#: already skips ``*.lock`` names, as for ``DELETION-LOCK.*.lock``.
+RECLAIM_MARKER_PREFIX = "RECLAIM."
+RECLAIM_MARKER_SUFFIX = ".lock"
+RECLAIM_MARKER_KIND = "wrkslots-bind-reclaim"
+RECLAIM_MARKER_VERSION = 1
+
+#: Reclaim marker states. ``live``: a reclaimer holds its flock, so the
+#: slot's bind is not re-established. ``stale``: nobody holds it (its
+#: reclaimer exited), so it is ignored and binds behave as before.
+#: ``unverifiable``: not an openable regular file; honoured as live, so
+#: a doubt never re-binds a checkout that is being reclaimed.
+RECLAIM_LIVE = "live"
+RECLAIM_STALE = "stale"
+RECLAIM_UNVERIFIABLE = "unverifiable"
+
+#: How long a reclaimer waits for another reclaimer of the same slot
+#: before refusing. Readers never wait: they test without blocking.
+RECLAIM_MARKER_TIMEOUT_SECONDS = 120.0
+
+#: Re-opens when the marker path stopped naming the locked inode
+#: between open and flock (another reclaimer finished and unlinked it).
+RECLAIM_MARKER_OPEN_ATTEMPTS = 5
+
+
+def reclaim_marker_path(control: Path, slot: str) -> Path:
+    """The reclaim marker of ``slot`` in ``control`` (#2238)."""
+
+    return control / f"{RECLAIM_MARKER_PREFIX}{slot}{RECLAIM_MARKER_SUFFIX}"
+
+
+def reclaim_marker_state(control: Path, slot: str) -> str | None:
+    """Whether a reclaimer holds ``slot``'s reclaim marker (#2238).
+
+    None when there is no marker. Otherwise the marker is opened
+    read-only (never created) and tested with a non-blocking shared
+    flock: blocked means its reclaimer is alive (``live``), acquired
+    means nobody holds it (``stale``, released at once). Anything that
+    is not an openable regular file is ``unverifiable``. Constant time:
+    one open and one flock attempt, no directory scan.
+    """
+
+    path = reclaim_marker_path(control, slot)
+    try:
+        descriptor = os.open(
+            path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+        )
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return RECLAIM_UNVERIFIABLE
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return RECLAIM_UNVERIFIABLE
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return RECLAIM_LIVE
+        except OSError:
+            return RECLAIM_UNVERIFIABLE
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        return RECLAIM_STALE
+    finally:
+        os.close(descriptor)
+
+
+def reclaim_marker_honoured(control: Path, slot: str) -> bool:
+    """Whether bind establishment must leave ``slot`` alone (#2238)."""
+
+    return reclaim_marker_state(control, slot) in (RECLAIM_LIVE, RECLAIM_UNVERIFIABLE)
+
+
+def reclaim_markers(control: Path) -> dict[str, str]:
+    """Every reclaim marker in ``control`` and its state, by slot (status)."""
+
+    try:
+        names = sorted(os.listdir(control))
+    except OSError:
+        return {}
+    markers: dict[str, str] = {}
+    shortest = len(RECLAIM_MARKER_PREFIX) + len(RECLAIM_MARKER_SUFFIX)
+    for name in names:
+        if (
+            len(name) <= shortest
+            or not name.startswith(RECLAIM_MARKER_PREFIX)
+            or not name.endswith(RECLAIM_MARKER_SUFFIX)
+        ):
+            continue
+        slot = name[len(RECLAIM_MARKER_PREFIX) : -len(RECLAIM_MARKER_SUFFIX)]
+        state = reclaim_marker_state(control, slot)
+        if state is not None:
+            markers[slot] = state
+    return dict(sorted(markers.items()))
+
+
+class ReclaimMarker:
+    """A reclaim marker this process holds; see ``hold_reclaim_marker``."""
+
+    def __init__(self, path: Path, descriptor: int) -> None:
+        self.path = path
+        self._descriptor = descriptor
+        self._unlinked = False
+
+    def unlink(self) -> None:
+        """Remove the marker file, still holding its flock (idempotent).
+
+        Only the inode this holder locked is removed: a file that
+        replaced it is another reclaimer's and is left in place.
+        """
+
+        if self._unlinked:
+            return
+        self._unlinked = True
+        try:
+            current = os.lstat(self.path)
+        except FileNotFoundError:
+            return
+        held = os.fstat(self._descriptor)
+        if (current.st_dev, current.st_ino) == (held.st_dev, held.st_ino):
+            self.path.unlink(missing_ok=True)
+
+
+#: Reclaim markers this thread holds, by path: taking one again in a
+#: nested reclaim reuses it (a second flock on a new descriptor would
+#: wait on our own).
+_RECLAIMS_HELD = threading.local()
+
+
+def _acquire_reclaim_marker(path: Path) -> int:
+    """Open and exclusively flock ``path``; return the holding descriptor."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + RECLAIM_MARKER_TIMEOUT_SECONDS
+    for _attempt in range(RECLAIM_MARKER_OPEN_ATTEMPTS):
+        try:
+            descriptor = os.open(
+                path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o644
+            )
+        except OSError as exc:
+            raise WorktreesImageError(f"cannot open reclaim marker {path}: {exc}") from exc
+        held = _flock_records_until(descriptor, deadline)
+        if held is None:
+            os.close(descriptor)
+            raise WorktreesImageError(
+                f"reclaim marker is busy: {path} was not free within "
+                f"{RECLAIM_MARKER_TIMEOUT_SECONDS:g}s; another reclaimer of this "
+                "slot holds it; retry after it exits"
+            )
+        if held != descriptor:
+            os.close(descriptor)
+        try:
+            current: os.stat_result | None = os.lstat(path)
+        except FileNotFoundError:
+            current = None
+        locked = os.fstat(held)
+        if current is not None and (current.st_dev, current.st_ino) == (
+            locked.st_dev,
+            locked.st_ino,
+        ):
+            return held
+        # Another reclaimer unlinked the file we opened before we
+        # locked it: our lock guards nothing. Open the path again.
+        fcntl.flock(held, fcntl.LOCK_UN)
+        os.close(held)
+    raise WorktreesImageError(
+        f"reclaim marker {path} was replaced on each of "
+        f"{RECLAIM_MARKER_OPEN_ATTEMPTS} attempts to take it; retry"
+    )
+
+
+@contextlib.contextmanager
+def hold_reclaim_marker(control: Path, slot: str, *, writer: str) -> Iterator[ReclaimMarker]:
+    """Hold ``slot``'s reclaim marker for one reclaim (#2238).
+
+    Take it BEFORE the first unmount of the slot's binds and drop the
+    bind record with ``forget_bind(..., reclaim=marker)``, which
+    removes the marker under the records lock in the same step. On any
+    other exit (the reclaim was abandoned and the record kept) the
+    marker is removed here, still under its flock, so binds behave as
+    before. A crashed holder's flock is released by the kernel: its
+    file is then stale, ignored by ``ensure_binds``, and taken over by
+    the next reclaim of the slot. The JSON payload is diagnostics only;
+    readers decide by the flock alone. Lock order: the marker before
+    the records lock (readers holding the records lock never wait on
+    a marker).
+    """
+
+    held: dict[Path, ReclaimMarker] = getattr(_RECLAIMS_HELD, "markers", {})
+    _RECLAIMS_HELD.markers = held
+    path = reclaim_marker_path(control, slot)
+    if path in held:
+        yield held[path]
+        return
+    descriptor = _acquire_reclaim_marker(path)
+    marker = ReclaimMarker(path, descriptor)
+    held[path] = marker
+    try:
+        payload = {
+            "kind": RECLAIM_MARKER_KIND,
+            "version": RECLAIM_MARKER_VERSION,
+            "slot": slot,
+            "pid": os.getpid(),
+            "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "writer": writer,
+        }
+        data = (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
+        os.ftruncate(descriptor, 0)
+        os.pwrite(descriptor, data, 0)
+        yield marker
+    finally:
+        held.pop(path, None)
+        try:
+            marker.unlink()
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+
 def mount_id_at(mount_point: Path, mountinfo: Path = Path("/proc/self/mountinfo")) -> int | None:
     """The mount ID of the topmost mount at ``mount_point``, or None."""
 
@@ -1965,14 +2236,23 @@ def relocate_bind(control: Path, mount_dir: Path, slot: str, source: Path, desti
     _update_bind_records(control, relocate)
 
 
-def forget_bind(control: Path, slot: str) -> None:
-    """Drop a slot's bind record only; mounts are the caller's business."""
+def forget_bind(control: Path, slot: str, *, reclaim: ReclaimMarker | None = None) -> None:
+    """Drop a slot's bind record only; mounts are the caller's business.
+
+    With ``reclaim`` (the slot's held reclaim marker, #2238) the marker
+    is removed under the same records lock, right after the record is
+    dropped, so a bind establishment that holds the lock sees either
+    the marker or no record, never a record without its marker.
+    """
 
     def drop(records: dict[str, BindRecord]) -> dict[str, BindRecord]:
         records.pop(slot, None)
         return records
 
-    _update_bind_records(control, drop)
+    with _records_lock(control):
+        _update_bind_records(control, drop)
+        if reclaim is not None:
+            reclaim.unlink()
 
 
 def umount_point(path: Path) -> None:
@@ -1984,21 +2264,21 @@ def umount_point(path: Path) -> None:
 def unbind_slot(control: Path, slot: str, slot_path: Path) -> None:
     """Unmount a slot's bind and drop its record (original stays beneath).
 
-    Crash order (unmount, then record): a crash between them leaves a
-    record saying bound with nothing mounted and the subvolume intact,
-    and the next config load's ``ensure_binds`` re-binds it, so a remove
-    interrupted here retries from the bound state. A record that
-    outlives its subvolume (deleted outside this order) is skipped by
-    ``ensure_binds``, never re-created and never a load failure.
+    The slot's reclaim marker is held from before the unmount until the
+    record is dropped (#2238), so no wrkslots command anywhere re-binds
+    the slot in between; a failed unmount removes the marker and keeps
+    the record. Crash order (unmount, then record): a crash between
+    them leaves a record saying bound with nothing mounted, the
+    subvolume intact and a stale marker, and the next config load's
+    ``ensure_binds`` re-binds it, so a remove interrupted here retries
+    from the bound state. A record that outlives its subvolume (deleted
+    outside this order) is skipped by ``ensure_binds``, never re-created
+    and never a load failure.
     """
 
-    unmount_bind(slot_path)
-
-    def drop(records: dict[str, BindRecord]) -> dict[str, BindRecord]:
-        records.pop(slot, None)
-        return records
-
-    _update_bind_records(control, drop)
+    with hold_reclaim_marker(control, slot, writer="wrkslots unbind") as reclaim:
+        unmount_bind(slot_path)
+        forget_bind(control, slot, reclaim=reclaim)
 
 
 def _binds_need_locked_pass(
@@ -2012,8 +2292,11 @@ def _binds_need_locked_pass(
 
     Mirrors the locked loop's skips from an unlocked read: journaled
     and fenced slots are left alone either way, a mounted target
-    needs the lock only while its top is shared, and an unmounted
-    target needs it only while its subvolume still exists.
+    needs the lock only while its top is shared, an unmounted target
+    needs it only while its subvolume still exists, and a slot whose
+    reclaim marker is held needs nothing (#2238). The marker is tested
+    only for a slot that would otherwise need work, so the common
+    all-mounted load costs no extra system call.
     """
 
     mounted_points = {entry.mount_point for entry in entries}
@@ -2032,9 +2315,13 @@ def _binds_need_locked_pass(
         if target in mounted_points:
             top = _top_entry(target, entries)
             if top is not None and "shared:" in top.propagation:
+                if reclaim_marker_honoured(control, slot):
+                    continue
                 return True
             continue
         if (mount_dir / record.subvolume).is_dir():
+            if reclaim_marker_honoured(control, slot):
+                continue
             return True
     return False
 
@@ -2053,9 +2340,16 @@ def ensure_binds(
     later recovery refuse that both paths exist, so it is left alone. A slot
     whose removal is journaled (a finish journal or a validate-batch seal)
     is likewise left alone: re-binding it, shared, is what pinned the
-    removal that journaled it (#1733). A bind that is already mounted but
-    still shared is made private here, so existing binds migrate without
-    an operator step.
+    removal that journaled it (#1733). A slot whose reclaim marker is held
+    (``RECLAIM.<slot>.lock``, #2238) is left alone too: a reclaimer has
+    unmounted, or is unmounting, its binds and drops its record next,
+    and a bind made here would pin the checkout it is removing.
+    The marker is tested after the mount table is read under the lock,
+    and every reclaimer takes it before its first unmount, so a target
+    found unmounted by a live reclaimer always finds its marker held; a
+    stale marker (its reclaimer exited) is ignored. A bind that is
+    already mounted but still shared is made private here, so existing
+    binds migrate without an operator step.
 
     The direct layout has no binds at all: with direct ``settings`` this
     returns before any record is read or written.
@@ -2081,7 +2375,14 @@ def ensure_binds(
     # the mount table and the records are read again inside it, so a
     # concurrent config load that bound a slot first is seen, not
     # raced. Each slot's work under the lock is constant-time (one
-    # table, one mount at most), never a registry scan.
+    # table, one mount at most), never a registry scan. Every binding
+    # decision comes from this locked pass alone (#2238, a consumer's
+    # binding requirement): it iterates the records loaded under this
+    # lock hold, never the unlocked pre-read above (which may only
+    # skip work), so a reclaimer that popped a record and unlinked its
+    # marker just before this lock is never re-bound from a stale
+    # list; and the reclaim-marker probe sits per slot, after this
+    # pass's one mount-table snapshot, right before any bind.
     with _records_lock(control):
         records = load_bind_records(control)
         entries = slotimage.mount_table()
@@ -2101,6 +2402,8 @@ def ensure_binds(
             if target in mounted_points:
                 top = _top_entry(target, entries)
                 if top is not None and "shared:" in top.propagation:
+                    if reclaim_marker_honoured(control, slot):
+                        continue
                     make_private(target, entries)
                     actions.append(f"made slot {slot} bind private")
                 continue
@@ -2109,6 +2412,10 @@ def ensure_binds(
                 # subvolume outside unbind's crash order). Skip it: do not
                 # fail every config load, do not re-create the slot path or
                 # subvolume, and do not block the remaining binds.
+                continue
+            if reclaim_marker_honoured(control, slot):
+                # A reclaimer holds the slot (#2238): it unmounted the
+                # bind and drops the record next, under this same lock.
                 continue
             bind_slot(control, mount_dir, slot, target)
             actions.append(f"bound slot {slot} from the worktrees image")
@@ -2137,6 +2444,7 @@ def status_report(root: Path, worktrees: Path, settings: WorktreesImageSettings)
             if settings.direct
             else doubled_bind_targets(worktrees.parent, worktrees)
         ),
+        "reclaim_markers": {} if settings.direct else reclaim_markers(worktrees.parent),
         "validate_dir": str(validate_external_dir(worktrees)),
         "validate_bind": (
             "mounted"

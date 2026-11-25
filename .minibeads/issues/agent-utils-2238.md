@@ -6,7 +6,7 @@ issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-11-25T09:02:00-05:00
-updated_at: 2026-11-25T09:02:00-05:00
+updated_at: 2026-11-25T09:50:00-05:00
 ---
 
 # Description
@@ -34,13 +34,17 @@ A per-slot reclaim marker in the control directory, honoured by `ensure_binds` i
   4. Close the descriptor.
   Abort, when the reclaim is abandoned and the record kept: unlink the marker while still holding its flock, then close it. `ensure_binds` may then re-bind as it does today.
 - Stale marker (the writer crashed): the kernel drops the flock, so the file is ignored. `ensure_binds` re-binds exactly as it does today, which preserves unbind's documented crash order ("an interrupted remove retries from the bound state"). The next reclaim of that slot takes over the same file. wrkslots never deletes a marker it did not write. `worktrees-image status` lists every marker as live or stale. A live marker has no maximum age, because the writer's liveness is its flock and the unmount retries are bounded by count.
+- Binding decisions come from the locked pass only (a consumer's binding requirement). The unlocked pre-read in `ensure_binds` may only skip work. The locked pass iterates the records loaded under the records lock and takes its one mount-table snapshot under the same hold. The marker probe runs per slot after that snapshot, right before any bind or privatise. A reclaimer that popped a record and unlinked its marker just before the lock is therefore never re-bound from a stale list.
 - wrkslots uses the same protocol: `unbind_slot` and `_remove_slot_directory` hold the marker across their unmount-to-forget window. Their own direct re-bind (content beneath the bind) is not refused by their own marker.
-- Rust parity: `wrkslotsd worktrees-image mount` (the Rust `ensure_binds` equivalent; it has no config-load bind path) honours live markers, Rust `unbind_slot` writes the marker, and Rust `worktrees-image status` lists markers.
+- Two more record writers read the records without the lock and then saved the whole map: relocating an unrecorded image mount (`_relocate_unrecorded_image_mount`), and the direct-layout switch's rollback. Either could resurrect a record a reclaimer had just dropped, or drop another slot's concurrent bind. Each is now a locked read-modify-write that changes only its own slots. The rollback puts back only the records the switch dropped, and skips any slot whose reclaim marker is held. No command saves a whole map any more.
+- Rust parity: `wrkslotsd worktrees-image mount` (the Rust `ensure_binds` equivalent; it has no config-load bind path) honours live markers and now holds the records flock across its whole re-establish pass, iterating the records loaded under it. Rust `unbind_slot` writes the marker, and Rust `worktrees-image status` lists markers.
 
 # Acceptance Criteria
 
 - With a live reclaim marker, or the bind-records lock, held for a recorded bind that namespace A unmounted, any read-only wrkslots command whose mount table (namespace B) shows the target unmounted does not re-bind the target and leaves the record untouched. The test uses fakes only and mounts nothing.
 - With no marker, or only a stale one, today's re-bind behaviour is unchanged.
+- A record popped and its marker unlinked between `ensure_binds`' unlocked pre-read and its locked pass is not re-bound.
+- A concurrent pop or bind of another slot made while the relocate path or the layout-switch rollback is writing is neither lost nor resurrected.
 - An older reader ignores the marker: registry identity and read identity are unchanged by a `RECLAIM.*.lock` file.
 - `unbind_slot` and `_remove_slot_directory` hold the marker across unmount and record drop and remove it afterwards, on success and on abort.
 - The Rust `wt_mount` and `unbind_slot` behave the same way, proven by Rust tests.

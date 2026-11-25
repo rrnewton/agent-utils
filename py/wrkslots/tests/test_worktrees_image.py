@@ -16,6 +16,7 @@ import socket
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -1126,12 +1127,21 @@ def test_no_unlocked_record_writer_remains() -> None:
 
     for function in (
         worktreesimage.bind_slot,
-        worktreesimage.unbind_slot,
+        worktreesimage.forget_bind,
         worktreesimage.relocate_bind,
         worktreesimage.save_bind_records,
+        worktreesimage.record_bind_if_absent,
+        worktreesimage.restore_bind_records,
     ):
         assert "_update_bind_records" in inspect.getsource(function), function.__name__
+    assert "forget_bind(" in inspect.getsource(worktreesimage.unbind_slot)
     assert "save_bind_records" in inspect.getsource(worktreesimage.save_binds)
+    # #2238: no command saves a whole map read earlier without the lock;
+    # each changes only its own slots through a locked writer.
+    from wrkslots import imagecmd
+
+    for caller in (cli, imagecmd):
+        assert "save_bind_records(" not in inspect.getsource(caller), caller.__name__
     module = inspect.getsource(worktreesimage)
     assert 'path.name + ".tmp"' not in module  # the old fixed temp name
     assert module.count("os.replace(temporary, path)") == 1  # one write path
@@ -3356,3 +3366,660 @@ def test_real_migrate_layout_round_trip(
             capture_output=True,
             check=False,
         )
+
+
+# --- #2238: reclaim markers -------------------------------------------------
+#
+# A reclaimer holds RECLAIM.<slot>.lock (an exclusive flock) from before its
+# first unmount until the slot's bind record is dropped; ensure_binds leaves
+# such a slot alone. Every test here uses fake mount tables and a fake mount
+# runner: nothing is mounted. A flock held on one open file description
+# blocks a test made through another, even in one process, so a marker held
+# by the test is exactly what another process would see.
+
+
+def _reclaim_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, slots: tuple[str, ...] = ("s1",)
+) -> tuple[Path, Path, Path, _FakeMounts]:
+    control = tmp_path / "worktrees"
+    mount_dir = worktreesimage.image_mount_dir(control)
+    slots_dir = control / "slots"
+    for slot in slots:
+        (mount_dir / slot).mkdir(parents=True)
+    worktreesimage.save_bind_records(
+        control,
+        {
+            slot: worktreesimage.BindRecord(
+                subvolume=slot, mount_id=100, target=str(slots_dir / slot)
+            )
+            for slot in slots
+        },
+    )
+    fake = _FakeMounts()
+    monkeypatch.setattr(worktreesimage, "_run", fake.run)
+    monkeypatch.setattr(worktreesimage, "mount_id_at", lambda point: 777)
+    # Namespace B's view: every recorded bind target is unmounted
+    # (namespace A's reclaimer unmounted it there).
+    monkeypatch.setattr(slotimage, "mount_table", lambda: [])
+    return control, mount_dir, slots_dir, fake
+
+
+def _record_identity(control: Path) -> tuple[bytes, int, int]:
+    path = worktreesimage.record_path(control)
+    status = path.stat()
+    return path.read_bytes(), status.st_ino, status.st_mtime_ns
+
+
+def _binds_of(fake: _FakeMounts) -> list[list[str]]:
+    return [call for call in fake.calls if call[:2] == ["mount", "--bind"]]
+
+
+def test_ensure_binds_leaves_a_slot_under_reclaim_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    control, mount_dir, slots_dir, fake = _reclaim_setup(
+        tmp_path, monkeypatch, ("s1", "s2")
+    )
+    with worktreesimage.hold_reclaim_marker(control, "s1", writer="test reclaimer"):
+        assert worktreesimage.reclaim_marker_state(control, "s1") == worktreesimage.RECLAIM_LIVE
+        actions = worktreesimage.ensure_binds(control, mount_dir, slots_dir)
+        records = worktreesimage.load_bind_records(control)
+    # The slot under reclaim is not re-bound and its record is not
+    # rewritten; the other slot binds exactly as before.
+    assert actions == ["bound slot s2 from the worktrees image"]
+    assert _binds_of(fake) == [["mount", "--bind", str(mount_dir / "s2"), str(slots_dir / "s2")]]
+    assert records["s1"] == worktreesimage.BindRecord(
+        subvolume="s1", mount_id=100, target=str(slots_dir / "s1")
+    )
+    assert records["s2"].mount_id == 777
+
+
+def test_ensure_binds_does_not_privatise_a_slot_under_reclaim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    control, mount_dir, slots_dir, fake = _reclaim_setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        slotimage, "mount_table", lambda: [_bind_entry(slots_dir / "s1", "shared:42")]
+    )
+    before = _record_identity(control)
+    with worktreesimage.hold_reclaim_marker(control, "s1", writer="test reclaimer"):
+        assert worktreesimage.ensure_binds(control, mount_dir, slots_dir) == []
+    assert fake.calls == []
+    assert _record_identity(control) == before
+
+
+def test_read_only_commands_never_rebind_a_slot_under_reclaim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # #2238 acceptance: a recorded bind unmounted in namespace A (the
+    # reclaimer's) and a read-only command in namespace B, whose mount
+    # table shows the image mounted and the target unmounted: with the
+    # marker held the target is not re-bound and the record is
+    # untouched; without it, today's re-bind still happens.
+    import json as json_module
+
+    root = tmp_path / "project"
+    control = root / "worktrees"
+    slots_dir = control / "slots"
+    mount_dir = worktreesimage.image_mount_dir(control)
+    (mount_dir / "s1").mkdir(parents=True)
+    slots_dir.mkdir(parents=True)
+    (root / "live.py").write_text("# probe\n")
+    (root / ".wrkslots.yml").write_text(
+        "schema: 2\n"
+        "machine: node-a\n"
+        "worktrees_dir: worktrees/slots\n"
+        "default_remote: origin\n"
+        "default_landed_ref: refs/remotes/origin/main\n"
+        "heartbeat_ttl_seconds: 60\n"
+        "liveness_command: live.py\n"
+        "worktrees_image:\n  path: wt.img\n  size_bytes: 1073741824\n"
+    )
+    (control / "ACTIVE.node-a.json").write_text(
+        json_module.dumps({"schema": 2, "machine": "node-a", "revision": 0, "slots": []})
+    )
+    (control / "ARCHIVED.node-a.json").write_text(
+        json_module.dumps({"schema": 2, "machine": "node-a", "revision": 0, "records": []})
+    )
+    worktreesimage.save_bind_records(
+        control,
+        {
+            "s1": worktreesimage.BindRecord(
+                subvolume="s1", mount_id=100, target=str(slots_dir / "s1")
+            )
+        },
+    )
+    image_mount = slotimage.MountEntry(
+        mount_point=mount_dir,
+        fstype="btrfs",
+        source="/dev/loop9",
+        device="0:999",
+        root="/",
+    )
+    monkeypatch.setattr(slotimage, "mount_table", lambda: [image_mount])
+    monkeypatch.setattr(slotimage, "ensure_all_mounted", lambda *a, **k: ([], []))
+    monkeypatch.setattr(cli, "_OWNED_REPRESENTATION_MOUNTS", frozenset())
+    monkeypatch.setattr(worktreesimage, "quota_mode_at", lambda *a, **k: "none")
+    fake = _FakeMounts()
+    monkeypatch.setattr(worktreesimage, "_run", fake.run)
+    monkeypatch.setattr(worktreesimage, "mount_id_at", lambda point: 777)
+    project = ["--project-root", str(root), "--machine", "node-a"]
+    before = _record_identity(control)
+
+    with worktreesimage.hold_reclaim_marker(control, "s1", writer="test reclaimer"):
+        assert cli.main([*project, "status"]) == 0
+        assert cli.main([*project, "worktrees-image", "status", "--format", "json"]) == 0
+        assert _binds_of(fake) == []
+        assert _record_identity(control) == before
+        out = capsys.readouterr().out
+        assert '"reclaim_markers": {\n    "s1": "live"\n  }' in out
+
+    # Released (the reclaimer abandoned the reclaim): binds behave as before.
+    assert not worktreesimage.reclaim_marker_path(control, "s1").exists()
+    assert cli.main([*project, "status"]) == 0
+    assert _binds_of(fake) == [
+        ["mount", "--bind", str(mount_dir / "s1"), str(slots_dir / "s1")]
+    ]
+    assert worktreesimage.load_bind_records(control)["s1"].mount_id == 777
+
+
+def test_ensure_binds_waits_out_a_reclaimer_holding_the_records_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # With the records lock held by a reclaimer that drops the record
+    # before releasing it, a racing config load that found the target
+    # unmounted waits on the lock, re-reads, and binds nothing.
+    control, mount_dir, slots_dir, fake = _reclaim_setup(tmp_path, monkeypatch)
+    waiting = threading.Event()
+    real_flock = worktreesimage._flock_records_until
+    main = threading.current_thread()
+
+    def observed(descriptor: int, deadline: float) -> int | None:
+        if threading.current_thread() is not main:
+            waiting.set()
+        return real_flock(descriptor, deadline)
+
+    monkeypatch.setattr(worktreesimage, "_flock_records_until", observed)
+    results: list[object] = []
+
+    def load() -> None:
+        try:
+            results.append(worktreesimage.ensure_binds(control, mount_dir, slots_dir))
+        except BaseException as exc:  # asserted below
+            results.append(exc)
+
+    with worktreesimage._records_lock(control):
+        loader = threading.Thread(target=load)
+        loader.start()
+        assert waiting.wait(timeout=60)
+        worktreesimage.forget_bind(control, "s1")
+    loader.join(timeout=60)
+    assert not loader.is_alive()
+    assert results == [[]]
+    assert _binds_of(fake) == []
+    assert worktreesimage.load_bind_records(control) == {}
+
+
+def test_a_reclaim_finished_after_the_unlocked_pre_read_is_not_rebound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R1 (#2238): the unlocked pre-read only decides whether to take the
+    # lock. A reclaimer that pops the record and unlinks its marker
+    # between that pre-read and the locked pass must not see the slot
+    # re-bound from the pre-read's stale list: the binding decision uses
+    # the records and the mount table read under the lock, and the
+    # marker probe sits per slot after them, right before the bind.
+    control, mount_dir, slots_dir, fake = _reclaim_setup(
+        tmp_path, monkeypatch, ("s1", "s2")
+    )
+    real_pre_check = worktreesimage._binds_need_locked_pass
+    pre_read: list[set[str]] = []
+
+    with worktreesimage.hold_reclaim_marker(control, "s1", writer="test reaper") as reclaim:
+
+        def pre_check_then_reaper_finishes(
+            control_: Path,
+            mount_dir_: Path,
+            slots_dir_: Path,
+            records: dict[str, worktreesimage.BindRecord],
+            entries: list[slotimage.MountEntry],
+        ) -> bool:
+            pre_read.append(set(records))
+            needed = real_pre_check(control_, mount_dir_, slots_dir_, records, entries)
+            # The reaper completes now: record popped and marker
+            # unlinked under the records lock, before the locked pass.
+            worktreesimage.forget_bind(control, "s1", reclaim=reclaim)
+            return needed
+
+        monkeypatch.setattr(
+            worktreesimage, "_binds_need_locked_pass", pre_check_then_reaper_finishes
+        )
+        actions = worktreesimage.ensure_binds(control, mount_dir, slots_dir)
+
+    assert pre_read == [{"s1", "s2"}]  # the stale pre-read still named s1
+    assert actions == ["bound slot s2 from the worktrees image"]
+    assert _binds_of(fake) == [["mount", "--bind", str(mount_dir / "s2"), str(slots_dir / "s2")]]
+    assert set(worktreesimage.load_bind_records(control)) == {"s2"}
+    assert not worktreesimage.reclaim_marker_path(control, "s1").exists()
+
+
+@pytest.mark.parametrize("marker", ["absent", "stale"])
+def test_without_a_live_reclaim_marker_binds_come_back_as_before(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, marker: str
+) -> None:
+    control, mount_dir, slots_dir, fake = _reclaim_setup(tmp_path, monkeypatch)
+    if marker == "stale":
+        # A crashed reclaimer: its file stays, its flock is gone.
+        worktreesimage.reclaim_marker_path(control, "s1").write_text(
+            '{"kind": "wrkslots-bind-reclaim", "slot": "s1"}\n', encoding="utf-8"
+        )
+        assert worktreesimage.reclaim_marker_state(control, "s1") == worktreesimage.RECLAIM_STALE
+    else:
+        assert worktreesimage.reclaim_marker_state(control, "s1") is None
+    actions = worktreesimage.ensure_binds(control, mount_dir, slots_dir)
+    assert actions == ["bound slot s1 from the worktrees image"]
+    assert _binds_of(fake) == [["mount", "--bind", str(mount_dir / "s1"), str(slots_dir / "s1")]]
+    # wrkslots never deletes a marker it did not write.
+    assert worktreesimage.reclaim_marker_path(control, "s1").exists() is (marker == "stale")
+
+
+def test_an_unverifiable_reclaim_marker_is_honoured_as_live(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    control, mount_dir, slots_dir, fake = _reclaim_setup(tmp_path, monkeypatch)
+    worktreesimage.reclaim_marker_path(control, "s1").mkdir()
+    assert (
+        worktreesimage.reclaim_marker_state(control, "s1")
+        == worktreesimage.RECLAIM_UNVERIFIABLE
+    )
+    assert worktreesimage.ensure_binds(control, mount_dir, slots_dir) == []
+    assert fake.calls == []
+    assert worktreesimage.reclaim_markers(control) == {"s1": "unverifiable"}
+
+
+def test_a_reclaim_marker_is_not_registry_state(tmp_path: Path) -> None:
+    # Older readers ignore the marker: the registry and read identities
+    # skip *.lock names, so creating, rewriting or removing a marker
+    # costs no concurrent mutation a validation round.
+    import json as json_module
+
+    config = _config(tmp_path, worktreesimage.MOUNTED)
+    config.control.mkdir(parents=True)
+    (config.control / "ACTIVE.testhost.json").write_text(
+        json_module.dumps({"schema": 2, "machine": "testhost", "revision": 0, "slots": []})
+    )
+    identity = cli._registry_identity(config)
+    read_identity = cli._registry_read_identity(config)
+    with worktreesimage.hold_reclaim_marker(config.control, "s1", writer="test reclaimer"):
+        assert cli._registry_identity(config) == identity
+        assert cli._registry_read_identity(config) == read_identity
+    worktreesimage.reclaim_marker_path(config.control, "s2").write_text("{}\n")
+    assert cli._registry_identity(config) == identity
+    assert cli._registry_read_identity(config) == read_identity
+
+
+def test_unbind_slot_holds_the_reclaim_marker_until_the_record_is_dropped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    control, mount_dir, slots_dir, fake = _reclaim_setup(tmp_path, monkeypatch)
+    seen: list[object] = []
+
+    def umount_then_race(argv: list[str], *, sudo: bool = False) -> object:
+        if argv[:1] == ["umount"]:
+            seen.append(worktreesimage.reclaim_marker_state(control, "s1"))
+            payload = worktreesimage.reclaim_marker_path(control, "s1").read_text()
+            seen.append(payload)
+            # Another wrkslots process loads its config right after
+            # the unmount, before the record is dropped.
+            racer = threading.Thread(
+                target=lambda: seen.append(
+                    worktreesimage.ensure_binds(control, mount_dir, slots_dir)
+                )
+            )
+            racer.start()
+            racer.join(timeout=60)
+        return fake.run(argv, sudo=sudo)
+
+    monkeypatch.setattr(worktreesimage, "_run", umount_then_race)
+    worktreesimage.unbind_slot(control, "s1", slots_dir / "s1")
+
+    import json as json_module
+
+    assert seen[0] == worktreesimage.RECLAIM_LIVE
+    payload = json_module.loads(str(seen[1]))
+    assert payload["kind"] == "wrkslots-bind-reclaim"
+    assert payload["version"] == 1
+    assert payload["slot"] == "s1"
+    assert payload["pid"] == os.getpid()
+    assert payload["writer"] == "wrkslots unbind"
+    assert seen[2] == []  # the racing load bound nothing
+    assert _binds_of(fake) == []
+    assert worktreesimage.load_bind_records(control) == {}
+    assert not worktreesimage.reclaim_marker_path(control, "s1").exists()
+
+
+def test_a_failed_unbind_removes_its_marker_and_keeps_the_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    control, mount_dir, slots_dir, _fake = _reclaim_setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(worktreesimage, "_run", _FakeMounts(fail_umount=True).run)
+    monkeypatch.setattr(worktreesimage, "_sleep", lambda seconds: None)
+    # The busy-holder scan reads a fixture process tree (empty), never
+    # the host's: scanning every process on a loaded host takes minutes.
+    empty_proc = tmp_path / "proc"
+    empty_proc.mkdir()
+    monkeypatch.setattr(worktreesimage, "_PROC_ROOT", empty_proc)
+    with pytest.raises(worktreesimage.WorktreesImageError):
+        worktreesimage.unbind_slot(control, "s1", slots_dir / "s1")
+    assert not worktreesimage.reclaim_marker_path(control, "s1").exists()
+    assert set(worktreesimage.load_bind_records(control)) == {"s1"}
+    # The reclaim was abandoned, so binds behave as before.
+    fake = _FakeMounts()
+    monkeypatch.setattr(worktreesimage, "_run", fake.run)
+    assert worktreesimage.ensure_binds(control, mount_dir, slots_dir) == [
+        "bound slot s1 from the worktrees image"
+    ]
+
+
+def test_remove_holds_the_reclaim_marker_across_unmount_and_record_drop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path, worktreesimage.MOUNTED)
+    control = config.control
+    mount_dir = worktreesimage.image_mount_dir(control)
+    (mount_dir / "s1").mkdir(parents=True)
+    slot_path = config.worktrees / "s1"
+    slot_path.mkdir(parents=True)
+    worktreesimage.save_bind_records(
+        control,
+        {"s1": worktreesimage.BindRecord(subvolume="s1", mount_id=5, target=str(slot_path))},
+    )
+    fake = _FakeMounts()
+    states: list[object] = []
+
+    def run(argv: list[str], *, sudo: bool = False) -> object:
+        if argv[:1] == ["umount"]:
+            states.append(worktreesimage.reclaim_marker_state(control, "s1"))
+            states.append(set(worktreesimage.load_bind_records(control)))
+        return fake.run(argv, sudo=sudo)
+
+    monkeypatch.setattr(worktreesimage, "_run", run)
+    cli._remove_slot_directory(config, slot_path)
+    assert states == [worktreesimage.RECLAIM_LIVE, {"s1"}]
+    assert not slot_path.exists() and not (mount_dir / "s1").exists()
+    assert worktreesimage.load_bind_records(control) == {}
+    assert not worktreesimage.reclaim_marker_path(control, "s1").exists()
+
+
+def test_remove_abandoned_for_content_beneath_releases_its_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The remove path's own re-bind (a host original beneath the bind)
+    # is never refused by its own marker, and the marker goes with the
+    # abandoned removal.
+    config = _config(tmp_path, worktreesimage.MOUNTED)
+    control = config.control
+    mount_dir = worktreesimage.image_mount_dir(control)
+    (mount_dir / "s1").mkdir(parents=True)
+    slot_path = config.worktrees / "s1"
+    slot_path.mkdir(parents=True)
+    (slot_path / "original.txt").write_text("host original\n")
+    worktreesimage.save_bind_records(
+        control,
+        {"s1": worktreesimage.BindRecord(subvolume="s1", mount_id=5, target=str(slot_path))},
+    )
+    fake = _FakeMounts()
+    monkeypatch.setattr(worktreesimage, "_run", fake.run)
+    monkeypatch.setattr(worktreesimage, "mount_id_at", lambda point: 778)
+    with pytest.raises(OSError, match="content sits beneath"):
+        cli._remove_slot_directory(config, slot_path)
+    assert _binds_of(fake) == [["mount", "--bind", str(mount_dir / "s1"), str(slot_path)]]
+    assert worktreesimage.load_bind_records(control)["s1"].mount_id == 778
+    assert not worktreesimage.reclaim_marker_path(control, "s1").exists()
+
+
+def test_a_second_reclaimer_of_one_slot_waits_then_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    control = tmp_path / "worktrees"
+    monkeypatch.setattr(worktreesimage, "RECLAIM_MARKER_TIMEOUT_SECONDS", 0.2)
+    failures: list[BaseException] = []
+
+    def second() -> None:
+        try:
+            with worktreesimage.hold_reclaim_marker(control, "s1", writer="second"):
+                pass
+        except BaseException as exc:  # asserted below
+            failures.append(exc)
+
+    with worktreesimage.hold_reclaim_marker(control, "s1", writer="first"):
+        thread = threading.Thread(target=second)
+        thread.start()
+        thread.join(timeout=60)
+        assert worktreesimage.reclaim_marker_state(control, "s1") == worktreesimage.RECLAIM_LIVE
+    assert not thread.is_alive()
+    assert len(failures) == 1
+    assert isinstance(failures[0], worktreesimage.WorktreesImageError)
+    assert "reclaim marker is busy" in str(failures[0])
+    assert not worktreesimage.reclaim_marker_path(control, "s1").exists()
+
+
+def test_a_reclaimer_takes_over_a_stale_marker(tmp_path: Path) -> None:
+    import json as json_module
+
+    control = tmp_path / "worktrees"
+    control.mkdir()
+    path = worktreesimage.reclaim_marker_path(control, "s1")
+    path.write_text("leftover from a crashed reclaimer, much longer than the payload " * 4)
+    with worktreesimage.hold_reclaim_marker(control, "s1", writer="next") as marker:
+        assert marker.path == path
+        assert worktreesimage.reclaim_marker_state(control, "s1") == worktreesimage.RECLAIM_LIVE
+        payload = json_module.loads(path.read_text())
+        assert payload["writer"] == "next" and payload["slot"] == "s1"
+        # Nested reclaims of one slot in one thread reuse the hold.
+        with worktreesimage.hold_reclaim_marker(control, "s1", writer="nested") as inner:
+            assert inner is marker
+        assert path.exists()
+    assert not path.exists()
+
+
+def test_a_reclaimer_reopens_a_marker_unlinked_before_its_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Another reclaimer finished and unlinked the file between our
+    # open and our flock: that lock guards nothing, so the path is
+    # opened again and the lock taken on the file that is there.
+    control = tmp_path / "worktrees"
+    control.mkdir()
+    path = worktreesimage.reclaim_marker_path(control, "s1")
+    real_flock = worktreesimage._flock_records_until
+    calls: list[int] = []
+
+    def unlink_first(descriptor: int, deadline: float) -> int | None:
+        calls.append(descriptor)
+        if len(calls) == 1:
+            path.unlink()
+        return real_flock(descriptor, deadline)
+
+    monkeypatch.setattr(worktreesimage, "_flock_records_until", unlink_first)
+    with worktreesimage.hold_reclaim_marker(control, "s1", writer="test"):
+        assert len(calls) == 2
+        assert worktreesimage.reclaim_marker_state(control, "s1") == worktreesimage.RECLAIM_LIVE
+    assert not path.exists()
+
+
+def test_status_lists_reclaim_markers_live_and_stale(tmp_path: Path) -> None:
+    config = _config(tmp_path, worktreesimage.MOUNTED)
+    config.control.mkdir(parents=True)
+    worktreesimage.reclaim_marker_path(config.control, "s2").write_text("{}\n")
+    (config.control / "RECLAIM.lock").write_text("")  # names no slot
+    settings = config.worktrees_image
+    assert settings is not None
+    with worktreesimage.hold_reclaim_marker(config.control, "s1", writer="test"):
+        report = worktreesimage.status_report(config.root, config.worktrees, settings)
+    assert report["reclaim_markers"] == {"s1": "live", "s2": "stale"}
+    direct = worktreesimage.status_report(
+        config.root,
+        config.worktrees,
+        worktreesimage.WorktreesImageSettings(
+            relative_path="worktrees.img",
+            size_bytes=2 * GIB,
+            mount_at=worktreesimage.MOUNT_AT_WORKTREES_DIR,
+        ),
+    )
+    assert direct["reclaim_markers"] == {}
+
+
+def _race_records_writer(
+    monkeypatch: pytest.MonkeyPatch,
+    control: Path,
+    mutate: Callable[[dict[str, worktreesimage.BindRecord]], dict[str, worktreesimage.BindRecord]],
+) -> list[threading.Thread]:
+    """Run ``mutate`` as a concurrent records writer at the caller's first read.
+
+    The writer starts right after the calling thread's first
+    ``load_bind_records`` and the caller continues only once the writer
+    has either finished (nothing held the records lock) or is waiting on
+    the lock the caller holds. Either way the outcome is decided by the
+    lock's state, never by timing.
+    """
+
+    real_load = worktreesimage.load_bind_records
+    real_flock = worktreesimage._flock_records_until
+    caller = threading.current_thread()
+    settled = threading.Event()
+    racers: list[threading.Thread] = []
+
+    def flock(descriptor: int, deadline: float) -> int | None:
+        if threading.current_thread() in racers:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return descriptor
+            except BlockingIOError:
+                settled.set()  # waiting on the caller's lock
+        return real_flock(descriptor, deadline)
+
+    def race() -> None:
+        worktreesimage._update_bind_records(control, mutate)
+        settled.set()
+
+    def load(control_: Path) -> dict[str, worktreesimage.BindRecord]:
+        result = real_load(control_)
+        if threading.current_thread() is caller and not racers:
+            racer = threading.Thread(target=race)
+            racers.append(racer)
+            racer.start()
+            assert settled.wait(timeout=60)
+        return result
+
+    monkeypatch.setattr(worktreesimage, "_flock_records_until", flock)
+    monkeypatch.setattr(worktreesimage, "load_bind_records", load)
+    return racers
+
+
+def test_relocating_an_unrecorded_mount_records_only_its_own_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #2238: a reclaimer pops "gone" and a create binds "s10" between
+    # this writer's read and its write. Neither change is lost or
+    # undone: the writer changes only its own slot, under the lock.
+    config = _config(tmp_path, worktreesimage.MOUNTED)
+    control = config.control
+    mount_dir = worktreesimage.image_mount_dir(control)
+    (mount_dir / "v1").mkdir(parents=True)
+    source = config.worktrees / "v1"
+    source.mkdir(parents=True)
+    worktreesimage.save_bind_records(
+        control,
+        {
+            "gone": worktreesimage.BindRecord(subvolume="gone"),
+            "keep": worktreesimage.BindRecord(subvolume="keep"),
+        },
+    )
+    relocated: list[tuple[str, Path, Path]] = []
+    monkeypatch.setattr(
+        worktreesimage,
+        "relocate_bind",
+        lambda control_, mount_dir_, slot, src, dst: relocated.append((slot, src, dst)),
+    )
+    monkeypatch.setattr(cli, "_refresh_owned_mounts", lambda config_: None)
+
+    def reclaimer_and_create(
+        records: dict[str, worktreesimage.BindRecord],
+    ) -> dict[str, worktreesimage.BindRecord]:
+        records.pop("gone", None)
+        records["s10"] = worktreesimage.BindRecord(subvolume="s10")
+        return records
+
+    racers = _race_records_writer(monkeypatch, control, reclaimer_and_create)
+    entry = slotimage.MountEntry(
+        mount_point=source, fstype="btrfs", source="/dev/loop9", device="0:999", root="/v1"
+    )
+    fenced = config.worktrees / ".v1.fenced.1"
+    assert cli._relocate_unrecorded_image_mount(config, source, fenced, entry)
+    for racer in racers:
+        racer.join(timeout=60)
+    assert racers and not any(racer.is_alive() for racer in racers)
+    records = worktreesimage.load_bind_records(control)
+    assert set(records) == {"keep", "s10", "v1"}
+    assert records["v1"] == worktreesimage.BindRecord(subvolume="v1", target=str(source))
+    assert relocated == [("v1", source, fenced)]
+
+
+def test_a_failed_layout_switch_puts_back_only_the_records_it_dropped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #2238: the direct-layout switch unbinds every slot and fails. Its
+    # rollback restores only the records it dropped, under the lock: a
+    # bind another slot recorded meanwhile survives, and a slot whose
+    # reclaimer now holds its marker is not resurrected.
+    from wrkslots import imagecmd
+
+    config = _layout_project(tmp_path)
+    assert config.worktrees_image is not None
+    config.worktrees_image.image_file(config.root).touch()
+    control = config.control
+    mount_dir = worktreesimage.image_mount_dir(control)
+    records: dict[str, worktreesimage.BindRecord] = {}
+    for slot in ("s1", "s2"):
+        (mount_dir / slot).mkdir(parents=True)
+        (config.worktrees / slot).mkdir(parents=True)
+        records[slot] = worktreesimage.BindRecord(
+            subvolume=slot, target=str(config.worktrees / slot)
+        )
+    worktreesimage.save_bind_records(control, records)
+    fake = _FakeLayoutHost(mount_dir, config.worktrees)
+    monkeypatch.setattr(worktreesimage, "_run", fake.run)
+    monkeypatch.setattr(worktreesimage, "mount_id_at", lambda point: 99)
+    monkeypatch.setattr(worktreesimage, "is_subvolume", lambda path: path.is_dir())
+    monkeypatch.setattr(slotimage, "mount_table", lambda: [])
+    real_mount_image = worktreesimage.mount_image
+    held = contextlib.ExitStack()
+    failed: list[Path] = []
+
+    def mount_image(image: Path, point: Path, settings: object) -> None:
+        if not failed:
+            failed.append(point)
+            # Meanwhile: a create records a bind for s9, and a
+            # reclaimer starts reclaiming s2 (its record is already
+            # gone, dropped by this switch's unbind).
+            worktreesimage.record_bind_if_absent(
+                control, "s9", worktreesimage.BindRecord(subvolume="s9")
+            )
+            held.enter_context(
+                worktreesimage.hold_reclaim_marker(control, "s2", writer="test reaper")
+            )
+            raise worktreesimage.WorktreesImageError("mount failed")
+        real_mount_image(image, point, settings)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(worktreesimage, "mount_image", mount_image)
+    with held, pytest.raises(cli.Refusal, match="the bind layout was re-established"):
+        imagecmd._migrate_layout_to_direct(
+            config, config.worktrees_image, [_record("s1"), _record("s2")]
+        )
+    assert failed == [config.worktrees]
+    after = worktreesimage.load_bind_records(control)
+    assert set(after) == {"s1", "s9"}
+    assert after["s1"].subvolume == "s1"

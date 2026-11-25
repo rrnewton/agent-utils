@@ -3494,6 +3494,56 @@ WantedBy=default.target
 Order your restore unit `After=` this one (or rely on its `Before=`), so a failed mount is a
 failed boot step with a journal entry, not a team revived into empty directories.
 
+### Reclaiming a bound slot: the reclaim marker
+
+Every command, read-only ones included, re-binds each recorded bind whose target is not mounted in
+its own mount namespace. A reclaimer unmounts a slot's binds and then drops the slot's bind record,
+and any command that runs between those two steps would bind the slot again and pin the checkout
+being removed. To prevent that, every reclaimer holds the slot's reclaim marker,
+`<control>/RECLAIM.<slot>.lock` (beside `.worktrees-image.json`), for the whole reclaim. That
+includes wrkslots' own unbind and removal, and any tool outside wrkslots that retires a bound
+checkout. Bind establishment leaves a slot alone while its marker is held. That covers config-load
+healing and `worktrees-image mount` in both editions.
+
+What counts is a held flock, not the file. The reclaimer holds an exclusive `flock` on the open
+marker. A reader opens the marker read-only, never creating it, and tries a non-blocking shared
+flock:
+
+- if the flock is blocked, the marker is `live` and the slot is skipped: no bind, no privatise,
+  and no record write;
+- if the reader gets the flock, the marker is `stale`. The reader releases it at once and binds
+  as before;
+- anything that is not an openable regular file is `unverifiable` and is honoured as live.
+
+The JSON payload is for diagnostics only, and no reader requires it: `kind`
+(`wrkslots-bind-reclaim`), `version` (1), `slot`, `pid`, `started_at` (UTC), and free-text
+`writer`. `worktrees-image status` lists every marker with its state. The name ends in `.lock`
+because every reader skips `*.lock` files in the control directory, so a reader that does not
+know the marker ignores it entirely. A `*.journal` name would count as registry state.
+
+A reclaimer outside wrkslots follows the same four steps wrkslots does:
+
+1. Before the first unmount, open the marker with `O_RDWR|O_CREAT|O_CLOEXEC|O_NOFOLLOW` and mode
+   0644, and take `flock(LOCK_EX)`. Then check that the path still names the inode you locked
+   (compare `fstat` with `lstat`), and reopen if it does not. Write the payload, and keep the
+   descriptor open.
+2. Unmount the slot's binds, outside any lock.
+3. Take `flock(LOCK_EX)` on `<control>/.worktrees-image.json.lock`. Under it, load the record,
+   remove the slot, and write the record atomically: a unique temporary name, fsync, rename, and
+   fsync of the directory. Then unlink the marker, still holding its flock, and release the
+   records lock. Only constant-time work belongs under the records lock.
+4. Close the marker descriptor.
+
+To abandon a reclaim and keep the record, unlink the marker while still holding its flock, then
+close it. Binds then behave as before. If a reclaimer crashes, the kernel releases its flock. Its
+marker file stays but is stale, so the slot is re-bound exactly as an interrupted removal always
+was, and the next reclaim of that slot reuses the file. wrkslots never deletes a marker it did not
+write. A tool that clears its own stale markers takes `flock(LOCK_EX|LOCK_NB)`, checks that the path
+still names the locked inode, and unlinks while holding the flock; a reclaimer that opened the old
+file meanwhile fails step 1's inode check and reopens. A live marker has no maximum age, because
+liveness is the flock, not a clock. Take the marker before the records lock, never after: a
+holder of the records lock tests markers without waiting.
+
 ## Running commands and agents inside a slot's box
 
 `wrkslots run SLOT -- COMMAND` runs COMMAND boxed to one slot. The box does not depend on how the

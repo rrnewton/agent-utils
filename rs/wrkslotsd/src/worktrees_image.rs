@@ -971,6 +971,216 @@ pub(crate) fn removal_journaled_slots(control: &Path) -> std::collections::BTree
     slots
 }
 
+/// Per-slot reclaim marker prefix (#2238), mirroring Python
+/// `RECLAIM_MARKER_PREFIX`: `<control>/RECLAIM.<slot>.lock`. A
+/// reclaimer holds an exclusive flock on it from before its first
+/// unmount until the slot's bind record is dropped. The `.lock`
+/// suffix keeps it out of every reader's registry identity.
+pub(crate) const RECLAIM_MARKER_PREFIX: &str = "RECLAIM.";
+/// Reclaim marker suffix (#2238).
+pub(crate) const RECLAIM_MARKER_SUFFIX: &str = ".lock";
+/// A reclaimer holds the marker: the slot's bind is left alone.
+pub(crate) const RECLAIM_LIVE: &str = "live";
+/// Nobody holds the marker (its reclaimer exited): it is ignored.
+pub(crate) const RECLAIM_STALE: &str = "stale";
+/// Not an openable regular file: honoured as live.
+pub(crate) const RECLAIM_UNVERIFIABLE: &str = "unverifiable";
+/// How long a reclaimer waits for another reclaimer of one slot.
+pub(crate) const RECLAIM_MARKER_TIMEOUT: Duration = Duration::from_secs(120);
+/// Re-opens when the marker path stopped naming the locked inode.
+pub(crate) const RECLAIM_MARKER_OPEN_ATTEMPTS: usize = 5;
+
+/// The reclaim marker of `slot` in `control` (#2238).
+pub(crate) fn reclaim_marker_path(control: &Path, slot: &str) -> PathBuf {
+    control.join(format!(
+        "{RECLAIM_MARKER_PREFIX}{slot}{RECLAIM_MARKER_SUFFIX}"
+    ))
+}
+
+/// Whether a reclaimer holds `slot`'s reclaim marker, mirroring
+/// Python `reclaim_marker_state`: None when absent; otherwise the
+/// marker is opened read-only (never created) and tested with a
+/// non-blocking shared flock: blocked is live, acquired is stale
+/// (released at once), anything else is unverifiable.
+pub(crate) fn reclaim_marker_state(control: &Path, slot: &str) -> Option<&'static str> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let path = reclaim_marker_path(control, slot);
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => return Some(RECLAIM_UNVERIFIABLE),
+    };
+    match file.metadata() {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        _ => return Some(RECLAIM_UNVERIFIABLE),
+    }
+    match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockShared) {
+        Ok(()) => {
+            let _ = rustix::fs::flock(&file, rustix::fs::FlockOperation::Unlock);
+            Some(RECLAIM_STALE)
+        }
+        Err(error) if error == rustix::io::Errno::WOULDBLOCK => Some(RECLAIM_LIVE),
+        Err(_) => Some(RECLAIM_UNVERIFIABLE),
+    }
+}
+
+/// Whether bind establishment must leave `slot` alone (#2238).
+pub(crate) fn reclaim_marker_honoured(control: &Path, slot: &str) -> bool {
+    matches!(
+        reclaim_marker_state(control, slot),
+        Some(RECLAIM_LIVE) | Some(RECLAIM_UNVERIFIABLE)
+    )
+}
+
+/// Every reclaim marker in `control` and its state, by slot,
+/// mirroring Python `reclaim_markers` (status).
+pub(crate) fn reclaim_markers(control: &Path) -> BTreeMap<String, &'static str> {
+    let mut markers = BTreeMap::new();
+    let Ok(read) = std::fs::read_dir(control) else {
+        return markers;
+    };
+    for entry in read.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.len() <= RECLAIM_MARKER_PREFIX.len() + RECLAIM_MARKER_SUFFIX.len()
+            || !name.starts_with(RECLAIM_MARKER_PREFIX)
+            || !name.ends_with(RECLAIM_MARKER_SUFFIX)
+        {
+            continue;
+        }
+        let slot = &name[RECLAIM_MARKER_PREFIX.len()..name.len() - RECLAIM_MARKER_SUFFIX.len()];
+        if let Some(state) = reclaim_marker_state(control, slot) {
+            markers.insert(slot.to_string(), state);
+        }
+    }
+    markers
+}
+
+/// A reclaim marker this process holds, mirroring Python
+/// `ReclaimMarker`: dropping it removes the file (only the inode it
+/// locked) and then releases the flock by closing the descriptor.
+pub(crate) struct ReclaimMarkerHold {
+    file: std::fs::File,
+    path: PathBuf,
+    unlinked: std::cell::Cell<bool>,
+}
+
+impl ReclaimMarkerHold {
+    /// Remove the marker file, still holding its flock (idempotent).
+    pub(crate) fn unlink(&self) {
+        use std::os::unix::fs::MetadataExt as _;
+        if self.unlinked.replace(true) {
+            return;
+        }
+        let (Ok(current), Ok(held)) = (std::fs::symlink_metadata(&self.path), self.file.metadata())
+        else {
+            return;
+        };
+        if (current.dev(), current.ino()) == (held.dev(), held.ino()) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+impl Drop for ReclaimMarkerHold {
+    fn drop(&mut self) {
+        self.unlink();
+    }
+}
+
+/// Take `slot`'s reclaim marker for one reclaim, mirroring Python
+/// `hold_reclaim_marker`: open (creating), exclusive flock bounded by
+/// `RECLAIM_MARKER_TIMEOUT`, confirm the path still names the locked
+/// inode, then write the diagnostic payload.
+pub(crate) fn hold_reclaim_marker(
+    control: &Path,
+    slot: &str,
+    writer: &str,
+) -> Result<ReclaimMarkerHold, String> {
+    hold_reclaim_marker_until(
+        control,
+        slot,
+        writer,
+        std::time::Instant::now() + RECLAIM_MARKER_TIMEOUT,
+    )
+}
+
+/// `hold_reclaim_marker` with an explicit deadline (tests).
+pub(crate) fn hold_reclaim_marker_until(
+    control: &Path,
+    slot: &str,
+    writer: &str,
+    deadline: std::time::Instant,
+) -> Result<ReclaimMarkerHold, String> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    let path = reclaim_marker_path(control, slot);
+    let _ = std::fs::create_dir_all(control);
+    for _attempt in 0..RECLAIM_MARKER_OPEN_ATTEMPTS {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o644)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|error| format!("cannot open reclaim marker {}: {error}", path.display()))?;
+        if crate::ensure_states::flock_wait(&file, deadline).is_err() {
+            return Err(format!(
+                "reclaim marker is busy: {} was not free within {}s; another reclaimer of \
+                 this slot holds it; retry after it exits",
+                path.display(),
+                RECLAIM_MARKER_TIMEOUT.as_secs()
+            ));
+        }
+        let locked = file.metadata().map_err(|error| {
+            format!("cannot inspect reclaim marker {}: {error}", path.display())
+        })?;
+        let same = std::fs::symlink_metadata(&path)
+            .map(|current| (current.dev(), current.ino()) == (locked.dev(), locked.ino()))
+            .unwrap_or(false);
+        if !same {
+            // Another reclaimer unlinked the file we opened before we
+            // locked it: our lock guards nothing. Open the path again.
+            continue;
+        }
+        let started_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|age| i64::try_from(age.as_secs()).ok())
+            .and_then(|seconds| chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, 0))
+            .map(|when| when.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+            .unwrap_or_default();
+        let payload = json!({
+            "kind": "wrkslots-bind-reclaim",
+            "version": 1,
+            "slot": slot,
+            "pid": std::process::id(),
+            "started_at": started_at,
+            "writer": writer,
+        });
+        let hold = ReclaimMarkerHold {
+            file,
+            path: path.clone(),
+            unlinked: std::cell::Cell::new(false),
+        };
+        hold.file
+            .set_len(0)
+            .and_then(|()| (&hold.file).write_all(format!("{payload}\n").as_bytes()))
+            .map_err(|error| format!("cannot write reclaim marker {}: {error}", path.display()))?;
+        return Ok(hold);
+    }
+    Err(format!(
+        "reclaim marker {} was replaced on each of {RECLAIM_MARKER_OPEN_ATTEMPTS} attempts to \
+         take it; retry",
+        path.display()
+    ))
+}
+
 fn unit_for_pid(proc_root: &Path, pid: &str) -> Option<String> {
     let text = std::fs::read_to_string(proc_root.join(pid).join("cgroup")).ok()?;
     for line in text.lines() {
@@ -1308,6 +1518,19 @@ pub(crate) fn render_wt_status(report: &Value, format: &str) -> String {
             ));
         }
     }
+    if let Some(markers) = report.get("reclaim_markers").and_then(Value::as_object) {
+        for (slot, state) in markers {
+            let state = state.as_str().unwrap_or_default();
+            let meaning = match state {
+                RECLAIM_LIVE => "a reclaimer holds it; its bind is not re-established",
+                RECLAIM_STALE => "its reclaimer exited; ignored, reused by the next reclaim",
+                _ => "not a lockable regular file; honoured as live",
+            };
+            out.push_str(&format!(
+                "reclaim marker: slot {slot} {state} ({meaning})\n"
+            ));
+        }
+    }
     if report["image_exists"].as_bool().unwrap_or(false) {
         out.push_str(&format!(
             "apparent={} allocated={}\n",
@@ -1434,6 +1657,17 @@ pub(crate) fn status_report_with_quota(
             .collect()
     };
     report.insert("doubled_binds".into(), Value::Array(doubled));
+    // Python `reclaim_markers` (#2238), read where the binds are.
+    let markers: serde_json::Map<String, Value> = if settings.direct() {
+        serde_json::Map::new()
+    } else {
+        let binds_root = ctx.worktrees.parent().unwrap_or(ctx.worktrees);
+        reclaim_markers(binds_root)
+            .into_iter()
+            .map(|(slot, state)| (slot, json!(state)))
+            .collect()
+    };
+    report.insert("reclaim_markers".into(), Value::Object(markers));
     let validate_dir = validate_external_dir(ctx.worktrees);
     report.insert("validate_dir".into(), json!(validate_dir.to_string_lossy()));
     let validate_mounted = ctx.entries.iter().any(|entry| {
@@ -1539,6 +1773,7 @@ fn render_report_json(report: &Value) -> String {
         "configured_quota_mode",
         "binds",
         "doubled_binds",
+        "reclaim_markers",
         "validate_dir",
         "validate_bind",
         "apparent_bytes",
@@ -1698,11 +1933,26 @@ pub(crate) fn wt_mount(
             }
         }
     }
-    // ensure_binds: fenced canonical slots and mounted targets
-    // are left alone; a record whose subvolume is gone is skipped
-    // without error or re-creation. Each bind mounts first, then
-    // records under the records flock.
+    // ensure_binds: fenced canonical slots, slots under reclaim
+    // (#2238) and mounted targets are left alone; a record whose
+    // subvolume is gone is skipped without error or re-creation.
+    // Each bind mounts first, then records. The whole pass holds the
+    // records flock and iterates the records loaded under it (#2238,
+    // a consumer's binding requirement): a reclaimer that popped a
+    // record and unlinked its marker before this lock is never
+    // re-bound from a stale list, and one that has not popped yet
+    // still holds its marker, probed per slot right before the bind.
+    if settings.direct() {
+        return mounted_outcome(&settings, ctx.root, &mount_dir);
+    }
+    let _ = std::fs::create_dir_all(ctx.control);
+    let lock_path = ctx.control.join(RECORD_LOCK_NAME);
+    let _records_lock = match crate::ensure_states::acquire_lock(&lock_path, &lock_path) {
+        Ok(lock) => lock,
+        Err(message) => return wt_refusal(&message),
+    };
     if let Ok(records) = load_bind_records(ctx.control) {
+        let mut current = records.clone();
         let mounted_points: Vec<PathBuf> = ctx
             .entries
             .iter()
@@ -1742,7 +1992,8 @@ pub(crate) fn wt_mount(
                 // private at this re-establish, peer views included.
                 let shared = crate::image_mounts::top_entry(&target, ctx.entries)
                     .is_some_and(|top| top.propagation.contains("shared:"));
-                if shared {
+                // #2238: a slot under reclaim is left alone.
+                if shared && !reclaim_marker_honoured(ctx.control, &slot) {
                     for spec in make_private_plan(&target, ctx.entries) {
                         if let Err(outcome) = run_one(runner, &spec) {
                             return outcome;
@@ -1753,6 +2004,14 @@ pub(crate) fn wt_mount(
             }
             let source = mount_dir.join(&record.subvolume);
             if !source.is_dir() {
+                continue;
+            }
+            // #2238: a reclaimer holds the slot: it unmounted the bind
+            // and drops the record next. The mount table was read
+            // before this test, and every reclaimer takes the marker
+            // before its first unmount, so a target unmounted by a
+            // live reclaimer always finds its marker held.
+            if reclaim_marker_honoured(ctx.control, &slot) {
                 continue;
             }
             let _ = std::fs::create_dir_all(&target);
@@ -1779,19 +2038,27 @@ pub(crate) fn wt_mount(
                 mount_id: mount_id(&target),
                 target: Some(target.to_string_lossy().into_owned()),
             };
-            if let Err(message) = update_bind_records(ctx.control, move |mut current| {
-                current.insert(slot.clone(), recorded);
-                current
-            }) {
+            // Still under the records flock taken above (not
+            // reentrant, so the locked writer is used directly).
+            current.insert(slot.clone(), recorded);
+            if let Err(message) = write_bind_records_locked(ctx.control, &current) {
                 return wt_refusal(&message);
             }
         }
     }
+    mounted_outcome(&settings, ctx.root, &mount_dir)
+}
+
+fn mounted_outcome(
+    settings: &WorktreesImageSettings,
+    root: &Path,
+    mount_dir: &Path,
+) -> HandlerOutcome {
     HandlerOutcome {
         exit: 0,
         stdout: format!(
             "mounted {} at {}{}\n",
-            settings.image_file(ctx.root).display(),
+            settings.image_file(root).display(),
             mount_dir.display(),
             if settings.direct() {
                 ""
@@ -1952,9 +2219,11 @@ fn copy_tree_skip_special(source: &Path, destination: &Path) -> Result<(), Strin
 /// injected mount classification of the image mount directory;
 /// `mount_id` records a bind's live id. The registry/lock side
 /// stays with the dispatch glue, as in the other handlers.
-/// Unbind one slot, mirroring Python `unbind_slot`: unmount
-/// first, then drop the record under the records flock, so an
-/// interrupted remove retries from the bound state.
+/// Unbind one slot, mirroring Python `unbind_slot`: hold the slot's
+/// reclaim marker (#2238), unmount, then drop the record and the
+/// marker under the records flock, so no re-establish binds the slot
+/// in between and an interrupted remove retries from the bound state.
+/// A failed unmount removes the marker and keeps the record.
 pub(crate) fn unbind_slot(
     ctx: &WtCtx<'_>,
     slot: &str,
@@ -1962,6 +2231,10 @@ pub(crate) fn unbind_slot(
     runner: &dyn crate::image_ops::PrivilegedRunner,
     proc_root: &Path,
 ) -> HandlerOutcome {
+    let reclaim = match hold_reclaim_marker(ctx.control, slot, "wrkslots unbind") {
+        Ok(reclaim) => reclaim,
+        Err(message) => return wt_refusal(&message),
+    };
     // #1733: privatise every view after the fence, then unmount with
     // a bounded busy retry; a still-busy unmount names its holders.
     let views = peer_views(slot_path, ctx.entries);
@@ -2060,8 +2333,11 @@ pub(crate) fn unbind_slot(
         ));
     }
     let slot_name = slot.to_string();
-    if let Err(message) = update_bind_records(ctx.control, move |mut records| {
+    if let Err(message) = update_bind_records(ctx.control, |mut records| {
         records.remove(&slot_name);
+        // Still under the records flock: the record and its marker
+        // go together.
+        reclaim.unlink();
         records
     }) {
         return wt_refusal(&message);
@@ -2913,6 +3189,351 @@ mod tests {
         let outcome = wt_status(&ctx, None, "human");
         assert_eq!(outcome.exit, 3);
         assert!(outcome.stderr.contains("worktrees_image does not apply on this host: configuration.worktrees_image applies on machines [image-host] only"), "{}", outcome.stderr);
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    // --- #2238: reclaim markers. Fake runners only; nothing mounts. A
+    // flock held on one open file description blocks a test made
+    // through another, even in one process.
+
+    #[test]
+    fn reclaim_marker_states_and_listing() {
+        let control = temp_root("reclaim-states");
+        assert_eq!(reclaim_marker_state(&control, "s1"), None);
+        std::fs::write(reclaim_marker_path(&control, "s2"), "{}\n").expect("stale");
+        assert_eq!(reclaim_marker_state(&control, "s2"), Some(RECLAIM_STALE));
+        std::fs::create_dir(reclaim_marker_path(&control, "s3")).expect("dir");
+        assert_eq!(
+            reclaim_marker_state(&control, "s3"),
+            Some(RECLAIM_UNVERIFIABLE)
+        );
+        std::fs::write(control.join("RECLAIM.lock"), "").expect("names no slot");
+        let hold = hold_reclaim_marker(&control, "s1", "test").expect("hold");
+        assert_eq!(reclaim_marker_state(&control, "s1"), Some(RECLAIM_LIVE));
+        assert!(reclaim_marker_honoured(&control, "s1"));
+        assert!(!reclaim_marker_honoured(&control, "s2"));
+        assert!(reclaim_marker_honoured(&control, "s3"));
+        let payload: Value = serde_json::from_str(
+            &std::fs::read_to_string(reclaim_marker_path(&control, "s1")).expect("payload"),
+        )
+        .expect("json payload");
+        assert_eq!(payload["kind"], "wrkslots-bind-reclaim");
+        assert_eq!(payload["version"], 1);
+        assert_eq!(payload["slot"], "s1");
+        assert_eq!(payload["writer"], "test");
+        let listed: Vec<(String, &str)> = reclaim_markers(&control).into_iter().collect();
+        assert_eq!(
+            listed,
+            vec![
+                ("s1".to_string(), RECLAIM_LIVE),
+                ("s2".to_string(), RECLAIM_STALE),
+                ("s3".to_string(), RECLAIM_UNVERIFIABLE),
+            ]
+        );
+        drop(hold);
+        assert!(!reclaim_marker_path(&control, "s1").exists());
+        std::fs::remove_dir_all(&control).expect("cleanup");
+    }
+
+    #[test]
+    fn a_second_reclaimer_of_one_slot_refuses_after_its_deadline() {
+        let control = temp_root("reclaim-busy");
+        let hold = hold_reclaim_marker(&control, "s1", "first").expect("first");
+        let second = hold_reclaim_marker_until(
+            &control,
+            "s1",
+            "second",
+            std::time::Instant::now() + Duration::from_millis(200),
+        );
+        let Err(message) = second else {
+            panic!("a second reclaimer must not take a held marker");
+        };
+        assert!(message.contains("reclaim marker is busy"), "{message}");
+        assert_eq!(reclaim_marker_state(&control, "s1"), Some(RECLAIM_LIVE));
+        drop(hold);
+        let next = hold_reclaim_marker(&control, "s1", "next").expect("takes over");
+        drop(next);
+        std::fs::remove_dir_all(&control).expect("cleanup");
+    }
+
+    #[test]
+    fn wt_mount_leaves_a_slot_under_reclaim_alone() {
+        use crate::image_ops::RunOutcome;
+        use std::cell::RefCell;
+        struct Fake {
+            calls: RefCell<Vec<Vec<String>>>,
+        }
+        impl crate::image_ops::PrivilegedRunner for Fake {
+            fn run(&self, spec: &CommandSpec) -> Result<RunOutcome, String> {
+                self.calls.borrow_mut().push(spec.argv.clone());
+                Ok(RunOutcome {
+                    returncode: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let root = temp_root("reclaim-mount");
+        let control = root.join("worktrees");
+        let worktrees = control.join("slots");
+        let mount_dir = control.join(IMAGE_MOUNT_NAME);
+        let mut records = BTreeMap::new();
+        for slot in ["s1", "s2"] {
+            std::fs::create_dir_all(mount_dir.join(slot)).expect("subvolume");
+            records.insert(
+                slot.to_string(),
+                BindRecord {
+                    subvolume: slot.to_string(),
+                    mount_id: Some(100),
+                    target: Some(worktrees.join(slot).to_string_lossy().into_owned()),
+                },
+            );
+        }
+        save_bind_records(&control, &records).expect("seed records");
+        // Namespace B's table: the image is mounted, every bind target
+        // is unmounted (namespace A's reclaimer unmounted it there).
+        let entries = vec![MountEntry {
+            mount_point: mount_dir.clone(),
+            fstype: "btrfs".to_string(),
+            source: "/dev/loop9".to_string(),
+            device: "0:999".to_string(),
+            root: "/".to_string(),
+            propagation: String::new(),
+            options: "rw".to_string(),
+        }];
+        let ctx = WtCtx {
+            root: &root,
+            control: &control,
+            worktrees: &worktrees,
+            entries: &entries,
+            skipped: None,
+        };
+        let settings =
+            settings_from_obj(&json!({"path": "wt.img", "size_bytes": 2_147_483_648_i64}))
+                .expect("settings");
+        let bound = |fake: &Fake| -> Vec<String> {
+            fake.calls
+                .borrow()
+                .iter()
+                .filter(|argv| argv.iter().any(|arg| arg == "--bind"))
+                .map(|argv| argv.last().cloned().unwrap_or_default())
+                .collect()
+        };
+
+        let hold = hold_reclaim_marker(&control, "s1", "test reclaimer").expect("hold");
+        let fake = Fake {
+            calls: RefCell::new(Vec::new()),
+        };
+        let mounted = wt_mount(&ctx, Some(settings.clone()), &|_| Some(777), &fake);
+        assert_eq!(mounted.exit, 0, "{}", mounted.stderr);
+        assert_eq!(
+            bound(&fake),
+            vec![worktrees.join("s2").to_string_lossy().into_owned()]
+        );
+        let after = load_bind_records(&control).expect("records");
+        assert_eq!(
+            after["s1"], records["s1"],
+            "the slot under reclaim keeps its record"
+        );
+        assert_eq!(after["s2"].mount_id, Some(777));
+
+        // Released (the reclaim was abandoned): binds behave as before.
+        drop(hold);
+        let fake = Fake {
+            calls: RefCell::new(Vec::new()),
+        };
+        let mounted = wt_mount(&ctx, Some(settings), &|_| Some(778), &fake);
+        assert_eq!(mounted.exit, 0, "{}", mounted.stderr);
+        assert!(bound(&fake).contains(&worktrees.join("s1").to_string_lossy().into_owned()));
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn unbind_holds_the_reclaim_marker_until_the_record_is_dropped() {
+        use crate::image_ops::RunOutcome;
+        use std::cell::RefCell;
+        struct Fake<'a> {
+            control: &'a Path,
+            returncode: i32,
+            seen: RefCell<Vec<Option<&'static str>>>,
+        }
+        impl crate::image_ops::PrivilegedRunner for Fake<'_> {
+            fn run(&self, _spec: &CommandSpec) -> Result<RunOutcome, String> {
+                // Every privatise and unmount runs under the marker.
+                self.seen
+                    .borrow_mut()
+                    .push(reclaim_marker_state(self.control, "slot-a"));
+                Ok(RunOutcome {
+                    returncode: self.returncode,
+                    stdout: String::new(),
+                    stderr: "unmount failed".to_string(),
+                })
+            }
+        }
+        let root = temp_root("reclaim-unbind");
+        let control = root.join("control");
+        let worktrees = root.join("worktrees");
+        let slot_path = worktrees.join("slot-a");
+        std::fs::create_dir_all(&control).expect("control");
+        std::fs::create_dir_all(&slot_path).expect("slot");
+        let mut records = BTreeMap::new();
+        records.insert(
+            "slot-a".to_string(),
+            BindRecord {
+                subvolume: "slot-a".to_string(),
+                mount_id: Some(9),
+                target: Some(slot_path.to_string_lossy().into_owned()),
+            },
+        );
+        save_bind_records(&control, &records).expect("seed record");
+        let entries = vec![MountEntry {
+            mount_point: slot_path.clone(),
+            fstype: "btrfs".to_string(),
+            source: "/dev/loop9".to_string(),
+            device: "0:999".to_string(),
+            root: "/slot-a".to_string(),
+            propagation: String::new(),
+            options: "rw".to_string(),
+        }];
+        let ctx = WtCtx {
+            root: &root,
+            control: &control,
+            worktrees: &worktrees,
+            entries: &entries,
+            skipped: None,
+        };
+        let proc_root = root.join("proc");
+        std::fs::create_dir_all(&proc_root).expect("proc root");
+
+        let failing = Fake {
+            control: &control,
+            returncode: 1,
+            seen: RefCell::new(Vec::new()),
+        };
+        let failed = unbind_slot(&ctx, "slot-a", &slot_path, &failing, &proc_root);
+        assert_eq!(failed.exit, 3);
+        assert_eq!(failing.seen.borrow().first(), Some(&Some(RECLAIM_LIVE)));
+        assert!(!reclaim_marker_path(&control, "slot-a").exists());
+        assert!(load_bind_records(&control)
+            .expect("records")
+            .contains_key("slot-a"));
+
+        let fake = Fake {
+            control: &control,
+            returncode: 0,
+            seen: RefCell::new(Vec::new()),
+        };
+        let done = unbind_slot(&ctx, "slot-a", &slot_path, &fake, &proc_root);
+        assert_eq!(done.exit, 0, "{}", done.stderr);
+        assert!(!fake.seen.borrow().is_empty());
+        assert!(fake
+            .seen
+            .borrow()
+            .iter()
+            .all(|state| *state == Some(RECLAIM_LIVE)));
+        assert!(!reclaim_marker_path(&control, "slot-a").exists());
+        assert!(!load_bind_records(&control)
+            .expect("records")
+            .contains_key("slot-a"));
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn wt_mount_binds_from_records_loaded_under_the_records_lock() {
+        // #2238 R1: the re-establish pass holds the records flock and
+        // iterates the records loaded under it. A reclaimer holding
+        // that lock pops a record and unlinks its marker, then
+        // releases it: the waiting mount binds only what is still
+        // recorded, whenever it got to the lock.
+        use crate::image_ops::RunOutcome;
+        use std::sync::Mutex;
+        struct Fake {
+            calls: Mutex<Vec<Vec<String>>>,
+        }
+        impl crate::image_ops::PrivilegedRunner for Fake {
+            fn run(&self, spec: &CommandSpec) -> Result<RunOutcome, String> {
+                self.calls.lock().expect("calls").push(spec.argv.clone());
+                Ok(RunOutcome {
+                    returncode: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let root = temp_root("reclaim-locked-pass");
+        let control = root.join("worktrees");
+        let worktrees = control.join("slots");
+        let mount_dir = control.join(IMAGE_MOUNT_NAME);
+        let mut records = BTreeMap::new();
+        for slot in ["s1", "s2"] {
+            std::fs::create_dir_all(mount_dir.join(slot)).expect("subvolume");
+            records.insert(
+                slot.to_string(),
+                BindRecord {
+                    subvolume: slot.to_string(),
+                    mount_id: Some(100),
+                    target: Some(worktrees.join(slot).to_string_lossy().into_owned()),
+                },
+            );
+        }
+        save_bind_records(&control, &records).expect("seed records");
+        let entries = vec![MountEntry {
+            mount_point: mount_dir.clone(),
+            fstype: "btrfs".to_string(),
+            source: "/dev/loop9".to_string(),
+            device: "0:999".to_string(),
+            root: "/".to_string(),
+            propagation: String::new(),
+            options: "rw".to_string(),
+        }];
+        let ctx = WtCtx {
+            root: &root,
+            control: &control,
+            worktrees: &worktrees,
+            entries: &entries,
+            skipped: None,
+        };
+        let settings =
+            settings_from_obj(&json!({"path": "wt.img", "size_bytes": 2_147_483_648_i64}))
+                .expect("settings");
+        let fake = Fake {
+            calls: Mutex::new(Vec::new()),
+        };
+        let reclaim = hold_reclaim_marker(&control, "s1", "test reaper").expect("marker");
+        let lock_path = control.join(RECORD_LOCK_NAME);
+        let records_lock =
+            crate::ensure_states::acquire_lock(&lock_path, &lock_path).expect("records lock");
+        let outcome = std::thread::scope(|scope| {
+            let mounting =
+                scope.spawn(|| wt_mount(&ctx, Some(settings.clone()), &|_| Some(777), &fake));
+            // The reaper finishes under the records lock: pop, unlink.
+            let mut remaining = load_bind_records(&control).expect("records");
+            remaining.remove("s1");
+            write_bind_records_locked(&control, &remaining).expect("pop");
+            reclaim.unlink();
+            drop(records_lock);
+            mounting.join().expect("mount thread")
+        });
+        drop(reclaim);
+        assert_eq!(outcome.exit, 0, "{}", outcome.stderr);
+        let bound: Vec<String> = fake
+            .calls
+            .lock()
+            .expect("calls")
+            .iter()
+            .filter(|argv| argv.iter().any(|arg| arg == "--bind"))
+            .map(|argv| argv.last().cloned().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            bound,
+            vec![worktrees.join("s2").to_string_lossy().into_owned()]
+        );
+        let after = load_bind_records(&control).expect("records");
+        assert_eq!(
+            after.keys().cloned().collect::<Vec<_>>(),
+            vec!["s2".to_string()]
+        );
+        assert!(!reclaim_marker_path(&control, "s1").exists());
         std::fs::remove_dir_all(&root).expect("cleanup");
     }
 }

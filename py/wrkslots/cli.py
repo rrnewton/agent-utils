@@ -6046,13 +6046,13 @@ def _relocate_unrecorded_image_mount(
     if not (mount_dir / subvolume).is_dir():
         return False
     try:
-        records = worktreesimage.load_bind_records(config.control)
-        if subvolume not in records:
-            updated = dict(records)
-            updated[subvolume] = worktreesimage.BindRecord(
-                subvolume=subvolume, target=str(source)
-            )
-            worktreesimage.save_bind_records(config.control, updated)
+        # Only this slot's record, read and written under the records
+        # lock (#2238): no other slot's concurrent change is lost.
+        worktreesimage.record_bind_if_absent(
+            config.control,
+            subvolume,
+            worktreesimage.BindRecord(subvolume=subvolume, target=str(source)),
+        )
         worktreesimage.relocate_bind(
             config.control, mount_dir, subvolume, source, destination
         )
@@ -6150,22 +6150,29 @@ def _remove_slot_directory(config: Config, path: Path) -> None:
             mount_dir = worktreesimage.image_mount_dir(config.control)
             try:
                 records = worktreesimage.load_bind_records(config.control)
-                # Unmount first WITHOUT dropping the record, and look
-                # underneath before anything is deleted (#1149): a
-                # pre-reclaim migrate left the host original beneath
-                # the bind, and deleting the subvolume first would
-                # destroy the real slot and expose the stale copy.
-                worktreesimage.umount_point(path)
-                if next(path.iterdir(), None) is not None:
-                    worktreesimage.bind_slot(config.control, mount_dir, bind_slot, path)
-                    raise OSError(
-                        errno.ENOTEMPTY,
-                        f"content sits beneath the worktrees-image bind at {path} "
-                        "(a host original an older migrate kept); the bind was "
-                        "re-established and nothing was deleted - reclaim the "
-                        "original or switch layout before removing the slot",
-                    )
-                worktreesimage.forget_bind(config.control, bind_slot)
+                # The slot's reclaim marker is held from before the
+                # unmount until the record is dropped (#2238), so no
+                # config load anywhere re-binds the slot in between;
+                # an abandoned removal (content beneath) removes it.
+                with worktreesimage.hold_reclaim_marker(
+                    config.control, bind_slot, writer="wrkslots remove"
+                ) as reclaim:
+                    # Unmount first WITHOUT dropping the record, and look
+                    # underneath before anything is deleted (#1149): a
+                    # pre-reclaim migrate left the host original beneath
+                    # the bind, and deleting the subvolume first would
+                    # destroy the real slot and expose the stale copy.
+                    worktreesimage.umount_point(path)
+                    if next(path.iterdir(), None) is not None:
+                        worktreesimage.bind_slot(config.control, mount_dir, bind_slot, path)
+                        raise OSError(
+                            errno.ENOTEMPTY,
+                            f"content sits beneath the worktrees-image bind at {path} "
+                            "(a host original an older migrate kept); the bind was "
+                            "re-established and nothing was deleted - reclaim the "
+                            "original or switch layout before removing the slot",
+                        )
+                    worktreesimage.forget_bind(config.control, bind_slot, reclaim=reclaim)
                 worktreesimage.delete_slot_subvolume(
                     mount_dir / records[bind_slot].subvolume
                 )

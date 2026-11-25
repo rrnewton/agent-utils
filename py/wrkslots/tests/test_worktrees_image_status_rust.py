@@ -16,12 +16,12 @@ from pathlib import Path
 
 import pytest
 from wrkslots import cli as wrkslots_cli
-from wrkslots import imagecmd, slotimage
+from wrkslots import imagecmd, slotimage, worktreesimage
 
 from wrkslots.tests.rust_binary import rust_wrkslotsd
 
 
-def _root(tmp_path: Path, section: bool = True) -> Path:
+def _root(tmp_path: Path, section: bool = True, worktrees_dir: str = "worktrees") -> Path:
     root = tmp_path / "project"
     control = root / "worktrees"
     control.mkdir(parents=True)
@@ -34,7 +34,7 @@ def _root(tmp_path: Path, section: bool = True) -> Path:
     (root / ".wrkslots.yml").write_text(
         "schema: 2\n"
         "machine: node-a\n"
-        "worktrees_dir: worktrees\n"
+        f"worktrees_dir: {worktrees_dir}\n"
         "default_remote: origin\n"
         "default_landed_ref: refs/remotes/origin/main\n"
         "heartbeat_ttl_seconds: 60\n"
@@ -88,6 +88,27 @@ def test_wt_status_matches_python_stdout(
         result = _rust(root, fmt)
         assert result.returncode == rc
         assert result.stdout == out
+
+
+def test_wt_status_reclaim_markers_match_python(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # #2238: both editions list each reclaim marker beside the binds,
+    # live while a reclaimer holds its flock, stale once nobody does.
+    root = _root(tmp_path, worktrees_dir="worktrees/slots")
+    control = root / "worktrees"
+    (control / "slots").mkdir()
+    worktreesimage.reclaim_marker_path(control, "s2").write_text("{}\n")
+    with worktreesimage.hold_reclaim_marker(control, "s1", writer="test reclaimer"):
+        for fmt in ("human", "json"):
+            rc, out, _err = _python(root, capsys, fmt)
+            result = _rust(root, fmt)
+            assert result.returncode == rc
+            assert result.stdout == out
+        assert '"reclaim_markers": {\n    "s1": "live",\n    "s2": "stale"\n  }' in out
+        rc, out, _err = _python(root, capsys, "human")
+    assert "reclaim marker: slot s1 live (a reclaimer holds it" in out
+    assert "reclaim marker: slot s2 stale (its reclaimer exited" in out
 
 
 def test_wt_status_unconfigured_refusal_matches_python(

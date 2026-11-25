@@ -133,6 +133,7 @@ fn render_wt_report(report: &Value) -> String {
         "configured_quota_mode",
         "binds",
         "doubled_binds",
+        "reclaim_markers",
         "validate_dir",
         "validate_bind",
         "apparent_bytes",
