@@ -26,6 +26,7 @@ import "./page/links.mjs";
 import "./page/scrolling.mjs";
 import "./page/keyboard.mjs";
 import "./page/replies.mjs";
+import "./page/glossary.mjs";
 import "./page/threads.mjs";
 import "./page/columns.mjs";
 import "./page/done.mjs";

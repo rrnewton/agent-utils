@@ -277,6 +277,13 @@ export interface PageNavigationDependencies<Column, ThreadLike, Pane> {
    */
   documentOutlineOpen?(): boolean;
   closeDocumentOutline?(): boolean;
+  /**
+   * Whether the full-screen glossary is up, and its close (`#2233 vibe-talk-glossary-popup`): its
+   * `menu:glossary` level, on top of everything, so one Back closes the glossary alone and leaves
+   * what is under it (an open Discuss included) as it was. Unwired, there is no glossary.
+   */
+  glossaryOpen?(): boolean;
+  closeGlossary?(): boolean;
   /** Close the open document one step: the previous one, or its list. */
   closeDocument(): void;
   threadListBack(): void;
@@ -576,6 +583,8 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
       : typeof outlineToggle.getAttribute === "function" && outlineToggle.getAttribute("aria-expanded") === "true") {
       open.push("menu:outline");
     }
+    // `#2233 vibe-talk-glossary-popup`. The full-screen glossary covers everything, so it is the top.
+    if (deps.glossaryOpen?.()) open.push("menu:glossary");
     return open;
   }
 
@@ -609,6 +618,7 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
       return true;
     }
     if (name === "menu:dismissed" && !el("dismissed-send-popout").hidden) return deps.closeDismissedPopout();
+    if (name === "menu:glossary") return deps.glossaryOpen?.() ? Boolean(deps.closeGlossary?.()) : false;
     if (name === "menu:outline") {
       if (deps.closeDocumentOutline) return deps.closeDocumentOutline();
       const toggle = el("doc-outline-open");

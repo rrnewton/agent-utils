@@ -2620,7 +2620,11 @@ test("THE SCROLLER IS SIZED BY ITS CELL ALONE, so a change beside it does not la
   // panel's top bar is sticky inside the panel's own scroll box, outside
   // #scroll-area entirely, so it cannot hang off the list either.
   assert.match(cssBlock(".discuss-head"), /position:\s*sticky/, "the Discuss top bar is not fixed in its pane");
-  const withoutBars = withoutAskBar.replace(/\.discuss-head\s*\{[^}]*\}/, " ");
+  // `#2233 vibe-talk-glossary-popup`: the full-screen glossary's head shares that very rule, under its
+  // own class, for the same reason: it sticks inside #glossary-panel's own scroll box, outside
+  // #scroll-area. Exactly that shared rule, nothing broader.
+  assert.match(cssBlock(".glossary-panel-head"), /position:\s*sticky/, "the glossary's head is not fixed in its pane");
+  const withoutBars = withoutAskBar.replace(/\.discuss-head,\s*\.glossary-panel-head\s*\{[^}]*\}/, " ");
   // The Labels panel's exception (`#1853`): its filter box sticks inside
   // #labels-panel's own scroller, and the panel floats from #search-float
   // outside #scroll-area, so it hangs off the list no more than Discuss's do.

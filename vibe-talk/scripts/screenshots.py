@@ -5675,6 +5675,322 @@ def _act_glossary_not_found(driver: Driver) -> None:
     driver.settle(300)
 
 
+# --- `#2233 vibe-talk-glossary-popup`: the Glossary button and the full-screen glossary ------------
+#
+# Every state here is the real server: the glossary popup reads `GET /api/v1/glossary/terms` (the
+# synthetic reviewed glossary run.sh writes for these states, plus what the walk's WTF? presses
+# learn through the loopback model stub), and WTF? asks the real lookup route. The one exception is
+# 107, which HOLDS the real lookup request (never answers it) until its shot is taken, to photograph
+# the popover while it looks up; the request then goes on to the server unchanged.
+
+# The lookups 107 holds until its shot is taken; released by `_after_glossary_looking_up`.
+_HELD_LOOKUPS: list[object] = []
+_LOOKUP_ROUTE = "**/api/v1/channels/*/glossary/lookup"
+
+
+def _glossary_channel(driver: Driver) -> None:
+    """The channel's list on screen, Discuss put away (a kept panel would stand over the list)."""
+    driver.load(with_token=True)
+    driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    if bool(driver.js("window.__visible('discuss-panel')")):
+        driver.click("discuss-open")
+        driver.page.wait_for_function("() => !window.__visible('discuss-panel')", timeout=10_000)
+    _ensure_pane(driver, "pane-discord")
+    driver.page.wait_for_function(
+        "() => document.querySelectorAll('#discord-log > li').length > 0 "
+        "&& !window.__visible('channel-loading')",
+        timeout=15_000,
+    )
+
+
+def _glossary_select(driver: Driver, term: str) -> None:
+    """A real drag over `term`, where it stands as text not yet linked, until the strip stands."""
+    find = (
+        "((term) => { const rows = [...document.querySelectorAll('#discord-log > li')]; "
+        "for (const row of rows) { "
+        "const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT); "
+        "for (let n = walker.nextNode(); n; n = walker.nextNode()) { "
+        "if (n.parentElement && n.parentElement.closest('.glossary-term, a, button, code')) continue; "
+        "const at = n.textContent.indexOf(term); "
+        "if (at < 0) continue; "
+        "const range = document.createRange(); "
+        "range.setStart(n, at); range.setEnd(n, at + term.length); "
+        "if (n.parentElement) n.parentElement.scrollIntoView({block: 'center'}); "
+        "const r = range.getBoundingClientRect(); "
+        "if (r.width > 4 && r.height > 4) return {x: r.left, y: r.top, width: r.width, height: r.height}; } } "
+        "return null; })(" + json.dumps(term) + ")"
+    )
+    for _attempt in range(3):
+        rect = driver.js(find)
+        assert isinstance(rect, dict), f"no selectable {term!r} text on screen"
+        middle = float(rect["y"]) + float(rect["height"]) / 2
+        driver.page.mouse.move(float(rect["x"]) + 1, middle)
+        driver.page.mouse.down()
+        driver.page.mouse.move(float(rect["x"]) + float(rect["width"]) - 1, middle, steps=8)
+        driver.page.mouse.up()
+        try:
+            driver.page.wait_for_function(
+                "() => window.__visible('selection-chip-wtf') && window.__visible('selection-chip')",
+                timeout=1_500,
+            )
+            return
+        except Exception:
+            continue
+    raise AssertionError("the WTF? chip never stood under the selection")
+
+
+def _glossary_press_wtf(driver: Driver, term: str, answered: bool = True) -> None:
+    """Select `term` and press WTF?; with `answered`, wait for the lookup's answer in the popover."""
+    _glossary_select(driver, term)
+    # The phone's own selection bar can stand over the button; the press is still the page's own.
+    driver.page.click("#selection-chip-wtf", force=True)
+    driver.page.wait_for_function("() => window.__visible('glossary-popover')", timeout=10_000)
+    if answered:
+        driver.page.wait_for_function(
+            "() => !document.getElementById('glossary-popover-body').textContent.includes('Looking this up')",
+            timeout=30_000,
+        )
+
+
+def _glossary_tap_term(driver: Driver, term: str = "jitter", at: float = 0.5) -> None:
+    """Tap a term the glossary already defines where the list links it, `at` of the way down the list."""
+    selector = f"#discord-log .glossary-term[data-glossary-term={json.dumps(term)}]"
+    if not bool(driver.js(f"document.querySelector({json.dumps(selector)}) !== null")):
+        # The page reads its terms on the first selection, and links them once it is let go.
+        _glossary_select(driver, "seeded")
+        driver.page.click("#selection-chip-dismiss", force=True)
+        driver.page.wait_for_function(
+            f"() => document.querySelector({json.dumps(selector)}) !== null", timeout=15_000
+        )
+    driver.js(
+        "((selector, at) => { const term = document.querySelector(selector); "
+        "const area = document.getElementById('scroll-area'); const box = area.getBoundingClientRect(); "
+        "area.scrollTop += term.getBoundingClientRect().top - box.top - box.height * at; return true; })"
+        f"({json.dumps(selector)}, {at})"
+    )
+    driver.page.wait_for_function(
+        f"(() => {{ const r = document.querySelector({json.dumps(selector)}).getBoundingClientRect(); "
+        "return r.top >= 0 && r.bottom <= (window.visualViewport ? window.visualViewport.height : innerHeight); })",
+        timeout=5_000,
+    )
+    driver.page.locator(selector).first.click(force=True)
+    driver.page.wait_for_function(
+        "() => window.__visible('glossary-popover') "
+        f"&& document.getElementById('glossary-popover-term').textContent === {json.dumps(term)}",
+        timeout=10_000,
+    )
+
+
+def _glossary_open(driver: Driver) -> None:
+    """Press the popover's Glossary button and wait for the glossary's answer."""
+    driver.page.click("#glossary-popover-open", force=True)
+    driver.page.wait_for_function(
+        "() => window.__visible('glossary-panel') && !window.__visible('glossary-popover') "
+        "&& !/Loading/.test(document.getElementById('glossary-panel-state').textContent || '')",
+        timeout=15_000,
+    )
+
+
+def _act_glossary_looking_up(driver: Driver) -> None:
+    """`#2233`: WTF? pressed, the lookup still out: the popover says so, with Glossary beside the X."""
+    _glossary_channel(driver)
+    _HELD_LOOKUPS.clear()
+    driver.page.route(_LOOKUP_ROUTE, lambda route: _HELD_LOOKUPS.append(route))
+    _glossary_press_wtf(driver, "release checklist", answered=False)
+    driver.page.wait_for_function(
+        "() => document.getElementById('glossary-popover-body').textContent.includes('Looking this up')",
+        timeout=10_000,
+    )
+
+
+def _after_glossary_looking_up(driver: Driver) -> None:
+    """Let the held lookup go on to the server, and put the popover away once it has answered."""
+    # Each held request goes on first; only then is the hold taken away (taking it away first
+    # cancels the handlers still holding them).
+    for route in list(_HELD_LOOKUPS):
+        try:
+            route.continue_()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    _HELD_LOOKUPS.clear()
+    driver.page.unroute(_LOOKUP_ROUTE)
+    driver.page.wait_for_function(
+        "() => !document.getElementById('glossary-popover-body').textContent.includes('Looking this up')",
+        timeout=30_000,
+    )
+    driver.page.click("#glossary-popover-close", force=True)
+
+
+def _act_glossary_found(driver: Driver) -> None:
+    """`#2233`: WTF? on a term the stub defines: the answer, its source, and Glossary beside the X."""
+    _glossary_channel(driver)
+    # One term per theme/profile: they share one server, and a term already learned stands linked.
+    term = {
+        ("dark", False): "overnight sweep",
+        ("dark", True): "both runners",
+        ("light", False): "sequential change",
+        ("light", True): "two issues",
+    }[(driver.theme, "android" in driver.profile.name)]
+    _glossary_press_wtf(driver, term)
+    driver.page.wait_for_function(
+        "() => document.getElementById('glossary-popover-body').textContent.includes('glossary definition')",
+        timeout=30_000,
+    )
+
+
+def _act_glossary_not_found_button(driver: Driver) -> None:
+    """`#2233`: WTF? on a term nothing defines: the not-found answer, still with Glossary beside the X."""
+    _glossary_channel(driver)
+    _glossary_press_wtf(driver, "release checklist")
+    driver.page.wait_for_function(
+        "() => document.getElementById('glossary-popover-body').textContent.includes('Couldn')",
+        timeout=30_000,
+    )
+
+
+def _act_glossary_term_popup(driver: Driver) -> None:
+    """`#2233`: a tap on a term the reviewed glossary defines: its popup, with the same Glossary button."""
+    _glossary_channel(driver)
+    _glossary_tap_term(driver, "jitter")
+
+
+def _act_glossary_open(driver: Driver) -> None:
+    """`#2233`: the glossary opened from a defined term's popup: full screen, at that term."""
+    _glossary_channel(driver)
+    _glossary_tap_term(driver, "jitter")
+    _glossary_open(driver)
+    driver.page.wait_for_function(
+        "() => { const row = document.querySelector('#glossary-panel .glossary-entry-current'); "
+        "if (!row) return false; const r = row.getBoundingClientRect(); "
+        "const p = document.getElementById('glossary-panel').getBoundingClientRect(); "
+        "return r.top >= p.top && r.bottom <= p.bottom; }",
+        timeout=5_000,
+    )
+
+
+def _act_glossary_search_keyboard(driver: Driver) -> None:
+    """`#2233`: the glossary searched ("runner": a term match, then a definition match), the phone's keyboard open."""
+    _act_glossary_open(driver)
+    driver.page.locator("#glossary-panel-search").click()
+    driver.page.fill("#glossary-panel-search", "runner")
+    driver.page.wait_for_function(
+        "() => / of /.test(document.getElementById('glossary-panel-count').textContent)", timeout=5_000
+    )
+    if "android" in driver.profile.name:
+        shrink_keyboard(driver, "112-glossary-search-keyboard", focus="#glossary-panel-search")
+
+
+def _after_glossary_search_keyboard(driver: Driver) -> None:
+    if "android" in driver.profile.name:
+        restore_keyboard(driver)
+
+
+def _act_glossary_no_match(driver: Driver) -> None:
+    """`#2233`: a search nothing matches: the glossary says so."""
+    _act_glossary_open(driver)
+    driver.page.fill("#glossary-panel-search", "nothing synthetic like this")
+    driver.page.wait_for_function(
+        "() => window.__visible('glossary-panel-state') "
+        "&& document.getElementById('glossary-panel-state').textContent.startsWith('No terms match')",
+        timeout=5_000,
+    )
+    # The keyboard is closed in this shot: the field gives up the focus as a phone's Done does.
+    driver.js("document.activeElement && document.activeElement.blur && document.activeElement.blur()")
+
+
+def _act_glossary_empty(driver: Driver) -> None:
+    """`#2233`: the glossary of a server that knows no term yet (run alone: no synthetic glossary)."""
+    _glossary_channel(driver)
+    _glossary_press_wtf(driver, "release checklist")
+    _glossary_open(driver)
+    driver.page.wait_for_function(
+        "() => (document.getElementById('glossary-panel-state').textContent || '').startsWith('No glossary entries yet')",
+        timeout=5_000,
+    )
+
+
+def _act_glossary_over_discuss(driver: Driver) -> None:
+    """`#2233`: Discuss open, then the glossary opened over it from a defined term above the sheet."""
+    _open_discuss(driver)
+    _glossary_tap_term(driver, "jitter", at=0.2)
+    _glossary_open(driver)
+
+
+def _act_glossary_closed_over_discuss(driver: Driver) -> None:
+    """`#2233`: the glossary of 115 closed by its X: Discuss is still open, the list where it was."""
+    _act_glossary_over_discuss(driver)
+    driver.click("glossary-panel-close")
+    driver.page.wait_for_function(
+        "() => !window.__visible('glossary-panel') && window.__visible('discuss-panel') "
+        "&& document.querySelector('[inert]') === null",
+        timeout=5_000,
+    )
+
+
+def _act_glossary_dynamic_walk(driver: Driver) -> None:
+    """`#2233`: the glossary exercised end to end on the real server, every step checked and logged.
+
+    Over an open Discuss: open from a defined term; the focus is in the glossary; Ctrl+/ opens no
+    search under it; Tab stays inside it; Escape closes it alone and gives the focus back to the term;
+    reopened, the browser's Back closes it alone (no reload, Discuss still open); reopened, a learned
+    entry's message source closes it and jumps to that message, Discuss still open. The steps and what each saw go to
+    `<theme>--<profile>--117-glossary-dynamic-walk.json` beside the shots; the shot is the landing.
+    """
+    steps: list[dict[str, object]] = []
+
+    def check(name: str, expression: str) -> None:
+        seen = bool(driver.js(expression))
+        steps.append({"step": name, "ok": seen})
+        if not seen:
+            (driver.out_dir / f"{driver.theme}--{driver.profile.name}--117-glossary-dynamic-walk.json").write_text(
+                json.dumps(steps, indent=2) + "\n"
+            )
+            raise AssertionError(f"dynamic walk: {name}")
+
+    _open_discuss(driver)
+    driver.js("window.__glossaryWalkMarker = 'no reload'")
+    _glossary_tap_term(driver, "jitter", at=0.2)
+    _glossary_open(driver)
+    check("the glossary is open over Discuss", "window.__visible('glossary-panel') && !document.getElementById('discuss-panel').hidden")
+    check("the focus is in the glossary", "!!document.activeElement && !!document.activeElement.closest('#glossary-panel')")
+    driver.page.keyboard.press("Control+/")
+    check("Ctrl+/ opened no search under the glossary", "!window.__visible('search-field')")
+    for _ in range(8):
+        driver.page.keyboard.press("Tab")
+    check("eight Tabs later the focus is still in the glossary", "!!document.activeElement && !!document.activeElement.closest('#glossary-panel')")
+    driver.page.keyboard.press("Escape")
+    driver.page.wait_for_function("() => !window.__visible('glossary-panel')", timeout=5_000)
+    check("Escape closed the glossary and left Discuss open", "!window.__visible('glossary-panel') && !document.getElementById('discuss-panel').hidden")
+    check("the focus went back to the tapped term", "!!document.activeElement && document.activeElement.classList.contains('glossary-term') && document.activeElement.getAttribute('data-glossary-term') === 'jitter'")
+    check("nothing is left inert or dimmed", "document.querySelector('[inert], [data-under-dim]') === null")
+    # Back: the glossary is a level of its own, on top.
+    _glossary_tap_term(driver, "jitter", at=0.2)
+    _glossary_open(driver)
+    driver.page.wait_for_function(
+        "() => JSON.stringify(history.state || {}).includes('glossary')", timeout=10_000
+    )
+    check("the glossary holds a history entry of its own", "JSON.stringify(history.state || {}).includes('glossary')")
+    driver.page.go_back()
+    driver.page.wait_for_function("() => !window.__visible('glossary-panel')", timeout=10_000)
+    check("Back closed the glossary without a reload", "window.__glossaryWalkMarker === 'no reload'")
+    check("Back closed the glossary alone: Discuss is still open", "!document.getElementById('discuss-panel').hidden")
+    # A learned entry's message source: the glossary closes and the page jumps to that message.
+    _glossary_tap_term(driver, "jitter", at=0.2)
+    _glossary_open(driver)
+    check("a learned entry carries a message source link", "document.querySelector('#glossary-panel [data-glossary-source=\"message\"]') !== null")
+    driver.page.locator('#glossary-panel [data-glossary-source="message"]').first.click()
+    driver.page.wait_for_function(
+        "() => !window.__visible('glossary-panel') "
+        "&& document.querySelector('#discord-log [data-landed=\"true\"], #discord-log [data-linked=\"true\"]') !== null",
+        timeout=15_000,
+    )
+    check("the source closed the glossary and the jump landed on its message", "!window.__visible('glossary-panel') && document.querySelector('#discord-log [data-landed=\"true\"], #discord-log [data-linked=\"true\"]') !== null")
+    check("the jump left Discuss open, where it was", "!document.getElementById('discuss-panel').hidden && window.__visible('discuss-panel')")
+    (driver.out_dir / f"{driver.theme}--{driver.profile.name}--117-glossary-dynamic-walk.json").write_text(
+        json.dumps(steps, indent=2) + "\n"
+    )
+
+
 def _act_discuss_search(driver: Driver) -> None:
     """`#2136`: two real summaries (current + earlier via the timeline walk),
     then the header search opened and a query typed, so the shot shows flat
@@ -5779,6 +6095,26 @@ def _act_documents_filter_bar(driver: Driver) -> None:
 
 
 MATRIX_PROFILES = ("android-412", "laptop-1280")
+
+
+# `#2233 vibe-talk-glossary-popup`: what every glossary popover state shows of the Glossary button.
+GLOSSARY_POPOVER_EXPECT: tuple[tuple[str, str], ...] = (
+    ("the popover carries the Glossary button beside the X, in its top row", "(() => { if (!window.__visible('glossary-popover') || !window.__visible('glossary-popover-open')) return false; const o = document.getElementById('glossary-popover-open').getBoundingClientRect(); const x = document.getElementById('glossary-popover-close').getBoundingClientRect(); const p = document.getElementById('glossary-popover').getBoundingClientRect(); return o.right <= x.left + 1 && Math.abs(o.top - x.top) <= 6 && o.top >= p.top && o.right <= p.right && o.left >= p.left; })()"),
+    ("the term and the words under it keep clear of the corner buttons", "(() => { const o = document.getElementById('glossary-popover-open').getBoundingClientRect(); const x = document.getElementById('glossary-popover-close').getBoundingClientRect(); return ['glossary-popover-term', 'glossary-popover-body'].every((id) => { const r = document.createRange(); r.selectNodeContents(document.getElementById(id)); return [...r.getClientRects()].every((t) => [o, x].every((b) => t.bottom <= b.top + 1 || t.top >= b.bottom - 1 || t.right <= b.left + 1 || t.left >= b.right - 1)); }); })()"),
+    ("no error banner is up", "!window.__visible('error-wrap')"),
+    ("#2188 the popover never overlaps the WTF? chip", "(() => { const p = document.getElementById('glossary-popover').getBoundingClientRect(); const w = document.getElementById('selection-chip-wtf'); if (!w || w.hidden || !window.__visible('selection-chip-wtf')) return true; const r = w.getBoundingClientRect(); return p.bottom <= r.top + 1 || p.top >= r.bottom - 1; })()"),
+    ("the popover covers none of the selected words", "(() => { const s = getSelection(); if (!s || !s.rangeCount || s.isCollapsed) return true; const p = document.getElementById('glossary-popover').getBoundingClientRect(); return [...s.getRangeAt(0).getClientRects()].every((r) => p.bottom <= r.top + 1 || p.top >= r.bottom - 1 || p.right <= r.left + 1 || p.left >= r.right - 1); })()"),
+)
+
+# `#2233`: what every full-screen glossary state shows.
+GLOSSARY_PANEL_EXPECT: tuple[tuple[str, str], ...] = (
+    ("the glossary stands over the main screen, Discuss's full-screen size", "(() => { if (!window.__visible('glossary-panel')) return false; const g = document.getElementById('glossary-panel').getBoundingClientRect(); const m = document.getElementById('screen-main').getBoundingClientRect(); return g.width * g.height >= 0.85 * m.width * m.height; })()"),
+    ("nothing under it takes a tap: the screen's middle is the glossary's, and the dock is inert", "(() => { const m = document.getElementById('screen-main').getBoundingClientRect(); const at = document.elementFromPoint(m.left + m.width / 2, m.top + m.height / 2); return !!at && !!at.closest('#glossary-panel') && document.getElementById('dock').closest('[inert]') !== null; })()"),
+    ("the popover gave way to the glossary", "!window.__visible('glossary-popover')"),
+    ("no error banner is up", "!window.__visible('error-wrap')"),
+)
+
+GLOSSARY_ALPHABETICAL = "(() => { const terms = [...document.querySelectorAll('#glossary-panel .glossary-entry-term')].map((t) => t.textContent); return terms.length > 1 && terms.every((t, i) => i === 0 || terms[i - 1].localeCompare(t, undefined, { sensitivity: 'base', numeric: true }) <= 0); })()"
 
 SCENES: tuple[Scene, ...] = (
     Scene(
@@ -9183,6 +9519,145 @@ SCENES: tuple[Scene, ...] = (
             ("no error banner is up", "!window.__visible('error-wrap')"),
         ),
     ),
+    # `#2233 vibe-talk-glossary-popup`. The Glossary button in each state of the glossary popover
+    # (looking up, found, not found, a defined term), then the full-screen glossary it opens. Run
+    # 114 (the empty glossary) alone: every other state here reads the synthetic glossary.
+    Scene(
+        name="107-glossary-popover-looking-up",
+        what="#2233 WTF? pressed, the real lookup held until the shot: 'Looking this up…' with Glossary beside the X",
+        act=_act_glossary_looking_up,
+        after=_after_glossary_looking_up,
+        profiles=MATRIX_PROFILES,
+        keep_transient=True,
+        expect=(
+            ("the popover says it is looking the words up", "window.__visible('glossary-popover') && document.getElementById('glossary-popover-body').textContent.includes('Looking this up')"),
+            *GLOSSARY_POPOVER_EXPECT,
+        ),
+    ),
+    Scene(
+        name="108-glossary-popover-found",
+        what="#2233 WTF? answered through the real lookup route: definition, source and Glossary beside the X",
+        act=_act_glossary_found,
+        profiles=MATRIX_PROFILES,
+        keep_transient=True,
+        expect=(
+            ("the popover shows the stub's definition", "window.__visible('glossary-popover') && document.getElementById('glossary-popover-body').textContent.includes('glossary definition')"),
+            ("the popover carries a source link", "window.__visible('glossary-popover-source') && document.getElementById('glossary-popover-link').textContent.trim().length > 0"),
+            *GLOSSARY_POPOVER_EXPECT,
+        ),
+    ),
+    Scene(
+        name="109-glossary-popover-not-found",
+        what="#2233 WTF? on a term nothing defines: the not-found answer, Glossary still beside the X",
+        act=_act_glossary_not_found_button,
+        profiles=MATRIX_PROFILES,
+        keep_transient=True,
+        expect=(
+            ("the popover says the term was not found", "window.__visible('glossary-popover') && document.getElementById('glossary-popover-body').textContent.includes('Couldn')"),
+            *GLOSSARY_POPOVER_EXPECT,
+        ),
+    ),
+    Scene(
+        name="110-glossary-term-popup",
+        what="#2233 a tap on a defined term (synthetic reviewed glossary): its popup carries the same Glossary button",
+        act=_act_glossary_term_popup,
+        profiles=MATRIX_PROFILES,
+        keep_transient=True,
+        expect=(
+            ("the popup shows the reviewed definition", "window.__visible('glossary-popover') && document.getElementById('glossary-popover-term').textContent === 'jitter' && document.getElementById('glossary-popover-body').textContent.includes('random delay')"),
+            *GLOSSARY_POPOVER_EXPECT[:3],
+        ),
+    ),
+    Scene(
+        name="111-glossary-open",
+        what="#2233 the glossary full screen, opened from a defined term: alphabetical, letter headings, badges, scrolled to and marking that term",
+        act=_act_glossary_open,
+        profiles=MATRIX_PROFILES,
+        keep_transient=True,
+        expect=(
+            *GLOSSARY_PANEL_EXPECT,
+            ("the entries are alphabetical", GLOSSARY_ALPHABETICAL),
+            ("reviewed entries carry their badge", "document.querySelectorAll('#glossary-panel .glossary-entry-badge[data-origin=\"reviewed\"]').length >= 8"),
+            ("it is opened at the tapped term, marked and in view", "(() => { const row = document.querySelector('#glossary-panel .glossary-entry-current'); if (!row) return false; const r = row.getBoundingClientRect(); const p = document.getElementById('glossary-panel').getBoundingClientRect(); return row.querySelector('.glossary-entry-term').textContent === 'jitter' && r.top >= p.top && r.bottom <= p.bottom; })()"),
+        ),
+    ),
+    Scene(
+        name="112-glossary-search-keyboard",
+        what="#2233 the glossary searched for 'cache': term matches, then definition matches; the phone's keyboard really open (viewport shrunk by 336px)",
+        act=_act_glossary_search_keyboard,
+        after=_after_glossary_search_keyboard,
+        profiles=MATRIX_PROFILES,
+        keep_transient=True,
+        expect=(
+            *GLOSSARY_PANEL_EXPECT,
+            ("the search holds the typed words", "document.getElementById('glossary-panel-search').value === 'runner'"),
+            ("the count says how many of all match", "/^\\d+ of \\d+ terms?$/.test(document.getElementById('glossary-panel-count').textContent)"),
+            ("every entry shown matches", "[...document.querySelectorAll('#glossary-panel .glossary-entry')].every((row) => row.textContent.toLowerCase().includes('runner'))"),
+            ("term matches come first, then definition matches under their heading", "(() => { const heads = [...document.querySelectorAll('#glossary-panel .glossary-letter')].map((h) => h.textContent); const terms = [...document.querySelectorAll('#glossary-panel .glossary-entry-term')].map((t) => t.textContent.toLowerCase()); return heads.includes('In definitions') && terms.length >= 2 && terms[0].includes('runner'); })()"),
+            ("on a phone the viewport really shrank, and the search stays on screen", "innerWidth > 600 || ((window.visualViewport ? window.visualViewport.height : innerHeight) <= 579 && document.getElementById('glossary-panel-search').getBoundingClientRect().bottom <= window.visualViewport.height)"),
+        ),
+    ),
+    Scene(
+        name="113-glossary-no-match",
+        what="#2233 a search nothing matches: the glossary says so (keyboard closed)",
+        act=_act_glossary_no_match,
+        profiles=MATRIX_PROFILES,
+        keep_transient=True,
+        expect=(
+            *GLOSSARY_PANEL_EXPECT,
+            ("the glossary says nothing matches", "window.__visible('glossary-panel-state') && document.getElementById('glossary-panel-state').textContent === 'No terms match “nothing synthetic like this”.'"),
+            ("no entry is shown", "document.querySelectorAll('#glossary-panel .glossary-entry').length === 0"),
+        ),
+    ),
+    Scene(
+        name="114-glossary-empty",
+        what="#2233 the glossary of a server that knows no term: how to learn one (run alone, no synthetic glossary)",
+        act=_act_glossary_empty,
+        profiles=MATRIX_PROFILES,
+        keep_transient=True,
+        expect=(
+            *GLOSSARY_PANEL_EXPECT,
+            ("the glossary says how to learn a term", "document.getElementById('glossary-panel-state').textContent === 'No glossary entries yet. Select words in a message and press WTF? to learn one.'"),
+        ),
+    ),
+    Scene(
+        name="115-glossary-over-discuss",
+        what="#2233 the glossary opened over an open Discuss: it covers it, and Discuss stays open beneath",
+        act=_act_glossary_over_discuss,
+        profiles=MATRIX_PROFILES,
+        keep_transient=True,
+        expect=(
+            *GLOSSARY_PANEL_EXPECT,
+            ("Discuss is still open beneath", "!document.getElementById('discuss-panel').hidden"),
+            ("Discuss is inert under the glossary", "document.getElementById('discuss-panel').closest('[inert]') !== null"),
+        ),
+    ),
+    Scene(
+        name="116-glossary-closed-discuss-stays",
+        what="#2233 the glossary over Discuss closed by its X: Discuss is still open beneath, nothing left inert",
+        act=_act_glossary_closed_over_discuss,
+        profiles=MATRIX_PROFILES,
+        keep_transient=True,
+        expect=(
+            ("the glossary is closed", "!window.__visible('glossary-panel')"),
+            ("Discuss is still open", "window.__visible('discuss-panel')"),
+            ("nothing is left inert or dimmed", "document.querySelector('[inert], [data-under-dim]') === null"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="117-glossary-dynamic-walk",
+        what="#2233 the glossary exercised end to end (focus, Ctrl+/, Tab, Escape, Back, a source jump), each step logged to a JSON beside the shot; the shot is the jump's landing",
+        act=_act_glossary_dynamic_walk,
+        profiles=MATRIX_PROFILES,
+        keep_transient=True,
+        expect=(
+            ("the glossary is closed", "!window.__visible('glossary-panel')"),
+            ("the jump landed on the source message", "document.querySelector('#discord-log [data-landed=\"true\"], #discord-log [data-linked=\"true\"]') !== null"),
+            ("Discuss is still open after the jump (the walk began with it open)", "!document.getElementById('discuss-panel').hidden"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
     Scene(
         name="104-arrival-below-before",
         what="#2230 the reader at the channel's foot, reading the first row on screen, just before a message arrives",
@@ -9482,7 +9957,8 @@ def run_captures(
     # states photograph exactly that), so Discuss has no window to show there.
     # `#2187`/`#2195`: the orphan scenes (93-98) stand on the same seeded glossary window as
     # 91/92, so they skip with them on a cacheless server instead of failing alone.
-    discuss_scenes = [s for s in scenes if s.name.startswith(("73-", "74-", "75-", "76-", "78-", "84-", "85-", "89-", "90-", "91-", "92-", "93-", "94-", "95-", "96-", "97-", "98-", "99-", "102-", "103-"))]
+    discuss_scenes = [s for s in scenes if s.name.startswith(("73-", "74-", "75-", "76-", "78-", "84-", "85-", "89-", "90-", "91-", "92-", "93-", "94-", "95-", "96-", "97-", "98-", "99-", "102-", "103-",
+                                                                        "107-", "108-", "109-", "110-", "111-", "112-", "113-", "114-", "115-", "116-", "117-"))]
     discuss_only = bool(wanted) and len(wanted) == len(discuss_scenes)
     if discuss_scenes and not seed_discuss_cache(60 if discuss_only else 10):
         if discuss_only:

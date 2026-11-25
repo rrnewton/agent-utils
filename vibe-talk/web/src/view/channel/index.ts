@@ -278,6 +278,11 @@ export { createNoiseActs } from "./noiseacts.ts";
 export type { NoiseActs, NoiseActsDependencies } from "./noiseacts.ts";
 export { createGlossaryView } from "./glossary.ts";
 export type { GlossaryDependencies, GlossaryTerm, GlossaryView } from "./glossary.ts";
+export {
+  createGlossaryPanel, filterGlossaryTerms, glossaryLetter, glossaryOriginLabel, glossarySourceTarget, normalizeGlossaryTerm,
+  sortGlossaryTerms,
+} from "./glossarypanel.ts";
+export type { GlossaryPanel, GlossaryPanelDependencies, GlossarySourceTarget } from "./glossarypanel.ts";
 export { mountTextSelection } from "./textselection.ts";
 export type { KeptTextSelection, TextSelection, TextSelectionDependencies } from "./textselection.ts";
 export * from "./searchopen.ts";

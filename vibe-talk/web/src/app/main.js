@@ -923,6 +923,9 @@ const shellNavigation = createPageNavigation({
   documentDepth: () => documentsView.depth(),
   documentOutlineOpen: () => documentsView.outlineOpen(),
   closeDocumentOutline: () => documentsView.closeOutline(),
+  // `#2233 vibe-talk-glossary-popup`: read from the element, which exists before the glossary view does.
+  glossaryOpen: () => !el("glossary-panel").hidden,
+  closeGlossary: () => glossaryView.closePanel(),
   closeDocument: () => documentsView.showList(),
   threadListBack: () => threadListBack(),
   leaveThread: () => leaveThread(),
@@ -1414,8 +1417,16 @@ const glossaryView = createGlossaryView({
   selectedChannelId: () => String(selectedChannelId() ?? ""),
   glossaryAvailable: () => serverFacts.glossaryAvailable(),
   idsOf: (row) => idsOf(/** @type {any} */ (row)),
-  openDocument: (key) => { void documentsView.show(key); },
+  // `#2233`: into the Documents view first, as a document link in a message goes (the popover's
+  // document source loaded the reader but left the channel on screen).
+  openDocument: (key) => {
+    chooseMajorView("docs");
+    void documentsView.show(key);
+  },
   tokenKnown: () => serverFacts.tokenScope() !== null,
+  // `#2233 vibe-talk-glossary-popup`: a glossary source tap jumps as a Discuss citation does.
+  jumpToMessage: (ref) => { void shellNavigation.jumpToMessageLink(ref); },
+  scheduleBackSync: () => shellNavigation.scheduleBackSync(),
 });
 
 /** `#1388` landing 1. Restate an open summary's strike after any mark settles. */

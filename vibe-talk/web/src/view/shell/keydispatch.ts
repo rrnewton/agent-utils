@@ -62,6 +62,12 @@ export interface KeyDispatchDependencies<Target, Pane, Column> {
   readerActed(): void;
   /** A key no binding took: the scroll keys'. */
   routeScrollKey(event: DispatchedKey, target: Target): void;
+  /**
+   * `#2233 vibe-talk-glossary-popup`. Whether a full-screen popup covers the page: then no key of the
+   * page acts, chords heard everywhere included, since what they act on is under the popup, and the
+   * popup answers its own keys (Escape, Tab). Unwired, nothing covers the page.
+   */
+  pageCovered?(): boolean;
 }
 
 /** The two listeners and the rule they share. */
@@ -150,6 +156,7 @@ export function createKeyDispatch<Target, Pane, Column>(deps: KeyDispatchDepende
     macFieldEditKey,
     onPageKey(event) {
       if (!event || event.isComposing || event.keyCode === 229) return;
+      if (deps.pageCovered?.()) return;
       // `#239 single-selection`. A key moves the one selection from wherever the mouse put it. Said
       // before a key its own element took (Escape out of the search, Enter in a message box) is left
       // alone: the keys are in use all the same, and what a still pointer lights stays put away.
@@ -161,6 +168,7 @@ export function createKeyDispatch<Target, Pane, Column>(deps: KeyDispatchDepende
     },
     onEverywhereKey(event) {
       if (!event || event.isComposing || event.keyCode === 229) return;
+      if (deps.pageCovered?.()) return;
       const binding = deps.keymap().find((one) => one.everywhere && one.run &&
         one.chords.some((chord) => chord.mod && chordMatches(chord, event)));
       if (!binding) return;

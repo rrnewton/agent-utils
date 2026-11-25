@@ -607,6 +607,32 @@
             <p id="discuss-stamp" hidden></p>
           </div>
 
+          <!-- `#2233 vibe-talk-glossary-popup`: the full-screen glossary, opened by the glossary
+               popover's Glossary button (the same button for a WTF? answer and a tapped defined term).
+               Drawn by Discuss's own full-screen rules (22-discuss.css: the full sheet on a phone, the
+               maximized panel on a desk) and its slim head's rules, under classes of its own (nothing
+               that means "the Discuss title" may match the glossary); it stands over an open Discuss without
+               touching it, and everything else is inert while it is up. web/src/view/channel/glossarypanel.ts
+               fills the count and the list as text. -->
+          <div id="glossary-panel" role="dialog" aria-modal="true" aria-labelledby="glossary-panel-title" tabindex="-1" hidden>
+            <div class="glossary-panel-head">
+              <span id="glossary-panel-title" class="glossary-panel-title">Glossary</span>
+              <span id="glossary-panel-count" class="glossary-panel-count" role="status"></span>
+              <div class="glossary-panel-actions">
+                <button id="glossary-panel-close" class="glossary-icon-button" type="button" aria-label="Close the glossary" title="Close the glossary">
+                  <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18" /></svg>
+                </button>
+              </div>
+              <!-- The search, a full-width second row of the sticky head, so it stays on screen as the list scrolls. -->
+              <div class="glossary-panel-search">
+                <input id="glossary-panel-search" type="search" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" placeholder="Search the glossary…" aria-label="Search the glossary" aria-controls="glossary-panel-list">
+              </div>
+            </div>
+            <p id="glossary-panel-state" class="glossary-panel-state" role="status" hidden></p>
+            <button id="glossary-panel-retry" class="glossary-panel-retry" type="button" hidden>Retry</button>
+            <div id="glossary-panel-list" class="glossary-panel-list"></div>
+          </div>
+
           <!--
             THE one scrolling element on the page.
 
@@ -4449,6 +4475,9 @@ writable = true</pre>
       <p id="glossary-popover-term" class="glossary-popover-term"></p>
       <p id="glossary-popover-body" class="glossary-popover-body" aria-live="polite"></p>
       <p id="glossary-popover-source" class="glossary-popover-source" hidden>Source: <a id="glossary-popover-link" href="#">source</a></p>
+      <!-- `#2233 vibe-talk-glossary-popup`: Glossary, in the top corner beside the X (no row of its own,
+           so the popover is no taller than before): the whole glossary, full screen, at this term. -->
+      <button id="glossary-popover-open" class="glossary-popover-open" type="button" title="Open the glossary" aria-haspopup="dialog" aria-controls="glossary-panel"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" /><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" /></svg>Glossary</button>
       <button id="glossary-popover-close" class="glossary-popover-close" type="button" title="Close" aria-label="Close">&times;</button>
     </div>
 

@@ -52,7 +52,10 @@
   }
 }
 
-#discuss-panel {
+/* `#2233 vibe-talk-glossary-popup`: the full-screen glossary (#glossary-panel) is drawn by these same
+ * rules as Discuss: this box, the full sheet below on a phone, the maximized panel on a desk. */
+#discuss-panel,
+#glossary-panel {
   position: absolute;
   left: 0;
   right: 0;
@@ -77,13 +80,15 @@
   z-index: var(--z-modal);
 }
 
-#discuss-panel[data-sheet="full"] {
+#discuss-panel[data-sheet="full"],
+#glossary-panel {
   /* The whole main area: the header stays on screen under the bar, which a
    * viewport-tall box bottom-anchored inside the screen could not promise. */
   height: 100%;
 }
 
-#discuss-panel[hidden] {
+#discuss-panel[hidden],
+#glossary-panel[hidden] {
   display: none;
 }
 
@@ -95,7 +100,8 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
 }
 
 @media (min-width: 900px) and (pointer: fine) {
-  #discuss-panel {
+  #discuss-panel,
+  #glossary-panel {
     position: absolute;
     left: auto;
     right: calc(8px + env(safe-area-inset-right));
@@ -145,7 +151,8 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
  * content never shows through. The title's row is no taller than its icon
  * buttons (44px on a phone, 32px on a desk): the title is small text in
  * that row, never a second tall row of its own. */
-.discuss-head {
+.discuss-head,
+.glossary-panel-head {
   position: sticky;
   top: 0;
   z-index: 2;
@@ -163,7 +170,8 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   border-bottom: 1px solid var(--edge);
 }
 
-.discuss-title {
+.discuss-title,
+.glossary-panel-title {
   font-size: 0.85rem;
   font-weight: 600;
   line-height: 1;
@@ -177,7 +185,8 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   text-overflow: ellipsis;
 }
 
-.discuss-actions {
+.discuss-actions,
+.glossary-panel-actions {
   order: 2;
   margin-left: auto;
   display: flex;
@@ -185,7 +194,8 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   flex: 0 0 auto;
 }
 
-.discuss-icon-button {
+.discuss-icon-button,
+.glossary-icon-button {
   width: 2rem;
   height: 2rem;
   padding: 0;
@@ -200,7 +210,8 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   font: inherit;
 }
 
-.discuss-icon-button .icon {
+.discuss-icon-button .icon,
+.glossary-icon-button .icon {
   width: 1.1rem;
   height: 1.1rem;
 }
@@ -215,7 +226,8 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   padding: 6px 0 2px;
 }
 
-#discuss-search-input {
+#discuss-search-input,
+#glossary-panel-search {
   box-sizing: border-box;
   width: 100%;
   padding: 6px 8px;
@@ -854,6 +866,7 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
 .discuss-link:focus-visible,
 #discuss-close:focus-visible,
 .discuss-icon-button:focus-visible,
+.glossary-icon-button:focus-visible,
 #discuss-mark-read:focus-visible,
 #discuss-mark-unread:focus-visible,
 #discuss-retry:focus-visible {
@@ -975,7 +988,8 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   }
 
   /* Maximized: the panel fills the main area, to just talk to Discuss. */
-  #screen-main[data-discuss="maximized"] > #discuss-panel {
+  #screen-main[data-discuss="maximized"] > #discuss-panel,
+  #screen-main > #glossary-panel {
     top: 8px;
     left: 8px;
     right: calc(8px + env(safe-area-inset-right));
@@ -1018,7 +1032,8 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
  * Tighter ends, same words; the icons keep the upper right and the control
  * line takes the full width under them rather than run underneath. */
 @media not ((min-width: 900px) and (pointer: fine)) {
-  .discuss-head {
+  .discuss-head,
+  .glossary-panel-head {
     /* `#1811`: one row always — the scoped title truncates with an
        ellipsis rather than wrapping the bar and decentring the grip. */
     flex-wrap: nowrap;
@@ -1027,14 +1042,16 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
 
   /* `#1531`: the title and its buttons share the fixed bar's one row;
    * the buttons keep 44px tap targets, so the bar is 44px plus its padding. */
-  .discuss-actions {
+  .discuss-actions,
+  .glossary-panel-actions {
     order: 2;
     width: auto;
     justify-content: flex-end;
     gap: 2px;
   }
 
-  .discuss-icon-button {
+  .discuss-icon-button,
+  .glossary-icon-button {
     width: 2.75rem;
     height: 2.75rem;
   }
@@ -1357,4 +1374,157 @@ stay its owner's (#1524). The pane itself already ends above the
    * `#1779 vibe-talk-toast-avoids-discuss-controls` fix on this base: the pill
    * stands by the pane's docked height (and centred on the channel pane on a
    * desk), so it no longer covers the docked pane's controls. */
+}
+
+/* `#2233 vibe-talk-glossary-popup`. The full-screen glossary's own parts; its box, head and full-screen
+ * geometry are Discuss's (the shared rules above). It stands over an open Discuss, and over the reading
+ * strip that Discuss lifts above itself, while everything under it is inert. */
+#glossary-panel {
+  z-index: calc(var(--z-modal) + 2);
+}
+
+#glossary-panel:focus {
+  outline: none;
+}
+
+/* The head shares Discuss's head rules above under its own classes (`.glossary-panel-head`,
+ * `-title`, `-actions`, `.glossary-icon-button`), so nothing that means "the Discuss title" matches
+ * it. Unlike Discuss's phone head (one row), the search is its full-width second row: this rule
+ * comes after the phone one and wins at the same specificity. */
+.glossary-panel-head {
+  flex-wrap: wrap;
+}
+
+.glossary-panel-search {
+  order: 3;
+  flex: 1 0 100%;
+}
+
+/* The field stands in the entries' own column on a desk, where the head is wider than the list;
+   its row stays the head's whole width, so it always wraps under the title and the X. */
+#glossary-panel-search {
+  display: block;
+  max-width: 48rem;
+  margin: 0 auto;
+}
+
+.glossary-panel-count {
+  order: 1;
+  color: var(--muted);
+  font-size: 0.8rem;
+  white-space: nowrap;
+}
+
+.glossary-panel-state {
+  margin: 14px auto;
+  max-width: 48rem;
+  color: var(--muted);
+}
+
+.glossary-panel-retry {
+  display: block;
+  margin: 0 auto 14px;
+  padding: 6px 14px;
+  background: var(--row-hover);
+  color: var(--ink);
+  border: 1px solid var(--edge);
+  border-radius: 6px;
+  font: inherit;
+  cursor: pointer;
+}
+
+.glossary-panel-retry[hidden] {
+  display: none;
+}
+
+.glossary-panel-list {
+  max-width: 48rem;
+  margin: 0 auto;
+  padding-bottom: 12px;
+}
+
+.glossary-letter {
+  margin: 14px 0 4px;
+  padding-bottom: 2px;
+  border-bottom: 1px solid var(--edge);
+  color: var(--accent);
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.glossary-entries {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.glossary-entry {
+  padding: 8px 6px;
+  border-bottom: 1px solid color-mix(in srgb, var(--edge) 55%, transparent);
+  border-radius: 6px;
+  overflow-wrap: anywhere;
+}
+
+/* The entry the glossary was opened at (a defined term, a found WTF? answer). */
+.glossary-entry-current {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.glossary-entry-head {
+  margin: 0 0 2px;
+}
+
+.glossary-entry-term {
+  font-weight: 700;
+}
+
+.glossary-entry-badge {
+  display: inline-block;
+  padding: 0 6px;
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 0.72rem;
+  line-height: 1.5;
+  vertical-align: 1px;
+}
+
+.glossary-entry-badge[data-origin="reviewed"] {
+  border-color: color-mix(in srgb, var(--ok) 60%, transparent);
+  color: var(--ok);
+}
+
+.glossary-entry-badge[data-origin="dynamic"] {
+  border-color: color-mix(in srgb, var(--accent) 60%, transparent);
+  color: var(--accent);
+}
+
+.glossary-entry-definition {
+  margin: 0;
+}
+
+.glossary-entry-source {
+  margin: 3px 0 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.glossary-entry-link {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.glossary-entry-link:focus-visible,
+.glossary-panel-retry:focus-visible,
+#glossary-panel-search:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }

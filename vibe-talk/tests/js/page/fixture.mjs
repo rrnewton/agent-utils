@@ -2348,6 +2348,25 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     discussAvailable: undefined,
     /** Whether client-config says WTF? glossary lookups can run (`#2156`); `undefined` sends nothing. */
     glossaryAvailable: undefined,
+    /** `#2233`. The terms `GET /api/v1/glossary/terms` serves, each `{ term, definition, source, origin }`. */
+    glossaryTerms: [],
+    /** `#2233`. The status the terms read answers with; anything but 200 fails it. */
+    glossaryTermsStatus: 200,
+    /** `#2233`. A promise the terms read waits on before it answers, or null. */
+    glossaryTermsHold: null,
+    /** `#2233`. How many times the page read the terms. */
+    glossaryTermReads: 0,
+    /** `#2156`. Every WTF? lookup's body, in order. */
+    glossaryLookups: [],
+    /** `#2156`. A lookup's answer: the known term the words name, else not found. */
+    glossaryLookup(body) {
+      const wanted = String(body && body.selected || "").toLowerCase();
+      const known = this.glossaryTerms.find((entry) => wanted.includes(String(entry.term).toLowerCase()));
+      return known
+        ? { state: "found", term: known.term, definition: known.definition, source: known.source, cached: true, reason: null, saved: false }
+        : { state: "not_found", term: String(body && body.selected || ""), definition: null, source: null, cached: false,
+          reason: "Searched recent messages and fetched documents.", saved: false };
+    },
     /** The scope the server reports for the saved token; `undefined` plays a malformed answer. */
     tokenScope: "write",
     /** Every explicit provider read-boundary request. Separate from local Done/archive calls. */
@@ -4551,6 +4570,23 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       if (/^\/api\/v1\/(channels\/[^/]+\/)?search\?/.test(String(path))) {
         page.serverSearchCalls.push(String(path));
         return page.serverSearch(String(path), options);
+      }
+      // `#2156 vibe-talk-wtf-glossary-lookup`, `#2233 vibe-talk-glossary-popup`: the known terms, from
+      // `page.glossaryTerms` (`page.glossaryTermsStatus` other than 200 fails the read, and
+      // `page.glossaryTermsHold`, a promise, holds it), and one WTF? lookup, answered by
+      // `page.glossaryLookup`. The server's shapes; tests/glossary_lookup.rs holds the real routes.
+      if (String(path) === "/api/v1/glossary/terms") {
+        page.glossaryTermReads += 1;
+        if (page.glossaryTermsHold) await page.glossaryTermsHold;
+        if (page.glossaryTermsStatus !== 200) {
+          return json(page.glossaryTermsStatus, { error: "unavailable", detail: "the glossary could not be read" });
+        }
+        return json(200, { terms: page.glossaryTerms });
+      }
+      if (/^\/api\/v1\/channels\/[^/]+\/glossary\/lookup$/.test(String(path)) && (options && options.method) === "POST") {
+        const body = JSON.parse(options.body);
+        page.glossaryLookups.push(body);
+        return json(200, page.glossaryLookup(body));
       }
       throw new Error(`the page fetched ${path}, which this fixture does not serve`);
     },

@@ -883,6 +883,11 @@ export function createKeyboardComposition<
     listGroups: [KEYS_MOVING, KEYS_MESSAGE],
     readerActed: () => deps.readerActed(),
     routeScrollKey: (event, target) => scrollKeys.routeScrollKey(event, target),
+    // `#2233 vibe-talk-glossary-popup`: the full-screen glossary covers the page while it is up.
+    pageCovered: () => {
+      const glossary = typeof document.getElementById === "function" ? document.getElementById("glossary-panel") : null;
+      return glossary !== null && !glossary.hidden;
+    },
   });
 
   const keyTimingInAddress = /[?&]key-timing(=|&|$)/.test(deps.locationSearch() || "");

@@ -742,6 +742,35 @@ Its output is above. Without it Discuss cannot answer and its states are unreach
     # regression inputs: an unquoted heredoc treats them as command substitutions, which once ran
     # the screenshot state names as shell commands before the server even started. Dynamic values
     # are emitted separately, one controlled value per printf.
+    # `#1855`: Discuss reads the served message cache (channel scopes are cache-only), so
+    # a run photographing Discuss needs one that fills and serves; see the config below.
+    # `#2233 vibe-talk-glossary-popup`: the glossary popup states (107-113, 115-117) also read a
+    # SYNTHETIC reviewed glossary (warm-up file, made-up terms only), so the popup shows
+    # reviewed entries beside the ones the walk learns; 114 photographs the empty glossary and
+    # runs alone, on a server that knows no term at all.
+    SHOTS_DISCUSS=0
+    SHOTS_GLOSSARY=0
+    for shots_state in "${SHOTS_ONLY[@]}"; do
+        case "$shots_state" in 73-*|74-*|75-*|76-*|78-*|84-*|85-*|89-*|90-*|91-*|92-*|99-*|10[7-9]-*|11[0-7]-*) SHOTS_DISCUSS=1 ;; esac
+        case "$shots_state" in 10[7-9]-*|11[0-3]-*|11[5-7]-*) SHOTS_GLOSSARY=1 ;; esac
+    done
+    if [ "$SHOTS_GLOSSARY" = 1 ]; then
+        cat > "$SHOTS_TMP/glossary-synthetic.md" <<'EOF'
+# Synthetic screenshot glossary
+
+Made-up entries for the screenshot walk only; several name words the fake chat's seeded
+messages use, so they link in the list.
+
+- **arm64 job**: the made-up build job that runs on the one arm64 runner
+- **jitter**: a random delay added before a retry, so callers do not all wake at once
+- **runner pool**: the set of build machines a job may be scheduled on
+- **changelog script**: a made-up script that writes release notes from merged changes
+- **maintainer account**: the one account allowed to rotate the release token
+- **Zephyr cache**: a synthetic cache name, for the last letter
+- **42 rule**: a synthetic rule, for the digits heading
+- **Élan gate**: a synthetic gate, for an accented first letter
+EOF
+    fi
     {
         printf '[server]\nbind = "127.0.0.1:%s"\n' "$SHOTS_PORT"
         cat <<'EOF'
@@ -788,6 +817,11 @@ EOF
 # store that is deleted with the run.
 [summaries]
 reply_timeout_seconds = 3
+EOF
+        if [ "$SHOTS_GLOSSARY" = 1 ]; then
+            printf 'catchup_warmup_files = ["%s/glossary-synthetic.md"]\n' "$SHOTS_TMP"
+        fi
+        cat <<'EOF'
 
 # Storage inside the throwaway directory, which is removed with it. The harness drives real calls
 # through a real server, so without this line either the run would have no durable state to
@@ -796,14 +830,9 @@ reply_timeout_seconds = 3
 [storage]
 EOF
         printf 'path = "%s/state/vibe-talk.sqlite3"\n' "$SHOTS_TMP"
-        # `#1855`: Discuss reads the served message cache (channel scopes are cache-only), so
-        # a run photographing Discuss needs one that fills and serves. Only then: the Settings
-        # and Help states photograph a server with NO cache, and that stays the default here.
-        # Beside the store, inside the 0700 throwaway directory the cache check requires.
-        SHOTS_DISCUSS=0
-        for shots_state in "${SHOTS_ONLY[@]}"; do
-            case "$shots_state" in 73-*|74-*|75-*|76-*|78-*|84-*|85-*|89-*|90-*|91-*|92-*|99-*) SHOTS_DISCUSS=1 ;; esac
-        done
+        # `#1855`: the served message cache (SHOTS_DISCUSS, decided above). Only for a Discuss
+        # run: the Settings and Help states photograph a server with NO cache, and that stays the
+        # default here. Beside the store, inside the 0700 throwaway directory the cache check requires.
         if [ "$SHOTS_DISCUSS" = 1 ]; then
             cat <<'EOF'
 

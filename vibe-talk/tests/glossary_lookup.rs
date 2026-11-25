@@ -501,3 +501,105 @@ async fn link_keys_are_real_targets_only_and_a_miss_says_so_plainly() {
     assert_eq!(calls.len(), 1, "{calls:?}");
     assert!(calls[0].1.contains("tracking ticket"), "{}", calls[0].1);
 }
+
+/// `#2233 vibe-talk-glossary-popup`: the full-screen glossary's exact request, `GET
+/// /api/v1/glossary/terms` with the page's token and no query, through the real router: the reviewed
+/// entries of the warm-up glossary and the learned ones in the deployment's store, each once, with
+/// the fields the popup draws (term, definition, source, origin). A learned definition comes back
+/// exactly as stored, markup and all: the popup draws it as text, and nothing on the way renders it.
+/// Every term here is synthetic.
+#[tokio::test]
+async fn the_glossary_popup_reads_every_term_with_its_origin() {
+    let defining = message(
+        1,
+        "The Zephyr cache keeps runner results for the synthetic fleet",
+    );
+    let source_id = defining.id.as_str().to_owned();
+    let backend = backend_with(vec![
+        defining,
+        message(2, "the Zephyr cache warmed up again"),
+    ]);
+    let dir = testing::TempDir::new("glossary-popup");
+    let reviewed = dir.path().join("glossary.md");
+    std::fs::write(
+        &reviewed,
+        "# Synthetic glossary\n\n- **alpha quorum**: three made-up votes out of five\n- **Runner**: a synthetic build worker\n",
+    )
+    .expect("reviewed glossary");
+    let store_path = dir.path().join("store.db");
+    let text = format!(
+        "{}\n[storage]\npath = \"{}\"\n[summaries]\ncatchup_warmup_files = [\"{}\"]\n",
+        testing::config_toml(),
+        store_path.display(),
+        reviewed.display()
+    );
+    let (mut state, _discord, _store, summarizer) = testing::state_with_summarizer(&text);
+    state.replace_chat(backend.clone());
+    let clock = testing::ManualClock::at(base_ms() + 3_600_000);
+    let mut state = testing::with_message_cache(state, dir.path(), clock).await;
+    state.message_cache.set_serve(true);
+    state.catchup_summarizer = Some(summarizer.clone());
+    state.catchup_model = Some(Arc::from("fake-model"));
+    fill(&state).await;
+    summarizer.answer_with(&format!(
+        "{{\"term\":\"Zephyr cache\",\"definition\":\"<img src=x onerror=1> a made-up cache for runner results\",\"source_kind\":\"message\",\"source_id\":\"{source_id}\"}}"
+    ));
+    let app = vibe_talk::http::router(state);
+    let (status, body) = post(
+        &app,
+        &lookup_path(),
+        Some(WRITE_TOKEN),
+        &json!({"selected": "Zephyr cache"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], json!("found"), "{body}");
+    let reads = backend.reads();
+    // The popup's own request: a read token, as a read-only page holds.
+    let (status, body) = get(&app, "/api/v1/glossary/terms", READ_TOKEN).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        backend.reads(),
+        reads,
+        "the term list must not call upstream"
+    );
+    let terms = body["terms"].as_array().expect("terms");
+    let named = |term: &str| {
+        terms
+            .iter()
+            .find(|t| t["term"] == json!(term))
+            .unwrap_or_else(|| panic!("no {term} in {body}"))
+            .clone()
+    };
+    let quorum = named("alpha quorum");
+    assert_eq!(quorum["origin"], json!("reviewed"), "{body}");
+    assert_eq!(
+        quorum["definition"],
+        json!("three made-up votes out of five"),
+        "{body}"
+    );
+    assert_eq!(quorum["source"], Value::Null, "{body}");
+    assert_eq!(named("Runner")["origin"], json!("reviewed"), "{body}");
+    let learned = named("Zephyr cache");
+    assert_eq!(learned["origin"], json!("dynamic"), "{body}");
+    assert_eq!(
+        learned["definition"],
+        json!("<img src=x onerror=1> a made-up cache for runner results"),
+        "a learned definition must come back as stored, for the popup to draw as text: {body}"
+    );
+    assert_eq!(learned["source"]["kind"], json!("message"), "{body}");
+    let href = learned["source"]["href"].as_str().expect("href");
+    assert!(
+        href.starts_with('?') && href.contains("&m="),
+        "a message source is the in-app address the popup links: {href}"
+    );
+    // Each term once.
+    let mut seen: Vec<String> = terms
+        .iter()
+        .map(|t| t["term"].as_str().unwrap_or_default().to_lowercase())
+        .collect();
+    let all = seen.len();
+    seen.sort();
+    seen.dedup();
+    assert_eq!(seen.len(), all, "a term is served twice: {body}");
+}

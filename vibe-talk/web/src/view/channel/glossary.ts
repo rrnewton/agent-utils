@@ -4,18 +4,17 @@
 // quoting view's `drawSelectionChip` shows it with the strip, in the same call and frame as Quoted
 // reply and the X, so the strip paints as one object. Learned entries are popover-only: they
 // are stored by the server, shown here and linked below, and never fed to the Discuss warm-up.
+// `#2233 vibe-talk-glossary-popup`. The popover's Glossary button, the same one for a WTF? answer and
+// for a tapped defined term, opens the full-screen glossary (glossarypanel.ts).
 
+import type { MessageLinkRef } from "../../foundation/index.ts";
 import { createListening } from "../dom/index.ts";
 import { setHiddenIfChanged } from "../dom/index.ts";
 import type { ElementById } from "../dom/index.ts";
+import { createGlossaryPanel, glossarySourceTarget } from "./glossarypanel.ts";
+import type { GlossaryTerm } from "./glossarypanel.ts";
 
-/** One known term as `GET /api/v1/glossary/terms` serves it. */
-export interface GlossaryTerm {
-  term: string;
-  definition: string;
-  source: { kind: string; href: string; label: string } | null;
-  origin: string;
-}
+export type { GlossaryTerm } from "./glossarypanel.ts";
 
 /** What the glossary view asks of the page. */
 export interface GlossaryDependencies {
@@ -29,12 +28,20 @@ export interface GlossaryDependencies {
   openDocument(key: string): void;
   /** Whether the page's token scope is known (a refused token reads nothing). */
   tokenKnown(): boolean;
+  /** `#2233`. Jump to a message through the page's link-jump path (a glossary source tap). */
+  jumpToMessage(ref: MessageLinkRef): void;
+  /** `#2233`. The back gesture's entries follow what is open. */
+  scheduleBackSync?(): void;
 }
 
 /** The glossary view's commands. */
 export interface GlossaryView {
   /** Fetch the known terms and link them in the lists. */
   refreshTerms(): Promise<void>;
+  /** `#2233`. Whether the full-screen glossary is up. */
+  panelOpen(): boolean;
+  /** `#2233`. Close the full-screen glossary (Back's `menu:glossary`); whether it was open. */
+  closePanel(): boolean;
   /** Take down the listeners this mount added. */
   unmount(): void;
 }
@@ -52,6 +59,10 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
   let terms: GlossaryTerm[] = [];
   let byNorm = new Map<string, GlossaryTerm>();
   let anchor: { top: number; left: number; bottom: number } | null = null;
+  // `#2233`. The known term the popover shows (null while it looks up or found nothing), and what
+  // opened the popover: the full-screen glossary opens at that term and gives the focus back there.
+  let popoverTerm: string | null = null;
+  let popoverOpener: HTMLElement | null = null;
 
   const wtf = () => deps.byId("selection-chip-wtf");
   const popover = () => deps.byId("glossary-popover");
@@ -85,21 +96,26 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
     body: string,
     source: GlossaryTerm["source"],
     savedNote: boolean,
+    known = false,
   ): void {
+    popoverTerm = known ? term : null;
     deps.byId("glossary-popover-term").textContent = term;
     deps.byId("glossary-popover-body").textContent = savedNote
       ? `${body} Saved to the glossary.`
       : body;
     const sourceLine = deps.byId("glossary-popover-source");
     const link = deps.byId("glossary-popover-link");
-    if (source) {
-      link.textContent = source.label;
-      if (source.kind === "document") {
+    // `#2233`. A source links only where it is checked to be an in-app message address or a document
+    // key (`glossarySourceTarget`); anything else (a `javascript:` address included) shows no line.
+    const target = glossarySourceTarget(source);
+    if (source && target) {
+      link.textContent = String(source.label ?? "") || "source";
+      if (target.kind === "document") {
         link.setAttribute("href", "#");
-        link.dataset.glossaryDoc = source.href;
+        link.setAttribute("data-glossary-doc", target.key);
         link.removeAttribute("data-msg");
       } else {
-        link.setAttribute("href", source.href);
+        link.setAttribute("href", target.href);
         link.removeAttribute("data-glossary-doc");
       }
       setHiddenIfChanged(sourceLine, false);
@@ -155,6 +171,7 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
     const info = selectionInfo() ?? (lastRange ? selectionInfo(lastRange) : null);
     const channel = deps.selectedChannelId();
     if (!info || !channel) return;
+    popoverOpener = wtf();
     anchor = anchor ?? { top: 80, left: 16, bottom: 120 };
     showPopover(info.text, "Looking this up…", null, false);
     try {
@@ -178,6 +195,7 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
           String(answer.definition),
           answer.source ?? null,
           answer.saved === true,
+          true,
         );
         await refreshTerms();
         const log = document.getElementById("discord-log");
@@ -200,6 +218,8 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
 
   function linkTermsIn(root: ParentNode, force = false): void {
     if (!terms.length) return;
+    // A document with no tree walker (a test's DOM) links nothing; every browser has one.
+    if (typeof document.createTreeWalker !== "function" || typeof NodeFilter === "undefined") return;
     // While any selection stands, linking anywhere risks the list rebuild
     // it triggers collapsing that selection; the press re-links on landing.
     if (!force) {
@@ -261,7 +281,7 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
       button.type = "button";
       button.className = "glossary-term";
       button.textContent = matched;
-      button.dataset.glossaryTerm = entry.term;
+      button.setAttribute("data-glossary-term", entry.term);
       const parent = node.parentNode;
       if (!parent) continue;
       if (after) parent.insertBefore(document.createTextNode(after), node.nextSibling);
@@ -272,22 +292,38 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
     }
   }
 
+  /** Read the known terms and link them in the lists; rejects when they could not be read. */
+  async function fetchTerms(): Promise<GlossaryTerm[]> {
+    const answer = (await deps.api("/api/v1/glossary/terms", { method: "GET" })) as {
+      terms?: GlossaryTerm[];
+    };
+    const list = answer && Array.isArray(answer.terms) ? answer.terms : [];
+    terms = [...list].sort((a, b) => b.term.length - a.term.length);
+    byNorm = new Map(terms.map((entry) => [normalize(entry.term), entry]));
+    const log = document.getElementById("discord-log");
+    if (log) linkTermsIn(log);
+    const pinned = document.getElementById("pinned-log");
+    if (pinned) linkTermsIn(pinned);
+    return list;
+  }
+
   async function refreshTerms(): Promise<void> {
     try {
-      const answer = (await deps.api("/api/v1/glossary/terms", { method: "GET" })) as {
-        terms?: GlossaryTerm[];
-      };
-      const list = answer && Array.isArray(answer.terms) ? answer.terms : [];
-      terms = [...list].sort((a, b) => b.term.length - a.term.length);
-      byNorm = new Map(terms.map((entry) => [normalize(entry.term), entry]));
-      const log = document.getElementById("discord-log");
-      if (log) linkTermsIn(log);
-      const pinned = document.getElementById("pinned-log");
-      if (pinned) linkTermsIn(pinned);
+      await fetchTerms();
     } catch {
       // No term list: nothing links, the WTF? press still answers for itself.
     }
   }
+
+  // `#2233 vibe-talk-glossary-popup`. The full-screen glossary; it reads the same term list, fresh at
+  // every open, and links the lists with it as a lookup does.
+  const panel = createGlossaryPanel({
+    byId: deps.byId,
+    loadTerms: () => fetchTerms(),
+    openDocument: (key) => deps.openDocument(key),
+    jumpToMessage: (ref) => deps.jumpToMessage(ref),
+    scheduleBackSync: () => deps.scheduleBackSync?.(),
+  });
 
   // Terms load lazily on first selection, never at page load: a page that
   // only reads must not spend a glossary read (or any read with its token).
@@ -324,8 +360,18 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
     void pressWtf();
   });
   listen<MouseEvent>(deps.byId("glossary-popover-close"), "click", () => closePopover());
+  // `#2233`. The Glossary button: the popover gives way to the full-screen glossary, at the term the
+  // popover showed when it showed one, and the focus goes back to what opened the popover on close.
+  listen<MouseEvent>(deps.byId("glossary-popover-open"), "click", (event) => {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    const term = popoverTerm;
+    const opener = popoverOpener;
+    closePopover();
+    panel.open({ term, returnFocus: opener });
+  });
   listen<MouseEvent>(deps.byId("glossary-popover-link"), "click", (event) => {
-    const key = (event.currentTarget as HTMLElement).dataset.glossaryDoc;
+    const key = (event.currentTarget as HTMLElement).getAttribute("data-glossary-doc");
     if (key) {
       event.preventDefault();
       closePopover();
@@ -341,11 +387,12 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
       target && typeof target.closest === "function" ? target.closest(".glossary-term") : null;
     if (termButton) {
       const held = termButton as HTMLElement;
-      const entry = byNorm.get(normalize(held.dataset.glossaryTerm || held.textContent || ""));
+      const entry = byNorm.get(normalize(held.getAttribute("data-glossary-term") || held.textContent || ""));
       if (entry) {
         const rect = termButton.getBoundingClientRect();
         anchor = { top: rect.top, left: rect.left, bottom: rect.bottom };
-        showPopover(entry.term, entry.definition, entry.source, false);
+        popoverOpener = held;
+        showPopover(entry.term, entry.definition, entry.source, false, true);
       }
       return;
     }
@@ -376,8 +423,11 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
 
   return {
     refreshTerms,
+    panelOpen: () => panel.isOpen(),
+    closePanel: () => panel.close(),
     unmount() {
       observer?.disconnect();
+      panel.unmount();
       unmount();
     },
   };
