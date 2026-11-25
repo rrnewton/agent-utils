@@ -5283,6 +5283,131 @@ def _act_search_bucket_main_only(driver: Driver) -> None:
     driver.settle(300)
 
 
+# `#2249 vibe-talk-search-signpost-hidden-while-reserved` (owner 370). "runner" settled (chips
+# standing, the list's head reserved), then one more key: the chips retire inside the input event
+# while the head stays reserved and the server's answer is pending. That moment lasts one debounce
+# window, so the act holds it still: the timers the key's own input event starts (the settled pass,
+# the server's ask) are queued, not dropped, and `after` starts them again. Nothing else on the page
+# is touched. The first row on screen is measured before the key (the same load, also shot as
+# `.before-key.png`) and after it, beside each shot (`.anchor.json`).
+SEARCH_CHIPS_STAND_JS = (
+    "(() => { const row = document.getElementById('search-bucket-row'); "
+    "return !!row && !row.hidden && !document.getElementById('search-bucket-main').hidden; })()"
+)
+
+SEARCH_FIRST_ROW_JS = """(() => {
+  const area = document.getElementById('scroll-area');
+  const top = area.getBoundingClientRect().top;
+  for (const row of document.querySelectorAll('#discord-log > li[data-id]')) {
+    const box = row.getBoundingClientRect();
+    if (box.bottom > top && box.height > 0) {
+      return { id: row.getAttribute('data-id'), top: Math.round(box.top * 10) / 10,
+               text: (row.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 120) };
+    }
+  }
+  return null;
+})()"""
+
+SEARCH_HEAD_JS = """(() => {
+  const main = document.getElementById('screen-main');
+  const sep = document.getElementById('search-screen-sep');
+  const box = sep.getClientRects().length ? sep.getBoundingClientRect() : null;
+  return { bucket_head: main.hasAttribute('data-bucket-head'),
+           bucket_head_css: getComputedStyle(main).getPropertyValue('--bucket-head').trim(),
+           chips_down: document.getElementById('search-bucket-row').hidden,
+           signpost_box: box ? { top: Math.round(box.top * 10) / 10, height: Math.round(box.height * 10) / 10 } : null,
+           search_count: window.__text('search-count'),
+           server_line: window.__text('server-line'),
+           scroll_top: document.getElementById('scroll-area').scrollTop };
+})()"""
+
+# One key into the search field, with the timers its own input event starts held in a queue.
+SEARCH_KEY_HELD_JS = """(value) => {
+  const realSetTimeout = window.setTimeout;
+  const held = [];
+  window.setTimeout = (run, ms, ...args) => { held.push({ run, ms: Number(ms) || 0, args }); return -held.length; };
+  try {
+    const field = document.getElementById('search-field');
+    field.value = value;
+    field.dispatchEvent(new Event('input', { bubbles: true }));
+  } finally {
+    window.setTimeout = realSetTimeout;
+  }
+  window.__searchKeyHeld = held;
+  return held.map((timer) => timer.ms);
+}"""
+
+SEARCH_KEY_RELEASE_JS = """() => {
+  const held = window.__searchKeyHeld || [];
+  window.__searchKeyHeld = [];
+  for (const timer of held) setTimeout(timer.run, timer.ms, ...timer.args);
+  return held.length;
+}"""
+
+
+def _search_sidecar(driver: Driver, name: str, record: dict[str, object]) -> None:
+    path = driver.out_dir / f"{driver.theme}--{driver.profile.name}--{name}.anchor.json"
+    path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+
+
+def _act_search_signpost_pending(driver: Driver) -> None:
+    """`#2249`: the key typed, the chips retired, the head still reserved and the answer pending:
+    the "On this screen" signpost stays down with the reservation, so no row moves."""
+    _act_search_bucket_fold(driver)
+    driver.page.wait_for_function(f"() => {SEARCH_CHIPS_STAND_JS}", timeout=20_000)
+    driver.settle(300)
+    reading = driver.js(SEARCH_FIRST_ROW_JS)
+    if not isinstance(reading, dict):
+        raise Unreachable("the settled search", "a result row is on screen", "no row on screen")
+    head_before = driver.js(SEARCH_HEAD_JS)
+    driver.js("window.__searchReading = " + json.dumps(reading))
+    driver.page.screenshot(
+        path=str(driver.out_dir / f"{driver.theme}--{driver.profile.name}--120-search-signpost-pending.before-key.png"))
+    held = driver.page.evaluate(SEARCH_KEY_HELD_JS, "runne")
+    after = driver.js(f"(() => {{ const r = document.querySelector('#discord-log > li[data-id=\"{reading['id']}\"]'); "
+                      "return r && r.getClientRects().length ? Math.round(r.getBoundingClientRect().top * 10) / 10 : null; })()")
+    _search_sidecar(driver, "120-search-signpost-pending", {
+        "moment": "one key after the settled 'runner' search ('runne'), its timers held: chips retired, head reserved, answer pending",
+        "held_timer_delays_ms": held,
+        "reading_before": reading,
+        "head_before": head_before,
+        "reading_row_top_after": after,
+        "dy": _dy(after, reading.get("top")),
+        "head_after": driver.js(SEARCH_HEAD_JS),
+    })
+
+
+def _after_search_signpost_pending(driver: Driver) -> None:
+    """Start the held timers again; the settled pass and the server's ask run through the real
+    route, and the chips stand for the new words (the next scene starts from a fresh load)."""
+    driver.js("window.__searchKeyReleased = (" + SEARCH_KEY_RELEASE_JS + ")()")
+    driver.page.wait_for_function(f"() => {SEARCH_CHIPS_STAND_JS}", timeout=20_000)
+    driver.page.wait_for_function(
+        "() => /Server search details|No more hits/.test(document.getElementById('server-line').textContent)",
+        timeout=20_000,
+    )
+
+
+def _act_search_settled_no_chip(driver: Driver) -> None:
+    """`#2249`: settled on words with no hit anywhere, through the real route: no chip stands, the
+    reservation is released and the "On this screen" signpost shows, as it always has."""
+    _act_search_bucket_fold(driver)
+    driver.page.wait_for_function(f"() => {SEARCH_CHIPS_STAND_JS}", timeout=20_000)
+    driver.page.fill("#search-field", "zzqv")
+    driver.page.wait_for_function(
+        "() => !document.getElementById('screen-main').hasAttribute('data-bucket-head')"
+        " && document.getElementById('search-bucket-row').hidden"
+        " && (window.__text('search-count') || '').startsWith('0 of')"
+        " && /Server search details|No more hits/.test(document.getElementById('server-line').textContent)",
+        timeout=20_000,
+    )
+    driver.settle(300)
+    _search_sidecar(driver, "121-search-settled-no-chip", {
+        "moment": "settled on 'zzqv' (no hit anywhere) after 'runner'",
+        "head": driver.js(SEARCH_HEAD_JS),
+    })
+
+
 def _act_discuss_preview(driver: Driver) -> None:
     _open_discuss(driver)
 
@@ -9706,6 +9831,47 @@ SCENES: tuple[Scene, ...] = (
             ("no error banner is up", "!window.__visible('error-wrap')"),
         ),
     ),
+    Scene(
+        name="120-search-signpost-pending",
+        what="#2249 one key after a settled search: chips retired, head reserved, answer pending; "
+             "the On this screen signpost stays down and the first row keeps its top",
+        act=_act_search_signpost_pending,
+        after=_after_search_signpost_pending,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            ("the chips retired for the new words", "document.getElementById('search-bucket-row').hidden"),
+            ("the head stays reserved while the answer is pending",
+             "document.getElementById('screen-main').hasAttribute('data-bucket-head')"
+             " && (window.__searchKeyHeld || []).length > 0"),
+            ("#2249 the On this screen signpost takes no box while the head is reserved",
+             "document.getElementById('search-screen-sep').getClientRects().length === 0"),
+            ("#2249 the first row on screen kept its top to the pixel",
+             "(() => { const was = window.__searchReading; "
+             "const r = document.querySelector(`#discord-log > li[data-id=\"${was.id}\"]`); "
+             "return !!r && Math.abs(r.getBoundingClientRect().top - was.top) <= 1; })()"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="121-search-settled-no-chip",
+        what="#2249 settled on words with no hit anywhere: no chip, no reserved head, the On this screen signpost shows",
+        act=_act_search_settled_no_chip,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            ("no chip stands and the head is released",
+             "document.getElementById('search-bucket-row').hidden"
+             " && !document.getElementById('screen-main').hasAttribute('data-bucket-head')"
+             " && getComputedStyle(document.getElementById('screen-main')).getPropertyValue('--bucket-head').trim() === '0px'"),
+            ("the server answered through the real route",
+             "/Server search details|No more hits/.test(document.getElementById('server-line').textContent)"),
+            ("the On this screen signpost shows",
+             "document.getElementById('search-screen-sep').getClientRects().length > 0"
+             " && document.getElementById('search-screen-sep').textContent.trim() === 'On this screen'"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
     # LAST IN THE WALK, and not by accident: it empties the server's durable store on the way in,
     # so that the summary the state above cached is really regenerated and can really fail. Nothing
     # after it in this profile would miss what it deletes, and the next profile purges anyway.
@@ -10215,7 +10381,8 @@ def run_captures(
     # `#2187`/`#2195`: the orphan scenes (93-98) stand on the same seeded glossary window as
     # 91/92, so they skip with them on a cacheless server instead of failing alone.
     discuss_scenes = [s for s in scenes if s.name.startswith(("73-", "74-", "75-", "76-", "78-", "84-", "85-", "89-", "90-", "91-", "92-", "93-", "94-", "95-", "96-", "97-", "98-", "99-", "100-", "101-", "102-", "103-",
-                                                                        "107-", "108-", "109-", "110-", "111-", "112-", "113-", "114-", "115-", "116-", "117-"))]
+                                                                        "107-", "108-", "109-", "110-", "111-", "112-", "113-", "114-", "115-", "116-", "117-",
+                                                                        "120-", "121-"))]
     discuss_only = bool(wanted) and len(wanted) == len(discuss_scenes)
     if discuss_scenes and not seed_discuss_cache(60 if discuss_only else 10):
         if discuss_only:
