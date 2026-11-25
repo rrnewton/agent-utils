@@ -514,7 +514,18 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
    * threads) is shown through here and settled exactly by that full pass moments later.
    */
   function applySearchFast(): void {
-    const hold = fastPassAnchor();
+    // `#2257`: the row being read is taken just before the first visibility write, never on a pass
+    // that writes nothing (no layout read at all then), and always while the layout is still the
+    // one the reader saw.
+    let hold: { row: Element; top: number; area: HTMLElement } | null = null;
+    let taken = false;
+    const hide = (row: SearchRow, hidden: boolean): void => {
+      if (!taken && (row.searchHidden !== hidden || classWords(row).includes("search-hidden") !== hidden)) {
+        taken = true;
+        hold = fastPassAnchor();
+      }
+      setSearchHidden(row, hidden);
+    };
     const node = searchField.open() ? searchParsed(searchField.query()).node : null;
     const typed = node !== null;
     const links = searchField.open() && searchField.links();
@@ -533,7 +544,7 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
         if (row.hasAttribute("data-server-hit")) {
           const bucket = row.getAttribute("data-bucket");
           const on = !deps.bucketOn || bucket === null ? null : deps.bucketOn(bucket);
-          if (on === false) setSearchHidden(row as SearchRow, true);
+          if (on === false) hide(row as SearchRow, true);
           continue;
         }
         const text = row.getAttribute("data-search");
@@ -543,12 +554,13 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
           const folded = (row as SearchRow).foldedSearch ?? text;
           hit = terms.every((term) => folded.includes(term));
         }
-        setSearchHidden(row as SearchRow, !hit);
+        hide(row as SearchRow, !hit);
         if (hit) standing += 1;
       }
     }
     // `#2257`: the row being read keeps its top across the visibility writes above it.
-    if (hold) keepFastPassAnchor(hold);
+    const held = hold as { row: Element; top: number; area: HTMLElement } | null;
+    if (held) keepFastPassAnchor(held);
     // `#1913`: retire the previous query's bucket chips at once (O(1)); the server ask and
     // its counts stay debounced with the full pass — no fetch, no recompute leaves this event.
     // `#2256`: the rows it stood decide the chip panel's head room in this same event.
