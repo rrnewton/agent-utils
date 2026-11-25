@@ -28,4 +28,7 @@ A consumer bridge stored an agent's reply (`agentctl chat reply`; receipt outcom
 
 # Notes
 
+Follow-up finding (same day): the outbound helper DID split the body (its log line: slack_format=markdown chunks=2, default max_chunk_bytes 11000), but the Slack CLI behind the helper refused chunk 0 as over its 12000-byte --markdown limit. The CLI counts its argument differently from the helper's raw byte count (escaping or non-ASCII encoding). So the fix must also size chunks the way the CLI counts, or re-split smaller on a size refusal, instead of retrying the same chunk.
+
+
 Reported by a consumer team's coordinator on 2026-11-25 (UTC): a reply of more than 12000 bytes retried for over an hour with no surfaced failure. The thread and reply addressing were correct; the size alone caused it.
