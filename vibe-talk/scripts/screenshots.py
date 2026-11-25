@@ -7400,6 +7400,8 @@ SCENES: tuple[Scene, ...] = (
         name="48e-bookmark-popover-keyboard-open",
         what="the Clear popover open with the keyboard open: above its chip, inside the shrunken viewport",
         act=_act_bookmark_popover_keyboard_open,
+        # The next scene (49) needs the full viewport back: its outbox row must sit inside the scroller.
+        after=_after_discuss_keyboard,
         profiles=("android-412",),
         expect=(
             ("the Discord pane is up", "window.__visible('pane-discord')"),
