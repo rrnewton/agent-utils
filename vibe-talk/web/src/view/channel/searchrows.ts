@@ -551,12 +551,15 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
       deps.bucketOn ? ["main", "threads", "transcripts", "thread"].map((id) => String(deps.bucketOn!(id))).join() : "",
       deps.heldMessages().length,
     ].join("|");
+    // Read runs are drawn on every pass, memo or not: their state (Fold
+    // read, a pin landing in a folded run) is not the search's, and the
+    // fold's label names it (`fold-pins-browser`).
+    deps.applyReadRuns();
     if (settledStamp && settledStamp.live && settledStamp.key === stampKey) return;
     const stamp = { key: stampKey, live: true };
     settledStamp = stamp;
     if (typeof queueMicrotask === "function") queueMicrotask(() => { stamp.live = false; });
     else stamp.live = false;
-    deps.applyReadRuns();
     const node = searchField.open() ? searchParsed(searchField.query()).node : null;
     // `#1825`: matching sees the group-expanded query; identity/terms stay raw.
     const matchNode = node !== null ? deps.expandLabelQuery(node) : null;
