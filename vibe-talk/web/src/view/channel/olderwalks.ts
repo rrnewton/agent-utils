@@ -996,8 +996,18 @@ function hitBucket(hit: Message): string {
 const byHitTime = (a: Message, b: Message): number =>
   (Date.parse(a.timestamp) || 0) - (Date.parse(b.timestamp) || 0);
 
-/** Fresh hits per built-in bucket, oldest first in each. */
+/** The grouping last built, and the answer state it was built from. */
+let bucketHitsCache: { key: string; grouped: Map<string, Message[]> } | null = null;
+
+/** Fresh hits per built-in bucket, oldest first in each. Built once per
+ * answer state: `serverFreshHits` builds the held-message map and scans
+ * every row on screen, and both the chip render and the fold asked for
+ * the grouping per answer, paying that walk twice (search-typing-fast). */
 function bucketHits(): Map<string, Message[]> {
+  const now = serverSearchNow();
+  const key = `${now.ticket}|${now.hits.length}|${(now.transcriptHits || []).length}|` +
+    `${String(selectedChannelId() || "")}|${columns.main.searched?.loaded || 0}|${el("discord-log").children.length}`;
+  if (bucketHitsCache && bucketHitsCache.key === key) return bucketHitsCache.grouped;
   const grouped = new Map<string, Message[]>();
   for (const hit of serverFreshHits()) {
     const id = hitBucket(hit);
@@ -1006,6 +1016,7 @@ function bucketHits(): Map<string, Message[]> {
     else grouped.set(id, [hit]);
   }
   for (const hits of grouped.values()) hits.sort(byHitTime);
+  bucketHitsCache = { key, grouped };
   return grouped;
 }
 
