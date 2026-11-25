@@ -20,7 +20,11 @@ phone and desktop sizes:
   the answer pending), the "On this screen" signpost takes no layout box at the key or at any
   frame until the chips stand again (it used to come back over the reserved room and push the
   reader's rows +23 px for the debounce window); settled on a query with no hit anywhere (no
-  chip, no reservation) the signpost shows.
+  chip, no reservation) the signpost shows;
+  `#2256`: the chip panel's head room is decided at the key, in the same pass as the key's own
+  filter: a mid-list reader and a reader at the foot keep the row being read at its top from the
+  first key through the settled answer (the server line at the foot lands below the newest row),
+  and words with no loaded match drop the room inside the input event, never later.
 
 The gate is a count of synchronous work per input event, never a wall-clock budget (owner
 rule 346); every wait is a condition wait. Pass --screenshots DIR to keep a PNG of each stage.
@@ -339,6 +343,95 @@ def walk_through(walk: Walk, total: int) -> None:
     walk.check(shown["boxes"] > 0 and shown["text"] == "On this screen",
                f"settled with no chip the 'On this screen' signpost does not show: {shown}")
     walk.shot("settled-no-chip")
+    head_room_walk(walk)
+
+
+# `#2256`: one key into the field, then every frame until the answer has settled: the reading
+# row's top against its top at the key, and whether the head room stood at each frame.
+HEAD_KEY_JS = """async ([value, rowId]) => {
+    const area = document.getElementById('scroll-area');
+    const main = document.getElementById('screen-main');
+    const field = document.getElementById('search-field');
+    field.value = value;
+    field.dispatchEvent(new Event('input', { bubbles: true }));
+    const row = rowId === null ? null : document.querySelector(`#discord-log > li[data-id="${rowId}"]`);
+    const top = () => row && row.getClientRects().length ? row.getBoundingClientRect().top : null;
+    const atKey = { top: top(), head: main.hasAttribute('data-bucket-head') };
+    const settled = () => /Server search details|No more hits/.test(document.getElementById('server-line').textContent)
+        && (value === 'zzqv' ? document.getElementById('search-count').textContent.startsWith('0 of')
+            : !document.getElementById('search-bucket-row').hidden);
+    let frames = 0; let moved = 0; let worst = 0; let headFlips = 0; let after = 0;
+    while (frames < 6000 && after < 10) {
+        await new Promise((resolve) => requestAnimationFrame(resolve));
+        frames += 1;
+        const now = top();
+        if (atKey.top !== null && now !== null && Math.abs(now - atKey.top) > 1) { moved += 1; worst = Math.max(worst, Math.abs(now - atKey.top)); }
+        if (main.hasAttribute('data-bucket-head') !== atKey.head) headFlips += 1;
+        if (settled()) after += 1;
+    }
+    return { atKey, frames, moved, worst: Math.round(worst * 10) / 10, headFlips, settled: settled(),
+             scrollTop: area.scrollTop };
+}"""
+
+PARK_JS = """(where) => {
+    const area = document.getElementById('scroll-area');
+    const rows = [...document.querySelectorAll('#discord-log > li[data-id]')].filter((row) => row.getClientRects().length);
+    if (where === 'foot') {
+        area.scrollTop = area.scrollHeight;
+        const box = area.getBoundingClientRect();
+        const last = [...rows].reverse().find((row) => row.getBoundingClientRect().bottom <= box.bottom + 1);
+        return last ? last.getAttribute('data-id') : null;
+    }
+    const row = rows.find((one) => (one.textContent || '').includes('Routine lane note 400,'));
+    const box = row.getBoundingClientRect(); const view = area.getBoundingClientRect();
+    area.scrollTop += box.top - (view.top + view.height / 2);
+    return row.getAttribute('data-id');
+}"""
+
+
+def head_room_walk(walk: Walk) -> None:
+    """`#2256 vibe-talk-search-head-room-no-shift`: the chip panel's head room is decided at the
+    key, in the same pass as the key's own filter, so neither the answer landing nor the search's
+    foot line moves the row being read.
+
+    Mid-list (the reading row matches, so it keeps its top): the first key of a search reserves the
+    room inside the input event, and the row keeps its top from the key through the settled answer.
+    At the foot (the newest row matches): the same, and the server's line appearing below the newest
+    row lands past its bottom edge instead of taking the reader to the list's foot. Release (the new
+    words match nothing loaded): the room goes inside the input event, with the rows the key took
+    away, and no frame after it adds or drops it again.
+    """
+    page = walk.page
+
+    def clear() -> None:
+        page.evaluate("""() => { const f = document.getElementById('search-field'); f.value = '';
+            f.dispatchEvent(new Event('input', { bubbles: true })); }""")
+        walk.until("() => document.getElementById('search-count').textContent === ''"
+                   " && !document.getElementById('screen-main').hasAttribute('data-bucket-head')",
+                   "the cleared search kept its count or its head room")
+
+    def first_key(where: str) -> None:
+        clear()
+        row_id = page.evaluate(PARK_JS, where)
+        walk.check(row_id is not None, f"no {where} row to read")
+        page.wait_for_function("() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(true))))")
+        seen = page.evaluate(HEAD_KEY_JS, ["routine", row_id])
+        walk.check(seen["atKey"]["head"] is True,
+                   f"{where}: the first key did not reserve the head room inside the input event: {seen}")
+        walk.check(seen["settled"] and seen["moved"] == 0 and seen["headFlips"] == 0,
+                   f"{where}: the reading row moved after the key ({seen['moved']} frames, up to {seen['worst']} px)"
+                   f" or the head room flipped ({seen['headFlips']} frames) before the answer settled: {seen}")
+
+    # Mid-list, the reading row a match: it keeps its top.
+    first_key("mid")
+    walk.shot("head-room-mid")
+    # At the foot, the newest row a match: it keeps its top; the server line lands below it.
+    first_key("foot")
+    walk.shot("head-room-foot")
+    # Release: words with no loaded match drop the room in the input event, once.
+    seen = page.evaluate(HEAD_KEY_JS, ["zzqv", None])
+    walk.check(seen["atKey"]["head"] is False and seen["headFlips"] == 0 and seen["settled"],
+               f"release: the head room did not go with the key, or came back before the settle: {seen}")
 
 
 def main() -> int:

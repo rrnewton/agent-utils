@@ -80,6 +80,9 @@ export interface OlderWalksDependencies {
   /** `#2200`: redraw "X of Y loaded" from the fold after the chips move. Optional for doubles. */
   refreshSearchCount?(): void;
   preservingScroll(mutate: () => void): void;
+  /** `#2256`: open the scroll owner's user-caused hold (`#2076`), so the restore that follows keeps
+   * the reader's row by its top even at the list's foot. Optional for doubles. */
+  beginUserChange?(): void;
   /** Put `area` at a measured scroll position through the scroll owner (`#1251`). */
   toPosition(area: HTMLElement, top: number): void;
   /** Bring `element` into view through the scroll owner (`#1251`). */
@@ -167,7 +170,7 @@ export interface OlderWalks {
   historyReach(): OlderHistoryReach;
   scheduleServerSearch(): void;
   /** `#1913`: retire the bucket chips when the typed query no longer matches the answered one. */
-  retireStaleBuckets(): void;
+  retireStaleBuckets(loadedHits?: number): void;
   /** `#2200`: whether a bucket chip stands, for the search filter (null: fold not standing). */
   bucketOnFor(id: string): boolean | null;
   /** `#2200`: the one search-result fold's counts per chip and their sum (null: fold not standing). */
@@ -776,9 +779,56 @@ let placedScopeKey = "";
 
 /** `#1913`: the typing-fast pass's note that the words changed: retire the chips the answered
  * query earned (see `hideBucketChips`). The server ask itself stays with the full pass. */
-function retireStaleBuckets(): void {
+function retireStaleBuckets(loadedHits?: number): void {
   const key = serverSearchKeyNow();
-  if (key !== "" && key !== serverSearchNow().key) hideBucketChips();
+  if (key !== "" && key !== serverSearchNow().key) {
+    hideBucketChips();
+    reserveHeadRoom(loadedHits === undefined ? searchedLoadedHits() : loadedHits);
+  }
+}
+
+/** `#2256`: how many loaded messages the last full pass found for the words in the field (the
+ * fold's loaded half, before the bucket gate). */
+function searchedLoadedHits(): number {
+  const loaded = columns.main.searched?.buckets;
+  return loaded ? loaded.main + loaded.threads + loaded.transcripts : 0;
+}
+
+/**
+ * `#2256 vibe-talk-search-head-room-no-shift` (owner 370): a change at the head or the foot of the
+ * list that the reader's search makes (the chip panel's head room, the server line at the foot)
+ * keeps the row being read where it stands. Scrolled into the list, the change goes through the
+ * scroll owner's user-caused hold, which keeps the row by its top even at the foot (`#2230`: what
+ * lands below the reader is seen past its bottom edge). At the very top there is no hold: the
+ * change lands with the key's own relayout, so the first result lays out below the panel's room
+ * and never under the panel (`#2254`).
+ */
+function holdingHeadChange(mutate: () => void): void {
+  if (el("scroll-area").scrollTop <= 0) {
+    mutate();
+    return;
+  }
+  if (deps.beginUserChange) deps.beginUserChange();
+  preservingScroll(mutate);
+}
+
+/**
+ * `#2256`: the head room for the chip panel is decided at the KEY that starts an answer, in the
+ * same pass as the key's own filter, so the answer landing neither adds nor drops it under the
+ * reader. Words with loaded hits will stand chips (the fold counts them while the answer loads),
+ * so the room is reserved now; words with none drop a standing room now, with the rows the key
+ * took away, instead of at the settle. Only where the server is asked at all (`serverCopyOpen`);
+ * elsewhere the chips' own render decides it as before.
+ */
+function reserveHeadRoom(loadedHits: number): void {
+  if (!serverCopyOpen()) return;
+  const screenMain = el("screen-main");
+  const want = loadedHits > 0;
+  if (want === screenMain.hasAttribute("data-bucket-head")) return;
+  holdingHeadChange(() => {
+    if (want) screenMain.setAttribute("data-bucket-head", "");
+    else screenMain.removeAttribute("data-bucket-head");
+  });
 }
 
 /** `#1913`: take the bucket chips down while a new query's answer is pending, so the previous
@@ -802,7 +852,10 @@ function scheduleServerSearch() {
   if (gathering.state().channel !== "" && (key === "" || !searchFurtherRunning())) stopSearchFurther();
   // `#1913` (liaison (B) on `#1899`): a new query retires the standing chips at once; their
   // counts described the last query, and the server's answer for this one is still to come.
-  if (key !== "" && key !== serverSearchNow().key) hideBucketChips();
+  if (key !== "" && key !== serverSearchNow().key) {
+    hideBucketChips();
+    reserveHeadRoom(searchedLoadedHits());
+  }
   serverSearchOwner.schedule(key, serverCopyOpen());
   // `#1786`: the same search in a new scope (another thread, another channel
   // view) partitions the same hits differently, and the view's redraw took
@@ -1352,13 +1405,21 @@ function renderServerSearch() {
   const serverSearch = serverSearchNow();
   const section = el("server-search");
   const wanted = serverSearch.key !== "";
-  if (section.hidden === wanted) section.hidden = !wanted;
+  // `#2256`: the server's line appearing at the foot lands below the row being read, held.
+  if (section.hidden === wanted) {
+    if (wanted) holdingHeadChange(() => { section.hidden = false; });
+    else section.hidden = true;
+  }
   if (!wanted) {
     serverExpanded = false;
     bucketsFor = "";
     clearServerHits();
     const rowOff = el("search-bucket-row");
     if (!rowOff.hidden) rowOff.hidden = true;
+    // `#2256`: no words, no room: a cleared or closed search releases the reservation (held), so
+    // the next search's first key decides it afresh and a reopened search brings no stale band.
+    const mainOff = el("screen-main");
+    if (mainOff.hasAttribute("data-bucket-head")) holdingHeadChange(() => mainOff.removeAttribute("data-bucket-head"));
     return;
   }
   // A typed query is a new search: its details wait for a fresh tap and its
@@ -1431,10 +1492,16 @@ function renderServerSearch() {
   // whose hold puts the reader's row back at its place in the same frame,
   // so the release moves nothing they see (`#1899`).
   const screenMain = el("screen-main");
-  const reserve = anyChip || (serverSearchNow().key !== "" && serverSearchNow().loading);
-  if (reserve && !screenMain.hasAttribute("data-bucket-head")) screenMain.setAttribute("data-bucket-head", "");
+  // `#2256`: pending counts only for words with loaded hits, as the key decided (`reserveHeadRoom`):
+  // words with none take no room while their answer loads, so a search that settles with no chip
+  // neither adds nor releases anything under the reader. Normally already decided at the key; a
+  // late add or release (fresh hits standing chips, the last chip going) is held the same way.
+  const reserve = anyChip || (serverSearchNow().key !== "" && serverSearchNow().loading && searchedLoadedHits() > 0);
+  if (reserve && !screenMain.hasAttribute("data-bucket-head")) {
+    holdingHeadChange(() => screenMain.setAttribute("data-bucket-head", ""));
+  }
   if (!reserve && screenMain.hasAttribute("data-bucket-head")) {
-    preservingScroll(() => screenMain.removeAttribute("data-bucket-head"));
+    holdingHeadChange(() => screenMain.removeAttribute("data-bucket-head"));
   }
   const bucketRow = el("search-bucket-row");
   // The row stands only while a chip stands (`#1899` follow-up, liaison

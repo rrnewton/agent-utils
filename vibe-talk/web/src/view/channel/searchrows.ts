@@ -139,7 +139,8 @@ export interface SearchRowsDependencies {
   renderOlderControl(): void;
   scheduleServerSearch(): void;
   /** `#1913`: retire bucket chips earned by an older query (O(1), no fetch). Optional for doubles. */
-  retireStaleBuckets?(): void;
+  /** `#2256`: `loadedHits` is how many loaded rows the fast pass stood for the words. */
+  retireStaleBuckets?(loadedHits?: number): void;
   /** `#2200`: whether a bucket's results stand in the timeline, or null where the
    * bucket fold is not standing for this search (no server search in play). */
   bucketOn?(id: string): boolean | null;
@@ -468,6 +469,7 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
     const terms = typed ? searchParsed(searchField.query()).terms : [];
     const exact = typed && !links && author === "everyone" && !deps.pinsOnly() && !entireThreadsOn &&
       plainAndOnly(deps.language.searchQueryTree(node));
+    let standing = 0;
     for (const id of SEARCH_LISTS) {
       if (deps.side() && id === "transcript") continue;
       const list = el(id);
@@ -489,11 +491,13 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
           hit = terms.every((term) => folded.includes(term));
         }
         setSearchHidden(row as SearchRow, !hit);
+        if (hit) standing += 1;
       }
     }
     // `#1913`: retire the previous query's bucket chips at once (O(1)); the server ask and
     // its counts stay debounced with the full pass — no fetch, no recompute leaves this event.
-    if (!deps.side() && deps.retireStaleBuckets) deps.retireStaleBuckets();
+    // `#2256`: the rows it stood decide the chip panel's head room in this same event.
+    if (!deps.side() && deps.retireStaleBuckets) deps.retireStaleBuckets(standing);
   }
 
   /** `#2200`: the one disjoint bucket a message counts in: Transcripts when its

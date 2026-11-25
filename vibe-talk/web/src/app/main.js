@@ -3053,7 +3053,7 @@ const searchRows = createSearchRows({
   renderReplyLinks,
   renderOlderControl: () => renderOlderControl(),
   scheduleServerSearch: () => scheduleServerSearch(),
-  retireStaleBuckets: () => retireStaleBuckets(),
+  retireStaleBuckets: (loadedHits) => retireStaleBuckets(loadedHits),
   bucketOn: (id) => bucketOnFor(id),
   foldCounts: () => foldCounts(),
   placeInlineReply: () => placeInlineReply(),
@@ -7620,7 +7620,7 @@ const olderWalks = mountOlderWalks({
   jumpToMessageLink, messageBody, markSearchHits, searchParsed, heldMessagesById,
   serverCardNode: (hit) => discordNode(/** @type {any} */ ([hit])),
   keepingCardPlace, walkCursorOwed: timelineView.walkCursorOwed, loadOlder: timelineView.loadOlder,
-  guardQuietly: (fn) => guardQuietly(fn), renderJumpNewest, applySearch, refreshSearchCount: () => refreshSearchCount(), preservingScroll, toPosition: (area, top) => scrollKeeping.toPosition(area, top), intoView: (element, block) => scrollKeeping.intoView(element, block), setStatus,
+  guardQuietly: (fn) => guardQuietly(fn), renderJumpNewest, applySearch, refreshSearchCount: () => refreshSearchCount(), preservingScroll, beginUserChange: () => scrollKeeping.beginUserChange(), toPosition: (area, top) => scrollKeeping.toPosition(area, top), intoView: (element, block) => scrollKeeping.intoView(element, block), setStatus,
   columnWork, columns, sideShowing, inColumn, columnSteps: () => /** @type {any} */ (columnSteps()), filterChanges,
   replyJumpCurrent: () => replyJumpTicket.current(), idsOf, rowMessages, plainReach, replyTally, providerOfChannel, channelDirectoryName: () => channelDirectory.providerName(),
 });
