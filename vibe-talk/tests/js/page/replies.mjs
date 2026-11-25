@@ -4305,8 +4305,12 @@ test("`#727 vt-selection-quick-reply`: Send posts the quoted reply in the messag
     assert.equal(arrivedTop, top, `${where}: the reply, or its answer, arriving moved the list`);
     assert.deepStrictEqual(page.dismissCalls, [], `${where}: a quote of one point in twenty marked the long message Done`);
   }
-  // THE CONTROL: a list not held for the quick reply follows the newest message down as it arrives.
-  const control = await run(await brokenModule([{ file: "src/view/channel/filterplace.ts", find: "    if (deps.quickReplyHolds(area)) return false;\n", replace: "" }]));
+  // THE CONTROL: a list not held for the quick reply, with the follow-at-rest `#2230
+  // vibe-talk-reading-row-stays-put` took out (owner 370) put back, follows the newest message down
+  // as it arrives.
+  const control = await run(await brokenModule([
+    { file: "src/view/channel/filterplace.ts", find: "    if (deps.quickReplyHolds(area)) return false;\n", replace: "" },
+    { file: "src/view/channel/readcore.ts", find: "  const holdsAtFoot = how.wasAtNewest &&", replace: "  const holdsAtFoot = false && how.wasAtNewest &&" }]));
   assert.notEqual(control.openArrivedTop, control.top, "with the list not held it stayed put anyway, so this test cannot see it");
 });
 

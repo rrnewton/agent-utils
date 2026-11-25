@@ -37,7 +37,8 @@ At each size, in two columns with a mouse:
   foot, the reply on screen, nothing offered as new (FOLLOW) -> PgDn goes on to the end of the room, the
   last reply's top at the middle (PAGING) -> a short reply arriving there moves nothing for 1.5 s sampled
   at every frame and is drawn on screen in the room (STILL), and PgDn again brings its top to the middle:
-  the room was fitted to it (FIT) -> End lands on the foot and closes the room (END). At 1280x700 the
+  the room was fitted to it (FIT) -> End lands on the foot and closes the room (END) -> a reply arriving
+  there moves nothing, the row being read held at every frame (ARRIVE: `#2230`, owner 370). At 1280x700 the
   thread's own message box under its last reply already holds that reply's top above the middle at the
   foot, so there PgDn and the wheel at the foot open no room (LIMIT).
 
@@ -288,6 +289,8 @@ def arguments() -> argparse.Namespace:
 FOOT_ROOMS = "src/view/channel/footroom.ts"
 LIST_KEEPERS = "src/view/channel/listkeepers.ts"
 LIT_CARDS = "src/view/channel/litcards.ts"
+LIVE_STREAM = "src/view/channel/livestream.ts"
+READ_CORE = "src/view/channel/readcore.ts"
 
 # Each negative control: its name, the file of the page it changes, the texts it takes out and what it puts in
 # their place, and the checks (by their tags) one of which must be the one that fails. A patch naming a file of its
@@ -299,8 +302,18 @@ CONTROLS: tuple[Control, ...] = (
     ("the room not the foot", FOOT_ROOMS,
      (("    return area.scrollHeight - room - area.scrollTop - (area.clientHeight || 0);\n",
        "    return area.scrollHeight - area.scrollTop - (area.clientHeight || 0);\n"),), ("JUMP", "FOLLOW")),
+    # Since `#2230 vibe-talk-reading-row-stays-put` (owner 370) no arrival follows the foot, so the room's own
+    # guard for a follower is reached only with the old follow put back as well: an arrival followed, and the
+    # follower in the room then taken to the foot, which moves the row being read (STILL).
     ("a follower in the room taken to the foot", FOOT_ROOMS,
-     (("      if (overscroll !== null && area.scrollTop >= footTop(area) - 0.5) return;\n", ""),), ("STILL",)),
+     (("      if (overscroll !== null && area.scrollTop >= footTop(area) - 0.5) return;\n", ""),
+      (LIVE_STREAM, "      if (ownSend(message, selfPosted)) {\n", "      if (true) {\n"),
+      (READ_CORE, "    !followsOwnSend;\n", "    !followsOwnSend && false;\n")), ("STILL",)),
+    # `#2230`: the follow of an arrival at the foot put back, as the page before owner 370 had it (`#1209`'s
+    # follow-at-rest): the reply arriving at the thread's foot moves the row being read (ARRIVE).
+    ("an arrival followed at the foot", LIVE_STREAM,
+     (("      if (ownSend(message, selfPosted)) {\n", "      if (true) {\n"),
+      (READ_CORE, "    !followsOwnSend;\n", "    !followsOwnSend && false;\n")), ("ARRIVE",)),
     ("no rest asked of the wheel", FOOT_ROOMS,
      (("const OVERSCROLL_REST_MS = 150;\n", "const OVERSCROLL_REST_MS = 0;\n"),), ("DETENT",)),
     ("the last card's change of size neither fitted to nor held", "src/app/main.js",
@@ -424,7 +437,7 @@ def control_probe(reader: Reader, rest_ms: float, tags: tuple[str, ...]) -> None
     failure tags. Each probe uses the same wheel, key, and frame assertions.
     An unknown control fails here rather than silently receiving less coverage.
     """
-    if tags in (("JUMP", "FOLLOW"), ("STILL",)):
+    if tags in (("JUMP", "FOLLOW"), ("STILL",), ("ARRIVE",)):
         thread_walk(reader)
     elif tags == ("DETENT",):
         back_up(reader, "side-cards", "DETENT")
@@ -812,6 +825,20 @@ def thread_walk(reader: Reader) -> None:
     key(reader, "End")
     at_foot_closed(reader, measure(reader, "side-log"), "END", "End")
     reader.notes.append("End came back to the foot")
+
+    # `#2230 vibe-talk-reading-row-stays-put` (owner 370): at the foot with the room closed, a reply
+    # arriving moves nothing. The row being read holds at every frame and the reply lands below it (ARRIVE).
+    before = reader.first("side-log")
+    reader.watch("side-log")
+    third = api.add("A reply arriving with the reader at the foot.", ROOM)
+    api.push("message", {"message": third}, str(third["id"]))
+    reader.wait_for(f"() => !!document.querySelector(\"#side-log > li[data-id='{third['id']}']\")",
+                    "the reply arriving at the foot never reached the thread on the right")
+    try:
+        reader.held(before, "a reply arriving with the reader at the thread's foot", list_id="side-log")
+    except AssertionError as error:
+        raise AssertionError(f"ARRIVE: {error}") from error
+    reader.notes.append("a reply arriving with the reader at the foot, the room closed, moved nothing (owner 370)")
     page.keyboard.press("Escape")
     reader.wait_for("() => document.getElementById('side-pane').hidden", "Esc did not go back to the cards")
 

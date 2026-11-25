@@ -4614,15 +4614,21 @@ test("`#243 filter-keeps-selection`: and nothing else moves it afterwards — no
   await reReadChannel(page);
   keptAt(page, "40", y, "a read bringing a new message");
   assert.ok(jumpSaysArrived(page), "the new message below is not offered");
-  // Once the reader scrolls, the newest line is followed again as it always was.
+  // Once the reader scrolls, the hold is let go; at the newest line a read bringing a message still
+  // moves nothing (`#2230 vibe-talk-reading-row-stays-put`, owner 370, superseding the follow this
+  // test used to pin here): the message lands below and the jump says so.
   area.scrollTop = area.scrollHeight;
   await area.dispatch("scroll");
+  const scrolledTo = area.scrollTop;
   page.messages = [...page.messages, message({ id: "42", content: longMessage("arrived again") })];
   await reReadChannel(page);
-  assert.ok(atBottomOf(area), "a reader on the newest line was not followed once they had scrolled");
-  // THE CONTROL: with the hold taken out, the read follows the newest line and the message moves.
+  assert.equal(area.scrollTop, scrolledTo, "a read bringing a message moved a reader on the newest line");
+  assert.ok(jumpSaysArrived(page), "the message that arrived below the reader is not offered");
+  // THE CONTROL: with the hold taken out, and the old follow-at-rest put back, the read follows the
+  // newest line and the message moves.
   const followed = await run(await brokenModule([
     { file: "src/view/channel/readcore.ts", find: "  if (how.keepPosition && keepFilterHold()) {", replace: "  if (false) {" },
+    { file: "src/view/channel/readcore.ts", find: "  const holdsAtFoot = how.wasAtNewest &&", replace: "  const holdsAtFoot = false && how.wasAtNewest &&" },
     { file: "src/view/channel/filterplace.ts", find: "    return deps.atBottom(area, deps.restSlackPx) && heldFilterRow() === null;", replace: "    return deps.atBottom(area, deps.restSlackPx);" }]));
   const before = yOf(followed, "40");
   followed.messages = [...followed.messages, message({ id: "41", content: longMessage("arrived") })];
@@ -4683,7 +4689,9 @@ test("`#243 filter-keeps-selection`: the reader's own act ends what the change h
   assert.ok(yOf(held.page, "28") < held.before - 1, "the test cannot see the held pin move the message opened");
 });
 
-test("`#243 filter-keeps-selection`: after the reader acts in the list — a press, a key, the mouse choosing another message, Collapse all — the newest line is followed again", async () => {
+test("`#243 filter-keeps-selection`: after the reader acts in the list — a press, a key, the mouse choosing another message, Collapse all — the hold is let go, and a read bringing a message moves nothing", async () => {
+  // Before `#2230 vibe-talk-reading-row-stays-put` (owner 370, 2026-11-25) the hold's end showed as the
+  // newest line followed again. No arrival follows the newest line now, so the hold itself is asked.
   const kept = async (script) => {
     const { page, messages } = pinnedPlacePage(["12", "27", "40"], script);
     await signIn(page);
@@ -4706,18 +4714,21 @@ test("`#243 filter-keeps-selection`: after the reader acts in the list — a pre
     const page = await kept(SCRIPT);
     await run(page);
     await page.settle();
+    assert.equal(page.pure("heldFilterRow")(), null, `after ${act}, the filter change still holds its message`);
+    const area = page.el("scroll-area");
+    const at = area.scrollTop;
     page.messages = [...page.messages, message({ id: String(n), content: longMessage(`arrived after ${act}`) })];
     n += 1;
     await reReadChannel(page);
-    assert.ok(atBottomOf(page.el("scroll-area")), `after ${act}, a reader on the newest line was not followed down`);
+    assert.equal(area.scrollTop, at, `after ${act}, a read bringing a message moved the reader`);
+    assert.ok(jumpSaysArrived(page), `after ${act}, the message that arrived below the reader is not offered`);
   }
-  // THE CONTROL: with the reader's act not ending the hold, the same tap leaves the new message unfollowed.
+  // THE CONTROL: with the reader's act not ending the hold, the same tap leaves the hold in place.
   const page = await kept(await brokenModule([{ file: "src/view/channel/filterplace.ts",
     find: "  function readerActed(): void {\n    filterState().hold = null;", replace: "  function readerActed(): void {\n    return;" }]));
   await acts["a tap in the list"](page);
-  page.messages = [...page.messages, message({ id: String(n), content: longMessage("arrived") })];
-  await reReadChannel(page);
-  assert.ok(!atBottomOf(page.el("scroll-area")), "the test cannot see the hold outlast the reader's act");
+  await page.settle();
+  assert.notEqual(page.pure("heldFilterRow")(), null, "the test cannot see the hold outlast the reader's act");
 });
 
 /** The `.body` of a channel row, and the top of each message's block in it, below the top of `scroller`'s box. */

@@ -38,12 +38,23 @@ export interface OwnPosts {
   removed(id: string): void;
   /** Take back what earlier pages of the device sent in the grace. */
   load(): void;
+  /**
+   * `#2230 vibe-talk-reading-row-stays-put`: messages `ids` were posted from this page through a card
+   * the reader confirmed (`#264 voice-send-approval`), not the outbox. The reader's own send: a read or
+   * a live message bringing one follows a reader at the foot as it always did, and never counts as an
+   * arrival on the jump. Kept apart from `noteSent`, whose posts the store and the receipts treat as
+   * the outbox's own.
+   */
+  noteConfirmed(ids: readonly string[]): void;
+  /** Whether message `id` was posted from this page through a confirmed card, within OWN_POST_GRACE_MS. */
+  confirmedHere(id: string): boolean;
 }
 
 /** An owner holding nothing sent. */
 export function createOwnPosts(deps: OwnPostsDependencies): OwnPosts {
   const sentFromHere = new Set<string>();
   const sentFromHereAt = new Map<string, number>();
+  const confirmedAt = new Map<string, number>();
   /** The saved `sentFromHereAt` still in its grace, by id. */
   const savedOwnPosts = (): Map<string, number> => {
     const kept = new Map<string, number>();
@@ -91,6 +102,16 @@ export function createOwnPosts(deps: OwnPostsDependencies): OwnPosts {
     },
     load() {
       for (const [id, at] of savedOwnPosts()) if (!sentFromHereAt.has(id)) sentFromHereAt.set(id, at);
+    },
+    noteConfirmed(ids) {
+      for (const id of ids) confirmedAt.set(id, deps.now());
+    },
+    confirmedHere(id) {
+      const at = confirmedAt.get(id);
+      if (at === undefined) return false;
+      if (deps.now() - at < OWN_POST_GRACE_MS) return true;
+      confirmedAt.delete(id);
+      return false;
     },
   };
 }

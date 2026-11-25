@@ -240,6 +240,8 @@ export interface TimelineViewDependencies {
   removalRecord: Removals;
   removedAfterRead(canon: ChannelCanon, id: string, versions: unknown): boolean;
   ownPostStands(id: string): boolean;
+  /** `#2230`: whether message `id` was posted from this page through a confirmed card (`OwnPosts.confirmedHere`). */
+  ownConfirmed?(id: string): boolean;
   foldReadState(payload: TimelineResponse, view: string): boolean;
   noteReplyGaps(payload: TimelineResponse, view: string, older: boolean, delta: boolean, before: unknown): void;
   noteServerPageBuild(payload: TimelineResponse): void;
@@ -2148,21 +2150,40 @@ function settleAfterRead(messages: readonly Message[], how: { area: HTMLElement;
   const previous = listState().newestId;
   const newest = messages.length ? String((messages[messages.length - 1] as Message).id) : null;
   const moved = newest !== null && listState().newestId !== null && newest !== listState().newestId;
-  const arrived = moved && how.ownAct !== true;
+  // `#2230 vibe-talk-reading-row-stays-put`: the reader's own sends among what this read brought (the
+  // outbox's, `ownPostStands`, and a confirmed card's, `ownConfirmed`) are never counted as arrivals on
+  // the jump, and a confirmed card's is followed at the foot as it always was (below). How many
+  // arrived is counted from the message that was newest before; when it is not in the list any more
+  // (more arrived than one read holds, or it was deleted) only that something did (`#207`).
+  const previousAt = previous === null ? -1 : messages.findIndex((message) => String(message.id) === previous);
+  const fresh = moved && previousAt >= 0 ? messages.slice(previousAt + 1).map((message) => String(message.id)) : [];
+  const confirmed = (id: string): boolean => deps.ownConfirmed?.(id) === true;
+  const othersFresh = fresh.filter((id) => !ownPostStands(id) && !confirmed(id));
+  const followsOwnSend = fresh.some(confirmed);
+  const arrived = moved && how.ownAct !== true && (previousAt < 0 || othersFresh.length > 0);
+  const arrivedCount = previousAt >= 0 ? othersFresh.length : null;
   listState().newestId = newest;
   // `#243 filter-keeps-selection`. A message a filter change holds in place stays where that change
   // put it, whatever this read measured when it was sent — before the change, perhaps — and whether or
   // not the reader was on the newest line then.
   if (how.keepPosition && keepFilterHold()) {
     if (arrived) {
-      const at = messages.findIndex((message) => String(message.id) === previous);
-      setJumpNewest(true, "discord", at >= 0 ? messages.length - 1 - at : null);
+      setJumpNewest(true, "discord", arrivedCount);
     } else {
       renderJumpNewest();
     }
     return;
   }
-  if (how.keepPosition && !how.wasAtNewest) {
+  // `#2230 vibe-talk-reading-row-stays-put` (owner 370, superseding `#1209`'s follow-at-rest): a
+  // keeping read that is not the reader's own act holds the row being read at the foot too. What it
+  // brought lands below that row, seen past its bottom edge, and the jump says it came; only the
+  // reader's own acts (`ownAct`: entering, a setting they changed) still take them to the newest.
+  // A list with nothing drawn before (`previous === null`) and a walk back (`heldPlaceAt`) land
+  // as they always did.
+  // The reader's own confirmed card coming back is theirs to see: followed, as before.
+  const holdsAtFoot = how.wasAtNewest && how.ownAct !== true && previous !== null && how.heldPlaceAt === undefined &&
+    !followsOwnSend;
+  if (how.keepPosition && (!how.wasAtNewest || holdsAtFoot)) {
     // A pixel offset is not a place in a conversation: an edit or deletion above it changes which
     // message occupies that pixel. Prefer the same rendered message at the same viewport offset.
     // A deleted anchor has no semantic destination, so only that case falls back to the old offset.
@@ -2185,11 +2206,10 @@ function settleAfterRead(messages: readonly Message[], how: { area: HTMLElement;
       deps.toPosition(how.area, how.previousTop);
     }
     if (arrived) {
-      // How many, counted from the message that was newest before. When it is not in the list any
-      // more — more arrived than one read holds, or it was deleted — only that something did.
-      // `#207 scrollback-jump`.
-      const at = messages.findIndex((message) => String(message.id) === previous);
-      setJumpNewest(true, "discord", at >= 0 ? messages.length - 1 - at : null);
+      // How many, the reader's own sends left out (`arrivedCount`). `#207 scrollback-jump`.
+      setJumpNewest(true, "discord", arrivedCount);
+    } else if (holdsAtFoot) {
+      renderJumpNewest();
     }
   } else if (!how.keepPosition || previous === null || how.heldPlaceAt !== undefined ||
       (moved && !(newest !== null && ownPostStands(newest)))) {

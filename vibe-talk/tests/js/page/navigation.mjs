@@ -1383,11 +1383,15 @@ test("an All read on the wire when Main is picked lands in Main: what it brought
 
   await pickThread(page, "main");
   assert.deepStrictEqual(shownIds(page), ["200", "201", "203"]);
+  const area = page.el("scroll-area");
+  const readingTop = area.scrollTop;
   release();
   await page.settle();
   await page.settle();
   assert.deepStrictEqual(shownIds(page), ["200", "201", "203", "206"], "Main did not show what All's read brought");
-  assert.ok(atBottomOf(page.el("scroll-area")), "a reader on the newest line was not kept on it");
+  // `#2230 vibe-talk-reading-row-stays-put`, owner 370 (2026-11-25), superseding "a reader on the newest
+  // line is kept on it": what the read brought lands below the reader, who is not moved.
+  assert.equal(area.scrollTop, readingTop, "the read that landed moved the reader");
   assert.deepStrictEqual(page.timelineCalls.slice(reads), [], "Main was read for what All's read had answered");
   assertCurrent(page, `Main after All's read says ${freshness(page).textContent}`);
   assert.notEqual(freshness(page).textContent, was.replace(/ · refreshing…$/, ""),

@@ -17,9 +17,11 @@ This samples the touched row's top on every animation frame from the act until
 the list settles and 30 more frames pass, and requires 0px of movement (1px of
 sub-pixel slack) at the end of the history and mid-list, on a 412x915 phone and
 at 1280x800, with windowed lists on and off. Two arrival walks guard the other
-half of the policy: an arrival with no act in flight still sticks to the
-bottom, and an arrival that lands while a user-caused change is settling is
-counted on the Newest chip and never undoes the touched row's anchor.
+half of the policy: an arrival with no act in flight, the reader at the foot,
+moves nothing (`#2230 vibe-talk-reading-row-stays-put`, owner 370, superseding
+the old "an arrival still sticks to the bottom"), and an arrival that lands
+while a user-caused change is settling is counted on the Newest chip and never
+undoes the touched row's anchor.
 
 Quote/reply-box opening is covered by `#2063`'s quote-still check (the box docks
 at the pane foot instead of scrolling the list); this check's keeper guard is
@@ -273,18 +275,25 @@ def details_walk(page: Page, label: str) -> str:
     return f"details {moved:.1f}px/{len(tops)}f"
 
 
-def arrival_sticks(page: Page, api: AnchorApi, label: str) -> str:
-    """No act in flight, reader at the foot: a live arrival is still followed."""
-    park(page, COUNT - 3, "end")
+def arrival_holds(page: Page, api: AnchorApi, label: str) -> str:
+    """No act in flight, reader at the foot: a live arrival moves nothing (`#2230`, owner 370).
+
+    The row being read keeps its top on every frame from the push until the list settles and 30
+    more frames pass; the arrival lands below it and is counted on the Newest chip.
+    """
+    start = park(page, COUNT - 3, "end")
     arrived = api.add("A message arriving live, with nobody touching the list.")
     api.push("message", {"message": arrived}, str(arrived["id"]))
     until(page, f"() => !!document.querySelector(\"#discord-log > li[data-id='{arrived['id']}']\")",
           f"{label}: the live message was never drawn")
-    until(page, """() => { const a = document.getElementById('scroll-area');
-        return a.scrollHeight - a.scrollTop - a.clientHeight <= 1; }""",
-          f"{label}: the reader did not follow the arrival to the foot")
+    tops = probe_frames(page)
+    moved = max((abs(t - float(start["top"])) for t in tops), default=0.0)
+    check(moved <= STILL_PX,
+          f"{label}: a live arrival at the foot moved the reading row {moved:.1f}px over {len(tops)} frames")
+    until(page, "() => document.getElementById('jump-newest').hasAttribute('data-arrivals')",
+          f"{label}: the arrival below the reader was not counted on the Newest chip")
     settled(page)
-    return "arrival followed to the foot"
+    return f"arrival at the foot: top {moved:.1f}px/{len(tops)}f, chipped"
 
 
 def end_target(page: Page, label: str) -> int:
@@ -382,7 +391,7 @@ def run(chromium: object, args: argparse.Namespace, label: str, width: int, heig
             if not shots_only:
                 report.append(f"{name} mid: {fold_walk(page, name, COUNT // 2, COUNT - 1, 'mid')}")
                 report.append(f"{name}: {details_walk(page, name)}")
-                report.append(f"{name}: {arrival_sticks(page, api, name)}")
+                report.append(f"{name}: {arrival_holds(page, api, name)}")
                 report.append(f"{name}: {arrival_during_act(page, api, name, end_target(page, name))}")
             check(not errors, f"{name}: the page threw: {errors}")
             context.close()

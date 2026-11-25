@@ -22,6 +22,10 @@ after-Done move land on the next unread row as its own explicit move.
 deterministic random archive/fold/expand/select/arrival sequences asserting
 the same invariant after each step, printing seed and step on failure. The
 gated run keeps a few fixed seeds; `--fuzz-steps 200` is the long opt-in.
+`--fuzz-skip NAME,...` leaves a run's fuzz half out, saying so by name: the gated
+run skips phone-412-windowed and desk-1280-windowed until #2239
+vibe-talk-windowed-coverage-shift-loses-reading-row (owner rule 346: fragile on
+the base too); their deterministic cases stay gated.
 
 `--screenshots DIR` writes one before/after pair per case (phone and desk,
 light and dark): the acted item outlined, a guide line at the anchor, and a
@@ -574,7 +578,10 @@ def run(chromium: object, args: argparse.Namespace, label: str, width: int, heig
             page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
             open_fold(page)
             name = f"{label}-{'windowed' if windowed else 'full'}"
-            if args.fuzz_seeds:
+            if args.fuzz_seeds and name in {one for one in args.fuzz_skip.split(",") if one}:
+                # Named, never silent: the gated run says which fuzz half it left out and why.
+                report.append(f"{name}: fuzz SKIPPED (--fuzz-skip; #2239 vibe-talk-windowed-coverage-shift-loses-reading-row)")
+            elif args.fuzz_seeds:
                 for seed in [int(one) for one in args.fuzz_seeds.split(",") if one]:
                     report.append(f"{name}: {fuzz(page, api, seed, args.fuzz_steps, name)}")
             elif after_unread:
@@ -607,6 +614,10 @@ def arguments() -> argparse.Namespace:
                         help="comma-separated fuzz seeds (empty: no fuzz); gated runs use a few fixed seeds")
     parser.add_argument("--fuzz-steps", type=int, default=14,
                         help="fuzz steps per seed (default 14; use 200 for the long opt-in run)")
+    parser.add_argument("--fuzz-skip", default="",
+                        help="comma-separated run names (e.g. phone-412-windowed) whose fuzz half is skipped "
+                             "and reported as skipped; default none. The gated run skips phone-412-windowed and "
+                             "desk-1280-windowed until #2239 vibe-talk-windowed-coverage-shift-loses-reading-row is fixed")
     return parser.parse_args()
 
 

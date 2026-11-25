@@ -26,6 +26,8 @@ type RefusedReason = "ended" | "withdrawn" | "hint" | "earlier_draft" | "replace
 export interface VoiceTranscriptDependencies<Column extends object> {
   /** Bring an element into view through the scroll owner (`#1251 scroll-single-owner`). */
   intoView(element: Element, block: string, inline?: string): void;
+  /** `#2230`: what a confirmed card posted is the reader's own send (`OwnPosts.noteConfirmed`). */
+  noteConfirmedSent?(ids: readonly string[]): void;
   session: CallSession;
   el<K extends string>(id: K): K extends keyof ElementById ? ElementById[K] : HTMLElement;
   leftEl(id: string): HTMLElement;
@@ -2191,6 +2193,8 @@ async function commitShownProposal(proposal: PendingPost, confirmedBy: "ui" | "s
           ? { kind: "refused", proposal, reason: "the chat service did not accept it" }
           : { kind: "partial", proposal };
     } else if (VibeTalkContract.is("CommittedPostResponse", answer)) {
+      // `#2230`: noted before anything draws it, so the read that brings it back follows the reader.
+      deps.noteConfirmedSent?.((answer.parts.length ? answer.parts : [answer.posted]).map((part) => String((part as { id: unknown }).id)));
       // The frozen card first, so a focus the card had goes to it rather than to the list.
       drawSentCard(proposal, confirmedBy, "sent", answer);
       settlePostCard(proposal);

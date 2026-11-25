@@ -7,12 +7,12 @@ import assert from "node:assert/strict";
 
 import { CHANNEL, CSS, RETRY_FIRST_MS, SEND_UNDO_MS, SLOW_SEND, THREADS_MAIN_STORAGE,
   UNPACK_STORAGE, cssBlock, cssRules, delayedReply, deliver, dismissedItems, errorResponse,
-  forwardTimeline, freshMessagePage, heldRow, inPlaceRows, json, keyedChannel, message, mouseOnto,
+  forwardTimeline, freshMessagePage, heldRow, inPlaceRows, json, jumpSaysArrived, keyedChannel, message, mouseOnto,
   newPage, openReplyOn, outgoingActions, outgoingDismiss, outgoingEdit, outgoingRetry, outgoingRows,
   outgoingSpinner, parityData, parityPage, passTime, pickThread, posted, postedWhere, pressHere,
   putBackOf, reReadChannel, reloadWith, reopenedChannel, replyButton, replyInStream, retryWait,
   retryingFirst, rowOf, savedOutgoing, sendBehind, sendChannel, sentOk, settleSend, showDiscord,
-  shownIds, signIn, sourceConstant, sseMessage, test, threadBadge, threadData, threadedService,
+  shownIds, signIn, sourceConstant, sseMessage, sseUpdate, test, threadBadge, threadData, threadedService,
   unpackedRow } from "./fixture.mjs";
 
 const RETRY_FLOOR_MS = sourceConstant("OUTGOING_RETRY_FLOOR_MS");
@@ -103,6 +103,58 @@ for (const [where, aboveFoot] of [["on the newest line", 0], ["a little above th
   });
 }
 
+
+// --- `#2230 vibe-talk-reading-row-stays-put`: the reader's OWN send through every way it comes back ---
+//
+// Owner 370 holds the row being read through every arrival. The reader's own send is not an arrival:
+// it is never counted on the jump ("1 new" for one's own message is wrong), and it moves the reader
+// exactly as `#1983` says a send does: "a send in All now adds its row at the foot and moves nothing —
+// no scroll at the Send tap or at the answer outside the fitted-keyboard regime, the composer hold
+// (#1839) released at the press so the send's redraws keep the reader's anchor, and a keeping re-read
+// that brought nothing new (or only the reader's own send) no longer re-takes the foot." At the foot
+// and mid-list alike, the anchor row keeps its place, whichever way the send comes back: drawn at the
+// tap, its echo and the live read behind it, a mutation re-read, or the catch-up read after a tab return.
+const OWN_SEND_PATHS = ["the optimistic draw at the tap", "a live read", "a mutation re-read", "the catch-up read after a tab return"];
+for (const where of ["at the foot", "mid-list"]) {
+  for (const path of OWN_SEND_PATHS) {
+    test(`#2230 the reader's own send ${where}, coming back through ${path}: the anchor row stays and the jump never says it arrived`, async () => {
+      const page = newPage();
+      const server = flashChannel(page);
+      await signIn(page);
+      await showDiscord(page, page.messages);
+      const area = page.el("scroll-area");
+      area.scrollTop = where === "at the foot" ? area.scrollHeight - area.clientHeight : Math.round(area.scrollHeight / 3);
+      await area.dispatch("scroll");
+      await page.settle();
+      const before = anchorOf(page);
+      const finish = delayedReply(page);
+      await sendBehind(page, `mine, sent ${where}`);
+      if (path !== OWN_SEND_PATHS[0]) {
+        const mine = message({ id: "9002", content: `mine, sent ${where}` });
+        finish(json(200, { posted: server.post(mine) }));
+        await page.settle();
+        if (path === "a live read") {
+          await deliver(page, page.stream(), sseMessage(mine, { self_posted: true }));
+        } else if (path === "a mutation re-read") {
+          server.edit("2003", { content: "thread0 message3, edited while the send came back" });
+          await deliver(page, page.stream(), sseUpdate("edit-2230-own", page.messages.find((m) => String(m.id) === "2003")));
+        } else {
+          await page.setVisibility("hidden");
+          page.setClock(page.clock() + 116_000);
+          await page.setVisibility("visible");
+        }
+        await page.settle();
+        await page.settle();
+        await page.settle();
+        assert.ok(shownIds(page).includes("9002"), `${path}: the sent message is not in the list`);
+      }
+      const now = anchorOf(page);
+      assert.equal(now.anchor, before.anchor, `${where}, ${path}: the anchor row changed`);
+      assert.equal(now.top, before.top, `${where}, ${path}: the anchor row moved from ${before.top} to ${now.top}`);
+      assert.equal(jumpSaysArrived(page), false, `${where}, ${path}: the jump counted the reader's own message as new`);
+    });
+  }
+}
 
 // --- one destination, in the order written -------------------------------------------------------
 //

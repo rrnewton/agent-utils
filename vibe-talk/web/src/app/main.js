@@ -733,6 +733,7 @@ var pageVoiceTranscript;
 function voiceTranscript() {
   if (!pageVoiceTranscript) pageVoiceTranscript = createVoiceTranscript({
   intoView: (element, block, inline) => scrollKeeping.intoView(element, block, inline),
+  noteConfirmedSent: (ids) => ownPosts.noteConfirmed(ids),
     get session() { return voiceCall().session; },
     get el() { return el; },
     get leftEl() { return leftEl; },
@@ -7557,6 +7558,7 @@ const timelineView = createTimelineView({
   replyTally, unseenReplies, followPlacement,
   unplacedCount: () => unplacedArrivals.count(), unplacedNext: () => unplacedArrivals.next(),
   heldUnansweredRoot, copyLedger, removalRecord, removedAfterRead, ownPostStands,
+  ownConfirmed: (id) => ownPosts.confirmedHere(String(id)),
   foldReadState, noteReplyGaps, noteServerPageBuild, renderColumns,
   threadPresenceNote: (hasThreads, inThread) => threadPresence.note(hasThreads, inThread),
   screenBelongsToToken, readModes, readLedger, api: /** @type {any} */ (api), currentDiscordLoad: (generation, channel, readingTodo) => currentDiscordLoad(generation, channel, readingTodo),
@@ -7903,6 +7905,7 @@ const { queueDiscordLoad, finishDiscordLoad, currentDiscordLoad, stopDiscordPoll
  */
 const liveStream = createLiveStream({
   channelStore, selectedChannelId, providerFacts,
+  ownSend: (id) => ownPostStands(id) || ownPosts.confirmedHere(String(id)),
   loadDiscord: (options) => timelineView.loadDiscord(options), refreshQuietly, setStatus,
   noteLiveEvent: (channel, fromTail) => abandonedReads.noteLiveEvent(channel, fromTail),
   contractIs: (name, value) => VibeTalkContract.is(/** @type {any} */ (name), value),

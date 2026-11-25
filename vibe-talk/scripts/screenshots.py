@@ -3264,6 +3264,131 @@ def _act_live_message(driver: Driver) -> None:
     driver.settle(250)
 
 
+# `#2230 vibe-talk-reading-row-stays-put` (owner 370). The SAME moment, twice: the reader parked at
+# the channel's foot with the first row on screen being read, then (105 only) a message arriving
+# live below it. The reading row's text and top are written beside each shot (`.anchor.json`), so
+# the before and after frames can be compared to the pixel.
+ARRIVAL_BELOW_ID = "9990000000000002230"
+
+READING_ROW_JS = """(() => {
+  const area = document.getElementById('scroll-area');
+  const top = area.getBoundingClientRect().top;
+  for (const row of document.querySelectorAll('#discord-log > li[data-id]')) {
+    const box = row.getBoundingClientRect();
+    if (box.bottom > top && box.height > 0) {
+      return { id: row.getAttribute('data-id'), top: Math.round(box.top * 10) / 10,
+               text: (row.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 120),
+               scrollTop: area.scrollTop,
+               footGap: Math.round(area.scrollHeight - area.scrollTop - area.clientHeight),
+               jumpShown: window.__visible('jump-newest'),
+               jumpLabel: window.__text('jump-newest-label') };
+    }
+  }
+  return null;
+})()"""
+
+
+def _arrival_below_sidecar(driver: Driver, name: str, record: dict[str, object]) -> None:
+    path = driver.out_dir / f"{driver.theme}--{driver.profile.name}--{name}.anchor.json"
+    path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+
+
+def _dy(after: object, before: object) -> float | None:
+    """How far the reading row moved, to a tenth of a pixel, or None when either top is missing."""
+    if not isinstance(after, (int, float)) or not isinstance(before, (int, float)):
+        return None
+    return round(float(after) - float(before), 1)
+
+
+def _park_reader_at_foot(driver: Driver) -> dict[str, object]:
+    """The whole channel up, the reader at its foot; the row being read, measured."""
+    _act_whole_channel(driver)
+    driver.js("(() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; })()")
+    driver.page.wait_for_function(
+        "() => { const a = document.getElementById('scroll-area'); "
+        "return a.scrollHeight - a.scrollTop - a.clientHeight <= 1; }", timeout=5_000)
+    driver.settle(300)
+    reading = driver.js(READING_ROW_JS)
+    if not isinstance(reading, dict):
+        raise Unreachable("the reader at the foot", "a row is on screen to read", "no row on screen")
+    return reading
+
+
+def _act_arrival_below_before(driver: Driver) -> None:
+    """The reader at the channel's foot, reading the first row on screen, just before anything arrives."""
+    reading = _park_reader_at_foot(driver)
+    _arrival_below_sidecar(driver, "104-arrival-below-before", {"moment": "before the arrival", "reading": reading})
+
+
+def _act_arrival_below_after(driver: Driver) -> None:
+    """The same moment, then a message arriving live below the reader: nothing moves, the jump says so."""
+    reading = _park_reader_at_foot(driver)
+    driver.js("window.__arrivalBelowReading = " + json.dumps(reading))
+    # The frame just before the push, from this same load: the before half of the same moment.
+    driver.page.screenshot(
+        path=str(driver.out_dir / f"{driver.theme}--{driver.profile.name}--105-arrival-below-after.before-push.png"))
+    said = driver.js(
+        f"window.__channelSays('{ARRIVAL_BELOW_ID}', 'claude-integ', "
+        "'a message arriving below the reader: it lands under the row being read, and nothing moves')"
+    )
+    if said is not True:
+        raise Unreachable("the arrival below", "the live stream is open to carry a message", "no stream")
+    driver.page.wait_for_function(
+        f"() => !!document.querySelector('#discord-log > li[data-id=\"{ARRIVAL_BELOW_ID}\"]')", timeout=10_000)
+    driver.page.wait_for_function("() => window.__visible('jump-newest')", timeout=5_000)
+    driver.settle(400)
+    after = driver.js(f"(() => {{ const r = document.querySelector('#discord-log > li[data-id=\"{reading['id']}\"]'); "
+                      "return r ? Math.round(r.getBoundingClientRect().top * 10) / 10 : null; })()")
+    _arrival_below_sidecar(driver, "105-arrival-below-after", {
+        "moment": "after a live arrival below the reader",
+        "reading_before": reading,
+        "reading_row_top_after": after,
+        "dy": _dy(after, reading.get("top")),
+        "now": driver.js(READING_ROW_JS),
+    })
+
+
+def _act_catchup_below_after(driver: Driver) -> None:
+    """The owner's moment through the real server: a message posted upstream, then the read the page
+    makes on coming back to the tab (`reason: "visible"`) brings it below the reader at the foot.
+
+    The post goes to the throwaway server's own reply route, so the catch-up read is the page's
+    exact request answered by the real router; only the page's call is made directly, rather than
+    waiting out the absence that would make it.
+    """
+    reading = _park_reader_at_foot(driver)
+    driver.js("window.__arrivalBelowReading = " + json.dumps(reading))
+    driver.page.screenshot(
+        path=str(driver.out_dir / f"{driver.theme}--{driver.profile.name}--106-catchup-below-after.before-push.png"))
+    channel = driver.js("document.getElementById('discord-channel').value")
+    request = Request(  # noqa: S310 - the loopback throwaway server this run started
+        f"{driver.base_url}/api/v1/channels/{channel}/reply?ack=accepted",
+        data=json.dumps({"text": "posted upstream while the tab was away: the catch-up read lands it below the reader"}).encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {driver.token}"},
+    )
+    with urlopen(request, timeout=10) as response:  # noqa: S310 - loopback
+        posted = json.loads(response.read().decode("utf-8") or "{}")
+    driver.js("(() => { window.__catchupRows = document.querySelectorAll('#discord-log > li[data-id]').length; "
+              "window.__catchupDone = false; "
+              "timelineView.loadDiscord({ keepPosition: true, reason: 'visible' }).then(() => { window.__catchupDone = true; }); "
+              "return window.__catchupRows; })()")
+    driver.page.wait_for_function("() => window.__catchupDone === true", timeout=15_000)
+    driver.page.wait_for_function(
+        "() => document.querySelectorAll('#discord-log > li[data-id]').length > window.__catchupRows", timeout=10_000)
+    driver.settle(400)
+    after = driver.js(f"(() => {{ const r = document.querySelector('#discord-log > li[data-id=\"{reading['id']}\"]'); "
+                      "return r ? Math.round(r.getBoundingClientRect().top * 10) / 10 : null; })()")
+    _arrival_below_sidecar(driver, "106-catchup-below-after", {
+        "moment": "after the catch-up read (reason visible) brought a message posted through the real server",
+        "posted": posted,
+        "reading_before": reading,
+        "reading_row_top_after": after,
+        "dy": _dy(after, reading.get("top")),
+        "now": driver.js(READING_ROW_JS),
+    })
+
+
 def _act_own_message_read(driver: Driver) -> None:
     """`#1881`: the owner's own message arrives replayed, as after a reconnect or restart.
 
@@ -9055,6 +9180,39 @@ SCENES: tuple[Scene, ...] = (
         expect=(
             ("#2220 the strip stands below the selection", "(() => { const r = document.getElementById('selection-chip-row').getBoundingClientRect(); const s = getSelection().getRangeAt(0).getBoundingClientRect(); return r.top >= s.bottom - 1; })()"),
             ("#2220 the strip is opaque and covers all three chips plus their gaps", "(() => { const row = document.getElementById('selection-chip-row'); const bg = getComputedStyle(row).backgroundColor; const m = bg.match(/rgba?\\(([^)]+)\\)/); const alpha = m && m[1].split(',').length === 4 ? parseFloat(m[1].split(',')[3]) : 1; if (alpha !== 1) return false; const r = row.getBoundingClientRect(); return ['selection-chip-wtf','selection-chip','selection-chip-dismiss'].every(id => { const b = document.getElementById(id).getBoundingClientRect(); return b.left >= r.left - 1 && b.right <= r.right + 1 && b.top >= r.top - 1 && b.bottom <= r.bottom + 1; }); })()"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="104-arrival-below-before",
+        what="#2230 the reader at the channel's foot, reading the first row on screen, just before a message arrives",
+        act=_act_arrival_below_before,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("the reader is at the foot", "(() => { const a = document.getElementById('scroll-area'); return a.scrollHeight - a.scrollTop - a.clientHeight <= 1; })()"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="105-arrival-below-after",
+        what="#2230 the same moment after a message arrives live below: the row being read keeps its top, the jump says it came",
+        act=_act_arrival_below_after,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("#2230 the row being read kept its top to the pixel", "(() => { const was = window.__arrivalBelowReading; const r = document.querySelector(`#discord-log > li[data-id=\"${was.id}\"]`); return !!r && Math.abs(r.getBoundingClientRect().top - was.top) <= 1; })()"),
+            ("#2230 the arrival landed below the reader", "!!document.querySelector('#discord-log > li[data-id=\"%s\"]')" % ARRIVAL_BELOW_ID),
+            ("#2230 the jump says something arrived", "window.__visible('jump-newest')"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="106-catchup-below-after",
+        what="#2230 the owner's moment through the real server: a catch-up read brings a message below the reader at the foot; the row being read keeps its top",
+        act=_act_catchup_below_after,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("#2230 the row being read kept its top to the pixel", "(() => { const was = window.__arrivalBelowReading; const r = document.querySelector(`#discord-log > li[data-id=\"${was.id}\"]`); return !!r && Math.abs(r.getBoundingClientRect().top - was.top) <= 1; })()"),
+            ("#2230 the jump says something arrived", "window.__visible('jump-newest')"),
             ("no error banner is up", "!window.__visible('error-wrap')"),
         ),
     ),

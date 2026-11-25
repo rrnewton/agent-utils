@@ -16,6 +16,8 @@ interface Footing {
   readonly width: number;
   readonly height: number;
   readonly context: string;
+  /** `#2230`: the newest row of the thread on the right when noted (null for the cards or no rows). */
+  readonly newest?: string | null;
 }
 
 export interface ListKeepersDependencies<Column> extends SizeWatching {
@@ -300,8 +302,16 @@ export function mountListKeepers<Column>(deps: ListKeepersDependencies<Column>):
       : "one");
     // On the newest line, and scrolled to it. What the column shows is noted only by this observer's
     // passes, which a change of it always brings: not on every scroll event.
+    // `#2230 vibe-talk-reading-row-stays-put`: the thread's newest row, so a pass can tell a reply that
+    // arrived from rows that changed size. The cards keep `#280`'s rule (a card a reply moved to the foot).
+    const threadNewest = (): string | null => {
+      if (columns.side.mode === "list") return null;
+      const rows = [...leftEl("side-log").children].filter((row) => row.hasAttribute("data-id"));
+      return rows.length ? (rows[rows.length - 1] as Element).getAttribute("data-id") : null;
+    };
     const note = (context = footing ? footing.context : ""): void => {
-      footing = { foot: area.scrollTop > 0 && atBottom(area), width: area.clientWidth, height: area.clientHeight, context };
+      footing = { foot: area.scrollTop > 0 && atBottom(area), width: area.clientWidth, height: area.clientHeight, context,
+        newest: threadNewest() };
     };
     // Whether the reader may be kept on the newest line now: the right column on screen, and no other rule
     // holding a place in it.
@@ -324,8 +334,11 @@ export function mountListKeepers<Column>(deps: ListKeepersDependencies<Column>):
       const context = contextOf();
       // `#2076`: a user-caused height change settling in this list is held by its
       // touched row's top (the scroll owner's hold), never taken to the foot here.
+      // `#2230` (owner 370): nor a reply that arrived in the thread: it lands below the row being read,
+      // and the read behind it offers the jump; only rows that changed size are followed here.
+      const arrived = was !== null && was.newest !== undefined && was.newest !== null && threadNewest() !== was.newest;
       if (was && was.foot && was.width === area.clientWidth && was.height === area.clientHeight &&
-          was.context === context && !atBottom(area, 1) && free() &&
+          was.context === context && !atBottom(area, 1) && free() && !arrived &&
           !(deps.userChangeActive && deps.userChangeActive())) {
         followFoot(area);
       }

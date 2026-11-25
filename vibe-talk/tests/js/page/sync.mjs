@@ -116,7 +116,10 @@ test("a background refresh does NOT drag a reader who has scrolled up", async ()
   assert.equal(area.scrollTop, 120, "a refresh nobody asked for yanked the reader to the bottom");
 });
 
-test("a background refresh DOES follow the newest line for a reader already at the bottom", async () => {
+test("a background refresh does NOT follow the newest line for a reader at the bottom either: the new message lands below and the jump says so", async () => {
+  // `#2230 vibe-talk-reading-row-stays-put`, owner 370 (2026-11-25), superseding the follow-at-rest
+  // this test used to pin: "I am reading at message x. Below it a refresh occurs. It jumps down. I
+  // don't want that." The reader at the foot is reading the foot; what the poll brings lands below.
   const page = newPage();
   await signIn(page);
   countingChannel(page, tallChannel());
@@ -130,8 +133,10 @@ test("a background refresh DOES follow the newest line for a reader already at t
   page.expireTimers(45000);
   await page.settle();
 
-  assert.ok(area.scrollTop > before, "the reader was at the bottom and did not follow");
-  assert.ok(atBottomOf(area), "it followed, but not to the newest message");
+  assert.equal(page.reads, 2, "the poll did not fire");
+  assert.equal(area.scrollTop, before, "a refresh nobody asked for moved the reader at the bottom");
+  assert.ok(!atBottomOf(area), "the new message did not land below the reader");
+  assert.equal(page.el("jump-newest").hidden, false, "the new message landed below and the jump said nothing");
 });
 
 test("REFRESH keeps your place too — asking for fresh messages is not asking to be moved", async () => {
@@ -2819,7 +2824,11 @@ test("THE ARROWS ARE MEASURED ONCE A REDRAW, every rectangle before any write; n
     assert.equal(log.filter((entry) => entry === "list").length, 1, "a redraw measured the arrows more than once");
     const measuring = log.slice(log.indexOf("list"));
     assert.deepStrictEqual(measuring.filter((entry) => entry === "write"), ["write", "write"], "the two arrows were not measured");
-    assert.ok(measuring.lastIndexOf("read") < measuring.indexOf("write"), "a rectangle was read after an arrow was written");
+    // The arrows' own pass: from the list's box to the last arrow written. After it, the poll holds the
+    // row being read by its rectangle, once (`#2230 vibe-talk-reading-row-stays-put`, owner 370: a reader
+    // at the foot is no longer taken to it, which read the list's height there instead).
+    const pass = measuring.slice(0, measuring.lastIndexOf("write") + 1);
+    assert.ok(pass.lastIndexOf("read") < pass.indexOf("write"), "a rectangle was read after an arrow was written");
     // Measured again with nothing changed, nothing is written.
     log.length = 0;
     page.resized(list);

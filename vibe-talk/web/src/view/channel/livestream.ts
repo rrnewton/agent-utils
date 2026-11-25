@@ -80,6 +80,8 @@ export interface LiveStreamDependencies {
   renderOutgoingMessages(): void;
   screens: { view(): string; screen(): string };
   followsNewest(area: HTMLElement): boolean;
+  /** `#2230`: whether message `id` is the reader's own send from this page (the outbox's or a confirmed card's). */
+  ownSend?(id: string): boolean;
   noteOutgoingEcho(id: string): void;
   settleFromServer(id: string): void;
   noteSelfAuthor(authorId: unknown): void;
@@ -350,14 +352,21 @@ function receiveLiveMessage(message: Message, selfPosted: boolean, replayed: boo
     // and whether or not it lands: a reply in the thread it offers to start turns the row's tag into
     // Thread(1) at once, and the offer has to go with it.
     if (!held) {
-      // `#280 scroll-stability`. Whether each column's reader is on its newest line is asked BEFORE
-      // the row goes in, which is what changes the answer — as the channel without threads below
-      // asks it, and as a send does (`#229`). Asked after, by the read below, a reader on the newest
-      // line was a row short of it by then and was never followed: the message arrived out of sight
-      // under them, and the jump offered to take them to it.
-      const pinned = liveFollowers();
+      // `#2230 vibe-talk-reading-row-stays-put` (owner 370, superseding `#1209`'s follow-at-rest
+      // and `#280`'s follow of a reader on the newest line): the row goes in below the one being
+      // read and nothing moves; the read below counts it on the jump (`settleAfterRead`). A column
+      // whose reader stood at its foot has its jump and selection drawn again now, as the follow
+      // drew them (`keepSelection` gives a redrawn column's row the focus back, `#284`). The
+      // reader's own send is theirs to see: a reader at the foot follows it, as before. Whether each
+      // column's reader is at its foot is asked BEFORE the row goes in, which changes the answer.
+      const atFoot = liveFollowers();
       appendToColumns(message, true, replayed);
-      followLiveArrival(pinned);
+      if (ownSend(message, selfPosted)) {
+        followLiveArrival(atFoot);
+      } else {
+        if (atFoot.main) inColumn(columns.main, renderScrollTools);
+        if (atFoot.side && sideShowing()) inColumn(columns.side, renderScrollTools);
+      }
       followReplyStore();
     } else if (places) {
       takeThreadRecord(message);
@@ -389,18 +398,22 @@ function receiveLiveMessage(message: Message, selfPosted: boolean, replayed: boo
   }
   // The SAME constructor the fetched rows go through, so the untrusted-content boundary is
   // identical on both paths. A live feed is not a reason to relax element construction.
-  const area = el("scroll-area");
-  // Not while a filter change holds a message in place: nothing but the reader moves it. `#243`.
-  const wasAtNewest = screens.view() === "discord" && followsNewest(area);
+  // `#2230 vibe-talk-reading-row-stays-put` (owner 370, superseding `#1209`'s follow-at-rest):
+  // an arrival never moves the list, at the foot or up it. The row lands below the one being
+  // read, seen past its bottom edge, and the jump says it came. The reader's own send is theirs
+  // to see: one at the foot follows it, as before, and it is never counted as an arrival. Whether
+  // the reader is at the foot is asked BEFORE the row goes in, which changes the answer.
+  const own = ownSend(message, selfPosted);
+  const followsOwn = own && screens.view() === "discord" && followsNewest(el("scroll-area"));
   // `#549 own-read-stored`. One of his is drawn as it starts: read, when he said so.
   // `#1881`: replayed copies too, as on the threaded path above.
   noteStartsRead([message]);
   appendChannelRow(message, true);
   listState().newestId = id;
-  if (wasAtNewest) {
+  if (followsOwn) {
     scrollToNewest();
-  } else if (!isNoise(message) && !hiddenEmpty(message)) {
-    // Somewhere else in the history, or looking at the call. Offer the jump; never take it.
+  } else if (!own && !isNoise(message) && !hiddenEmpty(message)) {
+    // Wherever the reader is, or looking at the call. Offer the jump; never take it.
     // Never for a placeholder the server reads automatically (`#196 auto-read-noise`): an offer to
     // go and look at "Working…" is the interruption the owner asked to be rid of.
     setJumpNewest(true, "discord", 1);
@@ -581,18 +594,17 @@ function settleReplays(read: unknown, page: unknown): void {
  * those are service groups once there are several. `#355 provider-grouped-channels`.
  */
 
-function liveFollowers() {
-  const follows = () => screens.screen() === "main" && screens.view() === "discord" &&
-    !entryLandingHolds() && followsNewest(el("scroll-area"));
-  return {
-    main: inColumn(columns.main, follows),
-    side: sideShowing() && inColumn(columns.side, follows),
-  };
+/**
+ * `#2230`: whether `message` is the reader's own send: one the server says it posted (`selfPosted`),
+ * or one this page recorded as its own (the outbox's, a confirmed card's).
+ */
+function ownSend(message: Message, selfPosted: boolean): boolean {
+  return selfPosted || deps.ownSend?.(String(message.id)) === true;
 }
 
 /**
- * Keep each reader `liveFollowers` found on the newest line on it, now that the message is in. The
- * rest are not moved at all; the read behind the message offers them the jump (`settleAfterRead`).
+ * Keep each reader `liveFollowers` found at the foot on it, now that the reader's own send is in.
+ * `#2230`: only for the reader's own send; any other arrival moves nobody.
  *
  * @param {{main: boolean, side: boolean}} pinned
  */
@@ -600,6 +612,15 @@ function liveFollowers() {
 function followLiveArrival(pinned: { main: boolean; side: boolean }): void {
   if (pinned.main) inColumn(columns.main, scrollToNewest);
   if (pinned.side && sideShowing()) inColumn(columns.side, scrollToNewest);
+}
+
+function liveFollowers() {
+  const follows = () => screens.screen() === "main" && screens.view() === "discord" &&
+    !entryLandingHolds() && followsNewest(el("scroll-area"));
+  return {
+    main: inColumn(columns.main, follows),
+    side: sideShowing() && inColumn(columns.side, follows),
+  };
 }
 
 /**

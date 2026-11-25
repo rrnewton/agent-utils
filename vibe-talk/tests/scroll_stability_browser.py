@@ -36,7 +36,8 @@ which must not move it by more than a pixel:
 
 and then, at each size:
 
-  a reader on the newest line follows a message arriving live, to the pixel -> at the desk the list of
+  a message arriving live moves nothing for a reader on the newest line, to the pixel (`#2230`, owner
+  370) -> at the desk the list of
   threads on the right opens at its foot, and stays there with the mouse over its last card and when a
   reply moves a thread to the foot -> the long thread, nothing in it unread, opens on its newest message
   with the list at its foot, and is still there a second and a half later; scrolled to its head, the page
@@ -997,22 +998,39 @@ def highlight_walk(reader: Reader) -> None:
 
 
 def follow_walk(reader: Reader) -> None:
-    """A reader on the newest line follows a message arriving live, to the pixel."""
+    """A message arriving live moves nothing for a reader on the newest line, to the pixel.
+
+    `#2230 vibe-talk-reading-row-stays-put`, owner 370 (2026-11-25), superseding the follow this walk
+    used to pin: the row being read keeps its top, the message lands below it, and the jump says so.
+    """
     page, api = reader.page, reader.api
     reader.scroll_main(1.0)
     reader.check(reader.gap("scroll-area") <= 1, "the reader is not on the newest line")
+    reading = page.evaluate(READING_ROW)
+    reader.check(bool(reading), "no row is on screen to read")
     arrived = api.add(f"A message arriving while the reader is on the newest line. {FILLER * 2}")
     api.push("message", {"message": arrived}, str(arrived["id"]))
     reader.wait_for(f"() => !!document.querySelector(\"#discord-log > li[data-id='{arrived['id']}']\")",
                     "the live message never reached Main")
     reader.quiet(700)
-    gap = reader.gap("scroll-area")
-    reader.check(gap <= 1, f"a reader on the newest line was left {gap:.0f}px above the message that arrived")
-    row = page.evaluate(f"() => {{ const row = document.querySelector(\"#discord-log > li[data-id='{arrived['id']}']\");"
-                        " const area = document.getElementById('scroll-area').getBoundingClientRect();"
-                        " return row.getBoundingClientRect().bottom <= area.bottom + 1; }")
-    reader.check(bool(row), "the message that arrived is below the screen")
-    reader.notes.append("a reader on the newest line followed a live message to the foot")
+    top = page.evaluate("(id) => { const row = document.querySelector(`#discord-log > li[data-id=\"${id}\"]`);"
+                        " return row ? row.getBoundingClientRect().top : null; }", reading["id"])
+    reader.check(top is not None and abs(float(top) - float(reading["top"])) <= 1,
+                 f"a message arriving moved the row being read on the newest line from {reading['top']} to {top}")
+    reader.wait_for("() => !document.getElementById('jump-newest').hidden",
+                    "the message that arrived below the reader is not offered")
+    reader.notes.append("a live message arriving under a reader on the newest line moved nothing; the jump offered it")
+
+
+#: The first row on Main's screen, the one being read: its id and top.
+READING_ROW = """() => {
+  const area = document.getElementById('scroll-area').getBoundingClientRect();
+  for (const row of document.querySelectorAll('#discord-log > li[data-id]')) {
+    const box = row.getBoundingClientRect();
+    if (box.bottom > area.top && box.height > 0) return { id: row.getAttribute('data-id'), top: box.top };
+  }
+  return null;
+}"""
 
 
 def cards_walk(reader: Reader) -> None:

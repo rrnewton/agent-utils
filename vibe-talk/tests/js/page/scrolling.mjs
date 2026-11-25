@@ -13,7 +13,7 @@ import { BOTTOM_SLACK_PX, CHANNEL, CHARS_PER_LINE, CSS_CODE, CSS_UNCONDITIONAL, 
   errorResponse, fillTranscript, focused, foldButton, gate, helpEntry, holdChannelReads,
   inTwoColumns, json, jumpSaysArrived, jumpShown, longMessage, manyThreadColumns, markupHolds,
   markupPlace, message, newPage, outgoingRetry, outgoingRows, pagedChannel, parkMidway, passTime,
-  pickThread, press, pullDown, reReadChannel, readerOn, relayed, reopenedChannel, replyButton, replyInStream,
+  pickThread, press, proposal, pullDown, reReadChannel, readerOn, relayed, reopenedChannel, replyButton, replyInStream,
   rowWithId, savedOutgoing, scrollToGap, sentWithoutKey, setReadNew, settingsGroup, showDiscord,
   shownIds, sideAtFoot, signIn, sourceCalls, sourceConstant, speakRelay, sseMessage, sseUpdate, startTalking,
   tallChannel, test, threadPage, touchAt, upstreamReadButton, withLiveChannel, youSay } from "./fixture.mjs";
@@ -1590,6 +1590,7 @@ test("A PULL UP PAST THE NEWEST MESSAGE REFRESHES, WITH THE CHANNEL ALREADY LOAD
   await signIn(page);
   const { area, all } = await parkedAtNewest(page);
   const readsBefore = page.pageReads;
+  const parkedTop = area.scrollTop;
   all.push(message({ id: "9995", content: "the arm64 runner came back by itself" }));
 
   await pullUp(page, PULL_ARM_PX);
@@ -1600,10 +1601,12 @@ test("A PULL UP PAST THE NEWEST MESSAGE REFRESHES, WITH THE CHANNEL ALREADY LOAD
     /before=/,
     "the pull up walked BACK instead of fetching what is new"
   );
-  assert.ok(shownIds(page).includes("9995"), "the message the pull up fetched is not on the screen");
-  // The reader was at the newest line and is at the new newest line: keeping their place, there,
-  // IS following the newest.
-  assert.ok(atBottomOf(area), "the refresh left the reader above the message it fetched");
+  assert.ok(shownIds(page).includes("9995"), "the message the pull up fetched is not in the list");
+  // `#2230 vibe-talk-reading-row-stays-put`, owner 370 (2026-11-25), superseding "keeping their place
+  // at the newest line IS following the newest": a refresh moves nothing; what it fetched lands below
+  // the row being read, and the jump says it came.
+  assert.equal(area.scrollTop, parkedTop, "the refresh moved the reader");
+  assert.ok(jumpSaysArrived(page), "the refresh fetched a message below the reader and the jump said nothing");
 
   // ...and it says so where the reader is looking, then goes.
   const affordance = page.el("pull-refresh");
@@ -2775,18 +2778,23 @@ for (const threads of [true, false]) {
     assert.deepStrictEqual(readerOn(page), before, "the read that landed moved the row the reader was on");
   });
 
-  test(`${kind}: a message arriving live is followed by a reader on the newest line, and moves nobody up the list`, async () => {
+  test(`${kind}: a message arriving live moves nobody, on the newest line or up the list`, async () => {
+    // `#2230 vibe-talk-reading-row-stays-put`, owner 370 (2026-11-25), superseding the follow of a
+    // reader on the newest line this test used to pin: the row being read stays where it is and the
+    // message lands below it, with the jump saying it came.
     const page = newPage();
     const messages = stabilityChannel(page, threads);
     const stream = await withLiveChannel(page, messages);
     const area = page.el("scroll-area");
     assert.ok(atBottomOf(area), "the channel did not open on its newest line");
+    const atFoot = readerOn(page);
     const first = message({ id: "27790", content: longMessage("arrived live") });
     page.messages = [...messages, first];
     await deliver(page, stream, sseMessage(first));
     await page.settle();
     assert.ok(rowWithId(page, "27790"), "the live message never reached the list");
-    assert.ok(atBottomOf(area), "a reader on the newest line was left above the message that arrived");
+    assert.deepStrictEqual(readerOn(page), atFoot, "a message arriving moved a reader on the newest line");
+    assert.ok(jumpSaysArrived(page), "nothing offered the reader on the newest line the message that arrived");
 
     area.scrollTop = Math.round(area.scrollHeight / 3);
     const before = readerOn(page);
@@ -3913,3 +3921,174 @@ test("`#338 column-overscroll` x `#340 composer-grow-box`: A READER PART-WAY INT
   assert.equal(untickJump.grewMoved, 0, "the premise: the growing box's keeper still holds in this control");
   assert.ok(untickJump.untickMoved > 1, `with Grow's keeper at scrollHeight the reader was not moved, so this test cannot see it: ${JSON.stringify(untickJump)}`);
 });
+
+// --- `#2230 vibe-talk-reading-row-stays-put`: NOTHING THAT ARRIVES MOVES THE ROW BEING READ ---------
+//
+// Owner request 370 (2026-11-25): "I am reading at message x. Below it s refresh occurs. It jumps down.
+// I don't want that. I want my message to stay on the screen and stable. Stuff appears under it if I can
+// see past it's bottoms edge. Maybe the newest chip appears if it wasn't already there. That's it.
+// Stability." This SUPERSEDES `#1209`'s follow-at-rest rule (a reader parked at the foot was taken to
+// whatever arrived): no arrival of any kind (a live insert, the re-read a mutation asks for, the poll,
+// the catch-up read after the tab comes back, a replay) moves the list, at the foot or up it. The row
+// being read keeps its top to the pixel, the new rows land below it, and the Newest chip says they came.
+// What still follows: the reader's OWN send (`#1983`), a tap on Newest, End.
+
+/** The row the reader is on, measured where it stands now. */
+const rowTopNow = (page, id) => rowWithId(page, id).getBoundingClientRect().top;
+
+/** Messages that arrive while the reader reads: long, so each is taller than a thumb's slack. */
+const arrivals = (from, count) => Array.from({ length: count }, (_unused, index) =>
+  message({ id: `2779${from + index}`, content: longMessage(`arrived ${from + index}`) }));
+
+/** Where the reader is reading: at the foot, or a third of the way down the history. */
+function readHere(page, where) {
+  const area = page.el("scroll-area");
+  if (where === "mid-list") area.scrollTop = Math.round(area.scrollHeight / 3);
+  assert.equal(atBottomOf(area), where === "at the foot", `the premise: the reader is ${where}`);
+  return readerOn(page);
+}
+
+/** The owner's invariant, for one arrival: same row, same top, the new rows in, the chip up. */
+function assertStayedPut(page, before, landed, what) {
+  for (const one of landed) assert.ok(rowWithId(page, String(one.id)), `${what}: ${one.id} never reached the list`);
+  assert.equal(rowTopNow(page, before.id), before.top, `${what} moved the row being read (owner 370)`);
+  assert.ok(jumpSaysArrived(page), `${what}: the Newest chip did not say anything arrived`);
+}
+
+for (const threads of [true, false]) {
+  const kind = threads ? "with threads" : "without threads";
+  for (const where of ["at the foot", "mid-list"]) {
+    test(`#2230 ${kind}, ${where}: a message arriving live leaves the row being read where it is`, async () => {
+      const page = newPage();
+      const messages = stabilityChannel(page, threads);
+      const stream = await withLiveChannel(page, messages);
+      const before = readHere(page, where);
+      const [one] = arrivals(0, 1);
+      page.messages = [...messages, one];
+      await deliver(page, stream, sseMessage(one));
+      await page.settle();
+      assertStayedPut(page, before, [one], "a live arrival");
+    });
+
+    test(`#2230 ${kind}, ${where}: the re-read an edit asks for, bringing new messages, leaves the row being read where it is`, async () => {
+      const page = newPage();
+      const messages = stabilityChannel(page, threads);
+      const stream = await withLiveChannel(page, messages);
+      const before = readHere(page, where);
+      const landed = arrivals(10, 3);
+      const edited = { ...messages[2], content: longMessage("message 2, edited") };
+      page.messages = [...messages.slice(0, 2), edited, ...messages.slice(3), ...landed];
+      await deliver(page, stream, sseUpdate("edit-2230", edited));
+      await page.settle();
+      await page.settle();
+      assertStayedPut(page, before, landed, "a mutation re-read");
+    });
+
+    test(`#2230 ${kind}, ${where}: the poll bringing new messages leaves the row being read where it is`, async () => {
+      const page = newPage();
+      const messages = stabilityChannel(page, threads);
+      await withLiveChannel(page, messages);
+      const before = readHere(page, where);
+      const landed = arrivals(20, 3);
+      page.messages = [...messages, ...landed];
+      await reReadChannel(page);
+      await page.settle();
+      assertStayedPut(page, before, landed, "the poll");
+    });
+
+    test(`#2230 ${kind}, ${where}: coming back after 116 s hidden, the catch-up read of several messages leaves the row being read where it is`, async () => {
+      // The owner's moment (6:14 AM ET): a tab return after 116 s hidden, then the reads it makes.
+      const page = newPage();
+      const messages = stabilityChannel(page, threads);
+      await withLiveChannel(page, messages);
+      const before = readHere(page, where);
+      await page.setVisibility("hidden");
+      page.setClock(page.clock() + 116_000);
+      const landed = arrivals(30, 4);
+      page.messages = [...messages, ...landed];
+      await page.setVisibility("visible");
+      await page.settle();
+      await page.settle();
+      await page.settle();
+      assertStayedPut(page, before, landed, "the catch-up after a tab return");
+    });
+  }
+}
+
+// The reader's OWN send, confirmed on the draft card (`#264`), comes back through a live message and the
+// read behind it while the reader is at the foot: it is theirs to see, so it is followed, as it always
+// was, and it is never counted on the jump as something new (the gate's approval-card walks, `#2230`).
+for (const threads of [true, false]) {
+  for (const desk of [false, true]) {
+    const kind = `${threads ? "with" : "without"} threads, ${desk ? "at a desk" : "on a phone"}`;
+    test(`#2230 ${kind}: the reader's own confirmed card at the foot, drawn by a live read, is followed and never counted as new`, async () => {
+      const page = newPage();
+      if (desk) await page.setDesk(true);
+      const messages = stabilityChannel(page, threads);
+      // The draft card comes with a call; the reader is in the channel while it goes on.
+      await startTalking(page);
+      await page.settle();
+      await showDiscord(page, messages);
+      const stream = page.stream();
+      const area = page.el("scroll-area");
+      area.scrollTop = area.scrollHeight - area.clientHeight;
+      await page.settle();
+      assert.ok(atBottomOf(area), "the premise: the reader is at the foot");
+      let posted = null;
+      const commit = page.commitProposal;
+      page.commitProposal = async (body) => {
+        const answer = await commit(body);
+        posted = JSON.parse(await answer.text()).posted;
+        return answer;
+      };
+      page.propose(proposal({ channel_id: CHANNEL.id, reply_to: null, text: longMessage("my own words, confirmed on the card") }));
+      await page.settle();
+      page.expireTimers(2000);
+      await page.settle();
+      assert.equal(page.el("post-confirm").hidden, false, "the premise: the draft card is up");
+      area.scrollTop = area.scrollHeight - area.clientHeight;
+      await page.settle();
+      await page.el("post-confirm-send").click();
+      await page.settle();
+      assert.ok(posted, "the premise: the card's Send posted a message");
+      // The card gone, a browser clamps the reader to the list's new foot; the fixture does not on its own.
+      area.scrollTop = Math.min(area.scrollTop, area.scrollHeight - area.clientHeight);
+      await page.settle();
+      assert.ok(atBottomOf(area), "the premise: the reader is at the foot once the card has gone");
+      page.messages = [...messages, posted];
+      await deliver(page, stream, sseMessage(posted));
+      await page.settle();
+      await page.settle();
+      assert.ok(rowWithId(page, String(posted.id)), "the reader's own message never reached the list");
+      assert.ok(atBottomOf(area), "the reader's own confirmed send left them above it");
+      assert.equal(jumpSaysArrived(page), false, "the jump counted the reader's own message as new");
+    });
+  }
+}
+
+// THE POSITIVE HALF. Without it, every "stayed put" above is satisfied by a page that never scrolls.
+// The reader's own way to the newest still takes them there once something has arrived below.
+for (const how of ["a tap on Newest", "End"]) {
+  test(`#2230: after arrivals land below the reader at the foot, ${how} still takes them to the newest`, async () => {
+    const page = newPage();
+    const messages = stabilityChannel(page, false);
+    await withLiveChannel(page, messages);
+    const before = readHere(page, "at the foot");
+    const landed = arrivals(40, 3);
+    page.messages = [...messages, ...landed];
+    await reReadChannel(page);
+    await page.settle();
+    assertStayedPut(page, before, landed, "the poll");
+    const area = page.el("scroll-area");
+    if (how === "End") await press(page, area, "End");
+    else await page.el("jump-newest").click();
+    await page.settle();
+    assert.ok(atBottomOf(area), `${how} did not take the reader to the newest`);
+    assert.ok(rowWithId(page, String(landed[landed.length - 1].id)).getBoundingClientRect().top < area.getBoundingClientRect().bottom,
+      `${how}: the newest arrival is still below the screen`);
+  });
+}
+
+// The reader's own send is `#1983 vibe-talk-all-view-send-flash`'s and is not changed here: it adds its
+// row at the foot without moving the anchor (tests/js/page/sending.mjs), and with the keyboard fitted the
+// confirmed send is followed as that regime always has been (`followsNewest` in the dispatch).
