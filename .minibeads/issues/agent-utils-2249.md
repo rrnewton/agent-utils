@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-search-signpost-hidden-while-reserved: the On this screen signpost stays hidden while the search bucket head is reserved, so no row moves in the debounce window'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -8,7 +8,8 @@ labels:
 - search
 - owner-ui
 created_at: 2026-11-25T13:46:00-05:00
-updated_at: 2026-11-25T13:46:00-05:00
+updated_at: 2026-11-25T16:08:00-05:00
+closed_at: 2026-11-25T16:08:00-05:00
 ---
 
 # Description
@@ -31,3 +32,7 @@ Cause: the `#1913` rule hides the "On this screen" signpost (`#search-screen-sep
 # Notes
 
 Owner-UI fast-track (rule 286). Related: #1913 vibe-talk-search-typing-lag (the signpost rule), #2200 vibe-talk-search-tab-counts-match-cards (the head reservation), #1899 vibe-talk-search-bucket-chips-pinned, #1762 vibe-talk-server-hits-collapsed-line (the signpost).
+
+## Resolution
+
+Landed as b00a99d3 (the signpost stays down while the search head is reserved) and a65a191f (screenshot scenes 120 and 121) on a green owner gate on the same change (f0583f44, 2026-11-25 3:46 PM ET). Per-frame trace: the signpost shows in 0 frames while the head is reserved and the reading row moves at most 0.6 px, against 31-34 frames and 23 px on main; phone and desktop, light and dark. Deployed the same afternoon; the 15-minute post-deploy watch was clean.
