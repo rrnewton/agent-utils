@@ -1,13 +1,14 @@
 ---
 title: 'vibe-talk-glossary-popup: a Glossary button in the WTF and defined-term popups opens a full-screen searchable alphabetical glossary'
-status: in_progress
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - vibe-talk
 - owner-ui
 created_at: 2026-11-25T08:50:00-05:00
-updated_at: 2026-11-25T08:50:00-05:00
+updated_at: 2026-11-25T12:48:57-05:00
+closed_at: 2026-11-25T17:48:57.000000000+00:00
 ---
 
 # Description
@@ -37,3 +38,7 @@ Today the WTF? press (#2156 vibe-talk-wtf-glossary-lookup) and a tap on an alrea
 # Notes
 
 Owner request part A (logging WTF calls to iterate on the engine) and part C (#2234) are separate.
+
+## Resolution
+
+Landed on main as f631fcdd in the stacked range e637f97c (with #2230 and #2242, one owner gate on the stack top, green 2026-11-25 12:22 PM ET), deployed 12:33 PM ET 11-25, and the 15-minute deploy watch came back clean (12:33 to 12:48 PM ET: no errors, no restarts). The glossary popover carries one Glossary button in its top corner beside the X, the same for a WTF? answer and a tapped defined term, and adds no row. It opens a full-screen glossary drawn by Discuss's own full-screen and head rules under classes of its own: alphabetical with letter headings, a search that filters term then definition matches, Reviewed and Learned badges, empty, no-match and failed-with-Retry states, opened at the known term it came from. It reads the existing read-only terms route (no server change), renders text only (message sources link only as checked in-app addresses and jump through the page's jump path; document sources open in Documents), and is modal: everything else inert and dimmed, the key dispatch standing down, Tab trapped, Escape, the X and the phone's Back closing it alone, focus returning, an open Discuss left open. Side fix: the popover's document source now switches to Documents. Evidence: page tests (both popups at phone and desktop, alphabetical order, search, empty and failed states, markup and a javascript: source rendered inert, inert plus keys plus Tab, Back with Discuss beneath, message jump and document open, two negative controls), a real-router test of the terms request, and screenshot scenes 107-117 (light and dark, phone and desktop, keyboard open and closed, a logged end-to-end walk), re-taken from the landed tree: scene 111 pixel-identical to the stack-top shots in all four, scene 115 identical apart from sub-visible border antialiasing and the dimmed bar under the popup. Side findings filed as #2244 vibe-talk-discuss-hours-field-scale; the scene 77 order dependency is the coordinator's #2243. Part C stays open as #2234 vibe-talk-glossary-term-index.
