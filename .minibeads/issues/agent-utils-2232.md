@@ -1,13 +1,14 @@
 ---
 title: 'vibe-talk-wtf-lookup-log-and-replay: log every WTF lookup privately and replay misses to improve the engine'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - vibe-talk
 - owner-ui
 created_at: 2026-11-25T08:55:00-05:00
-updated_at: 2026-11-25T08:55:00-05:00
+updated_at: 2026-11-25T16:32:00-05:00
+closed_at: 2026-11-25T16:32:00-05:00
 ---
 
 # Description
@@ -32,3 +33,30 @@ Part A of an owner request: WTF? lookups are not logged anywhere the team can le
 # Notes
 
 Filed by the lane from owner request 372 (part A); the glossary page and term index are separate parts.
+
+## Resolution
+
+[opus 5.5] Landed as aceb8907, gated at owner tier as 5d0695c9 (patch-id identical). The full gate's only red was vibe-talk.check.summary-link-browser, a Back-restoration wait on the phone walk, in code this change does not touch. It passed its solo rerun, 5 of 5 solo local runs on the change and 3 of 3 on its base. The liaison accepted it, and that step is now #2261 vibe-talk-summary-link-back-race. Deployed 2026-11-25 4:16 PM ET; the 15-min watch was clean (startup probe passed, no app errors or panics, no restarts).
+
+What shipped:
+- A private lookup log under the server's state directory: one JSON line per lookup in `wtf-lookups/lookups-YYYY-MM-DD.jsonl` (format v1). The directory is 0700 and files 0600, with size and age caps. It is on by default (`[summaries] wtf_lookup_log`), and a failed append only warns.
+- `vibe-talk wtf-replay`: re-runs logged lookups, misses first, against a loopback server only. It has a retrieval-only mode with no model call and prints hit rates per run.
+- Engine:
+  - Search the selection's head phrase first. A head that runs on past an ordinal label narrows to the label ("Box 5 again" to "Box 5").
+  - Rank by definitional fit and qualifier overlap.
+  - A channel_recent bucket from the cache-only walk.
+  - Query and time budgets per lookup.
+- An operator probe, `?probe=retrieval|full`, behind `[summaries] wtf_probe`.
+- The Row N regression through the real router, with its decoy, passes.
+
+Replay compare (13 synthetic cases, model stubbed, so engine-only times):
+- hits 8/13 before and 11/13 after, 0 lost (both no-definition cases are still not found);
+- median about 41 ms both;
+- p95 69-88 ms before and 125-141 ms after, from longer searches in budget-capped cases, not the channel scan.
+
+Follow-ups:
+- #2240 vibe-talk-glossary-learned-channel-scope;
+- #2252 vibe-talk-wtf-channel-recent-reach (the channel_recent scan saw 99 messages, not 300, in the fixture);
+- #2261 vibe-talk-summary-link-back-race.
+
+The summary-harvest loop (part A's later step) is designed only. It runs after the coordinator confirms the owner's scope and cost.
