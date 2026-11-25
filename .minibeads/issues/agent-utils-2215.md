@@ -29,4 +29,4 @@ Diagnosed while triaging an unrelated change's gate (the failing shard was first
 
 ## Resolution
 
-[watermelon-full-preview] Fixed in the same change that closes this issue: both scoped-vs-full status equivalence comparisons in py/wrkslots/tests/test_event_index.py now drop only heartbeat_age_seconds (a _timeless helper) and keep every other field exact, so a corrupted scoped row still fails. The whole file passes (6 tests), both affected tests pass 5/5 consecutively, and strict mypy is clean on the file.
+[watermelon-full-preview] Landed on github/main as 01f5ca3c. Fixed in the same change that closes this issue: both scoped-vs-full status equivalence comparisons in py/wrkslots/tests/test_event_index.py now drop only heartbeat_age_seconds (a _timeless helper) and keep every other field exact, so a corrupted scoped row still fails. The whole file passes (6 tests), both affected tests pass 5/5 consecutively, and strict mypy is clean on the file.
