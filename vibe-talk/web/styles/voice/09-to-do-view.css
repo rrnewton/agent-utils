@@ -1291,7 +1291,12 @@
   --bucket-head: 0px;
 }
 
-#screen-main[data-searching]:has(> #channel-freshness-anchor .search-bucket-chip:not([hidden])) {
+/* `#2200`: the reservation stands on a page-side flag (`data-bucket-head`,
+   set by the server-search render while a search stands or its answer is
+   pending), never on chip visibility: retiring the chips for a refined
+   query must not drop the reserved head and shift the list under the
+   reader (`#1899`: counts landing move nothing). */
+#screen-main[data-searching][data-bucket-head] {
   /* Chip row (2.5rem) + its panel padding and edge (0.7rem) + the gap
      below it (0.35rem). */
   --bucket-head: 3.7rem;
@@ -1301,7 +1306,7 @@
    room carries both rows, so the first result never stands under the
    panel however the chips fall. */
 @media (max-width: 480px) {
-  #screen-main[data-searching]:has(> #channel-freshness-anchor .search-bucket-chip:not([hidden])) {
+  #screen-main[data-searching][data-bucket-head] {
     --bucket-head: calc(3.7rem + 2.9rem);
   }
 }

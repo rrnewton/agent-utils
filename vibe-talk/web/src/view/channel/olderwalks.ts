@@ -1423,6 +1423,14 @@ function renderServerSearch() {
     const pressed = bucketOnNow(def.id) ? "true" : "false";
     if (chip.getAttribute("aria-pressed") !== pressed) chip.setAttribute("aria-pressed", pressed);
   }
+  // `#2200`: the list's head reservation (`--bucket-head`) stands while a
+  // search stands or its answer is pending, on this page-side flag — never
+  // on chip visibility, so retiring the chips for a refined query (the
+  // typing-fast pass) drops no reserved head and shifts nothing.
+  const screenMain = el("screen-main");
+  const reserve = serverSearchNow().key !== "" && (foldStanding() || serverSearchNow().loading);
+  if (reserve && !screenMain.hasAttribute("data-bucket-head")) screenMain.setAttribute("data-bucket-head", "");
+  if (!reserve && screenMain.hasAttribute("data-bucket-head")) screenMain.removeAttribute("data-bucket-head");
   const bucketRow = el("search-bucket-row");
   // The row stands only while a chip stands (`#1899` follow-up, liaison
   // scene 80): with no bucket hits it takes no space at all, so its opaque
