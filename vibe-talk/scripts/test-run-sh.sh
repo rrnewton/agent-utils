@@ -256,6 +256,17 @@ grep -q "config file: $TEST_XDG_CONFIG/vibe-talk/env" <<< "$out" \
     || fail "run.sh did not report reading the per-user config file"
 ok "~/.config/vibe-talk/env alone is enough (the owner's current setup keeps working)"
 
+# --- 7a. the installed-app name variables are forwarded to the container --------------------
+# VIBE_TALK_APP_NAME / VIBE_TALK_APP_SHORT_NAME set the PWA name. They were once missing from
+# OPTIONAL_VARS, so a configured name silently never reached the server.
+appcfg="$TMPDIR_TEST/appname.env"
+cp "$GOOD_CONFIG" "$appcfg"
+printf 'VIBE_TALK_APP_NAME=selftest-app\nVIBE_TALK_APP_SHORT_NAME=selftest-short\n' >> "$appcfg"
+out="$(run_sh --config "$appcfg" --dry-run --no-tunnel)"
+grep -q 'set: .*VIBE_TALK_APP_NAME' <<< "$out" || fail "VIBE_TALK_APP_NAME is not forwarded"
+grep -q 'set: .*VIBE_TALK_APP_SHORT_NAME' <<< "$out" || fail "VIBE_TALK_APP_SHORT_NAME is not forwarded"
+ok "VIBE_TALK_APP_NAME and VIBE_TALK_APP_SHORT_NAME are forwarded when configured"
+
 # --- 7b. VIBE_TALK_TUNNEL_ENABLED is honoured FROM the per-user config file -------------------
 # This flag lived only in the deleted per-checkout overlay, and losing it silently turned the
 # tunnel check off. The per-user file is now the only place it can live, so prove it is read
