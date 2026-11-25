@@ -102,6 +102,7 @@ fn describe(host: &dyn Host, service: &Service, newest: Option<&Snapshot>) -> Va
         }
         // A script without `exec` runs agentctl as the shell's child.
         host.process_children(pid)
+            .unwrap_or_default()
             .into_iter()
             .filter_map(|child| host.process_exe(child))
             .find(|child| discover::is_agentctl_name(&child.to_string_lossy()))

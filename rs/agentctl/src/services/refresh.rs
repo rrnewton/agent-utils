@@ -754,7 +754,16 @@ fn probe(
     let pid = if runs(pid) {
         pid
     } else {
-        host.process_children(pid)
+        // Children that could not be determined at all (an unreadable
+        // /proc) are reported at once as unknowable, not waited out as
+        // if the process simply had no agentctl child.
+        let Some(children) = host.process_children(pid) else {
+            return Err(Fatal(format!(
+                "the children of main process {pid} could not be determined, so whether it runs {} is unknowable",
+                binary.display()
+            )));
+        };
+        children
             .into_iter()
             .find(|child| runs(*child))
             .ok_or_else(|| {

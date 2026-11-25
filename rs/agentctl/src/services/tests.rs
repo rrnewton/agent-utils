@@ -108,6 +108,11 @@ struct Fake {
     /// #2120 test hook: a pin file written on the first unit stop, as a
     /// consumer would write it while the turnover waits on a unit.
     pin_to_write: RefCell<Option<(PathBuf, String)>>,
+    /// Children by parent pid, for a script without `exec` whose shell
+    /// stays the main process (#2227).
+    children: RefCell<BTreeMap<u32, Vec<u32>>>,
+    /// `process_children` cannot determine children at all (#2227).
+    children_unknown: Cell<bool>,
 }
 
 const UNIT_KEYS: [&str; 6] = [
@@ -148,6 +153,8 @@ impl Fake {
             calls: RefCell::default(),
             notify_calls: RefCell::default(),
             pin_to_write: RefCell::new(None),
+            children: RefCell::default(),
+            children_unknown: Cell::new(false),
         }
     }
 
@@ -185,13 +192,35 @@ impl Fake {
         let pid = self.next_pid.get();
         self.next_pid.set(pid + 1);
         self.starts.borrow_mut().insert(pid, self.clock.get());
-        self.exes.borrow_mut().insert(pid, program);
-        let environment = parsed
+        let environment: Vec<(String, String)> = parsed
             .environment()
             .unwrap()
             .into_iter()
             .map(|(name, value)| (name, value.replace("%%", "%")))
             .collect();
+        // A script without `exec` keeps the shell as the main process,
+        // with the service binary its child (#2227).
+        let no_exec = argv[0].ends_with("/sh")
+            && argv.len() > 2
+            && shell_words(&argv[2]).is_ok_and(|words| {
+                words
+                    .iter()
+                    .find(|word| !word.operator)
+                    .is_some_and(|first| first.text != "exec")
+            });
+        if no_exec {
+            let child = self.next_pid.get();
+            self.next_pid.set(child + 1);
+            self.starts.borrow_mut().insert(child, self.clock.get());
+            self.exes.borrow_mut().insert(pid, PathBuf::from(&argv[0]));
+            self.exes.borrow_mut().insert(child, program);
+            self.children.borrow_mut().insert(pid, vec![child]);
+            self.environs
+                .borrow_mut()
+                .insert(child, environment.clone());
+        } else {
+            self.exes.borrow_mut().insert(pid, program);
+        }
         self.environs.borrow_mut().insert(pid, environment);
         unit.active = "active".into();
         unit.pid = Some(pid);
@@ -531,8 +560,17 @@ impl Host for Fake {
         self.exes.borrow().get(&pid).cloned()
     }
 
-    fn process_children(&self, _pid: u32) -> Vec<u32> {
-        Vec::new()
+    fn process_children(&self, pid: u32) -> Option<Vec<u32>> {
+        if self.children_unknown.get() {
+            return None;
+        }
+        Some(
+            self.children
+                .borrow()
+                .get(&pid)
+                .cloned()
+                .unwrap_or_default(),
+        )
     }
 
     fn process_environ(&self, pid: u32) -> Option<Vec<(String, String)>> {
@@ -972,8 +1010,8 @@ impl Host for ConcurrentHost {
     fn process_exe(&self, _pid: u32) -> Option<PathBuf> {
         None
     }
-    fn process_children(&self, _pid: u32) -> Vec<u32> {
-        Vec::new()
+    fn process_children(&self, _pid: u32) -> Option<Vec<u32>> {
+        Some(Vec::new())
     }
     fn process_environ(&self, _pid: u32) -> Option<Vec<(String, String)>> {
         None
@@ -1727,6 +1765,67 @@ fn a_unit_file_service_gets_a_drop_in_and_loses_it_on_rollback() {
     assert_eq!(
         world.fake.process_exe(pid),
         Some(PathBuf::from("/state/bin/agentctl-old"))
+    );
+}
+
+/// A transient watcher whose `sh -c` script has no `exec`: the shell
+/// stays the main process and agentctl runs as its child (#2227).
+fn add_shelled_watcher(world: &World) {
+    world
+        .fake
+        .systemd_run(&transient_args(
+            "shelled.service",
+            "watcher in a shell",
+            &[&format!(
+                "WorkingDirectory={}",
+                world._temporary.0.join("team").display()
+            )],
+            &[
+                "/bin/sh",
+                "-c",
+                "/state/bin/agentctl-old watch-agents --state-dir /state/shelled 2>>/state/logs/shelled.log",
+            ],
+        ))
+        .unwrap();
+}
+
+#[test]
+fn refresh_finds_the_agentctl_child_of_a_shell_without_exec() {
+    let world = world();
+    add_shelled_watcher(&world);
+    let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
+    assert!(services
+        .iter()
+        .any(|service| service.unit == "shelled.service"));
+    let mut only = options(&world);
+    only.only = vec!["shelled.service".into()];
+    let report = refresh(&world.fake, &services, &only).unwrap();
+    assert_eq!(report.exit_code, 0, "{}", report.text);
+    assert_eq!(report.document["services"][0]["action"], "refreshed");
+}
+
+#[test]
+fn refresh_reports_unknowable_children_instead_of_a_timeout() {
+    // #2227: children that cannot be determined at all are reported as
+    // unknowable at once, not waited out as a health timeout.
+    let world = world();
+    add_shelled_watcher(&world);
+    world.fake.children_unknown.set(true);
+    let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
+    let mut only = options(&world);
+    only.only = vec!["shelled.service".into()];
+    let report = refresh(&world.fake, &services, &only).unwrap();
+    assert_eq!(report.exit_code, 1, "{}", report.text);
+    assert!(
+        report.text.contains("could not be determined"),
+        "{}",
+        report.text
+    );
+    assert!(report.text.contains("unknowable"), "{}", report.text);
+    assert!(
+        !report.text.contains("no healthy state within"),
+        "{}",
+        report.text
     );
 }
 

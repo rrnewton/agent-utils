@@ -62,8 +62,11 @@ pub trait Host {
     fn read_file(&self, path: &Path) -> Option<Vec<u8>>;
     /// The executable a process runs, as `/proc/PID/exe` names it.
     fn process_exe(&self, pid: u32) -> Option<PathBuf>;
-    /// The direct children of a process.
-    fn process_children(&self, pid: u32) -> Vec<u32>;
+    /// The direct children of a process: `Some` when they could be
+    /// determined (possibly none), `None` when they could not — an
+    /// unreadable /proc — so a caller can say "unknowable" instead of
+    /// treating an undetermined child set as an empty one.
+    fn process_children(&self, pid: u32) -> Option<Vec<u32>>;
     /// The environment a process started with, from `/proc/PID/environ`.
     fn process_environ(&self, pid: u32) -> Option<Vec<(String, String)>>;
     /// Run a program with an environment and return its exit status and standard output.
@@ -305,14 +308,8 @@ impl Host for SystemHost {
         fs::read_link(format!("/proc/{pid}/exe")).ok()
     }
 
-    fn process_children(&self, pid: u32) -> Vec<u32> {
-        fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
-            .map(|text| {
-                text.split_whitespace()
-                    .filter_map(|child| child.parse().ok())
-                    .collect()
-            })
-            .unwrap_or_default()
+    fn process_children(&self, pid: u32) -> Option<Vec<u32>> {
+        process_children_at(Path::new("/proc"), pid)
     }
 
     fn process_environ(&self, pid: u32) -> Option<Vec<(String, String)>> {
@@ -389,6 +386,55 @@ impl Host for SystemHost {
     }
 }
 
+/// The direct children of `pid` under `proc_root` (this, with a fake
+/// proc root, is what the tests drive). The task `children` file is the
+/// first source; kernels built without `CONFIG_PROC_CHILDREN` do not
+/// provide it, so its absence falls back to a parent-pid scan of every
+/// `/proc/PID/stat` record — the same fallback the other process readers
+/// in this crate use, through the shared stat parser. `None` when
+/// neither source can be read: the children could not be determined,
+/// which is not the same as a process having none.
+#[must_use]
+pub fn process_children_at(proc_root: &Path, pid: u32) -> Option<Vec<u32>> {
+    let children_file = proc_root
+        .join(pid.to_string())
+        .join("task")
+        .join(pid.to_string())
+        .join("children");
+    match fs::read_to_string(&children_file) {
+        Ok(text) => {
+            return Some(
+                text.split_whitespace()
+                    .filter_map(|child| child.parse().ok())
+                    .collect(),
+            )
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return None,
+    }
+    let entries = fs::read_dir(proc_root).ok()?;
+    let mut children = Vec::new();
+    for entry in entries.flatten() {
+        let Some(child) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(bytes) = fs::read(entry.path().join("stat")) else {
+            continue;
+        };
+        if agent_queue::identity::parse_process_stat(&bytes, u64::from(child))
+            .is_ok_and(|stat| stat.parent_pid == u64::from(pid))
+        {
+            children.push(child);
+        }
+    }
+    children.sort_unstable();
+    Some(children)
+}
+
 /// The running user's specifier values, from the environment the user
 /// manager itself uses (#1493).
 #[must_use]
@@ -459,6 +505,64 @@ mod tests {
         assert_eq!(states[0].drop_in_paths.len(), 2);
         assert_eq!(states[1].main_pid, None);
         assert_eq!(states[1].fragment_path, None);
+    }
+
+    /// A minimal stat record for `pid` whose parent is `parent`.
+    fn stat_record(pid: u32, parent: u32) -> String {
+        format!(
+            "{pid} (agentctl) S {parent} {pid} 0 -1 4194304 1 2 3 4 13 14 15 16 20 0 1 0 22 0 0"
+        )
+    }
+
+    fn fake_proc(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "agentctl-host-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn children_come_from_the_stat_scan_without_a_children_file() {
+        // No CONFIG_PROC_CHILDREN: no task children file anywhere, so
+        // the parent-pid stat scan must find the child.
+        let root = fake_proc("stat-scan");
+        for (pid, parent) in [(100, 1), (101, 100), (102, 1)] {
+            let dir = root.join(pid.to_string());
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("stat"), stat_record(pid, parent)).unwrap();
+        }
+        assert_eq!(process_children_at(&root, 100), Some(vec![101]));
+        assert_eq!(process_children_at(&root, 102), Some(Vec::new()));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_children_file_wins_over_the_stat_scan() {
+        let root = fake_proc("children-file");
+        let task = root.join("100/task/100");
+        fs::create_dir_all(&task).unwrap();
+        fs::write(task.join("children"), "102\n").unwrap();
+        for (pid, parent) in [(101, 100), (102, 1)] {
+            let dir = root.join(pid.to_string());
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("stat"), stat_record(pid, parent)).unwrap();
+        }
+        assert_eq!(process_children_at(&root, 100), Some(vec![102]));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unreadable_proc_cannot_determine_children() {
+        let root = fake_proc("unreadable");
+        let missing = root.join("no-such-proc");
+        assert_eq!(process_children_at(&missing, 100), None);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
