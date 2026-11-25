@@ -130,6 +130,10 @@ export function mountReadingJumps(deps: ReadingJumpsDependencies): ReadingJumps 
   listen<PointerEvent>(chip, "pointerup", endPress);
   listen<PointerEvent>(chip, "pointercancel", endPress);
   listen<Event>(window, "scroll", () => cancelHold(), { capture: true });
+  // The keyboard opening shrinks the viewport under an open popover; keep it above its chip.
+  listen<Event>(window, "resize", () => {
+    if (open) place();
+  });
   listen<MouseEvent>(chip, "contextmenu", (event) => {
     if (event && typeof event.preventDefault === "function") event.preventDefault();
     // The click an Android hold sends after its contextmenu must not also jump.
