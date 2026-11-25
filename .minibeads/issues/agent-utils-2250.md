@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-all-view-search-both-buckets-default: in the All view, search starts with Main and Threads both on'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
@@ -8,7 +8,8 @@ labels:
 - search
 - owner-ui
 created_at: 2026-11-25T14:12:00-05:00
-updated_at: 2026-11-25T14:12:00-05:00
+updated_at: 2026-11-25T14:51:00-05:00
+closed_at: 2026-11-25T14:51:00-05:00
 ---
 
 # Description
@@ -34,3 +35,7 @@ All shows top-level messages and thread replies together, so a search started th
 # Notes
 
 Owner-UI fast-track (rule 286); issue number pre-assigned by the coordinator. Related: #2200 vibe-talk-search-tab-counts-match-cards (the fold and the default), #1797 vibe-talk-search-bucket-toggles (the defaults table), #1894 (extra buckets off by default), #2251 vibe-talk-search-current-view-scope (searching inside a thread or transcript narrows to it).
+
+## Resolution
+
+[opus 5.5] Already done by #2200 vibe-talk-search-tab-counts-match-cards: its commit f7fa1ba7 set the Threads bucket to start on in All, and it is live in 8267bdfe (deployed 2026-11-25 1:46 PM ET). No code change here; closed on evidence the liaison accepted. Page test on main: "in All, Main and Threads both start on and the fold still sums" passes; a throwaway probe also showed a Main to All switch under one query ending with both on, and All to a thread ending with only "this thread" on. Dynamic check on a local throwaway server built from main 00da5a15 (page build 812cad22), real routes only: a thread fixture seeded through the server's test-only fake-seed route, cached by the server's own timeline reads, then searched from All. Every frame shows "3 in main" and "2 in threads" both pressed, "0 in Transcripts" unpressed, and the count "5 found (2 loaded, 3 older)", with all five hits as normal cards: phone 412x915 and desktop 1280x800, light and dark, Discuss open, and keyboard open (viewport really shrunk, search field focused). Two pre-existing layout findings from those frames are filed as #2254 and #2255.
