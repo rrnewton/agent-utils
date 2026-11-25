@@ -1,13 +1,14 @@
 ---
 title: 'vibe-talk-search-tab-counts-match-cards: search bucket counts match the cards shown, disjoint Main and Threads'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 - owner-ui
 created_at: 2026-11-24T06:36:00-05:00
-updated_at: 2026-11-24T06:36:00-05:00
+updated_at: 2026-11-25T14:03:00-05:00
+closed_at: 2026-11-25T14:03:00-05:00
 ---
 
 # Description
@@ -59,3 +60,7 @@ different style, with no clear indication of what happened.
 
 Owner UI request (fast-track, rule 286); filed by the coordinator
 (#2200 pre-assigned).
+
+## Resolution
+
+[opus 5.5] Landed on main as 8267bdfe (land-main exit 0, 2026-11-25 1:42 PM ET; 25 commits, the landed tree identical to the gated 60beecf5), deployed 1:46 PM ET, deploy watch clean to 2:01 PM ET (0 errors, 0 restarts). Owner-tier gate green on 60beecf5 (base e21a1cd9; 1:18 to 1:35 PM ET, 225 steps, no failed step). The bucket chips, the count and the cards are now one fold over the page's search-result state: each message counts in its own bucket (a root in Main, its replies in Threads), so Main and Threads are disjoint and the chips sum to the count; the count reads found, loaded and older; an edited query lands on the same state and chips as the fresh query; the chips retire with the query that earned them while the list's head reservation holds, released in place only when the search settles with no chip. Tests: the page suite (the fold sums and selected counts equal the cards shown, Main and Threads disjoint, edited query equals fresh query over random edit sequences, thread view counts), the real-server search test with top-level and thread-reply messages holding "theme" and "themes", and the browser walks (search-typing-fast, search-unmatched, search-bucket-pinned, server-hits, transcripts); validation graph, screenshot self-test, typecheck. Screenshots: scenes 100 (the bucket fold) and 101 (Main only), phone and desk, dark and light. Liaison checks on 60beecf5 before landing: a fixed row does not move when the chips retire (back within 0.6 px once the answer lands; on main the same row moved 36 px, 102 px on desk), a search settled with no hits leaves no band under the search bar (phone, dark and light), the #2230 catch-up scene 106 keeps the reading row (dy 0, the jump says 1 new), and a 5-pair search-typing-fast spot check on a busy host passed 5/5 beside main's 5/5. Follow-up: #2249 (the "On this screen" signpost shows for one debounce window while the chips are down and moves the list 23 px).
