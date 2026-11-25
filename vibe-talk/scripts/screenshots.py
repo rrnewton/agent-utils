@@ -9947,6 +9947,8 @@ SCENES: tuple[Scene, ...] = (
             ("the chips stand for the answer", "!document.getElementById('search-bucket-row').hidden"),
             ("#2256 the head room stood from the key on",
              "!!window.__headRoomTrace && window.__headRoomTrace.atKey.head === true && window.__headRoomTrace.headFlips === 0"),
+            ("#2256 no Newest offer: the reader is still on the newest row, the server line below it",
+             "!window.__visible('jump-newest')"),
             ("#2256 the newest row kept its top across the key and through the settled answer",
              "!!window.__headRoomTrace && window.__headRoomTrace.settled && window.__headRoomTrace.atKey.top !== null"
              " && window.__headRoomTrace.moved === 0"),

@@ -425,8 +425,11 @@ def head_room_walk(walk: Walk) -> None:
     # Mid-list, the reading row a match: it keeps its top.
     first_key("mid")
     walk.shot("head-room-mid")
-    # At the foot, the newest row a match: it keeps its top; the server line lands below it.
+    # At the foot, the newest row a match: it keeps its top; the server line lands below it, and
+    # the reader still on the newest row is offered no "Newest" jump.
     first_key("foot")
+    jump = page.evaluate("() => { const j = document.getElementById('jump-newest'); return !!j && !j.hidden && j.getClientRects().length > 0; }")
+    walk.check(jump is False, "foot: the reader kept on the newest row was offered a Newest jump for the server line below it")
     walk.shot("head-room-foot")
     # Release: words with no loaded match drop the room in the input event, once.
     seen = page.evaluate(HEAD_KEY_JS, ["zzqv", None])

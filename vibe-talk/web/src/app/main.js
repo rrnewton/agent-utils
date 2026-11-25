@@ -2471,6 +2471,21 @@ function heldComposer() {
 }
 
 /**
+ * `#2256 vibe-talk-search-head-room-no-shift`: the height the search's server line takes at the foot
+ * of the channel list (its box and the margin under it), 0 while it is down or for another list.
+ * @param {HTMLElement} area
+ * @returns {number}
+ */
+function searchFootLine(area) {
+  const section = el("server-search");
+  if (!section || section.hidden || area !== el("scroll-area") || typeof section.getBoundingClientRect !== "function") return 0;
+  const box = section.getBoundingClientRect();
+  if (!box || box.height <= 0) return 0;
+  const below = typeof getComputedStyle === "function" ? parseFloat(getComputedStyle(section).marginBottom) || 0 : 0;
+  return box.height + below;
+}
+
+/**
  * Entering a thread, on its first unread message (`createThreadEntry`, `#624
  * voice-page-modularity`): the landing owed on entry and kept across its read.
  *
@@ -2904,7 +2919,9 @@ const folding = createFolding({
   sidePane: () => /** @type {any} */ (sidePane),
   channelPane: () => /** @type {any} */ (channelPane),
   fitOverscroll,
-  footGap,
+  // `#2256`: the search's own line at the foot is not history. A reader kept on the newest row while
+  // that line lands below it (`placeFilterAnchor`) is still on the newest line: no "Newest" offer.
+  footGap: (area) => footGap(area) - searchFootLine(area),
   bottomSlackPx: BOTTOM_SLACK_PX,
   unseenReplies: unseenColumnReplies,
   unseenReply: unseenColumnReply,
