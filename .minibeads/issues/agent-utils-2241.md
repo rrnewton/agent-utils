@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-document-load-502-readable: a document load that fails with a 5xx or non-JSON reply says what failed and offers Retry'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -8,7 +8,8 @@ labels:
 - documents
 - ui
 created_at: 2026-11-25T10:15:00-05:00
-updated_at: 2026-11-25T10:15:00-05:00
+updated_at: 2026-11-25T12:15:00-05:00
+closed_at: 2026-11-25T12:15:00-05:00
 ---
 
 # Description
@@ -39,3 +40,13 @@ Related: `#1591` (open-source Documents view empty; its container build fix is l
 # Notes
 
 Reproduce and test only on a local server from the worktree build, with stub upstreams and a local front end; never the live instance.
+
+## Resolution
+
+Landed on main as ba287b68 (replay of 32d21bee, which passed the owner-tier gate: 225 steps, no failures); deployed 11:57 AM ET on 2026-11-25, deploy watch clean to 12:12 PM ET.
+
+Root cause: the GitHub fetcher's HTTP client had no connect or overall timeout, so a stalled upstream held `POST /api/v1/documents/fetch` open until the deployment's front end gave up and answered its own HTML 502 page; the page's client turned that body into "vibe-talk returned non-JSON (HTTP 502)" and the reader showed it verbatim, with the same text as a status toast and no way to try again.
+
+Fix: every document fetch and freshness check runs under a 45 s deadline and the GitHub client has a 10 s connect timeout, so a stalled upstream answers JSON 504 `document_fetch_timeout` naming the upstream. A handler panic answers JSON 500 `internal_error` with a fixed sentence and logs exactly one ERROR line (method, path, cause, panic message). The reader's failure says whose answer it was (vibe-talk's cause, or the proxy or tunnel in front of it with the document's host and the status), offers Retry (disabled "Retrying…" while it runs), and is no longer repeated as a status toast; the list card uses the same wording.
+
+Evidence: real-router tests for the stalled upstream (injected deadline, stub that never answers) and for the panic (JSON 500 plus one ERROR line); page tests drive the real API client over a proxy's HTML 502, a vibe-talk 504, a gateway's JSON 5xx and a Retry that lands with nothing left on the status line. A local reproduction behind a stand-in proxy showed the owner's exact string on the old build and the readable failure, Retry and vibe-talk's own 504 on the new one, at phone and desktop sizes in light and dark. The wall-clock test found along the way is #2245.
