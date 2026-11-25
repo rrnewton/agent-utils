@@ -98,8 +98,11 @@ export function mountReadingJumps(deps: ReadingJumpsDependencies): ReadingJumps 
         }
       }
       const top = bookmarkPopoverTop(chipBox.top, chipBox.bottom, height, viewHeight, toast);
-      popover.style.left = `${Math.round(left)}px`;
-      popover.style.top = `${Math.round(top)}px`;
+      // Absolute in document coordinates (the popover stands beside the glossary popover).
+      const scrollX = typeof window !== "undefined" ? window.scrollX || 0 : 0;
+      const scrollY = typeof window !== "undefined" ? window.scrollY || 0 : 0;
+      popover.style.left = `${Math.round(left + scrollX)}px`;
+      popover.style.top = `${Math.round(top + scrollY)}px`;
     } catch {
       // A host that cannot measure keeps the stylesheet's placement.
     }

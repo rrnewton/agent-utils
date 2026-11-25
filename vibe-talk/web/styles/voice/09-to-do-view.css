@@ -493,10 +493,11 @@
   touch-action: manipulation;
 }
 
-/* `#2229 bookmark-chip-clear-popover`. The hold's one item, fixed above the chip by the script so
-   neither the chip stack nor the dock can cover it and it never covers the chip. */
+/* `#2229 bookmark-chip-clear-popover`. The hold's one item, placed above the chip by the script
+   (document coordinates, beside the glossary popover outside the scroller's cell) so neither the
+   chip stack nor the dock can cover it and it never covers the chip. */
 .bookmark-clear-popover {
-  position: fixed;
+  position: absolute;
   z-index: var(--z-menu);
   box-sizing: border-box;
   padding: 0.4rem;

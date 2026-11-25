@@ -1417,16 +1417,6 @@
           </div>
 
           <!--
-            `#2229 bookmark-chip-clear-popover`. Press and hold the Bookmark chip (or right-click it
-            on a desk) for the way to take the bookmark away without travelling to its line. One
-            item, calling the same removal as the line's X (`#420 bookmark-clear`), Undo included.
-            Placed by the script above the chip, clamped inside the viewport.
-          -->
-          <div id="bookmark-clear-popover" class="bookmark-clear-popover" role="menu" aria-label="Bookmark" hidden>
-            <button id="bookmark-clear-button" class="bookmark-clear-item" type="button" role="menuitem">Clear bookmark</button>
-          </div>
-
-          <!--
             `#376 read-aloud-blocks`. Where a read of several blocks is, and the way through it:
             Previous, "2 of 5", Next (since `#627`, arrows: see below). Shown only while such a read plays, floating as the status
             line does and for the same reason (nothing under the reader's thumb moves when it
@@ -4445,6 +4435,16 @@ writable = true</pre>
       definition and its source link, or a clear failure. Opened by WTF? and by every
       glossary-linked term; placed under the selection or the tapped term.
     -->
+    <!--
+      `#2229 bookmark-chip-clear-popover`. Press and hold the Bookmark chip (or right-click it
+      on a desk) for the way to take the bookmark away without travelling to its line. One
+      item, calling the same removal as the line's X (`#420 bookmark-clear`), Undo included.
+      Beside the glossary popover, outside the scroller's cell; placed by the script above
+      the chip, clamped inside the viewport.
+    -->
+    <div id="bookmark-clear-popover" class="bookmark-clear-popover" role="menu" aria-label="Bookmark" hidden>
+      <button id="bookmark-clear-button" class="bookmark-clear-item" type="button" role="menuitem">Clear bookmark</button>
+    </div>
     <div id="glossary-popover" class="glossary-popover" role="dialog" aria-label="Glossary entry" hidden>
       <p id="glossary-popover-term" class="glossary-popover-term"></p>
       <p id="glossary-popover-body" class="glossary-popover-body" aria-live="polite"></p>
