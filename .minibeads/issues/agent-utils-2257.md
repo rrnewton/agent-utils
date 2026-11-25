@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-search-fast-pass-holds-reader: the search fast pass never moves the reading row when it hides rows above it'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -8,7 +8,8 @@ labels:
 - search
 - owner-ui
 created_at: 2026-11-25T15:16:00-05:00
-updated_at: 2026-11-25T15:16:00-05:00
+updated_at: 2026-11-25T18:31:00-05:00
+closed_at: 2026-11-25T18:31:00-05:00
 ---
 
 # Description
@@ -31,3 +32,7 @@ Found while tracing #2256 vibe-talk-search-head-room-no-shift, and on main: in a
 # Notes
 
 Owner-UI (owner 370). Split from #2256 by the coordinator; stacks on #2256. Related: #1913 vibe-talk-search-typing-lag (the fast pass), #243 filter-keeps-selection, #1901 vibe-talk-search-late-hits-shift-anchor, #2230 vibe-talk-reading-row-stays-put.
+
+## Resolution
+
+Landed as 5850cf36 (three commits: the fast pass keeps the row being read when it hides rows above it, takes that row only when it writes, and screenshot scenes 124 and 125 in a long channel) on a green owner gate on the same change (00e70be2, 2026-11-25 6:09 PM ET). Evidence: on the real server with 250 seeded messages, scene 124 (the row still matches) stays within 0.8 px every frame from the key through the answer and scene 125 (the row hidden, the next standing row takes its place) within 0.5 px, against main's -3427/-4715 and -376/-528 px; a pass that changes nothing reads no layout; 20 interleaved typing-fast pairs pass on both. The held row can still end under the chip panel when it sat just under the search bar: that is #2254. Deployed the same evening; the 15-minute post-deploy watch was clean.
