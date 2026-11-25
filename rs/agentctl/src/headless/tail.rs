@@ -310,19 +310,49 @@ pub fn render_lines(event: &Event, cx: &Context<'_>) -> Vec<Line> {
                 ),
             )],
         ),
-        "lifecycle.harness_exited" => cx.line(
-            ts,
-            &[],
-            &[s(
-                palette::ERROR,
-                &format!(
-                    "!! harness exited ({}); {}",
-                    data.get("code")
-                        .map_or_else(|| "signal".to_owned(), Value::to_string),
-                    text_of(data, "next"),
-                ),
-            )],
-        ),
+        "lifecycle.harness_exited" => {
+            let mut lines = cx.line(
+                ts,
+                &[],
+                &[s(
+                    palette::ERROR,
+                    &format!(
+                        "!! harness exited ({}); {}",
+                        data.get("code")
+                            .map_or_else(|| "signal".to_owned(), Value::to_string),
+                        text_of(data, "next"),
+                    ),
+                )],
+            );
+            // Its last stderr lines (#2248), under the exit like a tool's output.
+            let tail = &data["stderr_tail"];
+            let omitted = tail["omitted_lines"].as_u64().unwrap_or(0);
+            let gutter = format!("{}  │ ", " ".repeat(HEAD_COLUMNS));
+            let room = cx.width.saturating_sub(render::width_of(&gutter)).max(8);
+            if omitted > 0 {
+                lines.push(vec![
+                    s(palette::DETAIL, &gutter),
+                    s(
+                        palette::DETAIL,
+                        &format!(
+                            "… {omitted} earlier stderr line{}",
+                            if omitted == 1 { "" } else { "s" }
+                        ),
+                    ),
+                ]);
+            }
+            for text in tail["lines"].as_array().into_iter().flatten() {
+                let text = text.as_str().unwrap_or_default();
+                lines.push(vec![
+                    s(palette::DETAIL, &gutter),
+                    s(
+                        palette::FAIL.dimmed(),
+                        &render::truncate(&render::sanitize(text), room),
+                    ),
+                ]);
+            }
+            lines
+        }
         "lifecycle.stopped" => cx.line(
             ts,
             &[],
@@ -1513,6 +1543,41 @@ mod tests {
             lines.iter().any(|line| line.trim() == "second line"),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn a_harness_exit_shows_its_stderr_tail_under_the_exit_line() {
+        // #2248: an exit-2 usage error is visible in the log, not only in the journal.
+        let exited = event(
+            3,
+            "lifecycle.harness_exited",
+            json!({"code": 2, "next": "restarting with --resume in 2 s",
+                   "stderr_tail": {"lines": ["muse serve: --yolo is not a serve option",
+                                             "usage: muse serve [OPTIONS]"],
+                                   "omitted_lines": 4}}),
+        );
+        let lines = render(&exited, 100);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(
+            lines[0].contains("!! harness exited (2); restarting"),
+            "{lines:?}"
+        );
+        assert!(lines[1].contains("… 4 earlier stderr lines"), "{lines:?}");
+        assert!(
+            lines[2].ends_with("│ muse serve: --yolo is not a serve option"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[3].ends_with("│ usage: muse serve [OPTIONS]"),
+            "{lines:?}"
+        );
+        // An exit event without the field (an older wrapper's) renders as before.
+        let bare = event(
+            4,
+            "lifecycle.harness_exited",
+            json!({"code": 2, "next": "stopping"}),
+        );
+        assert_eq!(render(&bare, 100).len(), 1);
     }
 
     fn assistant(text: &str) -> Event {

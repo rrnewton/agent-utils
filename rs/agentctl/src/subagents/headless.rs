@@ -1675,6 +1675,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             Value::Null,
             |index| json!({"seq": index["last_seq"], "updated_at": index["updated_at"]}),
         );
+        result["last_harness_exit"] = last_harness_exit(&events_dir);
         result["session"] = json!(record.headless_session().ok());
         Ok(result)
     }
@@ -1774,6 +1775,32 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             "note": format!("if a systemd unit ran the wrapper, disable it so it does not start a wrapper for a missing record: systemctl --user disable {unit}"),
         }))
     }
+}
+
+/// Bytes of the newest events `status` reads for the last harness exit: a crash loop's exits
+/// are all recent, and `status` never reads the whole log.
+const LAST_EXIT_WINDOW_BYTES: u64 = 64 * 1024;
+
+/// The newest `lifecycle.harness_exited` in the recent event window, with what the harness said
+/// on stderr (#2248), or null when the window holds none.
+fn last_harness_exit(events_dir: &Path) -> Value {
+    events::read_recent(events_dir, LAST_EXIT_WINDOW_BYTES)
+        .ok()
+        .and_then(|recent| {
+            recent
+                .into_iter()
+                .rev()
+                .find(|event| event.kind == "lifecycle.harness_exited")
+        })
+        .map_or(Value::Null, |event| {
+            json!({
+                "seq": event.seq,
+                "ts": event.ts,
+                "code": event.data["code"],
+                "next": event.data["next"],
+                "stderr_tail": event.data.get("stderr_tail").cloned().unwrap_or(Value::Null),
+            })
+        })
 }
 
 /// Why stopping the wrapper that answered `status` would end a process of `caller` (the

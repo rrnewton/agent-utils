@@ -59,6 +59,7 @@ use super::claude::{self, InputState, Signal};
 use super::control;
 use super::events::{self, EventWriter};
 use super::reply::{self, ReplyCall};
+use super::stderr_tail;
 
 /// File name of the lock a running wrapper holds in the agent directory.
 pub const LOCK_FILE: &str = "headless.lock";
@@ -336,7 +337,13 @@ struct Harness {
     spawned_at: Instant,
     /// When the process was seen to exit; its output may still be draining.
     exited_at: Option<Instant>,
+    /// The last lines of its stderr, for the exit event (#2248).
+    stderr: Option<Arc<stderr_tail::Shared>>,
 }
+
+/// How long an exit waits for the harness's stderr to reach its end once the harness's process
+/// group is gone; only a process outside the group can hold it open longer.
+const STDERR_TAIL_WAIT: Duration = Duration::from_secs(2);
 
 impl Drop for Harness {
     /// A wrapper that leaves on an error must not orphan its harness, which runs in its own
@@ -508,7 +515,9 @@ impl Wrapper {
             .current_dir(&self.config.cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            // Piped, not inherited (#2248): the reader copies it on to the wrapper's own stderr
+            // and keeps its last lines for the exit event.
+            .stderr(Stdio::piped())
             .env("AGENTCTL_AGENT", &self.config.agent)
             .process_group(0);
         for entry in &self.config.environment {
@@ -523,6 +532,7 @@ impl Wrapper {
             .spawn()
             .map_err(|error| io_fail(&format!("start {}", self.config.command[0]), error))?;
         let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
         let mut stdin = child.stdin.take().expect("piped stdin");
         self.next_instance += 1;
         let instance = self.next_instance;
@@ -537,7 +547,13 @@ impl Wrapper {
             initialized: false,
             spawned_at: Instant::now(),
             exited_at: None,
+            stderr: None,
         });
+        let tail = stderr_tail::spawn(stderr, std::io::stderr())
+            .map_err(|error| io_fail("start harness stderr reader", error))?;
+        if let Some(harness) = self.harness.as_mut() {
+            harness.stderr = Some(tail);
+        }
         thread::Builder::new()
             .name("headless-harness-stdout".to_owned())
             .spawn(move || {
@@ -581,6 +597,7 @@ impl Wrapper {
             &self.config.session,
             &self.config.cwd,
             super::adapter::declared_effort(&self.config.arguments),
+            &self.config.arguments,
             self.config.approvals,
         ) {
             self.write_harness(hello);
@@ -599,6 +616,15 @@ impl Wrapper {
             None,
             json!({"pid": pid, "resume": resume, "argv_sha256": digest}),
         )?;
+        // Operator arguments this launch left off (#2247): said once per
+        // spawn, where `tail` and the watcher see it.
+        for warning in self.config.adapter.launch_warnings(&self.config.arguments) {
+            self.emit(
+                "error",
+                None,
+                json!({"class": "harness_arguments", "message": warning}),
+            )?;
+        }
         match hooks.harness_spawned(pid) {
             Ok(()) => {
                 self.pin_hook_failed = false;
@@ -1298,6 +1324,17 @@ impl Wrapper {
                         .as_mut()
                         .is_some_and(|harness| !std::mem::replace(&mut harness.initialized, true));
                     if first {
+                        // Settings only an open session takes go before any
+                        // queued input (#2247: Muse's standing effort, and its
+                        // approval mode after a resume).
+                        for opened in self.config.adapter.session_opened_lines(
+                            &self.config.session,
+                            super::adapter::declared_effort(&self.config.arguments),
+                            &self.config.arguments,
+                            self.config.approvals,
+                        ) {
+                            self.write_harness(opened);
+                        }
                         self.emit(
                             "lifecycle.harness",
                             None,
@@ -1550,6 +1587,14 @@ impl Wrapper {
                         drop(harness.input.take());
                         terminate_group(&mut harness.child);
                     }
+                }
+                Signal::SessionConfigFailed { setting, message } => {
+                    // Warn, never restart: the session runs on without it.
+                    self.emit(
+                        "error",
+                        causation,
+                        json!({"class": "session_config", "setting": setting, "message": message}),
+                    )?;
                 }
                 Signal::VersionMismatch { expected, actual } => {
                     // Warn, never refuse: the adapter's translation is
@@ -2261,6 +2306,7 @@ impl Wrapper {
         // A launcher can exit while its real harness, in the same process group, keeps the
         // session open; nothing of the group may outlive the harness record.
         let group = harness.child.id();
+        let stderr = harness.stderr.take();
         drop(harness);
         self.pin_pid = None;
         self.pin_identity = None;
@@ -2275,6 +2321,16 @@ impl Wrapper {
         if !leftovers.is_empty() {
             end_processes(&leftovers, Duration::from_secs(5));
         }
+        // What the harness said on stderr before it went (#2248): with its group ended, the
+        // stream reaches its end at once.
+        let stderr_tail = stderr.and_then(|tail| tail.finish(STDERR_TAIL_WAIT));
+        let exited = |next: String| {
+            let mut data = json!({"code": code, "next": next});
+            if let Some(tail) = &stderr_tail {
+                data["stderr_tail"] = tail.clone();
+            }
+            data
+        };
         self.clear_harness_record();
         if self.busy && self.stopping.is_none() {
             self.restart_notice = true;
@@ -2298,7 +2354,7 @@ impl Wrapper {
             self.emit(
                 "lifecycle.harness_exited",
                 None,
-                json!({"code": code, "next": "stopping"}),
+                exited("stopping".to_owned()),
             )?;
             self.set_status("stopped")?;
             self.emit(
@@ -2329,8 +2385,11 @@ impl Wrapper {
             self.emit(
                 "lifecycle.harness_exited",
                 None,
-                json!({"code": code, "next": format!("giving up after {} restarts in {} s",
-                        self.restarts.len(), self.config.restart_window.as_secs())}),
+                exited(format!(
+                    "giving up after {} restarts in {} s",
+                    self.restarts.len(),
+                    self.config.restart_window.as_secs()
+                )),
             )?;
             self.set_status("stopped")?;
             self.emit(
@@ -2346,7 +2405,7 @@ impl Wrapper {
         self.emit(
             "lifecycle.harness_exited",
             None,
-            json!({"code": code, "next": format!("restarting with --resume in {} s", delay.as_secs())}),
+            exited(format!("restarting with --resume in {} s", delay.as_secs())),
         )?;
         self.set_status("unreachable")?;
         Ok(None)

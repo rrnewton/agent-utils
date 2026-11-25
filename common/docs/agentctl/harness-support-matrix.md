@@ -618,7 +618,12 @@ launch arguments per adapter). The level sets themselves diverge:
   `set-effort` refuses the harness by name.
 - **Headless**: supported for Claude Code — recorded at once, applied
   at the next wrapper launch; the console applies it at the next turn
-  boundary (#1396 agentctl-console-effort-model).
+  boundary (#1396 agentctl-console-effort-model). Supported for Muse:
+  `muse serve` has no effort option, so on the serve transport the
+  declared effort travels on the wire, as the session's standing default
+  (`session/setReasoningEffort` once the session opens) and on every
+  `turn/start`; the exec transport passes `--reasoning-effort` to each
+  `muse exec` (#2247; `rs/agentctl/src/headless/muse.rs`).
 
 A live TUI agent applies a recorded effort at a safe point through the
 harness control where one exists, otherwise on restart `--resume`; a
@@ -702,7 +707,12 @@ and `py/agentctl/cli.py`, `py/agentctl/revive.py`).
   `rs/agentctl/src/subagents/headless.rs`). `--permission-prompts host`
   keeps working alongside the bypass, so hook "ask" decisions still
   route to chat (`effective_arguments` in
-  `rs/claude-stream-session/src/protocol.rs`); the Python foreign runner
+  `rs/claude-stream-session/src/protocol.rs`). `muse serve` refuses
+  approval flags (exit 2), so a headless Muse on the serve transport
+  turns `--yolo` and `--approval-mode never` into the session's
+  `allowAll` approval mode on the wire, and `--yolo` also into serve's
+  `--disable-sandbox` (#2247, `serve_launch` in
+  `rs/agentctl/src/headless/muse.rs`); the Python foreign runner
   appends the Codex bypass flag itself
   (`py/agentctl/foreign/agent_runner.py`), and this edition runs no
   headless Claude at all.

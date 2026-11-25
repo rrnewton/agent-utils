@@ -10,7 +10,21 @@
 //! wrapper's [`Signal`]s, so the typed event log, `tail`, `console`,
 //! `status` and the watcher work unchanged.
 //!
-//! Approvals: the session runs with approval mode `onRequest` on the wire.
+//! Launch (#2247): `muse serve` refuses exec and TUI options (`--yolo`,
+//! `--approval-mode`, `--reasoning-effort`, `--json`, ...) with exit 2, so
+//! its argv is built from an allowlist ([`serve_launch`]): the options
+//! `muse serve --help` lists plus the `muse` launcher's own, each kept
+//! once. Approval flags become the session's approval mode on the wire,
+//! and the declared effort travels on the wire too: the session's standing
+//! default (`session/setReasoningEffort`, once the session opens) and every
+//! `turn/start`'s `reasoningEffort`. Anything else is left off, and the
+//! wrapper logs what was left off at spawn.
+//!
+//! Approvals: the session runs with approval mode `onRequest` on the wire
+//! (`denyUnmatched` when nobody answers prompts), unless the operator
+//! arguments select one (`--yolo`, `--disable-approval`, `--approval-mode`).
+//! `session/start` carries it; a `session/resume` cannot, so a resumed
+//! session gets it as `session/setApprovalMode` once it opens.
 //! A prompt arrives as an `approval/request` server request; the wrapper
 //! holds it for the owner through the shared approval path, and the answer
 //! travels back as `approval/decide` naming the prompt's
@@ -50,6 +64,214 @@ const CLIENT_NAME: &str = "agentctl_headless";
 const HELLO_INIT_ID: &str = "agentctl-hello-init";
 /// JSON-RPC id of the wrapper's session-open request.
 const HELLO_SESSION_ID: &str = "agentctl-hello-session";
+/// JSON-RPC id of the standing-effort request sent once the session opens.
+const SESSION_EFFORT_ID: &str = "agentctl-session-effort";
+/// JSON-RPC id of the approval-mode request sent after a resume opens.
+const SESSION_APPROVAL_ID: &str = "agentctl-session-approval";
+
+/// `muse serve` options without a value (`muse serve --help`, Muse 1.4.27).
+/// Left out on purpose: the socket-daemon options (`--listen`, `--join` and
+/// the rest), which stop serving the wrapper over stdio, and
+/// `--per-session`, which refuses `--trust-workspace`.
+const SERVE_FLAGS: &[&str] = &[
+    "--no-session-log",
+    "--multi-tenant",
+    "--disable-request-user-input",
+    "--disable-sandbox",
+    "--disable-write",
+    "--disable-shell",
+    "--trust-workspace",
+    "--enable-attach",
+];
+/// `muse serve` options that take one value and may be given once (serve
+/// refuses a repeated `--model`): the last one given wins.
+const SERVE_SINGLE: &[&str] = &[
+    "--preset",
+    "--provider",
+    "--model",
+    "--contributor-mode",
+    "--sandbox-network",
+];
+/// The `muse` launcher's own options without a value: it reads them before
+/// it runs the binary, whatever the subcommand (`muse --help`).
+const LAUNCHER_FLAGS: &[&str] = &[
+    "--dangerously-enable-internet-mode",
+    "--secure-internet-mode",
+    "--dangerously-disable-linux-sandbox",
+    "--disable-muse-llm-rules",
+    "--meta-sensitive-mode",
+    "--meta-jail-audit-mode",
+];
+/// The `muse` launcher's own options that take a value; some repeat.
+const LAUNCHER_VALUED: &[&str] = &[
+    "--with-proxy",
+    "--meta-agent-role",
+    "--startup-context-mode",
+    "--meta-add-writable-dir",
+    "--meta-force-enable-features",
+    "--meta-tag",
+];
+/// Effort options: `muse serve` takes none, so the declared effort (`--effort`,
+/// which agentctl writes from the record) travels on the wire instead.
+const EFFORT_OPTIONS: &[&str] = &["--effort", "--reasoning-effort"];
+
+/// What one `muse serve` launch runs (#2247): the argv after the binary,
+/// the approval mode the operator arguments select, and what they asked
+/// for that serve cannot take.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ServeLaunch {
+    /// `serve`, its options and the launcher's, each option once.
+    pub argv: Vec<String>,
+    /// The MSP approval mode an approval flag selected; `None` keeps the
+    /// wrapper's default (`onRequest`, or `denyUnmatched` without approvals).
+    pub approval_mode: Option<&'static str>,
+    /// Operator arguments left off the serve argv, as given.
+    pub dropped: Vec<String>,
+}
+
+/// The MSP approval mode for an exec `--approval-mode` value. `never`
+/// (never ask) is Muse's permission bypass beside `--yolo`, as agentctl's
+/// own bypass rule reads it (`permission_bypass_flag`), so it allows all.
+fn exec_approval_mode(value: &str) -> Option<&'static str> {
+    match value {
+        "on-request" => Some("onRequest"),
+        "untrusted" => Some("promptUnmatched"),
+        "never" => Some("allowAll"),
+        _ => None,
+    }
+}
+
+/// The approval mode a serve session selects: the one the operator
+/// arguments chose, else `onRequest` when the wrapper answers prompts and
+/// `denyUnmatched` when nobody does.
+fn approval_mode(arguments: &[String], approvals: bool) -> &'static str {
+    serve_launch(arguments)
+        .approval_mode
+        .unwrap_or(if approvals {
+            "onRequest"
+        } else {
+            "denyUnmatched"
+        })
+}
+
+/// Add bare flag `name` to `options` unless it is there already.
+fn flag(options: &mut Vec<(String, Option<String>)>, name: &str) {
+    if !options.iter().any(|(option, _)| option == name) {
+        options.push((name.to_owned(), None));
+    }
+}
+
+/// Build the `muse serve` launch for operator `arguments` (#2247). Every
+/// kept option is in `muse serve --help`'s set or is a launcher option;
+/// approval flags become [`ServeLaunch::approval_mode`] (`--yolo` also
+/// disables serve's sandbox, as it does exec's); effort options leave the
+/// argv; a bare flag is kept once, a single-valued option keeps its last
+/// value, and a valued option that repeats keeps its distinct values.
+#[must_use]
+pub fn serve_launch(arguments: &[String]) -> ServeLaunch {
+    // (option, value): the argv is rendered from these once deduplicated.
+    let mut options: Vec<(String, Option<String>)> = vec![
+        ("--trust-workspace".to_owned(), None),
+        ("--disable-request-user-input".to_owned(), None),
+    ];
+    let mut launch = ServeLaunch::default();
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        index += 1;
+        let (name, inline) = match argument.split_once('=') {
+            Some((name, value)) if name.starts_with("--") => (name, Some(value.to_owned())),
+            _ => (argument.as_str(), None),
+        };
+        let name = if name == "-c" { "--config" } else { name };
+        let single = SERVE_SINGLE.contains(&name);
+        let valued = single
+            || name == "--config"
+            || LAUNCHER_VALUED.contains(&name)
+            || EFFORT_OPTIONS.contains(&name)
+            || name == "--approval-mode"
+            || name == "--approval-judge";
+        if valued {
+            let value = match inline {
+                Some(value) => Some(value),
+                None if index < arguments.len() && !arguments[index].starts_with("--") => {
+                    index += 1;
+                    Some(arguments[index - 1].clone())
+                }
+                None => None,
+            };
+            let Some(value) = value else {
+                launch.dropped.push(argument.clone());
+                continue;
+            };
+            if EFFORT_OPTIONS.contains(&name) {
+                if name != "--effort" {
+                    launch.dropped.push(format!("{name} {value}"));
+                }
+                continue;
+            }
+            if name == "--approval-mode" {
+                match exec_approval_mode(&value) {
+                    Some(mode) => launch.approval_mode = Some(mode),
+                    None => launch.dropped.push(format!("{name} {value}")),
+                }
+                continue;
+            }
+            if name == "--approval-judge" {
+                launch.dropped.push(format!("{name} {value}"));
+                continue;
+            }
+            if single {
+                if let Some(slot) = options.iter_mut().find(|(option, _)| option == name) {
+                    slot.1 = Some(value);
+                    continue;
+                }
+            } else if options
+                .iter()
+                .any(|(option, kept)| option == name && kept.as_deref() == Some(value.as_str()))
+            {
+                continue;
+            }
+            options.push((name.to_owned(), Some(value)));
+            continue;
+        }
+        if inline.is_some() {
+            // A bare flag never takes `=value`; serve would refuse it.
+            launch.dropped.push(argument.clone());
+            continue;
+        }
+        match name {
+            "--yolo" => {
+                launch.approval_mode = Some("allowAll");
+                flag(&mut options, "--disable-sandbox");
+            }
+            "--disable-approval" => launch.approval_mode = Some("allowAll"),
+            name if SERVE_FLAGS.contains(&name) || LAUNCHER_FLAGS.contains(&name) => {
+                flag(&mut options, name);
+            }
+            _ => {
+                // Not a serve option: leave it off, with the value it may carry
+                // (serve takes no positional arguments either).
+                let mut dropped = argument.clone();
+                if argument.starts_with('-')
+                    && index < arguments.len()
+                    && !arguments[index].starts_with('-')
+                {
+                    dropped.push(' ');
+                    dropped.push_str(&arguments[index]);
+                    index += 1;
+                }
+                launch.dropped.push(dropped);
+            }
+        }
+    }
+    launch.argv.push("serve".to_owned());
+    for (option, value) in options {
+        launch.argv.push(option);
+        launch.argv.extend(value);
+    }
+    launch
+}
 
 /// Which Muse transport a headless Muse runs. Selected explicitly at
 /// `start` and recorded; the wrapper never switches transports at runtime.
@@ -95,6 +317,9 @@ pub struct MuseHarness {
     /// `session/resume`, never `session/start` (which refuses a retained
     /// id). Learned from every successful open and from a conflict.
     must_resume: Mutex<bool>,
+    /// The last session open was a `session/resume`, which carries no
+    /// approval mode: the mode follows once the session opens.
+    resumed: Mutex<bool>,
 }
 
 impl MuseHarness {
@@ -106,6 +331,7 @@ impl MuseHarness {
             server_version: Mutex::new(None),
             session: Mutex::new(None),
             must_resume: Mutex::new(false),
+            resumed: Mutex::new(false),
         }
     }
 
@@ -117,6 +343,7 @@ impl MuseHarness {
             server_version: Mutex::new(None),
             session: Mutex::new(None),
             must_resume: Mutex::new(false),
+            resumed: Mutex::new(false),
         }
     }
 }
@@ -172,10 +399,13 @@ fn output_preview(text: &str) -> Vec<String> {
 }
 
 impl MuseHarness {
-    fn session_open_line(&self, resume_hint: bool, session: &str, approvals: bool) -> String {
+    fn session_open_line(&self, resume_hint: bool, session: &str, mode: &str) -> String {
         // A session this instance already opened (or collided with) is
         // resumed; the transcript hint covers a fresh wrapper process.
         let resume = resume_hint || self.must_resume.lock().map(|must| *must).unwrap_or(false);
+        if let Ok(mut resumed) = self.resumed.lock() {
+            *resumed = resume;
+        }
         let command_id = uuid_v7();
         if resume {
             line(json!({
@@ -188,13 +418,35 @@ impl MuseHarness {
                 "params": {
                     "commandId": command_id,
                     "sessionId": session,
-                    "approvalMode": if approvals { "onRequest" } else { "denyUnmatched" },
+                    "approvalMode": mode,
                 },
             }))
         }
     }
 
     fn parse_response(&self, id: &str, value: &Value) -> Vec<Signal> {
+        if id == SESSION_EFFORT_ID || id == SESSION_APPROVAL_ID {
+            // A setting applied once the session opened: a refusal is logged,
+            // never a restart (the per-turn effort still rides every turn).
+            let Some(error) = value.get("error") else {
+                return Vec::new();
+            };
+            let reason = error["data"]["reason"].as_str().unwrap_or_default();
+            let message = error["message"].as_str().unwrap_or("refused");
+            return vec![Signal::SessionConfigFailed {
+                setting: if id == SESSION_EFFORT_ID {
+                    "reasoning_effort"
+                } else {
+                    "approval_mode"
+                }
+                .to_owned(),
+                message: if reason.is_empty() {
+                    message.to_owned()
+                } else {
+                    format!("{message} ({reason})")
+                },
+            }];
+        }
         if id == HELLO_INIT_ID {
             if let Some(result) = value.get("result") {
                 let version = text_of(&result["serverInfo"], "version");
@@ -546,32 +798,10 @@ impl HarnessAdapter for MuseHarness {
             }
             return argv;
         }
-        // `muse serve` takes its model (and provider) at launch; the
-        // declared effort is per-turn on the wire, never a serve flag,
-        // and approval mode is selected per session in the handshake.
-        let mut argv = vec![
-            "serve".to_owned(),
-            "--trust-workspace".to_owned(),
-            "--disable-request-user-input".to_owned(),
-        ];
-        let mut iter = arguments.iter();
-        while let Some(argument) = iter.next() {
-            match argument.as_str() {
-                "--effort" => {
-                    let _ = iter.next();
-                }
-                "--model" => {
-                    argv.push("--model".to_owned());
-                    if let Some(model) = iter.next() {
-                        argv.push(model.clone());
-                    }
-                }
-                other if other.starts_with("--effort=") => {}
-                other if other.starts_with("--model=") => argv.push(other.to_owned()),
-                other => argv.push(other.to_owned()),
-            }
-        }
-        argv
+        // `muse serve` takes its model, provider and sandbox posture at
+        // launch; the declared effort and the approval mode travel on the
+        // wire, never as serve flags (#2247).
+        serve_launch(arguments).argv
     }
 
     fn hello_lines(
@@ -580,6 +810,7 @@ impl HarnessAdapter for MuseHarness {
         session: &str,
         _cwd: &Path,
         _effort: Option<&str>,
+        arguments: &[String],
         approvals: bool,
     ) -> Vec<String> {
         if self.transport == Transport::Exec {
@@ -596,8 +827,54 @@ impl HarnessAdapter for MuseHarness {
                 "params": {"clientInfo": {"name": CLIENT_NAME, "version": env!("CARGO_PKG_VERSION")}},
             })),
             line(json!({"jsonrpc": "2.0", "method": "initialized"})),
-            self.session_open_line(resume, session, approvals),
+            self.session_open_line(resume, session, approval_mode(arguments, approvals)),
         ]
+    }
+
+    fn session_opened_lines(
+        &self,
+        session: &str,
+        effort: Option<&str>,
+        arguments: &[String],
+        approvals: bool,
+    ) -> Vec<String> {
+        if self.transport == Transport::Exec {
+            // `muse exec` takes the effort per run; it has no approval wire.
+            return Vec::new();
+        }
+        let mut lines = Vec::new();
+        // `muse serve` has no effort option: the declared effort becomes
+        // the session's standing default, so a turn the host starts on its
+        // own runs at it too (every `turn/start` also carries it).
+        if let Some(effort) = effort {
+            lines.push(line(json!({
+                "jsonrpc": "2.0", "id": SESSION_EFFORT_ID, "method": "session/setReasoningEffort",
+                "params": {"commandId": uuid_v7(), "sessionId": session, "reasoningEffort": effort},
+            })));
+        }
+        // `session/resume` carries no approval mode: select it now.
+        if self.resumed.lock().map(|resumed| *resumed).unwrap_or(false) {
+            lines.push(line(json!({
+                "jsonrpc": "2.0", "id": SESSION_APPROVAL_ID, "method": "session/setApprovalMode",
+                "params": {"commandId": uuid_v7(), "sessionId": session,
+                           "mode": approval_mode(arguments, approvals)},
+            })));
+        }
+        lines
+    }
+
+    fn launch_warnings(&self, arguments: &[String]) -> Vec<String> {
+        if self.transport == Transport::Exec {
+            return Vec::new();
+        }
+        let dropped = serve_launch(arguments).dropped;
+        if dropped.is_empty() {
+            return Vec::new();
+        }
+        vec![format!(
+            "muse serve does not take {}; left off the serve command line (approval mode and the declared --effort travel on the wire)",
+            dropped.join(", ")
+        )]
     }
 
     fn needs_init_before_input(&self) -> bool {
@@ -730,9 +1007,15 @@ impl HarnessAdapter for MuseHarness {
             .map(|id| line(json!({"jsonrpc": "2.0", "id": id, "result": {}})))
     }
 
-    fn asks_wrapper(&self, _arguments: &[String], approvals: bool) -> bool {
-        // `muse exec` has no approval wire; its harness decides alone.
-        approvals && self.transport == Transport::Serve
+    fn asks_wrapper(&self, arguments: &[String], approvals: bool) -> bool {
+        // `muse exec` has no approval wire; its harness decides alone. A
+        // session that allows or denies every unmatched call never asks.
+        approvals
+            && self.transport == Transport::Serve
+            && matches!(
+                approval_mode(arguments, approvals),
+                "onRequest" | "promptUnmatched"
+            )
     }
 
     fn mask_secrets(&self, text: &str) -> String {
@@ -1076,12 +1359,247 @@ mod tests {
 
     #[test]
     fn hello_opens_the_recorded_session_on_request() {
-        let lines = harness().hello_lines(false, "sess-1", Path::new("/w"), Some("high"), true);
+        let lines =
+            harness().hello_lines(false, "sess-1", Path::new("/w"), Some("high"), &[], true);
         assert_eq!(lines.len(), 3);
         let open: Value = serde_json::from_str(&lines[2]).unwrap();
         assert_eq!(open["method"], "session/start");
         assert_eq!(open["params"]["sessionId"], "sess-1");
         assert_eq!(open["params"]["approvalMode"], "onRequest");
+    }
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| (*item).to_owned()).collect()
+    }
+
+    /// The operator arguments of the #2247 report: a Muse profile carrying exec and TUI flags,
+    /// as `declared_arguments` hands them to the wrapper (effort and model appended).
+    fn reported_profile() -> Vec<String> {
+        strings(&[
+            "--yolo",
+            "--dangerously-enable-internet-mode",
+            "--disable-request-user-input",
+            "--effort",
+            "max",
+            "--model",
+            "m1",
+        ])
+    }
+
+    #[test]
+    fn the_reported_profile_launches_a_serve_argv_serve_accepts() {
+        // #2247: serve refuses --yolo with exit 2; it becomes allowAll on the wire, and
+        // --yolo's sandbox half becomes serve's own --disable-sandbox.
+        let argv = harness().launch_arguments(false, "s", &reported_profile(), true);
+        assert_eq!(
+            argv,
+            strings(&[
+                "serve",
+                "--trust-workspace",
+                "--disable-request-user-input",
+                "--disable-sandbox",
+                "--dangerously-enable-internet-mode",
+                "--model",
+                "m1",
+            ])
+        );
+        let launch = serve_launch(&reported_profile());
+        assert_eq!(launch.approval_mode, Some("allowAll"));
+        assert!(launch.dropped.is_empty(), "{:?}", launch.dropped);
+        assert!(harness().launch_warnings(&reported_profile()).is_empty());
+        // Nothing is repeated, and every kept option is serve's or the launcher's.
+        let options: Vec<&String> = argv[1..].iter().filter(|a| a.starts_with("--")).collect();
+        let mut unique = options.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), options.len(), "{argv:?}");
+        for option in options {
+            assert!(
+                SERVE_FLAGS.contains(&option.as_str())
+                    || SERVE_SINGLE.contains(&option.as_str())
+                    || LAUNCHER_FLAGS.contains(&option.as_str()),
+                "{option} is not a serve or launcher option"
+            );
+        }
+    }
+
+    #[test]
+    fn the_reported_profile_selects_allow_all_and_carries_its_effort_on_the_wire() {
+        let h = harness();
+        let arguments = reported_profile();
+        let effort = crate::headless::adapter::declared_effort(&arguments);
+        assert_eq!(effort, Some("max"));
+        let hello = h.hello_lines(false, "sess-1", Path::new("/w"), effort, &arguments, true);
+        let open: Value = serde_json::from_str(&hello[2]).unwrap();
+        assert_eq!(open["method"], "session/start");
+        assert_eq!(open["params"]["approvalMode"], "allowAll");
+        // Nobody is asked: an allow-all session raises no prompts.
+        assert!(!h.asks_wrapper(&arguments, true));
+        // Once the session opens: the standing effort, and no approval change after a start.
+        let opened = h.session_opened_lines("sess-1", effort, &arguments, true);
+        assert_eq!(opened.len(), 1, "{opened:?}");
+        let set: Value = serde_json::from_str(&opened[0]).unwrap();
+        assert_eq!(set["method"], "session/setReasoningEffort");
+        assert_eq!(set["params"]["sessionId"], "sess-1");
+        assert_eq!(set["params"]["reasoningEffort"], "max");
+        assert!(claude::is_uuid(
+            set["params"]["commandId"].as_str().unwrap()
+        ));
+        // Every turn still carries it.
+        let turn: Value =
+            serde_json::from_str(&h.input_line("u1", "hi", "sess-1", effort)).unwrap();
+        assert_eq!(turn["params"]["reasoningEffort"], "max");
+    }
+
+    #[test]
+    fn a_resumed_session_gets_its_approval_mode_once_it_opens() {
+        let h = harness();
+        let arguments = reported_profile();
+        let hello = h.hello_lines(
+            true,
+            "sess-1",
+            Path::new("/w"),
+            Some("max"),
+            &arguments,
+            true,
+        );
+        let open: Value = serde_json::from_str(&hello[2]).unwrap();
+        assert_eq!(open["method"], "session/resume");
+        assert!(open["params"].get("approvalMode").is_none());
+        let opened = h.session_opened_lines("sess-1", Some("max"), &arguments, true);
+        let methods: Vec<Value> = opened
+            .iter()
+            .map(|row| serde_json::from_str::<Value>(row).unwrap())
+            .collect();
+        assert_eq!(methods[0]["method"], "session/setReasoningEffort");
+        assert_eq!(methods[1]["method"], "session/setApprovalMode");
+        assert_eq!(methods[1]["params"]["mode"], "allowAll");
+        assert_eq!(methods[1]["params"]["sessionId"], "sess-1");
+        // Without an approval flag the default stands: onRequest with approvals.
+        let plain = strings(&["--model", "m1"]);
+        let _ = h.hello_lines(true, "sess-1", Path::new("/w"), None, &plain, true);
+        let opened = h.session_opened_lines("sess-1", None, &plain, true);
+        let set: Value = serde_json::from_str(&opened[0]).unwrap();
+        assert_eq!(set["params"]["mode"], "onRequest");
+        assert!(h.asks_wrapper(&plain, true));
+    }
+
+    #[test]
+    fn a_refused_session_setting_is_logged_not_fatal() {
+        let h = harness();
+        let refused: Value = serde_json::from_str(
+            r#"{"id":"agentctl-session-effort","error":{"code":-32602,"message":"invalid params","data":{"reason":"unknown_tier"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            h.parse(&refused),
+            vec![Signal::SessionConfigFailed {
+                setting: "reasoning_effort".into(),
+                message: "invalid params (unknown_tier)".into(),
+            }]
+        );
+        let accepted: Value = serde_json::from_str(
+            r#"{"id":"agentctl-session-approval","result":{"status":"accepted","applyOutcome":"noop"}}"#,
+        )
+        .unwrap();
+        assert!(h.parse(&accepted).is_empty());
+    }
+
+    #[test]
+    fn serve_translates_approval_flags_and_leaves_exec_options_off() {
+        let launch = serve_launch(&strings(&[
+            "--approval-mode",
+            "untrusted",
+            "--json",
+            "--session-id",
+            "abc",
+            "--approval-judge=off",
+            "--reasoning-effort",
+            "high",
+            "--trust-workspace",
+            "--trust-workspace",
+            "-c",
+            "a=1",
+            "--config=a=1",
+            "--config",
+            "b=2",
+            "--model=m0",
+            "--model",
+            "m1",
+            "--listen",
+            "stray",
+            "--disable-sandbox=yes",
+            "--meta-tag",
+            "t1",
+            "--meta-tag=t1",
+        ]));
+        assert_eq!(launch.approval_mode, Some("promptUnmatched"));
+        assert_eq!(
+            launch.argv,
+            strings(&[
+                "serve",
+                "--trust-workspace",
+                "--disable-request-user-input",
+                "--config",
+                "a=1",
+                "--config",
+                "b=2",
+                "--model",
+                "m1",
+                "--meta-tag",
+                "t1",
+            ])
+        );
+        assert_eq!(
+            launch.dropped,
+            strings(&[
+                "--json",
+                "--session-id abc",
+                "--approval-judge off",
+                "--reasoning-effort high",
+                "--listen stray",
+                "--disable-sandbox=yes",
+            ])
+        );
+        let warnings = harness().launch_warnings(&strings(&["--json"]));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("--json"), "{warnings:?}");
+        // The last approval flag wins; `never` is the bypass, like --yolo.
+        let last = serve_launch(&strings(&["--yolo", "--approval-mode=on-request"]));
+        assert_eq!(last.approval_mode, Some("onRequest"));
+        assert!(last.argv.contains(&"--disable-sandbox".to_owned()));
+        let never = serve_launch(&strings(&["--approval-mode", "never"]));
+        assert_eq!(never.approval_mode, Some("allowAll"));
+        assert!(!never.argv.contains(&"--disable-sandbox".to_owned()));
+        assert!(!harness().asks_wrapper(&strings(&["--approval-mode", "never"]), true));
+        let disabled = serve_launch(&strings(&["--disable-approval"]));
+        assert_eq!(disabled.approval_mode, Some("allowAll"));
+        assert!(!disabled.argv.contains(&"--disable-sandbox".to_owned()));
+        // No approvals and no flag: nobody answers, so unmatched calls are denied.
+        assert_eq!(approval_mode(&[], false), "denyUnmatched");
+        assert_eq!(approval_mode(&[], true), "onRequest");
+    }
+
+    #[test]
+    fn the_exec_transport_launch_is_unchanged() {
+        let h = MuseHarness::exec();
+        let argv = h.launch_arguments(false, "sess-1", &reported_profile(), true);
+        assert_eq!(argv, strings(&["--session", "sess-1", "--model", "m1"]));
+        assert!(h
+            .hello_lines(
+                false,
+                "sess-1",
+                Path::new("/w"),
+                Some("max"),
+                &reported_profile(),
+                true
+            )
+            .is_empty());
+        assert!(h
+            .session_opened_lines("sess-1", Some("max"), &reported_profile(), true)
+            .is_empty());
+        assert!(h.launch_warnings(&reported_profile()).is_empty());
+        assert!(!h.asks_wrapper(&reported_profile(), true));
     }
 
     #[test]

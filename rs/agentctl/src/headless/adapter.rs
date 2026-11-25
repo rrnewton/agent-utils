@@ -41,17 +41,40 @@ pub trait HarnessAdapter: std::fmt::Debug + Send + Sync {
     ) -> Vec<String>;
 
     /// Lines the wrapper writes as soon as the harness starts, before any
-    /// queued input (a protocol handshake, a session open). Most harnesses
-    /// need none.
+    /// queued input (a protocol handshake, a session open). `arguments`
+    /// are the operator arguments `launch_arguments` was given. Most
+    /// harnesses need none.
     fn hello_lines(
         &self,
         resume: bool,
         session: &str,
         cwd: &Path,
         effort: Option<&str>,
+        arguments: &[String],
         approvals: bool,
     ) -> Vec<String> {
-        let _ = (resume, session, cwd, effort, approvals);
+        let _ = (resume, session, cwd, effort, arguments, approvals);
+        Vec::new()
+    }
+
+    /// Lines the wrapper writes once the harness's session has opened
+    /// (its first [`Signal::Init`]), before any queued input: settings a
+    /// protocol can only apply to an open session. Most harnesses need none.
+    fn session_opened_lines(
+        &self,
+        session: &str,
+        effort: Option<&str>,
+        arguments: &[String],
+        approvals: bool,
+    ) -> Vec<String> {
+        let _ = (session, effort, arguments, approvals);
+        Vec::new()
+    }
+
+    /// Warnings about one launch the wrapper logs at spawn, such as
+    /// operator arguments this harness's launch left off. Most have none.
+    fn launch_warnings(&self, arguments: &[String]) -> Vec<String> {
+        let _ = arguments;
         Vec::new()
     }
 

@@ -1609,6 +1609,17 @@ fn the_harness_is_spawned_with_the_configured_launch_environment() {
 /// every decision it receives in `FAKE_MUSE_LOG`.
 const FAKE_MUSE: &str = r#"
 import json, os, queue, sys, threading
+args = sys.argv[1:]
+def wire(value):
+    if os.environ.get("FAKE_MUSE_WIRE"):
+        with open(os.environ["FAKE_MUSE_WIRE"], "a") as handle:
+            handle.write(json.dumps(value) + "\n")
+wire({"argv": args})
+# Like Muse 1.4.27's serve: exec options are a usage error, exit 2 (#2247).
+for refused in ("--yolo", "--disable-approval", "--approval-mode", "--reasoning-effort", "--json"):
+    if any(arg == refused or arg.startswith(refused + "=") for arg in args):
+        sys.stderr.write("muse serve: " + refused + " is not a serve option\nusage: muse serve [OPTIONS]\n")
+        sys.exit(2)
 inputs = queue.Queue()
 def reader():
     for line in sys.stdin:
@@ -1630,9 +1641,15 @@ while True:
         out({"id": message["id"], "result": {"serverInfo": {"name": "muse", "version": "1.4.23"}}})
         continue
     if method in ("session/start", "session/resume"):
+        wire({"method": method, "params": message["params"]})
         session = message["params"]["sessionId"]
         out({"id": message["id"], "result": {"session": {"sessionId": session, "modelId": "fake",
-             "approvalMode": {"mode": "onRequest"}}}})
+             "approvalMode": {"mode": message["params"].get("approvalMode") or "onRequest"}}}})
+        continue
+    if method in ("session/setReasoningEffort", "session/setApprovalMode"):
+        wire({"method": method, "params": message["params"]})
+        out({"id": message["id"], "result": {"commandId": message["params"]["commandId"],
+             "status": "accepted"}})
         continue
     if method == "turn/interrupt":
         out({"id": message["id"], "result": {}})
@@ -1691,12 +1708,25 @@ impl Fixture {
         fixture.config.command = vec![
             "env".to_owned(),
             format!("FAKE_MUSE_LOG={}", fixture.root.join("muse.log").display()),
+            format!(
+                "FAKE_MUSE_WIRE={}",
+                fixture.root.join("muse-wire.log").display()
+            ),
             "python3".to_owned(),
             script.display().to_string(),
         ];
         fixture.config.adapter = std::sync::Arc::new(crate::headless::muse::MuseHarness::serve());
         fixture.config.config_directory = Some(fixture.root.join("muse-home"));
         fixture
+    }
+
+    /// What the fake Muse saw: its argv first, then session opens and settings.
+    fn muse_wire(&self) -> Vec<Value> {
+        fs::read_to_string(self.root.join("muse-wire.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|row| serde_json::from_str(row).ok())
+            .collect()
     }
 
     fn muse_log(&self) -> Vec<Value> {
@@ -1752,5 +1782,82 @@ fn a_muse_approval_is_held_and_answered_with_approval_decide() {
     fixture.wait("turn completed", || {
         fixture.has_event("turn.completed", |data| data["outcome"] == "completed")
     });
+    fixture.stop(handle);
+}
+
+#[test]
+fn a_muse_serve_launch_of_an_exec_profile_serves_with_approval_and_effort_on_the_wire() {
+    // #2247: a profile carrying --yolo made `muse serve` exit 2 on every restart. Now the
+    // serve argv holds only serve and launcher options, --yolo selects allowAll on the wire,
+    // and the declared effort becomes the session's standing default.
+    let mut fixture = Fixture::muse("muse-yolo");
+    fixture.config.arguments = [
+        "--yolo",
+        "--dangerously-enable-internet-mode",
+        "--disable-request-user-input",
+        "--effort",
+        "max",
+        "--model",
+        "m1",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let handle = fixture.start();
+    fixture.enqueue("m1", "hello muse", json!({}));
+    fixture.wait("turn completed", || {
+        fixture.has_event("turn.completed", |data| data["outcome"] == "completed")
+    });
+    let wire = fixture.muse_wire();
+    let argv: Vec<&str> = wire[0]["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(!argv.contains(&"--yolo"), "{argv:?}");
+    assert!(argv.contains(&"--disable-sandbox"), "{argv:?}");
+    for once in [
+        "--disable-request-user-input",
+        "--dangerously-enable-internet-mode",
+        "--trust-workspace",
+        "--model",
+    ] {
+        assert_eq!(
+            argv.iter().filter(|arg| **arg == once).count(),
+            1,
+            "{argv:?}"
+        );
+    }
+    let sent = |method: &str| {
+        wire.iter()
+            .find(|row| row["method"] == method)
+            .unwrap_or_else(|| panic!("no {method} in {wire:?}"))["params"]
+            .clone()
+    };
+    assert_eq!(sent("session/start")["approvalMode"], "allowAll");
+    assert_eq!(sent("session/setReasoningEffort")["reasoningEffort"], "max");
+    assert!(
+        fixture.has_event("lifecycle.harness", |data| data["permission_mode"]
+            == "allowAll")
+    );
+    assert!(!fixture.has_event("lifecycle.harness_exited", |_| true));
+    assert!(!fixture.has_event("error", |data| data["class"] == "harness_arguments"));
+    fixture.stop(handle);
+}
+
+#[test]
+fn a_muse_serve_launch_names_the_arguments_it_left_off() {
+    let mut fixture = Fixture::muse("muse-dropped");
+    fixture.config.arguments = ["--json", "--effort", "high"].map(str::to_owned).to_vec();
+    let handle = fixture.start();
+    fixture.wait("the warning", || {
+        fixture.has_event("error", |data| {
+            data["class"] == "harness_arguments"
+                && data["message"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("--json"))
+        })
+    });
+    assert!(!fixture.has_event("lifecycle.harness_exited", |_| true));
     fixture.stop(handle);
 }

@@ -43,7 +43,7 @@ Environment metadata contains names only; values remain in private profiles.
 | Interactive | A native Codex, Claude, or Muse TUI that remains directly accessible | Herdr, or tmux in the Rust edition |
 | Headless worker extension | Resumable Codex, AGY, or Muse structured turns; a terminal shows the transcript | Herdr or tmux and the chosen harness |
 | Headless Claude agent (Rust edition) | One persistent Claude Code stream-json process per agent, fed only from its durable queue; `agentctl tail` shows its typed event log | Claude Code; systemd to supervise it |
-| Headless Muse agent (Rust edition) | One persistent `muse serve` MSP host per agent, fed only from its durable queue with approvals relayed to the owner; `agentctl tail` shows the same typed event log | Muse; systemd to supervise it |
+| Headless Muse agent (Rust edition) | One persistent `muse serve` MSP host per agent, fed only from its durable queue with approvals relayed to the owner; `agentctl tail` shows the same typed event log. Serve takes only its own options and the `muse` launcher's: approval flags (`--yolo`, `--disable-approval`, `--approval-mode`) select the session's approval mode on the wire, the declared effort is set on the session and every turn, and any other argument is left off and named in an `error` event at spawn | Muse; systemd to supervise it |
 | Chat service | Provider messages connected to an interactive coordinator | Herdr and either the Python Google Chat transport or a Rust subscription plugin |
 | MCP extension | The same session operations over local MCP stdio | An MCP client |
 
@@ -3511,7 +3511,7 @@ agentctl approvals coordinator              # permission prompts waiting for the
 agentctl approve coordinator a4182          # at a terminal: let the held call run
 agentctl deny coordinator a4182 --reason 'use the fork'
 agentctl compact coordinator                # queue /compact for the turn boundary
-agentctl status coordinator                 # agent_status from the wrapper, queue counts
+agentctl status coordinator                 # agent_status from the wrapper, queue counts, last harness exit
 agentctl stop coordinator                   # clean stop, archive record, queue and log
 ```
 
@@ -3618,7 +3618,7 @@ send`, so re-reading a log repeats nothing.
 | Type | Data |
 | --- | --- |
 | `lifecycle.started`, `lifecycle.stopped` | wrapper build, cwd, settings digest; stop cause |
-| `lifecycle.harness_spawned`, `lifecycle.harness`, `lifecycle.harness_exited` | pid and resume; harness version, model, permission mode; exit code and what happens next |
+| `lifecycle.harness_spawned`, `lifecycle.harness`, `lifecycle.harness_exited` | pid and resume; harness version, model, permission mode; exit code, what happens next, and `stderr_tail` when the harness wrote to stderr: `lines`, its last lines (oldest first, masked, at most 20 lines of 512 bytes and 4 KiB in all) and `omitted_lines`, the earlier lines that did not fit. `agentctl status` shows the newest exit of the recent log as `last_harness_exit`, and `tail` prints the lines under the exit |
 | `status` | `idle`, `busy`, `unreachable` (harness restarting), `stopped` |
 | `input.queued` | `queue_id`, `harness_input_id`, `from`, `priority`, `deliver`, `excerpt` (600 bytes) |
 | `input.started`, `input.completed`, `input.cancelled` | `queue_id`, `mid_turn`, `before_start`, `recovered` |

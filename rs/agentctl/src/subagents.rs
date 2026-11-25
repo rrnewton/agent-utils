@@ -26286,6 +26286,8 @@ fi
     mod effort;
     /// `/goal` commands typed raw and proved by the harness's answer.
     mod goal_command;
+    /// A headless harness's last stderr lines in its exit event and status (#2248).
+    mod headless_exit;
     /// Takeover and handback of a headless agent: one writer per session.
     mod headless_takeover;
     /// The one console-viewer path every headless start goes through (#1973).

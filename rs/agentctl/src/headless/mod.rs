@@ -34,6 +34,7 @@ pub mod events;
 pub mod muse;
 pub mod render;
 pub mod reply;
+pub mod stderr_tail;
 pub mod tail;
 pub mod watch;
 pub mod wrapper;

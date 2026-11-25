@@ -189,6 +189,15 @@ pub enum Signal {
         /// The harness build that answered.
         actual: String,
     },
+    /// A session setting the wrapper applied after the session opened
+    /// (a standing reasoning effort, an approval mode after a resume) was
+    /// refused; the wrapper logs it and carries on, never restarting.
+    SessionConfigFailed {
+        /// Which setting: `reasoning_effort` or `approval_mode`.
+        setting: String,
+        /// Why it was refused, for the event log.
+        message: String,
+    },
 }
 
 /// Why a tool call never ran.
