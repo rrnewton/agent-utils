@@ -388,8 +388,16 @@
 /* `#1913` (liaison nit on `#1899`): while a bucket chip stands, its pinned panel overlays
    the head of the list where this signpost sits, and the heading peeks half-cut between
    the filter row and the panel. The chips already say where the server's hits are, so the
-   signpost stands down until they go. */
-#screen-main:has(> #channel-freshness-anchor .search-bucket-chip:not([hidden])) #search-screen-sep {
+   signpost stands down until they go.
+   `#2249`: it also stands down while the list's head is reserved (`#2200`'s
+   `data-bucket-head`, set while a chip stands or an answer is pending). The typing-fast pass
+   retires the chips inside the input event while the reservation keeps its room; keyed to the
+   chips alone the signpost came back over that room for the debounce window and moved the
+   reader's row +23 px until the answer stood the chips again. Settled with no chip the
+   reservation is released under the scroll owner's hold and the signpost returns in the same
+   mutation, exactly where it stood before. */
+#screen-main:has(> #channel-freshness-anchor .search-bucket-chip:not([hidden])) #search-screen-sep,
+#screen-main[data-searching][data-bucket-head] #search-screen-sep {
   display: none;
 }
 

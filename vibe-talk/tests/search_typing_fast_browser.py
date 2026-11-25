@@ -15,7 +15,12 @@ phone and desktop sizes:
   with the pinned bucket chips standing for "lantern" ("2 in main" / "5 in threads" — the
   fold counts loaded and fresh together, `#2200`), typing a new query retires those chips at
   once — the previous query's counts never stand for the new words — and after the debounced
-  server answer the chips stand for the new query's own fold, summing to its count.
+  server answer the chips stand for the new query's own fold, summing to its count;
+  `#2249`: while the list's head stays reserved over the retired chips (`data-bucket-head`,
+  the answer pending), the "On this screen" signpost takes no layout box at the key or at any
+  frame until the chips stand again (it used to come back over the reserved room and push the
+  reader's rows +23 px for the debounce window); settled on a query with no hit anywhere (no
+  chip, no reservation) the signpost shows.
 
 The gate is a count of synchronous work per input event, never a wall-clock budget (owner
 rule 346); every wait is a condition wait. Pass --screenshots DIR to keep a PNG of each stage.
@@ -275,13 +280,33 @@ def walk_through(walk: Walk, total: int) -> None:
         field.dispatchEvent(new Event('input', { bubbles: true }));
         const row = document.getElementById('search-bucket-row');
         const mainChip = document.getElementById('search-bucket-main');
+        const screenMain = document.getElementById('screen-main');
+        const sep = document.getElementById('search-screen-sep');
+        // `#2249`: every frame from here until the chips stand again, note any frame where
+        // the signpost has a layout box while the head is reserved.
+        window.__signpost = { frames: 0, shownWhileReserved: 0, running: true };
+        const sample = () => {
+            if (!window.__signpost.running) return;
+            window.__signpost.frames += 1;
+            if (screenMain.hasAttribute('data-bucket-head') && sep.getClientRects().length > 0) {
+                window.__signpost.shownWhileReserved += 1;
+            }
+            requestAnimationFrame(sample);
+        };
+        requestAnimationFrame(sample);
         return { rowHidden: row ? row.hidden : null, chipHidden: mainChip ? mainChip.hidden : null,
-                 chipText: mainChip ? (mainChip.textContent || '').trim() : null };
+                 chipText: mainChip ? (mainChip.textContent || '').trim() : null,
+                 bucketHead: screenMain.hasAttribute('data-bucket-head'),
+                 signpostBoxes: sep.getClientRects().length };
     }""")
     walk.check(retired["rowHidden"] is True and retired["chipHidden"] is True,
                f"the lantern chips still stand for 'routine': {retired}")
     walk.check(retired["chipText"] in ("", "2 in main"),
                f"the retired chip still speaks with fresh words: {retired}")
+    # `#2249`: the head stays reserved over the retired chips (the answer pending), and the
+    # signpost stays down with it, so nothing above the reader's rows grows at the key.
+    walk.check(retired["bucketHead"] is True and retired["signpostBoxes"] == 0,
+               f"at the key the 'On this screen' signpost came back over the reserved head: {retired}")
     # Settled on the new query: its count, and the chips standing for its own
     # fold (`#2200` — loaded matches count, so the row stands and sums to X).
     walk.until("() => document.getElementById('search-count').textContent.includes('of')"
@@ -296,7 +321,24 @@ def walk_through(walk: Walk, total: int) -> None:
       return x === n('search-bucket-main') + n('search-bucket-threads') + n('search-bucket-transcripts');
     }""")
     walk.check(summed, "the routine chips do not sum to the count")
+    signpost = page.evaluate("() => { window.__signpost.running = false; return window.__signpost; }")
+    walk.check(signpost["frames"] > 0 and signpost["shownWhileReserved"] == 0,
+               f"the signpost stood over the reserved head between the key and the chips: {signpost}")
     walk.shot("chips-retired")
+    # `#2249`: settled on a query with no hit anywhere, no chip stands and the reservation is
+    # released, and the signpost shows exactly as before.
+    page.evaluate("""() => { const f = document.getElementById('search-field'); f.value = 'zzqv';
+        f.dispatchEvent(new Event('input', { bubbles: true })); }""")
+    walk.until("() => !document.getElementById('screen-main').hasAttribute('data-bucket-head')"
+               " && document.getElementById('search-bucket-row').hidden"
+               " && document.getElementById('search-count').textContent.startsWith('0 of')"
+               " && /No more hits|Server search details/.test(document.getElementById('server-line').textContent)",
+               "the search never settled with no chip for a query with no hit")
+    shown = page.evaluate("""() => { const sep = document.getElementById('search-screen-sep');
+        return { boxes: sep.getClientRects().length, text: (sep.textContent || '').trim() }; }""")
+    walk.check(shown["boxes"] > 0 and shown["text"] == "On this screen",
+               f"settled with no chip the 'On this screen' signpost does not show: {shown}")
+    walk.shot("settled-no-chip")
 
 
 def main() -> int:
