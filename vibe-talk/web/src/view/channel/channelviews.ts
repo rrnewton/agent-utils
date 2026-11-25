@@ -143,6 +143,9 @@ export interface ChannelViewsDependencies {
   syncUnreadReplies(): void;
   renderChannelFreshness(): void;
   payThreadEntry(): void;
+  /** `#2251`: re-run the open search over the view just put up from held rows (no read
+   * follows a local switch to run it), so its results, count and chips follow the view. */
+  refilterSearch?(): void;
   rowsMissDone(): boolean;
   scrollToNewest(): void;
   /** Move the channel's list by a measured delta, or put it at a measured position, through the scroll owner (`#1251 scroll-single-owner`). */
@@ -704,6 +707,9 @@ export function createChannelViews(deps: ChannelViewsDependencies): ChannelViews
       // will come, unless the landing finds an unread message among the rows held.
       if (outrun) deps.scrollToNewest();
       deps.payThreadEntry();
+      // `#2251`: Back from a searched thread keeps the search; the view it lands on is
+      // searched again here, since no read follows this local switch to do it.
+      deps.refilterSearch?.();
       // Switching back to a view already fetched in this page is a local
       // presentation change. The live stream and periodic poll refresh the
       // active view; a tab switch itself must not become another network wait.
@@ -726,6 +732,8 @@ export function createChannelViews(deps: ChannelViewsDependencies): ChannelViews
       if (!(keepPlace && keepReaderPlace(place))) deps.scrollToNewest();
       // A thread lands on its first unread, from the rows just projected. `#221 read-modes`.
       deps.payThreadEntry();
+      // `#2251`: and the open search follows the view, as above.
+      deps.refilterSearch?.();
       // Main is a view of its own from here, in the snapshot too. A thread drawn from All's cover is
       // saved as All's, as it always was.
       if (inherited && view === "main") deps.saveChannelScope();

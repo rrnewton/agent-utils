@@ -5355,13 +5355,25 @@ def _open_scope_channel(driver: Driver) -> None:
         timeout=20_000,
     )
     if driver.js("document.getElementById('thread-select').value") != "flat":
-        driver.page.select_option("#thread-select", "flat")
+        _pick_view(driver, "flat")
     driver.page.wait_for_function(
         "() => document.getElementById('discord-log').getAttribute('data-view') === 'flat' "
         "&& !window.__visible('channel-loading')",
         timeout=15_000,
     )
     driver.settle(300)
+
+
+def _pick_view(driver: Driver, value: str) -> None:
+    """Choose `value` on the view picker as a pick does: the select's value, then its change."""
+    picked = driver.js(
+        "(() => { const s = document.getElementById('thread-select'); "
+        f"if (![...s.options].some((o) => o.value === {json.dumps(value)})) return 'no option'; "
+        f"s.value = {json.dumps(value)}; s.dispatchEvent(new Event('change', {{ bubbles: true }})); "
+        "return s.value; })()"
+    )
+    if picked != value:
+        raise Unreachable("scope-view", f"the view picker offers {value}", f"it answered {picked!r}")
 
 
 def _scope_search(driver: Driver, settled: str) -> None:
@@ -5389,7 +5401,22 @@ SCOPE_THREAD_SETTLED = SCOPE_ANSWERED + (
 
 def _open_scope_thread(driver: Driver, thread_id: str) -> None:
     _open_scope_channel(driver)
-    driver.page.select_option("#thread-select", f"thread:{thread_id}")
+    # The picker offers the threads among the loaded messages; this server's small fetch
+    # ceiling loads All a few rows at a time, so step back (by scrolling to the top, as
+    # `_act_whole_channel` does) until the thread is among them.
+    option = f"thread:{thread_id}"
+    has_option = f"[...document.getElementById('thread-select').options].some((o) => o.value === {json.dumps(option)})"
+    for _ in range(20):
+        if bool(driver.js(has_option)) or not bool(driver.js("window.__visible('load-older')")):
+            break
+        driver.js(
+            "(() => { window.__walkFrom = document.querySelectorAll('#discord-log > li').length; "
+            "document.getElementById('scroll-area').scrollTop = 0; return window.__walkFrom; })()"
+        )
+        driver.page.wait_for_function(
+            "() => document.querySelectorAll('#discord-log > li').length > window.__walkFrom", timeout=10_000)
+        driver.settle(120)
+    _pick_view(driver, option)
     driver.page.wait_for_function(
         "() => document.getElementById('discord-log').getAttribute('data-view') === 'thread' "
         "&& !window.__visible('channel-loading')",
@@ -5411,13 +5438,19 @@ SCOPE_TRACE_START_JS = """(() => {
     const empty = document.getElementById('search-empty');
     return empty && empty.getClientRects().length ? { id: 'search-empty', el: empty } : null;
   };
-  const tick = () => {
+  const sample = () => {
     const anchor = anchorOf();
     samples.push({ t: Math.round(performance.now()), id: anchor ? anchor.id : null,
       top: anchor ? Math.round(anchor.el.getBoundingClientRect().top * 10) / 10 : null,
-      row: !document.getElementById('search-bucket-row').hidden });
+      row: !document.getElementById('search-bucket-row').hidden,
+      q: document.getElementById('search-field').value,
+      ans: /Server search details|No more hits/.test(document.getElementById('server-line').textContent) });
+  };
+  const tick = () => {
+    sample();
     if (!window.__scopeTraceStop) requestAnimationFrame(tick);
   };
+  sample();
   requestAnimationFrame(tick);
 })()"""
 
@@ -5425,9 +5458,12 @@ SCOPE_TRACE_START_JS = """(() => {
 def _scope_traced_search(driver: Driver, scene: str) -> None:
     """Search in the open thread view with the per-frame trace running; write its sidecar.
 
-    The trace starts once the typed word has filtered the rows on the page (the anchor
-    stands) and before the server's answer stands the row; it runs on until the row has
-    stood for 30 frames. dy is the anchor's move from the last frame before the row stood.
+    Two moments, said apart. The search's START (the first typed frame): the rows filter and
+    the chip panel's head room is added (`#2200`'s reservation: the first result is never under
+    the panel), which a thread holding hits of its own does on main too — reported, not judged.
+    The ANSWER (the server's hits land and the bucket row stands, or stays): from the first typed
+    frame with an anchor through 30 frames after the answer, the anchor must not move (dy 0,
+    `#2230`'s rule). The anchor is the first shown result, else the empty sentence.
     """
     driver.click("search-toggle")
     driver.page.wait_for_function("() => window.__visible('search-field')", timeout=5_000)
@@ -5435,30 +5471,44 @@ def _scope_traced_search(driver: Driver, scene: str) -> None:
     driver.page.fill("#search-field", SCOPE_WORD)
     driver.page.wait_for_function(f"() => {SCOPE_THREAD_SETTLED}", timeout=20_000)
     driver.page.wait_for_function(
-        "() => { const s = window.__scopeTrace; const i = s.findIndex((x) => x.row); return i >= 0 && s.length - i > 30; }",
+        "() => { const s = window.__scopeTrace; const i = s.findIndex((x) => x.ans); return i >= 0 && s.length - i > 30; }",
         timeout=10_000,
     )
     driver.js("window.__scopeTraceStop = true")
     samples = cast(list[dict[str, object]], driver.js("window.__scopeTrace"))
-    stood = next(i for i, sample in enumerate(samples) if sample["row"])
-    before = samples[stood - 1] if stood > 0 else None
-    after = [sample for sample in samples[stood:] if before is not None and sample["id"] == before["id"]]
-    moves = [abs(float(cast(float, sample["top"])) - float(cast(float, before["top"])))
-             for sample in after if before is not None and sample["top"] is not None and before["top"] is not None]
+    pre = samples[0]
+    typed = [i for i, sample in enumerate(samples) if sample["q"] == SCOPE_WORD]
+    base_i = next(i for i in typed if samples[i]["id"] is not None)
+    base = samples[base_i]
+    answered = next(i for i, sample in enumerate(samples) if sample["ans"])
+    window = samples[base_i: answered + 31]
+    moves = [abs(float(cast(float, sample["top"])) - float(cast(float, base["top"])))
+             for sample in window if sample["id"] == base["id"] and sample["top"] is not None]
+    lost = [sample for sample in window if sample["id"] != base["id"]]
+    row_at_answer = bool(samples[answered]["row"])
     record = {
         "scene": scene, "theme": driver.theme, "profile": driver.profile.name,
-        "moment": "the server's answer lands and the bucket row stands up in a thread view",
-        "anchor": before["id"] if before else None,
-        "top_before_row": before["top"] if before else None,
-        "frames_after_row": len(after),
-        "max_abs_dy": max(moves) if moves else None,
-        "samples": samples[max(0, stood - 10): stood + 31],
+        "start": {
+            "moment": "the first typed frame: rows filtered, the chip panel's head room added",
+            "anchor_before": pre["id"], "top_before": pre["top"],
+            "anchor_typed": samples[typed[0]]["id"], "top_typed": samples[typed[0]]["top"],
+        },
+        "answer": {
+            "moment": "the server's answer lands; the bucket row stands (or stays)",
+            "anchor": base["id"], "top_from_first_typed_frame": base["top"],
+            "frames_measured": len(window), "frames_after_answer": len(samples) - answered,
+            "row_standing_at_answer": row_at_answer,
+            "anchor_lost_frames": len(lost),
+            "max_abs_dy": max(moves) if moves else None,
+        },
+        "samples": samples,
     }
     path = driver.out_dir / f"{driver.theme}--{driver.profile.name}--{scene}.dy.json"
     path.write_text(json.dumps(record, indent=1) + "\n", encoding="utf-8")
-    if before is None or not moves or max(moves) > 0.5:
-        raise Unreachable(scene, "the reading row stays put while the row stands (dy 0)",
-                          f"anchor {record['anchor']} moved {record['max_abs_dy']} px; sidecar {path.name}")
+    if not moves or max(moves) > 0.5 or lost:
+        raise Unreachable(scene, "the reading row stays put while the answer lands and the row stands (dy 0)",
+                          f"anchor {base['id']} moved {record['answer']['max_abs_dy']} px, lost {len(lost)} frames; "
+                          f"sidecar {path.name}")
     driver.settle(300)
 
 
@@ -5483,7 +5533,15 @@ def _act_search_scope_back_to_all(driver: Driver) -> None:
     driver.click("thread-back")
     driver.page.wait_for_function(
         "() => document.getElementById('discord-log').getAttribute('data-view') === 'flat'", timeout=15_000)
-    driver.page.wait_for_function(f"() => {SCOPE_ALL_SETTLED}", timeout=20_000)
+    try:
+        driver.page.wait_for_function(f"() => {SCOPE_ALL_SETTLED}", timeout=20_000)
+    except Exception as error:  # noqa: BLE001 - said with the page's state, then refused
+        state = driver.js(
+            "JSON.stringify({count: document.getElementById('search-count').textContent, "
+            "main: document.getElementById('search-bucket-main').textContent, "
+            "threads: document.getElementById('search-bucket-threads').textContent})")
+        raise Unreachable("122-search-scope-back-to-all", "All's own search stands after Back",
+                          f"the thread's search stayed: {state}") from error
     driver.js("document.getElementById('scroll-area').scrollTop = 0")
     driver.settle(300)
 

@@ -2106,6 +2106,10 @@ let transcriptsViewActive = false;
 let transcriptPlace = null;
 let transcriptRestored = false;
 const channelViews = createChannelViews({
+  // `#2251`: a view put up from held rows is searched again, inside the filter place-keeper.
+  refilterSearch: () => {
+    if (searchField.open()) keepingFilterPlace(() => applySearch());
+  },
   el: (id) => el(id),
   leftEl: (id) => leftEl(id),
   columnSide: () => columnWork.side(),

@@ -3210,6 +3210,25 @@ test("`#2251 vibe-talk-search-current-view-scope`: Back from a thread keeps the 
   assertFold(page, "back in All");
 });
 
+test("`#2251 vibe-talk-search-current-view-scope`: a search typed inside a thread follows Back to the view held behind it", async () => {
+  const page = await foldPage("flat");
+  await pickThread(page, THREAD_ONE);
+  await searchServer(page, "theme");
+  assert.equal(chipOf(page, "threads").textContent, "2 in other threads");
+  await page.el("thread-back").click();
+  await page.settle();
+  page.expireTimers(SERVER_SEARCH_DELAY_MS);
+  await page.settle();
+  assert.equal(page.el("thread-select").value, "flat");
+  assert.equal(page.el("search-field").value, "theme");
+  // All's own search, not the thread's left standing: its chips' words and
+  // defaults, and a count over All's rows.
+  assert.equal(chipOf(page, "threads").textContent, "3 in threads", "the thread's chips outlived Back");
+  assert.equal(chipOf(page, "main").getAttribute("aria-pressed"), "true");
+  assert.equal(chipOf(page, "threads").getAttribute("aria-pressed"), "true");
+  assertFold(page, "back in All after a search typed in the thread");
+});
+
 test("`#605 server-side-search`: the line never says the server searched further back than it says it did", async () => {
   const page = await serverSearchPage();
   // A budget spent above the stretch the server vouches for: no reach to claim.
