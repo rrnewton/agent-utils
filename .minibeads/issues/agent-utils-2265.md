@@ -7,7 +7,7 @@ assignee: cl-bulletstrike
 labels:
 - vibe-talk
 created_at: 2026-11-25T22:40:00.000000000+00:00
-updated_at: 2026-11-25T22:40:00.000000000+00:00
+updated_at: 2026-11-25T23:05:00.000000000+00:00
 ---
 
 # Description
@@ -20,7 +20,9 @@ Today the live strike (#1388 discuss-summary-staleness-update, #1820 vibe-talk-s
 
 Event-driven and keyed by message id. A per-panel strike index maps each cited message id to the bullet and section elements that cite it (each entry keeps its own cited ids and its group). Drawing the current answer and drawing the timeline each replace their group's entries from the freshly drawn tree, so a redraw, a restored record or an Update never leaves stale or detached elements indexed, and strike just that group.
 
-A state change that knows its ids (Done, archive, put back, a refused write's take-back, the Discuss panel's own mark buttons) passes them through `onReadStateChanged` and the page's strike refresh; the panel does one index lookup per id and recomputes only the entries found. Changes without an id list (server read state landing, view sync, the settle wrappers) diff the index's own id keys against a cached read bit and touch only entries whose cited id flipped; no DOM walk per event. An upstream delete restates through the same lookup with the current read rule. The current summary's fresh (green) marking keeps its present behaviour.
+A state change that knows its ids (Done, archive, put back, a refused write's take-back, the Discuss panel's own mark buttons) passes them through `onReadStateChanged` and the page's strike refresh; the panel does one index lookup per id and recomputes only the entries found. Changes without an id list (server read state landing, view sync, the settle wrappers) diff the index's own id keys against a cached read bit and touch only entries whose cited id flipped; no DOM walk per event. The current summary's fresh (green) marking keeps its present behaviour.
+
+Deleted upstream counts as done (rule set on the owner side on 2026-11-25; the owner may still object): a cited message the page learns was deleted upstream (a live delete or a refresh's deletions, the page's existing removal record) counts as handled for the strike, so a bullet whose other cited messages are read stays struck, and every citation link naming it is marked deleted with a muted "(deleted)" after the link (a class word and a stylesheet suffix, so the bullet text, search and read-aloud are unchanged). A later read that carries the message after all clears the mark. The removal record notifies the strike refresh with the removed ids, so a delete is one lookup per id like any other change. The page knows only the deletions it was told of; a deletion it never heard of (for example one that happened before a reload and is no longer in its saved removals) is not marked.
 
 # Acceptance Criteria
 
@@ -28,6 +30,7 @@ A state change that knows its ids (Done, archive, put back, a refused write's ta
 - A bullet is struck only while all its cited messages are read; an uncited bullet is never struck.
 - Redrawing the current summary or the timeline leaves no stale index entries; a strike update after a redraw reaches the new elements.
 - A state change looks up only the bullets citing the changed ids; no scan of all bullets per event.
+- A cited message deleted upstream counts as done: its bullet stays (or becomes) struck and its citation link shows the deleted mark, in both the current and an Earlier summary; a page test proves it.
 - A page test that fails on main proves the Earlier-summary strike and its clear, at phone and desktop sizes, through the real server router.
 - Screenshot matrix on a test instance (light and dark, keyboard open and closed, phone 412x915 and desktop 1280x800, Discuss open) plus the struck Earlier-summary bullet before and after.
 
