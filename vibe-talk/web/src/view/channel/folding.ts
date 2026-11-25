@@ -410,11 +410,24 @@ export function createFolding(deps: FoldingDependencies): Folding {
     set discord(value: boolean | number) { scrollPlace().jumpWanted = value; },
   };
 
+  /** Whether the scroll tools were drawn in the current task (`#2200`). */
+  let toolsDrawnThisTask = false;
+
   function setJumpNewest(wanted: boolean, view: string = deps.view(), arrived: number | null = 0): void {
     const held = (jumpNewestWanted as Record<string, boolean | number>)[view] as boolean | number;
-    if (!wanted) (jumpNewestWanted as Record<string, boolean | number>)[view] = false;
-    else if (arrived === null || held === true) (jumpNewestWanted as Record<string, boolean | number>)[view] = true;
-    else (jumpNewestWanted as Record<string, boolean | number>)[view] = (typeof held === "number" ? held : 0) + (arrived || 0);
+    let next: boolean | number;
+    if (!wanted) next = false;
+    else if (arrived === null || held === true) next = true;
+    else next = (typeof held === "number" ? held : 0) + (arrived || 0);
+    // `#2200`: an unchanged jump whose tools were already drawn in this
+    // task redraws nothing. A settled search pass ends in place-keeping,
+    // which clears the jump through here; with the jump already clear and
+    // the tools just drawn by that same pass, the redraw ran the whole
+    // pass again over every row (the settled-pass cost the typing walk
+    // measures). A changed jump, or the first draw of a task, always
+    // redraws — the offers and counts other acts wait on are never stale.
+    if (next === held && toolsDrawnThisTask) return;
+    (jumpNewestWanted as Record<string, boolean | number>)[view] = next;
     renderScrollTools();
   }
 
@@ -730,6 +743,10 @@ export function createFolding(deps: FoldingDependencies): Folding {
       return;
     }
     scrollTools().owed = false;
+    if (!toolsDrawnThisTask) {
+      toolsDrawnThisTask = true;
+      queueMicrotask(() => { toolsDrawnThisTask = false; });
+    }
     // `#1236 documents-reader-layout`. The fold items act on a message list —
     // the channel's, or the call transcript's — and the Documents view shows
     // neither, so none of them is offered there, whichever column this pass
