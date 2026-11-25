@@ -6050,6 +6050,14 @@ const TUNING_BANDS = {
     "how long a finger rests before the row shows who sent it and when. Below about a quarter of " +
     "a second an ordinary tap becomes a hold and the message stops folding; past a second and a " +
     "half the reader has concluded the gesture does not exist and lifted their finger"],
+  BOOKMARK_HOLD_MS: [250, 1500,
+    "how long a press rests on the Bookmark chip before it offers Clear instead of jumping. The " +
+    "row hold's band, for the same reason: below it a tap becomes a hold, past it the reader has " +
+    "concluded the gesture does not exist"],
+  BOOKMARK_HOLD_SLOP_PX: [4, 48,
+    "how far a press on the Bookmark chip may travel before it is a scroll, not a hold. Under a " +
+    "few pixels no resting finger is that still; past a thumb's width the press has plainly gone " +
+    "somewhere else and the popover opening would chase a scroll"],
   AUDIBLE_PEAK: [64, 1024,
     "the quietest sample peak that counts as sound (voice-unresponsive-signal). Below 64 dither and " +
     "codec noise read as a service that is speaking; above 1024 a quiet voice reads as silence"],
