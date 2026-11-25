@@ -1255,6 +1255,15 @@ function bucketOnFor(id: string): boolean | null {
     identityCache = { key, identity };
   }
   if (identityCache.identity !== bucketsFor) return null;
+  // `#2251`: the toggles were defaulted for another screen (the reader just left a thread,
+  // say) and the server render that re-defaults them has not run yet: this screen's
+  // defaults answer meanwhile. A pass asked between the view change and that render (the
+  // refilter on Back runs one) would otherwise gate this view's rows with the last view's
+  // toggles — in All with a thread's "this thread only", every row — and write "None match".
+  if (bucketView() !== bucketsView) {
+    const def = searchBucketDefs.find((one) => one.id === id);
+    return def ? def.defaultOn(bucketView()) : false;
+  }
   return bucketOnNow(id);
 }
 

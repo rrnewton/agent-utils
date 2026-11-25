@@ -5444,7 +5444,9 @@ SCOPE_TRACE_START_JS = """(() => {
       top: anchor ? Math.round(anchor.el.getBoundingClientRect().top * 10) / 10 : null,
       row: !document.getElementById('search-bucket-row').hidden,
       q: document.getElementById('search-field').value,
-      ans: /Server search details|No more hits/.test(document.getElementById('server-line').textContent) });
+      ans: /Server search details|No more hits/.test(document.getElementById('server-line').textContent),
+      panel: document.getElementById('search-bucket-row').hidden ? null
+        : Math.round(document.getElementById('search-bucket-row').getBoundingClientRect().bottom * 10) / 10 });
   };
   const tick = () => {
     sample();
@@ -5455,15 +5457,37 @@ SCOPE_TRACE_START_JS = """(() => {
 })()"""
 
 
+def _scope_moves(window: list[dict[str, object]]) -> tuple[list[float], list[dict[str, object]], int]:
+    """Frame-to-frame moves of one anchor over `window`: the counted moves of a row the reader
+    can see, the `#2200` landings of a row that stood UNDER the chip panel (its top above the
+    panel's bottom: unreadable there, so parking it below is not a move of what was read), and
+    how many frames the anchor was not the window's first."""
+    anchor = window[0]["id"]
+    moves: list[float] = []
+    landings: list[dict[str, object]] = []
+    lost = sum(1 for sample in window if sample["id"] != anchor)
+    for before, after in zip(window, window[1:]):
+        if before["id"] != anchor or after["id"] != anchor or before["top"] is None or after["top"] is None:
+            continue
+        step = abs(float(cast(float, after["top"])) - float(cast(float, before["top"])))
+        covered = before["panel"] is not None and float(cast(float, before["top"])) < float(cast(float, before["panel"])) - 1
+        if covered and step > 0.5:
+            landings.append({"from": before["top"], "to": after["top"], "panel_bottom": before["panel"], "t": after["t"]})
+        else:
+            moves.append(step)
+    return moves, landings, lost
+
+
 def _scope_traced_search(driver: Driver, scene: str) -> None:
     """Search in the open thread view with the per-frame trace running; write its sidecar.
 
-    Two moments, said apart. The search's START (the first typed frame): the rows filter and
-    the chip panel's head room is added (`#2200`'s reservation: the first result is never under
-    the panel), which a thread holding hits of its own does on main too — reported, not judged.
-    The ANSWER (the server's hits land and the bucket row stands, or stays): from the first typed
-    frame with an anchor through 30 frames after the answer, the anchor must not move (dy 0,
-    `#2230`'s rule). The anchor is the first shown result, else the empty sentence.
+    Judged (dy 0, `#2230`'s rule, for a row the reader can see): the ANSWER — the frame before
+    the server's answer shows through 30 frames after. Reported only: the frame the bucket row
+    stands against the frame before (on a thread with hits of its own it stands at the first
+    key on main too, where the panel's head room at the list's top moves the first result
+    down by the panel, `#2200`; where the thread has none, the first key filters the reading
+    row away), the filter settling between the first key and the answer, and `#2200`'s
+    parking of a first result that stood under the panel.
     """
     driver.click("search-toggle")
     driver.page.wait_for_function("() => window.__visible('search-field')", timeout=5_000)
@@ -5476,39 +5500,45 @@ def _scope_traced_search(driver: Driver, scene: str) -> None:
     )
     driver.js("window.__scopeTraceStop = true")
     samples = cast(list[dict[str, object]], driver.js("window.__scopeTrace"))
-    pre = samples[0]
-    typed = [i for i, sample in enumerate(samples) if sample["q"] == SCOPE_WORD]
-    base_i = next(i for i in typed if samples[i]["id"] is not None)
-    base = samples[base_i]
+    stood = next(i for i, sample in enumerate(samples) if sample["row"])
     answered = next(i for i, sample in enumerate(samples) if sample["ans"])
-    window = samples[base_i: answered + 31]
-    moves = [abs(float(cast(float, sample["top"])) - float(cast(float, base["top"])))
-             for sample in window if sample["id"] == base["id"] and sample["top"] is not None]
-    lost = [sample for sample in window if sample["id"] != base["id"]]
-    row_at_answer = bool(samples[answered]["row"])
+    stand_pair = samples[max(0, stood - 1): stood + 1]
+    stand_same = len(stand_pair) == 2 and stand_pair[0]["id"] == stand_pair[1]["id"]
+    stand_moves, stand_landings, _ = _scope_moves(stand_pair) if stand_same else ([], [], 0)
+    answer_window = samples[max(0, answered - 1): answered + 31]
+    answer_moves, answer_landings, answer_lost = _scope_moves(answer_window)
+    settle_window = samples[stood: max(stood + 1, answered)]
+    settle_moves, settle_landings, _ = _scope_moves(settle_window)
     record = {
         "scene": scene, "theme": driver.theme, "profile": driver.profile.name,
-        "start": {
-            "moment": "the first typed frame: rows filtered, the chip panel's head room added",
-            "anchor_before": pre["id"], "top_before": pre["top"],
-            "anchor_typed": samples[typed[0]]["id"], "top_typed": samples[typed[0]]["top"],
+        "row_stands": {
+            "moment": "the frame the bucket row first stands, against the frame before (reported)",
+            "frames": stand_pair,
+            "same_anchor": stand_same,
+            "note": None if stand_same else "the first key filtered the reading row away (it does not match)",
+            "max_abs_dy": max(stand_moves) if stand_moves else None,
+            "covered_first_result_landings_2200": stand_landings,
         },
         "answer": {
-            "moment": "the server's answer lands; the bucket row stands (or stays)",
-            "anchor": base["id"], "top_from_first_typed_frame": base["top"],
-            "frames_measured": len(window), "frames_after_answer": len(samples) - answered,
-            "row_standing_at_answer": row_at_answer,
-            "anchor_lost_frames": len(lost),
-            "max_abs_dy": max(moves) if moves else None,
+            "moment": "the server's answer shows (frame before it through 30 frames after); judged",
+            "anchor": answer_window[0]["id"],
+            "row_standing_at_answer": bool(samples[answered]["row"]),
+            "anchor_lost_frames": answer_lost,
+            "max_abs_dy": max(answer_moves) if answer_moves else None,
+            "covered_first_result_landings_2200": answer_landings,
+        },
+        "settling_reported_only": {
+            "moment": "between the row standing and the answer: the typed filter settling",
+            "max_abs_dy": max(settle_moves) if settle_moves else None,
+            "covered_first_result_landings_2200": settle_landings,
         },
         "samples": samples,
     }
     path = driver.out_dir / f"{driver.theme}--{driver.profile.name}--{scene}.dy.json"
     path.write_text(json.dumps(record, indent=1) + "\n", encoding="utf-8")
-    if not moves or max(moves) > 0.5 or lost:
-        raise Unreachable(scene, "the reading row stays put while the answer lands and the row stands (dy 0)",
-                          f"anchor {base['id']} moved {record['answer']['max_abs_dy']} px, lost {len(lost)} frames; "
-                          f"sidecar {path.name}")
+    if answer_lost or not answer_moves or max(answer_moves) > 0.5:
+        raise Unreachable(scene, "the reading row stays put as the answer lands and the row stands (dy 0)",
+                          f"moved {record['answer']['max_abs_dy']} px, anchor lost {answer_lost} frames; sidecar {path.name}")
     driver.settle(300)
 
 
@@ -10307,6 +10337,7 @@ SCENES: tuple[Scene, ...] = (
         expect=(
             ("the search is kept", "document.getElementById('search-field').value === 'quokka' && window.__visible('search-field')"),
             ("the field says Search All", "document.getElementById('search-field').getAttribute('placeholder') === 'Search All'"),
+            ("no None-match sentence stands over the results", "document.getElementById('search-empty').hidden"),
             ("All is the view and Main and Threads are both pressed", "document.getElementById('thread-select').value === 'flat' && document.getElementById('search-bucket-main').getAttribute('aria-pressed') === 'true' && document.getElementById('search-bucket-threads').getAttribute('aria-pressed') === 'true' && !document.getElementById('search-bucket-main').hidden && !document.getElementById('search-bucket-threads').hidden"),
             ("no error banner is up", "!window.__visible('error-wrap')"),
         ),
