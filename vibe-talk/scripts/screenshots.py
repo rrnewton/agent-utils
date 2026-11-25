@@ -10326,6 +10326,8 @@ SCENES: tuple[Scene, ...] = (
              "!document.getElementById('search-bucket-row').hidden && document.getElementById('search-bucket-thread').textContent === '0 in this thread' && document.getElementById('search-bucket-thread').getAttribute('aria-pressed') === 'true'"),
             ("main and the other threads are offered",
              "/^[1-9]/.test(document.getElementById('search-bucket-main').textContent) && /^[1-9]/.test(document.getElementById('search-bucket-threads').textContent)"),
+            ("the thread's None match does not say the search falls short of the server's history",
+             "!/does not reach yet/.test(document.getElementById('search-empty').textContent)"),
             ("no error banner is up", "!window.__visible('error-wrap')"),
         ),
     ),
