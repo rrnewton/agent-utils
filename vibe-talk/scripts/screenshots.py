@@ -5546,14 +5546,14 @@ def _act_search_scope_thread(driver: Driver) -> None:
     """`#2251`: the word searched in a thread that says it — this thread's hits as cards,
     the scope pressed, main and the other threads offered beside it."""
     _open_scope_thread(driver, SCOPE_THREAD_ONE)
-    _scope_traced_search(driver, "125-search-scope-thread")
+    _scope_traced_search(driver, "126-search-scope-thread")
 
 
 def _act_search_scope_thread_elsewhere(driver: Driver) -> None:
     """`#2251`: the word searched in a thread that never says it — "0 in this thread",
     pressed, and the offers from main and the other threads: the way to widen in place."""
     _open_scope_thread(driver, SCOPE_THREAD_THREE)
-    _scope_traced_search(driver, "126-search-scope-thread-elsewhere")
+    _scope_traced_search(driver, "127-search-scope-thread-elsewhere")
 
 
 def _act_search_scope_back_to_all(driver: Driver) -> None:
@@ -5570,7 +5570,7 @@ def _act_search_scope_back_to_all(driver: Driver) -> None:
             "JSON.stringify({count: document.getElementById('search-count').textContent, "
             "main: document.getElementById('search-bucket-main').textContent, "
             "threads: document.getElementById('search-bucket-threads').textContent})")
-        raise Unreachable("127-search-scope-back-to-all", "All's own search stands after Back",
+        raise Unreachable("128-search-scope-back-to-all", "All's own search stands after Back",
                           f"the thread's search stayed: {state}") from error
     driver.js("document.getElementById('scroll-area').scrollTop = 0")
     driver.settle(300)
@@ -10301,7 +10301,7 @@ SCENES: tuple[Scene, ...] = (
         ),
     ),
     Scene(
-        name="125-search-scope-thread",
+        name="126-search-scope-thread",
         what="#2251: searched in a thread that says the word: the field says Search this thread, the scope pressed, main and other threads offered",
         act=_act_search_scope_thread,
         profiles=MATRIX_PROFILES,
@@ -10316,7 +10316,7 @@ SCENES: tuple[Scene, ...] = (
         ),
     ),
     Scene(
-        name="126-search-scope-thread-elsewhere",
+        name="127-search-scope-thread-elsewhere",
         what="#2251: searched in a thread that never says the word: 0 in this thread pressed, the offers from main and other threads standing",
         act=_act_search_scope_thread_elsewhere,
         profiles=MATRIX_PROFILES,
@@ -10332,7 +10332,7 @@ SCENES: tuple[Scene, ...] = (
         ),
     ),
     Scene(
-        name="127-search-scope-back-to-all",
+        name="128-search-scope-back-to-all",
         what="#2251: Back from the searched thread: All, the search kept, Main and Threads both on",
         act=_act_search_scope_back_to_all,
         profiles=MATRIX_PROFILES,
@@ -10970,7 +10970,7 @@ def run_captures(
     # 91/92, so they skip with them on a cacheless server instead of failing alone.
     discuss_scenes = [s for s in scenes if s.name.startswith(("73-", "74-", "75-", "76-", "78-", "84-", "85-", "89-", "90-", "91-", "92-", "93-", "94-", "95-", "96-", "97-", "98-", "99-", "100-", "101-", "102-", "103-",
                                                                         "107-", "108-", "109-", "110-", "111-", "112-", "113-", "114-", "115-", "116-", "117-",
-                                                                        "120-", "121-", "123-", "124-", "125-", "126-", "127-"))]
+                                                                        "120-", "121-", "123-", "124-", "125-", "126-", "127-", "128-"))]
     discuss_only = bool(wanted) and len(wanted) == len(discuss_scenes)
     if discuss_scenes and not seed_discuss_cache(60 if discuss_only else 10):
         if discuss_only:
