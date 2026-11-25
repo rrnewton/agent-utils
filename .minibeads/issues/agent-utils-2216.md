@@ -1,13 +1,14 @@
 ---
 title: 'vibe-talk-pace-availability-flake: Pace popover tap races page render under load'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - vibe-talk
 - tests
 created_at: 2026-11-24T09:45:00-05:00
-updated_at: 2026-11-24T09:45:00-05:00
+updated_at: 2026-11-24T20:10:27-05:00
+closed_at: 2026-11-25T01:10:27.000000000+00:00
 ---
 
 # Description
@@ -48,3 +49,11 @@ alone, the same walk opens the popover in seconds.
 
 Found while gating #2189 vibe-talk-wtf-lookup-miss-diagnosis; the red
 step is unrelated to that change. Filed by the mu-wtfdiag lane.
+
+Closed: landed on main as 5703c2e8 (98e1a485 + 5703c2e8). An early-tap
+recorder stands from the bundle's first moments and remembers the first
+tap on the Read and Pace tiles; the mounts replay it through the
+now-wired control and mark the tile `data-wired`, the readiness
+condition the walk waits on. The walk taps at the earliest drawable
+moment and re-taps until the popover's own condition holds. Full owner
+gate on b806dd8e passed 2026-11-24 8:08 PM ET.
