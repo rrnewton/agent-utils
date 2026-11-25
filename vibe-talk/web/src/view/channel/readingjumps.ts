@@ -83,7 +83,7 @@ export function mountReadingJumps(deps: ReadingJumpsDependencies): ReadingJumps 
       const popBox = popover.getBoundingClientRect();
       if (!chipBox.width || !popBox.width) return;
       const viewWidth = document.documentElement?.clientWidth || chipBox.right;
-      const viewHeight = window.innerHeight || chipBox.bottom;
+      const viewHeight = (typeof window !== "undefined" ? window.innerHeight : 0) || chipBox.bottom;
       const gap = 8;
       const width = popBox.width;
       const height = popBox.height || 52;
@@ -163,11 +163,15 @@ export function mountReadingJumps(deps: ReadingJumpsDependencies): ReadingJumps 
   const endPress = (): void => cancelHold();
   listen<PointerEvent>(chip, "pointerup", endPress);
   listen<PointerEvent>(chip, "pointercancel", endPress);
-  listen<Event>(window, "scroll", () => cancelHold(), { capture: true });
-  // The keyboard opening shrinks the viewport under an open popover; keep it above its chip.
-  listen<Event>(window, "resize", () => {
-    if (open) place();
-  });
+  // Under node (the module suites) there is no window to hear scroll or resize from.
+  const win = typeof window !== "undefined" ? window : null;
+  if (win) {
+    listen<Event>(win, "scroll", () => cancelHold(), { capture: true });
+    // The keyboard opening shrinks the viewport under an open popover; keep it above its chip.
+    listen<Event>(win, "resize", () => {
+      if (open) place();
+    });
+  }
   listen<MouseEvent>(chip, "contextmenu", (event) => {
     if (event && typeof event.preventDefault === "function") event.preventDefault();
     // The click an Android hold sends after its contextmenu must not also jump.
