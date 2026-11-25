@@ -3219,38 +3219,42 @@ fn glossary_source_view(
 }
 
 /// What one WTF retrieval gathered: the capped candidate set plus the
-/// human-readable scope for the not-found answer (`#2189`).
+/// human-readable scope for the not-found answer (`#2189`, `#2232`).
 struct GlossaryRetrieval {
-    /// Candidates in evidence order: thread, link-target, then global.
+    /// Candidates in evidence order: thread, channel history, link-target,
+    /// then global.
     hits: Vec<Message>,
+    /// One logged line per candidate, in the same order.
+    meta: Vec<crate::glossary_lookup_log::LoggedCandidate>,
+    /// Candidates naming the head on word boundaries with a definitional cue.
+    strong: usize,
     /// `no definition found; searched …` for a miss.
     reason: String,
 }
+
+/// The newest messages of the pressed channel scanned for the head (`#2232`).
+const GLOSSARY_CHANNEL_RECENT_WINDOW: usize = 300;
+/// Reserved slots per bucket; twelve candidates in all.
+const GLOSSARY_BUCKET_SLOTS: usize = 4;
+/// Total candidates handed to the model.
+const GLOSSARY_MAX_CANDIDATES: usize = 12;
 
 /// Folded word set of a selection with hyphens read as spaces (`#2189`).
 fn glossary_word_set(selected: &str) -> Vec<String> {
     crate::search_query::fold(&selected.replace('-', " "))
         .split(' ')
+        .map(crate::glossary_query::clean_word)
         .filter(|w| !w.is_empty())
-        .map(str::to_owned)
         .collect()
-}
-
-/// Cheap singular stem: drop a trailing `s` (never `ss`) on longer words.
-fn glossary_stem(word: &str) -> String {
-    if word.len() > 3 && word.ends_with('s') && !word.ends_with("ss") {
-        word[..word.len() - 1].to_owned()
-    } else {
-        word.to_owned()
-    }
 }
 
 /// Whether folded `text` holds every word of `words`, stem-insensitively.
 fn glossary_holds(text: &str, words: &[String]) -> bool {
     !words.is_empty()
-        && words
-            .iter()
-            .all(|word| text.contains(word.as_str()) || text.contains(glossary_stem(word).as_str()))
+        && words.iter().all(|word| {
+            text.contains(word.as_str())
+                || text.contains(crate::glossary_query::stem(word).as_str())
+        })
 }
 
 /// Definitional-fit score of one candidate (`#2189`): phrase adjacency and
@@ -3259,7 +3263,10 @@ fn glossary_score(message: &Message, words: &[String], phrases: &[String]) -> i3
     let text = crate::search_query::fold(&message.content);
     let matched = words
         .iter()
-        .filter(|word| text.contains(word.as_str()) || text.contains(glossary_stem(word).as_str()))
+        .filter(|word| {
+            text.contains(word.as_str())
+                || text.contains(crate::glossary_query::stem(word).as_str())
+        })
         .count() as i32;
     let mut score = matched * 10;
     if phrases
@@ -3275,6 +3282,94 @@ fn glossary_score(message: &Message, words: &[String], phrases: &[String]) -> i3
         score -= 12;
     }
     score
+}
+
+/// How one candidate fits the selection's head (`#2232`).
+struct HeadFit {
+    score: i32,
+    head_match: bool,
+    strong: bool,
+    /// An ordinal head's label with another number ("Row 70" for "Row 7").
+    conflicts: bool,
+}
+
+/// The selection's head and qualifier, folded for matching (`#2232`).
+struct HeadTarget {
+    head: String,
+    label: Option<String>,
+    qualifier_words: Vec<String>,
+    words: Vec<String>,
+    phrases: Vec<String>,
+}
+
+impl HeadTarget {
+    fn new(selected: &str, split: &crate::glossary_query::HeadSplit) -> Self {
+        let head = crate::glossary_query::match_fold(&split.head);
+        let label = crate::glossary_query::is_ordinal_head(&split.head)
+            .then(|| head.split(' ').next().unwrap_or_default().to_owned());
+        let qualifier_words = split
+            .qualifier
+            .as_deref()
+            .map(glossary_word_set)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|w| crate::glossary_query::is_informative(w))
+            .collect();
+        Self {
+            head,
+            label,
+            qualifier_words,
+            words: glossary_word_set(selected),
+            phrases: vec![
+                crate::search_query::fold(&selected.replace('-', " ")),
+                crate::search_query::fold(selected),
+                selected.replace(['-', ' '], "").to_lowercase(),
+            ],
+        }
+    }
+
+    fn fit(&self, message: &Message) -> HeadFit {
+        let text = crate::glossary_query::match_fold(&message.content);
+        let head_match = crate::glossary_query::bounded_contains(&text, &self.head);
+        let defines = head_match && crate::glossary_query::defines_head(&text, &self.head);
+        let mut score = glossary_score(message, &self.words, &self.phrases);
+        if head_match {
+            score += 20;
+        }
+        if defines {
+            score += 20;
+        }
+        score += 4 * self
+            .qualifier_words
+            .iter()
+            .filter(|w| text.contains(w.as_str()))
+            .count() as i32;
+        let conflicts = !head_match
+            && self
+                .label
+                .as_deref()
+                .is_some_and(|label| crate::glossary_query::bounded_contains(&text, label));
+        HeadFit {
+            score,
+            head_match,
+            strong: defines,
+            conflicts,
+        }
+    }
+}
+
+fn glossary_candidate(
+    message: &Message,
+    bucket: &str,
+    fit: &HeadFit,
+) -> crate::glossary_lookup_log::LoggedCandidate {
+    crate::glossary_lookup_log::LoggedCandidate {
+        id: message.id.as_str().to_owned(),
+        channel: message.channel_id.as_str().to_owned(),
+        bucket: bucket.to_owned(),
+        score: fit.score,
+        head_match: fit.head_match,
+    }
 }
 
 /// Link-target keys in `text` (`#2189`): only real link targets — URLs and
@@ -3311,90 +3406,39 @@ fn glossary_link_tokens(text: &str) -> Vec<String> {
     out
 }
 
-/// The selection's human-readable search forms for the not-found sentence:
-/// the spaced full form, its longest shorter window, and its first word.
-fn glossary_human_queries(selected: &str) -> Vec<String> {
-    let spaced = selected.replace('-', " ");
-    let words: Vec<&str> = spaced.split_whitespace().collect();
-    let mut out: Vec<String> = Vec::new();
-    let full = words.join(" ");
-    if !full.is_empty() {
-        out.push(full);
+/// "a", "a and b", "a, b and c".
+fn glossary_and_list(items: &[String]) -> String {
+    match items.len() {
+        0 => String::new(),
+        1 => items[0].clone(),
+        n => format!("{} and {}", items[..n - 1].join(", "), items[n - 1]),
     }
-    if words.len() > 2 {
-        out.push(words[..words.len() - 1].join(" "));
-    }
-    if words.len() > 1 {
-        out.push(words[0].to_owned());
-    }
-    out.dedup();
-    out.truncate(3);
-    out
 }
 
-/// Search queries for a selection, best first (`#2189`): every window in
-/// space, hyphen and stemmed forms (multi-word before single-word), then
-/// the joined nospace form. Capped so a lookup stays cheap.
-fn glossary_queries(selected: &str) -> Vec<String> {
-    let raw_words: Vec<&str> = selected.split_whitespace().collect();
-    let mut multi: Vec<String> = Vec::new();
-    let mut single: Vec<String> = Vec::new();
-    let push = |list: &mut Vec<String>, query: String| {
-        if !query.is_empty() && !list.iter().any(|held| held == &query) {
-            list.push(query);
-        }
-    };
-    for take in (1..=raw_words.len()).rev() {
-        for start in 0..=(raw_words.len() - take) {
-            let window = &raw_words[start..start + take];
-            let base = window.join(" ");
-            let space = window
-                .iter()
-                .map(|w| w.replace('-', " "))
-                .collect::<Vec<_>>()
-                .join(" ");
-            let stemmed = space
-                .split(' ')
-                .map(glossary_stem)
-                .collect::<Vec<_>>()
-                .join(" ");
-            let target = if take > 1 { &mut multi } else { &mut single };
-            push(target, space.clone());
-            push(target, base);
-            push(target, stemmed);
-            if take == raw_words.len() {
-                push(
-                    &mut multi,
-                    window
-                        .iter()
-                        .map(|w| w.replace('-', ""))
-                        .collect::<Vec<_>>()
-                        .join(""),
-                );
-            }
-        }
-    }
-    multi.extend(single);
-    multi.truncate(16);
-    multi
-}
-
-/// Cache-only WTF retrieval with reserved buckets (`#2189`): up to four
-/// thread candidates, up to four link-target candidates, then global
-/// window hits ranked by definitional fit, twelve in all.
+/// Cache-only WTF retrieval with reserved buckets (`#2189`, `#2232`): the
+/// selection's own thread, then the pressed channel's recent history scanned
+/// for the head noun phrase on word boundaries, then link-target hits, then
+/// global searches planned head-first ([`crate::glossary_query::plan`]),
+/// twelve candidates in all. Searching stops early once enough strong
+/// candidates are held, and never runs more than
+/// [`crate::glossary_query::QUERY_BUDGET`] all-channel searches or past
+/// [`crate::glossary_query::RETRIEVAL_TIME_BUDGET_MS`]. Every search and
+/// candidate is recorded in `trace`.
 async fn glossary_retrieval(
     state: &AppState,
     channel_id: &str,
     selected: &str,
     context: &str,
     message_id: Option<&str>,
+    trace: &mut crate::glossary_lookup_log::LookupRecord,
 ) -> GlossaryRetrieval {
-    let words = glossary_word_set(selected);
-    let phrases = vec![
-        crate::search_query::fold(&selected.replace('-', " ")),
-        crate::search_query::fold(selected),
-        selected.replace(['-', ' '], "").to_lowercase(),
-    ];
+    use crate::glossary_lookup_log::LoggedQuery;
+    use crate::glossary_query as gq;
+    let started = std::time::Instant::now();
+    let split = gq::split_head(selected);
+    trace.head = split.head.clone();
+    trace.qualifier = split.qualifier.clone();
+    let target = HeadTarget::new(selected, &split);
     let channels = state.all_channels();
     let search = async |q: &str, limit: usize| -> Vec<Message> {
         crate::server_search::search(
@@ -3412,9 +3456,9 @@ async fn glossary_retrieval(
         .map(|answer| answer.hits)
         .unwrap_or_default()
     };
+    let mut strong = 0usize;
     // Thread-first: resolve the selected message from the cache alone.
-    let mut thread_hits: Vec<Message> = Vec::new();
-    let mut thread_searched = false;
+    let mut thread_hits: Vec<(HeadFit, Message)> = Vec::new();
     let selected_message = match message_id {
         Some(id) if !id.is_empty() => {
             state
@@ -3436,19 +3480,56 @@ async fn glossary_retrieval(
             )
             .await
             {
-                thread_searched = true;
-                let mut scored: Vec<(i32, Message)> = fetched
+                trace.buckets.thread_searched = true;
+                let mut scored: Vec<(HeadFit, Message)> = fetched
                     .messages
                     .into_iter()
-                    .filter(|m| glossary_holds(&crate::search_query::fold(&m.content), &words))
-                    .map(|m| (glossary_score(&m, &words, &phrases), m))
+                    .filter(|m| {
+                        glossary_holds(&crate::search_query::fold(&m.content), &target.words)
+                            || gq::bounded_contains(&gq::match_fold(&m.content), &target.head)
+                    })
+                    .map(|m| (target.fit(&m), m))
+                    .filter(|(fit, _)| !fit.conflicts)
                     .collect();
-                scored.sort_by_key(|(score, m)| (*score, m.created_ms().unwrap_or(0)));
+                scored.sort_by_key(|(fit, m)| (fit.score, m.created_ms().unwrap_or(0)));
                 scored.reverse();
-                thread_hits = scored.into_iter().take(4).map(|(_, m)| m).collect();
+                thread_hits = scored.into_iter().take(GLOSSARY_BUCKET_SLOTS).collect();
             }
         }
     }
+    let held_ids = |lists: &[&Vec<(HeadFit, Message)>], id: &MessageId| {
+        lists
+            .iter()
+            .any(|list| list.iter().any(|(_, held)| &held.id == id))
+    };
+    // `#2232`: the pressed channel's own recent history, scanned for the head
+    // on word boundaries. Cache-only; the selected message itself is skipped.
+    let mut recent_hits: Vec<(HeadFit, Message)> = Vec::new();
+    if let Ok(fetched) = crate::ops::catchup_fetch(
+        state,
+        Scope::Write,
+        channel_id,
+        crate::threads::TimelineView::Main,
+        None,
+        GLOSSARY_CHANNEL_RECENT_WINDOW,
+    )
+    .await
+    {
+        trace.buckets.channel_recent_scanned = fetched.messages.len();
+        let mut scored: Vec<(HeadFit, Message)> = fetched
+            .messages
+            .into_iter()
+            .filter(|m| message_id != Some(m.id.as_str()))
+            .filter(|m| !held_ids(&[&thread_hits], &m.id))
+            .map(|m| (target.fit(&m), m))
+            .filter(|(fit, _)| fit.head_match)
+            .collect();
+        scored.sort_by_key(|(fit, m)| (fit.score, m.created_ms().unwrap_or(0)));
+        scored.reverse();
+        recent_hits = scored.into_iter().take(GLOSSARY_BUCKET_SLOTS).collect();
+    }
+    strong += thread_hits.iter().filter(|(fit, _)| fit.strong).count();
+    strong += recent_hits.iter().filter(|(fit, _)| fit.strong).count();
     // Link-target keys from the containing line and the held message.
     let mut token_text = context.to_owned();
     if let Some(held) = &selected_message {
@@ -3458,72 +3539,158 @@ async fn glossary_retrieval(
     token_text.push(' ');
     token_text.push_str(selected);
     let tokens = glossary_link_tokens(&token_text);
-    let mut link_hits: Vec<Message> = Vec::new();
-    for token in &tokens {
-        for hit in search(token, 6).await {
+    trace.buckets.link_keys = tokens.len();
+    let mut searches = 0usize;
+    let elapsed = |started: std::time::Instant| {
+        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    };
+    let mut link_hits: Vec<(HeadFit, Message)> = Vec::new();
+    for token in tokens.iter().take(gq::LINK_QUERY_BUDGET) {
+        if let Err(stop) = gq::next_search_allowed(
+            searches,
+            elapsed(started),
+            0,
+            gq::QUERY_BUDGET,
+            gq::RETRIEVAL_TIME_BUDGET_MS,
+        ) {
+            trace.stopped = Some(stop.as_str().to_owned());
+            break;
+        }
+        let began = std::time::Instant::now();
+        let found = search(token, 6).await;
+        searches += 1;
+        let mut kept = 0;
+        for hit in &found {
             let folded = crate::search_query::fold(&hit.content);
             if folded.contains(&token.to_lowercase())
-                && !link_hits.iter().any(|held: &Message| held.id == hit.id)
-                && !thread_hits.iter().any(|held: &Message| held.id == hit.id)
+                && !held_ids(&[&thread_hits, &recent_hits, &link_hits], &hit.id)
+                && link_hits.len() < GLOSSARY_BUCKET_SLOTS
             {
-                link_hits.push(hit);
+                link_hits.push((target.fit(hit), hit.clone()));
+                kept += 1;
             }
         }
-        if link_hits.len() >= 4 {
+        trace.queries.push(LoggedQuery {
+            q: token.clone(),
+            kind: "link".to_owned(),
+            hits: found.len(),
+            kept,
+            ms: elapsed(began),
+        });
+        if link_hits.len() >= GLOSSARY_BUCKET_SLOTS {
             break;
         }
     }
-    link_hits.truncate(4);
-    // Global windows, rarity-weighted by definitional fit.
-    let mut global: Vec<(i32, Message)> = Vec::new();
-    for query in glossary_queries(selected) {
-        for hit in search(&query, 12).await {
-            if thread_hits.iter().any(|held: &Message| held.id == hit.id)
-                || link_hits.iter().any(|held: &Message| held.id == hit.id)
-                || global.iter().any(|(_, held)| held.id == hit.id)
-            {
-                continue;
+    strong += link_hits.iter().filter(|(fit, _)| fit.strong).count();
+    // Global searches, head first, rarity-weighted by definitional fit.
+    let mut global: Vec<(HeadFit, Message)> = Vec::new();
+    let mut searched_for: Vec<String> = Vec::new();
+    if trace.stopped.is_none() {
+        for planned in gq::plan(selected) {
+            if let Err(stop) = gq::next_search_allowed(
+                searches,
+                elapsed(started),
+                strong,
+                gq::QUERY_BUDGET,
+                gq::RETRIEVAL_TIME_BUDGET_MS,
+            ) {
+                trace.stopped = Some(stop.as_str().to_owned());
+                break;
             }
-            let score = glossary_score(&hit, &words, &phrases)
-                + i32::from(hit.channel_id.as_str() == channel_id) * 3;
-            global.push((score, hit));
+            let began = std::time::Instant::now();
+            let found = search(&planned.query, 12).await;
+            searches += 1;
+            searched_for.push(planned.human.clone());
+            let mut kept = 0;
+            for hit in found.iter() {
+                if held_ids(&[&thread_hits, &recent_hits, &link_hits, &global], &hit.id) {
+                    continue;
+                }
+                let mut fit = target.fit(hit);
+                if fit.conflicts {
+                    continue;
+                }
+                fit.score += i32::from(hit.channel_id.as_str() == channel_id) * 3;
+                if fit.strong {
+                    strong += 1;
+                }
+                global.push((fit, hit.clone()));
+                kept += 1;
+            }
+            trace.queries.push(LoggedQuery {
+                q: planned.human.clone(),
+                kind: planned.kind.as_str().to_owned(),
+                hits: found.len(),
+                kept,
+                ms: elapsed(began),
+            });
         }
     }
-    global.sort_by_key(|(score, m)| (*score, m.created_ms().unwrap_or(0)));
+    global.sort_by_key(|(fit, m)| (fit.score, m.created_ms().unwrap_or(0)));
     global.reverse();
+    trace.buckets.thread = thread_hits.len();
+    trace.buckets.channel_recent = recent_hits.len();
+    trace.buckets.link = link_hits.len();
     let mut hits: Vec<Message> = Vec::new();
-    hits.extend(thread_hits);
-    hits.extend(link_hits);
-    for (_, hit) in global {
-        if hits.len() >= 12 {
-            break;
+    let mut meta = Vec::new();
+    for (bucket, list) in [
+        ("thread", thread_hits),
+        ("channel_recent", recent_hits),
+        ("link", link_hits),
+        ("global", global),
+    ] {
+        for (fit, message) in list {
+            if hits.len() >= GLOSSARY_MAX_CANDIDATES {
+                break;
+            }
+            if bucket == "global" {
+                trace.buckets.global += 1;
+            }
+            meta.push(glossary_candidate(&message, bucket, &fit));
+            hits.push(message);
         }
-        hits.push(hit);
     }
-    let quoted: Vec<String> = glossary_human_queries(selected)
+    // The honest not-found sentence: the searches that actually ran.
+    let mut quoted: Vec<String> = searched_for
         .iter()
+        .take(5)
         .map(|q| format!("\"{q}\""))
         .collect();
-    let searched_for = match quoted.len() {
-        0 => String::new(),
-        1 => quoted[0].clone(),
-        _ => format!(
-            "{} and {}",
-            quoted[..quoted.len() - 1].join(", "),
-            quoted[quoted.len() - 1]
-        ),
+    if searched_for.len() > 5 {
+        quoted.push(format!("{} shorter forms", searched_for.len() - 5));
+    }
+    let mut also: Vec<String> = Vec::new();
+    if trace.buckets.thread_searched {
+        also.push("searched its thread".to_owned());
+    }
+    if trace.buckets.channel_recent_scanned > 0 && !split.head.is_empty() {
+        also.push(format!(
+            "scanned this channel's recent messages for \"{}\"",
+            split.head
+        ));
+    }
+    if !tokens.is_empty() {
+        also.push("followed the links in this message".to_owned());
+    }
+    let tail = if also.is_empty() {
+        "this message has no thread or links to follow".to_owned()
+    } else {
+        format!("I also {}", glossary_and_list(&also))
     };
-    let tail = match (thread_searched, tokens.is_empty()) {
-        (false, true) => "this message has no thread or links to follow".to_owned(),
-        (true, true) => "I also searched its thread".to_owned(),
-        (false, false) => "I also followed the links in this message".to_owned(),
-        (true, false) => "I also searched its thread and followed its links".to_owned(),
+    let reason = if quoted.is_empty() {
+        format!("I searched no messages beyond this channel; {tail}.")
+    } else {
+        format!(
+            "I searched recent messages and fetched documents for {}; {tail}.",
+            glossary_and_list(&quoted)
+        )
     };
+    trace.ms.retrieval = elapsed(started);
     GlossaryRetrieval {
         hits,
-        reason: format!(
-            "I searched recent messages and fetched documents for {searched_for}; {tail}."
-        ),
+        meta,
+        strong,
+        reason,
     }
 }
 
@@ -3561,6 +3728,14 @@ pub async fn glossary_terms(
     Ok(Json(crate::contract::GlossaryTermsResponse { terms }).into_response())
 }
 
+/// Query of `POST …/glossary/lookup`: the operator probe (`#2232`).
+#[derive(Debug, Default, Deserialize)]
+pub struct GlossaryLookupQuery {
+    /// `retrieval` (no model call) or `full`; honoured only with
+    /// `[summaries] wtf_probe = true`.
+    pub probe: Option<String>,
+}
+
 /// `POST /api/v1/channels/{channel_id}/glossary/lookup` — one WTF press:
 /// resolve the selected words to a glossary term from cache-only evidence
 /// and persist a dynamic entry. `#2156 vibe-talk-wtf-glossary-lookup`.
@@ -3568,14 +3743,145 @@ pub async fn glossary_terms(
 /// WRITE scope: it spends a model call and writes deployment state.
 /// Cache-only: evidence comes from this server's message cache and its
 /// already-fetched documents; the chat upstream is never called.
+///
+/// `#2232 vibe-talk-wtf-lookup-log-and-replay`: every press, whatever its
+/// outcome, appends one record to the private lookup log
+/// ([`crate::glossary_lookup_log`]) unless `[summaries] wtf_lookup_log` is
+/// off. With `[summaries] wtf_probe` on, `?probe=retrieval|full` skips the
+/// learned-entry short-circuit, never saves an entry, and answers with the
+/// record as `diagnostics`; `retrieval` stops before the model.
 pub async fn glossary_lookup(
     State(state): State<AppState>,
     _scope: WriteScope,
     Path(channel_id): Path<String>,
+    Query(query): Query<GlossaryLookupQuery>,
     Json(body): Json<crate::contract::GlossaryLookupRequest>,
 ) -> Result<Response, ApiError> {
+    use crate::glossary_lookup_log as lookup_log;
+    let started = std::time::Instant::now();
+    let probe = match query.probe.as_deref() {
+        None | Some("") => None,
+        Some(mode @ ("retrieval" | "full")) => {
+            if !state.config.summaries.wtf_probe {
+                return Err(ApiError::new(
+                    StatusCode::FORBIDDEN,
+                    "probe_disabled",
+                    "glossary lookup probes need [summaries] wtf_probe = true on this server",
+                ));
+            }
+            Some(mode.to_owned())
+        }
+        Some(_) => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "probe must be retrieval or full",
+            ));
+        }
+    };
+    let now = jiff::Timestamp::now();
+    let mut record = lookup_log::LookupRecord {
+        v: lookup_log::RECORD_VERSION,
+        ts: now.to_string(),
+        engine: lookup_log::ENGINE.to_owned(),
+        channel: channel_id.clone(),
+        message_id: body.message_id.clone().filter(|id| !id.is_empty()),
+        selected: body.selected.trim().to_owned(),
+        context: body
+            .context
+            .as_deref()
+            .unwrap_or("")
+            .chars()
+            .take(crate::glossary_dynamic::MAX_CONTEXT_CHARS)
+            .collect(),
+        probe: probe.clone(),
+        ..lookup_log::LookupRecord::default()
+    };
+    let result =
+        glossary_lookup_answer(&state, &channel_id, &body, probe.as_deref(), &mut record).await;
+    record.ms.total = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    if let Err(error) = &result {
+        if record.outcome.is_empty() {
+            record.outcome = "error".to_owned();
+            record.error = Some(error.code.to_owned());
+        }
+    }
+    // Redact every secret this deployment holds out of the free-text fields.
+    record.selected = crate::diagnostics::redacted(&record.selected, &state);
+    record.context = crate::diagnostics::redacted(&record.context, &state);
+    record.term = record
+        .term
+        .take()
+        .map(|t| crate::diagnostics::redacted(&t, &state));
+    record.definition = record
+        .definition
+        .take()
+        .map(|d| crate::diagnostics::redacted(&d, &state));
+    if state.config.summaries.wtf_lookup_log {
+        if let Some(state_dir) = lookup_log::state_dir_of(state.config.storage.path.as_deref()) {
+            let dir = lookup_log::log_dir(&state_dir);
+            let line = record.clone();
+            let written = tokio::task::spawn_blocking(move || {
+                lookup_log::append(
+                    &dir,
+                    &line,
+                    now,
+                    lookup_log::DAY_CAP_BYTES,
+                    lookup_log::KEEP_DAYS,
+                )
+            })
+            .await;
+            match written {
+                Ok(Ok(lookup_log::Appended::Written)) => {}
+                Ok(Ok(lookup_log::Appended::Dropped { first })) => {
+                    if first {
+                        tracing::warn!(
+                            "WTF lookup log reached its daily cap; later lookups today are not logged"
+                        );
+                    }
+                }
+                Ok(Err(error)) => tracing::warn!(error = %error, "WTF lookup log append failed"),
+                Err(error) => tracing::warn!(error = %error, "WTF lookup log task failed"),
+            }
+        }
+    }
+    let answer = result?;
+    if probe.is_some() {
+        Ok(Json(lookup_log::ProbeAnswer {
+            answer,
+            diagnostics: record,
+        })
+        .into_response())
+    } else {
+        Ok(Json(answer).into_response())
+    }
+}
+
+/// A not-found answer naming what was searched.
+fn glossary_not_found(selected: &str, reason: &str) -> crate::contract::GlossaryLookupResponse {
+    crate::contract::GlossaryLookupResponse {
+        state: "not_found".to_owned(),
+        term: selected.to_owned(),
+        definition: None,
+        source: None,
+        cached: false,
+        saved: false,
+        reason: Some(reason.to_owned()),
+    }
+}
+
+/// The lookup itself; `record` collects what it did for the log.
+#[allow(clippy::too_many_lines)]
+async fn glossary_lookup_answer(
+    state: &AppState,
+    channel_id: &str,
+    body: &crate::contract::GlossaryLookupRequest,
+    probe: Option<&str>,
+    record: &mut crate::glossary_lookup_log::LookupRecord,
+) -> Result<crate::contract::GlossaryLookupResponse, ApiError> {
     use crate::glossary_dynamic as dyn_gloss;
-    if state.channel(&channel_id).is_none() {
+    use crate::glossary_lookup_log::LoggedSource;
+    if state.channel(channel_id).is_none() {
         return Err(OpError::UnknownChannel.into());
     }
     let selected = body.selected.trim().to_owned();
@@ -3593,15 +3899,9 @@ pub async fn glossary_lookup(
             ),
         ));
     }
-    let context: String = body
-        .context
-        .as_deref()
-        .unwrap_or("")
-        .chars()
-        .take(dyn_gloss::MAX_CONTEXT_CHARS)
-        .collect();
+    let context = record.context.clone();
     // 1. Exact-hit short-circuit: no model call.
-    let reviewed = reviewed_glossary_entries(&state, Some(&channel_id));
+    let reviewed = reviewed_glossary_entries(state, Some(channel_id));
     let words: Vec<&str> = selected.split_whitespace().collect();
     for take in (1..=words.len()).rev() {
         let candidate = words[..take].join(" ");
@@ -3609,7 +3909,10 @@ pub async fn glossary_lookup(
             .iter()
             .find(|e| e.term.eq_ignore_ascii_case(&candidate))
         {
-            return Ok(Json(crate::contract::GlossaryLookupResponse {
+            record.outcome = "reviewed_hit".to_owned();
+            record.term = Some(entry.term.clone());
+            record.definition = Some(entry.definition.clone());
+            return Ok(crate::contract::GlossaryLookupResponse {
                 state: "found".to_owned(),
                 term: entry.term.clone(),
                 definition: Some(entry.definition.clone()),
@@ -3617,41 +3920,48 @@ pub async fn glossary_lookup(
                 cached: true,
                 saved: false,
                 reason: None,
-            })
-            .into_response());
+            });
         }
     }
-    let dynamic = dynamic_glossary_entries(&state);
-    if let Some(row) = dyn_gloss::find_for_selection(&dynamic, &selected) {
-        return Ok(Json(crate::contract::GlossaryLookupResponse {
-            state: "found".to_owned(),
-            term: row.term.clone(),
-            definition: Some(row.definition.clone()),
-            source: row.source.as_ref().map(glossary_source_view),
-            cached: true,
-            saved: false,
-            reason: None,
-        })
-        .into_response());
+    if probe.is_none() {
+        let dynamic = dynamic_glossary_entries(state);
+        if let Some(row) = dyn_gloss::find_for_selection(&dynamic, &selected) {
+            record.outcome = "learned_hit".to_owned();
+            record.term = Some(row.term.clone());
+            record.definition = Some(row.definition.clone());
+            return Ok(crate::contract::GlossaryLookupResponse {
+                state: "found".to_owned(),
+                term: row.term.clone(),
+                definition: Some(row.definition.clone()),
+                source: row.source.as_ref().map(glossary_source_view),
+                cached: true,
+                saved: false,
+                reason: None,
+            });
+        }
     }
-    let Some(agent) = state.catchup_summarizer.clone() else {
+    let agent = state.catchup_summarizer.clone();
+    if agent.is_none() && probe != Some("retrieval") {
         return Err(glossary_not_available());
-    };
-    // 2. Cache-only evidence: the selection's own thread first, then hits
-    // sharing its link targets, then global windows — each bucket with
-    // reserved slots so none can starve the others (`#2189`). Windows are
-    // hyphen/space/nospace and singular/plural insensitive; single common
-    // words are rarity-weighted last.
+    }
+    // 2. Cache-only evidence: the selection's own thread first, then the
+    // channel's recent history for the head noun phrase, then hits sharing
+    // its link targets, then global searches planned head-first — each bucket
+    // with reserved slots so none can starve the others (`#2189`, `#2232`).
     let retrieval = glossary_retrieval(
-        &state,
-        &channel_id,
+        state,
+        channel_id,
         &selected,
         &context,
         body.message_id.as_deref(),
+        record,
     )
     .await;
     let searched_reason = retrieval.reason.clone();
+    let strong = retrieval.strong;
+    record.candidates = retrieval.meta;
     let hits = retrieval.hits;
+    let docs_started = std::time::Instant::now();
     let doc_query = crate::search_query::parse(&selected);
     let mut doc_search = state.documents.search_documents(&doc_query, 5);
     let space_form = selected.replace('-', " ");
@@ -3666,18 +3976,31 @@ pub async fn glossary_lookup(
             }
         }
     }
+    record.ms.docs = u64::try_from(docs_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    record.buckets.docs = doc_search.hits.len();
+    record.docs = doc_search.hits.iter().map(|h| h.key.clone()).collect();
     if hits.is_empty() && doc_search.hits.is_empty() {
-        return Ok(Json(crate::contract::GlossaryLookupResponse {
-            state: "not_found".to_owned(),
-            term: selected.clone(),
-            definition: None,
-            source: None,
-            cached: false,
-            saved: false,
-            reason: Some(searched_reason.clone()),
-        })
-        .into_response());
+        record.outcome = "miss_no_evidence".to_owned();
+        return Ok(glossary_not_found(&selected, &searched_reason));
     }
+    // A retrieval probe stops here: evidence means a candidate that names the
+    // head on word boundaries with a definitional cue, or a fetched document.
+    let Some(agent) = agent.filter(|_| probe != Some("retrieval")) else {
+        let evidence = strong > 0 || !doc_search.hits.is_empty();
+        record.outcome = if evidence {
+            "evidence"
+        } else {
+            "miss_no_evidence"
+        }
+        .to_owned();
+        let mut answer = glossary_not_found(&selected, &searched_reason);
+        if evidence {
+            answer.state = "evidence".to_owned();
+            answer.term = record.head.clone();
+            answer.reason = None;
+        }
+        return Ok(answer);
+    };
     // 3. One model step: pick the logical term, define it from evidence.
     let mut evidence = String::new();
     for message in &hits {
@@ -3707,22 +4030,36 @@ pub async fn glossary_lookup(
     let system = "You maintain a project glossary. From the fenced evidence only, decide what \
 the reader's selected words mean. Choose the logical term: the shorter name when the phrase \
 around it is just this instance of it, the full phrase when the phrase itself is the named \
-thing. Answer with exactly one JSON object and nothing else: \
+thing. When the selection is a head phrase followed by a qualifier, as in \"Row 4, the nightly \
+build check\", the head phrase is usually the term and the qualifier describes it. Answer with \
+exactly one JSON object and nothing else: \
 {\"term\": \"<term>\", \"definition\": \"<one line, at most 240 characters>\", \
 \"source_kind\": \"message\" or \"document\", \"source_id\": \"<the msg id or doc key the \
 definition rests on>\"}. When the evidence does not define the words, answer \
 {\"term\": null}. Never invent a meaning the evidence does not support.";
+    let qualifier_line = record
+        .qualifier
+        .as_deref()
+        .map(|q| format!("Qualifier: {q}\n"))
+        .unwrap_or_default();
     let prompt = format!(
-        "Selected words: {selected}\nContaining line: {context}\n\nEvidence:\n{}",
+        "Selected words: {selected}\nHead phrase: {}\n{qualifier_line}Containing line: {context}\n\nEvidence:\n{}",
+        record.head,
         untrusted::fenced(&evidence)
     );
-    let raw = agent
-        .complete_prompt(system, &prompt)
-        .await
-        .map_err(|error| match error {
-            crate::summarize::SummaryError::NotConfigured(_) => glossary_not_available(),
-            other => ApiError::from(OpError::Summarizer(other)),
-        })?;
+    let model = state
+        .catchup_model
+        .as_deref()
+        .unwrap_or("side-agent")
+        .to_owned();
+    record.model = Some(model.clone());
+    let model_started = std::time::Instant::now();
+    let raw = agent.complete_prompt(system, &prompt).await;
+    record.ms.model = u64::try_from(model_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let raw = raw.map_err(|error| match error {
+        crate::summarize::SummaryError::NotConfigured(_) => glossary_not_available(),
+        other => ApiError::from(OpError::Summarizer(other)),
+    })?;
     let parsed: serde_json::Value =
         serde_json::from_str(raw.trim()).unwrap_or(serde_json::Value::Null);
     let term = parsed
@@ -3732,20 +4069,13 @@ definition rests on>\"}. When the evidence does not define the words, answer \
         .filter(|t| !t.is_empty())
         .map(str::to_owned);
     let Some(term) = term else {
-        return Ok(Json(crate::contract::GlossaryLookupResponse {
-            state: "not_found".to_owned(),
-            term: selected.clone(),
-            definition: None,
-            source: None,
-            cached: false,
-            saved: false,
-            reason: Some(searched_reason.clone()),
-        })
-        .into_response());
+        record.outcome = "miss_model_declined".to_owned();
+        return Ok(glossary_not_found(&selected, &searched_reason));
     };
     if term.chars().count() > dyn_gloss::MAX_SELECTION_CHARS
         || term.split_whitespace().count() > dyn_gloss::MAX_TERM_WORDS
     {
+        record.error = Some("term_too_long".to_owned());
         return Err(ApiError::from(OpError::Summarizer(
             crate::summarize::SummaryError::Shape(
                 "the glossary answer named a term longer than a selection may be".to_owned(),
@@ -3763,6 +4093,7 @@ definition rests on>\"}. When the evidence does not define the words, answer \
                 .collect::<String>()
         });
     let Some(definition) = definition else {
+        record.error = Some("no_definition".to_owned());
         return Err(ApiError::from(OpError::Summarizer(
             crate::summarize::SummaryError::Shape(
                 "the glossary answer carried no definition".to_owned(),
@@ -3819,16 +4150,10 @@ definition rests on>\"}. When the evidence does not define the words, answer \
         _ => None,
     };
     let Some(source) = source else {
-        return Ok(Json(crate::contract::GlossaryLookupResponse {
-            state: "not_found".to_owned(),
-            term: selected.clone(),
-            definition: None,
-            source: None,
-            cached: false,
-            saved: false,
-            reason: Some(searched_reason.clone()),
-        })
-        .into_response());
+        record.outcome = "miss_unlinked_source".to_owned();
+        record.term = Some(term);
+        record.definition = Some(definition);
+        return Ok(glossary_not_found(&selected, &searched_reason));
     };
     // Narrow a document source to its section when the evidence names one.
     let source = match &source {
@@ -3851,33 +4176,47 @@ definition rests on>\"}. When the evidence does not define the words, answer \
         }
         other => other.clone(),
     };
-    // 4. Persist (best-effort) and answer.
-    let model = state
-        .catchup_model
-        .as_deref()
-        .unwrap_or("side-agent")
-        .to_owned();
-    let row = dyn_gloss::DynamicEntry {
-        v: 1,
-        norm: dyn_gloss::normalize(&term),
-        term: term.clone(),
-        definition: definition.clone(),
-        source: Some(source.clone()),
-        model,
-        created: jiff::Timestamp::now().to_string(),
-        deleted: false,
-    };
+    record.outcome = "found".to_owned();
+    record.term = Some(term.clone());
+    record.definition = Some(definition.clone());
+    record.source = Some(match &source {
+        dyn_gloss::GlossarySource::Message {
+            channel, message, ..
+        } => LoggedSource {
+            kind: "message".to_owned(),
+            id: message.clone(),
+            channel: channel.clone(),
+        },
+        dyn_gloss::GlossarySource::Document { key, .. } => LoggedSource {
+            kind: "document".to_owned(),
+            id: key.clone(),
+            channel: String::new(),
+        },
+    });
+    // 4. Persist (best-effort) and answer. A probe never persists.
     let mut saved = false;
-    if let Some(state_dir) = dyn_gloss::state_dir_of(state.config.storage.path.as_deref()) {
-        let path = dyn_gloss::glossary_path(&state_dir);
-        match dyn_gloss::append_row(&path, &row, dyn_gloss::DEFAULT_MAX_BYTES) {
-            Ok(()) => saved = true,
-            Err(error) => {
-                tracing::warn!(error = %error, "dynamic glossary append failed");
+    if probe.is_none() {
+        let row = dyn_gloss::DynamicEntry {
+            v: 1,
+            norm: dyn_gloss::normalize(&term),
+            term: term.clone(),
+            definition: definition.clone(),
+            source: Some(source.clone()),
+            model,
+            created: jiff::Timestamp::now().to_string(),
+            deleted: false,
+        };
+        if let Some(state_dir) = dyn_gloss::state_dir_of(state.config.storage.path.as_deref()) {
+            let path = dyn_gloss::glossary_path(&state_dir);
+            match dyn_gloss::append_row(&path, &row, dyn_gloss::DEFAULT_MAX_BYTES) {
+                Ok(()) => saved = true,
+                Err(error) => {
+                    tracing::warn!(error = %error, "dynamic glossary append failed");
+                }
             }
         }
     }
-    Ok(Json(crate::contract::GlossaryLookupResponse {
+    Ok(crate::contract::GlossaryLookupResponse {
         state: "found".to_owned(),
         term,
         definition: Some(definition),
@@ -3886,7 +4225,6 @@ definition rests on>\"}. When the evidence does not define the words, answer \
         saved,
         reason: None,
     })
-    .into_response())
 }
 
 /// Query of `GET …/catchup/preview`: the scope, as the POST body's fields name it.

@@ -685,6 +685,15 @@ enabled = true
 # catchup_window_messages = 150  # how many of a channel's newest messages one Discuss
 #                                  # (catch-up) read covers; not in the summary cache key
 #
+# WTF lookup log (#2232): every WTF? lookup appends one JSON line (the selection, each search and
+# its hit count, candidate ids, the answer or the kind of miss, timings; never a token) under
+# <state>/wtf-lookups/, one 0600 file per UTC day in a 0700 directory, at most 2 MiB a day and 30
+# days kept. `vibe-talk wtf-replay` re-runs logged misses against a local test server.
+# wtf_probe lets that local server answer `?probe=retrieval|full` lookups (no saved entry, the
+# record returned as diagnostics); leave it off on a server people use. Neither is in the cache key.
+# wtf_lookup_log = true
+# wtf_probe = false
+#
 # The model to ask. NOTE: nothing reads this — the ElevenLabs agent runs whichever model it is
 # configured with, and [summaries.llm] below names its own `model` and never falls back to this
 # one — so today it does exactly one thing: it is folded into the cache key, so setting it

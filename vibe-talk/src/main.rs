@@ -54,6 +54,7 @@ USAGE:
                                           --help` shows its arguments
     vibe-talk cache-stats PATH
     vibe-talk unknown-terms-report [--days N] [--json] PATH
+    vibe-talk wtf-replay run|compare ...
 
 COMMANDS:
     (none)                run the server
@@ -91,6 +92,9 @@ COMMANDS:
                           (default 7) from the debug log at PATH (the .jsonl file, its
                           directory, or the state directory). See
                           `vibe-talk unknown-terms-report --help`
+    wtf-replay            re-run logged WTF lookups, misses first, against a LOCAL test
+                          server (loopback only, [summaries] wtf_probe = true) and compare
+                          two runs' hit rate and lookup time. See `vibe-talk wtf-replay --help`
     cache-stats PATH      print, as JSON, what the message cache file at PATH holds and what its
                           storage costs: bytes on disk, per table and index, and per message; and
                           for each channel its messages, replies, text bytes, the span of days
@@ -426,6 +430,14 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Some("unknown-terms-report") => return unknown_terms_report(argv),
+        Some("wtf-replay") => {
+            let printed = vibe_talk::wtf_replay::run_cli(argv.collect()).await?;
+            print!("{printed}");
+            if !printed.ends_with('\n') {
+                println!();
+            }
+            return Ok(());
+        }
         Some("glossary-report") => return glossary_report(argv),
         Some("cache-stats") => return cache_stats(argv),
         _ => {}

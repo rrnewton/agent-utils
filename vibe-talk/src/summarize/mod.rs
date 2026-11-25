@@ -781,6 +781,8 @@ mod tests {
             catchup_glossaries: _,
             catchup_warmup_max_chars: _,
             catchup_unknown_terms_log: _,
+            wtf_lookup_log: _,
+            wtf_probe: _,
             llm: _,
         } = config();
         vec![
@@ -845,6 +847,13 @@ mod tests {
                 false,
                 moved(|c| c.catchup_unknown_terms_log = !c.catchup_unknown_terms_log),
             ),
+            // `#2232`: the WTF lookup log and the operator probe; no word of a summary.
+            (
+                "wtf_lookup_log",
+                false,
+                moved(|c| c.wtf_lookup_log = !c.wtf_lookup_log),
+            ),
+            ("wtf_probe", false, moved(|c| c.wtf_probe = !c.wtf_probe)),
         ]
     }
 

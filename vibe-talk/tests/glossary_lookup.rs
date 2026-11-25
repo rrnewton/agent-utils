@@ -141,10 +141,23 @@ async fn cached_state(
     Arc<vibe_talk::summarize::fake::FakeSummarizer>,
     testing::TempDir,
 ) {
+    cached_state_with(backend, with_backend, "").await
+}
+
+/// [`cached_state`] with extra configuration appended (e.g. a `[summaries]` table).
+async fn cached_state_with(
+    backend: Arc<Backend>,
+    with_backend: bool,
+    extra: &str,
+) -> (
+    vibe_talk::state::AppState,
+    Arc<vibe_talk::summarize::fake::FakeSummarizer>,
+    testing::TempDir,
+) {
     let dir = testing::TempDir::new("glossary-lookup");
     let store_path = dir.path().join("store.db");
     let text = format!(
-        "{}\n[storage]\npath = \"{}\"\n",
+        "{}\n[storage]\npath = \"{}\"\n{extra}",
         testing::config_toml(),
         store_path.display()
     );
@@ -500,6 +513,386 @@ async fn link_keys_are_real_targets_only_and_a_miss_says_so_plainly() {
     let calls = summarizer.prompt_calls();
     assert_eq!(calls.len(), 1, "{calls:?}");
     assert!(calls[0].1.contains("tracking ticket"), "{}", calls[0].1);
+}
+
+#[tokio::test]
+async fn a_long_selection_finds_its_head_phrase_in_the_channels_earlier_status() {
+    // `#2232 vibe-talk-wtf-lookup-log-and-replay`: the first logged miss. A
+    // six-word selection "Row 7, the <qualifier> gate test" in a top-level
+    // status post (no thread, no links). "Row 7" is defined by an earlier
+    // top-level status in the same channel that never repeats the
+    // qualifier; a "Row 70" line is a decoy that a substring search would
+    // also match. The head noun phrase must be searched, in the channel's
+    // own recent history, on word boundaries.
+    let defining = message(
+        1,
+        "Status table. Row 7: widget build on the baseline image, owned by team blue",
+    );
+    let decoy = message(2, "Row 70: packaging check for the sample installer");
+    let noise_a = message(3, "the nightly gate is slow again; rerunning the test");
+    let noise_b = message(4, "test plan for the gate rewrite is in review");
+    let use_site = message(
+        5,
+        "Status: Row 7, the alpha-12-v3 gate test is green after the retry",
+    );
+    let source_id = defining.id.as_str().to_owned();
+    let decoy_id = decoy.id.as_str().to_owned();
+    let use_site_id = use_site.id.as_str().to_owned();
+    let backend = backend_with(vec![defining, decoy, noise_a, noise_b, use_site]);
+    let (state, summarizer, dir) = cached_state(backend.clone(), true).await;
+    fill(&state).await;
+    summarizer.answer_with(&format!(
+        "{{\"term\":\"Row 7\",\"definition\":\"the widget build on the baseline image\",\"source_kind\":\"message\",\"source_id\":\"{source_id}\"}}"
+    ));
+    let app = vibe_talk::http::router(state);
+    let reads = backend.reads();
+    let (status, body) = post(
+        &app,
+        &lookup_path(),
+        Some(WRITE_TOKEN),
+        &json!({
+            "selected": "Row 7, the alpha-12-v3 gate test",
+            "message_id": use_site_id,
+            "context": "Status: Row 7, the alpha-12-v3 gate test is green after the retry",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(backend.reads(), reads, "lookup must not call upstream");
+    let calls = summarizer.prompt_calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    let prompt = &calls[0].1;
+    assert!(
+        prompt.contains(&format!("id={source_id}")),
+        "the defining status must reach the evidence: {prompt}"
+    );
+    assert!(
+        !prompt.contains(&format!("id={decoy_id}")),
+        "the Row 70 decoy must not: {prompt}"
+    );
+    assert_eq!(body["state"], json!("found"), "{body}");
+    assert_eq!(body["term"], json!("Row 7"), "{body}");
+    assert_eq!(body["source"]["kind"], json!("message"), "{body}");
+    // The log shows why: the head was split off and found in the channel's
+    // own recent history, inside the query budget.
+    let records = vibe_talk::glossary_lookup_log::read_records(dir.path());
+    assert_eq!(records.len(), 1, "{records:?}");
+    let record = &records[0];
+    assert_eq!(record.outcome, "found");
+    assert_eq!(record.head, "Row 7");
+    assert_eq!(record.qualifier.as_deref(), Some("alpha-12-v3 gate test"));
+    assert_eq!(record.candidates[0].id, source_id, "{record:?}");
+    assert_eq!(record.candidates[0].bucket, "channel_recent", "{record:?}");
+    assert!(record.candidates[0].head_match);
+    assert!(
+        !record.candidates.iter().any(|c| c.id == decoy_id),
+        "{record:?}"
+    );
+    assert!(record.queries.len() <= vibe_talk::glossary_query::QUERY_BUDGET);
+    assert_eq!(
+        record.source.as_ref().map(|s| s.channel.as_str()),
+        Some(WRITE_CHANNEL)
+    );
+    assert_eq!(record.message_id.as_deref(), Some(use_site_id.as_str()));
+}
+
+fn lookup_log_mode(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(path)
+        .expect("exists")
+        .permissions()
+        .mode()
+        & 0o777
+}
+
+#[tokio::test]
+async fn every_lookup_outcome_is_logged_privately_and_the_switch_turns_it_off() {
+    // `#2232`: a miss and a refused request each leave one record, in a 0700
+    // directory of 0600 day files under the state directory.
+    let backend = backend_with(vec![message(1, "nothing relevant here")]);
+    let (state, _summarizer, dir) = cached_state(backend.clone(), true).await;
+    fill(&state).await;
+    let app = vibe_talk::http::router(state);
+    let (status, body) = post(
+        &app,
+        &lookup_path(),
+        Some(WRITE_TOKEN),
+        &json!({"selected": "Quokka Ledger", "context": "the Quokka Ledger moved"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], json!("not_found"), "{body}");
+    let (status, _) = post(
+        &app,
+        &lookup_path(),
+        Some(WRITE_TOKEN),
+        &json!({"selected": "  "}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let log_dir = vibe_talk::glossary_lookup_log::log_dir(dir.path());
+    assert_eq!(lookup_log_mode(&log_dir), 0o700);
+    let files = vibe_talk::glossary_lookup_log::day_files(&log_dir);
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert_eq!(lookup_log_mode(&files[0]), 0o600);
+    let records = vibe_talk::glossary_lookup_log::read_records(dir.path());
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records[0].outcome, "miss_no_evidence");
+    assert_eq!(records[0].selected, "Quokka Ledger");
+    assert_eq!(records[0].engine, vibe_talk::glossary_lookup_log::ENGINE);
+    assert!(!records[0].queries.is_empty());
+    assert_eq!(records[1].outcome, "error");
+    assert_eq!(records[1].error.as_deref(), Some("bad_request"));
+    let text = std::fs::read_to_string(&files[0]).expect("log");
+    assert!(!text.contains(WRITE_TOKEN), "no token in the log");
+
+    // Switched off: no log directory at all.
+    let backend = backend_with(vec![message(1, "nothing relevant here")]);
+    let (state, _summarizer, dir) =
+        cached_state_with(backend, true, "[summaries]\nwtf_lookup_log = false\n").await;
+    fill(&state).await;
+    let app = vibe_talk::http::router(state);
+    let (status, _) = post(
+        &app,
+        &lookup_path(),
+        Some(WRITE_TOKEN),
+        &json!({"selected": "Quokka Ledger"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!vibe_talk::glossary_lookup_log::log_dir(dir.path()).exists());
+}
+
+#[tokio::test]
+async fn a_long_selection_with_no_evidence_stays_inside_the_query_budget() {
+    // `#2232`: an eight-word selection that matches nothing runs at most the
+    // query budget of all-channel searches, and the not-found sentence names
+    // only searches that ran.
+    let backend = backend_with(vec![message(1, "nothing relevant here")]);
+    let (state, summarizer, dir) = cached_state(backend, true).await;
+    fill(&state).await;
+    let app = vibe_talk::http::router(state);
+    let (status, body) = post(
+        &app,
+        &lookup_path(),
+        Some(WRITE_TOKEN),
+        &json!({"selected": "Zorblat seven, the quuxing frobnitz manifold sweep check"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], json!("not_found"), "{body}");
+    assert!(
+        summarizer.prompt_calls().is_empty(),
+        "no evidence, no model call"
+    );
+    let records = vibe_talk::glossary_lookup_log::read_records(dir.path());
+    let record = &records[0];
+    assert_eq!(record.head, "Zorblat seven");
+    assert_eq!(
+        record.queries.len(),
+        vibe_talk::glossary_query::QUERY_BUDGET,
+        "{record:?}"
+    );
+    assert_eq!(record.stopped.as_deref(), Some("query_budget"));
+    assert_eq!(record.queries[0].q, "Zorblat seven");
+    let reason = body["reason"].as_str().expect("reason");
+    assert!(reason.contains("\"Zorblat seven\""), "{reason}");
+    assert!(reason.contains("shorter forms"), "{reason}");
+    assert!(
+        reason.contains("recent messages for \"Zorblat seven\""),
+        "{reason}"
+    );
+    assert!(
+        !reason.contains("\"sweep\""),
+        "an unrun search is never named: {reason}"
+    );
+}
+
+#[tokio::test]
+async fn a_probe_needs_the_switch_skips_learned_entries_and_never_saves() {
+    let defining = message(1, "Row 4: the nightly widget soak, owned by team green");
+    let use_site = message(2, "Row 4, the soak, is red again");
+    let source_id = defining.id.as_str().to_owned();
+    let use_site_id = use_site.id.as_str().to_owned();
+    let answer = format!(
+        "{{\"term\":\"Row 4\",\"definition\":\"the nightly widget soak\",\"source_kind\":\"message\",\"source_id\":\"{source_id}\"}}"
+    );
+    let selection = json!({"selected": "Row 4, the soak", "message_id": use_site_id});
+    let probe_path = |mode: &str| format!("{}?probe={mode}", lookup_path());
+
+    // Without the switch a probe is refused by name, and nothing is spent.
+    let backend = backend_with(vec![defining.clone(), use_site.clone()]);
+    let (state, summarizer, _dir) = cached_state(backend, true).await;
+    fill(&state).await;
+    let app = vibe_talk::http::router(state);
+    let (status, body) = post(
+        &app,
+        &probe_path("retrieval"),
+        Some(WRITE_TOKEN),
+        &selection,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.to_string().contains("probe_disabled"), "{body}");
+    let (status, _) = post(&app, &probe_path("bogus"), Some(WRITE_TOKEN), &selection).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(summarizer.prompt_calls().is_empty());
+
+    // With the switch: a retrieval probe makes no model call and reports
+    // what it did; a full probe calls the model but saves nothing; both skip
+    // a learned entry for the same words.
+    let backend = backend_with(vec![defining, use_site]);
+    let (state, summarizer, dir) =
+        cached_state_with(backend, true, "[summaries]\nwtf_probe = true\n").await;
+    fill(&state).await;
+    summarizer.answer_with(&answer);
+    let app = vibe_talk::http::router(state);
+    let (status, body) = post(&app, &lookup_path(), Some(WRITE_TOKEN), &selection).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["saved"], json!(true), "a reader press saves: {body}");
+    assert!(body.get("diagnostics").is_none(), "{body}");
+    assert_eq!(summarizer.prompt_calls().len(), 1);
+    let (status, body) = post(
+        &app,
+        &probe_path("retrieval"),
+        Some(WRITE_TOKEN),
+        &selection,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], json!("evidence"), "{body}");
+    assert_eq!(body["term"], json!("Row 4"), "{body}");
+    assert_eq!(body["diagnostics"]["outcome"], json!("evidence"), "{body}");
+    assert_eq!(body["diagnostics"]["probe"], json!("retrieval"), "{body}");
+    assert_eq!(
+        body["diagnostics"]["candidates"][0]["bucket"],
+        json!("channel_recent"),
+        "{body}"
+    );
+    assert_eq!(
+        summarizer.prompt_calls().len(),
+        1,
+        "a retrieval probe calls no model"
+    );
+    let (status, body) = post(&app, &probe_path("full"), Some(WRITE_TOKEN), &selection).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], json!("found"), "{body}");
+    assert_eq!(
+        body["cached"],
+        json!(false),
+        "the learned entry was skipped: {body}"
+    );
+    assert_eq!(body["saved"], json!(false), "a probe never saves: {body}");
+    assert_eq!(summarizer.prompt_calls().len(), 2);
+    let rows = std::fs::read_to_string(vibe_talk::glossary_dynamic::glossary_path(dir.path()))
+        .expect("learned file");
+    assert_eq!(
+        rows.lines().count(),
+        1,
+        "only the reader press saved: {rows}"
+    );
+    let records = vibe_talk::glossary_lookup_log::read_records(dir.path());
+    let outcomes: Vec<&str> = records.iter().map(|r| r.outcome.as_str()).collect();
+    assert_eq!(outcomes, vec!["found", "evidence", "found"]);
+}
+
+#[tokio::test]
+async fn the_replay_command_runs_logged_misses_against_a_local_server() {
+    // `#2232`: the real CLI path over a real loopback socket. The log holds
+    // one old miss; replaying it against the fixed engine hits.
+    let defining = message(1, "Row 7: widget build on the baseline image");
+    let use_site = message(2, "Status: Row 7, the alpha-12-v3 gate test is green");
+    let use_site_id = use_site.id.as_str().to_owned();
+    let backend = backend_with(vec![defining, use_site]);
+    let (state, _summarizer, dir) =
+        cached_state_with(backend, true, "[summaries]\nwtf_probe = true\n").await;
+    fill(&state).await;
+    let app = vibe_talk::http::router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let work = testing::TempDir::new("wtf-replay");
+    let old_log = work.path().join("old-state");
+    let miss = vibe_talk::glossary_lookup_log::LookupRecord {
+        v: 1,
+        ts: "2026-09-20T10:00:00Z".to_owned(),
+        engine: "wtf-engine-1".to_owned(),
+        channel: WRITE_CHANNEL.to_owned(),
+        message_id: Some(use_site_id),
+        selected: "Row 7, the alpha-12-v3 gate test".to_owned(),
+        outcome: "miss_no_evidence".to_owned(),
+        ..Default::default()
+    };
+    vibe_talk::glossary_lookup_log::append(
+        &vibe_talk::glossary_lookup_log::log_dir(&old_log),
+        &miss,
+        "2026-09-20T10:00:00Z".parse().expect("ts"),
+        vibe_talk::glossary_lookup_log::DAY_CAP_BYTES,
+        100_000,
+    )
+    .expect("seed log");
+    let token_file = work.path().join("token");
+    std::fs::write(&token_file, format!("{WRITE_TOKEN}\n")).expect("token");
+    let out = work.path().join("after.json");
+    let server = format!("http://127.0.0.1:{port}");
+    let args = |list: &[&str]| list.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+    // A denied port is refused before any request.
+    let refused = vibe_talk::wtf_replay::run_cli(args(&[
+        "run",
+        "--server",
+        &server,
+        "--token-file",
+        token_file.to_str().unwrap(),
+        "--log",
+        old_log.to_str().unwrap(),
+        "--deny-port",
+        &port.to_string(),
+    ]))
+    .await;
+    assert!(refused.is_err());
+    let printed = vibe_talk::wtf_replay::run_cli(args(&[
+        "run",
+        "--server",
+        &server,
+        "--token-file",
+        token_file.to_str().unwrap(),
+        "--log",
+        old_log.to_str().unwrap(),
+        "--pace-ms",
+        "0",
+        "--out",
+        out.to_str().unwrap(),
+    ]))
+    .await
+    .expect("replay runs");
+    assert!(printed.contains("HIT"), "{printed}");
+    assert!(printed.contains("1/1 hits"), "{printed}");
+    assert!(!printed.contains(WRITE_TOKEN), "the token is never printed");
+    let report: vibe_talk::wtf_replay::RunReport =
+        serde_json::from_str(&std::fs::read_to_string(&out).expect("report")).expect("parse");
+    assert_eq!(report.results[0].outcome.as_deref(), Some("evidence"));
+    assert_eq!(
+        report.engine.as_deref(),
+        Some(vibe_talk::glossary_lookup_log::ENGINE)
+    );
+    // The server logged the probe as a probe, so a later replay skips it.
+    let records = vibe_talk::glossary_lookup_log::read_records(dir.path());
+    assert_eq!(
+        records.last().and_then(|r| r.probe.as_deref()),
+        Some("retrieval")
+    );
+    let compared = vibe_talk::wtf_replay::run_cli(args(&[
+        "compare",
+        out.to_str().unwrap(),
+        out.to_str().unwrap(),
+    ]))
+    .await
+    .expect("compare");
+    assert!(compared.contains("gained (0)"), "{compared}");
 }
 
 /// `#2233 vibe-talk-glossary-popup`: the full-screen glossary's exact request, `GET

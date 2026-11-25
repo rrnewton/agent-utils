@@ -821,6 +821,16 @@ pub struct SummariesConfig {
     /// `<state>/unknown-terms/unknown-terms.jsonl`. `discuss-unknown-terms-log`.
     /// Default off; changes no word of a summary, so not in the cache key.
     pub catchup_unknown_terms_log: bool,
+    /// Private lookup log: append one JSONL record per WTF lookup under
+    /// `<state>/wtf-lookups/` (`0700`/`0600`, one file per UTC day, size and age
+    /// capped). `#2232 vibe-talk-wtf-lookup-log-and-replay`. Default on; changes
+    /// no word of a summary, so not in the cache key.
+    pub wtf_lookup_log: bool,
+    /// Operator switch: honour `?probe=retrieval|full` on the glossary lookup
+    /// route, which skips the learned-entry short-circuit, never saves an entry
+    /// and returns the lookup's diagnostics (`#2232`). Default off; set it only on
+    /// a local test server that `vibe-talk wtf-replay` drives.
+    pub wtf_probe: bool,
     /// A direct Messages API summariser, when `[summaries.llm]` is present. `#233 llm-summarizer`.
     ///
     /// When present it is THE summariser, and it is also the one that names threads; see
@@ -846,6 +856,8 @@ impl Default for SummariesConfig {
             catchup_glossaries: Vec::new(),
             catchup_warmup_max_chars: DEFAULT_CATCHUP_WARMUP_MAX_CHARS,
             catchup_unknown_terms_log: false,
+            wtf_lookup_log: true,
+            wtf_probe: false,
             llm: None,
         }
     }
@@ -2289,6 +2301,8 @@ struct FileSummaries {
     catchup_glossaries: Option<Vec<FileChannelGlossary>>,
     catchup_warmup_max_chars: Option<usize>,
     catchup_unknown_terms_log: Option<bool>,
+    wtf_lookup_log: Option<bool>,
+    wtf_probe: Option<bool>,
     llm: Option<FileLlm>,
 }
 
@@ -3605,6 +3619,8 @@ fn summaries_config(
         catchup_unknown_terms_log: file
             .catchup_unknown_terms_log
             .unwrap_or(defaults.catchup_unknown_terms_log),
+        wtf_lookup_log: file.wtf_lookup_log.unwrap_or(defaults.wtf_lookup_log),
+        wtf_probe: file.wtf_probe.unwrap_or(defaults.wtf_probe),
         llm,
     };
     for (index, rule) in summaries.catchup_glossaries.iter().enumerate() {
