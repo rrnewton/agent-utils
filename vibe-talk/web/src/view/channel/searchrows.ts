@@ -535,7 +535,26 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
     );
   }
 
+  /** The last settled pass's input fingerprint, live only for its task. */
+  let settledStamp: { key: string; live: boolean } | null = null;
+
   function applySearch(): void {
+    // `#2200`: a settled pass whose every input is unchanged since a pass
+    // earlier in the SAME task is not run again. Place-keeping after a
+    // settled pass takes the reader to the newest, whose jump-clearing
+    // redraw runs this pass a second time back-to-back (over every row);
+    // nothing it reads can have moved within the task, and any later
+    // pass — a new task, after a redraw or an arrival — always runs.
+    const stampKey = [
+      deps.searchKey(), deps.viewKey(), deps.side(), String(deps.selectedChannelId()),
+      deps.selectionView(), deps.pinsOnly(), entireThreadsOn, searchField.marked(),
+      deps.bucketOn ? ["main", "threads", "transcripts", "thread"].map((id) => String(deps.bucketOn!(id))).join() : "",
+      deps.heldMessages().length,
+    ].join("|");
+    if (settledStamp && settledStamp.live && settledStamp.key === stampKey) return;
+    const stamp = { key: stampKey, live: true };
+    settledStamp = stamp;
+    queueMicrotask(() => { stamp.live = false; });
     deps.applyReadRuns();
     const node = searchField.open() ? searchParsed(searchField.query()).node : null;
     // `#1825`: matching sees the group-expanded query; identity/terms stay raw.
