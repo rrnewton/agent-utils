@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import re
 import subprocess
 from collections.abc import Callable
@@ -27,6 +28,7 @@ from agentctl.subagents import (
 )
 import agentctl.legacy_cli as cli
 import agentctl.codex_goal as native_goal
+import agentctl.subagents as subagents_module
 
 
 #: Muse's plugin-hooks trust dialog, as the installed Muse draws it (#1932).
@@ -435,8 +437,34 @@ class FakeManagedClient:
             self.submitted.append(self.transcripts[pane_id][-1])
 
 
+def own_process_tree() -> list[int]:
+    """This test process and its descendants. The live-holder scan reads the
+    real /proc, and a fake's short session id ("session-1") can match any
+    same-uid process on a shared host; a test's holders are its own children,
+    so the scan sees only those."""
+    parents: dict[int, int] = {}
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            stat = Path(f"/proc/{name}/stat").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        parents[int(name)] = int(stat[stat.rindex(")") + 2:].split()[1])
+    tree = {os.getpid()}
+    grew = True
+    while grew:
+        grew = False
+        for pid, parent in parents.items():
+            if parent in tree and pid not in tree:
+                tree.add(pid)
+                grew = True
+    return sorted(tree)
+
+
 def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[ManagedAgents, FakeManagedClient]:
     monkeypatch.delenv("HERDR_WORKSPACE_ID", raising=False)
+    monkeypatch.setattr(subagents_module, "_proc_pids", own_process_tree)
     fake = FakeManagedClient()
     def goal(_session: str, _command: object = None) -> dict[str, object] | None:
         objectives = [text[6:] for text in fake.submitted if text.startswith("/goal ")]

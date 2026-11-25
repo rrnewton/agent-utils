@@ -1603,7 +1603,13 @@ def _acquire_flock_bounded(descriptor: int, *, deadline: float | None,
     """As :func:`_acquire_flock`, but give up at `deadline` (a monotonic
     time) instead of blocking in the kernel indefinitely: a send waits
     no longer than its deadline for a lock (#2036
-    agentctl-send-timeout-inotify-wait)."""
+    agentctl-send-timeout-inotify-wait).
+
+    With no deadline there is nothing to give up at, so the wait is the
+    kernel's blocking flock, which wakes the moment the holder releases:
+    no polling, and a hook on the blocking call sees it as before."""
+    if deadline is None:
+        return _acquire_flock(descriptor)
     key = _flock_key(descriptor)
     with _HELD_FLOCKS_GUARD:
         if key in _HELD_FLOCKS:
@@ -1614,7 +1620,7 @@ def _acquire_flock_bounded(descriptor: int, *, deadline: float | None,
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             break
         except BlockingIOError:
-            if deadline is not None and monotonic() >= deadline:
+            if monotonic() >= deadline:
                 raise AgentDeliveryError(
                     f"send gave up at its deadline waiting to lock {purpose}; "
                     "the queued item (if any) is intact and was not duplicated: "

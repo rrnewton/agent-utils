@@ -2460,6 +2460,13 @@ class _WorkspaceClient:
         return self.client.read(pane_id, source=source, lines=lines)
 
 
+def _proc_pids() -> list[int]:
+    """Every process id /proc lists: the processes the live-holder scan
+    inspects. One function, so a test can hand the scan its own process
+    tree instead of every same-uid process on a shared host."""
+    return [int(name) for name in os.listdir("/proc") if name.isdigit()]
+
+
 class ManagedAgents:
     """Registry-backed API for a coordinator's visible foreign-harness workers."""
 
@@ -3165,12 +3172,11 @@ class ManagedAgents:
         needle = session.encode()
         uid = os.getuid()
         try:
-            pids = [name for name in os.listdir("/proc") if name.isdigit()]
+            pids = _proc_pids()
         except OSError:
             return ("cannot scan /proc for a live holder of the recorded session; "
                     "refusing (fail closed) — remedy: retry where /proc is readable")
-        for pid_text in pids:
-            pid = int(pid_text)
+        for pid in pids:
             if pid == os.getpid():
                 continue
             base = f"/proc/{pid}"

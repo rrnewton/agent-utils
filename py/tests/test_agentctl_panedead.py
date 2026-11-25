@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import signal
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -9,7 +13,8 @@ import pytest
 from agentctl.errors import AgentDeliveryError, HerdrUnavailable
 from agentctl.subagents import ManagedAgents
 from .test_agentctl_lifecycle import prepare_revive
-from .test_herdr_subagents import FakeManagedClient, setup
+import agentctl.subagents as subagents_module
+from .test_herdr_subagents import FakeManagedClient, own_process_tree, setup
 
 OLD_BOOT = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 
@@ -56,6 +61,43 @@ def test_retire_previous_boot_missing_pane_stale_agent_archives(
     assert result["retired_dead_native"] is True
     assert not (manager._directory("worker") / "agent.json").exists()
 
+
+
+def test_retire_ignores_a_session_holder_outside_this_test_process_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A same-uid process elsewhere on a shared host whose argv carries the
+    # fake's short session id must not decide this test (two gate reds, 11-25).
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path))
+    record = manager.get("worker")
+    assert record.pane_id is not None and record.harness_anchor is not None
+    object.__setattr__(record.harness_anchor, "boot_id", OLD_BOOT)
+    manager._save(record)
+    session = record.native_session["value"] if record.native_session else record.session_value
+    assert isinstance(session, str) and len(session) < 16
+    # Double fork: the holder is reparented away, outside this process tree.
+    launcher = subprocess.run(
+        [sys.executable, "-c",
+         "import subprocess, sys; print(subprocess.Popen([sys.executable, '-c', "
+         "'import time; time.sleep(600)', sys.argv[1]], "
+         "start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+         "stderr=subprocess.DEVNULL).pid)", session],
+        capture_output=True, text=True, check=True,
+    )
+    stranger = int(launcher.stdout)
+    try:
+        assert stranger not in own_process_tree()
+        # The unrestricted scan does see it, so the fixture is what keeps it out.
+        monkeypatch.setattr(subagents_module, "_proc_pids",
+                            lambda: [int(name) for name in os.listdir("/proc") if name.isdigit()])
+        assert ManagedAgents._live_session_holder_refusal(manager.get("worker")) is not None
+        monkeypatch.setattr(subagents_module, "_proc_pids", own_process_tree)
+        _make_pane_gone(fake, record.pane_id, monkeypatch)
+        result = _retire(manager)
+        assert result["retired_dead_native"] is True
+    finally:
+        os.kill(stranger, signal.SIGKILL)
 
 def test_retire_same_boot_missing_pane_refuses_with_remedy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,

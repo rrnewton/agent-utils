@@ -816,11 +816,12 @@ def test_send_inspects_terminal_artifact_when_another_drain_consumed_its_id(
         message_id: str | None,
         serialize: bool,
         max_artifact_bytes: int | None = None,
+        deadline_end: float | None = None,
     ) -> str:
         del message_id, serialize
         identifier = original_enqueue(
             root, text, message_id="cross-drained", serialize=True,
-            max_artifact_bytes=max_artifact_bytes,
+            max_artifact_bytes=max_artifact_bytes, deadline_end=deadline_end,
         )
         source = tmp_path / "inbox/cross-drained.json"
         document = json.loads(source.read_text())
