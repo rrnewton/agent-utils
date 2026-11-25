@@ -5408,6 +5408,70 @@ def _act_search_settled_no_chip(driver: Driver) -> None:
     })
 
 
+# `#2256 vibe-talk-search-head-room-no-shift` (owner 370). The search's first key with the reader at
+# the newest line, traced on every frame until the server's answer stands: the chip panel's head room
+# is decided at the key and the server's line lands below the newest row, which keeps its top. The frame before the key
+# (`.before-key.png`) and the trace (`.anchor.json`: the row's text, its top at the key and at
+# every frame after) sit beside the shot.
+HEAD_ROOM_WORD = "seeded"
+
+HEAD_ROOM_TRACE_JS = """async (value) => {
+  const area = document.getElementById('scroll-area');
+  const main = document.getElementById('screen-main');
+  const field = document.getElementById('search-field');
+  // The row being read, measured BEFORE the key: the key's own pass may not move it either.
+  const box = area.getBoundingClientRect();
+  const row = [...document.querySelectorAll('#discord-log > li[data-id]')].reverse()
+    .find((one) => one.getClientRects().length && one.getBoundingClientRect().top < box.bottom);
+  const at = row ? row.getBoundingClientRect().top : null;
+  field.value = value;
+  field.dispatchEvent(new Event('input', { bubbles: true }));
+  const keyTop = row && row.getClientRects().length ? row.getBoundingClientRect().top : null;
+  const atKey = { id: row ? row.getAttribute('data-id') : null, top: at === null ? null : Math.round(at * 10) / 10,
+    dyAtKey: keyTop === null || at === null ? null : Math.round((keyTop - at) * 10) / 10,
+    text: row ? (row.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 120) : null,
+    head: main.hasAttribute('data-bucket-head'), scrollTop: area.scrollTop };
+  const settled = () => /Server search details|No more hits/.test(document.getElementById('server-line').textContent)
+    && !document.getElementById('search-bucket-row').hidden;
+  const frames = []; let after = 0; let n = 0;
+  while (n < 6000 && after < 10) {
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+    n += 1;
+    const now = row && row.isConnected && row.getClientRects().length ? row.getBoundingClientRect().top : null;
+    frames.push({ frame: n, dy: now === null || at === null ? null : Math.round((now - at) * 10) / 10,
+      head: main.hasAttribute('data-bucket-head'), chips: !document.getElementById('search-bucket-row').hidden,
+      scrollTop: Math.round(area.scrollTop) });
+    if (settled()) after += 1;
+  }
+  const moved = frames.filter((f) => f.dy === null || Math.abs(f.dy) > 1).length +
+    (atKey.dyAtKey === null || Math.abs(atKey.dyAtKey) > 1 ? 1 : 0);
+  const record = { atKey, frames, moved, headFlips: frames.filter((f) => f.head !== atKey.head).length, settled: settled() };
+  window.__headRoomTrace = record;
+  return record;
+}"""
+
+
+def _act_search_head_room_first_key(driver: Driver) -> None:
+    """`#2256`: the first key of a search with the reader at the newest line, traced through the answer:
+    the server's line appearing at the foot lands below the newest row, which keeps its top."""
+    _act_open_channel(driver)
+    driver.click("search-toggle")
+    driver.page.wait_for_function("() => window.__visible('search-field')", timeout=5_000)
+    # The reader at the newest line, where a channel opens: the newest row on screen is the one read.
+    driver.js("(() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; })()")
+    driver.page.wait_for_function(
+        "() => { const a = document.getElementById('scroll-area'); return a.scrollHeight - a.scrollTop - a.clientHeight <= 1; }",
+        timeout=5_000)
+    driver.settle(300)
+    driver.page.screenshot(
+        path=str(driver.out_dir / f"{driver.theme}--{driver.profile.name}--123-search-head-room-first-key.before-key.png"))
+    record = driver.page.evaluate(HEAD_ROOM_TRACE_JS, HEAD_ROOM_WORD)
+    _search_sidecar(driver, "123-search-head-room-first-key", {
+        "moment": f"the search's first key ({HEAD_ROOM_WORD!r}) with the reader at the newest line, every frame until the answer stood",
+        **cast(dict[str, object], record),
+    })
+
+
 def _act_discuss_preview(driver: Driver) -> None:
     _open_discuss(driver)
 
@@ -9872,6 +9936,23 @@ SCENES: tuple[Scene, ...] = (
             ("no error banner is up", "!window.__visible('error-wrap')"),
         ),
     ),
+    Scene(
+        name="123-search-head-room-first-key",
+        what="#2256 a search's first key at the newest line, traced through the answer: the head room is decided "
+             "at the key and the newest row keeps its top while the server line lands below it",
+        act=_act_search_head_room_first_key,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            ("the chips stand for the answer", "!document.getElementById('search-bucket-row').hidden"),
+            ("#2256 the head room stood from the key on",
+             "!!window.__headRoomTrace && window.__headRoomTrace.atKey.head === true && window.__headRoomTrace.headFlips === 0"),
+            ("#2256 the newest row kept its top across the key and through the settled answer",
+             "!!window.__headRoomTrace && window.__headRoomTrace.settled && window.__headRoomTrace.atKey.top !== null"
+             " && window.__headRoomTrace.moved === 0"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
     # LAST IN THE WALK, and not by accident: it empties the server's durable store on the way in,
     # so that the summary the state above cached is really regenerated and can really fail. Nothing
     # after it in this profile would miss what it deletes, and the next profile purges anyway.
@@ -10382,7 +10463,7 @@ def run_captures(
     # 91/92, so they skip with them on a cacheless server instead of failing alone.
     discuss_scenes = [s for s in scenes if s.name.startswith(("73-", "74-", "75-", "76-", "78-", "84-", "85-", "89-", "90-", "91-", "92-", "93-", "94-", "95-", "96-", "97-", "98-", "99-", "100-", "101-", "102-", "103-",
                                                                         "107-", "108-", "109-", "110-", "111-", "112-", "113-", "114-", "115-", "116-", "117-",
-                                                                        "120-", "121-"))]
+                                                                        "120-", "121-", "123-"))]
     discuss_only = bool(wanted) and len(wanted) == len(discuss_scenes)
     if discuss_scenes and not seed_discuss_cache(60 if discuss_only else 10):
         if discuss_only:
