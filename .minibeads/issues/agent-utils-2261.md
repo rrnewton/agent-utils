@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-summary-link-back-race: Back after a summary-link jump returns the row to its pre-jump top on phone (capture the race, then fix it)'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -8,7 +8,8 @@ labels:
 - flake
 - owner-ui
 created_at: 2026-11-25T16:12:00-05:00
-updated_at: 2026-11-25T16:17:00-05:00
+updated_at: 2026-11-25T18:48:00-05:00
+closed_at: 2026-11-25T18:48:00-05:00
 ---
 
 # Description
@@ -67,3 +68,7 @@ The step-1 trace (7e4f4090) caught the race on the 27th plain solo run of the st
 - With the list at 39, under the older-page trigger (80 px), an older page loads and holds the top row, so the main row stays 1074 px away for good.
 
 So Back did not end the landing it undid. The window runs from a landing until its first re-assert frame, and stays open for up to 30 frames while the layout still moves (for example the phone sheet settling). It is wider on a loaded host. The bug is in the page, not the tree, so it showed up on unrelated heads.
+
+## Resolution
+
+Step 1 (diagnostics) landed as ec77a953: on a timeout of the Back wait the test dumps the row top, scroll state, history.state and a per-frame Back trace with every list write and its stack. The captured failure named the race: the citation landing queues a per-frame re-assert for the next frame; when Back is handled in that same frame, Back restores the row and the landing's re-assert then scrolls back to the reply, undoing Back (an older-page load then holds the wrong spot). The fix landed as 2277a9e3 (Back ends the landing it undoes and drops the jump anchor on the row left) on a green owner gate on the same tree (08517651, 2026-11-25 6:28 PM ET). Evidence: a race-window probe that forces Back into the landing's frame fails every hit on main (4 of 4; 1074 px desk, 1389 px phone) and holds every hit on the fix (14 of 14); the committed step passed 20/20 solo with a per-frame Back check within 0.5 px (max drift 0.19 px); a fake-rAF module test and a navigation test fail with the fix removed. Load note: the 20 solo passes ran at load1 92-126 (29-40% of 316 threads), NOT at the >= 75% hot level this issue's acceptance named; a 20x rerun at load1 >= 237 is a follow-up. Deployed the same evening; the 15-minute post-deploy watch was clean. Follow-up: #2270 (the Linked message bubble stays on the reply row after Back).
