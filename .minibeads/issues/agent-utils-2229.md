@@ -1,13 +1,14 @@
 ---
 title: 'bookmark-chip-clear-popover: press and hold the Bookmark chip to clear the bookmark'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - vibe-talk
 - owner-ui
 created_at: 2026-11-25T02:14:00-05:00
-updated_at: 2026-11-25T02:14:00-05:00
+updated_at: 2026-11-25T11:16:07-05:00
+closed_at: 2026-11-25T16:16:07.000000000+00:00
 ---
 
 # Description
@@ -29,3 +30,7 @@ Press-and-hold on the chip (threshold matching the row hold, cancelled by moveme
 # Notes
 
 Owner UI request (fast-track). Prior work: the existing clear path and Undo, the jump-to-unread chip beside it, the row hold gesture, and the existing popover placement helpers. Overlap to clear with the coordinator before editing: the search-tabs lane and the saved-chip lane both touch the chips stylesheet.
+
+## Resolution
+
+Landed on main as 31856746 (gated as fad0df47, owner gate green 2026-11-25 10:54 AM ET with no failed steps), deployed 11:00 AM ET 11-25, and the 15-minute deploy watch came back clean (11:00 to 11:15 AM ET: no errors, no restarts). A press and hold on the Bookmark chip (450 ms; a press that travels 12px or more is a scroll, not a hold), a right-click, or the context-menu key on the focused chip opens one popover with "Clear bookmark". The popover sits above the chip, clear of a standing status line, and stays inside the viewport when the keyboard opens. Choosing it calls the existing bookmark removal, so the server write, the redraw and the Undo chip are the same as the line's X. A tap or click still jumps. The hold suppresses the click behind it and selects nothing. Escape, an outside press, or the chip going away closes the popover, and Escape returns focus to the chip. The bookmark line's X keeps its glyph and now has a 44px hit area. Checked with real input on a local server, phone and desktop, light and dark: tap, hold, travelled press, Escape, outside press, Clear (DELETE) and Undo (PUT), right-click, keyboard open and Clear. A screenshot-harness follow-up for scene 48b is #2246.
