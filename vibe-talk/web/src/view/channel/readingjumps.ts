@@ -6,6 +6,32 @@ import { createListening, nodeWithin } from "../dom/index.ts";
 
 /** How long a press on the Bookmark chip is held before it offers Clear, in milliseconds (the row hold's). */
 const BOOKMARK_HOLD_MS = 450;
+
+/**
+ * The popover's top (viewport coordinates): above the chip, clear of a standing status line
+ * (`#status-line`) where that leaves room, below the chip where above cannot fit, and above the
+ * chip again (over the status) where neither clear place fits, so the chip and the popover stay
+ * fully visible either way. Pure, so the arithmetic can be unit-checked without a DOM.
+ */
+export function bookmarkPopoverTop(
+  chipTop: number,
+  chipBottom: number,
+  height: number,
+  viewHeight: number,
+  toast: { top: number; bottom: number } | null,
+): number {
+  const gap = 8;
+  const above = chipTop - height - gap;
+  if (toast && above < toast.bottom && above + height > toast.top) {
+    const aboveToast = toast.top - height - gap;
+    if (aboveToast >= gap) return aboveToast;
+    const below = chipBottom + gap;
+    if (below + height <= viewHeight - gap) return below;
+    return Math.max(gap, above);
+  }
+  if (above < gap) return Math.min(chipBottom + gap, Math.max(gap, viewHeight - height - gap));
+  return above;
+}
 /** How far a press may travel before it is a scroll or swipe, not a hold, in CSS pixels. */
 const BOOKMARK_HOLD_SLOP_PX = 12;
 
@@ -62,8 +88,16 @@ export function mountReadingJumps(deps: ReadingJumpsDependencies): ReadingJumps 
       const width = popBox.width;
       const height = popBox.height || 52;
       const left = Math.min(Math.max(chipBox.left, gap), Math.max(gap, viewWidth - width - gap));
-      let top = chipBox.top - height - gap;
-      if (top < gap) top = Math.min(chipBox.bottom + gap, Math.max(gap, viewHeight - height - gap));
+      // Clear of a standing status line where it overlaps, never dismissing it.
+      let toast: { top: number; bottom: number } | null = null;
+      const status = deps.lookup("status-line");
+      if (status && !status.hidden && typeof status.getBoundingClientRect === "function") {
+        const statusBox = status.getBoundingClientRect();
+        if (statusBox.height && left < statusBox.right && left + width > statusBox.left) {
+          toast = { top: statusBox.top, bottom: statusBox.bottom };
+        }
+      }
+      const top = bookmarkPopoverTop(chipBox.top, chipBox.bottom, height, viewHeight, toast);
       popover.style.left = `${Math.round(left)}px`;
       popover.style.top = `${Math.round(top)}px`;
     } catch {

@@ -3714,14 +3714,14 @@ def _hold_bookmark_chip(driver: Driver) -> None:
 def _act_bookmark_clear_popover(driver: Driver) -> None:
     """`#2229 bookmark-chip-clear-popover`: the chip held, its Clear popover above it."""
     # Re-setting the bookmark the previous scene left would toggle it away; only set it when absent.
-    if not bool(driver.js("window.__visible('jump-bookmark')")):
+    if not bool(driver.js("(typeof window.__visible === 'function' && window.__visible('jump-bookmark'))")):
         _act_bookmark_chip(driver)
     _hold_bookmark_chip(driver)
 
 
 def _act_bookmark_cleared(driver: Driver) -> None:
     """`#2229 bookmark-chip-clear-popover`: Clear chosen from the hold popover; the Undo chip stands."""
-    if not bool(driver.js("window.__visible('jump-bookmark')")):
+    if not bool(driver.js("(typeof window.__visible === 'function' && window.__visible('jump-bookmark'))")):
         _act_bookmark_chip(driver)
     _hold_bookmark_chip(driver)
     driver.click("bookmark-clear-button")
