@@ -467,6 +467,9 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     for (const li of items) {
       if (li.getAttribute("data-read-run") === "member") continue;
       if ((li as HTMLElement).hidden) continue;
+      // `#2257`: a row a search hides has no box either (its class, read without a layout read);
+      // measured, its zero bottom would break the search's order and pick a hidden anchor.
+      if (/(^|\s)search-hidden(\s|$)/.test(li.getAttribute("class") || "")) continue;
       drawn.push(li);
     }
     let lo = 0;

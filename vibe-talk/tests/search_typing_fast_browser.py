@@ -24,7 +24,10 @@ phone and desktop sizes:
   `#2256`: the chip panel's head room is decided at the key, in the same pass as the key's own
   filter: a mid-list reader and a reader at the foot keep the row being read at its top from the
   first key through the settled answer (the server line at the foot lands below the newest row),
-  and words with no loaded match drop the room inside the input event, never later.
+  and words with no loaded match drop the room inside the input event, never later;
+  `#2257`: a reader mid-list keeps the row being read across the fast pass and through the settled
+  answer, whether that row still matches (it keeps its top) or is hidden (the next standing row below
+  takes its place).
 
 The gate is a count of synchronous work per input event, never a wall-clock budget (owner
 rule 346); every wait is a condition wait. Pass --screenshots DIR to keep a PNG of each stage.
@@ -435,6 +438,72 @@ def head_room_walk(walk: Walk) -> None:
     seen = page.evaluate(HEAD_KEY_JS, ["zzqv", None])
     walk.check(seen["atKey"]["head"] is False and seen["headFlips"] == 0 and seen["settled"],
                f"release: the head room did not go with the key, or came back before the settle: {seen}")
+    fast_pass_walk(walk)
+
+
+# `#2257`: the row being read, parked just under the floating search panel, then one key and every
+# frame until the answer has settled: the kept row's message (its meta line) against the anchor's
+# message before the key.
+FAST_PARK_JS = """(note) => {
+    const area = document.getElementById('scroll-area');
+    let clear = area.getBoundingClientRect().top;
+    for (const id of ['channel-freshness', 'search-float']) {
+        const node = document.getElementById(id);
+        if (node && !node.hidden) { const box = node.getBoundingClientRect(); if (box.height > 0) clear = Math.max(clear, box.bottom); }
+    }
+    const row = [...document.querySelectorAll('#discord-log > li[data-id]')]
+        .find((one) => one.getClientRects().length && (one.textContent || '').includes(`Routine lane note ${note},`));
+    area.scrollTop += row.getBoundingClientRect().top - clear - 2;
+    return row.getAttribute('data-id');
+}"""
+
+FAST_KEY_JS = """async ([value, anchorId, keptNote]) => {
+    const meta = (row) => (row.querySelector(':scope > .meta') || row).getBoundingClientRect().top;
+    const anchor = document.querySelector(`#discord-log > li[data-id="${anchorId}"]`);
+    const kept = [...document.querySelectorAll('#discord-log > li[data-id]')]
+        .find((one) => (one.textContent || '').includes(`Routine lane note ${keptNote},`));
+    const before = meta(anchor);
+    const field = document.getElementById('search-field');
+    field.value = value;
+    field.dispatchEvent(new Event('input', { bubbles: true }));
+    const settled = () => /Server search details|No more hits/.test(document.getElementById('server-line').textContent);
+    let worst = kept.getClientRects().length ? Math.abs(meta(kept) - before) : Infinity;
+    const atKey = worst;
+    let frames = 0; let after = 0;
+    while (frames < 6000 && after < 10) {
+        await new Promise((resolve) => requestAnimationFrame(resolve));
+        frames += 1;
+        worst = Math.max(worst, kept.getClientRects().length ? Math.abs(meta(kept) - before) : Infinity);
+        if (settled()) after += 1;
+    }
+    return { atKey: Math.round(atKey * 10) / 10, worst: Math.round(worst * 10) / 10, frames, settled: settled() };
+}"""
+
+
+def fast_pass_walk(walk: Walk) -> None:
+    """`#2257 vibe-talk-search-fast-pass-holds-reader`: a reader mid-list in this 800-plus-row channel
+    (the fast pass runs inside the input event here) keeps the row being read across the key and
+    through the settled answer.
+
+    The row still matches: it keeps its top. The row is hidden by the new words: the nearest standing
+    row below it takes its place. (Every frame within a pixel, measured by the message's meta line.)
+    """
+    page = walk.page
+
+    def clear() -> None:
+        page.evaluate("""() => { const f = document.getElementById('search-field'); f.value = '';
+            f.dispatchEvent(new Event('input', { bubbles: true })); }""")
+        walk.until("() => document.getElementById('search-count').textContent === ''", "the cleared search kept its count")
+
+    for case, note, value, kept_note in (("the row being read still matches", 400, "routine", 400),
+                                         ("the row being read is hidden: the next standing row takes its place", 405, "example.test", 410)):
+        clear()
+        anchor = page.evaluate(FAST_PARK_JS, note)
+        page.wait_for_function("() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(true))))")
+        seen = page.evaluate(FAST_KEY_JS, [value, anchor, kept_note])
+        walk.check(seen["settled"] and seen["worst"] <= 1,
+                   f"{case}: the row moved {seen['worst']} px between the key and the settled answer "
+                   f"({seen['atKey']} px at the key): {seen}")
 
 
 def main() -> int:

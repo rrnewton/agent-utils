@@ -103,6 +103,10 @@ export interface SearchRowsDependencies {
   setSearched(count: SearchCount): void;
   searchWalkHeld(): boolean;
   preservingScroll(fn: () => void): void;
+  /** `#2257`: move the list by `delta` through the scroll owner (its own write). Optional for doubles. */
+  nudge?(area: HTMLElement, delta: number): void;
+  /** `#2257`: the viewport y the floating search panel covers down to (the filter keeper's head). */
+  floatingClearance?(area: Element): number;
   /** `#2200`: bring a row into view through the scroll owner (`#1251`), so an
    * opened run's first row lands fully below the chip panel. Optional for doubles. */
   intoView?(element: Element, block: string): void;
@@ -452,6 +456,54 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
   }
 
   /**
+   * `#2257 vibe-talk-search-fast-pass-holds-reader` (owner 370): the row being read as the fast
+   * pass starts: the first drawn row of the list on screen reaching below the floating search panel,
+   * found by a binary search over the rows that stand (the search-hidden ones are skipped by their
+   * class, never measured), so a capture costs O(log n) layout reads however long the channel is.
+   * Null at the very top of the list (nothing above to hide), off the main screen, or where nothing
+   * lays out.
+   */
+  function fastPassAnchor(): { row: Element; top: number; area: HTMLElement } | null {
+    if (deps.side() || deps.screen() !== "main" || deps.view() !== "discord" || !deps.nudge) return null;
+    const area = el("scroll-area") as HTMLElement;
+    const list = deps.visibleList();
+    if (!list || !(area.scrollTop > 0) || typeof area.getBoundingClientRect !== "function") return null;
+    // The same head the filter's place-keeper measures from (`filterAnchor`): the first row reaching
+    // below the floating search panel, so the settled pass keeps the row this pass kept.
+    const edge = deps.floatingClearance ? deps.floatingClearance(area) : area.getBoundingClientRect().top;
+    const standing: Element[] = [];
+    for (const row of list.children) {
+      if ((row as HTMLElement).hidden || row.getAttribute("data-read-run") === "member") continue;
+      if (classWords(row as SearchRow).includes("search-hidden")) continue;
+      standing.push(row);
+    }
+    let lo = 0;
+    let hi = standing.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if ((standing[mid] as HTMLElement).getBoundingClientRect().bottom > edge) hi = mid;
+      else lo = mid + 1;
+    }
+    const row = standing[lo];
+    return row ? { row, top: row.getBoundingClientRect().top, area } : null;
+  }
+
+  /**
+   * `#2257`: put the row being read back at its top after the fast pass's visibility writes. Still
+   * standing, it keeps its top (dy 0). Hidden by the new words, the nearest standing row at or below
+   * it takes its place, or above it where none stands below. One or two layout reads.
+   */
+  function keepFastPassAnchor(hold: { row: Element; top: number; area: HTMLElement }): void {
+    const stands = (row: Element | null): boolean => Boolean(row) && !(row as HTMLElement).hidden &&
+      (row as Element).getAttribute("data-read-run") !== "member" && !classWords(row as SearchRow).includes("search-hidden");
+    let kept: Element | null = stands(hold.row) ? hold.row : null;
+    for (let next = hold.row.nextElementSibling; !kept && next; next = next.nextElementSibling) if (stands(next)) kept = next;
+    for (let prev = hold.row.previousElementSibling; !kept && prev; prev = prev.previousElementSibling) if (stands(prev)) kept = prev;
+    if (!kept || !deps.nudge) return;
+    deps.nudge(hold.area, kept.getBoundingClientRect().top - hold.top);
+  }
+
+  /**
    * `#1913 vibe-talk-search-typing-lag`: the pass that runs inside the input event. It only
    * toggles each row's `search-hidden` word from the row's cached folded text (substring checks,
    * no message re-read, no link/thread scan, no seam draw, no layout read). Everything slower —
@@ -462,6 +514,7 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
    * threads) is shown through here and settled exactly by that full pass moments later.
    */
   function applySearchFast(): void {
+    const hold = fastPassAnchor();
     const node = searchField.open() ? searchParsed(searchField.query()).node : null;
     const typed = node !== null;
     const links = searchField.open() && searchField.links();
@@ -494,6 +547,8 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
         if (hit) standing += 1;
       }
     }
+    // `#2257`: the row being read keeps its top across the visibility writes above it.
+    if (hold) keepFastPassAnchor(hold);
     // `#1913`: retire the previous query's bucket chips at once (O(1)); the server ask and
     // its counts stay debounced with the full pass — no fetch, no recompute leaves this event.
     // `#2256`: the rows it stood decide the chip panel's head room in this same event.
