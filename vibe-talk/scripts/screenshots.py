@@ -3732,6 +3732,22 @@ def _act_bookmark_cleared(driver: Driver) -> None:
     driver.settle(300)
 
 
+def _act_bookmark_popover_keyboard_open(driver: Driver) -> None:
+    """`#2229 bookmark-chip-clear-popover`: the popover open as the keyboard opens under it."""
+    _act_bookmark_clear_popover(driver)
+    shrink_keyboard(driver, "48e-bookmark-popover-keyboard-open")
+    driver.settle(300)
+
+
+def _act_no_bookmark_stack(driver: Driver) -> None:
+    """`#2229 bookmark-chip-clear-popover`: cleared, the Undo chip gone too: no Bookmark chip stands."""
+    _act_bookmark_cleared(driver)
+    driver.page.wait_for_function(
+        "() => !window.__visible('undo-bookmark')", timeout=20_000
+    )
+    driver.settle(300)
+
+
 def _act_settings_text_size(driver: Driver) -> None:
     """`#230 text-size-buttons`: the Text size group, a − and a + either side of its slider.
 
@@ -7357,6 +7373,46 @@ SCENES: tuple[Scene, ...] = (
             (
                 "no bookmark line is drawn",
                 "!document.querySelector('#discord-log .bookmark-line')",
+            ),
+            (
+                "nothing runs off the side of the screen",
+                "document.scrollingElement.scrollWidth <= innerWidth",
+            ),
+        ),
+    ),
+    Scene(
+        name="48d-no-bookmark-stack",
+        what="no bookmark held: the chip stack stands with Newest and no Bookmark chip, no Undo chip",
+        act=_act_no_bookmark_stack,
+        profiles=("android-412", "laptop-1280"),
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            ("the Bookmark chip is gone", "!window.__visible('jump-bookmark')"),
+            ("the Undo chip is gone", "!window.__visible('undo-bookmark')"),
+            ("no bookmark line is drawn", "!document.querySelector('#discord-log .bookmark-line')"),
+            (
+                "nothing runs off the side of the screen",
+                "document.scrollingElement.scrollWidth <= innerWidth",
+            ),
+        ),
+    ),
+    Scene(
+        name="48e-bookmark-popover-keyboard-open",
+        what="the Clear popover open with the keyboard open: above its chip, inside the shrunken viewport",
+        act=_act_bookmark_popover_keyboard_open,
+        profiles=("android-412",),
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            (
+                "the popover stands above the chip inside the visual viewport, clear of the status line",
+                "(() => { const p = document.getElementById('bookmark-clear-popover'); "
+                "const c = document.getElementById('jump-bookmark'); if (!p || !c) return false; "
+                "const b = p.getBoundingClientRect(); const chip = c.getBoundingClientRect(); "
+                "const vv = window.visualViewport ? window.visualViewport.height : innerHeight; "
+                "const s = document.getElementById('status-line'); "
+                "const sr = s && !s.hidden ? s.getBoundingClientRect() : null; "
+                "return b.bottom <= chip.top + 1 && b.top >= 0 && b.bottom <= vv "
+                "&& (!sr || !sr.height || b.bottom <= sr.top + 1 || b.top >= sr.bottom - 1); })()",
             ),
             (
                 "nothing runs off the side of the screen",
