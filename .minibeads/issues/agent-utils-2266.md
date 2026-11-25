@@ -10,7 +10,7 @@ labels:
 - reader
 - ui
 created_at: 2026-11-25T17:52:21-05:00
-updated_at: 2026-11-25T17:52:21-05:00
+updated_at: 2026-11-25T18:35:16-05:00
 ---
 
 # Description
@@ -21,13 +21,16 @@ This is the document reader's read-aloud navigator: the floating panel with two 
 
 # Design
 
-To be confirmed by the diagnosis and the liaison's review before code; the agreed shape is:
+Approved after diagnosis and liaison review (2026-11-25). Diagnosis summary: navigator and body taps sent a page block-model index that the cloud read path consumed as a server prepared-block index; the server cuts blocks into spoken pieces (one per table body row, long blocks into sentence pieces), so taps after any table or long block landed early on the default (cloud) voice, while device-voice taps and the segment-space arrows stayed exact. Reproduced on a local server (canary with a long paragraph and a table before the targets: section and body clicks lit the table on cloud, exact on device and on a no-trigger control). The one navigator browser test forced the device voice over short single-piece paragraphs with locator-centre taps, so it could not see this.
 
-- Sections row (top): real sections from the document's heading structure, numbered as headings (1, 2, 1.2, 2.3) and marked with the section sign. A click moves both the reader position and read-aloud to that section's start.
-- Chunks row (bottom): raw read-aloud chunks with no numbers. A click moves to that chunk reliably.
-- Step arrows: the fat arrows step by section (previous and next section); the thin arrows step by chunk (previous and next chunk). Labels, tooltips and accessible names say so.
-- Fixed panel size: cells stretch to fit and the panel's size never depends on the chunk count. On desktop the panel width is resizable and the panel can be dragged by a grab bar; the size and position persist per device.
-- In-document clicks: a click in the document body lands where clicked; the present offset is diagnosed and fixed.
+- One index space: every document position between reader and read-aloud owner is in page space (model block plus offset/piece within it). Mapping to server pieces happens only inside the owner, by element groups (the grouping position reporting already uses); no stored conversion. Out-of-range clamps; unaligned cuts fall back by server drawn element, never a silent restart at the top. Exact on both voices (device speech derives its list 1:1 from model texts).
+- Body taps resolve the tapped word by coordinates (caret from point; table taps resolve the row). While playing: jump there, no scroll, no whole-block centring. While paused: move the cued position and stay paused. With no read playing: set a read-start marker at the tapped line and do not speak (links and text selection keep working); Read starts at the marker. Every tap paints its feedback in the same frame. Same-document taps jump on the retained read (no fresh prepare, pause preserved).
+- Sections row (top): every real section from the heading tree as "§ 1.2 Title", flat in document order, no folding and no gap cells; the row scrolls when long. Titles truncated but visible on desktop; on phone, section numbers with the title on tooltip/long-press. Author numbers never duplicated. A document with no headings shows a single "§ Whole document".
+- Chunks row (bottom): unnumbered ticks for the current section's blocks, stretching to the fixed panel width (weight shares, 8 px minimum, then the row scrolls). Clicking a tick lands on that block.
+- Arrows: fat steps sections of the same heading tree the top row shows; thin steps visible chunks (one model block per press, every press changes the lit chunk). The position count for documents counts model blocks. Accessible names say section/chunk.
+- Fixed geometry: while a document read stands, both rows always render at fixed heights and the desktop panel width is the chosen width (default custom property), never content-sized; cell budgets derive from the chosen width. Desktop width is resizable by an edge drag and persisted per device beside the existing drag offset. On phone the docked strip replaces the bottom toolbar while a read stands (no overlap), full width, same fixed rows.
+- Rendering: cells built once per document (chunks per current section); position reports only move current/heard marking and scroll the current cell into view — no per-block rebuild, one delegated click listener, focus survives block boundaries.
+- Landing order: (A) the index fix alone with a cloud-voice canary test and the existing scrubber walks on both voices; (B) sections row, ticks, one section definition, no-rebuild rendering; (C) fixed geometry and resize; (D) body-tap modes and same-document jumps. Each step gated separately with dynamic local-server evidence. Deferred: client/server block-cut divergence classes beyond the aligned-cut mapping (fallback semantics preserved).
 
 Related work already landed: #2242 vibe-talk-documents-reader-toolbar (the reader controls docked in the bottom toolbar) and #2241 vibe-talk-document-load-502-readable (readable document load failures with Retry). Their commits and files are checked for overlap before any edit, as are the other reader-page changes in flight.
 
