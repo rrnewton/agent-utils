@@ -211,11 +211,13 @@ test("`#624 voice-page-modularity`: the chips stand on the channel's box where i
     "screen-main": box({ getBoundingClientRect: () => ({ bottom: 800 }) }),
     "scroll-tools": box({ getBoundingClientRect: () => ({ height: 40 }) }),
     "read-steer": box({ hidden: true }),
-    "frame-body": box({ style: { setProperty: (name, value) => props.set(name, value) } }),
+    "frame-body": box({}),
   };
+  // `#2277`: handed to the elements that read it (`writeGeometry`), never set on #frame-body.
   const chips = createChipsOverComposer({
     lookup: (id) => els[id], el: (id) => els[id], onChannel: () => true, rootFontPx: () => 16,
     root: () => ({ getAttribute: () => null }), placeReadSteer: () => { steered += 1; },
+    writeGeometry: (name, value) => props.set(name, value),
   });
   chips.placeChipsOverComposer();
   assert.equal(props.get("--composer-top"), "100px", "the box's top edge is 100px above the foot");
@@ -225,6 +227,53 @@ test("`#624 voice-page-modularity`: the chips stand on the channel's box where i
   els["scroll-area"].scrollTop = 0;
   chips.placeChipsOverComposer();
   assert.equal(props.get("--composer-top"), "0px", "a box below the screen leaves them at the foot");
+  // `#2277`: the measure reads and writes nothing; the stand writes only a change.
+  const writes = props.size;
+  props.clear();
+  els["scroll-area"].scrollTop = 1600;
+  assert.equal(chips.measureChipsTop(), 100, "the measure is the box's top edge above the foot");
+  assert.equal(props.size, 0, "the measure wrote");
+  chips.standChips(100);
+  assert.deepStrictEqual([...props], [["--composer-top", "100px"]]);
+  props.clear();
+  chips.standChips(100);
+  assert.equal(props.size, 0, "an unchanged stand wrote again");
+  assert.ok(writes > 0);
+});
+
+test("`#2277 vibe-talk-key-scroll-freezes-11-26`: the geometry is handed to every element that reads it, held ones only while the main screen shows, and never written twice unchanged", () => {
+  const { createGeometry, GEOMETRY_CONSUMERS, CHIPS_FOOT_CONSUMERS } = VIEW_DOM;
+  const written = [];
+  const nodes = new Map();
+  const node = (id) => {
+    if (!nodes.has(id)) {
+      const values = new Map();
+      nodes.set(id, { id, style: { getPropertyValue: (name) => values.get(name) || "", setProperty: (name, value) => { values.set(name, value); written.push(`${id} ${name} ${value}`); } } });
+    }
+    return nodes.get(id);
+  };
+  const state = { shown: true };
+  const geometry = createGeometry({ lookup: (id) => node(id), mainShown: () => state.shown });
+  // No element every row inherits from is ever written.
+  for (const [name, { live, held }] of Object.entries(GEOMETRY_CONSUMERS)) {
+    for (const id of [...live, ...held]) {
+      assert.ok(!["frame-body", "screens", "discord-log", "thread-list", "side-log"].includes(id), `${name} is written on ${id}, which rows inherit from`);
+    }
+  }
+  geometry.write("--scroll-tools-clearance", "calc(40px + 0.5rem)");
+  assert.deepStrictEqual(written.map((line) => line.split(" ")[0]), ["status-line", ...GEOMETRY_CONSUMERS["--scroll-tools-clearance"].held]);
+  written.length = 0;
+  geometry.write("--scroll-tools-clearance", "calc(40px + 0.5rem)");
+  assert.deepStrictEqual(written, [], "an unchanged value was written again");
+  state.shown = false;
+  geometry.write("--scroll-tools-clearance", "0px");
+  assert.deepStrictEqual(written, ["status-line --scroll-tools-clearance 0px"], "a held reader was written while another screen showed (#280)");
+  written.length = 0;
+  geometry.write("--composer-top", "12px");
+  assert.deepStrictEqual(written.map((line) => line.split(" ")[0]), [...CHIPS_FOOT_CONSUMERS]);
+  written.length = 0;
+  geometry.write("--keyboard-inset", "300px");
+  assert.deepStrictEqual(written, ["channel-composer --keyboard-inset 300px", "side-composer --keyboard-inset 300px"]);
 });
 
 test("`#624 voice-page-modularity`: undo stamps only rise, so two offers up at once always have an order", () => {
@@ -2650,4 +2699,83 @@ test("`#1251 scroll-single-owner`: the dom focus reveal is the owner's write onc
   focusMinimally(node);
   assert.deepStrictEqual(calls, [["focus", { preventScroll: true }], ["owner", true, "nearest", "nearest"]],
     "once handed in, the reveal is the owner's write and the node's own is not used");
+});
+
+test("`#2277 vibe-talk-key-scroll-freezes-11-26`: every var() of a geometry property sits in a rule for one of its readers, and each is registered not inherited", async () => {
+  const { readFileSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const { GEOMETRY_CONSUMERS, CHIPS_FOOT_CONSUMERS } = VIEW_DOM;
+  const styles = join(import.meta.dirname, "../../../web/styles");
+  const manifest = JSON.parse(readFileSync(join(styles, "voice.json"), "utf8"));
+  const css = manifest.parts.map((part) => readFileSync(join(styles, part), "utf8")).join("\n").replace(/\/\*[\s\S]*?\*\//g, " ");
+  const readers = new Map(Object.entries(GEOMETRY_CONSUMERS).map(([name, { live, held }]) => [name, new Set([...live, ...held])]));
+  readers.set("--chips-foot", new Set(CHIPS_FOOT_CONSUMERS));
+  // Registered, not inherited: written on its readers alone, a change restyles those few elements.
+  for (const name of readers.keys()) {
+    assert.match(css, new RegExp(`@property ${name} \\{[^}]*inherits:\\s*false`), `${name} is not registered as not inherited`);
+  }
+  /** A selector list split at its top-level commas. */
+  const split = (list) => {
+    const parts = [];
+    let depth = 0;
+    let start = 0;
+    for (let i = 0; i < list.length; i++) {
+      if (list[i] === "(") depth += 1;
+      else if (list[i] === ")") depth -= 1;
+      else if (list[i] === "," && depth === 0) { parts.push(list.slice(start, i)); start = i + 1; }
+    }
+    parts.push(list.slice(start));
+    return parts.map((one) => one.trim()).filter(Boolean);
+  };
+  /** The ids a selector's subject (its last compound, outside any parentheses) names. */
+  const subjectIds = (selector) => {
+    let depth = 0;
+    let cut = 0;
+    for (let i = 0; i < selector.length; i++) {
+      const ch = selector[i];
+      if (ch === "(") depth += 1;
+      else if (ch === ")") depth -= 1;
+      else if (depth === 0 && (ch === " " || ch === ">" || ch === "+" || ch === "~")) cut = i + 1;
+    }
+    let subject = selector.slice(cut);
+    // `:is(#a, #b)` / `:where(...)` as the subject: each alternative is a subject.
+    const is = /^:(?:is|where)\((.*)\)$/.exec(subject);
+    if (is) return split(is[1]).flatMap(subjectIds);
+    subject = subject.replace(/:(?:not|has)\([^)]*\)/g, "");
+    return [...subject.matchAll(/#([\w-]+)/g)].map((m) => m[1]);
+  };
+  // Walk the rules (at-rules' bodies included) and check each declaration that reads or sets a name.
+  const offenders = [];
+  let checked = 0;
+  const walk = (text) => {
+    let i = 0;
+    while (i < text.length) {
+      const open = text.indexOf("{", i);
+      if (open < 0) break;
+      const head = text.slice(i, open).trim();
+      let depth = 1;
+      let j = open + 1;
+      while (j < text.length && depth > 0) { if (text[j] === "{") depth += 1; else if (text[j] === "}") depth -= 1; j++; }
+      const body = text.slice(open + 1, j - 1);
+      if (head.startsWith("@media") || head.startsWith("@supports") || head.startsWith("@layer") || head.startsWith("@container")) walk(body);
+      else if (!head.startsWith("@")) {
+        for (const decl of body.split(";")) {
+          for (const [name, ids] of readers) {
+            const reads = decl.includes(`var(${name}`);
+            const sets = decl.trim().startsWith(`${name}:`);
+            if (!reads && !sets) continue;
+            checked += 1;
+            for (const selector of split(head)) {
+              const subjects = subjectIds(selector);
+              if (subjects.length === 0 || subjects.some((id) => !ids.has(id))) offenders.push(`${name} in "${selector}" (${subjects.join(", ") || "no id"})`);
+            }
+          }
+        }
+      }
+      i = j;
+    }
+  };
+  walk(css);
+  assert.ok(checked > 20, `the census read only ${checked} declarations: the walk is broken`);
+  assert.deepStrictEqual(offenders, [], "a rule reads or sets a geometry property on an element the page does not write it on");
 });

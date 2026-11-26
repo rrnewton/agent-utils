@@ -87,6 +87,13 @@ export interface ScrollKeepingDependencies {
    */
   composerHeld?(): Element | null;
   /**
+   * `#2277 vibe-talk-key-scroll-freezes-11-26`: while the keyboard has a box fitted, that
+   * composer's foot as the keyboard's jump brings it to the keyboard's top (its Send row
+   * included, the keyboard's room under it left out), so keeping the composer in view keeps the
+   * same foot the jump does; null otherwise, where the composer's whole box is kept. Absent: null.
+   */
+  composerFoot?(composer: Element): number | null;
+  /**
    * Whether Read is actively following (`#1856 vibe-talk-read-aloud-follow-not-yanked-up`):
    * a message is playing and not held. While it stands, a redraw is held on nothing: the
    * follow keeps the read sentence on screen, and restoring a pre-redraw anchor (or the
@@ -863,10 +870,13 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     // left the box, not where it stood at the capture.
     writeDelta(area, rect.top - (beforeTop - userDelta));
     // The restore can still leave the box past an edge (the list grew at the foot):
-    // bring it just inside, never through the history between.
+    // bring it just inside, never through the history between. `#2277`: with the keyboard up,
+    // its foot is the one the keyboard's jump keeps (`composerFoot`), not the box's padded bottom.
     const band = visibleBand(area);
     const now = composer.getBoundingClientRect();
-    if (now.bottom > band.foot) writeDelta(area, now.bottom - band.foot);
+    const fitted = deps.composerFoot ? deps.composerFoot(composer) : null;
+    const foot = fitted === null ? now.bottom : fitted;
+    if (foot > band.foot) writeDelta(area, foot - band.foot);
     else if (now.top < band.head) writeDelta(area, now.top - band.head);
     return true;
   }

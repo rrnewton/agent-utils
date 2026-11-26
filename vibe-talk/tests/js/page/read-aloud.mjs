@@ -1897,9 +1897,12 @@ test("`scrubber-full-width`: on a phone the strip playing is a full-width row on
   // list's foot keeps no second room for it.
   assert.match(rule(":root[data-read-strip] #screen-main"), /padding-bottom:\s*var\(--read-steer-height, 0px\);/,
     "the list runs under the strip");
-  assert.match(rule(":root[data-read-strip] #scroll-area"), /--read-steer-clearance:\s*0px;/,
+  // `#2277`: on each reader, which no longer inherit them (by the text: the rule parser splits a
+  // selector at the commas inside its `:is`). The lists' boxes and the pill keep no room for the strip;
+  // everything standing on the chips' foot stands on the strip.
+  assert.match(phone, /:root\[data-read-strip\] :is\(#status-line, #pull-refresh, #channel-composer, #voice-composer, #pane-discord, #side-composer, #side-pane, #side-list\)\s*\{\s*--read-steer-clearance:\s*0px !important;/,
     "the list's foot keeps room for a strip it no longer runs under");
-  assert.match(rule(":root[data-read-strip] #frame-body"), /--chips-foot:\s*max\(calc\(var\(--read-steer-height, 0px\) \+ 0\.5rem\)/,
+  assert.match(phone, /:root\[data-read-strip\] :is\(#scroll-tools, #pull-refresh, #status-line, #read-steer, #discuss-panel, #discuss-current-section\)\s*\{\s*--chips-foot:\s*max\(calc\(var\(--read-steer-height, 0px\) \+ 0\.5rem\)/,
     "the chips and the pill do not stand on the strip");
   assert.match(PAGE_CODE, /"--read-steer-height"[\s\S]*?\.observe\(el\("read-steer"\)\)/, "nothing measures the strip's height");
   // Playing: the second row (in the dock or the header) and the chips go. Held: the second row only.
@@ -1910,8 +1913,7 @@ test("`scrubber-full-width`: on a phone the strip playing is a full-width row on
   // A header gone this way is not `hidden`, so the body takes the notch's inset over (`#197`).
   assert.match(phone, /:root\[data-read-strip\] #topbar:has\([^{]*\+ #frame-body\s*\{\s*padding-top:\s*env\(safe-area-inset-top\);/,
     "the header gone for playback leaves the list under the notch");
-  assert.match(rule(":root[data-read-strip] #side-column"), /--read-steer-clearance:\s*0px;/,
-    "the thread list keeps room for a strip it no longer runs under");
+  // (The thread list's boxes, #side-composer, #side-pane and #side-list, are in the `:is` above.)
   // `#837 voice-page-jump-to-reading`: all but the way back to the message being read, while it is up (by the text,
   // as above).
   assert.match(phone, /:root\[data-read-strip="playing"\] #scroll-tools:not\(:has\(> #jump-reading:not\(\[hidden\]\)\)\),\s*:root\[data-read-strip="playing"\] #scroll-tools > :not\(#jump-reading\)\s*\{\s*display:\s*none;/,
@@ -2162,7 +2164,8 @@ test("`#451 read-strip-followups`: a moved strip is held in the window again whe
   // The composer's growth holds it by the same call, where the box's top edge is written: the
   // fixture lays no box out, so this half is read where it is written, as its neighbours are: in the page's
   // code, its modules included (web/src/view/shell `createChipsOverComposer`, `#624 voice-page-modularity`).
-  const composerTop = PAGE_CODE.indexOf('"--composer-top"');
+  // `#2277`: written through the geometry owner, on the elements that read it.
+  const composerTop = PAGE_CODE.indexOf('writeGeometry("--composer-top"');
   assert.ok(composerTop >= 0 && PAGE_CODE.slice(composerTop, composerTop + 400).includes("placeReadSteer()"),
     "the composer moving the strip's band holds no moved strip in the window");
 });

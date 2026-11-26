@@ -333,18 +333,20 @@ test("the floating chips keep their height clear above the composer, and never s
   assert.match(SCRIPT_CODE, /new window\.ResizeObserver\([\s\S]*?"--scroll-tools-clearance"[\s\S]*?\.observe\(el\("scroll-tools"\)\)/,
     "nothing measures the chips any more");
   // ...and the chips, the status pill and the pull's report over them stand no lower than its top edge.
-  assert.match(cssBlock("#frame-body"), /--chips-foot:\s*max\(0\.5rem, calc\(var\(--composer-top, 0px\) \+ 0\.25rem\)\);/,
+  // `#2277`: worked out on each element that stands on it, which no longer inherit it from #frame-body.
+  assert.match(CSS_CODE, /:is\(#scroll-tools, #pull-refresh, #status-line, #read-steer, #discuss-panel, #discuss-current-section\)\s*\{\s*--chips-foot:\s*max\(0\.5rem, calc\(var\(--composer-top, 0px\) \+ 0\.25rem\)\);/,
     "the chips' foot does not follow the message box's top edge");
   assert.match(cssRules(CSS_CODE, "#scroll-tools")[0], /bottom:\s*calc\(var\(--chips-foot, 0\.5rem\) \+ var\(--channel-pane-bottom, 0px\)\);/, "the chips stand on the foot of the list whatever is under them");
   assert.match(cssBlock("#status-line"), /bottom:\s*calc\(var\(--chips-foot, 0\.5rem\) \+ var\(--scroll-tools-clearance, 0px\) \+ var\(--read-steer-clearance, 0px\) \+ var\(--channel-pane-bottom, 0px\)\);/,
     "the status pill does not rise with the chips, and stands on the box being typed in");
   // The edge is measured where it moves: on a scroll, a change of the list's geometry, and the room.
   // Both in the lists' watch (web/src/view/channel `mountListWatch`, `#624 voice-page-modularity`).
-  assert.match(PAGE_CODE, /listen\(deps\.byId\("scroll-area"\), "scroll", \(\) => \{\s*deps\.placeChipsOverComposer\(\);/,
+  // `#2277`: measured before the jump reads the foot, and stood after it, in the same pass.
+  assert.match(PAGE_CODE, /listen\(deps\.byId\("scroll-area"\), "scroll", \(\) => \{[^}]*?const chipsTop = measure\(\);\s*deps\.renderJumpNewest\(\);\s*stand\(chipsTop\);/,
     "a scroll moves the box under the chips and nothing moves them");
   // In the same deferred decision as the jump, after the task the browser reported the sizes in; what else that
   // decision redraws after it (`#261 two-column-connectors`' links) may follow.
-  assert.match(PAGE_CODE, /deps\.afterThisTask\(\(\) => \{\s*decisionDue = false;\s*deps\.renderJumpNewest\(\);\s*deps\.placeChipsOverComposer\(\);/,
+  assert.match(PAGE_CODE, /deps\.afterThisTask\(\(\) => \{\s*decisionDue = false;[\s\S]{0,400}?const chipsTop = measure && stand \? measure\(\) : null;\s*deps\.renderJumpNewest\(\);\s*if \(chipsTop !== null && stand\) stand\(chipsTop\);\s*else deps\.placeChipsOverComposer\(\);/,
     "the box moving without a scroll leaves the chips where they were");
   assert.match(SCRIPT_CODE, /afterThisTask: \(act\) => \{ setTimeout\(act, 0\); \}/, "the lists' decision is not made after the task");
   // Written by the chips' owner (web/src/view/shell `createChipsOverComposer`, `#624 voice-page-modularity`).
@@ -359,14 +361,14 @@ test("ON THE CALL'S VIEW TOO, the chips' room growing under the box keeps a foll
   // slack, and stops following — the next turns are counted as "new" instead of followed. The page
   // re-pins a reader who was at the foot when the room changes, as it already did on the channel.
   // The fixture lays out no CSS, so the room is modelled where the browser makes it: the moment the
-  // page writes `--scroll-tools-clearance`, the box grows by that much.
+  // page writes `--scroll-tools-clearance` on the box (`#2277`: on its readers), the box grows by that much.
   const run = async (script) => {
     const page = newPage(new Map(), script, (p) => p.enableResizeObserver());
     await startTalking(page);
     const area = fillTranscript(page);
     assert.ok(atBottomOf(area), "the premise: the reader is following the call");
     const box = page.el("voice-composer");
-    const style = page.el("frame-body").style;
+    const style = box.style;
     const write = style.setProperty;
     style.setProperty = (name, value) => {
       write(name, value);
@@ -395,9 +397,9 @@ test("`#280 scroll-stability`: BACK FROM SETTINGS the chips' room is in the list
   // main screen and measured at nothing, and that nothing, written where the lists read their room, took
   // the room out of the list on Settings. Shown again, the list was 36px short, the reader within the
   // slack of its foot, and the chips' report then took them to it. The fixture lays out no CSS, so the
-  // room is modelled where the browser makes it: the lists' boxes read `--scroll-tools-clearance` from
-  // #screen-main where it is set there and from #frame-body otherwise, and the channel's box is two lines
-  // taller while what it reads is not nothing. The chips are measured at nothing while the main screen is
+  // room is modelled where the browser makes it: the channel's box reads `--scroll-tools-clearance` as
+  // written on it (`#2277`: on each reader, the lists' boxes only while #screen-main shows, the status
+  // pill always), and is two lines taller while what it reads is not nothing. The chips are measured at nothing while the main screen is
   // hidden, as a browser measures a box it does not lay out, and the list's place is kept while hidden and
   // clamped as it is shown (`clampedAsShownLikeChromium`).
   const ROOM_TEXT = "r".repeat(CHARS_PER_LINE * 2);
@@ -408,18 +410,14 @@ test("`#280 scroll-stability`: BACK FROM SETTINGS the chips' room is in the list
     const area = page.el("scroll-area");
     clampedAsShownLikeChromium(page, area);
     const screen = page.el("screen-main");
-    const frame = page.el("frame-body");
     const box = page.el("channel-composer");
     const tools = page.el("scroll-tools");
-    const room = () => screen.style.getPropertyValue("--scroll-tools-clearance") ||
-      frame.style.getPropertyValue("--scroll-tools-clearance");
-    for (const node of [screen, frame]) {
-      const write = node.style.setProperty;
-      node.style.setProperty = (name, value) => {
-        write(name, value);
-        if (name === "--scroll-tools-clearance") box.textContent = room() && room() !== "0px" ? ROOM_TEXT : "";
-      };
-    }
+    const room = () => box.style.getPropertyValue("--scroll-tools-clearance");
+    const write = box.style.setProperty;
+    box.style.setProperty = (name, value) => {
+      write(name, value);
+      if (name === "--scroll-tools-clearance") box.textContent = room() && room() !== "0px" ? ROOM_TEXT : "";
+    };
     const measureChips = () => {
       const height = screen.hidden ? 0 : tools.height();
       for (const observer of page.resizeObservers) {
@@ -439,7 +437,7 @@ test("`#280 scroll-stability`: BACK FROM SETTINGS the chips' room is in the list
       await page.el("open-settings").click();
       await page.settle();
       measureChips();
-      result.pillAtFoot = frame.style.getPropertyValue("--scroll-tools-clearance") === "0px";
+      result.pillAtFoot = page.el("status-line").style.getPropertyValue("--scroll-tools-clearance") === "0px";
       await page.el("close-settings").click();
       await page.settle();
       measureChips();
@@ -458,10 +456,10 @@ test("`#280 scroll-stability`: BACK FROM SETTINGS the chips' room is in the list
   };
   const real = await run(SCRIPT);
   assert.deepStrictEqual(real, { up0: true, up50: true, pillAtFoot: true, roomGoes: true, roomBack: true });
-  // THE CONTROL: the room written only where the status pill reads it. The reader 50px up is taken to the
-  // foot on the way back, and only they are.
-  const unheld = await run(await brokenScript(
-    '    if (!screen.hidden) screen.style.setProperty("--scroll-tools-clearance", room);\n', ""));
+  // THE CONTROL: the lists' boxes written while their screen is hidden, as the status pill is. The reader
+  // 50px up is taken to the foot on the way back, and only they are.
+  const unheld = await run(await brokenModule([{ file: "src/view/dom/geometry.ts",
+    find: "if (consumers.held.length && deps.mainShown()) for", replace: "for", count: 1 }]));
   assert.deepStrictEqual(unheld, { ...real, up50: false });
 });
 

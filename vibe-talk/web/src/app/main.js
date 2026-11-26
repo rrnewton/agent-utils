@@ -65,6 +65,7 @@ import {DISMISSED_SENDS_DAYS,
   unsentText,} from "../core/outbox/index.ts";
 import {DEFAULT_COLLAPSED_LINES, DEFAULT_DISCUSS_WIDTH, DEFAULT_TWO_COLUMN_SPLIT, DEVICE_SETTINGS, IDENTITY_KEY, MAX_COLLAPSED_LINES, MIN_COLLAPSED_LINES, clampDiscussWidth, clampTwoColumnSplit, createCardMaxLines, createCollapsedLines, createEnterSends, createInAppLinks, createKeptSwitch, createMarkReadFirstPercent, createMarkReadLongWords, createQuoteReadPercent, createSettingsSync, windowedConfig} from "../core/settings/index.ts";
 import {childByClass,
+  createGeometry,
   createOncePerFrame,
   focusLost,
   focusMinimally,
@@ -360,6 +361,13 @@ const columnWork = createColumnWork(columns);
 const { useColumn, inColumn } = columnWork;
 const { loadState, scrollPlace, scrollTools, selection, timelineRows, composerState, viewKey } = createColumnStateAccess(columnWork);
 const { el, leftEl } = createElementLookup(columnWork);
+// `#2277 vibe-talk-key-scroll-freezes-11-26`: the measured geometry handed to the stylesheet, written on
+// the elements whose rules read it (web/src/view/dom/geometry.ts), never on an element every row inherits
+// from: one write restyles those few elements, not every row of every list.
+const geometry = createGeometry({
+  lookup: (id) => document.getElementById(id),
+  mainShown: () => !leftEl("screen-main").hidden,
+});
 
 /**
  * The page's way to the browser and the server: web/src/app's now (`createServerAccess`, `#624`),
@@ -586,13 +594,13 @@ if (typeof window.ResizeObserver === "function") {
     // the call's transcript follows too, not only the channel.
     const pinned = !landed && screens.screen() === "main" && chipsFollowFoot(area, grew);
     const room = height > 0 ? `calc(${height}px + 0.5rem)` : "0px";
-    el("frame-body").style.setProperty("--scroll-tools-clearance", room);
+    // `#280`: the lists and their boxes, inside #screen-main, are written only while it shows
+    // (`held`); the status pill, over every screen, always (`live`). `#2277`: on the readers only.
+    geometry.write("--scroll-tools-clearance", room);
     // `#433 read-strip-low`. The row's height itself, without the half-rem the room keeps over
     // it: the read-aloud strip stands on the row's top edge, with no gap, so it hugs the row as
     // it wraps, empties or is hidden away.
-    el("frame-body").style.setProperty("--scroll-tools-height", `${height}px`);
-    const screen = leftEl("screen-main");
-    if (!screen.hidden) screen.style.setProperty("--scroll-tools-clearance", room);
+    geometry.write("--scroll-tools-height", `${height}px`);
     if (landed) placeEntryLanding(entryState().landing.row, entryState().landing.first);
     if (pinned) scrollKeeping.toFoot(area);
     // The room the channel's box keeps for them is above it, so it moved with them.
@@ -625,14 +633,11 @@ if (typeof window.ResizeObserver === "function") {
     const area = el("scroll-area");
     const landed = screens.screen() === "main" && screens.view() === "discord" && entryLandingHolds();
     const pinned = !landed && screens.screen() === "main" && chipsFollowFoot(area, grew);
-    el("frame-body").style.setProperty("--read-steer-clearance", room);
+    geometry.write("--read-steer-clearance", room);
     // `scrubber-full-width`. The height itself, without the air: on a phone the strip playing is a
     // row of its own over the dock, and the list ends at its top edge (`data-read-strip`). Held on
     // the hidden screen as the room is, so the list comes back laid out with it (`#280`).
-    el("frame-body").style.setProperty("--read-steer-height", `${height}px`);
-    const screen = leftEl("screen-main");
-    if (!screen.hidden) screen.style.setProperty("--read-steer-height", `${height}px`);
-    if (!screen.hidden) screen.style.setProperty("--read-steer-clearance", room);
+    geometry.write("--read-steer-height", `${height}px`);
     if (landed) placeEntryLanding(entryState().landing.row, entryState().landing.first);
     if (pinned) scrollKeeping.toFoot(area);
     // The strip floats in the same band as the chips over the channel's box, so it moved with it.
@@ -662,8 +667,9 @@ const chipsOverComposer = createChipsOverComposer({
   rootFontPx: () => rootFontPx(),
   root: () => document.documentElement,
   placeReadSteer: () => readAloudOwner().placeReadSteer(),
+  writeGeometry: (name, value) => geometry.write(name, value),
 });
-const { placeChipsOverComposer } = chipsOverComposer;
+const { placeChipsOverComposer, measureChipsTop, standChips } = chipsOverComposer;
 
 /**
  * The status line, the state dot beside it, the error panel and the connection details: one owner in
@@ -2955,6 +2961,8 @@ const scrollKeeping = createScrollKeeping({
   renderJumpNewest: () => renderJumpNewest(),
   setJumpNewest: (on, view, turns) => setJumpNewest(on, view, turns),
   composerHeld: () => heldComposer(),
+  // `#2277`: the keyboard's one foot for its fitted composer (null until the keyboard owner is made).
+  composerFoot: (composer) => (screenKeyboardRoom ? screenKeyboardRoom.fittedFoot(composer) : null),
   readFollowing: () => readAloudOwner().readFollowing(),
   anchorDebug: (check) => anchorDebug.check(check),
 });
@@ -9833,6 +9841,8 @@ const screenKeyboard = createOnScreenKeyboard({
     const sendId = KEYBOARD_SEND_PARTS[field.id];
     return sendId ? leftEl(sendId) : null;
   },
+  // `#2277`: the keyboard's room on the boxes that keep it, never on the root every row inherits from.
+  writeGeometry: (name, value) => geometry.write(name, value),
 });
 const { noteKeyboard, noteKeyboardReader, settleOnScroll, showKeyboardDebug, renderKeyboardDebug } = screenKeyboard;
 screenKeyboardRoom = screenKeyboard;
@@ -10305,6 +10315,8 @@ application.track(mountListWatch({
   leftById: (id) => leftEl(id),
   afterThisTask: (act) => { setTimeout(act, 0); },
   placeChipsOverComposer: () => placeChipsOverComposer(),
+  measureChipsTop: () => measureChipsTop(),
+  standChips: (top) => standChips(top),
   renderJumpNewest: () => renderJumpNewest(),
   replyBackOffered: () => replyArrows().back !== null,
   replyReturnRow: () => replyReturnRow(),

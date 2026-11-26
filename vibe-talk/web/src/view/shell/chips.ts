@@ -4,6 +4,11 @@
 // in at the foot, they stand on its top edge instead, as a sticky row would; docked under another screen,
 // on the draft's card. Written as `--composer-top`, how far above the foot of the list that edge is, which
 // the stylesheet stands them on. Holding the read-aloud strip against where it now docks is the page's.
+// `#2277 vibe-talk-key-scroll-freezes-11-26`: written on the elements that stand on it (`writeGeometry`,
+// web/src/view/dom/geometry.ts), never on an element every row inherits from; and measured apart from the
+// write, so a caller can make every read of its pass before anything is written (`measureChipsTop`).
+
+import type { GeometryName } from "../dom/index.ts";
 
 /** How far the status pill reaches above the chips, in rem: its gap and its least height (`#status-line`). */
 const CHIPS_PILL_REM = 2.4;
@@ -22,12 +27,18 @@ export interface ChipsOverComposerDependencies {
   root(): HTMLElement;
   /** The band the read-aloud strip floats in moved: hold it inside the window (`placeReadSteer`). */
   placeReadSteer(): void;
+  /** Hand a measured length to the elements that read it (`createGeometry`'s `write`). */
+  writeGeometry(name: GeometryName, value: string): void;
 }
 
 /** Standing the chips' one command. */
 export interface ChipsOverComposer {
   /** Measure where the box, or the draft over it, reaches into the chips' strip, and stand them on it. */
   placeChipsOverComposer(): void;
+  /** `#2277`: the measure alone: every read made, nothing written. */
+  measureChipsTop(): number;
+  /** `#2277`: stand the chips at a measured `top` (a write only where it changed). */
+  standChips(top: number): void;
 }
 
 /** Standing at the foot. */
@@ -36,6 +47,10 @@ export function createChipsOverComposer(deps: ChipsOverComposerDependencies): Ch
   let composerTop = 0;
 
   function placeChipsOverComposer(): void {
+    standChips(measureChipsTop());
+  }
+
+  function measureChipsTop(): number {
     let top = 0;
     // `#269 approval-card-inline`. A draft waiting above the channel's box is part of what they stand
     // on: they float over the messages above it, never over its Send. Docked under another screen, the
@@ -72,15 +87,19 @@ export function createChipsOverComposer(deps: ChipsOverComposerDependencies): Ch
         top += Math.round(steer.getBoundingClientRect().height);
       }
     }
+    return top;
+  }
+
+  function standChips(top: number): void {
     if (top === composerTop) return;
     composerTop = top;
-    leftEl("frame-body").style.setProperty("--composer-top", `${top}px`);
+    deps.writeGeometry("--composer-top", `${top}px`);
     // `#451 read-strip-followups`: the band the strip floats in just moved with the box, so a strip
     // put somewhere on a desk is held inside the window against where it now docks.
     deps.placeReadSteer();
   }
 
-  return { placeChipsOverComposer };
+  return { placeChipsOverComposer, measureChipsTop, standChips };
 }
 
 // What the page and the tests use of it.

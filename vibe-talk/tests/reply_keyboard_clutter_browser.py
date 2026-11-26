@@ -13,8 +13,8 @@ Three things stand here, beside `tests/keyboard_hides_bar_browser.py`'s bars and
     The reply in the stream is never fitted, so its row straddles the keyboard's top while it
     is written in; a fully-inside test stood the second Send over the visible half. At
     393x852 by touch, Reply mid-list with the keyboard up: exactly one Send stands in the
-    viewport, the reply's own, and the two never overlap. In the main composer, whose row
-    rests under the keys by design (#1135): exactly one Send stands, the corner one.
+    viewport, the reply's own, and the two never overlap. In the main composer, which rests
+    whole on the keys with its row in sight (`#2277`): exactly one Send stands, the row's own.
   * NO FLOATING CHIPS WHILE THE KEYBOARD IS UP. The jump chips stand down and the chips row
     moves to the top of the list, where Undo stays; the keyboard going down brings the whole
     row back at the list's foot as it was. The chips' drawn state here is the real one: the
@@ -189,20 +189,21 @@ def phone_walk(desk: Desk) -> None:
         page.keyboard.press("Escape")
     desk.wait_for("() => document.getElementById('column-reply').hidden", "Cancel did not put the reply away")
 
-    # The main composer: its row rests under the keys (#1135), so the one Send standing is the
-    # corner Send, and it presses the composer's own.
+    # The main composer: the whole composer rests on the keys, its row in sight (`#2277`; #1135 had
+    # parked the row under the keys), so the one Send standing is the row's own, and the corner Send
+    # stands down: nothing floats over the composer's corner (`#2274`).
     page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; }")
     desk.settled()
     page.tap("#channel-compose-text")
     found = keyboard(desk, True)
     desk.check(found["said"] == "open" and found["active"] == "channel-compose-text", f"composing, keyboard up: {found}")
-    desk.check(found["cornerDrawn"] is True, f"composing, keyboard up: no Send stands above the keyboard: {found}")
-    desk.check(not in_viewport(found, "mainSend"),
-               f"composing, keyboard up: the row's Send also stands in the viewport, two Sends: {found}")
+    desk.check(in_viewport(found, "mainSend"), f"composing, keyboard up: no Send stands above the keyboard: {found}")
+    desk.check(found["cornerDrawn"] is False,
+               f"composing, keyboard up: the corner Send also stands beside the row's own, two Sends: {found}")
     desk.shot("3-composer-keyboard-up")
     found = keyboard(desk, False)
     desk.check(found["cornerDrawn"] is False, f"composing, keyboard down: the corner Send outlived the keyboard: {found}")
-    desk.notes.append("in the main composer with the keyboard up: the corner Send alone stands")
+    desk.notes.append("in the main composer with the keyboard up: the row's own Send alone stands")
 
 
 def desk_walk(desk: Desk) -> None:

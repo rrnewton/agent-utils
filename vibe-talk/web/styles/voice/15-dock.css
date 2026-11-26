@@ -536,15 +536,16 @@
     white-space: nowrap;
   }
 
-  :root[data-read-strip] #frame-body {
+  /* `#2277`: on each element that stands on the chips' foot, which no longer inherit it. */
+  :root[data-read-strip] :is(#scroll-tools, #pull-refresh, #status-line, #read-steer, #discuss-panel, #discuss-current-section) {
     --chips-foot: max(calc(var(--read-steer-height, 0px) + 0.5rem), calc(var(--composer-top, 0px) + 0.25rem));
   }
 
-  :root[data-read-strip] #scroll-area,
-  :root[data-read-strip] #side-column,
-  :root[data-read-strip] #status-line,
-  :root[data-read-strip] #pull-refresh {
-    --read-steer-clearance: 0px;
+  /* `#2277`: every reader of the strip's room in the lists, their boxes, the pill and the pull's
+     report, which used to inherit this 0 from #scroll-area and #side-column. `!important` because the
+     page writes the measured room on each of them inline. */
+  :root[data-read-strip] :is(#status-line, #pull-refresh, #channel-composer, #voice-composer, #pane-discord, #side-composer, #side-pane, #side-list) {
+    --read-steer-clearance: 0px !important;
   }
 
   :root[data-read-strip] #control-bar,

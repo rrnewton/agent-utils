@@ -16,6 +16,12 @@ export interface ListWatchDependencies extends SizeWatching {
   afterThisTask(act: () => void): void;
   /** Keep the chips off the message box (`#245 done-feedback`). */
   placeChipsOverComposer(): void;
+  /**
+   * `#2277`: the same in two halves, the measure (every read, nothing written) and the stand (the
+   * write), so the scroll pass makes all its reads before its first write. Optional for doubles.
+   */
+  measureChipsTop?(): number;
+  standChips?(top: number): void;
   /** Offer the jump to the newest line, or take it away. */
   renderJumpNewest(): void;
   /** Whether a way back to a reply is offered, the row it goes back to, and taking the offer away (`#204`). */
@@ -62,9 +68,19 @@ export function mountListWatch(deps: ListWatchDependencies): ListWatch {
   // `#207 scrollback-jump` it is offered the moment they scroll far enough up the history to want it.
   // Only the jump, not every chip: this runs on every scroll event. See `renderJumpNewest`.
   listen(deps.byId("scroll-area"), "scroll", () => {
-    // `#245 done-feedback`. First, so the chips keep off the message box in the frame it moved in.
-    deps.placeChipsOverComposer();
-    deps.renderJumpNewest();
+    // `#245 done-feedback`. In this pass, so the chips keep off the message box in the frame it moved
+    // in. `#2277 vibe-talk-key-scroll-freezes-11-26`: measured first and written after the jump's own
+    // reads, so nothing this pass writes is laid out again inside it before the jump has read the foot.
+    const measure = deps.measureChipsTop;
+    const stand = deps.standChips;
+    if (measure && stand) {
+      const chipsTop = measure();
+      deps.renderJumpNewest();
+      stand(chipsTop);
+    } else {
+      deps.placeChipsOverComposer();
+      deps.renderJumpNewest();
+    }
     // `#204 reply-arrow`. The way back to a reply goes once the reply is on screen again, however
     // the reader brought it there: a chip offering to go where they already are is clutter.
     if (deps.replyBackOffered()) {
@@ -104,10 +120,14 @@ export function mountListWatch(deps: ListWatchDependencies): ListWatch {
       decisionDue = true;
       deps.afterThisTask(() => {
         decisionDue = false;
-        deps.renderJumpNewest();
         // `#245 done-feedback`. The message box moves without a scroll too: the window, a view or
-        // screen changing, the box itself resized.
-        deps.placeChipsOverComposer();
+        // screen changing, the box itself resized. `#2277`: measured before the jump writes.
+        const measure = deps.measureChipsTop;
+        const stand = deps.standChips;
+        const chipsTop = measure && stand ? measure() : null;
+        deps.renderJumpNewest();
+        if (chipsTop !== null && stand) stand(chipsTop);
+        else deps.placeChipsOverComposer();
         // `#340 composer-grow-box`. A box shown again, by a view, a screen or a send card going, is
         // measured where the browser does not size it.
         deps.fitGrowingBoxes();

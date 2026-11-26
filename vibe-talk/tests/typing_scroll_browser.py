@@ -183,8 +183,8 @@ def number(found: Json, *path: str) -> float:
 
 
 def whole_composer(reader: Reader, found: Json, when: str) -> None:
-    # The box whole above the visible foot, its composer not clipped at the top: a row parked
-    # under the box (#1135) stands below the keys at rest by design, so the box is the measure.
+    # The box whole above the visible foot, its composer not clipped at the top (since `#2277` the
+    # whole composer, Send row included, rests on the keys; the box stays the measure here).
     reader.check(found["box"] is not None and number(found, "box", "top") >= -1
                  and number(found, "box", "bottom") <= number(found, "viewport") + 1
                  and found["composer"] is not None and number(found, "composer", "top") >= -1,
@@ -292,7 +292,10 @@ def reading_walk(reader: Reader) -> None:
     found = place(reader)
     reader.check(found["active"] == "channel-compose-text", f"the box lost the focus: {found}")
     before_top = float(page.evaluate("() => document.getElementById('scroll-area').scrollTop"))
-    page.mouse.move(reader.width // 2, 300)  # type: ignore[attr-defined]
+    # Over the messages above the composer, as a reader's finger goes: since `#2277` the whole composer,
+    # its row included, stands on the keys, so a fixed 300px can land on the box itself.
+    over = float(page.evaluate("() => Math.max(40, document.getElementById('channel-composer').getBoundingClientRect().top / 2)"))
+    page.mouse.move(reader.width // 2, over)  # type: ignore[attr-defined]
     page.mouse.wheel(0, -700)
     reader.quiet(500)
     top = float(page.evaluate("() => document.getElementById('scroll-area').scrollTop"))

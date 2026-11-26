@@ -140,7 +140,8 @@ test("`#1144 scrollback-typing-jump`: typed at the foot, the jump is made whole 
   const { createOnScreenKeyboard } = VIEW_COMPOSER;
   const root = { clientWidth: 412, clientHeight: 915, setAttribute: () => {}, getAttribute: () => null, style: { setProperty: () => {} } };
   const area = { id: "scroll-area", scrollTop: 100, getBoundingClientRect: () => ({ top: 0, bottom: 900 }) };
-  // The foot is the box itself (#1135): its row stands 52px below it, inside the composer.
+  // `#2277`: the foot is the whole composer's, its Send row (52px below the box, inside the composer)
+  // included: the owner keeps Send in sight, and the keeper that holds the composer keeps the same foot.
   const composer = { id: "channel-composer", parentNode: area,
     getBoundingClientRect: () => ({ top: 793, bottom: 931 + (100 - area.scrollTop) }) };
   const field = { tagName: "TEXTAREA", id: "channel-compose-text", type: "textarea", isContentEditable: false,
@@ -162,21 +163,23 @@ test("`#1144 scrollback-typing-jump`: typed at the foot, the jump is made whole 
     el: (id) => els[id],
     viewport: () => ({ height: 579, scale: 1, offsetTop: 300 }), innerHeight: () => 915, scrollY: () => 0, root: () => root,
     activeElement: () => field, virtualKeyboard: () => undefined,
-    computedStyle: (node) => (node === composer ? { getPropertyValue: (name) => (name === "--keyboard-fit" ? "on" : "") } : null),
+    computedStyle: (node) => (node === composer ? { paddingBottom: "0px", getPropertyValue: (name) => (name === "--keyboard-fit" ? "on" : "") } : null),
     closeSpeedPopover: () => {}, nudge: (area, delta) => { area.scrollTop += delta; }, toFoot: (one) => { footTakes.push(one.id); one.scrollTop = one.scrollHeight; },
   });
   keyboard.noteKeyboard();
-  assert.equal(area.scrollTop, 100, "the fit as the keyboard came up left the foot on the keys");
-  assert.equal(keyboard.roomIn(area), 52,
-    "the room past the rows' foot is the inset and the row parked under the box, so rest on the box reads pinned (#1144)");
+  assert.equal(area.scrollTop, 152, "the fit as the keyboard came up left the composer's foot, Send row included, off the keys");
+  assert.equal(keyboard.fittedFoot(composer), 879, "the keepers' one foot is the composer's, on the keyboard's top");
+  assert.equal(keyboard.fittedFoot(els["side-scroll"]), null, "another element has no fitted foot");
+  assert.equal(keyboard.roomIn(area), 21,
+    "the room past the rows' foot is the keyboard's inset, so rest on the composer reads pinned (#1144)");
   assert.equal(keyboard.roomIn(els["side-scroll"]), 0, "no room is the keyboard's in another list");
   // The browser reveals the caret alone (the list left with the box part-shown), then the key is noted.
-  area.scrollTop = 90;
+  area.scrollTop = 142;
   keyboard.noteComposerInput(field);
   const due = timers.filter((one) => one && one.ms === 0);
   assert.equal(due.length, 1, "one completion is due for the key");
   due[0].run();
-  assert.equal(area.scrollTop, 100, "the whole foot is back on the keyboard's top");
+  assert.equal(area.scrollTop, 152, "the whole foot is back on the keyboard's top");
   keyboard.noteComposerInput({ id: "side-compose-text" });
   assert.equal(timers.filter((one) => one && one.ms === 0).length, 1, "another box's key completes nothing here");
 });

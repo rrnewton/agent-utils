@@ -423,8 +423,8 @@ export function mountListKeepers<Column>(deps: ListKeepersDependencies<Column>):
       if (was && was.foot && was.width === area.clientWidth && was.height === area.clientHeight
           && was.context === context && !atBottom(area, 1) && free()
           && !(deps.userChangeActive && deps.userChangeActive())) {
-        // To the rows' foot, not past it: room the keyboard keeps under the composer (a row
-        // parked under the box, #1135) stays below the keys, where the reader left it.
+        // To the rows' foot, not past it: room the keyboard keeps under the composer (its inset
+        // and the list's end padding past the fitted foot, `#2277`) stays below the keys.
         if (footTop) deps.toPosition(area, footTop(area));
         else followFoot(area);
       }

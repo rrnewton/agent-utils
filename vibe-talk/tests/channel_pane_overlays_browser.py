@@ -181,9 +181,10 @@ def phone_walk(desk: Desk) -> None:
     found = state(desk)
     desk.shot("1-phone-docked-overlays")
     check_inside(desk, found, "phone, Discuss half-pane docked")
-    # The keyboard up over the main composer at the list's end: its own Send
-    # rests under the keys, so the one Send standing is the corner Send at
-    # the keyboard's top — at the channel pane's foot, never over the sheet.
+    # The keyboard up over the main composer at the list's end: since `#2277`
+    # the composer rests whole on the keys with its own Send in sight, and the
+    # corner Send stands down; wherever a corner Send does stand, it stands at
+    # the channel pane's foot, never over the sheet.
     desk.page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; }")
     desk.settled()
     desk.page.tap("#channel-compose-text")

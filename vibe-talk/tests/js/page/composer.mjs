@@ -524,7 +524,9 @@ function phoneComposer(page, listBottom) {
   page.sayStyle({ "--keyboard-fit": "on" });
   const area = page.el("scroll-area");
   const box = page.el("channel-compose-text");
-  const room = () => Number.parseFloat(page.documentElement.style.getPropertyValue("--keyboard-inset")) || 0;
+  // `#2277`: the room is handed to the composer that keeps it, not to the root every row inherits from.
+  const composer = page.el("channel-composer");
+  const room = () => Number.parseFloat(composer.style.getPropertyValue("--keyboard-inset")) || 0;
   let top = END_TOP;
   Object.defineProperty(area, "scrollTop", {
     configurable: true,
@@ -538,6 +540,10 @@ function phoneComposer(page, listBottom) {
     const bottom = listBottom() - (top - END_TOP);
     return { top: bottom - BOX_PX, bottom, height: BOX_PX, left: 0, right: 393, width: 393 };
   };
+  // `#2277`: the composer's foot, which the jump brings to the keys, is the box's here: its Send and
+  // state line are not drawn, and the room under it is not part of what it shows.
+  composer.getClientRects = () => [{}];
+  composer.getBoundingClientRect = () => box.getBoundingClientRect();
   for (const id of ["channel-send", "channel-compose-state"]) page.el(id).getClientRects = () => [];
   return {
     area, box, room,
@@ -1365,7 +1371,8 @@ test("`#1135 raw-message-page`: the row under each channel box holds Send raw me
 
 /**
  * The channel's box as `phoneComposer` lays it out, with its actions row drawn `ROW_PX` tall under it:
- * the list scrolls that much further than the box's foot needs, and Send's foot is the row's.
+ * the list scrolls that much further than the box's foot needs, and Send's foot is the row's, which is
+ * the composer's own foot (`#2277`).
  */
 const ROW_PX = 44;
 function phoneComposerWithRow(page) {
@@ -1373,7 +1380,8 @@ function phoneComposerWithRow(page) {
   const area = page.el("scroll-area");
   const box = page.el("channel-compose-text");
   const send = page.el("channel-send");
-  const room = () => Number.parseFloat(page.documentElement.style.getPropertyValue("--keyboard-inset")) || 0;
+  const composer = page.el("channel-composer");
+  const room = () => Number.parseFloat(composer.style.getPropertyValue("--keyboard-inset")) || 0;
   let top = END_TOP;
   Object.defineProperty(area, "scrollTop", {
     configurable: true,
@@ -1392,12 +1400,17 @@ function phoneComposerWithRow(page) {
     const bottom = 852 - (top - END_TOP) + ROW_PX;
     return { top: bottom - ROW_PX, bottom, height: ROW_PX, left: 0, right: 393, width: 393 };
   };
+  composer.getClientRects = () => [{}];
+  composer.getBoundingClientRect = () => {
+    const bottom = send.getBoundingClientRect().bottom;
+    return { top: box.getBoundingClientRect().top, bottom, height: BOX_PX + ROW_PX, left: 0, right: 393, width: 393 };
+  };
   page.el("channel-compose-state").getClientRects = () => [];
   return { area, box, send, room, furthest: () => END_TOP + room() + ROW_PX,
     keysTop: () => page.viewport.offsetTop + page.viewport.visual };
 }
 
-test("`#1135 raw-message-page`: the box rests on the keyboard with its row still to scroll to, and the reader's scroll reveals it whole", async () => {
+test("`#2277 vibe-talk-key-scroll-freezes-11-26`: the whole composer, its Send row included, rests on the keyboard, so Send is in sight and the corner Send stands down", async () => {
   const page = newPage();
   await signIn(page);
   await showDiscord(page, [message({ id: "1000000000000000001" })]);
@@ -1405,20 +1418,21 @@ test("`#1135 raw-message-page`: the box rests on the keyboard with its row still
   await focusOn(page, phone.box);
   await page.resizeViewport({ visual: 472 });
   assert.equal(keyboardSaid(page), "open");
-  // The resting place is the box's foot on the keys, though Send is drawn under it...
-  assert.equal(phone.box.getBoundingClientRect().bottom, phone.keysTop(),
-    "the jump took the row to the keys instead of resting the box on them");
-  // ...with exactly the row's height of scroll left beyond it.
-  assert.equal(phone.furthest() - phone.area.scrollTop, ROW_PX,
-    "the resting place is the list's end, so nothing below the box can be scrolled to");
-  assert.ok(phone.send.getBoundingClientRect().bottom > phone.keysTop(), "the row is not below the keys at rest");
-  // The reader's own scroll the rest of the way: the row's foot on the keys, whole above them.
+  // The resting place is the composer's foot on the keys: Send's row, not the box alone (`#1135` parked
+  // the row under the keys; the owner keeps Send in sight, and one foot keeps the keepers agreed).
+  assert.equal(phone.send.getBoundingClientRect().bottom, phone.keysTop(),
+    "the jump left the Send row under the keys");
+  assert.ok(phone.send.getBoundingClientRect().top >= 0, "the row is cut off at the top");
+  // ...and that is the list's end: nothing of the composer is left parked under the keys.
+  assert.equal(phone.furthest() - phone.area.scrollTop, 0,
+    "the resting place is short of the list's end, so a row is parked under the keys");
+  // `ios-keyboard-send` (`#2274`): the row's own Send is on screen, so no second Send stands over the box.
+  assert.equal(page.el("keyboard-send").hidden, true, "the corner Send stands over the composer beside its own Send");
+  // The reader's own scroll to the end moves nothing further.
   await touch(page);
   phone.area.scrollTop = 1e9;
-  assert.equal(phone.area.scrollTop, phone.furthest());
   assert.equal(phone.send.getBoundingClientRect().bottom, phone.keysTop(),
     "scrolled to the end, the row does not stand on the keyboard's top");
-  assert.ok(phone.send.getBoundingClientRect().top >= 0, "the revealed row is cut off at the top");
 });
 
 test("`#1135 raw-message-page`: ticked, the post carries raw and the box unticks itself; unticked, the post is as it was", async () => {

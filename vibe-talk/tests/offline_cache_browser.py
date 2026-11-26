@@ -2022,7 +2022,7 @@ JUMP_UP_JS = "() => !document.getElementById('jump-newest').hidden"
 # the end of the list moves when it does.
 ROOM_SETTLED_JS = """() => {
     const row = document.getElementById('scroll-tools').getBoundingClientRect().height;
-    const room = document.getElementById('frame-body').style.getPropertyValue('--scroll-tools-clearance');
+    const room = document.getElementById('channel-composer').style.getPropertyValue('--scroll-tools-clearance');
     const px = /^calc\\(([\\d.]+)px \\+ 0\\.5rem\\)$/.exec(room);
     return row > 0 ? Boolean(px) && Math.abs(Number(px[1]) - row) < 0.5 : room === '0px' || room === '';
 }"""

@@ -1276,7 +1276,11 @@ class Driver:
             "discuss" in expression for _desc, expression in scene.expect
         )
         if not discuss_subject and bool(self.js("window.__visible('discuss-panel')")):
-            self.click("discuss-open")
+            # The button's own click, not a mouse click on it (`#2277`): a mouse click moves the
+            # focus to the button, which took it from the field the scene had just focused
+            # (77's composer, after a Discuss scene left the panel up at a desk) and failed
+            # that scene's "holds the focus" every time it ran after one.
+            self.page.evaluate("() => document.getElementById('discuss-open').click()")
             self.page.wait_for_function(
                 "() => !window.__visible('discuss-panel')", timeout=15_000
             )
@@ -5951,6 +5955,47 @@ def _act_search_fast_pass_row_hidden(driver: Driver) -> None:
     next standing row below (the next tenth note) takes its place."""
     _fast_act(driver, "125-search-fast-pass-row-hidden", "harbor", (FAST_READ // 10 + 1) * 10,
               "first key 'harbor' (the row read does not say it; the next tenth note does) mid-list, over 200 rows")
+
+
+# `#2277 vibe-talk-key-scroll-freezes-11-26`: typing at the foot of a long channel with the keyboard up. The
+# composer's top is sampled at every frame while the keys go in, so the shot carries its own "nothing
+# jumped" record; the whole composer, its Send row included, stands above the keys.
+def _act_long_list_typing(driver: Driver) -> None:
+    """`#2277`: the seeded channel walked back past 200 rows, the reader at the foot, the composer focused
+    with the keyboard really open, and words typed: the composer holds still and its Send row is in sight."""
+    _act_open_channel(driver)
+    _fast_seed(driver)
+    _act_open_channel(driver)
+    for _ in range(80):
+        if int(cast(float, driver.js("document.querySelectorAll('#discord-log > li[data-id]').length"))) > 210:
+            break
+        if not bool(driver.js("window.__visible('load-older')")):
+            break
+        driver.js("(() => { window.__walkFrom = document.querySelectorAll('#discord-log > li').length; "
+                  "document.getElementById('scroll-area').scrollTop = 0; return window.__walkFrom; })()")
+        driver.page.wait_for_function(
+            "() => document.querySelectorAll('#discord-log > li').length > window.__walkFrom", timeout=10_000)
+        driver.settle(80)
+    rows = int(cast(float, driver.js("document.querySelectorAll('#discord-log > li[data-id]').length")))
+    if rows <= 200:
+        raise Unreachable("138-long-list-typing", "over 200 rows loaded", f"{rows} rows")
+    driver.js("(() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; return a.scrollTop; })()")
+    driver.settle(400)
+    shrink_keyboard(driver, "138-long-list-typing", focus="#channel-compose-text")
+    driver.settle(600)
+    before = cast(float, driver.js("document.getElementById('channel-composer').getBoundingClientRect().top"))
+    driver.js("(() => { window.__typingTops = []; const c = document.getElementById('channel-composer'); "
+              "const sample = () => { if (!window.__typingOn) return; window.__typingTops.push(c.getBoundingClientRect().top); "
+              "requestAnimationFrame(sample); }; window.__typingOn = true; requestAnimationFrame(sample); return true; })()")
+    driver.page.keyboard.type("checking the long list ", delay=30)
+    driver.settle(600)
+    tops = cast(list[float], driver.js("(() => { window.__typingOn = false; return window.__typingTops; })()"))
+    spread = (max(tops) - min(tops)) if tops else 0.0
+    record: dict[str, object] = {"rows": rows, "composerTopBefore": round(before, 2), "frames": len(tops),
+              "composerTopMin": round(min(tops), 2) if tops else None, "composerTopMax": round(max(tops), 2) if tops else None,
+              "movedPx": round(spread, 2)}
+    driver.js(f"window.__longTyping = {json.dumps(record)}")
+    _search_sidecar(driver, "138-long-list-typing", record)
 
 
 def _act_discuss_preview(driver: Driver) -> None:
@@ -11193,6 +11238,24 @@ SCENES: tuple[Scene, ...] = (
         ),
     ),
     Scene(
+        name="138-long-list-typing",
+        what="#2277 typing at the foot of a long channel (over 200 rows) with the keyboard really open: the composer holds still, its Send row in sight",
+        act=_act_long_list_typing,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            ("the composer holds the focus", "document.activeElement === document.getElementById('channel-compose-text')"),
+            ("over 200 rows were loaded", "!!window.__longTyping && window.__longTyping.rows > 200"),
+            ("#2277 the composer held still while the words went in (0.5 px)",
+             "!!window.__longTyping && window.__longTyping.frames > 0 && window.__longTyping.movedPx <= 0.5"),
+            ("#2277 the composer's Send row is inside the shrunk viewport",
+             "(() => { const r = document.getElementById('channel-send').getBoundingClientRect(); "
+             "return r.height > 0 && r.top >= 0 && r.bottom <= (window.visualViewport ? window.visualViewport.height : innerHeight) + 1; })()"),
+            ("#2274 no corner Send stands over the composer beside its own", "!window.__visible('keyboard-send')"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
         name="124-search-fast-pass-row-matches",
         what="#2257 a search's first key with the reader mid-list in a long channel: the row read says the words and keeps its top",
         act=_act_search_fast_pass_row_matches,
@@ -12028,7 +12091,7 @@ def run_captures(
     # 91/92, so they skip with them on a cacheless server instead of failing alone.
     discuss_scenes = [s for s in scenes if s.name.startswith(("73-", "74-", "75-", "76-", "78-", "84-", "85-", "89-", "90-", "91-", "92-", "93-", "94-", "95-", "96-", "97-", "98-", "99-", "100-", "101-", "102-", "103-",
                                                                         "107-", "108-", "109-", "110-", "111-", "112-", "113-", "114-", "115-", "116-", "117-",
-                                                                        "120-", "121-", "123-", "124-", "125-", "126-", "127-", "128-", "130-", "131-",
+                                                                        "120-", "121-", "123-", "124-", "125-", "126-", "127-", "128-", "130-", "131-", "138-",
                                                                         "140-", "141-", "142-", "143-", "144-", "145-", "146-"))]
     discuss_only = bool(wanted) and len(wanted) == len(discuss_scenes)
     if discuss_scenes and not seed_discuss_cache(60 if discuss_only else 10):

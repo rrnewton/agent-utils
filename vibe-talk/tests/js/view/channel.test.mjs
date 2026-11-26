@@ -1572,6 +1572,22 @@ test("`#624 voice-page-modularity`: watching the lists answers a scroll at once,
   assert.deepStrictEqual([asked, area.listeners.length], [["can watch?"], 1],
     "a browser with no ResizeObserver lost the scroll listener, or a watcher was asked of it");
   bare.unmount();
+  // `#2277 vibe-talk-key-scroll-freezes-11-26`: with the chips' measure and stand apart, a scroll makes
+  // every read of its pass before its first write: the chips measured, the jump (which reads the foot
+  // before it writes), then the chips stood; and a burst of resizes decides the same way.
+  state.resize = true;
+  state.back = false;
+  state.sideShowing = false;
+  watchers.length = 0;
+  tasks.length = 0;
+  const split = mountListWatch({ ...deps, measureChipsTop: () => { log.push("measure chips"); return 7; },
+    standChips: (top) => log.push(`stand chips ${top}`) });
+  assert.deepStrictEqual(scroll(), ["measure chips", "jump", "stand chips 7", "older", "older turns", "summaries 0"],
+    "a scroll wrote before the jump read the foot");
+  watchers[0].report();
+  assert.deepStrictEqual(runTasks(), ["measure chips", "jump", "stand chips 7", "fit boxes", "links"],
+    "a burst of resizes wrote before the jump read the foot");
+  split.unmount();
 });
 
 test("`#624 voice-page-modularity`: the keepers hold a reader on the newest line as the dock grows, keep the right column's reader on its foot only where nothing else holds it, measure the arrows once per burst, and stop", () => {

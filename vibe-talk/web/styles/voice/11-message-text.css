@@ -527,22 +527,21 @@
    * hit — or any hit — once it is scrolled into view. The clearance is the
    * chips row's measured height plus its foot gap, written by the page's
    * ResizeObserver; the 2.75rem floor covers the chip appearing only because
-   * the reader scrolled away from the foot, before that measurement lands. */
-  scroll-margin-bottom: calc(max(var(--scroll-tools-clearance, 0px), 2.75rem) + 0.5rem);
+   * the reader scrolled away from the foot, before that measurement lands.
+   * `#2277`: kept on the scroller while a search is open (below), not on each
+   * hit: the chips' room is not inherited, so no row reads it. */
 }
 
-/* `#1786` draws in-scope server hits as timeline cards and outside hits as
- * quoted rows, both marked `data-server-hit`: the same foot reserve, so the
- * first of them brought to the foot rests clear of the Newest chip too. */
-#discord-log > li[data-server-hit] {
-  scroll-margin-bottom: calc(max(var(--scroll-tools-clearance, 0px), 2.75rem) + 0.5rem);
-}
-
-/* `#2200`: the server search section at the foot of the list takes the
-   same reserve, so its line brought to the foot rests clear of the
-   Newest pill instead of under its left edge. */
-#server-search {
-  scroll-margin-bottom: calc(max(var(--scroll-tools-clearance, 0px), 2.75rem) + 0.5rem);
+/* `#1786` server hits drawn as timeline cards and quoted rows (`data-server-hit`),
+   `#2200` the server search section at the foot of the list, and the hits above:
+   one foot reserve, so whichever is brought to the foot rests clear of the Newest
+   chip. `#2277 vibe-talk-key-scroll-freezes-11-26`: on the scroller as its
+   scroll padding while a search is open, the only time any of them is drawn, and
+   not as a margin on each, which made every row read the chips' room and be
+   restyled whenever it changed. The scroller is one of the room's readers
+   (`GEOMETRY_CONSUMERS`). */
+#screen-main[data-searching] #scroll-area {
+  scroll-padding-bottom: calc(max(var(--scroll-tools-clearance, 0px), 2.75rem) + 0.5rem);
 }
 
 .server-hit-meta {

@@ -1,15 +1,35 @@
 /* ------------------------------------------------------------------------------ the body --- */
 
+/* `#2277 vibe-talk-key-scroll-freezes-11-26`. The geometry the page measures (the box's top edge, the
+   chips' room and height, the read-aloud strip's room and height, the keyboard's room) and the chips'
+   foot worked out from it are NOT inherited. Written where every row inherited them (#frame-body,
+   #screen-main, the root), each change restyled every element of every list: 12.5k elements at 192
+   rows, about a second at 768 rows on a phone, and the box's top edge changes on every scroll at the
+   foot. The page writes each on exactly the elements whose own rules below read it
+   (web/src/view/dom/geometry.ts, `GEOMETRY_CONSUMERS`), and a style test refuses a `var()` of one of
+   them in a rule for any other element. A browser without `@property` inherits them as before. */
+@property --composer-top { syntax: "*"; inherits: false; }
+@property --chips-foot { syntax: "*"; inherits: false; }
+@property --scroll-tools-clearance { syntax: "*"; inherits: false; }
+@property --scroll-tools-height { syntax: "*"; inherits: false; }
+@property --read-steer-clearance { syntax: "*"; inherits: false; }
+@property --read-steer-height { syntax: "*"; inherits: false; }
+@property --keyboard-inset { syntax: "*"; inherits: false; }
+
+/* `#245 done-feedback`. Where the floating chips stand: half a rem above the foot of the list, or just
+   above the channel's message box wherever it reaches down into the strip they float in, so the box and
+   its Send never pass under them (`placeChipsOverComposer`, web/src/view/shell/chips.ts, writes
+   `--composer-top`, how far above the foot the box's top edge is, and 0 when they stay at the foot). The
+   status pill, the pull's report, the read-aloud strip and the floating Discuss panel stand on the
+   chips, so they rise with them. `#2277`: worked out on each of them (`CHIPS_FOOT_CONSUMERS`). */
+:is(#scroll-tools, #pull-refresh, #status-line, #read-steer, #discuss-panel, #discuss-current-section) {
+  --chips-foot: max(0.5rem, calc(var(--composer-top, 0px) + 0.25rem));
+}
+
 #frame-body {
   /* The anchor for #status-line, which floats over the bottom of the body area, above the dock.
      `#63 status-line-placement`. */
   position: relative;
-  /* `#245 done-feedback`. Where the floating chips stand: half a rem above the foot of the list, or
-     just above the channel's message box wherever it reaches down into the strip they float in, so
-     the box and its Send never pass under them (`placeChipsOverComposer` in web/voice.js writes
-     `--composer-top`, how far above the foot the box's top edge is, and 0 when they stay at the
-     foot). The status pill and the pull's report stand on the chips, so they rise with them. */
-  --chips-foot: max(0.5rem, calc(var(--composer-top, 0px) + 0.25rem));
   /* `min-height: 0` is the load-bearing one: without it a grid item refuses to shrink below its
      content, the body row grows past the viewport, and the document scrolls again — which is the
      exact behaviour this whole file removes. */

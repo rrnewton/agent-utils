@@ -8,6 +8,7 @@
 
 import type { ClockPort } from "../../ports/index.ts";
 import { isTextField, nodeWithin } from "../dom/index.ts";
+import type { GeometryName } from "../dom/index.ts";
 import { COMPOSER_FIELDS } from "./keys.ts";
 
 /** The least height, in CSS pixels, an on-screen keyboard takes: more than a browser's toolbar. */
@@ -88,6 +89,11 @@ export interface OnScreenKeyboardDependencies {
   cornerSend?(): HTMLElement | null | undefined;
   /** `ios-keyboard-send`. `field`'s own Send (`KEYBOARD_SEND_PARTS`), or null where it has none. */
   normalSend?(field: Element): HTMLElement | null | undefined;
+  /**
+   * `#2277`: hand the keyboard's room to the boxes that keep it (`createGeometry`'s `write`), never
+   * to the root every row inherits from. Absent (a double), the root is written as before.
+   */
+  writeGeometry?(name: GeometryName, value: string): void;
 }
 
 /** The keyboard's commands. */
@@ -112,6 +118,12 @@ export interface OnScreenKeyboard {
    * the page measures can leave it out. 0 for any other list, and while no box is fitted.
    */
   roomIn(area: HTMLElement): number;
+  /**
+   * `#2277 vibe-talk-key-scroll-freezes-11-26`: where the fitted `composer`'s own foot is (the bottom
+   * of what it shows, its Send row included, without the keyboard's room under it), the one foot the
+   * keepers bring to the keyboard's top; null while no box is fitted, or for another box.
+   */
+  fittedFoot(composer: Element): number | null;
   /** Draw the readout where `on`, keep it redrawn while it is, and set its switch. */
   showKeyboardDebug(on: boolean): void;
   /** Draw the readout, where it is on. */
@@ -310,8 +322,9 @@ export function createOnScreenKeyboard(deps: OnScreenKeyboardDependencies): OnSc
   }
 
   /**
-   * `#610 mobile-keyboard-compose`. The jump itself: the room for the keyboard as it now stands, then the box's foot
-   * brought to the keyboard's top. The composer's row stays below it, a scroll away (`#1135 raw-message-page`).
+   * `#610 mobile-keyboard-compose`. The jump itself: the room for the keyboard as it now stands, then the composer's
+   * foot, its Send row included, brought to the keyboard's top (`#2277`; `#1135 raw-message-page` parked the row
+   * under the keys).
    */
   function settleKeyboardFit(field: Element): void {
     renderKeyboardInset(keyboardInset(field));
@@ -329,9 +342,8 @@ export function createOnScreenKeyboard(deps: OnScreenKeyboardDependencies): OnSc
    * itself while the keyboard is up, so its box can be brought to the keyboard's top: as much of the list
    * it is in as the keyboard covers, from the visual viewport's foot to the list's own foot. Not from
    * `innerHeight`, which a browser may or may not shrink for the keyboard; less Safari's pan, so at the
-   * list's very end the last thing in the composer stands on the keyboard's top — which is the room the
-   * row under the box is scrolled into (`#1135 raw-message-page`); measured only at the jump and as the
-   * keyboard changes size.
+   * list's very end the last thing in the composer, its Send row, stands on the keyboard's top (`#2277`);
+   * measured only at the jump and as the keyboard changes size.
    */
   function keyboardInset(field: Element): number {
     const viewport = deps.viewport();
@@ -345,16 +357,30 @@ export function createOnScreenKeyboard(deps: OnScreenKeyboardDependencies): OnSc
   function renderKeyboardInset(inset: number): void {
     if (inset === onScreenKeyboard.inset) return;
     onScreenKeyboard.inset = inset;
-    deps.root().style.setProperty("--keyboard-inset", `${inset}px`);
+    if (deps.writeGeometry) deps.writeGeometry("--keyboard-inset", `${inset}px`);
+    else deps.root().style.setProperty("--keyboard-inset", `${inset}px`);
+  }
+
+  /**
+   * `#2277`: the bottom of what `composer` shows, its Send row included: its box's bottom less its
+   * padding under that, which is the keyboard's room while the keyboard is up (`--keyboard-inset`).
+   * One foot for the jump (`fitComposerToKeyboard`) and for the keeper that holds the box while rows
+   * change (`keepComposerInView`): with two (the field's foot here, the whole box's there) each row
+   * change raised the list by the Send row and the next jump dropped it back, a 70 px bounce per change.
+   */
+  function composerFoot(composer: Element): number {
+    const bottom = composer.getBoundingClientRect().bottom;
+    const style = deps.computedStyle(composer);
+    const under = style ? Number.parseFloat(style.paddingBottom) || 0 : 0;
+    return bottom - under;
   }
 
   /**
    * The composer `field` is written in, the list it is in, and its foot, where the stylesheet lays it out
    * for the keyboard (`--keyboard-fit`, which it sets under a coarse pointer alone); null elsewhere, as on
-   * a desk whose window is made shorter with the box focused. The foot is the box itself
-   * (`#1135 raw-message-page`): the row under it — Send raw message, Cancel and Send — stays below the
-   * keys at rest, and the reader scrolls the list further down to it, which the room under the composer
-   * (`keyboardInset`) leaves exactly the scroll for. The list is the one the composer is in.
+   * a desk whose window is made shorter with the box focused. `foot` is the box itself, which the readout
+   * names; the jump keeps the composer's own foot (`composerFoot`, `#2277`), the row under the box — Send
+   * raw message, Cancel and Send — included. The list is the one the composer is in.
    */
   function composerFit(field: Element | null): { area: HTMLElement; foot: Element; composer: HTMLElement } | null {
     const parts = field && KEYBOARD_FIT_PARTS[field.id];
@@ -377,18 +403,25 @@ export function createOnScreenKeyboard(deps: OnScreenKeyboardDependencies): OnSc
   function fitComposerToKeyboard(field: Element): void {
     const where = composerFit(field);
     if (!where) return;
-    const { area, foot } = where;
+    const { area, composer } = where;
     onScreenKeyboard.fittedArea = area;
-    // The room past the rows' foot is all the list keeps below the foot: the keyboard's inset
-    // and, with the foot the box itself (#1135), the row parked under it. Measured here, where
-    // both rects are already read, so the foot's measures never pay for it per scroll.
-    onScreenKeyboard.fittedRoom = Math.max(onScreenKeyboard.inset,
-      Math.round(where.composer.getBoundingClientRect().bottom - foot.getBoundingClientRect().bottom));
+    // `#2277`: the foot brought to the keyboard's top is the whole composer's, its Send row
+    // included (the owner keeps Send in sight), not the box's alone with the row parked under the
+    // keys (`#1135`): the keeper that holds the composer while rows change keeps the same foot
+    // (`fittedFoot`), so the two never move the list against each other.
+    const footBottom = composerFoot(composer);
     const viewport = deps.viewport();
     const keysTop = viewport ? (Number(viewport.offsetTop) || 0) + (Number(viewport.height) || 0) : deps.innerHeight() || 0;
     const target = Math.min(area.getBoundingClientRect().bottom, keysTop);
-    const off = foot.getBoundingClientRect().bottom - target;
+    const off = footBottom - target;
     if (Math.abs(off) >= 1) deps.nudge(area, off);
+    // The room past the rows' foot is all the list keeps below the fitted foot: the keyboard's
+    // inset under the row and the list's own end padding, so a reader resting on the composer is
+    // at the foot, and the keeper that takes a follower to the foot (`footTop`) stops where this
+    // jump does instead of going on past it and being brought back (`#2277`). Measured here, once
+    // the jump is made, so the foot's measures never pay for it per scroll.
+    const below = (Number(area.scrollHeight) || 0) - (Number(area.scrollTop) || 0) - (Number(area.clientHeight) || 0);
+    onScreenKeyboard.fittedRoom = Math.max(onScreenKeyboard.inset, Math.round(below));
     // For the readout: where the jump took the foot, and how far it has moved the list in all.
     const last = onScreenKeyboard.lastFit;
     const before = last && last.field === field.id && onScreenKeyboard.settling ? last.moved : 0;
@@ -490,6 +523,12 @@ export function createOnScreenKeyboard(deps: OnScreenKeyboardDependencies): OnSc
     roomIn(area) {
       return onScreenKeyboard.fitted !== null && area === onScreenKeyboard.fittedArea
         ? onScreenKeyboard.fittedRoom : 0;
+    },
+    fittedFoot(composer) {
+      const fitted = onScreenKeyboard.fitted;
+      const parts = fitted ? KEYBOARD_FIT_PARTS[fitted.id] : undefined;
+      if (!fitted || !parts || deps.lookup(parts[0]) !== composer) return null;
+      return composerFoot(composer);
     },
     showKeyboardDebug,
     renderKeyboardDebug,

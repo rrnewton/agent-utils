@@ -159,7 +159,17 @@ def main() -> int:
                 page.wait_for_function(
                     "() => (window.visualViewport ? window.visualViewport.height : window.innerHeight) === 579",
                     timeout=20_000)
-                page.wait_for_selector("#keyboard-send:not([hidden])", state="visible", timeout=20_000)
+                # `#2277`: the fitted composer rests whole on the keys, its own Send row in sight,
+                # so the corner Send stands down for it (`#2274`). Waited for as drawn state: the
+                # page says the keyboard is up and the box's own Send stands above the keys.
+                page.wait_for_function(
+                    "() => { const s = document.getElementById('channel-send').getBoundingClientRect();"
+                    " return document.documentElement.getAttribute('data-keyboard') === 'open'"
+                    " && s.height > 0 && s.bottom <= visualViewport.height + 1; }",
+                    timeout=20_000)
+                corner = page.evaluate("() => { const n = document.getElementById('keyboard-send');"
+                                       " return !!n && !n.hidden && n.getClientRects().length > 0; }")
+                check(corner is False, "phone keyboard open: a corner Send stands over the composer beside its own Send")
                 rects = page.evaluate("""() => {
                   const read = (id) => {
                     const e = document.getElementById(id);
@@ -168,7 +178,7 @@ def main() -> int:
                     return {left: b.left, right: b.right, top: b.top, bottom: b.bottom};
                   };
                   const chip = read('channel-save-draft');
-                  const send = read('keyboard-send');
+                  const send = read('channel-send');
                   const area = document.getElementById('channel-compose-text');
                   const b = area.getBoundingClientRect();
                   const cs = getComputedStyle(area);
@@ -190,7 +200,8 @@ def main() -> int:
                     check(not overlap,
                           f"phone keyboard open: the {name} covers typed text: {rect} vs {text}")
                 page.screenshot(path=str(args.screenshots / "phone-kbopen-chip-clear.png"))
-                print(f"phone keyboard open: chip and keyboard Send clear of the text area {rects}")
+                print(f"phone keyboard open: chip and the box's own Send clear of the text area, "
+                      f"no corner Send {rects}")
                 ctx.close()
                 browser.close()
             print(f"save-draft chip browser: passed; shots in {args.screenshots}")

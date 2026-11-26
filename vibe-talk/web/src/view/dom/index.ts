@@ -15,6 +15,8 @@ export { createOncePerFrame } from "./frames.ts";
 export type { FrameScheduler, OncePerFrame } from "./frames.ts";
 export type { PendingCopy, TextClipboard } from "./clipboard.ts";
 export { createListening } from "./listening.ts";
+export { CHIPS_FOOT_CONSUMERS, GEOMETRY_CONSUMERS, createGeometry } from "./geometry.ts";
+export type { Geometry, GeometryDependencies, GeometryName } from "./geometry.ts";
 export { insertSanitizedHtml } from "./html.ts";
 export type { Listening, SizeWatcher, SizeWatching } from "./listening.ts";
 export { foldSectionKeys, foldSectionsByHeading, openSectionKeys, setAllSections } from "./collapse.ts";
