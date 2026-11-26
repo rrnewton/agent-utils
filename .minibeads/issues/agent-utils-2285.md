@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-labels-browser-tapped-message-jumps: a tapped message moves 43 px in labels_browser.py on main'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 assignee: cl-tapjump
@@ -9,7 +9,8 @@ labels:
 - owner-ui
 - scroll-stability
 created_at: 2026-11-26T05:25:00-05:00
-updated_at: 2026-11-26T06:30:00-05:00
+updated_at: 2026-11-26T08:50:00-05:00
+closed_at: 2026-11-26T08:50:00-05:00
 ---
 
 # Description
@@ -45,3 +46,11 @@ Fix, approved by the lead, for the chip tap only (typed searches keep their beha
 # Notes
 
 Related: #1825 (hashtag labels, chips on cards), #1853 (Labels drop-down), #243 (the place-keeper the check relies on), #2279 (the lane that found the failure).
+
+## Resolution
+
+[opus 5.5] Landed on github/main as `a53a1241`, replayed by `land-main` from the gated head `d3b7a893` (one commit on `8c6b111c`, #2279; main had gained only agentctl, dagrun and issue files since). The owner gate on `d3b7a893` (ticket 1795697054107099441-1cd513b3, full selection, 7:44 to 8:02 AM ET on 2026-11-26) had one red, `vibe-talk.check.top-anchor-browser` ("a live arrival at the foot moved the reading row 27.7px"), which is not this change: it reproduces on main 8c6b111c, and an instrumented copy of this tree showed the new scroll code never runs in that walk (0 calls in 10 walks; a chip tap in the same build triggered it). That red was waived under the flake rule with the named cause #2291 vibe-talk-top-anchor-arrival-27px-race, after an exclusive rerun of the step on the same tree passed (ticket 1795700135182878371-ae36ec6a, passed 8:42 AM ET).
+
+What landed: tapping a label chip keeps the tapped message's top where it stood, even when the label's results are too few to scroll that far. `filterToLabel(label, row)` hands the tapped row to `keepingFilterPlace(change, tapped)` as the anchor; the placement holds it through the scroll owner's `holdRowAt`: room above the rows as padding on the list element, reclaimed in one write once scrolled wholly off the top, and room past the foot as a floor under the content (below the composer), trimmed on every scroll to what the shown place needs. Typed searches and every other filter change are unchanged. `labels_browser.py` checks the tap within 0.5 px and gates as a DAG step, its press finds a redrawn control again, and the new `label_chip_tap_browser.py` (also a DAG step) traces the tapped row per frame: short lists with room above (desk) or a floor (phone, keyboard down), a long list, and room above reclaimed under a scrolling reader with no frame moving the row.
+
+Evidence, reviewed by the liaison: per-frame traces on landed main (desk 0.000 px, phone 0.297 to 0.328 px from device-pixel snapping at scale 2.6) against main's 104 to 416 px jumps; the same check through the real server router with the shipped binary (labels derived by the server, real search route) in light and dark, desktop and phone with the keyboard open and closed; and the screenshot matrix (scenes 73 to 76, light and dark, phone 412x915 and desktop 1280x800, Discuss open), each folder with its BUILD.txt. The liaison accepted the visible band of room above the results on the desk (the same head-room approach as #2256 and #2262).
