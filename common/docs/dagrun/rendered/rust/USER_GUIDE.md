@@ -465,6 +465,19 @@ recorded before they existed reads as unprovenanced, which keeps every authored
 hint. Combining the flag with `--no-profile-feedback` (which turns the store
 reader off) derives nothing, and says so.
 
+`peak_bytes` is the step cgroup's `memory.peak`, and that counts page cache,
+which the kernel reclaims at the cap instead of killing the step. A step can
+therefore read as pinned at its cap with no OOM while its program used far
+less. To size headroom over memory that reclaim cannot free, each boxed row
+also records `anon_sampled_max_bytes` and `shmem_sampled_max_bytes`: the
+largest `anon` and `shmem` byte counts read from the step's `memory.stat`
+while it ran (`shmem` also once after it exits, since tmpfs pages stay
+charged), and `mem_sample_interval_ms`, the nominal spacing of those readings.
+cgroup v2 keeps no high-water mark for either, so these are sampled maxima:
+lower bounds that can miss a spike shorter than the interval, not kernel
+peaks. A blank cell means not measured (an unboxed step, or one that ended
+before its first reading), never zero. Nothing in planning reads them yet.
+
 The estimate is applied after the plan is built, so `--show-plan` prints the
 authored figures and the stderr lines above are the record of what actually
 took effect.
