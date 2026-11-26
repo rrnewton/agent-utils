@@ -2189,6 +2189,8 @@ const filterPlaceOwner = createFilterPlace({
   scrollToNewest: () => scrollToNewest(),
   nudge: (area, delta) => scrollKeeping.nudge(area, delta),
   toPosition: (area, top) => scrollKeeping.toPosition(area, top),
+  holdRowAt: (area, row, delta) => scrollKeeping.holdRowAt(area, row, delta),
+  clearTapRooms: () => scrollKeeping.clearTapRooms(),
   inputStamp: () => scrollKeeping.inputStamp(),
   userMovedSince: (mark) => scrollKeeping.userMovedSince(/** @type {any} */ (mark)),
   renderJumpNewest: () => renderJumpNewest(),
@@ -3471,20 +3473,21 @@ const { setSearchOpen, showSearchOpen } = searchOpenControl;
  * the results; keeping it at the same screen place rides the scroll owner's
  * place-keeping, as a filter change does.
  */
-function filterToLabel(label) {
+function filterToLabel(label, row = null) {
   // `#2279`: `label` is a label NAME (`#kvm`, `merge queue`), searched in its explicit form
   // (`label:#kvm`, `label:"merge queue"`), never the bare form a plain name would share.
   const query = labelQueryFor(label);
   // Owner thread 168: the tapped message is in the results and stays where it
   // is on the screen — the filter change rides the place-keeper every other
-  // filter change rides (`#243 filter-keeps-selection`).
+  // filter change rides (`#243 filter-keeps-selection`). `#2285`: the tapped
+  // row is the anchor, and keeps its top even where the results fit the screen.
   keepingFilterPlace(() => {
     setSearchOpen(true);
     searchField.setQuery(query);
     searchField.setMarked(query);
     el("search-field").value = query;
     applySearch();
-  });
+  }, row);
   labelsFilterRef?.syncButton();
 }
 
@@ -5951,7 +5954,7 @@ const channelRows = createChannelRows({
   markReadUpstream,
   storedSlackOpen: () => deviceSettings().get(DEVICE_SETTINGS.slackOpen),
   isPinnedId: (id) => isPinnedId(id),
-  filterToLabel: (label) => filterToLabel(label),
+  filterToLabel: (label, row) => filterToLabel(label, row),
   openLabelPicker: (messages, row, anchor) => postFactoLabelsRef?.open(messages, row, anchor),
   togglePin: (messages) => togglePin(messages),
   toggleBookmarkAt,

@@ -318,8 +318,24 @@ class Walk:
         return [str(one) for one in found] if isinstance(found, list) else []
 
     def press(self, selector: str) -> None:
-        self.page.locator(selector).scroll_into_view_if_needed()
-        box = self.page.locator(selector).bounding_box()
+        # `#2285`: a control the page redraws while it is pressed (the Labels drop-down draws its
+        # options on opening and again when the labels answer lands) is found again and pressed
+        # then; on a hot host the redraw can fall between finding it and measuring it. The hang
+        # backstop bounds the retries, never a budget (rule 346).
+        from playwright.sync_api import Error as PlaywrightError
+        deadline = time.monotonic() + browser_waits.HANG_BACKSTOP_MS / 1000
+        while True:
+            try:
+                self.page.locator(selector).scroll_into_view_if_needed()
+                box = self.page.locator(selector).bounding_box()
+            except PlaywrightError as error:
+                if "not attached" not in str(error) or time.monotonic() >= deadline:
+                    raise
+                self.page.wait_for_timeout(25)
+                continue
+            if box is not None or time.monotonic() >= deadline:
+                break
+            self.page.wait_for_timeout(25)
         self.check(box is not None, f"{selector} is not on the screen")
         if box is None:
             return
@@ -415,10 +431,13 @@ def walk_through(walk: Walk) -> None:
     walk.until("() => document.getElementById('search-count').textContent.includes('2 of')",
                "the chip's search was not counted")
     after = page.locator('#discord-log > li[data-id="201"]').bounding_box()
-    # The search bar opens above the list, so the row's viewport place moves
-    # by the bar's own height at most; it must stay on screen, unjumped (the
-    # `#243` place-keeper's promise, owner thread 168).
-    walk.check(before is not None and after is not None and 0 <= after["y"] - before["y"] <= 240,
+    # The search bar is already open here (step 2), so nothing above the list
+    # changes: the tapped row keeps its top exactly (`#243`'s promise, owner
+    # thread 168, rule 370). `#2285`: the two results fit the screen, so the
+    # place is held by room above the rows (desk) or past their foot (phone);
+    # positions are fractional, so the bound is half a pixel. The old window
+    # (up to 240 px down) let a 110 px move on the phone through.
+    walk.check(before is not None and after is not None and abs(after["y"] - before["y"]) <= 0.5,
                f"the tapped message jumped: {before and before['y']} -> {after and after['y']}")
     walk.shot("4-chip-filter")
 

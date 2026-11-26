@@ -1,0 +1,20 @@
+steps:
+  # `#1825 vibe-talk-hashtag-labels` and `#1853` in the browser engine, gating since
+  # `#2285 vibe-talk-labels-browser-tapped-message-jumps`: label chips on the cards, label:
+  # search, Whole threads, a chip tap that keeps the tapped row's top within 0.5 px, the
+  # Labels drop-down, and Settings > Labels groups, at 412x915 (keyboard up, Discuss open)
+  # and 1280x800 in both schemes, on a fake API. Condition waits only (#2077 backstop).
+  - group: check
+    job: labels-browser
+    desc: hashtag labels walk (chips, label search, chip tap keeps the tapped row within 0.5 px, Labels drop-down, Settings groups) in current Chromium at 412x915 and 1280x800 in both schemes
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/labels_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools, build.page]
+    timeout: 360
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 20
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824

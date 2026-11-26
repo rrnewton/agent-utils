@@ -204,6 +204,20 @@ export interface ScrollKeeping {
    */
   footRoom(area: HTMLElement): number;
   /**
+   * Hold `row`'s top after a change moved it `delta` px down the viewport (`#2285`, the
+   * label-chip tap): `nudge`'s write, with the room the list lacks added where it cannot
+   * scroll that far — past the foot by a floor under the content (kept to what the place shown
+   * needs), above the head by room on the list element itself, which goes unseen once scrolled
+   * wholly off the top.
+   */
+  holdRowAt(area: HTMLElement, row: Element, delta: number): void;
+  /** Take the rooms a tap held away (`#2285`: the room above the rows, whose height it answers,
+   * and the floor under the content): for a keeper that places the reader right after (a filter
+   * change), never a bare call. */
+  clearTapRooms(): number;
+  /** The room above the rows of the list standing in `area`, else 0 (`#2285`). */
+  headRoom(area: HTMLElement): number;
+  /**
    * Run a redraw of the channel's rows with the reader held where they are, and nothing
    * else decided: no jump recount, which the landing that asked for the redraw owns.
    */
@@ -280,6 +294,19 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
   let roomPx = 0;
   let roomList: HTMLElement | null = null;
   let roomPadding = "";
+  /** The room above the rows held so a tapped row keeps its top where the list
+   * cannot scroll far enough up (`#2285`): its height, the list it stands in, and
+   * that list's own top padding as it was before the room. */
+  let headPx = 0;
+  let headList: HTMLElement | null = null;
+  let headPadding = "";
+  /** The list's own top padding in px when the room was added: the room stands on top of it. */
+  let headBase = 0;
+  /** The floor held under a tapped row's content (`#2285`): the scroller's child kept at least
+   * `floorPx` tall so the held place stays reachable, and that child's own min-height before. */
+  let floorBox: HTMLElement | null = null;
+  let floorMin = "";
+  let floorPx = 0;
   /** When this owner last wrote the list's place, in `Date.now` terms. */
   let ownWriteAt = Number.NEGATIVE_INFINITY;
   /** How many times this owner has written the place (`#2091`): a settle loop
@@ -355,6 +382,148 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     return roomList !== null && typeof area.contains === "function" && area.contains(roomList) ? roomPx : 0;
   }
 
+  /** Give `list` `px` more room above its first row (`#2285`), on the list element itself. */
+  function addHeadRoom(list: HTMLElement, px: number): void {
+    if (typeof list.style !== "object" || px <= 0) return;
+    if (headList !== list) {
+      clearHeadRoom();
+      headList = list;
+      headPadding = list.style.paddingTop || "";
+      headBase = typeof getComputedStyle === "function" ? parseFloat(getComputedStyle(list).paddingTop) || 0 : 0;
+      headPx = 0;
+    }
+    headPx += px;
+    list.style.paddingTop = `${headBase + headPx}px`;
+  }
+
+  /** Take the rooms a tap held away (`#2285`): the room above the rows, whose height it
+   * answers, and the floor. The caller places the reader after it (a filter change does). */
+  function clearTapRooms(): number {
+    clearFloor();
+    return clearHeadRoom();
+  }
+
+  /** Take the held room above the rows away and answer its height (`#2285`). */
+  function clearHeadRoom(): number {
+    if (headList === null) return 0;
+    const px = headPx;
+    headList.style.paddingTop = headPadding;
+    headList = null;
+    headPx = 0;
+    headPadding = "";
+    headBase = 0;
+    return px;
+  }
+
+  /** The room held above the rows of the list standing in `area`, else 0 (`#2285`). */
+  function headRoom(area: HTMLElement): number {
+    return headList !== null && typeof area.contains === "function" && area.contains(headList) ? headPx : 0;
+  }
+
+  /**
+   * Reclaim the room above the rows once it is scrolled wholly off the top (`#2285`): the
+   * room goes and the place moves up by its height in the same task, so no frame shows
+   * the rows move. Where some of it still shows, it stays.
+   */
+  function reclaimHeadRoom(area: HTMLElement): void {
+    const px = headRoom(area);
+    if (px <= 0 || area.scrollTop < px) return;
+    const top = area.scrollTop;
+    clearHeadRoom();
+    noteOwnWrite();
+    area.scrollTop = top - px;
+  }
+
+  /** The scroller's own child that holds `row` (the pane its list and composer stand in), else null. */
+  function contentBlock(area: HTMLElement, row: Element): HTMLElement | null {
+    let at = row as HTMLElement | null;
+    while (at && at.parentElement !== area) at = at.parentElement;
+    return at && typeof at.style === "object" ? at : null;
+  }
+
+  /**
+   * Raise the floor under the content until `area` can scroll to `wanted` (`#2285`), exactly.
+   * The floor is a least height on the scroller's own child that holds the row (its pane), so
+   * the room it makes stands below everything in it — the rows, the search's server line, the
+   * composer — and content that shrinks there afterwards (the composer giving back the floating
+   * chips' room, a line folding) shrinks into the floor instead of taking the foot up and letting
+   * the browser's clamp move the row. `scrollHeight` measures the content only where it
+   * overflows, so the block is measured once with a floor high enough to overflow, and the floor
+   * is then set to what the place needs.
+   */
+  function raiseFloor(area: HTMLElement, row: Element, wanted: number): void {
+    const view = area.clientHeight || 0;
+    if (wanted <= area.scrollHeight - view) return;
+    const box = contentBlock(area, row);
+    if (!box) return;
+    if (floorBox !== box) {
+      clearFloor();
+      floorBox = box;
+      floorMin = box.style.minHeight || "";
+    }
+    const probe = Math.ceil(box.getBoundingClientRect().height + view + wanted);
+    box.style.minHeight = `${probe}px`;
+    const around = area.scrollHeight - probe;
+    floorPx = Math.max(0, Math.ceil(view + wanted - around));
+    box.style.minHeight = `${floorPx}px`;
+  }
+
+  /** Take the floor away (`#2285`): the content's own height is the foot again. */
+  function clearFloor(): void {
+    if (floorBox === null) return;
+    floorBox.style.minHeight = floorMin;
+    floorBox = null;
+    floorMin = "";
+    floorPx = 0;
+  }
+
+  /**
+   * Lower the floor to what the place shown needs (`#2285`), on every scroll: only room below
+   * the viewport's foot goes, so nothing on screen moves, and a reader scrolling up from a held
+   * place gives the room back as they go instead of meeting a clamp. Gone at the head, or once
+   * the content stands taller than the floor by itself.
+   */
+  function trimFloor(area: HTMLElement): void {
+    if (floorBox === null || !area.contains(floorBox)) return;
+    // At the head no place needs room past the foot.
+    if (area.scrollTop <= 0) {
+      clearFloor();
+      return;
+    }
+    const spare = area.scrollHeight - (area.clientHeight || 0) - area.scrollTop;
+    if (spare <= 0.5) return;
+    floorPx = Math.max(0, Math.ceil(floorPx - spare));
+    floorBox.style.minHeight = `${floorPx}px`;
+    if (floorBox.getBoundingClientRect().height > floorPx + 0.5) clearFloor();
+  }
+
+  /**
+   * Hold `row`'s top where it was after a change that moved it by `delta` px down the
+   * viewport (`#2285`): the scroll write the filter keeper makes (`nudge`), but where the
+   * list cannot scroll that far — it fits, or the row is near either end — the room it
+   * lacks is added instead of the browser's clamp moving the row: past the foot by the
+   * user-caused hold's own room (`writeHold`, `#2076`), above the head by room on the
+   * list itself. Answers nothing; the row stands where it stood.
+   */
+  function holdRowAt(area: HTMLElement, row: Element, delta: number): void {
+    if (Math.abs(delta) <= 0.5) return;
+    // The scroll watch reclaims the room this may add; stand it before there is any.
+    watchInput(area);
+    const wanted = area.scrollTop + delta;
+    if (wanted >= 0) {
+      raiseFloor(area, row, wanted);
+      writeHold(area, row, delta);
+      return;
+    }
+    const list = row.parentNode as HTMLElement | null;
+    if (!list) return;
+    addHeadRoom(list, -wanted);
+    if (area.scrollTop !== 0) {
+      noteOwnWrite();
+      area.scrollTop = 0;
+    }
+  }
+
   /**
    * Write `area`'s place to hold an anchor's top (`#2076`): where holding it would
    * scroll past the foot of what stands — a user-caused shrink at the end of the
@@ -405,6 +574,10 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     area.addEventListener("wheel", () => { userInputAt = Date.now(); readerInputAt = userInputAt; }, { passive: true });
     area.addEventListener("touchstart", () => { userInputAt = Date.now(); readerInputAt = userInputAt; }, { passive: true });
     area.addEventListener("scroll", () => {
+      // Room above the rows scrolled wholly off the top goes unseen, and the floor under a
+      // held place keeps only what the place shown needs (`#2285`).
+      reclaimHeadRoom(area);
+      trimFloor(area);
       // The reader's own scroll (not this owner's write) reclaims the held room
       // past the foot (`#2076`): the place is theirs again, room included.
       if (Date.now() - ownWriteAt > 1000) { userInputAt = Date.now(); clearFootRoom(); }
@@ -614,8 +787,9 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
 
   function toFoot(area: HTMLElement): void {
     // A deliberate write to the foot reclaims the held room (`#2076`): the rows'
-    // foot is the foot the reader is taken to.
+    // foot is the foot the reader is taken to. So do the tap's rooms (`#2285`).
     clearFootRoom();
+    clearTapRooms();
     writeTo(area, area.scrollHeight);
   }
 
@@ -1122,5 +1296,5 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     return onScreen;
   }
 
-  return { visibleList, shownChannelList, scrollAnchor, preservingScroll, preservingCollapse, preservingShrink, preservingShrinkAsync, shrinkSettling: () => shrinkActive, shrinkActSettled: () => shrinkActDoneGen === shrinkGen, holdingRows, toFoot, nudge, toPosition, wheelBy, glideTo, intoView, holdingReader, captureScroll, restoreScroll, followIfPinned, rowsOnScreen, userMovedSince, inputStamp: () => userInputAt, userChangeActive, beginUserChange: openUserHold, footRoom };
+  return { visibleList, shownChannelList, scrollAnchor, preservingScroll, preservingCollapse, preservingShrink, preservingShrinkAsync, shrinkSettling: () => shrinkActive, shrinkActSettled: () => shrinkActDoneGen === shrinkGen, holdingRows, toFoot, nudge, toPosition, wheelBy, glideTo, intoView, holdingReader, captureScroll, restoreScroll, followIfPinned, rowsOnScreen, userMovedSince, inputStamp: () => userInputAt, userChangeActive, beginUserChange: openUserHold, footRoom, holdRowAt, clearTapRooms, headRoom };
 }

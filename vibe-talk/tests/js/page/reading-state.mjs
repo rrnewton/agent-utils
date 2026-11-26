@@ -4255,7 +4255,7 @@ test("`#243 filter-keeps-selection`: a message selected among a search's matches
   assert.equal(focused(page), page.el("search-field"), "clearing the text took the focus out of the field");
   // THE CONTROL: without the placing, the same offset in the whole list is somewhere else entirely.
   const unplaced = await run(await brokenModule([{ file: "src/view/channel/filterplace.ts",
-    find: "        if (!landed || currentFilterHold() !== null) placeFilterAnchor(anchor, wasEmptied);",
+    find: "          if (!landed || currentFilterHold() !== null) placeFilterAnchor(anchor, wasEmptied, false, room);",
     replace: "        void anchor;" }]));
   assert.ok(Math.abs(yOf(unplaced.page, "25") - unplaced.y) > 1, "the test cannot see the message jump");
 });

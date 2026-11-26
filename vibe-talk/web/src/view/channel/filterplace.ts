@@ -95,6 +95,13 @@ export interface FilterPlaceDependencies {
   /** Move the list by a measured delta, or put it at a measured position, through the scroll owner (`#1251 scroll-single-owner`). */
   nudge(area: HTMLElement, delta: number): void;
   toPosition(area: HTMLElement, top: number): void;
+  /**
+   * `#2285`: hold a tapped row's top through the scroll owner, with the room the list lacks added
+   * where it cannot scroll that far (`holdRowAt`), and take that room away before a placement
+   * (`clearTapRooms`). Optional for doubles: without them a tap places by `nudge`, clamped.
+   */
+  holdRowAt?(area: HTMLElement, row: HTMLElement, delta: number): void;
+  clearTapRooms?(): number;
   /** The scroll owner's reader-input stamp, and whether the reader moved since one (`#1894`, guard from `#1880`). Optional for doubles. */
   inputStamp?(): number;
   userMovedSince?(mark: unknown): boolean;
@@ -144,8 +151,8 @@ export interface FilterPlace {
   followsNewest(area: HTMLElement): boolean;
   keepFilterHold(): boolean;
   filterAnchor(): FilterAnchor | null;
-  keepingFilterPlace<T>(change: () => T): T;
-  placeFilterAnchor(anchor: FilterAnchor | null, wasEmptied?: boolean, walked?: boolean): void;
+  keepingFilterPlace<T>(change: () => T, tapped?: HTMLElement | null): T;
+  placeFilterAnchor(anchor: FilterAnchor | null, wasEmptied?: boolean, walked?: boolean, room?: boolean): void;
   settlePendingFilterPlace(): void;
 }
 
@@ -198,6 +205,14 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
       offset: deps.messageTop(row, kept.length ? (kept[0] as string) : null) - deps.listPlaceTop(deps.el("scroll-area")),
       alternate: null,
     };
+  }
+
+  /** `#2285`: the row of the list on screen that holds `row` (itself, or the card it stands in), else null. */
+  function listChildHolding(row: HTMLElement): HTMLElement | null {
+    const list = deps.visibleList();
+    let at: HTMLElement | null = row;
+    while (at && at.parentNode !== list) at = at.parentElement;
+    return at && isMessageRow(at) ? standingRow(at) as HTMLElement | null : null;
   }
 
   /**
@@ -389,28 +404,39 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
    * screen in every column showing messages. A `change` that returns a promise — a read — is waited
    * for, and the reader placed when it lands. Returns what `change` returns.
    *
+   * `tapped` (`#2285`, owner thread 168 and rule 370): the row whose label chip the reader tapped.
+   * It is the anchor in the column showing it, whatever the reader had selected or scrolled to,
+   * and it keeps its top exactly: where the list the change leaves cannot scroll that far (it fits
+   * the screen, or the row is near an end), the scroll owner adds the room it lacks instead of
+   * letting the browser's clamp move the row.
+   *
    * @template T
    * @param {() => T} change
    * @returns {T}
    */
-  function keepingFilterPlace<T>(change: () => T): T {
+  function keepingFilterPlace<T>(change: () => T, tapped: HTMLElement | null = null): T {
     if (filterChanges.changing()) return change();
-    /** @type {Array<[ColumnFields, FilterAnchor | null, boolean]>} */
-    const kept: Array<[unknown, FilterAnchor | null, boolean]> = [];
+    /** @type {Array<[ColumnFields, FilterAnchor | null, boolean, boolean]>} */
+    const kept: Array<[unknown, FilterAnchor | null, boolean, boolean]> = [];
     deps.eachColumn(() => {
-      kept.push([deps.activeColumn(), filterAnchor(), deps.listEmptied()]);
+      const standing = tapped ? listChildHolding(tapped) : null;
+      kept.push([deps.activeColumn(), standing ? anchorAt(standing) : filterAnchor(), deps.listEmptied(), standing !== null]);
       // A landing a thread's entry made, or still owes, is spent: the reader has acted since. `#221`.
       deps.clearEntryLanding();
     });
     // A walk back for an earlier change is over: this one decides where the reader goes.
     endFilterWalk();
     const result = filterChanges.whileChanging(change);
+    // `#2285`: the rooms an earlier tap held (above the rows, the floor under them) go before this
+    // change places anyone; the anchors were measured on screen, so the placement below puts each
+    // back where it stood.
+    if (deps.clearTapRooms) deps.clearTapRooms();
     const place = (landed = false): void => {
-      for (const [column, anchor, wasEmptied] of kept) {
+      for (const [column, anchor, wasEmptied, room] of kept) {
         if (column === deps.sideColumn() && !deps.sideShowing()) continue;
         deps.inColumn(column, () => {
           // Once a read has landed, only for a reader still where the change put them.
-          if (!landed || currentFilterHold() !== null) placeFilterAnchor(anchor, wasEmptied);
+          if (!landed || currentFilterHold() !== null) placeFilterAnchor(anchor, wasEmptied, false, room);
         });
       }
     };
@@ -436,7 +462,7 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
    * or the kinds of link it names, or above the screen. The anchor is kept for the change that fills it
    * again. A list filled again with no anchor to go back to opens at its newest line, as a list does.
    */
-  function placeFilterAnchor(anchor: FilterAnchor | null, wasEmptied = false, walked = false): void {
+  function placeFilterAnchor(anchor: FilterAnchor | null, wasEmptied = false, walked = false, room = false): void {
     if (deps.screen() !== "main") return;
     const area = deps.el("scroll-area");
     if (deps.listEmptied()) {
@@ -480,7 +506,12 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
     // them back; the rows stand where they landed and the reader stays.
     const readerMoved = anchor.placeMark !== undefined && deps.userMovedSince
       ? deps.userMovedSince(anchor.placeMark) : false;
-    if (!readerMoved) deps.nudge(area, deps.messageTop(placed, row ? id : null) - deps.listPlaceTop(area) - offset);
+    if (!readerMoved) {
+      const delta = deps.messageTop(placed, row ? id : null) - deps.listPlaceTop(area) - offset;
+      // `#2285`: a tapped row keeps its top even where the list cannot scroll that far.
+      if (room && row && deps.holdRowAt) deps.holdRowAt(area, placed, delta);
+      else deps.nudge(area, delta);
+    }
     carrySelection(anchor, placed, substitute !== null);
     const pane = deps.view() === "discord" ? (deps.columnSide() ? deps.sidePane() : deps.channelPane()) : null;
     const mark = pane ? deps.markOf(pane) : null;

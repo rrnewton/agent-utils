@@ -9,7 +9,7 @@ labels:
 - owner-ui
 - scroll-stability
 created_at: 2026-11-26T05:25:00-05:00
-updated_at: 2026-11-26T05:25:00-05:00
+updated_at: 2026-11-26T06:30:00-05:00
 ---
 
 # Description
@@ -26,7 +26,13 @@ Triage questions this issue answers:
 
 # Design
 
-Triage first; the cause and the proposed fix are recorded here once the lead approves them.
+Triage (2026-11-26): deterministic (3 of 3 runs on main, load1 about 90) and owner-visible (the deployed build serves the same page). Bisect names 5730d703 (#1899, the bucket chips pinned under the search bar), but that landing only unmasked the defect. After the tap the label search leaves two results that fit the screen, so the filter keeper's scroll write (`nudge`, clamped by the browser) cannot reach the place that keeps the tapped row: on the desk the row must stand lower than the list's head allows, on the phone higher than the list's foot allows. The row moves by exactly the deficit in one frame. Before #1899 the bucket row stood in the list's flow and gave the desk row about 46 px of accidental room; the phone row moved 110 to 165 px all along, let through by a check that allowed 240 px down "for the search bar opening" while the bar was already open.
+
+Fix, approved by the lead, for the chip tap only (typed searches keep their behaviour):
+
+- The tapped row is the anchor: `filterToLabel(label, row)` hands it to `keepingFilterPlace(change, tapped)`, which anchors the row of the list on screen that holds it.
+- The placement holds it with room through the scroll owner's `holdRowAt`: a deficit above the head becomes padding on the list element itself, reclaimed in one write once scrolled wholly off the top (the room goes and the place moves up by it in the same task); a deficit past the foot becomes a floor (a least height on the scroller's child that holds the list and composer), so the room stands below the composer and content that shrinks there later (the composer giving back the floating chips' room) cannot take the foot up and clamp the row. The floor is lowered on every scroll to what the place shown needs and goes at the head. The next filter change takes both rooms away before it places anyone; a deliberate write to the foot does too.
+- `labels_browser.py` checks the tap within 0.5 px and gates as a DAG step; `label_chip_tap_browser.py` traces the tapped row per frame (short lists with room above or a floor, a long list, room reclaimed under a scrolling reader).
 
 # Acceptance Criteria
 

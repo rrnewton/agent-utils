@@ -925,6 +925,93 @@ test("`#2076 vibe-talk-top-anchor-policy`: a user-caused change at the foot hold
   assert.deepStrictEqual(calls.at(-1), ["chip", "discord", 1], "an arrival during the act was followed instead of chipped");
 });
 
+test("`#2285 vibe-talk-labels-browser-tapped-message-jumps`: a tapped row keeps its top where the list cannot scroll that far, by room above or a floor below, and neither moves a row when it goes", () => {
+  const { createScrollKeeping } = CHANNEL_VIEW;
+  // A scroller laid out as the browser lays it: the list's top padding (the room above) adds to
+  // the pane's content, the pane stands at least its min-height (the floor) tall, scrollHeight
+  // never reads less than the scroller's own height, and every scroll place is clamped to
+  // [0, scrollHeight - clientHeight] — on a write and whenever the content changes (`layout`).
+  const handlers = {};
+  const px = (value) => parseFloat(value) || 0;
+  let content = 300;
+  let top = 0;
+  const area = {
+    clientHeight: 500,
+    get scrollHeight() { return Math.max(20 + pane.getBoundingClientRect().height, this.clientHeight); },
+    get scrollTop() { return top; },
+    set scrollTop(value) { top = Math.min(Math.max(value, 0), this.scrollHeight - this.clientHeight); },
+    getBoundingClientRect: () => ({ top: 0 }),
+    addEventListener: (type, fn) => { handlers[type] = fn; },
+    contains: (node) => node === list || node === pane,
+  };
+  const layout = () => { area.scrollTop = top; };
+  const pane = { parentElement: area, style: { minHeight: "" },
+    getBoundingClientRect: () => ({ height: Math.max(content + px(list.style.paddingTop), px(pane.style.minHeight)) }) };
+  const list = { id: "discord-log", parentElement: pane, parentNode: pane, style: { paddingTop: "", paddingBottom: "" }, children: [] };
+  // The tapped row stands 100px into the list's content.
+  const row = { parentNode: list, parentElement: list, getAttribute: () => null,
+    getBoundingClientRect: () => ({ top: 100 + px(list.style.paddingTop) - top, bottom: 140 + px(list.style.paddingTop) - top }) };
+  list.children = [row];
+  const els = { "discord-log": list, "pinned-log": { id: "pinned-log", children: [] }, "scroll-area": area, "load-older": { hidden: true, getBoundingClientRect: () => ({ top: 0 }) }, transcript: { children: [] } };
+  const keep = createScrollKeeping({
+    el: (id) => els[id], onMain: () => true, currentView: () => "discord", channelView: () => "main", pinnedOnly: () => false,
+    heldFilterRow: () => null, searchWalk: () => null, atBottom: () => false,
+    scrollToNewest: () => {}, renderJumpNewest: () => {}, setJumpNewest: () => {},
+  });
+  // Desk: the tap left two rows that fit; the row stood at 143px, lower than the list's head
+  // lets it stand (100px at scroll 0). The browser's clamp would keep it at 100 (the 43px jump).
+  keep.holdRowAt(area, row, 100 - 143);
+  assert.equal(row.getBoundingClientRect().top, 143, "the row did not keep its top above a list that fits");
+  assert.equal(keep.headRoom(area), 43, "the room above the rows is not the 43px the clamp lacked");
+  assert.equal(list.style.paddingTop, "43px", "the room is not padding on the list element itself");
+  assert.equal(top, 0);
+  // The next placement takes the rooms away first and answers the room above.
+  assert.equal(keep.clearTapRooms(), 43);
+  assert.equal(list.style.paddingTop, "", "the list's own padding was not put back");
+  assert.equal(keep.headRoom(area), 0);
+  // Phone: the row stood at 0px and the fitting list puts it at 100px; the floor under the pane
+  // must let the scroller reach 100 even though scrollHeight hides how short the content is.
+  keep.holdRowAt(area, row, 100);
+  assert.equal(row.getBoundingClientRect().top, 0, "the row did not keep its top over a list that fits");
+  assert.equal(top, 100);
+  assert.equal(area.scrollHeight - area.clientHeight, 100, "the floor is not exactly what the place needs");
+  assert.equal(list.style.paddingBottom, "", "the floor went between the rows and what follows them");
+  // Content under the row shrinks afterwards (the composer gives back the chips' room): it
+  // shrinks into the floor, and the browser has no foot to clamp the row to.
+  content = 260;
+  layout();
+  assert.equal(row.getBoundingClientRect().top, 0, "content shrinking below the row moved it by the clamp");
+  // The reader scrolls up 40px: only the room below the viewport's foot goes, so the place holds.
+  top = 60;
+  handlers.scroll();
+  assert.equal(area.scrollHeight - area.clientHeight, 60, "the floor kept room the place shown does not need");
+  assert.equal(top, 60, "lowering the floor moved the place");
+  assert.equal(row.getBoundingClientRect().top, 40);
+  // Back at the head the content stands taller than any floor left: it goes.
+  top = 0;
+  handlers.scroll();
+  assert.equal(pane.style.minHeight, "", "the pane's own min-height was not put back");
+  // Reclaim: a long list (it scrolls), a row held 60px lower than scroll 0 allows.
+  content = 2000;
+  top = 0;
+  keep.holdRowAt(area, row, -60);
+  assert.equal(keep.headRoom(area), 60);
+  assert.equal(row.getBoundingClientRect().top, 160);
+  // The reader scrolls 40px: part of the room still shows, so it stays.
+  top = 40;
+  handlers.scroll();
+  assert.equal(keep.headRoom(area), 60, "room still on screen was taken away under the reader");
+  assert.equal(row.getBoundingClientRect().top, 120);
+  // On past it: the room goes and the place moves up by it in the same task, the row unmoved.
+  top = 90;
+  const seen = row.getBoundingClientRect().top;
+  handlers.scroll();
+  assert.equal(keep.headRoom(area), 0, "room scrolled wholly off the top was not reclaimed");
+  assert.equal(list.style.paddingTop, "");
+  assert.equal(top, 30);
+  assert.equal(row.getBoundingClientRect().top, seen, "reclaiming the room moved the row");
+});
+
 test("`#1251 scroll-single-owner`: a redraw that replaces the anchor row is held by the row re-found by id", () => {
   const { createScrollKeeping } = CHANNEL_VIEW;
   let shift = 0;
