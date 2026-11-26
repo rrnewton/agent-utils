@@ -278,6 +278,60 @@ def _read_cgroup_value(group: Path | None, name: str) -> str | None:
         return None
 
 
+@dataclass(frozen=True)
+class MemoryStatSample:
+    """One instantaneous ``memory.stat`` reading of the memory classes reclaim cannot free.
+
+    Either field is ``None`` when that counter is absent or unparseable; a manager returns
+    ``None`` for the whole sample when ``memory.stat`` cannot be read at all, so a caller can
+    tell "not measured" from a real zero."""
+
+    #: Anonymous memory (``anon``), in bytes.
+    anon_bytes: int | None = None
+    #: Shared memory (``shmem``, including tmpfs), in bytes.
+    shmem_bytes: int | None = None
+
+
+_I64_MAX = 2**63 - 1
+
+
+def _memory_stat_byte_count(value: str) -> int | None:
+    # ASCII digits only, within i64: the Rust build parses an i64, and int() alone would also
+    # accept signs, surrounding space, PEP-515 underscores and non-ASCII digits.
+    if not value or not all("0" <= ch <= "9" for ch in value):
+        return None
+    number = int(value)
+    return number if number <= _I64_MAX else None
+
+
+def parse_memory_stat_anon_shmem(text: str) -> MemoryStatSample | None:
+    """Parse the ``anon`` and ``shmem`` byte counters from cgroup-v2 ``memory.stat`` text.
+
+    Keys match whole (``anon_thp``/``shmem_thp`` are other counters), the first occurrence is
+    the reading, and the scan stops once both are seen. Returns ``None`` when neither counter
+    is present and parseable; a present counter whose value is not a plain decimal that fits an
+    i64 stays ``None`` in its own field, never 0. Same rule as the Rust build."""
+    anon: int | None = None
+    shmem: int | None = None
+    seen_anon = seen_shmem = False
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) < 2:
+            continue
+        key, value = fields[0], fields[1]
+        if key == "anon" and not seen_anon:
+            seen_anon = True
+            anon = _memory_stat_byte_count(value)
+        elif key == "shmem" and not seen_shmem:
+            seen_shmem = True
+            shmem = _memory_stat_byte_count(value)
+        if seen_anon and seen_shmem:
+            break
+    if anon is None and shmem is None:
+        return None
+    return MemoryStatSample(anon_bytes=anon, shmem_bytes=shmem)
+
+
 def _cpu_max_cores(value: str | None) -> int | None:
     """Whole granted cores from a ``cpu.max`` string (``"<quota> <period>"``), or None
     when unbounded (``"max ..."``) / unreadable. Floors to >=1 for any positive quota so a
@@ -2799,6 +2853,22 @@ class Cgroups:
         except (OSError, ValueError):
             return None
 
+    def memory_stat_sample(self, tag: str) -> MemoryStatSample | None:
+        """Instantaneous ``anon`` and ``shmem`` bytes from the step's ``memory.stat``.
+
+        cgroup v2 keeps no high-water mark for either, so the scheduler samples this on its
+        monitor ticks and keeps the maxima (lower bounds on the true peaks). Like
+        ``memory.peak`` the file is hierarchical, so a delegated step's reading covers its
+        nested run. ``None`` when disabled, unknown, unreadable or unparseable, never a zero.
+        Read BEFORE :meth:`cleanup`."""
+        if not self.enabled or self.root is None or tag not in self._made:
+            return None
+        try:
+            text = (self.root / _sanitize(tag) / "memory.stat").read_text()
+        except OSError:
+            return None
+        return parse_memory_stat_anon_shmem(text)
+
     def thread_count(self, tag: str) -> int | None:
         """Current descendant thread count from the step's ``cgroup.threads``."""
         if not self.enabled or self.root is None or tag not in self._made:
@@ -2966,6 +3036,10 @@ class NoopCgroups:
 
     def peak_bytes(self, tag: str) -> int | None:
         """Return ``None`` because no cgroup memory peak is available."""
+        return None
+
+    def memory_stat_sample(self, tag: str) -> MemoryStatSample | None:
+        """Return ``None`` because no cgroup ``memory.stat`` is available."""
         return None
 
     def cpu_stats(self, tag: str) -> Mapping[str, int] | None:

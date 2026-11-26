@@ -11,6 +11,7 @@ from __future__ import annotations
 from dagrun import perflog
 
 import csv
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -152,6 +153,64 @@ def test_dynamic_cpu_columns_are_sorted_alphabetically() -> None:
             "cpu.usage_usec",
             "cpu.user_usec",
         ]
+
+
+_MEMORY_SAMPLE_COLUMNS = [
+    "anon_sampled_max_bytes",
+    "shmem_sampled_max_bytes",
+    "mem_sample_interval_ms",
+]
+
+
+def _rust_step_profile_columns() -> list[str]:
+    source = (
+        Path(__file__).resolve().parents[2] / "rs" / "dagrun" / "src" / "perflog.rs"
+    ).read_text(encoding="utf-8")
+    match = re.search(
+        r"pub const STEP_PROFILE_COLUMNS: \[&str; (\d+)\] = \[(.*?)\];", source, re.S
+    )
+    assert match is not None, "STEP_PROFILE_COLUMNS not found in the Rust writer"
+    names = re.findall(r'"([^"]+)"', match.group(2))
+    assert len(names) == int(match.group(1))
+    return names
+
+
+def test_step_profile_columns_match_the_rust_writer_in_order() -> None:
+    """Both writers emit one schema, column for column: a reader of either build's store, by
+    name or by position, sees the same standard block. The memory-sample columns are the last
+    three, after every column that existed before them (append-only)."""
+    assert _rust_step_profile_columns() == list(perflog.STEP_PROFILE_COLUMNS)
+    columns = list(perflog.STEP_PROFILE_COLUMNS)
+    assert columns[-3:] == _MEMORY_SAMPLE_COLUMNS
+    assert columns[-4] == "memory_events_oom_group_kill"
+
+
+def test_widening_an_existing_store_appends_the_memory_columns_blank_for_old_rows() -> None:
+    """A store written before these columns keeps every old cell where it was; the new columns
+    go at the end of its header (after its dynamic ``cpu.*`` tail) and are blank, never 0, in
+    the rows that predate them."""
+    old_header = [c for c in perflog.STEP_PROFILE_COLUMNS if c not in _MEMORY_SAMPLE_COLUMNS]
+    old_header.append("cpu.usage_usec")
+    old_cells = [f"v{i}" for i in range(len(old_header))]
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / perflog._step_profiles_csv_name()
+        path.write_text(",".join(old_header) + "\n" + ",".join(old_cells) + "\n")
+        appended = append_step_profiles(
+            d,
+            [{"step": "g.new", "anon_sampled_max_bytes": 100, "shmem_sampled_max_bytes": None}],
+            git_sha="abc",
+            outer_jobs=1,
+        )
+        assert appended == path
+        with path.open(newline="") as handle:
+            rows = list(csv.reader(handle))
+    header, old_row, new_row = rows
+    assert header == old_header + _MEMORY_SAMPLE_COLUMNS
+    assert old_row == old_cells + ["", "", ""]
+    by_name = dict(zip(header, new_row))
+    assert by_name["anon_sampled_max_bytes"] == "100"
+    assert by_name["shmem_sampled_max_bytes"] == ""
+    assert by_name["mem_sample_interval_ms"] == ""
 
 
 def test_profile_csvs_use_lf_line_endings() -> None:

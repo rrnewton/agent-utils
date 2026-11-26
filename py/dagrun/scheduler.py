@@ -309,6 +309,62 @@ def _cpu_seconds_from_stats(stats: Mapping[str, int]) -> float | None:
     return None if usage_usec is None else usage_usec / 1_000_000
 
 
+class _SampledMemoryMax:
+    """Running maxima of instantaneous ``memory.stat`` anon/shmem samples.
+
+    cgroup v2 keeps no high-water mark for either, so these sampled maxima are lower bounds on
+    the true peaks. A field stays ``None`` until a reading lands, so "not measured" never
+    serializes as zero. Mirrors the Rust build's ``SampledMemoryMax``."""
+
+    __slots__ = ("anon_bytes", "shmem_bytes")
+
+    def __init__(self) -> None:
+        self.anon_bytes: int | None = None
+        self.shmem_bytes: int | None = None
+
+    def observe(self, sample: object | None, after_exit: bool) -> None:
+        """Fold one sample in. ``after_exit`` marks a reading taken once the step's leader was
+        seen to exit: its ``anon`` is DROPPED, because the kernel frees a process's anonymous
+        memory as it exits and what is left is the residue of a dead tree, not demand (a step
+        too short for a periodic sample would otherwise record about 0 as its peak). Its
+        ``shmem`` is kept: tmpfs pages stay charged to the step's cgroup after its processes
+        are gone."""
+        if sample is None:
+            return
+        anon = getattr(sample, "anon_bytes", None)
+        shmem = getattr(sample, "shmem_bytes", None)
+        if anon is not None and not after_exit:
+            self.anon_bytes = anon if self.anon_bytes is None else max(self.anon_bytes, anon)
+        if shmem is not None:
+            self.shmem_bytes = shmem if self.shmem_bytes is None else max(self.shmem_bytes, shmem)
+
+    def any(self) -> bool:
+        return self.anon_bytes is not None or self.shmem_bytes is not None
+
+
+def _mem_sample_interval_ms(profile_timeseries_interval_s: float | None) -> int:
+    """Nominal spacing of the monitor's memory samples, in whole milliseconds (rounded).
+
+    The monitor reads ``memory.stat`` on every tick it takes: the 1 s guard tick, and the trace
+    tick when ``--profile-timeseries`` asks for a shorter one. Rounds half up like the Rust
+    build, so both write the same cell for the same interval."""
+    interval = (
+        _MONITOR_INTERVAL_S
+        if profile_timeseries_interval_s is None
+        else min(profile_timeseries_interval_s, _MONITOR_INTERVAL_S)
+    )
+    return int(interval * 1000.0 + 0.5)
+
+
+def _memory_stat_sample(manager: object, tag: str) -> object | None:
+    """The manager's ``memory_stat_sample(tag)``, or ``None`` when it has no such method.
+
+    Optional by design, like the Rust trait's default: a manager written before this reading
+    existed has measured nothing, and that must not read as zero demand or break its runs."""
+    sampler = getattr(manager, "memory_stat_sample", None)
+    return None if sampler is None else sampler(tag)
+
+
 def _step_timeseries_sample(
     *,
     step: str,
@@ -1919,6 +1975,34 @@ class Runner:
 
         monitor_stop = threading.Event()
         thread_peak: int | None = None
+        sampled_memory = _SampledMemoryMax()
+        sampled_memory_lock = threading.Lock()
+        # Set once the leader's exit has been observed, BEFORE the reap. Each memory sample reads
+        # it AFTER the read, so a reading of the tree being killed is never taken for demand.
+        step_exited = threading.Event()
+        memory_warning_emitted = False
+
+        def _sample_memory(after_exit: bool = False) -> None:
+            """Fold one ``memory.stat`` reading into the step's sampled maxima (boxed only)."""
+
+            nonlocal memory_warning_emitted
+            if not boxed:
+                return
+            try:
+                sample = _memory_stat_sample(self.cgroups, step.tag)
+            except Exception as exc:
+                # Optional evidence: a broken reading must be visible but must never kill the
+                # monitor thread that enforces CPU-time limits.
+                sample = None
+                if not memory_warning_emitted:
+                    memory_warning_emitted = True
+                    _warn(
+                        f"step {step.tag!r}: memory.stat sample unavailable ({exc}); "
+                        "its anon/shmem maxima stay blank rather than invented"
+                    )
+            exited = after_exit or step_exited.is_set()
+            with sampled_memory_lock:
+                sampled_memory.observe(sample, exited)
         trace_sample_index = 0
         trace_previous_elapsed_s: float | None = None
         trace_previous_cpu_stats: Mapping[str, int] | None = None
@@ -2022,7 +2106,8 @@ class Runner:
                 if monitor_stop.wait(max(0.0, deadline - time.monotonic())):
                     return
                 now = time.monotonic()
-                if trace_interval is not None and now >= next_trace_deadline:
+                trace_due = trace_interval is not None and now >= next_trace_deadline
+                if trace_due:
                     _capture_timeseries_sample("periodic")
                     # Advance from the absolute schedule rather than from the end of the read.
                     # A slow sample therefore exposes a long actual interval instead of drifting
@@ -2030,6 +2115,9 @@ class Runner:
                     now = time.monotonic()
                     skipped = int((now - next_trace_deadline) // trace_interval) + 1
                     next_trace_deadline += skipped * trace_interval
+                # One memory.stat reading per tick taken (trace or guard), as the Rust monitor.
+                if trace_due or now >= next_guard_deadline:
+                    _sample_memory()
                 if now < next_guard_deadline:
                     continue
                 skipped_guards = int((now - next_guard_deadline) // _MONITOR_INTERVAL_S) + 1
@@ -2137,6 +2225,8 @@ class Runner:
             except Exception:
                 pass
         # proc.wait() has now observed the child exit (normally or after timeout teardown).
+        # From here on a memory sample reads a tree that has exited or is being reaped.
+        step_exited.set()
         # Stop counting it before monitor/reader joins, which can outlive the child when a
         # grandchild holds an output pipe open.
         with self.lock:
@@ -2154,6 +2244,14 @@ class Runner:
         # the process tree is quiescent and BEFORE cleanup destroys the counters; this also gives
         # a sub-interval step a useful start/final pair.
         _capture_timeseries_sample("final")
+        # One final memory reading before cleanup destroys the counters. The tree is dead, so
+        # only its shmem counts (see _SampledMemoryMax.observe): tmpfs pages the step left
+        # behind are still charged here, while its anonymous memory went with its processes.
+        _sample_memory(after_exit=True)
+        with sampled_memory_lock:
+            anon_sampled_max = sampled_memory.anon_bytes
+            shmem_sampled_max = sampled_memory.shmem_bytes
+            memory_sampled = sampled_memory.any()
 
         # Read the step's cgroup measurements BEFORE cleanup() rmdirs the child cgroup.
         # memory_events is read once and oom is taken from it, so the OOM count and the
@@ -2221,6 +2319,14 @@ class Runner:
             "oom_kills": oom_kills,
             "peak_bytes": peak,
             "thread_peak": thread_peak,
+            # Sampled maxima of memory.stat anon/shmem: lower bounds, blank when not measured.
+            "anon_sampled_max_bytes": anon_sampled_max,
+            "shmem_sampled_max_bytes": shmem_sampled_max,
+            "mem_sample_interval_ms": (
+                _mem_sample_interval_ms(self.profile_timeseries_interval_s)
+                if memory_sampled
+                else None
+            ),
             # Run-overlap + applied-cap provenance. Offsets share one monotonic run origin, so
             # two rows of the same run_id overlap iff their [started, finished] intervals do.
             "started_offset_s": round(started_offset_s, 3),

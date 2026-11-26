@@ -199,10 +199,10 @@ STEP_PROFILE_COLUMNS = [
     *ENRICHMENT_COLUMNS,
     # Run-overlap and applied-cap provenance (appended; blank when unavailable).
     *CENSORING_COLUMNS,
-    # Sampled maxima of instantaneous memory.stat anon/shmem (appended;
-    # blank when not measured, never zero for that case). These are
-    # lower bounds sampled on the monitor cadence in
-    # mem_sample_interval_ms, not kernel high-water marks.
+    # Sampled maxima of instantaneous memory.stat anon/shmem bytes (appended; blank when not
+    # measured, never zero for that case). Lower bounds sampled on the monitor cadence in
+    # mem_sample_interval_ms, not kernel high-water marks; anon only from readings taken while
+    # the step ran, shmem also from one after it exits. See the Rust STEP_PROFILE_COLUMNS docs.
     "anon_sampled_max_bytes", "shmem_sampled_max_bytes",
     "mem_sample_interval_ms",
 ]

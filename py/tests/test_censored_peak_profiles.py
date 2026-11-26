@@ -17,7 +17,14 @@ from pathlib import Path
 
 import pytest
 
-from dagrun.cgroup import Cgroups, NoopCgroups, _create_nested_run_root, _sanitize
+from dagrun.cgroup import (
+    Cgroups,
+    MemoryStatSample,
+    NoopCgroups,
+    _create_nested_run_root,
+    _sanitize,
+    parse_memory_stat_anon_shmem,
+)
 from dagrun.cli import main
 from dagrun.memory_feedback import Censoring, peak_observation_from_row
 from dagrun.model import DagConfig, ResourceHint, Step, oom_reached_step_cap
@@ -771,3 +778,144 @@ def test_memory_events_is_none_rather_than_empty_when_unreadable(tmp_path: Path)
 
     assert cgroups.memory_events("g.job") is None
     assert cgroups.oom_kills("g.job") == 0
+
+
+# ---------------------------------------------------------------------------
+# Sampled anon/shmem maxima beside the cache-inclusive peak.
+# ---------------------------------------------------------------------------
+
+_MEMORY_SAMPLE_COLUMNS = (
+    "anon_sampled_max_bytes",
+    "shmem_sampled_max_bytes",
+    "mem_sample_interval_ms",
+)
+
+
+def test_memory_stat_parse_matches_whole_keys_and_refuses_non_decimal_values() -> None:
+    """Same cases as the Rust build's parser test: both must read one file the same way."""
+    real = (
+        "anon_thp 4194304\nanon 1048576\nfile 2097152\nkernel 65536\n"
+        "shmem_thp 0\nshmem 262144\nfile_mapped 0\n"
+    )
+    assert parse_memory_stat_anon_shmem(real) == MemoryStatSample(1048576, 262144)
+    assert parse_memory_stat_anon_shmem("anon 0\nfile 7\n") == MemoryStatSample(0, None)
+    assert parse_memory_stat_anon_shmem("file 7\nshmem 9") == MemoryStatSample(None, 9)
+    for bad in ("+5", "-5", "1_000", "1.5", "0x10", "9223372036854775808", "\u0661"):
+        assert parse_memory_stat_anon_shmem(f"anon {bad}\nshmem 3\n") == MemoryStatSample(
+            None, 3
+        ), bad
+    assert parse_memory_stat_anon_shmem("anon\nshmem\n") is None
+    assert parse_memory_stat_anon_shmem("") is None
+    assert parse_memory_stat_anon_shmem("anon 1\nshmem 2\nanon 99\n") == MemoryStatSample(1, 2)
+
+
+def test_memory_stat_sample_is_none_when_missing_unparsable_or_disabled(tmp_path: Path) -> None:
+    cgroups, child = _planted_cgroupfs(tmp_path, "g.job")
+
+    assert cgroups.memory_stat_sample("g.job") is None
+    (child / "memory.stat").write_text("anon 1048576\nfile 2097152\nshmem 262144\n")
+    assert cgroups.memory_stat_sample("g.job") == MemoryStatSample(1048576, 262144)
+    (child / "memory.stat").write_text("anon nope\nshmem nope\n")
+    assert cgroups.memory_stat_sample("g.job") is None
+    (child / "memory.stat").write_text("anon 1\nshmem 2\n")
+    cgroups.enabled = False
+    assert cgroups.memory_stat_sample("g.job") is None
+    assert NoopCgroups().memory_stat_sample("g.job") is None
+
+
+class _MemoryStatCgroups(_PlantedCgroups):
+    """Serves scripted ``memory.stat`` readings: ``running`` until the step is reaped
+    (``kill``), then ``after_exit``, the way a real cgroup's anon drops as its processes die.
+
+    The first running reading creates ``sampled``, which the step waits for, so the run is
+    guaranteed one periodic sample without any wall-clock assumption."""
+
+    def __init__(
+        self,
+        running: MemoryStatSample | None,
+        after_exit: MemoryStatSample | None,
+        sampled: Path,
+    ) -> None:
+        super().__init__({"g.mem": (1 << 30, "max", {"max": 0, "oom": 0, "oom_kill": 0})})
+        self.running = running
+        self.after_exit = after_exit
+        self.sampled = sampled
+        self.killed = False
+
+    def kill(self, tag: str) -> bool:
+        self.killed = True
+        return False
+
+    def memory_stat_sample(self, tag: str) -> MemoryStatSample | None:
+        if self.killed:
+            return self.after_exit
+        self.sampled.write_text("1")
+        return self.running
+
+
+def _wait_for(path: Path) -> str:
+    # Wait on the EVENT (the fake served a running sample), bounded generously so a broken
+    # sampler fails the step instead of hanging the test.
+    return (
+        f"i=0; while [ ! -e '{path}' ]; do i=$((i+1)); [ $i -gt 6000 ] && exit 3; "
+        "sleep 0.05; done"
+    )
+
+
+def test_profile_row_records_running_anon_and_final_shmem_maxima(tmp_path: Path) -> None:
+    sampled = tmp_path / "sampled"
+    cgroups = _MemoryStatCgroups(
+        MemoryStatSample(anon_bytes=100, shmem_bytes=10),
+        # After the reap: a dead tree's anon must not count (999 would win a plain max), while
+        # tmpfs pages it left behind still do.
+        MemoryStatSample(anon_bytes=999, shmem_bytes=50),
+        sampled,
+    )
+    store = tmp_path / "store"
+    cfg = DagConfig(steps=(_step("mem", _wait_for(sampled)),))
+
+    _record(store, cfg, jobs=1, cgroups=cgroups)
+
+    row = _by_step(store)["g.mem"]
+    assert row["ok"] == "true"
+    assert row["peak_bytes"] == str(1 << 30)
+    assert row["anon_sampled_max_bytes"] == "100"
+    assert row["shmem_sampled_max_bytes"] == "50"
+    assert row["mem_sample_interval_ms"] == "1000"
+
+
+def test_profile_row_leaves_unmeasured_memory_samples_blank_never_zero(tmp_path: Path) -> None:
+    # A manager whose memory.stat is unreadable: three blanks, not three zeros.
+    unreadable = _MemoryStatCgroups(None, None, tmp_path / "sampled")
+    cfg = DagConfig(steps=(_step("mem", "true"),))
+    _record(tmp_path / "unreadable", cfg, jobs=1, cgroups=unreadable)
+    # A manager written before this reading existed: no method at all, still blanks, and the
+    # step runs (the monitor that enforces CPU budgets must not trip over the missing method).
+    planted = _PlantedCgroups({"g.mem": (4096, "max", {"max": 0})})
+    assert not hasattr(planted, "memory_stat_sample")
+    _record(tmp_path / "legacy", cfg, jobs=1, cgroups=planted)
+    # Unboxed.
+    _record(tmp_path / "unboxed", cfg, jobs=1, cgroups=NoopCgroups())
+
+    for store in ("unreadable", "legacy", "unboxed"):
+        row = _by_step(tmp_path / store)["g.mem"]
+        assert row["ok"] == "true", store
+        for column in _MEMORY_SAMPLE_COLUMNS:
+            assert row[column] == "", (store, column)
+
+
+def test_a_step_shorter_than_one_tick_records_its_shmem_but_not_a_dead_tree_anon(
+    tmp_path: Path,
+) -> None:
+    """The final reading is taken after the reap; only its shmem is evidence."""
+    cgroups = _MemoryStatCgroups(
+        None, MemoryStatSample(anon_bytes=0, shmem_bytes=4096), tmp_path / "s"
+    )
+    cfg = DagConfig(steps=(_step("mem", "true"),))
+
+    _record(tmp_path / "store", cfg, jobs=1, cgroups=cgroups)
+
+    row = _by_step(tmp_path / "store")["g.mem"]
+    assert row["anon_sampled_max_bytes"] == ""
+    assert row["shmem_sampled_max_bytes"] == "4096"
+    assert row["mem_sample_interval_ms"] == "1000"
