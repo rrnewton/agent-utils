@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-client-debug-mode: an owner switch that records client freeze attribution and uploads it with the scroll traces'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 assignee: cl-debugmode
@@ -8,7 +8,8 @@ labels:
 - vibe-talk
 - owner-ui
 created_at: 2026-11-26T03:40:00-05:00
-updated_at: 2026-11-26T03:40:00-05:00
+updated_at: 2026-11-26T11:44:00-05:00
+closed_at: 2026-11-26T11:44:00-05:00
 ---
 
 # Description
@@ -43,3 +44,13 @@ Server: the existing routes take the new optional fields (`deny_unknown_fields` 
 # Notes
 
 Owner-UI fast-track. Owning lane: cl-debugmode. Related: `#2066 vibe-talk-page-freeze` (the freeze watch this extends), `#2091 vibe-talk-shrink-anchor-policy` (its live invariant debug mode uses the same freeze channel), `#2277` (the night's freeze root cause, standing perf lane).
+
+## Resolution
+
+Landed 241aaf58 (replay of gated 6d7627f4; owner-tier gate pass, 226 steps, full selection): the client debug mode switch in Settings > Debug (and `?client-debug=1` for one load), named spans with layout reads, element count and S/D sizes, per-stall open spans, recent span ends and unattributed ms, long-animation-frame and Event Timing detail where delivered, and JS Self-Profiling at 20 ms (measured +2.7% to +3.1% renderer CPU on the phone walk; 10 ms cost +6% to +7.5%). The shell carries `Document-Policy: js-profiling` only for the switch's cookie or the flag, under its own ETag. The server takes the optional `debug` fields on the freeze-report and scroll-trace routes, refuses names outside the code-name alphabet or with id-like words, and logs `page_freeze_debug` and `client_debug_summary` lines with the browser class taken from the request's own User-Agent (the page never reads it, by an existing page rule).
+
+Follow-up landed 6a40d891 (replay of gated c8f26f0d): spans inside the row redraw (the dress loop with rows counted, the per-row label measure as one aggregated record), the read landing (fold, projection, draw) and the scroll handler chain, plus `s_src` on S. Its full gate's only red was `vibe-talk.check.read-modes-browser`, the pre-existing `#2293` flake (it fails the same way on unmodified main); the exclusive rerun of that step passed, and the waiver was named in the landing notice. An earlier follow-up gate red on `vibe-talk.check.reload-place-browser` was cleared as load (5/5 alone on the tree, 5/5 on main, 14 overlapping steps in the gate's CPU box). The follow-up also greys the label picker's find-or-add field while offline (review nit).
+
+S finding (`#2282`): on a threaded provider (Slack) reads land in the channel store, so S counts the store (`s_src=canon`); on an unthreaded provider the page draws its page reads without the store, so S counts the message rows drawn (`s_src=drawn`). Both were exercised on local fixtures (22 canon, 15 drawn).
+
+To read the attribution once the owner turns the mode on: grep the server log for `page_freeze_debug` and `client_debug_summary`.
