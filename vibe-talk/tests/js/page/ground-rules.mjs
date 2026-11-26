@@ -91,6 +91,15 @@ test("every number this page is tuned by stays inside a band that says what woul
     "the panel's fallback docked heights have drifted from the device setting's"
   );
   assert.ok(
+    sourceConstant("MIN_READ_STEER_WIDTH_PX") < sourceConstant("MAX_READ_STEER_WIDTH_PX"),
+    "the narrowest strip the reader may drag to is not narrower than the widest"
+  );
+  assert.ok(
+    sourceConstant("DEFAULT_READ_STEER_WIDTH_PX") >= sourceConstant("MIN_READ_STEER_WIDTH_PX") &&
+      sourceConstant("DEFAULT_READ_STEER_WIDTH_PX") <= sourceConstant("MAX_READ_STEER_WIDTH_PX"),
+    "the default strip width is not one the reader is allowed to drag to"
+  );
+  assert.ok(
     sourceConstant("MIN_TWO_COLUMN_SPLIT") < sourceConstant("MAX_TWO_COLUMN_SPLIT"),
     "the least split the reader may drag to is not less than the most"
   );

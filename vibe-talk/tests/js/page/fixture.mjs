@@ -5737,6 +5737,12 @@ const TUNING_BANDS = {
   MAX_READING_CH: [80, 240, "the widest; past a couple of hundred characters a line is unreadable"],
   DEFAULT_READING_CH: [45, 120,
     "what an unconfigured reader gets, and it has to be a width that is actually offered"],
+  // `#2266 vibe-talk-doc-reader-navigator-campaign`. The desk strip's width in pixels:
+  // the least keeps its one line whole, the most keeps it a strip and not a second bar.
+  MIN_READ_STEER_WIDTH_PX: [280, 440, "the narrowest desk strip the reader may drag to"],
+  MAX_READ_STEER_WIDTH_PX: [720, 1600, "the widest desk strip the reader may drag to"],
+  DEFAULT_READ_STEER_WIDTH_PX: [400, 720,
+    "the desk strip's width until dragged, and it has to be a width that is actually offered"],
   MIN_TWO_COLUMN_SPLIT: [20, 40,
     "the least of the window the left column may be dragged to (#1186 two-column-splitter): past " +
     "two fifths the column it leaves is too narrow to read, and the drag's own floor is in pixels"],
