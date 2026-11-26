@@ -30,13 +30,16 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt as _;
 use serde_json::Value;
 use tower::ServiceExt as _;
-use vibe_talk::chat::ChatClient;
+use vibe_talk::cache::RefreshKey;
+use vibe_talk::chat::{ChatClient, ChatError};
 use vibe_talk::discord::fake::FakeDiscord;
+use vibe_talk::live::Subscription;
 use vibe_talk::model::{ChannelId, MessageId};
 use vibe_talk::state::AppState;
 use vibe_talk::testing::{
     self, CountingChat, ManualClock, TempDir, TimelineChat, READ_CHANNEL, WRITE_TOKEN,
 };
+use vibe_talk::threads::TimelineView;
 
 /// 2026-08-18T12:00:00Z, as in `message_cache_serve`: fixture messages a minute apart.
 const T0: i64 = 1_787_054_400_000;
@@ -566,6 +569,228 @@ async fn a_cold_timeline_waits_for_the_provider_the_allowlisted_exception() {
     assert!(body.get("refresh_failed").is_none(), "{body}");
     settled(&d.state).await;
     d.counting.clear_holds();
+}
+
+/// Wait until no upstream read of one view is running, by claiming its refresh slot as
+/// `message_cache_serve`'s `refreshed` does: the condition is the claim coming free,
+/// polled, with `WAIT` only as a hang backstop.
+async fn claim_free(state: &AppState, channel: &str, view: TimelineView, limit: u16) {
+    let key = || RefreshKey::timeline(ChannelId(channel.to_owned()), view, None, limit);
+    tokio::time::timeout(WAIT, async {
+        while state.message_cache.claim_refresh(key()).is_none() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the read behind the answer finished");
+    settled(state).await;
+}
+
+/// Require `id` to arrive on `subscription` by live event: the retry's publication,
+/// with no page read made to collect it.
+async fn live_arrival(subscription: &mut Subscription, id: &MessageId) {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let live = subscription.receiver.recv().await.expect("a live arrival");
+            if live.message.id == *id {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("arrived by live event without a page read");
+}
+
+#[tokio::test]
+async fn a_failed_refresh_behind_a_stand_in_retries_on_the_schedule_not_the_next_read() {
+    // `#2280` S2: an ordinary failure (not a budget refusal) of the read behind a
+    // cache-first answer used to stand until the next page read. The schedule, aged
+    // here instead of slept through, is what retries it.
+    let d = deployment("state-sync-behind-retry").await;
+    d.fill_timeline().await;
+    d.clock.advance(2 * HOUR);
+    d.state.message_cache.set_serve(true);
+    let read = ChannelId(READ_CHANNEL.to_owned());
+    let late = d
+        .fake
+        .seed_at(&read, "Ada", "arrived late", T0 + 30 * MINUTE);
+    let mut subscription = d.state.live.subscribe(&read, None);
+    while subscription.receiver.try_recv().is_ok() {}
+
+    d.counting.fail_next(
+        "fetch_timeline",
+        None,
+        ChatError::Transport("down for one read".to_owned()),
+    );
+    let body = ok(
+        &d.state,
+        &path(READ_CHANNEL, "/timeline?view=main&limit=50&reason=enter"),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_answered_at_once(&body);
+    assert!(
+        !texts(&body).iter().any(|text| text == "arrived late"),
+        "the stand-in is the copy as it stood: {body}"
+    );
+
+    // No page read from here: the failed behind read retries when due and publishes.
+    claim_free(&d.state, READ_CHANNEL, TimelineView::Main, 50).await;
+    d.state.refresh_schedule.age(Duration::from_secs(300));
+    live_arrival(&mut subscription, &late).await;
+}
+
+/// A timeline provider whose next Flat page, once armed, leaves one thread's replies
+/// out and records the thread as owed — Slack `flat()` under its budget, at the
+/// `ChatClient` seam this file may stub. Later Flat pages are whole.
+struct OwedOnce {
+    inner: Arc<TimelineChat>,
+    owed: std::sync::Mutex<Option<MessageId>>,
+}
+
+impl OwedOnce {
+    fn arm(&self, root: MessageId) {
+        *self
+            .owed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(root);
+    }
+}
+
+#[async_trait::async_trait]
+impl ChatClient for OwedOnce {
+    fn provider_name(&self) -> &str {
+        self.inner.provider_name()
+    }
+
+    fn supports_threading(&self) -> bool {
+        self.inner.supports_threading()
+    }
+
+    async fn identity(&self) -> Result<vibe_talk::chat::ChatIdentity, ChatError> {
+        self.inner.identity().await
+    }
+
+    async fn fetch_page(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+        before: Option<&MessageId>,
+        after: Option<&MessageId>,
+    ) -> Result<Vec<vibe_talk::model::Message>, ChatError> {
+        self.inner.fetch_page(channel, limit, before, after).await
+    }
+
+    async fn fetch_timeline(
+        &self,
+        channel: &ChannelId,
+        request: &vibe_talk::threads::TimelineRequest,
+    ) -> Result<vibe_talk::threads::TimelinePage, ChatError> {
+        let mut page = self.inner.fetch_timeline(channel, request).await?;
+        if request.view == TimelineView::Flat {
+            let armed = self
+                .owed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(root) = armed {
+                page.messages
+                    .retain(|message| message.reply_to.as_ref() != Some(&root));
+                page.owed_threads.push(root);
+            }
+        }
+        Ok(page)
+    }
+
+    async fn fetch_thread_message(
+        &self,
+        channel: &ChannelId,
+        thread_id: &str,
+        message_id: &MessageId,
+    ) -> Result<vibe_talk::model::Message, ChatError> {
+        self.inner
+            .fetch_thread_message(channel, thread_id, message_id)
+            .await
+    }
+
+    async fn post_message(
+        &self,
+        channel: &ChannelId,
+        content: &str,
+        reply_to: Option<&MessageId>,
+    ) -> Result<vibe_talk::model::Message, ChatError> {
+        self.inner.post_message(channel, content, reply_to).await
+    }
+}
+
+/// As [`deployment`], counting over an [`OwedOnce`] timeline provider.
+async fn owed_deployment(tag: &str) -> (Deployment, Arc<OwedOnce>) {
+    let dir = TempDir::new(tag);
+    let (mut state, fake, _voice) = testing::state_from_toml(&testing::config_toml());
+    let read = ChannelId(READ_CHANNEL.to_owned());
+    let ids = (0..12)
+        .map(|n| fake.seed_at(&read, "Ada", &format!("message {n}"), T0 + n * MINUTE))
+        .collect();
+    let owed = Arc::new(OwedOnce {
+        inner: Arc::new(TimelineChat::new(fake.clone())),
+        owed: std::sync::Mutex::new(None),
+    });
+    let provider: Arc<dyn ChatClient> = owed.clone();
+    let counting = Arc::new(CountingChat::new(provider));
+    state.replace_chat(counting.clone());
+    let clock = ManualClock::at(T0 + HOUR);
+    let state = testing::with_message_cache(state, dir.path(), clock.clone()).await;
+    (
+        Deployment {
+            state,
+            fake,
+            counting,
+            clock,
+            ids,
+            _dir: dir,
+        },
+        owed,
+    )
+}
+
+#[tokio::test]
+async fn replies_an_all_read_left_out_as_owed_arrive_without_another_page_read() {
+    // `#2278`, through ops: the behind All read records its dropped thread as owed;
+    // the scheduled re-read — not the next poll — is what brings its replies in.
+    let (d, owed) = owed_deployment("state-sync-owed").await;
+    let read = ChannelId(READ_CHANNEL.to_owned());
+    let root = d.ids[5].clone();
+    // Prime All from the provider (serving still off), root alone in its thread.
+    ok(
+        &d.state,
+        &path(READ_CHANNEL, "/timeline?view=flat&limit=50"),
+        WRITE_TOKEN,
+    )
+    .await;
+    settled(&d.state).await;
+    d.clock.advance(2 * HOUR);
+    d.state.message_cache.set_serve(true);
+
+    let late = d.fake.seed_reply(&read, "Ada", "owed reply", &root);
+    let mut subscription = d.state.live.subscribe(&read, None);
+    while subscription.receiver.try_recv().is_ok() {}
+    owed.arm(root.clone());
+    let body = ok(
+        &d.state,
+        &path(READ_CHANNEL, "/timeline?view=flat&limit=50&reason=poll"),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_answered_at_once(&body);
+    assert!(
+        !texts(&body).iter().any(|text| text == "owed reply"),
+        "the stand-in predates the reply: {body}"
+    );
+
+    // No page read from here: the owed re-read, aged due, publishes the reply live.
+    claim_free(&d.state, READ_CHANNEL, TimelineView::Flat, 50).await;
+    d.state.refresh_schedule.age(Duration::from_secs(300));
+    live_arrival(&mut subscription, &late).await;
 }
 
 /// How one route stands under the principle today. `bound` is the worst wait the audit
@@ -1285,14 +1510,9 @@ const CONDITIONS: &[(&str, &str, &str)] = &[
         "S1",
     ),
     (
-        "behind refresh ordinary failure (timeline, window, recent)",
-        "no server-timed retry: waits for the next page read",
-        "S2",
-    ),
-    (
-        "all/flat read drops costly threads on a budget refusal (#2278)",
-        "replies absent until a later read reaches them",
-        "S2",
+        "recent window refresh failure",
+        "next catch-up re-reads; rate-limit backoff 30s",
+        "S3",
     ),
     (
         "catch-up preview in thread scope (step fill)",
@@ -1496,8 +1716,6 @@ fn every_condition_has_a_bound_and_a_step() {
             .any(|(name, _, _)| name.starts_with("cold view")),
         "the cold-view condition the cold test executes is listed"
     );
-    assert!(
-        CONDITIONS.iter().any(|(name, _, _)| name.contains("#2278")),
-        "the flat dropped-replies condition (S2) is listed"
-    );
+    // S2 removed the behind-failure and flat-owed conditions by fixing them; the
+    // retry cases above are their proof now, not entries here.
 }

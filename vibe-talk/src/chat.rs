@@ -2036,6 +2036,8 @@ pub fn newer_than_trimmed(
         older_pending: false,
         // What the newest page took from the cache, still not read. `#603 server-side-search`.
         held: page.held,
+        // What that page left out is still owed its re-read (`#2278`).
+        owed_threads: page.owed_threads,
     }
 }
 

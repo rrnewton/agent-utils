@@ -681,27 +681,49 @@ fn spawn_timeline_refresh(
         let fetch_began = std::time::Instant::now();
         let began = view_read_began(&state);
         let fill = state.message_cache.begin_for(caller, &channel);
-        // A budget-refused refresh retries in this task, waiting until the schedule says
-        // it is due (a condition on the schedule, not the next owner read); other
-        // failures stand as they did. Bounded, so a route that keeps refusing is not
-        // kept busy. `#1715 vibe-talk-refresh-refused-stale-page`.
+        // A refused or failed refresh retries in this task, waiting until the schedule
+        // says it is due (a condition on the schedule, not the next owner read), as does
+        // a page still owed threads' replies (`#2278`): bounded by
+        // `REFRESH_REFUSAL_RETRIES`/`REFRESH_FAILURE_RETRIES` attempts in all, so a route
+        // that keeps refusing is not kept busy. `#1715
+        // vibe-talk-refresh-refused-stale-page`, `#2280` S2.
+        let view_key = RefreshKey::view(
+            channel.clone(),
+            request.view,
+            request.thread_id.as_deref(),
+        );
         let mut attempts = 0u32;
         let mut page = loop {
+            // Retries, not the first fetch, draw on the bounded retry permits.
+            let _permit = if attempts > 0 {
+                Some(state.refresh_schedule.retry_permit().await)
+            } else {
+                None
+            };
             match state.chat.fetch_timeline(&channel, &request).await {
+                Ok(page) if page.owed_threads.is_empty() => break page,
+                Ok(_owed_page) if attempts < REFRESH_FAILURE_RETRIES => {
+                    attempts += 1;
+                    state.refresh_schedule.note_refusal(&view_key);
+                    drop(_permit);
+                    state.refresh_schedule.wait_until_due(&view_key).await;
+                    continue;
+                }
                 Ok(page) => break page,
                 Err(error) => {
                     let refused = error.never_sent();
-                    if refused && attempts < REFRESH_REFUSAL_RETRIES {
+                    let retryable = stand_in_for(&OpError::Chat(error.clone())).is_some();
+                    if retryable
+                        && attempts < REFRESH_REFUSAL_RETRIES.max(REFRESH_FAILURE_RETRIES)
+                    {
                         attempts += 1;
-                        let view_key = RefreshKey::view(
-                            channel.clone(),
-                            request.view,
-                            request.thread_id.as_deref(),
-                        );
-                        state.refresh_schedule.note_refusal(&view_key);
-                        if let Some(due) = state.refresh_schedule.next_due(&view_key) {
-                            tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
+                        if refused {
+                            state.refresh_schedule.note_refusal(&view_key);
+                        } else {
+                            state.refresh_schedule.note_outcome(&view_key, false);
                         }
+                        drop(_permit);
+                        state.refresh_schedule.wait_until_due(&view_key).await;
                         continue;
                     }
                     tracing::warn!(
@@ -726,10 +748,17 @@ fn spawn_timeline_refresh(
                 }
             }
         };
-        state.refresh_schedule.note_outcome(
-            &RefreshKey::view(channel.clone(), request.view, request.thread_id.as_deref()),
-            true,
-        );
+        if !page.owed_threads.is_empty() {
+            // Counts only: which threads, never what they say. The page's own notice
+            // already told the reader; the next scheduled refresh owes them again.
+            tracing::warn!(
+                consumer = "timeline_fallback",
+                owed = page.owed_threads.len(),
+                attempts,
+                "a refresh still owes threads' replies after its retries; they stand until the next scheduled refresh"
+            );
+        }
+        state.refresh_schedule.note_outcome(&view_key, true);
         // Before the read is offered, as in `timeline`, so the comparison knows its own writes.
         pending.compare(Upstream::of(&page.messages, page.has_more));
         if let Some(fill) = fill {
@@ -1760,7 +1789,9 @@ pub async fn timeline(
             match read_or_stand_in(state, &channel.id, request, read).await? {
                 Answered::Upstream(answer) => {
                     crate::cache_first::note(crate::cache_first::Source::Upstream);
-                    *answer
+                    let answer = *answer;
+                    spawn_owed_retry(state, &channel.id, request, &answer.0);
+                    answer
                 }
                 // `#622 cache-first-reads`: versioned as of when that read began.
                 Answered::Landed(landed) => {
@@ -1818,6 +1849,7 @@ pub async fn timeline(
             .run()
             .await?;
             crate::cache_first::note(crate::cache_first::Source::Upstream);
+            spawn_owed_retry(state, &channel.id, request, &answer.0);
             answer
         }
     };
@@ -3112,6 +3144,9 @@ fn spawn_behind_cache_first(
                             _ => state.live.publish(&channel, message.clone()),
                         }
                     }
+                    let owed = page.owed_threads.clone();
+                    let retry_served = page.messages.clone();
+                    let retry_key = key.clone();
                     state.landed.keep(
                         key,
                         request.after.clone(),
@@ -3126,6 +3161,19 @@ fn spawn_behind_cache_first(
                         )),
                     );
                     publish_serve_corrections(&state, &channel, served).await;
+                    // `#2278`: threads this read left out are re-read on the schedule,
+                    // not by the next poll happening to reach them.
+                    if !owed.is_empty() {
+                        state.refresh_schedule.note_refusal(&view_key);
+                        spawn_behind_refresh_retry(
+                            state.clone(),
+                            channel.clone(),
+                            request.clone(),
+                            retry_key,
+                            retry_served,
+                            1,
+                        );
+                    }
                 }
                 Err(error) if stand_in_for(&error).is_none() => {
                     state.refresh_schedule.note_outcome(&view_key, false);
@@ -3150,23 +3198,33 @@ fn spawn_behind_cache_first(
                             );
                         }
                     }
-                    state.landed.keep(
+                    // Kept past one poll (`OLDER_KEPT`, not `LANDED_KEPT`): at the
+                    // page's 45s cadence a 15s refusal normally expired unseen and
+                    // the view looped on stand-ins (`#2280` S2).
+                    state.landed.keep_for(
                         key,
                         request.after.clone(),
                         generation,
                         crate::cache_first::LandedAnswer::Refused(error),
+                        crate::cache_first::OLDER_KEPT,
                     );
                 }
                 Err(error) => {
-                    // `#1715 vibe-talk-refresh-refused-stale-page`: a refusal by this
-                    // server's own budget retries soon, in a task of its own — it does
-                    // not stand until the next owner read, on the long failure back-off.
+                    // `#1715 vibe-talk-refresh-refused-stale-page` + `#2280` S2: a
+                    // refusal by this server's own budget retries soon, an ordinary
+                    // failure on its back-off — either way in a task of its own, not
+                    // standing until the next owner read. Hurried reads keep their
+                    // fail-fast contract and retry nothing here.
                     let refused = match &error {
                         OpError::Chat(chat) => chat.never_sent(),
                         _ => false,
                     };
-                    if refused && !hurried {
-                        state.refresh_schedule.note_refusal(&view_key);
+                    if !hurried {
+                        if refused {
+                            state.refresh_schedule.note_refusal(&view_key);
+                        } else {
+                            state.refresh_schedule.note_outcome(&view_key, false);
+                        }
                         spawn_behind_refresh_retry(
                             state.clone(),
                             channel.clone(),
@@ -3192,10 +3250,50 @@ fn spawn_behind_cache_first(
     ))));
 }
 
-/// Retry a budget-refused refresh behind a cache-first answer, on the refresh
-/// schedule's own due instant: wait until it is due (a condition on the schedule, not
-/// the next owner read), then read once more, as an owner-facing refresh. Bounded by
-/// [`REFRESH_REFUSAL_RETRIES`]. `#1715 vibe-talk-refresh-refused-stale-page`.
+/// Schedule the re-read a page still owed threads' replies needs (`#2278`): the same
+/// bounded retry a failed refresh gets, begun from a provider-first answer whose page
+/// named what it left out. Newest reads only — a step back has the older walk's own
+/// retries (`#2264`).
+fn spawn_owed_retry(
+    state: &AppState,
+    channel: &ChannelId,
+    request: &crate::threads::TimelineRequest,
+    page: &crate::threads::TimelinePage,
+) {
+    if page.owed_threads.is_empty() || request.before.is_some() {
+        return;
+    }
+    // Counts only: which threads, never what they say.
+    tracing::info!(
+        consumer = "cache_first",
+        view = ?request.view,
+        owed = page.owed_threads.len(),
+        "an All read left threads' replies out; re-reading owed replies on the schedule"
+    );
+    state.refresh_schedule.note_refusal(&RefreshKey::view(
+        channel.clone(),
+        request.view,
+        request.thread_id.as_deref(),
+    ));
+    spawn_behind_refresh_retry(
+        state.clone(),
+        channel.clone(),
+        request.clone(),
+        flight_key(channel, request),
+        page.messages.clone(),
+        1,
+    );
+}
+
+/// Retry a refused, failed or still-owed refresh behind a cache-first answer, on the
+/// refresh schedule's own due instant: wait until it is due (a condition on the
+/// schedule, not the next owner read), then read once more, as an owner-facing
+/// refresh. Attempts of every kind together are bounded by
+/// [`REFRESH_REFUSAL_RETRIES`]/[`REFRESH_FAILURE_RETRIES`], and each fetch by the
+/// schedule's retry permits ([`crate::cache_first::MAX_RETRY_FETCHES`] across every
+/// channel, through the provider's own budget as any read). Past the bound the copy
+/// stands dated until the next scheduled refresh. `#1715
+/// vibe-talk-refresh-refused-stale-page`, `#2280` S2.
 fn spawn_behind_refresh_retry(
     state: AppState,
     channel: ChannelId,
@@ -3204,7 +3302,14 @@ fn spawn_behind_refresh_retry(
     served: Vec<Message>,
     attempt: u32,
 ) {
-    if attempt > REFRESH_REFUSAL_RETRIES {
+    if attempt > REFRESH_REFUSAL_RETRIES.max(REFRESH_FAILURE_RETRIES) {
+        // Counts only: the answered page already said replies were missing.
+        tracing::warn!(
+            consumer = "cache_first",
+            view = ?request.view,
+            attempts = attempt - 1,
+            "a refresh behind a page answered from the message cache exhausted its retries; it stands until the next scheduled refresh"
+        );
         return;
     }
     let reason = crate::read_reason::ReadReason::Refresh;
@@ -3213,9 +3318,7 @@ fn spawn_behind_refresh_retry(
         async move {
             let view_key =
                 RefreshKey::view(channel.clone(), request.view, request.thread_id.as_deref());
-            if let Some(due) = state.refresh_schedule.next_due(&view_key) {
-                tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
-            }
+            state.refresh_schedule.wait_until_due(&view_key).await;
             if !state.refresh_schedule.try_schedule(&view_key) {
                 return;
             }
@@ -3229,6 +3332,7 @@ fn spawn_behind_refresh_retry(
             let generation = state.landed.generation();
             let began_ms = crate::store::now_ms();
             let fetch_began = std::time::Instant::now();
+            let _permit = state.refresh_schedule.retry_permit().await;
             match state.chat.fetch_timeline(&channel, &request).await {
                 Ok(page) => {
                     state.refresh_schedule.note_outcome(&view_key, true);
@@ -3244,6 +3348,9 @@ fn spawn_behind_refresh_retry(
                             _ => state.live.publish(&channel, message.clone()),
                         }
                     }
+                    let owed = page.owed_threads.clone();
+                    let retry_served = page.messages.clone();
+                    let retry_key = key.clone();
                     state.landed.keep(
                         key,
                         request.after.clone(),
@@ -3258,22 +3365,48 @@ fn spawn_behind_refresh_retry(
                         )),
                     );
                     publish_serve_corrections(&state, &channel, served).await;
-                }
-                Err(error) => {
-                    let refused = error.never_sent();
-                    if refused {
+                    if !owed.is_empty() {
                         state.refresh_schedule.note_refusal(&view_key);
                         spawn_behind_refresh_retry(
-                            state,
-                            channel,
-                            request,
-                            key,
-                            served,
+                            state.clone(),
+                            channel.clone(),
+                            request.clone(),
+                            retry_key,
+                            retry_served,
                             attempt + 1,
                         );
+                    }
+                }
+                Err(error) => {
+                    if stand_in_for(&OpError::Chat(error.clone())).is_none() {
+                        // Refused-class, as behind a cache-first answer: kept past
+                        // one poll for the next read to answer with, never retried.
+                        state.refresh_schedule.note_outcome(&view_key, false);
+                        if channel_blocked(&state, &channel, &served).await {
+                            for was in served {
+                                state.live.publish_correction(
+                                    &channel,
+                                    crate::live::LiveKind::Delete,
+                                    was.clone(),
+                                    &was,
+                                );
+                            }
+                        }
+                        state.landed.keep_for(
+                            key,
+                            request.after.clone(),
+                            generation,
+                            crate::cache_first::LandedAnswer::Refused(OpError::Chat(error)),
+                            crate::cache_first::OLDER_KEPT,
+                        );
+                        return;
+                    }
+                    if error.never_sent() {
+                        state.refresh_schedule.note_refusal(&view_key);
                     } else {
                         state.refresh_schedule.note_outcome(&view_key, false);
                     }
+                    spawn_behind_refresh_retry(state, channel, request, key, served, attempt + 1);
                 }
             }
         },
@@ -3305,6 +3438,12 @@ const FLIGHT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 /// budget refuses it, each time waiting until the refresh schedule says it is due.
 /// `#1715 vibe-talk-refresh-refused-stale-page`.
 const REFRESH_REFUSAL_RETRIES: u32 = 4;
+
+/// How many times one refresh episode retries after an ordinary failure, or re-reads
+/// for threads still owed (`#2278`), attempts of every kind counted together in the
+/// retry task. Past it the copy stands dated (its page already said replies were
+/// missing) until the next scheduled refresh owes it again. `#2280` S2.
+const REFRESH_FAILURE_RETRIES: u32 = 4;
 
 /// The single-flight key of an upstream timeline read: a newest page's is the one its serve's
 /// refresh claims ([`RefreshKey::timeline`]), so a stand-in read and a refresh never run together

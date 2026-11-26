@@ -551,6 +551,8 @@ pub async fn generic_since<C: ChatClient + ?Sized>(
             older_pending: false,
             // What the newest page took from the cache, still not read. `#603 server-side-search`.
             held: newest.held,
+            // What that page left out is still owed its re-read (`#2278`).
+            owed_threads: newest.owed_threads,
         },
         position,
     })

@@ -1695,3 +1695,43 @@ async fn a_step_back_in_the_thread_list_uses_its_scan_and_a_newest_list_or_a_pos
         "a post here makes the next step back scan"
     );
 }
+
+#[tokio::test]
+async fn an_all_read_records_as_owed_the_threads_it_left_out() {
+    // `#2278`: left-out threads are owed work with names, not only a count in the
+    // notice — the server's scheduled re-read is aimed by this list.
+    let owed_ts = |page: &vibe_talk::threads::TimelinePage| -> Vec<String> {
+        let mut owed: Vec<String> = page
+            .owed_threads
+            .iter()
+            .map(|id| ts_from_message_id(id).expect("a Slack-encoded id"))
+            .collect();
+        owed.sort();
+        owed
+    };
+
+    // Past the costly-thread cap: the oldest five are owed, then none.
+    let (state, roots) = fifteen_threads();
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client();
+    let (first, _read) = all_page(&fake, &client).await;
+    let mut rest: Vec<String> = roots.iter().rev().skip(10).cloned().collect();
+    rest.sort();
+    assert_eq!(owed_ts(&first), rest, "cap-skipped roots are owed");
+    let (second, _read) = all_page(&fake, &client).await;
+    assert_eq!(owed_ts(&second), Vec::<String>::new(), "nothing left owed");
+
+    // Rate-limited: failed and stopped threads alike are owed — every root.
+    let (state, roots) = fifteen_threads();
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client();
+    fake.with(|state| {
+        state
+            .rate_limit_many
+            .insert("conversations.replies".to_owned(), (0, 1_000));
+    });
+    let (page, _read) = all_page(&fake, &client).await;
+    let mut all = roots.clone();
+    all.sort();
+    assert_eq!(owed_ts(&page), all, "every left-out root is owed");
+}

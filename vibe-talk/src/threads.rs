@@ -612,6 +612,12 @@ pub struct TimelinePage {
     /// as having seen them.
     #[serde(skip)]
     pub held: Vec<crate::model::MessageId>,
+    /// Roots whose replies this read left out — past its costly-thread cap, or stopped by
+    /// a rate limit — named so the server's scheduled re-read is aimed work, not only a
+    /// count in `notice`. Never sent: the page already says replies are missing there;
+    /// this is the server's own list of what it still owes (`#2278`, `#2280` S2).
+    #[serde(skip)]
+    pub owed_threads: Vec<crate::model::MessageId>,
 }
 
 impl TimelinePage {

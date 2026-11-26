@@ -363,10 +363,12 @@ enum Replies {
     Held(Vec<Message>),
     /// Read upstream: what the root counts, and the newest replies read.
     Upstream(u64, Vec<Raw>),
-    /// Not read: past [`FLAT_UPSTREAM_THREADS`], or after a rate limit stopped this read's reads.
-    Skipped,
-    /// The read failed; the thread is left out of the page rather than failing it.
-    Failed(ChatError),
+    /// Not read: past [`FLAT_UPSTREAM_THREADS`], or after a rate limit stopped this read's
+    /// reads. The root (when it names one) is owed a later read (`#2278`).
+    Skipped(Option<MessageId>),
+    /// The read failed; the thread is left out of the page rather than failing it, and
+    /// owed a later read (`#2278`).
+    Failed(Option<MessageId>, ChatError),
 }
 
 /// How many threads one All read may read upstream that cost a call — a thread its memory cannot
@@ -837,10 +839,13 @@ impl HttpSlackClient {
                         }
                     }
                     let ordering = std::sync::atomic::Ordering::SeqCst;
+                    // A root parsed from Slack always converts; without an id there is
+                    // nothing to name as owed, and the notice's count still says so.
+                    let root_id = ids::message_id_from_ts(&root.ts);
                     if !self.flat_free(conversation, root)
                         && (stopped.load(ordering) || costly.fetch_add(1, ordering) >= upstream_cap)
                     {
-                        return Replies::Skipped;
+                        return Replies::Skipped(root_id);
                     }
                     match self.flat_replies(conversation, root).await {
                         Ok(read) => Replies::Upstream(root.reply_count(), read),
@@ -848,7 +853,7 @@ impl HttpSlackClient {
                             if matches!(error.cause(), ChatError::RateLimited(_)) {
                                 stopped.store(true, ordering);
                             }
-                            Replies::Failed(error)
+                            Replies::Failed(root_id, error)
                         }
                     }
                 }
@@ -857,6 +862,7 @@ impl HttpSlackClient {
         let replies: Vec<Replies> = stream::iter(reads).buffered(4).collect().await;
         let mut raws = page.raws;
         let mut held = Vec::new();
+        let mut owed_threads = Vec::new();
         let (mut cut, mut skipped, mut failed) = (0_usize, 0_usize, 0_usize);
         let mut failure = None;
         for read in replies {
@@ -866,9 +872,13 @@ impl HttpSlackClient {
                     cut += usize::from(count > FLAT_MAX_REPLIES as u64);
                     raws.extend(read);
                 }
-                Replies::Skipped => skipped += 1,
-                Replies::Failed(error) => {
+                Replies::Skipped(root) => {
+                    skipped += 1;
+                    owed_threads.extend(root);
+                }
+                Replies::Failed(root, error) => {
                     failed += 1;
+                    owed_threads.extend(root);
                     failure.get_or_insert(error);
                 }
             }
@@ -902,6 +912,7 @@ impl HttpSlackClient {
             next_before: page.next_before,
             notice: flat_notice(cut, skipped + failed),
             held: held_ids,
+            owed_threads,
             ..TimelinePage::default()
         })
     }

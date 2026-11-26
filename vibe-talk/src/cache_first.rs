@@ -86,12 +86,30 @@ pub const REFUSAL_RETRY_BASE: Duration = Duration::from_secs(5);
 /// vibe-talk-refresh-refused-stale-page`.
 pub const REFUSAL_RETRY_MAX: Duration = Duration::from_secs(60);
 
+/// How many retry fetches (a failed or still-owed refresh read again, `#2280` S2) may be
+/// in flight at once across every channel. Each retry still goes through the provider's
+/// own budget (`admit` on Slack, the rate-limit run on Discord), so this bounds server
+/// work, never a way around that budget; the per-view claim besides keeps it to one
+/// retry fetch per view, and the semaphore is fair, so one channel's retries re-queue
+/// behind other channels' between attempts.
+pub const MAX_RETRY_FETCHES: usize = 4;
+
 /// When each view may next be refreshed upstream, and how its refreshes have fared: the server's
 /// own schedule for the reads it begins behind answers from the cache, so a page's read rate
 /// never sets the upstream read rate. One entry per view read. `#1227 poll-storm-stale-thread`.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RefreshSchedule {
     slots: Mutex<HashMap<RefreshKey, Slot>>,
+    retry_permits: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for RefreshSchedule {
+    fn default() -> Self {
+        Self {
+            slots: Mutex::new(HashMap::new()),
+            retry_permits: Arc::new(tokio::sync::Semaphore::new(MAX_RETRY_FETCHES)),
+        }
+    }
 }
 
 /// One view's place in [`RefreshSchedule`].
@@ -189,6 +207,36 @@ impl RefreshSchedule {
             .get(view)
             .map(|slot| slot.next_at)
             .filter(|next_at| *next_at > now)
+    }
+
+    /// Wait until a refresh of `view` is due, re-reading [`Self::next_due`] as it waits:
+    /// a back-off noted meanwhile extends the wait, and a test ageing the schedule
+    /// ([`Self::age`]) shortens it — sleeping once to a captured instant would do
+    /// neither. Wakes at most a second late. `#2280` S2.
+    pub async fn wait_until_due(&self, view: &RefreshKey) {
+        loop {
+            let Some(due) = self.next_due(view) else {
+                return;
+            };
+            let wake = tokio::time::Instant::from_std(due)
+                .min(tokio::time::Instant::now() + Duration::from_secs(1));
+            tokio::time::sleep_until(wake).await;
+        }
+    }
+
+    /// One of [`MAX_RETRY_FETCHES`] retry fetches across every channel. Hold it only
+    /// around the fetch itself, never while waiting to be due.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the permits were closed, which nothing does: they live as long as the
+    /// schedule, which lives as long as the server.
+    pub async fn retry_permit(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.retry_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("retry permits are never closed")
     }
 
     /// Whether a refresh of `view` may start now, without scheduling one. For tests.
