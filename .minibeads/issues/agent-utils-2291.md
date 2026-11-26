@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-top-anchor-arrival-27px-race: an arrival at the foot intermittently moves the row being read 27.7 px in top_anchor_browser on phone-412'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -8,7 +8,8 @@ labels:
 - scroll-stability
 - flaky-test
 created_at: 2026-11-26T08:40:00-05:00
-updated_at: 2026-11-26T08:40:00-05:00
+updated_at: 2026-11-26T17:00:00-05:00
+closed_at: 2026-11-26T17:00:00-05:00
 ---
 
 # Description
@@ -46,3 +47,15 @@ None of these runs was hot by the rule (load1 at or above 237). The constant 27.
 # Notes
 
 Related: `#2230 vibe-talk-reading-row-stays-put` (the arrival-at-foot policy the walk checks), `#2076` (the top-anchor policy and its user-caused hold), `#2279 vibe-talk-post-facto-labels` (replaced a 27.7 px re-read strip with an in-place regroup), `#2285 vibe-talk-labels-browser-tapped-message-jumps` (the gate where it showed; its red was cleared under the flake rule with this issue as the named cause).
+
+## Resolution
+
+Landed on main as ab130bf4 on 2026-11-26 at about 4:55 PM ET (gated as 2b9e275a, owner gate pass; liaison's option (2)).
+
+- The element: the in-flow "Loading messages…" line (`#channel-loading`, inside `#scroll-area` above `#discord-log`). A threaded live arrival appends its row and then re-reads the channel behind it. If that re-read was out for more than a second, `channelloading.ts` showed the line (the `#226` delayed line), and every row moved down by its height, 27.7 px at 412x915 (a 19.7 px box plus 8 px margins), light and dark, until the read landed. Contention stretched the re-read past the second, which is why it showed only under load. A channel without threads put the line up at once on every read, polls included.
+- The fix: a refresh nobody asked for (poll, live, visible, replay, mutation) over rows on screen never puts the line up, however slow, on either read path; the freshness pill says "refreshing…" all the while. The line stays for reads the reader asked for and for an empty list. `LOADING_LINE_DELAY_MS`, its timer and `LoadState.lineTimer` are gone.
+- The check: `top_anchor_browser.py` runs both arrival walks again with their order forced, at 412x915 and 1280x800, windowed on and off. The fake server holds the arrival's re-read, the page clock moves two seconds on, and the reading row is counted on every frame through the held read, its landing and 30 more frames. A fake without threads holds its poll's read the same way. No step waits on a wall clock. On main this was red every time: 40/40 threaded steps and 6/6 polls, 27.7 px each. After the fix it is green, with a largest move of 0.3 px.
+- Per-frame traces, fractional px from `getBoundingClientRect`, threshold 0.5 px: before, 27.71 px in all 12 keyboard-closed cells; after, 0.0 px, and the pill stood for the whole hold.
+- Not met: the 30-runs-in-a-row criterion. The full walk ran 16/16 green before the last amendment, then 4/4 on the final tree. No run reached load1 237, so none was hot.
+- Follow-ups: #2314 vibe-talk-refreshing-pill-covers-message-text, filed from the design review; #2315, the arrival follow of about 94 px with the keyboard open, routed to the #2292 owner.
+
