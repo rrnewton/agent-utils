@@ -2015,6 +2015,53 @@ test("`#442 read-strip-order`: a phone keeps the strip docked whatever a desk re
   assert.match(cssBlockIn(DESKTOP_QUERY, "#read-steer-grip"), /display:\s*inline-flex/);
 });
 
+test("`#2266 vibe-talk-doc-reader-navigator-campaign`: on a desk the strip is resized by its handle, clamped, and remembered", async () => {
+  const store = new Map();
+  const { page, rows } = await blockedRead({ store });
+  deskStrip(page, { width: 544 });
+  page.el("read-steer-resize").getClientRects = () => [{}];
+  const stripWidth = () => page.el("read-steer").style.getPropertyValue("--read-steer-width");
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  // The usual width stands until the handle is dragged.
+  assert.equal(stripWidth(), "544px", "the strip does not stand at its usual width");
+  const handle = page.el("read-steer-resize");
+  // The strip is centred, so its right edge tracks the pointer at twice
+  // the drag distance: +50px of pointer is +100px of width.
+  await handle.dispatch("pointerdown", { button: 0, pointerId: 1, clientX: 800, clientY: 640 });
+  await handle.dispatch("pointermove", { pointerId: 1, clientX: 850, clientY: 640 });
+  assert.equal(stripWidth(), "644px", "the strip does not follow the handle");
+  await handle.dispatch("pointerup", { pointerId: 1 });
+  assert.equal(store.get("vibe-talk.voice.read-steer-width"), "644", "the width is not remembered");
+  // The keyboard: an arrow widens it, Home restores the usual width.
+  await handle.dispatch("keydown", { key: "ArrowRight" });
+  assert.equal(stripWidth(), "660px", "ArrowRight did not widen the strip");
+  await handle.dispatch("keydown", { key: "Home" });
+  assert.equal(stripWidth(), "544px", "Home did not restore the usual width");
+  assert.equal(store.get("vibe-talk.voice.read-steer-width"), "544");
+  // Clamped: dragged far past either end it stops at the ends.
+  await handle.dispatch("pointerdown", { button: 0, pointerId: 1, clientX: 800, clientY: 640 });
+  await handle.dispatch("pointermove", { pointerId: 1, clientX: -2000, clientY: 640 });
+  await handle.dispatch("pointerup", { pointerId: 1 });
+  assert.equal(stripWidth(), "360px", "the width went under its minimum");
+  // A reload applies the remembered width.
+  const again = await blockedRead({ store: new Map([["vibe-talk.voice.read-steer-width", store.get("vibe-talk.voice.read-steer-width")]]) });
+  deskStrip(again.page, { width: 360 });
+  again.page.el("read-steer-resize").getClientRects = () => [{}];
+  await again.rows[0].dispatch("click", {});
+  await again.page.settle();
+  assert.equal(again.page.el("read-steer").style.getPropertyValue("--read-steer-width"), "360px",
+    "the strip forgot its width");
+  await again.page.el("read-steer-resize").dispatch("dblclick");
+  assert.equal(again.page.el("read-steer").style.getPropertyValue("--read-steer-width"), "544px",
+    "a double-click on the handle did not restore the usual width");
+  // The stylesheet applies the width, and draws the handle, only in the desk's regime.
+  assert.match(cssBlockIn(DESKTOP_QUERY, "#read-steer"), /width:\s*var\(--read-steer-width/);
+  assert.doesNotMatch(cssBlockOutside(DESKTOP_QUERY, "#read-steer"), /--read-steer-width/, "the width applies on a phone");
+  assert.match(cssBlockOutside(DESKTOP_QUERY, "#read-steer-resize"), /display:\s*none/, "the handle is drawn on a phone");
+  assert.match(cssBlockIn(DESKTOP_QUERY, "#read-steer-resize"), /display:\s*inline-flex/);
+});
+
 test("`#451 read-strip-followups`: a read started with s outside reading mode has the bar's Stop, and Read pauses it", async () => {
   // From `#442`'s handoff: s reads one message without entering the mode, and that read had no
   // bar Stop — Read, pressed to stop it, entered reading mode instead and left it playing.

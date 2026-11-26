@@ -33,6 +33,7 @@ export {
   DEFAULT_QUOTE_READ_PERCENT,
   DEFAULT_READ_KEEP_ALIVE_MS,
   DEFAULT_READ_PREROLL_MS,
+  DEFAULT_READ_STEER_WIDTH_PX,
   DEFAULT_READING_CH,
   DEFAULT_TWO_COLUMN_SPLIT,
   MAX_CARD_MAX_LINES,
@@ -71,6 +72,7 @@ export {
   clampReadKeepAliveMs,
   clampReadPrerollMs,
   clampReadSpeed,
+  clampReadSteerWidth,
   clampReadingWidth,
   clampTwoColumnSplit,
 } from "./bounds.ts";

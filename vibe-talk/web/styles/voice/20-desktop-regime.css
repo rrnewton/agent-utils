@@ -430,6 +430,45 @@
      here, so a phone's strip stays docked on the chips row whatever was stored. */
   #read-steer {
     translate: var(--read-steer-dx, 0px) var(--read-steer-dy, 0px);
+    /* `#2266`: the reader's chosen width, never the content's: the box
+       holds one size whatever the rows hold; cells stretch inside it. */
+    width: var(--read-steer-width, 34rem);
+  }
+
+  /* `#2266`: the width handle straddles the strip's right border, half
+     outside it, so it covers none of the controls it resizes around. */
+  #read-steer-resize {
+    pointer-events: auto;
+    position: absolute;
+    inset-inline-end: -7px;
+    top: 50%;
+    translate: 0 -50%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 14px;
+    min-height: 2.75rem;
+    padding: 0;
+    border: none;
+    border-radius: 999px;
+    background: transparent;
+    color: var(--muted);
+    cursor: ew-resize;
+    touch-action: none;
+  }
+
+  #read-steer-resize:active {
+    cursor: ew-resize;
+  }
+
+  #read-steer-resize:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+
+  #read-steer-resize svg {
+    width: 0.75rem;
+    height: 0.75rem;
   }
 
   #read-steer-grip {

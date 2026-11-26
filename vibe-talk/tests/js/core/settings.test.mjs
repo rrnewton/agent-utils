@@ -128,6 +128,7 @@ test("`#624 voice-page-modularity`: each device setting reads, keeps and refuses
     ["readAudioSource", "vibe-talk.voice.read-audio-source", null, [["agent", "agent"], ["device", "device"], ["wit", "wit"]], null],
     ["witVoice", "vibe-talk.voice.wit-voice", "", [["Charlie", "Charlie"], ["", null]], ""],
     ["readSteerOffset", "vibe-talk.voice.read-steer-offset", null, [[{ x: 3, y: -4 }, '{"x":3,"y":-4}'], [null, null]], null],
+    ["readSteerWidth", "vibe-talk.voice.read-steer-width", 544, [[700, "700"], [360, "360"]], 544],
     ["slackOpen", "vibe-talk.voice.slack-open", "browser", [["app", "app"], ["browser", "browser"]], "browser"],
     ["threadsMain", "vibe-talk.voice.threads-main", false, [[true, "on"], [false, "off"]], false],
     ["threadCardFolded", "vibe-talk.voice.thread-card-folded", false, [[true, "on"], [false, "off"]], false],

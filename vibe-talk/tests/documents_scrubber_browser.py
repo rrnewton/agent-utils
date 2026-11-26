@@ -516,6 +516,77 @@ def walk_canary(page: Page, touch: bool, card_name: str, label: str, voice: str)
         page.screenshot(path=str(Path(shots) / f"scrubber-canary-{label}-{voice}.png"))
 
 
+def walk_geometry(page: Page) -> None:
+    """`#2266` step C: the strip holds one size at every position on a
+    desk, its width drags wider by its right-edge handle, the width is
+    remembered across a reload, and a double-click restores it."""
+    card = page.locator("#documents-list .doc-card", has_text="canary-cloud")
+    card.click()
+    page.wait_for_function(
+        "(words) => (document.getElementById('doc-body')?.textContent || '').includes(words)",
+        arg="TARGET-cloudcanary-GAMMA-1", timeout=20_000)
+    install_lit_log(page)
+    set_voice(page, False, "cloud")
+    page.click("#read-aloud")
+    page.wait_for_selector("#read-steer #doc-nav:not([hidden]) .doc-nav-row", timeout=20_000)
+
+    def strip_box() -> dict[str, float]:
+        return cast(dict[str, float], page.evaluate("""() => {
+          const box = document.getElementById('read-steer').getBoundingClientRect();
+          return { w: Math.round(box.width), h: Math.round(box.height) };
+        }"""))
+
+    def reopen_and_read() -> None:
+        page.reload(wait_until="load")
+        page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
+        page.locator("#documents-list .doc-card", has_text="canary-cloud").first.click()
+        page.wait_for_function(
+            "(words) => (document.getElementById('doc-body')?.textContent || '').includes(words)",
+            arg="TARGET-cloudcanary-GAMMA-1", timeout=20_000)
+        install_lit_log(page)
+        set_voice(page, False, "cloud")
+        page.click("#read-aloud")
+        page.wait_for_selector("#read-steer #doc-nav:not([hidden]) .doc-nav-row", timeout=20_000)
+
+    first = strip_box()
+    # Positions change (sections, chunk counts); the box does not.
+    lit_at = lit_marker(page)
+    click_centre(page, page.locator(
+        '#doc-nav .doc-nav-section[aria-label^="Read from section 2.1 "]').first,
+        False, "section cell 2.1")
+    wait_first_lit(page, lit_at, "Gamma cloudcanary subsection", "tapping section §2.1")
+    deep = strip_box()
+    check(deep == first, f"the strip changed size deep in the document: {first} -> {deep}")
+    lit_at = lit_marker(page)
+    click_centre(page, page.locator(
+        '#doc-nav .doc-nav-section[aria-label^="Read from section 1 "]').first,
+        False, "section cell 1")
+    wait_first_lit(page, lit_at, "Alpha cloudcanary start", "tapping section §1")
+    check(strip_box() == first, f"the strip changed size back at the top: {strip_box()} vs {first}")
+
+    handle = page.locator("#read-steer-resize")
+    box = handle.bounding_box(timeout=20_000)
+    check(box is not None, "the width handle has no box on a desk")
+    assert box is not None
+    x, y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+    page.mouse.move(x, y)
+    page.mouse.down()
+    page.mouse.move(x + 70, y)
+    page.mouse.up()
+    grown = strip_box()
+    check(grown["w"] >= first["w"] + 100, f"dragging the handle did not widen the strip: {first} -> {grown}")
+    check(grown["h"] == first["h"], f"widening changed the strip height: {first} -> {grown}")
+
+    reopen_and_read()
+    kept = strip_box()
+    check(abs(kept["w"] - grown["w"]) <= 2, f"the width was not remembered across a reload: {kept} vs {grown}")
+    page.locator("#read-steer-resize").dblclick()
+    page.wait_for_function(
+        "() => document.getElementById('read-steer').style.getPropertyValue('--read-steer-width') === '544px'",
+        timeout=20_000)
+    check(abs(strip_box()["w"] - 544) <= 2, f"a double-click did not restore the usual width: {strip_box()}")
+
+
 def walk_authored(page: Page, touch: bool) -> None:
     card = page.locator("#documents-list .doc-card", has_text="authored-doc")
     if touch:
@@ -628,6 +699,9 @@ def main() -> int:
                     ctx, page = fresh_page(width, height, touch)
                     walk_canary(page, touch, name, label, voice)
                     ctx.close()
+                ctx, page = fresh_page(1280, 800, False)
+                walk_geometry(page)
+                ctx.close()
                 browser.close()
             print("documents scrubber browser check: numbers on the document (author's win, title "
                   "unnumbered), two scrubber rows from the section tree fitting 393x852 and 1280x800, "

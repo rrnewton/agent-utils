@@ -490,6 +490,19 @@ export function createKeymap<Target>(acts: KeymapActs<Target>): KeymapBinding<Ta
       controls: ["read-steer-grip"],
     },
     {
+      group: KEYS_MESSAGE, by: "grip",
+      chords: [{ key: "ArrowLeft" }, { key: "ArrowRight" },
+        { key: "ArrowLeft", shift: true }, { key: "ArrowRight", shift: true }],
+      does: "On the reading controls' width handle, on a desk: narrow or widen the reading controls; " +
+        "with Shift, by more. The width is remembered on this device",
+      controls: ["read-steer-resize"],
+    },
+    {
+      group: KEYS_MESSAGE, by: "grip", chords: [{ key: "Home" }],
+      does: "On the reading controls' width handle: Home restores the usual width, as a double-click does",
+      controls: ["read-steer-resize"],
+    },
+    {
       group: KEYS_MESSAGE, chords: [{ key: "." }],
       does: "Its ⋯ menu; ↑ and ↓ move through it",
       rowControls: ["row-more-button"],

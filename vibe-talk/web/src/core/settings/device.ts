@@ -17,6 +17,7 @@ import {
   DEFAULT_MSG_SCALE,
   DEFAULT_READ_KEEP_ALIVE_MS,
   DEFAULT_READ_PREROLL_MS,
+  DEFAULT_READ_STEER_WIDTH_PX,
   DEFAULT_READING_CH,
   DEFAULT_TWO_COLUMN_SPLIT,
   DEFAULT_DATA_REACH_BACK,
@@ -36,6 +37,7 @@ import {
   clampRenderPrefetchPx,
   clampRenderRowCap,
   clampReadSpeed,
+  clampReadSteerWidth,
   clampReadingWidth,
   clampTwoColumnSplit,
 } from "./bounds.ts";
@@ -253,6 +255,13 @@ export const DEVICE_SETTINGS = Object.freeze({
     write: (offset: SteerOffset | null) => (offset === null ? null : JSON.stringify(offset)),
     refused: { value: null },
   } satisfies DeviceSetting<SteerOffset | null>,
+  /** `#2266`: the read strip's chosen width on a desk, in CSS pixels, clamped. */
+  readSteerWidth: {
+    key: "vibe-talk.voice.read-steer-width",
+    read: (raw: string | null) => clampReadSteerWidth(raw),
+    write: (px: number) => String(clampReadSteerWidth(px)),
+    refused: { value: DEFAULT_READ_STEER_WIDTH_PX },
+  } satisfies DeviceSetting<number>,
   /** `#481 slack-app-deep-link`. Where Open in Slack goes from here: the app, or a browser tab unless the app was chosen. */
   slackOpen: {
     key: "vibe-talk.voice.slack-open",

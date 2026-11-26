@@ -1,7 +1,7 @@
 // Read-aloud transport and its controls, owned together (`#624 voice-page-modularity`).
 import { browserSpeechChunks, chunkStartSilenceMs, createPreparedSpeech, documentBlockGroups, documentGroupsAlign, documentListedBlockForModel, documentModelBlockForListed, documentModelPieceForListed, isRecoverableReadFailure, joinBytes, readClock, readPieces, readSectionStarts, readTimelineWeights, recoveryWait, sentenceEnds, silenceFrameCount, silentBefore, speechElapsedMs, speechSegments, ticketEnded, ticketTooShortForBlocks, wavLayout } from "../../core/speech/index.ts";
 import { READ_NO_SPEECH_MS, cloudFailureText } from "../../present/call/index.ts";
-import { DEVICE_SETTINGS, MAX_READ_SPEED, MIN_READ_SPEED, clampReadSpeed } from "../../core/settings/index.ts";
+import { DEVICE_SETTINGS, DEFAULT_READ_STEER_WIDTH_PX, MAX_READ_SPEED, MIN_READ_SPEED, clampReadSpeed, clampReadSteerWidth } from "../../core/settings/index.ts";
 import { cardRootOf, idsOf, rowMessages, rowSeen } from "../../view/channel/index.ts";
 import { browserSpeechFailure } from "../../present/notices/index.ts";
 import { isNoise } from "../../present/rows/index.ts";
@@ -3031,6 +3031,104 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     rememberReadSteerOffset();
   }
 
+  /**
+   * `#2266`: ON A DESK THE STRIP'S WIDTH IS THE READER'S, by the handle at
+   * its right edge: applied as `--read-steer-width` (the stylesheet gives
+   * the strip that width only in the desk regime; a phone's docked strip
+   * is full width whatever was stored), clamped, remembered on this
+   * device. The strip is centred, so its right edge tracks the pointer
+   * at twice the drag distance.
+   */
+  let readSteerWidth: number | null = null;
+  let readSteerResizeDrag: { x: number; from: number } | null = null;
+
+  function storedReadSteerWidth(): number {
+    return deps.deviceSettings().get(DEVICE_SETTINGS.readSteerWidth);
+  }
+
+  function applyReadSteerWidth(px: number): number {
+    const width = clampReadSteerWidth(px);
+    readSteerWidth = width;
+    deps.el("read-steer").style.setProperty("--read-steer-width", `${width}px`);
+    // A wider or narrower strip is held inside the window afresh.
+    placeReadSteer();
+    return width;
+  }
+
+  function initializeReadSteerWidth() {
+    applyReadSteerWidth(storedReadSteerWidth());
+  }
+
+  function rememberReadSteerWidth() {
+    if (readSteerWidth === null) return;
+    try {
+      deps.deviceSettings().keep(DEVICE_SETTINGS.readSteerWidth, readSteerWidth);
+    } catch (_error) {
+      // The width still stands on this page when storage is unavailable.
+    }
+  }
+
+  /** The width can be dragged where the stylesheet draws its handle: shown, on a desk. */
+  function readSteerResizable(): boolean {
+    const handle = deps.el("read-steer-resize");
+    return !deps.el("read-steer").hidden
+      && typeof handle.getClientRects === "function" && handle.getClientRects().length > 0;
+  }
+
+  function setReadSteerWidth(px: number | null) {
+    if (!readSteerResizable()) return;
+    applyReadSteerWidth(px === null ? DEFAULT_READ_STEER_WIDTH_PX : px);
+    rememberReadSteerWidth();
+  }
+
+  function onReadResizeDown(event: PointerEvent) {
+    if (!event || (event.button !== undefined && event.button !== 0) || !readSteerResizable()) return;
+    const strip = deps.el("read-steer");
+    const from = typeof strip.getBoundingClientRect === "function"
+      ? strip.getBoundingClientRect().width
+      : (readSteerWidth ?? DEFAULT_READ_STEER_WIDTH_PX);
+    readSteerResizeDrag = { x: event.clientX, from };
+    const handle = deps.el("read-steer-resize");
+    if (event.pointerId !== undefined && handle.setPointerCapture) handle.setPointerCapture(event.pointerId);
+    if (event.preventDefault) event.preventDefault();
+  }
+
+  function onReadResizeMove(event: PointerEvent) {
+    if (!readSteerResizeDrag || !event) return;
+    if (event.buttons === 0) {
+      onReadResizeUp();
+      return;
+    }
+    applyReadSteerWidth(readSteerResizeDrag.from + 2 * (event.clientX - readSteerResizeDrag.x));
+  }
+
+  function onReadResizeUp() {
+    if (!readSteerResizeDrag) return;
+    readSteerResizeDrag = null;
+    if (!readSteerResizable()) {
+      applyReadSteerWidth(storedReadSteerWidth());
+      return;
+    }
+    rememberReadSteerWidth();
+  }
+
+  // The handle is a control a keyboard can use too: Left/Right narrow and
+  // widen (Shift by more), Home restores the usual width.
+  function onReadResizeKey(event: KeyboardEvent) {
+    if (!event || event.ctrlKey || event.altKey || event.metaKey || !readSteerResizable()) return;
+    const step = event.shiftKey ? 64 : 16;
+    const at = readSteerWidth ?? DEFAULT_READ_STEER_WIDTH_PX;
+    const moves: Record<string, () => number | null> = {
+      ArrowLeft: () => at - step,
+      ArrowRight: () => at + step,
+      Home: () => null,
+    };
+    const next = moves[event.key]!;
+    if (!next) return;
+    if (event.preventDefault) event.preventDefault();
+    setReadSteerWidth(next());
+  }
+
   function onReadGripDown(event: PointerEvent) {
     if (!event || (event.button !== undefined && event.button !== 0) || !readSteerMovable()) return;
     readSteerDrag = { x: event.clientX, y: event.clientY, from: readSteerOffset || { x: 0, y: 0 } };
@@ -4433,6 +4531,12 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   onReadGripMove,
   onReadGripUp,
   onReadGripKey,
+  initializeReadSteerWidth,
+  onReadResizeDown,
+  onReadResizeMove,
+  onReadResizeUp,
+  onReadResizeKey,
+  setReadSteerWidth,
   jumpReading,
   stepReading,
   stepSection,

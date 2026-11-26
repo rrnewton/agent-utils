@@ -5700,6 +5700,7 @@ const combineSwitch = createKeptSwitch({
   render: (on) => messagePreferences.combine.render(on),
 });
 readAloudOwner().initializeReadSteerOffset();
+readAloudOwner().initializeReadSteerWidth();
 
 // What a finger or the mouse does on a row — a tap, a hold, a swipe — and the one claim a gesture puts on
 // the click behind it are web/src/view/channel's (`createRowGestures`: SWIPE_START_PX, SWIPE_COMMIT_PX,
@@ -9266,6 +9267,11 @@ application.track(mountReadControls({
   onReadGripUp: () => readAloudOwner().onReadGripUp(),
   onReadGripKey: (event) => readAloudOwner().onReadGripKey(event),
   moveReadSteer: (offset) => readAloudOwner().moveReadSteer(offset),
+  onReadResizeDown: (event) => readAloudOwner().onReadResizeDown(event),
+  onReadResizeMove: (event) => readAloudOwner().onReadResizeMove(event),
+  onReadResizeUp: () => readAloudOwner().onReadResizeUp(),
+  onReadResizeKey: (event) => readAloudOwner().onReadResizeKey(event),
+  setReadSteerWidth: (px) => readAloudOwner().setReadSteerWidth(px),
   placeReadSteer: () => readAloudOwner().placeReadSteer(),
   autoplayOn: () => autoplay.on(),
   setAutoplay: (on) => autoplay.setOn(on),

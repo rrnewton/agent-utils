@@ -568,7 +568,10 @@
 }
 .doc-nav-unit,
 .doc-nav-chunk {
-  min-height: 1.75rem;
+  /* `#2266`: one fixed cell height, so the two rows (and the strip
+     with them) hold one size whatever they hold. */
+  box-sizing: border-box;
+  height: 1.75rem;
   padding: 2px 4px;
   overflow: hidden;
   border: 1px solid var(--warn);

@@ -143,6 +143,28 @@ function clampReadingWidth(value: unknown): number {
 }
 
 /**
+ * `#2266`: the read strip's width on a desk, in CSS pixels. The minimum
+ * keeps the strip's one line whole (its count and arrows at their 44px
+ * floor); the default is where it stands until dragged wider.
+ */
+const MIN_READ_STEER_WIDTH_PX = 360;
+const MAX_READ_STEER_WIDTH_PX = 1024;
+const DEFAULT_READ_STEER_WIDTH_PX = 544;
+
+/** A strip width this page will actually apply, read as `clampReadingWidth` reads its width. */
+function clampReadSteerWidth(value: unknown): number {
+  const text = typeof value === "string" ? value.trim() : value;
+  if (text === "" || text === null || text === undefined) {
+    return DEFAULT_READ_STEER_WIDTH_PX;
+  }
+  const px = Number(text);
+  if (!Number.isFinite(px)) {
+    return DEFAULT_READ_STEER_WIDTH_PX;
+  }
+  return Math.min(MAX_READ_STEER_WIDTH_PX, Math.max(MIN_READ_STEER_WIDTH_PX, Math.round(px)));
+}
+
+/**
  * `#1186 two-column-splitter`. Where the separator between the desk's two columns stands, as a
  * PERCENTAGE of the main screen's width taken by the left column. Fifty until the reader drags
  * it; the ends keep each column at least 300px wide in the narrowest window that shows two
@@ -322,6 +344,7 @@ export {
   DEFAULT_QUOTE_READ_PERCENT,
   DEFAULT_READ_KEEP_ALIVE_MS,
   DEFAULT_READ_PREROLL_MS,
+  DEFAULT_READ_STEER_WIDTH_PX,
   DEFAULT_READING_CH,
   DEFAULT_TWO_COLUMN_SPLIT,
   MAX_CARD_MAX_LINES,
@@ -373,6 +396,7 @@ export {
   clampReadKeepAliveMs,
   clampReadPrerollMs,
   clampReadSpeed,
+  clampReadSteerWidth,
   clampReadingWidth,
   clampTwoColumnSplit,
 };

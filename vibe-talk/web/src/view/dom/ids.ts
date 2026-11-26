@@ -551,6 +551,7 @@ export interface ElementById {
   "read-steer-count": HTMLSpanElement;
   "read-steer-grip": HTMLButtonElement;
   "read-steer-quote": HTMLButtonElement;
+  "read-steer-resize": HTMLButtonElement;
   "read-steer-row": HTMLDivElement;
   "read-timeline": HTMLDivElement;
   "reader-box": HTMLDivElement;

@@ -24,6 +24,12 @@ export interface ReadControlsDependencies {
   onReadGripUp(): unknown;
   onReadGripKey(event: KeyboardEvent): unknown;
   moveReadSteer(offset: null): unknown;
+  /** `#2266`: the strip's width handle on a desk: pressed, moved, let go, its keys, the usual width restored. */
+  onReadResizeDown(event: PointerEvent): unknown;
+  onReadResizeMove(event: PointerEvent): unknown;
+  onReadResizeUp(): unknown;
+  onReadResizeKey(event: KeyboardEvent): unknown;
+  setReadSteerWidth(px: number | null): unknown;
   /** Hold the strip inside the window. */
   placeReadSteer(): unknown;
   /** `#886 voice-page-autoplay`. Whether autoplay is on, turning it on or off, and forgetting a Hang up's halt. */
@@ -83,6 +89,14 @@ export function mountReadControls(deps: ReadControlsDependencies): ReadControls 
   listen(el("read-steer-grip"), "lostpointercapture", () => deps.onReadGripUp());
   listen<KeyboardEvent>(el("read-steer-grip"), "keydown", (event) => deps.onReadGripKey(event));
   listen(el("read-steer-grip"), "dblclick", () => { deps.moveReadSteer(null); });
+  // `#2266`. The strip's width on a desk, by its right-edge handle.
+  listen<PointerEvent>(el("read-steer-resize"), "pointerdown", (event) => deps.onReadResizeDown(event));
+  listen<PointerEvent>(el("read-steer-resize"), "pointermove", (event) => deps.onReadResizeMove(event));
+  listen(el("read-steer-resize"), "pointerup", () => deps.onReadResizeUp());
+  listen(el("read-steer-resize"), "pointercancel", () => deps.onReadResizeUp());
+  listen(el("read-steer-resize"), "lostpointercapture", () => deps.onReadResizeUp());
+  listen<KeyboardEvent>(el("read-steer-resize"), "keydown", (event) => deps.onReadResizeKey(event));
+  listen(el("read-steer-resize"), "dblclick", () => { deps.setReadSteerWidth(null); });
   // `#886 voice-page-autoplay`. The strip's Autoplay toggle.
   listen(el("read-autoplay"), "click", () => deps.setAutoplay(!deps.autoplayOn()));
   const win = deps.win();
