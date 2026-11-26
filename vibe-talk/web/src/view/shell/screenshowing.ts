@@ -17,6 +17,8 @@ const SCREEN_TITLES: Readonly<Record<string, string>> = Object.freeze({ settings
 export interface ScreenShowingDependencies {
   /** Which screen is up, and a screen arrived at (`Screens.screen`, `Screens.arrive`). */
   readonly screens: Pick<Screens, "screen" | "arrive" | "beforeSettings">;
+  /** The page's root element, where the stylesheet reads which screen is up (`#2283`). Unwired, unmarked. */
+  root?(): HTMLElement;
   /** The page's element by id, in the column being worked on (`el`). */
   el(id: string): HTMLElement;
   /** Close the room past the right column's foot (`closeOverscroll`, `#338 column-overscroll`). */
@@ -115,6 +117,10 @@ export function createScreenShowing(deps: ScreenShowingDependencies): ScreenShow
     }
     // Which screen is up, where the stylesheet can see it.
     el("frame-body").setAttribute("data-screen", name);
+    // `#2283 vibe-talk-root-has-rules`. The same fact on the root, for the header's rules,
+    // which stand outside #frame-body and used to search it (and the header) on every toggle.
+    const root = deps.root?.();
+    if (root && root.getAttribute("data-screen") !== name) root.setAttribute("data-screen", name);
     // The control pane is a grid ROW inside the dock. Hiding it collapses the row, so the body grows
     // to fill the frame rather than leaving a band of empty pane under a sign-in form.
     //

@@ -43,6 +43,7 @@ function makeNavigation(state) {
       setHelpReturn: () => {}, view: () => state.view,
       setView: (name) => { calls.push(["showView", name]); state.view = name; },
     }),
+    root: () => el("root"),
     el, leftEl: el,
     inSide: () => false, mainColumn: () => "main", inColumn: (_c, act) => act(), sideColumn: () => "side",
     sideMode: () => state.sideMode, sideThreadId: () => state.sideThread,
@@ -262,6 +263,8 @@ test("`#624` shell navigation: showView swaps the panes and names the view now u
   state.view = "voice";
   const { nav, calls, elements } = makeNavigation(state);
   nav.showView("discord");
+  // `#2283`: the pane up is named on the root beside the panes' own `hidden`.
+  assert.equal(elements.get("root").attrs["data-pane"], "discord", "showView did not name the pane on the root");
   assert.equal(state.view, "discord");
   assert.deepStrictEqual(calls.filter((call) => Array.isArray(call) && call[0] === "showView"),
     [["showView", "discord"]]);
@@ -279,6 +282,9 @@ test("`#624` shell navigation: showView swaps the panes and names the view now u
   assert.deepStrictEqual(calls.filter((call) => Array.isArray(call) && call[0] === "restore"),
     [["restore", { pinned: false, anchor, anchorId: "m1", top: 44 }]],
     "the returning restore did not pass the captured mark through whole");
+  nav.showView("docs");
+  assert.equal(elements.get("root").attrs["data-pane"], "docs", "a second switch did not rename the pane");
+  assert.equal(elements.get("pane-docs").hidden, false, "the documents pane did not come up");
 });
 
 test("`#1959 vibe-talk-reader-one-click-jump`: the decision starts a read only for an active reader, a landed message, and a current jump", () => {

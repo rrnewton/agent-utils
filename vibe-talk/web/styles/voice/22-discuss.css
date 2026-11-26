@@ -41,13 +41,13 @@
 }
 
 @media (min-width: 900px) and (pointer: fine) {
-  :root:has(#screen-main[data-discuss="docked"]) {
+  :root[data-discuss="docked"] {
     --channel-pane-end: max(320px, var(--discuss-width, 560px));
   }
 }
 
 @media not ((min-width: 900px) and (pointer: fine)) {
-  :root:has(#screen-main > #discuss-panel:not([hidden])[data-sheet="half"]) {
+  :root[data-discuss-half] {
     --channel-pane-bottom: var(--discuss-docked-height, 50dvh);
   }
   /* `#2263`: the split's half-sheet default (timeline collapsed beside a Latest pair) reads the
@@ -100,7 +100,7 @@
 /* `#1501 discuss-read-aloud-parity`: the reading strip steers a Discuss read
    too, so while the panel stands open it floats above it, as it floats
    above the list under a message read. */
-body:has(#discuss-panel:not([hidden])) #read-steer {
+:root[data-discuss-open] #read-steer {
   z-index: calc(var(--z-modal) + 1);
 }
 

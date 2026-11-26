@@ -221,18 +221,18 @@
   }
 
   /* ...and with the reader's row hidden, the bar keeps that room itself: it takes the row, short of the corner. */
-  :root[data-reader="hidden"]:has(#pane-discord:not([hidden])) #dock:not(:has(#hang-up:not([hidden]))):not(:has(#read-aloud[data-active="true"])):not(:has(#read-aloud-stop:not([hidden]))) #control-bar-bottom:has(#view-switch:not([hidden])) {
+  :root[data-reader="hidden"][data-pane="discord"] #dock:not(:has(#hang-up:not([hidden]))):not(:has(#read-aloud[data-active="true"])):not(:has(#read-aloud-stop:not([hidden]))) #control-bar-bottom:has(#view-switch:not([hidden])) {
     margin-right: calc(var(--dock-switch) + var(--dock-menu) + 0.8rem);
   }
 
   /* In Documents the pane is away altogether, so the bar keeps the corner's room there too
      (`#1078 bottom-bar-switcher`): without it the bar takes the whole row and Fetch and
      Outline slide under the switch in its corner, untappable. */
-  :root:has(#pane-docs:not([hidden])) #control-bar-bottom:has(#view-switch:not([hidden])) {
+  :root[data-pane="docs"] #control-bar-bottom:has(#view-switch:not([hidden])) {
     margin-right: calc(var(--dock-switch) + var(--dock-fetch) + 3 * var(--dock-menu) + 1.6rem);
   }
 
-  :root[data-reader="hidden"]:has(#pane-discord:not([hidden])) #dock:not(:has(#hang-up:not([hidden]))):not(:has(#read-aloud[data-active="true"])):not(:has(#read-aloud-stop:not([hidden]))) #control-bar[data-placement="bottom"] {
+  :root[data-reader="hidden"][data-pane="discord"] #dock:not(:has(#hang-up:not([hidden]))):not(:has(#read-aloud[data-active="true"])):not(:has(#read-aloud-stop:not([hidden]))) #control-bar[data-placement="bottom"] {
     padding-bottom: 0;
   }
 
@@ -305,7 +305,7 @@
      second row standing over the page when the jumps (#2006) joined it. It
      never wraps; its padding is cut so its buttons stand on the bar buttons'
      line and the box no higher than the bar. */
-  :root:has(#pane-docs:not([hidden])) #control-pane:has(> #read-aloud:not([hidden])) {
+  :root[data-pane="docs"] #dock #control-pane:has(> #read-aloud:not([hidden])) {
     position: absolute;
     left: 0;
     right: 0;
@@ -358,7 +358,7 @@
     pointer-events: none;
   }
 
-  :root:has(#pane-docs:not([hidden])) #control-pane:has(> #read-aloud:not([hidden]))::before {
+  :root[data-pane="docs"] #dock #control-pane:has(> #read-aloud:not([hidden]))::before {
     content: "Reader";
     align-self: center;
     font-size: 0.85rem;
@@ -390,16 +390,16 @@
      Fetch/Outline, switch, from left to right. Fetch/Outline take a fixed
      width between the hamburger and the switch; the pair stands left of
      the hamburger at a bar button's width each. */
-  :root:has(#pane-docs:not([hidden])) #control-bar[data-placement="bottom"] #doc-outline-open,
-  :root:has(#pane-docs:not([hidden])) #control-bar[data-placement="bottom"] #docs-fetch {
+  :root[data-pane="docs"] #control-bar[data-placement="bottom"] #doc-outline-open,
+  :root[data-pane="docs"] #control-bar[data-placement="bottom"] #docs-fetch {
     right: calc(var(--dock-inset) + var(--dock-switch) + 0.4rem);
     width: var(--dock-fetch);
     box-sizing: border-box;
   }
-  :root:has(#pane-docs:not([hidden])) #control-bar[data-placement="bottom"] #action-menu-open {
+  :root[data-pane="docs"] #control-bar[data-placement="bottom"] #action-menu-open {
     right: calc(var(--dock-inset) + var(--dock-switch) + var(--dock-fetch) + 0.8rem);
   }
-  :root:has(#pane-docs:not([hidden])) #control-bar[data-placement="bottom"] #docs-starred-toggle {
+  :root[data-pane="docs"] #control-bar[data-placement="bottom"] #docs-starred-toggle {
     position: absolute;
     right: calc(var(--dock-inset) + var(--dock-switch) + var(--dock-fetch) + var(--dock-menu) + 1.2rem);
     bottom: 0.4rem;
@@ -407,7 +407,7 @@
     min-width: 0;
     box-sizing: border-box;
   }
-  :root:has(#pane-docs:not([hidden])) #control-bar[data-placement="bottom"] #docs-downloaded-toggle {
+  :root[data-pane="docs"] #control-bar[data-placement="bottom"] #docs-downloaded-toggle {
     position: absolute;
     right: calc(var(--dock-inset) + var(--dock-switch) + var(--dock-fetch) + 2 * var(--dock-menu) + 1.6rem);
     bottom: 0.4rem;
@@ -964,7 +964,7 @@
     padding: 0 0.5rem;
   }
 
-  :root:has(#pane-docs:not([hidden])) #control-pane:has(> #read-aloud:not([hidden])) {
+  :root[data-pane="docs"] #dock #control-pane:has(> #read-aloud:not([hidden])) {
     left: 3.5rem;
     right: calc(var(--dock-inset) + var(--dock-switch) + var(--dock-fetch) + var(--dock-menu) + 1.2rem);
   }

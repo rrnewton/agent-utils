@@ -434,7 +434,7 @@
 
 /* In Documents the floating search glass would sit on the top card's fetch
    button (and on Read in the reader); it is the channel's, not this view's. */
-#screen-main:has(#pane-docs:not([hidden])) #search-float {
+:root[data-pane="docs"] #search-float {
   display: none;
 }
 
@@ -443,7 +443,7 @@
    under it (`#1236 documents-reader-layout`); it is the message column's,
    not this view's. The same gate as the search glass above, so no document
    text can sit under it here. */
-#screen-main:has(#pane-docs:not([hidden])) #width-grip {
+:root[data-pane="docs"] #width-grip {
   display: none;
 }
 
@@ -718,7 +718,7 @@
 #doc-outline-open {
   display: none;
 }
-body:has(#pane-docs:not([hidden]) #docs-reader:not([hidden])) #doc-outline-open:not([hidden]) {
+:root[data-pane="docs"][data-docs="reader"] #doc-outline-open:not([hidden]) {
   display: flex;
 }
 /* The outline pop-up (#1038): floated over the document against #screen-main,
@@ -903,7 +903,7 @@ body:has(#control-bar[data-placement="top"]) #doc-outline-pop {
    on a phone it leaves the list's bar. It returns in the reader, where
    reading happens, and Settings keeps the same choice. */
 @media not ((min-width: 900px) and (pointer: fine)) {
-  :root:has(#pane-docs:not([hidden]) #docs-list-view:not([hidden])) #audio-source {
+  :root[data-pane="docs"][data-docs="list"] #audio-source {
     display: none;
   }
 }
@@ -911,8 +911,8 @@ body:has(#control-bar[data-placement="top"]) #doc-outline-pop {
 /* The pair's view is decided by the control bar (Documents), but the
    reader is a Documents view with no list to filter: while a document
    is open the pair stands down, as Fetch does. */
-:root:has(#pane-docs:not([hidden]) #docs-reader:not([hidden])) #docs-starred-toggle,
-:root:has(#pane-docs:not([hidden]) #docs-reader:not([hidden])) #docs-downloaded-toggle {
+:root[data-pane="docs"][data-docs="reader"] #docs-starred-toggle,
+:root[data-pane="docs"][data-docs="reader"] #docs-downloaded-toggle {
   display: none;
 }
 

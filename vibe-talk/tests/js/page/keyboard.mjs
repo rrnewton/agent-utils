@@ -31,28 +31,28 @@ test("`#429 keyboard-hides-bar`: both rows go while the keyboard is up, only on 
   // The channel view only: the call's view keeps its dock over the keyboard (`#241 voice-composer`).
   for (const rule of body.matchAll(/([^{}]+)\{[^{}]*\}/g)) {
     for (const selector of rule[1].split(/,\s*(?=:root)/)) {
-      assert.match(selector.trim(), /^:root\[data-keyboard="open"\]:has\(#pane-discord:not\(\[hidden\]\)\) /,
+      assert.match(selector.trim(), /^:root\[data-keyboard="open"\]\[data-pane="discord"\](?::not\(\[data-screen="(?:settings|help)"\]\))* /,
         `a keyboard rule reaches past the channel view: ${selector.trim()}`);
     }
   }
   // Both rows: the control bar wherever it is mounted, and the dock with nothing in it to stop.
-  assert.match(cssRules(body, ':root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #control-bar').join("\n"), /display:\s*none/,
+  assert.match(cssRules(body, ':root[data-keyboard="open"][data-pane="discord"] #control-bar').join("\n"), /display:\s*none/,
     "the control bar stays up over the keyboard");
   // (Read whole: `cssRules` splits a selector list at its commas, and this one has a comma inside `:has()`.)
   assert.match(body,
-    /:root\[data-keyboard="open"\]:has\(#pane-discord:not\(\[hidden\]\)\) #dock:not\(:has\(#read-aloud\[data-active="true"\]:not\(\[hidden\]\), #hang-up:not\(\[hidden\]\)\)\) \{\s*display:\s*none;\s*\}/,
+    /:root\[data-keyboard="open"\]\[data-pane="discord"\] #dock:not\(:has\(#read-aloud\[data-active="true"\]:not\(\[hidden\]\), #hang-up:not\(\[hidden\]\)\)\) \{\s*display:\s*none;\s*\}/,
     "the dock stays up over the keyboard with nothing playing");
   // The header the bar was moved to goes with it, but never Settings' way back.
-  assert.match(body, /#topbar:has\(#control-bar-top > #control-bar\):not\(:has\(#close-settings:not\(\[hidden\]\), #close-help:not\(\[hidden\]\)\)\)/);
+  assert.match(body, /:not\(\[data-screen="settings"\]\):not\(\[data-screen="help"\]\) #topbar:has\(#control-bar-top > #control-bar\)/);
   // A reading or a call keeps one slim row: its Stop or Hang up, and nothing else of the tile. A
   // read playing makes Read its Pause, and Stop (`#442 read-strip-order`, hidden otherwise) stays.
   assert.match(body,
-    /:root\[data-keyboard="open"\]:has\(#pane-discord:not\(\[hidden\]\)\) #control-pane > :is\(\.control, \.popover, #audio-source\):not\(#hang-up, #read-aloud\[data-active="true"\], #read-aloud-stop\) \{\s*display:\s*none;\s*\}/,
+    /:root\[data-keyboard="open"\]\[data-pane="discord"\] #control-pane > :is\(\.control, \.popover, #audio-source\):not\(#hang-up, #read-aloud\[data-active="true"\], #read-aloud-stop\) \{\s*display:\s*none;\s*\}/,
     "the rest of the tile stays up beside Stop");
   assert.match(body,
-    /:root\[data-keyboard="open"\]:has\(#pane-discord:not\(\[hidden\]\)\) #control-pane:has\(#read-aloud-stop:not\(\[hidden\]\)\) \{\s*grid-template-columns:\s*1fr 1fr;\s*\}/,
+    /:root\[data-keyboard="open"\]\[data-pane="discord"\] #control-pane:has\(#read-aloud-stop:not\(\[hidden\]\)\) \{\s*grid-template-columns:\s*1fr 1fr;\s*\}/,
     "a read playing leaves the slim row without Stop beside its Pause");
-  assert.match(cssRules(body, ':root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #control-pane').join("\n"), /grid-template-rows:\s*2\.75rem/);
+  assert.match(cssRules(body, ':root[data-keyboard="open"][data-pane="discord"] #control-pane').join("\n"), /grid-template-rows:\s*2\.75rem/);
   // Nothing the box needs is in either bar: Send and Grow are the composers', in the list.
   for (const id of ["channel-send", "send-text", "reply-send"]) {
     if (!PAGE_ELEMENTS.has(id)) continue;

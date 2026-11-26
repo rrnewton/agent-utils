@@ -1019,6 +1019,7 @@ const shellNavigation = createPageNavigation({
   clock: clockOnUse(),
   session: BACK_SESSION,
   screens: () => screens,
+  root: () => document.documentElement,
   el: (id) => el(id),
   leftEl: (id) => leftEl(id),
   inSide: () => columnWork.side(),
@@ -1387,6 +1388,7 @@ const screens = createScreens();
 
 /** The mounted Documents view. */
 const documentsView = createDocumentsView({
+  root: () => document.documentElement,
   intoView: (element, block, inline) => scrollKeeping.intoView(element, block, inline),
   nudge: (scroller, delta) => scrollKeeping.nudge(scroller, delta),
   toPosition: (scroller, top) => scrollKeeping.toPosition(scroller, top),
@@ -1616,6 +1618,7 @@ documentsSelector.mount();
  */
 const screenShowing = createScreenShowing({
   screens,
+  root: () => document.documentElement,
   el: (id) => el(id),
   closeOverscroll: () => closeOverscroll(),
   holdChannelPlace: () => holdChannelPlace(),

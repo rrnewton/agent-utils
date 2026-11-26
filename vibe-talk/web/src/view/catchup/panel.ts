@@ -1317,6 +1317,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
   function applySheet(full: boolean, keep: boolean): boolean {
     sheetFull = full;
     panel().setAttribute("data-sheet", full ? "full" : "half");
+    syncSheetRoot();
     drawHeaderToggles();
     // `#2263`: the timeline's default fold differs on a phone's half sheet.
     split.restate();
@@ -1346,6 +1347,25 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     if (!screen) return;
     if (!isOpen() || layoutMode === "overlay") screen.removeAttribute("data-discuss");
     else screen.setAttribute("data-discuss", layoutMode);
+    // `#2283 vibe-talk-root-has-rules`. The same fact on the root, for the rules that set
+    // the channel pane's end there: keyed off the attribute, not a document-wide search.
+    const root = document.documentElement;
+    if (root) {
+      if (!isOpen() || layoutMode === "overlay") root.removeAttribute("data-discuss");
+      else if (root.getAttribute("data-discuss") !== layoutMode) root.setAttribute("data-discuss", layoutMode);
+    }
+  }
+
+  /**
+   * `#2283 vibe-talk-root-has-rules`. The half sheet standing open, on the root beside the
+   * panel's own `data-sheet` and `hidden`: the pane's foot reads it there (22-discuss.css).
+   */
+  function syncSheetRoot(): void {
+    const root = document.documentElement;
+    if (!root) return;
+    const half = isOpen() && !sheetFull;
+    if (half && !root.hasAttribute("data-discuss-half")) root.setAttribute("data-discuss-half", "");
+    if (!half && root.hasAttribute("data-discuss-half")) root.removeAttribute("data-discuss-half");
   }
 
   function applyMode(mode: DiscussLayoutMode, keep: boolean): DiscussLayoutMode {
@@ -1424,6 +1444,14 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     // Every exit (close(), the X, Escape, the bar toggle) lands here, so the
     // screen's docked/maximized mark follows openness from this one place.
     syncScreenMode();
+    // `#2283 vibe-talk-root-has-rules`. Openness itself on the root, from this same one
+    // place, for what floats over the panel (the reading strip); the half-sheet fact follows.
+    const root = document.documentElement;
+    if (root) {
+      if (open && !root.hasAttribute("data-discuss-open")) root.setAttribute("data-discuss-open", "");
+      if (!open && root.hasAttribute("data-discuss-open")) root.removeAttribute("data-discuss-open");
+    }
+    syncSheetRoot();
     try {
       deps.byId("discuss-open").setAttribute("aria-expanded", open ? "true" : "false");
     } catch {

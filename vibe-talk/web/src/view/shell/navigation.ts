@@ -231,6 +231,8 @@ export interface PageNavigationDependencies<Column, ThreadLike, Pane> {
   /** Whether something over the channel is open (`rowMenus.open` etc. are read through `openMenus`). */
   // Page state, read only inside the returned functions.
   screens(): Pick<Screens, "screen" | "beforeSettings" | "helpReturn" | "setHelpReturn" | "view" | "setView">;
+  /** The page's root element, where the stylesheet reads which pane is up (`#2283`). Unwired, unmarked. */
+  root?(): HTMLElement;
   el(id: string): HTMLElement;
   leftEl(id: string): HTMLElement;
   inSide(): boolean;
@@ -1984,6 +1986,11 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
       if (leaving === "discord") deps.holdChannelPlace();
     }
     deps.screens().setView(name);
+    // `#2283 vibe-talk-root-has-rules`. Which pane is up, on the root beside the panes' own
+    // `hidden` below: the stylesheet keys the dock, the header and the Documents chrome off
+    // this one fact instead of re-searching the whole document for the pane on every toggle.
+    const root = deps.root?.();
+    if (root && root.getAttribute("data-pane") !== name) root.setAttribute("data-pane", name);
     el("pane-voice").hidden = name !== "voice";
     el("pane-discord").hidden = name !== "discord";
     el("pane-docs").hidden = name !== "docs";

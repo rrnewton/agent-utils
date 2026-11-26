@@ -414,16 +414,16 @@
  *     tile shrinks to ONE slim row holding Stop, or Hang up, instead of going: the sound is a tap from
  *     stopping. Everything else in the tile goes. */
 @media (pointer: coarse) {
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #control-bar,
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #topbar:has(#control-bar-top > #control-bar):not(:has(#close-settings:not([hidden]), #close-help:not([hidden]))) {
+  :root[data-keyboard="open"][data-pane="discord"] #control-bar,
+  :root[data-keyboard="open"][data-pane="discord"]:not([data-screen="settings"]):not([data-screen="help"]) #topbar:has(#control-bar-top > #control-bar) {
     display: none;
   }
 
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #dock:not(:has(#read-aloud[data-active="true"]:not([hidden]), #hang-up:not([hidden]))) {
+  :root[data-keyboard="open"][data-pane="discord"] #dock:not(:has(#read-aloud[data-active="true"]:not([hidden]), #hang-up:not([hidden]))) {
     display: none;
   }
 
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #control-pane {
+  :root[data-keyboard="open"][data-pane="discord"] #control-pane {
     grid-template-rows: 2.75rem;
     padding-top: 0.35rem;
     padding-bottom: calc(0.35rem + env(safe-area-inset-bottom));
@@ -433,11 +433,11 @@
      `:not(…)`: a rule under `:root:has(…)` whose last part names no class, id or attribute is one the
      browser can only check again on every element of the page, and it did so whenever anything on the
      page was shown or hidden — a fold, a filter, a card unpacked — about 20 ms a time on a phone. */
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #control-pane > :is(.control, .popover, #audio-source):not(#hang-up, #read-aloud[data-active="true"], #read-aloud-stop) {
+  :root[data-keyboard="open"][data-pane="discord"] #control-pane > :is(.control, .popover, #audio-source):not(#hang-up, #read-aloud[data-active="true"], #read-aloud-stop) {
     display: none;
   }
 
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #control-pane > :is(#hang-up, #read-aloud, #read-aloud-stop) {
+  :root[data-keyboard="open"][data-pane="discord"] #control-pane > :is(#hang-up, #read-aloud, #read-aloud-stop) {
     grid-column: 1 / -1;
     grid-row: 1;
     flex-direction: row;
@@ -446,15 +446,15 @@
 
   /* `#442 read-strip-order`. A read playing makes Read its Pause, so the slim row keeps Stop beside
      it, half and half, on its left as in the tile: the sound is still a tap from stopping. */
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #control-pane:has(#read-aloud-stop:not([hidden])) {
+  :root[data-keyboard="open"][data-pane="discord"] #control-pane:has(#read-aloud-stop:not([hidden])) {
     grid-template-columns: 1fr 1fr;
   }
 
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #control-pane:has(#read-aloud-stop:not([hidden])) > #read-aloud {
+  :root[data-keyboard="open"][data-pane="discord"] #control-pane:has(#read-aloud-stop:not([hidden])) > #read-aloud {
     grid-column: 2;
   }
 
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #control-pane > #read-aloud-stop {
+  :root[data-keyboard="open"][data-pane="discord"] #control-pane > #read-aloud-stop {
     grid-column: 1;
   }
 
@@ -490,31 +490,31 @@
      (measured in tests/keyboard_hides_bar_browser.py: the list scrolled 40px at the blur). The room is
      the keyboard's while it is up, whichever of the composer's controls holds the focus; only
      `--keyboard-fit`, which changes no height, still says which box is being written in. */
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #side-scroll {
+  :root[data-keyboard="open"][data-pane="discord"] #side-scroll {
     padding-bottom: 0;
   }
 
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) :is(#channel-composer, #side-composer) {
+  :root[data-keyboard="open"][data-pane="discord"] :is(#channel-composer, #side-composer) {
     padding-bottom: var(--keyboard-inset, 0px);
   }
 
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) :is(#channel-composer, #side-composer):has(> textarea:focus) {
+  :root[data-keyboard="open"][data-pane="discord"] :is(#channel-composer, #side-composer):has(> textarea:focus) {
     --keyboard-fit: on;
   }
 
   /* The box's state line, with nothing to say, is a row and a gap of nothing under the box. Something to
      say (a send failed, a send waits) still shows, under the box. */
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) :is(#channel-compose-state, #side-compose-state):empty {
+  :root[data-keyboard="open"][data-pane="discord"] :is(#channel-compose-state, #side-compose-state):empty {
     display: none;
   }
 
   /* Under a send card the box has Send's column beside it (`#screen-main[data-draft]`): one column, so the
      box takes the row. */
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #channel-composer:has(> #channel-compose-text[enterkeyhint="send"]:focus) {
+  :root[data-keyboard="open"][data-pane="discord"] #channel-composer:has(> #channel-compose-text[enterkeyhint="send"]:focus) {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) :is(#channel-compose-text, #side-compose-text)[enterkeyhint="send"]:focus {
+  :root[data-keyboard="open"][data-pane="discord"] :is(#channel-compose-text, #side-compose-text)[enterkeyhint="send"]:focus {
     grid-row: 1;
     grid-column: 1;
     padding-right: 3.25rem;
@@ -526,18 +526,18 @@
      key's 3.25rem), so a long line wraps before the chip and before the
      floating keyboard Send stands. The side box has no chip and keeps its
      own. */
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #channel-compose-text[enterkeyhint="send"]:focus {
+  :root[data-keyboard="open"][data-pane="discord"] #channel-compose-text[enterkeyhint="send"]:focus {
     padding-right: 7rem;
   }
 
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #reply-text[enterkeyhint="send"]:focus {
+  :root[data-keyboard="open"][data-pane="discord"] #reply-text[enterkeyhint="send"]:focus {
     grid-row: 2;
     grid-column: 1 / -1;
     padding-right: 3.25rem;
     resize: none;
   }
 
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) :is(#channel-compose-text, #side-compose-text, #reply-text)[enterkeyhint="send"]:focus ~ .newline-key {
+  :root[data-keyboard="open"][data-pane="discord"] :is(#channel-compose-text, #side-compose-text, #reply-text)[enterkeyhint="send"]:focus ~ .newline-key {
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -559,7 +559,7 @@
     line-height: 1;
   }
 
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #reply-text[enterkeyhint="send"]:focus ~ .newline-key {
+  :root[data-keyboard="open"][data-pane="discord"] #reply-text[enterkeyhint="send"]:focus ~ .newline-key {
     grid-row: 2;
     grid-column: 1 / -1;
   }
@@ -576,12 +576,12 @@
      (three ids there against two here as first written): with both `top` and that `bottom`
      standing, the strip stretched between them down the pane's right edge and its lone
      visible Undo chip stretched with it, over the reply box and its Send. */
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #screen-main > #scroll-tools {
+  :root[data-keyboard="open"][data-pane="discord"] #screen-main > #scroll-tools {
     bottom: auto;
     top: 0.35rem;
   }
 
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #scroll-tools > :is(#jump-newest, #jump-bookmark, #jump-unread, #jump-reading, #draft-chip, #back-to-reply) {
+  :root[data-keyboard="open"][data-pane="discord"] #scroll-tools > :is(#jump-newest, #jump-bookmark, #jump-unread, #jump-reading, #draft-chip, #back-to-reply) {
     display: none;
   }
 
@@ -589,26 +589,26 @@
      one line holding Post to main as a small toggle at its start and Cancel and Send reply at
      its end. The destination line and the target's id come back with the keyboard down; a
      state line with something to say (a send that failed) still shows. */
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #reply-compose #reply-target-meta,
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #reply-compose #reply-destination {
+  :root[data-keyboard="open"][data-pane="discord"] #reply-compose #reply-target-meta,
+  :root[data-keyboard="open"][data-pane="discord"] #reply-compose #reply-destination {
     display: none;
   }
 
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #reply-compose #reply-state:empty {
+  :root[data-keyboard="open"][data-pane="discord"] #reply-compose #reply-state:empty {
     display: none;
   }
 
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #reply-compose .reply-actions {
+  :root[data-keyboard="open"][data-pane="discord"] #reply-compose .reply-actions {
     flex-wrap: nowrap;
   }
 
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #reply-compose #reply-to-main-row {
+  :root[data-keyboard="open"][data-pane="discord"] #reply-compose #reply-to-main-row {
     margin-inline-end: auto;
     font-size: 0.8rem;
     white-space: nowrap;
   }
 
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #reply-compose :is(#reply-cancel, #reply-send) {
+  :root[data-keyboard="open"][data-pane="discord"] #reply-compose :is(#reply-cancel, #reply-send) {
     white-space: nowrap;
   }
 }
@@ -694,14 +694,14 @@
    Pause, or Stop shown), the row is drawn whatever the choice, so the sound is a tap from stopping and the read
    strip, which hides the bar, never leaves the screen with no way out. The bar, standing at the foot now, keeps
    the home indicator's inset the row used to keep; and a dock left with nothing in it goes. */
-:root[data-reader="hidden"]:has(#pane-discord:not([hidden])) #dock:not(:has(#hang-up:not([hidden]))):not(:has(#read-aloud[data-active="true"])):not(:has(#read-aloud-stop:not([hidden]))) #control-pane {
+:root[data-reader="hidden"][data-pane="discord"] #dock:not(:has(#hang-up:not([hidden]))):not(:has(#read-aloud[data-active="true"])):not(:has(#read-aloud-stop:not([hidden]))) #control-pane {
   display: none;
 }
 
-:root[data-reader="hidden"]:has(#pane-discord:not([hidden])) #dock:not(:has(#hang-up:not([hidden]))):not(:has(#read-aloud[data-active="true"])):not(:has(#read-aloud-stop:not([hidden]))) #control-bar[data-placement="bottom"] {
+:root[data-reader="hidden"][data-pane="discord"] #dock:not(:has(#hang-up:not([hidden]))):not(:has(#read-aloud[data-active="true"])):not(:has(#read-aloud-stop:not([hidden]))) #control-bar[data-placement="bottom"] {
   padding-bottom: calc(0.35rem + env(safe-area-inset-bottom));
 }
 
-:root[data-reader="hidden"]:has(#pane-discord:not([hidden])) #dock:not(:has(#control-bar)):not(:has(#hang-up:not([hidden]))):not(:has(#read-aloud[data-active="true"])):not(:has(#read-aloud-stop:not([hidden]))) {
+:root[data-reader="hidden"][data-pane="discord"] #dock:not(:has(#control-bar)):not(:has(#hang-up:not([hidden]))):not(:has(#read-aloud[data-active="true"])):not(:has(#read-aloud-stop:not([hidden]))) {
   display: none;
 }

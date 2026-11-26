@@ -40,6 +40,8 @@ export interface DocumentsViewDependencies {
   toPosition(scroller: HTMLElement, top: number): void;
   toFoot(scroller: HTMLElement): void;
   byId(id: string): HTMLElement;
+  /** The page's root element, where the stylesheet reads list-or-reader (`#2283`). Unwired, unmarked. */
+  root?(): HTMLElement;
   /** Read one document aloud through the page's shared read-aloud owner (`#1039`). */
   readDocument(doc: {
     key: string; title?: string; texts: readonly string[];
@@ -130,6 +132,15 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
   // (`#2007`), so a client-config answer landing after construction still counts.
   if (deps.internalLinkHosts) setInternalLinkHostProvider(deps.internalLinkHosts);
   const listening = createListening();
+  /**
+   * `#2283 vibe-talk-root-has-rules`. List or reader, on the root beside the two views'
+   * own `hidden` writes: the stylesheet keys the bar's Documents members off this one fact
+   * instead of re-searching the whole document for the views on every toggle.
+   */
+  function markDocs(which: "list" | "reader"): void {
+    const root = deps.root?.();
+    if (root && root.getAttribute("data-docs") !== which) root.setAttribute("data-docs", which);
+  }
   let readingNow = false;
   let wired = false;
   let liveTimer = 0;
@@ -496,6 +507,7 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     }
     deps.byId("docs-reader").hidden = true;
     deps.byId("docs-list-view").hidden = false;
+    markDocs("list");
     deps.byId("docs-fetch").hidden = false;
     try {
       deps.byId("docs-filter-bar").hidden = false;
@@ -578,6 +590,7 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     currentRow = list.rowFor(key);
     deps.byId("docs-list-view").hidden = true;
     deps.byId("docs-reader").hidden = false;
+    markDocs("reader");
     // The reader's jumps stand with it (`#2006`).
     try {
       deps.byId("doc-jumps").hidden = false;
@@ -838,6 +851,7 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
       if (readingNow) {
         deps.byId("docs-list-view").hidden = true;
         deps.byId("docs-reader").hidden = false;
+        markDocs("reader");
         deps.byId("docs-fetch").hidden = true;
         try {
           deps.byId("docs-filter-bar").hidden = true;

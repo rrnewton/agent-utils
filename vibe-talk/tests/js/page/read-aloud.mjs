@@ -1908,10 +1908,10 @@ test("`scrubber-full-width`: on a phone the strip playing is a full-width row on
   // Playing: the second row (in the dock or the header) and the chips go. Held: the second row only.
   assert.match(rule(":root[data-read-strip] #control-bar"), /display:\s*none;/, "the second row stays up during playback");
   // (By the text: the rule parser splits a selector at the commas inside its `:has`.)
-  assert.match(phone, /:root\[data-read-strip\] #topbar:has\(#control-bar-top > #control-bar\):not\([^{]*\{\s*display:\s*none;/,
+  assert.match(phone, /:root\[data-read-strip\](?::not\(\[data-screen="(?:settings|help)"\]\))* #topbar:has\(#control-bar-top > #control-bar\)[^{]*\{\s*display:\s*none;/,
     "the header holding only the bar stays up during playback");
   // A header gone this way is not `hidden`, so the body takes the notch's inset over (`#197`).
-  assert.match(phone, /:root\[data-read-strip\] #topbar:has\([^{]*\+ #frame-body\s*\{\s*padding-top:\s*env\(safe-area-inset-top\);/,
+  assert.match(phone, /:root\[data-read-strip\](?::not\(\[data-screen="(?:settings|help)"\]\))* #topbar:has\([^{]*\+ #frame-body\s*\{\s*padding-top:\s*env\(safe-area-inset-top\);/,
     "the header gone for playback leaves the list under the notch");
   // (The thread list's boxes, #side-composer, #side-pane and #side-list, are in the `:is` above.)
   // `#837 voice-page-jump-to-reading`: all but the way back to the message being read, while it is up (by the text,

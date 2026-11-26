@@ -597,7 +597,7 @@ test("`#880 voice-page-menu-placement`: Hide reader takes the channel's row of b
   assert.equal(page.storage.get("vibe-talk.voice.reader-hidden"), "1", "the choice is not kept");
   // The stylesheet takes the row away on the channel's view and leaves no band: the bar keeps the inset. But
   // a way out of sound stays: while a call can be hung up or a read is on, the row is drawn whatever the choice.
-  const P = ':root[data-reader="hidden"]:has(#pane-discord:not([hidden]))';
+  const P = ':root[data-reader="hidden"][data-pane="discord"]';
   const OUT = ':not(:has(#hang-up:not([hidden]))):not(:has(#read-aloud[data-active="true"]))' +
     ':not(:has(#read-aloud-stop:not([hidden])))';
   assert.match(cssBlock(`${P} #dock${OUT} #control-pane`), /display:\s*none/,
@@ -1235,6 +1235,10 @@ test("THE BAR FITS ON THE OWNER'S 375px PHONE, ON EVERY VIEW", async () => {
   await page.el("view-switch").click();
   const docs = barCostPx(page);
   assert.ok(docs.shown.includes("docs-fetch"), "this is not the Documents view's bar");
+  // `#2283`: the pane up and list-or-reader ride on the root with the panes' own `hidden`.
+  assert.equal(page.documentElement.getAttribute("data-pane"), "docs", "the root does not name the Documents pane");
+  assert.equal(page.documentElement.getAttribute("data-docs"), "list", "the root does not name the Documents list");
+  assert.equal(page.documentElement.getAttribute("data-screen"), "main", "the root does not name the main screen");
   assert.equal(docs.shown.at(-1), "view-switch", "the switch is not the Documents bar's last button");
   // `#2001` phone room: with the pair beside the hamburger the list's bar
   // has no room for the audio toggle too, so on a phone it leaves the
@@ -1242,7 +1246,7 @@ test("THE BAR FITS ON THE OWNER'S 375px PHONE, ON EVERY VIEW", async () => {
   // below is the phone bar as drawn: every fixed member, without audio.
   assert.match(
     CSS_CODE,
-    /:root:has\(#pane-docs:not\(\[hidden\]\) #docs-list-view:not\(\[hidden\]\)\) #audio-source \{\s*display: none;/,
+    /:root\[data-pane="docs"\]\[data-docs="list"\] #audio-source \{\s*display: none;/,
     "the audio toggle does not leave the phone Documents list bar"
   );
   const docsPhoneCost = docs.cost - memberPx("audio-source")
@@ -1969,7 +1973,7 @@ test("on a desk the view switch has one place, and the pane keeps the room for i
   assert.match(cssValue(cssBlockIn(DESKTOP_QUERY, "#dock"), "--dock-menu") || "", /^[\d.]+rem$/);
   // ...and with the reader's row hidden, the bar keeps that room, since no pane is there to.
   const hiddenRoom = cssBlockIn(DESKTOP_QUERY,
-    ':root[data-reader="hidden"]:has(#pane-discord:not([hidden])) #dock:not(:has(#hang-up:not([hidden])))' +
+    ':root[data-reader="hidden"][data-pane="discord"] #dock:not(:has(#hang-up:not([hidden])))' +
     ':not(:has(#read-aloud[data-active="true"])):not(:has(#read-aloud-stop:not([hidden]))) ' +
     '#control-bar-bottom:has(#view-switch:not([hidden]))');
   assert.equal(cssValue(hiddenRoom, "margin-right"), cssValue(room, "margin-right"),

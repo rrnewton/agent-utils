@@ -549,7 +549,7 @@
   }
 
   :root[data-read-strip] #control-bar,
-  :root[data-read-strip] #topbar:has(#control-bar-top > #control-bar):not(:has(#close-settings:not([hidden]), #close-help:not([hidden]))),
+  :root[data-read-strip]:not([data-screen="settings"]):not([data-screen="help"]) #topbar:has(#control-bar-top > #control-bar),
   :root[data-read-strip="playing"] #scroll-tools:not(:has(> #jump-reading:not([hidden]))),
   :root[data-read-strip="playing"] #scroll-tools > :not(#jump-reading) {
     display: none;
@@ -558,7 +558,7 @@
   /* The header gone this way is not `hidden`, so the body takes the top safe-area inset over here as
      `#197 floating-search` has it do for a hidden header: a read lasts minutes, and the notch would
      sit on the list's first line and the glass for all of them. */
-  :root[data-read-strip] #topbar:has(#control-bar-top > #control-bar):not(:has(#close-settings:not([hidden]), #close-help:not([hidden]))) + #frame-body {
+  :root[data-read-strip]:not([data-screen="settings"]):not([data-screen="help"]) #topbar:has(#control-bar-top > #control-bar) + #frame-body {
     padding-top: env(safe-area-inset-top);
   }
 }

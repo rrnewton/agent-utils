@@ -58,6 +58,7 @@ function fakeElement(tagName = "div") {
     removeEventListener(type, listener) { el.listeners[type] = (el.listeners[type] || []).filter((one) => one !== listener); },
     setAttribute(name, value) { el.attributes[name] = String(value); },
     getAttribute(name) { return name in el.attributes ? el.attributes[name] : null; },
+    hasAttribute(name) { return name in el.attributes; },
     removeAttribute(name) { delete el.attributes[name]; },
   };
   let textContent = "";
@@ -233,6 +234,7 @@ function fixture({ selection = { view: "flat", threadId: null, thread: null }, r
   };
   const savedDocument = globalThis.document;
   globalThis.document = {
+    documentElement: fakeElement("html"),
     createTextNode: (text) => ({ nodeType: 3, textContent: String(text), children: [] }),
     createElement: (tag) => {
       if (tag !== "template") return fakeElement(tag);
@@ -1799,8 +1801,13 @@ test("catchup modes: closing a docked panel frees the column; reopening docks ag
     await flush();
     click(fx.els["discuss-dock-toggle"]);
     assert.equal(fx.els["screen-main"].getAttribute("data-discuss"), "docked");
+    // `#2283`: the same facts on the root, where the pane-end and strip rules read them.
+    assert.equal(globalThis.document.documentElement.getAttribute("data-discuss"), "docked", "docking did not name the mode on the root");
+    assert.equal(globalThis.document.documentElement.hasAttribute("data-discuss-open"), true, "opening did not mark the root open");
     // Programmatic close: no reserved column, remembered mode kept.
     view.close();
+    assert.equal(globalThis.document.documentElement.getAttribute("data-discuss"), null, "close left the mode on the root");
+    assert.equal(globalThis.document.documentElement.hasAttribute("data-discuss-open"), false, "close left the root marked open");
     assert.equal(view.isOpen(), false);
     assert.equal(fx.els["screen-main"].getAttribute("data-discuss"), null, "close left the docked column reserved");
     assert.equal(view.mode(), "docked", "close forgot the remembered mode");
@@ -2107,6 +2114,7 @@ function foldEl(tagName = "div", text = "") {
     removeEventListener(type, listener) { el.listeners[type] = (el.listeners[type] || []).filter((one) => one !== listener); },
     setAttribute(name, value) { el.attributes[name] = String(value); },
     getAttribute(name) { return name in el.attributes ? el.attributes[name] : null; },
+    hasAttribute(name) { return name in el.attributes; },
     removeAttribute(name) { delete el.attributes[name]; },
   };
   let own = text;

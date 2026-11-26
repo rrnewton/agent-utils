@@ -2277,8 +2277,9 @@ async function withDocumentsView(options, run) {
   const posts = [];
   const jumps = [];
   const replies = [];
+  const rootEl = readerEl("html");
   const view = mod.createDocumentsView({
-    api, byId,
+    api, byId, root: () => rootEl,
     intoView: (element, block, inline) => { if (element && typeof element.scrollIntoView === "function") element.scrollIntoView(inline === undefined ? { block } : { block, inline }); },
     nudge: (scroller, delta) => { scroller.scrollTop += delta; }, toPosition: (scroller, top) => { scroller.scrollTop = top; }, toFoot: (scroller) => { scroller.scrollTop = scroller.scrollHeight; },
     readDocument: (doc) => { reads.push(doc); },
@@ -2297,7 +2298,7 @@ async function withDocumentsView(options, run) {
     querySelector: () => null,
   };
   try {
-    await run({ view, els, byId, opened, reads, stops, statuses, posts, jumps, replies });
+    await run({ view, els, byId, rootEl, opened, reads, stops, statuses, posts, jumps, replies });
   } finally {
     view.unmount();
     if (savedDocument === undefined) delete globalThis.document; else globalThis.document = savedDocument;
@@ -2305,8 +2306,10 @@ async function withDocumentsView(options, run) {
 }
 
 test("documents view: opens stack, back() walks them one step at a time, the list ends the chain", async () => {
-  await withDocumentsView({}, async ({ view, byId }) => {
+  await withDocumentsView({}, async ({ view, byId, rootEl }) => {
     await view.show("doc-a");
+    // `#2283`: list-or-reader is named on the root beside the views' own `hidden`.
+    assert.equal(rootEl.getAttribute("data-docs"), "reader", "opening a document did not name the reader on the root");
     assert.equal(view.reading(), true);
     assert.equal(view.depth(), 1);
     assert.equal(view.current()?.key, "doc-a");
@@ -2329,6 +2332,7 @@ test("documents view: opens stack, back() walks them one step at a time, the lis
     assert.equal(view.depth(), 0);
     assert.equal(byId("docs-list-view").hidden, false);
     assert.equal(byId("docs-reader").hidden, true);
+    assert.equal(rootEl.getAttribute("data-docs"), "list", "reaching the list did not name it on the root");
   });
 });
 

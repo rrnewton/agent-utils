@@ -712,7 +712,7 @@ test("MOBILE KEYBOARD COMPOSE: Keyboard layout debug draws the page's numbers ov
 
 test("MOBILE KEYBOARD COMPOSE: with the keyboard up, the box's foot is on it, the row under it stays drawn to be scrolled to, and the new-line key comes only while Enter sends", () => {
   const { body } = keyboardMedia();
-  const P = ':root[data-keyboard="open"]:has(#pane-discord:not([hidden]))';
+  const P = ':root[data-keyboard="open"][data-pane="discord"]';
   const rule = (selector) => {
     const at = body.indexOf(`${P} ${selector} {`);
     assert.ok(at >= 0, `no keyboard rule for ${selector}`);
