@@ -7,7 +7,7 @@ labels:
 - vibe-talk
 - flaky-test
 created_at: 2026-11-26T11:52:00-05:00
-updated_at: 2026-11-26T11:52:00-05:00
+updated_at: 2026-11-26T15:32:00-05:00
 ---
 
 # Description
@@ -46,3 +46,5 @@ Fix the check, not the page, first:
 # Notes
 
 Related: `#1990 vibe-talk-archive-single-row-dress` (the check and the single-row dress it guards), `#2292 vibe-talk-windowed-composer-foot-fight` (the windowing-on hardening epic; its deferred re-slice is the other party in the race, and its Notes' stacking puts `#2283` before it), `#2283 vibe-talk-root-has-rules` (the gate that surfaced this; its C1 was cleared of the red by the 6+6 runs above and the step is being handled under the flake rule there). Filed by mu-hasrules at coordb's direction, 2026-11-26.
+
+Real cause (2026-11-26, mu-statesync; instrumented solo repro on unmodified main 1d33464f): not the selection/re-slice race in Design, and not #2307's keep-alive poisoning. This check's fake stack (BigApi over GapApi over the offline fake) never served the archive writes: the base fake's POST answers only /api/v1/freeze-report and returns 404 for /dismiss and /restore. The page therefore drew each archive optimistically and rightly took it back when the write was refused. In the captured failing run the row was mounted with focus on it, the dismiss POST reached the fake, and data-archived went false -> true -> false again about 28 ms later; `until()` polls every 25 ms, so the slower desk-windowed leg intermittently never observed the transient true and then waited out its backstop. The base handler reads POST bodies whole, and no unread-body parse error occurred in these runs, so #2307 does not explain this flake. Fix: GapApi serves dismiss/restore successfully in the server's answered shape, records the dismissed ids, and reports them on later timeline reads for the rows carried; the desk-windowed leg skip added with #2297 comes out in the same commit. The selection-across-re-slice question for real readers stays with #2292; the captured failures are explained without it.

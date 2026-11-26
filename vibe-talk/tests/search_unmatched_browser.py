@@ -132,6 +132,10 @@ class GapApi(FakeApi):
                                                      "reply_count_exact": True,
                                                      "display_name": "harbor-thread"}}
         self.history_asked: list[str] = []
+        # `#2303`: the dismissals this fake has taken, so an archive write can
+        # be answered and a later timeline read reports them as the server's
+        # copy would (see `post` and `timeline` below).
+        self.dismissed_ids: set[str] = set()
 
     def client_config(self, scope: str) -> Json:
         cache = {"available": True, "enabled": True, "bytes": 4_000_000, "messages": 900, "channels": 2,
@@ -162,11 +166,47 @@ class GapApi(FakeApi):
                 "now_ms": 1_790_000_000_000}
 
     def post(self, path: str, body: Json) -> tuple[int, Json]:
+        if path.endswith("/dismiss") or path.endswith("/restore"):
+            # `#2303`: serve the archive writes as the server does. The base
+            # fake refuses them (404), and a walk that archives then reads the
+            # page's optimistic state before that refusal takes it back —
+            # about half of the archive-single-row desk-windowed runs lost
+            # that race. Answer with exactly which messages changed state,
+            # oldest first as requested, in the server's answered shape.
+            raw = body.get("messages")
+            wanted = [str(one) for one in raw] if isinstance(raw, list) else []
+            if not wanted:
+                return super().post(path, body)
+            with self.lock:
+                if path.endswith("/dismiss"):
+                    changed = [one for one in wanted if one not in self.dismissed_ids]
+                    self.dismissed_ids.update(changed)
+                else:
+                    changed = [one for one in wanted if one in self.dismissed_ids]
+                    self.dismissed_ids.difference_update(changed)
+            return 200, {"channel": CHANNEL, "messages": changed, "count": len(changed),
+                         "read_state_notice": "Read state is vibe-talk's own. The source chat "
+                         "service shares none with this bridge, so nothing here is read from "
+                         "it or written back: marking a channel read here does not clear its "
+                         "badge in the source app, and clearing it there does not change this."}
         if path.endswith("/history/prioritize"):
             with self.lock:
                 self.history_asked.append(path)
             return 202, self.history_state()
         return super().post(path, body)
+
+    def timeline(self, query: dict[str, list[str]]) -> Json:
+        answer = super().timeline(query)
+        rows = answer["messages"]
+        dismissed = answer["dismissed"]
+        assert isinstance(rows, list) and isinstance(dismissed, list)
+        # The dismissals taken above, reported for the rows this read carries,
+        # as a timeline read after the writes would (`#2303`).
+        with self.lock:
+            recorded = [str(row["id"]) for row in rows
+                        if isinstance(row, dict) and str(row.get("id")) in self.dismissed_ids]
+        answer["dismissed"] = list(dict.fromkeys([*dismissed, *recorded]))
+        return answer
 
 
 def gap_handler_for(api: GapApi) -> type:

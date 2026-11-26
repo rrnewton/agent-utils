@@ -172,17 +172,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--web-root", type=Path, default=fixture.WEB_ROOT,
                         help="directory holding the page to serve")
     parser.add_argument("--screenshots", type=Path, help="directory to write one PNG per stage into")
-    parser.add_argument("--include-desk-windowed", action="store_true",
-                        help="also run the desk-windowed leg, skipped pending #2303")
     return parser.parse_args()
-
-
-# `#2303 vibe-talk-archive-single-row-desk-windowed-flake`: the desk-windowed leg fails about half its
-# runs on unmodified main. The test's fake refuses the archive write, the page rightly takes back its
-# optimistic "archived", and the leg looks for it in a window of a few tens of milliseconds. Skipped
-# from gating under owner rule 346 until #2303 fixes the fake; the phone leg keeps gating, and
-# --include-desk-windowed runs the skipped leg by hand.
-SKIPPED_PENDING_2303 = {"desk-windowed"}
 
 
 def main() -> int:
@@ -202,10 +192,6 @@ def main() -> int:
     report: list[str] = []
     with sync_playwright() as playwright:
         for label, width, height, windowed, scheme in runs:
-            if label in SKIPPED_PENDING_2303 and not args.include_desk_windowed:
-                report.append(f"{label} {width}x{height} windowed={windowed}: SKIPPED pending #2303 "
-                              "(the fake refuses the archive write; --include-desk-windowed runs it)")
-                continue
             api = typing_fast.BigApi()
             server, thread, url = typing_fast.serve(api, web_root)
             try:
