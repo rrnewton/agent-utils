@@ -1,13 +1,14 @@
 ---
 title: 'vibe-talk-summary-bullet-restyle-everywhere: Done or archive on a cited message restyles every bullet that cites it, Earlier summaries included'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 assignee: cl-bulletstrike
 labels:
 - vibe-talk
 created_at: 2026-11-25T22:40:00.000000000+00:00
-updated_at: 2026-11-25T23:05:00.000000000+00:00
+updated_at: 2026-11-26T01:30:00.000000000+00:00
+closed_at: 2026-11-26T01:30:00.000000000+00:00
 ---
 
 # Description
@@ -37,3 +38,7 @@ Deleted upstream counts as done (rule set on the owner side on 2026-11-25; the o
 # Notes
 
 Owner fast-track (owner-priority gate, deployed on landing). Siblings from the same owner request: the Discuss pane split with a collapsible timeline, and the All view's stale timeline and failing Loading older.
+
+## Resolution
+
+[opus 5.5] Landed on github/main as `6e143fa46175863fb8f7a0d106898a29aef49b1a` (gated head `1abe46ab`, owner-priority gate pass, full selection; same patch as the reviewed `4d7d1c75`, rebased only). A per-panel strike index (`view/catchup/strikeindex.ts`) maps each cited message id to the bullets, sections and citation links naming it, in the current summary and every Earlier summary (never a follow-up turn); each draw replaces its own group, and an element found detached is dropped when an event reaches it. Done, put back and refused take-backs pass their ids through `onReadStateChanged`, so a change restyles with one lookup per id; changes without ids diff a cached per-id state. A message deleted upstream counts as done: the removal record tells a watcher the ids it removes or takes back, and the citing links wear `discuss-cite-deleted`, which the stylesheet suffixes with a muted "(deleted)". Tests: unit tests for the index, the panel (current and Earlier bullet struck on a Done, cleared on put back, struck and marked when deleted; fails on the old page with "the earlier summary's bullet did not strike") and the removal watcher; screenshot scenes `130-discuss-strike-earlier` (real catchup, record and dismiss routes; the model stub cites window lines only while a scene turns citing on) and `131-discuss-strike-deleted` (threaded client configuration, real timeline reads with the deleted message taken out, a live `message_delete`), reviewed with the standard Discuss matrix in light and dark at 412x915 and 1280x800. Known limit: the page marks only deletions it was told of in this session.
