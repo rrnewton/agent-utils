@@ -76,6 +76,18 @@ SNAP_JS = """() => ({ cls: window.__perf.cls, child: window.__perf.child,
     mounted: document.querySelectorAll('#discord-log > li').length })"""
 
 
+
+# Ceilings for the gated subset (#2281), set from the 2026-11-26
+# baseline on current main (measuring commit in the budget report):
+# the measured count plus about half again, rounded up. Pure counts
+# only — a hot host cannot breach them by being slow. Re-measure and
+# re-justify before raising any of them.
+CEILINGS: dict[str, dict[str, int]] = {
+    "composer-key": {"cls": 10, "child": 10, "rect": 40, "layout": 12, "recalc": 30},
+    "search-key": {"cls": 1250, "child": 40, "rect": 220, "layout": 40, "recalc": 70},
+    "arrival": {"cls": 10, "child": 1300, "rect": 220, "layout": 40, "recalc": 50},
+}
+
 def until(page: Page, script: str, why: str,
           seconds: float = browser_waits.HANG_BACKSTOP_MS / 1000) -> None:
     deadline = time.monotonic() + seconds
@@ -127,6 +139,17 @@ class PerfApi(typing_fast.BigApi):
         return {**super().client_config(scope), "live_poll_seconds": 1}
 
 
+def check_ceilings(row: dict[str, object]) -> None:
+    """Gate mode: the pure counts stay under their ceilings (#2281)."""
+    limits = CEILINGS.get(str(row["trigger"]))
+    if limits is None:
+        return
+    for key, limit in limits.items():
+        check(int(row[key]) <= limit,
+              f"{row['trigger']}: {key}={row[key]} over the ceiling {limit} "
+              f"(counts only; re-measure before raising)")
+
+
 def walk(page: Page, api: PerfApi, label: str, total: int) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     archive.open_channel(page, total)
@@ -136,7 +159,8 @@ def walk(page: Page, api: PerfApi, label: str, total: int) -> list[dict[str, obj
         page.keyboard.type("x")
         page.evaluate("() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)))")
 
-    rows.append(measure(page, label, "composer-key", composer_key))
+    row = measure(page, label, "composer-key", composer_key)
+    rows.append(row)
 
     def search_key() -> None:
         page.click("#search-toggle")
@@ -178,6 +202,8 @@ def main() -> int:
     parser.add_argument("--browser-executable", default=os.environ.get("VIBE_TALK_CHROMIUM"))
     parser.add_argument("--web-root", type=Path, default=fixture.WEB_ROOT)
     parser.add_argument("--report", action="store_true", help="print the baseline table (default)")
+    parser.add_argument("--gate", action="store_true",
+                        help="gated subset (phone, windowed off, three triggers) with count ceilings")
     args = parser.parse_args()
     try:
         from playwright.sync_api import sync_playwright
@@ -188,7 +214,9 @@ def main() -> int:
     load1 = os.getloadavg()[0]
     all_rows: list[dict[str, object]] = []
     with sync_playwright() as playwright:
-        for label, windowed in (("phone-full", False), ("phone-windowed", True)):
+        runs = (("phone-full", False),) if args.gate else (
+            ("phone-full", False), ("phone-windowed", True))
+        for label, windowed in runs:
             api = PerfApi()
             server, thread, url = typing_fast.serve(api, web_root)
             try:
@@ -208,7 +236,11 @@ def main() -> int:
                     errors: list[str] = []
                     page.on("pageerror", lambda error: errors.append(str(error)))
                     page.goto(url, wait_until="load")
-                    all_rows.extend(walk(page, api, label, total))
+                    walked = walk(page, api, label, total)
+                    if args.gate:
+                        for row in walked:
+                            check_ceilings(row)
+                    all_rows.extend(walked)
                     check(not errors, f"{label}: the page threw: {errors}")
                     context.close()
             finally:

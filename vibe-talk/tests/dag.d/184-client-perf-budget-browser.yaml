@@ -1,0 +1,21 @@
+steps:
+  # `#2281 vibe-talk-client-perf-benchmarks`: load-invariant counts for the hot
+  # triggers (composer key, search key, live arrival) on the big channel at
+  # phone size, windowed lists off. Pure counts only (class writes, childList
+  # mutations, layout reads, Layout/RecalcStyle counts) under ceilings set from
+  # the measured baseline; long-task count and CPU time are report-only and
+  # never gate, so a hot host cannot red this step by being slow.
+  - group: check
+    job: client-perf-budget-browser
+    desc: per-trigger work counts (writes, mutations, layout reads, layouts) stay under their ceilings for composer/search keys and a live arrival, in current Chromium at 412x915
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/client_perf_budget_browser.py --gate
+    jobs_flag: ""
+    deps: [setup.contract-tools, build.page]
+    timeout: 600
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 45
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
