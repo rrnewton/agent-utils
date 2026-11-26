@@ -179,6 +179,8 @@ import {createSideThreadActs} from "../view/channel/index.ts";
 import {createCardRuns} from "../view/channel/index.ts";
 import {createReadModeAct} from "../view/channel/index.ts";
 import { decode, decodeTagged, is, roots } from "../contract/index.ts";
+import {labelQueryFor} from "../core/channels/index.ts";
+import {mountPostFactoLabels} from "../app/index.ts";
 
 // vibe-talk voice page.
 //
@@ -3437,6 +3439,8 @@ function restoreSearchEntryPlace() {
 // `#1853`: the Labels drop-down, created with the mounts below; the search
 // bar's closing shuts its panel through this holder until then.
 let labelsFilterRef = null;
+/** `#2279 vibe-talk-post-facto-labels`: the label picker's glue, mounted with the Labels drop-down. */
+let postFactoLabelsRef = null;
 const searchOpenControl = createSearchOpenControl({
   keepingFilterPlace,
   restoreEntryPlace: () => restoreSearchEntryPlace(),
@@ -3468,14 +3472,17 @@ const { setSearchOpen, showSearchOpen } = searchOpenControl;
  * place-keeping, as a filter change does.
  */
 function filterToLabel(label) {
+  // `#2279`: `label` is a label NAME (`#kvm`, `merge queue`), searched in its explicit form
+  // (`label:#kvm`, `label:"merge queue"`), never the bare form a plain name would share.
+  const query = labelQueryFor(label);
   // Owner thread 168: the tapped message is in the results and stays where it
   // is on the screen — the filter change rides the place-keeper every other
   // filter change rides (`#243 filter-keeps-selection`).
   keepingFilterPlace(() => {
     setSearchOpen(true);
-    searchField.setQuery(`label:${label}`);
-    searchField.setMarked(`label:${label}`);
-    el("search-field").value = `label:${label}`;
+    searchField.setQuery(query);
+    searchField.setMarked(query);
+    el("search-field").value = query;
     applySearch();
   });
   labelsFilterRef?.syncButton();
@@ -5297,7 +5304,7 @@ const freshRead = createFreshRead({
   scheduleDiscordPoll: (ms) => scheduleDiscordPoll(ms),
   setChannelFreshness: (state) => setChannelFreshness(/** @type {any} */ (state)),
   notePinsRevision: (revision) => notePinsRevision(revision),
-  noteBookmark: (payload) => noteBookmark(payload),
+  noteBookmark: (payload) => { noteBookmark(payload); postFactoLabelsRef?.noteRead(payload); },
   providerOfChannel: (id) => providerOfChannel(id),
   providerFacts, selectedChannelId: () => selectedChannelId(),
 });
@@ -5752,6 +5759,7 @@ const messageDetails = createMessageDetails({
   bookmarkAbove: (row) => bookmarkAbove(row),
   toggleBookmarkAt: (row) => toggleBookmarkAt(row),
   inThisColumn: (act) => inThisColumn(act),
+  openLabelPicker: (messages, row, anchor) => postFactoLabelsRef?.open(messages, row, anchor),
 });
 const { toggleMessageDetails: rawToggleMessageDetails } = messageDetails;
 /** Opening or closing a details sheet changes its row's height: the reader's own
@@ -5944,6 +5952,7 @@ const channelRows = createChannelRows({
   storedSlackOpen: () => deviceSettings().get(DEVICE_SETTINGS.slackOpen),
   isPinnedId: (id) => isPinnedId(id),
   filterToLabel: (label) => filterToLabel(label),
+  openLabelPicker: (messages, row, anchor) => postFactoLabelsRef?.open(messages, row, anchor),
   togglePin: (messages) => togglePin(messages),
   toggleBookmarkAt,
   copyDeepLink,
@@ -7779,7 +7788,9 @@ const timelineView = createTimelineView({
   foldReadState, noteReplyGaps, noteServerPageBuild, renderColumns,
   threadPresenceNote: (hasThreads, inThread) => threadPresence.note(hasThreads, inThread),
   screenBelongsToToken, readModes, readLedger, api: /** @type {any} */ (api), currentDiscordLoad: (generation, channel, readingTodo) => currentDiscordLoad(generation, channel, readingTodo),
-  get noChannelWords() { return NO_CHANNEL_TO_READ; }, notePinsRevision, noteBookmark, plainReach,
+  get noChannelWords() { return NO_CHANNEL_TO_READ; }, notePinsRevision, plainReach,
+  // `#2279`: every landed read also says where the menu labels are, as it says where the bookmark is.
+  noteBookmark: (payload) => { noteBookmark(payload); postFactoLabelsRef?.noteRead(payload); },
   noiseRenderCount: () => noiseSettings.renderCount(), foldedOneIds, foldedOnes, readRuns, setReadMode,
   collapseRevealed: (rows) => { for (const row of rows) { const entry = /** @type {any} */ (row).foldEntry; if (entry) setFolded(entry, true); } },
   setJumpNewest, scrollToNewest, keepFilterHold, inThisColumn: (fn) => inThisColumn(fn), pinsView, searchOffered: () => searchOffered(),
@@ -8144,7 +8155,8 @@ const liveStream = createLiveStream({
   watchAllAttached: () => watchAll.attached(),
   voiceCanSendText: () => voiceCall().canSendText(), relayMode,
   reportUnrelayed: (messages, reason) => voiceCall().reportUnrelayed(/** @type {any} */ (messages), /** @type {any} */ (reason)),
-  refreshServerSettings: async () => { await refreshServerSettings(); }, onSettingsFrame: (frame) => onSettingsFrame(frame), onOlderEvent: (event) => timelineView.takeOlderEvent(event), hiddenNow: () => document.hidden,
+  refreshServerSettings: async () => { await refreshServerSettings(); }, onSettingsFrame: (frame) => onSettingsFrame(frame), onOlderEvent: (event) => timelineView.takeOlderEvent(event),
+  onLabelsEvent: (event) => postFactoLabelsRef?.onLabelsEvent(/** @type {any} */ (event)), hiddenNow: () => document.hidden,
   noteHiddenMessage: () => hiddenStream.noteMessage(),
   relayToAgent: (message, selfPosted, replayed, arrival) => voiceCall().relayToAgent(message, selfPosted, replayed, arrival),
   refreshAfterMutation: () => refreshAfterLiveMutation(), noteChannelReadFailure,
@@ -9230,7 +9242,7 @@ application.track(mountColumnSplitterControls({
 // in the page's order; its `unmount` waits for the ordered boot's teardown.
 application.track(mountDocumentListeners({
   onVisibility: () => onVisibility(),
-  closeRowMenuOutside: (event) => closeRowMenuOutside(event),
+  closeRowMenuOutside: (event) => { closeRowMenuOutside(event); postFactoLabelsRef?.closeOutside(/** @type {any} */ (event)); },
 }));
 // The kept text selection's document listeners were mounted with it, where they have always
 // been registered; only their teardown is recorded here, in the page's order.
@@ -10194,6 +10206,44 @@ const labelsFilter = createLabelsFilter({
 labelsFilterRef = labelsFilter;
 application.track(labelsFilter);
 labelsFilter.syncButton();
+// `#2279 vibe-talk-post-facto-labels`: the label picker a message's ⋯ menu and long-press sheet
+// open, over the same label list the drop-down and Settings read; the page's exact label writes.
+const postFactoLabels = mountPostFactoLabels({
+  byId: (id) => el(id),
+  entries: () => labelsView.dropdownEntries(),
+  refreshLabels: () => labelsView.refresh(),
+  canon: () => channelStore.current(),
+  selectedChannel: () => String(selectedChannelId() || ""),
+  threading: () => providerFacts.threading(),
+  isPinned: (messages) => messages.some((message) => isPinnedId(message.id)),
+  togglePin: (messages) => togglePin(messages),
+  writeLabel: (channel, id, name, present) => apiDecoded("MessageLabelChangeResponse",
+    `/api/v1/channels/${encodeURIComponent(channel)}/message-labels/${encodeURIComponent(id)}`,
+    { method: present ? "PUT" : "DELETE", body: { name } }),
+  readChannelLabels: (channel) => apiDecoded("MessageLabelsResponse",
+    `/api/v1/channels/${encodeURIComponent(channel)}/message-labels`),
+  followPlacement: () => followPlacement(),
+  patchFlatRows: (change) => regroupChannelRows(false, change),
+  holdingRow: (id, redraw) => {
+    const row = [...el("discord-log").children].find((li) => (li.getAttribute("data-ids") || "").split(" ").includes(id));
+    if (!row || screens.view() !== "discord") { redraw(); return; }
+    preservingCollapse(el("scroll-area"), /** @type {any} */ (row), channelPane.head(), channelPane.foot(), redraw);
+  },
+  saveChannelScope: () => saveChannelScope(),
+  online: () => navigator.onLine !== false,
+  narrow: () => document.documentElement.clientWidth < 700,
+  visibleViewport: () => {
+    const view = window.visualViewport;
+    return view
+      ? { top: view.offsetTop, height: view.height, width: view.width }
+      : { top: 0, height: window.innerHeight, width: document.documentElement.clientWidth };
+  },
+  guard: (run) => { void guardQuietly(run)(); },
+});
+postFactoLabelsRef = postFactoLabels;
+application.track(postFactoLabels.picker);
+// The keyboard opening or closing moves what the picker may cover: place it again.
+window.visualViewport?.addEventListener("resize", () => { if (postFactoLabels.picker.isOpen()) postFactoLabels.picker.refresh(); });
 
 application.track(mountFilterChips({
   intoView: (element, block, inline) => scrollKeeping.intoView(element, block, inline),

@@ -43,6 +43,8 @@ export interface SearchSubject {
   readonly hasLink: boolean;
   /** Its hashtag labels, folded (`#1825`). */
   readonly labels: readonly string[];
+  /** Its plain labels (names without `#`), folded (`#2279`). */
+  readonly plainLabels: readonly string[];
   /** Whether it is in its channel's pin set: what `label:pinned` matches (`#1853`). */
   readonly pinned: boolean;
 }
@@ -56,6 +58,7 @@ export interface SearchSubjectInput {
   readonly createdMs?: number;
   readonly inThread?: boolean;
   readonly labels?: readonly string[];
+  readonly plainLabels?: readonly string[];
   readonly pinned?: boolean;
 }
 
@@ -164,7 +167,9 @@ function searchField(raw: string, chars: readonly string[], cursor: { at: number
     if (searchFoldedValue(value) === "link") node = { kind: "has" };
   } else if (name === "label") {
     const slug = searchFoldedValue(value);
-    if (slug) node = { kind: "label", slug };
+    // `#2279`: a quoted value names a plain label alone (`label:"merge queue"`), kept quoted
+    // in the tree; `#` (quoted or not) names the hashtag label alone; the built-in stands.
+    if (slug) node = { kind: "label", slug: afterPhrase !== null && !slug.startsWith("#") && slug !== "pinned" ? `"${slug}"` : slug };
   } else {
     const day = searchDay(value);
     if (day) node = { kind: name as "before" | "after", day };
@@ -339,7 +344,12 @@ export function searchQueryMatches(node: SearchNode | null, subject: SearchSubje
       return subject.hasLink;
     case "label":
       // `#1853`: `pinned` reads the pin set alone, never the hashtag list.
-      return node.slug === "pinned" ? subject.pinned : subject.labels.includes(node.slug);
+      if (node.slug === "pinned") return subject.pinned;
+      // `#2279`: `label:#kvm` names the hashtag label alone; a bare `label:kvm` keeps matching
+      // `#kvm` (older chips and links) and also a plain label named `kvm`.
+      if (node.slug.startsWith("#")) return subject.labels.includes(node.slug.slice(1));
+      if (node.slug.startsWith("\"")) return subject.plainLabels.includes(node.slug.slice(1, -1));
+      return subject.labels.includes(node.slug) || subject.plainLabels.includes(node.slug);
     case "not":
       return !searchQueryMatches(node.child, subject, dayStartMs);
     case "and":
@@ -350,7 +360,7 @@ export function searchQueryMatches(node: SearchNode | null, subject: SearchSubje
 }
 
 /** A message, folded once for matching: the haystack is the author, the drawn text and each link address, one a line. */
-export function searchSubject({ author = "", authorId = "", text = "", links = [], createdMs = 0, inThread = false, labels = [], pinned = false }: SearchSubjectInput): SearchSubject {
+export function searchSubject({ author = "", authorId = "", text = "", links = [], createdMs = 0, inThread = false, labels = [], plainLabels = [], pinned = false }: SearchSubjectInput): SearchSubject {
   return {
     text: searchFold([author, text, ...links].join("\n")),
     author: searchFold(author),
@@ -359,6 +369,7 @@ export function searchSubject({ author = "", authorId = "", text = "", links = [
     inThread,
     hasLink: links.length > 0,
     labels: labels.map((label) => searchFold(label)),
+    plainLabels: plainLabels.map((label) => searchFold(label)),
     pinned,
   };
 }
@@ -374,9 +385,13 @@ export function searchQueryExpandLabels(node: SearchNode | null, expand: (slug: 
     case "label": {
       // `#1853`: the built-in label is never group-expanded.
       if (node.slug === "pinned") return node;
-      const spellings = expand(node.slug);
+      // `#2279`: a plain label (quoted) is never grouped.
+      if (node.slug.startsWith("\"")) return node;
+      // `#2279`: an explicit `#` label expands through its slug and stays explicit.
+      const explicit = node.slug.startsWith("#");
+      const spellings = expand(explicit ? node.slug.slice(1) : node.slug);
       if (spellings.length <= 1) return node;
-      return { kind: "or", children: spellings.map((slug) => ({ kind: "label" as const, slug })) };
+      return { kind: "or", children: spellings.map((slug) => ({ kind: "label" as const, slug: explicit ? `#${slug}` : slug })) };
     }
     case "not":
       return { kind: "not", child: searchQueryExpandLabels(node.child, expand)! };

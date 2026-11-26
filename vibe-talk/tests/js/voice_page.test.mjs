@@ -35,6 +35,7 @@ import "./page/reading-state.mjs";
 import "./page/search.mjs";
 import "./page/sync.mjs";
 import "./page/sending.mjs";
+import "./page/labels.mjs";
 
 // Raise this with the suite. It is a floor against a suite that stopped COLLECTING, so it has to
 // track the real count; left behind, it would keep passing while half the suite went missing.

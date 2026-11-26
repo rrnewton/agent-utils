@@ -259,6 +259,9 @@ pub struct SearchRequest<'a> {
     /// The channel's pin set, by message id: what `label:pinned` matches
     /// (`#1853`). Empty unless the query names the built-in label.
     pub pinned_ids: &'a std::collections::HashSet<String>,
+    /// The channel's labels added from message menus, by message id (`#2279`), merged with
+    /// the text-derived ones as serving merges them.
+    pub manual_labels: &'a std::collections::HashMap<String, Vec<String>>,
 }
 
 /// What a search of the cache found, and how far it can vouch for its absence of hits.
@@ -331,6 +334,8 @@ pub struct SearchAsk<'a> {
     pub day_start_ms: &'a dyn Fn(Day) -> i64,
     /// The channel's pin set, by message id (`#1853`). See [`SearchRequest::pinned_ids`].
     pub pinned_ids: &'a std::collections::HashSet<String>,
+    /// The channel's menu labels (`#2279`). See [`SearchRequest::manual_labels`].
+    pub manual_labels: &'a std::collections::HashMap<String, Vec<String>>,
 }
 
 /// One channel's copy searched: what was found, over which view, and how far the server's walk
@@ -426,6 +431,14 @@ pub(crate) fn test_rows(
         // The haystack is `search_text`, the page's haystack folded (`#604`), which keeps no
         // separate list of links: a link is a web address anywhere in it, as the page lists only
         // web links (`anchorsIn`). Text that spells one without linking it counts too.
+        let labels = crate::labels::merge(
+            &crate::labels::GroupIndex::default(),
+            &message.content,
+            request
+                .manual_labels
+                .get(message.id.as_str())
+                .map_or(&[][..], Vec::as_slice),
+        );
         let subject = Subject::new(
             &row.search_text,
             &message.author,
@@ -434,8 +447,10 @@ pub(crate) fn test_rows(
             row.in_thread,
             row.search_text.contains("http://") || row.search_text.contains("https://"),
         )
-        // `#1825`: labels derived from the cached text, as they are at serve time.
-        .with_labels(&crate::labels::extract_hashtags(&message.content))
+        // `#1825`: labels derived from the cached text, as they are at serve time, and
+        // (`#2279`) the menu-added ones merged in as serving merges them.
+        .with_labels(&labels.labels)
+        .with_plain_labels(&labels.plain)
         // `#1853`: the built-in label reads the caller's pin set for the channel.
         .with_pinned(request.pinned_ids.contains(message.id.as_str()));
         if request.query.matches(&subject, request.day_start_ms) {

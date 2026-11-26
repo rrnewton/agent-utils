@@ -71,7 +71,11 @@
 //!   `after:D` one created at or after it (Gmail's reading: `after:` includes its day, `before:`
 //!   does not). The caller resolves days, because only it knows the zone.
 //! - `has:link` matches a message with a link.
-//! - `label:x` matches a message whose derived hashtag labels (`#1825`) include `x`, folded.
+//! - `label:x` matches a message whose derived hashtag labels (`#1825`) include `x`, folded,
+//!   or (`#2279`) whose plain labels include `x`. `label:#x` matches the hashtag label alone,
+//!   and a quoted value (`label:"merge queue"`, `label:"todo"`) the plain label alone, kept
+//!   quoted in the tree. The bare form matching both a hashtag and a plain label of one name is
+//!   the one known overlap; every chip and link the page makes uses an explicit form.
 //!   `label:pinned` is the built-in label (`#1853`): it matches only a message in the
 //!   channel's pin set ([`Subject::pinned`]), never a hashtag — `#pinned` is reserved and
 //!   the extractor yields no such label.
@@ -360,6 +364,8 @@ pub struct Subject {
     pub has_link: bool,
     /// Its hashtag labels, folded (`#1825`). Empty until [`Subject::with_labels`].
     pub labels: Vec<String>,
+    /// Its plain labels, folded (`#2279`). Empty until [`Subject::with_plain_labels`].
+    pub plain_labels: Vec<String>,
     /// Whether the message is in its channel's pin set: what the built-in
     /// `label:pinned` matches (`#1853`). False until [`Subject::with_pinned`].
     pub pinned: bool,
@@ -385,6 +391,7 @@ impl Subject {
             in_thread,
             has_link,
             labels: Vec::new(),
+            plain_labels: Vec::new(),
             pinned: false,
         }
     }
@@ -393,6 +400,13 @@ impl Subject {
     #[must_use]
     pub fn with_labels(mut self, labels: &[String]) -> Self {
         self.labels = labels.iter().map(|label| fold(label)).collect();
+        self
+    }
+
+    /// Attach the message's plain labels (`#2279`: names without `#`; folded here).
+    #[must_use]
+    pub fn with_plain_labels(mut self, labels: &[String]) -> Self {
+        self.plain_labels = labels.iter().map(|label| fold(label)).collect();
         self
     }
 
@@ -471,6 +485,22 @@ impl Query {
             match node {
                 // `#1853`: the built-in label is never group-expanded.
                 Node::Label(slug) if slug == "pinned" => Node::Label(slug.clone()),
+                // `#2279`: a plain label (quoted) is never grouped.
+                Node::Label(slug) if slug.starts_with('"') => Node::Label(slug.clone()),
+                // `#2279`: an explicit `#` label expands through its slug and stays explicit.
+                Node::Label(slug) if slug.starts_with('#') => {
+                    let spellings = expand(&slug[1..]);
+                    if spellings.len() <= 1 {
+                        Node::Label(slug.clone())
+                    } else {
+                        Node::Or(
+                            spellings
+                                .into_iter()
+                                .map(|one| Node::Label(format!("#{one}")))
+                                .collect(),
+                        )
+                    }
+                }
                 Node::Label(slug) => {
                     let spellings = expand(slug);
                     if spellings.len() <= 1 {
@@ -525,11 +555,18 @@ fn node_matches(node: &Node, subject: &Subject, day_start_ms: &dyn Fn(Day) -> i6
         Node::HasLink => subject.has_link,
         // `#1853`: `pinned` reads the pin set alone; a hashtag list entry can
         // never satisfy it (the extractor reserves the slug).
+        // `#2279`: `label:#kvm` names the hashtag label alone; a bare `label:kvm` keeps
+        // matching `#kvm` (every older chip and link) and also a plain label named `kvm`.
         Node::Label(slug) => {
             if slug == "pinned" {
                 subject.pinned
+            } else if let Some(hashtag) = slug.strip_prefix('#') {
+                subject.labels.iter().any(|label| label == hashtag)
+            } else if let Some(plain) = slug.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+                subject.plain_labels.iter().any(|label| label == plain)
             } else {
                 subject.labels.iter().any(|label| label == slug)
+                    || subject.plain_labels.iter().any(|label| label == slug)
             }
         }
         Node::Not(inner) => !node_matches(inner, subject, day_start_ms),
@@ -668,7 +705,14 @@ fn field(raw: &str, chars: &[char], i: &mut usize, may_take_phrase: bool) -> Opt
         "has" => (folded_value(&value) == "link").then_some(Node::HasLink),
         "label" => {
             let slug = folded_value(&value);
-            (!slug.is_empty()).then_some(Node::Label(slug))
+            // `#2279`: a quoted value names a plain label alone (`label:"merge queue"`), kept
+            // quoted in the tree; `#` (quoted or not) names the hashtag label alone.
+            let slug = if after_phrase.is_some() && !slug.starts_with('#') && slug != "pinned" {
+                format!("\"{slug}\"")
+            } else {
+                slug
+            };
+            (!slug.trim_matches('"').is_empty()).then_some(Node::Label(slug))
         }
         "before" => Day::parse(&value).map(Node::Before),
         _ => Day::parse(&value).map(Node::After),
@@ -976,6 +1020,14 @@ mod tests {
                         .collect()
                 })
                 .unwrap_or_default();
+            let msg_plain: Vec<String> = message["plain_labels"]
+                .as_array()
+                .map(|l| {
+                    l.iter()
+                        .filter_map(|h| h.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
             let subject = Subject::new(
                 &haystack(author, message["text"].as_str().unwrap_or(""), &hrefs),
                 author,
@@ -985,6 +1037,7 @@ mod tests {
                 !hrefs.is_empty(),
             )
             .with_labels(&msg_labels)
+            .with_plain_labels(&msg_plain)
             .with_pinned(message["pinned"].as_bool().unwrap_or(false));
             let query = parse(case["query"].as_str().expect("query"));
             let got = query.matches(&subject, &|day| day.start_ms_at_offset(offset));

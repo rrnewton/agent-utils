@@ -182,6 +182,15 @@
   display: none;
 }
 
+/* `#2279 vibe-talk-post-facto-labels` (liaison, owner rule 370): where the chips
+   would push the row's controls (⋯) off the header line, they take a line of
+   their own under the header instead (measureLabelRow sets the mark), so the
+   controls stay on the first line and no empty band is left. */
+li[data-labels-below] > .meta > .label-chips {
+  order: 99;
+  flex-basis: 100%;
+}
+
 /* A hashtag-only body line hidden because its chips stand in the header
    (`#1836`: shown again inline when the header has no room). */
 .hashtag-line[hidden] {
@@ -1081,6 +1090,157 @@
   color: var(--muted);
   font-size: 0.85rem;
   white-space: nowrap;
+}
+
+/* `#2279 vibe-talk-post-facto-labels`: the label picker. Fixed in the top layer
+   (popover), so neither it nor the phone keyboard its field opens moves the list:
+   placed by labelpicker.ts under the row's ⋯ on a desktop, full width at the top
+   of the visible viewport on a phone; its own list scrolls in what is left. */
+#label-picker {
+  position: fixed;
+  inset: auto;
+  margin: 0;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  width: min(22rem, calc(100vw - 1rem));
+  max-height: 70vh;
+  overflow: hidden;
+  background: var(--panel);
+  color: inherit;
+  border: 1px solid var(--edge);
+  border-radius: 0.6rem;
+  box-shadow: 0 4px 18px color-mix(in srgb, var(--shadow) 35%, transparent);
+  padding: 0.5rem;
+  z-index: 40;
+}
+
+#label-picker[hidden] {
+  display: none;
+}
+
+.label-picker-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.label-picker-title {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.label-picker-close {
+  margin-left: auto;
+  min-width: var(--toggle-hit);
+  min-height: var(--toggle-hit);
+  border: none;
+  background: transparent;
+  color: inherit;
+  font-size: 1.3rem;
+  cursor: pointer;
+}
+
+.label-picker-current {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.label-picker-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+  padding: 0.1rem 0.5rem;
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.label-picker-remove {
+  min-width: 1.9rem;
+  min-height: 1.9rem;
+  margin: -0.3rem -0.4rem -0.3rem 0;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 1.05rem;
+  cursor: pointer;
+}
+
+.label-picker-note:empty,
+.label-picker-error:empty {
+  display: none;
+}
+
+.label-picker-note,
+.label-picker-error {
+  margin: 0;
+  font-size: 0.85rem;
+}
+
+.label-picker-input {
+  width: 100%;
+  min-height: var(--toggle-hit);
+  box-sizing: border-box;
+}
+
+.label-picker-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  min-height: 0;
+  flex: 1 1 auto;
+}
+
+.label-picker-option {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: var(--toggle-hit);
+  padding: 0.25rem 0.5rem;
+  border-radius: 0.4rem;
+  cursor: pointer;
+}
+
+.label-picker-option[data-active] {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.label-picker-check {
+  width: 1.1rem;
+  flex: 0 0 auto;
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.label-picker-name {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.label-picker-option[aria-selected="true"] .label-picker-name {
+  font-weight: 700;
+}
+
+.label-picker-pinned .label-picker-name {
+  color: var(--pin-ink);
+  font-weight: 700;
+}
+
+.label-picker-new .label-picker-name {
+  color: var(--accent);
+}
+
+.label-picker-count {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 0.85rem;
 }
 
 /* `#251 author-filter`. Whose messages, left of Links: its square abuts Links' as Pinned's does, on

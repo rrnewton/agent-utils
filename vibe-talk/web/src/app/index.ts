@@ -8,3 +8,5 @@ export type { KeyboardColumn, KeyboardComposition, KeyboardCompositionDependenci
 export { createServerAccess } from "./server.ts";
 export type { ServerAccess, ServerAccessDependencies } from "./server.ts";
 export * from "./guards.ts";
+export { mountPostFactoLabels } from "./postfactolabels.ts";
+export type { PostFactoLabels, PostFactoLabelsDependencies, ServedLabelState } from "./postfactolabels.ts";

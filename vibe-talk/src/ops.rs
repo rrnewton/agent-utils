@@ -370,11 +370,24 @@ pub(crate) fn stamp(state: &AppState, messages: &mut [Message]) {
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
+    let manual_labels = state
+        .manual_labels
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     for message in messages {
         // `#1825 vibe-talk-hashtag-labels`: derived from the text as it now stands, on
         // every serve, so an edit relabels at once and nothing is stored. Grouped
-        // spellings show as their group's display (owner thread 167).
-        message.labels = label_groups.apply(&crate::labels::extract_hashtags(&message.content));
+        // spellings show as their group's display (owner thread 167). `#2279`: the
+        // labels added from the message menu merge in here, so a menu-added `#kvm` is
+        // the typed one's label and a plain name rides beside it.
+        let merged = crate::labels::merge(
+            &label_groups,
+            &message.content,
+            manual_labels.of(message.channel_id.as_str(), message.id.as_str()),
+        );
+        message.labels = merged.labels;
+        message.plain_labels = merged.plain;
+        message.manual_labels = merged.manual;
         message.spoken_time = crate::clock::spoken(&message.timestamp, &state.config.timezone);
         message.spoken_content = prepared_body(state, &message.content, &message.mentions, now_ms);
         // `#408 copy-upstream-link`: the message's own address in its service, formed by its
@@ -8589,6 +8602,199 @@ pub async fn unpin(
     Ok((channel, change))
 }
 
+/// This server's copies of some messages' texts (`#2279`), for the typed labels beside the
+/// menu's. Never an upstream read: a label is this server's own, and an owner tap must not spend
+/// the provider's budget. A message the cache does not hold whole is left out.
+async fn held_texts(
+    state: &AppState,
+    channel: &ChannelId,
+    messages: &[MessageId],
+) -> std::collections::HashMap<MessageId, String> {
+    let sink = Arc::clone(&state.message_cache);
+    let channel_key = channel.clone();
+    let wanted = messages.to_vec();
+    tokio::task::spawn_blocking(move || {
+        let mut out = std::collections::HashMap::new();
+        let (Some(cache), Some(chan)) = (sink.cache(), sink.chan_key(&channel_key)) else {
+            return out;
+        };
+        for id in wanted {
+            if let Some(found) = cache.message(&chan, &id).served().flatten() {
+                if !found.content_partial {
+                    out.insert(id, found.message.content);
+                }
+            }
+        }
+        out
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// The menu labels' revision, server-wide (`#2279`), from memory; `None` without a store.
+#[must_use]
+pub fn labels_revision(state: &AppState) -> Option<i64> {
+    state
+        .manual_labels
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .stored_revision()
+}
+
+/// Every message of one channel with a menu label, as served now (`#2279`). Read scope at the
+/// route. Complete for the channel; each entry derived from this server's copy of the text when
+/// it holds one.
+///
+/// # Errors
+///
+/// [`OpError::UnknownChannel`] outside the allowlist.
+pub async fn channel_message_labels(
+    state: &AppState,
+    channel_id: &str,
+) -> Result<(ChannelInfo, Vec<crate::contract::LiveLabelsEvent>, i64), OpError> {
+    let channel = allowed(state, channel_id).await?;
+    let (held, revision) = {
+        let index = state
+            .manual_labels
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (index.channel(channel.id.as_str()), index.revision())
+    };
+    let ids: Vec<MessageId> = held.keys().map(|id| MessageId(id.clone())).collect();
+    let texts = held_texts(state, &channel.id, &ids).await;
+    let groups = state
+        .label_groups
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let mut messages: Vec<crate::contract::LiveLabelsEvent> = held
+        .into_iter()
+        .map(|(id, names)| {
+            let id = MessageId(id);
+            let text = texts.get(&id);
+            let merged = crate::labels::merge(&groups, text.map_or("", String::as_str), &names);
+            crate::contract::LiveLabelsEvent {
+                channel_id: channel.id.clone(),
+                message_id: id,
+                labels: merged.labels,
+                plain_labels: merged.plain,
+                manual_labels: merged.manual,
+                derived: text.is_some(),
+                revision,
+            }
+        })
+        .collect();
+    messages.sort_by(|a, b| a.message_id.as_str().cmp(b.message_id.as_str()));
+    Ok((channel, messages, revision))
+}
+
+/// What a message-label add or remove did (`#2279 vibe-talk-post-facto-labels`).
+#[derive(Clone, Debug)]
+pub struct MessageLabelOutcome {
+    /// The message's labels after the call, as the live event carries them.
+    pub event: crate::contract::LiveLabelsEvent,
+    /// The name as normalized and stored.
+    pub name: crate::labels::LabelName,
+    /// Whether the call changed what is stored.
+    pub changed: bool,
+    /// For a remove: the label stays because the message text carries it.
+    pub text_derived: bool,
+}
+
+/// Add (`present`) or remove one label of one message from its menu (`#2279
+/// vibe-talk-post-facto-labels`). Write scope at the route. Idempotent.
+///
+/// Server-local: the label is kept in this server's store and merged into every serve of the
+/// message ([`stamp`]); nothing is sent to the chat provider. The answer and the `labels` live
+/// event carry the message's labels as re-derived from this server's copy of its text, when it
+/// holds one (no upstream read is made for it). One log line, with no label name and no text.
+///
+/// # Errors
+///
+/// [`OpError::UnknownChannel`] outside the allowlist; [`OpError::Store`] for a name the
+/// normalizer refuses ([`crate::store::StoreError::BadId`], its reason the message), past the
+/// bounds ([`crate::store::StoreError::TooLarge`]), with no store, or when the write fails.
+pub async fn set_message_label(
+    state: &AppState,
+    channel_id: &str,
+    message: &MessageId,
+    raw_name: &str,
+    present: bool,
+) -> Result<(ChannelInfo, MessageLabelOutcome), OpError> {
+    let started = std::time::Instant::now();
+    let channel = allowed(state, channel_id).await?;
+    let name =
+        crate::labels::LabelName::parse(raw_name).map_err(crate::store::StoreError::BadId)?;
+    let stored = name.stored();
+    let change = state
+        .store
+        .set_message_label(&channel.id, message, &stored, present)
+        .await?;
+    state
+        .manual_labels
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .set(
+            channel.id.as_str(),
+            message.as_str(),
+            change.names.clone(),
+            change.revision,
+        );
+    let held = held_texts(state, &channel.id, std::slice::from_ref(message))
+        .await
+        .remove(message);
+    let groups = state
+        .label_groups
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let derived = held.is_some();
+    let merged = crate::labels::merge(&groups, held.as_deref().unwrap_or(""), &change.names);
+    let text_derived = !present
+        && match &name {
+            crate::labels::LabelName::Hashtag(slug) => held.as_deref().is_some_and(|text| {
+                let shown = groups.apply(&crate::labels::extract_hashtags(text));
+                groups
+                    .apply(std::slice::from_ref(slug))
+                    .iter()
+                    .all(|one| shown.contains(one))
+            }),
+            crate::labels::LabelName::Plain(_) => false,
+        };
+    let event = crate::contract::LiveLabelsEvent {
+        channel_id: channel.id.clone(),
+        message_id: message.clone(),
+        labels: merged.labels,
+        plain_labels: merged.plain,
+        manual_labels: merged.manual,
+        derived,
+        revision: change.revision,
+    };
+    if change.changed {
+        state.live.publish_labels(event.clone());
+    }
+    tracing::info!(
+        consumer = "labels",
+        channel = %channel.id,
+        message = %message,
+        act = if present { "add" } else { "remove" },
+        kind = name.kind(),
+        changed = change.changed,
+        derived,
+        ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "message label"
+    );
+    Ok((
+        channel,
+        MessageLabelOutcome {
+            event,
+            name,
+            changed: change.changed,
+            text_derived,
+        },
+    ))
+}
+
 /// One channel's explicit thread-pin records. Read scope. `#1550 thread-list-pins`.
 ///
 /// SEPARATE from message pins ([`pins`]): thread pins keep no snapshot, and a
@@ -8622,9 +8828,7 @@ pub async fn set_thread_pin(
 /// Every hashtag label in the loaded history, counted, with the groups
 /// (`#1825`). Read scope. Counts aggregate the server's held copy across every
 /// channel it answers for; grouped spellings fold into their display.
-pub async fn labels(
-    state: &AppState,
-) -> Result<(Vec<crate::contract::LabelCount>, crate::store::LabelGroups), OpError> {
+pub async fn labels(state: &AppState) -> Result<Labels, OpError> {
     let groups = state.store.label_groups().await?;
     let index = crate::labels::GroupIndex::new(
         groups
@@ -8643,17 +8847,27 @@ pub async fn labels(
     let scans = channels.iter().map(|channel| {
         let sink = Arc::clone(&sink);
         let id = channel.id.clone();
+        // `#2279`: the channel's menu labels count with the typed ones.
+        let manual = state
+            .manual_labels
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .channel(id.as_str());
         async move {
-            tokio::task::spawn_blocking(move || sink.label_counts(&id))
+            tokio::task::spawn_blocking(move || sink.label_counts(&id, &manual))
                 .await
                 .unwrap_or(Err(crate::cache::search::SearchRefusal::NoCache))
         }
     });
     let mut totals: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut plain_totals: std::collections::BTreeMap<String, usize> = Default::default();
     for scanned in futures_util::future::join_all(scans).await {
         let Ok(counts) = scanned else { continue };
-        for (spelling, count) in counts {
+        for (spelling, count) in counts.hashtags {
             *totals.entry(spelling).or_insert(0) += count;
+        }
+        for (name, count) in counts.plain {
+            *plain_totals.entry(name).or_insert(0) += count;
         }
     }
     // Fold grouped spellings into their display; keep the raw names the page's
@@ -8675,7 +8889,30 @@ pub async fn labels(
         })
         .collect();
     labels.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok((labels, groups))
+    let plain = plain_totals
+        .into_iter()
+        .map(|(name, count)| crate::contract::LabelCount {
+            name,
+            count,
+            group_id: None,
+        })
+        .collect();
+    Ok(Labels {
+        labels,
+        plain,
+        groups,
+    })
+}
+
+/// Every label in the loaded history, counted, with the groups ([`labels`]).
+#[derive(Debug)]
+pub struct Labels {
+    /// Hashtag labels (typed or added from a menu), by slug, grouped spellings listed too.
+    pub labels: Vec<crate::contract::LabelCount>,
+    /// Plain labels added from a menu (`#2279`), by name.
+    pub plain: Vec<crate::contract::LabelCount>,
+    /// Every label group.
+    pub groups: crate::store::LabelGroups,
 }
 
 /// Create a label group and refresh derivation (`#1825`). Write scope at the route.

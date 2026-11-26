@@ -306,6 +306,8 @@ async fn a_gap_a_suspect_channel_and_a_blocked_one_each_miss() {
         content_html: String::new(),
         noise: false,
         labels: Vec::new(),
+        plain_labels: Vec::new(),
+        manual_labels: Vec::new(),
         reactions: None,
         heading: None,
         sent_refs: Vec::new(),

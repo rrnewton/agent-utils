@@ -2511,6 +2511,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         reply_dismissals: view === "main" && page.threads.length > 0 && !url.searchParams.get("before")
           ? replyDismissals(messages, page.dealtWith) : undefined,
         pins_revision: page.servePinsRevision ? page.pinsRevision : undefined,
+        // `#2279`: the menu labels' revision, when a test turns it on (a server with a store).
+        labels_revision: page.serveLabelsRevision ? page.labelsRevision : undefined,
         bookmark: page.servedBookmark(),
       });
     },
@@ -2727,6 +2729,15 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
      * no store sends none — so every test written before pins sees no extra request.
      */
     servePinsRevision: false,
+    /** `#2279`: whether channel reads carry `labels_revision`, and the revision they say. */
+    serveLabelsRevision: false,
+    labelsRevision: 0,
+    /** `#2279`: message id → its menu labels by name (`#kvm`, `merge queue`), as the server keeps them. */
+    menuLabels: new Map(),
+    /** `#2279`: message id → the hashtags its text carries, kept before the first label write. */
+    typedLabels: new Map(),
+    /** `#2279`: every label write and list read, as `{method, id, body}`, in order. */
+    labelCalls: [],
     /** How many times the page read the list. */
     pinReads: 0,
     /** Every pin write, as `{method, id, body}`, in order. */
@@ -4031,16 +4042,74 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       // counts over the messages this fixture holds, groups as the page set them.
       if (String(path) === "/api/v1/labels") {
         const counts = new Map();
+        const plainCounts = new Map();
         for (const held of page.messages) {
           for (const label of held.labels || []) counts.set(label, (counts.get(label) || 0) + 1);
+          for (const label of held.plain_labels || []) plainCounts.set(label, (plainCounts.get(label) || 0) + 1);
         }
         const groups = page.labelGroups || [];
         const groupId = new Map(groups.map((group) => [group.display, group.id]));
         return json(200, {
           labels: [...counts].map(([name, count]) => ({ name, count, group_id: groupId.get(name) ?? null })),
+          ...(plainCounts.size ? { plain: [...plainCounts].map(([name, count]) => ({ name, count })) } : {}),
           groups, groups_revision: 1,
           labels_notice: "Labels are this fixture's own. Counts cover the loaded history only.",
         });
+      }
+      // `#2279 vibe-talk-post-facto-labels`. The menu labels, as the server keeps them: a PUT or
+      // DELETE naming one label in its body, answered with the message's labels as served now
+      // (typed hashtags, then the menu's), the message's served copy changed with it, and the
+      // channel's complete list.
+      const labelRoute = /^\/api\/v1\/channels\/([^/?]+)\/message-labels(?:\/([^/?]+))?$/.exec(String(path));
+      if (labelRoute) {
+        const method = (options && options.method) || "GET";
+        const body = options && options.body ? JSON.parse(options.body) : null;
+        const state = (id) => {
+          const held = page.messages.find((m) => String(m.id) === id);
+          const names = page.menuLabels.get(id) || [];
+          const typed = held ? (page.typedLabels.get(id) ?? held.labels ?? []) : [];
+          const labels = [...typed];
+          for (const name of names) if (name.startsWith("#") && !labels.includes(name.slice(1))) labels.push(name.slice(1));
+          return {
+            channel_id: decodeURIComponent(labelRoute[1]), message_id: id, labels,
+            plain_labels: names.filter((name) => !name.startsWith("#")),
+            manual_labels: names.filter((name) => !name.startsWith("#") || !typed.includes(name.slice(1))),
+            derived: Boolean(held), revision: page.labelsRevision,
+          };
+        };
+        page.labelCalls.push({ method, id: labelRoute[2] ? decodeURIComponent(labelRoute[2]) : null, body });
+        if (!labelRoute[2]) {
+          return json(200, { channel_id: decodeURIComponent(labelRoute[1]),
+            messages: [...page.menuLabels.keys()].filter((id) => (page.menuLabels.get(id) || []).length).map(state),
+            revision: page.labelsRevision });
+        }
+        const id = decodeURIComponent(labelRoute[2]);
+        const raw = String((body && body.name) || "").trim();
+        const name = raw.startsWith("#") ? `#${raw.slice(1).toLowerCase()}` : raw.toLowerCase().replace(/\s+/g, " ");
+        if (!/^#[a-z][a-z0-9_-]*$/.test(name) && (name.startsWith("#") || !name)) {
+          return json(400, { error: "bad_id", detail: "a # label is one word: a letter, then letters, digits, - or _" });
+        }
+        const held = page.messages.find((m) => String(m.id) === id);
+        if (held && !page.typedLabels.has(id)) page.typedLabels.set(id, [...(held.labels || [])]);
+        const names = [...(page.menuLabels.get(id) || [])];
+        const had = names.includes(name);
+        const present = method === "PUT";
+        if (present && !had) names.push(name);
+        if (!present && had) names.splice(names.indexOf(name), 1);
+        page.menuLabels.set(id, names);
+        if (had !== present) page.labelsRevision += 1;
+        const event = state(id);
+        // The server's copy now serves the merged labels, as `stamp` does.
+        page.messages = page.messages.map((m) => {
+          if (String(m.id) !== id) return m;
+          const next = { ...m, labels: event.labels, plain_labels: event.plain_labels, manual_labels: event.manual_labels };
+          for (const field of ["labels", "plain_labels", "manual_labels"]) if (!next[field].length) delete next[field];
+          return next;
+        });
+        const typed = page.typedLabels.get(id) || [];
+        return json(200, { event, name, changed: had !== present,
+          ...(!present && name.startsWith("#") && typed.includes(name.slice(1)) ? { text_derived: true } : {}),
+          labels_notice: "Labels are this fixture's own." });
       }
       // `#206 pin-message`. The pins, as the server keeps them: listed oldest message first, a PUT
       // keeping the row the page sent, a DELETE that is not an error twice, and the bound dropping

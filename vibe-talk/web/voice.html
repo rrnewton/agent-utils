@@ -4561,6 +4561,26 @@ writable = true</pre>
     <button id="keyboard-send" class="keyboard-send" type="button" hidden>Send</button>
 
     <!--
+      `#2279 vibe-talk-post-facto-labels`. The label picker a message's ⋯ menu ("Add label…") and its
+      long-press sheet ("Label…") open: Pinned first, then the labels known, most used first, and a
+      new name to add (a leading # makes it the hashtag label a typed #kvm makes). In the top layer
+      while open (popover), fixed, so it and the keyboard its field opens never move the list.
+      Drawn by web/src/view/channel/labelpicker.ts.
+    -->
+    <div id="label-picker" class="label-picker" role="dialog" aria-labelledby="label-picker-title" popover="manual" hidden>
+      <div class="label-picker-head">
+        <h2 id="label-picker-title" class="label-picker-title">Labels</h2>
+        <button id="label-picker-close" class="label-picker-close" type="button" aria-label="Close labels" title="Close">×</button>
+      </div>
+      <div id="label-picker-current" class="label-picker-current" aria-label="Labels on this message" hidden></div>
+      <p id="label-picker-note" class="hint label-picker-note" role="status"></p>
+      <label class="labels-panel-filter-label" for="label-picker-input">Find or add a label</label>
+      <input id="label-picker-input" class="label-picker-input" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" enterkeyhint="done" data-lpignore="true" data-1p-ignore="true" data-form-type="other" placeholder="Find or add · # for a hashtag label" />
+      <p id="label-picker-error" class="hint label-picker-error" role="status"></p>
+      <ul id="label-picker-list" class="label-picker-list" role="listbox" aria-label="Labels for this message"></ul>
+    </div>
+
+    <!--
       The dock: the third grid ROW, not a pinned or absolutely positioned overlay, which is why it
       cannot drift, overlap the transcript, or be scrolled off the bottom of the page.
 
@@ -5196,6 +5216,7 @@ writable = true</pre>
       `renderKeyboardDebug` in web/voice.js; it takes no touch, and a screen reader skips it.
     -->
     <pre id="keyboard-debug-readout" aria-hidden="true" hidden></pre>
+
 
     <!--
       The page's script. The page build (web/build.mjs) bundles it with the modules it calls, the wire

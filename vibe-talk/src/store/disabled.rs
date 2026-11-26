@@ -410,6 +410,20 @@ impl StateStore for DisabledStore {
         refuse()
     }
 
+    async fn message_labels(&self) -> Result<super::MessageLabels, StoreError> {
+        refuse()
+    }
+
+    async fn set_message_label(
+        &self,
+        _: &ChannelId,
+        _: &MessageId,
+        _: &str,
+        _: bool,
+    ) -> Result<super::MessageLabelChange, StoreError> {
+        refuse()
+    }
+
     async fn bookmark(&self, _: &ChannelId) -> Result<Bookmark, StoreError> {
         // A refusal, not "no bookmark", for the pins' reason: a page told there is none would offer
         // to set one that cannot be kept. `#240 reading-bookmark`.

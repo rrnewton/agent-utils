@@ -2384,6 +2384,7 @@ impl Sink {
             budget: ask.budget,
             day_start_ms: ask.day_start_ms,
             pinned_ids: ask.pinned_ids,
+            manual_labels: ask.manual_labels,
         };
         let outcome = cache
             .search(&chan, &request)
@@ -2405,7 +2406,8 @@ impl Sink {
     pub fn label_counts(
         &self,
         channel: &ChannelId,
-    ) -> Result<std::collections::BTreeMap<String, usize>, super::search::SearchRefusal> {
+        manual: &std::collections::HashMap<String, Vec<String>>,
+    ) -> Result<super::LabelTally, super::search::SearchRefusal> {
         use super::search::{SearchRefusal, SearchView};
         let cache = self
             .cache()
@@ -2434,7 +2436,7 @@ impl Sink {
         };
         let chan = ChanKey::new(route.key.clone(), channel.as_str());
         cache
-            .label_counts(&chan, view, LABEL_COUNT_BUDGET)
+            .label_counts(&chan, view, LABEL_COUNT_BUDGET, manual)
             .served()
             .ok_or(SearchRefusal::Blocked)
     }
@@ -3912,6 +3914,8 @@ mod tests {
             content_html: String::new(),
             noise: false,
             labels: Vec::new(),
+            plain_labels: Vec::new(),
+            manual_labels: Vec::new(),
             reactions: None,
             heading: None,
             sent_refs: Vec::new(),

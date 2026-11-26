@@ -1298,6 +1298,8 @@ impl Raw {
             content_html: String::new(),
             noise: false,
             labels: Vec::new(),
+            plain_labels: Vec::new(),
+            manual_labels: Vec::new(),
             // A trace entry's v2 word on what the agent sent (`#1886` part C).
             sent_refs: self.sent_refs(),
             sent_vestigial: false,

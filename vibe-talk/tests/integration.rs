@@ -94,6 +94,9 @@ mod ingest;
 #[path = "labels.rs"]
 mod labels;
 
+#[path = "message_labels.rs"]
+mod message_labels;
+
 #[path = "live.rs"]
 mod live;
 

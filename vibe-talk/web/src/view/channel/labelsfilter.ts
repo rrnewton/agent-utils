@@ -9,6 +9,7 @@
 // which is what the closed button names.
 
 import { childByClass, createListening } from "../dom/index.ts";
+import { loneLabelName } from "../../core/channels/index.ts";
 
 /** One drop-down row as Settings' labels browser serves it (its own
  * `LabelDropdownEntry` in view/settings, kept structurally: view/channel
@@ -18,6 +19,8 @@ export interface LabelDropdownEntry {
   readonly count: number;
   readonly grouped: boolean;
   readonly spellings: readonly string[];
+  /** `#2279`: a plain label (a name without `#`, added from a message menu). */
+  readonly plain?: boolean;
 }
 
 /** What the drop-down asks of the page. */
@@ -37,7 +40,7 @@ export interface LabelsFilterDependencies {
   setPinnedOnly(on: boolean): void;
   /** The search field's words, for naming and clearing a label filter. */
   query(): string;
-  /** Open the search filtered to `label`, the card chips' own act. */
+  /** Open the search filtered to one label NAME (`#kvm`, `merge queue`), the card chips' own act. */
   filterToLabel(label: string): void;
   /** Take a lone `label:<slug>` query away, the bar staying open. */
   clearLabelQuery(): void;
@@ -57,10 +60,19 @@ export interface LabelsFilter {
   unmount(): void;
 }
 
-/** The label a query of exactly `label:<slug>` names, else null. */
+/**
+ * The label NAME a query of exactly one label term names, else null (`#2279`): `#kvm` for
+ * `label:#kvm` or the older `label:kvm`, `merge queue` for `label:"merge queue"`, `pinned`.
+ */
 export function loneLabelOf(query: string): string | null {
-  const match = /^label:([a-z0-9_-]+)$/i.exec(query.trim());
-  return match ? match[1]!.toLowerCase() : null;
+  return loneLabelName(query);
+}
+
+/** A drop-down row's element id: the built-ins and hashtag slugs as `#1853` named them. */
+function optionId(value: string): string {
+  if (value === "all" || value === "pinned") return `labels-option-${value}`;
+  if (value.startsWith("#")) return `labels-option-${value.slice(1)}`;
+  return `labels-option-plain-${encodeURIComponent(value)}`;
 }
 
 /** Closed, nothing selected but what the page already filters to. */
@@ -73,7 +85,7 @@ export function createLabelsFilter(deps: LabelsFilterDependencies): LabelsFilter
   /** Option values in drawn order, All first, for the keyboard. */
   let drawnValues: string[] = [];
 
-  /** The filter in force: "pinned", a hashtag slug, or null. */
+  /** The filter in force: "pinned", a label name (`#kvm`, `merge queue`), or null. */
   function activeLabel(): string | null {
     if (deps.pinnedOnly()) return "pinned";
     return loneLabelOf(deps.query());
@@ -84,12 +96,12 @@ export function createLabelsFilter(deps: LabelsFilterDependencies): LabelsFilter
     const active = activeLabel();
     const word = childByClass(button, "labels-filter-word");
     if (word) {
-      word.textContent = active === "pinned" ? "Pinned" : active ? `#${active}` : "Labels";
+      word.textContent = active === "pinned" ? "Pinned" : active ?? "Labels";
     }
     button.setAttribute(
       "aria-label",
       active
-        ? `Labels: ${active === "pinned" ? "Pinned" : `#${active}`} selected. Filter by label`
+        ? `Labels: ${active === "pinned" ? "Pinned" : active} selected. Filter by label`
         : "Labels. Filter by label",
     );
     if (active) button.setAttribute("data-active-label", active);
@@ -109,11 +121,14 @@ export function createLabelsFilter(deps: LabelsFilterDependencies): LabelsFilter
         grouped: false,
       },
     ];
+    const bare = needle.replace(/^#/, "");
     for (const entry of deps.entries()) {
-      if (needle && !entry.name.includes(needle) && !entry.spellings.some((s) => s.includes(needle))) continue;
+      if (bare && !entry.name.includes(bare) && !entry.spellings.some((s) => s.includes(bare))) continue;
+      // `#2279`: values are label NAMES — a hashtag label's begins with `#`, a plain one's not.
+      const value = entry.plain ? entry.name : `#${entry.name}`;
       out.push({
-        value: entry.name,
-        name: `#${entry.name}${entry.grouped ? " (G)" : ""}`,
+        value,
+        name: `${value}${entry.grouped ? " (G)" : ""}`,
         count: `${entry.count} in loaded history`,
         pinned: false,
         grouped: entry.grouped,
@@ -133,7 +148,7 @@ export function createLabelsFilter(deps: LabelsFilterDependencies): LabelsFilter
       ...shown.map((row) => {
         const item = document.createElement("li");
         item.className = row.pinned ? "labels-option labels-option-pinned" : "labels-option";
-        item.id = `labels-option-${row.value}`;
+        item.id = optionId(row.value);
         item.setAttribute("role", "option");
         item.setAttribute("aria-selected", String(active === row.value || (row.value === "all" && active === null)));
         item.setAttribute(
@@ -161,7 +176,7 @@ export function createLabelsFilter(deps: LabelsFilterDependencies): LabelsFilter
     const onlyBuiltIns = shown.length <= 2;
     el("labels-panel-state").textContent =
       deps.entries().length === 0
-        ? "No hashtag labels in the loaded history yet. #pinned is reserved for Pinned."
+        ? "No labels in the loaded history yet: type a #hashtag in a message, or add one from a message's ⋯ menu. #pinned is reserved for Pinned."
         : onlyBuiltIns && input.value.trim() !== ""
           ? "No labels match that filter."
           : "";
@@ -171,7 +186,7 @@ export function createLabelsFilter(deps: LabelsFilterDependencies): LabelsFilter
   function focusValue(value: string): void {
     activeValue = value;
     draw();
-    el(`labels-option-${value}`)?.focus();
+    el(optionId(value))?.focus();
   }
 
   function select(value: string): void {

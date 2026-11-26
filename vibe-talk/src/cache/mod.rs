@@ -193,6 +193,16 @@ pub trait Clock: Send + Sync {
     fn now_ms(&self) -> i64;
 }
 
+/// How many held messages carry each label (`#1825`, `#2279`): hashtag slugs and plain names
+/// apart, as [`crate::model::Message::labels`] and [`crate::model::Message::plain_labels`] are.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LabelTally {
+    /// Hashtag slug → messages carrying it, typed or menu-added.
+    pub hashtags: std::collections::BTreeMap<String, usize>,
+    /// Plain name → messages carrying it.
+    pub plain: std::collections::BTreeMap<String, usize>,
+}
+
 /// The system clock.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemClock;
@@ -2515,17 +2525,32 @@ impl MessageCache {
         chan: &ChanKey,
         view: search::SearchView,
         budget: usize,
-    ) -> Read<std::collections::BTreeMap<String, usize>> {
+        manual: &std::collections::HashMap<String, Vec<String>>,
+    ) -> Read<LabelTally> {
         let scope_key = view.horizon_scope().key();
         self.read_scope(chan, &scope_key, |connection| {
             let snapshot = connection.unchecked_transaction()?;
             let (rows, _more) =
                 reader::search_rows(&snapshot, chan, view.scope_sql(), i64::MAX, budget)?;
             snapshot.finish()?;
-            let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
+            // `#2279`: the menu-added labels merged in as serving merges them, so a message
+            // carrying `#kvm` both typed and added counts once.
+            let mut counts = LabelTally::default();
+            let groups = crate::labels::GroupIndex::default();
             for row in &rows {
-                for label in crate::labels::extract_hashtags(&row.message.message.content) {
-                    *counts.entry(label).or_insert(0) += 1;
+                let message = &row.message.message;
+                let merged = crate::labels::merge(
+                    &groups,
+                    &message.content,
+                    manual
+                        .get(message.id.as_str())
+                        .map_or(&[][..], Vec::as_slice),
+                );
+                for label in merged.labels {
+                    *counts.hashtags.entry(label).or_insert(0) += 1;
+                }
+                for label in merged.plain {
+                    *counts.plain.entry(label).or_insert(0) += 1;
                 }
             }
             Ok(counts)

@@ -2654,7 +2654,12 @@ test("THE SCROLLER IS SIZED BY ITS CELL ALONE, so a change beside it does not la
   const withoutSplit = withoutPreview
     .replace(/#discuss-panel #discuss-current-head\s*\{[^}]*position:\s*sticky[^}]*\}/, " ")
     .replace(/#discuss-latest > \.discuss-qa > summary\s*\{[^}]*position:\s*sticky[^}]*\}/, " ");
-  assert.doesNotMatch(withoutSplit, /position:\s*(fixed|sticky)/, "something now escapes the scroller's containment");
+  // The label picker's exception (`#2279 vibe-talk-post-facto-labels`): it stands in the top layer
+  // (a popover at the body's level, outside #scroll-area), fixed as the open row menu is, so it
+  // hangs off nothing in the list. Exactly that selector.
+  assert.match(cssBlock("#label-picker"), /position:\s*fixed/, "the label picker is not fixed in the top layer");
+  const withoutPicker = withoutSplit.replace(/#label-picker\s*\{[^}]*position:\s*fixed[^}]*\}/, " ");
+  assert.doesNotMatch(withoutPicker, /position:\s*(fixed|sticky)/, "something now escapes the scroller's containment");
 });
 
 test("A HIDDEN PAGE POLLS NOTHING: the poll waits for it to come back, and one that came due meanwhile runs then", async () => {

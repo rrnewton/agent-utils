@@ -136,11 +136,23 @@ pub async fn search(
         };
         pinned_by_channel.push(Arc::new(ids));
     }
+    // `#2279`: each channel's menu labels, merged into every row as serving merges them.
+    let manual_by_channel: Vec<Arc<std::collections::HashMap<String, Vec<String>>>> = {
+        let index = state
+            .manual_labels
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        channels
+            .iter()
+            .map(|channel| Arc::new(index.channel(channel.id.as_str())))
+            .collect()
+    };
     // Every channel at once, each on the blocking pool: the file's readers serve them side by side.
     let searches = channels.iter().enumerate().map(|(index, channel)| {
         let sink = Arc::clone(&state.message_cache);
         let query = Arc::clone(&query);
         let pinned_ids = Arc::clone(&pinned_by_channel[index]);
+        let manual_labels = Arc::clone(&manual_by_channel[index]);
         let zone = zone.clone();
         let id = channel.id.clone();
         async move {
@@ -158,6 +170,7 @@ pub async fn search(
                         budget: BUDGET,
                         day_start_ms: &day_start_ms,
                         pinned_ids: &pinned_ids,
+                        manual_labels: &manual_labels,
                     },
                 )
             })

@@ -55,6 +55,8 @@ fn message(
         content_html: String::new(),
         noise,
         labels: Vec::new(),
+        plain_labels: Vec::new(),
+        manual_labels: Vec::new(),
         thread: thread.map(|(thread_id, is_root)| MessageThread {
             class: None,
             hue: None,

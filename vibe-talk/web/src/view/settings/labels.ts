@@ -23,7 +23,7 @@ export interface LabelGroupRow {
 export interface LabelsDependencies {
   lookup(id: string): HTMLElement;
   request(path: string, options: { method: string; body?: unknown }): Promise<unknown>;
-  /** Open the search filtered to `label` (and leave Settings). */
+  /** Open the search filtered to one label NAME, `#kvm` or `merge queue` (and leave Settings). */
   openLabel(label: string): void;
   guard(run: () => Promise<unknown>): () => void;
 }
@@ -35,6 +35,8 @@ export interface LabelDropdownEntry {
   readonly count: number;
   readonly grouped: boolean;
   readonly spellings: readonly string[];
+  /** `#2279`: a plain label (a name without `#`, added from a message menu). */
+  readonly plain?: boolean;
 }
 
 /** The labels browser's commands. */
@@ -51,6 +53,8 @@ export interface LabelsView {
 /** Mount the browser: first read at once, then on `refresh`. */
 export function mountLabels(deps: LabelsDependencies): LabelsView {
   let labels: LabelRow[] = [];
+  /** `#2279`: the plain labels (names without `#`), never grouped. */
+  let plain: LabelRow[] = [];
   let groups: LabelGroupRow[] = [];
   let sortByCount = true;
   /** Checked spellings. Module state, so filtering never clears it. */
@@ -66,7 +70,12 @@ export function mountLabels(deps: LabelsDependencies): LabelsView {
     name: string;
     count: number;
     group?: LabelGroupRow;
+    /** `#2279`: a plain label, shown and searched without `#`. */
+    plain?: boolean;
   }
+
+  /** The entry's label name as the page names labels: `#kvm`, or a plain name. */
+  const nameOf = (entry: Entry): string => (entry.plain ? entry.name : `#${entry.name}`);
 
   function entries(): Entry[] {
     const grouped = new Set(groups.flatMap((group) => group.spellings as string[]));
@@ -80,6 +89,7 @@ export function mountLabels(deps: LabelsDependencies): LabelsView {
     for (const row of labels) {
       if (!grouped.has(row.name)) out.push({ name: row.name, count: row.count });
     }
+    for (const row of plain) out.push({ name: row.name, count: row.count, plain: true });
     return out;
   }
 
@@ -99,12 +109,12 @@ export function mountLabels(deps: LabelsDependencies): LabelsView {
         item.className = "label-row";
         const box = document.createElement("input");
         box.type = "checkbox";
-        box.checked = checked.has(entry.name);
-        box.disabled = entry.group !== undefined;
+        box.checked = !entry.plain && checked.has(entry.name);
+        box.disabled = entry.group !== undefined || entry.plain === true;
         box.title = entry.group
           ? `#${entry.name} is grouped; edit the group to change it`
-          : "";
-        box.setAttribute("aria-label", `Select #${entry.name} to combine`);
+          : entry.plain ? `${entry.name} has no # and is not grouped` : "";
+        box.setAttribute("aria-label", `Select ${nameOf(entry)} to combine`);
         box.addEventListener("change", () => {
           if (box.checked) checked.add(entry.name);
           else checked.delete(entry.name);
@@ -113,11 +123,11 @@ export function mountLabels(deps: LabelsDependencies): LabelsView {
         const name = document.createElement("button");
         name.type = "button";
         name.className = "label-name";
-        name.textContent = `#${entry.name}`;
+        name.textContent = nameOf(entry);
         name.title = entry.group
           ? `Show only #${entry.name} (spellings: ${entry.group.spellings.join(", ")})`
-          : `Show only #${entry.name}`;
-        name.addEventListener("click", () => deps.openLabel(entry.name));
+          : `Show only ${nameOf(entry)}`;
+        name.addEventListener("click", () => deps.openLabel(nameOf(entry)));
         const count = document.createElement("span");
         count.className = "label-count";
         count.textContent = `${entry.count} in loaded history`;
@@ -136,9 +146,9 @@ export function mountLabels(deps: LabelsDependencies): LabelsView {
       }),
     );
     el("labels-state").textContent =
-      labels.length === 0
-        ? "No hashtag labels in the loaded history yet. Type one, like #kvm, at the end of a message. #pinned is reserved for the built-in Pinned label and never becomes a hashtag label."
-        : `${labels.length} label${labels.length === 1 ? "" : "s"} in the loaded history. Tick spellings that mean the same thing, then Combine.`;
+      labels.length + plain.length === 0
+        ? "No labels in the loaded history yet. Type one, like #kvm, at the end of a message, or add one from a message's ⋯ menu. #pinned is reserved for the built-in Pinned label and never becomes a hashtag label."
+        : `${labels.length + plain.length} label${labels.length + plain.length === 1 ? "" : "s"} in the loaded history. Tick # spellings that mean the same thing, then Combine.`;
     drawCombine();
   }
 
@@ -216,10 +226,12 @@ export function mountLabels(deps: LabelsDependencies): LabelsView {
     try {
       const answer = (await deps.request("/api/v1/labels", { method: "GET" })) as {
         labels?: LabelRow[];
+        plain?: LabelRow[];
         groups?: LabelGroupRow[];
       };
       const { labels: rows, groups: held } = answer;
       labels = rows || [];
+      plain = answer.plain || [];
       groups = held || [];
       draw();
     } catch {
@@ -255,6 +267,7 @@ export function mountLabels(deps: LabelsDependencies): LabelsView {
           count: entry.count,
           grouped: entry.group !== undefined,
           spellings: entry.group ? [...entry.group.spellings] : [entry.name],
+          ...(entry.plain ? { plain: true } : {}),
         }))
         .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
     },

@@ -3346,6 +3346,7 @@ fn a_cache_search_matches_with_the_shared_language_and_says_how_far_back_it_look
             budget,
             day_start_ms: &day,
             pinned_ids: &std::collections::HashSet::new(),
+            manual_labels: &std::collections::HashMap::new(),
         };
         fx.cache
             .search(&fx.chan, &request)
@@ -3444,6 +3445,7 @@ fn a_search_finds_a_reply_observed_before_a_channel_drop_and_flags_it_stale() {
         budget: 100,
         day_start_ms: &day,
         pinned_ids: &std::collections::HashSet::new(),
+        manual_labels: &std::collections::HashMap::new(),
     };
     let clean = fx
         .cache
@@ -3520,6 +3522,7 @@ fn a_cache_search_takes_rare_terms_from_the_index_once_every_text_is_folded() {
             budget: 1_000,
             day_start_ms: &day,
             pinned_ids: &std::collections::HashSet::new(),
+            manual_labels: &std::collections::HashMap::new(),
         };
         fx.cache
             .search(&fx.chan, &request)
@@ -3618,6 +3621,7 @@ fn a_cache_search_for_label_pinned_reads_the_pin_set_alone() {
             budget: 1_000,
             day_start_ms: &day,
             pinned_ids: &pins,
+            manual_labels: &std::collections::HashMap::new(),
         };
         fx.cache
             .search(&fx.chan, &request)
@@ -3664,6 +3668,7 @@ fn a_cache_search_horizon_stops_at_the_age_limit() {
             budget: 100,
             day_start_ms: &day,
             pinned_ids: &std::collections::HashSet::new(),
+            manual_labels: &std::collections::HashMap::new(),
         };
         fx.cache
             .search(&fx.chan, &request)
@@ -3708,6 +3713,7 @@ fn a_cache_search_stops_only_on_a_whole_millisecond() {
             budget,
             day_start_ms: &day,
             pinned_ids: &std::collections::HashSet::new(),
+            manual_labels: &std::collections::HashMap::new(),
         };
         fx.cache
             .search(&fx.chan, &request)

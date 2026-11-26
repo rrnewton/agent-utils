@@ -57,6 +57,8 @@ fn thread_message(id: &str, n: i64, content: &str) -> Message {
         content_html: String::new(),
         noise: false,
         labels: Vec::new(),
+        plain_labels: Vec::new(),
+        manual_labels: Vec::new(),
         thread: Some(MessageThread {
             class: None,
             hue: None,

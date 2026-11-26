@@ -611,6 +611,17 @@ fn routes(state: AppState) -> Router {
             "/api/v1/label-groups/{id}",
             axum::routing::put(api::update_label_group).delete(api::dissolve_label_group),
         )
+        // `#2279 vibe-talk-post-facto-labels`. A label added to (PUT) or removed from
+        // (DELETE) one message from its menu, idempotent both ways; the body names the
+        // label. WRITE scope, NO MCP TOOL, for the pins' reason; server-local.
+        .route(
+            "/api/v1/channels/{channel_id}/message-labels",
+            get(api::message_labels),
+        )
+        .route(
+            "/api/v1/channels/{channel_id}/message-labels/{message_id}",
+            axum::routing::put(api::add_message_label).delete(api::remove_message_label),
+        )
         // `#240 reading-bookmark`. The owner's place in a channel's backlog, one per channel. READ
         // scope to see it, WRITE scope to move or clear it — a PUT or DELETE that may carry
         // `if_revision`, refused 409 when another device moved it first — and NO MCP TOOL, for the

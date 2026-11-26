@@ -168,6 +168,259 @@ impl GroupIndex {
     }
 }
 
+// --- labels added from the message menu ------------------------------------------------------
+//
+// `#2279 vibe-talk-post-facto-labels` (owner requests 380, 382). ONE label set of NAMES: a
+// hashtag label's name begins with `#` (`#kvm`), every other label is a plain name
+// (`merge queue`). A menu-added `#kvm` and a typed `#kvm` are the SAME label because the
+// hashtag subset keeps #1825's representation — the bare folded slug in
+// [`crate::model::Message::labels`] — and the menu-added slugs join the typed ones there
+// before the groups apply ([`merge`]). Plain labels ride beside them in
+// [`crate::model::Message::plain_labels`]. Only the menu's labels are stored (origin
+// `manual`, `vibe-talk/src/store/sqlite.rs`); text-derived labels stay derived.
+
+/// The longest plain label name, in characters, after folding.
+pub const MAX_PLAIN_LABEL_CHARS: usize = 40;
+
+/// The longest hashtag slug, as a label group may name one
+/// ([`crate::store::validate_label_group`]).
+pub const MAX_HASHTAG_SLUG_CHARS: usize = 64;
+
+/// At most this many menu-added labels on one message.
+pub const MAX_MANUAL_LABELS_PER_MESSAGE: usize = 32;
+
+/// At most this many menu-added label rows on the whole server.
+pub const MAX_MANUAL_LABEL_ROWS: usize = 20_000;
+
+/// One label name, normalized: what the store keeps and every surface compares.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum LabelName {
+    /// `#kvm`: the slug, folded by the extractor's token rule, without its `#`.
+    Hashtag(String),
+    /// `merge queue`: folded with the search fold, white space collapsed.
+    Plain(String),
+}
+
+impl LabelName {
+    /// Normalize a name as the owner typed it in the menu. A leading `#` makes it a hashtag
+    /// label under the extractor's token rule; anything else is a plain name.
+    ///
+    /// # Errors
+    ///
+    /// A sentence saying why the name cannot be a label, fit to show beside the field.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let trimmed = raw.trim();
+        if let Some(rest) = trimmed.strip_prefix('#') {
+            let mut chars = rest.chars();
+            let well_formed = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+                && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'));
+            if !well_formed {
+                return Err(
+                    "a # label is one word: a letter, then letters, digits, - or _".to_owned(),
+                );
+            }
+            if rest.chars().count() > MAX_HASHTAG_SLUG_CHARS {
+                return Err(format!(
+                    "a # label is at most {MAX_HASHTAG_SLUG_CHARS} characters"
+                ));
+            }
+            let slug = rest.to_ascii_lowercase();
+            if slug == "pinned" {
+                return Err(PINNED_RESERVED.to_owned());
+            }
+            return Ok(Self::Hashtag(slug));
+        }
+        let folded = crate::search_query::fold(trimmed)
+            .trim_matches(' ')
+            .to_owned();
+        if folded.is_empty() {
+            return Err("a label needs a name".to_owned());
+        }
+        if folded.chars().count() > MAX_PLAIN_LABEL_CHARS {
+            return Err(format!(
+                "a label is at most {MAX_PLAIN_LABEL_CHARS} characters"
+            ));
+        }
+        if folded
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '"' | ':'))
+        {
+            return Err("a label cannot hold a quote, a colon or a control character".to_owned());
+        }
+        if folded.starts_with('#') {
+            return Err("a # label is one word: a letter, then letters, digits, - or _".to_owned());
+        }
+        if folded == "pinned" {
+            return Err(PINNED_RESERVED.to_owned());
+        }
+        Ok(Self::Plain(folded))
+    }
+
+    /// Read a name back as the store keeps it ([`Self::stored`]): no refusal, since only
+    /// [`Self::parse`] ever wrote one.
+    #[must_use]
+    pub fn from_stored(stored: &str) -> Self {
+        match stored.strip_prefix('#') {
+            Some(slug) => Self::Hashtag(slug.to_owned()),
+            None => Self::Plain(stored.to_owned()),
+        }
+    }
+
+    /// The name as the owner sees it, and as the store keeps it: `#kvm` or `merge queue`.
+    #[must_use]
+    pub fn stored(&self) -> String {
+        match self {
+            Self::Hashtag(slug) => format!("#{slug}"),
+            Self::Plain(name) => name.clone(),
+        }
+    }
+
+    /// `hashtag` or `plain`, for a log line that must not carry the name itself.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Hashtag(_) => "hashtag",
+            Self::Plain(_) => "plain",
+        }
+    }
+}
+
+const PINNED_RESERVED: &str =
+    "\"pinned\" is the built-in Pinned label: use Pin message in the same menu";
+
+/// One message's labels as served: the three fields [`crate::ops::stamp`] writes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Merged {
+    /// Hashtag slugs, typed then menu-added, groups applied ([`crate::model::Message::labels`]).
+    pub labels: Vec<String>,
+    /// Plain names, menu-added ([`crate::model::Message::plain_labels`]).
+    pub plain: Vec<String>,
+    /// The menu-added names the text does not also carry: the removable ones
+    /// ([`crate::model::Message::manual_labels`]).
+    pub manual: Vec<String>,
+}
+
+/// Merge one message's text-derived and menu-added labels (`#2279`).
+///
+/// A menu-added `#kvm` joins the typed slugs before `groups` apply, so it is the same label as
+/// a typed `#kvm` everywhere `labels` is read. It counts as removable only while the text does
+/// not also carry it (compared after grouping, so a typed spelling of the same group keeps it).
+#[must_use]
+pub fn merge(groups: &GroupIndex, content: &str, manual: &[String]) -> Merged {
+    let typed = extract_hashtags(content);
+    if manual.is_empty() {
+        return Merged {
+            labels: groups.apply(&typed),
+            ..Merged::default()
+        };
+    }
+    let typed_shown = groups.apply(&typed);
+    let mut slugs = typed;
+    let mut plain: Vec<String> = Vec::new();
+    let mut removable: Vec<String> = Vec::new();
+    for stored in manual {
+        match LabelName::from_stored(stored) {
+            LabelName::Hashtag(slug) => {
+                let shown = groups.apply(std::slice::from_ref(&slug));
+                if !shown.iter().all(|one| typed_shown.contains(one)) {
+                    removable.push(stored.clone());
+                }
+                if !slugs.contains(&slug) {
+                    slugs.push(slug);
+                }
+            }
+            LabelName::Plain(name) => {
+                if !plain.contains(&name) {
+                    removable.push(stored.clone());
+                    plain.push(name);
+                }
+            }
+        }
+    }
+    Merged {
+        labels: groups.apply(&slugs),
+        plain,
+        manual: removable,
+    }
+}
+
+/// Every menu-added label, per message, as derivation and search see them (`#2279`): loaded
+/// from the store at startup and written through on every change, so [`crate::ops::stamp`]
+/// (sync) merges without a store read per serve.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ManualIndex {
+    /// Channel id → message id → stored names, in the order they were added.
+    by_channel: std::collections::HashMap<String, std::collections::HashMap<String, Vec<String>>>,
+    /// The store's revision for these labels.
+    revision: i64,
+    /// Whether a store stands behind the index: read from one at startup, or written through.
+    stored: bool,
+}
+
+impl ManualIndex {
+    /// Build from the store's rows, oldest first.
+    #[must_use]
+    pub fn new(rows: &[crate::store::MessageLabelRow], revision: i64) -> Self {
+        let mut index = Self {
+            revision,
+            stored: true,
+            ..Self::default()
+        };
+        for row in rows {
+            index
+                .by_channel
+                .entry(row.channel_id.clone())
+                .or_default()
+                .entry(row.message_id.clone())
+                .or_default()
+                .push(row.name.clone());
+        }
+        index
+    }
+
+    /// One message's menu-added names; empty for none.
+    #[must_use]
+    pub fn of(&self, channel_id: &str, message_id: &str) -> &[String] {
+        self.by_channel
+            .get(channel_id)
+            .and_then(|messages| messages.get(message_id))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// One channel's menu-added names by message id, for a search over the channel's cache.
+    #[must_use]
+    pub fn channel(&self, channel_id: &str) -> std::collections::HashMap<String, Vec<String>> {
+        self.by_channel.get(channel_id).cloned().unwrap_or_default()
+    }
+
+    /// Replace one message's names (after a store write), at `revision`.
+    pub fn set(&mut self, channel_id: &str, message_id: &str, names: Vec<String>, revision: i64) {
+        let messages = self.by_channel.entry(channel_id.to_owned()).or_default();
+        if names.is_empty() {
+            messages.remove(message_id);
+        } else {
+            messages.insert(message_id.to_owned(), names);
+        }
+        if messages.is_empty() {
+            self.by_channel.remove(channel_id);
+        }
+        self.revision = self.revision.max(revision);
+        self.stored = true;
+    }
+
+    /// The revision these labels are at.
+    #[must_use]
+    pub fn revision(&self) -> i64 {
+        self.revision
+    }
+
+    /// The revision, when a store stands behind the index; `None` on a server with no store.
+    #[must_use]
+    pub fn stored_revision(&self) -> Option<i64> {
+        self.stored.then_some(self.revision)
+    }
+}
+
 /// Positions that cannot hold a hashtag: fenced code, inline code, URLs and
 /// `<#…>` channel references. Masking (rather than stripping) keeps every
 /// other position's neighbours exactly as written.
@@ -295,6 +548,145 @@ fn mask_channel_refs(chars: &[char], masked: &mut [bool]) {
 
 #[cfg(test)]
 mod tests {
+    // `#2279 vibe-talk-post-facto-labels`: the menu's name normalizer and the merge rule.
+
+    #[test]
+    fn a_menu_name_with_a_hash_follows_the_extractors_token_rule() {
+        use super::LabelName;
+        assert_eq!(
+            LabelName::parse("#KVM"),
+            Ok(LabelName::Hashtag("kvm".to_owned()))
+        );
+        assert_eq!(
+            LabelName::parse("  #bench_2-x "),
+            Ok(LabelName::Hashtag("bench_2-x".to_owned()))
+        );
+        for refused in [
+            "#", "#1abc", "#123", "#kv m", "#kvm!", "#é", "#pinned", "#Pinned",
+        ] {
+            assert!(
+                LabelName::parse(refused).is_err(),
+                "{refused:?} must be refused"
+            );
+        }
+        assert!(LabelName::parse(&format!("#a{}", "b".repeat(64))).is_err());
+        // What the extractor would mint from the same text is the same slug.
+        assert_eq!(super::extract_hashtags("x #KVM"), vec!["kvm".to_owned()]);
+    }
+
+    #[test]
+    fn a_menu_name_without_a_hash_is_a_plain_label_folded_like_search() {
+        use super::LabelName;
+        assert_eq!(
+            LabelName::parse("  Merge   Queue "),
+            Ok(LabelName::Plain("merge queue".to_owned()))
+        );
+        assert_eq!(
+            LabelName::parse("Café"),
+            Ok(LabelName::Plain("cafe".to_owned()))
+        );
+        assert_eq!(
+            LabelName::parse("kvm"),
+            Ok(LabelName::Plain("kvm".to_owned()))
+        );
+        for refused in [
+            "",
+            "   ",
+            "pinned",
+            "PINNED",
+            "auto:topic",
+            "say \"hi\"",
+            "a\u{7}b",
+        ] {
+            assert!(
+                LabelName::parse(refused).is_err(),
+                "{refused:?} must be refused"
+            );
+        }
+        assert!(LabelName::parse(&"x".repeat(41)).is_err());
+        assert!(LabelName::parse(&"x".repeat(40)).is_ok());
+        // Stored forms read back to the same name.
+        for name in ["#kvm", "merge queue"] {
+            assert_eq!(LabelName::from_stored(name).stored(), name);
+        }
+        assert_eq!(LabelName::parse("#kvm").map(|n| n.kind()), Ok("hashtag"));
+        assert_eq!(LabelName::parse("kvm").map(|n| n.kind()), Ok("plain"));
+    }
+
+    #[test]
+    fn a_menu_added_hashtag_is_the_typed_label_and_only_menu_labels_are_removable() {
+        let groups = GroupIndex::default();
+        // Typed only: as #1825 served it.
+        let typed = super::merge(&groups, "fixed #kvm", &[]);
+        assert_eq!(typed.labels, vec!["kvm".to_owned()]);
+        assert!(typed.plain.is_empty() && typed.manual.is_empty());
+        // Menu-added #kvm on a message with no hashtag: the same slug, removable.
+        let added = super::merge(&groups, "fixed", &["#kvm".to_owned()]);
+        assert_eq!(added.labels, vec!["kvm".to_owned()]);
+        assert_eq!(added.manual, vec!["#kvm".to_owned()]);
+        // Both typed and added: one label, not removable (the text carries it).
+        let both = super::merge(&groups, "fixed #kvm", &["#kvm".to_owned()]);
+        assert_eq!(both.labels, vec!["kvm".to_owned()]);
+        assert!(both.manual.is_empty());
+        // Typed first, then menu-added, deduped; a plain label rides beside.
+        let mixed = super::merge(
+            &groups,
+            "#perf done",
+            &[
+                "#kvm".to_owned(),
+                "merge queue".to_owned(),
+                "merge queue".to_owned(),
+            ],
+        );
+        assert_eq!(mixed.labels, vec!["perf".to_owned(), "kvm".to_owned()]);
+        assert_eq!(mixed.plain, vec!["merge queue".to_owned()]);
+        assert_eq!(
+            mixed.manual,
+            vec!["#kvm".to_owned(), "merge queue".to_owned()]
+        );
+    }
+
+    #[test]
+    fn groups_apply_to_menu_added_hashtags_as_to_typed_ones() {
+        let groups = GroupIndex::new(vec![(
+            "benchmarking".to_owned(),
+            vec!["benchmark".to_owned(), "benchmarking".to_owned()],
+        )]);
+        let added = super::merge(&groups, "fixed", &["#benchmark".to_owned()]);
+        assert_eq!(added.labels, vec!["benchmarking".to_owned()]);
+        assert_eq!(added.manual, vec!["#benchmark".to_owned()]);
+        // A typed spelling of the same group carries it: not removable.
+        let carried = super::merge(&groups, "fixed #benchmarking", &["#benchmark".to_owned()]);
+        assert_eq!(carried.labels, vec!["benchmarking".to_owned()]);
+        assert!(carried.manual.is_empty());
+    }
+
+    #[test]
+    fn the_manual_index_keys_by_channel_and_message() {
+        let rows = vec![
+            crate::store::MessageLabelRow {
+                channel_id: "C1".to_owned(),
+                message_id: "m1".to_owned(),
+                name: "#kvm".to_owned(),
+                added_ms: 1,
+            },
+            crate::store::MessageLabelRow {
+                channel_id: "C2".to_owned(),
+                message_id: "m1".to_owned(),
+                name: "merge queue".to_owned(),
+                added_ms: 2,
+            },
+        ];
+        let mut index = super::ManualIndex::new(&rows, 7);
+        assert_eq!(index.of("C1", "m1"), ["#kvm".to_owned()]);
+        assert_eq!(index.of("C2", "m1"), ["merge queue".to_owned()]);
+        assert!(index.of("C1", "m2").is_empty());
+        index.set("C1", "m1", Vec::new(), 9);
+        assert!(index.of("C1", "m1").is_empty());
+        assert!(index.channel("C1").is_empty());
+        assert_eq!(index.revision(), 9);
+    }
+
     use super::{extract_hashtags, GroupIndex};
 
     fn labels(text: &str) -> Vec<String> {

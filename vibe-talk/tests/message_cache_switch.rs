@@ -273,6 +273,8 @@ fn message(at_ms: i64, text: &str) -> Message {
         content_html: String::new(),
         noise: false,
         labels: Vec::new(),
+        plain_labels: Vec::new(),
+        manual_labels: Vec::new(),
         reactions: None,
         heading: None,
         sent_refs: Vec::new(),
@@ -712,6 +714,8 @@ async fn the_purge_names_every_table_the_store_empties_and_the_message_cache() {
             match table.as_str() {
                 "channel_aliases" => "aliases".to_owned(),
                 "pin_revisions" => "pins".to_owned(),
+                // `#2279`: the menu labels' revision is part of the menu labels.
+                "message_label_state" => "message_labels".to_owned(),
                 "read_mark_epochs" => "read_marks".to_owned(),
                 "thread_hue_tombstones" => "thread_hues".to_owned(),
                 _ => table,

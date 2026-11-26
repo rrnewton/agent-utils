@@ -514,6 +514,10 @@ pub struct LiveHub {
     /// same streams as messages, as an event of its own name, so the page that asked steps again
     /// at once. No replay tail: a page that reconnects takes the step again itself.
     older: broadcast::Sender<crate::contract::LiveOlderEvent>,
+    /// A message's labels changed from a message menu (`#2279 vibe-talk-post-facto-labels`):
+    /// carried on the same streams, as an event of its own name with no cursor. No replay tail:
+    /// a page that missed one reads the labels with the message next time, merged at serve time.
+    labels: broadcast::Sender<crate::contract::LiveLabelsEvent>,
     /// How many reaction updates and corrections this hub has published: the uniqueness of
     /// their event ids. A subscriber resumes after the LAST event of the id it names, so an
     /// update or correction reusing its message's create id would silently swallow everything
@@ -572,6 +576,7 @@ impl LiveHub {
             store: std::sync::OnceLock::new(),
             settings: settings_sender,
             older: broadcast::channel(OLDER_CAPACITY).0,
+            labels: broadcast::channel(LABELS_CAPACITY).0,
             reaction_memory: Mutex::new(BTreeMap::new()),
             updates: std::sync::atomic::AtomicU64::new(0),
         }
@@ -625,6 +630,18 @@ impl LiveHub {
     pub fn publish_older(&self, event: crate::contract::LiveOlderEvent) {
         // No subscriber is not an error: nobody is open to tell.
         let _ = self.older.send(event);
+    }
+
+    /// Tell every open page that one message's labels changed (`#2279`).
+    pub fn publish_labels(&self, event: crate::contract::LiveLabelsEvent) {
+        // No subscriber is not an error: nobody is open to tell.
+        let _ = self.labels.send(event);
+    }
+
+    /// Label changes from now on, for one stream to carry (`#2279`).
+    #[must_use]
+    pub fn subscribe_labels(&self) -> broadcast::Receiver<crate::contract::LiveLabelsEvent> {
+        self.labels.subscribe()
     }
 
     /// Ends of older-history walks from now on, for one stream to carry.
@@ -1847,6 +1864,14 @@ pub const EVENT_OLDER: &str = "older";
 /// one walk's end, at most one per channel view at a time.
 const OLDER_CAPACITY: usize = 64;
 
+/// The SSE event name for a message's labels changed from a menu. `#2279
+/// vibe-talk-post-facto-labels`.
+pub const EVENT_LABELS: &str = "labels";
+
+/// How many `labels` events one slow subscriber may fall behind before it skips some: each is
+/// one owner tap, so a page this far behind is reading a fresh copy anyway.
+const LABELS_CAPACITY: usize = 256;
+
 /// Turn one [`Subscription`] into the body of a Server-Sent Events response.
 ///
 /// The replay tail goes out first, oldest first, then everything live. Each event carries an
@@ -1908,11 +1933,14 @@ pub fn events(
         settings_receiver: broadcast::Receiver<Vec<crate::client_settings::SyncedSetting>>,
         /// Ends of older-history walks, this channel's carried (`#2264`).
         older_receiver: broadcast::Receiver<crate::contract::LiveOlderEvent>,
+        /// Label changes, this channel's carried (`#2279`).
+        labels_receiver: broadcast::Receiver<crate::contract::LiveLabelsEvent>,
     }
     let markup = crate::render::markup_for(&app.config, &channel);
     let profiles = crate::render::profile_base_for(&app.config, &channel);
     let settings_receiver = app.live.subscribe_settings();
     let older_receiver = app.live.subscribe_older();
+    let labels_receiver = app.live.subscribe_labels();
     let start = State {
         replay: subscription.replay.into_iter().collect(),
         receiver: subscription.receiver,
@@ -1927,6 +1955,7 @@ pub fn events(
         replay_hues: None,
         settings_receiver,
         older_receiver,
+        labels_receiver,
     };
     futures_util::stream::unfold(start, |mut state| async move {
         if state.reset_on_attach {
@@ -2006,6 +2035,18 @@ pub fn events(
                             }
                         }
                     }
+                    labels = state.labels_receiver.recv() => {
+                        match labels {
+                            Ok(event) if event.channel_id == state.channel => {
+                                return Some((Ok(labels_event(&event)), state));
+                            }
+                            Ok(_) => {}
+                            Err(broadcast::error::RecvError::Lagged(_))
+                            | Err(broadcast::error::RecvError::Closed) => {
+                                state.labels_receiver = state.app.live.subscribe_labels();
+                            }
+                        }
+                    }
                 }
             };
             match next {
@@ -2081,9 +2122,12 @@ pub fn all_events(
         settings_receiver: broadcast::Receiver<Vec<crate::client_settings::SyncedSetting>>,
         /// Ends of older-history walks, for listed channels (`#2264`).
         older_receiver: broadcast::Receiver<crate::contract::LiveOlderEvent>,
+        /// Label changes, for listed channels (`#2279`).
+        labels_receiver: broadcast::Receiver<crate::contract::LiveLabelsEvent>,
     }
     let settings_receiver = app.live.subscribe_settings();
     let older_receiver = app.live.subscribe_older();
+    let labels_receiver = app.live.subscribe_labels();
     let start = State {
         start: subscription.start,
         replay: subscription.replay.into_iter().collect(),
@@ -2094,6 +2138,7 @@ pub fn all_events(
         caller,
         settings_receiver,
         older_receiver,
+        labels_receiver,
     };
     futures_util::stream::unfold(start, |mut state| async move {
         if state.reset_on_attach {
@@ -2134,6 +2179,18 @@ pub fn all_events(
                             Err(broadcast::error::RecvError::Lagged(_))
                             | Err(broadcast::error::RecvError::Closed) => {
                                 state.older_receiver = state.app.live.subscribe_older();
+                            }
+                        }
+                    }
+                    labels = state.labels_receiver.recv() => {
+                        match labels {
+                            Ok(event) if state.app.channel(event.channel_id.as_str()).is_some() => {
+                                return Some((Ok(labels_event(&event)), state));
+                            }
+                            Ok(_) => {}
+                            Err(broadcast::error::RecvError::Lagged(_))
+                            | Err(broadcast::error::RecvError::Closed) => {
+                                state.labels_receiver = state.app.live.subscribe_labels();
                             }
                         }
                     }
@@ -2344,6 +2401,21 @@ fn older_event(event: &crate::contract::LiveOlderEvent) -> axum::response::sse::
         .unwrap_or_else(|_| {
             axum::response::sse::Event::default()
                 .event(EVENT_OLDER)
+                .data("{}")
+        })
+}
+
+/// A live stream `labels` event (`#2279 vibe-talk-post-facto-labels`): no `id`, as a settings
+/// event has none, so it never moves a subscriber's resume cursor.
+fn labels_event(event: &crate::contract::LiveLabelsEvent) -> axum::response::sse::Event {
+    axum::response::sse::Event::default()
+        .event(EVENT_LABELS)
+        .json_data(event)
+        // Plain strings, a bool and an integer: serialization cannot fail. If it ever could, the
+        // page reads the labels with the message next time; nothing here ends the stream.
+        .unwrap_or_else(|_| {
+            axum::response::sse::Event::default()
+                .event(EVENT_LABELS)
                 .data("{}")
         })
 }
@@ -4537,6 +4609,8 @@ mod tests {
             content_html: String::new(),
             noise: false,
             labels: Vec::new(),
+            plain_labels: Vec::new(),
+            manual_labels: Vec::new(),
             reactions: None,
             heading: None,
             mentions: Vec::new(),

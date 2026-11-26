@@ -6772,6 +6772,146 @@ def _act_glossary_not_found_button(driver: Driver) -> None:
     )
 
 
+# --- `#2279 vibe-talk-post-facto-labels`: a label added after the fact ---------------------------
+
+#: The row the label scenes label: the newest row on screen, whose ⋯ menu stands in view.
+LABEL_ROW = "#discord-log > li[data-id]:last-of-type"
+
+
+def _label_open_picker(driver: Driver) -> None:
+    """The channel on screen, the newest row's ⋯ menu opened and its Add label… pressed."""
+    _glossary_channel(driver)
+    row = driver.page.locator(LABEL_ROW)
+    row.scroll_into_view_if_needed()
+    row.locator(".row-more-button").click()
+    driver.page.wait_for_function(
+        "() => { const item = document.querySelector('" + LABEL_ROW + " .row-label-button'); "
+        "return !!item && item.getClientRects().length > 0; }",
+        timeout=10_000,
+    )
+    row.locator(".row-label-button").click()
+    driver.page.wait_for_function(
+        "() => window.__visible('label-picker') && document.querySelectorAll('#label-picker-list li').length > 0",
+        timeout=10_000,
+    )
+
+
+def _act_label_picker_menu(driver: Driver) -> None:
+    """`#2279`: the label picker opened from a row's ⋯ menu: Pinned first, the known labels."""
+    _label_open_picker(driver)
+
+
+#: What the label picker's place is, said when a wait for it fails.
+LABEL_PICKER_STATE = (
+    "() => { const e = document.getElementById('label-picker'); const r = e.getBoundingClientRect(); "
+    "const v = window.visualViewport; return JSON.stringify({open: e.matches(':popover-open'), top: r.top, "
+    "bottom: r.bottom, vv: v ? [v.offsetTop, v.height] : null, inner: innerHeight, "
+    "focus: document.activeElement && document.activeElement.id, "
+    "news: document.querySelectorAll('#label-picker-list .label-picker-new').length}); }"
+)
+
+
+def _label_wait(driver: Driver, scene: str, what: str, condition: str) -> None:
+    """Wait for `condition`; a timeout fails the run by name, with the picker's state."""
+    try:
+        driver.page.wait_for_function(condition, timeout=10_000)
+    except Exception as error:
+        raise Unreachable(scene, what, f"{error.__class__.__name__}; {driver.js(f'({LABEL_PICKER_STATE})()')}") from error
+
+
+def _act_label_picker_keyboard(driver: Driver) -> None:
+    """`#2279`: a new #name typed in the picker; on a phone the keyboard really open."""
+    scene = "151-label-picker-keyboard"
+    _label_open_picker(driver)
+    # A name no earlier pass of this run added (each theme and profile shares one server), so
+    # the picker offers it as new.
+    driver.page.fill("#label-picker-input", _label_fresh_name(driver))
+    _label_wait(driver, scene, "the picker offers the new name",
+                "() => !!document.querySelector('#label-picker-list .label-picker-new')")
+    if "android" in driver.profile.name:
+        shrink_keyboard(driver, scene, focus="#label-picker-input")
+        # The picker places itself in what the keyboard leaves: wait for it to stand there.
+        _label_wait(driver, scene, "the picker stands in what the keyboard leaves",
+                    "() => document.getElementById('label-picker').getBoundingClientRect().bottom "
+                    "<= window.visualViewport.offsetTop + window.visualViewport.height + 0.5")
+
+
+def _after_label_picker_keyboard(driver: Driver) -> None:
+    if "android" in driver.profile.name:
+        restore_keyboard(driver)
+
+
+def _label_fresh_name(driver: Driver) -> str:
+    """`#perf-<theme>-<profile>`: a hashtag name this pass of the run has to itself."""
+    return f"#perf-{driver.theme}-{driver.profile.name}"
+
+
+def _act_label_added(driver: Driver) -> None:
+    """`#2279`: #perf and a plain label added from the picker: their chips on the row, picker shut.
+
+    Every theme and profile shares one server, so a later pass finds the labels an earlier one
+    added: a name already on the row is left as it is, one already known is picked, and only a
+    name nobody has added is typed as new."""
+    _label_open_picker(driver)
+    for name in ("#perf", "merge queue"):
+        on_row = bool(driver.js(
+            "[...document.querySelectorAll('" + LABEL_ROW + " .label-chip')].some((c) => c.textContent === "
+            + json.dumps(name) + ")"
+        ))
+        if on_row:
+            continue
+        driver.page.fill("#label-picker-input", name)
+        driver.page.wait_for_function(
+            "(name) => !!document.querySelector('#label-picker-list .label-picker-new') "
+            "|| [...document.querySelectorAll('#label-picker-list li')].some((li) => li.getAttribute('data-value') === name)",
+            arg=name,
+            timeout=10_000,
+        )
+        if bool(driver.js("!!document.querySelector('#label-picker-list .label-picker-new')")):
+            driver.page.locator("#label-picker-input").press("Enter")
+        else:
+            driver.page.locator(f'#label-picker-list li[data-value="{name}"]').click()
+        driver.page.wait_for_function(
+            "(name) => [...document.querySelectorAll('" + LABEL_ROW + " .label-chip')].some((c) => c.textContent === name)",
+            arg=name,
+            timeout=10_000,
+        )
+    driver.click("label-picker-close")
+    driver.page.wait_for_function("() => !window.__visible('label-picker')", timeout=10_000)
+
+
+def _act_label_longpress_sheet(driver: Driver) -> None:
+    """`#2279`: the phone's long press opens the details sheet, Label… beside the bookmark."""
+    _glossary_channel(driver)
+    row = driver.page.locator(LABEL_ROW)
+    row.scroll_into_view_if_needed()
+    # A finger, not a mouse: the page's hold answers touch pointers only (gestures.ts).
+    driver.js(
+        "(() => { const body = document.querySelector('" + LABEL_ROW + " .body'); "
+        "const r = body.getBoundingClientRect(); "
+        "body.dispatchEvent(new PointerEvent('pointerdown', {pointerType: 'touch', pointerId: 7, "
+        "isPrimary: true, bubbles: true, clientX: r.left + r.width / 2, clientY: r.top + 6})); })()"
+    )
+    driver.page.wait_for_function(
+        "() => !!document.querySelector('" + LABEL_ROW + " .msg-details')", timeout=10_000
+    )
+    driver.js(
+        "(() => { const body = document.querySelector('" + LABEL_ROW + " .body'); "
+        "body.dispatchEvent(new PointerEvent('pointerup', {pointerType: 'touch', pointerId: 7, "
+        "isPrimary: true, bubbles: true})); })()"
+    )
+    driver.page.wait_for_function(
+        "() => !!document.querySelector('" + LABEL_ROW + " .msg-details-label')", timeout=10_000
+    )
+
+
+def _act_label_longpress_picker(driver: Driver) -> None:
+    """`#2279`: Label… in the long-press sheet opens the same picker."""
+    _act_label_longpress_sheet(driver)
+    driver.page.locator(LABEL_ROW + " .msg-details-label").click()
+    driver.page.wait_for_function("() => window.__visible('label-picker')", timeout=10_000)
+
+
 def _act_glossary_term_popup(driver: Driver) -> None:
     """`#2233`: a tap on a term the reviewed glossary defines: its popup, with the same Glossary button."""
     _glossary_channel(driver)
@@ -11558,6 +11698,66 @@ SCENES: tuple[Scene, ...] = (
              "!!document.querySelector('[data-read-start=\"true\"]')"),
             ("no read stands for the mark", "document.getElementById('read-steer').hidden === true"),
             ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    # `#2279 vibe-talk-post-facto-labels`: labels added after the fact.
+    Scene(
+        name="150-label-picker-menu",
+        what="#2279 the label picker from a row's ⋯ menu: Pinned built in first, the known labels, a field to add one",
+        act=_act_label_picker_menu,
+        profiles=MATRIX_PROFILES,
+        keep_transient=True,
+        expect=(
+            ("the picker is up", "window.__visible('label-picker')"),
+            ("Pinned is the first row", "document.querySelector('#label-picker-list li').getAttribute('data-value') === 'pinned'"),
+            ("the picker is wholly on screen", "(() => { const r = document.getElementById('label-picker').getBoundingClientRect(); return r.top >= 0 && r.left >= 0 && r.right <= innerWidth && r.bottom <= innerHeight; })()"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="151-label-picker-keyboard",
+        what="#2279 a new #name typed in the picker (Add new label #perf-…); on a phone the keyboard really open (viewport shrunk by 336px), nothing covered",
+        act=_act_label_picker_keyboard,
+        after=_after_label_picker_keyboard,
+        profiles=MATRIX_PROFILES,
+        keep_transient=True,
+        expect=(
+            ("the picker offers the new name", "document.querySelector('#label-picker-list .label-picker-new .label-picker-name').textContent === 'Add new label ' + document.getElementById('label-picker-input').value"),
+            ("the field holds the typed #name", "document.getElementById('label-picker-input').value.startsWith('#perf-')"),
+            ("on a phone the viewport really shrank and the picker stands in what is left", "innerWidth > 600 || ((window.visualViewport ? window.visualViewport.height : innerHeight) <= 579 && document.getElementById('label-picker').getBoundingClientRect().bottom <= window.visualViewport.offsetTop + window.visualViewport.height + 0.5 && document.getElementById('label-picker-input').getBoundingClientRect().bottom <= window.visualViewport.offsetTop + window.visualViewport.height)"),
+        ),
+    ),
+    Scene(
+        name="152-label-added",
+        what="#2279 #perf and the plain label 'merge queue' added from the picker: their chips on the row (one label set), the picker shut",
+        act=_act_label_added,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("the row carries both chips", "(() => { const t = [...document.querySelectorAll('" + LABEL_ROW + " .label-chip')].map((c) => c.textContent); return t.includes('#perf') && t.includes('merge queue'); })()"),
+            ("the plain chip has no #", "document.querySelector('" + LABEL_ROW + " .label-chip-plain').textContent === 'merge queue'"),
+            ("the picker is shut", "!window.__visible('label-picker')"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="153-label-longpress-sheet",
+        what="#2279 the phone's long press: the details sheet with Label… beside Bookmark above",
+        act=_act_label_longpress_sheet,
+        profiles=("android-412",),
+        keep_transient=True,
+        expect=(
+            ("the sheet offers Label…", "document.querySelector('" + LABEL_ROW + " .msg-details-label').textContent === 'Label…'"),
+        ),
+    ),
+    Scene(
+        name="154-label-longpress-picker",
+        what="#2279 Label… from the long-press sheet opens the same picker (phone)",
+        act=_act_label_longpress_picker,
+        profiles=("android-412",),
+        keep_transient=True,
+        expect=(
+            ("the picker is up", "window.__visible('label-picker')"),
+            ("Pinned is the first row", "document.querySelector('#label-picker-list li').getAttribute('data-value') === 'pinned'"),
         ),
     ),
     Scene(

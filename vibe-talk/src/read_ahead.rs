@@ -841,6 +841,8 @@ mod tests {
             content_html: String::new(),
             noise: false,
             labels: Vec::new(),
+            plain_labels: Vec::new(),
+            manual_labels: Vec::new(),
             thread: thread.map(|id| MessageThread {
                 class: None,
                 hue: None,

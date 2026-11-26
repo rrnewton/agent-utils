@@ -597,6 +597,8 @@ pub async fn ingest_event(
                 content_html: String::new(),
                 noise: false,
                 labels: Vec::new(),
+                plain_labels: Vec::new(),
+                manual_labels: Vec::new(),
                 reactions: None,
                 heading: None,
                 mentions: Vec::new(),
@@ -2600,6 +2602,9 @@ pub struct PageResponse {
     /// The revision this channel's pins are at, as on a timeline read. `#206 pin-message`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pins_revision: Option<i64>,
+    /// The menu labels' revision, as on a timeline read (`#2279 vibe-talk-post-facto-labels`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub labels_revision: Option<i64>,
     /// This channel's bookmark, as on a timeline read. `#240 reading-bookmark`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bookmark: Option<crate::store::Bookmark>,
@@ -2643,6 +2648,7 @@ pub async fn page(
     let bookmark = ops::bookmark_state(&state, &step.channel.id).await;
     Ok(Json(PageResponse {
         pins_revision,
+        labels_revision: ops::labels_revision(&state),
         bookmark,
         returned: step.returned(),
         channel: step.channel,
@@ -3002,6 +3008,7 @@ pub async fn transcript_thread(
     Ok(no_store(Json(TimelineResponse {
         pins_revision: None,
         thread_pins_revision: None,
+        labels_revision: None,
         channel_summary: None,
         bookmark: None,
         returned,
@@ -3118,6 +3125,8 @@ pub async fn timeline(
     Ok(no_store(Json(TimelineResponse {
         pins_revision,
         thread_pins_revision: thread_facts.thread_pins_revision,
+        // `#2279`: from memory, no store read: the index is written through on every change.
+        labels_revision: ops::labels_revision(&state),
         channel_summary: thread_facts.channel_summary,
         bookmark,
         returned: page.messages.len() + page.threads.len(),
@@ -7707,6 +7716,8 @@ pub const PURGED: &[&str] = &[
     "noise_rules",
     "noise_exemptions",
     "pins",
+    // `#2279 vibe-talk-post-facto-labels`.
+    "message_labels",
     // `#1550 thread-list-pins`.
     "thread_pins",
     "thread_pin_revisions",
@@ -8810,13 +8821,77 @@ pub async fn labels(
     State(state): State<AppState>,
     _scope: ReadScope,
 ) -> Result<Response, ApiError> {
-    let (labels, groups) = ops::labels(&state).await?;
+    let ops::Labels {
+        labels,
+        plain,
+        groups,
+    } = ops::labels(&state).await?;
     Ok(no_store(Json(crate::contract::LabelsResponse {
         labels,
+        plain,
         groups: groups.groups,
         groups_revision: groups.revision,
         labels_notice: LABELS_NOTICE,
     })))
+}
+
+/// `GET /api/v1/channels/{channel_id}/message-labels` — every message of the channel with a
+/// label added from its menu, as served now (`#2279`). Read scope. Complete for the channel.
+pub async fn message_labels(
+    State(state): State<AppState>,
+    _scope: ReadScope,
+    Path(channel_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let (channel, messages, revision) = ops::channel_message_labels(&state, &channel_id).await?;
+    Ok(no_store(Json(crate::contract::MessageLabelsResponse {
+        channel_id: channel.id,
+        messages,
+        revision,
+    })))
+}
+
+/// `PUT /api/v1/channels/{channel_id}/message-labels/{message_id}` — add one label to one
+/// message from its menu (`#2279 vibe-talk-post-facto-labels`). Idempotent. Write scope.
+/// The body names the label (`{"name": "#kvm"}`); a thread reply is named by its own id.
+pub async fn add_message_label(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Path((channel_id, message_id)): Path<(String, String)>,
+    Json(request): Json<crate::contract::MessageLabelRequest>,
+) -> Result<Response, ApiError> {
+    message_label_answer(&state, &channel_id, message_id, &request.name, true).await
+}
+
+/// `DELETE /api/v1/channels/{channel_id}/message-labels/{message_id}` — remove one label the
+/// menu added (`#2279`). Idempotent. Write scope. A label the message text carries stays, and
+/// the answer says so (`text_derived`).
+pub async fn remove_message_label(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Path((channel_id, message_id)): Path<(String, String)>,
+    Json(request): Json<crate::contract::MessageLabelRequest>,
+) -> Result<Response, ApiError> {
+    message_label_answer(&state, &channel_id, message_id, &request.name, false).await
+}
+
+async fn message_label_answer(
+    state: &AppState,
+    channel_id: &str,
+    message_id: String,
+    name: &str,
+    present: bool,
+) -> Result<Response, ApiError> {
+    let (_channel, outcome) =
+        ops::set_message_label(state, channel_id, &MessageId(message_id), name, present).await?;
+    Ok(no_store(Json(
+        crate::contract::MessageLabelChangeResponse {
+            event: outcome.event,
+            name: outcome.name.stored(),
+            changed: outcome.changed,
+            text_derived: outcome.text_derived,
+            labels_notice: LABELS_NOTICE,
+        },
+    )))
 }
 
 /// `POST /api/v1/label-groups` — combine spellings under one display. Write scope.

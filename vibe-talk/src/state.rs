@@ -170,6 +170,10 @@ pub struct AppState {
     /// startup and replaced on every group edit, so `ops::stamp` (sync) maps
     /// spellings to displays without a store read per serve.
     pub label_groups: Arc<std::sync::RwLock<crate::labels::GroupIndex>>,
+    /// The labels added from message menus as derivation sees them (`#2279
+    /// vibe-talk-post-facto-labels`): loaded from the store at startup and written through on
+    /// every change, so `ops::stamp` (sync) merges them without a store read per serve.
+    pub manual_labels: Arc<std::sync::RwLock<crate::labels::ManualIndex>>,
     /// What the user said lately, as the voice page heard it, and which of their asks to send were
     /// spent. `#511 voice-explicit-send-only`; see [`crate::send_intent`]. In memory.
     pub send_intent: Arc<crate::send_intent::SendIntent>,
@@ -329,6 +333,23 @@ impl AppState {
         );
         *self
             .label_groups
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = index;
+        Ok(count)
+    }
+
+    /// Reload the menu-label index from the store (`#2279`). Called at startup.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::store::StoreError`] when the store cannot be read; the index then keeps its
+    /// previous value (menu labels simply do not show).
+    pub async fn refresh_manual_labels(&self) -> Result<usize, crate::store::StoreError> {
+        let held = self.store.message_labels().await?;
+        let count = held.rows.len();
+        let index = crate::labels::ManualIndex::new(&held.rows, held.revision);
+        *self
+            .manual_labels
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = index;
         Ok(count)

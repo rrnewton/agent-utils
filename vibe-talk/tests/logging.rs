@@ -1938,6 +1938,8 @@ async fn the_message_cache_switch_logs_numbers_and_never_an_id_or_a_word_it_held
         content_html: String::new(),
         noise: false,
         labels: Vec::new(),
+        plain_labels: Vec::new(),
+        manual_labels: Vec::new(),
         reactions: None,
         heading: None,
         sent_refs: Vec::new(),

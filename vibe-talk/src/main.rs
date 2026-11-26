@@ -958,6 +958,9 @@ async fn main() -> anyhow::Result<()> {
         label_groups: Arc::new(std::sync::RwLock::new(
             vibe_talk::labels::GroupIndex::default(),
         )),
+        manual_labels: Arc::new(std::sync::RwLock::new(
+            vibe_talk::labels::ManualIndex::default(),
+        )),
         send_intent: Arc::new(vibe_talk::send_intent::SendIntent::new()),
         reply_reads: Arc::new(vibe_talk::reply_read::ReplyReads::new()),
         live: Arc::clone(&live),
@@ -1052,6 +1055,16 @@ async fn main() -> anyhow::Result<()> {
         }
         Err(vibe_talk::store::StoreError::Unavailable(_)) => {}
         Err(error) => tracing::warn!(%error, "could not restore the label groups"),
+    }
+    // `#2279 vibe-talk-post-facto-labels`. The labels added from message menus.
+    match state.refresh_manual_labels().await {
+        Ok(labels) => {
+            if labels > 0 {
+                tracing::info!(labels, "restored the message labels");
+            }
+        }
+        Err(vibe_talk::store::StoreError::Unavailable(_)) => {}
+        Err(error) => tracing::warn!(%error, "could not restore the message labels"),
     }
     state.refresh_routes();
     // `#628 documents-index-server`. Rebuild the fold from the cache when it

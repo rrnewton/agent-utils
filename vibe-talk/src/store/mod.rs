@@ -1462,6 +1462,40 @@ pub struct LabelGroups {
     pub revision: i64,
 }
 
+/// One label added to a message from its menu (`#2279 vibe-talk-post-facto-labels`): origin
+/// `manual`. Text-derived hashtag labels are never stored; they are derived at serve time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MessageLabelRow {
+    /// The channel the message is in: message ids are per channel.
+    pub channel_id: String,
+    /// The message, by its provider id (a thread reply's own id).
+    pub message_id: String,
+    /// The label as shown and kept: `#kvm` or `merge queue` ([`crate::labels::LabelName`]).
+    pub name: String,
+    /// When it was added, milliseconds since the epoch.
+    pub added_ms: i64,
+}
+
+/// Every menu-added label, oldest first, and the revision they are at (it grows on any change).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MessageLabels {
+    /// Every row, oldest first.
+    pub rows: Vec<MessageLabelRow>,
+    /// See [`StateStore::message_labels`].
+    pub revision: i64,
+}
+
+/// What adding or removing one menu label did (`#2279`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MessageLabelChange {
+    /// Whether the call changed what is stored.
+    pub changed: bool,
+    /// The message's menu-added names after the call, oldest first.
+    pub names: Vec<String>,
+    /// The labels' revision after the call.
+    pub revision: i64,
+}
+
 /// Check a group's display and spellings as the extractor could have typed them:
 /// each a slug (`[a-z0-9_-]`, letter first, already folded), none empty, none
 /// repeated, the display among the spellings.
@@ -2790,6 +2824,22 @@ pub trait StateStore: Send + Sync {
 
     /// Dissolve a label group; its spellings are plain labels again.
     async fn dissolve_label_group(&self, id: i64) -> Result<LabelGroups, StoreError>;
+
+    /// Every label added from a message menu (`#2279 vibe-talk-post-facto-labels`), oldest
+    /// first, with the revision they are at. Server-wide; read once at startup.
+    async fn message_labels(&self) -> Result<MessageLabels, StoreError>;
+
+    /// Add (`present`) or remove one menu label of one message. Idempotent. `name` is already
+    /// normalized ([`crate::labels::LabelName::stored`]). Refuses an add past
+    /// [`crate::labels::MAX_MANUAL_LABELS_PER_MESSAGE`] on the message or
+    /// [`crate::labels::MAX_MANUAL_LABEL_ROWS`] in all, as [`StoreError::TooLarge`].
+    async fn set_message_label(
+        &self,
+        channel: &ChannelId,
+        message: &MessageId,
+        name: &str,
+        present: bool,
+    ) -> Result<MessageLabelChange, StoreError>;
 
     /// This channel's bookmark and the revision it is at. `#240 reading-bookmark`.
     ///

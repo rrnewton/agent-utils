@@ -36,6 +36,8 @@ export interface LiveStreamDependencies {
   onSettingsFrame(frame: LiveFrame): void;
   /** `#2264`: the server's walk of a view's older history ended (`takeOlderEvent`). */
   onOlderEvent(event: { channel_id?: unknown; view?: unknown; thread_id?: unknown; before?: unknown; ok?: unknown }): void;
+  /** `#2279`: a message's labels changed from a message menu (a `LiveLabelsEvent`). */
+  onLabelsEvent?(event: unknown): void;
   hiddenNow(): boolean;
   noteHiddenMessage(): void;
   relayToAgent(message: Message, selfPosted: boolean, replayed?: boolean, arrival?: unknown): void;
@@ -224,6 +226,18 @@ function onStreamFrame(frame: LiveFrame): void {
       return;
     }
     if (deps.contractIs("LiveOlderEvent", event)) deps.onOlderEvent(event);
+    return;
+  }
+  // `#2279 vibe-talk-post-facto-labels`. A message's labels changed from a message menu, here or
+  // on another device: the whole state for one message, carrying no cursor of its own.
+  if (frame.event === "labels") {
+    let event = null;
+    try {
+      event = JSON.parse(frame.data || "null");
+    } catch (_error) {
+      return;
+    }
+    if (deps.contractIs("LiveLabelsEvent", event)) deps.onLabelsEvent?.(event);
     return;
   }
   if (!frame.data) {

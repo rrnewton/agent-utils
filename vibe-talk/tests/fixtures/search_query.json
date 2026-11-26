@@ -982,6 +982,58 @@
     "label",
     "pinned"
    ]
+  },
+  {
+   "query": "label:#kvm",
+   "tree": [
+    "label",
+    "#kvm"
+   ]
+  },
+  {
+   "query": "label:#KVM",
+   "tree": [
+    "label",
+    "#kvm"
+   ]
+  },
+  {
+   "query": "label:\"Merge  Queue\"",
+   "tree": [
+    "label",
+    "\"merge queue\""
+   ]
+  },
+  {
+   "query": "-label:\"merge queue\"",
+   "tree": [
+    "not",
+    [
+     "label",
+     "\"merge queue\""
+    ]
+   ]
+  },
+  {
+   "query": "label:\"#KVM\"",
+   "tree": [
+    "label",
+    "#kvm"
+   ]
+  },
+  {
+   "query": "label:\"Pinned\"",
+   "tree": [
+    "label",
+    "pinned"
+   ]
+  },
+  {
+   "query": "label:\"\"",
+   "tree": [
+    "word",
+    "label:"
+   ]
   }
  ],
  "match": [
@@ -1613,6 +1665,133 @@
      "kvm"
     ],
     "pinned": true
+   },
+   "matches": true
+  },
+  {
+   "query": "label:#kvm",
+   "message": {
+    "author": "Ada",
+    "text": "fixed #kvm",
+    "created": "2026-10-24T10:00:00Z",
+    "labels": [
+     "kvm"
+    ]
+   },
+   "matches": true
+  },
+  {
+   "query": "label:#kvm",
+   "message": {
+    "author": "Ada",
+    "text": "fixed",
+    "created": "2026-10-24T10:00:00Z",
+    "labels": [],
+    "plain_labels": [
+     "kvm"
+    ]
+   },
+   "matches": false
+  },
+  {
+   "query": "label:kvm",
+   "message": {
+    "author": "Ada",
+    "text": "fixed",
+    "created": "2026-10-24T10:00:00Z",
+    "labels": [],
+    "plain_labels": [
+     "kvm"
+    ]
+   },
+   "matches": true
+  },
+  {
+   "query": "label:\"merge queue\"",
+   "message": {
+    "author": "Ada",
+    "text": "fixed",
+    "created": "2026-10-24T10:00:00Z",
+    "labels": [],
+    "plain_labels": [
+     "merge queue"
+    ]
+   },
+   "matches": true
+  },
+  {
+   "query": "label:\"Merge Queue\"",
+   "message": {
+    "author": "Ada",
+    "text": "fixed",
+    "created": "2026-10-24T10:00:00Z",
+    "labels": [],
+    "plain_labels": [
+     "merge queue"
+    ]
+   },
+   "matches": true
+  },
+  {
+   "query": "label:\"merge queue\"",
+   "message": {
+    "author": "Ada",
+    "text": "fixed",
+    "created": "2026-10-24T10:00:00Z",
+    "labels": [
+     "merge"
+    ],
+    "plain_labels": []
+   },
+   "matches": false
+  },
+  {
+   "query": "-label:\"merge queue\"",
+   "message": {
+    "author": "Ada",
+    "text": "fixed",
+    "created": "2026-10-24T10:00:00Z",
+    "labels": [],
+    "plain_labels": [
+     "merge queue"
+    ]
+   },
+   "matches": false
+  },
+  {
+   "query": "label:#pinned",
+   "message": {
+    "author": "Ada",
+    "text": "fixed",
+    "created": "2026-10-24T10:00:00Z",
+    "labels": [],
+    "plain_labels": []
+   },
+   "matches": false
+  },
+  {
+   "query": "label:\"kvm\"",
+   "message": {
+    "author": "Ada",
+    "text": "fixed",
+    "created": "2026-10-24T10:00:00Z",
+    "labels": [
+     "kvm"
+    ],
+    "plain_labels": []
+   },
+   "matches": false
+  },
+  {
+   "query": "label:\"kvm\"",
+   "message": {
+    "author": "Ada",
+    "text": "fixed",
+    "created": "2026-10-24T10:00:00Z",
+    "labels": [],
+    "plain_labels": [
+     "kvm"
+    ]
    },
    "matches": true
   }

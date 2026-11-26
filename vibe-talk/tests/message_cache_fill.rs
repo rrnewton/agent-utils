@@ -60,6 +60,8 @@ fn message(channel: &str, at_ms: i64, text: &str) -> Message {
         content_html: String::new(),
         noise: false,
         labels: Vec::new(),
+        plain_labels: Vec::new(),
+        manual_labels: Vec::new(),
         reactions: None,
         heading: None,
         sent_refs: Vec::new(),

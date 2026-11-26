@@ -1931,6 +1931,7 @@ async fn the_purge_route_erases_all_three_records_and_leaves_the_store_usable() 
             "noise_rules",
             "noise_exemptions",
             "pins",
+            "message_labels",
             "thread_pins",
             "thread_pin_revisions",
             "bookmarks",

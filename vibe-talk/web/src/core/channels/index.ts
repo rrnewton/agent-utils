@@ -91,3 +91,13 @@ export { DEFAULT_ROW_PX, correctionFor, estimatedHeightFor, forgetHeight, height
 export { createHydrationPacer } from "./hydration.ts";
 export type { HydrationPacer } from "./hydration.ts";
 export type { RowClass } from "./heights.ts";
+export {
+  LABEL_LIMITS,
+  checkLabelName,
+  labelNamesOf,
+  labelQueryFor,
+  loneLabelName,
+  withLabelState,
+  withoutMenuLabels,
+} from "./labels.ts";
+export type { LabelNameCheck, LabelState, LabelledMessage } from "./labels.ts";

@@ -617,6 +617,9 @@ impl SqliteStore {
         // before. A future ladder step that touches them must CREATE IF NOT
         // EXISTS and adopt them, never assume their absence.
         ensure_label_group_tables(&connection)?;
+        // `#2279 vibe-talk-post-facto-labels`: the labels added from a message's
+        // menu live outside the ladder for the label groups' reason above.
+        ensure_message_label_tables(&connection)?;
         // `#1840 vibe-talk-draft-sync-across-devices`: synced composer drafts
         // live OUTSIDE the migration ladder for the thread_class reason above:
         // purely additive, so a rolled-back binary opens the database and
@@ -774,6 +777,114 @@ fn ensure_label_group_tables(connection: &Connection) -> Result<(), StoreError> 
             ",
         )
         .map_err(backend)
+}
+
+/// The menu-label tables (`#2279 vibe-talk-post-facto-labels`), created if absent. NOT a
+/// migration, for [`ensure_label_group_tables`]' reason: purely additive, so an older binary
+/// opens the database and never reads them, and `user_version` stays where it was. `origin` is
+/// `manual` for every row today; it is there so later origins (#2234's glossary) can share the
+/// table without a change of shape.
+fn ensure_message_label_tables(connection: &Connection) -> Result<(), StoreError> {
+    connection
+        .execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS message_labels (
+                channel_id TEXT    NOT NULL,
+                message_id TEXT    NOT NULL,
+                name       TEXT    NOT NULL,
+                origin     TEXT    NOT NULL DEFAULT 'manual',
+                added_ms   INTEGER NOT NULL,
+                PRIMARY KEY (channel_id, message_id, name)
+            ) STRICT;
+
+            CREATE TABLE IF NOT EXISTS message_label_state (
+                id       INTEGER PRIMARY KEY CHECK (id = 1),
+                revision INTEGER NOT NULL
+            ) STRICT;
+            ",
+        )
+        .map_err(backend)
+}
+
+/// Every menu label in `connection`, oldest first, with their revision.
+fn message_labels_in(connection: &Connection) -> Result<super::MessageLabels, StoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT channel_id, message_id, name, added_ms FROM message_labels \
+             WHERE origin = 'manual' ORDER BY added_ms, rowid",
+        )
+        .map_err(backend)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(super::MessageLabelRow {
+                channel_id: row.get(0)?,
+                message_id: row.get(1)?,
+                name: row.get(2)?,
+                added_ms: row.get(3)?,
+            })
+        })
+        .map_err(backend)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(backend)?);
+    }
+    let revision: i64 = connection
+        .query_row(
+            "SELECT revision FROM message_label_state WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(backend)?
+        .unwrap_or(0);
+    Ok(super::MessageLabels {
+        rows: out,
+        revision,
+    })
+}
+
+/// One message's menu labels, oldest first.
+fn message_label_names(
+    connection: &Connection,
+    channel: &str,
+    message: &str,
+) -> Result<Vec<String>, StoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT name FROM message_labels WHERE channel_id = ?1 AND message_id = ?2 \
+             AND origin = 'manual' ORDER BY added_ms, rowid",
+        )
+        .map_err(backend)?;
+    let rows = statement
+        .query_map(rusqlite::params![channel, message], |row| row.get(0))
+        .map_err(backend)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(backend)?);
+    }
+    Ok(out)
+}
+
+/// Advance the menu labels' revision, as the pins' revisions advance.
+fn bump_message_label_revision(connection: &Connection) -> Result<i64, StoreError> {
+    let previous: i64 = connection
+        .query_row(
+            "SELECT revision FROM message_label_state WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(backend)?
+        .unwrap_or(0);
+    let revision = super::next_pin_revision(previous, now_ms());
+    connection
+        .execute(
+            "INSERT INTO message_label_state (id, revision) VALUES (1, ?1) \
+             ON CONFLICT(id) DO UPDATE SET revision = excluded.revision",
+            rusqlite::params![revision],
+        )
+        .map_err(backend)?;
+    Ok(revision)
 }
 
 /// Every label group in `connection`, by display, with the shared revision.
@@ -3548,6 +3659,88 @@ impl StateStore for SqliteStore {
         .await
     }
 
+    async fn message_labels(&self) -> Result<super::MessageLabels, StoreError> {
+        self.with_connection(move |connection| message_labels_in(connection))
+            .await
+    }
+
+    async fn set_message_label(
+        &self,
+        channel: &ChannelId,
+        message: &MessageId,
+        name: &str,
+        present: bool,
+    ) -> Result<super::MessageLabelChange, StoreError> {
+        super::validate_pin_id(message)?;
+        let channel = channel.as_str().to_owned();
+        let message = message.as_str().to_owned();
+        let name = name.to_owned();
+        self.with_connection(move |connection| {
+            let transaction = connection.transaction().map_err(backend)?;
+            let held = message_label_names(&transaction, &channel, &message)?;
+            let has = held.contains(&name);
+            if has == present {
+                let revision: i64 = transaction
+                    .query_row(
+                        "SELECT revision FROM message_label_state WHERE id = 1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(backend)?
+                    .unwrap_or(0);
+                return Ok(super::MessageLabelChange {
+                    changed: false,
+                    names: held,
+                    revision,
+                });
+            }
+            if present {
+                if held.len() >= crate::labels::MAX_MANUAL_LABELS_PER_MESSAGE {
+                    return Err(StoreError::TooLarge(format!(
+                        "a message holds at most {} labels added from its menu",
+                        crate::labels::MAX_MANUAL_LABELS_PER_MESSAGE
+                    )));
+                }
+                let total: i64 = transaction
+                    .query_row("SELECT COUNT(*) FROM message_labels", [], |row| row.get(0))
+                    .map_err(backend)?;
+                if usize::try_from(total).unwrap_or(usize::MAX)
+                    >= crate::labels::MAX_MANUAL_LABEL_ROWS
+                {
+                    return Err(StoreError::TooLarge(format!(
+                        "this server holds at most {} labels added from message menus",
+                        crate::labels::MAX_MANUAL_LABEL_ROWS
+                    )));
+                }
+                transaction
+                    .execute(
+                        "INSERT INTO message_labels (channel_id, message_id, name, origin, added_ms) \
+                         VALUES (?1, ?2, ?3, 'manual', ?4)",
+                        rusqlite::params![channel, message, name, now_ms()],
+                    )
+                    .map_err(backend)?;
+            } else {
+                transaction
+                    .execute(
+                        "DELETE FROM message_labels WHERE channel_id = ?1 AND message_id = ?2 \
+                         AND name = ?3",
+                        rusqlite::params![channel, message, name],
+                    )
+                    .map_err(backend)?;
+            }
+            let revision = bump_message_label_revision(&transaction)?;
+            let names = message_label_names(&transaction, &channel, &message)?;
+            transaction.commit().map_err(backend)?;
+            Ok(super::MessageLabelChange {
+                changed: true,
+                names,
+                revision,
+            })
+        })
+        .await
+    }
+
     async fn bookmark(&self, channel: &ChannelId) -> Result<Bookmark, StoreError> {
         let channel = channel.clone();
         self.with_connection(move |connection| bookmark_row(connection, channel.as_str()))
@@ -4135,6 +4328,14 @@ impl StateStore for SqliteStore {
             // pin's revision starts from the clock, past every one handed out before.
             transaction
                 .execute("DELETE FROM pins", [])
+                .map_err(backend)?;
+            // `#2279`: the labels added from message menus go with the pins, and their
+            // revision with them.
+            transaction
+                .execute("DELETE FROM message_labels", [])
+                .map_err(backend)?;
+            transaction
+                .execute("DELETE FROM message_label_state", [])
                 .map_err(backend)?;
             transaction
                 .execute("DELETE FROM pin_revisions", [])
@@ -5066,6 +5267,107 @@ mod tests {
             .await
             .expect("dissolve");
         assert!(gone.groups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn message_labels_round_trip_bound_and_survive_reopen_without_moving_the_ladder() {
+        // `#2279 vibe-talk-post-facto-labels`: menu labels keyed by (channel, message, name),
+        // idempotent both ways, bounded per message, kept across a reopen, outside the ladder.
+        let dir = TempDir::new("sqlite-message-labels");
+        let file = dir.path().join("state").join("vibe-talk.sqlite3");
+        let store = SqliteStore::open(&file, Retention::default()).expect("open");
+        let channel = ChannelId("C1".to_owned());
+        let other = ChannelId("C2".to_owned());
+        let message = MessageId("1700000000.000100".to_owned());
+        assert!(store.message_labels().await.expect("read").rows.is_empty());
+
+        let added = store
+            .set_message_label(&channel, &message, "#kvm", true)
+            .await
+            .expect("add");
+        assert!(added.changed);
+        assert_eq!(added.names, vec!["#kvm".to_owned()]);
+        assert!(added.revision > 0);
+        let again = store
+            .set_message_label(&channel, &message, "#kvm", true)
+            .await
+            .expect("add again");
+        assert!(!again.changed, "an add is idempotent");
+        assert_eq!(again.revision, added.revision);
+        let plain = store
+            .set_message_label(&channel, &message, "merge queue", true)
+            .await
+            .expect("add plain");
+        assert_eq!(
+            plain.names,
+            vec!["#kvm".to_owned(), "merge queue".to_owned()]
+        );
+        assert!(plain.revision > added.revision);
+        // Message ids are per channel: the same id in another channel is another message.
+        let elsewhere = store
+            .set_message_label(&other, &message, "#perf", true)
+            .await
+            .expect("other channel");
+        assert_eq!(elsewhere.names, vec!["#perf".to_owned()]);
+
+        // The per-message bound.
+        let crowded = MessageId("1700000000.000200".to_owned());
+        for n in 0..crate::labels::MAX_MANUAL_LABELS_PER_MESSAGE {
+            store
+                .set_message_label(&channel, &crowded, &format!("#l{n}"), true)
+                .await
+                .expect("within the bound");
+        }
+        let refused = store
+            .set_message_label(&channel, &crowded, "#onemore", true)
+            .await
+            .expect_err("past the bound");
+        assert!(matches!(refused, StoreError::TooLarge(_)), "{refused}");
+
+        // Reopen: kept, and the ensure step neither fails nor moves `user_version`.
+        drop(store);
+        let reopened = SqliteStore::open(&file, Retention::default()).expect("reopen");
+        let held = reopened.message_labels().await.expect("read back");
+        let ours: Vec<&str> = held
+            .rows
+            .iter()
+            .filter(|row| row.channel_id == "C1" && row.message_id == message.as_str())
+            .map(|row| row.name.as_str())
+            .collect();
+        assert_eq!(ours, ["#kvm", "merge queue"]);
+        {
+            let guard = reopened
+                .connection
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let version: i64 = guard
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .expect("version");
+            assert_eq!(
+                usize::try_from(version).expect("version"),
+                MIGRATIONS.len(),
+                "the menu-label tables must not move user_version"
+            );
+        }
+
+        // Remove: idempotent, and only that name of that message.
+        let removed = reopened
+            .set_message_label(&channel, &message, "#kvm", false)
+            .await
+            .expect("remove");
+        assert!(removed.changed);
+        assert_eq!(removed.names, vec!["merge queue".to_owned()]);
+        let removed_again = reopened
+            .set_message_label(&channel, &message, "#kvm", false)
+            .await
+            .expect("remove again");
+        assert!(!removed_again.changed);
+
+        // The purge takes them, revision and all.
+        reopened.purge_everything().await.expect("purge");
+        let after = reopened.message_labels().await.expect("read");
+        assert!(after.rows.is_empty());
+        assert_eq!(after.revision, 0);
     }
 
     #[test]
@@ -8721,7 +9023,8 @@ mod tests {
                  DROP TABLE IF EXISTS post_keys; DROP TABLE IF EXISTS thread_hue_tombstones;
                  DROP TABLE IF EXISTS read_mark_epochs; DROP TABLE IF EXISTS client_settings;
                  DROP TABLE IF EXISTS thread_hues;
-                 DROP TABLE IF EXISTS label_group_spellings; DROP TABLE IF EXISTS label_groups; DROP TABLE IF EXISTS label_group_state;",
+                 DROP TABLE IF EXISTS label_group_spellings; DROP TABLE IF EXISTS label_groups; DROP TABLE IF EXISTS label_group_state;
+                 DROP TABLE IF EXISTS message_labels; DROP TABLE IF EXISTS message_label_state;",
             )
             .expect("undo the later steps");
         let pasted: String = statements.iter().map(|line| format!("{line}\n")).collect();

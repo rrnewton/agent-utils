@@ -33,6 +33,8 @@ test("the details sheet names who and when, every id, and bookmarks above the ro
     bookmarkAbove: () => false,
     toggleBookmarkAt: () => calls.push("toggleBookmark"),
     inThisColumn: (act) => act,
+    // `#2279`: the long-press sheet's Label… opens the picker.
+    openLabelPicker: (messages, _row, anchor) => calls.push(`labels ${messages.map((m) => m.id).join("+")} ${anchor.textContent}`),
   });
   const row = fakeElement("li");
   row.removeChild = (kid) => { row.children = row.children.filter((held) => held !== kid); };
@@ -45,7 +47,11 @@ test("the details sheet names who and when, every id, and bookmarks above the ro
     sheet.children[1].textContent,
     "id m1 + m2",
     "Bookmark above",
+    "Label…",
   ]);
+  sheet.children[4].listeners.click();
+  assert.deepEqual(calls, ["labels m1+m2 Label…"], "Label… did not open the picker for the row's messages");
+  calls.length = 0;
   assert.equal(sheet.children[1].textContent, PRESENT_TIME.fullLocalTime(message()), "the when line is the full local time");
   sheet.children[3].listeners.click();
   assert.deepEqual(calls, ["toggleBookmark"]);

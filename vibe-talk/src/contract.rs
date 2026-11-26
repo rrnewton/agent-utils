@@ -626,6 +626,10 @@ pub struct LabelCount {
 pub struct LabelsResponse {
     /// Every label, grouped spellings folded into their display, by name.
     pub labels: Vec<LabelCount>,
+    /// Every plain label (a name without `#`, added from a message menu, `#2279`), by name.
+    /// Absent or empty for none; an older server never sends it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plain: Vec<LabelCount>,
     /// Every label group, as stored.
     pub groups: Vec<crate::store::LabelGroup>,
     /// The revision the groups are at; a page compares it to notice edits.
@@ -981,6 +985,14 @@ pub struct TimelineResponse {
     /// cannot say, and from an older server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_pins_revision: Option<i64>,
+    /// The revision the labels added from message menus are at, server-wide (`#2279
+    /// vibe-talk-post-facto-labels`). On every read, newest page and delta alike, as
+    /// `pins_revision` is and for its reason: a page that missed a `labels` live event (asleep,
+    /// offline, a dropped stream) learns from a read it makes anyway that labels changed, and reads
+    /// the channel's list (`GET /api/v1/channels/{channel}/message-labels`) to bring every copy it
+    /// holds current. Absent when no store is configured, and from an older server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels_revision: Option<i64>,
     /// What this server knows of the channel's threads as a whole. Absent when its cache
     /// cannot say, and from an older server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1557,6 +1569,71 @@ pub struct LiveOlderEvent {
     pub before: String,
     /// Whether the walk brought what it read; false when it failed or gave up.
     pub ok: bool,
+}
+
+/// One message's labels changed from a message menu (`#2279 vibe-talk-post-facto-labels`), on
+/// this or another device. Carried on the live streams as SSE event `labels`, with no `id` (as a
+/// settings or older event has none), so it never moves a resume cursor. The state is whole,
+/// not a delta: a page sets the message's three label fields to these, ignoring an event whose
+/// `revision` is older than one it already applied. A page that missed the event learns the same
+/// labels from its next read of the message, since every read merges them at serve time.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct LiveLabelsEvent {
+    /// The channel the message is in.
+    pub channel_id: ChannelId,
+    /// The message, by its own id (a thread reply's own id).
+    pub message_id: crate::model::MessageId,
+    /// [`crate::model::Message::labels`] as served now.
+    pub labels: Vec<String>,
+    /// [`crate::model::Message::plain_labels`] as served now.
+    pub plain_labels: Vec<String>,
+    /// [`crate::model::Message::manual_labels`] as served now.
+    pub manual_labels: Vec<String>,
+    /// Whether `labels` was derived from this server's copy of the message text. False when
+    /// the server holds no copy: `labels` then names only the menu-added hashtag labels, and a
+    /// page keeps the typed ones it already shows beside them.
+    pub derived: bool,
+    /// The labels' revision after the change.
+    pub revision: i64,
+}
+
+/// `GET /api/v1/channels/{channel_id}/message-labels` (`#2279`): every message of the channel
+/// that carries a label added from its menu, each with its labels as served now. The list is
+/// COMPLETE for the channel: a page bringing its copies current after a missed event applies each
+/// entry, and strips the menu labels from any held message the list does not name.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct MessageLabelsResponse {
+    /// The channel.
+    pub channel_id: ChannelId,
+    /// Every message with a menu label, each as a `labels` event would carry it.
+    pub messages: Vec<LiveLabelsEvent>,
+    /// The labels' revision this list is at.
+    pub revision: i64,
+}
+
+/// `PUT` or `DELETE /api/v1/channels/{channel_id}/message-labels/{message_id}` (`#2279`): the
+/// label to add or remove, as the owner typed it (`#kvm`, `merge queue`). The server normalizes it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct MessageLabelRequest {
+    /// The label's name. A leading `#` makes it a hashtag label.
+    pub name: String,
+}
+
+/// The answer to a message-label add or remove (`#2279`): the message's labels after it, the same
+/// state the `labels` live event carries to every other page.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct MessageLabelChangeResponse {
+    /// The labels now, as the live event carries them.
+    pub event: LiveLabelsEvent,
+    /// The name as normalized and stored (`#kvm`, `merge queue`).
+    pub name: String,
+    /// Whether the call changed what is stored.
+    pub changed: bool,
+    /// For a remove: the label stays because the message text carries it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub text_derived: bool,
+    /// The standing statement that labels are this server's own.
+    pub labels_notice: &'static str,
 }
 
 /// Who spoke a `vibe-talk-v1` transcript line.
@@ -2220,6 +2297,11 @@ fn roots(generator: &mut schemars::SchemaGenerator) -> Vec<schemars::Schema> {
         generator.subschema_for::<DeleteComposerDraftRequest>(),
         // `#2264 vibe-talk-all-view-older-load-stuck`. Appended, for the same reason.
         generator.subschema_for::<LiveOlderEvent>(),
+        // `#2279 vibe-talk-post-facto-labels`. Appended, for the same reason.
+        generator.subschema_for::<LiveLabelsEvent>(),
+        generator.subschema_for::<MessageLabelRequest>(),
+        generator.subschema_for::<MessageLabelChangeResponse>(),
+        generator.subschema_for::<MessageLabelsResponse>(),
     ]
 }
 

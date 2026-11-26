@@ -90,6 +90,8 @@ impl Thread {
             content_html: String::new(),
             noise: false,
             labels: Vec::new(),
+            plain_labels: Vec::new(),
+            manual_labels: Vec::new(),
             timestamp: iso(self.start_ms + i64::try_from(n).expect("small") * MINUTE_MS),
             spoken_time: String::new(),
             reply_to: None,

@@ -1837,6 +1837,13 @@
         "labels_notice": {
           "description": "The standing statement that these labels are this server's own.",
           "type": "string"
+        },
+        "plain": {
+          "description": "Every plain label (a name without `#`, added from a message menu, `#2279`), by name.\nAbsent or empty for none; an older server never sends it.",
+          "items": {
+            "$ref": "#/$defs/LabelCount"
+          },
+          "type": "array"
         }
       },
       "required": [
@@ -1902,6 +1909,59 @@
           "type": "string"
         }
       ]
+    },
+    "LiveLabelsEvent": {
+      "description": "One message's labels changed from a message menu (`#2279 vibe-talk-post-facto-labels`), on\nthis or another device. Carried on the live streams as SSE event `labels`, with no `id` (as a\nsettings or older event has none), so it never moves a resume cursor. The state is whole,\nnot a delta: a page sets the message's three label fields to these, ignoring an event whose\n`revision` is older than one it already applied. A page that missed the event learns the same\nlabels from its next read of the message, since every read merges them at serve time.",
+      "properties": {
+        "channel_id": {
+          "$ref": "#/$defs/ChannelId",
+          "description": "The channel the message is in."
+        },
+        "derived": {
+          "description": "Whether `labels` was derived from this server's copy of the message text. False when\nthe server holds no copy: `labels` then names only the menu-added hashtag labels, and a\npage keeps the typed ones it already shows beside them.",
+          "type": "boolean"
+        },
+        "labels": {
+          "description": "[`crate::model::Message::labels`] as served now.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "manual_labels": {
+          "description": "[`crate::model::Message::manual_labels`] as served now.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "message_id": {
+          "$ref": "#/$defs/MessageId",
+          "description": "The message, by its own id (a thread reply's own id)."
+        },
+        "plain_labels": {
+          "description": "[`crate::model::Message::plain_labels`] as served now.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "revision": {
+          "description": "The labels' revision after the change.",
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "channel_id",
+        "message_id",
+        "labels",
+        "plain_labels",
+        "manual_labels",
+        "derived",
+        "revision"
+      ],
+      "type": "object"
     },
     "LiveMessageEvent": {
       "description": "The data of a live stream `message` or `message_update` event.",
@@ -2048,7 +2108,14 @@
           "description": "Snowflake of this message."
         },
         "labels": {
-          "description": "The hashtag labels of this message (`#1825 vibe-talk-hashtag-labels`), derived by\n[`crate::labels::extract_hashtags`] from `content` EVERY TIME the message is served\n(in [`crate::ops::stamp`], as `noise` is decided) — never stored and never trusted\nfrom whoever sent the message, so an edit updates the labels with the text. Bare\nslugs (`kvm`); auto-generated topics will carry an `auto:` prefix when they exist.\nEMPTY means the text holds no hashtag. Absent from an older server means the same.",
+          "description": "The hashtag labels of this message (`#1825 vibe-talk-hashtag-labels`), derived by\n[`crate::labels::extract_hashtags`] from `content` EVERY TIME the message is served\n(in [`crate::ops::stamp`], as `noise` is decided) — never stored and never trusted\nfrom whoever sent the message, so an edit updates the labels with the text. Bare\nslugs (`kvm`); auto-generated topics will carry an `auto:` prefix when they exist.\nEMPTY means the text holds no hashtag. Absent from an older server means the same.\n\n`#2279 vibe-talk-post-facto-labels`: the hashtag labels added from the message menu join\nthe typed ones here, so a menu-added `#kvm` is the same label as a typed one.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "manual_labels": {
+          "description": "The labels added from the menu that the text does not also carry, by name as shown\n(`#kvm`, `merge queue`): exactly the ones the menu may remove (`#2279`). A label the text\ncarries stays while the text has it. EMPTY for none.",
           "items": {
             "type": "string"
           },
@@ -2072,6 +2139,13 @@
             "string",
             "null"
           ]
+        },
+        "plain_labels": {
+          "description": "The plain labels (names without `#`, folded: `merge queue`) added to this message from\nits menu (`#2279 vibe-talk-post-facto-labels`), merged at serve time like `labels`. The\nhashtag labels are the subset of all labels whose names begin with `#`; these are the\nrest. EMPTY for none; absent from an older server means the same.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         },
         "reactions": {
           "description": "The emoji people reacted to this message with, and how many of each. `#219\nemoji-reactions`.\n\nABSENT AND EMPTY ARE DIFFERENT ANSWERS. Absent (`None`) means this copy came by a path that\ncannot see reactions: a provider that does not report them, or a live echo of a message,\nwhich carries none. Empty means the source looked and there are none. So a live copy\nwithout reactions never overwrites a held copy that has them — the echo of a message\narrives after the read that brought its acknowledgements — while a read replaces them, as\nit replaces the rest of the message. Discord omits the array when there are none, so on\nthat provider absent from a read means none. Slack omits it too, and so does a Slack bridge\nthat cannot supply reactions, so there it stays \"not reported\" (`#312 slack-reactions`).\n\nCounts, and whether the owner is among those who reacted, never who else did: that is a\nseparate question for each emoji, and asking it would hand this server identities it has\nno use for. UNTRUSTED: a custom emoji's name is written by whoever made it.",
@@ -2287,6 +2361,78 @@
     "MessageId": {
       "description": "A Discord message snowflake, as a string.",
       "type": "string"
+    },
+    "MessageLabelChangeResponse": {
+      "description": "The answer to a message-label add or remove (`#2279`): the message's labels after it, the same\nstate the `labels` live event carries to every other page.",
+      "properties": {
+        "changed": {
+          "description": "Whether the call changed what is stored.",
+          "type": "boolean"
+        },
+        "event": {
+          "$ref": "#/$defs/LiveLabelsEvent",
+          "description": "The labels now, as the live event carries them."
+        },
+        "labels_notice": {
+          "description": "The standing statement that labels are this server's own.",
+          "type": "string"
+        },
+        "name": {
+          "description": "The name as normalized and stored (`#kvm`, `merge queue`).",
+          "type": "string"
+        },
+        "text_derived": {
+          "description": "For a remove: the label stays because the message text carries it.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "event",
+        "name",
+        "changed",
+        "labels_notice"
+      ],
+      "type": "object"
+    },
+    "MessageLabelRequest": {
+      "description": "`PUT` or `DELETE /api/v1/channels/{channel_id}/message-labels/{message_id}` (`#2279`): the\nlabel to add or remove, as the owner typed it (`#kvm`, `merge queue`). The server normalizes it.",
+      "properties": {
+        "name": {
+          "description": "The label's name. A leading `#` makes it a hashtag label.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "MessageLabelsResponse": {
+      "description": "`GET /api/v1/channels/{channel_id}/message-labels` (`#2279`): every message of the channel\nthat carries a label added from its menu, each with its labels as served now. The list is\nCOMPLETE for the channel: a page bringing its copies current after a missed event applies each\nentry, and strips the menu labels from any held message the list does not name.",
+      "properties": {
+        "channel_id": {
+          "$ref": "#/$defs/ChannelId",
+          "description": "The channel."
+        },
+        "messages": {
+          "description": "Every message with a menu label, each as a `labels` event would carry it.",
+          "items": {
+            "$ref": "#/$defs/LiveLabelsEvent"
+          },
+          "type": "array"
+        },
+        "revision": {
+          "description": "The labels' revision this list is at.",
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "channel_id",
+        "messages",
+        "revision"
+      ],
+      "type": "object"
     },
     "MessageThread": {
       "description": "Thread membership attached to a message without conflating it with a reply reference.",
@@ -4042,6 +4188,14 @@
           "description": "Whether accessible threads exist in this channel.",
           "type": "boolean"
         },
+        "labels_revision": {
+          "description": "The revision the labels added from message menus are at, server-wide (`#2279\nvibe-talk-post-facto-labels`). On every read, newest page and delta alike, as\n`pins_revision` is and for its reason: a page that missed a `labels` live event (asleep,\noffline, a dropped stream) learns from a read it makes anyway that labels changed, and reads\nthe channel's list (`GET /api/v1/channels/{channel}/message-labels`) to bring every copy it\nholds current. Absent when no store is configured, and from an older server.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "limit": {
           "description": "Page size actually requested.",
           "format": "uint16",
@@ -5272,6 +5426,18 @@
     },
     {
       "$ref": "#/$defs/LiveOlderEvent"
+    },
+    {
+      "$ref": "#/$defs/LiveLabelsEvent"
+    },
+    {
+      "$ref": "#/$defs/MessageLabelRequest"
+    },
+    {
+      "$ref": "#/$defs/MessageLabelChangeResponse"
+    },
+    {
+      "$ref": "#/$defs/MessageLabelsResponse"
     }
   ],
   "description": "Generated from vibe-talk/src/contract.rs by `make -C vibe-talk contract`. Do not edit.",

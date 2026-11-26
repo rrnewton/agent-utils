@@ -113,6 +113,9 @@ struct State {
     label_groups: BTreeMap<i64, super::LabelGroup>,
     label_group_revision: i64,
     next_label_group_id: i64,
+    /// Menu-added labels, oldest first, and their revision. `#2279`.
+    message_labels: Vec<super::MessageLabelRow>,
+    message_label_revision: i64,
     /// `(channel, thread)` to its explicit thread-pin state. `#1550 thread-list-pins`.
     thread_pins: BTreeMap<(String, String), bool>,
     /// Channel to its thread-pin revision.
@@ -1655,6 +1658,73 @@ impl StateStore for FakeStore {
         })
     }
 
+    async fn message_labels(&self) -> Result<super::MessageLabels, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        Ok(super::MessageLabels {
+            rows: state.message_labels.clone(),
+            revision: state.message_label_revision,
+        })
+    }
+
+    async fn set_message_label(
+        &self,
+        channel: &ChannelId,
+        message: &MessageId,
+        name: &str,
+        present: bool,
+    ) -> Result<super::MessageLabelChange, StoreError> {
+        super::validate_pin_id(message)?;
+        let mut state = self.lock();
+        armed(&mut state)?;
+        let names_of = |state: &State| -> Vec<String> {
+            state
+                .message_labels
+                .iter()
+                .filter(|row| {
+                    row.channel_id == channel.as_str() && row.message_id == message.as_str()
+                })
+                .map(|row| row.name.clone())
+                .collect()
+        };
+        let held = names_of(&state);
+        if held.iter().any(|one| one == name) == present {
+            return Ok(super::MessageLabelChange {
+                changed: false,
+                names: held,
+                revision: state.message_label_revision,
+            });
+        }
+        if present {
+            if held.len() >= crate::labels::MAX_MANUAL_LABELS_PER_MESSAGE
+                || state.message_labels.len() >= crate::labels::MAX_MANUAL_LABEL_ROWS
+            {
+                return Err(StoreError::TooLarge(
+                    "too many labels added from message menus".to_owned(),
+                ));
+            }
+            state.message_labels.push(super::MessageLabelRow {
+                channel_id: channel.as_str().to_owned(),
+                message_id: message.as_str().to_owned(),
+                name: name.to_owned(),
+                added_ms: now_ms(),
+            });
+        } else {
+            state.message_labels.retain(|row| {
+                !(row.channel_id == channel.as_str()
+                    && row.message_id == message.as_str()
+                    && row.name == name)
+            });
+        }
+        state.message_label_revision =
+            super::next_pin_revision(state.message_label_revision, now_ms());
+        Ok(super::MessageLabelChange {
+            changed: true,
+            names: names_of(&state),
+            revision: state.message_label_revision,
+        })
+    }
+
     async fn bookmark(&self, channel: &ChannelId) -> Result<Bookmark, StoreError> {
         let mut state = self.lock();
         armed(&mut state)?;
@@ -2055,6 +2125,8 @@ impl StateStore for FakeStore {
         armed(&mut state)?;
         state.thread_hues.clear();
         state.thread_hue_tombstones.clear();
+        state.message_labels.clear();
+        state.message_label_revision = 0;
         state.upstream_clear.clear();
         state.history_modes.clear();
         state.conversations.clear();

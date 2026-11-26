@@ -141,7 +141,10 @@ export interface ChannelRowsDependencies extends ChannelRenderPassDependencies {
   historyReach(): { start: boolean; topLevel: boolean; whole: boolean; threads: number; full: number };
   closeOpenMenu(name: string): boolean;
   /** `#1825`: a label chip was clicked: open the search filtered to that label. */
+  /** Open the search filtered to one label NAME (`#kvm`, `merge queue`; `#2279`). */
   filterToLabel(label: string, row: HTMLElement): void;
+  /** Open the label picker for the row's messages (`#2279`), under `anchor`. */
+  openLabelPicker(messages: Message[], row: HTMLElement, anchor: HTMLElement): void;
 }
 
 /** The row drawer's commands and questions. */
@@ -151,7 +154,7 @@ export interface ChannelRows {
   mayLeadToReplies(message: Message): boolean;
   hiddenEmpty(message: Message): boolean;
   glom(messages: Message[]): Message[][];
-  regroupChannelRows(rebuild?: boolean): void;
+  regroupChannelRows(rebuild?: boolean, change?: (message: Message) => Message): void;
   channelRowFrame(messages: Message[]): { li: ChannelRow; meta: HTMLElement; body: HTMLElement; content: string; text: string; reactions: HTMLElement | null };
   editedMark(messages: Message[]): HTMLElement | null;
   reactionStrip(messages: Message[]): HTMLElement | null;
@@ -235,9 +238,12 @@ export function createChannelRows(deps: ChannelRowsDependencies): ChannelRows {
     return groups;
   }
 
-  function regroupChannelRows(rebuild = false): void {
+  function regroupChannelRows(rebuild = false, change?: (message: Message) => Message): void {
     const list = el("discord-log");
-    const messages = deps.listedMessages();
+    // `#2279`: `change` gives held messages their new copies (a label added after the fact on a
+    // flat provider, whose rows are its store); a changed copy's row is drawn again, in place.
+    const listed = deps.listedMessages();
+    const messages = change ? listed.map((message) => change(message as Message)) : listed;
     deps.preservingScroll(() => {
       // `rebuild`: every row is built again, as when the links switch rewires each body as it
       // is built (`#543`); a kept row would keep what the old switch gave it.
@@ -292,27 +298,33 @@ export function createChannelRows(deps: ChannelRowsDependencies): ChannelRows {
     // line, styled like Pinned (gold stays Pinned-only). The labels are the
     // server's derivation, served with the message; clicking one filters.
     const rowLabels: string[] = [];
+    // `#2279 vibe-talk-post-facto-labels`: the plain labels added from the menu ride
+    // beside the hashtag ones, by name (no `#`); one chip per name across the row.
+    const rowPlain: string[] = [];
     for (const message of messages) {
       for (const label of (message as { labels?: string[] }).labels || []) {
         if (!rowLabels.includes(label)) rowLabels.push(label);
       }
+      for (const label of (message as { plain_labels?: string[] }).plain_labels || []) {
+        if (!rowPlain.includes(label)) rowPlain.push(label);
+      }
     }
     const labelCluster = document.createElement("span");
     labelCluster.className = "label-chips";
-    for (const label of rowLabels) {
+    for (const name of [...rowLabels.map((slug) => `#${slug}`), ...rowPlain]) {
       const chip = document.createElement("button");
       chip.type = "button";
-      chip.className = "label-chip";
-      chip.textContent = `#${label}`;
-      chip.title = `Show only #${label}`;
-      chip.setAttribute("aria-label", `Filter to label ${label}`);
+      chip.className = name.startsWith("#") ? "label-chip" : "label-chip label-chip-plain";
+      chip.textContent = name;
+      chip.title = `Show only ${name}`;
+      chip.setAttribute("aria-label", `Filter to label ${name}`);
       chip.addEventListener("click", (event) => {
         event.stopPropagation();
-        deps.filterToLabel(label, li);
+        deps.filterToLabel(name, li);
       });
       labelCluster.append(chip);
     }
-    if (rowLabels.length > 0) meta.append(labelCluster);
+    if (rowLabels.length + rowPlain.length > 0) meta.append(labelCluster);
     const body = document.createElement("div");
     body.className = "body";
     deps.renderBodyInto(body, messages);
@@ -354,6 +366,14 @@ export function createChannelRows(deps: ChannelRowsDependencies): ChannelRows {
     if (!cluster || cluster.children.length === 0) return;
     const wasHidden = cluster.hidden;
     if (wasHidden) cluster.hidden = false;
+    // `#2279` (liaison, owner rule 370): the chips never push the row's controls (⋯) off the
+    // header line, leaving an empty band. Measured with the chips inline: where the controls
+    // wrapped below the author, the chips take a line of their own under the header instead
+    // (`data-labels-below`, 09-to-do-view.css), and the controls stand on the first line.
+    row.removeAttribute("data-labels-below");
+    const author = row.querySelector(".msg-author") as HTMLElement | null;
+    const controls = row.querySelector(".row-acts") as HTMLElement | null;
+    if (author && controls && controls.offsetTop > author.offsetTop + 1) row.setAttribute("data-labels-below", "");
     const tops = new Set([...cluster.children].map((chip) => (chip as HTMLElement).offsetTop));
     const room = tops.size <= 1;
     cluster.hidden = !room;
@@ -850,6 +870,22 @@ export function createChannelRows(deps: ChannelRowsDependencies): ChannelRows {
       setMenu(false);
       deps.guardQuietly(() => deps.togglePin(messages))();
     }));
+    // `#2279 vibe-talk-post-facto-labels`: label the message after the fact, with the
+    // same labels a typed hashtag makes, from the menu that pins it.
+    const labelItem = document.createElement("button");
+    labelItem.className = "row-label-button";
+    labelItem.setAttribute("type", "button");
+    labelItem.setAttribute(
+      "title",
+      "Add a label to this message on this server, for every device: a #hashtag label or a plain " +
+        `one. Find it again in the Labels drop-down. ${service} is not changed.`
+    );
+    labelItem.textContent = "Add label…";
+    deps.sayRowShortcut(labelItem, "row-label-button");
+    labelItem.addEventListener("click", deps.inThisColumn(() => {
+      setMenu(false);
+      deps.openLabelPicker(messages, li, moreButton);
+    }));
     const bookmarkItem = document.createElement("button");
     bookmarkItem.className = "row-bookmark-button";
     bookmarkItem.setAttribute("type", "button");
@@ -883,7 +919,7 @@ export function createChannelRows(deps: ChannelRowsDependencies): ChannelRows {
       setMenu(false);
       deps.guardQuietly(() => deps.copyDeepLink(message))();
     }));
-    menu.append(copy, ...(openLink ? [openLink] : []), ...(copyLink ? [copyLink] : []), deepCopy, pinItem, bookmarkItem, readGroup);
+    menu.append(copy, ...(openLink ? [openLink] : []), ...(copyLink ? [copyLink] : []), deepCopy, pinItem, labelItem, bookmarkItem, readGroup);
     more.append(moreButton, menu);
     acts.append(more);
     const done = document.createElement("button");

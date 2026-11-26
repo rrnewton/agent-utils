@@ -591,12 +591,21 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
   /** Hold `anchor` at `targetTop` in `area` across `mutate`, the selection kept as in `preservingScroll`. */
   function preservingScrollAt(area: HTMLElement, anchor: Element, targetTop: number, mutate: () => void): void {
     const selection = deps.selectionIn ? deps.selectionIn(area) : null;
+    const list = anchor.parentNode;
+    const id = anchor.getAttribute ? anchor.getAttribute("data-id") : null;
     mutate();
-    if (!anchor.parentNode) {
+    // `#2279 vibe-talk-post-facto-labels`: an act whose redraw REBUILT the touched row (its
+    // message changed, so the row was drawn again) holds the row that stands for it now, found
+    // in the same list by its message id, as it would have held the row itself.
+    let kept: Element | null = anchor;
+    if (!anchor.parentNode && list && id !== null) {
+      kept = ([...(list as Element).children] as Element[]).find((row) => row.getAttribute("data-id") === id) ?? null;
+    }
+    if (!kept || !kept.parentNode) {
       deps.renderJumpNewest();
     } else {
-      const shown = shownRowFor(anchor);
-      const held = shown !== anchor ? shown as Element : anchor;
+      const shown = shownRowFor(kept);
+      const held = shown !== kept ? shown as Element : kept;
       writeHold(area, held, held.getBoundingClientRect().top - targetTop);
       deps.renderJumpNewest();
     }

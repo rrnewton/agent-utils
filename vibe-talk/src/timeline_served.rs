@@ -257,6 +257,8 @@ mod tests {
             thread: None,
             noise: false,
             labels: Vec::new(),
+            plain_labels: Vec::new(),
+            manual_labels: Vec::new(),
             reactions: None,
             heading: None,
             mentions: Vec::new(),

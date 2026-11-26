@@ -750,11 +750,13 @@ Its output is above. Without it Discuss cannot answer and its states are unreach
     # runs alone, on a server that knows no term at all.
     # `#2242 vibe-talk-documents-reader-toolbar`: the Documents reader states (118, 119) open a
     # REAL document: they get the [documents] paste section and a plain message cache below.
+    # `#2279 vibe-talk-post-facto-labels`: the label states (150-154) get the serving cache too,
+    # so a label write's answer is derived from the server's own copy of the message, as live.
     SHOTS_DISCUSS=0
     SHOTS_GLOSSARY=0
     SHOTS_READER=0
     for shots_state in "${SHOTS_ONLY[@]}"; do
-        case "$shots_state" in 73-*|74-*|75-*|76-*|78-*|84-*|85-*|89-*|90-*|91-*|92-*|99-*|100-*|101-*|10[7-9]-*|11[0-7]-*|12[01]-*|12[3-8]-*|13[01]-*|14[0-6]-*) SHOTS_DISCUSS=1 ;; esac
+        case "$shots_state" in 73-*|74-*|75-*|76-*|78-*|84-*|85-*|89-*|90-*|91-*|92-*|99-*|100-*|101-*|10[7-9]-*|11[0-7]-*|12[01]-*|12[3-8]-*|13[01]-*|14[0-6]-*|15[0-4]-*) SHOTS_DISCUSS=1 ;; esac
         case "$shots_state" in 10[7-9]-*|11[0-3]-*|11[5-7]-*) SHOTS_GLOSSARY=1 ;; esac
         case "$shots_state" in 118-*|119-*|13[2-7]-*) SHOTS_READER=1 ;; esac
     done

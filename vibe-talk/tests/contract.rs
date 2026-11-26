@@ -19,8 +19,9 @@ use vibe_talk::contract::{
     CatchupStamp, CatchupUnreadRef, CatchupUpdateRequest, CatchupWindow, ClientConfigResponse,
     ClientSettings, CommittedPostResponse, ComposerDraft, ComposerDrafts,
     DeleteComposerDraftRequest, DraftScope, LabelCount, LabelGroupRequest, LabelGroupsResponse,
-    LabelsResponse, LiveDeleteEvent, LiveDelivery, LiveMessageEvent, LiveOlderEvent,
-    LiveResetEvent, MessageCacheHistory, MessageCacheRequest, MessageCacheStatus, MessagesResponse,
+    LabelsResponse, LiveDeleteEvent, LiveDelivery, LiveLabelsEvent, LiveMessageEvent,
+    LiveOlderEvent, LiveResetEvent, MessageCacheHistory, MessageCacheRequest, MessageCacheStatus,
+    MessageLabelChangeResponse, MessageLabelRequest, MessageLabelsResponse, MessagesResponse,
     NoiseRules, PendingPost, PendingPostResponse, PinChangeResponse, PinsResponse, ProposalSettled,
     ProviderDescription, ReplayUnavailable, ReplyDismissals, SearchResponse, SearchScope,
     ThreadPinChangeResponse, ThreadPinsResponse, TimelineResponse, TokenScope, TranscriptRole,
@@ -90,6 +91,8 @@ fn message(id: &str) -> Message {
         content_html: String::new(),
         noise: false,
         labels: Vec::new(),
+        plain_labels: Vec::new(),
+        manual_labels: Vec::new(),
         reactions: None,
         heading: None,
         mentions: Vec::new(),
@@ -137,6 +140,8 @@ fn threaded_message(id: &str) -> Message {
         // generated validators are proven against both.
         noise: true,
         labels: Vec::new(),
+        plain_labels: Vec::new(),
+        manual_labels: Vec::new(),
         // `#217 markdown-blocks`, the same way.
         content_html: "<p><em>hello</em></p>\n".into(),
         // `#219 emoji-reactions`: a standard emoji and a custom one here, none on the plain
@@ -435,6 +440,7 @@ fn timeline(view: TimelineView, page: TimelinePage) -> TimelineResponse {
         reply_dismissals: None,
         pins_revision: None,
         thread_pins_revision: None,
+        labels_revision: None,
         channel_summary: None,
         bookmark: None,
         // `#529 page-build-stale-notice`.
@@ -779,6 +785,8 @@ fn samples() -> Value {
             // does: here one is set, on the next none is, and the rest leave the field out.
             to(&TimelineResponse {
                 pins_revision: Some(1_790_000_000_000),
+                // `#2279`: the menu labels' revision, as every read from a server with a store.
+                labels_revision: Some(1_790_000_000_002),
                 bookmark: Some(bookmark(Some(BookmarkPlace::Above))),
                 ..timeline(TimelineView::Main, TimelinePage {
                     messages: vec![plain.clone()],
@@ -864,6 +872,84 @@ fn samples() -> Value {
                 ok: false,
             }),
         ],
+        // `#2279 vibe-talk-post-facto-labels`: a change derived from the held text with every
+        // field filled, and one for a message the server holds no copy of.
+        "LiveLabelsEvent": [
+            to(&LiveLabelsEvent {
+                channel_id: vibe_talk::model::ChannelId("100".into()),
+                message_id: vibe_talk::model::MessageId("1700000000.000200".into()),
+                labels: vec!["kvm".into(), "perf".into()],
+                plain_labels: vec!["merge queue".into()],
+                manual_labels: vec!["#perf".into(), "merge queue".into()],
+                derived: true,
+                revision: 1_790_000_000_000,
+            }),
+            to(&LiveLabelsEvent {
+                channel_id: vibe_talk::model::ChannelId("100".into()),
+                message_id: vibe_talk::model::MessageId("1700000000.000300".into()),
+                labels: Vec::new(),
+                plain_labels: Vec::new(),
+                manual_labels: Vec::new(),
+                derived: false,
+                revision: 1_790_000_000_001,
+            }),
+        ],
+        "MessageLabelsResponse": [
+            to(&MessageLabelsResponse {
+                channel_id: vibe_talk::model::ChannelId("100".into()),
+                messages: vec![LiveLabelsEvent {
+                    channel_id: vibe_talk::model::ChannelId("100".into()),
+                    message_id: vibe_talk::model::MessageId("1700000000.000200".into()),
+                    labels: vec!["kvm".into()],
+                    plain_labels: vec!["merge queue".into()],
+                    manual_labels: vec!["#kvm".into(), "merge queue".into()],
+                    derived: true,
+                    revision: 1_790_000_000_000,
+                }],
+                revision: 1_790_000_000_000,
+            }),
+            to(&MessageLabelsResponse {
+                channel_id: vibe_talk::model::ChannelId("100".into()),
+                messages: Vec::new(),
+                revision: 0,
+            }),
+        ],
+        "MessageLabelRequest": [
+            to(&MessageLabelRequest { name: "#kvm".into() }),
+            to(&MessageLabelRequest { name: "merge queue".into() }),
+        ],
+        "MessageLabelChangeResponse": [
+            to(&MessageLabelChangeResponse {
+                event: LiveLabelsEvent {
+                    channel_id: vibe_talk::model::ChannelId("100".into()),
+                    message_id: vibe_talk::model::MessageId("1700000000.000200".into()),
+                    labels: vec!["kvm".into()],
+                    plain_labels: Vec::new(),
+                    manual_labels: Vec::new(),
+                    derived: true,
+                    revision: 1_790_000_000_000,
+                },
+                name: "#kvm".into(),
+                changed: false,
+                text_derived: true,
+                labels_notice: "labels are this server's own",
+            }),
+            to(&MessageLabelChangeResponse {
+                event: LiveLabelsEvent {
+                    channel_id: vibe_talk::model::ChannelId("100".into()),
+                    message_id: vibe_talk::model::MessageId("1700000000.000200".into()),
+                    labels: Vec::new(),
+                    plain_labels: vec!["merge queue".into()],
+                    manual_labels: vec!["merge queue".into()],
+                    derived: true,
+                    revision: 1_790_000_000_001,
+                },
+                name: "merge queue".into(),
+                changed: true,
+                text_derived: false,
+                labels_notice: "labels are this server's own",
+            }),
+        ],
         "VibeTalkV1ServerFrame": [
             to(&VibeTalkV1ServerFrame::SessionStarted {
                 greeting: None,
@@ -909,6 +995,13 @@ fn samples() -> Value {
                 heading: None,
                 ..message("302")
             }),
+            // `#2279 vibe-talk-post-facto-labels`: typed and menu-added labels, plain ones too.
+            to(&Message {
+                labels: vec!["kvm".into(), "perf".into()],
+                plain_labels: vec!["merge queue".into()],
+                manual_labels: vec!["#perf".into(), "merge queue".into()],
+                ..message("303")
+            }),
         ],
         "ThreadSummary": [to(&thread_summary(Some(plain.clone()))), to(&thread_summary(None))],
         "ThreadPinsResponse": [
@@ -950,6 +1043,8 @@ fn samples() -> Value {
                     LabelCount { name: "benchmarking".into(), count: 12, group_id: Some(1) },
                     LabelCount { name: "kvm".into(), count: 3, group_id: None },
                 ],
+                // `#2279`: a plain label added from a message menu.
+                plain: vec![LabelCount { name: "merge queue".into(), count: 1, group_id: None }],
                 groups: vec![vibe_talk::store::LabelGroup {
                     id: 1,
                     display: "benchmarking".into(),
@@ -962,6 +1057,7 @@ fn samples() -> Value {
             }),
             to(&LabelsResponse {
                 labels: Vec::new(),
+                plain: Vec::new(),
                 groups: Vec::new(),
                 groups_revision: 0,
                 labels_notice: "labels are this server's own",

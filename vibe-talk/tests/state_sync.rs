@@ -1449,6 +1449,23 @@ fn classification() -> Vec<Entry> {
         e("POST", "/api/v1/label-groups", Class::Local),
         e("PUT", "/api/v1/label-groups/{id}", Class::Local),
         e("DELETE", "/api/v1/label-groups/{id}", Class::Local),
+        // `#2279 vibe-talk-post-facto-labels`: menu labels, this server's own store and its
+        // cached copy of the text; never an upstream read or write.
+        e(
+            "GET",
+            "/api/v1/channels/{channel_id}/message-labels",
+            Class::Local,
+        ),
+        e(
+            "PUT",
+            "/api/v1/channels/{channel_id}/message-labels/{message_id}",
+            Class::Local,
+        ),
+        e(
+            "DELETE",
+            "/api/v1/channels/{channel_id}/message-labels/{message_id}",
+            Class::Local,
+        ),
         e("GET", "/api/v1/channels/{channel_id}/bookmark", Class::Zero),
         e(
             "PUT",

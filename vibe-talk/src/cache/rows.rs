@@ -249,6 +249,8 @@ pub(crate) fn reconstruct(
         content_html: String::new(),
         noise: false,
         labels: Vec::new(),
+        plain_labels: Vec::new(),
+        manual_labels: Vec::new(),
         sent_refs: extra.sent_refs,
         sent_vestigial: false,
         reactions: extra.reactions,

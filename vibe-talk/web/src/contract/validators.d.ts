@@ -1417,6 +1417,11 @@ export interface LabelsResponse {
    * The standing statement that these labels are this server's own.
    */
   labels_notice: string;
+  /**
+   * Every plain label (a name without `#`, added from a message menu, `#2279`), by name.
+   * Absent or empty for none; an older server never sends it.
+   */
+  plain?: LabelCount[];
 }
 
 /**
@@ -1451,6 +1456,47 @@ export interface LiveDeleteEvent {
  * How channel changes reach the live stream.
  */
 export type LiveDelivery = "off" | "poll" | "push";
+
+/**
+ * One message's labels changed from a message menu (`#2279 vibe-talk-post-facto-labels`), on
+ * this or another device. Carried on the live streams as SSE event `labels`, with no `id` (as a
+ * settings or older event has none), so it never moves a resume cursor. The state is whole,
+ * not a delta: a page sets the message's three label fields to these, ignoring an event whose
+ * `revision` is older than one it already applied. A page that missed the event learns the same
+ * labels from its next read of the message, since every read merges them at serve time.
+ */
+export interface LiveLabelsEvent {
+  /**
+   * The channel the message is in.
+   */
+  channel_id: ChannelId;
+  /**
+   * Whether `labels` was derived from this server's copy of the message text. False when
+   * the server holds no copy: `labels` then names only the menu-added hashtag labels, and a
+   * page keeps the typed ones it already shows beside them.
+   */
+  derived: boolean;
+  /**
+   * [`crate::model::Message::labels`] as served now.
+   */
+  labels: string[];
+  /**
+   * [`crate::model::Message::manual_labels`] as served now.
+   */
+  manual_labels: string[];
+  /**
+   * The message, by its own id (a thread reply's own id).
+   */
+  message_id: MessageId;
+  /**
+   * [`crate::model::Message::plain_labels`] as served now.
+   */
+  plain_labels: string[];
+  /**
+   * The labels' revision after the change.
+   */
+  revision: number;
+}
 
 /**
  * The data of a live stream `message` or `message_update` event.
@@ -1624,8 +1670,17 @@ export interface Message {
    * from whoever sent the message, so an edit updates the labels with the text. Bare
    * slugs (`kvm`); auto-generated topics will carry an `auto:` prefix when they exist.
    * EMPTY means the text holds no hashtag. Absent from an older server means the same.
+   *
+   * `#2279 vibe-talk-post-facto-labels`: the hashtag labels added from the message menu join
+   * the typed ones here, so a menu-added `#kvm` is the same label as a typed one.
    */
   labels?: string[];
+  /**
+   * The labels added from the menu that the text does not also carry, by name as shown
+   * (`#kvm`, `merge queue`): exactly the ones the menu may remove (`#2279`). A label the text
+   * carries stays while the text has it. EMPTY for none.
+   */
+  manual_labels?: string[];
   /**
    * Whether the owner's noise rules call this message read already. `#196 auto-read-noise`.
    *
@@ -1659,6 +1714,13 @@ export interface Message {
    * say, and a copy without it never takes away one another copy brought.
    */
   op_key?: string | null;
+  /**
+   * The plain labels (names without `#`, folded: `merge queue`) added to this message from
+   * its menu (`#2279 vibe-talk-post-facto-labels`), merged at serve time like `labels`. The
+   * hashtag labels are the subset of all labels whose names begin with `#`; these are the
+   * rest. EMPTY for none; absent from an older server means the same.
+   */
+  plain_labels?: string[];
   /**
    * The emoji people reacted to this message with, and how many of each. `#219
    * emoji-reactions`.
@@ -1893,6 +1955,65 @@ export interface MessageCacheStatus {
  * A Discord message snowflake, as a string.
  */
 export type MessageId = string;
+
+/**
+ * The answer to a message-label add or remove (`#2279`): the message's labels after it, the same
+ * state the `labels` live event carries to every other page.
+ */
+export interface MessageLabelChangeResponse {
+  /**
+   * Whether the call changed what is stored.
+   */
+  changed: boolean;
+  /**
+   * The labels now, as the live event carries them.
+   */
+  event: LiveLabelsEvent;
+  /**
+   * The standing statement that labels are this server's own.
+   */
+  labels_notice: string;
+  /**
+   * The name as normalized and stored (`#kvm`, `merge queue`).
+   */
+  name: string;
+  /**
+   * For a remove: the label stays because the message text carries it.
+   */
+  text_derived?: boolean;
+}
+
+/**
+ * `PUT` or `DELETE /api/v1/channels/{channel_id}/message-labels/{message_id}` (`#2279`): the
+ * label to add or remove, as the owner typed it (`#kvm`, `merge queue`). The server normalizes it.
+ */
+export interface MessageLabelRequest {
+  /**
+   * The label's name. A leading `#` makes it a hashtag label.
+   */
+  name: string;
+}
+
+/**
+ * `GET /api/v1/channels/{channel_id}/message-labels` (`#2279`): every message of the channel
+ * that carries a label added from its menu, each with its labels as served now. The list is
+ * COMPLETE for the channel: a page bringing its copies current after a missed event applies each
+ * entry, and strips the menu labels from any held message the list does not name.
+ */
+export interface MessageLabelsResponse {
+  /**
+   * The channel.
+   */
+  channel_id: ChannelId;
+  /**
+   * Every message with a menu label, each as a `labels` event would carry it.
+   */
+  messages: LiveLabelsEvent[];
+  /**
+   * The labels' revision this list is at.
+   */
+  revision: number;
+}
 
 /**
  * Thread membership attached to a message without conflating it with a reply reference.
@@ -3177,6 +3298,15 @@ export interface TimelineResponse {
    */
   has_threads: boolean;
   /**
+   * The revision the labels added from message menus are at, server-wide (`#2279
+   * vibe-talk-post-facto-labels`). On every read, newest page and delta alike, as
+   * `pins_revision` is and for its reason: a page that missed a `labels` live event (asleep,
+   * offline, a dropped stream) learns from a read it makes anyway that labels changed, and reads
+   * the channel's list (`GET /api/v1/channels/{channel}/message-labels`) to bring every copy it
+   * holds current. Absent when no store is configured, and from an older server.
+   */
+  labels_revision?: number | null;
+  /**
    * Page size actually requested.
    */
   limit: number;
@@ -3880,6 +4010,10 @@ export interface Contract {
   PutComposerDraftResponse: PutComposerDraftResponse;
   DeleteComposerDraftRequest: DeleteComposerDraftRequest;
   LiveOlderEvent: LiveOlderEvent;
+  LiveLabelsEvent: LiveLabelsEvent;
+  MessageLabelRequest: MessageLabelRequest;
+  MessageLabelChangeResponse: MessageLabelChangeResponse;
+  MessageLabelsResponse: MessageLabelsResponse;
 }
 
 /** A contract type a peer may extend with new `type` tags. */

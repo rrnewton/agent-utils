@@ -406,6 +406,14 @@ export interface ElementById {
   "label-group-spellings": HTMLTextAreaElement;
   "label-group-state": HTMLParagraphElement;
   "label-group-title": HTMLHeadingElement;
+  "label-picker": HTMLDivElement;
+  "label-picker-close": HTMLButtonElement;
+  "label-picker-current": HTMLDivElement;
+  "label-picker-error": HTMLParagraphElement;
+  "label-picker-input": HTMLInputElement;
+  "label-picker-list": HTMLUListElement;
+  "label-picker-note": HTMLParagraphElement;
+  "label-picker-title": HTMLHeadingElement;
   "labels-button": HTMLButtonElement;
   "labels-combine": HTMLButtonElement;
   "labels-filter": HTMLInputElement;

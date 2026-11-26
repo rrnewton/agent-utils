@@ -260,8 +260,22 @@ pub struct Message {
     /// from whoever sent the message, so an edit updates the labels with the text. Bare
     /// slugs (`kvm`); auto-generated topics will carry an `auto:` prefix when they exist.
     /// EMPTY means the text holds no hashtag. Absent from an older server means the same.
+    ///
+    /// `#2279 vibe-talk-post-facto-labels`: the hashtag labels added from the message menu join
+    /// the typed ones here, so a menu-added `#kvm` is the same label as a typed one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
+    /// The plain labels (names without `#`, folded: `merge queue`) added to this message from
+    /// its menu (`#2279 vibe-talk-post-facto-labels`), merged at serve time like `labels`. The
+    /// hashtag labels are the subset of all labels whose names begin with `#`; these are the
+    /// rest. EMPTY for none; absent from an older server means the same.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plain_labels: Vec<String>,
+    /// The labels added from the menu that the text does not also carry, by name as shown
+    /// (`#kvm`, `merge queue`): exactly the ones the menu may remove (`#2279`). A label the text
+    /// carries stays while the text has it. EMPTY for none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub manual_labels: Vec<String>,
     /// The chat messages this trace entry says the agent sent before it
     /// (v2 `sent`, `#1886 vibe-talk-transcripts-view` part C;
     /// [`crate::transcripts::sent_refs_of_metadata`]). Server-only, like
@@ -650,6 +664,8 @@ mod tests {
             content_html: String::new(),
             noise: false,
             labels: Vec::new(),
+            plain_labels: Vec::new(),
+            manual_labels: Vec::new(),
             reactions: None,
             heading: None,
             mentions: Vec::new(),

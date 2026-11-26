@@ -912,7 +912,13 @@
           "name": "kvm"
         }
       ],
-      "labels_notice": "labels are this server's own"
+      "labels_notice": "labels are this server's own",
+      "plain": [
+        {
+          "count": 1,
+          "name": "merge queue"
+        }
+      ]
     },
     {
       "groups": [],
@@ -928,6 +934,34 @@
       "message_id": "300",
       "observed_ms": 1790000000000,
       "replayed": true
+    }
+  ],
+  "LiveLabelsEvent": [
+    {
+      "channel_id": "100",
+      "derived": true,
+      "labels": [
+        "kvm",
+        "perf"
+      ],
+      "manual_labels": [
+        "#perf",
+        "merge queue"
+      ],
+      "message_id": "1700000000.000200",
+      "plain_labels": [
+        "merge queue"
+      ],
+      "revision": 1790000000000
+    },
+    {
+      "channel_id": "100",
+      "derived": false,
+      "labels": [],
+      "manual_labels": [],
+      "message_id": "1700000000.000300",
+      "plain_labels": [],
+      "revision": 1790000000001
     }
   ],
   "LiveMessageEvent": [
@@ -1084,6 +1118,28 @@
       "reply_to": null,
       "spoken_time": "",
       "timestamp": "2026-09-25T12:00:00+00:00"
+    },
+    {
+      "author": "someone",
+      "author_id": "7",
+      "author_is_bot": false,
+      "channel_id": "100",
+      "content": "hello",
+      "id": "303",
+      "labels": [
+        "kvm",
+        "perf"
+      ],
+      "manual_labels": [
+        "#perf",
+        "merge queue"
+      ],
+      "plain_labels": [
+        "merge queue"
+      ],
+      "reply_to": null,
+      "spoken_time": "",
+      "timestamp": "2026-09-25T12:00:00+00:00"
     }
   ],
   "MessageCacheRequest": [
@@ -1120,6 +1176,80 @@
       "max_megabytes": 256,
       "messages": 0,
       "reason": "switched_off"
+    }
+  ],
+  "MessageLabelChangeResponse": [
+    {
+      "changed": false,
+      "event": {
+        "channel_id": "100",
+        "derived": true,
+        "labels": [
+          "kvm"
+        ],
+        "manual_labels": [],
+        "message_id": "1700000000.000200",
+        "plain_labels": [],
+        "revision": 1790000000000
+      },
+      "labels_notice": "labels are this server's own",
+      "name": "#kvm",
+      "text_derived": true
+    },
+    {
+      "changed": true,
+      "event": {
+        "channel_id": "100",
+        "derived": true,
+        "labels": [],
+        "manual_labels": [
+          "merge queue"
+        ],
+        "message_id": "1700000000.000200",
+        "plain_labels": [
+          "merge queue"
+        ],
+        "revision": 1790000000001
+      },
+      "labels_notice": "labels are this server's own",
+      "name": "merge queue"
+    }
+  ],
+  "MessageLabelRequest": [
+    {
+      "name": "#kvm"
+    },
+    {
+      "name": "merge queue"
+    }
+  ],
+  "MessageLabelsResponse": [
+    {
+      "channel_id": "100",
+      "messages": [
+        {
+          "channel_id": "100",
+          "derived": true,
+          "labels": [
+            "kvm"
+          ],
+          "manual_labels": [
+            "#kvm",
+            "merge queue"
+          ],
+          "message_id": "1700000000.000200",
+          "plain_labels": [
+            "merge queue"
+          ],
+          "revision": 1790000000000
+        }
+      ],
+      "revision": 1790000000000
+    },
+    {
+      "channel_id": "100",
+      "messages": [],
+      "revision": 0
     }
   ],
   "MessagesResponse": [
@@ -2082,6 +2212,7 @@
       ],
       "has_more": false,
       "has_threads": false,
+      "labels_revision": 1790000000002,
       "limit": 50,
       "messages": [
         {

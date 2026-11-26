@@ -59,3 +59,5 @@ export { createSideThreadActs } from "../view/channel/index.ts";
 export { createCardRuns } from "../view/channel/index.ts";
 export { createReadModeAct } from "../view/channel/index.ts";
 export { decode, decodeTagged, is, roots } from "../contract/index.ts";
+export { labelQueryFor } from "../core/channels/index.ts";
+export { mountPostFactoLabels } from "../app/index.ts";

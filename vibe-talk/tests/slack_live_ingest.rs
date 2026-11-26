@@ -884,6 +884,8 @@ fn a_push_that_loses_the_race_to_a_read_is_known_under_the_feed_lock() {
         content_html: String::new(),
         noise: false,
         labels: Vec::new(),
+        plain_labels: Vec::new(),
+        manual_labels: Vec::new(),
         reactions: None,
         heading: None,
         mentions: Vec::new(),

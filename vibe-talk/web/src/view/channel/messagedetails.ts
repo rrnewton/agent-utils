@@ -13,6 +13,8 @@ export interface MessageDetailsDependencies {
   bookmarkAbove(row: HTMLElement): boolean;
   toggleBookmarkAt(row: HTMLElement): void;
   inThisColumn(act: () => void): () => void;
+  /** Open the label picker for the row's messages under `anchor` (`#2279`). */
+  openLabelPicker(messages: Message[], row: HTMLElement, anchor: HTMLElement): void;
 }
 
 /** Opening and closing a message's details sheet. */
@@ -62,7 +64,17 @@ export function createMessageDetails(deps: MessageDetailsDependencies): MessageD
       const open = childByClass(li, "msg-details");
       if (open) li.removeChild(open);
     }));
-    details.append(who, when, ...(edited === null ? [] : [editedLine]), id, mark);
+    // `#2279 vibe-talk-post-facto-labels`: the phone's long-press reaches the labels too,
+    // beside the bookmark, as the ⋯ menu's "Add label…" does.
+    const label = document.createElement("button");
+    label.className = "chip msg-details-label";
+    label.setAttribute("type", "button");
+    label.textContent = "Label…";
+    label.setAttribute("title", "Add or remove this message's labels, kept on this server for every device");
+    label.addEventListener("click", deps.inThisColumn(() => {
+      deps.openLabelPicker(messages, li, label);
+    }));
+    details.append(who, when, ...(edited === null ? [] : [editedLine]), id, mark, label);
     li.append(details);
   }
 

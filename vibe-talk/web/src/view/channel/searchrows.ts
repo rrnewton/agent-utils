@@ -336,6 +336,8 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
         inThread: Boolean((message as { thread?: { is_root?: boolean } }).thread && (message as { thread?: { is_root?: boolean } }).thread?.is_root === false),
         // `#1825`: the labels the server derived and served with the message.
         labels: ((message as { labels?: unknown }).labels as string[] | undefined) || [],
+        // `#2279`: the plain labels added from the message menu, served beside them.
+        plainLabels: ((message as { plain_labels?: unknown }).plain_labels as string[] | undefined) || [],
       } as never);
       subjectByMessage.set(message, subject);
     }

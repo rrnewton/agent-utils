@@ -35,7 +35,7 @@ const MESSAGE_EPOCH = Date.parse("2026-08-19T04:31:00.000Z");
 const shownPinnedIds = (page) =>
   page.el("pinned-log").children.filter((li) => !li.hasClass("search-hidden")).map((li) => li.getAttribute("data-id"));
 
-test("the ⋯ menu is Copy text, its vibe-talk link, then Pin, then the bookmark, then the two that mark read under one caption", async () => {
+test("the ⋯ menu is Copy text, its vibe-talk link, then Pin, Add label, then the bookmark, then the two that mark read under one caption", async () => {
   for (const upstream of [false, true]) {
     const page = newPage();
     page.upstreamReadMarkSupported = upstream;
@@ -44,13 +44,15 @@ test("the ⋯ menu is Copy text, its vibe-talk link, then Pin, then the bookmark
     const items = rowMoreMenu(rows[0]).children;
     // `#462 webapp-deep-links`: the app's own link with the copies, Pin after them.
     assert.deepStrictEqual(items.map((node) => node.className),
-      ["row-copy-button", "row-copy-deep-link-button", "row-pin-button", "row-bookmark-button", "row-more-group"], `the menu's order (upstream ${upstream})`);
+      ["row-copy-button", "row-copy-deep-link-button", "row-pin-button", "row-label-button", "row-bookmark-button", "row-more-group"], `the menu's order (upstream ${upstream})`);
     assert.equal(items[0].textContent, "Copy text", "Copy text is not first");
     assert.equal(items[1].textContent, "Copy vibe-talk link");
     assert.equal(items[2].textContent, "Pin message");
+    // `#2279 vibe-talk-post-facto-labels`: labels after the fact, beside the pin.
+    assert.equal(items[3].textContent, "Add label…");
     // `#240 reading-bookmark`.
-    assert.equal(items[3].textContent, "Bookmark above");
-    const group = items[4];
+    assert.equal(items[4].textContent, "Bookmark above");
+    const group = items[5];
     assert.equal(group.getAttribute("role"), "group", "the two that mark read are not a group");
     assert.equal(group.getAttribute("aria-label"), "Mark read");
     const [caption, through, provider] = group.children;
@@ -5732,9 +5734,10 @@ test("`#1853`: the Labels drop-down lists Pinned first, then labels most used fi
   await page.el("labels-filter-input").setValue("");
   // Picking #kvm filters like the typed search, and the button names it.
   await pickLabel(page, "kvm");
-  assert.equal(page.el("search-field").value, "label:kvm");
+  // `#2279`: every label the page offers searches in its explicit form.
+  assert.equal(page.el("search-field").value, "label:#kvm");
   assert.deepStrictEqual(unfiltered(page, "discord-log").map((li) => li.getAttribute("data-id")), [String(messages[0].id), String(messages[1].id)]);
-  assert.equal(button.getAttribute("data-active-label"), "kvm");
+  assert.equal(button.getAttribute("data-active-label"), "#kvm");
   assert.match(button.getAttribute("aria-label"), /#kvm selected/);
   assert.equal(page.el("labels-panel").hidden, true, "picking a label left the panel open");
   // Picking it again clears, as All messages does.

@@ -41,6 +41,8 @@ fn message(seq: i64, content: &str) -> Message {
         content_html: String::new(),
         noise: false,
         labels: Vec::new(),
+        plain_labels: Vec::new(),
+        manual_labels: Vec::new(),
         thread: None,
         reactions: None,
         heading: None,

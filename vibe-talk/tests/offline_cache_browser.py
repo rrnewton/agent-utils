@@ -1940,7 +1940,8 @@ MENU_JS = """({list, id, upstream}) => {""" + FLOAT_HELPERS_JS + """
     const menu = row && row.querySelector('.row-more-menu');
     if (!menu || !shown(menu)) return {problems: [`row ${id}'s ⋯ menu is not open`], items: []};
     const names = [...menu.children].filter(shown).map((e) => e.className);
-    if (names.join(' ') !== 'row-copy-button row-copy-deep-link-button row-pin-button row-bookmark-button row-more-group') problems.push(`the menu holds ${names.join(', ')}`);
+    // `#2279`: Add label… after Pin (offline it opens the picker, which writes nothing and says so).
+    if (names.join(' ') !== 'row-copy-button row-copy-deep-link-button row-pin-button row-label-button row-bookmark-button row-more-group') problems.push(`the menu holds ${names.join(', ')}`);
     const group = menu.querySelector('.row-more-group');
     const caption = group && group.querySelector('.row-more-caption');
     if (!caption || !shown(caption) || caption.textContent !== 'Mark read') problems.push('the read group has no caption');

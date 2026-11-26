@@ -161,7 +161,8 @@ class LabelsApi(FakeApi):
             matched = True
             for term in text.split():
                 if term.lower().startswith("label:"):
-                    slug = term.split(":", 1)[1].lower()
+                    # `#2279`: the explicit `label:#kvm` the chips send names the hashtag label.
+                    slug = term.split(":", 1)[1].lower().removeprefix("#")
                     group = next((g for g in self.groups
                                   if slug == g["display"] or slug in g["spellings"]), None)
                     wanted = set(group["spellings"]) if group else {slug}
@@ -408,7 +409,8 @@ def walk_through(walk: Walk) -> None:
     walk.settled()
     before = row.bounding_box()
     walk.press('#discord-log > li[data-id="201"] .label-chip >> nth=0')
-    walk.until("() => document.getElementById('search-field').value === 'label:kvm'",
+    # `#2279`: chips search the explicit form.
+    walk.until("() => document.getElementById('search-field').value === 'label:#kvm'",
                "the chip did not open the label search")
     walk.until("() => document.getElementById('search-count').textContent.includes('2 of')",
                "the chip's search was not counted")
@@ -442,10 +444,10 @@ def walk_through(walk: Walk) -> None:
     page.fill("#labels-filter-input", "")
     walk.shot("4b-dropdown")
     walk.press("#labels-option-perf")
-    walk.until("() => document.getElementById('search-field').value === 'label:perf'",
+    walk.until("() => document.getElementById('search-field').value === 'label:#perf'",
                "picking #perf did not filter to it")
     walk.check(walk.shown() == ["206"], f"label:perf shows {walk.shown()}")
-    walk.check(page.evaluate("() => document.getElementById('labels-button').getAttribute('data-active-label')") == "perf",
+    walk.check(page.evaluate("() => document.getElementById('labels-button').getAttribute('data-active-label')") == "#perf",
                "the Labels button does not name #perf")
     # Pinned from the drop-down, then All messages back out of it.
     walk.press("#labels-button")
