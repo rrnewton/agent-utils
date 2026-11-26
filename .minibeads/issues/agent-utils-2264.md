@@ -1,13 +1,14 @@
 ---
 title: 'vibe-talk-all-view-older-load-stuck: in the All view, Loading older shows but never loads, so summary citations point past the scrollback'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 - owner-ui
 created_at: 2026-11-25T17:40:00-05:00
-updated_at: 2026-11-25T19:50:00-05:00
+updated_at: 2026-11-25T21:51:00-05:00
+closed_at: 2026-11-25T21:51:00-05:00
 ---
 
 # Description
@@ -46,3 +47,14 @@ Root cause (2026-11-25, reproduced on a local server against a fake Slack):
 - The page took each empty answer as a normal step and fired the next one on the next scroll event.
 - A second defect sat on the same path: the page never drew a step back answered from the copy for Slack All. Every such answer is marked refresh_failed, and the page would not lower the view's floor for it.
 - The citation the owner clicked after the reload made no older read at all: the reloaded page already held the message.
+
+## Resolution
+
+[opus 5.5] Landed on github/main as `f25f33aff8bdee310143b1cf33bc507da1677783`: the gated head `40146d30` (owner-priority gate pass, full selection) replayed onto `9786b3ab`, with an identical patch. It is the reviewed and accepted `daadf308`, rebased only. Deployed to the live instance at 9:36 PM ET on 2026-11-25; the post-deploy watch was clean (startup probe passed, no app errors or panics, no restarts, both services active).
+
+- Server: one walk per channel view at a time, under the cache's backward claim. The first step waits the 1.5 s step wait for it. Every other step of the view, and every step while a failed walk backs the view off, is answered at once with `older_pending` and begins no upstream read. For Slack's Main and All the walk re-lists Main below the page: one history call per page, resuming where the view's last re-list stopped when no drop came since. The copy then proves the step and answers it. Elsewhere, the provider's own walk runs, and a late answer is kept for the next step. The walk reads under the `older-walk` reason at the page share of Slack's budget, below live work. Refusals retry on the #1715 schedule; failures back the view off. It publishes the live `older` event to its own step and to every step that waited. One `consumer="older_walk"` log line per walk.
+- Page: "Fetching older messages from <service>…" while pending, with no further step on scroll. The `older` event takes the step again. A failed walk says so, with tap to retry. A step answered from the copy now lowers the view's floor, so its rows are drawn (the second defect).
+- Contract: `TimelinePage.older_pending`; `LiveOlderEvent` (SSE `older`).
+- Tests that fail on main: message_cache_serve (five steps under a held Slack make one Main read, then the step is served from the copy, with the event and the walk line; a failed walk sends ok=false and backs off; a step waiting on a partial answer's read hears the event; All walked back to its start, one walk at a time); the slack budget test (the walk stops at half the ceiling, live keeps its share); scrolling.mjs (pending with no scroll loop and a re-step on the event; failed and tap retry; a copy step's rows drawn).
+- Acceptance, on a local real server against a fake Slack after a drop, at 412x915 and 1280x800, light and dark: scrolling past the copy's floor in All shows pending at about 1.6 s and 50 older rows at about 12.2 s (one walk, 2 older reads); the next step answers in 205-253 ms; the walk reaches the channel's start. Screenshot matrix from landed main (BUILD.txt f25f33af).
+- Screenshot note (#1989): with the shared harness's documented command, scene 77-composer-keyboard-open failed twice at dark laptop-1280 when it ran right after scenes 73-76 in one run ("the composer holds the focus" not reached). It passed run alone, and in the gate's full desks walk on the same build, so the matrix was shot as two runs (73-76, then 77).
