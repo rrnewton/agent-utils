@@ -1,13 +1,13 @@
 ---
 title: 'vibe-talk-read-modes-held-walk-thread-option-timeout: the held walk waits out ten wall-clock seconds for the thread option under load, on unmodified main'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: mu-statesync
 labels:
 - vibe-talk
 created_at: 2026-11-26T10:18:00-05:00
-updated_at: 2026-11-26T13:45:00-05:00
+updated_at: 2026-11-26T16:32:00-05:00
 ---
 
 # Description
@@ -32,3 +32,7 @@ Filed from the #2280 S3 gate on `afb8ecaa` (ticket 1795702247402631538, read-mod
 Update 2026-11-26 11:48 AM ET: a longer backstop is not the fix. In a temporary experiment (reverted before the disable commit), the same held-walk wait with a 120-second backstop passed 4 direct runs and then wedged for the full 120 seconds with the thread option still absent. The condition can therefore fail to arrive at all on some runs, not merely arrive slowly: this points at a real page or fake-API bug (the option never appears) that a condition-based rewrite must root-cause, not paper over. The step was disabled from gating instead of keeping the backstop change: 05418230, landed gated as d7ce9c3b (full gate 215/217 ok, the two reds being unrelated CPU timeouts that passed on exclusive rerun). This issue stays open for the real fix.
 
 Resolution in progress (2026-11-26): the wedge is root-caused and it is not the timeout. Under host load the page takes a longtask and its freeze-watch diagnostics POST to /api/v1/freeze-report; the check fake's do_POST answered 404 without reading the body, so on the HTTP/1.1 keep-alive connection the JSON body was parsed as the next request line (stdlib 400/501) and a pooled fetch - the picker touch's view=threads read - could draw that error as its whole answer. refreshThreadDirectory then recorded the failure quietly with nothing retrying while the picker stood open, so the thread option never arrived (the 120 s observation) until a re-touch. Fix, three layers: the fake consumes POST bodies (the sweep is #2307), the page retries the directory fetch leg once inside the same single-flight (a persistent failure still surfaces; proven with an always-failing fake: exactly two fetches, then the failure), and held_walk's waits name their page condition with HELD_BACKSTOP_MS as a hang backstop only. The step returns to gating in the same commit.
+
+## Resolution
+
+Landed (2026-11-26): 955af92a55c84d3257173dbef3f9f6b6ee317b48 on github/main (gated commit c05c6f8b, replayed by land-main). The full owner gate passed 219/219 on the rebased tree (ticket 1795723594402918906-3e0d43b4) with the step re-enabled, after an earlier gate was red only on the #2303 archive flake; the 10 solo passes, the always-failing-fake boundedness proof (exactly two fetches, then the failure surfaces) and the liaison-reviewed before/after picker shots are mu-statesync's evidence for the same commit. The wedge itself no longer exists by construction: an unread POST body cannot poison the reused connection, and a directory read the picker asked for retries once inside its single flight instead of leaving the open picker waiting on a second touch. The sibling-fake sweep for the same unread-body pattern is #2307.
