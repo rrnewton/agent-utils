@@ -1388,6 +1388,12 @@ const discussView = createDiscussView({
   // `#1354 discuss-layout-modes`. The panel's mode, on this device with the rest.
   storedMode: () => deviceSettings().get(DEVICE_SETTINGS.discussMode),
   keepMode: (mode) => deviceSettings().keep(DEVICE_SETTINGS.discussMode, mode),
+  // `#2263 vibe-talk-discuss-split-pane`. The timeline pane's kept height and
+  // its collapsed state, on this device with the rest; never sent to the server.
+  storedTimelineHeight: () => deviceSettings().get(DEVICE_SETTINGS.discussTimelineHeight),
+  keepTimelineHeight: (px) => deviceSettings().keep(DEVICE_SETTINGS.discussTimelineHeight, px),
+  storedTimelineCollapsed: () => deviceSettings().get(DEVICE_SETTINGS.discussTimelineCollapsed),
+  keepTimelineCollapsed: (collapsed) => deviceSettings().keep(DEVICE_SETTINGS.discussTimelineCollapsed, collapsed),
   // `#1497 discuss-fold-state-persist`. The saved summary's open sections, on
   // this device with the rest; a new summary's keep replaces the entry whole.
   storedFolds: () => deviceSettings().get(DEVICE_SETTINGS.discussFolds),

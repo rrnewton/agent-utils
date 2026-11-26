@@ -16,6 +16,7 @@
 import { createListening, foldSectionsByHeading, insertSanitizedHtml, openSectionKeys, setAllSections, setClassWord } from "../dom/index.ts";
 import { hasWord } from "./strikes.ts";
 import { createStrikeIndex, type StrikeFacts } from "./strikeindex.ts";
+import { createTimelineSplit, splitLatestPair, timelineEntryKey } from "./split.ts";
 import { createComposerKeys } from "../composer/index.ts";
 import { deepLinkRefFrom } from "../../foundation/index.ts";
 import type { MessageLinkRef } from "../../foundation/index.ts";
@@ -177,6 +178,15 @@ export interface DiscussPanelDependencies {
   /** `#1354 discuss-layout-modes`. The panel's layout mode, as last left on this device. */
   storedMode?(): DiscussLayoutMode;
   keepMode?(mode: DiscussLayoutMode): void;
+  /**
+   * `#2263 vibe-talk-discuss-split-pane`. The timeline pane's kept height (CSS px; null is
+   * the stylesheet's default share) and whether it stands collapsed, as last left on this
+   * device. Absent in a host that keeps nothing, where the choices last the session.
+   */
+  storedTimelineHeight?(): number | null;
+  keepTimelineHeight?(px: number | null): void;
+  storedTimelineCollapsed?(): boolean;
+  keepTimelineCollapsed?(collapsed: boolean): void;
   /**
    * `#1497 discuss-fold-state-persist`. The one kept fold entry on this device
    * and its keep, handed in where the page keeps them (the device settings, as
@@ -841,6 +851,16 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     if (termsList) termsList.textContent = "";
     const timeline = maybe("discuss-timeline");
     if (timeline) timeline.textContent = "";
+    // `#2263`: the Latest pair and the timeline's header count are the scope's own too.
+    const section = maybe("discuss-timeline-section");
+    if (section) section.hidden = true;
+    const count = maybe("discuss-timeline-count");
+    if (count) count.textContent = "";
+    const latest = maybe("discuss-latest");
+    if (latest) {
+      latest.textContent = "";
+      latest.hidden = true;
+    }
     const uncovered = maybe("discuss-uncovered");
     if (uncovered) uncovered.hidden = true;
   }
@@ -928,6 +948,15 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
   let sheetFull = false;
   let layoutMode: DiscussLayoutMode = "overlay";
   let drag: { startX: number; startWidth: number } | null = null;
+  // `#2263 vibe-talk-discuss-split-pane`: the timeline pane's size, fold and boundary,
+  // and the scroll-owner helpers the timeline and Latest draws go through.
+  const split = createTimelineSplit({
+    maybe: (id) => maybe(id),
+    storedHeight: deps.storedTimelineHeight,
+    keepHeight: deps.keepTimelineHeight,
+    storedCollapsed: deps.storedTimelineCollapsed,
+    keepCollapsed: deps.keepTimelineCollapsed,
+  });
   // `#1497 discuss-fold-state-persist`. The record the drawn summary answers
   // to (its scope and generation, `recordKeyFor`), the sections standing open
   // in it, and the last record a saved draw named — an in-session restore of
@@ -1375,6 +1404,8 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       storedMode = "overlay";
     }
     applyMode(storedMode === "docked" || storedMode === "maximized" ? storedMode : "overlay", false);
+    // `#2263`: the timeline pane's kept height and fold, with the rest of the layout.
+    split.applyStored();
   }
 
   function isOpen(): boolean {
@@ -1563,6 +1594,10 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       foldOpen = record === null ? new Set() : keptFoldsFor(record);
     }
     if (record !== null) lastFoldRecord = record;
+    // `#2263`: the summary pane is its own scroller; a redraw never moves it (the
+    // replace below could clamp its scroll for a moment), it stays where the reader left it.
+    const summaryPane = maybe("discuss-current-section") as (HTMLElement & { scrollTop?: number }) | null;
+    const summaryScroll = summaryPane?.scrollTop ?? 0;
     const box = deps.byId("discuss-answer");
     box.replaceChildren();
     drawCurrentCovers(answer);
@@ -1618,6 +1653,9 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     } else {
       setClassWord(box, "discuss-answer--plain", true);
       box.textContent = answer.text;
+    }
+    if (summaryPane !== null && typeof summaryPane.scrollTop === "number" && summaryPane.scrollTop !== summaryScroll) {
+      summaryPane.scrollTop = summaryScroll;
     }
     // `#1388` landing 1: the strike stands from this draw (a plain draw has
     // no citation links to map, so nothing is struck there). `#2265`: the
@@ -1765,9 +1803,82 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
    * shares the current summary's folded style and opens headings-first, with a
    * small expand-all to the right of its header for the second step.
    */
+  /**
+   * One follow-up question and its answer as a collapsible pair (`#2137`). `#2263`: the
+   * newest pair stands open in the Latest block, the rest folded in the timeline.
+   */
+  function drawPair(pair: DiscussEntryShape[], latest: boolean): HTMLElement {
+    const opening = pair[0];
+    const when = opening !== undefined && opening.kind === "turn" ? opening.at_ms : 0;
+    const details = document.createElement("details");
+    details.className = latest ? "discuss-qa discuss-collapsible discuss-latest-qa" : "discuss-qa discuss-collapsible";
+    if (opening !== undefined) details.setAttribute("data-entry-key", timelineEntryKey(opening));
+    const summary = document.createElement("summary");
+    summary.className = "discuss-collapsible-head";
+    const label = document.createElement("span");
+    label.className = "discuss-collapsible-label";
+    // `#2137`: the folded header carries the verbatim question, so the
+    // pair can be told apart from a summary without opening it. `#2263`: the
+    // Latest pair stands open, its question right below, so its header is one
+    // short line.
+    label.textContent = latest
+      ? `Latest follow-up · ${when > 0 ? summaryTimeLabel(when, nowMs()) : "—"}`
+      : opening !== undefined && opening.kind === "turn" && opening.speaker === "you" && opening.text !== ""
+        ? `Follow-up question ${when > 0 ? summaryTimeLabel(when, nowMs()) : "—"} — ${opening.text}`
+        : `Follow-up question ${when > 0 ? summaryTimeLabel(when, nowMs()) : "—"}`;
+    summary.appendChild(label);
+    details.appendChild(summary);
+    const body = document.createElement("div");
+    body.className = "discuss-qa-body";
+    for (const entry of pair) {
+      if (entry.kind !== "turn") continue;
+      const line = document.createElement("p");
+      line.className = entry.speaker === "you" ? "discuss-turn discuss-you" : "discuss-turn discuss-agent";
+      // `#2137`: label each paragraph so model text can never sit in
+      // the question's place.
+      const turnLabel = document.createElement("span");
+      turnLabel.className = "discuss-turn-label";
+      turnLabel.textContent = entry.speaker === "you" ? "You" : "Discuss";
+      line.appendChild(turnLabel);
+      if (entry.text_html !== "") insertSanitizedHtml(line, entry.text_html);
+      else line.appendChild(document.createTextNode(entry.text));
+      body.appendChild(line);
+    }
+    details.appendChild(body);
+    if (latest) (details as HTMLDetailsElement).open = true;
+    return details as HTMLElement;
+  }
+
+  /**
+   * `#2263`. The newest follow-up pair, open in its own Latest block between the timeline and
+   * the composer; hidden when the record ends on a summary. A host without the block keeps
+   * the pair in the timeline as before.
+   */
+  function drawLatest(latest: DiscussEntryShape[]): void {
+    const box = maybe("discuss-latest");
+    if (box === null) return;
+    box.replaceChildren();
+    const first = latest[0];
+    if (first === undefined) {
+      box.hidden = true;
+      split.showLatest(null);
+      return;
+    }
+    box.appendChild(drawPair(latest, true) as never);
+    box.hidden = false;
+    keepCitationsInApp(box);
+    split.showLatest(timelineEntryKey(first));
+  }
+
   function drawTimeline(entries: DiscussEntryShape[], scope: DiscussScope): void {
     searchTimeline = entries;
     const box = deps.byId("discuss-timeline");
+    // `#2263`: the newest follow-up pair stands in the Latest block (where the host has
+    // one); the timeline pane keeps the reader's row through this redraw.
+    const hasLatest = maybe("discuss-latest") !== null;
+    const { history, latest } = hasLatest ? splitLatestPair(entries) : { history: entries, latest: [] as DiscussEntryShape[] };
+    const scopeKey = scopeKeyOf(scope);
+    const restoreRow = split.holdTimelineRow(scopeKey);
     box.replaceChildren();
     // `#2134 vibe-talk-discuss-timeline-expand-inline`: the toggle stands
     // on the Timeline header row, straight right of the label, with no row
@@ -1780,8 +1891,11 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         }
       }
     }
-    if (entries.length === 0) {
+    drawLatest(latest);
+    if (history.length === 0) {
       indexStrikes("timeline", null);
+      split.drawHead(scopeKey, 0, 0);
+      restoreRow();
       return;
     }
     const timelineToggle = makeDiscussToggle("timeline", () => box as unknown as HTMLElement, (open) => setDetailsDeep(box as unknown as HTMLElement, open));
@@ -1794,55 +1908,30 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       box.appendChild(bar);
     }
     let at = 0;
-    while (at < entries.length) {
-      const entry = entries[at];
+    let rows = 0;
+    let summaries = 0;
+    while (at < history.length) {
+      const entry = history[at];
       if (entry === undefined) break;
       if (entry.kind === "turn") {
         const pair: DiscussEntryShape[] = [entry];
         at += 1;
-        if (entry.speaker === "you" && at < entries.length) {
-          const next = entries[at];
+        if (entry.speaker === "you" && at < history.length) {
+          const next = history[at];
           if (next !== undefined && next.kind === "turn" && next.speaker !== "you") {
             pair.push(next);
             at += 1;
           }
         }
-        const when = entry.at_ms;
-        const details = document.createElement("details");
-        details.className = "discuss-qa discuss-collapsible";
-        const summary = document.createElement("summary");
-        summary.className = "discuss-collapsible-head";
-        const label = document.createElement("span");
-        label.className = "discuss-collapsible-label";
-        // `#2137`: the folded header carries the verbatim question, so the
-        // pair can be told apart from a summary without opening it.
-        label.textContent = entry.speaker === "you" && entry.text !== ""
-          ? `Follow-up question ${when > 0 ? summaryTimeLabel(when, nowMs()) : "—"} — ${entry.text}`
-          : `Follow-up question ${when > 0 ? summaryTimeLabel(when, nowMs()) : "—"}`;
-        summary.appendChild(label);
-        details.appendChild(summary);
-        const body = document.createElement("div");
-        body.className = "discuss-qa-body";
-        for (const entry of pair) {
-          if (entry.kind !== "turn") continue;
-          const line = document.createElement("p");
-          line.className = entry.speaker === "you" ? "discuss-turn discuss-you" : "discuss-turn discuss-agent";
-          // `#2137`: label each paragraph so model text can never sit in
-          // the question's place.
-          const turnLabel = document.createElement("span");
-          turnLabel.className = "discuss-turn-label";
-          turnLabel.textContent = entry.speaker === "you" ? "You" : "Discuss";
-          line.appendChild(turnLabel);
-          if (entry.text_html !== "") insertSanitizedHtml(line, entry.text_html);
-          else line.appendChild(document.createTextNode(entry.text));
-          body.appendChild(line);
-        }
-        details.appendChild(body);
-        box.appendChild(details);
+        rows += 1;
+        box.appendChild(drawPair(pair, false));
       } else {
         at += 1;
+        rows += 1;
+        summaries += 1;
         const details = document.createElement("details");
         details.className = "discuss-old discuss-collapsible";
+        details.setAttribute("data-entry-key", timelineEntryKey(entry));
         const summary = document.createElement("summary");
         summary.className = "discuss-collapsible-head discuss-old-head";
         const label = document.createElement("span");
@@ -1910,8 +1999,9 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     // `#2265`: earlier summaries' bullets join the strike index, so a Done
     // on a message they cite strikes them as it strikes the current one.
     indexStrikes("timeline", box);
+    split.drawHead(scopeKey, rows, summaries);
+    restoreRow();
     drawSearchHits();
-    void scope;
   }
 
   /** `#2136`. The summaries search filters: the current one, then every earlier one. */
@@ -2670,6 +2760,13 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         if (timelineBox !== null) {
           listening.listen(timelineBox, "click", (event) => answerTap(event, timelineBox));
         }
+        // `#2263 vibe-talk-discuss-split-pane`: the Latest pair's citations jump as the
+        // timeline's do, and the timeline's header row is the boundary (drag, keys, fold).
+        const latestBox = maybe("discuss-latest");
+        if (latestBox !== null) {
+          listening.listen(latestBox, "click", (event) => answerTap(event, latestBox));
+        }
+        split.mount((el, type, handler) => listening.listen(el, type, handler as never));
         listening.listen(deps.byId("discuss-mark-read"), "click", () => mark(true));
         listening.listen(deps.byId("discuss-mark-unread"), "click", () => mark(false));
         // `#1383`: the header's two layout toggles beside Close. Dock switches

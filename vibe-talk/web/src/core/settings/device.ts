@@ -30,6 +30,7 @@ import {
   clampQuoteReadPercent,
   clampCollapsedLines,
   clampDiscussDockedHeight,
+  clampDiscussTimelineHeight,
   clampDiscussWidth,
   clampMsgScale,
   clampReadKeepAliveMs,
@@ -308,6 +309,23 @@ export const DEVICE_SETTINGS = Object.freeze({
     write: (pct: number) => String(pct),
     refused: { value: DEFAULT_DISCUSS_DOCKED_HEIGHT },
   } satisfies DeviceSetting<number>,
+  /** `#2263 vibe-talk-discuss-split-pane`. The Discuss timeline pane's height in CSS pixels, as the
+   * reader last dragged the boundary between the current summary and the timeline; null (no entry)
+   * is the stylesheet's default share. Per device, as the width is: never sent to the server. */
+  discussTimelineHeight: {
+    key: "vibe-talk.voice.discuss-timeline-height",
+    read: (raw: string | null) => clampDiscussTimelineHeight(raw),
+    write: (px: number | null) => (px === null ? null : String(px)),
+    refused: { value: null },
+  } satisfies DeviceSetting<number | null>,
+  /** `#2263`. Whether the Discuss timeline stands collapsed to its one header row. Per device; a
+   * refused read is expanded. Collapsing never forgets the kept height. */
+  discussTimelineCollapsed: {
+    key: "vibe-talk.voice.discuss-timeline-collapsed",
+    read: (raw: string | null) => raw === "1",
+    write: (collapsed: boolean) => (collapsed ? "1" : null),
+    refused: { value: false },
+  } satisfies DeviceSetting<boolean>,
   /** `#1344 discuss-panel-resize` (owner reply 417). Whether the phone's Discuss sheet stands at
    * full height: half until the reader maximizes it, and the choice sticks across close/reopen.
    * Per device; a refused read is half. */

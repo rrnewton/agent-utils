@@ -5987,6 +5987,174 @@ def _act_discuss_timeline_layout(driver: Driver) -> None:
     driver.settle(200)
 
 
+# `#2263 vibe-talk-discuss-split-pane`: the split Discuss panel's states, every one through the
+# real routes and the loopback model stub only. The kept size and fold live on the device, and a
+# profile's scenes share one browser context, so each state first forgets them and reopens.
+SPLIT_KEYS_JS = (
+    "(() => { localStorage.removeItem('vibe-talk.voice.discuss-timeline-height');"
+    " localStorage.removeItem('vibe-talk.voice.discuss-timeline-collapsed');"
+    " localStorage.removeItem('vibe-talk.voice.discuss-sheet-full');"
+    " localStorage.removeItem('vibe-talk.voice.discuss-mode'); })()"
+)
+
+# What every split state must show: the panes inside the panel, the panel not scrolling, the
+# composer whole, and the summary pane standing above the timeline.
+SPLIT_PANES_JS = (
+    "(() => { const p = document.getElementById('discuss-panel').getBoundingClientRect(); "
+    "const inside = (el) => { if (!el || el.hidden) return true; const r = el.getBoundingClientRect(); "
+    "return r.top >= p.top - 1 && r.bottom <= p.bottom + 1; }; "
+    "const panel = document.getElementById('discuss-panel'); "
+    "return panel.scrollHeight <= panel.clientHeight + 1 "
+    "&& ['discuss-current-section', 'discuss-timeline-section', 'discuss-latest', 'discuss-followup', 'discuss-send']"
+    ".every((id) => inside(document.getElementById(id))); })()"
+)
+
+
+def _split_ask(driver: Driver, question: str) -> None:
+    """One follow-up through the real route; it lands open in the Latest block."""
+    driver.page.fill("#discuss-followup", question)
+    driver.click("discuss-send")
+    driver.page.wait_for_function(
+        f"() => !document.getElementById('discuss-latest').hidden "
+        f"&& document.getElementById('discuss-latest').textContent.includes({json.dumps(question)})",
+        timeout=30_000,
+    )
+
+
+def _split_tap_out(driver: Driver) -> None:
+    """Composing on a phone the Summarize bar stands aside; a reader taps out of the box first."""
+    driver.js("document.activeElement && document.activeElement.blur && document.activeElement.blur()")
+    driver.page.wait_for_function(
+        "() => document.querySelector('.discuss-ask').getBoundingClientRect().height > 0", timeout=10_000)
+
+
+def _split_resummarize(driver: Driver) -> None:
+    """Summarize again: the standing summary moves into the timeline as an earlier one."""
+    _split_tap_out(driver)
+    before = int(cast(float, driver.js("document.querySelectorAll('#discuss-timeline .discuss-old').length")))
+    if int(cast(float, driver.js("Number(document.getElementById('discuss-count').value)"))) == 0:
+        driver.page.fill("#discuss-count", "6")
+    driver.click("discuss-summarize")
+    driver.page.wait_for_function(
+        f"() => document.querySelectorAll('#discuss-timeline .discuss-old').length > {before}",
+        timeout=30_000,
+    )
+
+
+def _act_discuss_split(driver: Driver) -> None:
+    """A summary, two follow-ups around a re-summarize, and a third follow-up standing as
+    the Latest pair: the timeline holds a Q/A pair, an earlier summary and another pair."""
+    _open_discuss(driver)
+    driver.js(SPLIT_KEYS_JS)
+    driver.click("discuss-close")
+    driver.page.wait_for_function("() => !window.__visible('discuss-panel')", timeout=10_000)
+    driver.click("discuss-open")
+    driver.page.wait_for_function("() => window.__visible('discuss-panel')", timeout=15_000)
+    _act_discuss_summary_in_open_panel(driver)
+    _split_ask(driver, "What is the next step?")
+    _split_resummarize(driver)
+    _split_ask(driver, "Who reviews the fix?")
+    _split_ask(driver, "When does it ship?")
+    _split_tap_out(driver)
+    driver.settle(200)
+
+
+def _act_discuss_summary_in_open_panel(driver: Driver) -> None:
+    if int(cast(float, driver.js("Number(document.getElementById('discuss-count').value)"))) == 0:
+        driver.page.fill("#discuss-count", "6")
+    driver.click("discuss-summarize")
+    driver.page.wait_for_function(
+        "() => document.getElementById('discuss-answer').textContent.includes('Model stub summary')",
+        timeout=30_000,
+    )
+
+
+def _split_drag_head(driver: Driver, dy: int) -> None:
+    """Drag the timeline's header row (the boundary) by `dy` CSS px (negative: up)."""
+    box = driver.page.locator("#discuss-timeline-head").bounding_box()
+    assert box is not None
+    x = box["x"] + box["width"] * 0.55
+    y = box["y"] + box["height"] / 2
+    driver.page.mouse.move(x, y)
+    driver.page.mouse.down()
+    steps = 8
+    for i in range(1, steps + 1):
+        driver.page.mouse.move(x, y + dy * i / steps)
+    driver.page.mouse.up()
+
+
+def _act_discuss_split_dragged(driver: Driver) -> None:
+    _act_discuss_split(driver)
+    _split_drag_head(driver, -60)
+    driver.page.wait_for_function(
+        "() => document.getElementById('discuss-panel').getAttribute('data-timeline-size') === 'kept'",
+        timeout=10_000,
+    )
+    driver.settle(200)
+
+
+def _act_discuss_split_collapsed(driver: Driver) -> None:
+    """Collapsed to its header row, then a new earlier summary arrives: the header says so
+    and stays collapsed; a follow-up after it stands in the Latest block."""
+    _act_discuss_split(driver)
+    driver.click("discuss-timeline-fold")
+    driver.page.wait_for_function(
+        "() => document.getElementById('discuss-timeline-section').getAttribute('data-collapsed') === 'true'",
+        timeout=10_000,
+    )
+    _split_resummarize(driver)
+    _split_ask(driver, "Is anything blocked?")
+    _split_tap_out(driver)
+    driver.settle(200)
+
+
+def _act_discuss_split_keyboard_open(driver: Driver) -> None:
+    _act_discuss_split(driver)
+    shrink_keyboard(driver, "143-discuss-split-keyboard-open", focus="#discuss-followup")
+
+
+def _act_discuss_split_after_blur(driver: Driver) -> None:
+    """Composing with the keyboard up, then the box lets the focus go and the keyboard goes:
+    the Summarize bar is back below the composer."""
+    _act_discuss_split(driver)
+    shrink_keyboard(driver, "146-discuss-split-after-blur", focus="#discuss-followup")
+    driver.js("document.activeElement.blur()")
+    restore_keyboard(driver)
+    driver.page.wait_for_function(
+        "() => document.querySelector('.discuss-ask').getBoundingClientRect().height > 0", timeout=10_000)
+    driver.settle(200)
+
+
+def _act_discuss_split_full(driver: Driver) -> None:
+    _act_discuss_split(driver)
+    driver.click("discuss-full-toggle")
+    driver.page.wait_for_function(
+        "() => document.getElementById('discuss-full-toggle').getAttribute('aria-pressed') === 'true'",
+        timeout=10_000,
+    )
+    driver.settle(200)
+
+
+def _act_discuss_split_docked(driver: Driver) -> None:
+    _act_discuss_split(driver)
+    driver.click("discuss-dock-toggle")
+    driver.page.wait_for_function(
+        "() => document.getElementById('screen-main').getAttribute('data-discuss') === 'docked'",
+        timeout=10_000,
+    )
+    driver.settle(200)
+
+
+def _after_discuss_split(driver: Driver) -> None:
+    """Put the kept layout back to its defaults for the scenes after this one."""
+    driver.js(SPLIT_KEYS_JS)
+
+
+def _after_discuss_split_keyboard(driver: Driver) -> None:
+    restore_keyboard(driver)
+    _after_discuss_split(driver)
+
+
 def _act_discuss_terms(driver: Driver) -> None:
     """`#1924` (c): summarize through the real route, then open the Terms
     block the stub answer carries and bring it into view, so the shot
@@ -10870,6 +11038,131 @@ SCENES: tuple[Scene, ...] = (
             ("no error banner is up", "!window.__visible('error-wrap')"),
         ),
     ),
+    # `#2263 vibe-talk-discuss-split-pane` (owner request 374): the split Discuss panel.
+    Scene(
+        name="140-discuss-split-default",
+        what="#2263 Discuss split: the current summary in its own pane, the timeline at its default "
+             "share below, the newest follow-up open in Latest, then the composer",
+        act=_act_discuss_split,
+        after=_after_discuss_split,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("the Discuss panel is open", "window.__visible('discuss-panel')"),
+            ("the panes, Latest and the composer stand inside the panel, which does not scroll", SPLIT_PANES_JS),
+            ("the timeline holds history and the Latest pair stands open",
+             "document.querySelectorAll('#discuss-timeline > details').length >= 2 "
+             "&& document.querySelector('#discuss-latest > details.discuss-qa').open "
+             "&& document.getElementById('discuss-latest').textContent.includes('When does it ship?')"),
+            ("the timeline header counts its rows", "/· \\d+/.test(document.getElementById('discuss-timeline-count').textContent)"),
+            ("no fixture refusal is showing for Discuss",
+             "!document.getElementById('discuss-panel').textContent.includes('not served by this check') "
+             "&& !document.getElementById('discuss-panel').textContent.includes('not_found')"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="141-discuss-split-dragged",
+        what="#2263 the boundary dragged up 60px: the timeline stands at its kept constant height",
+        act=_act_discuss_split_dragged,
+        after=_after_discuss_split,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("the Discuss panel is open", "window.__visible('discuss-panel')"),
+            ("the panes, Latest and the composer stand inside the panel, which does not scroll", SPLIT_PANES_JS),
+            ("the kept height is on the panel and on the device",
+             "document.getElementById('discuss-panel').getAttribute('data-timeline-size') === 'kept' "
+             "&& Number(localStorage.getItem('vibe-talk.voice.discuss-timeline-height')) >= 48"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="142-discuss-split-collapsed",
+        what="#2263 the timeline collapsed to its header row; a new earlier summary arrived while collapsed, "
+             "so the header says so without opening; the Latest pair and the composer below",
+        act=_act_discuss_split_collapsed,
+        after=_after_discuss_split,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("the Discuss panel is open", "window.__visible('discuss-panel')"),
+            ("the panes, Latest and the composer stand inside the panel, which does not scroll", SPLIT_PANES_JS),
+            ("the timeline stands collapsed, its body hidden",
+             "document.getElementById('discuss-timeline-section').getAttribute('data-collapsed') === 'true' "
+             "&& !window.__visible('discuss-timeline')"),
+            ("the collapsed header shows its count and the new-summary hint",
+             "/· \\d+/.test(document.getElementById('discuss-timeline-count').textContent) "
+             "&& window.__visible('discuss-timeline-new') "
+             "&& document.getElementById('discuss-timeline-new').textContent.includes('new summar')"),
+            ("the Latest pair stands open", "document.getElementById('discuss-latest').textContent.includes('Is anything blocked?')"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="143-discuss-split-keyboard-open",
+        what="#2263 the keyboard open over the split panel (viewport really shrunk by 336px): the composer "
+             "and the Latest pair keep their room",
+        act=_act_discuss_split_keyboard_open,
+        after=_after_discuss_split_keyboard,
+        # The on-screen keyboard is a phone's; a desk window that short floats no keyboard.
+        profiles=("android-412",),
+        expect=(
+            ("the Discuss panel is open", "window.__visible('discuss-panel')"),
+            ("the viewport really shrank", "(window.visualViewport ? window.visualViewport.height : window.innerHeight) <= 579"),
+            ("the composer stands whole inside the panel and the viewport",
+             "(() => { const p = document.getElementById('discuss-panel').getBoundingClientRect(); "
+             "const vh = window.visualViewport ? window.visualViewport.height : window.innerHeight; "
+             "return ['discuss-followup', 'discuss-send'].every((id) => { const r = document.getElementById(id).getBoundingClientRect(); "
+             "return r.top >= p.top - 1 && r.bottom <= p.bottom + 1 && r.bottom <= vh + 1; }); })()"),
+            ("composing on a phone, the Summarize bar stands aside",
+             "document.querySelector('.discuss-ask').getBoundingClientRect().height === 0"),
+            ("the Latest pair keeps a readable height inside the panel",
+             "(() => { const p = document.getElementById('discuss-panel').getBoundingClientRect(); "
+             "const l = document.getElementById('discuss-latest').getBoundingClientRect(); "
+             "return l.height >= 40 && l.top >= p.top - 1 && l.bottom <= p.bottom + 1; })()"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="146-discuss-split-after-blur",
+        what="#2263 after composing on a phone: the box let the focus go and the keyboard went, and the "
+             "Summarize bar is back below the composer, the panes in place",
+        act=_act_discuss_split_after_blur,
+        after=_after_discuss_split,
+        profiles=("android-412",),
+        expect=(
+            ("the Discuss panel is open", "window.__visible('discuss-panel')"),
+            ("the viewport is at its full height again",
+             "(window.visualViewport ? window.visualViewport.height : window.innerHeight) > 800"),
+            ("the Summarize bar is back", "document.querySelector('.discuss-ask').getBoundingClientRect().height > 0"),
+            ("the panes, Latest and the composer stand inside the panel, which does not scroll", SPLIT_PANES_JS),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="144-discuss-split-full",
+        what="#2263 the split panel at full screen (the phone's full sheet, the desk's maximized panel)",
+        act=_act_discuss_split_full,
+        after=_after_discuss_split,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("the Discuss panel is open", "window.__visible('discuss-panel')"),
+            ("it stands at full screen", "document.getElementById('discuss-full-toggle').getAttribute('aria-pressed') === 'true'"),
+            ("the panes, Latest and the composer stand inside the panel, which does not scroll", SPLIT_PANES_JS),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="145-discuss-split-docked",
+        what="#2263 the split panel docked beside the list on a desk",
+        act=_act_discuss_split_docked,
+        after=_after_discuss_split,
+        profiles=("laptop-1280",),
+        expect=(
+            ("the Discuss panel is open and docked",
+             "window.__visible('discuss-panel') && document.getElementById('screen-main').getAttribute('data-discuss') === 'docked'"),
+            ("the panes, Latest and the composer stand inside the panel, which does not scroll", SPLIT_PANES_JS),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
     # LAST IN THE WALK, and not by accident: it empties the server's durable store on the way in,
     # so that the summary the state above cached is really regenerated and can really fail. Nothing
     # after it in this profile would miss what it deletes, and the next profile purges anyway.
@@ -11459,7 +11752,8 @@ def run_captures(
     # 91/92, so they skip with them on a cacheless server instead of failing alone.
     discuss_scenes = [s for s in scenes if s.name.startswith(("73-", "74-", "75-", "76-", "78-", "84-", "85-", "89-", "90-", "91-", "92-", "93-", "94-", "95-", "96-", "97-", "98-", "99-", "100-", "101-", "102-", "103-",
                                                                         "107-", "108-", "109-", "110-", "111-", "112-", "113-", "114-", "115-", "116-", "117-",
-                                                                        "120-", "121-", "123-", "124-", "125-", "126-", "127-", "128-", "130-", "131-"))]
+                                                                        "120-", "121-", "123-", "124-", "125-", "126-", "127-", "128-", "130-", "131-",
+                                                                        "140-", "141-", "142-", "143-", "144-", "145-", "146-"))]
     discuss_only = bool(wanted) and len(wanted) == len(discuss_scenes)
     if discuss_scenes and not seed_discuss_cache(60 if discuss_only else 10):
         if discuss_only:

@@ -569,17 +569,41 @@
                 <ul id="discuss-terms-list"></ul>
               </details>
               <p id="discuss-stale" hidden><span id="discuss-stale-text"></span> <span class="discuss-stale-buttons"><button id="discuss-update" type="button">Update</button> <button id="discuss-new-summary" type="button">New summary</button></span></p>
+              <!-- `#2263 vibe-talk-discuss-split-pane`: the summary's own marks, its uncovered
+                   line and its stamp scroll with it in the summary pane, so the bottom of the
+                   panel keeps room for the Latest pair and the composer. -->
+              <div id="discuss-footer" hidden>
+                <div class="discuss-marks">
+                  <button id="discuss-mark-read" type="button">Mark read</button>
+                  <button id="discuss-mark-unread" type="button">Mark unread</button>
+                </div>
+                <p id="discuss-unmarkable" hidden></p>
+              </div>
+              <p id="discuss-uncovered" hidden><button id="discuss-uncovered-go" type="button">Summarize</button> <span id="discuss-uncovered-text"></span></p>
+              <p id="discuss-stamp" hidden></p>
             </section>
-            <section class="discuss-section discuss-timeline-section" aria-labelledby="discuss-timeline-heading">
+            <!-- `#2263 vibe-talk-discuss-split-pane` (owner request 374): the current summary
+                 above holds still in its own scroller while the timeline (outline) scrolls in
+                 its own below it. The timeline's header row is the boundary: drag it (mouse,
+                 touch) or step it from the grip's keys; its title folds the timeline to this
+                 one row. Its kept height and fold are per device (view/catchup/split.ts). -->
+            <section id="discuss-timeline-section" class="discuss-section discuss-timeline-section" aria-labelledby="discuss-timeline-heading" data-collapsed="false">
               <hr class="discuss-sep">
               <!-- `#2134 vibe-talk-discuss-timeline-expand-inline`: the
                    Timeline Expand/Collapse toggle stands on this header row,
                    straight right of the label, with no row of its own. -->
               <div id="discuss-timeline-head" class="discuss-section-head discuss-timeline-head">
-                <h2 id="discuss-timeline-heading" class="discuss-section-title">Timeline</h2>
+                <span id="discuss-split" class="discuss-split-grip" role="separator" aria-orientation="horizontal" tabindex="0"
+                      aria-controls="discuss-timeline" aria-label="Boundary between the summary and the timeline"
+                      aria-valuemin="0" aria-valuemax="4000" aria-valuenow="0"></span>
+                <h2 id="discuss-timeline-heading" class="discuss-section-title"><button id="discuss-timeline-fold" class="discuss-timeline-fold" type="button" aria-expanded="true" aria-controls="discuss-timeline" aria-label="Collapse the timeline">Timeline<span id="discuss-timeline-count" class="discuss-timeline-count"></span></button></h2>
+                <span id="discuss-timeline-new" class="discuss-timeline-new" role="status" hidden></span>
               </div>
               <div id="discuss-timeline"></div>
             </section>
+            <!-- `#2263`: the newest follow-up pair, open, between the timeline and the composer,
+                 so the latest answer stays in view however long the history above it is. -->
+            <section id="discuss-latest" class="discuss-latest" aria-label="Latest follow-up" hidden></section>
             <div id="discuss-draft-offer" class="draft-sync-offer" role="group" aria-labelledby="discuss-draft-offer-text" hidden>
               <p id="discuss-draft-offer-text"></p>
               <button id="discuss-draft-use" type="button">Use draft</button>
@@ -595,16 +619,7 @@
               </span>
             </div>
             <p id="discuss-draft-note" class="hint" role="status" aria-live="polite" hidden></p>
-            <div id="discuss-footer" hidden>
-              <div class="discuss-marks">
-                <button id="discuss-mark-read" type="button">Mark read</button>
-                <button id="discuss-mark-unread" type="button">Mark unread</button>
-              </div>
-              <p id="discuss-unmarkable" hidden></p>
-            </div>
-            <p id="discuss-uncovered" hidden><button id="discuss-uncovered-go" type="button">Summarize</button> <span id="discuss-uncovered-text"></span></p>
             <button id="discuss-retry" type="button" hidden>Retry</button>
-            <p id="discuss-stamp" hidden></p>
           </div>
 
           <!-- `#2233 vibe-talk-glossary-popup`: the full-screen glossary, opened by the glossary

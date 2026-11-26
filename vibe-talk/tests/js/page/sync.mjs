@@ -2647,7 +2647,14 @@ test("THE SCROLLER IS SIZED BY ITS CELL ALONE, so a change beside it does not la
   const withoutPreview = withoutPickerGroup
     .replace(/#theme-preview-slot\s*\{[^}]*\}/, " ")
     .replace(/#theme-preview-slot\s*\{[^}]*position:\s*fixed[^}]*\}/, " ");
-  assert.doesNotMatch(withoutPreview, /position:\s*(fixed|sticky)/, "something now escapes the scroller's containment");
+  // The split panes' exceptions (`#2263 vibe-talk-discuss-split-pane`): the current summary's
+  // header sticks inside the summary pane, and the Latest pair's header inside the Latest block,
+  // both scrollers of #discuss-panel, outside #scroll-area. Exactly those two selectors.
+  assert.match(cssBlock("#discuss-panel #discuss-current-head"), /position:\s*sticky/, "the summary header does not stick in its pane");
+  const withoutSplit = withoutPreview
+    .replace(/#discuss-panel #discuss-current-head\s*\{[^}]*position:\s*sticky[^}]*\}/, " ")
+    .replace(/#discuss-latest > \.discuss-qa > summary\s*\{[^}]*position:\s*sticky[^}]*\}/, " ");
+  assert.doesNotMatch(withoutSplit, /position:\s*(fixed|sticky)/, "something now escapes the scroller's containment");
 });
 
 test("A HIDDEN PAGE POLLS NOTHING: the poll waits for it to come back, and one that came due meanwhile runs then", async () => {

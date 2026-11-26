@@ -1,0 +1,15 @@
+steps:
+  - group: check
+    job: discuss-split-browser
+    desc: the Discuss split pane (#2263) against the real server (fake chat upstream, loopback model stub) in current Chromium at 412x915 and 1280x800 — the summary holds still while the timeline scrolls and grows, the boundary moves by mouse, touch and keys and is kept across a reload, the timeline collapses with a new-summary hint, the Latest pair scrolls to its end, and the phone keyboard leaves the composer and Latest in view
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/discuss_split_browser.py
+    jobs_flag: ""
+    deps: [build.release, setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 60
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824

@@ -1550,3 +1550,318 @@ stay its owner's (#1524). The pane itself already ends above the
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
+
+/* `#2263 vibe-talk-discuss-split-pane` (owner request 374): the Discuss panel stands
+ * as panes. The current summary is its own scroller on top and holds still while the
+ * timeline (outline) scrolls in its own below it; the timeline's header row is the
+ * boundary between them (dragged by mouse or touch, stepped by the grip's keys), and its
+ * title folds the timeline to that one row; the newest follow-up pair stands open in
+ * the Latest block under the timeline, then the composer. Only the summary gives way
+ * first when room runs short (down to its header row), then the timeline body, then
+ * the Latest block; nothing else in the panel shrinks, so the composer stays whole.
+ * Once the reader has dragged the boundary, the kept height holds and the Latest block
+ * gives way before the timeline (the drag itself stops while Latest still shows a few lines).
+ * That order is said by shrink weights far apart (summary 10000, then 100 and 1),
+ * never by fractional ones: the flex algorithm hands out only that fraction of the overflow
+ * when the shrink factors left sum to less than one, so 0.001 would leave the panel overfull.
+ *
+ * The timeline's share: until the reader drags the boundary it takes 35% of the room
+ * the summary and the timeline share (grow 35 against the summary's 65); once dragged it
+ * stands at the kept constant height (`--discuss-timeline-height` in px, kept per device
+ * by view/catchup/split.ts, `data-timeline-size="kept"`). The panel itself no longer
+ * scrolls while everything fits; its overflow stays as the last resort for a pane too
+ * short for even the minimums. The glossary panel shares Discuss's box rules above but
+ * none of these: every rule here names #discuss-panel. */
+#discuss-panel {
+  display: flex;
+  flex-direction: column;
+  --discuss-timeline-head-height: 3rem;
+}
+
+#discuss-panel > * {
+  flex: 0 0 auto;
+}
+
+#discuss-panel > #discuss-current-section {
+  flex: 65 10000 0px;
+  /* Its floor keeps a few lines of the summary under its header, never the header alone. */
+  min-height: max(2.75rem, 15%);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border-top: 1px solid var(--edge);
+}
+
+/* The panes draw their own boundaries; the separators stay for a host without them. */
+#discuss-panel > .discuss-section > .discuss-sep {
+  display: none;
+}
+
+/* The summary's header (title, Covers, toggle) stays at the top of its pane. */
+#discuss-panel #discuss-current-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--panel);
+}
+
+#discuss-panel > #discuss-timeline-section {
+  display: flex;
+  flex-direction: column;
+  flex: 35 100 var(--discuss-timeline-head-height);
+  min-height: var(--discuss-timeline-head-height);
+  overflow: hidden;
+  border-top: 1px solid var(--edge);
+}
+
+/* Dragged: the boundary is the reader's, so the summary may go down to its header row. */
+#discuss-panel[data-timeline-size="kept"] > #discuss-current-section {
+  flex: 1 10000 0px;
+  min-height: 2.75rem;
+}
+
+#discuss-panel[data-timeline-size="kept"] > #discuss-timeline-section:not([data-collapsed="true"]) {
+  flex: 0 1 calc(var(--discuss-timeline-height, 12rem) + var(--discuss-timeline-head-height));
+}
+
+#discuss-panel > #discuss-timeline-section[data-collapsed="true"] {
+  flex: 0 0 auto;
+}
+
+#discuss-panel > #discuss-timeline-section[hidden] {
+  display: none;
+}
+
+/* The boundary: the whole header row drags (its fold-all toggle keeps its own click). */
+#discuss-timeline-section > .discuss-timeline-head {
+  flex: 0 0 auto;
+  min-height: var(--discuss-timeline-head-height);
+  box-sizing: border-box;
+  gap: 8px;
+  cursor: ns-resize;
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+#discuss-timeline-section > #discuss-timeline {
+  flex: 1 1 0px;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+#discuss-timeline-section[data-collapsed="true"] > #discuss-timeline,
+#discuss-timeline-section[data-collapsed="true"] .discuss-toggle {
+  display: none;
+}
+
+/* The grip mark (the #1556 three lines), the boundary's keyboard handle. */
+.discuss-split-grip {
+  flex: 0 0 28px;
+  width: 28px;
+  height: 12px;
+  align-self: center;
+  border-radius: 6px;
+  color: var(--muted);
+  opacity: 0.85;
+  background:
+    linear-gradient(currentColor, currentColor) center 0 / 100% 2px no-repeat,
+    linear-gradient(currentColor, currentColor) center 5px / 100% 2px no-repeat,
+    linear-gradient(currentColor, currentColor) center 10px / 100% 2px no-repeat;
+}
+
+.discuss-timeline-head:hover .discuss-split-grip,
+.discuss-timeline-head:active .discuss-split-grip {
+  color: var(--ink);
+  opacity: 1;
+}
+
+.discuss-split-grip:focus-visible,
+.discuss-timeline-fold:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+#discuss-timeline-heading {
+  flex: 0 1 auto;
+  min-width: 0;
+  margin: 0;
+}
+
+/* The title folds the timeline: it reads as the heading, with its triangle. */
+.discuss-timeline-fold {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  min-height: 2.75rem;
+  max-width: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--ink);
+  font: inherit;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.discuss-timeline-fold::before {
+  content: "▾";
+  width: 1.2rem;
+  color: var(--muted);
+  font-size: 1.1rem;
+  line-height: 1;
+}
+
+.discuss-timeline-fold[aria-expanded="false"]::before {
+  content: "▸";
+}
+
+.discuss-timeline-count {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+/* While collapsed: an earlier summary arrived (liaison 2026-11-25); no auto-expand. */
+.discuss-timeline-new {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--accent);
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.discuss-timeline-new[hidden] {
+  display: none;
+}
+
+/* The Latest pair: open, at most 30% of the panel, scrolling inside itself to its end (30, not
+ * the 40 first proposed: at 40 a long answer beside the summary's floor left the timeline no
+ * room at all by default, even in a full-height docked column). */
+#discuss-panel > #discuss-latest {
+  flex: 0 1 auto;
+  max-height: 30%;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border-top: 1px solid var(--edge);
+}
+
+#discuss-panel[data-timeline-size="kept"] > #discuss-latest {
+  flex: 0 100 auto;
+}
+
+#discuss-panel > #discuss-latest[hidden] {
+  display: none;
+}
+
+#discuss-latest > .discuss-qa {
+  margin-top: 0;
+}
+
+#discuss-latest > .discuss-qa[open] {
+  border-top: none;
+  border-bottom: none;
+}
+
+#discuss-latest > .discuss-qa > summary {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  min-height: 2.25rem;
+  padding: 0.3rem 0;
+  font-size: 0.95rem;
+  background: var(--panel);
+}
+
+/* An open summary search shrinks the summary pane rather than push the composer out. */
+#discuss-panel > #discuss-search:not([hidden]) {
+  flex: 0 1000 auto;
+  min-height: 0;
+  max-height: 40%;
+  overflow-y: auto;
+}
+
+@media (min-width: 900px) and (pointer: fine) {
+  #discuss-panel {
+    --discuss-timeline-head-height: 2.5rem;
+  }
+
+  .discuss-timeline-fold {
+    min-height: 2.25rem;
+  }
+
+  /* The floating overlay is as tall as its content, up to its cap, so its panes are
+   * measured from the cap: the summary from its content, the timeline's default from
+   * the cap (30%), the Latest block's 30% and the search's 40% likewise. */
+  #screen-main:not([data-discuss]) > #discuss-panel > #discuss-current-section {
+    flex: 1 10000 auto;
+    min-height: max(2.75rem, calc((100vh - 6rem - var(--chips-foot, 0.5rem)) * 0.15));
+  }
+
+  #screen-main:not([data-discuss]) > #discuss-panel:not([data-timeline-size="kept"]) > #discuss-timeline-section:not([data-collapsed="true"]) {
+    flex: 0 100 calc((100vh - 6rem) * 0.3 + var(--discuss-timeline-head-height));
+  }
+
+  #screen-main:not([data-discuss]) > #discuss-panel > #discuss-latest {
+    max-height: calc((100vh - 6rem) * 0.3);
+  }
+
+  #screen-main:not([data-discuss]) > #discuss-panel > #discuss-search:not([hidden]) {
+    max-height: calc((100vh - 6rem) * 0.4);
+  }
+}
+
+/* Composing on a phone (the follow-up box holds the focus, so the on-screen keyboard is up
+ * and the sheet is short; `data-composing`, set by view/catchup/split.ts, which keeps it until a
+ * press that took the focus away has ended): the Summarize bar steps aside until then, and
+ * the composer, no longer stacked over that bar, stands in its own place. Only what stands
+ * BELOW the panes steps aside, so its return on blur only takes room from the panes' feet and
+ * never moves a summary row (the liaison's "nothing jumps"); the scope line above the summary
+ * stays. Only the follow-up composer's own focus does this; the bar's own fields keep it. */
+@media not ((min-width: 900px) and (pointer: fine)) {
+  #discuss-panel[data-composing="true"] > .discuss-ask {
+    display: none;
+  }
+
+  #discuss-panel[data-composing="true"] .discuss-compose {
+    position: static;
+  }
+}
+
+/* With the keyboard really up as well (the viewport short), the scope line above the summary
+ * steps aside too: there a blur also takes the keyboard down, so the whole sheet changes size
+ * anyway, while a composer focused at full height (a hardware keyboard) keeps it and its blur
+ * moves no summary row. */
+@media (not ((min-width: 900px) and (pointer: fine))) and (max-height: 600px) {
+  #discuss-panel[data-composing="true"] > #discuss-scope {
+    display: none;
+  }
+}
+
+/* A short pane (a phone with its keyboard up): the summary and the timeline may give
+ * way entirely, so the Latest pair and the composer keep the room. */
+@media (max-height: 600px) {
+  #discuss-panel > #discuss-current-section,
+  #discuss-panel[data-timeline-size="kept"] > #discuss-current-section,
+  #discuss-panel > #discuss-timeline-section {
+    min-height: 0;
+  }
+
+  /* Collapsed, its header row gives way too: the Latest pair and the composer come first. */
+  #discuss-panel > #discuss-timeline-section[data-collapsed="true"] {
+    flex-shrink: 100;
+  }
+
+  /* A kept timeline height gives way before the Latest pair here too. */
+  #discuss-panel[data-timeline-size="kept"] > #discuss-timeline-section:not([data-collapsed="true"]) {
+    flex-shrink: 100;
+  }
+
+  #discuss-panel[data-timeline-size="kept"] > #discuss-latest {
+    flex-shrink: 1;
+  }
+}

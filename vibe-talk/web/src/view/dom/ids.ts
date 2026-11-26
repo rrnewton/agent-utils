@@ -148,6 +148,7 @@ export interface ElementById {
   "discuss-full-toggle": HTMLButtonElement;
   "discuss-head": HTMLDivElement;
   "discuss-hours": HTMLInputElement;
+  "discuss-latest": HTMLElement;
   "discuss-links": HTMLUListElement;
   "discuss-mark-read": HTMLButtonElement;
   "discuss-mark-unread": HTMLButtonElement;
@@ -167,6 +168,7 @@ export interface ElementById {
   "discuss-search-toggle": HTMLButtonElement;
   "discuss-send": HTMLButtonElement;
   "discuss-since": HTMLInputElement;
+  "discuss-split": HTMLSpanElement;
   "discuss-stale": HTMLParagraphElement;
   "discuss-stale-text": HTMLSpanElement;
   "discuss-stamp": HTMLParagraphElement;
@@ -176,8 +178,12 @@ export interface ElementById {
   "discuss-terms-list": HTMLUListElement;
   "discuss-terms-summary": HTMLElement;
   "discuss-timeline": HTMLDivElement;
+  "discuss-timeline-count": HTMLSpanElement;
+  "discuss-timeline-fold": HTMLButtonElement;
   "discuss-timeline-head": HTMLDivElement;
   "discuss-timeline-heading": HTMLHeadingElement;
+  "discuss-timeline-new": HTMLSpanElement;
+  "discuss-timeline-section": HTMLElement;
   "discuss-title": HTMLSpanElement;
   "discuss-uncovered": HTMLParagraphElement;
   "discuss-uncovered-go": HTMLButtonElement;

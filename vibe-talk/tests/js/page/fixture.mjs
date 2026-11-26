@@ -5767,6 +5767,27 @@ const TUNING_BANDS = {
     "the panel's own ceiling where a host hands it no clamp (#1552): mirrors the device setting's"],
   FALLBACK_DEFAULT_DOCKED_HEIGHT: [40, 60,
     "the panel's own default where a host hands it no clamp (#1552): mirrors the device setting's"],
+  MIN_DISCUSS_TIMELINE_HEIGHT: [32, 96,
+    "the shortest kept height of the Discuss timeline pane (#2263 vibe-talk-discuss-split-pane), " +
+    "in px: under one folded row it shows nothing, and past two rows the pane can no longer be made small"],
+  MAX_DISCUSS_TIMELINE_HEIGHT: [2000, 10000,
+    "the tallest kept height of the Discuss timeline pane (#2263), in px: the panel's own layout caps " +
+    "what is shown, so this only has to be past any screen without letting a damaged entry be huge"],
+  TIMELINE_MIN_PX: [32, 96,
+    "the smallest expanded timeline body a drag or a key leaves (#2263): one folded row; it mirrors " +
+    "the device setting's floor"],
+  TIMELINE_COLLAPSE_BELOW_PX: [16, 48,
+    "a boundary released with less timeline body than this collapses it (#2263): under a row's " +
+    "worth it reads as a fold, past the floor a real small pane would collapse by surprise"],
+  TIMELINE_STEP_PX: [8, 64,
+    "one arrow-key step of the Discuss boundary (#2263): about a line; smaller is a crawl, larger " +
+    "skips past the height the reader wanted"],
+  LATEST_KEEP_PX: [40, 120,
+    "the least a boundary drag leaves the Discuss Latest pair (#2263): its header and about two " +
+    "lines; less hides the answer the reader just asked for, more makes the drag stop early"],
+  TIMELINE_DRAG_SLOP_PX: [3, 12,
+    "movement under this on the timeline header is a tap, not a drag (#2263): smaller turns a " +
+    "shaky tap on the fold into a resize, larger makes a short drag feel stuck"],
   MIN_DISCUSS_WIDTH: [240, 400,
     "the narrowest the Discuss overlay may be dragged to (#1344 discuss-panel-resize): under a " +
     "reading column the answer wraps to nothing, past it the floor leaves no desk to drag on"],

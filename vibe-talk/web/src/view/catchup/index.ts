@@ -10,6 +10,8 @@ export { FRESH_CLASS, STRUCK_BULLET_CLASS, STRUCK_SECTION_CLASS, applyStrikes, c
 export type { StrikeElement } from "./strikes.ts";
 export { DELETED_CITE_CLASS, createStrikeIndex } from "./strikeindex.ts";
 export type { StrikeFacts, StrikeIndex, StrikeIndexElement, StrikeTally } from "./strikeindex.ts";
+export { TIMELINE_COLLAPSE_BELOW_PX, TIMELINE_MIN_PX, TIMELINE_STEP_PX, createTimelineSplit, releasedTimeline, splitLatestPair, timelineEntryKey, timelineKeyAct, timelineNewHint } from "./split.ts";
+export type { SplitEntry, TimelineSplit, TimelineSplitDependencies } from "./split.ts";
 export type {
   CatchupAnswer,
   CatchupFooterLink,
@@ -185,6 +187,11 @@ export interface DiscussViewDependencies {
   /** `#1354 discuss-layout-modes`. The panel's layout mode, forwarded to the panel. */
   storedMode?(): "overlay" | "docked" | "maximized";
   keepMode?(mode: "overlay" | "docked" | "maximized"): void;
+  /** `#2263 vibe-talk-discuss-split-pane`. The timeline pane's kept height and collapse, forwarded to the panel. */
+  storedTimelineHeight?(): number | null;
+  keepTimelineHeight?(px: number | null): void;
+  storedTimelineCollapsed?(): boolean;
+  keepTimelineCollapsed?(collapsed: boolean): void;
   /** `#1497 discuss-fold-state-persist`. The kept Discuss folds, forwarded to the panel. */
   storedFolds?(): DiscussFoldState | null;
   keepFolds?(state: DiscussFoldState): void;
@@ -546,6 +553,10 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
     keepSheetFull: deps.keepSheetFull,
     storedMode: deps.storedMode,
     keepMode: deps.keepMode,
+    storedTimelineHeight: deps.storedTimelineHeight,
+    keepTimelineHeight: deps.keepTimelineHeight,
+    storedTimelineCollapsed: deps.storedTimelineCollapsed,
+    keepTimelineCollapsed: deps.keepTimelineCollapsed,
     storedFolds: deps.storedFolds,
     keepFolds: deps.keepFolds,
     storedCoverage: deps.storedCoverage,

@@ -25,6 +25,8 @@ const {
   createStrikeIndex, DELETED_CITE_CLASS,
   hoursSinceStart, countForHours, boundForHours, hoursFloor1, formatHoursFloor1, summaryTimeLabel, withoutTimestampCitations, uncoveredInScope,
   summarySearchWords, summarySearchMatches, summarySearchRows, summarySearchHits,
+  splitLatestPair, timelineEntryKey, releasedTimeline, timelineKeyAct, timelineNewHint, createTimelineSplit,
+  TIMELINE_MIN_PX, TIMELINE_COLLAPSE_BELOW_PX, TIMELINE_STEP_PX,
 } = VIEW;
 
 // ---- fakes -----------------------------------------------------------------------------------
@@ -3089,4 +3091,177 @@ test("timestamps: citation links are not handed to the device voice (#1823)", ()
     withoutTimestampCitations("Ada shipped the fix [(09:51 ↩)](?c=C9&v=all&m=slack:C9:111)"),
     "Ada shipped the fix");
   assert.equal(withoutTimestampCitations("at 13:33 we ship (as planned)"), "at 13:33 we ship (as planned)");
+});
+
+// ---- `#2263 vibe-talk-discuss-split-pane` -------------------------------------------------------
+
+test("split: the newest follow-up pair leaves the timeline for Latest; a record ending on a summary has none (#2263)", () => {
+  const you = (t) => ({ kind: "turn", speaker: "you", text: "q", at_ms: t });
+  const agent = (t) => ({ kind: "turn", speaker: "agent", text: "a", at_ms: t });
+  const summary = (t) => ({ kind: "summary", created_ms: t });
+  const pair = splitLatestPair([summary(1), you(2), agent(2), you(3), agent(3)]);
+  assert.deepEqual(pair.history.map(timelineEntryKey), ["summary:1", "turn:2:you", "turn:2:agent"]);
+  assert.deepEqual(pair.latest.map(timelineEntryKey), ["turn:3:you", "turn:3:agent"]);
+  // A re-summarize after the last follow-up: the record ends on a summary, so no Latest.
+  const none = splitLatestPair([you(2), agent(2), summary(4)]);
+  assert.equal(none.latest.length, 0);
+  assert.equal(none.history.length, 3);
+  // A question still unanswered moves alone; an answer with no question before it moves alone.
+  assert.deepEqual(splitLatestPair([summary(1), you(5)]).latest.map(timelineEntryKey), ["turn:5:you"]);
+  assert.deepEqual(splitLatestPair([agent(6), agent(7)]).latest.map(timelineEntryKey), ["turn:7:agent"]);
+  assert.deepEqual(splitLatestPair([]), { history: [], latest: [] });
+});
+
+test("split: a released boundary collapses under its threshold, else keeps at least the floor (#2263)", () => {
+  assert.deepEqual(releasedTimeline(0), { collapsed: true, height: TIMELINE_MIN_PX });
+  assert.deepEqual(releasedTimeline(TIMELINE_COLLAPSE_BELOW_PX - 1), { collapsed: true, height: TIMELINE_MIN_PX });
+  assert.deepEqual(releasedTimeline(TIMELINE_COLLAPSE_BELOW_PX), { collapsed: false, height: TIMELINE_MIN_PX });
+  assert.deepEqual(releasedTimeline(180.4), { collapsed: false, height: 180 });
+  assert.deepEqual(releasedTimeline(Number.NaN), { collapsed: true, height: TIMELINE_MIN_PX });
+});
+
+test("split: the boundary's keys step, page, go to the ends and fold; others are not its (#2263)", () => {
+  assert.deepEqual(timelineKeyAct("ArrowUp", 100, 400, 600), { kind: "height", px: 100 + TIMELINE_STEP_PX });
+  assert.deepEqual(timelineKeyAct("ArrowDown", 100, 400, 600), { kind: "height", px: 100 - TIMELINE_STEP_PX });
+  assert.deepEqual(timelineKeyAct("ArrowDown", TIMELINE_MIN_PX, 400, 600), { kind: "height", px: TIMELINE_MIN_PX }, "a step under the floor");
+  assert.deepEqual(timelineKeyAct("ArrowUp", 395, 400, 600), { kind: "height", px: 400 }, "a step past the panel's room");
+  assert.deepEqual(timelineKeyAct("PageUp", 100, 400, 600), { kind: "height", px: 250 });
+  assert.deepEqual(timelineKeyAct("PageDown", 300, 400, 600), { kind: "height", px: 150 });
+  assert.deepEqual(timelineKeyAct("Home", 300, 400, 600), { kind: "height", px: TIMELINE_MIN_PX });
+  assert.deepEqual(timelineKeyAct("End", 100, 400, 600), { kind: "height", px: 400 });
+  assert.deepEqual(timelineKeyAct("Enter", 100, 400, 600), { kind: "toggle" });
+  assert.deepEqual(timelineKeyAct(" ", 100, 400, 600), { kind: "toggle" });
+  assert.equal(timelineKeyAct("a", 100, 400, 600), null);
+  assert.equal(timelineNewHint(0), "");
+  assert.equal(timelineNewHint(1), "1 new summary");
+  assert.equal(timelineNewHint(3), "3 new summaries");
+});
+
+function splitFixture({ height = null, collapsed = false } = {}) {
+  const els = {};
+  for (const id of ["discuss-panel", "discuss-timeline-section", "discuss-timeline-head", "discuss-timeline", "discuss-timeline-fold",
+    "discuss-timeline-count", "discuss-timeline-new", "discuss-split", "discuss-latest", "discuss-current-section", "discuss-current-head"]) {
+    els[id] = fakeElement(id === "discuss-timeline-fold" ? "button" : "div");
+    els[id].removeProperty = undefined;
+  }
+  const styleRemoved = [];
+  els["discuss-panel"].style.removeProperty = (name) => { styleRemoved.push(name); delete els["discuss-panel"].style.props[name]; };
+  const kept = { height, collapsed, heightKeeps: [], collapsedKeeps: [] };
+  const split = createTimelineSplit({
+    maybe: (id) => els[id] ?? null,
+    storedHeight: () => kept.height,
+    keepHeight: (px) => { kept.height = px; kept.heightKeeps.push(px); },
+    storedCollapsed: () => kept.collapsed,
+    keepCollapsed: (c) => { kept.collapsed = c; kept.collapsedKeeps.push(c); },
+  });
+  return { els, kept, split, styleRemoved };
+}
+
+test("split: the kept height and fold stand on the panel from the device, and every keep goes back to it (#2263)", () => {
+  const fx = splitFixture({ height: 180, collapsed: true });
+  fx.split.applyStored();
+  assert.equal(fx.els["discuss-panel"].style.props["--discuss-timeline-height"], "180px");
+  assert.equal(fx.els["discuss-panel"].getAttribute("data-timeline-size"), "kept");
+  assert.equal(fx.els["discuss-timeline-section"].getAttribute("data-collapsed"), "true");
+  assert.equal(fx.els["discuss-timeline-fold"].getAttribute("aria-expanded"), "false");
+  assert.deepEqual([fx.kept.heightKeeps, fx.kept.collapsedKeeps], [[], []], "restating the kept layout kept something");
+  // The title folds and unfolds; collapsing never forgets the height.
+  fx.split.mount((el, type, handler) => el.addEventListener(type, handler));
+  click(fx.els["discuss-timeline-fold"]);
+  assert.equal(fx.els["discuss-timeline-section"].getAttribute("data-collapsed"), "false");
+  assert.deepEqual(fx.kept.collapsedKeeps, [false]);
+  assert.equal(fx.split.height(), 180);
+  // The grip's keys: Enter folds, ArrowUp grows by a step and keeps it.
+  fire(fx.els["discuss-split"], "keydown", { key: "Enter" });
+  assert.equal(fx.split.collapsed(), true);
+  fire(fx.els["discuss-split"], "keydown", { key: "Enter" });
+  assert.equal(fx.split.collapsed(), false);
+  fire(fx.els["discuss-split"], "keydown", { key: "ArrowUp" });
+  assert.equal(fx.kept.height, 180 + TIMELINE_STEP_PX);
+  assert.equal(fx.els["discuss-panel"].style.props["--discuss-timeline-height"], `${180 + TIMELINE_STEP_PX}px`);
+  // A double-click on the header goes back to the stylesheet's default share.
+  fire(fx.els["discuss-timeline-head"], "dblclick", { target: fx.els["discuss-timeline-head"] });
+  assert.equal(fx.kept.height, null);
+  assert.equal(fx.els["discuss-panel"].getAttribute("data-timeline-size"), null);
+  assert.ok(fx.styleRemoved.includes("--discuss-timeline-height"), "the default share did not take the kept height off");
+});
+
+test("split: collapsed, the header counts its rows and names earlier summaries that arrived, without opening (#2263)", () => {
+  const fx = splitFixture();
+  fx.split.applyStored();
+  fx.split.drawHead("scope-a", 3, 1);
+  assert.equal(fx.els["discuss-timeline-count"].textContent, " · 3");
+  assert.equal(fx.els["discuss-timeline-new"].hidden, true);
+  fx.split.setCollapsed(true, true);
+  fx.split.drawHead("scope-a", 4, 1);
+  assert.equal(fx.els["discuss-timeline-new"].hidden, true, "a follow-up is not a new summary");
+  fx.split.drawHead("scope-a", 5, 2);
+  assert.equal(fx.els["discuss-timeline-new"].textContent, "1 new summary");
+  assert.equal(fx.els["discuss-timeline-new"].hidden, false);
+  assert.equal(fx.split.collapsed(), true, "a new summary opened the timeline");
+  // Another scope keeps its own count; back to the first, the hint still stands.
+  fx.split.drawHead("scope-b", 2, 2);
+  assert.equal(fx.els["discuss-timeline-new"].hidden, true, "a scope first drawn collapsed showed a hint");
+  fx.split.drawHead("scope-a", 5, 2);
+  assert.equal(fx.els["discuss-timeline-new"].textContent, "1 new summary");
+  // Opened: seen, so the hint goes and does not come back for the same summaries.
+  fx.split.setCollapsed(false, true);
+  assert.equal(fx.els["discuss-timeline-new"].hidden, true);
+  fx.split.setCollapsed(true, true);
+  fx.split.drawHead("scope-a", 5, 2);
+  assert.equal(fx.els["discuss-timeline-new"].hidden, true);
+  // An empty history hides the section.
+  fx.split.drawHead("scope-a", 0, 0);
+  assert.equal(fx.els["discuss-timeline-section"].hidden, true);
+});
+
+test("split: a record ending on a follow-up draws that pair open in Latest and the rest in the timeline (#2263)", async () => {
+  const fx = fixture();
+  for (const id of ["discuss-latest", "discuss-timeline-section", "discuss-timeline-fold", "discuss-timeline-count", "discuss-timeline-new", "discuss-split"]) {
+    fx.els[id] = fakeElement(id === "discuss-timeline-fold" ? "button" : "div");
+  }
+  let record = savedRecord({
+    timeline: [
+      { kind: "summary", summary: { view: "flat", window: { count: 9, unread_count: 1 }, covered_ids: ["m0"], markable_ids: ["m0"], footer_links: [], text: "older point", text_html: "", unknown_terms: [], stamp: null, created_ms: T1 } },
+      { kind: "turn", turn: { speaker: "you", text: "first question", text_html: "", at_ms: T1 + 1 } },
+      { kind: "turn", turn: { speaker: "agent", text: "first answer", text_html: "", at_ms: T1 + 1 } },
+      { kind: "turn", turn: { speaker: "you", text: "newest question", text_html: "", at_ms: T2 } },
+      { kind: "turn", turn: { speaker: "agent", text: "newest answer", text_html: "", at_ms: T2 } },
+    ],
+  });
+  fx.deps.catchupRecord = () => Promise.resolve(record);
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    view.open();
+    await flush();
+    const latest = fx.els["discuss-latest"];
+    assert.equal(latest.hidden, false);
+    assert.equal(latest.children.length, 1);
+    const pair = latest.children[0];
+    assert.equal(pair.open, true, "the Latest pair is not open");
+    assert.match(pair.children[0].textContent, /^Latest follow-up · /);
+    assert.match(pair.children[1].textContent, /You\s*newest question/);
+    assert.match(pair.children[1].textContent, /Discuss\s*newest answer/);
+    const rows = [...fx.els["discuss-timeline"].children];
+    assert.equal(rows.length, 2, "the timeline still holds the Latest pair");
+    assert.match(rows[0].children[0].textContent, /Earlier summary/);
+    assert.match(rows[1].children[0].textContent, /Follow-up question .* — first question/);
+    assert.equal(rows[1].open ?? false, false, "a timeline pair drew open");
+    assert.equal(fx.els["discuss-timeline-count"].textContent, " · 2");
+    assert.equal(fx.els["discuss-timeline-section"].hidden, false);
+    // A redraw keeps the folds the reader opened (a row closing under the reader would move it).
+    rows[0].open = true;
+    view.openWith({ channelId: "chan-1", threadId: null, view: "flat", label: "Channel chan-1" });
+    await flush();
+    assert.equal(fx.els["discuss-timeline"].children[0].open, true, "the redraw closed the row the reader opened");
+    assert.notEqual(fx.els["discuss-timeline"].children[0], rows[0], "the timeline was not redrawn");
+    // Summarize again: the record ends on a summary, so Latest hides and the pair joins the timeline.
+    record = savedRecord({ timeline: [...record.timeline, { kind: "summary", summary: { ...record.timeline[0].summary, created_ms: T2 + 1 } }] });
+    // A same-scope reopen restores the answer without a read; the record is read on openWith.
+    view.openWith({ channelId: "chan-1", threadId: null, view: "flat", label: "Channel chan-1" });
+    await flush();
+    assert.equal(latest.hidden, true, "Latest still stands after a summary");
+    assert.equal(fx.els["discuss-timeline"].children.length, 4);
+  } finally { fx.restore(); }
 });

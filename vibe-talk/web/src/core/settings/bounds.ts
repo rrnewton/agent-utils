@@ -221,6 +221,24 @@ function clampDiscussDockedHeight(value: unknown): number {
   return Math.min(MAX_DISCUSS_DOCKED_HEIGHT, Math.max(MIN_DISCUSS_DOCKED_HEIGHT, Math.round(pct)));
 }
 
+/**
+ * `#2263 vibe-talk-discuss-split-pane`. The Discuss timeline (outline) pane's kept height, in CSS
+ * pixels: a constant size the reader drags the boundary to, kept per device. Null is the default
+ * (35% of the panel, the stylesheet's own). The floor shows one folded row; the ceiling is far
+ * past any screen, because the panel's own layout caps what is shown.
+ */
+const MIN_DISCUSS_TIMELINE_HEIGHT = 48;
+const MAX_DISCUSS_TIMELINE_HEIGHT = 4000;
+
+/** A timeline height this page will apply: null (the default) for anything that is not a positive number. */
+function clampDiscussTimelineHeight(value: unknown): number | null {
+  const text = typeof value === "string" ? value.trim() : value;
+  if (text === "" || text === null || text === undefined) return null;
+  const px = Number(text);
+  if (!Number.isFinite(px) || px <= 0) return null;
+  return Math.min(MAX_DISCUSS_TIMELINE_HEIGHT, Math.max(MIN_DISCUSS_TIMELINE_HEIGHT, Math.round(px)));
+}
+
 /** A Discuss width this page will actually apply, read as `clampTwoColumnSplit` reads its split. */
 function clampDiscussWidth(value: unknown): number {
   const text = typeof value === "string" ? value.trim() : value;
@@ -350,6 +368,7 @@ export {
   MAX_CARD_MAX_LINES,
   MAX_COLLAPSED_LINES,
   MAX_DISCUSS_DOCKED_HEIGHT,
+  MAX_DISCUSS_TIMELINE_HEIGHT,
   MAX_DISCUSS_WIDTH,
   MAX_MSG_SCALE,
   MAX_MARK_READ_FIRST_PERCENT,
@@ -363,6 +382,7 @@ export {
   MIN_CARD_MAX_LINES,
   MIN_COLLAPSED_LINES,
   MIN_DISCUSS_DOCKED_HEIGHT,
+  MIN_DISCUSS_TIMELINE_HEIGHT,
   MIN_DISCUSS_WIDTH,
   MIN_MSG_SCALE,
   MIN_MARK_READ_FIRST_PERCENT,
@@ -388,6 +408,7 @@ export {
   clampRenderPrefetchPx,
   clampRenderRowCap,
   clampDiscussDockedHeight,
+  clampDiscussTimelineHeight,
   clampDiscussWidth,
   clampMsgScale,
   clampMarkReadFirstPercent,

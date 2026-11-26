@@ -90,6 +90,17 @@ test("every number this page is tuned by stays inside a band that says what woul
       sourceConstant("FALLBACK_DEFAULT_DOCKED_HEIGHT") === sourceConstant("DEFAULT_DISCUSS_DOCKED_HEIGHT"),
     "the panel's fallback docked heights have drifted from the device setting's"
   );
+  // `#2263 vibe-talk-discuss-split-pane`: the drag's floor is the kept height's floor, and a
+  // release collapses only below it, so a kept small pane is never collapsed by its own floor.
+  assert.ok(
+    sourceConstant("TIMELINE_MIN_PX") === sourceConstant("MIN_DISCUSS_TIMELINE_HEIGHT") &&
+      sourceConstant("MIN_DISCUSS_TIMELINE_HEIGHT") < sourceConstant("MAX_DISCUSS_TIMELINE_HEIGHT"),
+    "the timeline drag's floor has drifted from the device setting's"
+  );
+  assert.ok(
+    sourceConstant("TIMELINE_COLLAPSE_BELOW_PX") < sourceConstant("TIMELINE_MIN_PX"),
+    "a release at the timeline's own floor would collapse it"
+  );
   assert.ok(
     sourceConstant("MIN_READ_STEER_WIDTH_PX") < sourceConstant("MAX_READ_STEER_WIDTH_PX"),
     "the narrowest strip the reader may drag to is not narrower than the widest"
