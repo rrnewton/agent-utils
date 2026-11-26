@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-settings-header-layout: the Settings header buttons fill the column, no stray side notes, and a short update chip'
-status: open
+status: closed
 priority: 1
 issue_type: task
 assignee: cl-settingshead
@@ -8,7 +8,8 @@ labels:
 - vibe-talk
 - owner-ui
 created_at: 2026-11-26T11:00:00-05:00
-updated_at: 2026-11-26T11:00:00-05:00
+updated_at: 2026-11-26T14:55:00-05:00
+closed_at: 2026-11-26T14:55:00-05:00
 ---
 
 # Description
@@ -43,3 +44,14 @@ Settings header only; no other Settings change.
 
 - Owner request 388, 2026-11-26 10:55 AM ET.
 - Prior work: `#372 settings-header-layout` (the one-row head, buttons at the row's end), `#529 page-build-stale-notice` (the build sentence), `#457 settings-server-side` (the client-side note).
+
+## Resolution
+
+Landed on main as 266b60b3 (the change) and 1d599e7c (a test-only follow-up), on 2026-11-26 at about 2:51 PM ET.
+
+- Expand all, Welcome and Open help are one row of equal widths under the server line. The row fills the settings column on phone and desktop alike (a CSS grid of equal columns). On a desk it uses the panes' 1rem gap, so with three panes each button sits over one.
+- The "(client side)" note under Screen and keys is gone.
+- The build sentence is now an "Update available · Reload" chip right after the host. It shows only while the server serves a newer page build. A tap reloads, and both builds are in its tooltip and in Storage and connection. When the page is up to date, the head says nothing about the build. The server line keeps the chip's 2rem height in both states, so a chip that arrives while Settings is open moves nothing below it (found by the advisory design review). The host is ellipsized and the port stays whole.
+- "Channel Settings: [channel] ?" stays on one line on a phone; it used to wrap the "?" onto its own line.
+- Tests: page tests for the head's structure and the chip, with negative controls. desktop_layout_browser measures the row in Chromium (equal widths, spanning the column within 1 px at 393, 1280 and 1920), checks the update chip, that the button row does not move, and the Channel Settings row, and now serves the page build, which closed #676. Screenshot scenes 155-settings-head and 156-settings-head-update.
+- Follow-ups: #2305 (the /page route carries no page_build, so on an unthreaded server neither update chip appears), and the pre-existing design-review findings appended to #2301. 1d599e7c skips only the desk-windowed leg of archive_single_row_browser.py pending #2303, which is that test's own flake.
