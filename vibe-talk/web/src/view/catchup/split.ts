@@ -435,21 +435,27 @@ export function createTimelineSplit(deps: TimelineSplitDependencies): TimelineSp
   }
 
   /**
-   * A new Latest pair lands on its answer's first text line, just under the pair's sticky
-   * header (which carries the question): the answer is what is new, and a short Latest block
-   * (a phone's half sheet, the keyboard up) would otherwise show the labels and the question
-   * just typed. The "Discuss" label scrolls off above; a pair that fits whole shows whole.
+   * A new Latest pair lands on its answer's first BODY text line (its first list item or
+   * paragraph), just under the pair's sticky header (which carries the question): the answer
+   * is what is new, and a short Latest block (a phone's half sheet, the keyboard up) would
+   * otherwise show the labels, a heading and the question just typed. The "Discuss" label and
+   * a leading heading scroll off above; an answer with no such block lands under its label; a
+   * pair that fits whole shows whole.
    */
   function alignLatest(): void {
     const box = el("discuss-latest");
     if (box === null) return;
     box.scrollTop = 0;
     latestAligned = 0;
+    const text = box.querySelector?.(".discuss-agent li, .discuss-agent p") as SplitElement | null | undefined;
     const label = box.querySelector?.(".discuss-agent .discuss-turn-label") as SplitElement | null | undefined;
     const header = box.querySelector?.(".discuss-qa > summary") as SplitElement | null | undefined;
     if (!label || typeof label.getBoundingClientRect !== "function" || typeof box.getBoundingClientRect !== "function") return;
     try {
-      const offset = label.getBoundingClientRect().bottom - box.getBoundingClientRect().top - (rectHeight(header ?? null) ?? 0);
+      const start = text && typeof text.getBoundingClientRect === "function"
+        ? text.getBoundingClientRect().top
+        : label.getBoundingClientRect().bottom;
+      const offset = start - box.getBoundingClientRect().top - (rectHeight(header ?? null) ?? 0);
       if (offset > 0) box.scrollTop = Math.round(offset);
       latestAligned = box.scrollTop ?? 0;
     } catch {

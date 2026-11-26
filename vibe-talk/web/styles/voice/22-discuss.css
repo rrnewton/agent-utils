@@ -1929,3 +1929,12 @@ stay its owner's (#1524). The pane itself already ends above the
     flex-shrink: 1;
   }
 }
+
+/* Composing on a phone with the keyboard up, the timeline's header row (below the summary)
+ * steps aside too, back on blur: a sliver of it was all a shrink could leave there, and the
+ * Latest pair needs the room for two whole lines of its answer (liaison). */
+@media (not ((min-width: 900px) and (pointer: fine))) and (max-height: 600px) {
+  #discuss-panel[data-composing="true"] > #discuss-timeline-section {
+    display: none;
+  }
+}
