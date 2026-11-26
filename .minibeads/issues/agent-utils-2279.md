@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-post-facto-labels: add any label, #hashtag labels included, to a message from its menu after the fact'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 assignee: cl-labels
@@ -9,7 +9,7 @@ labels:
 - labels
 - owner-ui
 created_at: 2026-11-26T03:45:00-05:00
-updated_at: 2026-11-26T03:45:00-05:00
+updated_at: 2026-11-26T07:40:00-05:00
 ---
 
 # Description
@@ -54,3 +54,14 @@ Design note approved by coordb, reviewed by the liaison with changes (all taken)
 # Notes
 
 Prior work to read: #1825 (extractor, derived labels, label groups outside the migration ladder), #1853 (Labels drop-down, reserved `pinned` slug), the post-facto pin path in the action menu (the pattern to follow), #2234 (glossary as the superset of labels).
+
+## Resolution
+
+Landed on main as 8c6b111c (owner-tier gate pass on 3e10d769, the same tree; liaison OK on the shots). An earlier gate on d09ed64e was red on offline-cache x3 (the ⋯ menu expectation lacked "Add label…", fixed together with the offline behaviour below) and documents-browser (not reproducible: 3/3 on main and 3/3 on the tree).
+
+Beyond the design above:
+- Liaison, owner rule 370: a row whose chips would push ⋯ off the header line gets them on a line of its own under the header (measureLabelRow's `data-labels-below` mark). The row a label change grows or shrinks keeps its top: this page's own write, or another device's `labels` event. It goes through the scroll owner's #2076 act path (`preservingCollapse`), which re-finds a row the redraw rebuilt by its data-id. Traces: 16/16 at 0.00 px (phone and desk; newest and mid; add, remove, remote add and remote remove).
+- Offline, the picker writes nothing and says so (Pin's pattern).
+- Evidence: real-router e2e `tests/message_labels.rs`; page tests `tests/js/page/labels.mjs`; screenshot scenes 150-154 (BEFORE on 3e10d769, AFTER from landed main 8c6b111c); a two-device walk on a local server.
+- Follow-up filed: #2286 (a cache-serve test that waits on wall-clock time).
+
