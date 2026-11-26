@@ -1482,6 +1482,82 @@ def test_contained_command_applies_the_cpu_cap_and_nice_10(
     assert any(word.endswith("nice") for word in wrapped) and "10" in wrapped
 
 
+#: Arguments systemd-run would rewrite if it expanded the environment (#2316).
+_EXPANSION_PAYLOAD = ["A:${PROBE}", "B:$$", "C:${x%% *}", "$PROBE", "D:$PROBE"]
+
+
+@pytest.mark.parametrize("supported", [True, False])
+def test_contained_command_turns_expansion_off_when_systemd_run_accepts_it(
+    monkeypatch: pytest.MonkeyPatch, supported: bool
+) -> None:
+    """#2316: the scope gets --expand-environment=no right before the
+    separator when systemd-run accepts it, and the old argv otherwise."""
+    gate = _gate_module()
+    monkeypatch.delenv("GATE_CPU_CONTAINMENT", raising=False)
+    systemd_run = shutil.which("systemd-run")
+    if systemd_run is None:
+        pytest.skip("no systemd-run here")
+    monkeypatch.setattr(gate, "_NO_EXPAND_SUPPORTED", {systemd_run: supported})
+    wrapped, contained = gate._contained_command(["sh", "-c", "echo ${HOME} $$"], "2316-t", 4)
+    separator = wrapped.index("--")
+    assert contained
+    assert wrapped[-3:] == ["sh", "-c", "echo ${HOME} $$"]
+    assert (wrapped[separator - 1] == "--expand-environment=no") is supported, wrapped
+    assert ("--expand-environment=no" in wrapped) is supported, wrapped
+
+
+@pytest.mark.parametrize(
+    ("script", "supported"),
+    [
+        ('[ "$1" = --expand-environment=no ] && [ "$2" = --version ] && exit 0\nexit 9\n', True),
+        ("echo \"systemd-run: unrecognized option '$1'\" >&2\nexit 1\n", False),
+    ],
+    ids=["accepts", "refuses"],
+)
+def test_no_expand_probe_is_asked_once_and_a_refusal_is_noted(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], script: str, supported: bool
+) -> None:
+    gate = _gate_module()
+    calls = tmp_path / "calls"
+    fake = tmp_path / "systemd-run"
+    fake.write_text(f"#!/bin/sh\necho call >> '{calls}'\n{script}")
+    fake.chmod(0o755)
+    expected = ["--expand-environment=no"] if supported else []
+    assert gate._systemd_run_no_expand_args(str(fake)) == expected
+    assert gate._systemd_run_no_expand_args(str(fake)) == expected
+    assert calls.read_text().splitlines() == ["call"]
+    out = capsys.readouterr().out
+    assert ("refuses --expand-environment=no" in out and "#2316" in out) is (not supported), out
+
+
+def test_contained_preflight_and_gate_command_get_dollar_text_byte_for_byte(
+    tmp_path: Path,
+) -> None:
+    """#2316, live: through real contained scopes, the shell-text preflight
+    and the admitted command both see ${PROBE}, $$, ${x%% *} and a
+    whole-word $PROBE unchanged although the gate has PROBE set."""
+    if shutil.which("systemd-run") is None:
+        pytest.skip("no systemd-run here")
+    preflight_out = tmp_path / "preflight.txt"
+    gate_out = tmp_path / "gate.txt"
+    quoted = " ".join(f"'{arg}'" for arg in _EXPANSION_PAYLOAD)
+    env = {**_env(tmp_path), "PROBE": "expanded",
+           "GATE_PREFLIGHT_COMMAND": f"printf '%s\\n' {quoted} > {preflight_out}"}
+    env.pop("GATE_CPU_CONTAINMENT", None)
+    env.pop("GATE_HOLD_NOW", None)
+    env.pop("x", None)
+    writer = "import sys; open(sys.argv[1], 'w').write(chr(10).join(sys.argv[2:]) + chr(10))"
+    done = subprocess.run([PY, str(GATE), "--", PY, "-c", writer, str(gate_out),
+                           *_EXPANSION_PAYLOAD],
+                          env=env, capture_output=True, text=True, timeout=120)
+    if "running without CPU containment" in done.stdout:
+        pytest.skip(f"no contained scope here:\n{done.stdout}")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "preflight containment" in done.stdout, done.stdout
+    assert preflight_out.read_text().splitlines() == _EXPANSION_PAYLOAD, done.stdout
+    assert gate_out.read_text().splitlines() == _EXPANSION_PAYLOAD, done.stdout
+
+
 def test_the_preflight_runs_contained_like_a_gate(tmp_path: Path) -> None:
     """#1370: the preflight child sees the capped scheduler widths and
     runs at nice 10 under the per-gate CPU quota."""

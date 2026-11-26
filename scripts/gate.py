@@ -592,6 +592,48 @@ def host_cpu_quota_cpus(path: Path | None = None) -> int:
 CONTAINMENT_NICE = 10
 
 
+#: Makes systemd-run pass the contained command's arguments through byte for byte (#2316).
+NO_EXPAND_ENVIRONMENT = "--expand-environment=no"
+
+#: Whether each systemd-run executable accepts NO_EXPAND_ENVIRONMENT, asked once per process.
+_NO_EXPAND_SUPPORTED: dict[str, bool] = {}
+
+
+def _systemd_run_no_expand_args(systemd_run: str) -> list[str]:
+    """``[NO_EXPAND_ENVIRONMENT]`` when ``systemd_run`` accepts it, else nothing.
+
+    ``systemd-run --scope`` in newer systemd expands ``${NAME}`` anywhere in an
+    argument, a whole-word ``$NAME`` and ``$$`` (to ``$``) in the command, from
+    the caller's environment, so a gate or preflight command holding such text
+    would run rewritten. systemd before 254 refuses the option, and its scopes
+    never expanded, so there the command line stays as it was after one note.
+    The probe (``--version`` after the option) needs no bus and starts no unit."""
+    supported = _NO_EXPAND_SUPPORTED.get(systemd_run)
+    if supported is None:
+        try:
+            probe = subprocess.run(
+                [systemd_run, NO_EXPAND_ENVIRONMENT, "--version"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+            )
+            supported = probe.returncode == 0
+            if not supported:
+                print(
+                    f"gate: note: this systemd-run refuses {NO_EXPAND_ENVIRONMENT} (systemd "
+                    "older than 254), so it is left out; scopes there do not expand ${...} "
+                    "in arguments (#2316)",
+                    flush=True,
+                )
+        except (OSError, subprocess.TimeoutExpired):
+            # Not runnable: the scope launch itself fails and says so.
+            supported = False
+        _NO_EXPAND_SUPPORTED[systemd_run] = supported
+    return [NO_EXPAND_ENVIRONMENT] if supported else []
+
+
 def _contained_command(
     command: list[str], run_id: str, quota_cpus: int, slice_name: str | None = None
 ) -> tuple[list[str], bool]:
@@ -621,7 +663,9 @@ def _contained_command(
         # The operator named the slice (ci-hub policy): this gate's
         # scope lives under it; absent, it stays under the user slice.
         wrapped.append(f"--slice={slice_name}")
-    wrapped += ["--", *niced]
+    # The command is the caller's (and $GATE_PREFLIGHT_COMMAND is shell text):
+    # systemd-run must hand it over unexpanded.
+    wrapped += [*_systemd_run_no_expand_args(systemd_run), "--", *niced]
     return wrapped, True
 
 
