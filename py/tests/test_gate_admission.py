@@ -1359,6 +1359,114 @@ def test_the_preflight_runs_named_validation_steps() -> None:
     assert listed.returncode == 0, listed.stdout + listed.stderr
     steps = {line.split()[1] for line in listed.stdout.splitlines() if line.strip().startswith("STEP ")}
     assert set(gate.PREFLIGHT_STEPS) <= steps, sorted(set(gate.PREFLIGHT_STEPS) - steps)
+    # #2308: the conditional steps are real graph steps too, with fix hints.
+    conditional = set(gate.preflight_touched_steps(None))
+    assert conditional == {gate.PREFLIGHT_ISSUE_STEP, *gate.PREFLIGHT_FMT_STEPS.values()}
+    assert conditional <= steps, sorted(conditional - steps)
+    assert conditional <= set(gate.PREFLIGHT_FIX_HINTS)
+
+
+def test_preflight_touched_steps_follow_the_changed_paths() -> None:
+    """#2308: the issue reader for `.minibeads/`, each workspace's rustfmt
+    check for its Rust sources and manifests, both for a root rustfmt config,
+    nothing extra for anything else."""
+    gate = _gate_module()
+    issue, rs_fmt, vt_fmt = (gate.PREFLIGHT_ISSUE_STEP, gate.PREFLIGHT_FMT_STEPS["rs"],
+                             gate.PREFLIGHT_FMT_STEPS["vibe-talk"])
+    touched = gate.preflight_touched_steps
+    assert touched([]) == []
+    assert touched(["README.md", "scripts/gate.py", "vibe-talk/web/voice.js", "rs/README.md"]) == []
+    assert touched([".minibeads/issues/agent-utils-1.md"]) == [issue]
+    assert touched(["rs/agentctl/src/main.rs"]) == [rs_fmt]
+    assert touched(["rs/agentctl/Cargo.toml"]) == [rs_fmt]
+    assert touched(["vibe-talk/src/server.rs"]) == [vt_fmt]
+    assert touched(["rustfmt.toml"]) == [rs_fmt, vt_fmt]
+    assert touched(["rs/x.rs", ".minibeads/issues/a.md", "vibe-talk/build.rs"]) == [issue, rs_fmt, vt_fmt]
+    # Unknown change: everything, never nothing.
+    assert touched(None) == [issue, rs_fmt, vt_fmt]
+
+
+def _git(root: Path, *argv: str) -> str:
+    done = subprocess.run(["git", "-C", str(root), "-c", "commit.gpgsign=false", *argv],
+                          capture_output=True, text=True,
+                          env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+                               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"})
+    assert done.returncode == 0, done.stderr
+    return done.stdout
+
+
+def test_preflight_selection_reads_committed_uncommitted_and_untracked_work(tmp_path: Path) -> None:
+    """#2308: the touched set is the one `validate.py --base` selects from:
+    commits since the merge base, uncommitted edits and untracked files; the
+    command's --base wins; no merge base means every conditional step, said."""
+    gate = _gate_module()
+    root = tmp_path / "repo"
+    root.mkdir()
+    _git(root, "init", "-q", "-b", "main")
+    _write(root / "README.md", "x\n")
+    _write(root / "rs" / "a.rs", "fn a() {}\n")
+    _write(root / "vibe-talk" / "src" / "b.rs", "fn b() {}\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "base")
+    _git(root, "branch", "upstream")
+    validate = ["python3", "scripts/validate.py", "--base", "upstream", "--keep-going"]
+
+    steps, note = gate.preflight_selection(validate, root=root)
+    assert steps == list(gate.PREFLIGHT_STEPS) and note is None
+
+    _write(root / "README.md", "y\n")
+    _git(root, "commit", "-qam", "docs")
+    assert gate.preflight_selection(validate, root=root) == (list(gate.PREFLIGHT_STEPS), None)
+
+    _write(root / "rs" / "a.rs", "fn a()   {}\n")
+    _git(root, "commit", "-qam", "committed rust change")
+    steps, _ = gate.preflight_selection(validate, root=root)
+    assert steps == [*gate.PREFLIGHT_STEPS, gate.PREFLIGHT_FMT_STEPS["rs"]]
+
+    _write(root / "vibe-talk" / "src" / "b.rs", "fn b()   {}\n")  # uncommitted
+    _write(root / ".minibeads" / "issues" / "agent-utils-9.md", "# Bogus\n")  # untracked
+    steps, note = gate.preflight_selection(validate, root=root)
+    assert steps == [*gate.PREFLIGHT_STEPS, gate.PREFLIGHT_ISSUE_STEP,
+                     gate.PREFLIGHT_FMT_STEPS["rs"], gate.PREFLIGHT_FMT_STEPS["vibe-talk"]]
+    assert note is None
+
+    # Against HEAD itself only the uncommitted and untracked work counts.
+    steps, _ = gate.preflight_selection(["validate.py", "--base", "HEAD"], root=root)
+    assert steps == [*gate.PREFLIGHT_STEPS, gate.PREFLIGHT_ISSUE_STEP, gate.PREFLIGHT_FMT_STEPS["vibe-talk"]]
+
+    # No --base: the default base, which this repository does not have.
+    steps, note = gate.preflight_selection(["validate.py", "--all"], root=root)
+    assert steps == [*gate.PREFLIGHT_STEPS, *gate.preflight_touched_steps(None)]
+    assert note is not None and gate.PREFLIGHT_DEFAULT_BASE in note and "unknown" in note
+
+
+def test_a_preflight_refusal_on_issue_parse_or_rustfmt_names_the_fix(tmp_path: Path) -> None:
+    """#2308: a failing issue reader or rustfmt step refuses the run before
+    it queues, like any preflight step, and the refusal says what to run."""
+    issue_fail = (
+        "echo '[repository.hygiene.issue-parse] ✗ FAIL   refuse an issue file'; "
+        "echo '[repository.hygiene.issue-parse] E  .minibeads/issues/agent-utils-9.md: unknown section'; "
+        "echo '[repository.format.rust] ✗ FAIL   rustfmt checks the workspace'; "
+        "echo '[repository.format.rust] E  Diff in rs/a.rs at line 1'; "
+        "echo '[repository.hygiene.client-names] ✓ PASS   names'; exit 1"
+    )
+    ran = tmp_path / "ran"
+    env = {**_env(tmp_path), "GATE_PREFLIGHT_COMMAND": issue_fail}
+    done = subprocess.run([PY, str(GATE), "--", PY, "-c", f"open({str(ran)!r}, 'w')"],
+                          env=env, capture_output=True, text=True, timeout=30)
+    assert done.returncode == 65, done.stdout
+    assert "not queued" in done.stdout
+    assert ".minibeads/issues/agent-utils-9.md: unknown section" in done.stdout
+    assert "Diff in rs/a.rs at line 1" in done.stdout
+    assert "gate: preflight: repository.hygiene.issue-parse: an issue file the pinned mb cannot parse" in done.stdout
+    assert "python3 scripts/check_issue_parse.py" in done.stdout
+    assert "gate: preflight: repository.format.rust: rustfmt drift in rs/" in done.stdout
+    assert "vibe-talk.check.fmt" not in done.stdout, "a step that did not fail gets no hint"
+    assert not ran.exists()
+    assert not list((tmp_path / "admission" / "runs").glob("*.json"))
+    [row] = _ledger_rows(tmp_path)
+    assert row["kind"] == "preflight-refused"
+    assert row["failed_steps"] == ["repository.format.rust", "repository.hygiene.issue-parse"]
 
 
 def _hold(tmp_path: Path, *args: str) -> subprocess.CompletedProcess[str]:

@@ -317,10 +317,16 @@ Preflight: before a top-level run takes a ticket, it runs the repository's
 deterministic content checks on this checkout (PREFLIGHT_STEPS: the
 client-name guard and the package contract, whose standalone-docs rules and
 test censuses fail the same way every time) through the validation graph, in
-about 20 seconds. If either fails, the run never queues: the failing steps'
-lines are printed, the refusal is recorded in the ledger, and gate.py exits
-PREFLIGHT_EXIT. Without the preflight, a lane learned of a one-word docstring
-violation only after waiting for a ticket and running a full gate. A nested
+about 20 seconds. When the change (committed since the merge base with the
+command's --base, default github/main, plus uncommitted and untracked work)
+touches `.minibeads/`, the pinned-mb issue reader runs too, and when it
+touches a Rust source, manifest or rustfmt config, so does that workspace's
+rustfmt check (rustfmt only, never a build); an unknown change runs them all
+and says so (#2308). If any fails, the run never queues: the failing steps'
+lines are printed with what to run to fix them, the refusal is recorded in
+the ledger, and gate.py exits PREFLIGHT_EXIT. Without the preflight, a lane
+learned of a one-word docstring violation, an unparseable issue file or
+rustfmt drift only after waiting for a ticket and running a full gate. A nested
 gate and a --rerun ticket skip it, because their tree already passed it.
 --skip-preflight skips it too, and the ledger records that it did.
 $GATE_PREFLIGHT_COMMAND (a shell command) replaces the checks, for tests.
@@ -494,6 +500,30 @@ PREFLIGHT_STEPS = (
     "repository.hygiene.client-names",
     "python.repository-infrastructure.package-contract",
 )
+
+#: Content checks the preflight adds only for a change that touches what they
+#: read (#2308): the pinned-mb issue reader when `.minibeads/` changed, and the
+#: rustfmt step (never a build) of each Rust workspace with a changed source,
+#: manifest or rustfmt config. Both failed the same way on every run, yet each
+#: was found only after a full gate (35 and 13 gate heads in one week).
+PREFLIGHT_ISSUE_STEP = "repository.hygiene.issue-parse"
+PREFLIGHT_FMT_STEPS = {
+    "rs": "repository.format.rust",
+    "vibe-talk": "vibe-talk.check.fmt",
+}
+#: A rustfmt config at the repository root applies to every workspace below it.
+PREFLIGHT_ROOT_RUSTFMT = ("rustfmt.toml", ".rustfmt.toml")
+#: The base the touched set is taken against when the command names none.
+PREFLIGHT_DEFAULT_BASE = "github/main"
+#: What to do about a refusal by each conditional step.
+PREFLIGHT_FIX_HINTS = {
+    PREFLIGHT_ISSUE_STEP: ("an issue file the pinned mb cannot parse: run "
+                           "`python3 scripts/check_issue_parse.py` and fix the file it names "
+                           "(top-level headings only Description, Design, Acceptance Criteria, "
+                           "Notes; a title with an apostrophe needs YAML quoting)"),
+    "repository.format.rust": "rustfmt drift in rs/: run `cargo fmt --all --manifest-path rs/Cargo.toml`",
+    "vibe-talk.check.fmt": "rustfmt drift in vibe-talk/: run `cd vibe-talk && cargo fmt --all`",
+}
 
 #: Exit status for a run refused by the preflight (EX_DATAERR).
 PREFLIGHT_EXIT = 65
@@ -2741,8 +2771,73 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-def preflight_command() -> list[str]:
-    """The preflight's command: PREFLIGHT_STEPS through the validation graph, or
+def preflight_changed_paths(root: Path, base: str) -> list[str] | None:
+    """Paths of `root` that differ from `base`: committed since the merge base,
+    uncommitted and untracked, the set `validate.py --base` selects from.
+    None when git cannot say (no such base, no merge base, not a checkout)."""
+
+    def git(*argv: str) -> str | None:
+        try:
+            done = subprocess.run(["git", *argv], cwd=root, capture_output=True, text=True,
+                                  check=False)
+        except OSError:
+            return None
+        return done.stdout if done.returncode == 0 else None
+
+    merge_base = git("merge-base", base, "HEAD")
+    if merge_base is None or not merge_base.strip():
+        return None
+    out: set[str] = set()
+    for argv in (("diff", "--no-renames", "--name-only", f"{merge_base.strip()}...HEAD"),
+                 ("diff", "--no-renames", "--name-only", "HEAD"),
+                 ("ls-files", "--others", "--exclude-standard")):
+        listed = git(*argv)
+        if listed is None:
+            return None
+        out.update(line for line in listed.splitlines() if line)
+    return sorted(out)
+
+
+def _rustfmt_input(path: str) -> bool:
+    name = path.rsplit("/", 1)[-1]
+    return path.endswith(".rs") or name in ("Cargo.toml", *PREFLIGHT_ROOT_RUSTFMT)
+
+
+def preflight_touched_steps(paths: list[str] | None) -> list[str]:
+    """The conditional preflight steps (#2308) that `paths` call for; every one
+    of them when the touched set is unknown (None)."""
+
+    if paths is None:
+        return [PREFLIGHT_ISSUE_STEP, *PREFLIGHT_FMT_STEPS.values()]
+    steps: list[str] = []
+    if any(path.startswith(".minibeads/") for path in paths):
+        steps.append(PREFLIGHT_ISSUE_STEP)
+    root_config = any(path in PREFLIGHT_ROOT_RUSTFMT for path in paths)
+    for directory, step in PREFLIGHT_FMT_STEPS.items():
+        if root_config or any(path.startswith(f"{directory}/") and _rustfmt_input(path)
+                              for path in paths):
+            steps.append(step)
+    return steps
+
+
+def preflight_selection(command: list[str], root: Path | None = None) -> tuple[list[str], str | None]:
+    """(the preflight's steps, a note to print or None) for a gate of `command`:
+    PREFLIGHT_STEPS plus the conditional steps for this checkout's change
+    against the command's --base (PREFLIGHT_DEFAULT_BASE when it names none)."""
+
+    base = PREFLIGHT_DEFAULT_BASE
+    if "--base" in command and command.index("--base") + 1 < len(command):
+        base = command[command.index("--base") + 1]
+    paths = preflight_changed_paths(root or _repo_root(), base)
+    note = None
+    if paths is None:
+        note = (f"gate: the change against {base} is unknown (no merge base), so the "
+                "preflight runs the issue-parse and every rustfmt check too (#2308)")
+    return [*PREFLIGHT_STEPS, *preflight_touched_steps(paths)], note
+
+
+def preflight_command(steps: list[str] | tuple[str, ...] = PREFLIGHT_STEPS) -> list[str]:
+    """The preflight's command: `steps` through the validation graph, or
     $GATE_PREFLIGHT_COMMAND run by the shell."""
 
     override = os.environ.get("GATE_PREFLIGHT_COMMAND")
@@ -2751,10 +2846,12 @@ def preflight_command() -> list[str]:
     root = _repo_root()
     return [str(root / "common" / "bin" / "dagrun"), "run",
             "--dag", str(root / "validation.dag.yaml"), "--keep-going", "--no-profile",
-            "--selected", ",".join(PREFLIGHT_STEPS)]
+            "--selected", ",".join(steps)]
 
 
-def run_preflight(slice_name: str | None = None) -> tuple[bool, float, list[str], list[str]]:
+def run_preflight(slice_name: str | None = None,
+                  steps: list[str] | tuple[str, ...] = PREFLIGHT_STEPS,
+                  ) -> tuple[bool, float, list[str], list[str]]:
     """Run the preflight in this checkout: (passed, seconds, failed steps, lines to show).
 
     Contained like a gate (#1370): the per-gate CPU cap and nice 10 through
@@ -2763,7 +2860,7 @@ def run_preflight(slice_name: str | None = None) -> tuple[bool, float, list[str]
     started = time.time()
     quota_cpus = host_cpu_quota_cpus()
     run_id = f"preflight-{os.getpid()}"
-    command, contained = _contained_command(preflight_command(), run_id, quota_cpus, slice_name)
+    command, contained = _contained_command(preflight_command(steps), run_id, quota_cpus, slice_name)
     if contained:
         print(f"gate: preflight containment: systemd scope agent-utils-gate-{run_id}, "
               f"CPUQuota={quota_cpus * 100}% ({quota_cpus} CPUs), "
@@ -2997,18 +3094,26 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
     elif getattr(args, "skip_preflight", False):
         preflight = "skipped: --skip-preflight"
     else:
-        passed, seconds, failed, shown = run_preflight(args.slice)
+        # $GATE_PREFLIGHT_COMMAND replaces the checks, so it needs no selection.
+        steps, note = ((list(PREFLIGHT_STEPS), None) if os.environ.get("GATE_PREFLIGHT_COMMAND")
+                       else preflight_selection(command))
+        if note:
+            print(note, flush=True)
+        passed, seconds, failed, shown = run_preflight(args.slice, steps)
         if not passed:
             print(f"gate: preflight FAILED in {seconds:.0f}s, so this run was not queued; "
                   "fix these and run the gate again (--skip-preflight overrides, recorded):",
                   flush=True)
             for line in shown:
                 print(line, flush=True)
+            for step in failed:
+                if step in PREFLIGHT_FIX_HINTS:
+                    print(f"gate: preflight: {step}: {PREFLIGHT_FIX_HINTS[step]}", flush=True)
             now_s = time.time()
             _record_ledger(args, command, now_s, now_s, PREFLIGHT_EXIT, set(), set(failed),
                            "FAILED", kind="preflight-refused", preflight="failed")
             return PREFLIGHT_EXIT
-        print(f"gate: preflight passed in {seconds:.0f}s ({', '.join(PREFLIGHT_STEPS)})", flush=True)
+        print(f"gate: preflight passed in {seconds:.0f}s ({', '.join(steps)})", flush=True)
         preflight = "passed"
     # #1262: a full gate queues only after the same tree passed locally.
     local_reason = getattr(args, "no_local_preflight", None)
