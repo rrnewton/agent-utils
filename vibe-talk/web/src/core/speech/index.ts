@@ -19,7 +19,8 @@ export {
 export { SPEECH_HOLD_CAP_MS_DEFAULT, SPEECH_HOLD_DBFS_DEFAULT, bufferDbfs, speechHoldFrom } from "./hold.ts";
 export type { SpeechHold } from "./hold.ts";
 
-export { readClock, readSectionStarts, readTimelineWeights, silentBefore } from "./read-steering.ts";
+export { documentBlockGroups, documentGroupsAlign, documentListedBlockForModel, documentModelBlockForListed, documentModelPieceForListed, readClock, readSectionStarts, readTimelineWeights, silentBefore } from "./read-steering.ts";
+export type { DocumentBlockGroup } from "./read-steering.ts";
 
 export { DEFAULT_READ_PREROLL_MS, chunkStartSilenceMs, silenceFrameCount } from "./preroll.ts";
 export { outputRateFrom } from "./format.ts";

@@ -127,3 +127,62 @@ test("`#624 voice-page-modularity`: the speech hold reads the server's level and
   assert.equal(bufferDbfs(new Float32Array([1, -1, 1, -1])), 0);
   assert.ok(Math.abs(bufferDbfs(new Float32Array([0.1, -0.1])) + 20) < 1e-5, "a tenth of full scale is -20 dBFS (to float32 precision)");
 });
+
+test("`#2266 vibe-talk-doc-reader-navigator-campaign`: model blocks and prepared pieces map by element groups, both ways", () => {
+  const { documentBlockGroups, documentGroupsAlign, documentListedBlockForModel,
+    documentModelBlockForListed, documentModelPieceForListed } = SPEECH_PIECES;
+  // The diagnosis canary in miniature: 9 model blocks; the long paragraph is
+  // 2 server pieces and the table is one piece a body row (13 listed).
+  const kinds = ["heading", "heading", "paragraph", "table", "heading", "paragraph", "paragraph", "heading", "paragraph"];
+  const listed = [];
+  const push = (element, kind, pieces) => {
+    for (let piece = 0; piece < pieces; piece += 1) listed.push({ kind, element, piece, pieces, spoken: true });
+  };
+  push(0, "heading", 1); push(1, "heading", 1); push(2, "paragraph", 2); push(3, "table", 4);
+  push(4, "heading", 1); push(5, "paragraph", 1); push(6, "paragraph", 1);
+  push(7, "heading", 1); push(8, "paragraph", 1);
+  assert.equal(listed.length, 13);
+
+  const groups = documentBlockGroups(listed);
+  assert.deepStrictEqual(groups.map((group) => group.members.length), [1, 1, 2, 4, 1, 1, 1, 1, 1]);
+  assert.equal(documentGroupsAlign(groups, kinds), true, "the canary cuts do not align");
+
+  // Reporting: a listed piece names its model block (table rows are block 3).
+  assert.equal(documentModelBlockForListed(listed, kinds, 7), 3, "the last table row is not the table block");
+  assert.equal(documentModelBlockForListed(listed, kinds, 8), 4, "the heading after the table is not model block 4");
+  assert.equal(documentModelBlockForListed(listed, kinds, 3), 2, "the long paragraph's second piece is not its block");
+  assert.deepStrictEqual(documentModelPieceForListed(listed, kinds, 6), { block: 3, piece: 2 });
+  assert.deepStrictEqual(documentModelPieceForListed(listed, kinds, 3), { block: 2, piece: 1 });
+
+  // Seeking: a model block (and piece) names its listed piece — the inverse.
+  assert.equal(documentListedBlockForModel(listed, kinds, 4), 8, "section after the table sought in listed space");
+  assert.equal(documentListedBlockForModel(listed, kinds, 3, 2), 6, "the table's third row was not sought");
+  assert.equal(documentListedBlockForModel(listed, kinds, 2, 1), 3);
+  assert.equal(documentListedBlockForModel(listed, kinds, 2, 99), 3, "a piece past the block did not clamp inside it");
+  assert.equal(documentListedBlockForModel(listed, kinds, 99), 12, "a block past the end did not clamp to the last block");
+  assert.equal(documentListedBlockForModel(listed, kinds, -1), 0);
+  for (let at = 0; at < listed.length; at += 1) {
+    const model = documentModelPieceForListed(listed, kinds, at);
+    assert.equal(documentListedBlockForModel(listed, kinds, model.block, model.piece), at,
+      `listed ${at} does not round-trip through model space`);
+  }
+
+  // Unaligned cuts (a front-matter block only one side counts): fall back to
+  // the server's drawn element, never silence and never the top.
+  const shifted = ["paragraph", ...kinds];
+  assert.equal(documentGroupsAlign(groups, shifted), false);
+  assert.equal(documentModelBlockForListed(listed, shifted, 8), 4, "unaligned reporting lost the drawn element");
+  assert.equal(documentListedBlockForModel(listed, shifted, 4), 8, "unaligned seeking missed its drawn block");
+  assert.equal(documentListedBlockForModel(listed, shifted, 3, 1), 5);
+
+  // No model cut: the prepared list's own numbering, as before.
+  assert.equal(documentModelBlockForListed(listed, undefined, 7), 7);
+  assert.equal(documentListedBlockForModel(listed, undefined, 7), 7);
+  assert.equal(documentListedBlockForModel([], kinds, 0), -1, "an empty list sought somewhere");
+
+  // A pre-pieces server (no `element`): one listed block a drawn block.
+  const plain = kinds.map((kind) => ({ kind, spoken: true }));
+  assert.equal(documentGroupsAlign(documentBlockGroups(plain), kinds), true);
+  assert.equal(documentListedBlockForModel(plain, kinds, 4), 4);
+  assert.equal(documentModelBlockForListed(plain, kinds, 4), 4);
+});

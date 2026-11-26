@@ -1,5 +1,5 @@
 // Read-aloud transport and its controls, owned together (`#624 voice-page-modularity`).
-import { browserSpeechChunks, chunkStartSilenceMs, createPreparedSpeech, isRecoverableReadFailure, joinBytes, readClock, readPieces, readSectionStarts, readTimelineWeights, recoveryWait, sentenceEnds, silenceFrameCount, silentBefore, speechElapsedMs, speechSegments, ticketEnded, ticketTooShortForBlocks, wavLayout } from "../../core/speech/index.ts";
+import { browserSpeechChunks, chunkStartSilenceMs, createPreparedSpeech, documentBlockGroups, documentGroupsAlign, documentListedBlockForModel, documentModelBlockForListed, documentModelPieceForListed, isRecoverableReadFailure, joinBytes, readClock, readPieces, readSectionStarts, readTimelineWeights, recoveryWait, sentenceEnds, silenceFrameCount, silentBefore, speechElapsedMs, speechSegments, ticketEnded, ticketTooShortForBlocks, wavLayout } from "../../core/speech/index.ts";
 import { READ_NO_SPEECH_MS, cloudFailureText } from "../../present/call/index.ts";
 import { DEVICE_SETTINGS, MAX_READ_SPEED, MIN_READ_SPEED, clampReadSpeed } from "../../core/settings/index.ts";
 import { cardRootOf, idsOf, rowMessages, rowSeen } from "../../view/channel/index.ts";
@@ -27,7 +27,15 @@ interface PrepareReply {
 }
 type SpeechSegment = ReturnType<typeof speechSegments>[number];
 interface Point { x: number; y: number }
-interface ReadFrom { part: number; block: number | null; recovery?: number; hold?: boolean; chunk?: number }
+/**
+ * Where a read starts. `#2266 vibe-talk-doc-reader-navigator-campaign`: for a
+ * DOCUMENT read, `block`/`piece` are in the caller's block-model space (the
+ * `texts`/`kinds` cut), never the prepared list's; the owner maps them to
+ * prepared pieces at the seek (`documentListedBlockForModel`), as reporting
+ * maps back (`documentModelBlockForListed`). For a message read there is no
+ * model and `block` stays the prepared list's own index.
+ */
+interface ReadFrom { part: number; block: number | null; piece?: number; recovery?: number; hold?: boolean; chunk?: number }
 
 /**
  * `#1838 vibe-talk-reader-continues-into-thread`. A read captured before a view switch, so the
@@ -414,10 +422,10 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   }
 
   /** `#1039 documents-read-parity`: {@link readWithDeviceTail} for a document, from `block`. */
-  function readDocumentWithDeviceTail(payload: DocumentPayload, id: string, ticket: number, block: number | null) {
+  function readDocumentWithDeviceTail(payload: DocumentPayload, id: string, ticket: number, block: number | null, piece = 0) {
     if (!chainDeviceTail || readAloudPlayback !== "audio") return false;
     try {
-      readWithBrowserSpeech([id], id, ticket, { payload, from: { part: 0, block } });
+      readWithBrowserSpeech([id], id, ticket, { payload, from: { part: 0, block, piece } });
       deps.setStatus("Reading with the device voice.");
       return true;
     } catch (_error) {
@@ -720,12 +728,34 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     let flat: { segment: number; text: string }[];
     let startAt = 0;
     if (docPayload !== null) {
-      listed = docPayload.entry && docPayload.entry.blocks && docPayload.entry.blocks.length > 0
-        ? docPayload.entry.blocks
-        : docPayload.texts.map((said, at) => ({
-            kind: docPayload.kinds && docPayload.kinds[at] ? docPayload.kinds[at] as string : "paragraph",
-            spoken: true, chars: said.length, element: at, piece: 0, pieces: 1,
-          }));
+      // `#2266`: the device voice speaks the model's own texts, one a block,
+      // even where a cloud entry rides along (a device tail): segmenting by
+      // the server's pieces while speaking `texts[segment.block]` said the
+      // wrong words after any split block. The derived list is 1:1 with the
+      // model, so its seek below is the model seek itself. What the entry
+      // still decides is only which blocks say nothing (`#1039`): a model
+      // block is spoken where any piece of its element group is.
+      const entryBlocks = docPayload.entry && docPayload.entry.blocks && docPayload.entry.blocks.length > 0
+        ? docPayload.entry.blocks : null;
+      let spokenOf: boolean[] | null = null;
+      if (entryBlocks) {
+        const groups = documentBlockGroups(entryBlocks);
+        const groupSpoken = groups.map((group) =>
+          group.members.some((index) => entryBlocks[index] && entryBlocks[index]!.spoken !== false));
+        if (documentGroupsAlign(groups, docPayload.kinds)
+            || ((!docPayload.kinds || docPayload.kinds.length === 0) && groups.length === docPayload.texts.length)) {
+          spokenOf = groupSpoken;
+        } else {
+          spokenOf = docPayload.texts.map((_, at) => {
+            const groupAt = groups.findIndex((group, ordinal) => (group.element ?? ordinal) === at);
+            return groupAt === -1 ? true : groupSpoken[groupAt]!;
+          });
+        }
+      }
+      listed = docPayload.texts.map((said, at) => ({
+        kind: docPayload.kinds && docPayload.kinds[at] ? docPayload.kinds[at] as string : "paragraph",
+        spoken: spokenOf ? spokenOf[at]! : true, chars: said.length, element: at, piece: 0, pieces: 1,
+      }));
       segments = speechSegments([{ blocks: listed }]);
       flat = [];
       segments.forEach((segment, at) => {
@@ -733,8 +763,10 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
         for (const chunkText of browserSpeechChunks(blockText)) flat.push({ segment: at, text: chunkText });
       });
       if (flat.length === 0) throw new Error("This document has no text to read.");
-      const wanted = doc!.from && doc!.from.block !== null ? doc!.from.block : null;
-      const startSegment = wanted === null ? 0
+      const wanted = doc!.from && doc!.from.block !== null
+        ? documentListedBlockForModel(listed, docPayload.kinds, doc!.from.block, doc!.from.piece ?? 0)
+        : null;
+      const startSegment = wanted === null || wanted === -1 ? 0
         : Math.max(0, segments.findIndex((segment) => segment.block === null || segment.block >= wanted));
       startAt = flat.findIndex((one) => one.segment >= startSegment);
       if (startAt < 0) startAt = 0;
@@ -1509,7 +1541,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   let deviceRetryParts: string[] | null = null;
 
   /** `#1039 documents-read-parity`: the document of the last failed cloud document read, and its block. */
-  let deviceRetryDocument: { payload: DocumentPayload; block: number | null } | null = null;
+  let deviceRetryDocument: { payload: DocumentPayload; block: number | null; piece: number } | null = null;
 
   /**
    * `#548 cloud-read-failures`. The owner, 2026-10-26: with the voice's speech access expired, the
@@ -1540,7 +1572,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
    * payload is stashed apart from a message's retry parts, which name rows a document is not in.
    */
   function cloudDocumentFailed(reason: string, detail: unknown, payload: DocumentPayload, block: number | null,
-      report: ((reason: string, text: string) => void) | null = null) {
+      report: ((reason: string, text: string) => void) | null = null, piece = 0) {
     noteReadStop("error");
     stopReading();
     setReadState("failed");
@@ -1549,7 +1581,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     deps.setStatus(text);
     deps.showError(text, { stay: true });
     deviceRetryParts = null;
-    deviceRetryDocument = { payload, block };
+    deviceRetryDocument = { payload, block, piece };
     deps.el("read-on-device").hidden = browserSpeechEngine() === null;
     if (report) report(reason, text);
   }
@@ -1570,7 +1602,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
       readAloudPlayback = "browser";
       readAloudLabel = "Device voice";
       try {
-        deps.guardQuietly(() => readDocument(retryDocument.payload, { part: 0, block: retryDocument.block }))();
+        deps.guardQuietly(() => readDocument(retryDocument.payload, { part: 0, block: retryDocument.block, piece: retryDocument.piece }))();
       } finally {
         readAloudPlayback = heldVoice.playback;
         readAloudLabel = heldVoice.voiceName;
@@ -2692,22 +2724,8 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     if (!kinds || kinds.length === 0) return segment.block;
     const listed = playing.blocks && playing.blocks[segment.part] ? playing.blocks[segment.part]! : null;
     if (!listed) return kinds.length === 1 ? 0 : segment.block;
-    const currentBlock = listed[segment.block];
-    const drawn = currentBlock && Number.isInteger(currentBlock.element) ? currentBlock.element as number : segment.block;
-    const groups: { kind: string; members: number[] }[] = [];
-    listed.forEach((block, index) => {
-      const element = block && Number.isInteger(block.element) ? block.element as number : null;
-      const last = groups[groups.length - 1];
-      if (last && element !== null && (last as { element?: number }).element === element) last.members.push(index);
-      else groups.push({ kind: String(block && block.kind || ""), members: [index], ...(element !== null ? { element } : {}) } as { kind: string; members: number[] });
-    });
-    if (groups.length !== kinds.length || groups.some((group, at) => group.kind !== kinds[at])) return drawn;
-    const mapped = new Map<number, number>();
-    for (let at = 0; at < groups.length; at += 1) {
-      for (const member of groups[at]!.members) mapped.set(member, at);
-    }
-    const model = mapped.get(segment.block);
-    return model === undefined ? drawn : model;
+    // `#2266`: the one listed->model mapping (core/speech), shared with seeking.
+    return documentModelBlockForListed(listed, kinds, segment.block);
   }
 
   function reactToHeldSentence() {
@@ -2758,7 +2776,14 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     if (playing === null) {
       if (jumpPaint !== null && jumpPaint.document && jumpPaint.document.onReadingBlock) {
         const segment = jumpPaint.segments[jumpPaint.segment];
-        if (segment && segment.block !== null) jumpPaint.document.onReadingBlock(segment.block, segment.block);
+        if (segment && segment.block !== null) {
+          // `#2266`: paint in the caller's model space, as below, never the raw listed index.
+          const listed = jumpPaint.blocks && jumpPaint.blocks[segment.part] ? jumpPaint.blocks[segment.part]! : null;
+          const model = listed
+            ? documentModelBlockForListed(listed, jumpPaint.document.kinds, segment.block)
+            : segment.block;
+          jumpPaint.document.onReadingBlock(model, model);
+        }
       }
       return;
     }
@@ -2792,42 +2817,13 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
       else tell(null);
       return;
     }
-    // The drawn block the current prepared block is a piece of, in the
-    // server's own numbering: the fallback light where the two cuts
-    // disagree, so a playing read keeps a light (and its navigator)
-    // instead of reporting a stop that never happened.
-    const currentBlock = listed[segment.block];
-    const drawnOf = (block: PreparedBlock | undefined, fallback: number): number =>
-      (block && Number.isInteger(block.element) ? block.element as number : fallback);
-    const groups: { kind: string; members: number[] }[] = [];
-    listed.forEach((block, index) => {
-      const element = block && Number.isInteger(block.element) ? block.element as number : null;
-      const last = groups[groups.length - 1];
-      if (last && element !== null && (last as { element?: number }).element === element) {
-        last.members.push(index);
-      } else {
-        groups.push({ kind: String(block && block.kind || ""), members: [index], ...(element !== null ? { element } : {}) } as { kind: string; members: number[] });
-      }
-    });
-    if (groups.length !== kinds.length
-        || groups.some((group, at) => group.kind !== kinds[at])) {
-      // `#2004`. The cuts disagree (an issue's front matter is the known
-      // case: the server counts it, the drawn body does not). Light the
-      // server's drawn block rather than nothing: a slightly early or
-      // late light beside a playing voice beats no light at all, and the
-      // surface keeps its read (a null here reads as "stopped" and takes
-      // the navigator and the tap gate down with it).
-      const drawn = drawnOf(currentBlock, segment.block);
-      tell(drawn, drawn);
-      return;
-    }
-    const mapped = new Map<number, number>();
-    for (let at = 0; at < groups.length; at += 1) {
-      for (const member of groups[at]!.members) mapped.set(member, at);
-    }
-    const model = mapped.get(segment.block);
-    const drawn = drawnOf(currentBlock, segment.block);
-    tell(model === undefined ? drawn : model, model === undefined ? drawn : model);
+    // `#2266`: the one listed->model mapping (core/speech), shared with
+    // seeking. Where the cuts disagree it falls back to the server's drawn
+    // block (`#2004`: an issue's front matter is the known case — the server
+    // counts it, the drawn body does not), so a playing read keeps a light
+    // and its navigator instead of reporting a stop that never happened.
+    const model = documentModelBlockForListed(listed, kinds, segment.block);
+    tell(model, model);
   }
 
   /**
@@ -3110,10 +3106,19 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     noteReadStop("jump");
     readJumping = true;
     readJumpPending = true;
+    // `#2266`: a document jump re-enters `readDocument` in its model space:
+    // the segment's prepared piece becomes the model block and piece it is of.
+    const documentFrom = (): ReadFrom => {
+      if (segment.block === null) return { part: segment.part, block: null, hold };
+      const listed = playing.blocks && playing.blocks[segment.part] ? playing.blocks[segment.part]! : null;
+      if (!listed) return { part: segment.part, block: segment.block, hold };
+      const { block, piece } = documentModelPieceForListed(listed, playing.document!.kinds, segment.block);
+      return { part: segment.part, block, piece, hold };
+    };
     try {
       // `#1039 documents-read-parity`: a document read is rebuilt from its retained payload.
       deps.guardQuietly(() => playing.kind === "document" && playing.document
-        ? readDocument(playing.document, { part: segment.part, block: segment.block, hold })
+        ? readDocument(playing.document, documentFrom())
         : readAloud(playing.parts, { part: segment.part, block: segment.block, hold }))();
     } finally {
       readJumping = false;
@@ -3497,11 +3502,13 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
    * @param {number} wait
    */
   function recoverRead(parts: string[], from: ReadFrom & { recovery: number }, wait: number,
-      payload: DocumentPayload | null = null) {
+      payload: DocumentPayload | null = null, reportBlock: number | null = from.block) {
     // `#2056`: the failure this retry answers, kept for its recovered report
     // when the resumed read plays. The ticket URL goes before the forgetting.
+    // `#2266`: the report names the LISTED block (the server's numbering under
+    // its ticket) even where a document `from` seeks in model space.
     const failedEntry = preparedEntry(parts[from.part]!);
-    pendingRecoveryReport = { url: failedEntry ? failedEntry.url : null, reason: "lost", block: from.block };
+    pendingRecoveryReport = { url: failedEntry ? failedEntry.url : null, reason: "lost", block: reportBlock };
     noteReadStop("connection_lost");
     // Every ticket minted before this may be as dead as the one that failed.
     forgetPreparedSpeech();
@@ -3540,7 +3547,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
         // after the last, the media keys and the audio output it held go back.
         const wait = recoveryWait(from.recovery);
         if (wait !== null) {
-          recoverRead(parts, { ...from, recovery: from.recovery + 1 }, wait, payload);
+          recoverRead(parts, { ...from, recovery: from.recovery + 1 }, wait, payload, reportBlock);
         } else {
           releaseMediaSession();
           quietReadAloudContext();
@@ -3774,15 +3781,28 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
         outcome: "gave_up",
       });
     };
+    // `#2266`: a document segment as the model block/piece it is of, for every
+    // restart below that re-enters in model space. Failure REPORTS keep the
+    // listed block: the server names stream failures by its own numbering.
+    const modelFromSegment = (segment: SpeechSegment): { block: number | null; piece: number } => {
+      if (!isDocument || segment.block === null) return { block: segment.block, piece: 0 };
+      const listedForPart = blocks[segment.part];
+      if (!listedForPart) return { block: segment.block, piece: 0 };
+      return documentModelPieceForListed(listedForPart, payload!.kinds, segment.block);
+    };
     // `#1039 documents-read-parity`. A cloud failure of either kind, each to its own retry stash.
     const failCloud = (reason: string, detail: unknown, at: number) => {
-      if (isDocument) cloudDocumentFailed(reason, detail, payload!, segments[at]!.block, reportFailure(at));
-      else cloudReadFailed(reason, detail, parts, reportFailure(at));
+      if (isDocument) {
+        const from = modelFromSegment(segments[at]!);
+        cloudDocumentFailed(reason, detail, payload!, from.block, reportFailure(at), from.piece);
+      } else cloudReadFailed(reason, detail, parts, reportFailure(at));
     };
     // `#1039 documents-read-parity`. The chain's device tail of either kind, from segment `at`.
-    const deviceTail = (at: number) => (isDocument
-      ? readDocumentWithDeviceTail(payload!, id, ticket, segments[at]!.block)
-      : readWithDeviceTail(parts, id, ticket));
+    const deviceTail = (at: number) => {
+      if (!isDocument) return readWithDeviceTail(parts, id, ticket);
+      const from = modelFromSegment(segments[at]!);
+      return readDocumentWithDeviceTail(payload!, id, ticket, from.block, from.piece);
+    };
     // `#548 cloud-read-failures`. A part with no speech arrived READ_NO_SPEECH_MS after its first audio
     // stops the read: silence slower than `drained` can say so. Counted from the first audio of a part
     // that has been started (`maybeGuardSpeech`), never from the request: a cold session or a busy
@@ -3952,7 +3972,12 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
           if (wait !== null) {
             const heard = nowPlaying !== null && nowPlaying!.id === id && !started[at] ? nowPlaying!.segment! : at;
             const segment = segments[heard] || segments[at]!;
-            recoverRead(parts, { part: segment.part, block: segment.block, recovery: recovery + 1 }, wait, payload);
+            // `#2266`: a document recovery seeks in model space; its failure
+            // report still names the listed block under the old ticket.
+            const from = modelFromSegment(segment);
+            recoverRead(parts,
+              { part: segment.part, block: from.block, piece: from.piece, recovery: recovery + 1 },
+              wait, payload, segment.block);
             return;
           }
           // `#487`: and what was prepared before a lost part with it, so the next tap prepares again
@@ -4241,7 +4266,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
         entry = await prepareDocumentSpeech(key);
       } catch (error) {
         if (ticket !== readingTicket) return;
-        cloudDocumentFailed("refused", (error as Error).message, payload, from ? from.block : null);
+        cloudDocumentFailed("refused", (error as Error).message, payload, from ? from.block : null, null, from?.piece ?? 0);
         return;
       }
       if (ticket !== readingTicket) return;
@@ -4250,15 +4275,26 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     const ready: (PreparedEntry | null)[] = [entry];
     const segments = speechSegments(ready);
     if (segments.length === 0) {
-      cloudDocumentFailed("refused", "that document has nothing to read", payload, from ? from.block : null);
+      cloudDocumentFailed("refused", "that document has nothing to read", payload, from ? from.block : null, null, from?.piece ?? 0);
       return;
     }
     pendingRead = null;
     const selection = speechSelection();
     const sources = segments.map((segment) => `${entry!.url}?selection=${selection}` +
       (segment.block === null ? "" : `&block=${segment.block}`));
-    const first = from === null ? 0 : Math.max(0, segments.findIndex((segment) =>
-      segment.part === from.part && (from.block === null || segment.block === null || segment.block >= from.block)));
+    // `#2266`: `from.block` is the caller's model block; map it to a prepared
+    // piece here, the inverse of reporting, and never compare the two spaces.
+    // A target past the last spoken piece clamps to the last segment.
+    const target = from !== null && from.block !== null
+      ? documentListedBlockForModel(entry.blocks ?? [], payload.kinds, from.block, from.piece ?? 0)
+      : null;
+    let first = 0;
+    if (from !== null) {
+      const found = segments.findIndex((segment) =>
+        segment.part === from.part
+        && (target === null || segment.block === null || segment.block >= target));
+      first = found === -1 ? segments.length - 1 : found;
+    }
     const recovery = from !== null && Number.isInteger(from.recovery) ? from.recovery! : 0;
     await playPreparedRead({
       id, parts, ticket, tapBegan, streamed: true, ready, objectUrls: [], segments, sources, first, recovery,

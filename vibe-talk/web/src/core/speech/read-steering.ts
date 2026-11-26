@@ -74,3 +74,106 @@ export function readSectionStarts(playing: { segments: readonly SpeechSegment[];
   return startsWhere((listed, before) => listed === null
     || (!continues(listed) && !(listed.kind === "item" && before !== null && before.kind === "item")));
 }
+
+
+/**
+ * `#2266 vibe-talk-doc-reader-navigator-campaign`. One drawn block's prepared
+ * pieces together: consecutive listed blocks sharing one server `element`
+ * (a table's rows, a long block's sentence pieces). A server from before
+ * pieces lists one block per drawn block with no `element`; each is then its
+ * own group, in order.
+ */
+export interface DocumentBlockGroup {
+  readonly kind: string;
+  readonly element: number | null;
+  readonly members: number[];
+}
+
+/** The element groups of one prepared list, in order (see above). */
+export function documentBlockGroups(listed: readonly PreparedBlock[]): DocumentBlockGroup[] {
+  const groups: DocumentBlockGroup[] = [];
+  listed.forEach((block, index) => {
+    const element = block && Number.isInteger(block.element) ? block.element as number : null;
+    const last = groups[groups.length - 1];
+    if (last && element !== null && last.element === element) last.members.push(index);
+    else groups.push({ kind: String(block && block.kind || ""), element, members: [index] });
+  });
+  return groups;
+}
+
+/**
+ * Whether `groups` align onto a caller's block model: one group a model
+ * block, kinds agreeing in order. No model (`kinds` absent or empty) never
+ * aligns; callers then keep the prepared list's own numbering.
+ */
+export function documentGroupsAlign(groups: readonly DocumentBlockGroup[], kinds: readonly string[] | undefined): boolean {
+  return !!kinds && kinds.length > 0 && groups.length === kinds.length
+    && groups.every((group, at) => group.kind === kinds[at]);
+}
+
+function drawnElementOf(listed: readonly PreparedBlock[], listedIndex: number): number {
+  const block = listed[listedIndex];
+  return block && Number.isInteger(block.element) ? block.element as number : listedIndex;
+}
+
+/**
+ * The caller's block-model index of prepared block `listedIndex`: its group
+ * ordinal where the cuts align, else the server's drawn element (the
+ * `#2004` fallback light), else the listed index itself where the caller
+ * cut no model. The one mapping position reports use.
+ */
+export function documentModelBlockForListed(
+    listed: readonly PreparedBlock[], kinds: readonly string[] | undefined, listedIndex: number): number {
+  if (!kinds || kinds.length === 0) return listedIndex;
+  const groups = documentBlockGroups(listed);
+  if (documentGroupsAlign(groups, kinds)) {
+    const at = groups.findIndex((group) => group.members.includes(listedIndex));
+    if (at !== -1) return at;
+  }
+  return drawnElementOf(listed, listedIndex);
+}
+
+/** The above with the piece's place in its block: `{block, piece}` in model space. */
+export function documentModelPieceForListed(
+    listed: readonly PreparedBlock[], kinds: readonly string[] | undefined, listedIndex: number): { block: number; piece: number } {
+  if (!kinds || kinds.length === 0) return { block: listedIndex, piece: 0 };
+  const groups = documentBlockGroups(listed);
+  const at = groups.findIndex((group) => group.members.includes(listedIndex));
+  if (at === -1) return { block: drawnElementOf(listed, listedIndex), piece: 0 };
+  const piece = Math.max(0, groups[at]!.members.indexOf(listedIndex));
+  return documentGroupsAlign(groups, kinds)
+    ? { block: at, piece }
+    : { block: drawnElementOf(listed, listedIndex), piece };
+}
+
+/**
+ * The prepared block a seek to model block `modelBlock` (its `piece`-th
+ * piece, clamped) starts at, or -1 where the list is empty: the group's
+ * member where the cuts align; else the group the server drew as that
+ * block (nearest at or before it); with no model, the listed index itself,
+ * clamped, as before a model was cut. Seeking in the page's block space is
+ * the inverse of {@link documentModelBlockForListed}; nothing outside the
+ * read owner ever names a listed index for a document.
+ */
+export function documentListedBlockForModel(
+    listed: readonly PreparedBlock[], kinds: readonly string[] | undefined,
+    modelBlock: number, piece = 0): number {
+  if (listed.length === 0) return -1;
+  const clamp = (value: number, last: number) => Math.max(0, Math.min(last, Math.floor(value) || 0));
+  if (!kinds || kinds.length === 0) return clamp(modelBlock, listed.length - 1);
+  const groups = documentBlockGroups(listed);
+  let group: DocumentBlockGroup | undefined;
+  if (documentGroupsAlign(groups, kinds)) {
+    group = groups[clamp(modelBlock, groups.length - 1)];
+  } else {
+    for (const candidate of groups) {
+      const drawn = candidate.element ?? groups.indexOf(candidate);
+      if (drawn <= modelBlock) group = candidate;
+      if (drawn === modelBlock) break;
+      if (drawn > modelBlock && group) break;
+    }
+    group = group ?? groups[0];
+  }
+  if (!group || group.members.length === 0) return -1;
+  return group.members[clamp(piece, group.members.length - 1)]!;
+}
