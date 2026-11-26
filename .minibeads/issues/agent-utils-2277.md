@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-key-scroll-freezes-11-26: the page never blocks typing or scrolling for seconds on a busy phone channel'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 assignee: cl-freeze
@@ -8,7 +8,7 @@ labels:
 - vibe-talk
 - owner-ui
 created_at: 2026-11-26T03:45:00-05:00
-updated_at: 2026-11-26T06:00:00-05:00
+updated_at: 2026-11-26T10:10:00-05:00
 ---
 
 # Description
@@ -55,3 +55,5 @@ Before and after on the same clone, 768 rows (drawn rows cloned for length), 4x:
 Gating check (counts, never time): tests/geometry_restyle_browser.py (phone and desktop, 260 rows). The page before the fix fails all three parts.
 
 Follow-ups: `#2283 vibe-talk-root-has-rules` (the root-anchored `:has()` rules, the next page lane), and windowed lists on by default (evidence pending).
+
+Landed as fbe206a9 on 2026-11-26 (owner gate on 85212ddd, 230 of 230 steps green; an earlier gate on f5f4668c was red on save-draft-chip-browser, which still waited for the corner Send, and was fixed test-only). Deploy by the coordinator from 10:00 AM ET. The windowed-lists comparison done for the follow-up (windowed on: the composer moves about 46 px while typing through arrivals, and a jump into the middle of the list shows no row for a moment) is reported to the coordinator, not filed here.

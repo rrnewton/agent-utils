@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-phone-send-pill-overlaps-composer: on a phone with the keyboard open, the floating Send pill overlaps the channel composer lower-right corner'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
@@ -8,7 +8,7 @@ labels:
 - owner-ui
 - ui
 created_at: 2026-11-25T21:44:00-05:00
-updated_at: 2026-11-25T21:44:00-05:00
+updated_at: 2026-11-26T10:10:00-05:00
 ---
 
 # Description
@@ -35,3 +35,9 @@ Reproduce: `cd vibe-talk && scripts/run.sh --screenshots --theme both --profiles
 # Notes
 
 Found by the #2264 screenshot review (owner request 374, part B) and filed at the liaison's request: an owner-UI bug, not fast-track. Related: #1504 (the keyboard Send itself), #1871 (the compact layout's chip reserve and keyboard Send), #1680 (open: two Sends overlap in the inline reply form while typing).
+
+## Resolution
+
+Fixed by `#2277 vibe-talk-key-scroll-freezes-11-26` (fbe206a9, 2026-11-26). The fitted composer (the channel's box, and its right-column twin) now rests whole on the keyboard's top, its own row with Send included, instead of parking that row under the keys. With the box's own Send in sight, the corner Send stands down, so nothing floats over the composer's corner and exactly one Send stands. The #1504 promise holds: a Send stays reachable above the keyboard (the box's own).
+
+Checks: `tests/save_draft_chip_browser.py` (phone, keyboard open: no corner Send, the chip and the box's own Send clear of the text area), `tests/reply_keyboard_clutter_browser.py` (main composer: the row's own Send alone stands; the inline reply keeps its own single Send), `tests/geometry_restyle_browser.py` (no corner Send while typing at the foot) and screenshot scene 77 at android-412 and laptop-1280 in light and dark, before (main's page: the pill over the corner) and after (the whole composer on the keys, no pill), BUILD.txt naming the tree. The Discuss ask box was not re-checked here.
