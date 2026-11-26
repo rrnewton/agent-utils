@@ -119,7 +119,7 @@
     box-shadow: 0 0.5rem 1.5rem color-mix(in srgb, var(--shadow) 35%, transparent);
   }
 
-  body:has(#control-bar[data-placement="top"]) #discuss-panel {
+  :root[data-bar-placement="top"] #discuss-panel {
     top: calc(4.5rem + env(safe-area-inset-top));
     bottom: auto;
   }

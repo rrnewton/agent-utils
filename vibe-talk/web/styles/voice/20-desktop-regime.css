@@ -149,7 +149,7 @@
   }
 
   /* The pane's phone edge clearance for a bar in the header (19) is the dock's padding here. */
-  #dock:not(:has(#control-bar)) #control-pane {
+  :root[data-bar-placement="top"] #dock #control-pane {
     padding-bottom: 0;
   }
 
@@ -222,23 +222,23 @@
 
   /* `#1909`: `#docs-filter-bar` stands between these two in the markup, so
      the room is kept over a general sibling, not the adjacent one. */
-  #control-bar-bottom:has(#view-switch:not([hidden])) ~ #control-pane {
+  #control-bar-bottom[data-switch] ~ #control-pane {
     margin-right: calc(var(--dock-switch) + var(--dock-menu) + 0.8rem);
   }
 
   /* ...and with the reader's row hidden, the bar keeps that room itself: it takes the row, short of the corner. */
-  :root[data-reader="hidden"][data-pane="discord"] #dock:not(:has(#hang-up:not([hidden]))):not(:has(#read-aloud[data-active="true"])):not(:has(#read-aloud-stop:not([hidden]))) #control-bar-bottom:has(#view-switch:not([hidden])) {
+  :root[data-reader="hidden"][data-pane="discord"]:not([data-call]):not([data-read-active]):not([data-read-stop]) #dock #control-bar-bottom[data-switch] {
     margin-right: calc(var(--dock-switch) + var(--dock-menu) + 0.8rem);
   }
 
   /* In Documents the pane is away altogether, so the bar keeps the corner's room there too
      (`#1078 bottom-bar-switcher`): without it the bar takes the whole row and Fetch and
      Outline slide under the switch in its corner, untappable. */
-  :root[data-pane="docs"] #control-bar-bottom:has(#view-switch:not([hidden])) {
+  :root[data-pane="docs"] #control-bar-bottom[data-switch] {
     margin-right: calc(var(--dock-switch) + var(--dock-fetch) + 3 * var(--dock-menu) + 1.6rem);
   }
 
-  :root[data-reader="hidden"][data-pane="discord"] #dock:not(:has(#hang-up:not([hidden]))):not(:has(#read-aloud[data-active="true"])):not(:has(#read-aloud-stop:not([hidden]))) #control-bar[data-placement="bottom"] {
+  :root[data-reader="hidden"][data-pane="discord"]:not([data-call]):not([data-read-active]):not([data-read-stop]) #dock #control-bar[data-placement="bottom"] {
     padding-bottom: 0;
   }
 
@@ -427,7 +427,7 @@
      leaves it unhidden there, and on a phone that never shows: Hide read is placed in the same
      grid cell, later in the markup, and covers it. A row has no cells to cover anything with, so
      the reading view says here what the phone tile already shows — Hide read, Pace, Read. */
-  #control-pane:has(#read-aloud:not([hidden])) #speaker {
+  #control-pane:has(> #read-aloud:not([hidden])) #speaker {
     display: none;
   }
 

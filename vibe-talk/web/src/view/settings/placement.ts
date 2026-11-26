@@ -18,6 +18,8 @@ const BAR_PLACEMENT_KEY = "vibe-talk.voice.bar-placement";
 export interface BarPlacementDependencies {
   /** The element with this id (`el`). */
   lookup(id: string): HTMLElement;
+  /** The page's root element, where the stylesheet reads the placement (`#2283`). Unwired, unmarked. */
+  root?(): HTMLElement;
   /** The device's storage (`deviceStorage`); reading or writing it may throw. */
   storage(): StoragePort;
   /** Redraw the bar, which decides what it shows from where it is (`renderControlBar`). */
@@ -54,6 +56,11 @@ export function mountBarPlacement(deps: BarPlacementDependencies): BarPlacement 
   function set(where: unknown): void {
     placement = placementOf(where);
     deps.lookup("control-bar").setAttribute("data-placement", placement);
+    // `#2283 vibe-talk-root-has-rules`. The same fact on the root, beside the bar's own:
+    // the rules for the header, the outline pop-up and the Discuss panel read it there
+    // instead of re-searching the document for the bar on every toggle.
+    const root = deps.root?.();
+    if (root && root.getAttribute("data-bar-placement") !== placement) root.setAttribute("data-bar-placement", placement);
     deps.lookup(placement === "top" ? "control-bar-top" : "control-bar-bottom").append(deps.lookup("control-bar"));
     deps.renderControlBar();
   }

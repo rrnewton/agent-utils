@@ -291,7 +291,7 @@ test("the transcript is the one thing that scrolls, and the control pane is a gr
     "the controls must clear the home indicator"
   );
   assert.match(
-    cssBlock("#dock:not(:has(#control-bar)) #control-pane"),
+    cssBlock(':root[data-bar-placement="top"] #dock #control-pane'),
     /padding-bottom:\s*calc\([^)]*env\(safe-area-inset-bottom\)/,
     "with the bar in the header the pane must clear the home indicator itself"
   );
@@ -598,13 +598,12 @@ test("`#880 voice-page-menu-placement`: Hide reader takes the channel's row of b
   // The stylesheet takes the row away on the channel's view and leaves no band: the bar keeps the inset. But
   // a way out of sound stays: while a call can be hung up or a read is on, the row is drawn whatever the choice.
   const P = ':root[data-reader="hidden"][data-pane="discord"]';
-  const OUT = ':not(:has(#hang-up:not([hidden]))):not(:has(#read-aloud[data-active="true"]))' +
-    ':not(:has(#read-aloud-stop:not([hidden])))';
-  assert.match(cssBlock(`${P} #dock${OUT} #control-pane`), /display:\s*none/,
+  const OUT = ':not([data-call]):not([data-read-active]):not([data-read-stop])';
+  assert.match(cssBlock(`${P}${OUT} #dock #control-pane`), /display:\s*none/,
     "the row is still drawn, or is hidden over Hang up, a lit Read or Stop");
-  assert.match(cssBlock(`${P} #dock${OUT} #control-bar[data-placement="bottom"]`), /safe-area-inset-bottom/,
+  assert.match(cssBlock(`${P}${OUT} #dock #control-bar[data-placement="bottom"]`), /safe-area-inset-bottom/,
     "the bar at the foot loses the home indicator's inset");
-  assert.match(cssBlock(`${P} #dock:not(:has(#control-bar))${OUT}`), /display:\s*none/, "an empty dock stays as a band");
+  assert.match(cssBlock(`${P}[data-bar-placement="top"]${OUT} #dock`), /display:\s*none/, "an empty dock stays as a band");
   assert.equal(cssRules(CSS, `${P} #control-pane`).length, 0, "the row is hidden with no way out of sound kept");
   // The keys act through the row's buttons, whose own `hidden` it left alone: h cycles, s reads.
   assert.equal(page.el("todo-filter").hidden, false, "hiding the row hid its buttons, which the keys read");
@@ -843,6 +842,8 @@ test("CHOOSING TOP REALLY MOVES THE BAR, AND THE CHOICE SURVIVES A RELOAD", asyn
   const bar = page.el("control-bar");
   assert.equal(bar.parentNode, page.el("control-bar-bottom"), "the default home is not the dock");
   assert.equal(bar.getAttribute("data-placement"), "bottom");
+  // `#2283`: the placement is named on the root too, where the header and pop-up rules read it.
+  assert.equal(page.documentElement.getAttribute("data-bar-placement"), "bottom", "the root does not name the bar's home");
   assert.equal(page.el("bar-placement").value, "bottom", "the setting does not show where it is");
 
   page.el("bar-placement").value = "top";
@@ -855,6 +856,9 @@ test("CHOOSING TOP REALLY MOVES THE BAR, AND THE CHOICE SURVIVES A RELOAD", asyn
     "the bar is in BOTH homes at once, so nothing was moved"
   );
   assert.equal(bar.getAttribute("data-placement"), "top");
+  assert.equal(page.documentElement.getAttribute("data-bar-placement"), "top", "the root did not follow the bar into the header");
+  // `#2283`: the bottom mount's switch mark goes with the bar — in the header no room is kept for it below.
+  assert.equal(page.el("control-bar-bottom").hasAttribute("data-switch"), false, "the empty bottom mount still claims the switch");
   assert.match(page.el("bar-placement-state").textContent, /Saved/);
 
   // A reload: same storage, a brand new execution of the page.
@@ -1867,10 +1871,10 @@ test("the desktop dock leaves the phone's declarations as they were", () => {
     "#control-pane .control",
     "#control-pane .control > svg",
     "#control-pane .control-note",
-    "#control-pane:has(#read-aloud:not([hidden])) #speaker",
+    "#control-pane:has(> #read-aloud:not([hidden])) #speaker",
     "#control-pane button:focus-visible",
     '#control-bar[data-placement="bottom"] #view-switch',
-    "#control-bar-bottom:has(#view-switch:not([hidden])) ~ #control-pane",
+    "#control-bar-bottom[data-switch] ~ #control-pane",
     '#control-bar[data-placement="bottom"] .switch-word',
     "#control-pane .control:has(> .control-note:not([hidden])) > svg",
   ]) {
@@ -1923,7 +1927,7 @@ test("the pane's markup runs in the order its buttons are seen, so Tab follows t
   // Sound acts on a call's voice. Without a call the channel view shows Hide read, Pace and Read,
   // and on a desk nothing is left to cover Sound the way the phone tile's shared cell does.
   assert.match(
-    cssBlockIn(DESKTOP_QUERY, "#control-pane:has(#read-aloud:not([hidden])) #speaker"),
+    cssBlockIn(DESKTOP_QUERY, "#control-pane:has(> #read-aloud:not([hidden])) #speaker"),
     /display:\s*none/
   );
 });
@@ -1958,7 +1962,7 @@ test("on a desk the view switch has one place, and the pane keeps the room for i
   // The room: the pane's right margin is the switch's width, the hamburger's beside it (`#880
   // voice-page-menu-placement`) and their gaps, and only while the switch is up (text mode takes it down,
   // and the pane does not hold an empty corner for it).
-  const room = cssBlockIn(DESKTOP_QUERY, "#control-bar-bottom:has(#view-switch:not([hidden])) ~ #control-pane");
+  const room = cssBlockIn(DESKTOP_QUERY, "#control-bar-bottom[data-switch] ~ #control-pane");
   assert.match(room, /margin-right:\s*calc\(var\(--dock-switch\) \+ var\(--dock-menu\) \+ [\d.]+rem\)/,
     "the pane keeps no room for the switch and the hamburger");
   assert.match(cssValue(cssBlockIn(DESKTOP_QUERY, "#dock"), "--dock-switch") || "", /^[\d.]+rem$/);
@@ -1973,9 +1977,8 @@ test("on a desk the view switch has one place, and the pane keeps the room for i
   assert.match(cssValue(cssBlockIn(DESKTOP_QUERY, "#dock"), "--dock-menu") || "", /^[\d.]+rem$/);
   // ...and with the reader's row hidden, the bar keeps that room, since no pane is there to.
   const hiddenRoom = cssBlockIn(DESKTOP_QUERY,
-    ':root[data-reader="hidden"][data-pane="discord"] #dock:not(:has(#hang-up:not([hidden])))' +
-    ':not(:has(#read-aloud[data-active="true"])):not(:has(#read-aloud-stop:not([hidden]))) ' +
-    '#control-bar-bottom:has(#view-switch:not([hidden]))');
+    ':root[data-reader="hidden"][data-pane="discord"]:not([data-call]):not([data-read-active]):not([data-read-stop]) ' +
+    '#dock #control-bar-bottom[data-switch]');
   assert.equal(cssValue(hiddenRoom, "margin-right"), cssValue(room, "margin-right"),
     "with the reader hidden, the bar runs under the switch");
   // ...and it is the pane that keeps it, the last thing in the dock and so on its last row.

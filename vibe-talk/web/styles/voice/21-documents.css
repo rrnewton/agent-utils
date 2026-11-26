@@ -47,8 +47,8 @@
 /* While a call can be hung up the row is a signpost only: it hangs over the pane's row, and
    the way out of sound is never under it, even in the settle after a switch press. Choosing
    a view from a cell remains where no call is live. */
-:root:has(#hang-up:not([hidden])) .view-cards,
-:root:has(#hang-up:not([hidden])) .view-card {
+:root[data-call] .view-cards,
+:root[data-call] .view-card {
   pointer-events: none;
 }
 .view-card {
@@ -746,7 +746,7 @@
   box-shadow: 0 0.5rem 1.5rem color-mix(in srgb, var(--shadow) 35%, transparent);
   z-index: var(--z-modal);
 }
-body:has(#control-bar[data-placement="top"]) #doc-outline-pop {
+:root[data-bar-placement="top"] #doc-outline-pop {
   top: calc(4.5rem + env(safe-area-inset-top));
   bottom: auto;
 }

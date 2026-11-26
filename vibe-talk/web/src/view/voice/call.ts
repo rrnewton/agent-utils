@@ -4635,6 +4635,10 @@ function renderControls() {
     deps.el("control-pane").hidden = !deps.docsReaderOpen;
   }
   deps.el("read-aloud").hidden = !reading;
+  // `#2283 vibe-talk-root-has-rules`. Read standing, on the root beside its own `hidden`:
+  // the dock's keyboard and reader-hidden gates read it (with `data-read-active` below)
+  // instead of re-searching the dock for the button on every toggle.
+  document.documentElement.toggleAttribute("data-read-shown", reading);
   deps.el("read-speed").hidden = !reading;
   // The archive filter belongs to the CHANNEL, so it appears with the channel and not with a call.
   deps.el("todo-filter").hidden = !channel;
@@ -4657,6 +4661,8 @@ function renderControls() {
   // with s keeps the way-out colour and the keyboard-up slim row's Pause (`#429`), which both key
   // off this. `renderReadTransport` keeps it as a read starts, holds and ends between these draws.
   deps.el("read-aloud").setAttribute("data-active", deps.readingMode || deps.readInProgress() || deps.pendingRead !== null ? "true" : "false");
+  // `#2283`: the same fact on the root; `renderReadTransport` mirrors it between these draws.
+  document.documentElement.toggleAttribute("data-read-active", deps.readingMode || deps.readInProgress() || deps.pendingRead !== null);
   // The state the READER cares about, on the control they pressed. Reset to a plain ready when the
   // mode is off, so a failure from the last session does not greet them on the next one.
   deps.el("read-aloud").setAttribute("data-read-state", deps.readingMode ? deps.readState : "idle");
@@ -4672,6 +4678,9 @@ function renderControls() {
   // that either means nothing or means something alarming. Absent in the channel view.
   deps.el("clear-view").hidden = reading;
   deps.el("hang-up").hidden = !live;
+  // `#2283`: a call to hang up, on the root beside Hang up's own `hidden`, for the dock
+  // gates and the view cards' signpost rule.
+  document.documentElement.toggleAttribute("data-call", live);
   deps.el("hangup-label").textContent = chat ? "End chat" : "Hang up";
   deps.el("control-pane").className = chat ? "chat" : live ? "" : "solo";
   // `#241 voice-composer`. Send works with NOTHING open — that is how a typed conversation starts —

@@ -1908,10 +1908,10 @@ test("`scrubber-full-width`: on a phone the strip playing is a full-width row on
   // Playing: the second row (in the dock or the header) and the chips go. Held: the second row only.
   assert.match(rule(":root[data-read-strip] #control-bar"), /display:\s*none;/, "the second row stays up during playback");
   // (By the text: the rule parser splits a selector at the commas inside its `:has`.)
-  assert.match(phone, /:root\[data-read-strip\](?::not\(\[data-screen="(?:settings|help)"\]\))* #topbar:has\(#control-bar-top > #control-bar\)[^{]*\{\s*display:\s*none;/,
+  assert.match(phone, /:root\[data-read-strip\]\[data-bar-placement="top"\](?::not\(\[data-screen="(?:settings|help)"\]\))* #topbar[^{]*\{\s*display:\s*none;/,
     "the header holding only the bar stays up during playback");
   // A header gone this way is not `hidden`, so the body takes the notch's inset over (`#197`).
-  assert.match(phone, /:root\[data-read-strip\](?::not\(\[data-screen="(?:settings|help)"\]\))* #topbar:has\([^{]*\+ #frame-body\s*\{\s*padding-top:\s*env\(safe-area-inset-top\);/,
+  assert.match(phone, /:root\[data-read-strip\]\[data-bar-placement="top"\](?::not\(\[data-screen="(?:settings|help)"\]\))* #topbar \+ #frame-body\s*\{\s*padding-top:\s*env\(safe-area-inset-top\);/,
     "the header gone for playback leaves the list under the notch");
   // (The thread list's boxes, #side-composer, #side-pane and #side-list, are in the `:is` above.)
   // `#837 voice-page-jump-to-reading`: all but the way back to the message being read, while it is up (by the text,
@@ -1928,12 +1928,12 @@ test("`scrubber-full-width`: on a phone the strip playing is a full-width row on
 test("`#442 read-strip-order`: the phone tile gives Stop a fourth column on Pause's left, only while it shows", () => {
   // On Read's LEFT: Read, the Pause reached for without looking, keeps the edge under the thumb,
   // so a blind tap to pause never lands on a Stop that has just appeared where Read was.
-  assert.match(cssBlock("#control-pane:has(#read-aloud-stop:not([hidden]))"),
+  assert.match(cssBlock("#control-pane:has(> #read-aloud-stop:not([hidden]))"),
     /grid-template-columns:\s*3\.5rem 1fr 1fr 1fr;/, "the tile has no column for Stop");
   const stop = cssBlock("#control-pane #read-aloud-stop");
   assert.match(stop, /grid-column:\s*3;/, "Stop is not beside Pause, on its left");
   assert.match(stop, /grid-row:\s*1 \/ span 2;/);
-  assert.match(cssBlock("#control-pane:has(#read-aloud-stop:not([hidden])) #read-aloud"), /grid-column:\s*4;/,
+  assert.match(cssBlock("#control-pane:has(> #read-aloud-stop:not([hidden])) #read-aloud"), /grid-column:\s*4;/,
     "Read gave up the edge under the thumb to Stop");
   const pane = HTML_CODE.slice(HTML_CODE.indexOf('id="control-pane"'));
   assert.ok(pane.indexOf('id="read-speed"') < pane.indexOf('id="read-aloud-stop"') &&
@@ -2087,6 +2087,10 @@ test("`#451 read-strip-followups`: a read started with s outside reading mode ha
   assert.equal(page.el("read-aloud-label").text(), "Pause", "Read does not pause a read started with s");
   assert.equal(page.el("read-aloud").getAttribute("aria-pressed"), "false", "starting the read entered reading mode");
   assert.equal(page.el("read-aloud").getAttribute("data-active"), "true", "the one-off read does not light its Pause as a session's does");
+  // `#2283`: the same facts on the root for the dock gates, and the react-only strip named on the screen.
+  assert.equal(page.documentElement.hasAttribute("data-read-active"), true, "the root does not say a read is on");
+  assert.equal(page.documentElement.hasAttribute("data-read-stop"), true, "the root does not say Stop stands");
+  assert.equal(page.el("screen-main").hasAttribute("data-react-steer"), true, "the screen does not name the react-only strip");
   await page.el("read-aloud").click();
   await page.settle();
   assert.equal(page.el("read-aloud-label").text(), "Resume", "Read did not hold the read started with s");

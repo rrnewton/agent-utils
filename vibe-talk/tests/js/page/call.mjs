@@ -311,10 +311,13 @@ test("HANG UP IS NOT ON THE SCREEN WHEN THERE IS NO CALL", async () => {
   const page = newPage();
   await signIn(page);
   assert.equal(page.el("hang-up").hidden, true, "Hang up is on screen before any call");
+  // `#2283`: the same fact on the root, for the stylesheet's dock and view-card gates.
+  assert.equal(page.documentElement.hasAttribute("data-call"), false, "the root says a call is up before any call");
   assert.equal(page.el("control-pane").className, "solo", "the one action must take both columns");
 
   await startTalking(page);
   assert.equal(page.el("hang-up").hidden, false, "Hang up vanished during a live call");
+  assert.equal(page.documentElement.hasAttribute("data-call"), true, "the root does not say a call is up during one");
   assert.equal(page.el("control-pane").className, "");
 
   await page.el("hang-up").click();

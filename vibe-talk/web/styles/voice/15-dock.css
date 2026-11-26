@@ -149,8 +149,8 @@
    scrollers keep its room at their foot as scroll room, so a landing — the
    read's own follow among them — never puts the sentence being read under
    it. No layout moves: the room is an inset of the scroll, not of the box. */
-#frame-body:has(#read-steer[data-react-only]:not([hidden])) #scroll-area,
-#frame-body:has(#read-steer[data-react-only]:not([hidden])) #side-scroll {
+#screen-main[data-react-steer] #scroll-area,
+#screen-main[data-react-steer] #side-scroll {
   scroll-padding-bottom: calc(var(--read-steer-height, 3.5rem) + 1rem);
 }
 
@@ -549,7 +549,7 @@
   }
 
   :root[data-read-strip] #control-bar,
-  :root[data-read-strip]:not([data-screen="settings"]):not([data-screen="help"]) #topbar:has(#control-bar-top > #control-bar),
+  :root[data-read-strip][data-bar-placement="top"]:not([data-screen="settings"]):not([data-screen="help"]) #topbar,
   :root[data-read-strip="playing"] #scroll-tools:not(:has(> #jump-reading:not([hidden]))),
   :root[data-read-strip="playing"] #scroll-tools > :not(#jump-reading) {
     display: none;
@@ -558,7 +558,7 @@
   /* The header gone this way is not `hidden`, so the body takes the top safe-area inset over here as
      `#197 floating-search` has it do for a hidden header: a read lasts minutes, and the notch would
      sit on the list's first line and the glass for all of them. */
-  :root[data-read-strip]:not([data-screen="settings"]):not([data-screen="help"]) #topbar:has(#control-bar-top > #control-bar) + #frame-body {
+  :root[data-read-strip][data-bar-placement="top"]:not([data-screen="settings"]):not([data-screen="help"]) #topbar + #frame-body {
     padding-top: env(safe-area-inset-top);
   }
 }

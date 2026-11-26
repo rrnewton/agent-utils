@@ -28,7 +28,7 @@
 /* With the bar moved up into the header this pane is the dock's only row again, and the edge
    clearance is its own once more. The desktop block takes this back: there the dock's own
    padding carries the row. */
-#dock:not(:has(#control-bar)) #control-pane {
+:root[data-bar-placement="top"] #dock #control-pane {
   padding-bottom: calc(0.6rem + env(safe-area-inset-bottom));
 }
 
@@ -196,11 +196,11 @@
    Stop takes the new column on Read's LEFT, so Read keeps the edge a thumb reaches for without
    looking and a blind tap to pause never lands on Stop. At 375px each of the three wide columns
    is still well over a 44px target. */
-#control-pane:has(#read-aloud-stop:not([hidden])) {
+#control-pane:has(> #read-aloud-stop:not([hidden])) {
   grid-template-columns: 3.5rem 1fr 1fr 1fr;
 }
 
-#control-pane:has(#read-aloud-stop:not([hidden])) #read-aloud {
+#control-pane:has(> #read-aloud-stop:not([hidden])) #read-aloud {
   grid-column: 4;
 }
 
@@ -298,7 +298,7 @@
 
 /* Only while the reader row is the pane's content: with a call up, Sound and
    Clear hold that column, and the toggle waits in its hidden state. */
-#control-pane:has(#read-aloud[hidden]) #audio-source {
+#control-pane:has(> #read-aloud[hidden]) #audio-source {
   display: none;
 }
 
@@ -415,11 +415,11 @@
  *     stopping. Everything else in the tile goes. */
 @media (pointer: coarse) {
   :root[data-keyboard="open"][data-pane="discord"] #control-bar,
-  :root[data-keyboard="open"][data-pane="discord"]:not([data-screen="settings"]):not([data-screen="help"]) #topbar:has(#control-bar-top > #control-bar) {
+  :root[data-keyboard="open"][data-pane="discord"][data-bar-placement="top"]:not([data-screen="settings"]):not([data-screen="help"]) #topbar {
     display: none;
   }
 
-  :root[data-keyboard="open"][data-pane="discord"] #dock:not(:has(#read-aloud[data-active="true"]:not([hidden]), #hang-up:not([hidden]))) {
+  :root[data-keyboard="open"][data-pane="discord"]:not([data-call]):not([data-read-active][data-read-shown]) #dock {
     display: none;
   }
 
@@ -446,11 +446,11 @@
 
   /* `#442 read-strip-order`. A read playing makes Read its Pause, so the slim row keeps Stop beside
      it, half and half, on its left as in the tile: the sound is still a tap from stopping. */
-  :root[data-keyboard="open"][data-pane="discord"] #control-pane:has(#read-aloud-stop:not([hidden])) {
+  :root[data-keyboard="open"][data-pane="discord"] #control-pane:has(> #read-aloud-stop:not([hidden])) {
     grid-template-columns: 1fr 1fr;
   }
 
-  :root[data-keyboard="open"][data-pane="discord"] #control-pane:has(#read-aloud-stop:not([hidden])) > #read-aloud {
+  :root[data-keyboard="open"][data-pane="discord"] #control-pane:has(> #read-aloud-stop:not([hidden])) > #read-aloud {
     grid-column: 2;
   }
 
@@ -694,14 +694,14 @@
    Pause, or Stop shown), the row is drawn whatever the choice, so the sound is a tap from stopping and the read
    strip, which hides the bar, never leaves the screen with no way out. The bar, standing at the foot now, keeps
    the home indicator's inset the row used to keep; and a dock left with nothing in it goes. */
-:root[data-reader="hidden"][data-pane="discord"] #dock:not(:has(#hang-up:not([hidden]))):not(:has(#read-aloud[data-active="true"])):not(:has(#read-aloud-stop:not([hidden]))) #control-pane {
+:root[data-reader="hidden"][data-pane="discord"]:not([data-call]):not([data-read-active]):not([data-read-stop]) #dock #control-pane {
   display: none;
 }
 
-:root[data-reader="hidden"][data-pane="discord"] #dock:not(:has(#hang-up:not([hidden]))):not(:has(#read-aloud[data-active="true"])):not(:has(#read-aloud-stop:not([hidden]))) #control-bar[data-placement="bottom"] {
+:root[data-reader="hidden"][data-pane="discord"]:not([data-call]):not([data-read-active]):not([data-read-stop]) #dock #control-bar[data-placement="bottom"] {
   padding-bottom: calc(0.35rem + env(safe-area-inset-bottom));
 }
 
-:root[data-reader="hidden"][data-pane="discord"] #dock:not(:has(#control-bar)):not(:has(#hang-up:not([hidden]))):not(:has(#read-aloud[data-active="true"])):not(:has(#read-aloud-stop:not([hidden]))) {
+:root[data-reader="hidden"][data-pane="discord"][data-bar-placement="top"]:not([data-call]):not([data-read-active]):not([data-read-stop]) #dock {
   display: none;
 }

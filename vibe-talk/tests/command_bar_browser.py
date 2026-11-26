@@ -343,11 +343,15 @@ def hide_reader(page: Page, where: str, touch: bool, shots: Path | None, width: 
         check(shrank >= 30, f"{where}: hiding the reader gave the list only {shrank:.0f}px")
     beside(now, f"{where}, reader hidden")
     # A way out of sound stays: with Hang up, Stop or a lit Read the row is drawn whatever the choice.
+    # Each way is simulated whole, as its owner writes it (`#2283`): the element's own state
+    # and the root flag the dock gates now read, set by renderControls/renderReadTransport.
     for way, show, hide in (
-        ("Hang up", "el('hang-up').hidden = false", "el('hang-up').hidden = true"),
-        ("Stop", "el('read-aloud-stop').hidden = false", "el('read-aloud-stop').hidden = true"),
-        ("a lit Read", "el('read-aloud').setAttribute('data-active', 'true')",
-         "el('read-aloud').setAttribute('data-active', 'false')"),
+        ("Hang up", "el('hang-up').hidden = false; document.documentElement.setAttribute('data-call', '')",
+         "el('hang-up').hidden = true; document.documentElement.removeAttribute('data-call')"),
+        ("Stop", "el('read-aloud-stop').hidden = false; document.documentElement.setAttribute('data-read-stop', '')",
+         "el('read-aloud-stop').hidden = true; document.documentElement.removeAttribute('data-read-stop')"),
+        ("a lit Read", "el('read-aloud').setAttribute('data-active', 'true'); document.documentElement.setAttribute('data-read-active', '')",
+         "el('read-aloud').setAttribute('data-active', 'false'); document.documentElement.removeAttribute('data-read-active')"),
     ):
         page.evaluate(f"() => {{ const el = (id) => document.getElementById(id); {show}; }}")
         page.wait_for_timeout(100)

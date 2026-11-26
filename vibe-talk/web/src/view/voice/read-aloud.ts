@@ -3485,6 +3485,8 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
       // As `renderControls` states it, kept here for the starts, holds and stops between its draws
       // (`#451 read-strip-followups`).
       button.setAttribute("data-active", readingMode || readInProgress() || pendingRead !== null ? "true" : "false");
+      // `#2283`: the same fact on the root, kept here as `data-active` is (`#451` above).
+      document.documentElement.toggleAttribute("data-read-active", readingMode || readInProgress() || pendingRead !== null);
     }
     if (nowPlaying !== null || (pendingRead === null && !readJumping)) {
       readJumpPending = false;
@@ -3508,6 +3510,8 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     // strip to stop it from.
     const stop = deps.el("read-aloud-stop");
     if (stop && button) stop.hidden = button.hidden || !readInProgress();
+    // `#2283`: Stop standing, on the root beside its own `hidden`, for the dock gates.
+    if (stop) document.documentElement.toggleAttribute("data-read-stop", !stop.hidden);
     renderReadLayout();
   }
 
@@ -3535,6 +3539,12 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
       renderReadTimeline();
     }
     const root = document.documentElement;
+    // `#2283 vibe-talk-root-has-rules`. The strip standing for React alone, named on the
+    // main screen beside the strip's own state (settled above and in `renderReadSteer`,
+    // which reaches here through `renderReadTransport`): the scrollers' foot room reads
+    // it there instead of the frame re-searching for the strip on every toggle.
+    const screen = deps.el("screen-main");
+    if (screen) screen.toggleAttribute("data-react-steer", !strip.hidden && strip.hasAttribute("data-react-only"));
     // `#821`: a strip standing for React alone is no read in progress: the layout stays as it was.
     if (strip.hidden || strip.hasAttribute("data-react-only")) root.removeAttribute("data-read-strip");
     // Held through a jump, it says what it said: a held read's jump cues its block up held.

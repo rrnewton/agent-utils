@@ -4296,6 +4296,7 @@ const audioDevices = mountAudioDevices({
  * @type {import("../view/settings/index.ts").BarPlacement}
  */
 const barPlacement = mountBarPlacement({
+  root: () => document.documentElement,
   lookup: (id) => el(id),
   storage: () => deviceStorage(),
   renderControlBar: () => renderControlBar(),

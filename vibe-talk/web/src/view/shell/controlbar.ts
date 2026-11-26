@@ -109,6 +109,15 @@ export function createControlBar(deps: ControlBarDependencies): ControlBar {
     // to the agent... then the UI shifts and I lose the toggle". The message box is in the call's
     // transcript now, so the switch is on the main screen in every state, a call and a draft included.
     deps.el("view-switch").hidden = !main;
+    // `#2283 vibe-talk-root-has-rules`. The switch standing IN its bottom mount, marked
+    // on the mount beside the switch's own `hidden`: the pane's kept room beside it reads
+    // the mount's mark instead of re-searching the bar for the switch on every toggle.
+    // In the header home the switch stands but the mount is empty, and no room is kept.
+    try {
+      deps.el("control-bar-bottom").toggleAttribute("data-switch", main && deps.barWhere() !== "top");
+    } catch {
+      // A host without the mount keeps the switch's own drawing.
+    }
     // `#820 voice-page-action-menu`. The list's actions: Expand or Collapse all, on the call's transcript as on
     // the channel, and Summaries and Hide reader on the channel. Beside the switch, on the main screen as it is
     // (`#880 voice-page-menu-placement`).
