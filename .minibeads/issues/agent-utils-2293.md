@@ -7,7 +7,7 @@ assignee: mu-statesync
 labels:
 - vibe-talk
 created_at: 2026-11-26T10:18:00-05:00
-updated_at: 2026-11-26T10:18:00-05:00
+updated_at: 2026-11-26T11:48:00-05:00
 ---
 
 # Description
@@ -28,3 +28,5 @@ Make the held walk's thread-option wait condition-based end to end, in the patte
 # Notes
 
 Filed from the #2280 S3 gate on `afb8ecaa` (ticket 1795702247402631538, read-modes the only functional red; landed under waiver as `dce61a5b`). Related: `#2077 vibe-talk-browser-checks-hot-host`, `#1250 vibe-talk-timing-robust` (the behaviour-only return pattern), `#2280 vibe-talk-state-sync-audit` (the gate that surfaced it). No server change is wanted for this issue; the check's fake API is the whole of its read path.
+
+Update 2026-11-26 11:48 AM ET: a longer backstop is not the fix. In a temporary experiment (reverted before the disable commit), the same held-walk wait with a 120-second backstop passed 4 direct runs and then wedged for the full 120 seconds with the thread option still absent. The condition can therefore fail to arrive at all on some runs, not merely arrive slowly: this points at a real page or fake-API bug (the option never appears) that a condition-based rewrite must root-cause, not paper over. The step was disabled from gating instead of keeping the backstop change: 05418230, landed gated as d7ce9c3b (full gate 215/217 ok, the two reds being unrelated CPU timeouts that passed on exclusive rerun). This issue stays open for the real fix.
