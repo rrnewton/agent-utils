@@ -99,6 +99,7 @@ interface SplitElement {
   scrollTop?: number;
   scrollHeight?: number;
   clientHeight?: number;
+  clientTop?: number;
   children?: ArrayLike<unknown>;
   style?: { setProperty?(name: string, value: string): void; removeProperty?(name: string): void };
   setAttribute(name: string, value: string): void;
@@ -455,8 +456,11 @@ export function createTimelineSplit(deps: TimelineSplitDependencies): TimelineSp
       const start = text && typeof text.getBoundingClientRect === "function"
         ? text.getBoundingClientRect().top
         : label.getBoundingClientRect().bottom;
-      const offset = start - box.getBoundingClientRect().top - (rectHeight(header ?? null) ?? 0);
-      if (offset > 0) box.scrollTop = Math.round(offset);
+      // From the block's content top (inside its border), where the sticky header stands.
+      const border = typeof box.clientTop === "number" ? box.clientTop : 0;
+      const offset = start - box.getBoundingClientRect().top - border - (rectHeight(header ?? null) ?? 0);
+      // Never past the line: a fraction short leaves the line whole under the header.
+      if (offset > 0) box.scrollTop = Math.floor(offset);
       latestAligned = box.scrollTop ?? 0;
     } catch {
       // Nothing measured: the pair stands from its top.

@@ -207,7 +207,8 @@ TOP_ROW_WHOLE = """() => {
 PANES_FIT = """() => {
   const panel = document.getElementById('discuss-panel');
   const p = panel.getBoundingClientRect();
-  const inside = (id) => { const el = document.getElementById(id); if (!el || el.hidden) return true;
+  const inside = (id) => { const el = document.getElementById(id);
+    if (!el || el.hidden || el.getClientRects().length === 0) return true;
     const r = el.getBoundingClientRect(); return r.top >= p.top - 1 && r.bottom <= p.bottom + 1; };
   return panel.scrollHeight <= panel.clientHeight + 1
     && ['discuss-current-section', 'discuss-timeline-section', 'discuss-latest', 'discuss-followup', 'discuss-send'].every(inside);

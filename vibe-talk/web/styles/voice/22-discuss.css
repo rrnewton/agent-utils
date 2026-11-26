@@ -1937,4 +1937,9 @@ stay its owner's (#1524). The pane itself already ends above the
   #discuss-panel[data-composing="true"] > #discuss-timeline-section {
     display: none;
   }
+
+  /* There the Latest pair takes all the room the summary gives up, past its 30% cap. */
+  #discuss-panel[data-composing="true"] > #discuss-latest {
+    max-height: none;
+  }
 }

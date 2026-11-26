@@ -6013,7 +6013,7 @@ SPLIT_LATEST_LINES_JS = (
 
 SPLIT_PANES_JS = (
     "(() => { const p = document.getElementById('discuss-panel').getBoundingClientRect(); "
-    "const inside = (el) => { if (!el || el.hidden) return true; const r = el.getBoundingClientRect(); "
+    "const inside = (el) => { if (!el || el.hidden || el.getClientRects().length === 0) return true; const r = el.getBoundingClientRect(); "
     "return r.top >= p.top - 1 && r.bottom <= p.bottom + 1; }; "
     "const panel = document.getElementById('discuss-panel'); "
     "return panel.scrollHeight <= panel.clientHeight + 1 "
