@@ -7062,7 +7062,7 @@ def _act_documents_reader_toolbar(driver: Driver) -> None:
         timeout=60_000,
     )
     _ensure_pane(driver, "pane-docs")
-    card = driver.page.locator("#documents-list .doc-card").first
+    card = driver.page.locator("#documents-list .doc-card", has_text="reader-toolbar-report").first
     card.wait_for(state="visible", timeout=30_000)
     card.click()
     driver.page.wait_for_function(
@@ -7104,6 +7104,141 @@ def _act_documents_reader_toolbar_playing(driver: Driver) -> None:
     driver.click("read-aloud")
     driver.page.wait_for_function(
         "() => window.__visible('read-aloud-stop')", timeout=20_000
+    )
+
+
+NAVIGATOR_NESTED_URL = "https://paste.example/navigator-nested"
+NAVIGATOR_FLAT_URL = "https://paste.example/navigator-flat"
+
+
+def _stub_endless_device_voice(driver: Driver) -> None:
+    """A device voice that starts and never ends, so the read stands."""
+    driver.page.evaluate(
+        "() => { const voice = {name: 'Shot voice', lang: 'en-US', localService: true, default: true,"
+        "  voiceURI: 'shot'};"
+        "  const engine = { paused: false, speaking: false, pending: false, getVoices: () => [voice],"
+        "    addEventListener() {}, removeEventListener() {},"
+        "    speak(u) { this.speaking = true; setTimeout(() => { if (u.onstart) u.onstart({}); }, 30); },"
+        "    cancel() { this.speaking = false; }, pause() { this.paused = true; },"
+        "    resume() { this.paused = false; } };"
+        "  Object.defineProperty(window, 'speechSynthesis', {value: engine, configurable: true});"
+        "  window.SpeechSynthesisUtterance = function (text) { this.text = text; }; }"
+    )
+    driver.page.wait_for_function(
+        "() => { const t = document.getElementById('audio-source');"
+        " return !!t && !t.hidden && t.getAttribute('aria-checked') !== null; }",
+        timeout=20_000,
+    )
+    if driver.js("document.getElementById('audio-source').getAttribute('aria-checked')") == "true":
+        driver.click("audio-source")
+        driver.page.wait_for_function(
+            "() => document.getElementById('audio-source').getAttribute('aria-checked') === 'false'",
+            timeout=20_000,
+        )
+
+
+def _open_reader_doc(driver: Driver, url: str, title: str, scene: str) -> None:
+    """Post `url` once (by title), then open its card in the reader."""
+    driver.load(with_token=True)
+    driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    posted = driver.page.evaluate(
+        "async ([url, title]) => {"
+        "  const headers = { Authorization: 'Bearer ' + localStorage.getItem('vibe-talk.token'),"
+        "    'Content-Type': 'application/json' };"
+        "  const listed = await (await fetch('/api/v1/documents?limit=50', { headers })).json();"
+        "  if ((listed.documents || []).some((d) => (d.title || '').includes(title))) return 'already there';"
+        "  const channel = document.getElementById('discord-channel').value;"
+        "  const response = await fetch('/api/v1/channels/' + encodeURIComponent(channel) +"
+        "    '/reply', { method: 'POST', headers, body: JSON.stringify({ text: 'Report: ' + url }) });"
+        "  return response.status;"
+        "}",
+        [url, title],
+    )
+    if posted not in ("already there", 200):
+        raise Unreachable(scene, "the paste link could be posted into the channel",
+                          f"the server answered {posted!r} to the reply route")
+    driver.page.wait_for_function(
+        "async (title) => {"
+        "  const headers = { Authorization: 'Bearer ' + localStorage.getItem('vibe-talk.token') };"
+        "  const channel = document.getElementById('discord-channel').value;"
+        "  await fetch('/api/v1/channels/' + encodeURIComponent(channel) + '/page?limit=20&render=html', { headers });"
+        "  const listed = await (await fetch('/api/v1/documents?limit=50', { headers })).json();"
+        "  return (listed.documents || []).some((d) => (d.title || '').includes(title));"
+        "}",
+        arg=title,
+        polling=500,
+        timeout=60_000,
+    )
+    _ensure_pane(driver, "pane-docs")
+    card = driver.page.locator("#documents-list .doc-card", has_text=title).first
+    card.wait_for(state="visible", timeout=30_000)
+    card.click()
+    driver.page.wait_for_function(
+        "() => !!document.querySelector('#doc-body')?.textContent?.trim() && window.__visible('read-aloud')",
+        timeout=30_000,
+    )
+
+
+def _navigator_read(driver: Driver, url: str, title: str, scene: str) -> None:
+    """`#2266`: a navigator fixture open and reading on the endless device voice."""
+    _open_reader_doc(driver, url, title, scene)
+    _stub_endless_device_voice(driver)
+    driver.click("read-aloud")
+    driver.page.wait_for_function(
+        "() => window.__visible('read-aloud-stop')"
+        " && !!document.querySelector('#doc-nav:not([hidden]) .doc-nav-row')",
+        timeout=20_000,
+    )
+
+
+def _act_navigator_nested(driver: Driver) -> None:
+    """`#2266`: mid-document in a nested-heading document (§2.1 current)."""
+    _navigator_read(driver, NAVIGATOR_NESTED_URL, "navigator-nested", "132-navigator-nested-mid")
+    driver.page.locator(
+        '#doc-nav .doc-nav-section[aria-label^="Read from section 2.1 "]').first.click()
+    driver.page.wait_for_function(
+        "() => document.querySelector('#doc-nav .doc-nav-section[aria-current=\"true\"] .doc-nav-num')"
+        "?.textContent === '§2.1'",
+        timeout=20_000,
+    )
+
+
+def _act_navigator_flat(driver: Driver) -> None:
+    """`#2266`: a heading-less document: one § Whole document cell over its ticks."""
+    _navigator_read(driver, NAVIGATOR_FLAT_URL, "navigator-flat", "133-navigator-flat")
+
+
+def _act_navigator_arrows_before(driver: Driver) -> None:
+    """`#2266`: the nested document standing at §1, before an arrow press."""
+    _navigator_read(driver, NAVIGATOR_NESTED_URL, "navigator-nested", "134-navigator-arrows-before")
+    driver.page.locator(
+        '#doc-nav .doc-nav-section[aria-label^="Read from section 1 "]').first.click()
+    driver.page.wait_for_function(
+        "() => document.querySelector('#doc-nav .doc-nav-section[aria-current=\"true\"] .doc-nav-num')"
+        "?.textContent === '§1'",
+        timeout=20_000,
+    )
+
+
+def _act_navigator_fat_after(driver: Driver) -> None:
+    """`#2266`: after one fat Next from §1: standing at the next section, §1.1."""
+    _act_navigator_arrows_before(driver)
+    driver.click("read-section-next")
+    driver.page.wait_for_function(
+        "() => document.querySelector('#doc-nav .doc-nav-section[aria-current=\"true\"] .doc-nav-num')"
+        "?.textContent === '§1.1'",
+        timeout=20_000,
+    )
+
+
+def _act_navigator_thin_after(driver: Driver) -> None:
+    """`#2266`: after one thin Next from §1's heading: its first paragraph."""
+    _act_navigator_arrows_before(driver)
+    driver.click("read-next")
+    driver.page.wait_for_function(
+        "() => document.querySelector('#doc-nav .doc-nav-chunk[aria-current=\"true\"]')"
+        "?.getAttribute('aria-label') === 'Read from 1 ¶ 1'",
+        timeout=20_000,
     )
 
 
@@ -10968,6 +11103,73 @@ SCENES: tuple[Scene, ...] = (
         ),
     ),
     Scene(
+        name="132-navigator-nested-mid",
+        what="#2266 mid-document in a nested-heading document: every § section flat in the top "
+             "row (§2.1 current, its title showing), unnumbered chunk ticks under it",
+        act=_act_navigator_nested,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("the Documents reader is open on a real document",
+             "window.__visible('docs-reader') && !!document.querySelector('#doc-body h1')"),
+            ("#2266 the navigator stands with §2.1 current",
+             "document.querySelector('#doc-nav .doc-nav-section[aria-current=\"true\"] .doc-nav-num')?.textContent === '§2.1'"),
+            ("#2266 chunk ticks carry no numbers",
+             "[...document.querySelectorAll('#doc-nav .doc-nav-chunk')].every((el) => el.textContent === '')"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="133-navigator-flat",
+        what="#2266 a heading-less document reading: one § Whole document cell over its ticks",
+        act=_act_navigator_flat,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("the Documents reader is open on a real document",
+             "window.__visible('docs-reader') && !!document.querySelector('#doc-body')?.textContent?.trim()"),
+            ("#2266 the whole-document cell stands current",
+             "document.querySelector('#doc-nav .doc-nav-section[aria-current=\"true\"] .doc-nav-title')?.textContent === 'Whole document'"),
+            ("#2266 chunk ticks carry no numbers",
+             "[...document.querySelectorAll('#doc-nav .doc-nav-chunk')].every((el) => el.textContent === '')"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="134-navigator-arrows-before",
+        what="#2266 the nested document standing at §1, before an arrow press (count in drawn blocks)",
+        act=_act_navigator_arrows_before,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("#2266 §1 stands current",
+             "document.querySelector('#doc-nav .doc-nav-section[aria-current=\"true\"] .doc-nav-num')?.textContent === '§1'"),
+            ("the count counts drawn blocks",
+             # 14 model blocks in the nested fixture (see run.sh).
+             "document.getElementById('read-steer-count')?.textContent?.endsWith(' of 14') === true"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="135-navigator-fat-after",
+        what="#2266 after one fat Next from §1: standing at the next section §1.1 (pair with 128)",
+        act=_act_navigator_fat_after,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("#2266 §1.1 stands current after the fat press",
+             "document.querySelector('#doc-nav .doc-nav-section[aria-current=\"true\"] .doc-nav-num')?.textContent === '§1.1'"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="136-navigator-thin-after",
+        what="#2266 after one thin Next from §1's heading: its first paragraph tick (pair with 128)",
+        act=_act_navigator_thin_after,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("#2266 the first paragraph tick stands current after the thin press",
+             "document.querySelector('#doc-nav .doc-nav-chunk[aria-current=\"true\"]')?.getAttribute('aria-label') === 'Read from 1 ¶ 1'"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
         name=SUMMARY_FAILED_STATE,
         what="summary mode when the summariser fails: the row says so quietly and keeps the message",
         act=_act_summary_failed,
@@ -11252,7 +11454,7 @@ def run_captures(
     # with the [documents] paste section (and the message cache) run.sh writes when those scenes
     # are NAMED with --only. A wider walk's server has neither, so it skips them by name, as it
     # skips Discuss above, rather than failing on a document that never registers.
-    reader_scenes = [s for s in scenes if s.name.startswith(("118-", "119-"))]
+    reader_scenes = [s for s in scenes if s.name.startswith(("118-", "119-", "132-", "133-", "134-", "135-", "136-"))]
     if reader_scenes and not wanted:
         for scene in reader_scenes:
             print(f"  skip  {scene.name:<30} no [documents] section on a wider walk's server")

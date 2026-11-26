@@ -756,7 +756,7 @@ Its output is above. Without it Discuss cannot answer and its states are unreach
     for shots_state in "${SHOTS_ONLY[@]}"; do
         case "$shots_state" in 73-*|74-*|75-*|76-*|78-*|84-*|85-*|89-*|90-*|91-*|92-*|99-*|100-*|101-*|10[7-9]-*|11[0-7]-*|12[01]-*|12[3-8]-*|13[01]-*) SHOTS_DISCUSS=1 ;; esac
         case "$shots_state" in 10[7-9]-*|11[0-3]-*|11[5-7]-*) SHOTS_GLOSSARY=1 ;; esac
-        case "$shots_state" in 118-*|119-*) SHOTS_READER=1 ;; esac
+        case "$shots_state" in 118-*|119-*|13[2-6]-*) SHOTS_READER=1 ;; esac
     done
     if [ "$SHOTS_GLOSSARY" = 1 ]; then
         cat > "$SHOTS_TMP/glossary-synthetic.md" <<'EOF'
@@ -884,6 +884,21 @@ EOF
                 printf 'Paragraph %s: the report goes on, so the page scrolls behind the toolbar.\n\n' "$shots_para"
             done
         } > "$SHOTS_TMP/reader-toolbar-report"
+        # `#2266`: navigator fixtures — nested headings (14 blocks) and no headings at all.
+        {
+            printf '# Navigator nested report\n\nOpening words before any section.\n\n'
+            printf '## Alpha part\n\nAlpha paragraph one carries plain words.\n\nAlpha paragraph two carries plain words.\n\n'
+            printf '### Alpha detail\n\nAlpha detail paragraph carries plain words.\n\n'
+            printf '## Beta part\n\nBeta paragraph one carries plain words.\n\nBeta paragraph two carries plain words.\n\n'
+            printf '### Beta detail\n\nBeta detail paragraph carries plain words.\n\n'
+            printf '## Gamma part\n\nGamma closing paragraph carries plain words.\n\n'
+        } > "$SHOTS_TMP/navigator-nested"
+        {
+            printf 'Navigator flat notes hold plain paragraphs and no headings at all.\n\n'
+            for shots_para in $(seq 1 13); do
+                printf 'Flat paragraph %s carries plain words for the ticks under it.\n\n' "$shots_para"
+            done
+        } > "$SHOTS_TMP/navigator-flat"
     fi
 
     step "Starting the throwaway server"
