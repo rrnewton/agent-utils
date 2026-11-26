@@ -678,6 +678,10 @@ pub enum RejectionReason {
     SenderNotAllowed,
     /// The message began with a configured prefix that suppresses request admission.
     IgnoredPrefix,
+    /// The message addressed this host but named a target the provider refuses: an agent this
+    /// host does not have, another host when only this host was addressed, or a malformed
+    /// target. Like [`Self::IgnoredPrefix`], it may name an allowed sender.
+    TargetRefused,
 }
 
 impl RejectionReason {
@@ -687,6 +691,7 @@ impl RejectionReason {
         match self {
             Self::SenderNotAllowed => "sender_not_allowed",
             Self::IgnoredPrefix => "ignored_prefix",
+            Self::TargetRefused => "target_refused",
         }
     }
 }
@@ -2256,6 +2261,7 @@ mod tests {
         for reason in [
             RejectionReason::SenderNotAllowed,
             RejectionReason::IgnoredPrefix,
+            RejectionReason::TargetRefused,
         ] {
             let mut subscription =
                 subscription_with_child(rejection("channels/other", "users/guest", reason), true);
@@ -2284,16 +2290,17 @@ mod tests {
         );
         assert!(contradictory.is_poisoned());
 
-        let event = rejection(
-            "channels/one",
-            "users/owner",
+        for reason in [
             RejectionReason::IgnoredPrefix,
-        );
-        let mut ignored = subscription_with_child(event.clone(), true);
-        let Some(SubscriptionItem::Batch(batch)) = ignored.next_item().expect("receive") else {
-            panic!("expected a durable ignored-prefix reference");
-        };
-        assert_eq!(batch.events(), &[CommittableEvent::Checkpoint, event]);
+            RejectionReason::TargetRefused,
+        ] {
+            let event = rejection("channels/one", "users/owner", reason);
+            let mut ignored = subscription_with_child(event.clone(), true);
+            let Some(SubscriptionItem::Batch(batch)) = ignored.next_item().expect("receive") else {
+                panic!("expected a durable {} reference", reason.as_str());
+            };
+            assert_eq!(batch.events(), &[CommittableEvent::Checkpoint, event]);
+        }
     }
 
     #[test]
