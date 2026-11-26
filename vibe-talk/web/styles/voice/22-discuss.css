@@ -1838,6 +1838,39 @@ stay its owner's (#1524). The pane itself already ends above the
   }
 }
 
+/* The split layout's own spacing: the panes draw the boundaries, so the lines between the
+ * head and the composer stand close (every pixel here is a line of the Latest answer on a
+ * phone's half sheet), and the composer, which no longer floats over scrolled content, needs
+ * neither the gap nor the padding of the old whole-panel scroll. */
+#discuss-panel > #discuss-status {
+  margin-top: 2px;
+}
+
+#discuss-panel > .discuss-compose {
+  margin-top: 6px;
+}
+
+#discuss-panel > #discuss-draft-note {
+  margin-top: 2px;
+  margin-bottom: 0;
+}
+
+#discuss-latest > .discuss-qa > summary {
+  min-height: 2rem;
+  padding: 0.2rem 0;
+}
+
+@media not ((min-width: 900px) and (pointer: fine)) {
+  #discuss-panel {
+    --discuss-timeline-head-height: 2.75rem;
+  }
+
+  #discuss-panel .discuss-compose {
+    padding-top: 4px;
+    padding-bottom: 4px;
+  }
+}
+
 /* A phone's half sheet with a Latest pair: the Latest pair has the room (liaison), so the
  * summary may go down to its header row there (the timeline's default there is collapsed,
  * view/catchup/split.ts). Not with the keyboard up, where the short-pane rules below hold. */
