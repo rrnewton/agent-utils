@@ -61,6 +61,9 @@ export interface FootRoomsDependencies {
   sideUp(): boolean;
   /** Put a scroller at a measured position, through the scroll owner (`#1251`). */
   toPosition(area: Scroller, top: number): void;
+  /** `#2262`: the height the search's server line takes at the foot of `area` (0 while it is down),
+   * room past the rows' foot like the overscroll room. Optional for doubles. */
+  searchFootRoom?(area: Scroller): number;
   /** End a pack slide still running (`finishPackSlide`). */
   finishPackSlide(): void;
   /** The card drawn for thread `id`, or null (`cardRow`). */
@@ -205,7 +208,17 @@ export function createFootRooms(deps: FootRoomsDependencies): FootRooms {
    * at it, and one scrolled up from it is that far from it, whatever the keyboard does.
    */
   function roomsPastFoot(area: Scroller): number {
-    return overscrollRoom(area) + overextendRoom(area) + (deps.keyboardRoom ? deps.keyboardRoom(area) || 0 : 0);
+    return overscrollRoom(area) + overextendRoom(area) + (deps.keyboardRoom ? deps.keyboardRoom(area) || 0 : 0) +
+      searchFootRoom(area);
+  }
+
+  /** `#2262 vibe-talk-search-head-room-two-columns` (owner 370): the search's server line under the
+   * newest row is room past the rows' foot, not history: a reader resting on the newest row with only
+   * that line below is on the newest line (so a later filter change keeps them there and no Newest
+   * jump is offered), and following the newest line goes to the rows' foot, never taking the reader
+   * down past the newest row to show the line. */
+  function searchFootRoom(area: Scroller): number {
+    return deps.searchFootRoom ? Math.max(0, deps.searchFootRoom(area) || 0) : 0;
   }
 
   function footGap(area: Scroller): number {
@@ -328,6 +341,11 @@ export function createFootRooms(deps: FootRoomsDependencies): FootRooms {
       fitOverscroll(area);
       if (overscroll !== null && area.scrollTop >= footTop(area) - 0.5) return;
       closeOverscroll();
+    }
+    // `#2262`: with the search's line at the foot, the newest line is the rows' foot, above it.
+    if (searchFootRoom(area) > 0) {
+      deps.toPosition(area, footTop(area));
+      return;
     }
     deps.toFoot(area);
   }

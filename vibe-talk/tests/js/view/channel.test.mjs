@@ -3275,6 +3275,84 @@ test("`#624 voice-page-modularity`: a filter change keeps the reader's message w
   assert.equal(freshFilterState().hold, null, "a fresh column shared its filter hold");
 });
 
+test("`#2262 vibe-talk-search-head-room-two-columns`: a reader at the head of a list that fits keeps the head row through the search, not the newest line", () => {
+  const { createFilterPlace, freshFilterState } = CHANNEL_VIEW;
+  // The list fits: the reader at scrollTop 0 is at its head and at its newest line at once.
+  const run = ({ typed, side = false, scrollTop = 0 }) => {
+    const record = freshFilterState();
+    const log = [];
+    const area = { scrollTop };
+    let room = 0;
+    const row = {
+      parentNode: null, className: "", hidden: false,
+      getAttribute: (name) => (name === "data-search" ? "" : name === "data-ids" ? "m1" : null),
+      hasAttribute: () => false,
+      getBoundingClientRect: () => ({ top: 140 + room - area.scrollTop, bottom: 200 + room - area.scrollTop }),
+    };
+    const list = { children: [row] };
+    row.parentNode = list;
+    const pane = { marks: new Map(), context: () => "main", head: () => 100, foot: () => 800 };
+    const owner = createFilterPlace({
+      el: () => area,
+      activeFilter: () => record,
+      activeColumn: () => "main",
+      columnSide: () => side,
+      searchWordsTyped: () => typed,
+      mainColumn: () => "main", sideColumn: () => "side",
+      inColumn: (_c, act) => act(),
+      eachColumn: (act) => act(),
+      screen: () => "main", view: () => "discord",
+      renderOlderControl: () => {}, dismissStatus: () => {},
+      filterPlace: () => "main",
+      pinsView: () => ({ only: false }),
+      visibleList: () => list,
+      listEmptied: () => false,
+      atBottom: () => true,
+      quickReplyHolds: () => false,
+      endSearchWalks: () => {},
+      scrollToNewest: () => log.push("newest"),
+      nudge: (target, delta) => { target.scrollTop += delta; }, toPosition: (target, top) => { target.scrollTop = top; },
+      renderJumpNewest: () => {},
+      guardQuietly: (fn) => fn,
+      setStatus: (text) => log.push(text),
+      sidePane: () => pane, channelPane: () => pane,
+      markOf: () => null, markedRow: () => null, rowInView: () => false,
+      takeRow: () => {}, rowOf: (_p, r) => r, paneRows: () => [],
+      releaseRow: () => {}, rowTimeTabStop: () => {}, drawSelection: () => {},
+      hidingRead: () => false, threading: () => true,
+      timelineRows: () => ({ messages: [] }),
+      olderPages: () => ({ moreAbove: false, cursor: null }),
+      loadOlder: () => null, walkCursorOwed: () => false,
+      channelContextKey: () => "ctx",
+      scrollAnchor: () => null,
+      listPlaceTop: () => 100,
+      floatingClearance: () => 100,
+      messageTop: (placed) => placed.getBoundingClientRect().top,
+      rowMessages: () => [],
+      clearEntryLanding: () => {},
+      sideShowing: () => false,
+    });
+    const before = row.getBoundingClientRect().top;
+    const anchor = owner.filterAnchor();
+    // The key's change: the chip panel's room comes in above the rows.
+    owner.keepingFilterPlace(() => { room = 59; });
+    return { anchor, log, moved: row.getBoundingClientRect().top - before, scrollTop: area.scrollTop };
+  };
+  const head = run({ typed: true });
+  assert.equal(head.anchor.newest, false, "a reader at the head of a list that fits was taken for a newest-line reader");
+  assert.deepStrictEqual(head.log, [], "the search followed the newest line for a reader at the head of a list that fits");
+  assert.equal(head.moved, 0, "the head row moved across the search's change");
+  assert.equal(head.scrollTop, 59, "the head row was not kept by the scroll");
+  // Everything else at the newest line follows it, as before: no words in the search, the right
+  // column's own list, or a reader scrolled even a little into the list.
+  for (const [why, args] of [["no words in the search", { typed: false }], ["the right column", { typed: true, side: true }],
+    ["a reader scrolled into the list", { typed: true, scrollTop: 5 }]]) {
+    const other = run(args);
+    assert.equal(other.anchor.newest, true, `${why}: the newest line was not the anchor`);
+    assert.deepStrictEqual(other.log, ["newest"], `${why}: the change did not follow the newest line`);
+  }
+});
+
 test("`#624 voice-page-modularity`: the relay mode is read, drawn and switched from the module alone", () => {
   const { createLiveState } = CHANNEL_VIEW;
   const stored = new Map();

@@ -27,7 +27,10 @@ phone and desktop sizes:
   and words with no loaded match drop the room inside the input event, never later;
   `#2257`: a reader mid-list keeps the row being read across the fast pass and through the settled
   answer, whether that row still matches (it keeps its top) or is hidden (the next standing row below
-  takes its place).
+  takes its place);
+  `#2262`: a reader at the very top of a thread's own view that fits on the screen keeps the head
+  row's top from before the first key until the answer lands (the search keeps the head row, never
+  following the newest line down by the server line at the foot).
 
 The gate is a count of synchronous work per input event, never a wall-clock budget (owner
 rule 346); every wait is a condition wait. Pass --screenshots DIR to keep a PNG of each stage.
@@ -162,7 +165,8 @@ class Walk:
         self.check(bool(self.page.evaluate(script)), why)
 
 
-def walk_through(walk: Walk, total: int) -> None:
+def open_search(walk: Walk, total: int) -> None:
+    """Sign in, wait for the big channel's rows, and open the search."""
     page = walk.page
     page.fill("#api-token", TOKEN)
     page.click("#save-token")
@@ -179,6 +183,11 @@ def walk_through(walk: Walk, total: int) -> None:
                "the big channel did not open with its messages")
     page.click("#search-toggle")
     page.wait_for_selector("#search-field", state="visible", timeout=browser_waits.HANG_BACKSTOP_MS)
+
+
+def walk_through(walk: Walk, total: int) -> None:
+    page = walk.page
+    open_search(walk, total)
     page.evaluate(RECT_INSTALL_JS)
     deltas = page.evaluate(TYPE_KEYS_JS)
     walk.check(all(isinstance(one, int) for one in deltas) and len(deltas) == 7,
@@ -506,6 +515,74 @@ def fast_pass_walk(walk: Walk) -> None:
                    f"({seen['atKey']} px at the key): {seen}")
 
 
+# `#2262`: the reader at the very top of the lantern thread's own view, then one key and every
+# frame until the server's answer lands: the head row's top against its top before the key.
+HEAD_TOP_JS = """async () => {
+    const area = document.getElementById('scroll-area');
+    const line = document.getElementById('server-line');
+    area.scrollTop = 0;
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    const view = area.getBoundingClientRect();
+    const row = [...document.querySelectorAll('#discord-log > li[data-id]')]
+        .find((one) => one.getClientRects().length && one.getBoundingClientRect().top >= view.top);
+    const footGap = area.scrollHeight - area.scrollTop - area.clientHeight;
+    const before = row.getBoundingClientRect().top;
+    const state = { line: (line.textContent || '').trim(), section: !document.getElementById('server-search').hidden,
+        head: document.getElementById('screen-main').hasAttribute('data-bucket-head'), sh: area.scrollHeight, ch: area.clientHeight };
+    // The count redraws that come with asking the server and with its answer park the thread's
+    // current result (`#2258`): frames are measured until the server is asked (the page's fetch is
+    // the global one, looked up at each call).
+    let asked = false;
+    const realFetch = window.fetch;
+    window.fetch = function (...args) {
+        if (String(args[0] && args[0].url ? args[0].url : args[0]).includes('/search')) asked = true;
+        return realFetch.apply(this, args);
+    };
+    const field = document.getElementById('search-field');
+    field.value = 'lantern';
+    field.dispatchEvent(new Event('input', { bubbles: true }));
+    const atKey = row.getBoundingClientRect().top - before;
+    const answered = () => asked || !/Searching/.test(line.textContent || '');
+    let frames = 0; let worst = Math.abs(atKey);
+    try {
+        while (frames < 6000 && !answered()) {
+            await new Promise((resolve) => requestAnimationFrame(resolve));
+            frames += 1;
+            if (answered()) break;
+            worst = Math.max(worst, row.isConnected && row.getClientRects().length ? Math.abs(row.getBoundingClientRect().top - before) : Infinity);
+        }
+    } finally {
+        window.fetch = realFetch;
+    }
+    return { footGap: Math.round(footGap), atKey: Math.round(atKey * 10) / 10, worst: Math.round(worst * 10) / 10,
+             frames, asked, answered: answered(), scrollTop: area.scrollTop, state };
+}"""
+
+
+def head_reader_walk(walk: Walk, total: int) -> None:
+    """`#2262 vibe-talk-search-head-room-two-columns`: a reader at the very top of the lantern thread's
+    own view (at desktop size the thread fits on the screen, so the reader is at its head and at its
+    newest line at once) keeps the head row's top from before the first key until the server is asked:
+    the search's change keeps the head row instead of following the newest line, which the server
+    line at the foot would move. (The count redraws at the ask and the answer park the thread's
+    current result: `#2258`.) On a fresh page:
+    the first search of its session, so the server is asked and the head room reserved at the key.
+    """
+    page = walk.page
+    open_search(walk, total)
+    page.evaluate("""() => { const p = document.getElementById('thread-select');
+        p.value = 'thread:spaces/A/threads/lantern'; p.dispatchEvent(new Event('change', { bubbles: true })); }""")
+    walk.until("() => document.getElementById('thread-select').value === 'thread:spaces/A/threads/lantern'"
+               " && [...document.querySelectorAll('#discord-log > li[data-id]')].filter((r) => r.getClientRects().length).length === 4",
+               "the lantern thread's own view did not open with its four messages")
+    seen = page.evaluate(HEAD_TOP_JS)
+    if page.viewport_size and page.viewport_size["width"] >= 1000:
+        walk.check(seen["footGap"] <= 24, f"head: the lantern thread does not fit the desktop screen, so the case is not exercised: {seen}")
+    walk.check(seen["asked"] and seen["worst"] <= 1,
+               f"head: the head row moved {seen['worst']} px between the key and the server ask ({seen['atKey']} px at the key): {seen}")
+    walk.shot("head-reader")
+
+
 def main() -> int:
     args = arguments()
     try:
@@ -521,31 +598,36 @@ def main() -> int:
         ("light-desk", 1280, 800, False, "light"),
     )
     report: list[str] = []
+    sessions = (
+        (walk_through, "typing bounded per key, chips follow the query"),
+        (head_reader_walk, "a reader at the head of a thread that fits keeps the head row"),
+    )
     with sync_playwright() as playwright:
         for label, width, height, touch, scheme in runs:
-            api = BigApi()
-            server, thread, url = serve(api, web_root)
-            try:
-                with tempfile.TemporaryDirectory(prefix="vibe-talk-typing-fast-") as profile:
-                    context = playwright.chromium.launch_persistent_context(
-                        profile, headless=True, executable_path=args.browser_executable,
-                        timezone_id="America/New_York",
-                        viewport={"width": width, "height": height}, color_scheme=scheme,  # type: ignore[arg-type]
-                        device_scale_factor=2.625 if touch else 1, is_mobile=touch, has_touch=touch)
-                    browser_waits.hot_host_timeouts(context)
-                    page = context.pages[0]
-                    errors: list[str] = []
-                    page.on("pageerror", lambda error: errors.append(str(error)))
-                    page.goto(url, wait_until="load")
-                    walk = Walk(page, label, args.screenshots)
-                    walk_through(walk, total)
-                    check(not errors, f"{label}: the page threw: {errors}")
-                    context.close()
-                    report.append(f"{label} {width}x{height}: typing bounded per key, chips follow the query")
-            finally:
-                server.shutdown()
-                server.server_close()
-                thread.join()
+            for session, said in sessions:
+                api = BigApi()
+                server, thread, url = serve(api, web_root)
+                try:
+                    with tempfile.TemporaryDirectory(prefix="vibe-talk-typing-fast-") as profile:
+                        context = playwright.chromium.launch_persistent_context(
+                            profile, headless=True, executable_path=args.browser_executable,
+                            timezone_id="America/New_York",
+                            viewport={"width": width, "height": height}, color_scheme=scheme,  # type: ignore[arg-type]
+                            device_scale_factor=2.625 if touch else 1, is_mobile=touch, has_touch=touch)
+                        browser_waits.hot_host_timeouts(context)
+                        page = context.pages[0]
+                        errors: list[str] = []
+                        page.on("pageerror", lambda error: errors.append(str(error)))
+                        page.goto(url, wait_until="load")
+                        walk = Walk(page, label, args.screenshots)
+                        session(walk, total)
+                        check(not errors, f"{label}: the page threw: {errors}")
+                        context.close()
+                        report.append(f"{label} {width}x{height}: {said}")
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                    thread.join()
     for line in report:
         print(line)
     print("search typing fast browser walk: ok")

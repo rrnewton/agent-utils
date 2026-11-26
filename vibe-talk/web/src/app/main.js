@@ -2054,8 +2054,8 @@ const filterPlaceOwner = createFilterPlace({
   activeFilter: () => columnWork.active().filter,
   activeColumn: () => columnWork.active(),
   columnSide: () => columnWork.side(),
-  // `#2256`: one column only (the right column's room past its foot keeps main's behaviour).
-  searchWordsTyped: () => !sideColumnUp() && screens.view() === "discord" && searchField.open() && searchTyped(searchField.query()),
+  // `#2262`: a reader at the head of a list that fits keeps the head row through the search's changes.
+  searchWordsTyped: () => screens.view() === "discord" && searchField.open() && searchTyped(searchField.query()),
   mainColumn: () => columns.main,
   sideColumn: () => columns.side,
   inColumn: (column, act) => inColumn(/** @type {any} */ (column), act),
@@ -2497,18 +2497,28 @@ function heldComposer() {
 }
 
 /**
- * `#2256 vibe-talk-search-head-room-no-shift`: the height the search's server line takes at the foot
- * of the channel list (its box and the margin under it), 0 while it is down or for another list.
+ * `#2256 vibe-talk-search-head-room-no-shift`, `#2262`: the height the search's server line takes at
+ * the foot of the channel list (from the bottom of what stands before it to the margin under it), 0
+ * while it is down or for another list.
  * @param {HTMLElement} area
  * @returns {number}
  */
 function searchFootLine(area) {
   const section = el("server-search");
   if (!section || section.hidden || area !== el("scroll-area") || typeof section.getBoundingClientRect !== "function") return 0;
+  // `#2262`: only the collapsed line. Opened (its details, All channels, More), it is what the reader
+  // went to read, and the foot is the foot again.
+  const detail = el("server-detail");
+  if (detail && !detail.hidden) return 0;
   const box = section.getBoundingClientRect();
   if (!box || box.height <= 0) return 0;
   const below = typeof getComputedStyle === "function" ? parseFloat(getComputedStyle(section).marginBottom) || 0 : 0;
-  return box.height + below;
+  // `#2262`: from the bottom of what stands before it (the rows' list), so the gap above the line is
+  // counted too: the room is exactly how much further down the list's foot is with the line up.
+  let before = section.previousElementSibling;
+  while (before && typeof before.getClientRects === "function" && before.getClientRects().length === 0) before = before.previousElementSibling;
+  const from = before && typeof before.getBoundingClientRect === "function" ? Math.min(before.getBoundingClientRect().bottom, box.top) : box.top;
+  return box.bottom + below - from;
 }
 
 /**
@@ -2651,6 +2661,7 @@ const BOTTOM_SLACK_PX = 24;
 // made and read as no room until then.
 var screenKeyboardRoom = null;
 const footRooms = createFootRooms({
+  searchFootRoom: (area) => searchFootLine(/** @type {HTMLElement} */ (area)),
   clock: clockOnUse(),
   side: () => leftEl("side-scroll"),
   overscrollBox: () => leftEl("side-overscroll"),
@@ -2945,9 +2956,9 @@ const folding = createFolding({
   sidePane: () => /** @type {any} */ (sidePane),
   channelPane: () => /** @type {any} */ (channelPane),
   fitOverscroll,
-  // `#2256`: the search's own line at the foot is not history. A reader kept on the newest row while
-  // that line lands below it (`placeFilterAnchor`) is still on the newest line: no "Newest" offer.
-  footGap: (area) => footGap(area) - searchFootLine(area),
+  // `#2262`: the search's own line at the foot is not history: `footGap` counts it as room past the
+  // rows' foot, so a reader on the newest row with that line below is offered no "Newest" jump.
+  footGap,
   bottomSlackPx: BOTTOM_SLACK_PX,
   unseenReplies: unseenColumnReplies,
   unseenReply: unseenColumnReply,

@@ -48,10 +48,6 @@ export interface FilterAnchor {
   time: number;
   offset: number;
   alternate: FilterAnchor | null;
-  /** `#2256`: for a reader on the newest line, the newest message row on screen at the capture and
-   * its bottom edge, so the change keeps that line where it stood rather than the list's foot. */
-  newestRow?: HTMLElement | null;
-  newestBottom?: number;
 }
 
 /** A pane's selection mark, as the filter place reads it. */
@@ -76,8 +72,7 @@ export interface FilterPlaceDependencies {
   activeFilter(): FilterState;
   activeColumn(): unknown;
   columnSide(): boolean;
-  /** `#2256`: whether the channel list's own search is open with words in one column (no right
-   * column up), so its server line is to land at the list's foot. Optional for doubles. */
+  /** `#2262`: whether the channel list's own search is open with words in it. Optional for doubles. */
   searchWordsTyped?(): boolean;
   mainColumn(): unknown;
   sideColumn(): unknown;
@@ -344,16 +339,15 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
     return true;
   }
 
-  /** `#2256`: the newest message row with a box, read from the list's end (no per-row measurement).
-   * Null where nothing lays out (a document without boxes): the newest line is followed there. */
-  function lastShownMessageRow(): HTMLElement | null {
-    const rows = deps.visibleList().children;
-    for (let index = rows.length - 1; index >= 0; index -= 1) {
-      const row = rows[index] as HTMLElement;
-      if (typeof row.getClientRects !== "function") return null;
-      if (isMessageRow(row) && standingRow(row) === row && row.getClientRects().length > 0) return row;
-    }
-    return null;
+  /**
+   * `#2262` (owner 370): a reader at the very top of a list that fits on the screen is at its head as
+   * much as at its newest line. With words in the channel list's own search, a change there keeps the
+   * head row where it stands, as it does at the top of a longer list: following the newest line would
+   * take the reader down by what the search adds at the foot (its server line) less what it adds at the
+   * head (the chip panel's room), moving the row they read.
+   */
+  function atSearchHead(area: HTMLElement): boolean {
+    return !deps.columnSide() && area.scrollTop <= 0 && Boolean(deps.searchWordsTyped && deps.searchWordsTyped());
   }
 
   /** Measure the anchor of a filter change in the column being worked on, or null with no list on screen. */
@@ -375,16 +369,10 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
       return held.row === null ? asked : { ...asked, alternate: anchorAt(held.row) };
     }
     if (showing && pane && mark && chosen) return anchorAt(chosen, mark);
-    if (deps.atBottom(area)) {
-      // `#2256`: only for the channel list's own search in one column (`searchWordsTyped` says no
-      // right column is up), whose server line lands at the foot. Any other change at the newest
-      // line, two columns included, measures nothing more here and keeps main's follow: with the
-      // right column up, its room past its foot takes an arrival in place (`#2230`).
-      const newestRow = !deps.columnSide() && deps.searchWordsTyped && deps.searchWordsTyped()
-        ? lastShownMessageRow() : null;
+    if (deps.atBottom(area) && !atSearchHead(area)) {
       return { placeMark: deps.inputStamp ? { inputAt: deps.inputStamp() } : undefined,
         newest: true, row: null, ids: [], selected: null, drawn: false, focused: false, time: NaN, offset: 0,
-        alternate: null, newestRow, newestBottom: newestRow ? newestRow.getBoundingClientRect().bottom : undefined };
+        alternate: null };
     }
     const head = pane ? pane.head() : deps.floatingClearance(area);
     const foot = pane ? pane.foot() : area.getBoundingClientRect().top + (area.clientHeight || 0);
@@ -462,20 +450,8 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
     }
     if (!anchor || anchor.newest) {
       filterState().hold = null;
-      // `#2256 vibe-talk-search-head-room-no-shift` (owner 370, as `#2230` for arrivals): a reader on
-      // the newest line keeps that line where it stood while it still stands. What the change adds
-      // below it (the search's server line at the foot) is seen past its bottom edge, never taken by
-      // following the list's foot. With the line gone (filtered away), the newest line is followed.
-      // The foot is followed first, as ever (it also reclaims any held room past it, `#2076`, and
-      // closes a column's overscroll room); then the line is put back where it stood.
       if (anchor || wasEmptied) deps.scrollToNewest();
       else deps.renderJumpNewest();
-      const kept = anchor ? anchor.newestRow : null;
-      if (kept && typeof anchor?.newestBottom === "number" && kept.isConnected && typeof kept.getClientRects === "function" &&
-        kept.getClientRects().length > 0 && (typeof area.contains !== "function" || area.contains(kept))) {
-        deps.nudge(area, kept.getBoundingClientRect().bottom - anchor.newestBottom);
-        deps.renderJumpNewest();
-      }
       return;
     }
     let row = anchorRow(anchor);

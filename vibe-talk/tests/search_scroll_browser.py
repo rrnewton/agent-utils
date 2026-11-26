@@ -66,7 +66,18 @@ STATE_JS = """() => {
   const visible = shown.filter((li) => { const r = li.getBoundingClientRect();
     return r.bottom > r.top && r.bottom > clip.top && r.top < clip.bottom; });
   const head = visible.length ? visible[0].getBoundingClientRect().top - clip.top : null;
-  return {top: area.scrollTop, foot: area.scrollHeight - area.clientHeight,
+  // `#2262`: the search's collapsed server line under the newest row is room past the rows' foot,
+  // so the foot a search lands on is the rows' foot, above that line.
+  const line = document.getElementById('server-search');
+  const detail = document.getElementById('server-detail');
+  let room = 0;
+  if (line && !line.hidden && line.getClientRects().length && !(detail && !detail.hidden)) {
+    let before = line.previousElementSibling;
+    while (before && !before.getClientRects().length) before = before.previousElementSibling;
+    const box = line.getBoundingClientRect();
+    room = box.bottom + (parseFloat(getComputedStyle(line).marginBottom) || 0) - (before ? Math.min(before.getBoundingClientRect().bottom, box.top) : box.top);
+  }
+  return {top: area.scrollTop, foot: area.scrollHeight - area.clientHeight, footRoom: room,
     firstVisible: visible.length ? visible[0].dataset.id : null, firstTop: head,
     lastVisible: visible.length ? visible[visible.length - 1].dataset.id : null,
     shown: shown.length};
@@ -175,8 +186,10 @@ def walk_through(walk: Walk, keyboard: bool, discuss: bool = False) -> None:
                "the needle search did not filter to fifteen")
     walk.settled()
     state = walk.state()
-    walk.check(abs(number(state, "top") - number(state, "foot")) <= 2,
-               f"no hit on screen: reader at {state['top']}, foot is {state['foot']}")
+    # `#2262`: on the newest line: at the list's foot, or at the rows' foot just above the search's
+    # line there (that line is room past the rows' foot, as the right column's overscroll room is).
+    walk.check(number(state, "foot") - number(state, "footRoom") - 2 <= number(state, "top") <= number(state, "foot") + 2,
+               f"no hit on screen: reader at {state['top']}, foot is {state['foot']} (room past the rows' foot {state['footRoom']})")
     walk.check(state["lastVisible"] == message_id(39),
                f"the newest hit is not on screen: last visible is {state['lastVisible']}")
     walk.shot("after-search-no-hit-on-screen-bottom")
