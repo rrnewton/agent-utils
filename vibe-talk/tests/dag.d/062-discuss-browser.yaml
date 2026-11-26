@@ -13,7 +13,11 @@ steps:
       est_duration_s: 60
       classification: latency-bound
       preferred_inner_jobs: 4
-      rss_baseline_bytes: 1073741824
+      # `#2319 vibe-talk-discuss-browser-memory-hint`: one Chromium walk needs more
+      # than 1 GiB. Of 91 profiled runs, 6 were OOM-killed at the 1.25 GiB cap that
+      # baseline set (NO_RESULT); runs under a larger cap peaked at 1.42 GiB (median
+      # 1.18). 1.75 GiB puts the cap near 2.19 GiB, above the peak with headroom.
+      rss_baseline_bytes: 1879048192
 
   # `#1820 vibe-talk-summary-strikethrough-live`: archiving from a cited
   # message's own row strikes its summary bullet with no reload, and

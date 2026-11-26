@@ -17,4 +17,7 @@ steps:
       resources: {browser: 1}
       est_duration_s: 90
       classification: latency-bound
-      rss_baseline_bytes: 1073741824
+      # `#2319 vibe-talk-discuss-browser-memory-hint`: same Chromium working set as
+      # discuss-browser: of 48 profiled runs, 1 OOM-killed at the 1.25 GiB cap of a
+      # 1 GiB baseline, peaks up to 1.30 GiB. 1.75 GiB puts the cap near 2.19 GiB.
+      rss_baseline_bytes: 1879048192
