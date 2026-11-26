@@ -5530,9 +5530,10 @@ What DONE means here: the per-message mark behind Done/Undo on the page
 message, never per thread — a root and each reply are marked independently, a reply's mark held
 under its parent channel's id. The per-channel read mark is secondary: shown in the header,
 never used to tag a message. Messages the owner's noise rules call read are counted in the
-header and not listed. The route behind it, `GET /api/v1/channels/{id}/recap`, is read-scope
-and writes nothing; with no durable store configured it still answers, with every message
-UNREAD and no read mark.
+header and not listed. The route behind it, `GET /api/v1/channels/{id}/recap`, is read-scope:
+the answering request writes nothing and reads no provider; a backfill-scoped
+caller may schedule one bounded fill walk. With no durable store configured it
+still answers, with every message UNREAD and no read mark.
 
 ## The API
 

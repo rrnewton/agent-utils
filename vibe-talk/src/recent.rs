@@ -158,7 +158,7 @@ pub const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(30);
 /// held window at all. See the module documentation.
 pub const JOURNAL: usize = crate::live::REPLAY_TAIL;
 
-/// The four durations, gathered so a test can shorten them.
+/// The five durations, gathered so a test can shorten them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Timing {
     /// See [`ACTIVITY_DEADLINE`].
@@ -169,6 +169,10 @@ pub struct Timing {
     pub reuse_live_fed: Duration,
     /// See [`REUSE_UNFED`].
     pub reuse_unfed: Duration,
+    /// See [`RATE_LIMIT_BACKOFF`]: the floor a failed refresh (rate-limited or
+    /// otherwise transient) waits out before its retry (`#2280` S3), still under
+    /// the provider's own `retry_after` when that is longer.
+    pub retry_backoff: Duration,
 }
 
 impl Default for Timing {
@@ -178,6 +182,7 @@ impl Default for Timing {
             cold_deadline: COLD_DEADLINE,
             reuse_live_fed: REUSE_LIVE_FED,
             reuse_unfed: REUSE_UNFED,
+            retry_backoff: RATE_LIMIT_BACKOFF,
         }
     }
 }
@@ -456,7 +461,7 @@ impl RecentWindows {
         let slot = windows.slots.entry(channel.clone()).or_default();
         // Whatever else was read meanwhile, the provider is refusing reads of this channel now.
         if let Some(after) = error.retry_after() {
-            slot.backoff_until = Some(Instant::now() + after.max(RATE_LIMIT_BACKOFF));
+            slot.backoff_until = Some(Instant::now() + after.max(self.timing.retry_backoff));
         }
         if slot
             .held
@@ -477,6 +482,16 @@ impl RecentWindows {
             .get(channel)
             .and_then(|slot| slot.backoff_until)
             .is_some_and(|until| Instant::now() < until)
+    }
+
+    /// Until when `channel` is backing off, when it is: what a refresh retry waits
+    /// out, re-read as it waits like the refresh schedule's due instant.
+    pub(crate) fn backoff_until(&self, channel: &ChannelId) -> Option<Instant> {
+        self.windows()
+            .slots
+            .get(channel)
+            .and_then(|slot| slot.backoff_until)
+            .filter(|until| Instant::now() < *until)
     }
 
     /// Drop every held window, every journalled push and every failure, and forget every refresh
@@ -653,6 +668,17 @@ impl RecentWindows {
         channel: &ChannelId,
         grant: Option<FillGrant>,
     ) -> (watch::Receiver<bool>, Option<Claim>) {
+        self.claim_with(channel, grant, false)
+    }
+
+    /// As [`RecentWindows::claim`], for a refresh begun behind an answer (see
+    /// [`refresh_retrying`]): only such a claim re-reads after a transient failure.
+    fn claim_with(
+        self: &Arc<Self>,
+        channel: &ChannelId,
+        grant: Option<FillGrant>,
+        retry: bool,
+    ) -> (watch::Receiver<bool>, Option<Claim>) {
         let mut windows = self.windows();
         let slot = windows.slots.entry(channel.clone()).or_default();
         if let Some((_, running)) = &slot.refreshing {
@@ -669,6 +695,7 @@ impl RecentWindows {
             number,
             done: Some(done),
             grant,
+            retry,
         };
         (running, Some(claim))
     }
@@ -699,6 +726,10 @@ struct Claim {
     /// under this and nothing else, so a write-scope caller who joins a read claimed at read scope
     /// adds no authority to it.
     grant: Option<FillGrant>,
+    /// Whether a transient failure of this claim is re-read after its back-off:
+    /// only a refresh begun behind an answer (`refresh_retrying`), never a catch-up's
+    /// own reads, whose cost is the contract `recent_many` pins.
+    retry: bool,
 }
 
 impl Drop for Claim {
@@ -858,6 +889,25 @@ pub fn refresh(
     done
 }
 
+/// As [`refresh`], for a read begun behind an answer already given (a digest or
+/// tool read answered from the held copy): a transient failure is re-read after
+/// its back-off, at most [`MAX_REFRESH_RETRIES`] times, still single-flight under
+/// the claim and the provider's permits. A catch-up's own refreshes never retry:
+/// their upstream cost is the contract `recent_many` pins. `#2280` S3.
+pub fn refresh_retrying(
+    state: &AppState,
+    channel: &ChannelId,
+    limit: u16,
+    grant: Option<FillGrant>,
+) -> watch::Receiver<bool> {
+    let windows = Arc::clone(state.live.recent());
+    let (done, claim) = windows.claim_with(channel, grant, true);
+    if let Some(claim) = claim {
+        tokio::spawn(read_alone(state.clone(), claim, limit));
+    }
+    done
+}
+
 /// Whether a refresh gives up at the provider's first rate limit rather than waiting it out
 /// ([`crate::read_reason::hurry`]): when the message cache serves, since a catch-up then answers
 /// from the cache in the read's place and does not wait for it. `#649 voice-agent-tools`: on
@@ -868,37 +918,92 @@ fn gives_up_early(state: &AppState) -> bool {
     state.message_cache.serve_enabled()
 }
 
+/// How many times one claimed refresh re-reads after a transient failure, each after
+/// its back-off, before the failure stands for the next catch-up (`#2280` S3). The
+/// read already holding the claim is the retry's single flight, and each attempt
+/// still takes one of its provider's [`REFRESH_CONCURRENCY`] permits.
+const MAX_REFRESH_RETRIES: u32 = 2;
+
 /// Read one claimed channel's newest `limit` messages on their own, keep what the read brought or
-/// its failure, and end the refresh.
+/// its failure, and end the refresh. A transient failure of a grant-bearing claim is
+/// retried here, at most [`MAX_REFRESH_RETRIES`] times, waiting out the channel's
+/// back-off between attempts: a caller with no fill grant starts no retry read
+/// (caller-grant-only, `#2280` S3), and a failure another read has since superseded
+/// is not retried either.
 async fn read_alone(state: AppState, claim: Claim, limit: u16) {
-    // Begun when asked for, not when a permit came free: the window is no newer than that, and
-    // every push from then on is applied to it again. See the module documentation. The message
-    // cache's fill is begun then too, under the claimant's grant (`#208 persistent-cache`): what
-    // the read saw is no newer than that either.
-    let mark = claim.windows.mark(&claim.channel);
-    let fill = claim
-        .grant
-        .and_then(|grant| state.message_cache.begin(&grant, &claim.channel));
-    let started = mark.started();
     let permits = claim
         .windows
         .permits(state.providers.key_for(&claim.channel).as_deref());
-    let read = match permits.acquire().await {
-        // `remote-ops-audit`: counted as the catch-up's, whoever's request queued it.
-        Ok(_permit) => {
-            crate::read_reason::ReadReason::Recent
-                .scope(crate::read_reason::hurry(
-                    gives_up_early(&state),
-                    crate::recent_view::read(&state, &claim.channel, limit),
-                ))
-                .await
+    let mut retries = 0u32;
+    loop {
+        // Begun when asked for, not when a permit came free: the window is no newer than that, and
+        // every push from then on is applied to it again. See the module documentation. The message
+        // cache's fill is begun then too, under the claimant's grant (`#208 persistent-cache`): what
+        // the read saw is no newer than that either.
+        let mark = claim.windows.mark(&claim.channel);
+        let fill = claim
+            .grant
+            .and_then(|grant| state.message_cache.begin(&grant, &claim.channel));
+        let started = mark.started();
+        let read = match permits.acquire().await {
+            // `remote-ops-audit`: counted as the catch-up's, whoever's request queued it.
+            Ok(_permit) => {
+                crate::read_reason::ReadReason::Recent
+                    .scope(crate::read_reason::hurry(
+                        gives_up_early(&state),
+                        crate::recent_view::read(&state, &claim.channel, limit),
+                    ))
+                    .await
+            }
+            Err(_) => Err(ChatError::Refused("the server is shutting down".to_owned())),
+        };
+        if let (Some(fill), Ok(read)) = (fill, &read) {
+            fill.offer_recent_dated(read);
         }
-        Err(_) => Err(ChatError::Refused("the server is shutting down".to_owned())),
-    };
-    if let (Some(fill), Ok(read)) = (fill, &read) {
-        fill.offer_recent_dated(read);
+        let retry_delay = match &read {
+            Err(error)
+                if claim.retry
+                    && claim.grant.is_some()
+                    && error.is_transient()
+                    && retries < MAX_REFRESH_RETRIES =>
+            {
+                Some(
+                    error
+                        .retry_after()
+                        .unwrap_or(Duration::ZERO)
+                        .max(claim.windows.timing().retry_backoff),
+                )
+            }
+            _ => None,
+        };
+        keep(&claim, mark, limit, read, started.elapsed().as_millis());
+        let Some(retry_delay) = retry_delay else {
+            break;
+        };
+        retries += 1;
+        // Wait before the retry. A rate limit has already put its instant on the slot
+        // (`note_failure`); another transient failure waits here only. Putting an
+        // ordinary failure on the slot too would change whether a catch-up reads the
+        // channel again, which is another caller's contract, not this retry's.
+        // A success meanwhile (a direct read landing) clears the failure and ends it.
+        if claim.windows.backoff_until(&claim.channel).is_some() {
+            loop {
+                if claim.windows.snapshot(&claim.channel).failure.is_none() {
+                    return drop(claim);
+                }
+                let Some(until) = claim.windows.backoff_until(&claim.channel) else {
+                    break;
+                };
+                let wake = until.min(tokio::time::Instant::now() + Duration::from_secs(1));
+                tokio::time::sleep_until(wake).await;
+            }
+        } else {
+            tokio::time::sleep(retry_delay).await;
+        }
+        if claim.windows.snapshot(&claim.channel).failure.is_none() {
+            break;
+        }
     }
-    keep(&claim, mark, limit, read, started.elapsed().as_millis());
     drop(claim);
 }
 

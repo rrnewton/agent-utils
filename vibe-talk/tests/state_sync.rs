@@ -30,14 +30,15 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt as _;
 use serde_json::Value;
 use tower::ServiceExt as _;
-use vibe_talk::cache::RefreshKey;
+use vibe_talk::auth::Scope;
+use vibe_talk::cache::{FillGrant, RefreshKey};
 use vibe_talk::chat::{ChatClient, ChatError};
 use vibe_talk::discord::fake::FakeDiscord;
 use vibe_talk::live::Subscription;
 use vibe_talk::model::{ChannelId, MessageId};
 use vibe_talk::state::AppState;
 use vibe_talk::testing::{
-    self, CountingChat, ManualClock, TempDir, TimelineChat, READ_CHANNEL, WRITE_TOKEN,
+    self, CountingChat, ManualClock, TempDir, TimelineChat, READ_CHANNEL, READ_TOKEN, WRITE_TOKEN,
 };
 use vibe_talk::threads::TimelineView;
 
@@ -131,17 +132,39 @@ struct Deployment {
 }
 
 async fn deployment(tag: &str) -> Deployment {
+    deployment_inner(tag, 12, None).await
+}
+
+/// As [`deployment`], with `count` seeded messages and, when given, recent-window
+/// durations of `recent_timing` in place of the production ones.
+async fn deployment_sized(
+    tag: &str,
+    count: i64,
+    recent_timing: Option<vibe_talk::recent::Timing>,
+) -> Deployment {
+    deployment_inner(tag, count, recent_timing).await
+}
+
+async fn deployment_inner(
+    tag: &str,
+    count: i64,
+    recent_timing: Option<vibe_talk::recent::Timing>,
+) -> Deployment {
     let dir = TempDir::new(tag);
     let (mut state, fake, _voice) = testing::state_from_toml(&testing::config_toml());
     let read = ChannelId(READ_CHANNEL.to_owned());
-    let ids = (0..12)
+    let ids = (0..count)
         .map(|n| fake.seed_at(&read, "Ada", &format!("message {n}"), T0 + n * MINUTE))
         .collect();
     let timeline: Arc<dyn ChatClient> = Arc::new(TimelineChat::new(fake.clone()));
     let counting = Arc::new(CountingChat::new(timeline));
     state.replace_chat(counting.clone());
-    let clock = ManualClock::at(T0 + HOUR);
+    let clock = ManualClock::at(T0 + HOUR.max((count + 10) * MINUTE));
     let state = testing::with_message_cache(state, dir.path(), clock.clone()).await;
+    let state = match recent_timing {
+        Some(timing) => testing::with_recent_timing(state, timing),
+        None => state,
+    };
     Deployment {
         state,
         fake,
@@ -194,15 +217,22 @@ impl Deployment {
 
 /// Drive `uri` with the write token (the page's scope: serving requires it) while the next
 /// upstream call of any method is held, and require the answer before that call is released.
+async fn answers_while_held(d: &Deployment, uri: &str) -> (StatusCode, Value) {
+    answers_while_held_as(d, uri, WRITE_TOKEN).await
+}
+
+/// As [`answers_while_held`], with the caller's own token: a read-token case proves the
+/// answer it gets (and any work it may start) under that scope, not the page's.
 ///
 /// Either no upstream call begins at all, or one begins behind the answer: both complete
 /// here. An answer that awaits upstream completes in neither arm and fails on `WAIT`.
-async fn answers_while_held(d: &Deployment, uri: &str) -> (StatusCode, Value) {
+async fn answers_while_held_as(d: &Deployment, uri: &str, token: &str) -> (StatusCode, Value) {
     let before = d.counting.calls().len();
     let mut held = d.counting.hold_next_any();
     let state = d.state.clone();
     let asked = uri.to_owned();
-    let mut task = tokio::spawn(async move { call(&state, &asked, WRITE_TOKEN).await });
+    let token = token.to_owned();
+    let mut task = tokio::spawn(async move { call(&state, &asked, &token).await });
     let answered = tokio::select! {
         done = &mut task => done.expect("the request ran"),
         entered = &mut held.entered => {
@@ -238,6 +268,13 @@ fn assert_answered_at_once(body: &Value) {
 /// As [`answers_while_held`], requiring success.
 async fn ok_while_held(d: &Deployment, uri: &str) -> Value {
     let (status, body) = answers_while_held(d, uri).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+    body
+}
+
+/// As [`answers_while_held_as`], requiring success.
+async fn ok_while_held_as(d: &Deployment, uri: &str, token: &str) -> Value {
+    let (status, body) = answers_while_held_as(d, uri, token).await;
     assert_eq!(status, StatusCode::OK, "{uri}: {body}");
     body
 }
@@ -575,7 +612,16 @@ async fn a_cold_timeline_waits_for_the_provider_the_allowlisted_exception() {
 /// `message_cache_serve`'s `refreshed` does: the condition is the claim coming free,
 /// polled, with `WAIT` only as a hang backstop.
 async fn claim_free(state: &AppState, channel: &str, view: TimelineView, limit: u16) {
-    let key = || RefreshKey::timeline(ChannelId(channel.to_owned()), view, None, limit);
+    claim_key_free(
+        state,
+        RefreshKey::timeline(ChannelId(channel.to_owned()), view, None, limit),
+    )
+    .await;
+}
+
+/// As [`claim_free`], for a named claim of the test's own (a recap fill's).
+async fn claim_key_free(state: &AppState, named: RefreshKey) {
+    let key = || named.clone();
     tokio::time::timeout(WAIT, async {
         while state.message_cache.claim_refresh(key()).is_none() {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -638,6 +684,215 @@ async fn a_failed_refresh_behind_a_stand_in_retries_on_the_schedule_not_the_next
     claim_free(&d.state, READ_CHANNEL, TimelineView::Main, 50).await;
     d.state.refresh_schedule.age(Duration::from_secs(300));
     live_arrival(&mut subscription, &late).await;
+}
+
+/// The texts a recap answer carries, group by group as [`texts`] reads one page.
+fn recap_texts(body: &Value) -> Vec<String> {
+    body["groups"]
+        .as_array()
+        .expect("groups")
+        .iter()
+        .flat_map(|group| {
+            group["messages"]
+                .as_array()
+                .expect("group messages")
+                .iter()
+                .map(|message| {
+                    message["content"]
+                        .as_str()
+                        .expect("content is text")
+                        .to_owned()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// The claim under which a recap fill of one window runs (ops' own key, named here so a
+/// test can wait for that fill the way [`claim_free`] waits for a refresh).
+fn recap_fill_key(since_ms: i64, until_ms: i64) -> RefreshKey {
+    RefreshKey {
+        channel: ChannelId(READ_CHANNEL.to_owned()),
+        read: format!("recap:{since_ms}:{until_ms}"),
+    }
+}
+
+#[tokio::test]
+async fn recap_answers_from_held_copy_and_fills_behind_a_write_request() {
+    // `#2280` S3: a recap whose window the cache has not covered answers with what it
+    // holds, says it is still filling, and the next ask — no live event in between —
+    // is whole once the bounded walk has landed.
+    let d = deployment_sized("state-sync-recap-fill", 130, None).await;
+    d.fill_timeline().await;
+    d.state.message_cache.set_serve(true);
+    let (since, until) = (T0, T0 + 130 * MINUTE);
+    let uri = path(
+        READ_CHANNEL,
+        &format!("/recap?since_ms={since}&until_ms={until}"),
+    );
+
+    let partial = ok_while_held(&d, &uri).await;
+    assert_eq!(partial["pending"], Value::Bool(true), "{partial}");
+    assert_eq!(
+        partial["checked_ms"],
+        Value::from(T0 + 140 * MINUTE),
+        "{partial}"
+    );
+    assert_eq!(recap_texts(&partial).len(), 50, "{partial}");
+    assert!(
+        !recap_texts(&partial).iter().any(|text| text == "message 0"),
+        "the held copy does not reach the window's start yet: {partial}"
+    );
+
+    claim_key_free(&d.state, recap_fill_key(since, until)).await;
+    let filled = ok(&d.state, &uri, WRITE_TOKEN).await;
+    // A filled answer omits `pending` (it serializes only when true).
+    assert!(
+        matches!(filled.get("pending"), None | Some(Value::Bool(false))),
+        "filled recap still pending: {:?}",
+        filled.get("pending")
+    );
+    assert_eq!(recap_texts(&filled).len(), 130, "{filled}");
+    assert!(
+        recap_texts(&filled).iter().any(|text| text == "message 0"),
+        "the filled recap reaches the window's start: {filled}"
+    );
+}
+
+#[tokio::test]
+async fn a_read_token_recap_answers_from_held_copy_and_schedules_no_provider_read() {
+    // Caller-grant-only (`#2280` S3 policy): a read token gets the held copy and its
+    // pending flag, and drives no provider read — not in the request, and not from a
+    // walk an aged schedule would wake.
+    let d = deployment_sized("state-sync-recap-read", 130, None).await;
+    d.fill_timeline().await;
+    d.state.message_cache.set_serve(true);
+    let (since, until) = (T0, T0 + 130 * MINUTE);
+    let uri = path(
+        READ_CHANNEL,
+        &format!("/recap?since_ms={since}&until_ms={until}"),
+    );
+    let before = d.counting.calls().len();
+
+    let body = ok_while_held_as(&d, &uri, READ_TOKEN).await;
+    assert_eq!(body["pending"], Value::Bool(true), "{body}");
+    assert_eq!(recap_texts(&body).len(), 50, "{body}");
+
+    d.state.refresh_schedule.age(Duration::from_secs(300));
+    claim_key_free(&d.state, recap_fill_key(since, until)).await;
+    assert_eq!(
+        calls_since(&d, before),
+        Vec::<String>::new(),
+        "a read-token recap began upstream calls"
+    );
+}
+
+#[tokio::test]
+async fn digest_answers_from_held_copy_to_a_read_token() {
+    // The S3 digest branch: a dated held window at once, pending, and no provider read
+    // begun for a read-scope caller (a write caller's refresh behind is the existing
+    // tool-read behaviour).
+    let d = deployment("state-sync-digest-held").await;
+    d.fill_window().await;
+    d.clock.advance(5 * SECOND);
+    d.state.message_cache.set_serve(true);
+    d.fake.seed_at(
+        &ChannelId(READ_CHANNEL.to_owned()),
+        "Ada",
+        "after the digest copy",
+        T0 + 30 * MINUTE,
+    );
+    let before = d.counting.calls().len();
+
+    let body = ok_while_held_as(&d, &path(READ_CHANNEL, "/digest?limit=5"), READ_TOKEN).await;
+    assert_eq!(body["pending"], Value::Bool(true), "{body}");
+    assert!(body["as_of"].is_string(), "dated held copy: {body}");
+    let summaries: Vec<String> = body["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .map(|entry| {
+            entry["summary"]
+                .as_str()
+                .expect("summary is text")
+                .to_owned()
+        })
+        .collect();
+    assert!(
+        !summaries
+            .iter()
+            .any(|summary| summary.contains("after the digest copy")),
+        "the digest is the held copy: {body}"
+    );
+    assert_eq!(
+        calls_since(&d, before),
+        Vec::<String>::new(),
+        "a read-token digest began upstream calls"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_recent_refresh_retries_only_for_a_grant_bearing_claim() {
+    // `#2280` S3 (the S2-deferred recent retry): one transient failure of a claimed
+    // refresh is re-read after its back-off — shortened here by the injected
+    // `Timing::retry_backoff`, never by sleeping the schedule out — and only when
+    // the claim carries a fill grant (caller-grant-only).
+    let timing = vibe_talk::recent::Timing {
+        retry_backoff: Duration::from_millis(5),
+        ..vibe_talk::recent::Timing::default()
+    };
+    let channel = ChannelId(READ_CHANNEL.to_owned());
+
+    let d = deployment_sized("state-sync-recent-retry", 12, Some(timing)).await;
+    d.counting.fail_next(
+        "fetch_recent_dated",
+        None,
+        ChatError::Transport("down for one read".to_owned()),
+    );
+    let grant = FillGrant::for_caller(Scope::Write);
+    let mut done = vibe_talk::recent::refresh_retrying(&d.state, &channel, 50, grant);
+    tokio::time::timeout(WAIT, done.wait_for(|over| *over))
+        .await
+        .expect("the refresh and its retry finished")
+        .expect("the refresh watch is open");
+    assert!(
+        d.state.live.recent().holds(&channel),
+        "the retry landed the window"
+    );
+    assert_eq!(
+        d.counting
+            .calls()
+            .iter()
+            .filter(|call| call.method == "fetch_recent_dated")
+            .count(),
+        2,
+        "one failed read and its retry"
+    );
+
+    let d = deployment_sized("state-sync-recent-no-grant", 12, Some(timing)).await;
+    d.counting.fail_next(
+        "fetch_recent_dated",
+        None,
+        ChatError::Transport("down for one read".to_owned()),
+    );
+    let mut done = vibe_talk::recent::refresh_retrying(&d.state, &channel, 50, None);
+    tokio::time::timeout(WAIT, done.wait_for(|over| *over))
+        .await
+        .expect("the unretried refresh finished")
+        .expect("the refresh watch is open");
+    assert!(
+        !d.state.live.recent().holds(&channel),
+        "no window landed without a retry"
+    );
+    assert_eq!(
+        d.counting
+            .calls()
+            .iter()
+            .filter(|call| call.method == "fetch_recent_dated")
+            .count(),
+        1,
+        "a claim with no grant retries nothing"
+    );
 }
 
 /// A timeline provider whose next Flat page, once armed, leaves one thread's replies
@@ -1114,22 +1369,8 @@ fn classification() -> Vec<Entry> {
                 step: "S3",
             },
         ),
-        e(
-            "GET",
-            "/api/v1/channels/{channel_id}/digest",
-            Class::Awaited {
-                bound: "window provider read",
-                step: "S3",
-            },
-        ),
-        e(
-            "GET",
-            "/api/v1/channels/{channel_id}/recap",
-            Class::Awaited {
-                bound: "walk to 50 pages, each awaited",
-                step: "S3",
-            },
-        ),
+        e("GET", "/api/v1/channels/{channel_id}/digest", Class::Held),
+        e("GET", "/api/v1/channels/{channel_id}/recap", Class::Held),
         e(
             "POST",
             "/api/v1/channels/{channel_id}/catchup",
@@ -1560,6 +1801,8 @@ const HELD_TEMPLATES: &[(&str, &str)] = &[
     ("GET", "/api/v1/channels/{channel_id}/messages"),
     ("GET", "/api/v1/channels/{channel_id}/search"),
     ("GET", "/api/v1/search"),
+    ("GET", "/api/v1/channels/{channel_id}/digest"),
+    ("GET", "/api/v1/channels/{channel_id}/recap"),
 ];
 
 /// Every `(METHOD, path)` the router source registers with a literal path. The same

@@ -5970,6 +5970,14 @@ pub struct DigestResponse {
     /// Messages in the window the owner's noise rules call read, which have no entry.
     /// `#196 auto-read-noise`.
     pub noise: usize,
+    /// When the copy this digest came from was complete to, RFC 3339, when it was a
+    /// held copy rather than a current read (`#2280` S3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_of: Option<String>,
+    /// Whether this digest is the held copy while its refresh is still owed: newer
+    /// messages may be missing until a later ask.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pending: bool,
     /// Standing reminder that the content is third-party text.
     pub untrusted_content_notice: &'static str,
 }
@@ -5987,6 +5995,8 @@ pub async fn digest(
         entries: digest.entries,
         complete: digest.complete,
         noise: digest.noise,
+        as_of: digest.as_of,
+        pending: digest.pending,
         untrusted_content_notice: untrusted::NOTICE,
     }))
 }

@@ -173,6 +173,15 @@ pub struct RecapResponse {
     /// Whether the window walk hit its bound, so older in-window messages may be missing.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
+    /// Whether this answer is the server's held copy while the window is still being
+    /// filled (or awaits an independent fill): counts and groups may grow on the next
+    /// ask. `#2280` S3.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pending: bool,
+    /// When the held copy this answer came from was last checked against the provider,
+    /// local time in Unix milliseconds. Absent on an upstream answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_ms: Option<i64>,
     /// The thread groups, ordered by their first in-window message.
     pub groups: Vec<RecapGroup>,
     /// Standing reminder that the content is third-party text.
@@ -415,7 +424,12 @@ fn render_channel(response: &RecapResponse, mode: DoneMode) -> String {
         response.counts.unread,
         response.counts.noise
     ));
-    if response.truncated {
+    if response.pending {
+        out.push_str(
+            "Note: still filling — this is the server's held copy; older in-window \
+             messages may be missing. Run again for the filled recap.\n",
+        );
+    } else if response.truncated {
         out.push_str(
             "Note: the window walk hit its bound; older in-window messages may be missing.\n",
         );
@@ -1017,6 +1031,8 @@ mod tests {
                 noise: 0,
             },
             truncated: false,
+            pending: false,
+            checked_ms: None,
             groups: group_window(
                 vec![done, unread],
                 &HashSet::from([at(BASE, 1)]),
@@ -1038,6 +1054,15 @@ mod tests {
         assert!(shrunk.contains("DONE"), "{shrunk}");
         assert!(shrunk.contains("UNREAD"), "{shrunk}");
         assert!(shrunk.contains("do not repeat DONE"), "{shrunk}");
+    }
+
+    #[test]
+    fn a_pending_recap_says_it_is_still_filling() {
+        let mut response = response_with("done", "unread");
+        response.pending = true;
+        let rendered = render(std::slice::from_ref(&response), 0);
+        assert!(rendered.contains("still filling"), "{rendered}");
+        assert!(rendered.contains("Run again"), "{rendered}");
     }
 
     #[test]

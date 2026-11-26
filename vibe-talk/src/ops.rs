@@ -497,6 +497,10 @@ pub struct Window {
     /// served a copy it could not bring up to date just now. `None` means now. `#208
     /// persistent-cache`: a bridge reading its Flat view says so; see [`crate::recent_view`].
     pub as_of: Option<String>,
+    /// Whether this window is the server's held copy while its refresh is still owed
+    /// (a digest answered cache-only first, `#2280` S3): newer messages may be missing
+    /// until a later ask. An upstream or proven-served window is never pending.
+    pub pending: bool,
 }
 
 impl Window {
@@ -935,6 +939,7 @@ async fn read_window(
                 messages,
                 limit,
                 as_of,
+                pending: false,
             },
             None,
         ));
@@ -942,7 +947,12 @@ async fn read_window(
     // `#649 voice-agent-tools`: a voice agent's read (a digest, a lookup by id) is answered from the
     // message cache at once, dated by its last listing, with the recent read behind it. Its size is
     // what it holds, never what was asked, so it never claims to be the whole channel.
-    if tool_read(state, caller) {
+    // `#2280` S3: a digest takes the same branch for every caller — a held window
+    // answered dated and pending, never awaiting the provider read it stands in for.
+    // Only a caller with a fill grant starts that read behind it (caller-grant-only).
+    let digest_cache_first =
+        matches!(wants, Wants::Window(Consumer::Digest)) && state.message_cache.serve_enabled();
+    if tool_read(state, caller) || digest_cache_first {
         if let Some(copy) = cached_window(state, &channel.id, limit)
             .await
             .filter(|copy| !copy.messages.is_empty())
@@ -962,6 +972,7 @@ async fn read_window(
                     messages,
                     limit: held,
                     as_of: copy.checked_ms.map(crate::clock::iso_from_ms),
+                    pending: true,
                 },
                 None,
             ));
@@ -1011,6 +1022,7 @@ async fn read_window(
             messages,
             limit,
             as_of: read.as_of,
+            pending: false,
         },
         held,
     ))
@@ -3967,6 +3979,8 @@ pub struct Digest {
     pub oldest: Option<MessageId>,
     /// [`Window::as_of`]: when set, the provider's copy was complete only up to that instant.
     pub as_of: Option<String>,
+    /// [`Window::pending`]: this digest is the held copy while its refresh is still owed.
+    pub pending: bool,
 }
 
 /// One speakable line per recent message. Read scope.
@@ -4010,6 +4024,7 @@ pub async fn digest(
         noise: noise.len(),
         oldest,
         as_of: window.as_of,
+        pending: window.pending,
     })
 }
 
@@ -4509,11 +4524,16 @@ async fn cache_covers_rows(state: &AppState, channel: &ChannelId, messages: &[Me
 /// caller's grant, and not while the provider is rate-limiting it
 /// ([`crate::recent::RATE_LIMIT_BACKOFF`]). `#649 voice-agent-tools`.
 fn refresh_behind(state: &AppState, caller: crate::auth::Scope, channel: &ChannelId) {
+    // Caller-grant-only (`#2280` S3 policy): a caller with no fill grant starts no
+    // provider read here, however the answer it just got was served.
+    if crate::cache::FillGrant::for_caller(caller).is_none() {
+        return;
+    }
     if state.live.recent().backing_off(channel) {
         return;
     }
     let scan = activity_scan(state, DEFAULT_ACTIVITY_LINES);
-    drop(crate::recent::refresh(
+    drop(crate::recent::refresh_retrying(
         state,
         channel,
         scan,
@@ -7944,6 +7964,12 @@ pub async fn recap(
             .created_ms()
             .is_some_and(|ms| ms >= since_ms && ms < until_ms)
     };
+    // `#2280` S3: with serving on, the held copy answers at once (pending while its
+    // window is still owed a fill) and no provider read begins on this request. With
+    // serving off there is no copy to answer from, and the walk below is the read.
+    if state.message_cache.serve_enabled() {
+        return recap_from_cache(state, caller, channel, since_ms, until_ms).await;
+    }
     // The flat timeline walked backwards. A backend with no thread timelines refuses it; such
     // a channel has no thread replies to interleave, so its own messages are the whole window
     // and the `/page` range walk answers instead.
@@ -8130,26 +8156,8 @@ pub async fn recap(
             }
         }
     }
-    held.sort_by_key(|message| (message.created_ms().unwrap_or(i64::MAX), message.id.clone()));
-    held.dedup_by(|next, kept| next.id == kept.id);
-    let noise = held.iter().filter(|message| message.noise).count();
-    let visible: Vec<Message> = held.into_iter().filter(|message| !message.noise).collect();
-    let own = crate::own_read::settle(state, caller, &channel.id, &visible).await;
-    let mut dismissed: std::collections::HashSet<MessageId> =
-        match state.store.dismissals(&channel.id).await {
-            Ok(ids) => ids.into_iter().collect(),
-            Err(crate::store::StoreError::Unavailable(_)) => std::collections::HashSet::new(),
-            Err(error) => return Err(error.into()),
-        };
-    dismissed.extend(own);
-    let read_mark = match state.store.read_mark(&channel.id).await {
-        Ok(mark) => mark.map(|mark| crate::recap::RecapReadMark {
-            last_read: mark.last_read,
-            marked_at_ms: mark.marked_at_ms,
-        }),
-        Err(crate::store::StoreError::Unavailable(_)) => None,
-        Err(error) => return Err(error.into()),
-    };
+    let (visible, dismissed, read_mark, noise) =
+        recap_visible(state, caller, &channel, held).await?;
     // The openings of threads whose root predates the window.
     let mut threads: Vec<String> = Vec::new();
     for message in &visible {
@@ -8212,50 +8220,680 @@ pub async fn recap(
         if !walk_finished {
             walk_truncated = true;
         }
-        all.sort_by_key(|message| (message.created_ms().unwrap_or(i64::MAX), message.id.clone()));
-        all.dedup_by(|next, kept| next.id == kept.id);
-        // Noise is never listed, in an opening any more than in the window.
-        all.retain(|message| !message.noise);
-        // Only a walk that reached the thread's start may call its oldest message the root.
-        let Some(root) = all.first().cloned().filter(|_| !walk_truncated) else {
-            contexts.insert(
-                thread_id.clone(),
-                crate::recap::ThreadContext {
-                    root: None,
-                    opening: Vec::new(),
-                    hidden_before: None,
-                    truncated: true,
-                },
-            );
-            continue;
-        };
-        let before_window: Vec<Message> = all
-            .iter()
-            .skip(1)
-            .filter(|message| message.created_ms().is_some_and(|ms| ms < since_ms))
-            .cloned()
-            .collect();
-        let opening: Vec<Message> = before_window
-            .iter()
-            .take(crate::recap::CONTEXT_REPLIES)
-            .cloned()
-            .collect();
-        let hidden_before = if walk_truncated {
-            None
-        } else {
-            Some(before_window.len().saturating_sub(opening.len()))
-        };
         contexts.insert(
             thread_id.clone(),
-            crate::recap::ThreadContext {
-                root: Some(root),
-                opening,
-                hidden_before,
-                truncated: walk_truncated,
-            },
+            thread_context_from(all, since_ms, walk_truncated),
         );
     }
-    // Threads past the opening bound still say their opening was not read.
+    Ok(assemble_recap(
+        channel, since_ms, until_ms, visible, dismissed, read_mark, noise, truncated, false, None,
+        contexts, threads,
+    ))
+}
+
+/// A recap window's held messages made visible: sorted, de-duplicated, noise left
+/// out and counted, each tagged source (dismissals plus own-read) and the read mark
+/// read. Shared by the upstream walk and the held-copy answer (`#2280` S3).
+async fn recap_visible(
+    state: &AppState,
+    caller: crate::auth::Scope,
+    channel: &ChannelInfo,
+    mut held: Vec<Message>,
+) -> Result<
+    (
+        Vec<Message>,
+        std::collections::HashSet<MessageId>,
+        Option<crate::recap::RecapReadMark>,
+        usize,
+    ),
+    OpError,
+> {
+    held.sort_by_key(|message| (message.created_ms().unwrap_or(i64::MAX), message.id.clone()));
+    held.dedup_by(|next, kept| next.id == kept.id);
+    let noise = held.iter().filter(|message| message.noise).count();
+    let visible: Vec<Message> = held.into_iter().filter(|message| !message.noise).collect();
+    let own = crate::own_read::settle(state, caller, &channel.id, &visible).await;
+    let mut dismissed: std::collections::HashSet<MessageId> =
+        match state.store.dismissals(&channel.id).await {
+            Ok(ids) => ids.into_iter().collect(),
+            Err(crate::store::StoreError::Unavailable(_)) => std::collections::HashSet::new(),
+            Err(error) => return Err(error.into()),
+        };
+    dismissed.extend(own);
+    let read_mark = match state.store.read_mark(&channel.id).await {
+        Ok(mark) => mark.map(|mark| crate::recap::RecapReadMark {
+            last_read: mark.last_read,
+            marked_at_ms: mark.marked_at_ms,
+        }),
+        Err(crate::store::StoreError::Unavailable(_)) => None,
+        Err(error) => return Err(error.into()),
+    };
+    Ok((visible, dismissed, read_mark, noise))
+}
+
+/// One thread's opening from a walk of it (held or upstream): its root and first
+/// replies before the window, or a truncated context when the walk did not reach
+/// the thread's start. Noise is never listed, in an opening as in the window.
+fn thread_context_from(
+    mut all: Vec<Message>,
+    since_ms: i64,
+    walk_truncated: bool,
+) -> crate::recap::ThreadContext {
+    all.sort_by_key(|message| (message.created_ms().unwrap_or(i64::MAX), message.id.clone()));
+    all.dedup_by(|next, kept| next.id == kept.id);
+    all.retain(|message| !message.noise);
+    // Only a walk that reached the thread's start may call its oldest message the root.
+    let Some(root) = all.first().cloned().filter(|_| !walk_truncated) else {
+        return crate::recap::ThreadContext {
+            root: None,
+            opening: Vec::new(),
+            hidden_before: None,
+            truncated: true,
+        };
+    };
+    let before_window: Vec<Message> = all
+        .iter()
+        .skip(1)
+        .filter(|message| message.created_ms().is_some_and(|ms| ms < since_ms))
+        .cloned()
+        .collect();
+    let opening: Vec<Message> = before_window
+        .iter()
+        .take(crate::recap::CONTEXT_REPLIES)
+        .cloned()
+        .collect();
+    let hidden_before = Some(before_window.len().saturating_sub(opening.len()));
+    crate::recap::ThreadContext {
+        root: Some(root),
+        opening,
+        hidden_before,
+        truncated: walk_truncated,
+    }
+}
+
+/// One scope's held copy walked back to `since_ms` (or its start): the messages the
+/// cache holds of it, when its newest end was last checked, and whether the walk
+/// proves it reached `since_ms` (or the scope's start) with nothing missing.
+struct HeldScope {
+    messages: Vec<Message>,
+    checked_ms: Option<i64>,
+    complete: bool,
+}
+
+/// Walk one held scope back to `since_ms` from the cache alone (`#2280` S3), spending
+/// held pages out of `pages_left` (shared across a whole recap, so the answer is
+/// bounded local work as the upstream walk is bounded provider work). No provider
+/// call begins here, at any scope.
+async fn held_scope_window(
+    state: &AppState,
+    channel: &ChannelId,
+    view: crate::threads::TimelineView,
+    thread_id: Option<&str>,
+    since_ms: i64,
+    pages_left: &mut usize,
+) -> HeldScope {
+    let ask = Ask::Timeline {
+        view,
+        thread: thread_id.map(str::to_owned),
+        limit: usize::from(MAX_PAGE),
+    };
+    if *pages_left == 0 {
+        return HeldScope {
+            messages: Vec::new(),
+            checked_ms: None,
+            complete: false,
+        };
+    }
+    *pages_left -= 1;
+    let Some(stale) = state.message_cache.stale_timeline(channel, &ask).await else {
+        return HeldScope {
+            messages: Vec::new(),
+            checked_ms: None,
+            complete: false,
+        };
+    };
+    let checked_ms = stale.checked_ms;
+    if stale.reaches_start {
+        return HeldScope {
+            messages: stale.messages,
+            checked_ms,
+            complete: true,
+        };
+    }
+    let mut held = stale.messages;
+    loop {
+        let Some(oldest) = held
+            .iter()
+            .min_by_key(|message| (message.created_ms().unwrap_or(i64::MAX), message.id.clone()))
+        else {
+            // A listed but empty scope is whole: nothing older exists in it to miss.
+            return HeldScope {
+                messages: held,
+                checked_ms,
+                complete: true,
+            };
+        };
+        let Some(at_ms) = oldest.created_ms() else {
+            return HeldScope {
+                messages: held,
+                checked_ms,
+                complete: false,
+            };
+        };
+        if at_ms <= since_ms {
+            return HeldScope {
+                messages: held,
+                checked_ms,
+                complete: true,
+            };
+        }
+        if *pages_left == 0 {
+            return HeldScope {
+                messages: held,
+                checked_ms,
+                complete: false,
+            };
+        }
+        *pages_left -= 1;
+        let oldest_id = oldest.id.clone();
+        let Some(below) = state
+            .message_cache
+            .held_below(
+                channel,
+                &ask,
+                (at_ms, oldest_id.as_str()),
+                MAX_RECAP_MESSAGES,
+            )
+            .await
+        else {
+            return HeldScope {
+                messages: held,
+                checked_ms,
+                complete: false,
+            };
+        };
+        // A step the file could not prove whole still answers with its covered
+        // suffix: rows gap-free up to the page they step back from. Keeping them
+        // and stepping again from their oldest is how the walk crosses `since_ms`
+        // without a hole; only a step that stops short (no rows, or the page bound)
+        // leaves the scope incomplete.
+        if below.messages.is_empty() {
+            return HeldScope {
+                messages: held,
+                checked_ms,
+                complete: below.proven && !below.has_more,
+            };
+        }
+        let has_more = below.has_more;
+        held.extend(below.messages);
+        held.sort_by_key(|message| (message.created_ms().unwrap_or(i64::MAX), message.id.clone()));
+        held.dedup_by(|next, kept| next.id == kept.id);
+        if !has_more {
+            return HeldScope {
+                messages: held,
+                checked_ms,
+                complete: below.proven,
+            };
+        }
+    }
+}
+
+/// The older of two checked instants; an unchecked scope makes the whole unchecked.
+fn checked_min(held: Option<i64>, scope: Option<i64>) -> Option<i64> {
+    match (held, scope) {
+        (Some(held), Some(scope)) => Some(held.min(scope)),
+        _ => None,
+    }
+}
+
+/// The claim one recap fill of one window runs under: a second request for the same
+/// window while it runs starts no second walk. Named here so a test can wait for it.
+fn recap_fill_key(channel: &ChannelId, since_ms: i64, until_ms: i64) -> RefreshKey {
+    RefreshKey {
+        channel: channel.clone(),
+        read: format!("recap:{since_ms}:{until_ms}"),
+    }
+}
+
+/// A recap answered from the held copy at once (`#2280` S3): Main's held walk plus
+/// each active thread's, dated by the oldest check among them, `pending` unless
+/// every scope proved the window and was checked at or after its end. A caller
+/// whose scope holds a fill grant (and only such a caller) schedules the bounded
+/// fill behind it; a read-scope caller schedules nothing and is answered exactly
+/// the same, to be filled by the server's independent backfill.
+async fn recap_from_cache(
+    state: &AppState,
+    caller: crate::auth::Scope,
+    channel: ChannelInfo,
+    since_ms: i64,
+    until_ms: i64,
+) -> Result<crate::recap::RecapResponse, OpError> {
+    use crate::threads::TimelineView;
+    let in_window = |message: &Message| {
+        message
+            .created_ms()
+            .is_some_and(|ms| ms >= since_ms && ms < until_ms)
+    };
+    let mut pages_left = MAX_RECAP_PAGES;
+    let main = held_scope_window(
+        state,
+        &channel.id,
+        TimelineView::Main,
+        None,
+        since_ms,
+        &mut pages_left,
+    )
+    .await;
+    let mut checked_ms = main.checked_ms;
+    let mut complete = main.complete;
+    let mut held = main.messages;
+
+    // Threads active in the window: named by a held message's thread (its root's last
+    // activity may be in-window though the root is older), or by the held thread list.
+    let mut thread_ids: Vec<String> = Vec::new();
+    let mut note_thread = |id: &str| {
+        if !thread_ids.iter().any(|held| held == id) {
+            thread_ids.push(id.to_owned());
+        }
+    };
+    for message in &held {
+        if let Some(thread) = &message.thread {
+            let active = in_window(message)
+                || thread
+                    .last_reply_at
+                    .as_deref()
+                    .and_then(crate::clock::instant_ms)
+                    .is_some_and(|ms| ms >= since_ms);
+            if active {
+                note_thread(&thread.id.clone());
+            }
+        }
+    }
+    if pages_left > 0 {
+        pages_left -= 1;
+        let ask = Ask::Timeline {
+            view: TimelineView::Threads,
+            thread: None,
+            limit: MAX_RECAP_MESSAGES,
+        };
+        if let Some(list) = state.message_cache.stale_timeline(&channel.id, &ask).await {
+            checked_ms = checked_min(checked_ms, list.checked_ms);
+            for summary in &list.threads {
+                if crate::clock::instant_ms(&summary.updated_at)
+                    .is_some_and(|ms| ms >= since_ms && ms < until_ms)
+                {
+                    note_thread(&summary.id.clone());
+                }
+            }
+        }
+    }
+    for thread_id in &thread_ids {
+        let replies = held_scope_window(
+            state,
+            &channel.id,
+            TimelineView::Thread,
+            Some(thread_id),
+            since_ms,
+            &mut pages_left,
+        )
+        .await;
+        checked_ms = checked_min(checked_ms, replies.checked_ms);
+        complete &= replies.complete;
+        held.extend(replies.messages);
+    }
+
+    let bound_cut = held.iter().filter(|message| in_window(message)).count() >= MAX_RECAP_MESSAGES;
+    let mut window_held: Vec<Message> = held.into_iter().filter(in_window).collect();
+    window_held
+        .sort_by_key(|message| (message.created_ms().unwrap_or(i64::MAX), message.id.clone()));
+    window_held.dedup_by(|next, kept| next.id == kept.id);
+    if window_held.len() > MAX_RECAP_MESSAGES {
+        window_held = window_held.split_off(window_held.len() - MAX_RECAP_MESSAGES);
+    }
+    let (visible, dismissed, read_mark, noise) =
+        recap_visible(state, caller, &channel, window_held).await?;
+
+    // Thread openings, from each thread's held scope walked to its start.
+    let mut threads: Vec<String> = Vec::new();
+    for message in &visible {
+        if let Some(thread) = &message.thread {
+            if !threads.contains(&thread.id) {
+                threads.push(thread.id.clone());
+            }
+        }
+    }
+    let mut contexts: std::collections::BTreeMap<String, crate::recap::ThreadContext> =
+        std::collections::BTreeMap::new();
+    for thread_id in threads.iter().take(MAX_RECAP_CONTEXT_THREADS) {
+        let has_root = visible.iter().any(|message| {
+            message
+                .thread
+                .as_ref()
+                .is_some_and(|thread| thread.id == *thread_id && thread.is_root)
+        });
+        if has_root {
+            continue;
+        }
+        let opening = held_scope_window(
+            state,
+            &channel.id,
+            TimelineView::Thread,
+            Some(thread_id),
+            i64::MIN,
+            &mut pages_left,
+        )
+        .await;
+        checked_ms = checked_min(checked_ms, opening.checked_ms);
+        complete &= opening.complete;
+        let context = thread_context_from(opening.messages, since_ms, !opening.complete);
+        contexts.insert(thread_id.clone(), context);
+    }
+
+    let fresh = checked_ms.is_some_and(|checked| checked >= until_ms);
+    let pending = !complete || !fresh;
+    if pending {
+        spawn_recap_fill(state, caller, &channel, since_ms, until_ms, threads.clone());
+    }
+    Ok(assemble_recap(
+        channel,
+        since_ms,
+        until_ms,
+        visible,
+        dismissed,
+        read_mark,
+        noise,
+        bound_cut || pending,
+        pending,
+        checked_ms,
+        contexts,
+        threads,
+    ))
+}
+
+/// Schedule the one bounded fill walk for a pending recap window, under the caller's
+/// own fill grant only (`#2280` S3 policy): no grant, no walk — a read-scope caller is
+/// answered from the held copy and starts nothing. Single-flight per window under
+/// [`recap_fill_key`], paced by the refresh schedule like every behind read.
+fn spawn_recap_fill(
+    state: &AppState,
+    caller: crate::auth::Scope,
+    channel: &ChannelInfo,
+    since_ms: i64,
+    until_ms: i64,
+    threads: Vec<String>,
+) {
+    let Some(grant) = crate::cache::FillGrant::for_caller(caller) else {
+        return;
+    };
+    let key = recap_fill_key(&channel.id, since_ms, until_ms);
+    let Some(claim) = state.message_cache.claim_refresh(key.clone()) else {
+        return;
+    };
+    if !state.refresh_schedule.try_schedule(&key) {
+        return;
+    }
+    let state = state.clone();
+    let channel = channel.clone();
+    drop(tokio::spawn(
+        crate::read_reason::ReadReason::Backfill.scope(crate::read_reason::hurry(
+            false,
+            async move {
+                let _claim = claim;
+                let filled =
+                    recap_fill_walk(&state, caller, &channel, since_ms, until_ms, grant, threads)
+                        .await;
+                state.refresh_schedule.note_outcome(&key, filled);
+            },
+        )),
+    ));
+}
+
+/// One fill page: read upstream under `grant` and offer it. A walk's first page is
+/// its newest listing; each later page is offered as older than the page before it
+/// (`below_ms`, that page's oldest), the continuity a step back's claims rest on —
+/// a bare `Before` offer under a fresh fill would be dropped as unproven.
+async fn recap_fill_page(
+    state: &AppState,
+    channel: &ChannelId,
+    request: &crate::threads::TimelineRequest,
+    grant: crate::cache::FillGrant,
+    below_ms: Option<i64>,
+) -> Result<crate::threads::TimelinePage, ChatError> {
+    let fill = state.message_cache.begin(&grant, channel);
+    let page = state.chat.fetch_timeline(channel, request).await?;
+    if let Some(fill) = fill {
+        match below_ms {
+            Some(below_ms) => {
+                fill.offer_older(request, &page, below_ms);
+            }
+            None => {
+                fill.offer_timeline(request, crate::cache::observe::TimelineRead::Newest, &page);
+            }
+        }
+    }
+    Ok(page)
+}
+
+/// The oldest creation instant a page holds, for the next fill page's `below_ms`.
+fn page_oldest_ms(page: &crate::threads::TimelinePage) -> Option<i64> {
+    page.messages.iter().filter_map(Message::created_ms).min()
+}
+
+/// The bounded fill walk behind a pending recap: the Flat window back to `since_ms`
+/// (or the `/page` range walk where Flat is refused), the threads list for threads
+/// active in it, then each active thread — the first
+/// [`MAX_RECAP_CONTEXT_THREADS`] to their starts (their openings), the rest back to
+/// `since_ms`. At most [`MAX_RECAP_PAGES`] provider pages in all, each through the
+/// provider's own budget as any read; `false` when the budget ran out or a read
+/// failed, with what was read already offered.
+async fn recap_fill_walk(
+    state: &AppState,
+    caller: crate::auth::Scope,
+    channel: &ChannelInfo,
+    since_ms: i64,
+    until_ms: i64,
+    grant: crate::cache::FillGrant,
+    threads: Vec<String>,
+) -> bool {
+    use crate::threads::{TimelineRequest, TimelineView};
+    let mut pages_left = MAX_RECAP_PAGES;
+    let mut active = threads;
+    let note_active = |active: &mut Vec<String>, id: &str| {
+        if !active.iter().any(|held| held == id) {
+            active.push(id.to_owned());
+        }
+    };
+
+    // The window itself, Main first: its listings prove the coverage the next held
+    // answer checks, which a Flat page's never do (its replies live in their threads).
+    let mut before: Option<String> = None;
+    let mut below_ms: Option<i64> = None;
+    let mut flat_done = false;
+    let mut flat_refused = false;
+    while pages_left > 0 {
+        pages_left -= 1;
+        let request = TimelineRequest {
+            view: TimelineView::Main,
+            thread_id: None,
+            before: before.clone(),
+            after: None,
+            limit: MAX_PAGE,
+        };
+        let page = match recap_fill_page(state, &channel.id, &request, grant, below_ms).await {
+            Ok(page) => page,
+            Err(error) if matches!(error.cause(), ChatError::Refused(_)) => {
+                flat_refused = true;
+                break;
+            }
+            Err(_) => return false,
+        };
+        if page.messages.is_empty() {
+            flat_done = true;
+            break;
+        }
+        below_ms = page_oldest_ms(&page);
+        let reached = page
+            .messages
+            .iter()
+            .filter_map(Message::created_ms)
+            .min()
+            .is_some_and(|oldest| oldest < since_ms);
+        if !page.has_more || reached {
+            flat_done = true;
+            break;
+        }
+        match page.next_before {
+            Some(next) if before.as_deref() != Some(next.as_str()) => before = Some(next),
+            _ => break,
+        }
+    }
+    if flat_refused {
+        // No thread timelines: the range walk is the whole window, as the upstream
+        // recap's fallback walks it. Each step fills under the caller's grant.
+        let mut since_arg = crate::clock::iso_from_ms(since_ms);
+        let until_arg = crate::clock::iso_from_ms(until_ms);
+        while pages_left > 0 {
+            pages_left -= 1;
+            let step = match page(
+                state,
+                caller,
+                channel.id.as_str(),
+                PageRequest {
+                    limit: Some(MAX_PAGE),
+                    before: None,
+                    since: Some(&since_arg),
+                    until: Some(&until_arg),
+                    hours: None,
+                },
+            )
+            .await
+            {
+                Ok(step) => step,
+                Err(_) => return false,
+            };
+            if !step.has_more {
+                flat_done = true;
+                break;
+            }
+            match step.next_since {
+                Some(next) => since_arg = next,
+                None => break,
+            }
+        }
+        return flat_done;
+    }
+    if !flat_done {
+        return false;
+    }
+
+    // Threads active in the window, from the provider's own list.
+    let mut before: Option<String> = None;
+    let mut below_ms: Option<i64> = None;
+    while pages_left > 0 {
+        pages_left -= 1;
+        let request = TimelineRequest {
+            view: TimelineView::Threads,
+            thread_id: None,
+            before: before.clone(),
+            after: None,
+            limit: MAX_PAGE,
+        };
+        let page = match recap_fill_page(state, &channel.id, &request, grant, below_ms).await {
+            Ok(page) => page,
+            Err(error) if matches!(error.cause(), ChatError::Refused(_)) => break,
+            Err(_) => return false,
+        };
+        below_ms = page
+            .threads
+            .iter()
+            .filter_map(|summary| crate::clock::instant_ms(&summary.updated_at))
+            .min();
+        let mut oldest_activity: Option<i64> = None;
+        for summary in &page.threads {
+            if let Some(ms) = crate::clock::instant_ms(&summary.updated_at) {
+                oldest_activity = Some(oldest_activity.map_or(ms, |held: i64| held.min(ms)));
+                if ms >= since_ms {
+                    note_active(&mut active, &summary.id.clone());
+                }
+            }
+        }
+        if !page.has_more || oldest_activity.is_some_and(|ms| ms < since_ms) {
+            break;
+        }
+        match page.next_before {
+            Some(next) if before.as_deref() != Some(next.as_str()) => before = Some(next),
+            _ => break,
+        }
+    }
+
+    // Each active thread: openings first, to their starts; the rest to the window.
+    for (index, thread_id) in active.iter().enumerate() {
+        let to_start = index < MAX_RECAP_CONTEXT_THREADS;
+        let mut before: Option<String> = None;
+        let mut below_ms: Option<i64> = None;
+        let mut thread_done = false;
+        while pages_left > 0 {
+            pages_left -= 1;
+            let request = TimelineRequest {
+                view: TimelineView::Thread,
+                thread_id: Some(thread_id.clone()),
+                before: before.clone(),
+                after: None,
+                limit: MAX_PAGE,
+            };
+            let page = match recap_fill_page(state, &channel.id, &request, grant, below_ms).await {
+                Ok(page) => page,
+                Err(error) if matches!(error.cause(), ChatError::Refused(_)) => {
+                    thread_done = true;
+                    break;
+                }
+                Err(_) => return false,
+            };
+            below_ms = page_oldest_ms(&page);
+            if !page.has_more {
+                thread_done = true;
+                break;
+            }
+            let reached = page
+                .messages
+                .iter()
+                .filter_map(Message::created_ms)
+                .min()
+                .is_some_and(|oldest| oldest < since_ms);
+            if reached && !to_start {
+                thread_done = true;
+                break;
+            }
+            match page.next_before {
+                Some(next) if before.as_deref() != Some(next.as_str()) => before = Some(next),
+                _ => break,
+            }
+        }
+        if !thread_done {
+            return false;
+        }
+    }
+    true
+}
+
+/// Assemble one recap answer from its visible window and thread contexts: threads
+/// past the opening bound still say their opening was not read, then counts and
+/// groups. Shared by the upstream walk and the held-copy answer (`#2280` S3).
+#[allow(clippy::too_many_arguments)]
+fn assemble_recap(
+    channel: ChannelInfo,
+    since_ms: i64,
+    until_ms: i64,
+    visible: Vec<Message>,
+    dismissed: std::collections::HashSet<MessageId>,
+    read_mark: Option<crate::recap::RecapReadMark>,
+    noise: usize,
+    truncated: bool,
+    pending: bool,
+    checked_ms: Option<i64>,
+    mut contexts: std::collections::BTreeMap<String, crate::recap::ThreadContext>,
+    threads: Vec<String>,
+) -> crate::recap::RecapResponse {
     for thread_id in threads.iter().skip(MAX_RECAP_CONTEXT_THREADS) {
         let has_root = visible.iter().any(|message| {
             message
@@ -8284,15 +8922,17 @@ pub async fn recap(
         noise,
     };
     let groups = crate::recap::group_window(visible, &dismissed, &contexts);
-    Ok(crate::recap::RecapResponse {
+    crate::recap::RecapResponse {
         channel,
         window: crate::recap::RecapWindow { since_ms, until_ms },
         read_mark,
         counts,
         truncated,
+        pending,
+        checked_ms,
         groups,
         untrusted_content_notice: crate::untrusted::NOTICE.to_owned(),
-    })
+    }
 }
 
 /// What one dismissal or one restoration did.
@@ -9709,6 +10349,7 @@ pub async fn summarize_message_scoped(
             messages,
             limit: state.effective_limit(limit),
             as_of: None,
+            pending: false,
         }
     } else {
         shared_window(state, caller, channel, limit, began, message_id).await?
@@ -9921,6 +10562,7 @@ async fn shared_window(
                 messages,
                 limit: read.limit,
                 as_of: read.as_of.clone(),
+                pending: false,
             });
         }
     }

@@ -1339,6 +1339,7 @@ async fn run_digest(state: &AppState, caller: Scope, args: &Value) -> Result<Str
         noise,
         oldest,
         as_of,
+        pending,
     } = ops::digest(
         state,
         caller,
@@ -1385,6 +1386,16 @@ async fn run_digest(state: &AppState, caller: Scope, args: &Value) -> Result<Str
             format!("{line}{}\n", as_of_note(as_of.as_deref(), ops::now_ms()))
         }
         _ => header,
+    };
+    let header = if pending && as_of.is_none() {
+        match header.strip_suffix('\n') {
+            Some(line) => {
+                format!("{line} This is the held copy; ask again later for a filled digest.\n")
+            }
+            None => header,
+        }
+    } else {
+        header
     };
     let owner = crate::owner::Owner::of(state);
     // `#649 voice-agent-tools` item 7: read here or not, from the same record the page shows.

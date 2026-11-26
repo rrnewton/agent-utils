@@ -1220,6 +1220,7 @@ mod tests {
             messages: window,
             limit: 50,
             as_of: None,
+            pending: false,
         });
         let rebuilt = read_ahead.recall_window(&channel, &read).expect("all held");
         assert_eq!(
