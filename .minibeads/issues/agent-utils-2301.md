@@ -7,7 +7,7 @@ labels:
 - vibe-talk
 - owner-ui
 created_at: 2026-11-26T11:35:00-05:00
-updated_at: 2026-11-26T11:35:00-05:00
+updated_at: 2026-11-26T12:25:00-05:00
 ---
 
 # Description
@@ -37,3 +37,13 @@ Page-only fixes, one surface at a time, reusing existing components (R15). The c
 # Notes
 
 [watermelon-full-preview] Filed 2026-11-26 from the #2298 vibe-talk-ui-rules-and-design-review pilot (report §6, findings §6.2 and §6.3; two further pilot findings were withdrawn on re-inspection and are not here). Owner-UI fast-track applies when the page-nits lane picks this up. If the owner later settles the density question, file the target/gap work as its own issue rather than widening this one.
+
+## More findings from the #2297 review (2026-11-26)
+
+The advisory design review of #2297 vibe-talk-settings-header-layout (screenshot matrix 73-77 plus Settings states 155/156, light and dark, android-412 and laptop-1280) also found these. All of them predate #2297, which does not change them. The coordinator added them here. The dark-composer finding (R14) is left out because #2294 vibe-talk-dark-composer-black fixes it.
+
+6. Channel Settings "?" (R9 targets): on a phone the "?" beside the channel select is about 24 CSS px across and about 8 CSS px from the select (shots 155/156, android-412), so a 48 px hit area would overlap the select. This is part of the touch-target sizing question deferred to the owner above. Record it there and do not resize it under this issue.
+7. Focused composer, filled Send (R13 with R3): with the Discuss composer focused on a phone (76-discuss-keyboard-open, both themes), the filled, prominent Send belongs to the unfocused channel composer, and Discuss's own Send is the quiet one. Only the focused composer's Send should be prominent.
+8. Pace and Read both filled (R3): Pace and Read are both filled primary buttons in the phone control bar (73-75), and the channel Send is filled too, so up to three filled buttons share one screen.
+9. Discuss status sentence (R5): after a summary, the Discuss header reads "Read 7 unread of 7. Older messages weren't fetched, so this covers the newest part only — summarize again later to include more of them.", three lines on a phone (74-discuss-summary). Show a short status with the detail one tap away.
+10. Settings card gap (R10 spacing): the Settings section cards are about 10 CSS px apart, which is off the 4/8 scale, while the gap from the header buttons to the first card is 12 (155/156, both sizes).
