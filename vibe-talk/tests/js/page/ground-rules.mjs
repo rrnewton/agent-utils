@@ -227,7 +227,7 @@ test("`#624 voice-page-modularity`: each column keeps its own records of its old
   assert.deepStrictEqual(JSON.parse(same("JSON.stringify([columns.side.load.generation, columns.side.load.freshness, loadState().freshness])")),
     [1, "slow", "fresh"]);
   assert.deepStrictEqual(JSON.parse(JSON.stringify(page.preludeBinding("freshLoadState")())),
-    { freshness: "fresh", freshAt: 0, refreshing: false, lineTimer: null, generation: 0 });
+    { freshness: "fresh", freshAt: 0, refreshing: false, generation: 0 });
   // And entering a view.
   assert.equal(same("inColumn(columns.side, () => entryState()) === columns.side.entry && entryState() === columns.main.entry"), true);
   assert.deepStrictEqual(JSON.parse(JSON.stringify(page.preludeBinding("freshEntryState")())),

@@ -6002,12 +6002,6 @@ const TUNING_BANDS = {
     "how long a dropped live stream waits before reconnecting. Under a second it hammers a " +
     "server that is already unwell; past a couple of minutes the channel view is stale for long " +
     "enough that the reader trusts it and should not"],
-  // `#226 page-energy-profile`.
-  LOADING_LINE_DELAY_MS: [300, 3000,
-    "how long a refresh nobody asked for may be out before its loading line shows over the rows. " +
-    "Under a third of a second an ordinary poll puts the line and its spinner up and takes them down " +
-    "again, laying the whole history out twice for a word the pill already says; past three seconds a " +
-    "slow refresh looks like none"],
   LIVE_HIDDEN_CLOSE_MS: [30000, 600000,
     "how long a hidden page with no call keeps its live stream. Under half a minute a glance at " +
     "another app closes and reopens it, and comes back to a pill without 'Live' while it does; past " +

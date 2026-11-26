@@ -12,7 +12,7 @@ const CHANNEL = await moduleForTests("src/view/channel/index.ts");
 
 test("fresh column records start as they always did, and share nothing", () => {
   assert.deepEqual(CHANNEL.freshLoadState(), {
-    freshness: "fresh", freshAt: 0, refreshing: false, lineTimer: null, generation: 0,
+    freshness: "fresh", freshAt: 0, refreshing: false, generation: 0,
   });
   assert.deepEqual(CHANNEL.freshScrollPlace(), { jumpWanted: false, inScrollback: false });
   assert.deepEqual(CHANNEL.freshScrollTools(), { held: 0, owed: false });

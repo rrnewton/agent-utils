@@ -200,7 +200,6 @@ export interface LoadState {
   freshness: string;
   freshAt: number;
   refreshing: boolean;
-  lineTimer: ReturnType<typeof setTimeout> | null;
   generation: number;
 }
 
@@ -218,13 +217,13 @@ export interface ScrollToolsState {
 
 /**
  * A column's own record of its reads' state (`#624 voice-page-modularity`, plan step 15, as
- * `freshOlderPages`): `freshness` and `freshAt` and `refreshing` below; `lineTimer`, the loading line's
- * timer (`renderChannelLoading`); `generation`, bumped by each read the column starts, so a completed
- * read can tell whether it still describes the column (`currentDiscordLoad`).
+ * `freshOlderPages`): `freshness` and `freshAt` and `refreshing` below; `generation`, bumped by each
+ * read the column starts, so a completed read can tell whether it still describes the column
+ * (`currentDiscordLoad`).
  *
  */
 export function freshLoadState(): LoadState {
-  return { freshness: "fresh", freshAt: 0, refreshing: false, lineTimer: null, generation: 0 };
+  return { freshness: "fresh", freshAt: 0, refreshing: false, generation: 0 };
 }
 
 /**

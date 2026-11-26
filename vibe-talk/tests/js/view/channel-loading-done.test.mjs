@@ -15,7 +15,7 @@ const ANNOTATIONS = await moduleForTests("src/core/annotations/index.ts");
 function makeLoading() {
   const calls = [];
   const indicator = { hidden: true, textContent: "" };
-  const state = { refreshing: false, lineTimer: null, view: "main" };
+  const state = { refreshing: false, view: "main" };
   const loading = CHANNEL.createChannelLoading({
     el: () => indicator,
     loadState: () => state,
@@ -40,7 +40,17 @@ test("the loading line shows for an asked read, hides after, and stays quiet ove
   assert.equal(indicator.hidden, true);
   assert.equal(state.refreshing, false);
   assert.deepEqual(calls, ["freshness", "freshness", "freshness", "freshness"]);
-  assert.equal(CHANNEL.LOADING_LINE_DELAY_MS, 1000);
+});
+
+test("a background read over rows never puts the line up; the pill says it is out (#2291)", () => {
+  const { loading, indicator, state, calls } = makeLoading();
+  loading.renderChannelLoading(true, false, true);
+  assert.equal(indicator.hidden, true, "a refresh nobody asked for put the in-flow line up over the rows");
+  assert.equal(state.refreshing, true, "the pill was not told the read is out");
+  loading.renderChannelLoading(false);
+  assert.equal(indicator.hidden, true);
+  assert.equal(state.refreshing, false);
+  assert.deepEqual(calls, ["freshness", "freshness"]);
 });
 
 test("only a read nothing the reader did asked for is background", () => {

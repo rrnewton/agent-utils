@@ -1464,8 +1464,8 @@ async function loadTimeline(options?: TimelineReadOptions): Promise<void> {
   // rows in it: a quiet read queued with one for a view that has nothing to draw shows the line.
   const ownAct = Boolean(options && options.ownAct);
   const rowsUp = el(view === "threads" ? "thread-list" : "discord-log").children.length > 0;
-  // `#226 page-energy-profile`. A refresh nobody asked for, over rows on screen, shows its line only
-  // once it has been out for `LOADING_LINE_DELAY_MS`: the pill already says "refreshing…".
+  // `#2291 vibe-talk-top-anchor-arrival-27px-race`. A refresh nobody asked for, over rows on screen,
+  // never puts the in-flow line up over them, however slow: the pill says "refreshing…".
   renderChannelLoading(true, Boolean(options && options.quiet) && rowsUp, rowsUp && backgroundRead(options));
   /** @type {VibeTalk.TimelineResponse[]} every page this refresh folded, in order */
   const landed: TimelineResponse[] = [];
@@ -2463,7 +2463,9 @@ async function loadDiscord(options?: TimelineReadOptions): Promise<void> {
   }
   const area = el("scroll-area");
   const position = channelReadPosition(area);
-  renderChannelLoading(true);
+  // `#2291 vibe-talk-top-anchor-arrival-27px-race`. As for a timeline read: a refresh nobody asked
+  // for, over rows on screen, never puts the in-flow line up over them; the pill says "refreshing…".
+  renderChannelLoading(true, false, el("discord-log").children.length > 0 && backgroundRead(options));
   try {
     if (!keepPosition) {
       setStatus("fetching the channel…");

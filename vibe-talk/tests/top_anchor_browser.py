@@ -23,6 +23,17 @@ the old "an arrival still sticks to the bottom"), and an arrival that lands
 while a user-caused change is settling is counted on the Newest chip and never
 undoes the touched row's anchor.
 
+Both arrival walks run once more with their order forced (`#2291
+vibe-talk-top-anchor-arrival-27px-race`): the fake server holds the re-read
+the arrival starts, the page clock is brought past the second after which a
+refresh nobody asked for once put its in-flow "Loading messages…" line over
+the rows (27.7px at 412, moving every row), and the frames are counted while
+the read is out and after it lands. Nothing waits on luck or a wall clock:
+each step waits on its condition (the row drawn, the read at the server, the
+read landed), and the hold only delays the fake server's answer. A channel
+without threads re-reads on its poll, not on an arrival, and put the line up
+at once for every poll until `#2291`: its forced walk holds the poll's read.
+
 Quote/reply-box opening is covered by `#2063`'s quote-still check (the box docks
 at the pane foot instead of scrolling the list); this check's keeper guard is
 what keeps that dock from being dragged to the foot while it settles.
@@ -39,7 +50,8 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
+from urllib.parse import parse_qs, urlsplit
 
 import offline_cache_browser as fixture
 import page_sources
@@ -58,6 +70,12 @@ LONG = PROSE * 2
 COUNT = 90
 STATE_S = 30.0
 STILL_PX = 1.0
+# How far the forced walks bring the page clock on while the arrival's re-read is held: past the
+# second (`#226 page-energy-profile`) after which a refresh nobody asked for put its in-flow loading
+# line over the rows until `#2291`, so a line timed off a read's age would be up when frames count.
+SLOW_READ_MS = 2_000
+# Past the channel's own 45 s re-read (`DISCORD_POLL_MS`), brought forward on the page clock.
+POLL_PAST_MS = 46_000
 
 
 def message_id(index: int) -> str:
@@ -95,8 +113,28 @@ class AnchorApi(fixture.FakeApi):
         self.frames.put(f"id: {event_id}\nevent: {event}\ndata: {json.dumps(body)}\n\n".encode())
 
 
+class FlatAnchorApi(AnchorApi):
+    """The same ninety messages from a provider without threads: the page reads `/page`, not `/timeline`."""
+
+    def client_config(self, scope: str) -> Json:
+        config = super().client_config(scope)
+        config["threading_supported"] = False
+        return config
+
+
 def handler(api: AnchorApi) -> type[BaseHTTPRequestHandler]:
     class Handler(handler_for(api)):  # type: ignore[misc]
+        def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's API
+            parts = urlsplit(self.path)
+            if parts.path.startswith("/api/v1/channels/") and parts.path.endswith("/page"):
+                # A channel without threads reads its newest page here, held as `/timeline` is.
+                with api.lock:
+                    api.requests.append(f"GET {self.path}")
+                api.timeline_gate.wait(20)
+                self.json(200, api.timeline(parse_qs(parts.query)))
+                return
+            super().do_GET()
+
         def stream(self) -> None:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -133,6 +171,14 @@ def until(page: Page, script: str, what: str) -> None:
     while time.monotonic() < deadline and not page.evaluate(script):
         page.wait_for_timeout(25)
     check(bool(page.evaluate(script)), what)
+
+
+def until_true(page: Page, test: Callable[[], bool], what: str) -> None:
+    """Wait for a condition on this side (the fake server's record), polling on the page's turn."""
+    deadline = time.monotonic() + STATE_S
+    while time.monotonic() < deadline and not test():
+        page.wait_for_timeout(25)
+    check(test(), what)
 
 
 def settled(page: Page) -> None:
@@ -333,7 +379,111 @@ def arrival_during_act(page: Page, api: AnchorApi, label: str, index: int) -> st
     return f"arrival during act: top {moved:.1f}px/{len(tops)}f, chipped"
 
 
-def open_main(page: Page, touch: bool, windowed: bool) -> None:
+def timeline_reads(api: AnchorApi) -> int:
+    """How many channel reads the fake server has been asked for, held ones included."""
+    with api.lock:
+        return sum(1 for line in api.requests
+                   if line.startswith("GET ") and line.split(" ", 1)[1].split("?", 1)[0].endswith(("/timeline", "/page")))
+
+
+REREAD_STATE = """() => ({
+  line: !document.getElementById('channel-loading').hidden,
+  pill: document.getElementById('channel-freshness').textContent || '',
+})"""
+
+
+def frames(page: Page, count: int) -> None:
+    """Let `count` animation frames pass, with the probe still sampling."""
+    page.evaluate(f"""() => new Promise((done) => {{
+        let n = 0; const s = () => (++n >= {count} ? done() : requestAnimationFrame(s));
+        requestAnimationFrame(s); }})""")
+
+
+def held_reread(page: Page, api: AnchorApi, label: str, begin: Callable[[], None]) -> str:
+    """Hold the re-read `begin` starts at the server, past a slow read's second on the page clock.
+
+    The probe started at the park samples every frame from `begin` through the held read, its
+    landing and 30 more frames. Returns what the page showed while the read was out.
+    """
+    reads = timeline_reads(api)
+    api.timeline_gate.clear()
+    try:
+        begin()
+        until_true(page, lambda: timeline_reads(api) > reads,
+                   f"{label}: the channel's re-read never reached the server")
+        page.clock.fast_forward(SLOW_READ_MS)
+        frames(page, 30)
+        held = page.evaluate(REREAD_STATE)
+    finally:
+        api.timeline_gate.set()
+    check("refreshing" in str(held["pill"]),
+          f"{label}: the pill did not say the held re-read was out: {held['pill']!r}")
+    until(page, "() => !/refreshing/.test(document.getElementById('channel-freshness').textContent || '')",
+          f"{label}: the held re-read never landed")
+    return "line up" if held["line"] else "pill only"
+
+
+def forced_arrival_at_foot(page: Page, api: AnchorApi, label: str) -> str:
+    """`arrival_holds` with its order forced: the arrival's re-read is out, slow, and lands."""
+    start = park(page, COUNT - 3, "end")
+
+    def arrive() -> None:
+        arrived = api.add("A message arriving live while the channel's re-read is slow.")
+        api.push("message", {"message": arrived}, str(arrived["id"]))
+        until(page, f"() => !!document.querySelector(\"#discord-log > li[data-id='{arrived['id']}']\")",
+              f"{label}: the live message was never drawn")
+
+    shown = held_reread(page, api, label, arrive)
+    tops = probe_frames(page)
+    moved = max((abs(t - float(start["top"])) for t in tops), default=0.0)
+    check(moved <= STILL_PX,
+          f"{label}: a live arrival at the foot, its re-read slow ({shown}), moved the reading row "
+          f"{moved:.1f}px over {len(tops)} frames")
+    until(page, "() => document.getElementById('jump-newest').hasAttribute('data-arrivals')",
+          f"{label}: the arrival below the reader was not counted on the Newest chip")
+    settled(page)
+    return f"forced arrival at the foot: top {moved:.1f}px/{len(tops)}f, {shown}, chipped"
+
+
+def forced_arrival_during_act(page: Page, api: AnchorApi, label: str) -> str:
+    """`arrival_during_act` with its order forced: the arrival's re-read is out, slow, and lands."""
+    park(page, COUNT - 1, "end")
+    index = end_target(page, label)
+    start = park(page, index, "end")
+    check(float(start["top"]) > 0, f"{label}: the touched row's top is off screen at the foot")
+
+    def arrive() -> None:
+        page.locator(f"#discord-log > li[data-id=\"{message_id(index)}\"] button.fold").click(force=True)
+        arrived = api.add("A message arriving live while the expand settles and the re-read is slow.")
+        api.push("message", {"message": arrived}, str(arrived["id"]))
+        until(page, f"() => document.querySelector('#discord-log > li[data-id=\"{message_id(index)}\"]')"
+                    ".getAttribute('data-collapsed') === 'false'", f"{label}: the expand never landed")
+        until(page, f"() => !!document.querySelector(\"#discord-log > li[data-id='{arrived['id']}']\")",
+              f"{label}: the live message was never drawn")
+
+    shown = held_reread(page, api, label, arrive)
+    tops = probe_frames(page)
+    moved = max((abs(t - float(start["top"])) for t in tops), default=0.0)
+    check(moved <= STILL_PX,
+          f"{label}: an arrival during the act, its re-read slow ({shown}), moved the touched top "
+          f"{moved:.1f}px over {len(tops)} frames")
+    until(page, "() => document.getElementById('jump-newest').hasAttribute('data-arrivals')",
+          f"{label}: the arrival during the act was not counted on the Newest chip")
+    return f"forced arrival during act: top {moved:.1f}px/{len(tops)}f, {shown}, chipped"
+
+
+def forced_poll_at_foot(page: Page, api: AnchorApi, label: str) -> str:
+    """A channel without threads: its poll's read held slow at the server moves no row (`#2291`)."""
+    start = park(page, COUNT - 3, "end")
+    shown = held_reread(page, api, label, lambda: page.clock.fast_forward(POLL_PAST_MS))
+    tops = probe_frames(page)
+    moved = max((abs(t - float(start["top"])) for t in tops), default=0.0)
+    check(moved <= STILL_PX,
+          f"{label}: the poll's slow read ({shown}) moved the reading row {moved:.1f}px over {len(tops)} frames")
+    return f"forced poll at the foot, no threads: top {moved:.1f}px/{len(tops)}f, {shown}"
+
+
+def open_main(page: Page, touch: bool, windowed: bool, threads: bool = True) -> None:
     page.fill("#api-token", TOKEN)
     page.click("#save-token")
     try:
@@ -344,7 +494,9 @@ def open_main(page: Page, touch: bool, windowed: bool) -> None:
         pass  # no first-run Welcome on this path (a returning reader, a refusal, or a saved choice)
     page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
     until(page, "() => document.querySelectorAll('#discord-log > li[data-id]').length > 0", "the channel did not open")
-    if touch:
+    if not threads:
+        pass  # one list: no Main to pick, no thread column beside it
+    elif touch:
         page.select_option("#thread-select", "main")
     else:
         page.click("#column-toggle")
@@ -360,8 +512,9 @@ def open_main(page: Page, touch: bool, windowed: bool) -> None:
 
 
 def run(chromium: object, args: argparse.Namespace, label: str, width: int, height: int,
-        touch: bool, scheme: str, windowed: bool, shots_only: bool) -> list[str]:
-    api = AnchorApi()
+        touch: bool, scheme: str, windowed: bool, shots_only: bool, forced: bool = False,
+        flat: bool = False) -> list[str]:
+    api = FlatAnchorApi() if flat else AnchorApi()
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler(api))
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -379,9 +532,23 @@ def run(chromium: object, args: argparse.Namespace, label: str, width: int, heig
             page = context.pages[0]
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))
+            if forced:
+                # Time flows as normal; the forced walks step it past a slow read's second.
+                page.clock.install()
             page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
-            open_main(page, touch, windowed)
+            open_main(page, touch, windowed, threads=not flat)
             name = f"{label}-{'windowed' if windowed else 'full'}"
+            if forced and flat:
+                report.append(f"{name}: {forced_poll_at_foot(page, api, name)}")
+                check(not errors, f"{name}: the page threw: {errors}")
+                context.close()
+                return report
+            if forced:
+                report.append(f"{name}: {forced_arrival_at_foot(page, api, name)}")
+                report.append(f"{name}: {forced_arrival_during_act(page, api, name)}")
+                check(not errors, f"{name}: the page threw: {errors}")
+                context.close()
+                return report
             if args.screenshots:
                 park(page, COUNT - 3, "end")
                 page.screenshot(path=str(args.screenshots / f"{name}-before.png"))
@@ -420,6 +587,10 @@ def main() -> int:
         for label, width, height, touch in (("phone-412", 412, 915, True), ("desk-1280", 1280, 800, False)):
             for windowed in (False, True):
                 report += run(playwright.chromium, args, label, width, height, touch, "dark", windowed, False)
+                report += run(playwright.chromium, args, f"{label}-forced", width, height, touch, "dark",
+                              windowed, False, forced=True)
+        report += run(playwright.chromium, args, "phone-412-forced-nothreads", 412, 915, True, "dark", False, False,
+                      forced=True, flat=True)
         if args.screenshots:
             for label, width, height, touch in (("phone-412", 412, 915, True), ("desk-1280", 1280, 800, False)):
                 for scheme in ("light", "dark"):

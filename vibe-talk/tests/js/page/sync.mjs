@@ -28,7 +28,7 @@ import { ALICE, BOTTOM_SLACK_PX, CHANNEL, CHARS_PER_LINE, COUNTS_ALL_READ_MS, CS
   sourceConstant, speakRelay, sseDelete, sseMessage, sseUpdate, startTalking, tagOf, tagged,
   tallChannel, tallColumns, test, threadBadge, threadButton, threadData, threadOptions, threadPage,
   timelineAnswer, turnTodoOn, twoColumnServer, twoColumns, unreadChip, viewOf, watchTurns, wideCard,
-  withLiveChannel, withReplies, yOf, togglePinned } from "./fixture.mjs";
+  withLiveChannel, withReplies, yOf, togglePinned, passTime } from "./fixture.mjs";
 
 /** Placing in its module (`createPlacing`, `#624`): a patch there, and a page built with patches. */
 const placingPatch = ([find, replace]) => ({ file: "src/view/channel/placing.ts", find, replace });
@@ -2498,7 +2498,6 @@ test("coming back after fifteen seconds away reads what changed; a glance away r
 // formatter. These pin each of those away, by what the page does rather than by how long it takes.
 
 const LIVE_HIDDEN_CLOSE_MS = sourceConstant("LIVE_HIDDEN_CLOSE_MS");
-const LOADING_LINE_DELAY_MS = sourceConstant("LOADING_LINE_DELAY_MS");
 
 test("A REFRESH THAT BRINGS NOTHING BUILDS NOTHING: the same rows stay, and what did change still redraws", async () => {
   const { page, server } = await forwardPage();
@@ -2578,7 +2577,10 @@ test("...NOR ONE THAT MARKS A REPLY DONE ON ANOTHER DEVICE: Main's count of it g
   assert.equal(unreadChip(page, "201"), null, "a reply marked Done on another device still counted as unread on Main");
 });
 
-test("A REFRESH NOBODY ASKED FOR, over rows on screen, shows its loading line only once it is slow", async () => {
+test("A REFRESH NOBODY ASKED FOR, over rows on screen, never puts its loading line up, however slow", async () => {
+  // `#2291 vibe-talk-top-anchor-arrival-27px-race`. The line stands in the scroller's flow above the
+  // history: put up over rows on screen, it moved every row by its height, the one being read
+  // included. The pill says the read is out; until `#2291` a poll out past a second showed the line.
   const { page, server } = await forwardPage();
   const line = page.el("channel-loading");
   const held = gate(server.answer);
@@ -2587,17 +2589,16 @@ test("A REFRESH NOBODY ASKED FOR, over rows on screen, shows its loading line on
   await page.settle();
   assert.equal(line.hidden, true, "a poll over rows on screen put its loading line up at once");
   assert.match(page.el("channel-freshness").textContent, /refreshing…$/, "the pill did not say the poll was out");
-  assert.equal(page.expireTimers(LOADING_LINE_DELAY_MS), 1, "nothing waited to show the line of a slow poll");
-  assert.equal(line.hidden, false, "a slow poll never said it was loading");
+  // Out for ten seconds, inside the twenty a read is given before the page gives up on it.
+  await passTime(page, 10_000);
+  assert.equal(line.hidden, true, "a slow poll put its loading line up over the rows");
+  assert.match(page.el("channel-freshness").textContent, /refreshing…$/, "the pill stopped saying the poll was out");
   server.hold = null;
   held.open();
   await page.settle();
   await page.settle();
-  assert.equal(line.hidden, true, "the line outlived its poll");
-  // A quick one never shows it, and leaves nothing waiting to.
-  await pollOnce(page);
-  assert.equal(line.hidden, true);
-  assert.equal(page.expireTimers(LOADING_LINE_DELAY_MS), 0, "a finished poll left its line waiting to show");
+  assert.equal(line.hidden, true, "the line came up as the poll landed");
+  assert.doesNotMatch(page.el("channel-freshness").textContent, /refreshing/, "the pill outlived its poll");
 });
 
 test("THE SCROLLER IS SIZED BY ITS CELL ALONE, so a change beside it does not lay its history out again", () => {
@@ -3340,7 +3341,6 @@ test("`remote-ops-audit` W7: a poll queued behind a read given up on, and then p
   await page.settle();
   assert.equal(page.timelineCalls.length - calls, 1, "fixture: the queued poll was not put off");
   page.setClock(sent + 25000);
-  page.expireTimers(LOADING_LINE_DELAY_MS);
   await page.settle();
   const line = page.el("channel-loading");
   assert.equal(line.hidden, true, `the loading line stayed up with no read out: "${line.textContent}"`);
