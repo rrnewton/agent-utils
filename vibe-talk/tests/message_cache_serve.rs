@@ -1578,13 +1578,22 @@ async fn a_thread_scope_search_asks_from_the_newest_and_never_reads_upstream() {
             (
                 2,
                 vec![
-                    (slack_fake::ts(130, 0), "a quokka reply in thread one".to_owned()),
-                    (slack_fake::ts(140, 0), "a plain reply in thread one".to_owned()),
+                    (
+                        slack_fake::ts(130, 0),
+                        "a quokka reply in thread one".to_owned(),
+                    ),
+                    (
+                        slack_fake::ts(140, 0),
+                        "a plain reply in thread one".to_owned(),
+                    ),
                 ],
             ),
             (
                 3,
-                vec![(slack_fake::ts(190, 0), "a quokka reply in thread two".to_owned())],
+                vec![(
+                    slack_fake::ts(190, 0),
+                    "a quokka reply in thread two".to_owned(),
+                )],
             ),
         ] {
             let mut message = fixture.history[SLACK_CH][index].clone();

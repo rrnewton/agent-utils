@@ -5322,7 +5322,9 @@ def _open_scope_channel(driver: Driver) -> None:
     channel = str(driver.js("document.getElementById('discord-channel').value"))
     if driver.base_url not in _SCOPE_SEEDED:
         start = int(time.time() * 1000) - 20 * 60 * 1000
-        at = lambda step: start + step * 60_000  # noqa: E731 - one line of arithmetic
+
+        def at(step: int) -> int:
+            return start + step * 60_000
         _seed_message(driver, channel, {"author": "codex-eng", "at_ms": at(0),
                                         "text": "a quokka spotted on main: the first sighting of the day"})
         thread_one = [("claude-integ", "thread one: the quokka migration plan"),
@@ -5509,6 +5511,7 @@ def _scope_traced_search(driver: Driver, scene: str) -> None:
     answer_moves, answer_landings, answer_lost = _scope_moves(answer_window)
     settle_window = samples[stood: max(stood + 1, answered)]
     settle_moves, settle_landings, _ = _scope_moves(settle_window)
+    answer_max = max(answer_moves) if answer_moves else None
     record = {
         "scene": scene, "theme": driver.theme, "profile": driver.profile.name,
         "row_stands": {
@@ -5524,7 +5527,7 @@ def _scope_traced_search(driver: Driver, scene: str) -> None:
             "anchor": answer_window[0]["id"],
             "row_standing_at_answer": bool(samples[answered]["row"]),
             "anchor_lost_frames": answer_lost,
-            "max_abs_dy": max(answer_moves) if answer_moves else None,
+            "max_abs_dy": answer_max,
             "covered_first_result_landings_2200": answer_landings,
         },
         "settling_reported_only": {
@@ -5538,7 +5541,7 @@ def _scope_traced_search(driver: Driver, scene: str) -> None:
     path.write_text(json.dumps(record, indent=1) + "\n", encoding="utf-8")
     if answer_lost or not answer_moves or max(answer_moves) > 0.5:
         raise Unreachable(scene, "the reading row stays put as the answer lands and the row stands (dy 0)",
-                          f"moved {record['answer']['max_abs_dy']} px, anchor lost {answer_lost} frames; sidecar {path.name}")
+                          f"moved {answer_max} px, anchor lost {answer_lost} frames; sidecar {path.name}")
     driver.settle(300)
 
 
