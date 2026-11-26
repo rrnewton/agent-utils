@@ -184,6 +184,8 @@ class Walk:
         self.phone = phone
         self.shots = shots
         self.tag = tag
+        # The "holds still" evidence: each act's anchor text and rect.top before and after.
+        self.sidecar: dict[str, object] = {"corner": tag}
         page.add_init_script(
             f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)});"
             " localStorage.setItem('vibe-talk.welcome.dismissed', '1'); } catch (e) {}")
@@ -202,6 +204,10 @@ class Walk:
     def shot(self, name: str) -> None:
         if self.shots is not None:
             self.page.screenshot(path=str(self.shots / f"{self.tag}-{name}.png"))
+
+    def write_sidecar(self) -> None:
+        if self.shots is not None:
+            (self.shots / f"{self.tag}-sidecar.json").write_text(json.dumps(self.sidecar, indent=1) + "\n")
 
     def fits(self, what: str) -> None:
         check(bool(self.page.evaluate(PANES_FIT)),
@@ -294,7 +300,10 @@ class Walk:
             "() => document.getElementById('discuss-panel').getAttribute('data-timeline-size') === 'kept'")
         grown = height(page, "discuss-timeline")
         check(grown >= start + 100, f"{self.tag}: the drag did not move the boundary: {start} -> {grown}")
-        check(abs(top(page, "#discuss-current-heading") - summary_top) < 0.5,
+        dragged_top = top(page, "#discuss-current-heading")
+        self.sidecar["drag"] = {"anchor": "Current summary heading", "top_before": summary_top, "top_after": dragged_top,
+                                "timeline_before": start, "timeline_after": grown, "kept": self.kept()}
+        check(abs(dragged_top - summary_top) < 0.5,
               f"{self.tag}: the summary moved under the boundary drag")
         # The kept height is the dragged one; the flex layout may round the pane a pixel or two.
         check(abs(float(str(self.kept())) - grown) <= 3,
@@ -317,6 +326,8 @@ class Walk:
             " return { at, text: rows[at].textContent.trim().slice(0, 60), top: rows[at].getBoundingClientRect().top }; })()")
         check(held is not None, f"{self.tag}: no summary row in view to hold")
         reading = float(held["top"])
+        scrolls: list[dict[str, object]] = []
+        self.sidecar["timeline_scroll"] = {"anchor": held["text"], "top_before": reading, "after": scrolls}
         for where in ("middle", "end", "start"):
             page.evaluate(
                 "(w) => { const t = document.getElementById('discuss-timeline');"
@@ -326,7 +337,9 @@ class Walk:
                 "(w) => { const t = document.getElementById('discuss-timeline'); const max = t.scrollHeight - t.clientHeight;"
                 " return w === 'start' ? t.scrollTop === 0 : w === 'end' ? Math.abs(t.scrollTop - max) <= 1 : t.scrollTop > 0; }",
                 arg=where)
-            check(abs(self.held_top(held) - float(reading)) < 0.5,
+            now_top = self.held_top(held)
+            scrolls.append({"timeline_at": where, "top": now_top})
+            check(abs(now_top - float(reading)) < 0.5,
                   f"{self.tag}: the summary row moved when the timeline scrolled to its {where}")
             check(page.evaluate("document.getElementById('discuss-current-section').scrollTop") == summary_scroll,
                   f"{self.tag}: the summary pane scrolled with the timeline")
@@ -351,11 +364,14 @@ class Walk:
             f"() => document.getElementById('discuss-latest').textContent.includes({json.dumps(question)})")
         page.wait_for_function(
             f"() => document.getElementById('discuss-timeline').children.length > {rows_before}")
-        check(abs(self.held_top(held) - float(reading)) < 0.5,
+        grew_top = self.held_top(held)
+        check(abs(grew_top - float(reading)) < 0.5,
               f"{self.tag}: the summary row moved when the timeline grew")
         moved = page.evaluate(
             "(k) => { const row = document.querySelector(`#discuss-timeline > [data-entry-key=\"${k}\"]`);"
             " return row ? row.getBoundingClientRect().top : null; }", anchor["key"])
+        self.sidecar["timeline_grow"] = {"summary_anchor": held["text"], "summary_top_before": reading, "summary_top_after": grew_top,
+                                         "timeline_anchor": anchor["key"], "timeline_top_before": anchor["top"], "timeline_top_after": moved}
         check(moved is not None and abs(float(moved) - float(anchor["top"])) < 0.5,
               f"{self.tag}: the timeline row being read moved when the timeline grew: {anchor} -> {moved}")
         self.fits("after the timeline grew")
@@ -454,6 +470,8 @@ class Walk:
         after = page.evaluate(
             "(n) => [...document.querySelectorAll('#discuss-current-heading, #discuss-answer > *')]"
             ".map((r) => r.getBoundingClientRect().top).slice(0, n)", len(rows))
+        self.sidecar["blur"] = {"anchors": "Current summary heading and the summary's visible rows", "tops_composing": rows,
+                                "tops_after_blur": after, "frames": ["phone-light-composing.png", "phone-light-after-blur.png"]}
         check(all(abs(a - b) < 0.5 for a, b in zip(rows, after)),
               f"{self.tag}: a summary row moved when the Summarize bar came back on blur: {rows} -> {after}")
         self.fits("after blur")
@@ -514,6 +532,7 @@ def walk(page: Page, phone: bool, shots: Path | None, tag: str) -> None:
             drive.fits("the half sheet")
             drive.composing_blur()
             drive.keyboard_open()
+        drive.write_sidecar()
     finally:
         instance.close()
 
