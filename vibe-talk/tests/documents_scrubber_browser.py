@@ -32,7 +32,7 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import cast
 
-from playwright.sync_api import Locator, Page, sync_playwright
+from playwright.sync_api import BrowserContext, Locator, Page, sync_playwright
 
 from browser_audio import CHROMIUM_AUDIO_ARGS
 import documents_read_browser as harness
@@ -190,6 +190,7 @@ def click_centre(page: Page, locator: Locator, touch: bool, what: str) -> None:
     """Tap `locator` by coordinates, after proving the point hits it."""
     box = locator.bounding_box(timeout=20_000)
     check(box is not None, f"{what} has no box to tap")
+    assert box is not None
     x = box["x"] + box["width"] / 2
     y = box["y"] + box["height"] / 2
     handle = locator.element_handle(timeout=20_000)
@@ -551,7 +552,7 @@ def main() -> int:
             with sync_playwright() as pw:
                 browser = pw.chromium.launch(args=CHROMIUM_AUDIO_ARGS)
 
-                def fresh_page(width: int, height: int, touch: bool):
+                def fresh_page(width: int, height: int, touch: bool) -> tuple[BrowserContext, Page]:
                     ctx = browser.new_context(
                         viewport={"width": width, "height": height}, has_touch=touch, is_mobile=touch)
                     browser_waits.hot_host_timeouts(ctx)
