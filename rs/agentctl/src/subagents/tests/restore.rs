@@ -5523,3 +5523,70 @@ fn restore_never_resumes_a_lane_whose_plan_only_skips_its_lifecycle() {
     assert!(row.get("resumed").is_none(), "{report}");
     assert_eq!(report["resumed_lanes"], json!([]), "{report}");
 }
+
+#[test]
+fn watch_answers_a_lane_at_the_hooks_dialog_and_never_reads_a_hooks_directory_as_an_agent() {
+    // #2237: a registry's `hooks/` directory holding only a hook script,
+    // top-level (layout 1) or under `agents/` (layout 2), is no agent: the
+    // watch's hooks sweep answers the real Muse lane at the dialog and
+    // reports nothing about "hooks".
+    for current in [false, true] {
+        let fixture = Fixture::new();
+        fixture
+            .manager()
+            .start(
+                "lane",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    harness: "muse".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        *fixture.client.status.lock().unwrap() = Some("idle".to_owned());
+        *fixture.client.screen.lock().unwrap() = Some(super::hooks_trust::DIALOG.to_owned());
+        let registry = fixture.root.join("registry");
+        let hooks = if current {
+            registry.join("agents/hooks")
+        } else {
+            registry.join("hooks")
+        };
+        fs::create_dir_all(&hooks).unwrap();
+        fs::write(hooks.join("permission-autodeny.py"), "#!/bin/sh\n").unwrap();
+        let host = ScriptedHost::new();
+        let findings = watch_once(
+            &fixture.client,
+            &registry,
+            &host,
+            &RestoreConfig {
+                units: Vec::new(),
+                ..config(&fixture, None)
+            },
+            &WatchOptions {
+                interval: Duration::from_secs(60),
+                once: true,
+                check_only: false,
+                wrkslots: None,
+                state_dir: Some(fixture.root.join("watch")),
+                queue_stale: Duration::from_secs(600),
+            },
+            &mut Default::default(),
+            &mut Default::default(),
+        );
+        let hooks_trust: Vec<&Value> = findings
+            .iter()
+            .filter(|row| row["check"] == "hooks_trust")
+            .collect();
+        assert_eq!(hooks_trust.len(), 1, "current={current}: {findings:?}");
+        assert_eq!(hooks_trust[0]["subject"], "lane", "{findings:?}");
+        assert_eq!(hooks_trust[0]["ok"], true, "{findings:?}");
+        assert!(
+            !findings.iter().any(
+                |row| row["subject"] == "hooks" || row.to_string().contains("hooks/agent.json")
+            ),
+            "current={current}: {findings:?}"
+        );
+        assert_eq!(fixture.client.hooks_answers.lock().unwrap().len(), 1);
+    }
+}

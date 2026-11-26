@@ -2,7 +2,7 @@
 //! reaches only this registry's managed Muse lanes.
 use super::*;
 
-const DIALOG: &str = "Review plugin hooks\n\
+pub(super) const DIALOG: &str = "Review plugin hooks\n\
     39 new or changed hooks need your trust.\n\
     Hooks run commands on your machine when their event matches.\n\
     Approval follows the declaration, including after script updates.\n\
@@ -296,4 +296,108 @@ fn a_relaunch_launch_skips_pretrust() {
         )
         .unwrap();
     assert!(fixture.client.pretrust_calls.lock().unwrap().is_empty());
+}
+
+/// Put a `hooks/` directory holding only a hook script into `registry`,
+/// top-level (layout 1) or under `agents/` (layout 2), as an operator does.
+fn hooks_directory(registry: &Path, current: bool) {
+    let hooks = if current {
+        registry.join("agents/hooks")
+    } else {
+        registry.join("hooks")
+    };
+    fs::create_dir_all(&hooks).unwrap();
+    fs::write(hooks.join("permission-autodeny.py"), "#!/bin/sh\n").unwrap();
+}
+
+#[test]
+fn a_hooks_directory_beside_a_lane_is_never_listed_as_an_agent() {
+    // #2237: list, the watcher's rows and the hooks sweep's listing name
+    // only the real lane, in either layout; doctor leaves a top-level
+    // script directory alone (its mode included: it is the operator's,
+    // not an agent directory) and still reports a recordless directory
+    // under `agents/`, which only agentctl writes.
+    for current in [false, true] {
+        let fixture = Fixture::new();
+        let manager = start_muse(&fixture);
+        let registry = fixture.root.join("registry");
+        hooks_directory(&registry, current);
+        let names = |rows: Vec<Value>| -> Vec<String> {
+            rows.iter()
+                .map(|row| row["name"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(
+            names(manager.list().unwrap()),
+            ["coord"],
+            "current={current}"
+        );
+        assert_eq!(
+            names(manager.watch_rows().unwrap()),
+            ["coord"],
+            "current={current}"
+        );
+        assert_eq!(
+            agent_queue::registry::names(&registry).unwrap(),
+            ["coord"],
+            "current={current}"
+        );
+        let doctor = manager.doctor(false).unwrap();
+        let hooks_rows: Vec<&Value> = doctor["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["name"] == "hooks")
+            .collect();
+        if current {
+            assert_eq!(hooks_rows.len(), 1, "{doctor}");
+        } else {
+            assert!(hooks_rows.is_empty(), "{doctor}");
+        }
+    }
+}
+
+#[test]
+fn a_lane_stopped_while_the_answer_waits_for_its_lock_gets_no_keypress() {
+    // #2237: the sweep listed the lane and read its record, then a stop,
+    // holding the lifecycle lock, removed the record. Read again under
+    // the lock, the record is gone: nothing to answer, not "unknown agent".
+    let fixture = Fixture::new();
+    let manager = start_muse(&fixture);
+    show_dialog(&fixture);
+    let registry = fixture.root.join("registry");
+    let directory = agent_queue::registry::directory(&registry, "coord").unwrap();
+    let stop = manager.lock("coord").unwrap();
+    let outcome = std::thread::scope(|scope| {
+        let answer = scope.spawn(|| fixture.manager().answer_hooks_trust_if_dialog("coord"));
+        // Wait on the condition (the answer visibly waits for the lock),
+        // however loaded the host is; the guard only reports a hang.
+        let guard = std::time::Instant::now() + Duration::from_secs(600);
+        while !answer.is_finished()
+            && crate::lock_wait::contention(&registry, "coord")["waiters"]
+                .as_array()
+                .map_or(0, Vec::len)
+                == 0
+        {
+            assert!(
+                std::time::Instant::now() < guard,
+                "the answer never waited for the lock"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !answer.is_finished(),
+            "the answer must wait for the stop's lock"
+        );
+        fs::rename(&directory, fixture.root.join("stopped-coord")).unwrap();
+        drop(stop);
+        answer.join().unwrap()
+    });
+    assert_eq!(outcome.unwrap(), None);
+    assert!(fixture.client.hooks_answers.lock().unwrap().is_empty());
+    assert_eq!(
+        fixture.client.screen.lock().unwrap().as_deref(),
+        Some(DIALOG),
+        "no key reached the pane"
+    );
 }

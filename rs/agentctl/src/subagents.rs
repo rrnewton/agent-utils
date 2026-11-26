@@ -10567,15 +10567,28 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             // Doctor must also see recordless directories (an orphan queue
             // is its finding), so it lists both layouts raw: `names` itself
             // now lists only directories holding a record (#2121).
+            let current = agent_queue::registry::current_names(&self.registry)
+                .map_err(|error| fail(error.to_string()))?;
             let mut names = agent_queue::registry::legacy_names(&self.registry)
                 .map_err(|error| fail(error.to_string()))?;
-            names.extend(
-                agent_queue::registry::current_names(&self.registry)
-                    .map_err(|error| fail(error.to_string()))?,
-            );
+            names.extend(current.iter().cloned());
             names.sort();
             names.dedup();
             for agent_name in names {
+                // A top-level directory with neither a record nor a queue,
+                // and no rename naming it, is the operator's own (a `hooks/`
+                // script directory, #2237), not an agent directory: it is
+                // neither read nor held to an agent directory's rules.
+                if !current.contains(&agent_name)
+                    && !journal_names.contains(agent_name.as_str())
+                    && agent_queue::registry::record_directories(&self.registry, &agent_name)
+                        .is_ok_and(|directories| directories.is_empty())
+                    && !agent_queue::registry::legacy_directory(&self.registry, &agent_name)
+                        .join("queue")
+                        .exists()
+                {
+                    continue;
+                }
                 match self.read_record_for_scan(&agent_name) {
                     Ok(Some(record)) => records.push(record),
                     // A rename journal explains a missing record better than an orphan does.
