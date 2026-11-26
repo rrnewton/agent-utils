@@ -1,6 +1,6 @@
 ---
 title: 'agentctl-restore-legacy-report-scope: a registry never reads another registry''s legacy shared restore report as its own'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
@@ -8,7 +8,7 @@ labels:
 - restore
 - watch
 created_at: 2026-11-24T13:28:00-05:00
-updated_at: 2026-11-24T13:28:00-05:00
+updated_at: 2026-11-26T07:45:00-05:00
 ---
 
 # Description
@@ -32,3 +32,13 @@ Seen on 2026-11-24. On a host up since 2026-11-02, one team's `agentctl watch` r
 # Notes
 
 Related: #975 (boot-restore retry, shared state directory), #1359 (reports under the registry), #1405 (restore epochs), #1426 (unprovable pre-epoch report not alarmed).
+
+## Resolution
+
+Landed on main in the agentctl stack a724562b..7e89d795 (12 commits replayed by land-main from the gated 62a72cde, the same patch, in the order #2218, #2214, #2222, #2217), as ebc409d7 and 103132a1. Gate ticket 1795671224491121398-107888b7: full selection, 65 steps, pass, finished 7:32 AM ET on 2026-11-26 (rust.agentctl 3106 passed, 0 failed; both python.agentctl shards ran, 1457 passed each).
+
+- Every new restore report records `registry_id` (the per-team key) and `registry_path` (the canonical registry path), at both write sites in `restore()`.
+- A report found in the legacy shared directory counts for a registry only when its recorded identity matches. A report from before the identity fields counts only when every agent it names exists in the registry and its coordinator is the registry's coordinator (restore.json or designated). `boot_report_state`, `read_boot_report`, restore-teams' recorded-report read, team verify's snapshot and the team driver's ack clock all apply the same proof.
+- `restore --dry-run` names a foreign shared report once, as `foreign_legacy_report`. Reports in a registry's own legacy locations keep their meaning.
+- Tests (`rs/agentctl/src/subagents/tests/restore.rs`, `restore.rs`): `a_foreign_shared_report_counts_for_no_registry`, `a_shared_report_matching_this_registry_still_counts`, `a_recorded_registry_identity_decides_shared_attribution`, `restore_reports_carry_the_registry_identity`.
+- New persisted fields: `registry_id`, `registry_path` and the dry run's `foreign_legacy_report`, all additive; the consumer whose pinned reader reads restore reports accepted them before landing.
