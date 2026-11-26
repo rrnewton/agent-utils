@@ -2106,8 +2106,9 @@ class Runner:
                 if monitor_stop.wait(max(0.0, deadline - time.monotonic())):
                     return
                 now = time.monotonic()
-                trace_due = trace_interval is not None and now >= next_trace_deadline
-                if trace_due:
+                trace_due = False
+                if trace_interval is not None and now >= next_trace_deadline:
+                    trace_due = True
                     _capture_timeseries_sample("periodic")
                     # Advance from the absolute schedule rather than from the end of the read.
                     # A slow sample therefore exposes a long actual interval instead of drifting
