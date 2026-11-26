@@ -3142,6 +3142,41 @@ test("`#1839 vibe-talk-composer-stays-in-view-while-dictating`: while a composer
   assert.equal(area.scrollTop, 300, "with no composer held, a still list was moved");
 });
 
+test("`#2292 vibe-talk-windowed-composer-foot-fight`: the owner's composer hold, for writers outside its holds: where it stands, and one write back", () => {
+  const { createScrollKeeping } = CHANNEL_VIEW;
+  const log = { id: "discord-log", children: [] };
+  const writes = [];
+  const area = { _top: 300, getBoundingClientRect: () => ({ top: 0, bottom: 100 }) };
+  Object.defineProperty(area, "scrollTop", { get() { return this._top; }, set(value) { writes.push(value - this._top); this._top = value; } });
+  const els = { "discord-log": log, "pinned-log": { id: "pinned-log", children: [] }, "scroll-area": area, "load-older": { hidden: true, getBoundingClientRect: () => ({ top: 0 }) }, transcript: { children: [] } };
+  // The composer's box moves with the list, standing in view at top 60 of a 100 px band.
+  let offset = 360;
+  const composer = { getBoundingClientRect: () => { const top = offset - area.scrollTop; return { top, bottom: top + 40, height: 40 }; } };
+  let held = composer;
+  const keep = createScrollKeeping({
+    el: (id) => els[id], onMain: () => true, currentView: () => "discord", channelView: () => "main", pinnedOnly: () => false,
+    heldFilterRow: () => null, searchWalk: () => null, atBottom: () => false,
+    scrollToNewest: () => { throw new Error("the newest line was followed while the composer held the view"); },
+    renderJumpNewest: () => {}, setJumpNewest: () => {},
+    composerHeld: () => held,
+  });
+  const before = keep.heldComposerTop(area);
+  assert.equal(before, 60, "the held composer's top in view was not measured");
+  // A row drawn above it (a windowed re-slice, an arrival) pushes it down 25 px: one write puts it back.
+  offset += 25;
+  assert.equal(keep.keepComposer(area, before), true, "the composer keep did not answer for the view");
+  assert.deepEqual(writes, [25], "the composer was not put back with one measured write");
+  assert.equal(composer.getBoundingClientRect().top, 60, "the composer did not stand where it stood");
+  // Out of the band (the reader scrolled up into the history with the box focused), or no composer: nothing to keep.
+  area.scrollTop = 0;
+  writes.length = 0;
+  assert.equal(keep.heldComposerTop(area), null, "a composer below the band was reported as holding the view");
+  held = null;
+  assert.equal(keep.heldComposerTop(area), null, "with no composer held, a top was reported");
+  assert.equal(keep.keepComposer(area, 60), false, "with no composer held, the keep answered for the view");
+  assert.deepEqual(writes, [], "with no composer held, the list was moved");
+});
+
 test("`#1839 vibe-talk-composer-stays-in-view-while-dictating`: the drill keeper stands down while a composer holds the view", () => {
   const { createThreadEntry, freshEntryState } = CHANNEL_VIEW;
   const record = freshEntryState();

@@ -1,0 +1,20 @@
+steps:
+  # `#2292 vibe-talk-windowed-composer-foot-fight`: while the reader types at the foot and messages
+  # arrive (each with its read's landing), every scroll write is the scroll owner's composer keep and
+  # the composer moves under one whole pixel; and a jump onto the middle of a windowed list has a row
+  # in the band as its scroll is answered. Counts and geometry, no wall-clock budget.
+  - group: check
+    job: windowed-composer-foot-browser
+    desc: typing at the foot through arrivals moves the composer under 1 px with one writer (the composer keep), windowed lists on and off; a jump into a windowed list has a row in the band as answered and painted; in current Chromium at 412x915 by touch with the keyboard up and 1280x800 (#2292)
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/windowed_composer_foot_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools, build.page]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 15
+      classification: latency-bound
+      preferred_inner_jobs: 4
+      rss_baseline_bytes: 1073741824

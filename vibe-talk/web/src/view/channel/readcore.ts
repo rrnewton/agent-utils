@@ -329,6 +329,14 @@ export interface TimelineViewDependencies {
   windowed?(): { prefetchPx: number; rowCap: number } | null;
   /** `#1846` step 5: ids pinned into the window (jump/search target, speaking row). Absent: none. */
   pinnedIds?(): readonly string[];
+  /**
+   * `#2292 vibe-talk-windowed-composer-foot-fight`: the scroll owner's composer hold, for the
+   * writers here that run outside its holds (the windowed renderer, a read's landing). The held
+   * composer's top where it stands in view, else null; and the owner's one write putting it
+   * back there (its foot the keyboard's fitted foot, `#2277`). Absent: no composer is kept here.
+   */
+  heldComposerTop?(area: HTMLElement): number | null;
+  keepComposer?(area: HTMLElement, beforeTop: number): boolean;
   screensView(): string;
   renderJumpNewest(): void;
 }
@@ -379,8 +387,8 @@ export interface TimelineView {
   readRunsSuspended(): boolean;
   applyNewestPage(payload: TimelineResponse, saved?: boolean): number;
   channelReadPosition(area: HTMLElement): { wasAtNewest: boolean; previousTop: number; anchorId: string | null; anchorTop: number; around: { marks: { id: string; top: number }[]; near: ReturnType<typeof rowNeighbours> } | null };
-  settleAfterRead(messages: readonly Message[], how: { area: HTMLElement; keepPosition: boolean; ownAct?: boolean; wasAtNewest: boolean; previousTop: number; anchorId?: string | null; anchorTop?: number; around?: { marks: { id: string; top: number }[]; near: ReturnType<typeof rowNeighbours> } | null; heldPlaceAt?: number }): void;
-  landedReadPosition(area: HTMLElement, keepPosition: boolean, sentAtNewest: boolean): { wasAtNewest: boolean; keepPosition: boolean; previousTop: number; anchorId: string | null; anchorTop: number; around: { marks: { id: string; top: number }[]; near: ReturnType<typeof rowNeighbours> } | null };
+  settleAfterRead(messages: readonly Message[], how: { area: HTMLElement; keepPosition: boolean; ownAct?: boolean; wasAtNewest: boolean; previousTop: number; anchorId?: string | null; anchorTop?: number; around?: { marks: { id: string; top: number }[]; near: ReturnType<typeof rowNeighbours> } | null; heldPlaceAt?: number; composerTop?: number | null }): void;
+  landedReadPosition(area: HTMLElement, keepPosition: boolean, sentAtNewest: boolean): { wasAtNewest: boolean; keepPosition: boolean; previousTop: number; anchorId: string | null; anchorTop: number; around: { marks: { id: string; top: number }[]; near: ReturnType<typeof rowNeighbours> } | null; composerTop: number | null };
   rowIsRead(row: Element): boolean;
   cycleReadMode(): void;
   inView(message: Message, view: string, thread: string | null, scope?: string | null): boolean;
@@ -530,6 +538,12 @@ export function createTimelineView(deps: TimelineViewDependencies): TimelineView
   // height change answering (a fold, a reprice); a second flip in a row is
   // the corrections chasing each other, and that one is not applied.
   let winLastNudge: { key: string; sign: number; flips: number } | null = null;
+  // `#2292 vibe-talk-windowed-composer-foot-fight`: the held composer's top as the outermost
+  // render of this window began (null: no composer holds the view), carried across the
+  // converge and coverage re-renders as `winHoldAnchor` carries the row, and how deep the
+  // renders stand, so only the outermost measures it.
+  let winComposerTop: number | null = null;
+  let winRenderDepth = 0;
 
   function groupHeightPx(group: Message[], bucket: string): number {
     const canon = channelStore.current();
@@ -549,6 +563,25 @@ export function createTimelineView(deps: TimelineViewDependencies): TimelineView
   }
 
   /**
+   * `#2292 vibe-talk-windowed-composer-foot-fight` (c)2: whether the band the reader sees in
+   * `area` stands wholly above the first mounted row of the window in `list`, or wholly below its
+   * last: on spacer, with no row on screen. Constant time: two rows and the area are measured.
+   * False whenever the list is not a standing window, or rows follow its bottom spacer (a row
+   * appended at the foot, which only the next full redraw windows).
+   */
+  function bandMissesWindow(list: HTMLElement, area: HTMLElement): boolean {
+    const head = list.firstElementChild as HTMLElement | null;
+    const foot = list.lastElementChild as HTMLElement | null;
+    if (!head || !foot || head.dataset.windowSpacer !== "top" || foot.dataset.windowSpacer !== "bottom") return false;
+    const first = head.nextElementSibling as HTMLElement | null;
+    const last = foot.previousElementSibling as HTMLElement | null;
+    if (!first || !last || first.dataset.windowSpacer || last.dataset.windowSpacer) return false;
+    const box = area.getBoundingClientRect();
+    const bandFoot = box.top + (area.clientHeight || 0);
+    return first.getBoundingClientRect().top >= bandFoot || last.getBoundingClientRect().bottom <= box.top;
+  }
+
+  /**
    * Draw only the window of `groups` around the reader (`#1846` step 3): spacers carry the
    * unmounted heights (step 2 index), rows outside the slice are measured and unmounted, and
    * the anchor row is held with one measured write through the scroll owner. False when
@@ -557,6 +590,22 @@ export function createTimelineView(deps: TimelineViewDependencies): TimelineView
   function renderWindowed(list: HTMLElement, groups: Message[][]): boolean {
     const cfg = deps.windowed ? deps.windowed() : null;
     if (!cfg || selection().view === "threads") return false;
+    // `#2292 vibe-talk-windowed-composer-foot-fight`: the outermost render measures where the
+    // held composer stands before anything moves; the converge and coverage re-renders inside
+    // it keep that place, as they keep the first render's row (`winHoldAnchor`).
+    if (winRenderDepth === 0) winComposerTop = deps.heldComposerTop ? deps.heldComposerTop(el("scroll-area")) : null;
+    winRenderDepth += 1;
+    try {
+      return renderWindowedNow(list, groups);
+    } finally {
+      winRenderDepth -= 1;
+      if (winRenderDepth === 0) winComposerTop = null;
+    }
+  }
+
+  function renderWindowedNow(list: HTMLElement, groups: Message[][]): boolean {
+    const cfg = deps.windowed ? deps.windowed() : null;
+    if (!cfg) return false;
     const area = el("scroll-area");
     // `#1985`: heights are priced by the LIST's width (the rows' own layout
     // width), not the scroller's: rows measured while a narrower column had
@@ -798,7 +847,16 @@ export function createTimelineView(deps: TimelineViewDependencies): TimelineView
         return true;
       }
     }
-    if (atFoot && slice.to === groups.length) {
+    if (winComposerTop !== null && deps.keepComposer) {
+      // `#2292`: the composer the reader is writing in holds the view (`#1839`): neither the
+      // foot lock nor the row anchor writes, since either holds a place the composer does not
+      // stand on (the list's true foot is past the keyboard's fitted foot; a row above it moves
+      // with every height between). The scroll owner's one composer write keeps it instead.
+      winLastNudge = null;
+      const before = area.scrollTop;
+      deps.keepComposer(area, winComposerTop);
+      if (Math.abs(area.scrollTop - before) > 0.5) winSelfScrollStamp += 1;
+    } else if (atFoot && slice.to === groups.length) {
       // The foot lock, landed: with the last group mounted the scroll height
       // is real, so one measured write puts the reader on the bottom row.
       winLastNudge = null;
@@ -842,8 +900,25 @@ export function createTimelineView(deps: TimelineViewDependencies): TimelineView
     if (!winListening && typeof area.addEventListener === "function") {
       winListening = true;
       let queued = false;
+      // `#2292`: a synchronous re-slice taken this frame (below); the next one waits a frame.
+      let missTaken = false;
       area.addEventListener("scroll", () => {
-        if (queued || !winGroups) return;
+        if (!winGroups) return;
+        // `#2292 vibe-talk-windowed-composer-foot-fight` (c)2: a jump onto a spacer (a
+        // programmatic jump into the middle of the list, a search hit, a far wheel) leaves no
+        // mounted row in the band; waiting for the frame's deferred re-slice showed blank
+        // spacer meanwhile. Only the first and last mounted rows are measured (constant time),
+        // and only that case re-slices in the same task; every other scroll keeps the
+        // deferred path and its hysteresis below. Once per frame at most.
+        if (!missTaken && deps.windowed && deps.windowed() && bandMissesWindow(list, area)) {
+          missTaken = true;
+          if (typeof requestAnimationFrame === "function") requestAnimationFrame(() => { missTaken = false; });
+          else missTaken = false;
+          winSelfScrollLive = false;
+          renderWindowed(list, winGroups);
+          return;
+        }
+        if (queued) return;
         queued = true;
         const run = () => {
           queued = false;
@@ -2232,7 +2307,7 @@ function takeDeferredOlder() {
 // web/src/view/channel's (`createPullToRefresh`, `#624 voice-page-modularity`); what a refresh reads is
 // here.
 
-function settleAfterRead(messages: readonly Message[], how: { area: HTMLElement; keepPosition: boolean; ownAct?: boolean; wasAtNewest: boolean; previousTop: number; anchorId?: string | null; anchorTop?: number; around?: { marks: { id: string; top: number }[]; near: ReturnType<typeof rowNeighbours> } | null; heldPlaceAt?: number }): void {
+function settleAfterRead(messages: readonly Message[], how: { area: HTMLElement; keepPosition: boolean; ownAct?: boolean; wasAtNewest: boolean; previousTop: number; anchorId?: string | null; anchorTop?: number; around?: { marks: { id: string; top: number }[]; near: ReturnType<typeof rowNeighbours> } | null; heldPlaceAt?: number; composerTop?: number | null }): void {
   const previous = listState().newestId;
   const newest = messages.length ? String((messages[messages.length - 1] as Message).id) : null;
   const moved = newest !== null && listState().newestId !== null && newest !== listState().newestId;
@@ -2276,7 +2351,16 @@ function settleAfterRead(messages: readonly Message[], how: { area: HTMLElement;
     // ...or the line of the collapsed run it has joined since. `#221 read-modes`.
     // `#612 view-stability`: in the Threads list, not after a card a reply moved to the foot (`heldRowAfter`).
     const held = heldRowAfter(how);
-    if (held && Number.isFinite(how.anchorTop)) {
+    // `#2292 vibe-talk-windowed-composer-foot-fight`: while the composer the reader is writing in
+    // held the view as the read landed (`composerTop`, `#1839`), it is the place kept, not a row:
+    // the scroll owner's one composer write puts it back (its foot the keyboard's fitted foot,
+    // `#2277`), and the row restore below stands down. Restoring the row after the owner had
+    // kept the composer is what moved the composer 46 px with windowed lists on.
+    const composerKept = typeof how.composerTop === "number" && how.heldPlaceAt === undefined && deps.keepComposer
+      ? deps.keepComposer(how.area, how.composerTop) : false;
+    if (composerKept) {
+      // Kept above; the jump below is still decided.
+    } else if (held && Number.isFinite(how.anchorTop)) {
       deps.toPosition(how.area, how.previousTop);
       deps.nudge(how.area, held.row.getBoundingClientRect().top - held.top);
     } else if (how.heldPlaceAt !== undefined) {
@@ -2340,9 +2424,12 @@ function settleAfterRead(messages: readonly Message[], how: { area: HTMLElement;
  * @param {boolean} sentAtNewest
  */
 
-function landedReadPosition(area: HTMLElement, keepPosition: boolean, sentAtNewest: boolean): { wasAtNewest: boolean; keepPosition: boolean; previousTop: number; anchorId: string | null; anchorTop: number; around: { marks: { id: string; top: number }[]; near: ReturnType<typeof rowNeighbours> } | null } {
+function landedReadPosition(area: HTMLElement, keepPosition: boolean, sentAtNewest: boolean): { wasAtNewest: boolean; keepPosition: boolean; previousTop: number; anchorId: string | null; anchorTop: number; around: { marks: { id: string; top: number }[]; near: ReturnType<typeof rowNeighbours> } | null; composerTop: number | null } {
   const at = channelReadPosition(area);
-  return { ...at, keepPosition: keepPosition || (sentAtNewest && !at.wasAtNewest) };
+  // `#2292 vibe-talk-windowed-composer-foot-fight`: and where the held composer stood in view as
+  // the read landed, for `settleAfterRead`: while it holds the view, it is the place kept.
+  const composerTop = deps.heldComposerTop ? deps.heldComposerTop(area) : null;
+  return { ...at, keepPosition: keepPosition || (sentAtNewest && !at.wasAtNewest), composerTop };
 }
 
 /**
@@ -2624,6 +2711,13 @@ function appendChannelRow(arriving: Message, live = false, folded = false): void
     return;
   }
   const list = el("discord-log");
+  // `#2292 vibe-talk-windowed-composer-foot-fight`: where the composer the reader is writing in
+  // stood before this row was drawn above it. The redraw's own hold (`holdingRows`) measures it only
+  // after the row stands, below its place, and could only bring it back inside the band's edge, a
+  // list padding short of the foot the list's foot keeper then took it back to (8 px each arrival
+  // at the desk). Put back from here instead, by the scroll owner's one composer write.
+  const area = el("scroll-area");
+  const composerTop = deps.heldComposerTop ? deps.heldComposerTop(area) : null;
   const append = () => {
     // A LIVE ARRIVAL CAN JOIN THE ROW ABOVE IT, and it has to be given the chance: the second half
     // of a split post usually arrives over the stream a fraction of a second after the first, so
@@ -2647,6 +2741,7 @@ function appendChannelRow(arriving: Message, live = false, folded = false): void
   // is ABOVE the foot of the list: the reader below it is held where they are reading.
   if (gatheredParent() !== null) preservingScroll(append);
   else append();
+  if (composerTop !== null && deps.keepComposer) deps.keepComposer(area, composerTop);
   // A live arrival and an acknowledged send are both what a reload should show next.
   save();
 }

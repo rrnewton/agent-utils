@@ -7841,6 +7841,9 @@ const timelineView = createTimelineView({
   toPosition: (area, top) => scrollKeeping.toPosition(area, top),
   windowed: () => { const cfg = windowedConfig(deviceSettings(), document.documentElement.clientWidth < 900); return cfg.windowed ? { prefetchPx: cfg.prefetchPx, rowCap: cfg.rowCap } : null; },
   pinnedIds: () => { const id = jumpAnchor.id(); return id ? [id] : []; },
+  // `#2292`: the scroll owner's composer hold, for the windowed renderer and a read's landing.
+  heldComposerTop: (area) => scrollKeeping.heldComposerTop(area),
+  keepComposer: (area, top) => scrollKeeping.keepComposer(area, top),
 });
 const { loadCanon, drawProjection, walkCursorOwed, heldViewRows, drawHeldRows, rowsAsDrawn, applyTimelinePage: applyTimelinePagePass, renderCachedTimeline, mutationAwaitsRead, loadTimeline, foldLateTimelinePage, loadOlderTimeline, foldLiveMessage: foldLiveMessagePass, inView, projectView, holdingMessage, foldTimelinePage, foldTimelineDelta: foldTimelineDeltaPass, loadOlder, maybeLoadOlder, takeDeferredOlder, appendChannelRow: appendChannelRowPass, appendToColumns, applyReadRuns, readRunPlan, readRunRows, cycleReadMode, readRunsSuspended, rowIsRead, openReadRun, openPinnedRun, peelReadRun, renderReadModeControl, applyNewestPage, channelReadPosition: channelReadPositionPass, settleAfterRead: settleAfterReadPass, landedReadPosition } = timelineView;
 // A read's page landing, a live arrival and a poll's delta, as the client debug mode's spans (`#2276`).

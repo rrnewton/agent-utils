@@ -37,7 +37,7 @@ export interface ChannelRefreshDependencies {
   channelStore: ChannelStore;
   viewKey(view?: string, thread?: string | null): string;
   channelReadPosition(area: HTMLElement): { wasAtNewest: boolean; previousTop: number; anchorId: string | null; anchorTop: number; around: unknown };
-  landedReadPosition(area: HTMLElement, keepPosition: boolean, sentAtNewest: boolean): { wasAtNewest: boolean; keepPosition: boolean; previousTop: number; anchorId: string | null; anchorTop: number; around: unknown };
+  landedReadPosition(area: HTMLElement, keepPosition: boolean, sentAtNewest: boolean): { wasAtNewest: boolean; keepPosition: boolean; previousTop: number; anchorId: string | null; anchorTop: number; around: unknown; composerTop?: number | null };
   settleAfterRead(messages: readonly Message[], how: unknown): void;
   applyTimelinePage(payload: TimelineResponse, older?: boolean, saved?: boolean, delta?: boolean, rows?: readonly Message[] | null, held?: Map<string, Message> | null): Message[];
   foldTimelineDelta(payload: TimelineResponse, sent: string | null, view?: string, thread?: string | null): boolean;

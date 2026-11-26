@@ -254,6 +254,16 @@ export interface ScrollKeeping {
   /** A turn arrived: follow it only if the reader had not scrolled away. */
   followIfPinned(pinned: boolean, turns?: number, view?: string): void;
   /**
+   * `#2292 vibe-talk-windowed-composer-foot-fight`: the held composer's top where it stands in
+   * view in `area` now (`composerBefore`), else null; and putting it back at `beforeTop` with
+   * this owner's one composer write (`keepComposerInView`, the keyboard's fitted foot kept).
+   * For a writer that runs outside this owner's holds (the windowed renderer's re-slice, a
+   * read's landing): while the composer holds the view it is the place kept, never a row,
+   * so such a writer stands its own row hold down and asks for this one instead.
+   */
+  heldComposerTop(area: HTMLElement): number | null;
+  keepComposer(area: HTMLElement, beforeTop: number): boolean;
+  /**
    * Which of `rows` stand at least partly in the visible message area
    * (`#1734 vibe-talk-search-view-scroll-default`): the shared scroller's box,
    * cut down to the `visualViewport` where one stands, so an on-screen
@@ -1306,5 +1316,6 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     return onScreen;
   }
 
-  return { visibleList, shownChannelList, scrollAnchor, preservingScroll, preservingCollapse, preservingShrink, preservingShrinkAsync, shrinkSettling: () => shrinkActive, shrinkActSettled: () => shrinkActDoneGen === shrinkGen, holdingRows, toFoot, nudge, toPosition, wheelBy, glideTo, intoView, holdingReader, captureScroll, restoreScroll, followIfPinned, rowsOnScreen, userMovedSince, inputStamp: () => userInputAt, userChangeActive, beginUserChange: openUserHold, footRoom, holdRowAt, clearTapRooms, headRoom };
+  return { visibleList, shownChannelList, scrollAnchor, preservingScroll, preservingCollapse, preservingShrink, preservingShrinkAsync, shrinkSettling: () => shrinkActive, shrinkActSettled: () => shrinkActDoneGen === shrinkGen, holdingRows, toFoot, nudge, toPosition, wheelBy, glideTo, intoView, holdingReader, captureScroll, restoreScroll, followIfPinned, rowsOnScreen, userMovedSince, inputStamp: () => userInputAt, userChangeActive, beginUserChange: openUserHold, footRoom, holdRowAt, clearTapRooms, headRoom,
+    heldComposerTop: composerBefore, keepComposer: (area: HTMLElement, beforeTop: number) => keepComposerInView(area, beforeTop) };
 }
