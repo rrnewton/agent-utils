@@ -67,7 +67,8 @@ pub mod disabled;
 pub mod fake;
 pub mod sqlite;
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -83,6 +84,33 @@ pub const MAX_ID_LEN: usize = 64;
 /// append loop into an unbounded write; it is far above anything a person says in one breath.
 pub const MAX_TURN_CHARS: usize = 8_000;
 
+/// The screenshot harness's anchored clock (`#2283` C1 liaison note): the epoch
+/// millisecond `VIBE_TALK_FAKE_NOW_MS` names, and the monotonic instant it was
+/// first read. Only `scripts/run.sh --screenshots` sets the variable, on its
+/// throwaway server alone, to the same fixed instant the harness anchors the
+/// page's `Date` to — so a summary or turn the walk saves is stamped in the
+/// seeded era it photographs, and a before/after pair differs only where the
+/// page does. Unset or unparseable (every real run), there is no anchor.
+static FAKE_NOW: OnceLock<Option<(i64, Instant)>> = OnceLock::new();
+
+fn fake_now() -> Option<&'static (i64, Instant)> {
+    FAKE_NOW
+        .get_or_init(|| {
+            std::env::var("VIBE_TALK_FAKE_NOW_MS")
+                .ok()
+                .and_then(|value| value.parse::<i64>().ok())
+                .filter(|ms| *ms > 0)
+                .map(|ms| (ms, Instant::now()))
+        })
+        .as_ref()
+}
+
+/// The anchored reading: the anchor plus the real time elapsed since it was
+/// taken, so durations, ordering and ages inside one run still agree.
+fn anchored_ms(anchor: i64, started: Instant, at: Instant) -> i64 {
+    anchor + i64::try_from(at.saturating_duration_since(started).as_millis()).unwrap_or(0)
+}
+
 /// Milliseconds since the Unix epoch, now.
 ///
 /// The store stamps its own records rather than trusting a client-supplied instant: the browser's
@@ -90,6 +118,9 @@ pub const MAX_TURN_CHARS: usize = 8_000;
 /// interleave wrongly for no visible reason.
 #[must_use]
 pub fn now_ms() -> i64 {
+    if let Some((anchor, started)) = fake_now() {
+        return anchored_ms(*anchor, *started, Instant::now());
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
@@ -3210,6 +3241,32 @@ pub const PREVIEW_CHARS: usize = 120;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_anchored_clock_advances_from_its_anchor_by_elapsed_real_time() {
+        let started = Instant::now();
+        assert_eq!(
+            anchored_ms(1_795_003_200_000, started, started),
+            1_795_003_200_000
+        );
+        assert_eq!(
+            anchored_ms(
+                1_795_003_200_000,
+                started,
+                started + std::time::Duration::from_millis(1_500)
+            ),
+            1_795_003_201_500
+        );
+        // A reading from before the anchor was taken cannot move it backwards.
+        assert_eq!(
+            anchored_ms(
+                1_795_003_200_000,
+                started + std::time::Duration::from_secs(5),
+                started
+            ),
+            1_795_003_200_000
+        );
+    }
 
     #[test]
     fn a_conversation_id_refuses_path_traversal_and_everything_like_it() {

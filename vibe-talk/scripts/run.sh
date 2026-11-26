@@ -906,6 +906,12 @@ EOF
     step "Starting the throwaway server"
     (
         cd "$SHOTS_TMP" || exit 1
+        # One clock for every scene, the server's half (`#2283`): the store's stamps
+        # anchor to the same fixed instant the page's Date is anchored to in
+        # screenshots.py (2026-11-18T12:00:00Z) and advance in real time from there,
+        # so a summary or turn the walk saves is stamped in the seeded era and a
+        # before/after pair differs only where the page does.
+        VIBE_TALK_FAKE_NOW_MS=1795003200000 \
         exec "$SHOTS_BIN" --config "$SHOTS_TMP/vibe-talk.toml" --fake-discord \
             > "$SHOTS_TMP/server.log" 2>&1
     ) &

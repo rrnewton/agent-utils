@@ -1162,7 +1162,10 @@ class Driver:
         # now) are the same on every run and every date, never whatever
         # the host's calendar makes of the fixed seed dates (the
         # 37936-hours and 0.0-hours frames). Timers are untouched: only
-        # Date is anchored, and it still moves.
+        # Date is anchored, and it still moves. The throwaway server's
+        # store stamps share the anchor (`VIBE_TALK_FAKE_NOW_MS`, set by
+        # run.sh; #2283), so a summary or turn the walk saves is stamped
+        # in the same era and before/after pairs can come out identical.
         script += (
             "\ntry {\n"
             "  const __anchor = Date.parse('2026-11-18T12:00:00Z');\n"
