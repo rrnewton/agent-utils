@@ -816,7 +816,7 @@ impl HerdrClient {
             format!("HOME={home}"),
             "--setenv".to_owned(),
             format!("TOKIO_WORKER_THREADS={SERVER_WORKER_THREADS}"),
-            herdr_bin,
+            manager_literal(&herdr_bin),
             "server".to_owned(),
         ];
         let completed = self
@@ -1073,7 +1073,9 @@ impl HerdrClient {
                 "--setenv".to_owned(),
                 format!("HOME={home}"),
             ];
-            wrapped.extend(command);
+            // The manager would expand `${...}`, `$NAME` and `$$` in the command, which carries
+            // pane text such as a `pane run` command line (#2316).
+            wrapped.extend(command.iter().map(|arg| manager_literal(arg)));
             command = wrapped;
         }
         let home = self.account_home()?;
@@ -1316,6 +1318,18 @@ fn utf8_absolute(path: &Path, what: &str) -> Result<String> {
     path.to_str()
         .map(str::to_owned)
         .ok_or_else(|| HerdrRunError::unavailable(format!("{what} is not valid UTF-8")))
+}
+
+/// `arg` written so the systemd service manager hands it to the program unchanged (#2316).
+///
+/// A transient service's command line is expanded by the manager when it starts the process:
+/// `${NAME}` anywhere and a whole-word `$NAME` become the unit's environment values (an unknown
+/// name becomes the empty string) and `$$` becomes `$`. Doubling every `$` makes each one literal
+/// on every systemd version, so this needs no probe, unlike `--expand-environment=no` (systemd
+/// 254 and later). Only for service-mode calls: a `--scope` command line is not expanded by older
+/// systemd, which would then keep the doubled `$$`.
+fn manager_literal(arg: &str) -> String {
+    arg.replace('$', "$$")
 }
 
 fn strings(values: &[&str]) -> Vec<String> {
@@ -2250,6 +2264,86 @@ mod tests {
                 "--lines",
                 "4",
             ])
+        );
+    }
+
+    /// Text the service manager would rewrite if a broker call passed it unescaped (#2316).
+    const EXPANSION_PAYLOAD: &str = "echo A:${PROBE} B:$$ C:${x%% *}; echo $PROBE";
+
+    #[test]
+    fn broker_calls_double_every_dollar_and_leave_plain_text_alone() {
+        let doubled = "echo A:$${PROBE} B:$$$$ C:$${x%% *}; echo $$PROBE";
+        assert_eq!(manager_literal(EXPANSION_PAYLOAD), doubled);
+        assert_eq!(manager_literal("git status"), "git status");
+        let runner = FakeRunner::with_outputs(vec![output(0, "", "")]);
+        client("systemd-run", runner.clone())
+            .run("p", EXPANSION_PAYLOAD)
+            .unwrap();
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(
+            calls[0][calls[0].len() - 4..],
+            strings(&["pane", "run", "p", doubled])[..]
+        );
+        // The direct broker runs Herdr itself, with no manager in between: text unchanged.
+        let runner = FakeRunner::with_outputs(vec![output(0, "", "")]);
+        client("direct", runner.clone())
+            .run("p", EXPANSION_PAYLOAD)
+            .unwrap();
+        assert_eq!(runner.calls()[0].last().unwrap(), EXPANSION_PAYLOAD);
+    }
+
+    /// Live: a broker call through the real user manager delivers dollar text byte for byte (an
+    /// expanded `${PROBE}` would arrive empty). `/bin/sh -c` stands in for Herdr and prints its
+    /// arguments, its own script included in the escaping. Skipped without a usable user manager,
+    /// and below an outer validation run, whose cgroup a transient unit would leave.
+    #[test]
+    fn live_broker_call_delivers_dollar_text_byte_for_byte() {
+        let outer = [
+            "DAGRUN_DELEGATED_CGROUP",
+            "DAGRUN_DELEGATED_UNBOXED",
+            "DAGRUN_IN_SCOPE",
+            "DAGRUN_OUTER_RUN",
+        ]
+        .iter()
+        .any(|key| std::env::var_os(key).is_some());
+        let systemd_run = SYSTEMD_RUN_CANDIDATES
+            .iter()
+            .map(PathBuf::from)
+            .find(|path| path.is_file());
+        let (false, Some(systemd_run)) = (outer, systemd_run) else {
+            eprintln!("skipping: no fresh systemd user manager here (#2316 live probe)");
+            return;
+        };
+        let client = HerdrClient::from_parts(
+            "systemd-run",
+            PathBuf::from("/bin/sh"),
+            systemd_run,
+            std::env::temp_dir(),
+            Arc::new(SystemCommandRunner),
+            Arc::new(NoSleep),
+        )
+        .expect("client");
+        let usable = client.invoke(&strings(&["-c", "exit 0"]));
+        if !usable.as_ref().is_ok_and(|output| output.status == 0) {
+            eprintln!("skipping: the user manager refused a transient unit: {usable:?}");
+            return;
+        }
+        let printed = client
+            .invoke(&strings(&[
+                "-c",
+                "printf '%s\\n' \"$@\"",
+                "sh",
+                EXPANSION_PAYLOAD,
+                "$PROBE",
+                "$$",
+            ]))
+            .expect("broker call");
+        assert_eq!(printed.status, 0, "{printed:?}");
+        assert_eq!(
+            printed.stdout.lines().collect::<Vec<_>>(),
+            vec![EXPANSION_PAYLOAD, "$PROBE", "$$"],
+            "the manager rewrote the command: {printed:?}"
         );
     }
 }

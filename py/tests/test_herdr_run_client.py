@@ -559,3 +559,45 @@ def test_a_file_the_kernel_cannot_execute_is_an_exec_format_error(tmp_path: obje
     assert raised.value.errno == 8
     assert os_error_text(raised.value) == "Exec format error (os error 8)"
     assert not os.path.exists(script + ".ran")
+
+
+#: Text the service manager would rewrite if a broker call passed it unescaped (#2316).
+EXPANSION_PAYLOAD = "echo A:${PROBE} B:$$ C:${x%% *}; echo $PROBE"
+DOUBLED_PAYLOAD = "echo A:$${PROBE} B:$$$$ C:$${x%% *}; echo $$PROBE"
+
+
+def test_broker_calls_double_every_dollar_and_leave_plain_text_alone() -> None:
+    assert client_module._manager_literal(EXPANSION_PAYLOAD) == DOUBLED_PAYLOAD
+    assert client_module._manager_literal("git status") == "git status"
+    runner = RecordingRunner(((0, "", ""),))
+    HerdrClient(herdr_bin="fixture-herdr", broker="systemd-run", run=runner).run(
+        "p", EXPANSION_PAYLOAD
+    )
+    assert len(runner.calls) == 1
+    assert runner.calls[0][-4:] == ("pane", "run", "p", DOUBLED_PAYLOAD)
+    # The direct broker runs Herdr itself, with no manager in between: text unchanged.
+    direct = RecordingRunner(((0, "", ""),))
+    HerdrClient(herdr_bin="fixture-herdr", run=direct).run("p", EXPANSION_PAYLOAD)
+    assert direct.calls[0][-1] == EXPANSION_PAYLOAD
+
+
+def test_live_broker_call_delivers_dollar_text_byte_for_byte() -> None:
+    """A broker call through the real user manager delivers dollar text byte for byte (an
+    expanded ``${PROBE}`` would arrive empty). ``/bin/sh -c`` stands in for Herdr and prints its
+    arguments, its own script included in the escaping. Skipped without a usable user manager,
+    and below an outer validation run, whose cgroup a transient unit would leave."""
+    outer = ("DAGRUN_DELEGATED_CGROUP", "DAGRUN_DELEGATED_UNBOXED", "DAGRUN_IN_SCOPE",
+             "DAGRUN_OUTER_RUN")
+    if any(key in os.environ for key in outer):
+        pytest.skip("below an outer validation run (#2316 live probe)")
+    if not any(os.path.isfile(path) for path in client_module.SYSTEMD_RUN_CANDIDATES):
+        pytest.skip("no systemd-run here")
+    client = HerdrClient(herdr_bin="/bin/sh", broker="systemd-run")
+    usable = client._invoke(["-c", "exit 0"])
+    if usable.returncode != 0:
+        pytest.skip(f"the user manager refused a transient unit: {usable.stderr}")
+    printed = client._invoke(
+        ["-c", "printf '%s\\n' \"$@\"", "sh", EXPANSION_PAYLOAD, "$PROBE", "$$"]
+    )
+    assert printed.returncode == 0, printed.stderr
+    assert printed.stdout.splitlines() == [EXPANSION_PAYLOAD, "$PROBE", "$$"], printed

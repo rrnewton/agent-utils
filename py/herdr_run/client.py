@@ -203,6 +203,19 @@ def _timeout_text(timeout: float) -> str:
     return f"control command timed out after {int(timeout)}s"
 
 
+def _manager_literal(arg: str) -> str:
+    """``arg`` written so the systemd service manager hands it to the program unchanged (#2316).
+
+    A transient service's command line is expanded by the manager when it starts the process:
+    ``${NAME}`` anywhere and a whole-word ``$NAME`` become the unit's environment values (an
+    unknown name becomes the empty string) and ``$$`` becomes ``$``. Doubling every ``$`` makes
+    each one literal on every systemd version, so this needs no probe, unlike
+    ``--expand-environment=no`` (systemd 254 and later). Only for service-mode calls: a
+    ``--scope`` command line is not expanded by older systemd, which would then keep the doubled
+    ``$$``."""
+    return arg.replace("$", "$$")
+
+
 def _invoke_error_text(exc: BaseException, timeout: float) -> str:
     if isinstance(exc, subprocess.TimeoutExpired):
         return _timeout_text(timeout)
@@ -455,7 +468,9 @@ class HerdrClient:
                 "--quiet",
                 "--setenv",
                 f"HOME={self._account_home()}",
-                *command,
+                # The manager would expand `${...}`, `$NAME` and `$$` in the command, which
+                # carries pane text such as a `pane run` command line (#2316).
+                *(_manager_literal(arg) for arg in command),
             ]
         try:
             return self._execute(command)
@@ -546,7 +561,7 @@ class HerdrClient:
             f"HOME={home}",
             "--setenv",
             f"TOKIO_WORKER_THREADS={SERVER_WORKER_THREADS}",
-            herdr,
+            _manager_literal(herdr),
             "server",
         ]
         try:
