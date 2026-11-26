@@ -1,13 +1,14 @@
 ---
 title: 'agentctl-watch-non-agent-registry-dirs: a registry directory without agent.json, such as hooks/, is never read as an agent'
-status: in_progress
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - agentctl
 assignee: cl-hookdirs
 created_at: 2026-11-25T09:20:00-05:00
-updated_at: 2026-11-25T09:20:00-05:00
+updated_at: 2026-11-26T16:14:00-05:00
+closed_at: 2026-11-26T16:14:00-05:00
 ---
 
 # Description
@@ -36,3 +37,16 @@ Root cause. The first notice comes from a watch built before #2121, whose regist
 # Notes
 
 Reported by a consumer's lead; follows #2121 and #1932.
+
+## Resolution
+
+Landed as c0f05e5c (gated as 605b079d, a full gate with no failed steps).
+
+- The listing fix itself is #2121: names are listed only from directories holding an `agent.json`. A watch still reporting "hooks_trust hooks" runs a build from before #2121 and stops once refreshed to a build that carries it.
+- The "unknown agent" race (a record that vanishes before either load, and the watch-agents pass dropping unregistered names) was fixed independently by #2222 while this change waited for its gate. That duplicate code was dropped here.
+- c0f05e5c adds the doctor fix: a top-level directory with no record, no queue and no rename naming it (such as `hooks/`) is no longer read or reported as record-unreadable.
+- c0f05e5c also adds regression tests:
+  - in either layout, `hooks/` lists as no agent in list, the watch rows or the name listing;
+  - `agentctl watch` reports nothing about `hooks/`;
+  - a lane stopped while the hooks-trust answer waits for its lifecycle lock gets no keypress.
+- No persisted format changes.
