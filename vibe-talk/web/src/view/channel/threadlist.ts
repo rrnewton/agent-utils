@@ -783,13 +783,27 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
       Date.now() - (cover.fullAt || 0) < deps.reconcileMs() ? cover.newest : null;
     try {
       let payload: unknown;
-      try {
-        payload = await deps.fetchTimeline(sent ? `${base}&after=${encodeURIComponent(sent as string)}` : base);
-      } catch (error) {
-        if (!sent || !deps.isCursorRefusal(error)) throw error;
-        if (cover && cover.newest === sent) cover.newest = null;
-        sent = null;
-        payload = await deps.fetchTimeline(base);
+      // `#2293`: one bounded retry of the read itself. This read is what a
+      // picker touch asks for; a transient failure (a network blip, a
+      // gateway's non-JSON error page) used to be swallowed below into
+      // `threadListFailures` with nothing retrying while the picker stood
+      // open, so one unlucky touch left older threads un-offered until a
+      // later re-touch. The second failure still surfaces exactly as the
+      // first would have; the cursor-refusal fallback is untouched.
+      for (let attempt = 0; ; attempt++) {
+        try {
+          try {
+            payload = await deps.fetchTimeline(sent ? `${base}&after=${encodeURIComponent(sent as string)}` : base);
+          } catch (error) {
+            if (!sent || !deps.isCursorRefusal(error)) throw error;
+            if (cover && cover.newest === sent) cover.newest = null;
+            sent = null;
+            payload = await deps.fetchTimeline(base);
+          }
+          break;
+        } catch (error) {
+          if (attempt >= 1) throw error;
+        }
       }
       if (String(deps.selectedChannelId()) !== channel) return;
       // `#1986`: envelope facts on the same answer: a moved thread-pin revision re-reads the

@@ -1,13 +1,11 @@
 steps:
-  # DISABLED from gating (`disabled-optin`, #2293): held_walk can wait the
-  # hang backstop without the thread option arriving on unmodified main under
-  # load, so a longer wall-clock budget is not the fix. It stays runnable by
-  # hand / validate --include-disabled and returns only on #2293's condition-
-  # based, hot-host proof.
+  # Re-enabled by #2293's fix: the fake consumes POST bodies (keep-alive
+  # poison, #2307), a failed directory read retries once in the page, and
+  # held_walk's waits name their page condition with a hang backstop only.
   - group: check
     job: read-modes-browser
     desc: a thread entered on its first unread, a collapsed read run opened by a real tap, and Main's unread-replies count, in current Chromium at 412x915 and 1280x800
-    labels: [validation-vibe-talk, validation-vibe-talk-page, disabled-optin]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/read_modes_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools, build.page]
@@ -19,4 +17,3 @@ steps:
       classification: latency-bound
       preferred_inner_jobs: 4
       rss_baseline_bytes: 1073741824
-

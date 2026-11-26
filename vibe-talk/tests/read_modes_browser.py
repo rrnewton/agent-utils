@@ -78,6 +78,11 @@ READ_REPLIES = 45
 HELD_WINDOW = 7
 # The longest the second walk's thread read is held for, should the walk fail before it opens the gate.
 THREAD_HOLD_S = 30.0
+# The held walk's waits are condition waits (#2293): each names the page state
+# it waits for, and this is only the hang backstop that fails the walk if that
+# state can never arrive — never a wall-clock verdict on a loaded host. The
+# backstop is paid at most once per walk (the first unmet condition ends it).
+HELD_BACKSTOP_MS = 120_000
 ROOT_ID = "7700000000000000000"
 ANSWER_ID = "7700000000000000500"
 # The smallest target a thumb is given anywhere on this page.
@@ -234,6 +239,11 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
                 self.json(404, {"error": "not_found", "detail": "not served by this check"})
 
         def do_POST(self) -> None:  # noqa: N802
+            # Consume the body before answering (#2307): this handler speaks
+            # HTTP/1.1 keep-alive, so unread body bytes (the page's
+            # freeze-report POST) would be parsed as the next request line
+            # and a later pooled fetch could draw that 400 as its answer.
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
             self.json(404, {"error": "not_found", "detail": "not served by this check"})
 
         def asset(self, request_path: str) -> None:
@@ -859,15 +869,15 @@ def held_walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed:
     page.fill("#api-token", TOKEN)
     page.click("#save-token")
     try:
-        page.wait_for_function("() => !document.getElementById('screen-welcome').hidden || !document.getElementById('screen-main').hidden", timeout=3_000)
+        page.wait_for_function("() => !document.getElementById('screen-welcome').hidden || !document.getElementById('screen-main').hidden", timeout=HELD_BACKSTOP_MS)
         if page.evaluate("() => !document.getElementById('screen-welcome').hidden"):
             page.click("#welcome-start")
     except Exception:
         pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
-    page.wait_for_function("() => !document.getElementById('screen-main').hidden", timeout=10_000)
+    page.wait_for_function("() => !document.getElementById('screen-main').hidden", timeout=HELD_BACKSTOP_MS)
     # `#1781`: sign-in lands on the channel already.
     page.wait_for_function(f"() => document.querySelectorAll('#discord-log > li').length === {HELD_WINDOW}",
-                           timeout=10_000)
+                           timeout=HELD_BACKSTOP_MS)
     page.wait_for_timeout(300)
     for _tap in range(3):
         if named() == "fold":
@@ -880,10 +890,10 @@ def held_walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed:
     # channel's thread list, as it does for a thumb.
     page.dispatch_event("#thread-select", "pointerdown")
     page.wait_for_function(f"() => [...document.getElementById('thread-select').options]"
-                           f".some((option) => option.value === 'thread:{THREAD_ID}')", timeout=10_000)
+                           f".some((option) => option.value === 'thread:{THREAD_ID}')", timeout=HELD_BACKSTOP_MS)
     # The server holds the thread's read back: what is up is what All held, landed at once.
     page.select_option("#thread-select", f"thread:{THREAD_ID}")
-    page.wait_for_function(answer_open, timeout=5_000)
+    page.wait_for_function(answer_open, timeout=HELD_BACKSTOP_MS)
     m = measure(page)
     check(m["root"] is None, f"{size}: the root was up before the thread's read landed; these are not held rows")
     floating = number(m, "floating")
@@ -897,9 +907,9 @@ def held_walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed:
     # The read lands: the root at the head, the line, the answer still open, as in a thread entered
     # with every row held.
     page.wait_for_function(f"() => document.querySelector('#discord-log > li[data-id=\"{ROOT_ID}\"]')",
-                           timeout=15_000)
+                           timeout=HELD_BACKSTOP_MS)
     last: object = None
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + HELD_BACKSTOP_MS / 1000
     m = measure(page)
     while time.monotonic() < deadline:
         m = measure(page)
