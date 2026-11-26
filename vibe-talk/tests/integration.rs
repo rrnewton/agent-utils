@@ -298,6 +298,9 @@ mod slack_upstream_clear;
 #[path = "startup.rs"]
 mod startup;
 
+#[path = "state_sync.rs"]
+mod state_sync;
+
 #[path = "summaries.rs"]
 mod summaries;
 

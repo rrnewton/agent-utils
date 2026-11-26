@@ -619,9 +619,10 @@ struct HoldGate {
     release: tokio::sync::oneshot::Receiver<()>,
 }
 
-/// One `/timeline` read held at the provider, from [`TimelineChat::hold_next_timeline`]: it has
-/// taken its answer from the channel as it stood and waits before handing it back, so a test can
-/// change the world underneath a read that is in flight.
+/// One provider read held before it answers, from [`TimelineChat::hold_next_timeline`] or
+/// [`CountingChat::hold_next`]: a timeline read has taken its answer from the channel as it stood
+/// and waits before handing it back, so a test can change the world underneath a read that is in
+/// flight, or prove an answer did not wait for it at all (`#2280`).
 pub struct HeldRead {
     /// Answers once the read has taken its answer and is waiting.
     pub entered: tokio::sync::oneshot::Receiver<()>,
@@ -872,6 +873,13 @@ struct ScriptedFailure {
     error: crate::chat::ChatError,
 }
 
+/// A call [`CountingChat`] holds before answering, once: `method`/`view` of `None` match any.
+struct ScriptedHold {
+    method: Option<&'static str>,
+    view: Option<crate::threads::TimelineView>,
+    gate: HoldGate,
+}
+
 /// A chat provider that COUNTS every upstream call made through it: the common fixture of the
 /// remote-ops audit (2026-10-13, section 5), so a test can assert how many calls one user-visible
 /// action costs, per method, channel, timeline view and read reason.
@@ -880,12 +888,15 @@ struct ScriptedFailure {
 /// included, so the wrapped provider behaves exactly as it would unwrapped. Each async method (the
 /// ones that may reach a provider) is recorded as a [`CountedCall`] when it is made, before it
 /// answers. Optionally every such call waits a delay first ([`CountingChat::with_delay`]; tokio's
-/// clock, so a paused test spends none of it), and a call can be scripted to fail
-/// ([`CountingChat::fail_next`]), still counted, without reaching the wrapped provider.
+/// clock, so a paused test spends none of it), a call can be scripted to fail
+/// ([`CountingChat::fail_next`]), still counted, without reaching the wrapped provider, and the
+/// next call can be held before it answers ([`CountingChat::hold_next`]), so a test can tell a
+/// call a page answer awaited from one begun behind it (`#2280`): counting alone cannot.
 pub struct CountingChat {
     inner: Arc<dyn crate::chat::ChatClient>,
     calls: Mutex<Vec<CountedCall>>,
     failures: Mutex<Vec<ScriptedFailure>>,
+    holds: Mutex<Vec<ScriptedHold>>,
     delay: Duration,
 }
 
@@ -897,6 +908,7 @@ impl CountingChat {
             inner,
             calls: Mutex::new(Vec::new()),
             failures: Mutex::new(Vec::new()),
+            holds: Mutex::new(Vec::new()),
             delay: Duration::ZERO,
         }
     }
@@ -921,6 +933,47 @@ impl CountingChat {
             view,
             error,
         });
+    }
+
+    /// Hold the next call of `method` (of any view) after it is counted, until the returned
+    /// [`HeldRead::release`] is sent to or dropped. Each hold is used once, oldest first.
+    #[must_use]
+    pub fn hold_next(&self, method: &'static str) -> HeldRead {
+        self.hold_next_matching(Some(method), None)
+    }
+
+    /// Hold the next counted call of any method, as [`CountingChat::hold_next`]: the state-sync
+    /// matrix's question is whether a page answer waited for upstream at all, not which method
+    /// it waited for (`#2280`).
+    #[must_use]
+    pub fn hold_next_any(&self) -> HeldRead {
+        self.hold_next_matching(None, None)
+    }
+
+    /// Drop every queued hold no counted call has taken yet: a test whose answer came back
+    /// before any upstream call began leaves its hold queued, and without this the next case's
+    /// first call would take that stale (already released) hold instead of its own. A call
+    /// already held keeps its gate: taking a hold removes it from this queue.
+    pub fn clear_holds(&self) {
+        lock(&self.holds).clear();
+    }
+
+    fn hold_next_matching(
+        &self,
+        method: Option<&'static str>,
+        view: Option<crate::threads::TimelineView>,
+    ) -> HeldRead {
+        let (entered_tx, entered) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        lock(&self.holds).push(ScriptedHold {
+            method,
+            view,
+            gate: HoldGate {
+                entered: entered_tx,
+                release: release_rx,
+            },
+        });
+        HeldRead { entered, release }
     }
 
     /// Every call made so far, oldest first.
@@ -955,7 +1008,10 @@ impl CountingChat {
             .count()
     }
 
-    /// Record `call`, wait the delay, and answer with a scripted failure or with `forward`.
+    /// Record `call`, wait the delay and any scripted hold, and answer with a scripted failure
+    /// or with `forward`. The hold is taken before `forward` is awaited, so `entered` means the
+    /// call reached this provider and has not answered: an answer that completes while it is
+    /// held did not wait for it, however the call is later counted.
     async fn counted<T, F>(
         &self,
         call: CountedCall,
@@ -974,9 +1030,23 @@ impl CountingChat {
                 })
                 .map(|at| failures.remove(at).error)
         };
+        let hold = {
+            let mut holds = lock(&self.holds);
+            holds
+                .iter()
+                .position(|hold| {
+                    hold.method.is_none_or(|method| method == call.method)
+                        && hold.view.is_none_or(|view| call.view == Some(view))
+                })
+                .map(|at| holds.remove(at))
+        };
         lock(&self.calls).push(call);
         if !self.delay.is_zero() {
             tokio::time::sleep(self.delay).await;
+        }
+        if let Some(hold) = hold {
+            let _ = hold.gate.entered.send(());
+            let _ = hold.gate.release.await;
         }
         match scripted {
             Some(error) => Err(error),
