@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-doc-reader-navigator-campaign: the document reader navigator shows real sections, goes where clicked, and keeps a fixed size'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 assignee: mu-docnav
@@ -10,7 +10,8 @@ labels:
 - reader
 - ui
 created_at: 2026-11-25T17:52:21-05:00
-updated_at: 2026-11-25T18:35:16-05:00
+updated_at: 2026-11-26T04:47:18.000000000+00:00
+closed_at: 2026-11-26T04:47:18.000000000+00:00
 ---
 
 # Description
@@ -50,3 +51,7 @@ Related work already landed: #2242 vibe-talk-documents-reader-toolbar (the reade
 Owner-UI fast-track (owner-priority gate, deployed on landing). Reproduce and test only on a local server from the worktree build with fixture data; never the live instance.
 
 Step A (one page index space for document reads: navigator and body taps seek in the page's block space on both voices; the device voice speaks the page's own texts) landed as caf7a08b on a green owner gate on the same tree (e5dd9542, 2026-11-25 9:02 PM ET) whose selection ran the scrubber, read, control-bar and read-aloud-blocks browser checks; deployed the same evening with a clean 15-minute watch. Steps B, C and D follow.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main in four gated steps, each deployed on landing: step A `caf7a08b` (one page index space for document reads — navigator and body taps seek in the page's block space on both voices, mapped to spoken pieces by element groups inside the read owner; the device voice speaks the page's own texts), step B `d3d15491` (every section flat as § number and bare title, unnumbered chunk ticks, cells built once per document/section behind one delegated listener, fat arrows stepping the payload's section tree, thin arrows one model block, the strip count in model blocks), step C `7b96b335` (the desk strip at the reader's chosen fixed width by its right-edge handle, remembered per device; fixed row heights), step D `0ab352c1` (deployed 11:45 PM ET, watch clean; body taps resolve the tapped word or table row — playing jumps there on the retained entry without scrolling, paused cues held, no read marks where Read starts and says nothing; clipped row edges fade and reveal by wheel, drag and arrow keys). Diagnosis root cause for the wrong landings: taps sent a page block-model index the cloud path consumed as a server prepared-piece index (tables speak per row, long blocks per sentence piece), so landings after any table or long block started early on the default voice while device taps and segment-space arrows stayed exact; the one navigator browser test forced the device voice over short single-piece paragraphs and could not see it. Tests: a cloud-voice canary in the scrubber (fails on the old seek, with the existing walks on both voices), pure mapping round-trips, marker/held/offset tests in the fake page and owner suites, geometry and taps walks in the scrubber, and screenshot scenes 132-137 with the final matrix (light and dark, phone 412x915 and desktop 1280x800, Discuss in the phone shots) taken from the landed build. Deferred, noted in step A's evidence: client/server block-cut divergence classes beyond the aligned-cut mapping keep the drawn-element fallback a concrete document can still exercise; no issue filed yet at the coordinator's direction.
