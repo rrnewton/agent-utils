@@ -1,0 +1,16 @@
+steps:
+  - group: check
+    job: dark-composer-black-browser
+    desc: in dark every box the reader writes in (channel, thread, call, reply, quick reply, Discuss) is the message cards' black and its words and placeholder keep 4.5:1 on it, at rest, focused and with the keyboard up; light unchanged; system and forced themes, in current Chromium at 412x915 by touch and 1280x800 (#2294)
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/dark_composer_black_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools, build.page]
+    timeout: 360
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 25
+      classification: latency-bound
+      preferred_inner_jobs: 4
+      rss_baseline_bytes: 1073741824

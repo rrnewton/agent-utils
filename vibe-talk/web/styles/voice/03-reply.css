@@ -47,6 +47,24 @@
   resize: vertical;
 }
 
+/* `#2294 vibe-talk-dark-composer-black`. The owner, 2026-11-26: "I would like the black background
+   to apply to the COMPOSE window too because I look at that a lot." In dark every box the reader
+   writes in (the channel's, the thread's, the call's, the reply in the stream, the quick reply and
+   Discuss's "Ask about this") is the message cards' own surface, `--theirs` (`#2154`: true black),
+   so a theme that repaints the cards repaints these boxes with them. Keyed on the theme the page
+   paints, so a forced Dark on a light system is black as well. The words, the placeholder and the
+   caret only gain contrast on it. Light keeps each box's own surface (`--panel`; Discuss's field
+   `--row-hover`). One selector per line, never an `:is()` list: the page suite's rule matcher
+   splits a selector list on every comma. */
+:root[data-theme="dark"] #channel-compose-text,
+:root[data-theme="dark"] #side-compose-text,
+:root[data-theme="dark"] #compose-text,
+:root[data-theme="dark"] #reply-text,
+:root[data-theme="dark"] #quick-reply-text,
+:root[data-theme="dark"] #discuss-followup {
+  background: var(--theirs);
+}
+
 /*
  * `#410 inline-reply-editor`. A reply open IN THE STREAM, under the message it answers and the replies
  * gathered under it, with the later messages below it. The owner, 2026-10-21: "our new Reply interface
