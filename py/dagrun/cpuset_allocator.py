@@ -37,6 +37,7 @@ if __name__ == "__main__" and __package__ in (None, ""):  # pragma: no cover
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dagrun import reservation
+from dagrun.systemd_run import no_expand_args
 from dagrun import __version__
 
 PROG = "cpuset-alloc"
@@ -98,13 +99,21 @@ def _systemd_run_available() -> bool:
     return r.returncode == 0
 
 
-def _scope_argv(cores: Sequence[int], cmd: Sequence[str], *, tag: str = "") -> list[str]:
+def _scope_argv(
+    cores: Sequence[int],
+    cmd: Sequence[str],
+    *,
+    tag: str = "",
+    no_expand: Sequence[str] | None = None,
+) -> list[str]:
     """Build the ``systemd-run`` argv that boxes ``cmd``'s whole tree onto ``cores``.
 
     ``--scope`` runs the command SYNCHRONOUSLY in this session and propagates its
     exit code; ``-p AllowedCPUs=`` sets ``cpuset.cpus`` on the scope cgroup so the
     command and every descendant inherit the hard bound; ``--collect`` reaps the
-    unit even if the command fails so a leaked scope does not linger."""
+    unit even if the command fails so a leaked scope does not linger.
+    ``no_expand`` (default: asked of the installed systemd-run) goes before ``--``:
+    the command is the caller's, often shell text, and must arrive byte for byte (#2316)."""
     argv = [
         "systemd-run",
         "--user",
@@ -118,6 +127,7 @@ def _scope_argv(cores: Sequence[int], cmd: Sequence[str], *, tag: str = "") -> l
         # A human-readable unit name aids `systemctl --user list-units` debugging.
         safe = "".join(c if c.isalnum() else "-" for c in tag)[:48]
         argv += ["--unit", f"cpuset-alloc-{safe}-{os.getpid()}"]
+    argv.extend(no_expand_args(f"{PROG}:") if no_expand is None else no_expand)
     argv.append("--")
     argv.extend(cmd)
     return argv

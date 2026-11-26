@@ -1763,6 +1763,9 @@ fn attempt_scope_reexec_inner(
         "--setenv={EXPECTED_OUTER_CPU_COUNT_ENV}={}",
         cpu_count.map_or_else(String::new, |value| value.to_string())
     ));
+    // The re-exec carries this process's own argv, which can hold text such as an `--args` value
+    // or a path with `${...}` or `$$` in it; systemd-run must hand it over unexpanded (#2316).
+    args.extend(crate::systemd_run::no_expand_args(LOG_PREFIX));
     args.push("--".into());
 
     match std::env::current_exe() {

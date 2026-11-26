@@ -43,6 +43,7 @@ pub mod sizing;
 pub mod summary;
 pub mod sweep;
 pub mod sync;
+mod systemd_run;
 pub use testrun_core::test_results;
 pub mod viz;
 

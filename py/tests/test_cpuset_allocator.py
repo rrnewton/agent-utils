@@ -50,6 +50,94 @@ def test_scope_argv_uses_allowedcpus_hard_pin() -> None:
     assert not any("setaffinity" in a or a == "taskset" for a in argv)
 
 
+#: Arguments systemd-run would rewrite if it expanded the environment (#2316).
+_EXPANSION_PAYLOAD = ["A:${PROBE}", "B:$$", "C:${x%% *}", "$PROBE", "D:$PROBE"]
+
+
+def test_scope_argv_turns_expansion_off_before_the_separator() -> None:
+    command = ["sh", "-c", "echo ${HOME} $$"]
+    argv = ca._scope_argv([3, 1], command, tag="t", no_expand=["--expand-environment=no"])
+    dd = argv.index("--")
+    assert argv[dd - 1] == "--expand-environment=no"
+    assert argv[dd + 1 :] == command
+    # A systemd-run that refuses the option gets the old argv, unchanged.
+    old = ca._scope_argv([3, 1], command, tag="t", no_expand=[])
+    assert not any(a.startswith("--expand-environment") for a in old)
+    assert len(old) + 1 == len(argv)
+
+
+@pytest.mark.parametrize(("answer", "flag"), [(True, True), (False, False), (None, False)])
+def test_scope_argv_default_asks_systemd_run_once(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    answer: bool | None,
+    flag: bool,
+) -> None:
+    from dagrun import systemd_run
+
+    asked: list[str] = []
+
+    def probe(program: str) -> bool | None:
+        asked.append(program)
+        return answer
+
+    monkeypatch.setattr(systemd_run, "probe_no_expand", probe)
+    monkeypatch.setattr(systemd_run, "_SUPPORTED", None)
+    for _ in range(2):
+        argv = ca._scope_argv([0], ["true"])
+        assert ("--expand-environment=no" in argv) is flag
+    assert asked == ["systemd-run"]
+    err = capsys.readouterr().err
+    # Only a refusal is worth a note; a missing binary fails at launch and says so there.
+    assert ("refuses --expand-environment=no" in err) is (answer is False)
+
+
+def test_no_expand_probe_reports_support_refusal_and_absence(tmp_path: Path) -> None:
+    from dagrun import systemd_run
+
+    new = tmp_path / "new-systemd-run"
+    new.write_text(
+        '#!/bin/sh\n[ "$1" = --expand-environment=no ] && [ "$2" = --version ] && exit 0\nexit 9\n'
+    )
+    old = tmp_path / "old-systemd-run"
+    old.write_text("#!/bin/sh\necho \"systemd-run: unrecognized option '$1'\" >&2\nexit 1\n")
+    for path in (new, old):
+        path.chmod(0o755)
+    assert systemd_run.probe_no_expand(str(new)) is True
+    assert systemd_run.probe_no_expand(str(old)) is False
+    assert systemd_run.probe_no_expand(str(tmp_path / "missing")) is None
+    note = systemd_run.unsupported_note("cpuset-alloc:")
+    assert note.startswith("cpuset-alloc: note: ") and "${...}" in note and "#2316" in note
+
+
+def test_scope_argv_passes_dollar_text_literally_live(
+    inherited_runner_authority_env: Mapping[str, str],
+) -> None:
+    """Live: the exact argv ``cpuset-alloc run`` launches gets its arguments byte for byte, even
+    with a caller variable of the same name set."""
+    if inherited_runner_authority_env:
+        pytest.skip(
+            "live systemd scope would escape the parent-owned delegated validation cgroup "
+            "(#2316 live probe)"
+        )
+    if not shutil.which("systemd-run") or not _systemd():
+        pytest.skip("no usable systemd user scope here")
+    core = min(os.sched_getaffinity(0))
+    env = {k: v for k, v in os.environ.items() if k != "x"}
+    env["PROBE"] = "expanded"
+    proc = subprocess.run(
+        ca._scope_argv([core], ["printf", "%s\\n", *_EXPANSION_PAYLOAD]),
+        capture_output=True,
+        text=True,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        timeout=60,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.splitlines() == _EXPANSION_PAYLOAD, proc.stderr
+
+
 def test_cpulist_is_sorted_comma_form() -> None:
     assert ca._cpulist([5, 1, 3]) == "1,3,5"
     assert ca._cpulist([2]) == "2"

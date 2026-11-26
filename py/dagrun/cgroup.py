@@ -26,6 +26,7 @@ from types import FrameType
 from typing import TYPE_CHECKING
 
 from dagrun.capabilities import Lane, is_enforced
+from dagrun.systemd_run import no_expand_args
 from dagrun.sizing import (
     BUILD_JOBS_ENV,
     OPERATOR_BUILD_JOBS_ENV,
@@ -1482,6 +1483,10 @@ def reexec_in_scope(
            f"--setenv={naming.env_scope_unit}={unit}.scope",
            f"--setenv={EXPECTED_OUTER_MEMORY_MAX_ENV}={memory_max or ''}",
            f"--setenv={EXPECTED_OUTER_CPU_COUNT_ENV}={cpu_count or ''}",
+           # The re-exec carries this process's own argv, which can hold text such as an
+           # `--args` value or a path with `${...}` or `$$` in it; systemd-run must hand it over
+           # unexpanded (#2316).
+           *no_expand_args(naming.log_prefix),
            "--", *argv]
     print(f"{naming.log_prefix} re-exec inside transient systemd scope {unit}.scope "
           "(two-level cgroup; full-descendant cleanup on exit)…")

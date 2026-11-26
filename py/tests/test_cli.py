@@ -3193,3 +3193,143 @@ def test_unboxed_run_enforces_a_lower_bound_and_exposes_its_escape() -> None:
         f"setsid escape must remain visible as the reason capabilities stays false:\n{escaped_out}"
     )
     assert "CPU-TIMEOUT" not in escaped_out, escaped_out
+
+
+# --------------------------------------------------------------------------- #
+# #2316: the outer-scope re-exec hands its own argv to systemd-run unexpanded  #
+# --------------------------------------------------------------------------- #
+
+#: One --args value with every form systemd-run rewrites (${NAME}, $$, an invalid name, $NAME).
+_EXPANSION_PAYLOAD = "A:${PROBE} B:$$ C:${x%% *} D:$PROBE"
+
+#: Scope-policy and nesting knobs a fresh top-level run must not inherit.
+_TOP_LEVEL_SCRUB = (
+    "CI",
+    "GITHUB_ACTIONS",
+    "DAGRUN_IN_SCOPE",
+    "DAGRUN_SCOPE_UNIT",
+    "DAGRUN_DIRECT_CGROUP",
+    "DAGRUN_OUTER_RUN",
+    "DAGRUN_DELEGATED_CGROUP",
+    "DAGRUN_DELEGATED_UNBOXED",
+    "DAGRUN_EXPECTED_OUTER_MEMORY_MAX_BYTES",
+    "DAGRUN_EXPECTED_OUTER_CPU_COUNT",
+    "DAGRUN_OUTER_MEMORY_MAX_BYTES",
+)
+
+
+def _args_dag(tmp: Path, out: Path) -> Path:
+    """A one-step DAG whose step writes its single-quoted {args} text to ``out``."""
+    dag = tmp / "args.json"
+    step = {
+        "group": "g",
+        "job": "j",
+        "cmd": f"printf '%s' '{{args}}' > {shlex.quote(str(out))}",
+        "timeout": 60,
+        "cpu_timeout": 600,
+    }
+    dag.write_text(json.dumps({"steps": [step]}), encoding="utf-8")
+    return dag
+
+
+def _run_top_level(dag: Path, payload: str, env_extra: Mapping[str, str]) -> subprocess.CompletedProcess[str]:
+    symlink = Path(__file__).resolve().parent.parent / "bin" / "dagrun"
+    env = {k: v for k, v in os.environ.items() if k not in _TOP_LEVEL_SCRUB and k != "x"}
+    env.update({"DAGRUN_FORCE_SCOPE_ATTEMPT": "1", "DAGRUN_NO_STEP_LOGS": "1"})
+    env.update(env_extra)
+    return subprocess.run(
+        [sys.executable, str(symlink), "run", "--dag", str(dag), "--no-profile",
+         "--args", payload],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=300,
+        check=False,
+    )
+
+
+def _recording_systemd_run(tmp: Path, probe_exit: int) -> tuple[str, Path]:
+    """A recording systemd-run (each call: a CALL line, then one argument per line). The option
+    probe exits ``probe_exit``; every other call succeeds, so the scope probe passes and the
+    re-exec ends the run there. A refusing systemctl keeps the slice setup off the real session."""
+    shim = tmp / "bin"
+    shim.mkdir()
+    log = tmp / "calls.txt"
+    quoted = shlex.quote(str(log))
+    (shim / "systemd-run").write_text(
+        "#!/bin/sh\n"
+        f"echo CALL >> {quoted}\n"
+        f"for a in \"$@\"; do printf '%s\\n' \"$a\" >> {quoted}; done\n"
+        "if [ \"$1\" = --expand-environment=no ] && [ \"$2\" = --version ]; then "
+        f"exit {probe_exit}; fi\n"
+        "exit 0\n"
+    )
+    (shim / "systemctl").write_text("#!/bin/sh\nexit 1\n")
+    for name in ("systemd-run", "systemctl"):
+        (shim / name).chmod(0o755)
+    return f"{shim}{os.pathsep}{os.environ['PATH']}", log
+
+
+def _recorded_calls(log: Path) -> list[list[str]]:
+    calls: list[list[str]] = []
+    for line in log.read_text().splitlines() if log.exists() else []:
+        if line == "CALL":
+            calls.append([])
+        elif calls:
+            calls[-1].append(line)
+    return calls
+
+
+def _reexec_call(calls: list[list[str]]) -> list[str]:
+    for call in calls:
+        if "--" in call and "run" in call[call.index("--") + 1:]:
+            return call
+    return []
+
+
+def test_reexec_turns_expansion_off_when_systemd_run_accepts_it(tmp_path: Path) -> None:
+    path, log = _recording_systemd_run(tmp_path, 0)
+    proc = _run_top_level(_args_dag(tmp_path, tmp_path / "out.txt"), _EXPANSION_PAYLOAD,
+                          {"PATH": path})
+    calls = _recorded_calls(log)
+    reexec = _reexec_call(calls)
+    assert "--" in reexec, f"no re-exec recorded: {calls}\n{proc.stderr}"
+    separator = reexec.index("--")
+    assert reexec[separator - 1] == "--expand-environment=no", reexec
+    assert reexec[reexec.index("--args") + 1] == _EXPANSION_PAYLOAD, reexec
+    probes = [call for call in calls if call[:1] == ["--expand-environment=no"]]
+    assert len(probes) == 1, calls
+    assert "#2316" not in proc.stderr, proc.stderr
+
+
+def test_reexec_keeps_the_old_argv_with_a_note_when_systemd_run_refuses_it(tmp_path: Path) -> None:
+    path, log = _recording_systemd_run(tmp_path, 1)
+    proc = _run_top_level(_args_dag(tmp_path, tmp_path / "out.txt"), _EXPANSION_PAYLOAD,
+                          {"PATH": path})
+    reexec = _reexec_call(_recorded_calls(log))
+    assert "--" in reexec, proc.stderr
+    assert not any(arg.startswith("--expand-environment") for arg in reexec), reexec
+    assert "refuses --expand-environment=no" in proc.stderr and "#2316" in proc.stderr, proc.stderr
+
+
+def test_live_reexec_delivers_dollar_text_byte_for_byte(
+    tmp_path: Path, inherited_runner_authority_env: Mapping[str, str]
+) -> None:
+    """Through a real ``systemd-run --user --scope``, the step sees the --args text byte for byte
+    although the caller has PROBE set."""
+    if inherited_runner_authority_env:
+        pytest.skip(
+            "fresh top-level systemd re-exec could escape the parent-owned validation cgroup; "
+            "run this integration test standalone (#2316 live probe)"
+        )
+    written = tmp_path / "out.txt"
+    dag = _args_dag(tmp_path, written)
+    for payload in (_EXPANSION_PAYLOAD, "$PROBE"):
+        written.unlink(missing_ok=True)
+        proc = _run_top_level(dag, payload, {"PROBE": "expanded"})
+        combined = proc.stdout + proc.stderr
+        if proc.returncode == 3:
+            pytest.skip(f"cgroup boxing unavailable here:\n{combined}")
+        assert proc.returncode == 0, combined
+        assert "cgroup boxing ACTIVE" in combined, combined
+        assert written.read_text() == payload, combined

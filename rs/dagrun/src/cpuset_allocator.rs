@@ -66,26 +66,42 @@ fn cpulist(cores: &[usize]) -> String {
 fn scope_command(cores: &[usize], command: &[String], tag: &str) -> Command {
     let mut out = Command::new("systemd-run");
     out.process_group(0);
-    out.args([
+    out.args(scope_argv(
+        cores,
+        command,
+        tag,
+        &crate::systemd_run::no_expand_args(&format!("{PROG}:")),
+    ));
+    out
+}
+
+/// The `systemd-run` arguments (after the program) that box `command` onto `cores`. `no_expand`
+/// goes before `--`: the command is the caller's, often shell text, and must arrive byte for byte
+/// (#2316).
+fn scope_argv(cores: &[usize], command: &[String], tag: &str, no_expand: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = [
         "--user",
         "--scope",
         "--collect",
         "--quiet",
         "-p",
         &format!("AllowedCPUs={}", cpulist(cores)),
-    ]);
+    ]
+    .iter()
+    .map(|arg| arg.to_string())
+    .collect();
     if !tag.is_empty() {
         let safe: String = tag
             .chars()
             .map(|ch| if ch.is_alphanumeric() { ch } else { '-' })
             .take(48)
             .collect();
-        out.args([
-            "--unit",
-            &format!("cpuset-alloc-{safe}-{}", std::process::id()),
-        ]);
+        out.push("--unit".to_string());
+        out.push(format!("cpuset-alloc-{safe}-{}", std::process::id()));
     }
-    out.arg("--").args(command);
+    out.extend(no_expand.iter().cloned());
+    out.push("--".to_string());
+    out.extend(command.iter().cloned());
     out
 }
 
@@ -814,5 +830,66 @@ mod tests {
     fn executable_preflight_rejects_missing_paths() {
         assert!(executable_available("true"));
         assert!(!executable_available("/definitely/missing/cpuset-command"));
+    }
+
+    /// Arguments systemd-run would rewrite if it expanded the environment (#2316).
+    const EXPANSION_PAYLOAD: [&str; 5] = ["A:${PROBE}", "B:$$", "C:${x%% *}", "$PROBE", "D:$PROBE"];
+
+    #[test]
+    fn scope_argv_turns_expansion_off_before_the_separator() {
+        let command: Vec<String> = ["sh", "-c", "echo ${HOME} $$"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+        let flag = vec![crate::systemd_run::NO_EXPAND_ENVIRONMENT.to_string()];
+        let argv = scope_argv(&[3, 1], &command, "t", &flag);
+        let separator = argv.iter().position(|arg| arg == "--").unwrap();
+        assert_eq!(argv[separator - 1], "--expand-environment=no", "{argv:?}");
+        assert_eq!(argv[separator + 1..], command[..], "{argv:?}");
+        assert!(argv.contains(&"AllowedCPUs=1,3".to_string()), "{argv:?}");
+        // A systemd-run that refuses the option gets the old argv, unchanged.
+        let old = scope_argv(&[3, 1], &command, "t", &[]);
+        assert!(!old
+            .iter()
+            .any(|arg| arg.starts_with("--expand-environment")));
+        assert_eq!(old.len() + 1, argv.len());
+    }
+
+    /// Live: the exact command `cpuset-alloc run` launches gets its arguments byte for byte, even
+    /// with a caller variable of the same name set. Skipped without a usable user scope, and below
+    /// an outer dagrun run, where a fresh top-level scope would escape the validation's cgroup.
+    #[test]
+    fn scope_command_passes_dollar_text_literally() {
+        let outer = [
+            "DAGRUN_DELEGATED_CGROUP",
+            "DAGRUN_OUTER_RUN",
+            "DAGRUN_IN_SCOPE",
+        ]
+        .iter()
+        .any(|key| std::env::var_os(key).is_some());
+        if outer || !systemd_run_available() {
+            eprintln!("skipping: no fresh systemd user scope available here (#2316 live probe)");
+            return;
+        }
+        let Some(core) = current_allowed().into_iter().next() else {
+            eprintln!("skipping: no allowed core");
+            return;
+        };
+        let mut command = vec!["printf".to_string(), "%s\\n".to_string()];
+        command.extend(EXPANSION_PAYLOAD.iter().map(|arg| arg.to_string()));
+        let output = scope_command(&[core], &command, "")
+            .env("PROBE", "expanded")
+            .env_remove("x")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let printed = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            printed.lines().collect::<Vec<_>>(),
+            EXPANSION_PAYLOAD.to_vec(),
+            "systemd-run rewrote the command; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
